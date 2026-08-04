@@ -1,0 +1,25 @@
+[package]
+name = "meshfox-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+meshfox-core = { path = "../core" }
+axum = { version = "0.7", features = ["ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "sync", "io-util", "time"] }
+tower-http = { version = "0.5", features = ["cors"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rust-embed = "8"
+mime_guess = "2"
+open = "5"
+async-stream = "0.3"
+uuid = { version = "1", features = ["v4"] }
+libc = "0.2"
+portable-pty = "0.9.0"
+anyhow = "1.0.104"
+
+[dev-dependencies]
+futures-util = "0.3.33"
+tokio-tungstenite = "0.30.0"

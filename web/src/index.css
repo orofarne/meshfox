@@ -1,0 +1,1418 @@
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --fg: #1a1a1a;
+  --node-bg: #fdfdfd;
+  --node-border: #d0d0d0;
+  --accent: #3d6ef5;
+  --code-bg: #eef0f3;
+  --code-head-bg: #e4e7ec;
+  --fail: #c22b2b;
+  /* A passing constraint's badge color — --fail's counterpart. */
+  --ok: #1b7a43;
+  /* Dependency chains (`deps=`) get their own color throughout — the run
+   * button, the inline "after: …" badge, and the cross-node arrows — kept
+   * visually distinct from --accent (plain run) and --fail (error). */
+  --dep: #a05dd1;
+  --dep-flash: rgba(160, 93, 209, 0.28);
+  /* meshfox's own Markdown syntax extensions, as highlighted in the
+   * CodeMirror source editors (see meshfoxSyntax.ts) — `meshfox:node`/
+   * `meshfox:edge`/etc. comments and runnable-fence attributes
+   * (`name=`/`cache`/`deps=`/...), kept visually distinct from --accent/
+   * --dep so they don't read as "a run/deps UI element" instead of "a bit
+   * of source syntax". */
+  --syntax-tint: rgba(61, 110, 245, 0.07);
+  --syntax-attr: #96660a;
+  --syntax-value: #1b7a43;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16171a;
+    --fg: #e8e8e8;
+    --node-bg: #202226;
+    --node-border: #3a3d42;
+    --code-bg: #16181c;
+    --code-head-bg: #26282d;
+    --fail: #e56a6a;
+    --ok: #6fcf97;
+    --dep: #c68ae8;
+    --dep-flash: rgba(198, 138, 232, 0.32);
+    --syntax-tint: rgba(107, 148, 255, 0.1);
+    --syntax-attr: #d8b656;
+    --syntax-value: #6fcf97;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+/* Replaces the whole app once `/api/watch`'s connection has ended — see
+ * App.tsx's `serverGone`. */
+.server-gone {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.25rem;
+  height: 100%;
+  font-size: 1rem;
+  opacity: 0.75;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.5rem 1rem;
+  border-bottom: 1px solid var(--node-border);
+}
+
+.toolbar .error {
+  color: #d33;
+  font-size: 0.85rem;
+}
+
+.mode-badge {
+  font-size: 0.75rem;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--node-border);
+  opacity: 0.75;
+}
+
+.mode-badge-edit {
+  border-color: var(--accent);
+  color: var(--accent);
+  opacity: 1;
+}
+
+/* Toolbar-wide constraint pass/fail summary (see App.tsx's
+ * `constraintStats`) — absent entirely when the document declares no
+ * `constraint` nodes, same "nothing to show" convention as the other
+ * toolbar badges here. */
+.constraint-stats {
+  font-size: 0.75rem;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--node-border);
+  white-space: nowrap;
+}
+
+.constraint-stats-ok {
+  border-color: var(--ok);
+  color: var(--ok);
+}
+
+.constraint-stats-fail {
+  border-color: var(--fail);
+  color: var(--fail);
+  font-weight: 600;
+}
+
+/* Layout (position/size from dragging/resizing) auto-saves, debounced —
+ * this is purely informational, not a control (there's nothing to click;
+ * see App.tsx's `layoutSaveTimer` effect). */
+.saving-indicator {
+  font-size: 0.75rem;
+  opacity: 0.6;
+  font-style: italic;
+}
+
+.deps-toggle {
+  font-size: 0.75rem;
+  padding: 0.15rem 0.6rem;
+  border-radius: 999px;
+  border: 1px solid var(--node-border);
+  background: transparent;
+  color: var(--fg);
+  cursor: pointer;
+  opacity: 0.75;
+}
+
+.deps-toggle-active {
+  border-color: var(--dep);
+  color: var(--dep);
+  opacity: 1;
+}
+
+.canvas-area {
+  flex: 1;
+  min-height: 0;
+}
+
+/* Toolbar's "Source" mode (CanvasSourceEditor) — fills the same
+ * `.canvas-area` slot the graph view normally occupies, not a modal, since
+ * there's nothing underneath worth seeing at the same time. */
+.mesh-source-editor {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.mesh-source-editor-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.4rem 0.75rem;
+  border-bottom: 1px solid var(--node-border);
+}
+
+.mesh-source-editor-label {
+  font-size: 0.8rem;
+  opacity: 0.7;
+}
+
+.mesh-source-editor-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-left: auto;
+}
+
+.mesh-source-editor-actions button {
+  font-size: 0.8rem;
+  padding: 0.25rem 0.75rem;
+  border-radius: 4px;
+  border: 1px solid var(--node-border);
+  background: transparent;
+  color: var(--fg);
+  cursor: pointer;
+}
+
+.mesh-source-editor-actions button:last-child {
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.mesh-source-editor-actions button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.mesh-source-editor-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.mesh-source-editor-body .cm-editor {
+  height: 100%;
+}
+
+.mesh-source-editor-loading {
+  padding: 1rem;
+  opacity: 0.7;
+}
+
+/* meshfox's own syntax extensions on top of plain Markdown/HTML — see
+ * meshfoxSyntax.ts's decorations, shared by every CodeMirror source editor
+ * in the app (NodeTextEditor, CanvasSourceEditor). Each of our marks nests
+ * *outside* the base Markdown language's own syntax-highlighting span for
+ * the same text (an HTML comment's content, a fence's info string) — that
+ * inner span always carries its own explicit `color`, which wins for its
+ * own text over anything an ancestor declares, no matter the ancestor's
+ * specificity. The `*` + `!important` pair is what actually reaches
+ * through it: `!important` beats CodeMirror's own (non-important)
+ * injected color rule once both apply to the very same descendant
+ * element, which plain specificity here cannot. */
+.cm-meshfoxComment,
+.cm-meshfoxComment * {
+  background: var(--syntax-tint);
+  border-radius: 3px;
+}
+
+.cm-meshfoxKeyword,
+.cm-meshfoxKeyword * {
+  color: var(--accent) !important;
+  font-weight: 600 !important;
+}
+
+.cm-meshfoxAttrName,
+.cm-meshfoxAttrName * {
+  color: var(--syntax-attr) !important;
+}
+
+.cm-meshfoxAttrValue,
+.cm-meshfoxAttrValue * {
+  color: var(--syntax-value) !important;
+}
+
+.mesh-node {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--node-bg);
+  border: 1px solid var(--node-border);
+  border-radius: 6px;
+  overflow: hidden;
+  font-size: 0.85rem;
+}
+
+.mesh-node-title {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-weight: 600;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--node-border);
+}
+
+.mesh-node-title-text {
+  min-width: 0;
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  /* React Flow's own stylesheet sets `user-select: none` on every
+   * `.react-flow__node` (an ancestor of this, added so dragging a node
+   * doesn't also drag-select its text) — that blanket rule otherwise makes
+   * a node's title uncopyable even read-only, where there's no dragging to
+   * protect. Restored here and on `.mesh-node-body`/`.mesh-file-code-preview`
+   * below, not on the node as a whole, so the surrounding chrome (padding,
+   * title bar background) stays draggable in Edit mode without a stray
+   * text selection racing the drag.
+   *
+   * `user-select` alone isn't enough, though: React Flow's canvas-wide
+   * pan-on-drag (d3-zoom, active regardless of Edit mode) still captures
+   * any mousedown+drag that starts here and calls `preventDefault`, which
+   * silently kills the browser's own text-selection drag before it can
+   * start — the two were fighting over the same gesture. The `nopan` class
+   * on this element in MeshNode.tsx (React Flow's own opt-out, alongside
+   * `nodrag`/`nowheel`) tells that pan behavior to step aside here, so a
+   * drag starting on the text selects it instead of panning the canvas;
+   * dragging from anywhere else (empty canvas, node border, title bar's
+   * own padding) still pans exactly as before. */
+  user-select: text;
+}
+
+.mesh-node-title[data-level="1"] {
+  font-size: 1.05rem;
+}
+
+/* A heading-only node (empty body), read-only — see MeshNode.tsx's
+ * `isTitleOnly`. Takes over the whole card instead of sitting in its
+ * usual flex-shrink-0 row up top, so the title centers in what would
+ * otherwise be a mostly-empty box. Unlike `.mesh-node-title-text` above,
+ * this *is* the title bar's own root element (there's no separate inner
+ * span to carry `nopan`/`user-select: text` — a title-only node has
+ * nothing else in its title bar to keep draggable), so it carries both
+ * itself; see `.mesh-node-title-text`'s comment for why both are needed. */
+.mesh-node-title-centered {
+  flex: 1;
+  border-bottom: none;
+  justify-content: center;
+  text-align: center;
+  white-space: normal;
+  font-size: 1rem;
+  user-select: text;
+}
+
+/* A `constraint` node's own pass/fail pill (see MeshNode.tsx's
+ * `ConstraintBadge`) — sits in its title bar, next to the title text and
+ * before the edit-mode action icons, so it's visible read-only too. */
+.mesh-node-constraint-badge {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.1rem;
+  height: 1.1rem;
+  border-radius: 50%;
+  font-size: 0.7rem;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.mesh-node-constraint-badge-ok {
+  background: var(--ok);
+  color: var(--node-bg);
+}
+
+.mesh-node-constraint-badge-fail {
+  background: var(--fail);
+  color: var(--node-bg);
+}
+
+/* Icon buttons (edit text, open settings) — edit mode only, sit together
+ * in the title bar next to the (possibly truncated) title text rather than
+ * floating over the node body. */
+.mesh-node-title-actions {
+  flex-shrink: 0;
+  display: flex;
+  gap: 0.3rem;
+}
+
+.mesh-node-icon-button {
+  flex-shrink: 0;
+  font-size: 1rem;
+  line-height: 1;
+  padding: 0.3rem 0.5rem;
+  border-radius: 4px;
+  border: 1px solid var(--node-border);
+  background: transparent;
+  color: var(--fg);
+  cursor: pointer;
+  opacity: 0.7;
+}
+
+.mesh-node-icon-button:hover {
+  opacity: 1;
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* Delete is destructive — its own hover color instead of the shared accent,
+ * so it doesn't read as "just another edit action" in the title bar. */
+.mesh-node-delete-icon:hover {
+  border-color: var(--fail);
+  color: var(--fail);
+}
+
+/* A node's own tags — small chip row right under the title bar, both
+ * read-only and edit mode (they're diagram content, not an editing
+ * control). */
+.mesh-node-tags {
+  flex-shrink: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  padding: 0.4rem 0.75rem 0;
+}
+
+/* Read-only tag chip — shared by a node's own tags (above) and an extra
+ * edge's tags (see DeletableEdge.tsx); purely a display, no remove button
+ * (compare `.tag-chip`, the editable kind used inside TagEditor). */
+.mesh-tag-chip {
+  font-size: 0.72rem;
+  line-height: 1.4;
+  padding: 0.05rem 0.5rem;
+  border-radius: 999px;
+  background: var(--bg);
+  border: 1px solid var(--node-border);
+  color: var(--fg);
+  opacity: 0.85;
+  white-space: nowrap;
+}
+
+/* Floating "add child" button (see MeshNode.tsx's `NodeToolbar` usage) —
+ * only its own circular appearance; position/offset/z-index are handled by
+ * `NodeToolbar` itself (portaled above every node, so it stays clickable
+ * even when a tightly-packed neighbor visually overlaps this node's edge). */
+.mesh-node-add-child {
+  width: 20px;
+  height: 20px;
+  line-height: 18px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--accent);
+  background: var(--node-bg);
+  color: var(--accent);
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.mesh-node-add-child:hover {
+  background: var(--accent);
+  color: #fff;
+}
+
+.mesh-node[data-type="group"] {
+  background: transparent;
+  border-style: dashed;
+  /* A group's box is a big, mostly-empty rectangle that visually wraps its
+   * members — with a transparent background it *looks* like you can see
+   * through to whatever's underneath (an edge, another node's control),
+   * but by default the div still fully occupies that area for pointer-event
+   * hit-testing, silently swallowing clicks meant for that other element.
+   * Re-enabled on the title bar below so the group itself stays selectable/
+   * draggable by grabbing its title. */
+  pointer-events: none;
+}
+
+.mesh-node[data-type="group"] .mesh-node-title {
+  border-bottom: none;
+  opacity: 0.8;
+  pointer-events: auto;
+}
+
+.mesh-node[data-suggested="true"]:not([data-type="group"]) {
+  border-style: dashed;
+  opacity: 0.9;
+}
+
+.mesh-node-hint {
+  margin: 0.5rem 0 0;
+  font-size: 0.75rem;
+  opacity: 0.6;
+}
+
+.mesh-node-body {
+  flex: 1;
+  /* Without this, a flex item defaults to `min-height: auto` — "at least
+   * as tall as my own content" — which silently defeats `overflow: auto`
+   * below: the item just grows to fit its content instead of shrinking to
+   * the space the flex container actually has and scrolling the rest.
+   * Matters most for a capped, auto-height node (see MeshNode.tsx's
+   * `data.maxHeight`, autolayout.ts-driven, applied as this node's own
+   * `max-height` for a depth-≥2 node) — without this, its content
+   * overflows the capped box outright instead of scrolling inside it. */
+  min-height: 0;
+  overflow: auto;
+  padding: 0.5rem 0.75rem;
+  /* See `.mesh-node-title-text`'s comment — overrides React Flow's
+   * ancestor `user-select: none` so a node's Markdown/code/output text is
+   * selectable and copyable, in Edit mode or not. */
+  user-select: text;
+}
+
+/* A `file` node's `display: "code"` body — see `FileCodePreview` in
+ * MeshNode.tsx. Scrolls within its own box rather than growing the node,
+ * same as `.mesh-node-body`. */
+.mesh-file-code-preview {
+  flex: 1;
+  overflow: auto;
+  user-select: text;
+}
+
+.mesh-file-code-preview .cm-editor {
+  height: 100%;
+  font-size: 0.78rem;
+}
+
+/* NodeTextEditor is rendered via a portal (into document.body), as a
+ * fixed, centered overlay — not inline inside the node's own box, whose
+ * size is rarely enough room for a real code editor and is at the mercy of
+ * the canvas's current pan/zoom (which could push the editor's own
+ * controls off-screen for a node near the edge of the current view). Same
+ * backdrop idea as `.vars-modal-backdrop`, just sized for a two-pane code
+ * editor instead of a small form. */
+.mesh-text-editor-backdrop {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.4);
+  z-index: 2000;
+}
+
+.mesh-text-editor {
+  display: flex;
+  flex-direction: column;
+  width: min(1100px, 92vw);
+  height: min(720px, 85vh);
+  background: var(--node-bg);
+  border: 1px solid var(--node-border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+  overflow: hidden;
+}
+
+.mesh-text-editor-panes {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  border-top: 1px solid var(--node-border);
+}
+
+.mesh-text-editor-source {
+  min-width: 0;
+  overflow: auto;
+  border-right: 1px solid var(--node-border);
+}
+
+.mesh-text-editor-source .cm-editor {
+  height: 100%;
+}
+
+.mesh-text-editor-preview {
+  min-width: 0;
+  overflow: auto;
+  padding: 0.5rem 0.75rem;
+}
+
+.mesh-text-editor-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  padding: 0.4rem 0.75rem;
+  border-top: 1px solid var(--node-border);
+}
+
+.mesh-text-editor-actions button {
+  font-size: 0.8rem;
+  padding: 0.25rem 0.75rem;
+  border-radius: 4px;
+  border: 1px solid var(--node-border);
+  background: transparent;
+  color: var(--fg);
+  cursor: pointer;
+}
+
+.mesh-text-editor-actions button:last-child {
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* TtyPanel — a `tty` block's interactive-terminal run panel. Same portal/
+ * fixed-overlay idea as `.mesh-text-editor-backdrop` above, plus a
+ * "minimize to a corner pill" state that never touches the terminal's own
+ * layout size: `.collapsed` only ever toggles `visibility`/pointer-events
+ * on the full panel and shows the separate `.mesh-tty-pill` instead — the
+ * xterm.js instance underneath stays mounted at its exact previous pixel
+ * size the whole time, so a full-screen program running inside never sees
+ * a spurious resize just because the panel was tucked out of the way. */
+.mesh-tty-backdrop {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.4);
+  z-index: 2000;
+}
+
+.mesh-tty-backdrop.collapsed {
+  background: transparent;
+  pointer-events: none;
+}
+
+.mesh-tty-panel {
+  display: flex;
+  flex-direction: column;
+  width: min(900px, 92vw);
+  height: min(560px, 82vh);
+  background: #0d0e10;
+  border: 1px solid var(--node-border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  overflow: hidden;
+}
+
+.mesh-tty-backdrop.collapsed .mesh-tty-panel {
+  visibility: hidden;
+}
+
+.mesh-tty-head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.4rem 0.6rem;
+  background: var(--code-head-bg);
+  border-bottom: 1px solid var(--node-border);
+  color: var(--fg);
+  font-size: 0.8rem;
+}
+
+.mesh-tty-head-title {
+  font-weight: 600;
+}
+
+.mesh-tty-head-status {
+  opacity: 0.7;
+}
+
+.mesh-tty-head-status[data-status="error"] {
+  color: var(--fail);
+  opacity: 1;
+}
+
+.mesh-tty-head-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 0.35rem;
+}
+
+.mesh-tty-head-actions button {
+  font-size: 0.75rem;
+  padding: 0.15rem 0.5rem;
+  border-radius: 4px;
+  border: 1px solid var(--node-border);
+  background: transparent;
+  color: var(--fg);
+  cursor: pointer;
+}
+
+.mesh-tty-body {
+  flex: 1;
+  min-height: 0;
+  padding: 0.4rem;
+}
+
+.mesh-tty-body .xterm,
+.mesh-tty-body .xterm-viewport {
+  height: 100%;
+}
+
+.mesh-tty-pill {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 2001;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.4rem 0.8rem;
+  border-radius: 999px;
+  border: 1px solid var(--node-border);
+  background: var(--node-bg);
+  color: var(--fg);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.3);
+  cursor: pointer;
+  font-size: 0.8rem;
+  pointer-events: auto;
+}
+
+/* Left "rail" column of dots (one per code block) plus a connecting line —
+ * a lightweight visual thread through a node's runnable blocks, distinct
+ * from the precise per-edge "after: …" links each block still shows.
+ * Every segment (markdown included) gets its own explicit grid row so the
+ * rail lines up with its block without any JS measurement. */
+.mesh-rail {
+  display: grid;
+  grid-template-columns: 16px 1fr;
+  column-gap: 0.4rem;
+}
+
+.mesh-rail-content {
+  min-width: 0;
+}
+
+.mesh-rail-dot {
+  position: relative;
+  z-index: 1;
+  justify-self: center;
+  width: 9px;
+  height: 9px;
+  margin-top: 0.95rem;
+  border-radius: 50%;
+  background: var(--node-bg);
+  border: 2px solid var(--node-border);
+}
+
+/* A block that's the source or target of a same-node `deps=` edge — same
+ * accent color as the "⛓ run chain" button and the "after: …" links, so
+ * the rail reads as the same concept rather than a new one. */
+.mesh-rail-dot[data-in-chain="true"] {
+  border-color: var(--dep);
+  background: var(--dep);
+}
+
+.mesh-rail-line {
+  grid-column: 1;
+  justify-self: center;
+  width: 2px;
+  margin: 0.95rem 0;
+  background: var(--node-border);
+}
+
+.mesh-node-body pre,
+.mesh-code-block pre {
+  margin: 0;
+  padding: 0.6rem 0.75rem;
+  overflow-x: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  background: var(--code-bg);
+  border-radius: 6px;
+}
+
+.mesh-node-body pre {
+  border: 1px solid var(--node-border);
+}
+
+.mesh-node-body :not(pre) > code {
+  background: var(--code-bg);
+  padding: 0.1em 0.4em;
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.85em;
+}
+
+/* One runnable fence: language label + run button, right above its own
+ * code — not a button bar detached at the bottom of the node. */
+.mesh-code-block {
+  border: 1px solid var(--node-border);
+  border-radius: 6px;
+  margin: 0.6rem 0;
+  overflow: hidden;
+}
+
+.mesh-code-block:first-child {
+  margin-top: 0;
+}
+
+.mesh-code-block-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.3rem 0.6rem;
+  background: var(--code-head-bg);
+  border-bottom: 1px solid var(--node-border);
+}
+
+.mesh-code-lang {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  opacity: 0.6;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* `seg.tty` marker next to the language label — small and understated,
+ * same spirit as `.mesh-code-lang` next to it, not a loud warning. */
+.mesh-tty-badge {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0.05rem 0.35rem;
+  border-radius: 3px;
+  border: 1px solid var(--dep);
+  color: var(--dep);
+}
+
+/* Note that this block's run button will also trigger other blocks first —
+ * its own row (not squeezed into the head next to lang/button), so it can
+ * wrap and list any number of `deps=` entries without clipping or
+ * overlapping them. Always visible, not gated by the "show deps" toggle,
+ * since it's contextual info about this one block rather than graph
+ * clutter. */
+.mesh-code-deps {
+  padding: 0.25rem 0.6rem;
+  font-size: 0.7rem;
+  color: var(--dep);
+  background: var(--code-head-bg);
+  border-bottom: 1px solid var(--node-border);
+  overflow-wrap: anywhere;
+}
+
+/* Each dependency in "after: …" is its own jump-to-block link — styled
+ * like inline text, not a button, since there can be several in a row. */
+.mesh-dep-link {
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  font-size: inherit;
+  color: inherit;
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.mesh-dep-link:hover {
+  text-decoration-style: solid;
+}
+
+/* Briefly highlights a code block after jumping to it via an "after: …"
+ * link, so the eye can find it even after the canvas has panned. A
+ * background wash rather than a box-shadow ring: `.mesh-code-block` has
+ * `overflow: hidden` (for its rounded corners), which clips an outer
+ * box-shadow on the same element — a background color isn't clipped the
+ * same way, since it's painted within the box's own visible area. */
+.mesh-code-block-flash {
+  animation: mesh-code-block-flash-pulse 1.2s ease-out;
+}
+
+@keyframes mesh-code-block-flash-pulse {
+  0% {
+    background-color: var(--dep-flash);
+  }
+  100% {
+    background-color: transparent;
+  }
+}
+
+.mesh-code-block-head button {
+  font-size: 0.75rem;
+  padding: 0.15rem 0.5rem;
+  border-radius: 4px;
+  border: 1px solid var(--accent);
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.mesh-code-block-head button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* A block with `deps=` always runs its whole dependency chain first — this
+ * button needs to visibly read as "more than one thing is about to run",
+ * not just a recolor, so it also gets its own icon/label (see MeshNode). */
+.mesh-code-block-head button.mesh-run-chain {
+  border-color: var(--dep);
+  color: var(--dep);
+  font-weight: 600;
+}
+
+/* Kill — a destructive action (SIGKILL), so it borrows --fail rather than
+ * getting its own color: visually "this stops something", same register
+ * as a failed exit code, not just another run-button variant. Filled
+ * rather than outlined so it doesn't read as just another mode of "run". */
+.mesh-code-block-head button.mesh-kill-button {
+  border-color: var(--fail);
+  background: var(--fail);
+  color: #fff;
+}
+
+.mesh-code-block-head button.mesh-kill-button:hover {
+  filter: brightness(1.1);
+}
+
+.mesh-code-block pre {
+  border: none;
+  border-radius: 0;
+}
+
+.mesh-code-output {
+  border-top: 1px solid var(--node-border);
+}
+
+.mesh-code-output-head {
+  padding: 0.25rem 0.6rem;
+  font-size: 0.7rem;
+  opacity: 0.65;
+}
+
+.mesh-code-output[data-exit="fail"] .mesh-code-output-head,
+.mesh-code-output[data-exit="killed"] .mesh-code-output-head {
+  color: var(--fail);
+  opacity: 1;
+}
+
+/* Still streaming — no exit code yet, so neither the "ok" nor "fail"
+ * treatment applies. A pulsing dot rather than a color says "in
+ * progress" without implying success or failure either way. */
+.mesh-code-output[data-exit="running"] .mesh-code-output-head {
+  color: var(--accent);
+  opacity: 1;
+}
+
+.mesh-code-output[data-exit="running"] .mesh-code-output-head::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 0.4em;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: mesh-output-pulse 1.1s ease-in-out infinite;
+  vertical-align: middle;
+}
+
+@keyframes mesh-output-pulse {
+  0%,
+  100% {
+    opacity: 0.25;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.mesh-code-output-transient {
+  font-style: italic;
+}
+
+.mesh-code-output pre {
+  border: none;
+  border-radius: 0;
+  border-top: 1px dashed var(--node-border);
+}
+
+/* Cross-node `deps=` arrows (toggled via the toolbar's "show deps" button)
+ * — deliberately not just a recolored tree edge: dotted rather than
+ * dashed, and thicker, so it reads as a different *kind* of relationship
+ * (a run-order dependency) rather than a structural nesting/edge line. */
+.react-flow__edge.mesh-dep-edge .react-flow__edge-path {
+  stroke: var(--dep);
+  stroke-width: 2px;
+  stroke-dasharray: 1 5;
+  stroke-linecap: round;
+}
+
+.react-flow__edge.mesh-dep-edge .react-flow__edge-text {
+  fill: var(--dep);
+}
+
+.react-flow__edge.mesh-dep-edge .react-flow__edge-textbg {
+  fill: var(--bg);
+}
+
+/* Delete "×" at a deletable edge's midpoint — an extra (`meshfox:edge`)
+ * edge, or a structural one with somewhere to promote in its place (see
+ * DeletableEdge.tsx) — edit mode only. Borrows --fail the same way the kill
+ * button does: this is a destructive action, not just another edge
+ * decoration. */
+.mesh-edge-delete {
+  /* `.react-flow__edgelabel-renderer` (this button's positioning parent —
+   * see DeletableEdge.tsx) is a full-canvas overlay with `pointer-events: none`
+   * so it doesn't swallow clicks meant for the pane/edges below it; without
+   * restoring this on the button itself, it renders but every click passes
+   * straight through it. */
+  pointer-events: all;
+  width: 18px;
+  height: 18px;
+  line-height: 16px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--node-border);
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 0.8rem;
+  cursor: pointer;
+  opacity: 0.7;
+}
+
+.mesh-edge-delete:hover {
+  opacity: 1;
+  border-color: var(--fail);
+  color: var(--fail);
+}
+
+/* Edit-mode midpoint cluster for a deletable edge — the label (if the edge
+ * has one) plus the "×" button, laid out together so they don't overlap
+ * (see DeletableEdge.tsx). */
+.mesh-edge-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  pointer-events: none;
+}
+
+.mesh-edge-toolbar > * {
+  pointer-events: all;
+}
+
+.mesh-edge-label-badge {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  font-size: 0.75rem;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  background: var(--bg);
+  border: 1px solid var(--node-border);
+  color: var(--fg);
+  max-width: 16rem;
+}
+
+/* A tag chip nested inside the label badge (see DeletableEdge.tsx) needs
+ * its own background to stand apart from the label text sharing the same
+ * pill, rather than the transparent look `.mesh-tag-chip` otherwise has
+ * everywhere else it's used directly against the canvas background. */
+.mesh-edge-label-badge .mesh-tag-chip {
+  background: var(--node-bg);
+}
+
+/* Read-only mode: just the label, no controls, no click target — an extra
+ * edge's text is diagram content, visible whether or not you're editing. */
+.mesh-edge-label-readonly {
+  opacity: 0.85;
+}
+
+/* Inline "click the arrow" editor for one extra edge's label/color/line
+ * style/arrowheads (see DeletableEdge.tsx's EdgeEditorPanel) — same small
+ * floating-card shape as .vars-modal, just anchored to the edge instead of
+ * centered over the whole canvas, and with no backdrop since it's meant to
+ * feel like a direct-manipulation control rather than a blocking dialog. */
+.mesh-edge-editor {
+  /* Same reason `.mesh-edge-delete` needs it — this panel's positioning
+   * parent, `.react-flow__edgelabel-renderer`, is a canvas-wide overlay
+   * with `pointer-events: none` so it doesn't block clicks meant for
+   * whatever's underneath; without restoring it here, none of this
+   * panel's own inputs/selects/buttons would be clickable. */
+  pointer-events: all;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  width: 220px;
+  padding: 0.75rem;
+  padding-top: 1.5rem;
+  background: var(--node-bg);
+  border: 1px solid var(--node-border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+  font-size: 0.8rem;
+  z-index: 10;
+}
+
+.mesh-edge-editor-close {
+  position: absolute;
+  top: 0.4rem;
+  right: 0.4rem;
+  width: 18px;
+  height: 18px;
+  line-height: 16px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--node-border);
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 0.8rem;
+  cursor: pointer;
+  opacity: 0.7;
+}
+
+.mesh-edge-editor-close:hover {
+  opacity: 1;
+}
+
+.mesh-edge-editor-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.mesh-edge-editor-field span {
+  opacity: 0.75;
+}
+
+.mesh-edge-editor-field input,
+.mesh-edge-editor-field select {
+  font: inherit;
+  padding: 0.3rem 0.4rem;
+  border: 1px solid var(--node-border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+.mesh-edge-editor-swatches {
+  display: flex;
+  gap: 0.3rem;
+  margin-top: 0.25rem;
+}
+
+/* Pre-run "configure missing variables" modal (see VarsForm.tsx) — the
+ * browser counterpart to `meshfox run`/`configure`'s terminal prompt.
+ * Works the same regardless of read-only/Edit mode: it's local run
+ * configuration, not a document edit. */
+.vars-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.4);
+  z-index: 1000;
+}
+
+.vars-modal {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  width: min(420px, 90vw);
+  max-height: 85vh;
+  overflow: auto;
+  padding: 1.25rem;
+  background: var(--node-bg);
+  border: 1px solid var(--node-border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+}
+
+.vars-modal h3 {
+  margin: 0;
+}
+
+.vars-modal-hint {
+  margin: 0;
+  font-size: 0.8rem;
+  opacity: 0.75;
+}
+
+.vars-modal-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 0.85rem;
+}
+
+.vars-modal-field input,
+.vars-modal-field select {
+  font: inherit;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--node-border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+.vars-modal-field input[type="checkbox"] {
+  align-self: flex-start;
+  width: 1rem;
+  height: 1rem;
+}
+
+.vars-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 0.25rem;
+}
+
+.vars-modal-actions button {
+  font-size: 0.85rem;
+  padding: 0.35rem 0.9rem;
+  border-radius: 4px;
+  border: 1px solid var(--node-border);
+  background: transparent;
+  color: var(--fg);
+  cursor: pointer;
+}
+
+.vars-modal-actions button[type="submit"] {
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* NodeSettings.tsx — reuses .vars-modal's backdrop/card/field/actions
+ * wholesale (same "small blocking form" shape); only the color swatches
+ * and the extra-edges chip list below are genuinely new. */
+.node-settings-modal {
+  width: min(460px, 90vw);
+}
+
+.node-settings-swatches {
+  display: flex;
+  gap: 0.35rem;
+  margin-top: 0.3rem;
+}
+
+.node-settings-swatch {
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--node-border);
+  cursor: pointer;
+  background: var(--bg);
+}
+
+.node-settings-swatch[data-swatch="none"] {
+  background: repeating-linear-gradient(
+    45deg,
+    var(--node-border),
+    var(--node-border) 2px,
+    transparent 2px,
+    transparent 5px
+  );
+}
+
+/* Presets "1"–"6" mirror JSON Canvas's own preset palette, so the swatch
+ * itself gives a rough preview of what the preset actually looks like
+ * rather than just a numbered button. */
+.node-settings-swatch[data-swatch="1"] { background: #c22b2b; }
+.node-settings-swatch[data-swatch="2"] { background: #d9822b; }
+.node-settings-swatch[data-swatch="3"] { background: #d9c02b; }
+.node-settings-swatch[data-swatch="4"] { background: #3d9e4f; }
+.node-settings-swatch[data-swatch="5"] { background: #3d6ef5; }
+.node-settings-swatch[data-swatch="6"] { background: #a05dd1; }
+
+.node-settings-id-error {
+  margin: -0.3rem 0 0;
+  font-size: 0.8rem;
+  color: #d33;
+}
+
+.node-settings-id-hint {
+  margin: -0.3rem 0 0;
+  font-size: 0.8rem;
+  opacity: 0.8;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.node-settings-id-hint button {
+  font: inherit;
+  padding: 0.1rem 0.5rem;
+  border-radius: 4px;
+  border: 1px solid var(--node-border);
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+}
+
+.node-settings-edge-hint {
+  margin: -0.15rem 0 0;
+  font-size: 0.75rem;
+  opacity: 0.65;
+}
+
+.node-settings-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  min-height: 1.5rem;
+}
+
+.node-settings-empty-hint {
+  font-size: 0.8rem;
+  opacity: 0.6;
+}
+
+.node-settings-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.78rem;
+  padding: 0.15rem 0.3rem 0.15rem 0.55rem;
+  border-radius: 999px;
+  border: 1px solid var(--dep);
+  color: var(--dep);
+}
+
+.node-settings-chip-remove {
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  opacity: 0.8;
+}
+
+.node-settings-chip-remove:hover {
+  opacity: 1;
+}
+
+/* TagEditor.tsx — shared by a node's own Tags field (NodeSettings) and an
+ * extra edge's Tags field (DeletableEdge's editor popover). Same chip-row-
+ * plus-input shape as the incoming-edges list above, styled with the plain
+ * neutral palette (`--fg`/`--node-border`) rather than `--dep`, since a tag
+ * isn't a graph relationship. */
+.tag-editor-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  min-height: 1.4rem;
+}
+
+.tag-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.78rem;
+  padding: 0.15rem 0.3rem 0.15rem 0.55rem;
+  border-radius: 999px;
+  border: 1px solid var(--node-border);
+  color: var(--fg);
+}
+
+.tag-chip-remove {
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  opacity: 0.7;
+}
+
+.tag-chip-remove:hover {
+  opacity: 1;
+}
+
+.tag-editor input {
+  width: 100%;
+  margin-top: 0.35rem;
+  font: inherit;
+  padding: 0.3rem 0.4rem;
+  border: 1px solid var(--node-border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+.node-settings-add-edge {
+  display: flex;
+  gap: 0.4rem;
+  margin-top: 0.4rem;
+}
+
+.node-settings-add-edge select {
+  flex: 1;
+  font: inherit;
+  padding: 0.3rem 0.4rem;
+  border: 1px solid var(--node-border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+.node-settings-add-edge button {
+  font-size: 0.8rem;
+  padding: 0.3rem 0.6rem;
+  border-radius: 4px;
+  border: 1px solid var(--dep);
+  background: transparent;
+  color: var(--dep);
+  cursor: pointer;
+}
+
+/* Shared by DeleteNodeDialog's action buttons — destructive, so styled
+ * distinctly from the plain (bordered, neutral) `.vars-modal-actions`
+ * buttons around them. */
+.node-settings-delete-button {
+  font-size: 0.85rem;
+  padding: 0.35rem 0.9rem;
+  border-radius: 4px;
+  border: 1px solid var(--fail);
+  background: transparent;
+  color: var(--fail);
+  cursor: pointer;
+}
+
+.node-settings-delete-button:hover {
+  background: var(--fail);
+  color: #fff;
+}
+
+/* DeleteNodeDialog.tsx — reuses `.vars-modal`'s backdrop/card/hint/actions
+ * wholesale; only the stacked "what happens to the children" choice below
+ * is genuinely new. */
+.node-delete-options {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.node-delete-options .node-settings-delete-button {
+  text-align: left;
+  padding: 0.5rem 0.75rem;
+}

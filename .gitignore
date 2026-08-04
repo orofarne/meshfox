@@ -1,0 +1,16 @@
+/target
+node_modules/
+# crates/server embeds this directory at compile time (rust-embed) — keep
+# the directory itself tracked (via .gitkeep) so a fresh clone still
+# compiles before `npm run build` has ever run, but ignore actual build output.
+web/dist/*
+!web/dist/.gitkeep
+# Playwright e2e run artifacts (web/playwright.config.ts) — reports/traces,
+# never inputs to the suite itself.
+web/test-results/
+web/playwright-report/
+web/blob-report/
+.DS_Store
+# Resolved meshfox:var answers (see SPEC.md's "Variables") — local machine
+# state, analogous to CMake's CMakeCache.txt, never something to commit.
+.meshfox/

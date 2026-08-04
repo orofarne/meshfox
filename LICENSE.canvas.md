@@ -1,0 +1,71 @@
+<!-- meshfox:canvas -->
+# License & Third-Party Notices
+<!-- meshfox:node id="root" -->
+
+meshfox itself is MIT-licensed (see [LICENSE](./LICENSE), also inlined below). This document tracks every third-party dependency pulled into the published binary/bundle — backend (Rust crates, `Cargo.toml`) and UI (npm packages, `web/package.json`) — and records the license-compatibility check against MIT.
+
+Only **direct** dependencies are listed by name below; the full transitive tree (292 Rust crates, 186 npm production packages) was checked programmatically and is summarized in "License compatibility" — nothing in it requires anything beyond attribution.
+
+## MIT License
+<!-- meshfox:node id="license-file" type="file" display="code" -->
+
+[LICENSE](./LICENSE)
+
+## Backend dependencies (Rust / crates.io)
+<!-- meshfox:node id="backend-deps" -->
+
+Direct dependencies across `crates/core`, `crates/server`, `crates/cli` (`cargo metadata`, deduplicated; dev-only deps of `crates/server` — `futures-util`, `tokio-tungstenite` — omitted since they never ship). All are permissive and MIT-compatible.
+
+| Crate | License |
+|---|---|
+| anyhow | MIT OR Apache-2.0 |
+| async-stream | MIT |
+| axum | MIT |
+| clap | MIT OR Apache-2.0 |
+| libc | MIT OR Apache-2.0 |
+| mime_guess | MIT |
+| open | MIT |
+| portable-pty | MIT |
+| rpassword | Apache-2.0 |
+| rust-embed | MIT |
+| serde | MIT OR Apache-2.0 |
+| serde_json | MIT OR Apache-2.0 |
+| starlark | Apache-2.0 |
+| thiserror | MIT OR Apache-2.0 |
+| tokio | MIT |
+| tower-http | MIT |
+| uuid | Apache-2.0 OR MIT |
+
+## UI dependencies (npm)
+<!-- meshfox:node id="ui-deps" -->
+
+Direct `dependencies` from `web/package.json` — these ship inside the built browser bundle:
+
+| Package | License |
+|---|---|
+| @codemirror/lang-markdown | MIT |
+| @codemirror/language | MIT |
+| @codemirror/language-data | MIT |
+| @codemirror/state | MIT |
+| @uiw/react-codemirror | MIT |
+| @xterm/addon-fit | MIT |
+| @xterm/xterm | MIT |
+| @xyflow/react | MIT |
+| anser | MIT |
+| react | MIT |
+| react-dom | MIT |
+| react-markdown | MIT |
+| remark-gfm | MIT |
+
+Direct `devDependencies` — build/test tooling only, never shipped:
+
+| Package | License |
+|---|---|
+| @playwright/test | Apache-2.0 |
+| @types/node | MIT |
+| @types/react | MIT |
+| @types/react-dom | MIT |
+| @vitejs/plugin-react | MIT |
+| typescript | Apache-2.0 |
+| vite | MIT |
+

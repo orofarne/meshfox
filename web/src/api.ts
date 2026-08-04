@@ -1,0 +1,376 @@
+import type { CanvasDoc, ExtraEdgeDto, NodeType, VarStatus } from "./types";
+
+export async function fetchCanvas(): Promise<CanvasDoc> {
+  const res = await fetch("/api/canvas");
+  if (!res.ok) throw new Error(`GET /api/canvas: ${res.status}`);
+  return res.json();
+}
+
+/**
+ * Only the declared `meshfox:var`s `block`'s own chain actually
+ * references (via `env=` — a block that declares none gets back an empty
+ * list, regardless of how many variables the document declares), each
+ * with its current resolve-without-prompting status (env/cache/default —
+ * no overrides) — see SPEC.md's "Variables". Call before running a block
+ * to find out whether anything still needs asking (`resolved: false`);
+ * pass whatever the user answers as `runBlockStream`'s `vars` argument.
+ */
+export async function fetchVars(path: string[], block: string, withDeps: boolean): Promise<VarStatus[]> {
+  const params = new URLSearchParams({ path: path.join(","), block, noDeps: String(!withDeps) });
+  const res = await fetch(`/api/vars?${params}`);
+  if (!res.ok) throw new Error(`GET /api/vars: ${res.status}`);
+  return res.json();
+}
+
+export async function saveCanvas(canvas: CanvasDoc): Promise<void> {
+  const res = await fetch("/api/canvas", {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(canvas),
+  });
+  if (!res.ok) throw new Error(`PUT /api/canvas: ${res.status}`);
+}
+
+/** The whole document's raw Markdown text, verbatim — what the toolbar's
+ * "Source" mode edits. */
+export async function fetchCanvasSource(): Promise<string> {
+  const res = await fetch("/api/canvas/raw");
+  if (!res.ok) throw new Error(`GET /api/canvas/raw: ${res.status}`);
+  return res.text();
+}
+
+/**
+ * Overwrites the whole document with `text`, verbatim. The server rejects
+ * (422, nothing written) anything that doesn't parse — the thrown error's
+ * message is the parser's, suitable to show right next to Source mode's
+ * Save button so an invalid edit is never silently lost or half-applied.
+ */
+export async function saveCanvasSource(text: string): Promise<void> {
+  const res = await fetch("/api/canvas/raw", {
+    method: "PUT",
+    headers: { "content-type": "text/plain" },
+    body: text,
+  });
+  if (!res.ok) {
+    const msg = await res.text();
+    throw new Error(msg || `PUT /api/canvas/raw: ${res.status}`);
+  }
+}
+
+/**
+ * Adds a new, empty-bodied child node under `parentId`, titled `title` —
+ * lands as the last item in the parent's existing subtree, with no
+ * position set (the web client's own auto-layout, see `./autolayout.ts`,
+ * places it same as any other position-less node, until it's dragged or
+ * `meshfox fmt` gives it a real one). Returns the fresh canvas (same shape
+ * `fetchCanvas` returns) so the caller can just `setCanvas` with it
+ * directly.
+ */
+export async function createNode(parentId: string, title: string): Promise<CanvasDoc> {
+  const res = await fetch("/api/nodes", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ parentId, title }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `POST /api/nodes: ${res.status}`);
+  }
+  return res.json();
+}
+
+/** Only the fields actually present are changed — see `updateNode`. */
+export interface NodePatch {
+  title?: string;
+  nodeType?: NodeType;
+  color?: string;
+  /** New link target for a `file`/`link` node (replaces its whole body). */
+  target?: string;
+  /** New raw Markdown body for a `text` node. */
+  text?: string;
+  /** Full replacement list of extra incoming edges (`meshfox:edge`) — omit
+   * to leave them untouched, pass `[]` to remove them all. */
+  extraParents?: ExtraEdgeDto[];
+  /** file-node display mode — see `CanvasNode.display`. */
+  display?: "link" | "code";
+  /** file-node syntax-highlighting language hint — see `CanvasNode.lang`. */
+  lang?: string;
+  /** Full replacement list of tags — omit to leave them untouched, pass
+   * `[]` to clear them. */
+  tags?: string[];
+}
+
+/**
+ * Applies `patch` to node `id` — title/type/color/target/text/extraParents
+ * are all independently optional, so a caller only ever sends what it
+ * actually changed. The server validates the fully-patched document parses
+ * before saving anything (e.g. `nodeType: "group"` on a node with a
+ * non-empty body is rejected, 422, with nothing written) — surfaces as a
+ * thrown error carrying the server's message, same as `saveCanvas`.
+ */
+export async function updateNode(id: string, patch: NodePatch): Promise<CanvasDoc> {
+  const res = await fetch(`/api/nodes/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `PATCH /api/nodes/${id}: ${res.status}`);
+  }
+  return res.json();
+}
+
+/**
+ * Deletes `id` — the root is rejected by the server (422) rather than
+ * producing a rootless document. `mode` picks what happens to `id`'s direct
+ * children: `"subtree"` (default) deletes them too, along with every
+ * descendant (`mdcanvas::delete_node`); `"reparent"` promotes them to `id`'s
+ * own parent instead, leaving their own subtrees otherwise untouched
+ * (`mdcanvas::delete_node_reparent_children`). Either way, any
+ * `meshfox:edge` elsewhere that pointed at `id` itself is dropped too.
+ */
+export async function deleteNode(id: string, mode: "subtree" | "reparent" = "subtree"): Promise<CanvasDoc> {
+  const params = mode === "reparent" ? "?children=reparent" : "";
+  const res = await fetch(`/api/nodes/${encodeURIComponent(id)}${params}`, { method: "DELETE" });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `DELETE /api/nodes/${id}: ${res.status}`);
+  }
+  return res.json();
+}
+
+export interface NodeFileContent {
+  content: string;
+  /** `true` if the file was larger than the server's preview cap and
+   * `content` is only its leading portion. */
+  truncated: boolean;
+}
+
+/**
+ * Reads a `file` node's target off disk, fresh, for its `display="code"`
+ * preview — never cached client-side, since the underlying file can change
+ * between renders. Rejects (thrown error) for a non-file node, a node with
+ * no target, a target outside the canvas directory, a missing file, or one
+ * that looks binary — the caller falls back to the plain link view in every
+ * one of those cases.
+ */
+export async function fetchNodeFileContent(id: string): Promise<NodeFileContent> {
+  const res = await fetch(`/api/nodes/${encodeURIComponent(id)}/file-content`);
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `GET /api/nodes/${id}/file-content: ${res.status}`);
+  }
+  return res.json();
+}
+
+/**
+ * Deletes `id`'s structural (nesting) parent edge, promoting its existing
+ * extra edge from `newParentId` to take its place — `newParentId` must
+ * already be one of `id`'s extra parents (see `CanvasNode.extraParents`),
+ * the server rejects (422) anything else, same as it does for a cycle
+ * (`newParentId` being `id` itself or one of its own descendants) or `id`
+ * being the root (see `mdcanvas::reparent_node`).
+ */
+export async function reparentNode(id: string, newParentId: string): Promise<CanvasDoc> {
+  const res = await fetch(`/api/nodes/${encodeURIComponent(id)}/reparent`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ newParentId }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `POST /api/nodes/${id}/reparent: ${res.status}`);
+  }
+  return res.json();
+}
+
+/**
+ * Changes `id`'s own id to `newId` — rewrites every reference the server
+ * tracks structurally (other nodes' `parent=`/`meshfox:edge from=`), plus
+ * best-effort text rewrites of `deps="id/block"` fence references
+ * elsewhere in the document. The server rejects (thrown error) an empty
+ * `newId`, one containing a `"` character, or one already used by another
+ * node — nothing is written in any of those cases.
+ */
+export async function renameNodeId(id: string, newId: string): Promise<CanvasDoc> {
+  const res = await fetch(`/api/nodes/${encodeURIComponent(id)}/rename-id`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ newId }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `POST /api/nodes/${id}/rename-id: ${res.status}`);
+  }
+  return res.json();
+}
+
+// Mirrors crates/server/src/lib.rs's `RunEvent` (JSON shape, camelCase) —
+// one of these per line of /api/run's streamed `application/x-ndjson`
+// response body. `started` is always first; `killed`/`error`/`done` are
+// each terminal for the run (no further lines follow).
+export type RunEvent =
+  | { type: "started"; runId: string }
+  | { type: "step-start"; nodeId: string; block: string }
+  | { type: "output"; nodeId: string; block: string; text: string }
+  | { type: "step-end"; nodeId: string; block: string; exitCode: number }
+  | { type: "killed"; nodeId: string; block: string }
+  | { type: "error"; message: string }
+  | { type: "done"; exitCode: number };
+
+/**
+ * Running is always allowed. `persist` controls whether a `cache`d block's
+ * output actually gets written into the file — pass `false` (e.g. outside
+ * Edit mode) to see the result without touching anything on disk.
+ * `withDeps` controls whether `block`'s `deps=` chain runs first (the "⛓
+ * run chain" button) or just `block` itself (the plain "run" button).
+ *
+ * The response streams as it happens (see SPEC.md's "Runnable code
+ * fences") — `onEvent` is called once per line, in order, as each arrives,
+ * not all at once at the end. Resolves once the stream closes; rejects
+ * only for a failure before any of that started (chain resolution — a
+ * dangling block, a cycle — reported as a normal HTTP error status by the
+ * server since nothing has run yet at that point). A failure *after*
+ * streaming began shows up as an `"error"` (or `"killed"`) event instead,
+ * not a rejection — `onEvent` is where those need handling.
+ */
+export async function runBlockStream(
+  path: string[],
+  block: string,
+  persist: boolean,
+  withDeps: boolean,
+  onEvent: (event: RunEvent) => void,
+  vars?: Record<string, string>,
+): Promise<void> {
+  const res = await fetch("/api/run", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path, block, persist, noDeps: !withDeps, vars: vars ?? {} }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `POST /api/run: ${res.status}`);
+  }
+  if (!res.body) {
+    throw new Error("POST /api/run: response had no body to stream");
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffered = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffered += decoder.decode(value, { stream: true });
+    let newlineAt: number;
+    while ((newlineAt = buffered.indexOf("\n")) >= 0) {
+      const line = buffered.slice(0, newlineAt);
+      buffered = buffered.slice(newlineAt + 1);
+      if (line.trim()) onEvent(JSON.parse(line) as RunEvent);
+    }
+  }
+}
+
+/**
+ * Cancels an in-flight run started by `runBlockStream` (`runId` comes from
+ * that stream's first `"started"` event) — kills whichever block is
+ * currently executing and stops the rest of its dependency chain. A 404
+ * (already finished, or an unknown id) is treated the same as success:
+ * either way, there's nothing left to kill.
+ */
+export async function killRun(runId: string): Promise<void> {
+  const res = await fetch("/api/kill", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ runId }),
+  });
+  if (!res.ok && res.status !== 404) {
+    throw new Error(`POST /api/kill: ${res.status}`);
+  }
+}
+
+/**
+ * Clears every non-group node's stored `x`/`y`/`width`/`height` back to
+ * unset, reverting the whole document to auto-placed (see
+ * `./autolayout.ts`) — irreversible except by undoing the file change some
+ * other way. Returns the fresh canvas (same shape `fetchCanvas` returns),
+ * ready to `setCanvas` with directly.
+ */
+export async function clearLayout(): Promise<CanvasDoc> {
+  const res = await fetch("/api/canvas/clear-layout", { method: "POST" });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `POST /api/canvas/clear-layout: ${res.status}`);
+  }
+  return res.json();
+}
+
+/**
+ * Opens one long-lived connection to `/api/watch` (NDJSON, one line per
+ * event) for as long as this tab stays open. The server counts each open
+ * connection as one open tab and, once every one of them has gone, exits on
+ * its own a few seconds later (see README's roadmap) — so this is meant to
+ * be called once, for the lifetime of the page, not per-request.
+ *
+ * `onChanged` fires for each `"changed"` event: the on-disk file changed
+ * from underneath the server (an external edit), so the caller should
+ * reload. `onDisconnected` fires once the stream ends for any reason —
+ * including, notably, not an error at all: the connection simply closing is
+ * how this notices the server process itself has stopped, since there's
+ * nothing left on the other end to keep it open. Returns a function that
+ * stops watching (aborts the underlying request) without itself triggering
+ * `onDisconnected`.
+ *
+ * A reload (or any other navigation away from this tab) also closes the
+ * connection out from under the fetch, from the browser's side, not this
+ * function's own `AbortController` — indistinguishable, by error alone,
+ * from the server itself actually having died. `pagehide` fires first in
+ * that case (reload, back/forward, closing the tab), so it's used here to
+ * tell "this tab is leaving" apart from "the server is gone": without it, a
+ * plain reload would misread its own connection drop as the server having
+ * stopped and (see App.tsx's `serverGone`) try to close the very tab that's
+ * mid-reload instead of letting it finish.
+ */
+export function watchChanges(onChanged: () => void, onDisconnected: () => void): () => void {
+  const controller = new AbortController();
+  let leaving = false;
+  const markLeaving = () => {
+    leaving = true;
+  };
+  window.addEventListener("pagehide", markLeaving);
+
+  (async () => {
+    try {
+      const res = await fetch("/api/watch", { signal: controller.signal });
+      if (!res.ok || !res.body) {
+        if (!leaving) onDisconnected();
+        return;
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffered = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffered += decoder.decode(value, { stream: true });
+        let newlineAt: number;
+        while ((newlineAt = buffered.indexOf("\n")) >= 0) {
+          const line = buffered.slice(0, newlineAt);
+          buffered = buffered.slice(newlineAt + 1);
+          if (!line.trim()) continue;
+          const event = JSON.parse(line) as { type: string };
+          if (event.type === "changed") onChanged();
+        }
+      }
+      if (!leaving) onDisconnected();
+    } catch {
+      if (!controller.signal.aborted && !leaving) onDisconnected();
+    }
+  })();
+
+  return () => {
+    window.removeEventListener("pagehide", markLeaving);
+    controller.abort();
+  };
+}
