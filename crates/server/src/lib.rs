@@ -1524,7 +1524,34 @@ async fn watch_changes(State(state): State<Arc<AppState>>) -> Response {
 /// that isn't a real asset (client-side routes) — or, if the UI was never
 /// built into this binary at all, a message saying so instead of a bare
 /// 404.
-async fn serve_embedded(uri: Uri) -> Response {
+/// Serves `path` (a request path, already stripped of its leading `/`) off
+/// disk, resolved relative to the canvas file's own directory — `None` if
+/// it doesn't exist, isn't a plain file, or resolves outside that
+/// directory (`..` traversal).
+async fn serve_canvas_relative_file(state: &AppState, path: &str) -> Option<Response> {
+    let canvas_dir = state
+        .canvas_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    let canvas_dir = canvas_dir.canonicalize().ok()?;
+
+    let candidate = canvas_dir.join(path);
+    let resolved = candidate.canonicalize().ok()?;
+    if !resolved.starts_with(&canvas_dir) || !resolved.is_file() {
+        return None;
+    }
+
+    let bytes = std::fs::read(&resolved).ok()?;
+    let mime = mime_guess::from_path(&resolved).first_or_octet_stream();
+    Some((
+        [(header::CONTENT_TYPE, mime.as_ref().to_string())],
+        bytes,
+    )
+        .into_response())
+}
+
+async fn serve_embedded(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
 
@@ -1535,6 +1562,16 @@ async fn serve_embedded(uri: Uri) -> Response {
             file.data,
         )
             .into_response();
+    }
+
+    // Not a built-in UI asset — try it as a file next to the canvas (e.g.
+    // an image pulled in by a plain `![](screenshot.webp)` link), so
+    // relative asset references render the same in `meshfox view` as they
+    // do on GitHub. Same canonicalize + `starts_with` traversal guard as
+    // `get_node_file_content` above, so this can't be used to read
+    // arbitrary files outside the canvas directory.
+    if let Some(file_response) = serve_canvas_relative_file(&state, path).await {
+        return file_response;
     }
 
     match WebAssets::get("index.html") {
@@ -1589,8 +1626,8 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/run/tty", get(run_block_tty))
         .route("/api/kill", post(kill_run))
         .route("/api/watch", get(watch_changes))
-        .with_state(state)
         .fallback(serve_embedded)
+        .with_state(state)
         .layer(CorsLayer::permissive())
 }
 

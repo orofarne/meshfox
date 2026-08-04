@@ -7,6 +7,7 @@ An executable canvas: a hierarchical, node-based document where nodes hold Markd
 
 Status: **early bootstrap**. This document is itself a valid meshfox canvas — every `##` section here is a node, nested under this root. The leading HTML comment above the title is the `meshfox:canvas` marker (see [SPEC.md](./SPEC.md), or browse this file with `meshfox view` — "File format" below includes it live); it's what lets tooling recognize this as a canvas despite the plain `.md` extension.
 
+![Screenshot](screenshot.webp)
 
 ## Concept
 <!-- meshfox:node id="concept" -->
