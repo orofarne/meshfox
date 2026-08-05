@@ -188,6 +188,55 @@ enum Command {
         /// single candidate in the current directory.
         canvas: Option<PathBuf>,
     },
+    /// Experimental: export a canvas as a static site. Resolves includes
+    /// (same as `validate`/`view`), turns the canvas's node tree into a
+    /// recursive `SiteData` (context key `site`) and hands it to a
+    /// user-supplied Tera template. A node with no real, authored
+    /// `x`/`y`/`width`/`height` gets no computed position at all — the
+    /// template renders it as an ordinary nested HTML element and the
+    /// *browser* lays it out and sizes it from its real content (no
+    /// pre-computed/estimated pixels to get wrong); a node that does have
+    /// all four real values keeps rendering at exactly that authored pixel
+    /// position. A structural (parent/child) connector between two
+    /// flow-positioned nodes is drawn in pure CSS (they're always
+    /// DOM-adjacent); everything else — a `meshfox:edge` cross-reference,
+    /// or a structural edge touching a real-positioned node — is left for
+    /// a small non-interactive JS pass in the template to measure and draw.
+    /// Every `*.tera` file in `--template` (except one whose basename
+    /// starts with `_`, a partial meant to be `{% import %}`ed rather than
+    /// rendered standalone) is rendered and written to `--out` at the same
+    /// relative path minus `.tera`; every other file is copied verbatim
+    /// (CSS, fonts, ...). A local image referenced from a node's Markdown
+    /// body is copied alongside the output automatically; a `file`-type
+    /// node's `display="code"` target is read once and inlined into the
+    /// HTML directly (nothing left to fetch once static). See
+    /// `site-template/` in this repo for a working example.
+    Static {
+        /// Path to the .canvas.md file. If omitted: auto-discover the
+        /// single candidate in the current directory.
+        canvas: Option<PathBuf>,
+        /// Template directory.
+        #[arg(short, long)]
+        template: PathBuf,
+        /// Output directory. Refused if it already exists and is
+        /// non-empty, unless `--force`.
+        #[arg(short, long, default_value = "site")]
+        out: PathBuf,
+        /// Overwrite an existing, non-empty `--out` directory.
+        #[arg(long)]
+        force: bool,
+        /// Prefixed onto a relative link/target this command doesn't
+        /// already copy into `--out` (a plain Markdown link, or a
+        /// `file`/`link` node's own target when not `display="code"`) — a
+        /// local image and a `display="code"` target are unaffected, since
+        /// they're already self-contained in the output. Useful when
+        /// publishing to a host where the site's own root isn't the
+        /// canvas's own directory, so a leftover relative reference should
+        /// resolve against e.g. the original repo instead. Left as-is when
+        /// omitted.
+        #[arg(long)]
+        base_url: Option<String>,
+    },
     /// Structural edits to individual nodes in a canvas file: add, move,
     /// rename, delete, or set a node's body/position/style/edges — the CLI
     /// counterpart to the web UI's Edit-mode node operations (the same
@@ -446,6 +495,10 @@ fn main() {
         Command::List { canvas } => {
             let canvas_path = canvas.unwrap_or_else(find_canvas);
             list(&canvas_path)
+        }
+        Command::Static { canvas, template, out, force, base_url } => {
+            let canvas_path = canvas.unwrap_or_else(find_canvas);
+            static_cmd(&canvas_path, &template, &out, force, base_url.as_deref())
         }
         Command::Node { command } => match command {
             NodeCommand::Add { canvas, parent_id, title } => {
@@ -1710,6 +1763,129 @@ fn fmt_opt_num(v: Option<f64>) -> String {
 /// Every `node` subcommand's last step before handing a patch back to be
 /// written: make sure it still parses — the same validate-before-commit
 /// shape every mutating `/api/nodes*` server handler uses.
+fn static_cmd(canvas_path: &Path, template_dir: &Path, out_dir: &Path, force: bool, base_url: Option<&str>) {
+    let raw = read_raw_or_exit(canvas_path);
+    let canvas = Canvas::from_markdown(&raw).unwrap_or_else(|e| {
+        eprintln!("failed to parse {}: {e}", canvas_path.display());
+        std::process::exit(1);
+    });
+    // Same as `validate`/`view`: splice in `include` nodes so the exported
+    // site shows the fully composed document, not the bare link `run`/`fmt`
+    // see in the raw file.
+    let canvas = meshfox_core::include::resolve(&canvas, canvas_path).unwrap_or_else(|e| {
+        eprintln!("meshfox static: {}: {e}", canvas_path.display());
+        std::process::exit(1);
+    });
+
+    if !template_dir.is_dir() {
+        eprintln!("meshfox static: {} is not a directory", template_dir.display());
+        std::process::exit(1);
+    }
+
+    let out_non_empty =
+        out_dir.exists() && std::fs::read_dir(out_dir).map(|mut d| d.next().is_some()).unwrap_or(false);
+    if out_non_empty && !force {
+        eprintln!(
+            "meshfox static: {} already exists and is not empty (pass --force to overwrite)",
+            out_dir.display()
+        );
+        std::process::exit(1);
+    }
+
+    // Same "bare filename has an empty, not missing, parent" edge case
+    // `meshfox_server::get_node_file_content` handles — a canvas passed as
+    // just `README.md` (no directory component) resolves relative images/
+    // `display="code"` targets against the current directory.
+    let canvas_dir = canvas_path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let (site, assets) = meshfox_core::staticgen::build(&canvas, canvas_dir, base_url);
+    let mut context = tera::Context::new();
+    context.insert("site", &site);
+
+    // A proper glob-registered `Tera` instance, not a one-off render per
+    // file: a template needs cross-file `{% import %}` to define the
+    // canvas tree's recursive rendering macro just once (see
+    // `site-template/_macros.html.tera`) rather than duplicating it inline
+    // in every page.
+    let glob = format!("{}/**/*.tera", template_dir.display());
+    let tera = tera::Tera::new(&glob).unwrap_or_else(|e| {
+        eprintln!("meshfox static: failed to load templates from {}: {e}", template_dir.display());
+        std::process::exit(1);
+    });
+
+    let mut count = 0;
+    for name in tera.get_template_names() {
+        // A `_`-prefixed basename is a partial — imported by another
+        // template (`{% import "_macros.html.tera" as macros %}`), never
+        // rendered as its own output page. Same convention Jekyll/
+        // Eleventy use for includes/partials.
+        let is_partial = Path::new(name).file_name().and_then(|f| f.to_str()).is_some_and(|b| b.starts_with('_'));
+        if is_partial {
+            continue;
+        }
+        let rendered = tera.render(name, &context).unwrap_or_else(|e| {
+            eprintln!("meshfox static: failed to render {name}: {e}");
+            std::process::exit(1);
+        });
+        write_output_file(&out_dir.join(Path::new(name).with_extension("")), rendered.as_bytes()).unwrap_or_else(|e| {
+            eprintln!("meshfox static: {e}");
+            std::process::exit(1);
+        });
+        count += 1;
+    }
+
+    count += copy_template_assets(template_dir, template_dir, out_dir).unwrap_or_else(|e| {
+        eprintln!("meshfox static: {e}");
+        std::process::exit(1);
+    });
+
+    for asset in &assets {
+        let bytes = std::fs::read(&asset.source).unwrap_or_else(|e| {
+            eprintln!("meshfox static: failed to read {}: {e}", asset.source.display());
+            std::process::exit(1);
+        });
+        write_output_file(&out_dir.join(&asset.dest_rel), &bytes).unwrap_or_else(|e| {
+            eprintln!("meshfox static: {e}");
+            std::process::exit(1);
+        });
+        count += 1;
+    }
+
+    println!("meshfox static: wrote {count} file(s) to {}", out_dir.display());
+}
+
+/// Recursively copies every non-`.tera` file under `dir` (a subtree of
+/// `root`) into `out_root` at the same relative path — CSS, fonts, and any
+/// other asset a template needs verbatim. `.tera` files are rendered
+/// separately by the caller through a proper glob-registered `Tera`
+/// instance (needed for cross-file `{% import %}`), not copied here.
+/// Returns the number of files copied.
+fn copy_template_assets(root: &Path, dir: &Path, out_root: &Path) -> Result<usize, String> {
+    let mut count = 0;
+    for entry in std::fs::read_dir(dir).map_err(|e| format!("failed to read {}: {e}", dir.display()))? {
+        let entry = entry.map_err(|e| format!("failed to read {}: {e}", dir.display()))?;
+        let path = entry.path();
+        if path.is_dir() {
+            count += copy_template_assets(root, &path, out_root)?;
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) == Some("tera") {
+            continue;
+        }
+        let rel = path.strip_prefix(root).expect("walked from root, so always a prefix");
+        let bytes = std::fs::read(&path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+        write_output_file(&out_root.join(rel), &bytes)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn write_output_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(path, bytes).map_err(|e| format!("failed to write {}: {e}", path.display()))
+}
+
 fn validate_patch(updated: &str) -> Result<(), String> {
     Canvas::from_markdown(updated).map(|_| ()).map_err(|e| e.to_string())
 }

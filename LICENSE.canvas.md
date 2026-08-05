@@ -4,7 +4,7 @@
 
 meshfox itself is MIT-licensed (see [LICENSE](./LICENSE), also inlined below). This document tracks every third-party dependency pulled into the published binary/bundle — backend (Rust crates, `Cargo.toml`) and UI (npm packages, `web/package.json`) — and records the license-compatibility check against MIT.
 
-Only **direct** dependencies are listed by name below; the full transitive tree (292 Rust crates, 187 npm production packages) was checked programmatically and is summarized in "License compatibility" — nothing in it requires anything beyond attribution.
+Only **direct** dependencies are listed by name below; the full transitive tree actually reachable from a *shipped* binary (315 Rust crates — normal-dependency edges only, dev/build-only trees excluded, since those never compile into what's published; 187 npm production packages) was checked programmatically and is summarized in "License compatibility" — nothing in it requires anything beyond attribution.
 
 ## MIT License
 <!-- meshfox:node id="license-file" type="file" display="code" -->
@@ -14,7 +14,7 @@ Only **direct** dependencies are listed by name below; the full transitive tree 
 ## Backend dependencies (Rust / crates.io)
 <!-- meshfox:node id="backend-deps" -->
 
-Direct dependencies across `crates/core`, `crates/server`, `crates/cli` (`cargo metadata`, deduplicated; dev-only deps of `crates/server` — `futures-util`, `tokio-tungstenite` — omitted since they never ship). All are permissive and MIT-compatible.
+Direct dependencies across `crates/core`, `crates/server`, `crates/cli` (`cargo metadata`, deduplicated; dev-only deps omitted since they never ship — `crates/server`'s `futures-util`/`tokio-tungstenite`, `crates/cli`'s `scraper` (ISC) and its own transitive tree, which includes a few MPL-2.0-licensed crates (`cssparser`, `selectors`, ...) that never reach the published binary either way). All are permissive and MIT-compatible.
 
 | Crate | License |
 |---|---|
@@ -26,11 +26,13 @@ Direct dependencies across `crates/core`, `crates/server`, `crates/cli` (`cargo 
 | mime_guess | MIT |
 | open | MIT |
 | portable-pty | MIT |
+| pulldown-cmark | MIT |
 | rpassword | Apache-2.0 |
 | rust-embed | MIT |
 | serde | MIT OR Apache-2.0 |
 | serde_json | MIT OR Apache-2.0 |
 | starlark | Apache-2.0 |
+| tera | MIT |
 | thiserror | MIT OR Apache-2.0 |
 | tokio | MIT |
 | tower-http | MIT |

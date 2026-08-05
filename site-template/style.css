@@ -1,0 +1,433 @@
+:root {
+  --bg: #f6f7f9;
+  --fg: #1b1f24;
+  --muted: #6b7280;
+  --panel: #ffffff;
+  --border: #d9dce1;
+  --accent-default: #6366f1;
+  --code-bg: #f0f1f4;
+  --link: #2563eb;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14161a;
+    --fg: #e7e9ee;
+    --muted: #9aa1ac;
+    --panel: #1c1f25;
+    --border: #313640;
+    --accent-default: #8385f5;
+    --code-bg: #23262d;
+    --link: #7aa2ff;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+}
+
+a {
+  color: var(--link);
+}
+
+.site-header {
+  display: flex;
+  align-items: center;
+  gap: 1.25rem;
+  padding: 1.5rem 2rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.mascot {
+  margin: 0;
+  font-size: 0.9rem;
+  line-height: 1.15;
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
+.site-header h1 {
+  margin: 0 0 0.25rem;
+  font-size: 1.5rem;
+}
+
+.subtitle {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+  max-width: 60ch;
+}
+
+.canvas-wrap {
+  overflow: auto;
+  padding: 2rem;
+  /* A deep/wide subtree (real rightward branching, once index.html.tera's
+     own script has measured and repositioned it) can end up wider than the
+     viewport — expected and fine, but only if it's obvious there's a
+     horizontal scrollbar to reach the rest with. Style it to actually be
+     visible (not each browser's thin, often hover-only default) rather
+     than relying on it. */
+  scrollbar-width: thin; /* Firefox */
+  scrollbar-color: var(--muted) transparent; /* Firefox */
+}
+
+.canvas-wrap::-webkit-scrollbar {
+  height: 12px;
+  width: 12px;
+}
+
+.canvas-wrap::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.canvas-wrap::-webkit-scrollbar-thumb {
+  background: var(--muted);
+  border-radius: 999px;
+  border: 3px solid var(--bg);
+}
+
+/* The single positioning origin every real-positioned (`.node.positioned`)
+   node anchors to, however deep it's nested — nothing else in the tree is
+   itself positioned, so `position: absolute` on a descendant always
+   resolves against this one shared coordinate space, reproducing the
+   canvas's own authored pixel layout exactly. An unpositioned node is
+   just an ordinary flowed element and ignores this entirely.
+
+   Also the coordinate space index.html.tera's own small script draws
+   `meshfox:edge` cross-references against, once it has real rendered
+   positions — see that file's doc comment. */
+.tree {
+  position: relative;
+}
+
+/* Wraps one node's own card (`.node`) and its `.node-children` as
+   SIBLINGS, not one nested inside the other — see `_macros.html.tera`'s
+   doc comment for why that distinction matters (width/border stacking).
+
+   A row is a flex ROW by default: the card sits beside its own children
+   column, branching right the way `web/src/autolayout.ts`'s
+   `placeRightward` does — but as plain CSS flow, not a JS-measured
+   position (an earlier version of this template needed real
+   `offsetWidth`/`offsetHeight` measurements and a JS pass to reposition
+   depth >=2 nodes this way; expressing it as an ordinary flex row instead
+   means the browser lays every level out for free, no script, no risk of
+   scroll/centering bugs a JS position pass can introduce). `align-items:
+   center` is what lets a card's own vertical center coincide exactly with
+   its row's cross-axis center — the connector pseudo-elements below (and
+   `.node.has-children::after`) rely on that to anchor a horizontal "twig"
+   at a plain `top: 50%`, with no JS measurement needed either. */
+.node-row {
+  display: flex;
+  align-items: center;
+  gap: 1.75rem;
+}
+
+/* Root's own row is the one exception: its children stack in a column
+   *below* it (see `.node-children.root-children` below) instead of beside
+   it, matching `_macros.html.tera`'s doc comment. `.tree`'s only direct
+   `.node-row` child is always root's own. */
+.tree > .node-row {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0;
+}
+
+/* A node's own children, stacked in a column — this is what
+   `_macros.html.tera`'s `.node-row` (a flex row) puts beside the parent
+   card for every node except root (see `.root-children` below, and
+   `.tree > .node-row` above). `position: relative` anchors the "twig and
+   spine" connector pseudo-elements below. */
+.node-children {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  position: relative;
+  /* A node-children column is a flex *item* of its own parent's
+     `.node-row` (the branch-right case) — without this, a wide/deep
+     subtree that doesn't fit the viewport gets proportionally shrunk
+     along with its parent card instead of overflowing (`.canvas-wrap`'s
+     own `overflow: auto` is the intended release valve for that, not a
+     squeeze — see its own doc comment). */
+  flex-shrink: 0;
+  /* How far left of a child's own card the connector spine sits — half of
+     `.node-row`'s own `gap` for the normal (branch-right) case, so the
+     parent-side nub (`.node.has-children::after` below) meets it exactly
+     in the middle of that gap; `.root-children` overrides it to half of
+     its own smaller `margin-left` instead. See the connector doc comment
+     further down for the full design. */
+  --connector-offset: 0.875rem;
+}
+
+/* Root's own direct children ("sections") read almost like a plain
+   vertical list below root, only a small nudge right — not a full
+   branch-right step — same document-outline convention `layout.rs`/
+   `web/src/autolayout.ts` use (`ROOT_CHILD_INDENT`, deliberately much
+   smaller than `autolayout.ts`'s `H_GAP`, the step every deeper level
+   gets via `.node-row`'s own `gap` above). `_macros.html.tera` sets this
+   class on root's own `.node-children` (`n.depth == 0`). */
+.node-children.root-children {
+  margin-top: 0.75rem;
+  margin-left: 1rem;
+  --connector-offset: 0.5rem;
+}
+
+/* --- Structural connectors (pure CSS, no JS) ---------------------------
+   A "twig and spine" pair, the standard technique for an org-chart/file-
+   tree style connector: each child row draws a short horizontal "twig"
+   from a shared vertical "spine" into its own card (`::before`), plus its
+   own segment of that spine (`::after`) — `top`/`bottom` percentages
+   resolve against each row's own *real* rendered height, so this needs no
+   measurement or fixed sizes anywhere, unlike the JS approach this
+   replaced. The two `calc()` offsets below extend a row's own spine
+   segment half a gap above and below itself, so adjacent siblings' own
+   segments meet exactly in the middle of the gap between them with no
+   visible break; `:first-child`/`:last-child` clip the ends so the spine
+   never extends above the first child or below the last one (a lone
+   child gets top:50%/bottom:50%, i.e. no visible spine at all — just its
+   own twig, correctly). */
+.node-children > .node-row {
+  position: relative;
+}
+.node-children > .node-row::before {
+  content: "";
+  position: absolute;
+  left: calc(-1 * var(--connector-offset));
+  top: 50%;
+  width: var(--connector-offset);
+  height: 2px;
+  background: var(--border);
+  transform: translateY(-50%);
+}
+.node-children > .node-row::after {
+  content: "";
+  position: absolute;
+  left: calc(-1 * var(--connector-offset));
+  top: calc(-0.5rem);
+  bottom: calc(-0.5rem);
+  width: 2px;
+  background: var(--border);
+}
+.node-children > .node-row:first-child::after {
+  top: 50%;
+}
+.node-children > .node-row:last-child::after {
+  bottom: 50%;
+}
+/* Root -> depth-1 is one continuous line down root's own left side (both
+   ends on the left — see `web/src/MeshNode.tsx`'s root-only Left-source
+   special case), not a fresh spine starting at the first child: extend
+   the first child's own segment up through `.root-children`'s
+   `margin-top` gap so it reaches root's own card. */
+.node-children.root-children > .node-row:first-child::after {
+  top: calc(-0.75rem);
+}
+
+.node {
+  --accent: var(--accent-default);
+  position: relative;
+  display: inline-block;
+  /* A card is a flex item of its own `.node-row` — must never shrink
+     below its intended width tier when a wide/deep subtree doesn't fit
+     the viewport; see `.node-children`'s own doc comment for why
+     overflowing into `.canvas-wrap`'s scroll is the intended behavior
+     here, not a squeeze. */
+  flex-shrink: 0;
+  /* Same two-tier width rule `web/src/autolayout.ts` computes in JS from
+     `window.innerWidth` (root and its direct children get 60% of the
+     viewport, everything deeper gets 40%, uniformly regardless of how
+     much deeper) — expressed natively in CSS instead via `vw`, so it's
+     live-responsive to the real viewport with no script and nothing for
+     Rust to compute. This is the "deep" (depth ≥2) tier; `.node.shallow`
+     below overrides it for depth 0/1 (`_macros.html.tera` sets that class
+     from `n.depth`). */
+  max-width: clamp(260px, 40vw, 640px);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-top: 3px solid var(--accent);
+  border-radius: 8px;
+  padding: 0.6rem 0.75rem;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+}
+
+.node.shallow {
+  max-width: clamp(320px, 60vw, 900px);
+}
+
+/* The parent-side half of the structural connector: a short horizontal
+   nub from a card with children out to the middle of `.node-row`'s own
+   `gap`, meeting the child-side spine (`.node-children > .node-row::
+   before`/`::after` above) exactly there. Root's own connector to its
+   children is drawn differently (see `.root-children`'s own extended
+   first-child spine above, a vertical line down root's own left side, not
+   a horizontal nub off its right) — `.tree > .node-row` is always root's
+   own row, so this turns the nub off there specifically. */
+.node.has-children::after {
+  content: "";
+  position: absolute;
+  left: 100%;
+  top: 50%;
+  width: 0.875rem;
+  height: 2px;
+  background: var(--border);
+  transform: translateY(-50%);
+}
+.tree > .node-row > .node.has-children::after {
+  display: none;
+}
+
+/* A real, authored position/size overrides the flow-driven sizing above —
+   it's the author's own explicit box, not something to cap or reflow. */
+.node.positioned {
+  max-width: none;
+  overflow: auto;
+}
+
+.node.type-group {
+  background: transparent;
+  border: 1px dashed var(--border);
+  border-top: 1px dashed var(--accent);
+  box-shadow: none;
+  display: block;
+}
+
+/* The JS-drawn overlay for meshfox:edge cross-references (see
+   index.html.tera) — a child of `.tree` itself (not `document.body`),
+   sized to `.tree`'s own box and drawn in `.tree`-relative coordinates,
+   so it scrolls together with the nodes it connects under any scrolling
+   ancestor (`.canvas-wrap`'s own `overflow: auto`, or the page itself)
+   instead of staying fixed in the viewport while the content moves
+   underneath it. Structural (parent/child) edges never appear here — see
+   `.node-children`'s own doc comment above, they're pure CSS. */
+.mesh-edge-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+  z-index: 5;
+}
+
+.node-title {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-weight: 600;
+  font-size: 0.95rem;
+  margin-bottom: 0.35rem;
+}
+
+.type-group .node-title {
+  color: var(--muted);
+  font-weight: 500;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.1rem;
+  height: 1.1rem;
+  border-radius: 50%;
+  font-size: 0.7rem;
+  color: #fff;
+}
+
+.badge.ok {
+  background: #16a34a;
+}
+
+.badge.fail {
+  background: #dc2626;
+}
+
+.node-tags:empty {
+  display: none;
+}
+
+.node-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  margin-bottom: 0.4rem;
+}
+
+.tag {
+  font-size: 0.7rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  background: var(--code-bg);
+  color: var(--muted);
+}
+
+.node-body {
+  font-size: 0.85rem;
+}
+
+.node-body > :first-child {
+  margin-top: 0;
+}
+
+.node-body > :last-child {
+  margin-bottom: 0;
+}
+
+.node-body img {
+  max-width: 100%;
+  border-radius: 6px;
+}
+
+.file-preview-truncated {
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-style: italic;
+}
+
+.node-body pre {
+  background: var(--code-bg);
+  padding: 0.5rem;
+  border-radius: 6px;
+  overflow-x: auto;
+  font-size: 0.8rem;
+}
+
+.node-body code {
+  background: var(--code-bg);
+  border-radius: 3px;
+  padding: 0.05rem 0.3rem;
+  font-size: 0.85em;
+}
+
+.node-body pre code {
+  background: none;
+  padding: 0;
+}
+
+.node-body table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.8rem;
+}
+
+.node-body th,
+.node-body td {
+  border: 1px solid var(--border);
+  padding: 0.25rem 0.5rem;
+  text-align: left;
+}
+
+.site-footer {
+  padding: 1.5rem 2rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+  border-top: 1px solid var(--border);
+}

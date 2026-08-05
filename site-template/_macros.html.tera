@@ -1,0 +1,70 @@
+{# Recursive node renderer for the canvas tree (site.root). Each call
+   produces one `.node-row`: the node's own card (`.node`) and, if it has
+   children, a `.node-children` block — as SIBLINGS, not one nested inside
+   the other (nesting a child's whole `.node-row` *inside* the parent's own
+   `.node` card would put every descendant inside an ancestor's padding
+   box, eating into width and drawing borders on top of each other — see
+   `crates/cli/tests/site_template.rs`'s `no_node_card_is_nested_inside_
+   another_nodes_card`, guarding against exactly that).
+
+   `.node-row` is a flex ROW by default: a node's own card sits beside its
+   `.node-children` column, branching right — pure CSS, no measurement or
+   repositioning needed (see style.css's own doc comment for why an earlier
+   version of this template needed a JS pass here and no longer does).
+   Root's own row is the one exception (`.tree > .node-row`, scoped in CSS):
+   its children stack in a column *below* it instead, with only a small
+   nudge right — same document-outline convention `web/src/autolayout.ts`
+   calls `ROOT_CHILD_INDENT`, as opposed to the full branch-right step
+   (`H_GAP`) every deeper level gets. `n.depth` (real tree depth; see
+   `crates/core/src/staticgen.rs`'s `NodeView.depth` doc comment) is what
+   lets that CSS tell "root or its direct children" (depth <=1) apart from
+   "real rightward branching" (depth >=2) for the `.shallow`/`.deep` width
+   tiers too.
+
+   `has-children` marks a card whose row also has a `.node-children`
+   sibling — style.css uses it to draw the parent-side half of the
+   structural connector (see that file's doc comment for the full
+   "twig and spine" connector design); a leaf card gets no such
+   pseudo-element at all.
+
+   A node with a real, authored x/y/width/height (n.position is defined)
+   renders at that exact pixel position, absolutely, against the single
+   `.tree` wrapper's origin (see style.css's `.tree { position: relative; }`
+   — no other wrapper in this file is itself positioned, so an
+   absolutely-positioned node anchors to that one shared origin no matter
+   how deep it is nested). Everything else is an ordinary flowed flex item,
+   sized and placed entirely by CSS.
+
+   Every structural (parent/child) connector is drawn by pure CSS straight
+   from this nesting (see style.css) — only `meshfox:edge` cross-references
+   (which can point anywhere, not just to a DOM sibling) still need a real
+   browser-measured position, drawn by index.html.tera's own small script
+   from site.edges. #}
+{% macro node(n) -%}
+<div class="node-row">
+  <div class="node type-{{ n.node_type }}{% if n.position %} positioned{% endif %}{% if n.depth <= 1 %} shallow{% else %} deep{% endif %}{% if n.children %} has-children{% endif %}"
+       id="node-{{ n.id }}"
+       data-depth="{{ n.depth }}"
+       {%- if n.position %} style="position: absolute; left: {{ n.position.x }}px; top: {{ n.position.y }}px; width: {{ n.position.width }}px; height: {{ n.position.height }}px;{% if n.color is defined %} --accent: {{ n.color }};{% endif %}"
+       {%- elif n.color is defined %} style="--accent: {{ n.color }};"
+       {%- endif %}>
+    <div class="node-title">
+      <span class="node-title-text">{{ n.title }}</span>
+      {%- if n.constraint_ok is defined %}
+      <span class="badge {% if n.constraint_ok %}ok{% else %}fail{% endif %}">{% if n.constraint_ok %}&#10003;{% else %}&#10007;{% endif %}</span>
+      {%- endif %}
+    </div>
+    {%- if n.tags %}
+    <div class="node-tags">{% for t in n.tags %}<span class="tag">{{ t }}</span>{% endfor %}</div>
+    {%- endif %}
+    {%- if n.node_type != "group" %}
+    <div class="node-body">{{ n.html_body | safe }}</div>
+    {%- endif %}
+  </div>
+  {%- if n.children %}
+  <div class="node-children{% if n.depth == 0 %} root-children{% endif %}" data-parent-depth="{{ n.depth }}">
+    {%- for child in n.children %}{{ self::node(n=child) }}{% endfor %}
+  </div>
+  {%- endif %}
+</div>
+{%- endmacro node %}

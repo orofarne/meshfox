@@ -15,6 +15,7 @@ pub mod include;
 pub mod layout;
 pub mod mdcanvas;
 pub mod output;
+pub mod staticgen;
 pub mod tree;
 pub mod varcache;
 pub mod vars;
@@ -28,6 +29,7 @@ pub use include::IncludeError;
 pub use layout::LayoutBox;
 pub use mdcanvas::{NodeMeta, ParseError};
 pub use output::{write_output, ExecOutput};
+pub use staticgen::{Asset, EdgeView, NodeView, Position, SiteData};
 pub use tree::{RunnableBlock, TreeError};
 pub use varcache::VarCache;
 pub use vars::{

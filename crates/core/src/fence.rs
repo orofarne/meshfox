@@ -363,6 +363,36 @@ pub fn single_starlark_fence(body: &str) -> Option<String> {
     (lang == "starlark").then(|| fence.code.clone())
 }
 
+/// Rewrites every top-level fenced code block's info string down to just its
+/// bare language token, dropping meshfox's own attributes (`name=`,
+/// `cache`, `deps=`, ...) — for rendering a node's body as plain HTML (see
+/// `crate::staticgen`), where those attributes would otherwise leak into the
+/// rendered `class="language-..."`. Content outside fences, and each
+/// fence's own code, is left byte-for-byte untouched; only the opening
+/// delimiter line is rewritten.
+pub fn strip_fence_attrs(markdown: &str) -> String {
+    let fences = scan_raw_fences(markdown);
+    if fences.is_empty() {
+        return markdown.to_string();
+    }
+    let mut out = String::with_capacity(markdown.len());
+    let mut cursor = 0;
+    for fence in &fences {
+        out.push_str(&markdown[cursor..fence.span.start]);
+        let (lang, _attrs) = parse_info_string(&fence.info);
+        let delim: String = std::iter::repeat(fence.delim_char).take(fence.delim_len).collect();
+        out.push_str(&delim);
+        out.push_str(&lang);
+        out.push('\n');
+        out.push_str(&fence.code);
+        out.push('\n');
+        out.push_str(&delim);
+        cursor = fence.span.end;
+    }
+    out.push_str(&markdown[cursor..]);
+    out
+}
+
 fn lines_with_offsets(s: &str) -> Vec<(usize, &str)> {
     let mut result = Vec::new();
     let mut offset = 0;
@@ -713,5 +743,22 @@ mod tests {
     #[test]
     fn single_starlark_fence_rejects_no_fence() {
         assert_eq!(single_starlark_fence("just prose"), None);
+    }
+
+    #[test]
+    fn strip_fence_attrs_drops_meshfox_attributes() {
+        let md = "prose\n\n```bash name=\"build\" cache deps=\"x\"\necho hi\n```\n\nmore prose";
+        let stripped = strip_fence_attrs(md);
+        assert!(stripped.contains("```bash\necho hi\n```"));
+        assert!(!stripped.contains("name="));
+        assert!(!stripped.contains("cache"));
+        assert!(stripped.starts_with("prose\n\n"));
+        assert!(stripped.ends_with("more prose"));
+    }
+
+    #[test]
+    fn strip_fence_attrs_leaves_plain_text_untouched() {
+        let md = "just prose, no fences\n";
+        assert_eq!(strip_fence_attrs(md), md);
     }
 }

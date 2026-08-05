@@ -14,3 +14,7 @@ meshfox-server = { path = "../server" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 rpassword = "7"
+tera = "1"
+
+[dev-dependencies]
+scraper = "0.20"
