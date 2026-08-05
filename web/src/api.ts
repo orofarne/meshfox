@@ -307,70 +307,117 @@ export async function clearLayout(): Promise<CanvasDoc> {
 }
 
 /**
- * Opens one long-lived connection to `/api/watch` (NDJSON, one line per
- * event) for as long as this tab stays open. The server counts each open
- * connection as one open tab and, once every one of them has gone, exits on
- * its own a few seconds later (see README's roadmap) — so this is meant to
- * be called once, for the lifetime of the page, not per-request.
+ * Delays (ms) between reconnect attempts after `/api/watch` drops — see
+ * `watchChanges` below. Cumulative sum (~9.6s) deliberately lands just under
+ * the server's own `AUTO_EXIT_GRACE` (10s, see server's `lib.rs`): as long
+ * as reconnecting succeeds within that window, the server never even
+ * considers itself abandoned, so both sides agree on when a drop was real.
+ */
+const WATCH_RECONNECT_DELAYS_MS = [200, 400, 800, 1600, 3200, 3200];
+
+/**
+ * Opens a long-lived connection to `/api/watch` (NDJSON, one line per event)
+ * for as long as this tab stays open, transparently reconnecting (see
+ * `WATCH_RECONNECT_DELAYS_MS`) whenever the connection drops. The server
+ * counts each open connection as one open tab and, once every one of them
+ * has stayed gone past its own grace period, exits on its own (see
+ * README's roadmap) — so this is meant to be called once, for the lifetime
+ * of the page, not per-request.
  *
  * `onChanged` fires for each `"changed"` event: the on-disk file changed
  * from underneath the server (an external edit), so the caller should
- * reload. `onDisconnected` fires once the stream ends for any reason —
- * including, notably, not an error at all: the connection simply closing is
- * how this notices the server process itself has stopped, since there's
- * nothing left on the other end to keep it open. Returns a function that
- * stops watching (aborts the underlying request) without itself triggering
+ * reload. `onDisconnected` fires only once every reconnect attempt has
+ * failed — that's this function's best guess that the server process itself
+ * has actually stopped, since there's nothing left on the other end to keep
+ * it open, as opposed to a connection that merely dropped and can be
+ * re-established. Treating every single drop as fatal used to close the tab
+ * too eagerly in two situations that are both just a transient drop, not a
+ * dead server: waking a sleeping/hibernated laptop (the loopback socket can
+ * come back looking reset even though the server process never exited), and
+ * — on Firefox specifically — refreshing the tab, where the outgoing page's
+ * fetch can observe the connection die before its own `pagehide` handler
+ * (below) has had a chance to mark it as leaving. Retrying instead of
+ * reacting immediately gives both cases a chance to resolve themselves: the
+ * hibernate case by the retry simply succeeding once the socket is usable
+ * again, the refresh case because the retry is scheduled with `setTimeout`
+ * on a page that's already being torn down by the navigation, so it never
+ * actually fires. Returns a function that stops watching (aborts the
+ * underlying request and any pending retry) without itself triggering
  * `onDisconnected`.
  *
  * A reload (or any other navigation away from this tab) also closes the
  * connection out from under the fetch, from the browser's side, not this
  * function's own `AbortController` — indistinguishable, by error alone,
  * from the server itself actually having died. `pagehide` fires first in
- * that case (reload, back/forward, closing the tab), so it's used here to
- * tell "this tab is leaving" apart from "the server is gone": without it, a
- * plain reload would misread its own connection drop as the server having
- * stopped and (see App.tsx's `serverGone`) try to close the very tab that's
- * mid-reload instead of letting it finish.
+ * the common case (reload, back/forward, closing the tab), so it's used
+ * here to tell "this tab is leaving" apart from "the server is gone":
+ * without it, a plain reload would misread its own connection drop as the
+ * server having stopped and (see App.tsx's `serverGone`) try to close the
+ * very tab that's mid-reload instead of letting it finish. The reconnect
+ * retries above are the backstop for when `pagehide` loses that race.
  */
 export function watchChanges(onChanged: () => void, onDisconnected: () => void): () => void {
   const controller = new AbortController();
   let leaving = false;
+  let stopped = false;
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
   const markLeaving = () => {
     leaving = true;
   };
   window.addEventListener("pagehide", markLeaving);
 
-  (async () => {
-    try {
-      const res = await fetch("/api/watch", { signal: controller.signal });
-      if (!res.ok || !res.body) {
-        if (!leaving) onDisconnected();
+  const connectOnce = async (onEstablished: () => void): Promise<void> => {
+    const res = await fetch("/api/watch", { signal: controller.signal });
+    if (!res.ok || !res.body) {
+      throw new Error(`GET /api/watch: ${res.status}`);
+    }
+    // A response is in hand — this attempt reached the server, so any
+    // future drop is a fresh problem and should restart the backoff from
+    // its shortest delay rather than resume wherever a much earlier,
+    // unrelated attempt left off.
+    onEstablished();
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffered = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffered += decoder.decode(value, { stream: true });
+      let newlineAt: number;
+      while ((newlineAt = buffered.indexOf("\n")) >= 0) {
+        const line = buffered.slice(0, newlineAt);
+        buffered = buffered.slice(newlineAt + 1);
+        if (!line.trim()) continue;
+        const event = JSON.parse(line) as { type: string };
+        if (event.type === "changed") onChanged();
+      }
+    }
+    // The stream ending is itself a drop (the server never sends a
+    // deliberate "goodbye" event) — fall through to the retry logic below
+    // exactly like a network error would.
+    throw new Error("GET /api/watch: stream ended");
+  };
+
+  const run = (attempt: number) => {
+    let established = false;
+    connectOnce(() => {
+      established = true;
+    }).catch(() => {
+      if (leaving || stopped || controller.signal.aborted) return;
+      const nextAttempt = established ? 0 : attempt;
+      if (nextAttempt >= WATCH_RECONNECT_DELAYS_MS.length) {
+        onDisconnected();
         return;
       }
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffered = "";
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffered += decoder.decode(value, { stream: true });
-        let newlineAt: number;
-        while ((newlineAt = buffered.indexOf("\n")) >= 0) {
-          const line = buffered.slice(0, newlineAt);
-          buffered = buffered.slice(newlineAt + 1);
-          if (!line.trim()) continue;
-          const event = JSON.parse(line) as { type: string };
-          if (event.type === "changed") onChanged();
-        }
-      }
-      if (!leaving) onDisconnected();
-    } catch {
-      if (!controller.signal.aborted && !leaving) onDisconnected();
-    }
-  })();
+      retryTimer = setTimeout(() => run(nextAttempt + 1), WATCH_RECONNECT_DELAYS_MS[nextAttempt]);
+    });
+  };
+  run(0);
 
   return () => {
+    stopped = true;
     window.removeEventListener("pagehide", markLeaving);
+    if (retryTimer !== undefined) clearTimeout(retryTimer);
     controller.abort();
   };
 }
