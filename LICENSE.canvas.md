@@ -4,7 +4,7 @@
 
 meshfox itself is MIT-licensed (see [LICENSE](./LICENSE), also inlined below). This document tracks every third-party dependency pulled into the published binary/bundle — backend (Rust crates, `Cargo.toml`) and UI (npm packages, `web/package.json`) — and records the license-compatibility check against MIT.
 
-Only **direct** dependencies are listed by name below; the full transitive tree (292 Rust crates, 186 npm production packages) was checked programmatically and is summarized in "License compatibility" — nothing in it requires anything beyond attribution.
+Only **direct** dependencies are listed by name below; the full transitive tree (292 Rust crates, 187 npm production packages) was checked programmatically and is summarized in "License compatibility" — nothing in it requires anything beyond attribution.
 
 ## MIT License
 <!-- meshfox:node id="license-file" type="file" display="code" -->
@@ -39,7 +39,7 @@ Direct dependencies across `crates/core`, `crates/server`, `crates/cli` (`cargo 
 ## UI dependencies (npm)
 <!-- meshfox:node id="ui-deps" -->
 
-Direct `dependencies` from `web/package.json` — these ship inside the built browser bundle:
+Direct `dependencies` from `web/package.json` — these ship inside the built browser bundle. All are permissive and MIT-compatible; `@fontsource/fira-code` (the self-hosted Fira Code font files) is SIL OFL-1.1 rather than MIT, which only requires the font itself keep its license/copyright notice — it doesn't reach the rest of the bundle:
 
 | Package | License |
 |---|---|
@@ -47,6 +47,7 @@ Direct `dependencies` from `web/package.json` — these ship inside the built br
 | @codemirror/language | MIT |
 | @codemirror/language-data | MIT |
 | @codemirror/state | MIT |
+| @fontsource/fira-code | OFL-1.1 |
 | @uiw/react-codemirror | MIT |
 | @xterm/addon-fit | MIT |
 | @xterm/xterm | MIT |

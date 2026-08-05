@@ -56,9 +56,16 @@ body,
 }
 
 body {
-  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-family: "Fira Code", system-ui, -apple-system, "Segoe UI", sans-serif;
   background: var(--bg);
   color: var(--fg);
+}
+
+/* Every CodeMirror source editor in the app (NodeTextEditor,
+ * CanvasSourceEditor) shares this one rule rather than each editor's own
+ * wrapper class repeating it. */
+.cm-editor {
+  font-family: "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
 .app {
@@ -737,7 +744,7 @@ body {
   margin: 0;
   padding: 0.6rem 0.75rem;
   overflow-x: auto;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 0.78rem;
   line-height: 1.45;
   background: var(--code-bg);
@@ -752,7 +759,7 @@ body {
   background: var(--code-bg);
   padding: 0.1em 0.4em;
   border-radius: 4px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 0.85em;
 }
 
@@ -784,7 +791,7 @@ body {
   text-transform: uppercase;
   letter-spacing: 0.04em;
   opacity: 0.6;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
 /* `seg.tty` marker next to the language label — small and understated,

@@ -24,9 +24,17 @@ mod prompt;
 /// version, which doesn't change between commits.
 const VERSION: &str = concat!("commit ", env!("MESHFOX_GIT_COMMIT"), " (", env!("MESHFOX_GIT_DATE"), ")");
 
+const MASCOT: &str = r"
+
+ /\_/\
+( ¬‿¬ )──●──●──●
+  c c
+";
+
 #[derive(Parser)]
 #[command(
     name = "meshfox",
+    before_help = MASCOT,
     about = "CLI and local web viewer/editor for a meshfox canvas. Run `meshfox spec` for the full .canvas.md format specification.",
     after_help = "Agent Usage:\n  If you are an AI coding agent, run `meshfox --agent-help` before hand-editing a\n  .canvas.md file. It covers when to prefer `meshfox node <verb>` over a raw text\n  edit, how to run non-interactively, and other guidance not covered above.",
     version = VERSION

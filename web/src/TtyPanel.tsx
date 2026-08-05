@@ -99,6 +99,7 @@ export function TtyPanel({ path, blockName, withDeps, persist, vars, onClose }: 
 
     const term = new Terminal({
       convertEol: true,
+      fontFamily: '"Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
       fontSize: 13,
       cursorBlink: true,
       theme: dark

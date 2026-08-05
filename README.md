@@ -1,6 +1,12 @@
 <!-- meshfox:canvas -->
 # meshfox
 
+```
+ /\_/\
+( ¬‿¬ )──●──●──●
+  c c
+```
+
 <!-- meshfox:var name="INSTALL_PATH" prompt="Install prefix?" default="/usr/local/bin" -->
 
 An executable canvas: a hierarchical, node-based document where nodes hold Markdown, and code blocks inside that Markdown can be run — with their output optionally cached right next to the code.

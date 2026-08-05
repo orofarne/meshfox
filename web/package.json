@@ -8,6 +8,8 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
+    "gen-icons": "node scripts/gen-icons.mjs",
+    "gen-screenshot": "node scripts/gen-screenshot.mjs",
     "pretest:e2e": "npm run build",
     "test:e2e": "playwright test",
     "test:e2e:ui": "playwright test --ui"
@@ -17,6 +19,7 @@
     "@codemirror/language": "^6.12.4",
     "@codemirror/language-data": "^6.5.2",
     "@codemirror/state": "^6.7.1",
+    "@fontsource/fira-code": "^5.3.0",
     "@uiw/react-codemirror": "^4.25.11",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
