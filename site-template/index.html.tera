@@ -14,7 +14,6 @@
   &gt; ^ &lt;</pre>
   <div class="site-header-text">
     <h1>{{ site.title }}</h1>
-    <p class="subtitle">A static snapshot of a <a href="https://github.com/">meshfox</a> canvas — laid out by your browser, not pre-computed pixels.</p>
   </div>
 </header>
 

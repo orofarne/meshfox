@@ -1,24 +1,29 @@
+/* Black + orange, in the spirit of https://www.ash-hq.org/ — a vivid
+   orange accent (`--accent-default`) against a near-black panel/background
+   pair in dark mode, warmed-white/near-black text either way instead of
+   cool neutrals, so the accent doesn't clash with the rest of the
+   palette. */
 :root {
-  --bg: #f6f7f9;
-  --fg: #1b1f24;
-  --muted: #6b7280;
+  --bg: #faf7f4;
+  --fg: #201a14;
+  --muted: #7a6f63;
   --panel: #ffffff;
-  --border: #d9dce1;
-  --accent-default: #6366f1;
-  --code-bg: #f0f1f4;
-  --link: #2563eb;
+  --border: #e5ddd2;
+  --accent-default: #ea580c;
+  --code-bg: #f4ede3;
+  --link: #c2410c;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #14161a;
-    --fg: #e7e9ee;
-    --muted: #9aa1ac;
-    --panel: #1c1f25;
-    --border: #313640;
-    --accent-default: #8385f5;
-    --code-bg: #23262d;
-    --link: #7aa2ff;
+    --bg: #0a0a0c;
+    --fg: #f2ede6;
+    --muted: #9c948a;
+    --panel: #131316;
+    --border: #2c2620;
+    --accent-default: #ff6e15;
+    --code-bg: #19191c;
+    --link: #ff9a52;
   }
 }
 
@@ -55,15 +60,8 @@ a {
 }
 
 .site-header h1 {
-  margin: 0 0 0.25rem;
-  font-size: 1.5rem;
-}
-
-.subtitle {
   margin: 0;
-  color: var(--muted);
-  font-size: 0.9rem;
-  max-width: 60ch;
+  font-size: 1.5rem;
 }
 
 .canvas-wrap {

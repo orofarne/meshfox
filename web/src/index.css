@@ -1,12 +1,19 @@
+/* Black + orange, in the spirit of https://www.ash-hq.org/ — see
+ * site-template/style.css's own doc comment (the static export uses the
+ * same accent/background pair) for where this palette comes from.
+ * --fail/--ok/--dep/--syntax-attr/--syntax-value are status/semantic
+ * colors (error, success, run-order dependency, other syntax roles), kept
+ * as-is rather than folded into the brand palette — they need to stay
+ * recognizable as "red means error"/"green means ok" regardless of theme. */
 :root {
   color-scheme: light dark;
-  --bg: #ffffff;
-  --fg: #1a1a1a;
-  --node-bg: #fdfdfd;
-  --node-border: #d0d0d0;
-  --accent: #3d6ef5;
-  --code-bg: #eef0f3;
-  --code-head-bg: #e4e7ec;
+  --bg: #faf7f4;
+  --fg: #201a14;
+  --node-bg: #ffffff;
+  --node-border: #e5ddd2;
+  --accent: #ea580c;
+  --code-bg: #f4ede3;
+  --code-head-bg: #ece1d2;
   --fail: #c22b2b;
   /* A passing constraint's badge color — --fail's counterpart. */
   --ok: #1b7a43;
@@ -21,24 +28,25 @@
    * (`name=`/`cache`/`deps=`/...), kept visually distinct from --accent/
    * --dep so they don't read as "a run/deps UI element" instead of "a bit
    * of source syntax". */
-  --syntax-tint: rgba(61, 110, 245, 0.07);
+  --syntax-tint: rgba(234, 88, 12, 0.07);
   --syntax-attr: #96660a;
   --syntax-value: #1b7a43;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #16171a;
-    --fg: #e8e8e8;
-    --node-bg: #202226;
-    --node-border: #3a3d42;
-    --code-bg: #16181c;
-    --code-head-bg: #26282d;
+    --bg: #0a0a0c;
+    --fg: #f2ede6;
+    --node-bg: #131316;
+    --node-border: #2c2620;
+    --accent: #ff6e15;
+    --code-bg: #19191c;
+    --code-head-bg: #211f1c;
     --fail: #e56a6a;
     --ok: #6fcf97;
     --dep: #c68ae8;
     --dep-flash: rgba(198, 138, 232, 0.32);
-    --syntax-tint: rgba(107, 148, 255, 0.1);
+    --syntax-tint: rgba(255, 110, 21, 0.12);
     --syntax-attr: #d8b656;
     --syntax-value: #6fcf97;
   }
@@ -59,6 +67,10 @@ body {
   font-family: "Fira Code", system-ui, -apple-system, "Segoe UI", sans-serif;
   background: var(--bg);
   color: var(--fg);
+}
+
+a {
+  color: var(--accent);
 }
 
 /* Every CodeMirror source editor in the app (NodeTextEditor,

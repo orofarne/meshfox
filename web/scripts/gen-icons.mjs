@@ -60,7 +60,7 @@ body {
   font-variant-ligatures: none;
   font-feature-settings: "calt" 0, "liga" 0, "dlig" 0;
   font-size: ${masterSize * 0.2}px;
-  color: #ffffff;
+  color: #ff6e15;
 }
 .row {
   display: flex;
@@ -96,7 +96,7 @@ const corner = Math.round(masterSize * 0.18);
 execFileSync("magick", [
   "-size", `${masterSize}x${masterSize}`,
   "xc:none",
-  "-fill", "#3d6ef5",
+  "-fill", "#0a0a0c",
   "-draw", `roundrectangle 0,0 ${masterSize - 1},${masterSize - 1} ${corner},${corner}`,
   bgPath,
 ]);
