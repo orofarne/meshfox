@@ -125,6 +125,90 @@ fn recursive_macro_partial_is_imported_but_never_rendered_as_its_own_page() {
 }
 
 #[test]
+fn template_toml_supplies_base_url_and_icons_but_is_never_copied_to_out() {
+    let template_dir = unique_dir("template-config");
+    write_file(
+        &template_dir.join("index.html.tera"),
+        "{% for icon in icons %}<link rel=\"{{ icon.rel }}\" href=\"{{ icon.href }}\">\n{% endfor %}{{ site.root.html_body | safe }}",
+    );
+    write_file(
+        &template_dir.join("template.toml"),
+        "base_url = \"https://example.com/repo\"\n\n[[icons]]\nrel = \"icon\"\nhref = \"favicon.ico\"\n",
+    );
+    // A real (if tiny) asset `icons` points at — proves `template.toml`
+    // itself doesn't need to be the only new file in the template dir for
+    // this to work.
+    write_file(&template_dir.join("favicon.ico"), "not a real ico, just bytes");
+
+    let canvas_path = unique_dir("canvas-config").join("doc.canvas.md");
+    // A plain Markdown link in the root's own body — the kind `base_url`
+    // actually prefixes (see meshfox_core::staticgen's own doc comment); a
+    // literal `<a>` written directly in a template's own HTML never goes
+    // through that resolution at all, so it wouldn't exercise this.
+    write_file(&canvas_path, "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n[LICENSE](./LICENSE)\n");
+
+    let out_dir = unique_dir("out-config");
+
+    let status = meshfox()
+        .arg("static")
+        .arg(&canvas_path)
+        .arg("--template")
+        .arg(&template_dir)
+        .arg("--out")
+        .arg(&out_dir)
+        .status()
+        .expect("failed to run meshfox");
+    assert!(status.success());
+
+    let index = std::fs::read_to_string(out_dir.join("index.html")).unwrap();
+    assert!(index.contains(r#"<link rel="icon" href="favicon.ico">"#), "{index}");
+    // base_url from template.toml, not a CLI flag (static no longer has one).
+    assert!(index.contains(r#"href="https://example.com/repo/LICENSE""#), "{index}");
+
+    assert!(out_dir.join("favicon.ico").exists(), "an ordinary asset icons points at is still copied verbatim");
+    assert!(!out_dir.join("template.toml").exists(), "template.toml is the template's own config, not one of its pages/assets");
+
+    let _ = std::fs::remove_dir_all(&template_dir);
+    let _ = std::fs::remove_dir_all(canvas_path.parent().unwrap());
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+#[test]
+fn a_template_with_no_template_toml_gets_an_empty_config() {
+    // Same as this file's other fixtures (no template.toml at all) — must
+    // keep working exactly as before this file existed: empty `icons`,
+    // no `base_url` prefixing.
+    let template_dir = unique_dir("template-no-config");
+    write_file(
+        &template_dir.join("index.html.tera"),
+        "icons:{% for icon in icons %}{{ icon.href }}{% endfor %}:end",
+    );
+
+    let canvas_path = unique_dir("canvas-no-config").join("doc.canvas.md");
+    write_file(&canvas_path, FIXTURE_CANVAS);
+
+    let out_dir = unique_dir("out-no-config");
+
+    let status = meshfox()
+        .arg("static")
+        .arg(&canvas_path)
+        .arg("--template")
+        .arg(&template_dir)
+        .arg("--out")
+        .arg(&out_dir)
+        .status()
+        .expect("failed to run meshfox");
+    assert!(status.success());
+
+    let index = std::fs::read_to_string(out_dir.join("index.html")).unwrap();
+    assert!(index.contains("icons::end"), "no template.toml means no icons at all: {index}");
+
+    let _ = std::fs::remove_dir_all(&template_dir);
+    let _ = std::fs::remove_dir_all(canvas_path.parent().unwrap());
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+#[test]
 fn refuses_to_clobber_a_non_empty_out_dir_without_force() {
     let template_dir = unique_dir("template2");
     write_file(&template_dir.join("index.html.tera"), "{{ site.title }}");

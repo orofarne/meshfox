@@ -206,11 +206,15 @@ enum Command {
     /// starts with `_`, a partial meant to be `{% import %}`ed rather than
     /// rendered standalone) is rendered and written to `--out` at the same
     /// relative path minus `.tera`; every other file is copied verbatim
-    /// (CSS, fonts, ...). A local image referenced from a node's Markdown
-    /// body is copied alongside the output automatically; a `file`-type
-    /// node's `display="code"` target is read once and inlined into the
-    /// HTML directly (nothing left to fetch once static). See
-    /// `site-template/` in this repo for a working example.
+    /// (CSS, fonts, ...) — except `template.toml` itself, the template's
+    /// own config file (optional; a template with none gets an empty
+    /// `base_url` and no `icons`), read from `--template`'s own directory
+    /// and never copied to `--out`. A local image referenced from a node's
+    /// Markdown body is copied alongside the output automatically; a
+    /// `file`-type node's `display="code"` target is read once and inlined
+    /// into the HTML directly (nothing left to fetch once static). See
+    /// `site-template/` in this repo for a working example, including its
+    /// own `template.toml`.
     Static {
         /// Path to the .canvas.md file. If omitted: auto-discover the
         /// single candidate in the current directory.
@@ -225,17 +229,6 @@ enum Command {
         /// Overwrite an existing, non-empty `--out` directory.
         #[arg(long)]
         force: bool,
-        /// Prefixed onto a relative link/target this command doesn't
-        /// already copy into `--out` (a plain Markdown link, or a
-        /// `file`/`link` node's own target when not `display="code"`) — a
-        /// local image and a `display="code"` target are unaffected, since
-        /// they're already self-contained in the output. Useful when
-        /// publishing to a host where the site's own root isn't the
-        /// canvas's own directory, so a leftover relative reference should
-        /// resolve against e.g. the original repo instead. Left as-is when
-        /// omitted.
-        #[arg(long)]
-        base_url: Option<String>,
     },
     /// Structural edits to individual nodes in a canvas file: add, move,
     /// rename, delete, or set a node's body/position/style/edges — the CLI
@@ -496,9 +489,9 @@ fn main() {
             let canvas_path = canvas.unwrap_or_else(find_canvas);
             list(&canvas_path)
         }
-        Command::Static { canvas, template, out, force, base_url } => {
+        Command::Static { canvas, template, out, force } => {
             let canvas_path = canvas.unwrap_or_else(find_canvas);
-            static_cmd(&canvas_path, &template, &out, force, base_url.as_deref())
+            static_cmd(&canvas_path, &template, &out, force)
         }
         Command::Node { command } => match command {
             NodeCommand::Add { canvas, parent_id, title } => {
@@ -1760,10 +1753,87 @@ fn fmt_opt_num(v: Option<f64>) -> String {
     v.map(|n| n.to_string()).unwrap_or_else(|| "?".to_string())
 }
 
+/// Basename of a template's own optional config file (`--template`'s own
+/// directory, never a page — see `load_template_config`) — excluded by name
+/// from `copy_template_assets`'s otherwise-copy-everything sweep the same
+/// way a `.tera` file already is, since it configures the export rather
+/// than being part of it.
+const TEMPLATE_CONFIG_FILE: &str = "template.toml";
+
+/// A template's own settings, read from `template.toml` in its directory —
+/// deliberately not a `--static` CLI flag: both fields are a property of
+/// *this template* (how it wants relative links resolved, which icons it
+/// ships), not something a caller picks per invocation, so they belong
+/// checked into the template alongside its own `.tera`/CSS files instead of
+/// repeated on every command line that uses it. Both are optional — a
+/// template with no `template.toml` at all gets `Default::default()`
+/// (no `base_url`, no `icons`), same as today's behavior before this file
+/// existed.
+#[derive(Debug, Default, serde::Deserialize)]
+struct TemplateConfig {
+    /// Prefixed onto a relative link/target `static` doesn't already copy
+    /// into `--out` (a plain Markdown link, or a `file`/`link` node's own
+    /// target when not `display="code"`) — a local image and a
+    /// `display="code"` target are unaffected, since they're already
+    /// self-contained in the output. Useful when publishing to a host
+    /// where the site's own root isn't the canvas's own directory, so a
+    /// leftover relative reference should resolve against e.g. the
+    /// original repo instead. Left as-is (`None`) when the template
+    /// doesn't set one.
+    #[serde(default)]
+    base_url: Option<String>,
+    /// `<link>` tags for the page's own icons (favicon, apple-touch-icon,
+    /// ...) — exposed to every template as the `icons` context key so
+    /// `index.html.tera` (or any other page) can render them itself; see
+    /// `IconLink`. Each `href` is expected to be a relative path to a file
+    /// this same template directory actually ships (copied to `--out`
+    /// verbatim by `copy_template_assets`, same as any other asset) —
+    /// nothing here fetches or copies an icon from anywhere else.
+    #[serde(default)]
+    icons: Vec<IconLink>,
+}
+
+/// One `<link rel="..." href="...">` icon tag — see `TemplateConfig::icons`.
+/// Mirrors the shape of a real `<link>` element closely enough that a
+/// template can render one directly from each entry's fields, e.g.:
+/// `<link rel="{{ icon.rel }}" href="{{ icon.href }}">`.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct IconLink {
+    /// `"icon"` or `"apple-touch-icon"`, same as the real attribute.
+    rel: String,
+    /// Relative path (from the rendered page) to the icon file itself.
+    href: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sizes: Option<String>,
+    /// Named `mime_type` (not `type`, a reserved word awkward to use as a
+    /// Rust field) but serialized/read back as plain `type` — both in
+    /// `template.toml` and in the Tera context a template reads it from —
+    /// since that's the real HTML attribute name.
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    mime_type: Option<String>,
+}
+
+/// Reads `template_dir`'s own `template.toml`, if it has one — a template
+/// with none gets `TemplateConfig::default()` (no `base_url`, no `icons`),
+/// exactly today's behavior before this file existed. A `template.toml`
+/// that exists but fails to parse is a hard error (same "fail loud, don't
+/// silently fall back" stance every other malformed-input path in this CLI
+/// takes), not silently ignored.
+fn load_template_config(template_dir: &Path) -> TemplateConfig {
+    let path = template_dir.join(TEMPLATE_CONFIG_FILE);
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return TemplateConfig::default();
+    };
+    toml::from_str(&raw).unwrap_or_else(|e| {
+        eprintln!("meshfox static: failed to parse {}: {e}", path.display());
+        std::process::exit(1);
+    })
+}
+
 /// Every `node` subcommand's last step before handing a patch back to be
 /// written: make sure it still parses — the same validate-before-commit
 /// shape every mutating `/api/nodes*` server handler uses.
-fn static_cmd(canvas_path: &Path, template_dir: &Path, out_dir: &Path, force: bool, base_url: Option<&str>) {
+fn static_cmd(canvas_path: &Path, template_dir: &Path, out_dir: &Path, force: bool) {
     let raw = read_raw_or_exit(canvas_path);
     let canvas = Canvas::from_markdown(&raw).unwrap_or_else(|e| {
         eprintln!("failed to parse {}: {e}", canvas_path.display());
@@ -1792,14 +1862,17 @@ fn static_cmd(canvas_path: &Path, template_dir: &Path, out_dir: &Path, force: bo
         std::process::exit(1);
     }
 
+    let config = load_template_config(template_dir);
+
     // Same "bare filename has an empty, not missing, parent" edge case
     // `meshfox_server::get_node_file_content` handles — a canvas passed as
     // just `README.md` (no directory component) resolves relative images/
     // `display="code"` targets against the current directory.
     let canvas_dir = canvas_path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
-    let (site, assets) = meshfox_core::staticgen::build(&canvas, canvas_dir, base_url);
+    let (site, assets) = meshfox_core::staticgen::build(&canvas, canvas_dir, config.base_url.as_deref());
     let mut context = tera::Context::new();
     context.insert("site", &site);
+    context.insert("icons", &config.icons);
 
     // A proper glob-registered `Tera` instance, not a one-off render per
     // file: a template needs cross-file `{% import %}` to define the
@@ -1857,7 +1930,9 @@ fn static_cmd(canvas_path: &Path, template_dir: &Path, out_dir: &Path, force: bo
 /// `root`) into `out_root` at the same relative path — CSS, fonts, and any
 /// other asset a template needs verbatim. `.tera` files are rendered
 /// separately by the caller through a proper glob-registered `Tera`
-/// instance (needed for cross-file `{% import %}`), not copied here.
+/// instance (needed for cross-file `{% import %}`), not copied here; nor is
+/// `root`'s own `template.toml` (see `TEMPLATE_CONFIG_FILE`/
+/// `load_template_config`) — a template's own config, not one of its pages.
 /// Returns the number of files copied.
 fn copy_template_assets(root: &Path, dir: &Path, out_root: &Path) -> Result<usize, String> {
     let mut count = 0;
@@ -1869,6 +1944,9 @@ fn copy_template_assets(root: &Path, dir: &Path, out_root: &Path) -> Result<usiz
             continue;
         }
         if path.extension().and_then(|e| e.to_str()) == Some("tera") {
+            continue;
+        }
+        if path == root.join(TEMPLATE_CONFIG_FILE) {
             continue;
         }
         let rel = path.strip_prefix(root).expect("walked from root, so always a prefix");

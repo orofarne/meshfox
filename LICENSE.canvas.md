@@ -4,7 +4,7 @@
 
 meshfox itself is MIT-licensed (see [LICENSE](./LICENSE), also inlined below). This document tracks every third-party dependency pulled into the published binary/bundle — backend (Rust crates, `Cargo.toml`) and UI (npm packages, `web/package.json`) — and records the license-compatibility check against MIT.
 
-Only **direct** dependencies are listed by name below; the full transitive tree actually reachable from a *shipped* binary (315 Rust crates — normal-dependency edges only, dev/build-only trees excluded, since those never compile into what's published; 187 npm production packages) was checked programmatically and is summarized in "License compatibility" — nothing in it requires anything beyond attribution.
+Only **direct** dependencies are listed by name below; the full transitive tree actually reachable from a *shipped* binary (321 Rust crates — normal-dependency edges only, dev/build-only trees excluded, since those never compile into what's published; 187 npm production packages) was checked programmatically and is summarized in "License compatibility" — nothing in it requires anything beyond attribution.
 
 ## MIT License
 <!-- meshfox:node id="license-file" type="file" display="code" -->
@@ -35,6 +35,7 @@ Direct dependencies across `crates/core`, `crates/server`, `crates/cli` (`cargo 
 | tera | MIT |
 | thiserror | MIT OR Apache-2.0 |
 | tokio | MIT |
+| toml | MIT OR Apache-2.0 |
 | tower-http | MIT |
 | uuid | Apache-2.0 OR MIT |
 

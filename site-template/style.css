@@ -190,7 +190,12 @@ a {
    visible break; `:first-child`/`:last-child` clip the ends so the spine
    never extends above the first child or below the last one (a lone
    child gets top:50%/bottom:50%, i.e. no visible spine at all — just its
-   own twig, correctly). */
+   own twig, correctly). Solid `--accent-default` (the theme accent, not
+   any one node's own possibly-overridden `--accent`, since a connector
+   spans two different cards which could each have their own custom
+   color) rather than the plain `--border` gray — these lines *are* the
+   page's arrows, same as the JS-drawn `meshfox:edge` ones below, so both
+   read as "an arrow" in the same color. */
 .node-children > .node-row {
   position: relative;
 }
@@ -201,7 +206,7 @@ a {
   top: 50%;
   width: var(--connector-offset);
   height: 2px;
-  background: var(--border);
+  background: var(--accent-default);
   transform: translateY(-50%);
 }
 .node-children > .node-row::after {
@@ -211,7 +216,7 @@ a {
   top: calc(-0.5rem);
   bottom: calc(-0.5rem);
   width: 2px;
-  background: var(--border);
+  background: var(--accent-default);
 }
 .node-children > .node-row:first-child::after {
   top: 50%;
@@ -248,7 +253,14 @@ a {
      from `n.depth`). */
   max-width: clamp(260px, 40vw, 640px);
   background: var(--panel);
-  border: 1px solid var(--border);
+  /* The whole frame reads as this node's own accent color, not just the
+     top stripe — a soft (~30% mixed with transparent, same convention
+     https://www.ash-hq.org/ uses for its own card borders) tint on the
+     three sides, full-strength on top where it's always been. `color-mix`
+     (not a second custom property) is what lets this still follow a
+     node's own real, per-node `--accent` override (a JSON Canvas color
+     preset) rather than only ever the theme default. */
+  border: 1px solid color-mix(in srgb, var(--accent) 32%, transparent);
   border-top: 3px solid var(--accent);
   border-radius: 8px;
   padding: 0.6rem 0.75rem;
@@ -274,7 +286,7 @@ a {
   top: 50%;
   width: 0.875rem;
   height: 2px;
-  background: var(--border);
+  background: var(--accent-default);
   transform: translateY(-50%);
 }
 .tree > .node-row > .node.has-children::after {
@@ -290,7 +302,7 @@ a {
 
 .node.type-group {
   background: transparent;
-  border: 1px dashed var(--border);
+  border: 1px dashed color-mix(in srgb, var(--accent) 32%, transparent);
   border-top: 1px dashed var(--accent);
   box-shadow: none;
   display: block;

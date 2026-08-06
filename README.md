@@ -240,6 +240,8 @@ Run it from a real terminal — `meshfox run README.md usage usage-tty vim-demo`
 
 Renders a canvas's node graph — boxes, tags, cached output, and every structural/`meshfox:edge` connection — as a plain static HTML/CSS/SVG site (no JS, no live server), through a user-supplied [Tera](https://keats.github.io/tera/) template: every `*.tera` file in `--template` is rendered with the canvas's data (context key `site`) and written to `--out` at the same relative path minus `.tera`; everything else in the template directory is copied verbatim (CSS, fonts, images, ...). [`site-template/`](./site-template) in this repo is a real, working template (used for the example below) that also happens to be a decent way to publish a canvas's README as a project page.
 
+A template's own settings live in an optional `template.toml` right in its own directory (see [`site-template/template.toml`](./site-template/template.toml)) rather than as `static` command-line flags — they're a property of *that template*, not something to repeat on every invocation: `base_url`, prefixed onto a relative link/target the command doesn't already copy into `--out`; and `icons`, a list of `<link rel="..." href="...">` tags (exposed to every template as the `icons` context key) for the page's own favicon/apple-touch-icon set. `template.toml` itself is read, never rendered or copied into `--out`. A template with none gets an empty config — no `base_url` prefixing, no icon tags — same as before this file existed.
+
 ```bash name="static-help" cache
 meshfox static -h
 ```
@@ -247,7 +249,7 @@ meshfox static -h
 ```text
 exit code: 0
 
-Experimental: export a canvas as a static site. Resolves includes (same as `validate`/`view`), turns the canvas's node tree into a recursive `SiteData` (context key `site`) and hands it to a user-supplied Tera template. A node with no real, authored `x`/`y`/`width`/`height` gets no computed position at all — the template renders it as an ordinary nested HTML element and the *browser* lays it out and sizes it from its real content (no pre-computed/estimated pixels to get wrong); a node that does have all four real values keeps rendering at exactly that authored pixel position. A structural (parent/child) connector between two flow-positioned nodes is drawn in pure CSS (they're always DOM-adjacent); everything else — a `meshfox:edge` cross-reference, or a structural edge touching a real-positioned node — is left for a small non-interactive JS pass in the template to measure and draw. Every `*.tera` file in `--template` (except one whose basename starts with `_`, a partial meant to be `{% import %}`ed rather than rendered standalone) is rendered and written to `--out` at the same relative path minus `.tera`; every other file is copied verbatim (CSS, fonts, ...). A local image referenced from a node's Markdown body is copied alongside the output automatically; a `file`-type node's `display="code"` target is read once and inlined into the HTML directly (nothing left to fetch once static). See `site-template/` in this repo for a working example
+Experimental: export a canvas as a static site. Resolves includes (same as `validate`/`view`), turns the canvas's node tree into a recursive `SiteData` (context key `site`) and hands it to a user-supplied Tera template. A node with no real, authored `x`/`y`/`width`/`height` gets no computed position at all — the template renders it as an ordinary nested HTML element and the *browser* lays it out and sizes it from its real content (no pre-computed/estimated pixels to get wrong); a node that does have all four real values keeps rendering at exactly that authored pixel position. A structural (parent/child) connector between two flow-positioned nodes is drawn in pure CSS (they're always DOM-adjacent); everything else — a `meshfox:edge` cross-reference, or a structural edge touching a real-positioned node — is left for a small non-interactive JS pass in the template to measure and draw. Every `*.tera` file in `--template` (except one whose basename starts with `_`, a partial meant to be `{% import %}`ed rather than rendered standalone) is rendered and written to `--out` at the same relative path minus `.tera`; every other file is copied verbatim (CSS, fonts, ...) — except `template.toml` itself, the template's own config file (optional; a template with none gets an empty `base_url` and no `icons`), read from `--template`'s own directory and never copied to `--out`. A local image referenced from a node's Markdown body is copied alongside the output automatically; a `file`-type node's `display="code"` target is read once and inlined into the HTML directly (nothing left to fetch once static). See `site-template/` in this repo for a working example, including its own `template.toml`
 
 Usage: meshfox static [OPTIONS] --template <TEMPLATE> [CANVAS]
 
@@ -258,12 +260,9 @@ Options:
   -t, --template <TEMPLATE>  Template directory
   -o, --out <OUT>            Output directory. Refused if it already exists and is non-empty, unless `--force` [default: site]
       --force                Overwrite an existing, non-empty `--out` directory
-      --base-url <BASE_URL>  Prefixed onto a relative link/target this command doesn't already copy into `--out` (a plain Markdown link, or a `file`/`link` node's own target when not `display="code"`) — a local image and a `display="code"` target are unaffected, since they're already self-contained in the output. Useful when publishing to a host where the site's own root isn't the canvas's own directory, so a leftover relative reference should resolve against e.g. the original repo instead. Left as-is when omitted
   -h, --help                 Print help
 ```
 <!-- /meshfox:output -->
-
-
 
 Rendering `examples/hello.canvas.md` with that template into a scratch directory:
 
@@ -276,7 +275,12 @@ rm -rf /tmp/meshfox-static-demo
 ```text
 exit code: 0
 
-meshfox static: wrote 2 file(s) to /tmp/meshfox-static-demo
+meshfox static: wrote 7 file(s) to /tmp/meshfox-static-demo
+apple-touch-icon.png
+favicon-16.png
+favicon-32.png
+favicon.ico
+icon-192.png
 index.html
 style.css
 ```

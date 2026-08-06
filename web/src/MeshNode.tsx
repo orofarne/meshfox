@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useState } from "react";
 import { Handle, NodeResizer, NodeToolbar, Position, useReactFlow, type NodeProps } from "@xyflow/react";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import CodeMirror from "@uiw/react-codemirror";
 import { LanguageDescription } from "@codemirror/language";
@@ -12,6 +12,19 @@ import { AnsiText } from "./AnsiText";
 import { NodeTextEditor, usePrefersDark } from "./NodeTextEditor";
 import { fetchNodeFileContent } from "./api";
 import type { ConstraintStatusDto, NodeType } from "./types";
+
+/**
+ * Shared by every `<ReactMarkdown>` in this file: a link in a node's
+ * rendered body opens in a new tab rather than navigating the canvas
+ * itself away from the app — `rel="noopener noreferrer"` is the standard
+ * `target="_blank"` companion (the opened page otherwise gets a live
+ * `window.opener` back to this one). `node` is react-markdown's own mdast
+ * node for this element, not a real DOM attribute — destructured out so it
+ * never reaches the native `<a>`.
+ */
+const markdownComponents: Components = {
+  a: ({ node: _node, ...props }) => <a {...props} target="_blank" rel="noopener noreferrer" />,
+};
 
 /**
  * Live state of one block's most recent run, from `App.tsx`'s handling of
@@ -590,7 +603,7 @@ export function NodeBodyPreview({ text }: { text: string }) {
     <div className="mesh-node-body nopan" ref={wheelRef}>
       {segments.map((seg, i) =>
         seg.type === "markdown" ? (
-          <ReactMarkdown key={i} remarkPlugins={[remarkGfm]}>
+          <ReactMarkdown key={i} remarkPlugins={[remarkGfm]} components={markdownComponents}>
             {seg.content}
           </ReactMarkdown>
         ) : (
@@ -682,7 +695,7 @@ function MeshNodeBody({ data, nodeId }: { data: MeshNodeData; nodeId: string }) 
       <div className="mesh-node-body nopan" ref={wheelRef}>
         {segments.map((seg, i) =>
           seg.type === "markdown" ? (
-            <ReactMarkdown key={i} remarkPlugins={[remarkGfm]}>
+            <ReactMarkdown key={i} remarkPlugins={[remarkGfm]} components={markdownComponents}>
               {seg.content}
             </ReactMarkdown>
           ) : (
@@ -707,7 +720,7 @@ function MeshNodeBody({ data, nodeId }: { data: MeshNodeData; nodeId: string }) 
       {segments.map((seg, i) =>
         seg.type === "markdown" ? (
           <div key={`md-${i}`} className="mesh-rail-content" style={{ gridRow: i + 1, gridColumn: 2 }}>
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>{seg.content}</ReactMarkdown>
+            <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{seg.content}</ReactMarkdown>
           </div>
         ) : (
           <Fragment key={seg.name}>

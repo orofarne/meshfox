@@ -1,0 +1,45 @@
+# This template's own config — read by `meshfox static` from this exact
+# path (`--template`'s own directory + "template.toml"), never rendered or
+# copied into --out itself. Both keys are optional; see `meshfox static -h`.
+
+# Prefixed onto a relative link/target `static` doesn't already copy into
+# --out (a plain Markdown link, or a `file`/`link` node's own target when
+# not display="code"). This repo's own canvases (README.md, examples/) get
+# published as plain Markdown on GitHub, not alongside this site — so a
+# leftover relative link (e.g. a plain [LICENSE](./LICENSE) reference) needs
+# to resolve back against the real repo instead of a 404 on whatever host
+# is serving this template's own output.
+base_url = "https://github.com/orofarne/meshfox/blob/main/"
+
+# Same favicon set web/public/ ships for the main interactive UI (see
+# web/index.html) — copied here verbatim (they're plain assets, not
+# templated) so this static export looks like the same project rather than
+# a generic, icon-less page. Every `href` below is a relative path to one of
+# those copied-in files.
+[[icons]]
+rel = "icon"
+href = "favicon.ico"
+sizes = "any"
+
+[[icons]]
+rel = "icon"
+type = "image/png"
+sizes = "16x16"
+href = "favicon-16.png"
+
+[[icons]]
+rel = "icon"
+type = "image/png"
+sizes = "32x32"
+href = "favicon-32.png"
+
+[[icons]]
+rel = "icon"
+type = "image/png"
+sizes = "192x192"
+href = "icon-192.png"
+
+[[icons]]
+rel = "apple-touch-icon"
+sizes = "180x180"
+href = "apple-touch-icon.png"

@@ -312,7 +312,8 @@ struct RenderCtx<'a> {
 /// stripped first (see `crate::fence::strip_fence_attrs`) so a runnable
 /// block's `name=`/`cache`/`deps=` don't leak into the rendered
 /// `class="language-..."`, and every image/link URL rewritten per `ctx`
-/// (see `resolve_image_url`/`resolve_link_url`).
+/// (see `resolve_image_url`/`resolve_link_url`). Every link additionally
+/// gets `target="_blank"` (see `add_target_blank`).
 fn render_markdown(text: &str, ctx: &RenderCtx, assets: &mut Vec<Asset>) -> String {
     use pulldown_cmark::{html, Event, Options, Parser, Tag};
     let stripped = crate::fence::strip_fence_attrs(text);
@@ -333,6 +334,40 @@ fn render_markdown(text: &str, ctx: &RenderCtx, assets: &mut Vec<Asset>) -> Stri
         .collect();
     let mut out = String::new();
     html::push_html(&mut out, events.into_iter());
+    add_target_blank(&out)
+}
+
+/// Adds `target="_blank" rel="noopener noreferrer"` to every rendered
+/// `<a href="...">` — a static page has no in-app navigation to protect,
+/// so clicking a link (to GitHub, an external doc, ...) shouldn't lose the
+/// page the reader was on. In-page anchors (`href="#..."` — a footnote
+/// reference/back-reference, or a plain user-written `[jump](#heading)`
+/// link) are left alone: those navigate *within* this same page, where a
+/// new tab would be wrong, not right.
+///
+/// A plain string scan rather than an `Event`-level rewrite: pulldown-
+/// cmark's own HTML writer (`html::push_html`) has no way to attach extra
+/// attributes to a link through `Tag::Link`'s fields, but it *does* always
+/// render one exactly as `<a href="..."` (see its own `src/html.rs`) —
+/// including a footnote's own internally-generated anchors, which never
+/// pass through `Tag::Link`/this module's own event-mapping at all and so
+/// couldn't be reached that way regardless. `<a href="` is therefore an
+/// unambiguous, exhaustive marker for "a link starts here" in whatever this
+/// function ever produces.
+fn add_target_blank(html: &str) -> String {
+    const MARKER: &str = "<a href=\"";
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(idx) = rest.find(MARKER) {
+        out.push_str(&rest[..idx]);
+        rest = &rest[idx + MARKER.len()..];
+        if rest.starts_with('#') {
+            out.push_str(MARKER);
+        } else {
+            out.push_str("<a target=\"_blank\" rel=\"noopener noreferrer\" href=\"");
+        }
+    }
+    out.push_str(rest);
     out
 }
 
@@ -418,7 +453,8 @@ fn render_file_code(node: &Node, canvas_dir: &Path) -> String {
     let Some(target) = node.target.as_deref() else {
         return "<p><em>no target</em></p>".to_string();
     };
-    let fallback_link = || format!("<p><a href=\"{0}\">{0}</a></p>", html_escape(target));
+    let fallback_link =
+        || format!("<p><a target=\"_blank\" rel=\"noopener noreferrer\" href=\"{0}\">{0}</a></p>", html_escape(target));
 
     let Some(resolved) = resolve_canvas_relative(target, canvas_dir) else {
         return fallback_link();
@@ -536,6 +572,35 @@ mod tests {
         assert_eq!(root.tags, vec!["a".to_string(), "b".to_string()]);
         assert!(root.html_body.contains("hello"));
         assert_eq!(site.title, "Root");
+    }
+
+    #[test]
+    fn a_rendered_link_opens_in_a_new_tab() {
+        let c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n[meshfox](https://github.com/example/meshfox)\n");
+        let site = build_site(&c);
+        let body = &site.find("root").unwrap().html_body;
+        assert!(
+            body.contains("<a target=\"_blank\" rel=\"noopener noreferrer\" href=\"https://github.com/example/meshfox\">"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn an_in_page_anchor_link_does_not_open_in_a_new_tab() {
+        // A plain user-written `#heading` link, and a footnote reference
+        // (pulldown-cmark's own internally-generated `<a href="#...">`,
+        // never passing through this module's own Tag::Link handling at
+        // all) — both navigate within the same page, where a new tab is
+        // wrong, not right.
+        let c = canvas(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+             [jump](#somewhere) and a footnote[^1].\n\n\
+             [^1]: the footnote body\n",
+        );
+        let site = build_site(&c);
+        let body = &site.find("root").unwrap().html_body;
+        assert!(!body.contains("target=\"_blank\""), "{body}");
+        assert!(body.contains("<a href=\"#somewhere\">"), "{body}");
     }
 
     #[test]
@@ -761,7 +826,7 @@ mod tests {
         let (site, _assets) = build(&c, &dir, None);
         let src = site.find("src").unwrap();
         assert!(!src.html_body.contains("<pre>"), "{}", src.html_body);
-        assert!(src.html_body.contains("<a href=\"blob.bin\""), "{}", src.html_body);
+        assert!(src.html_body.contains("href=\"blob.bin\""), "{}", src.html_body);
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -776,7 +841,7 @@ mod tests {
 
         let (site, _assets) = build(&c, &dir, None);
         let src = site.find("src").unwrap();
-        assert!(src.html_body.contains("<a href=\"nope.rs\""), "{}", src.html_body);
+        assert!(src.html_body.contains("href=\"nope.rs\""), "{}", src.html_body);
 
         fs::remove_dir_all(&dir).ok();
     }

@@ -13,6 +13,13 @@ import { fileURLToPath } from "node:url";
 const webRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = path.resolve(webRoot, "..");
 const outDir = path.join(webRoot, "public");
+// site-template/ ships its own copy of the same icon set (see its own
+// template.toml's `icons`), used for the identical reason: so the static
+// export looks like the same project as the interactive UI. Kept as a
+// plain file copy (not a symlink/build step the static exporter would
+// need to know about) so `meshfox static` can go on treating it as just
+// another asset in the template directory.
+const siteTemplateDir = path.join(repoRoot, "site-template");
 const masterSize = 1024;
 
 const mascot = fs.readFileSync(path.join(repoRoot, "mascot.txt"), "utf8").replace(/\n$/, "");
@@ -144,4 +151,11 @@ execFileSync("magick", [
 
 fs.rmSync(masterPath);
 
-console.log(`wrote icon set to ${path.relative(repoRoot, outDir)}/`);
+// site-template/'s own copy — same subset its template.toml's `icons`
+// references (icon-512.png has no <link> tag anywhere, in web/index.html
+// or template.toml, so it's not copied here either).
+for (const name of ["favicon.ico", "favicon-16.png", "favicon-32.png", "apple-touch-icon.png", "icon-192.png"]) {
+  fs.copyFileSync(path.join(outDir, name), path.join(siteTemplateDir, name));
+}
+
+console.log(`wrote icon set to ${path.relative(repoRoot, outDir)}/ and ${path.relative(repoRoot, siteTemplateDir)}/`);

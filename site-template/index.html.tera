@@ -5,6 +5,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{ site.title }} — meshfox</title>
+{%- for icon in icons %}
+<link rel="{{ icon.rel }}" href="{{ icon.href }}"{% if icon.type %} type="{{ icon.type }}"{% endif %}{% if icon.sizes %} sizes="{{ icon.sizes }}"{% endif %}>
+{%- endfor %}
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -76,13 +79,14 @@
     var defs = svgEl("defs");
     overlay.appendChild(defs);
 
-    // Same `--muted` custom property style.css uses for its own quiet
-    // structural-line coloring elsewhere (e.g. `.node.type-group`'s
-    // border) — one source of truth for "the quiet structural-line
-    // color," already tuned for contrast against `--bg` in both themes,
-    // read fresh here rather than duplicated as a hardcoded hex so
-    // light/dark and any future retheme stay in sync automatically.
-    var defaultColor = getComputedStyle(document.documentElement).getPropertyValue("--muted").trim() || "#8a8f98";
+    // Same `--accent-default` custom property style.css uses for every
+    // other arrow on the page (the CSS-drawn structural connectors) — an
+    // edge with no explicit `color` of its own reads as the same accent
+    // rather than a separate, unrelated gray; already tuned for contrast
+    // against `--bg` in both themes, read fresh here rather than
+    // duplicated as a hardcoded hex so light/dark and any future retheme
+    // stay in sync automatically.
+    var defaultColor = getComputedStyle(document.documentElement).getPropertyValue("--accent-default").trim() || "#ff6e15";
 
     edges.forEach(function (edge, i) {
       var from = document.getElementById("node-" + edge.from);
