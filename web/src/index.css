@@ -52,6 +52,25 @@
   }
 }
 
+/* React Flow's own default edge color/width (used by every edge with no
+ * explicit `style.stroke` of its own — every structural `tree`/`smoothstep`
+ * edge, and a `meshfox:edge` extra edge with no per-edge color override —
+ * see App.tsx's own edge-building effect) — overriding its `--xy-edge-
+ * stroke-default`/`--xy-edge-stroke-width-default` custom properties here
+ * is what `@xyflow/react/dist/style.css` itself expects a theming
+ * consumer to do, rather than fighting its own `.react-flow-path` rule's
+ * specificity. Both selectors (plain and `.dark`) are needed since
+ * `colorMode="system"` (see App.tsx's `<ReactFlow>`) toggles the `.dark`
+ * class itself, and `.react-flow.dark`'s own two-class rule would
+ * otherwise outrank a plain `.react-flow` one regardless of source order.
+ * `var(--accent)` (not a literal hex) is what keeps this in sync with
+ * light/dark automatically — no separate `.dark` color value to repeat. */
+.react-flow,
+.react-flow.dark {
+  --xy-edge-stroke-default: var(--accent);
+  --xy-edge-stroke-width-default: 1.75;
+}
+
 * {
   box-sizing: border-box;
 }
