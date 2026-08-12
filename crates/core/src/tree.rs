@@ -109,7 +109,7 @@ mod tests {
             lang: None,
             interpreter: None,
             text: text.to_string(),
-            constraint_status: None,
+            constraint_results: Vec::new(),
         }
     }
 

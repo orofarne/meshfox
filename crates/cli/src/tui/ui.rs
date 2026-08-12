@@ -76,7 +76,6 @@ fn type_marker(t: NodeType) -> &'static str {
         NodeType::Link => "[link] ",
         NodeType::Group => "[group] ",
         NodeType::Include => "[include] ",
-        NodeType::Constraint => "[constraint] ",
     }
 }
 
@@ -104,11 +103,17 @@ fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
                 flags.push("tty");
             }
             let badge = if flags.is_empty() { String::new() } else { format!("  [{}]", flags.join(",")) };
+            let constraint_mark = match row.constraint_ok {
+                Some(true) => Span::styled("  ✓", Style::default().fg(Color::Green)),
+                Some(false) => Span::styled("  ✗", Style::default().fg(Color::Red)),
+                None => Span::raw(""),
+            };
             let line = Line::from(vec![
                 Span::raw(indent),
                 Span::styled(disclosure, Style::default().fg(Color::DarkGray)),
                 Span::styled(type_marker(row.node_type), Style::default().fg(Color::DarkGray)),
                 Span::raw(row.title.clone()),
+                constraint_mark,
                 Span::styled(badge, Style::default().fg(Color::Green)),
             ]);
             ListItem::new(line)
@@ -230,7 +235,20 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         hint.push_str(" · c configure");
     }
     hint.push_str(" · ? help · q quit");
-    f.render_widget(Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray)))), area);
+
+    let mut spans = Vec::new();
+    if let Some((total, failed)) = app.constraint_stats {
+        let (text, color) = if failed > 0 {
+            (format!("{failed}/{total} constraints failing"), Color::Red)
+        } else {
+            (format!("all {total} constraint{} pass", if total == 1 { "" } else { "s" }), Color::Green)
+        };
+        spans.push(Span::styled(text, Style::default().fg(color)));
+        spans.push(Span::styled("  ·  ", Style::default().fg(Color::DarkGray)));
+    }
+    spans.push(Span::styled(hint, Style::default().fg(Color::DarkGray)));
+
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {

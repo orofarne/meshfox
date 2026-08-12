@@ -17,6 +17,12 @@ pub struct TreeRow {
     pub runnable_count: usize,
     pub has_cache: bool,
     pub has_tty: bool,
+    /// Aggregate pass/fail across every embedded constraint fence in this
+    /// node's own body (`node.constraint_results`, populated by
+    /// `App`'s `resolve_includes` before `flatten` ever runs) — `Some(true)`
+    /// only when every one of them passed, `None` when the node has no
+    /// constraint fences at all.
+    pub constraint_ok: Option<bool>,
 }
 
 pub fn flatten(canvas: &Canvas, expanded: &HashSet<String>) -> Vec<TreeRow> {
@@ -38,6 +44,11 @@ fn visit(
     let has_children = !children.is_empty();
     let is_expanded = depth == 0 || expanded.contains(&node.id);
     let blocks = scan_runnable_blocks(&node.id, &node.text);
+    let constraint_ok = if node.constraint_results.is_empty() {
+        None
+    } else {
+        Some(node.constraint_results.iter().all(|r| r.ok))
+    };
 
     rows.push(TreeRow {
         node_id: node.id.clone(),
@@ -49,6 +60,7 @@ fn visit(
         runnable_count: blocks.len(),
         has_cache: blocks.iter().any(|b| b.cache),
         has_tty: blocks.iter().any(|b| b.tty),
+        constraint_ok,
     });
 
     if has_children && is_expanded {

@@ -17,6 +17,11 @@ pub struct Canvas {
 /// `crate::include`). `Text` is the default and the only one with freeform
 /// Markdown content — see `mdcanvas` for the `type=` attribute and
 /// per-type body constraints.
+///
+/// There's no `Constraint` variant: a Starlark contract (see
+/// `crate::constraint`) is a ` ```starlark constraint ` fence embedded in
+/// any node's body, same as a runnable ` ```bash name="..." ` fence — not a
+/// node type of its own.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum NodeType {
@@ -32,11 +37,6 @@ pub enum NodeType {
     /// `GET /api/canvas`). Never resolved on disk: `run`/`fmt`/`validate`
     /// parse the raw file and see the bare link, same as `file`/`link`.
     Include,
-    /// Body is exactly one ` ```starlark ` fence — a sandboxed contract over
-    /// the document tree (see `crate::constraint`), evaluated by `meshfox
-    /// check`. No Markdown prose alongside it, same "body is exactly one
-    /// thing" shape as `File`/`Link`/`Include`.
-    Constraint,
 }
 
 impl NodeType {
@@ -51,7 +51,6 @@ impl NodeType {
             NodeType::Link => "link",
             NodeType::Group => "group",
             NodeType::Include => "include",
-            NodeType::Constraint => "constraint",
         }
     }
 }
@@ -229,14 +228,15 @@ pub struct Node {
     /// the next heading. For `group`, always empty. For `file`/`link`,
     /// always exactly the one Markdown link `target` was parsed from.
     pub text: String,
-    /// `constraint`-node only: its most recently evaluated result (see
-    /// `crate::constraint::annotate_status`). Never set by `mdcanvas::parse`
-    /// itself — only by whatever consumer wants it (the server, before
-    /// serving `GET /api/canvas`). `None` for a `constraint` node just means
-    /// this consumer didn't evaluate it, not that it passed; `None` for
-    /// every other node type always.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub constraint_status: Option<crate::constraint::ConstraintStatus>,
+    /// Most recently evaluated result of every ` ```starlark constraint `
+    /// fence embedded in this node's body (see
+    /// `crate::constraint::annotate_status`), one entry per fence, in
+    /// document order. Never set by `mdcanvas::parse` itself — only by
+    /// whatever consumer wants it (the server, before serving `GET
+    /// /api/canvas`). Empty just means this consumer didn't evaluate this
+    /// node's constraints (or it has none), not that they passed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub constraint_results: Vec<crate::constraint::ConstraintStatus>,
 }
 
 impl Node {

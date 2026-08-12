@@ -460,11 +460,12 @@ fn canvas_response(raw: &str, canvas_path: &std::path::Path) -> Result<Json<Canv
     // content; the UI treats included subtrees as read-only for now.
     let mut canvas = meshfox_core::include::resolve(&canvas, canvas_path)
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
-    // Every `constraint` node's script is meant to be cheap and pure (no
-    // I/O, tick/heap/callstack-bounded — see `constraint::evaluate`), so
-    // running them all on every fetch (rather than only on an explicit
-    // `meshfox check`) is safe and keeps the UI's pass/fail badges current
-    // without a separate endpoint or a stale on-disk cache to invalidate.
+    // Every embedded constraint fence's script is meant to be cheap and
+    // pure (no I/O, tick/heap/callstack-bounded — see
+    // `constraint::evaluate`), so running them all on every fetch (rather
+    // than only on an explicit `meshfox check`) is safe and keeps the UI's
+    // pass/fail badges current without a separate endpoint or a stale
+    // on-disk cache to invalidate.
     meshfox_core::constraint::annotate_status(&mut canvas);
     Ok(Json(canvas))
 }

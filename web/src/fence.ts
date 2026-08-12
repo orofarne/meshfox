@@ -80,7 +80,20 @@ export interface CodeSegment {
   output?: CachedOutput;
 }
 
-export type BodySegment = MarkdownSegment | CodeSegment;
+export interface ConstraintSegment {
+  type: "constraint";
+  /** Explicit `name="..."` attribute, if given — mirrors
+   * `core::fence::ConstraintBlock.name`. Together with this segment's
+   * position among a node's other constraint segments, this is what the
+   * server's `ConstraintStatusDto.label` is derived from; the client never
+   * recomputes that itself; it matches this node's `constraintResults` to
+   * its constraint segments purely by position (see `MeshNode.tsx`'s
+   * `MeshNodeBody`), since both are built from the same document order. */
+  name?: string;
+  code: string;
+}
+
+export type BodySegment = MarkdownSegment | CodeSegment | ConstraintSegment;
 
 const OUTPUT_END_MARKER = "<!-- /meshfox:output -->";
 
@@ -218,6 +231,19 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
 
     const [lang, ...rest] = tokenize(info);
     const attrs = attrsFromTokens(rest);
+
+    if (lang === "starlark" && attrs.constraint !== undefined && attrs.constraint !== "false") {
+      // Mirrors `core::fence::scan_constraint_blocks` — a bare `constraint`
+      // flag opts a starlark fence in, same as a runnable fence opts in
+      // with `name=`. A plain, unflagged `​```starlark`​` fence (e.g. a
+      // documentation example) falls through below instead: `starlark`
+      // isn't in `isSupportedLang`, so it's left as inert Markdown.
+      flushMarkdown();
+      segments.push({ type: "constraint", name: attrs.name, code: codeLines.join("\n") });
+      i = j + 1;
+      continue;
+    }
+
     if (!isSupportedLang(lang) || (!attrs.name && !soloUnnamed)) {
       // Either an unsupported language (never runnable, regardless of
       // naming — see `isSupportedLang`), or not a runnable block and not

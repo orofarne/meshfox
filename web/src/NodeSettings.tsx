@@ -207,7 +207,6 @@ export function NodeSettings({ node, allNodes, onChange, onRenameId, onClose }: 
             <option value="file">file</option>
             <option value="link">link</option>
             <option value="group">group</option>
-            <option value="constraint">constraint</option>
           </select>
         </label>
         {(nodeType === "file" || nodeType === "link") && (

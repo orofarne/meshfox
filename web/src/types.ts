@@ -1,13 +1,17 @@
 // Mirrors crates/core/src/canvas.rs's Node/Canvas (JSON shape, camelCase).
 
-export type NodeType = "text" | "file" | "link" | "group" | "constraint";
+export type NodeType = "text" | "file" | "link" | "group";
 
-/** A `constraint` node's most recently evaluated result — mirrors
- * crates/core/src/constraint.rs's `ConstraintStatus`. Present only once the
- * server has evaluated it (always, as of `GET /api/canvas` — see
- * `crates/server/src/lib.rs`'s `canvas_response`); absent means "not
- * evaluated by this response", not "passed". */
+/** One embedded ` ```starlark constraint ` fence's most recently evaluated
+ * result — mirrors crates/core/src/constraint.rs's `ConstraintStatus`. A
+ * node can carry several (see `CanvasNode.constraintResults`); present at
+ * all means the server has evaluated it (always, as of `GET /api/canvas` —
+ * see `crates/server/src/lib.rs`'s `canvas_response`). */
 export interface ConstraintStatusDto {
+  /** Display identifier for this fence specifically: the explicit
+   * `name="..."` (as `"<node-id>/<name>"`) if given, else the node's own id
+   * when it's the node's only constraint, else `"<node-id>#<n>"`. */
+  label: string;
   ok: boolean;
   /** Every `fail(msg)` call the script made, or the one parse/runtime/
    * resource-limit error if it didn't run to completion. Empty when `ok`. */
@@ -63,8 +67,10 @@ export interface CanvasNode {
    * `target`, making the node runnable — absent means it isn't. */
   interpreter?: string;
   text: string;
-  /** `constraint`-node only — see `ConstraintStatusDto`. */
-  constraintStatus?: ConstraintStatusDto;
+  /** Results of every embedded ` ```starlark constraint ` fence in this
+   * node's own body, in document order — see `ConstraintStatusDto`. Absent
+   * or empty means this node has no constraint fences. */
+  constraintResults?: ConstraintStatusDto[];
 }
 
 export interface CanvasDoc {

@@ -103,14 +103,15 @@ of JSON, for readable diffs and hand-editability.
   whatever consumer resolves includes — never written back to disk.
   `run`/`fmt`/`validate` see the bare link, same as `file`/`link`. See
   "Includes" below.
-- **`constraint`** — body must be *exactly* one ` ```starlark ` fence and
-  nothing else — a sandboxed contract over the document tree, evaluated by
-  `meshfox check`. See "Constraint nodes" below.
 
-Any other `type=` value, a non-empty `group` body, a `file`/`link`/`include`
-body that isn't a single link, or a `constraint` body that isn't a single
-` ```starlark ` fence is a parse error (`meshfox validate` catches these,
-plus a missing/cyclic/unparseable include target).
+Any other `type=` value, a non-empty `group` body, or a `file`/`link`/
+`include` body that isn't a single link is a parse error (`meshfox
+validate` catches these, plus a missing/cyclic/unparseable include target).
+
+There's no node type for a constraint contract — a Starlark check is an
+embedded fence living in any node's ordinary body, alongside its prose and
+runnable code, same as a `` ```bash name="..." `` fence. See "Constraint
+fences" below.
 
 ## Includes
 
@@ -139,80 +140,6 @@ that opens with the `meshfox:canvas` marker.
 An included file can itself declare includes; those are resolved too,
 with a cycle (A includes B includes A) reported as an error rather than
 recursing forever.
-
-## Constraint nodes
-
-A `type="constraint"` node's body is a sandboxed [Starlark](https://github.com/bazelbuild/starlark)
-contract over the document tree — a way to assert invariants a canvas
-should hold (e.g. "every node tagged `table` has exactly one `file` child")
-as part of the document itself, checked by `meshfox check` rather than
-enforced only by convention. There's no separate "document" object: `doc`
-is simply the root node, and every node — `doc` included — exposes the
-same navigation methods, so a constraint scopes a check to its own subtree
-with `self.descendants()` the exact same way it would reach the whole
-document via `doc.descendants()`. A constraint typically governs the
-subtree it's placed in, so a natural place for one is *as the parent* of
-whatever it's checking, e.g. a constraint node sitting above a group of
-`table`-tagged nodes:
-
-    ## Table shape
-    <!-- meshfox:node type="constraint" -->
-
-    ### Users
-    <!-- meshfox:node tags="table" -->
-    ...
-
-    ```starlark
-    for n in self.descendants():
-        if "table" in n.tags:
-            files = [c for c in n.children() if c.type == "file"]
-            if len(files) != 1:
-                fail(n.id + ": expected exactly one file child, got " + str(len(files)))
-    ```
-
-The script sees:
-
-- **`doc`** — the document's root node.
-- **`self`** — the constraint's own node, so a script can find its place
-  in the tree without hardcoding its own id.
-- On every node (both of the above, and any node reached through them):
-  - **`.id`**, **`.title`**, **`.type`** (a string, e.g. `"file"`),
-    **`.parent`** (a string, or `None` for the root), **`.tags`** (a list
-    of strings) — plain read-only fields.
-  - **`.children()`** — its direct structural children (same tree
-    `Canvas::children` walks — not extra `meshfox:edge` parents).
-  - **`.descendants()`** — everything in its subtree (children, their
-    children, ...), not just direct children — the usual way to scope a
-    check to "this constraint's own subtree" (`self.descendants()`)
-    instead of the whole document (`doc.descendants()`).
-  - **`.node(id)`** — the node with that id anywhere in the document, or
-    `None`.
-  - **`.nodes_with_tag(tag)`** — every node in the *whole document* whose
-    `tags` includes `tag`, regardless of where it's called from. Prefer
-    `self.descendants()` filtered by tag when a constraint should only
-    govern its own subtree; reach for this only when a rule is genuinely
-    document-wide.
-- **`fail(msg)`** — records a violation *without* stopping the script, so
-  one constraint can report every offending node in a single run instead of
-  just the first. A script that never calls `fail` passes.
-
-Beyond these, and Starlark's own built-ins (`len`, `range`, string
-methods, list/dict comprehensions, ...), the sandbox has nothing: no file
-I/O, no network, no way to see any other node's fully-resolved include
-tree, and no way to mutate the document — a constraint only ever
-reads and reports. Evaluation is resource-bounded (instruction count, call
-depth, heap size); a script that times out or errors (syntax error,
-unbound name, ...) counts as a failing constraint, with that error as its
-one message. Each constraint node gets its own fresh sandbox — nothing
-persists between them, and nothing carries over between one `meshfox
-check` run and the next.
-
-`meshfox check` runs every constraint node and reports pass/fail per node,
-exiting non-zero if any fails (or if the file doesn't parse — `validate`'s
-job, which `check` implies). Distinct from `meshfox validate`: `validate`
-asks whether the file *parses* as a well-formed canvas; `check` asks
-whether the document, once parsed, actually satisfies whatever rules its
-own constraint nodes declare.
 
 ## Runnable code fences
 
@@ -295,6 +222,98 @@ explicitly-given path still parses whatever heading structure it finds).
     ```
 
 Running `test` here always runs `build` first.
+
+## Constraint fences
+
+A ` ```starlark constraint ` fence, living in any node's ordinary
+Markdown body alongside its prose and runnable code, is a sandboxed
+[Starlark](https://github.com/bazelbuild/starlark) contract over the
+document tree — a way to assert invariants a canvas should hold (e.g.
+"every node tagged `table` has exactly one `file` child") as part of the
+document itself, checked by `meshfox check` rather than enforced only by
+convention. There's no dedicated node type for this (see "Node types"
+above) and no restriction on what else shares the node's body — a node may
+carry prose, runnable fences, and any number of constraint fences, in any
+order:
+
+    ## Entities
+    <!-- meshfox:node -->
+
+    ```starlark constraint
+    for n in self.descendants():
+        if "table" in n.tags:
+            files = [c for c in n.children() if c.type == "file"]
+            if len(files) != 1:
+                fail(n.id + ": expected exactly one file child, got " + str(len(files)))
+    ```
+
+    ### Users
+    <!-- meshfox:node tags="table" -->
+    ...
+
+The `constraint` flag (`` ```starlark constraint ``, mirroring the bare
+`cache`/`default`/`tty` flags on a runnable fence) is what opts a fence in
+— a plain ` ```starlark ` fence with no flag is left alone, e.g. a
+documentation example showing Starlark syntax that was never meant to
+actually run. An optional `name="..."` attribute labels a fence for
+`meshfox check`'s output when a node carries more than one (see below);
+unnamed fences are identified by their enclosing node's id alone if it's
+the node's only one, or `<node-id>#<n>` (1-based, in document order)
+when it isn't.
+
+There's no separate "document" object: `doc` is simply the root node, and
+every node — `doc` included — exposes the same navigation methods, so a
+constraint scopes a check to its own subtree with `self.descendants()` the
+exact same way it would reach the whole document via `doc.descendants()`.
+`self` is the node whose body the fence lives in — a constraint typically
+governs the subtree of the node it's placed in, so a natural place for one
+is directly in the node that's the natural parent of whatever it's
+checking (like `Entities` above), rather than needing a dedicated node of
+its own just to sit above that subtree.
+
+The script sees:
+
+- **`doc`** — the document's root node.
+- **`self`** — the node whose body this fence lives in, so a script can
+  find its place in the tree without hardcoding its own id.
+- On every node (both of the above, and any node reached through them):
+  - **`.id`**, **`.title`**, **`.type`** (a string, e.g. `"file"`),
+    **`.parent`** (a string, or `None` for the root), **`.tags`** (a list
+    of strings) — plain read-only fields.
+  - **`.children()`** — its direct structural children (same tree
+    `Canvas::children` walks — not extra `meshfox:edge` parents).
+  - **`.descendants()`** — everything in its subtree (children, their
+    children, ...), not just direct children — the usual way to scope a
+    check to "this fence's own node's subtree" (`self.descendants()`)
+    instead of the whole document (`doc.descendants()`).
+  - **`.node(id)`** — the node with that id anywhere in the document, or
+    `None`.
+  - **`.nodes_with_tag(tag)`** — every node in the *whole document* whose
+    `tags` includes `tag`, regardless of where it's called from. Prefer
+    `self.descendants()` filtered by tag when a constraint should only
+    govern its own subtree; reach for this only when a rule is genuinely
+    document-wide.
+- **`fail(msg)`** — records a violation *without* stopping the script, so
+  one constraint can report every offending node in a single run instead of
+  just the first. A script that never calls `fail` passes.
+
+Beyond these, and Starlark's own built-ins (`len`, `range`, string
+methods, list/dict comprehensions, ...), the sandbox has nothing: no file
+I/O, no network, no way to see any other node's fully-resolved include
+tree, and no way to mutate the document — a constraint only ever reads and
+reports. Evaluation is resource-bounded (instruction count, call depth,
+heap size); a script that times out or errors (syntax error, unbound
+name, ...) counts as a failing constraint, with that error as its one
+message. Each constraint fence gets its own fresh sandbox — nothing
+persists between them, and nothing carries over between one `meshfox
+check` run and the next.
+
+`meshfox check` runs every constraint fence in the document and reports
+pass/fail per fence, exiting non-zero if any fails (or if the file doesn't
+parse — `validate`'s job, which `check` implies). Distinct from `meshfox
+validate`: `validate` asks whether the file *parses* as a well-formed
+canvas; `check` asks whether the document, once parsed, actually satisfies
+whatever rules its own constraint fences declare.
 
 ## Interactive (`tty`) blocks
 
@@ -533,10 +552,10 @@ then the block name).
 - `meshfox validate` — parse-only validation (single root, no duplicate ids,
   no dangling edges, type body rules, no dangling/cyclic `deps=`); no
   execution, no writes. Exit non-zero on error — usable in CI/pre-commit.
-- `meshfox check` — run every `constraint` node's Starlark contract (see
-  "Constraint nodes" above) and report pass/fail per node. Exit non-zero if
-  the file fails to parse or any constraint fails — usable in CI/pre-commit
-  alongside (or instead of) `validate`.
+- `meshfox check` — run every embedded constraint fence's Starlark contract
+  (see "Constraint fences" above) and report pass/fail per fence. Exit
+  non-zero if the file fails to parse or any constraint fails — usable in
+  CI/pre-commit alongside (or instead of) `validate`.
 - `meshfox spec` — print this specification.
 
 `list`/`fmt`/`view`/`validate`/`check` take the canvas path as an optional

@@ -1,10 +1,13 @@
-//! Evaluating `Constraint` nodes: sandboxed Starlark contracts over the
-//! document tree, run by `meshfox check`.
+//! Evaluating embedded ` ```starlark constraint ` fences: sandboxed
+//! Starlark contracts over the document tree, run by `meshfox check`.
 //!
-//! Each constraint's script gets `doc` — the document's root node — and
-//! `self` — its own node — built fresh from the `Canvas` before every run:
-//! plain Starlark values (structs, closures over a shared node list) with
-//! no reference back into Rust, so there's nothing for the sandbox to leak
+//! A constraint is a fence living in some node's Markdown body (see
+//! `crate::fence::scan_constraint_blocks`), not a node type of its own — a
+//! node can carry zero, one, or several. Each constraint's script gets
+//! `doc` — the document's root node — and `self` — the node whose body the
+//! fence lives in — built fresh from the `Canvas` before every run: plain
+//! Starlark values (structs, closures over a shared node list) with no
+//! reference back into Rust, so there's nothing for the sandbox to leak
 //! into or mutate. There's no separate "document" type — every node,
 //! `doc` included, exposes `.children()`/`.descendants()`/`.node(id)`/
 //! `.nodes_with_tag(tag)`, so a script scopes a check to its own subtree
@@ -17,7 +20,7 @@
 //! (`meshfox check`, or the server evaluating every constraint on every
 //! canvas load).
 
-use crate::canvas::{Canvas, Node, NodeType};
+use crate::canvas::{Canvas, Node};
 use starlark::any::ProvidesStaticType;
 use starlark::environment::{Globals, GlobalsBuilder, LibraryExtension, Module};
 use starlark::eval::Evaluator;
@@ -38,11 +41,19 @@ use starlark::values::none::NoneType;
 use std::cell::RefCell;
 use std::fmt::Write as _;
 
-/// Result of running one `Constraint` node's script.
+/// Result of running one embedded constraint fence's script.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConstraintResult {
+    /// Id of the node whose body the fence lives in.
     pub node_id: String,
+    /// Title of the node whose body the fence lives in.
     pub title: String,
+    /// Human-readable identifier for this fence specifically, since a node
+    /// can carry more than one: the explicit `name="..."` attribute (as
+    /// `"<node-id>/<name>"`) if given, else just `node_id` when it's the
+    /// node's only constraint, else `"<node-id>#<n>"` (1-based, in document
+    /// order) to keep multiple unnamed ones apart.
+    pub label: String,
     pub ok: bool,
     /// Every `fail(msg)` call the script made, in order. On a script/parse
     /// error or a resource-limit trip, this holds that one error message
@@ -50,20 +61,31 @@ pub struct ConstraintResult {
     pub messages: Vec<String>,
 }
 
-/// A constraint node's result, in the shape sent over `GET /api/canvas`
-/// (see `crate::canvas::Node::constraint_status`) — same information as
+/// One constraint fence's result, in the shape sent over `GET /api/canvas`
+/// (see `crate::canvas::Node::constraint_results`) — same information as
 /// `ConstraintResult` minus the node's own id/title, which the `Node` this
 /// rides along on already carries.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ConstraintStatus {
+    pub label: String,
     pub ok: bool,
     pub messages: Vec<String>,
 }
 
 impl From<ConstraintResult> for ConstraintStatus {
     fn from(r: ConstraintResult) -> Self {
-        ConstraintStatus { ok: r.ok, messages: r.messages }
+        ConstraintStatus { label: r.label, ok: r.ok, messages: r.messages }
+    }
+}
+
+/// The default identifier for a constraint fence with no explicit
+/// `name="..."` — see `ConstraintResult::label`.
+fn label_for(node_id: &str, name: Option<&str>, index: usize, total_in_node: usize) -> String {
+    match name {
+        Some(name) => format!("{node_id}/{name}"),
+        None if total_in_node <= 1 => node_id.to_string(),
+        None => format!("{node_id}#{index}"),
     }
 }
 
@@ -107,54 +129,58 @@ fn globals() -> Globals {
         .build()
 }
 
-/// Runs every `Constraint` node's script against `canvas`, in document
-/// order. Each node gets its own fresh Starlark heap/module — nothing
-/// persists between them, so one constraint's globals or state can't leak
-/// into another's.
+/// Runs every embedded constraint fence's script against `canvas`, in
+/// document order (node order, then fence order within a node). Each fence
+/// gets its own fresh Starlark heap/module — nothing persists between
+/// them, so one constraint's globals or state can't leak into another's.
 pub fn evaluate(canvas: &Canvas) -> Vec<ConstraintResult> {
     let prelude = build_prelude(canvas);
     let globals = globals();
-    canvas
-        .nodes
-        .iter()
-        .filter(|n| n.node_type == NodeType::Constraint)
-        .map(|n| evaluate_one(&prelude, &globals, n))
-        .collect()
+    let mut results = Vec::new();
+    for node in &canvas.nodes {
+        let blocks = crate::fence::scan_constraint_blocks(&node.text);
+        let total = blocks.len();
+        for (i, block) in blocks.into_iter().enumerate() {
+            results.push(evaluate_one(&prelude, &globals, node, block, i + 1, total));
+        }
+    }
+    results
 }
 
-/// Runs every `Constraint` node's script and writes each result into its
-/// own node's `constraint_status` — never set by `mdcanvas::parse` itself,
-/// only by whatever consumer wants it (the server, before serving `GET
-/// /api/canvas`), populated by a consumer rather than by parsing.
+/// Runs every embedded constraint fence's script and writes each node's
+/// results into its own `constraint_results` — never set by
+/// `mdcanvas::parse` itself, only by whatever consumer wants it (the
+/// server, before serving `GET /api/canvas`), populated by a consumer
+/// rather than by parsing.
 pub fn annotate_status(canvas: &mut Canvas) {
+    let mut by_node: std::collections::HashMap<String, Vec<ConstraintStatus>> = std::collections::HashMap::new();
     for result in evaluate(canvas) {
-        if let Some(node) = canvas.node_mut(&result.node_id) {
-            node.constraint_status = Some(result.into());
+        by_node.entry(result.node_id.clone()).or_default().push(result.into());
+    }
+    for node in &mut canvas.nodes {
+        if let Some(results) = by_node.remove(&node.id) {
+            node.constraint_results = results;
         }
     }
 }
 
-fn evaluate_one(prelude: &str, globals: &Globals, node: &Node) -> ConstraintResult {
+fn evaluate_one(
+    prelude: &str,
+    globals: &Globals,
+    node: &Node,
+    block: crate::fence::ConstraintBlock,
+    index: usize,
+    total_in_node: usize,
+) -> ConstraintResult {
     let node_id = node.id.clone();
     let title = node.title.clone();
+    let label = label_for(&node_id, block.name.as_deref(), index, total_in_node);
 
-    let script = match crate::fence::single_starlark_fence(node.text.trim()) {
-        Some(s) => s,
-        None => {
-            return ConstraintResult {
-                node_id,
-                title,
-                ok: false,
-                messages: vec!["constraint body is not a single ```starlark fence".to_string()],
-            };
-        }
-    };
-
-    let source = format!("{prelude}self = doc.node({})\n{script}\n", star_str(&node_id));
+    let source = format!("{prelude}self = doc.node({})\n{}\n", star_str(&node_id), block.code);
     let violations = Violations::default();
 
     let outcome: Result<(), String> = Module::with_temp_heap(|module| {
-        let ast = AstModule::parse(&format!("{node_id}.star"), source, &dialect())
+        let ast = AstModule::parse(&format!("{label}.star"), source, &dialect())
             .map_err(|e| e.to_string())?;
         let mut eval = Evaluator::new(&module);
         eval.set_max_callstack_size(MAX_CALLSTACK).map_err(|e| e.to_string())?;
@@ -171,7 +197,7 @@ fn evaluate_one(prelude: &str, globals: &Globals, node: &Node) -> ConstraintResu
         messages.push(e);
     }
 
-    ConstraintResult { node_id, title, ok, messages }
+    ConstraintResult { node_id, title, label, ok, messages }
 }
 
 /// Starlark source defining `doc` — the document's root node — and every
@@ -276,25 +302,83 @@ mod tests {
     fn a_passing_constraint_has_no_messages() {
         let c = canvas(
             "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
-             ## Check\n<!-- meshfox:node id=\"check\" type=\"constraint\" -->\n\n\
-             ```starlark\npass\n```\n",
+             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
+             ```starlark constraint\npass\n```\n",
         );
         let results = evaluate(&c);
         assert_eq!(results.len(), 1);
         assert!(results[0].ok, "{:?}", results[0].messages);
         assert!(results[0].messages.is_empty());
+        assert_eq!(results[0].label, "check");
     }
 
     #[test]
     fn fail_records_a_message_without_stopping_the_script() {
         let c = canvas(
             "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
-             ## Check\n<!-- meshfox:node id=\"check\" type=\"constraint\" -->\n\n\
-             ```starlark\nfail(\"first\")\nfail(\"second\")\n```\n",
+             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
+             ```starlark constraint\nfail(\"first\")\nfail(\"second\")\n```\n",
         );
         let results = evaluate(&c);
         assert!(!results[0].ok);
         assert_eq!(results[0].messages, vec!["first".to_string(), "second".to_string()]);
+    }
+
+    #[test]
+    fn a_plain_starlark_fence_without_the_flag_is_not_a_constraint() {
+        // A documentation example showing Starlark syntax, not an actual
+        // check — same as an unnamed bash fence isn't runnable.
+        let c = canvas(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+             ## Example\n<!-- meshfox:node id=\"example\" -->\n\n\
+             ```starlark\nfail(\"not actually run\")\n```\n",
+        );
+        assert!(evaluate(&c).is_empty());
+    }
+
+    #[test]
+    fn a_constraint_fence_coexists_with_prose_and_other_content() {
+        // The whole point of embedding: a node keeps its normal prose (and
+        // other fences) alongside its check, rather than needing a
+        // dedicated node whose body is exactly one fence.
+        let c = canvas(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
+             Some prose explaining the rule.\n\n\
+             ```bash name=\"build\"\ncargo build\n```\n\n\
+             ```starlark constraint\npass\n```\n\n\
+             More prose after.\n",
+        );
+        let results = evaluate(&c);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].ok, "{:?}", results[0].messages);
+    }
+
+    #[test]
+    fn multiple_unnamed_constraints_in_one_node_get_indexed_labels() {
+        let c = canvas(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
+             ```starlark constraint\npass\n```\n\n\
+             ```starlark constraint\nfail(\"second one\")\n```\n",
+        );
+        let results = evaluate(&c);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].label, "check#1");
+        assert!(results[0].ok);
+        assert_eq!(results[1].label, "check#2");
+        assert!(!results[1].ok);
+    }
+
+    #[test]
+    fn a_named_constraint_is_labeled_node_id_slash_name() {
+        let c = canvas(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
+             ```starlark constraint name=\"table-shape\"\npass\n```\n",
+        );
+        let results = evaluate(&c);
+        assert_eq!(results[0].label, "check/table-shape");
     }
 
     #[test]
@@ -303,8 +387,8 @@ mod tests {
             "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
              ## Table\n<!-- meshfox:node id=\"table\" tags=\"table\" -->\n\n\
              ### Schema\n<!-- meshfox:node id=\"schema\" type=\"file\" -->\n\n[schema](schema.sql)\n\n\
-             ## Check\n<!-- meshfox:node id=\"check\" type=\"constraint\" -->\n\n\
-             ```starlark\n\
+             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
+             ```starlark constraint\n\
              for n in doc.nodes_with_tag(\"table\"):\n\
              \x20   files = [c for c in n.children() if c.type == \"file\"]\n\
              \x20   if len(files) != 1:\n\
@@ -320,8 +404,8 @@ mod tests {
         let c = canvas(
             "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
              ## Table\n<!-- meshfox:node id=\"table\" tags=\"table\" -->\n\n\
-             ## Check\n<!-- meshfox:node id=\"check\" type=\"constraint\" -->\n\n\
-             ```starlark\n\
+             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
+             ```starlark constraint\n\
              for n in doc.nodes_with_tag(\"table\"):\n\
              \x20   files = [c for c in n.children() if c.type == \"file\"]\n\
              \x20   if len(files) != 1:\n\
@@ -341,20 +425,20 @@ mod tests {
         let c = canvas(
             "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
              ## Table\n<!-- meshfox:node id=\"table\" tags=\"table\" -->\n\n\
-             ## Check\n<!-- meshfox:node id=\"check\" type=\"constraint\" -->\n\n\
-             ```starlark\nif len(self.nodes_with_tag(\"table\")) != 1:\n\x20   fail(\"expected one\")\n```\n",
+             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
+             ```starlark constraint\nif len(self.nodes_with_tag(\"table\")) != 1:\n\x20   fail(\"expected one\")\n```\n",
         );
         let results = evaluate(&c);
         assert!(results[0].ok, "{:?}", results[0].messages);
     }
 
     #[test]
-    fn self_is_the_running_constraint_s_own_node() {
+    fn self_is_the_node_the_fence_lives_in() {
         let c = canvas(
             "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
-             ## Check\n<!-- meshfox:node id=\"check\" type=\"constraint\" -->\n\n\
-             ```starlark\n\
-             if self.id != \"check\" or self.type != \"constraint\":\n\
+             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
+             ```starlark constraint\n\
+             if self.id != \"check\" or self.type != \"text\":\n\
              \x20   fail(\"self is wrong: \" + self.id)\n\
              ```\n",
         );
@@ -363,20 +447,20 @@ mod tests {
     }
 
     #[test]
-    fn self_descendants_scopes_a_check_to_the_constraint_s_own_subtree() {
-        // Mirrors the real shape that motivated `descendants`: the
-        // constraint is the *parent* of the subtree it governs (like
-        // `table-shape` being moved above `references`/`user-data`/
-        // `app-data` in the live example), and the `table`-tagged node is
-        // nested two levels under the constraint itself — a plain
-        // `self.children()` wouldn't reach it, only `descendants` does. A
-        // sibling subtree with its own `table` node sits outside `self`,
-        // and must NOT be seen — unlike the whole-document
+    fn self_descendants_scopes_a_check_to_its_own_node_s_subtree() {
+        // Mirrors the real shape that motivated `descendants`: a
+        // constraint typically governs the subtree of the node its fence
+        // lives in (like `table-shape` living directly in `entities`,
+        // above `references`/`user-data`/`app-data`), and the
+        // `table`-tagged node is nested two levels under that node — a
+        // plain `self.children()` wouldn't reach it, only `descendants`
+        // does. A sibling subtree with its own `table` node sits outside
+        // `self`, and must NOT be seen — unlike the whole-document
         // `nodes_with_tag`, `descendants` only walks `self`'s own subtree.
         let c = canvas(
             "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
-             ## Check\n<!-- meshfox:node id=\"check\" type=\"constraint\" -->\n\n\
-             ```starlark\n\
+             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
+             ```starlark constraint\n\
              for n in self.descendants():\n\
              \x20   if \"table\" in n.tags:\n\
              \x20       files = [c for c in n.children() if c.type == \"file\"]\n\
@@ -398,8 +482,8 @@ mod tests {
     fn self_descendants_still_catches_a_violation_nested_two_levels_down() {
         let c = canvas(
             "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
-             ## Check\n<!-- meshfox:node id=\"check\" type=\"constraint\" -->\n\n\
-             ```starlark\n\
+             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
+             ```starlark constraint\n\
              for n in self.descendants():\n\
              \x20   if \"table\" in n.tags:\n\
              \x20       files = [c for c in n.children() if c.type == \"file\"]\n\
@@ -418,8 +502,8 @@ mod tests {
     fn a_syntax_error_is_reported_as_a_failure_not_a_panic() {
         let c = canvas(
             "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
-             ## Check\n<!-- meshfox:node id=\"check\" type=\"constraint\" -->\n\n\
-             ```starlark\nthis is not valid starlark(((\n```\n",
+             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
+             ```starlark constraint\nthis is not valid starlark(((\n```\n",
         );
         let results = evaluate(&c);
         assert!(!results[0].ok);
@@ -433,8 +517,8 @@ mod tests {
         // the way to build an expensive-enough loop to trip the budget.
         let c = canvas(
             "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
-             ## Check\n<!-- meshfox:node id=\"check\" type=\"constraint\" -->\n\n\
-             ```starlark\nfor i in range(100000000):\n\x20   pass\n```\n",
+             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
+             ```starlark constraint\nfor i in range(100000000):\n\x20   pass\n```\n",
         );
         let results = evaluate(&c);
         assert!(!results[0].ok);
@@ -446,8 +530,8 @@ mod tests {
         let c = canvas(
             "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
              ## He said \"hi\"\n<!-- meshfox:node id=\"quoted\" -->\n\n\
-             ## Check\n<!-- meshfox:node id=\"check\" type=\"constraint\" -->\n\n\
-             ```starlark\n\
+             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
+             ```starlark constraint\n\
              n = doc.node(\"quoted\")\n\
              if n.title != 'He said \"hi\"':\n\
              \x20   fail(\"title mismatch: \" + n.title)\n\
@@ -458,39 +542,57 @@ mod tests {
     }
 
     #[test]
-    fn non_constraint_nodes_are_not_evaluated() {
+    fn nodes_without_constraint_fences_are_not_evaluated() {
         let c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\nsome text\n");
         assert!(evaluate(&c).is_empty());
     }
 
     #[test]
-    fn annotate_status_writes_the_result_onto_the_constraint_s_own_node() {
+    fn annotate_status_writes_results_onto_the_owning_node() {
         let mut c = canvas(
             "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
-             ## Check\n<!-- meshfox:node id=\"check\" type=\"constraint\" -->\n\n\
-             ```starlark\nfail(\"nope\")\n```\n",
+             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
+             ```starlark constraint\nfail(\"nope\")\n```\n",
         );
-        assert_eq!(c.node("root").unwrap().constraint_status, None);
-        assert_eq!(c.node("check").unwrap().constraint_status, None);
+        assert!(c.node("root").unwrap().constraint_results.is_empty());
+        assert!(c.node("check").unwrap().constraint_results.is_empty());
 
         annotate_status(&mut c);
 
-        assert_eq!(c.node("root").unwrap().constraint_status, None);
-        let status = c.node("check").unwrap().constraint_status.as_ref().unwrap();
-        assert!(!status.ok);
-        assert_eq!(status.messages, vec!["nope".to_string()]);
+        assert!(c.node("root").unwrap().constraint_results.is_empty());
+        let results = &c.node("check").unwrap().constraint_results;
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].ok);
+        assert_eq!(results[0].messages, vec!["nope".to_string()]);
     }
 
     #[test]
     fn annotate_status_marks_a_passing_constraint_ok() {
         let mut c = canvas(
             "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
-             ## Check\n<!-- meshfox:node id=\"check\" type=\"constraint\" -->\n\n\
-             ```starlark\npass\n```\n",
+             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
+             ```starlark constraint\npass\n```\n",
         );
         annotate_status(&mut c);
-        let status = c.node("check").unwrap().constraint_status.as_ref().unwrap();
-        assert!(status.ok);
-        assert!(status.messages.is_empty());
+        let results = &c.node("check").unwrap().constraint_results;
+        assert!(results[0].ok);
+        assert!(results[0].messages.is_empty());
+    }
+
+    #[test]
+    fn annotate_status_writes_multiple_results_for_multiple_fences() {
+        let mut c = canvas(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
+             ```starlark constraint name=\"a\"\npass\n```\n\n\
+             ```starlark constraint name=\"b\"\nfail(\"nope\")\n```\n",
+        );
+        annotate_status(&mut c);
+        let results = &c.node("check").unwrap().constraint_results;
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].label, "check/a");
+        assert!(results[0].ok);
+        assert_eq!(results[1].label, "check/b");
+        assert!(!results[1].ok);
     }
 }

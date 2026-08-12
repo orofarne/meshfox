@@ -146,9 +146,9 @@ a {
 }
 
 /* Toolbar-wide constraint pass/fail summary (see App.tsx's
- * `constraintStats`) — absent entirely when the document declares no
- * `constraint` nodes, same "nothing to show" convention as the other
- * toolbar badges here. */
+ * `constraintStats`) — absent entirely when the document has no embedded
+ * ` ```starlark constraint ` fences at all, same "nothing to show"
+ * convention as the other toolbar badges here. */
 .constraint-stats {
   font-size: 0.75rem;
   padding: 0.15rem 0.5rem;
@@ -368,9 +368,10 @@ a {
   user-select: text;
 }
 
-/* A `constraint` node's own pass/fail pill (see MeshNode.tsx's
- * `ConstraintBadge`) — sits in its title bar, next to the title text and
- * before the edit-mode action icons, so it's visible read-only too. */
+/* A node's own aggregate constraint pass/fail pill (see MeshNode.tsx's
+ * `ConstraintBadge`) — shown for any node whose body has ≥1 embedded
+ * ` ```starlark constraint ` fence, in its title bar next to the title text
+ * and before the edit-mode action icons, so it's visible read-only too. */
 .mesh-node-constraint-badge {
   flex-shrink: 0;
   display: inline-flex;

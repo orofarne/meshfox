@@ -6,7 +6,7 @@ import CodeMirror from "@uiw/react-codemirror";
 import { LanguageDescription } from "@codemirror/language";
 import { languages } from "@codemirror/language-data";
 import type { Extension } from "@codemirror/state";
-import { defaultBlockName, parseBody, type BodySegment, type CodeSegment } from "./fence";
+import { defaultBlockName, parseBody, type BodySegment, type CodeSegment, type ConstraintSegment } from "./fence";
 import { parseBlockRef, blockDomId } from "./deps";
 import { AnsiText } from "./AnsiText";
 import { NodeTextEditor, usePrefersDark } from "./NodeTextEditor";
@@ -99,12 +99,13 @@ export interface MeshNodeData {
    * so both dependency visualizations turn on/off together. */
   showDeps: boolean;
   target?: string;
-  /** constraint-node only — its most recently evaluated pass/fail result
-   * (see `ConstraintStatusDto`). Absent means the server hasn't evaluated
-   * it (never the case for a loaded canvas, since `GET /api/canvas`
-   * always does), not "passed" — the badge below only renders once this
-   * is actually present. */
-  constraintStatus?: ConstraintStatusDto;
+  /** Results of every embedded ` ```starlark constraint ` fence in this
+   * node's own body, in document order (see `ConstraintStatusDto`) — matched
+   * to its rendered `ConstraintSegment` purely by position, both being built
+   * from the same document order. Absent or empty means this node has no
+   * constraint fences (nothing to roll up into the title-bar badge below),
+   * not "0 constraints, 0 passing". */
+  constraintResults?: ConstraintStatusDto[];
   /** file-node display mode — `"code"` shows a read-only, syntax-highlighted
    * preview of the target file's own content instead of a plain link. */
   display?: "link" | "code";
@@ -130,9 +131,9 @@ export interface MeshNodeData {
    * instead of streaming captured output the way `onRun` does. Same
    * `withDeps` meaning: plain "run" (false) vs "⛓ run chain" (true). */
   onRunTty: (blockName: string, withDeps: boolean) => void;
-  /** constraint-node only — its Starlark isn't a `run`nable fence (only
-   * bash/sh are), so its body gets this instead of a Run button: re-fetches
-   * the whole canvas, which re-evaluates every constraint server-side (see
+  /** A constraint fence's Starlark isn't a `run`nable fence (only bash/sh
+   * are), so each one gets this instead of a Run button: re-fetches the
+   * whole canvas, which re-evaluates every constraint server-side (see
    * App.tsx's `load`) and refreshes this node's badge/messages. */
   onRecheckConstraint: () => void;
   /** Creates a new child node under this one — the "+" button (inline in
@@ -186,13 +187,29 @@ function sameNodeChainNames(segments: BodySegment[]): Set<string> {
 const TYPE_ICON: Partial<Record<NodeType, string>> = {
   file: "📎",
   link: "🔗",
-  constraint: "🛡️",
 };
 
-/** Small pass/fail pill for a `constraint` node's title bar — green check
- * when its script raised no violations, red cross (with every `fail(msg)`
- * as a tooltip) otherwise. Renders nothing until the server has actually
- * evaluated it (see `MeshNodeData.constraintStatus`'s doc comment). */
+/** Rolls up every embedded constraint fence's result in a node into one
+ * pass/fail summary for the title-bar pill — `undefined` when the node has
+ * no constraint fences at all (nothing to show), `ok: true` only when every
+ * one of them passed. Each failing fence's messages are prefixed with its
+ * own `label` in the rolled-up tooltip, since a node's badge can now be
+ * covering more than one check. */
+function aggregateConstraintStatus(results: ConstraintStatusDto[] | undefined): ConstraintStatusDto | undefined {
+  if (!results || results.length === 0) return undefined;
+  const failing = results.filter((r) => !r.ok);
+  return {
+    label: "",
+    ok: failing.length === 0,
+    messages: failing.flatMap((r) => r.messages.map((m) => `${r.label}: ${m}`)),
+  };
+}
+
+/** Small aggregate pass/fail pill for a node's title bar, covering every
+ * embedded constraint fence in its body — green check when all of them
+ * raised no violations, red cross (with every failing one's messages as a
+ * tooltip) otherwise. Renders nothing for a node with no constraint fences
+ * (see `aggregateConstraintStatus`). */
 function ConstraintBadge({ status }: { status: ConstraintStatusDto | undefined }) {
   if (!status) return null;
   return (
@@ -202,7 +219,7 @@ function ConstraintBadge({ status }: { status: ConstraintStatusDto | undefined }
           ? "mesh-node-constraint-badge mesh-node-constraint-badge-ok"
           : "mesh-node-constraint-badge mesh-node-constraint-badge-fail"
       }
-      title={status.ok ? "Constraint passes" : status.messages.join("\n")}
+      title={status.ok ? "Constraints pass" : status.messages.join("\n")}
     >
       {status.ok ? "✓" : "✗"}
     </span>
@@ -618,22 +635,26 @@ export function NodeBodyPreview({ text }: { text: string }) {
   const wheelRef = useStopWheelIfScrollable<HTMLDivElement>();
   return (
     <div className="mesh-node-body nopan" ref={wheelRef}>
-      {segments.map((seg, i) =>
-        seg.type === "markdown" ? (
-          <ReactMarkdown key={i} remarkPlugins={[remarkGfm]} components={markdownComponents}>
-            {seg.content}
-          </ReactMarkdown>
-        ) : (
-          <div className="mesh-code-block" key={`${seg.name}-${i}`}>
+      {segments.map((seg, i) => {
+        if (seg.type === "markdown") {
+          return (
+            <ReactMarkdown key={i} remarkPlugins={[remarkGfm]} components={markdownComponents}>
+              {seg.content}
+            </ReactMarkdown>
+          );
+        }
+        const lang = seg.type === "constraint" ? `starlark${seg.name ? ` · ${seg.name}` : ""}` : seg.lang;
+        return (
+          <div className="mesh-code-block" key={`${seg.type === "constraint" ? "constraint" : seg.name}-${i}`}>
             <div className="mesh-code-block-head">
-              <span className="mesh-code-lang">{seg.lang}</span>
+              <span className="mesh-code-lang">{lang}</span>
             </div>
             <pre>
               <code>{seg.code}</code>
             </pre>
           </div>
-        ),
-      )}
+        );
+      })}
     </div>
   );
 }
@@ -656,49 +677,42 @@ export function NodeBodyPreview({ text }: { text: string }) {
  * block's own "after: …" links.
  */
 
-/** Pulls the Starlark source out of a `constraint` node's body — always
- * exactly one ` ```starlark ` fence and nothing else (`mdcanvas` rejects
- * any other body shape for this type, see SPEC.md's "Constraint nodes"),
- * so this never needs to handle anything else gracefully. Falls back to
- * the raw text on the off chance a not-yet-reloaded node's body doesn't
- * match (e.g. mid-edit), rather than rendering nothing. */
-function constraintScript(text: string): string {
-  const match = /^```starlark\n([\s\S]*?)\n?```$/.exec(text.trim());
-  return match ? match[1] : text.trim();
-}
-
-/** A `constraint` node's body: its Starlark source, read-only, with a
- * "recheck" button in place of the Run button a runnable fence would get
- * (Starlark isn't a `run`nable language — see `MeshNodeData.onRun`'s
- * counterpart, `onRecheckConstraint`) — and, once evaluated and failing,
- * every `fail(msg)` the script raised, right under the code (the same
- * information the title-bar badge's tooltip has, but readable without
- * hovering, and not truncated to one line).
+/** One embedded ` ```starlark constraint ` fence within a node's body: its
+ * Starlark source, read-only, with a "recheck" button in place of the Run
+ * button a runnable fence would get (Starlark isn't a `run`nable language —
+ * see `MeshNodeData.onRun`'s counterpart, `onRecheckConstraint`) — and,
+ * once evaluated and failing, every `fail(msg)` the script raised, right
+ * under the code (the same information the title-bar badge's tooltip has,
+ * but readable without hovering, and not truncated to one line).
  */
-function ConstraintBody({ data }: { data: MeshNodeData }) {
-  const status = data.constraintStatus;
-  const wheelRef = useStopWheelIfScrollable<HTMLDivElement>();
+function ConstraintFenceBlock({
+  seg,
+  status,
+  onRecheck,
+}: {
+  seg: ConstraintSegment;
+  status: ConstraintStatusDto | undefined;
+  onRecheck: () => void;
+}) {
   return (
-    <div className="mesh-node-body nopan" ref={wheelRef}>
-      <div className="mesh-code-block">
-        <div className="mesh-code-block-head">
-          <span className="mesh-code-lang">starlark</span>
-          <button onClick={data.onRecheckConstraint} title="Re-fetch the canvas and re-evaluate every constraint">
-            ↻ recheck
-          </button>
-        </div>
-        <pre>
-          <code>{constraintScript(data.text)}</code>
-        </pre>
-        {status && !status.ok && (
-          <div className="mesh-code-output" data-exit="fail">
-            <div className="mesh-code-output-head">{status.messages.length} failing</div>
-            <pre>
-              <code>{status.messages.join("\n")}</code>
-            </pre>
-          </div>
-        )}
+    <div className="mesh-code-block">
+      <div className="mesh-code-block-head">
+        <span className="mesh-code-lang">starlark{seg.name ? ` · ${seg.name}` : ""}</span>
+        <button onClick={onRecheck} title="Re-fetch the canvas and re-evaluate every constraint">
+          ↻ recheck
+        </button>
       </div>
+      <pre>
+        <code>{seg.code}</code>
+      </pre>
+      {status && !status.ok && (
+        <div className="mesh-code-output" data-exit="fail">
+          <div className="mesh-code-output-head">{status.messages.length} failing</div>
+          <pre>
+            <code>{status.messages.join("\n")}</code>
+          </pre>
+        </div>
+      )}
     </div>
   );
 }
@@ -708,23 +722,36 @@ function MeshNodeBody({ data, nodeId }: { data: MeshNodeData; nodeId: string }) 
   const wheelRef = useStopWheelIfScrollable<HTMLDivElement>();
 
   if (!data.showDeps) {
+    let constraintIdx = 0;
     return (
       <div className="mesh-node-body nopan" ref={wheelRef}>
-        {segments.map((seg, i) =>
-          seg.type === "markdown" ? (
-            <ReactMarkdown key={i} remarkPlugins={[remarkGfm]} components={markdownComponents}>
-              {seg.content}
-            </ReactMarkdown>
-          ) : (
-            <RunnableCodeBlock key={seg.name} seg={seg} data={data} nodeId={nodeId} />
-          ),
-        )}
+        {segments.map((seg, i) => {
+          if (seg.type === "markdown") {
+            return (
+              <ReactMarkdown key={i} remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                {seg.content}
+              </ReactMarkdown>
+            );
+          }
+          if (seg.type === "constraint") {
+            // Matched to `data.constraintResults` purely by position — both
+            // are built from the same document order (see
+            // `MeshNodeData.constraintResults`'s doc comment).
+            const status = data.constraintResults?.[constraintIdx];
+            constraintIdx += 1;
+            return (
+              <ConstraintFenceBlock key={`constraint-${i}`} seg={seg} status={status} onRecheck={data.onRecheckConstraint} />
+            );
+          }
+          return <RunnableCodeBlock key={seg.name} seg={seg} data={data} nodeId={nodeId} />;
+        })}
       </div>
     );
   }
 
   const chainNames = sameNodeChainNames(segments);
   const codeRows = segments.map((seg, i) => (seg.type === "code" ? i : -1)).filter((i) => i !== -1);
+  let railConstraintIdx = 0;
 
   return (
     <div className="mesh-node-body mesh-rail nopan" ref={wheelRef}>
@@ -734,12 +761,24 @@ function MeshNodeBody({ data, nodeId }: { data: MeshNodeData; nodeId: string }) 
           style={{ gridRow: `${codeRows[0] + 1} / ${codeRows[codeRows.length - 1] + 2}` }}
         />
       )}
-      {segments.map((seg, i) =>
-        seg.type === "markdown" ? (
-          <div key={`md-${i}`} className="mesh-rail-content" style={{ gridRow: i + 1, gridColumn: 2 }}>
-            <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{seg.content}</ReactMarkdown>
-          </div>
-        ) : (
+      {segments.map((seg, i) => {
+        if (seg.type === "markdown") {
+          return (
+            <div key={`md-${i}`} className="mesh-rail-content" style={{ gridRow: i + 1, gridColumn: 2 }}>
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{seg.content}</ReactMarkdown>
+            </div>
+          );
+        }
+        if (seg.type === "constraint") {
+          const status = data.constraintResults?.[railConstraintIdx];
+          railConstraintIdx += 1;
+          return (
+            <div key={`constraint-${i}`} className="mesh-rail-content" style={{ gridRow: i + 1, gridColumn: 2 }}>
+              <ConstraintFenceBlock seg={seg} status={status} onRecheck={data.onRecheckConstraint} />
+            </div>
+          );
+        }
+        return (
           <Fragment key={seg.name}>
             <span
               className="mesh-rail-dot"
@@ -751,8 +790,8 @@ function MeshNodeBody({ data, nodeId }: { data: MeshNodeData; nodeId: string }) 
               <RunnableCodeBlock seg={seg} data={data} nodeId={nodeId} />
             </div>
           </Fragment>
-        ),
-      )}
+        );
+      })}
     </div>
   );
 }
@@ -795,7 +834,6 @@ export function NodeBodyContent({ data, nodeId }: { data: MeshNodeData; nodeId: 
       </div>
     );
   }
-  if (data.nodeType === "constraint") return <ConstraintBody data={data} />;
   return <MeshNodeBody data={data} nodeId={nodeId} />;
 }
 
@@ -829,6 +867,7 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
   const quickRunLive = quickRunBlockName ? data.liveBlocks[quickRunBlockName] : undefined;
   const quickRunBusy = quickRunLive?.status === "queued" || quickRunLive?.status === "running";
   const canOpenFile = data.nodeType === "file" && !!data.target;
+  const constraintStatus = aggregateConstraintStatus(data.constraintResults);
 
   return (
     <div
@@ -860,7 +899,7 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
             {TYPE_ICON[data.nodeType] ? `${TYPE_ICON[data.nodeType]} ` : ""}
             {data.title}
           </span>
-          {data.nodeType === "constraint" && <ConstraintBadge status={data.constraintStatus} />}
+          <ConstraintBadge status={constraintStatus} />
           {quickRunBlockName && (
             <button
               type="button"

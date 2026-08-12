@@ -111,13 +111,13 @@ pub struct NodeView {
     /// (depth ≥2, measured and repositioned by JS) — see the module doc
     /// comment.
     pub depth: u32,
-    /// `"text"` | `"file"` | `"link"` | `"group"` | `"include"` |
-    /// `"constraint"` — see `NodeType::as_str`. In practice `"include"`
-    /// never appears in a `SiteData` built from an already
-    /// `include::resolve`d canvas (an include node becomes a `group` or
-    /// `text` node once resolved — see `crate::include`'s module docs) —
-    /// this module doesn't resolve includes itself, so it's left as a
-    /// possible value for a caller that passes a raw, unresolved canvas.
+    /// `"text"` | `"file"` | `"link"` | `"group"` | `"include"` — see
+    /// `NodeType::as_str`. In practice `"include"` never appears in a
+    /// `SiteData` built from an already `include::resolve`d canvas (an
+    /// include node becomes a `group` or `text` node once resolved — see
+    /// `crate::include`'s module docs) — this module doesn't resolve
+    /// includes itself, so it's left as a possible value for a caller that
+    /// passes a raw, unresolved canvas.
     pub node_type: &'static str,
     /// `Some` only when the source had all four of `x`/`y`/`width`/
     /// `height` — the author's own explicit canvas layout, rendered at
@@ -138,11 +138,12 @@ pub struct NodeView {
     /// `file`/`link` node target (path or URL); `None` for every other type.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
-    /// `Some(true)`/`Some(false)` for a `constraint` node whose contract was
-    /// evaluated; `None` for every other node type. Skipped from the
-    /// serialized (and so Tera-visible) form entirely when `None`, rather
-    /// than serializing as JSON `null` — that's what lets a template tell
-    /// "no constraint here" apart from "constraint evaluated to false" via
+    /// `Some(true)` if every embedded ` ```starlark constraint ` fence in
+    /// this node's own body passed, `Some(false)` if any failed; `None` for
+    /// a node with no constraint fences at all. Skipped from the serialized
+    /// (and so Tera-visible) form entirely when `None`, rather than
+    /// serializing as JSON `null` — that's what lets a template tell "no
+    /// constraint here" apart from "a constraint evaluated to false" via
     /// Tera's `is defined` test, since both would otherwise be equally
     /// falsy in a plain `{% if %}`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -214,8 +215,14 @@ pub fn build(canvas: &Canvas, canvas_dir: &Path, base_url: Option<&str>) -> (Sit
     let canvas_dir = canvas_dir.canonicalize().unwrap_or_else(|_| canvas_dir.to_path_buf());
     let ctx = RenderCtx { canvas_dir: &canvas_dir, base_url };
 
-    let constraint_ok: std::collections::HashMap<String, bool> =
-        crate::constraint::evaluate(canvas).into_iter().map(|r| (r.node_id, r.ok)).collect();
+    // One node can carry several constraint fences; aggregate to "did every
+    // one of this node's own constraints pass" — presence in the map at
+    // all is what tells `build_node_view` this node has constraints to
+    // report on, absence means none.
+    let mut constraint_ok: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    for r in crate::constraint::evaluate(canvas) {
+        constraint_ok.entry(r.node_id).and_modify(|ok| *ok = *ok && r.ok).or_insert(r.ok);
+    }
 
     let root_node = canvas.nodes.iter().find(|n| n.parent.is_none()).expect("a parsed canvas always has a root");
 
@@ -253,7 +260,7 @@ fn build_node_view(
         (Some(x), Some(y), Some(width), Some(height)) => Some(Position { x, y, width, height }),
         _ => None,
     };
-    let ok = (node.node_type == NodeType::Constraint).then(|| constraint_ok.get(&node.id).copied().unwrap_or(false));
+    let ok = constraint_ok.get(&node.id).copied();
     let children = canvas
         .children(&node.id)
         .into_iter()
@@ -705,16 +712,28 @@ mod tests {
     }
 
     #[test]
-    fn constraint_ok_set_only_for_constraint_nodes() {
+    fn constraint_ok_set_only_for_nodes_with_a_constraint_fence() {
         let c = canvas(
             "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
-             ## Check\n<!-- meshfox:node id=\"check\" type=\"constraint\" -->\n\n\
-             ```starlark\npass\n```\n",
+             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
+             ```starlark constraint\npass\n```\n",
         );
         let site = build_site(&c);
         let check = site.find("check").unwrap();
         assert_eq!(site.find("root").unwrap().constraint_ok, None);
         assert_eq!(check.constraint_ok, Some(true));
+    }
+
+    #[test]
+    fn constraint_ok_is_false_if_any_of_a_node_s_fences_fail() {
+        let c = canvas(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
+             ```starlark constraint name=\"a\"\npass\n```\n\n\
+             ```starlark constraint name=\"b\"\nfail(\"nope\")\n```\n",
+        );
+        let site = build_site(&c);
+        assert_eq!(site.find("check").unwrap().constraint_ok, Some(false));
     }
 
     #[test]

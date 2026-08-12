@@ -881,7 +881,7 @@ export default function App() {
             liveBlocks: {},
             showDeps,
             target: n.target,
-            constraintStatus: n.constraintStatus,
+            constraintResults: n.constraintResults,
             display: n.display,
             lang: n.lang,
             interpreter: n.interpreter,
@@ -1333,19 +1333,16 @@ export default function App() {
     handleSaveLayout();
   }, [nodes, handleSaveLayout]);
 
-  // Aggregate pass/fail across every `constraint` node's most recently
-  // evaluated status (see `ConstraintStatusDto`) — `null` when the
-  // document declares none, so the toolbar badge below can render nothing
-  // rather than a vacuous "0/0". A constraint the server hasn't evaluated
-  // yet (shouldn't happen for a loaded canvas — `GET /api/canvas` always
-  // does) doesn't count as failing, just isn't counted either way.
+  // Aggregate pass/fail across every embedded constraint fence's most
+  // recently evaluated status (see `ConstraintStatusDto`), across every
+  // node — `null` when the document has none at all, so the toolbar badge
+  // below can render nothing rather than a vacuous "0/0".
   const constraintStats = useMemo(() => {
     if (!canvas) return null;
-    const constraints = canvas.nodes.filter((n) => n.type === "constraint");
-    if (constraints.length === 0) return null;
-    const evaluated = constraints.filter((n) => n.constraintStatus);
-    const failed = evaluated.filter((n) => !n.constraintStatus!.ok).length;
-    return { total: constraints.length, evaluated: evaluated.length, failed };
+    const results = canvas.nodes.flatMap((n) => n.constraintResults ?? []);
+    if (results.length === 0) return null;
+    const failed = results.filter((r) => !r.ok).length;
+    return { total: results.length, failed };
   }, [canvas]);
 
   const toolbar = useMemo(

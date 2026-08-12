@@ -137,6 +137,13 @@ pub struct App {
     pub status: String,
     pub show_help: bool,
     pub should_quit: bool,
+    /// Aggregate `(total, failed)` across every embedded constraint fence
+    /// in `display_canvas`, computed alongside it (see
+    /// `resolve_includes`/`rebuild_display_canvas`) — `None` when the
+    /// document has no constraint fences at all, so the footer can render
+    /// nothing rather than a vacuous "0/0" (same convention the web UI's
+    /// toolbar badge uses).
+    pub constraint_stats: Option<(usize, usize)>,
 }
 
 /// A non-secret declaration's currently-resolved value with no overrides
@@ -183,6 +190,7 @@ impl App {
         let var_cache = VarCache::load(&canvas_path).unwrap_or_else(|_| VarCache::in_memory());
         let expanded = HashSet::new();
         let display_canvas = resolve_includes(&canvas, &canvas_path);
+        let constraint_stats = constraint_stats(&display_canvas);
         let rows = tree::flatten(&display_canvas, &expanded);
         // `Picker::from_query_stdio()` (protocol auto-detection) turned out
         // to be unreliable across real terminals in practice — a terminal
@@ -216,6 +224,7 @@ impl App {
             status: String::new(),
             show_help: false,
             should_quit: false,
+            constraint_stats,
         };
         app.render_current_document();
         Ok(app)
@@ -514,6 +523,7 @@ impl App {
 
     fn rebuild_display_canvas(&mut self) {
         self.display_canvas = resolve_includes(&self.canvas, &self.canvas_path);
+        self.constraint_stats = constraint_stats(&self.display_canvas);
     }
 
     /// Whether the currently selected row is a `file` node with a
@@ -952,7 +962,25 @@ impl App {
 /// unresolved canvas rather than refusing to show anything — the rest of
 /// the document is still worth browsing even if one `include` is broken.
 fn resolve_includes(canvas: &Canvas, canvas_path: &Path) -> Canvas {
-    meshfox_core::include::resolve(canvas, canvas_path).unwrap_or_else(|_| canvas.clone())
+    let mut resolved = meshfox_core::include::resolve(canvas, canvas_path).unwrap_or_else(|_| canvas.clone());
+    // Populates every node's `constraint_results` (see
+    // `meshfox_core::constraint::annotate_status`) so `tree::flatten` and
+    // `constraint_stats` below can read pass/fail straight off the tree
+    // without re-evaluating it themselves.
+    meshfox_core::constraint::annotate_status(&mut resolved);
+    resolved
+}
+
+/// `(total, failed)` across every embedded constraint fence in `canvas`
+/// (already `annotate_status`-ed by `resolve_includes`) — `None` when there
+/// are none at all. See `App::constraint_stats`.
+fn constraint_stats(canvas: &Canvas) -> Option<(usize, usize)> {
+    let results: Vec<_> = canvas.nodes.iter().flat_map(|n| n.constraint_results.iter()).collect();
+    if results.is_empty() {
+        return None;
+    }
+    let failed = results.iter().filter(|r| !r.ok).count();
+    Some((results.len(), failed))
 }
 
 fn load_image_protocol(picker: &mut Picker, path: &Path) -> Option<Protocol> {

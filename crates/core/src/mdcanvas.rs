@@ -63,14 +63,12 @@ pub enum ParseError {
     UnknownExplicitParent(String, String),
     #[error("node {0:?}'s parent chain (via explicit parent= overrides) cycles back to itself")]
     CyclicParent(String),
-    #[error("node {0:?} has unknown type={1:?} (expected text, file, link, group, include, or constraint)")]
+    #[error("node {0:?} has unknown type={1:?} (expected text, file, link, group, or include)")]
     UnknownNodeType(String, String),
     #[error("group node {0:?} must have an empty body (groups are purely organizational)")]
     GroupHasBody(String),
     #[error("{1} node {0:?} must have a body that is exactly one Markdown link, e.g. [label](target)")]
     InvalidLinkBody(String, &'static str),
-    #[error("constraint node {0:?} must have a body that is exactly one ```starlark fence, nothing else")]
-    InvalidConstraintBody(String),
 }
 
 impl Canvas {
@@ -149,7 +147,6 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
             Some("link") => NodeType::Link,
             Some("group") => NodeType::Group,
             Some("include") => NodeType::Include,
-            Some("constraint") => NodeType::Constraint,
             Some(other) => {
                 return Err(ParseError::UnknownNodeType(id.clone(), other.to_string()))
             }
@@ -167,12 +164,6 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
                 Some((_, target)) => Some(target),
                 None => return Err(ParseError::InvalidLinkBody(id.clone(), node_type.as_str())),
             },
-            NodeType::Constraint => {
-                if crate::fence::single_starlark_fence(&body).is_none() {
-                    return Err(ParseError::InvalidConstraintBody(id.clone()));
-                }
-                None
-            }
             NodeType::Text => None,
         };
 
@@ -198,7 +189,7 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
             lang: seg.node_attrs.get("lang").cloned(),
             interpreter: seg.node_attrs.get("interpreter").cloned(),
             text: body,
-            constraint_status: None,
+            constraint_results: Vec::new(),
         });
     }
 
@@ -1923,30 +1914,17 @@ Reused from Tests as well.
     }
 
     #[test]
-    fn constraint_node_requires_exactly_one_starlark_fence() {
-        let ok = "# Root\n\n## Check\n<!-- meshfox:node type=\"constraint\" -->\n\n```starlark\npass\n```\n";
-        let c = parse(ok).unwrap();
-        assert_eq!(c.node("check").unwrap().node_type, NodeType::Constraint);
-        assert_eq!(c.node("check").unwrap().text, "```starlark\npass\n```");
-
-        let prose_around =
-            "# Root\n\n## Check\n<!-- meshfox:node type=\"constraint\" -->\n\nsee below\n\n```starlark\npass\n```\n";
-        assert_eq!(
-            parse(prose_around).unwrap_err(),
-            ParseError::InvalidConstraintBody("check".to_string())
-        );
-
-        let wrong_lang = "# Root\n\n## Check\n<!-- meshfox:node type=\"constraint\" -->\n\n```lua\npass\n```\n";
-        assert_eq!(
-            parse(wrong_lang).unwrap_err(),
-            ParseError::InvalidConstraintBody("check".to_string())
-        );
-
-        let empty = "# Root\n\n## Check\n<!-- meshfox:node type=\"constraint\" -->\n\nbody\n";
-        assert_eq!(
-            parse(empty).unwrap_err(),
-            ParseError::InvalidConstraintBody("check".to_string())
-        );
+    fn a_node_body_can_carry_an_embedded_constraint_fence_alongside_anything_else() {
+        // No dedicated node type or body-shape restriction any more — a
+        // `` ```starlark constraint `` fence is just part of a normal
+        // node's Markdown, same as a runnable `` ```bash name="..." ``
+        // fence. See `crate::constraint`/`crate::fence::scan_constraint_blocks`
+        // for the actual evaluation, not `parse` — the parser doesn't know
+        // or care that the fence is there.
+        let md = "# Root\n\n## Check\n<!-- meshfox:node -->\n\nsee below\n\n```starlark constraint\npass\n```\n";
+        let c = parse(md).unwrap();
+        assert_eq!(c.node("check").unwrap().node_type, NodeType::Text);
+        assert!(c.node("check").unwrap().text.contains("```starlark constraint\npass\n```"));
     }
 
     #[test]

@@ -346,21 +346,39 @@ fn build_code_block(f: RawFence, lang: String, attrs: HashMap<String, String>, n
     }
 }
 
-/// The Starlark source of a `Constraint` node's body, if `body` (already
-/// trimmed by the caller — see `mdcanvas::parse`) is *exactly* one
-/// ` ```starlark ` fence and nothing else — same "body is exactly one
-/// thing" shape `parse_single_link` enforces for `file`/`link`/`include`.
-/// Any surrounding prose, more than one fence, or a fence in some other
-/// language all fail this, same as a malformed link fails
-/// `parse_single_link`.
-pub fn single_starlark_fence(body: &str) -> Option<String> {
-    let fences = scan_raw_fences(body);
-    let [fence] = fences.as_slice() else { return None };
-    if fence.span != (0..body.len()) {
-        return None;
-    }
-    let (lang, _attrs) = parse_info_string(&fence.info);
-    (lang == "starlark").then(|| fence.code.clone())
+/// One ` ```starlark constraint ` fence found by `scan_constraint_blocks` —
+/// a Starlark contract embedded in a node's body (see `crate::constraint`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConstraintBlock {
+    /// Explicit `name="..."` attribute, if given — see
+    /// `crate::constraint::evaluate` for how a block without one gets a
+    /// default label.
+    pub name: Option<String>,
+    pub code: String,
+    pub span: Range<usize>,
+}
+
+/// Every ` ```starlark constraint ` fence in `markdown`, in document order
+/// — a node's embedded Starlark contracts (see `crate::constraint`). A
+/// plain ` ```starlark ` fence without the bare `constraint` flag is left
+/// alone (e.g. a documentation example showing Starlark syntax), the same
+/// way an unnamed `bash` fence is left alone by `scan_code_blocks` unless
+/// it opts in with `name=`.
+pub fn scan_constraint_blocks(markdown: &str) -> Vec<ConstraintBlock> {
+    scan_raw_fences(markdown)
+        .into_iter()
+        .filter_map(|f| {
+            let (lang, attrs) = parse_info_string(&f.info);
+            if lang != "starlark" {
+                return None;
+            }
+            let is_constraint = attrs.get("constraint").map(|v| v != "false").unwrap_or(false);
+            if !is_constraint {
+                return None;
+            }
+            Some(ConstraintBlock { name: attrs.get("name").cloned(), code: f.code.clone(), span: f.span.clone() })
+        })
+        .collect()
 }
 
 /// Rewrites every top-level fenced code block's info string down to just its
@@ -711,38 +729,50 @@ mod tests {
     }
 
     #[test]
-    fn single_starlark_fence_extracts_the_sole_fence_code() {
-        let body = "```starlark\nfail(\"bad\")\n```";
-        assert_eq!(single_starlark_fence(body).as_deref(), Some("fail(\"bad\")"));
+    fn scan_constraint_blocks_finds_a_flagged_fence() {
+        let md = "prose\n\n```starlark constraint\nfail(\"bad\")\n```\n\nmore prose";
+        let blocks = scan_constraint_blocks(md);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].code, "fail(\"bad\")");
+        assert_eq!(blocks[0].name, None);
     }
 
     #[test]
-    fn single_starlark_fence_rejects_surrounding_prose() {
-        let body = "some text\n```starlark\nfail(\"bad\")\n```";
-        assert_eq!(single_starlark_fence(body), None);
+    fn scan_constraint_blocks_ignores_a_plain_starlark_fence() {
+        // No bare `constraint` flag — just an example/documentation fence,
+        // not a real check.
+        let md = "```starlark\nfail(\"bad\")\n```";
+        assert!(scan_constraint_blocks(md).is_empty());
     }
 
     #[test]
-    fn single_starlark_fence_rejects_trailing_prose() {
-        let body = "```starlark\nfail(\"bad\")\n```\nmore text";
-        assert_eq!(single_starlark_fence(body), None);
+    fn scan_constraint_blocks_ignores_wrong_language_even_with_the_flag() {
+        let md = "```lua constraint\nfail(\"bad\")\n```";
+        assert!(scan_constraint_blocks(md).is_empty());
     }
 
     #[test]
-    fn single_starlark_fence_rejects_wrong_language() {
-        let body = "```lua\nfail(\"bad\")\n```";
-        assert_eq!(single_starlark_fence(body), None);
+    fn scan_constraint_blocks_reads_the_name_attribute() {
+        let md = "```starlark constraint name=\"table-shape\"\npass\n```";
+        let blocks = scan_constraint_blocks(md);
+        assert_eq!(blocks[0].name.as_deref(), Some("table-shape"));
     }
 
     #[test]
-    fn single_starlark_fence_rejects_more_than_one_fence() {
-        let body = "```starlark\na()\n```\n```starlark\nb()\n```";
-        assert_eq!(single_starlark_fence(body), None);
+    fn scan_constraint_blocks_finds_several_in_document_order() {
+        let md = "```starlark constraint name=\"a\"\npass\n```\n\ntext\n\n```starlark constraint name=\"b\"\npass\n```\n";
+        let blocks = scan_constraint_blocks(md);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].name.as_deref(), Some("a"));
+        assert_eq!(blocks[1].name.as_deref(), Some("b"));
     }
 
     #[test]
-    fn single_starlark_fence_rejects_no_fence() {
-        assert_eq!(single_starlark_fence("just prose"), None);
+    fn scan_constraint_blocks_coexists_with_prose_and_other_fences() {
+        let md = "some description\n\n```bash name=\"build\"\ncargo build\n```\n\n```starlark constraint\npass\n```\n";
+        let blocks = scan_constraint_blocks(md);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].code, "pass");
     }
 
     #[test]

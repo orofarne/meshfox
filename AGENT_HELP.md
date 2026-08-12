@@ -53,9 +53,10 @@ It runs the same parse checks every other command does, without executing or
 writing anything, and exits non-zero on failure — safe to chain in a script
 or run right after any edit, by hand or via `node`.
 
-If the document has any `type="constraint"` nodes (a Starlark contract over
-the tree, e.g. "every node tagged `table` has exactly one `file` child" —
-see `meshfox spec`'s "Constraint nodes"), also run:
+If the document has any embedded ` ```starlark constraint ` fences (a
+Starlark contract over the tree, living in any node's own body, e.g.
+"every node tagged `table` has exactly one `file` child" — see `meshfox
+spec`'s "Constraint fences"), also run:
 
     meshfox check <file>
 

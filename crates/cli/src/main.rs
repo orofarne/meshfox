@@ -181,16 +181,17 @@ enum Command {
         /// single candidate in the current directory.
         canvas: Option<PathBuf>,
     },
-    /// Run every `constraint`-type node's Starlark contract against the
-    /// document (see `crate::constraint`/SPEC.md's "Constraint nodes") and
-    /// report which passed. Distinct from `validate`: `validate` checks
-    /// that the file *parses* as a well-formed canvas; `check` asks whether
-    /// the document as a whole satisfies whatever rules its own constraint
-    /// nodes declare (e.g. "every node tagged `table` has exactly one
-    /// `file` child") — implies `validate` first, since an unparseable file
-    /// has no constraints to run. Exits non-zero if the file fails to parse
-    /// or any constraint fails, so it's usable as a pre-commit/CI check
-    /// alongside (or instead of) `validate`.
+    /// Run every embedded ` ```starlark constraint ` fence's Starlark
+    /// contract against the document (see `crate::constraint`/SPEC.md's
+    /// "Constraint nodes") and report which passed. Distinct from
+    /// `validate`: `validate` checks that the file *parses* as a
+    /// well-formed canvas; `check` asks whether the document as a whole
+    /// satisfies whatever rules its own constraint fences declare (e.g.
+    /// "every node tagged `table` has exactly one `file` child") — implies
+    /// `validate` first, since an unparseable file has no constraints to
+    /// run. Exits non-zero if the file fails to parse or any constraint
+    /// fails, so it's usable as a pre-commit/CI check alongside (or
+    /// instead of) `validate`.
     Check {
         /// Path to the .canvas.md file. If omitted: auto-discover the
         /// single candidate in the current directory.
@@ -386,8 +387,7 @@ enum NodeCommand {
         height: Option<f64>,
         #[arg(long)]
         color: Option<String>,
-        /// `text` (the default), `file`, `link`, `group`, `include`, or
-        /// `constraint`.
+        /// `text` (the default), `file`, `link`, `group`, or `include`.
         #[arg(long = "type")]
         node_type: Option<String>,
         /// `file`-node display mode: `link` (the default) or `code`.
@@ -691,10 +691,11 @@ fn validate(canvas_path: &PathBuf) {
     }
 }
 
-/// Runs every `constraint` node's Starlark contract (`meshfox_core::constraint::evaluate`)
-/// and reports pass/fail per node, same exit-code convention as every other
-/// check here (non-zero if the file doesn't parse, or if any constraint
-/// fails) — usable in CI/pre-commit alongside `validate`.
+/// Runs every embedded constraint fence's Starlark contract
+/// (`meshfox_core::constraint::evaluate`) and reports pass/fail per fence,
+/// same exit-code convention as every other check here (non-zero if the
+/// file doesn't parse, or if any constraint fails) — usable in CI/pre-commit
+/// alongside `validate`.
 fn check(canvas_path: &PathBuf) {
     let raw = std::fs::read_to_string(canvas_path).unwrap_or_else(|e| {
         eprintln!("failed to read {}: {e}", canvas_path.display());
@@ -707,15 +708,15 @@ fn check(canvas_path: &PathBuf) {
 
     let results = meshfox_core::evaluate_constraints(&canvas);
     if results.is_empty() {
-        println!("meshfox check: {} ok (no constraint nodes)", canvas_path.display());
+        println!("meshfox check: {} ok (no constraints)", canvas_path.display());
         return;
     }
 
     for r in &results {
         if r.ok {
-            println!("meshfox check: ok   {} {:?}", r.node_id, r.title);
+            println!("meshfox check: ok   {} {:?}", r.label, r.title);
         } else {
-            eprintln!("meshfox check: FAIL {} {:?}", r.node_id, r.title);
+            eprintln!("meshfox check: FAIL {} {:?}", r.label, r.title);
             for msg in &r.messages {
                 eprintln!("meshfox check:         {msg}");
             }
@@ -1623,8 +1624,7 @@ fn parse_node_type(s: &str) -> Result<NodeType, String> {
         "link" => Ok(NodeType::Link),
         "group" => Ok(NodeType::Group),
         "include" => Ok(NodeType::Include),
-        "constraint" => Ok(NodeType::Constraint),
-        _ => Err(format!("unknown --type {s:?} (expected text/file/link/group/include/constraint)")),
+        _ => Err(format!("unknown --type {s:?} (expected text/file/link/group/include)")),
     }
 }
 
@@ -2238,7 +2238,6 @@ Shared body.
         assert_eq!(parse_node_type("link").unwrap(), NodeType::Link);
         assert_eq!(parse_node_type("group").unwrap(), NodeType::Group);
         assert_eq!(parse_node_type("include").unwrap(), NodeType::Include);
-        assert_eq!(parse_node_type("constraint").unwrap(), NodeType::Constraint);
         assert!(parse_node_type("bogus").is_err());
     }
 

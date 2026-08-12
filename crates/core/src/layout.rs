@@ -262,7 +262,7 @@ fn intrinsic_size(node: &Node) -> (f64, f64) {
 fn estimate_size(node: &Node) -> (f64, f64) {
     match node.node_type {
         NodeType::Group => (NARROW_WIDTH, MIN_HEIGHT),
-        NodeType::File | NodeType::Link | NodeType::Include | NodeType::Constraint => {
+        NodeType::File | NodeType::Link | NodeType::Include => {
             (NARROW_WIDTH, TITLE_HEIGHT + BODY_PADDING + LINE_HEIGHT * 2.0)
         }
         NodeType::Text => estimate_text_size(&node.text),
