@@ -73,9 +73,12 @@ export interface CanvasDoc {
 
 // Mirrors crates/server/src/lib.rs's `VarStatus` (JSON shape, camelCase) —
 // one declared `meshfox:var` per entry, see SPEC.md's "Variables". `value`
-// is only present when `resolved` is true and the variable isn't `secret`
-// — a secret is never sent to the browser even if the server process's own
-// environment already resolved it, since there's no reason to.
+// is omitted for a `secret` variable regardless of `resolved` — a secret is
+// never sent to the browser even if the server process's own environment
+// already resolved it, since there's no reason to. For a non-secret
+// variable, `value` can be present even when `resolved` is false: a
+// `required` declaration that's still unconfirmed still carries its own
+// `default` here, purely as VarsForm's pre-filled suggestion.
 export interface VarStatus {
   name: string;
   type: "string" | "int" | "bool" | "select";

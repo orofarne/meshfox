@@ -13,7 +13,7 @@ use meshfox_core::deps::BlockAddr;
 use meshfox_core::fence::{self, scan_runnable_blocks};
 use meshfox_core::mdcanvas;
 use meshfox_core::output::{write_output, ExecOutput};
-use meshfox_core::vars::{declared_vars, resolve_block_env, VarDecl};
+use meshfox_core::vars::{declared_vars, resolve_block_env, VarDecl, VarType};
 use meshfox_core::{Canvas, FileDisplay, NodeType, VarCache};
 use meshfox_server::stream_exec::SpawnedProcess;
 use ratatui::layout::Rect;
@@ -34,10 +34,25 @@ pub enum Focus {
     Document,
 }
 
-pub struct VarPromptState {
-    pub decl: VarDecl,
-    pub input: String,
-    pub queue: Vec<VarDecl>,
+/// A modal form for one or more declared variables at once — all of them
+/// visible and editable together (arrow keys move the focused field,
+/// Enter submits the whole form), same shape as the web UI's `VarsForm`,
+/// rather than asking one at a time. Built either by `advance_run` (just
+/// whatever a run still needs) or by `trigger_configure` (every declared
+/// non-secret variable in the document).
+pub struct VarFormState {
+    pub decls: Vec<VarDecl>,
+    /// Parallel to `decls` — one editable buffer per field, pre-filled
+    /// with `current_value` (so submitting untouched just confirms the
+    /// suggestion).
+    pub inputs: Vec<String>,
+    pub selected: usize,
+    /// `true` for a `c`-triggered walk of every declared (non-secret)
+    /// variable (see `trigger_configure`), `false` for the ordinary
+    /// "resolve whatever a run still needs" form (`advance_run`) — purely
+    /// so `ui.rs` can title the modal accordingly and so submitting it
+    /// doesn't try to resume a run that was never started.
+    pub configuring: bool,
 }
 
 pub struct BlockChoice {
@@ -118,10 +133,46 @@ pub struct App {
     pub run: Option<RunState>,
     pub pending_tty: Option<PendingTty>,
     pub block_picker: Option<BlockPickerState>,
-    pub var_prompt: Option<VarPromptState>,
+    pub var_form: Option<VarFormState>,
     pub status: String,
     pub show_help: bool,
     pub should_quit: bool,
+}
+
+/// A non-secret declaration's currently-resolved value with no overrides
+/// in play — the process environment, then the on-disk cache, then its
+/// own `default` — same precedence `vars::resolve` uses minus the
+/// `run_overrides`/form-override step, and the same idea as the CLI's own
+/// `current_value` in `main.rs`. Shown as a var form field's pre-filled
+/// suggestion, both for `advance_run`'s "still missing" form (where, by
+/// construction, this can only ever equal `decl.default` — env/cache
+/// already failed, or it wouldn't be missing) and for `trigger_configure`'s
+/// "every declared variable" form (where it's the actual point: show
+/// what's already resolved, not just the bare `default`).
+fn current_value(decl: &VarDecl, cache: &VarCache) -> Option<String> {
+    std::env::var(&decl.name).ok().or_else(|| cache.get(&decl.name).map(str::to_string)).or_else(|| decl.default.clone())
+}
+
+/// A var form field's starting value, coerced to something its own
+/// control can actually represent — a `bool` field is a toggle, so its
+/// value is always canonically `"true"` or `"false"` (anything else,
+/// including no suggestion at all, starts as `"false"`); a `select` field
+/// is a chooser over `decl.choices`, so a suggestion that isn't actually
+/// one of them (a stale cache entry from before `choices=` changed, say)
+/// falls back to the first choice rather than displaying something the
+/// left/right cycle could never have produced itself. `String`/`Int`
+/// fields are free text, so whatever `current_value` found (or an empty
+/// string) passes through unchanged.
+fn initial_field_input(decl: &VarDecl, cache: &VarCache) -> String {
+    let suggestion = current_value(decl, cache);
+    match decl.var_type {
+        VarType::Bool => if suggestion.as_deref() == Some("true") { "true" } else { "false" }.to_string(),
+        VarType::Select => match suggestion {
+            Some(v) if decl.choices.iter().any(|c| c == &v) => v,
+            _ => decl.choices.first().cloned().unwrap_or_default(),
+        },
+        VarType::String | VarType::Int => suggestion.unwrap_or_default(),
+    }
 }
 
 impl App {
@@ -161,7 +212,7 @@ impl App {
             run: None,
             pending_tty: None,
             block_picker: None,
-            var_prompt: None,
+            var_form: None,
             status: String::new(),
             show_help: false,
             should_quit: false,
@@ -171,8 +222,8 @@ impl App {
     }
 
     pub async fn on_key(&mut self, key: KeyEvent) {
-        if self.var_prompt.is_some() {
-            self.on_var_prompt_key(key).await;
+        if self.var_form.is_some() {
+            self.on_var_form_key(key).await;
             return;
         }
         if self.block_picker.is_some() {
@@ -210,6 +261,7 @@ impl App {
             KeyCode::Char('r') => self.trigger_run(true).await,
             KeyCode::Char('R') => self.trigger_run(false).await,
             KeyCode::Char('K') => self.kill_running(),
+            KeyCode::Char('c') => self.trigger_configure(),
             KeyCode::PageDown => self.scroll_document(10),
             KeyCode::PageUp => self.scroll_document(-10),
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => self.scroll_document(10),
@@ -218,21 +270,76 @@ impl App {
         }
     }
 
-    async fn on_var_prompt_key(&mut self, key: KeyEvent) {
+    /// All of `var_form`'s fields at once — arrow keys/Tab move which one's
+    /// focused, and Enter submits the *whole* form regardless of which
+    /// field is focused (same as pressing Enter in an HTML text input
+    /// submits its enclosing `<form>`, which is what the web UI's own
+    /// `VarsForm` is). Editing a field is type-aware, same control each
+    /// type gets in `VarsForm`/the CLI's own line prompt: `String`/`Int`
+    /// take free text (type/backspace); `Bool` and `Select` are a
+    /// left/right toggle/cycle instead — typing a character or backspace
+    /// does nothing to those, since there's no text to edit.
+    async fn on_var_form_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Enter => self.submit_var_prompt().await,
-            KeyCode::Esc => self.cancel_var_prompt(),
+            KeyCode::Enter => self.submit_var_form().await,
+            KeyCode::Esc => self.cancel_var_form(),
+            KeyCode::Up | KeyCode::BackTab => {
+                if let Some(vf) = &mut self.var_form {
+                    vf.selected = vf.selected.checked_sub(1).unwrap_or(vf.decls.len() - 1);
+                }
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                if let Some(vf) = &mut self.var_form {
+                    vf.selected = (vf.selected + 1) % vf.decls.len();
+                }
+            }
+            KeyCode::Left => self.cycle_var_form_field(-1),
+            KeyCode::Right => self.cycle_var_form_field(1),
             KeyCode::Backspace => {
-                if let Some(vp) = &mut self.var_prompt {
-                    vp.input.pop();
+                if let Some(vf) = &mut self.var_form {
+                    let i = vf.selected;
+                    if matches!(vf.decls[i].var_type, VarType::String | VarType::Int) {
+                        vf.inputs[i].pop();
+                    }
                 }
             }
             KeyCode::Char(c) => {
-                if let Some(vp) = &mut self.var_prompt {
-                    vp.input.push(c);
+                if let Some(vf) = &mut self.var_form {
+                    let i = vf.selected;
+                    if matches!(vf.decls[i].var_type, VarType::String | VarType::Int) {
+                        vf.inputs[i].push(c);
+                    }
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Left/right on the focused field of `var_form` — a no-op for
+    /// `String`/`Int` (nothing to cycle through), flips `Bool` between
+    /// `"true"`/`"false"`, and steps `Select` to the next/previous
+    /// `choices` entry (wrapping both ways), starting from wherever the
+    /// current value sits (or the first choice, if it somehow isn't one —
+    /// same fallback `initial_field_input` already applies when a field is
+    /// first built).
+    fn cycle_var_form_field(&mut self, dir: i32) {
+        let Some(vf) = &mut self.var_form else { return };
+        let i = vf.selected;
+        match vf.decls[i].var_type {
+            VarType::Bool => {
+                vf.inputs[i] = if vf.inputs[i] == "true" { "false" } else { "true" }.to_string();
+            }
+            VarType::Select => {
+                let choices = &vf.decls[i].choices;
+                if choices.is_empty() {
+                    return;
+                }
+                let len = choices.len() as i32;
+                let current = choices.iter().position(|c| c == &vf.inputs[i]).map(|p| p as i32).unwrap_or(0);
+                let next = (current + dir).rem_euclid(len) as usize;
+                vf.inputs[i] = choices[next].clone();
+            }
+            VarType::String | VarType::Int => {}
         }
     }
 
@@ -266,7 +373,7 @@ impl App {
     /// it. Nothing else (run/kill buttons, clicking inside a `tty`
     /// handoff) is wired up yet.
     pub fn on_mouse(&mut self, mouse: MouseEvent) {
-        if self.var_prompt.is_some() || self.block_picker.is_some() {
+        if self.var_form.is_some() || self.block_picker.is_some() {
             return; // modal is up — no pane underneath it to click through to
         }
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -556,10 +663,8 @@ impl App {
 
             let resolution = resolve_block_env(&block.env, &self.decls, &self.run_overrides, &self.var_cache);
             if !resolution.missing.is_empty() {
-                let mut queue = resolution.missing;
-                let decl = queue.remove(0);
-                let input = decl.default.clone().unwrap_or_default();
-                self.var_prompt = Some(VarPromptState { decl, input, queue });
+                let inputs = resolution.missing.iter().map(|d| initial_field_input(d, &self.var_cache)).collect();
+                self.var_form = Some(VarFormState { decls: resolution.missing, inputs, selected: 0, configuring: false });
                 return;
             }
 
@@ -682,24 +787,69 @@ impl App {
         }
     }
 
-    async fn submit_var_prompt(&mut self) {
-        let Some(vp) = self.var_prompt.take() else { return };
-        if !vp.decl.secret {
-            let _ = self.var_cache.set(&vp.decl.name, &vp.input);
+    /// Saves every field in `var_form` at once — whatever's currently
+    /// typed in each, not just the focused one — same "submit the whole
+    /// form" semantics as the web UI's `VarsForm`. A `secret` field is
+    /// never written to the cache (still resolves for just this run via
+    /// `run_overrides`, same as before), matching `vars::resolve`'s own
+    /// secret handling.
+    async fn submit_var_form(&mut self) {
+        let Some(vf) = self.var_form.take() else { return };
+        for (decl, value) in vf.decls.iter().zip(vf.inputs.iter()) {
+            if !decl.secret {
+                let _ = self.var_cache.set(&decl.name, value);
+            }
+            self.run_overrides.insert(decl.name.clone(), value.clone());
         }
-        self.run_overrides.insert(vp.decl.name.clone(), vp.input.clone());
-        if !vp.queue.is_empty() {
-            let mut queue = vp.queue;
-            let decl = queue.remove(0);
-            let input = decl.default.clone().unwrap_or_default();
-            self.var_prompt = Some(VarPromptState { decl, input, queue });
+        if vf.configuring {
+            self.status = "meshfox: saved declared variable(s) to the cache".into();
         } else {
             self.advance_run().await;
         }
     }
 
-    fn cancel_var_prompt(&mut self) {
-        self.var_prompt = None;
+    /// `c` — walks every declared non-secret variable in the whole
+    /// document (regardless of which, if any, block currently references
+    /// it via `env=`), same scope `meshfox configure` covers, all shown at
+    /// once with each one's currently-resolved value as the pre-filled
+    /// suggestion. Confirming (even unchanged) writes it to the cache —
+    /// the browser counterpart is `VarsForm` opened from the toolbar's
+    /// "configure" button; see `crates/server/src/lib.rs`'s
+    /// `/api/vars/configure`. A no-op (past a status message) when
+    /// there's nothing configurable, or while a run/another form/the
+    /// block picker is already active.
+    fn trigger_configure(&mut self) {
+        if self.var_form.is_some() || self.block_picker.is_some() {
+            return;
+        }
+        if self.run.as_ref().is_some_and(|r| !r.finished) {
+            self.status = "a run is already in progress — press K to kill it first".into();
+            return;
+        }
+        let decls: Vec<VarDecl> = self.decls.iter().filter(|d| !d.secret).cloned().collect();
+        if decls.is_empty() {
+            self.status = "meshfox: this canvas declares no configurable (non-secret) variable(s)".into();
+            return;
+        }
+        let inputs = decls.iter().map(|d| initial_field_input(d, &self.var_cache)).collect();
+        self.var_form = Some(VarFormState { decls, inputs, selected: 0, configuring: true });
+    }
+
+    /// Whether the footer/help hint for `c` (configure) should be shown at
+    /// all — same "configurable" definition `trigger_configure` itself
+    /// uses (declared, non-secret; a document that declares only secret
+    /// variables has nothing `c` could usefully do, same as the CLI's own
+    /// `configure` skipping them).
+    pub fn has_configurable_vars(&self) -> bool {
+        self.decls.iter().any(|d| !d.secret)
+    }
+
+    fn cancel_var_form(&mut self) {
+        let Some(vf) = self.var_form.take() else { return };
+        if vf.configuring {
+            self.status = "configure cancelled".into();
+            return;
+        }
         if let Some(run) = &mut self.run {
             run.finished = true;
             run.had_failure = true;

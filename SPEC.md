@@ -341,6 +341,7 @@ variable is always document-wide, never per-node:
     <!-- meshfox:var name="INSTALL_PATH" prompt="Install prefix?" default="/usr/local/bin" -->
     <!-- meshfox:var name="LOG_LEVEL" type="select" choices="debug,info,warn,error" default="info" -->
     <!-- meshfox:var name="API_TOKEN" secret -->
+    <!-- meshfox:var name="REGION" default="us-east-1" required -->
 
 Attributes:
 
@@ -362,6 +363,18 @@ Attributes:
   pre-filled anywhere — the only way to supply one without an
   interactive prompt is `--set`/the process environment. It's asked for
   fresh every single time it's needed.
+- `required` — flag (`required` or `required=true`). A `required`
+  variable's own `default` is never taken silently, even when nothing
+  else resolves it — it still needs one explicit interactive answer, the
+  same as if it had no `default` at all, with `default` offered as the
+  prompt's own pre-filled suggestion (so confirming it is just pressing
+  Enter). This is only a one-time confirmation, not a standing "ask every
+  run": like any other non-secret answer, whatever's confirmed is written
+  to the cache, so the next run of any block referencing it resolves
+  straight from there without prompting again. Without `required`, a
+  variable with a `default` is simply used, never prompted for, unless it
+  has no `default` at all (in which case it always needs an answer either
+  way).
 
 ### Consumption (`env=`)
 
@@ -391,11 +404,13 @@ Resolving one declared variable (for whichever block's `env=` asked for
 it) tries, in order: an explicit override (`meshfox run --set
 NAME=value`, or a value submitted through the web UI's form) → the
 process environment → the on-disk cache (skipped entirely for `secret`)
-→ the declaration's own `default`. Whatever isn't resolved by any of
-those needs an interactive answer — a terminal prompt for the CLI, a
-form for the web UI — which, for a non-secret variable, is then written
-to the cache so a later run of *any* block referencing the same variable
-doesn't ask again.
+→ the declaration's own `default` (skipped entirely for `required` — see
+above). Whatever isn't resolved by any of those needs an interactive
+answer — a terminal prompt for the CLI, a form for the web UI — which,
+for a non-secret variable, is then written to the cache so a later run of
+*any* block referencing the same variable doesn't ask again (this is what
+turns a `required` variable's mandatory first confirmation into an
+ordinary cache hit on every run after).
 
 The cache lives at `<dir>/.meshfox/<filename>.env`, next to the canvas
 file itself (e.g. `examples/hello.canvas.md` ->

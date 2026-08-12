@@ -195,6 +195,11 @@ struct RunRequest {
 /// variable's `value` is always omitted (even if it happens to already be
 /// resolved via the server process's own environment) — no reason to ever
 /// put a secret on the wire if the browser doesn't need to ask for it.
+/// A `required` variable that's still unconfirmed shows up as
+/// `resolved: false` with its own `default` carried in `value` anyway —
+/// not because it's resolved, but so the form the UI opens for it can
+/// still offer that default as a pre-filled suggestion instead of a blank
+/// field (see `meshfox_core::vars::resolve`).
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct VarStatus {
@@ -246,22 +251,92 @@ async fn get_vars(
 
     let cache = state.vars_cache.lock().unwrap();
     let resolved = meshfox_core::resolve_vars(&relevant, &HashMap::new(), &cache);
-    let statuses = relevant
-        .into_iter()
-        .map(|d| {
-            let resolved_value = resolved.values.get(&d.name).cloned();
-            VarStatus {
-                name: d.name.clone(),
-                var_type: d.var_type.as_str(),
-                prompt: d.prompt,
-                choices: d.choices,
-                secret: d.secret,
-                resolved: resolved_value.is_some(),
-                value: if d.secret { None } else { resolved_value },
-            }
-        })
-        .collect();
+    let statuses = relevant.into_iter().map(|d| var_status(d, &resolved)).collect();
     Ok(Json(statuses))
+}
+
+/// Builds one `VarStatus` from a declaration and the already-computed
+/// `ResolvedVars` for the whole batch — split out from `get_vars` so this
+/// (pure, `State`/`Query`-free) mapping is unit-testable on its own.
+fn var_status(d: meshfox_core::VarDecl, resolved: &meshfox_core::ResolvedVars) -> VarStatus {
+    let resolved_value = resolved.values.get(&d.name).cloned();
+    let is_resolved = resolved_value.is_some();
+    // A `required` declaration with nothing else supplying it lands in
+    // `resolved.values` as absent (see `vars::resolve`) even though it has
+    // a `default` — fall back to that `default` here purely so the form
+    // still has something to pre-fill, without marking it `resolved`.
+    let value = resolved_value.or_else(|| d.default.clone());
+    VarStatus {
+        name: d.name,
+        var_type: d.var_type.as_str(),
+        prompt: d.prompt,
+        choices: d.choices,
+        secret: d.secret,
+        resolved: is_resolved,
+        value: if d.secret { None } else { value },
+    }
+}
+
+/// `GET /api/vars/configure` — every declared *non-secret* `meshfox:var`
+/// in the whole document, in declaration order, regardless of which (if
+/// any) block's `env=` actually references it. The browser counterpart to
+/// `meshfox configure` (see `crates/cli/src/main.rs`'s `configure`, and
+/// the TUI's `c` key): unlike `GET /api/vars`, this is never scoped to one
+/// block's chain, and a `secret` declaration is left out entirely — same
+/// as the CLI, asking for one that's never cached and immediately
+/// discarded again wouldn't do anything useful.
+async fn get_configure_vars(State(state): State<Arc<AppState>>) -> Result<Json<Vec<VarStatus>>, ApiError> {
+    let raw = state.raw.lock().unwrap().clone();
+    let canvas = parse_or_error(&raw)?;
+    let decls = meshfox_core::declared_vars(&canvas)
+        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    let configurable: Vec<_> = decls.into_iter().filter(|d| !d.secret).collect();
+
+    let cache = state.vars_cache.lock().unwrap();
+    let resolved = meshfox_core::resolve_vars(&configurable, &HashMap::new(), &cache);
+    let statuses = configurable.into_iter().map(|d| var_status(d, &resolved)).collect();
+    Ok(Json(statuses))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigureVarsRequest {
+    vars: HashMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigureVarsResponse {
+    saved: usize,
+}
+
+/// `POST /api/vars/configure` — the submit side of the form `GET`'s own
+/// endpoint feeds: every entry in `req.vars` naming a declared non-secret
+/// variable is written to the cache, *even if unchanged* from what was
+/// already there — same as `meshfox configure` always rewriting the
+/// cache with whatever's answered, confirmed or not, rather than only on
+/// an actual change. Doesn't run anything; this only ever updates the
+/// cache.
+async fn post_configure_vars(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ConfigureVarsRequest>,
+) -> Result<Json<ConfigureVarsResponse>, ApiError> {
+    let raw = state.raw.lock().unwrap().clone();
+    let canvas = parse_or_error(&raw)?;
+    let decls = meshfox_core::declared_vars(&canvas)
+        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+
+    let mut cache = state.vars_cache.lock().unwrap();
+    let mut saved = 0;
+    for decl in decls.iter().filter(|d| !d.secret) {
+        if let Some(value) = req.vars.get(&decl.name) {
+            cache.set(&decl.name, value).map_err(|e| {
+                ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to save {}: {e}", decl.name))
+            })?;
+            saved += 1;
+        }
+    }
+    Ok(Json(ConfigureVarsResponse { saved }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1773,6 +1848,7 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/nodes/:id/run", post(run_file_node))
         .route("/api/nodes/:id/open", post(open_node_file))
         .route("/api/vars", get(get_vars))
+        .route("/api/vars/configure", get(get_configure_vars).post(post_configure_vars))
         .route("/api/run", post(run_block))
         .route("/api/run/tty", get(run_block_tty))
         .route("/api/kill", post(kill_run))
@@ -2170,5 +2246,214 @@ mod run_file_tests {
         let (status, _) = post(addr, "/api/nodes/nope/open").await;
         assert_eq!(status, 404);
         let _ = std::fs::remove_file(&canvas_path);
+    }
+}
+
+#[cfg(test)]
+mod var_status_tests {
+    use super::*;
+
+    fn decl(name: &str, default: Option<&str>, required: bool, secret: bool) -> meshfox_core::VarDecl {
+        meshfox_core::VarDecl {
+            name: name.to_string(),
+            var_type: meshfox_core::VarType::String,
+            prompt: name.to_string(),
+            default: default.map(String::from),
+            choices: Vec::new(),
+            secret,
+            required,
+        }
+    }
+
+    #[test]
+    fn required_with_default_offers_it_unresolved() {
+        let d = decl("X", Some("default-val"), true, false);
+        let resolved = meshfox_core::resolve_vars(std::slice::from_ref(&d), &HashMap::new(), &VarCache::in_memory());
+        let status = var_status(d, &resolved);
+        assert!(!status.resolved);
+        assert_eq!(status.value.as_deref(), Some("default-val"));
+    }
+
+    #[test]
+    fn required_once_cached_resolves_normally() {
+        let d = decl("X", Some("default-val"), true, false);
+        let mut cache = VarCache::in_memory();
+        cache.set("X", "confirmed-val").unwrap();
+        let resolved = meshfox_core::resolve_vars(std::slice::from_ref(&d), &HashMap::new(), &cache);
+        let status = var_status(d, &resolved);
+        assert!(status.resolved);
+        assert_eq!(status.value.as_deref(), Some("confirmed-val"));
+    }
+
+    #[test]
+    fn plain_declaration_with_default_still_resolves_silently() {
+        let d = decl("X", Some("default-val"), false, false);
+        let resolved = meshfox_core::resolve_vars(std::slice::from_ref(&d), &HashMap::new(), &VarCache::in_memory());
+        let status = var_status(d, &resolved);
+        assert!(status.resolved);
+        assert_eq!(status.value.as_deref(), Some("default-val"));
+    }
+
+    #[test]
+    fn required_secret_never_sends_its_default_either() {
+        let d = decl("TOKEN", Some("default-val"), true, true);
+        let resolved = meshfox_core::resolve_vars(std::slice::from_ref(&d), &HashMap::new(), &VarCache::in_memory());
+        let status = var_status(d, &resolved);
+        assert!(!status.resolved);
+        assert_eq!(status.value, None);
+    }
+}
+
+#[cfg(test)]
+mod vars_endpoint_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    fn write_test_canvas(contents: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("meshfox-vars-test-{}.canvas.md", uuid::Uuid::new_v4()));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    /// Plain (non-chunked) GET — `/api/vars`'s response is a single JSON
+    /// array, not a stream, unlike `run_file_tests::post`'s target.
+    async fn get(addr: SocketAddr, path: &str) -> (u16, String) {
+        let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.expect("read");
+        let mut parts = response.splitn(2, "\r\n\r\n");
+        let head = parts.next().unwrap_or_default();
+        let body = parts.next().unwrap_or_default();
+        let status = head
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        (status, body.to_string())
+    }
+
+    const REQUIRED_CANVAS: &str = concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "<!-- meshfox:var name=\"INSTALL_PATH\" default=\"/usr/local/bin\" required -->\n\n",
+        "```bash name=\"install\" env=\"$INSTALL_PATH\"\necho hi\n```\n",
+    );
+
+    #[tokio::test]
+    async fn get_vars_reports_a_required_default_as_unresolved_but_prefilled() {
+        let canvas_path = write_test_canvas(REQUIRED_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, body) = get(addr, "/api/vars?block=install").await;
+        assert_eq!(status, 200);
+        let statuses: Vec<serde_json::Value> = serde_json::from_str(&body).expect("valid VarStatus JSON");
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0]["name"], "INSTALL_PATH");
+        assert_eq!(statuses[0]["resolved"], false);
+        assert_eq!(statuses[0]["value"], "/usr/local/bin");
+
+        let _ = std::fs::remove_file(&canvas_path);
+        let _ = std::fs::remove_dir_all(meshfox_core::varcache::cache_path(&canvas_path).parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn get_vars_reports_a_required_var_resolved_once_cached() {
+        let canvas_path = write_test_canvas(REQUIRED_CANVAS);
+        let mut cache = VarCache::load(&canvas_path).expect("load cache");
+        cache.set("INSTALL_PATH", "/opt/confirmed").expect("seed cache");
+
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let (status, body) = get(addr, "/api/vars?block=install").await;
+        assert_eq!(status, 200);
+        let statuses: Vec<serde_json::Value> = serde_json::from_str(&body).expect("valid VarStatus JSON");
+        assert_eq!(statuses[0]["resolved"], true);
+        assert_eq!(statuses[0]["value"], "/opt/confirmed");
+
+        let _ = std::fs::remove_file(&canvas_path);
+        let _ = std::fs::remove_dir_all(meshfox_core::varcache::cache_path(&canvas_path).parent().unwrap());
+    }
+
+    /// A JSON POST, same head-parsing as `get` above — `/api/vars/configure`'s
+    /// response is a small, non-chunked JSON object too.
+    async fn post_json(addr: SocketAddr, path: &str, body: &str) -> (u16, String) {
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.expect("read");
+        let mut parts = response.splitn(2, "\r\n\r\n");
+        let head = parts.next().unwrap_or_default();
+        let resp_body = parts.next().unwrap_or_default();
+        let status = head
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        (status, resp_body.to_string())
+    }
+
+    const CONFIGURE_CANVAS: &str = concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "<!-- meshfox:var name=\"GREETING\" default=\"Hello\" -->\n",
+        "<!-- meshfox:var name=\"INSTALL_PATH\" default=\"/usr/local/bin\" required -->\n",
+        "<!-- meshfox:var name=\"API_TOKEN\" secret -->\n\n",
+        "```bash name=\"greet\" env=\"$GREETING\"\necho \"$GREETING\"\n```\n",
+    );
+
+    #[tokio::test]
+    async fn get_configure_vars_lists_every_non_secret_declaration_regardless_of_env_usage() {
+        // Unlike `/api/vars`, this isn't scoped to any block's own `env=`
+        // chain — `INSTALL_PATH` isn't referenced by any block in this
+        // canvas at all, and still shows up.
+        let canvas_path = write_test_canvas(CONFIGURE_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, body) = get(addr, "/api/vars/configure").await;
+        assert_eq!(status, 200);
+        let statuses: Vec<serde_json::Value> = serde_json::from_str(&body).expect("valid VarStatus JSON");
+        let names: Vec<&str> = statuses.iter().map(|s| s["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["GREETING", "INSTALL_PATH"]);
+        assert_eq!(statuses[0]["resolved"], true);
+        assert_eq!(statuses[0]["value"], "Hello");
+        // required, no default fallback allowed
+        assert_eq!(statuses[1]["resolved"], false);
+        assert_eq!(statuses[1]["value"], "/usr/local/bin");
+
+        let _ = std::fs::remove_file(&canvas_path);
+        let _ = std::fs::remove_dir_all(meshfox_core::varcache::cache_path(&canvas_path).parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn post_configure_vars_saves_every_answered_non_secret_variable() {
+        let canvas_path = write_test_canvas(CONFIGURE_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, body) = post_json(
+            addr,
+            "/api/vars/configure",
+            r#"{"vars":{"GREETING":"Hi","INSTALL_PATH":"/opt/app","API_TOKEN":"sk-should-not-be-saved","UNKNOWN":"ignored"}}"#,
+        )
+        .await;
+        assert_eq!(status, 200);
+        let resp: serde_json::Value = serde_json::from_str(&body).expect("valid response JSON");
+        // Only the two declared non-secret variables actually present in
+        // the document are saved — the secret and the unknown name aren't.
+        assert_eq!(resp["saved"], 2);
+
+        let cache = VarCache::load(&canvas_path).expect("load cache");
+        assert_eq!(cache.get("GREETING"), Some("Hi"));
+        assert_eq!(cache.get("INSTALL_PATH"), Some("/opt/app"));
+        assert_eq!(cache.get("API_TOKEN"), None);
+
+        let _ = std::fs::remove_file(&canvas_path);
+        let _ = std::fs::remove_dir_all(meshfox_core::varcache::cache_path(&canvas_path).parent().unwrap());
     }
 }

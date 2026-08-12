@@ -58,6 +58,17 @@ pub struct VarDecl {
     /// only `--set`/the process environment can supply one without an
     /// interactive prompt. See `crate::varcache`.
     pub secret: bool,
+    /// Forces an interactive confirmation the first time this variable is
+    /// needed, even when `default` would otherwise resolve it silently —
+    /// `resolve`/`resolve_block_env` skip the `default` fallback for a
+    /// `required` declaration, so it lands in `missing` (with `default`
+    /// still attached, for the caller to offer as the prompt's pre-filled
+    /// suggestion) until an override/the environment/the cache actually
+    /// supplies a value. Once answered, the non-secret answer is cached
+    /// same as any other, so later runs resolve it from there without
+    /// asking again — this only affects the *first* confirmation, not
+    /// every run.
+    pub required: bool,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -97,9 +108,10 @@ fn build_var_decl(attrs: HashMap<String, String>) -> Result<VarDecl, VarsError> 
         return Err(VarsError::SelectMissingChoices(name));
     }
     let secret = attrs.get("secret").map(|v| v != "false").unwrap_or(false);
+    let required = attrs.get("required").map(|v| v != "false").unwrap_or(false);
     let prompt = attrs.get("prompt").cloned().unwrap_or_else(|| name.clone());
     let default = attrs.get("default").cloned();
-    Ok(VarDecl { name, var_type, prompt, default, choices, secret })
+    Ok(VarDecl { name, var_type, prompt, default, choices, secret, required })
 }
 
 /// Scans `markdown` (a node's own body text) for `meshfox:var` comments,
@@ -192,12 +204,18 @@ pub struct ResolvedVars {
 /// `--set`/a submitted web form), the current process environment, the
 /// on-disk cache (skipped entirely for a `secret` declaration — it's never
 /// read from or written to `cache`, see `crate::varcache`), and finally
-/// each declaration's own `default`. Whatever isn't resolved by any of
-/// those ends up in `missing`, for the caller to prompt for and resolve
-/// again — a variable's own type/`choices` are informational for that
-/// prompt only; nothing here validates an incoming value against them
-/// (an incoming value is just a plain string, the same as any other env
-/// var).
+/// each declaration's own `default` — except for a `required` declaration,
+/// which skips that last step: with nothing else supplying a value, it
+/// lands in `missing` (still carrying `default`, for the caller to offer
+/// as the prompt's pre-filled suggestion) rather than silently taking the
+/// default. This is only a one-time confirmation, not a standing "always
+/// ask" — once answered, a non-secret answer is written to `cache` same as
+/// any other resolution, so the very next lookup finds it there and
+/// resolves without prompting again. Whatever isn't resolved ends up in
+/// `missing`, for the caller to prompt for and resolve again — a
+/// variable's own type/`choices` are informational for that prompt only;
+/// nothing here validates an incoming value against them (an incoming
+/// value is just a plain string, the same as any other env var).
 pub fn resolve(
     decls: &[VarDecl],
     overrides: &HashMap<String, String>,
@@ -211,7 +229,7 @@ pub fn resolve(
             .cloned()
             .or_else(|| std::env::var(&decl.name).ok())
             .or_else(|| if decl.secret { None } else { cache.get(&decl.name).map(str::to_string) })
-            .or_else(|| decl.default.clone());
+            .or_else(|| if decl.required { None } else { decl.default.clone() });
         match found {
             Some(v) => {
                 values.insert(decl.name.clone(), v);
@@ -286,6 +304,14 @@ mod tests {
         assert_eq!(decls[0].prompt, "INSTALL_PATH");
         assert_eq!(decls[0].default.as_deref(), Some("/usr/local/bin"));
         assert!(!decls[0].secret);
+        assert!(!decls[0].required);
+    }
+
+    #[test]
+    fn scans_required_flag() {
+        let md = "<!-- meshfox:var name=\"INSTALL_PATH\" default=\"/usr/local/bin\" required -->\n";
+        let decls = scan_var_decls(md).unwrap();
+        assert!(decls[0].required);
     }
 
     #[test]
@@ -371,6 +397,10 @@ mod tests {
     }
 
     fn decl(name: &str, default: Option<&str>, secret: bool) -> VarDecl {
+        required_decl(name, default, secret, false)
+    }
+
+    fn required_decl(name: &str, default: Option<&str>, secret: bool, required: bool) -> VarDecl {
         VarDecl {
             name: name.to_string(),
             var_type: VarType::String,
@@ -378,6 +408,7 @@ mod tests {
             default: default.map(String::from),
             choices: Vec::new(),
             secret,
+            required,
         }
     }
 
@@ -419,6 +450,44 @@ mod tests {
         let resolved = resolve(&decls, &HashMap::new(), &cache);
         assert!(resolved.values.is_empty());
         assert_eq!(resolved.missing.len(), 1);
+    }
+
+    #[test]
+    fn resolve_required_with_a_default_is_still_missing_until_confirmed() {
+        // Unlike a plain declaration, a `required` one must not silently
+        // take its `default` — it needs an explicit first confirmation.
+        let decls = vec![required_decl("X", Some("default-val"), false, true)];
+        let cache = VarCache::in_memory();
+        let resolved = resolve(&decls, &HashMap::new(), &cache);
+        assert!(resolved.values.is_empty());
+        assert_eq!(resolved.missing, decls);
+        // The declaration in `missing` still carries `default`, so the
+        // caller can offer it as the prompt's pre-filled suggestion.
+        assert_eq!(resolved.missing[0].default.as_deref(), Some("default-val"));
+    }
+
+    #[test]
+    fn resolve_required_reads_from_cache_once_confirmed() {
+        // Once an answer (even the default, confirmed as-is) has been
+        // cached, a `required` variable resolves like any other — it's a
+        // one-time confirmation, not a standing "always ask".
+        let decls = vec![required_decl("X", Some("default-val"), false, true)];
+        let mut cache = VarCache::in_memory();
+        cache.set("X", "default-val").unwrap();
+        let resolved = resolve(&decls, &HashMap::new(), &cache);
+        assert_eq!(resolved.values.get("X").map(String::as_str), Some("default-val"));
+        assert!(resolved.missing.is_empty());
+    }
+
+    #[test]
+    fn resolve_required_still_prefers_override_and_env_over_prompting() {
+        let decls = vec![required_decl("X", Some("default-val"), false, true)];
+        let mut overrides = HashMap::new();
+        overrides.insert("X".to_string(), "override-val".to_string());
+        let cache = VarCache::in_memory();
+        let resolved = resolve(&decls, &overrides, &cache);
+        assert_eq!(resolved.values.get("X").map(String::as_str), Some("override-val"));
+        assert!(resolved.missing.is_empty());
     }
 
     #[test]
@@ -481,5 +550,19 @@ mod tests {
         let resolution = resolve_block_env(&env_refs, &decls, &HashMap::new(), &cache);
         assert!(resolution.env.is_empty());
         assert_eq!(resolution.missing, vec![decls[0].clone()]);
+    }
+
+    #[test]
+    fn resolve_block_env_treats_a_required_default_as_missing() {
+        let decls = vec![required_decl("INSTALL_PATH", Some("/usr/local/bin"), false, true)];
+        let env_refs = vec![crate::fence::EnvRef {
+            local_name: "INSTALL_PATH".to_string(),
+            var_name: "INSTALL_PATH".to_string(),
+        }];
+        let cache = VarCache::in_memory();
+        let resolution = resolve_block_env(&env_refs, &decls, &HashMap::new(), &cache);
+        assert!(resolution.env.is_empty());
+        assert_eq!(resolution.missing, vec![decls[0].clone()]);
+        assert_eq!(resolution.missing[0].default.as_deref(), Some("/usr/local/bin"));
     }
 }

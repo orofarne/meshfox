@@ -22,6 +22,8 @@ import {
   openNodeFile,
   killRun,
   fetchVars,
+  fetchConfigureVars,
+  saveConfigureVars,
   createNode,
   updateNode,
   deleteNode,
@@ -152,6 +154,18 @@ export default function App() {
      * (via `ttySession`) with the answers instead of calling `executeRun`. */
     tty?: boolean;
   } | null>(null);
+  // Whether the toolbar's "configure" button should even appear — set from
+  // `load()`'s own `fetchConfigureVars` call, so it's known without a
+  // click. `null` while unknown yet (first load in flight) is treated the
+  // same as `false` below; a canvas that declares only `secret` variables
+  // (or none at all) reports empty here, same as the TUI's own
+  // `has_configurable_vars`.
+  const [hasConfigurableVars, setHasConfigurableVars] = useState(false);
+  // The open "configure every declared variable" modal (see VarsForm,
+  // `handleConfigure`) — the browser counterpart to `meshfox configure`/
+  // the TUI's `c` key. Independent of `varsModal`: this isn't gating a
+  // run, it can be opened any time the toolbar button is visible.
+  const [configureVars, setConfigureVars] = useState<VarStatus[] | null>(null);
   // Set while a `tty` block's interactive terminal panel is open — see
   // `handleRunTty`/`TtyPanel`. Only one at a time (opening another closes
   // whatever's already open, same as `NodeTextEditor`'s single-editor
@@ -203,6 +217,15 @@ export default function App() {
       setError(null);
     } catch (e) {
       setError(String(e));
+    }
+    // Best-effort and separate from the try/catch above: a failure here
+    // (or the document simply declaring no configurable variable) should
+    // just hide the toolbar button, never surface as the page's own error.
+    try {
+      const vars = await fetchConfigureVars();
+      setHasConfigurableVars(vars.length > 0);
+    } catch {
+      setHasConfigurableVars(false);
     }
   }, []);
 
@@ -542,6 +565,31 @@ export default function App() {
   );
 
   const handleVarsCancel = useCallback(() => setVarsModal(null), []);
+
+  // Toolbar "configure" button — the browser counterpart to `meshfox
+  // configure`/the TUI's `c` key: opens a form for *every* declared
+  // non-secret variable in the document (not just what one block's chain
+  // still needs), pre-filled with each one's currently-resolved value.
+  // Always fetches fresh right before opening, same as `handleRun` does
+  // for its own gate, rather than reusing whatever `load()` last saw.
+  const handleConfigure = useCallback(async () => {
+    try {
+      setConfigureVars(await fetchConfigureVars());
+    } catch (e) {
+      setError(String(e));
+    }
+  }, []);
+
+  const handleConfigureSubmit = useCallback(async (answers: Record<string, string>) => {
+    setConfigureVars(null);
+    try {
+      await saveConfigureVars(answers);
+    } catch (e) {
+      setError(String(e));
+    }
+  }, []);
+
+  const handleConfigureCancel = useCallback(() => setConfigureVars(null), []);
 
   // Reads current state through `setNodes`'s updater rather than closing
   // over the `nodes` variable directly: `data.onKill` is bound once (when
@@ -1359,10 +1407,19 @@ export default function App() {
         >
           ⛓ {showDeps ? "hide deps" : "show deps"}
         </button>
+        {hasConfigurableVars && (
+          <button
+            className="deps-toggle"
+            onClick={handleConfigure}
+            title="Interactively resolve every declared meshfox:var and save the answers (see SPEC.md's Variables) — same as `meshfox configure`"
+          >
+            ⚙ configure
+          </button>
+        )}
         {error && <span className="error">{error}</span>}
       </div>
     ),
-    [editMode, sourceMode, sourceDirty, dirty, error, showDeps, constraintStats],
+    [editMode, sourceMode, sourceDirty, dirty, error, showDeps, constraintStats, hasConfigurableVars, handleConfigure],
   );
 
   if (serverGone) {
@@ -1425,6 +1482,16 @@ export default function App() {
       </div>
       {varsModal && (
         <VarsForm vars={varsModal.missing} onSubmit={handleVarsSubmit} onCancel={handleVarsCancel} />
+      )}
+      {configureVars && (
+        <VarsForm
+          vars={configureVars}
+          onSubmit={handleConfigureSubmit}
+          onCancel={handleConfigureCancel}
+          title="Configure declared variables"
+          hint="Every declared variable, whether or not any block currently needs it — answered here (even left unchanged) is saved right away, same as `meshfox configure`."
+          submitLabel="save"
+        />
       )}
       {ttySession && (
         <TtyPanel

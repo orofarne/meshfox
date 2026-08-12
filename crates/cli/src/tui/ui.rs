@@ -1,5 +1,5 @@
 //! Rendering the TUI's three panes (tree / document / output) plus its
-//! modal overlays (block picker, variable prompt, help).
+//! modal overlays (block picker, variable form, help).
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -10,7 +10,7 @@ use ratatui_image::Image;
 
 use super::app::{App, Focus};
 use super::markdown::Segment;
-use meshfox_core::NodeType;
+use meshfox_core::{NodeType, VarType};
 
 const OUTPUT_HEIGHT: u16 = 9;
 const FOOTER_HEIGHT: u16 = 1;
@@ -50,14 +50,14 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_tree(f, layout.tree, app);
     render_document(f, layout.document, &*app);
     render_output(f, layout.output, &*app);
-    render_footer(f, layout.footer);
+    render_footer(f, layout.footer, &*app);
 
     if let Some(bp) = &app.block_picker {
         render_block_picker(f, area, bp);
-    } else if let Some(vp) = &app.var_prompt {
-        render_var_prompt(f, area, vp);
+    } else if let Some(vf) = &app.var_form {
+        render_var_form(f, area, vf);
     } else if app.show_help {
-        render_help(f, area);
+        render_help(f, area, &*app);
     }
 }
 
@@ -219,12 +219,15 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(text), inner);
 }
 
-fn render_footer(f: &mut Frame, area: Rect) {
-    let hint = "tab focus · j/k move/scroll · enter expand · h/l collapse/expand · r run · R run (no deps) · K kill · ? help · q quit";
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray)))),
-        area,
+fn render_footer(f: &mut Frame, area: Rect, app: &App) {
+    let mut hint = String::from(
+        "tab focus · j/k move/scroll · enter expand · h/l collapse/expand · r run · R run (no deps) · K kill",
     );
+    if app.has_configurable_vars() {
+        hint.push_str(" · c configure");
+    }
+    hint.push_str(" · ? help · q quit");
+    f.render_widget(Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray)))), area);
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
@@ -235,28 +238,70 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     Rect { x, y, width, height }
 }
 
-fn render_var_prompt(f: &mut Frame, area: Rect, vp: &super::app::VarPromptState) {
-    let rect = centered_rect(60, 6, area);
+/// Every field in `vf` at once, one per row — arrow keys/Tab move which
+/// row is focused (highlighted), typing edits only that row's value, and
+/// Enter submits every row's current value together, same "whole form at
+/// once" shape as the web UI's `VarsForm` rather than one field at a time.
+fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
+    let height = (vf.decls.len() as u16 + 4).min(area.height);
+    let rect = centered_rect(64, height, area);
     f.render_widget(Clear, rect);
-    let block = Block::default().borders(Borders::ALL).title(" variable needed ");
+    let title = if vf.configuring { " configure variables " } else { " variables needed " };
+    let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
-    let masked;
-    let shown: &str = if vp.decl.secret {
-        masked = "*".repeat(vp.input.chars().count());
-        &masked
-    } else {
-        &vp.input
-    };
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
 
-    let lines = vec![
-        Line::from(vp.decl.prompt.clone()),
-        Line::from(""),
-        Line::from(vec![Span::raw("> "), Span::styled(shown, Style::default().fg(Color::LightGreen)), Span::raw("_")]),
-        Line::from(Span::styled("enter confirm · esc cancel run", Style::default().fg(Color::DarkGray))),
-    ];
-    f.render_widget(Paragraph::new(lines), inner);
+    let items: Vec<ListItem> = vf
+        .decls
+        .iter()
+        .zip(vf.inputs.iter())
+        .enumerate()
+        .map(|(i, (decl, input))| {
+            let masked;
+            let shown: &str = if decl.secret {
+                masked = "*".repeat(input.chars().count());
+                &masked
+            } else {
+                input.as_str()
+            };
+            // `Bool`/`Select` are a left/right toggle/cycle, not free text
+            // (see `App::cycle_var_form_field`) — the `‹ ›` framing marks
+            // that visually, on every such row, not just the focused one,
+            // same way `VarsForm` renders them as a checkbox/dropdown
+            // rather than a text input. `String`/`Int` keep the plain
+            // text-cursor look, shown only on the focused row.
+            let value = match decl.var_type {
+                VarType::Bool | VarType::Select => format!("‹ {shown} ›"),
+                VarType::String | VarType::Int => {
+                    format!("{shown}{}", if i == vf.selected { "_" } else { "" })
+                }
+            };
+            ListItem::new(Line::from(vec![
+                Span::raw(format!("{}: ", decl.prompt)),
+                Span::styled(value, Style::default().fg(Color::LightGreen)),
+            ]))
+        })
+        .collect();
+
+    let mut state = ListState::default();
+    state.select(Some(vf.selected));
+    let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    f.render_stateful_widget(list, rows[0], &mut state);
+
+    let esc_hint = if vf.configuring {
+        "↑/↓/tab field · ←/→ toggle/cycle · enter save all · esc cancel configure"
+    } else {
+        "↑/↓/tab field · ←/→ toggle/cycle · enter confirm all · esc cancel run"
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(esc_hint, Style::default().fg(Color::DarkGray)))),
+        rows[1],
+    );
 }
 
 fn render_block_picker(f: &mut Frame, area: Rect, bp: &super::app::BlockPickerState) {
@@ -296,14 +341,8 @@ fn render_block_picker(f: &mut Frame, area: Rect, bp: &super::app::BlockPickerSt
     f.render_stateful_widget(list, inner, &mut state);
 }
 
-fn render_help(f: &mut Frame, area: Rect) {
-    let rect = centered_rect(62, 23, area);
-    f.render_widget(Clear, rect);
-    let block = Block::default().borders(Borders::ALL).title(" keybindings ");
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
-
-    let lines = vec![
+fn render_help(f: &mut Frame, area: Rect, app: &App) {
+    let mut items = vec![
         "tab             switch focus: tree <-> document",
         "j / k / ↑ / ↓   move selection (tree) or scroll (document)",
         "enter           expand/collapse node",
@@ -313,6 +352,11 @@ fn render_help(f: &mut Frame, area: Rect) {
         "R               run this node's block only (skip deps)",
         "  (a node with more than one block opens a picker first)",
         "K               kill the running block",
+    ];
+    if app.has_configurable_vars() {
+        items.push("c               configure every declared variable (see SPEC.md's \"Variables\")");
+    }
+    items.extend([
         "PageUp/Down     scroll the document pane",
         "Ctrl-u / Ctrl-d scroll the document pane",
         "?               toggle this help",
@@ -324,9 +368,14 @@ fn render_help(f: &mut Frame, area: Rect) {
         "",
         "running a `tty` block hands the real terminal over to it,",
         "same as `meshfox run` — this UI reappears once it exits",
-    ]
-    .into_iter()
-    .map(Line::from)
-    .collect::<Vec<_>>();
+    ]);
+
+    let rect = centered_rect(62, items.len() as u16 + 2, area);
+    f.render_widget(Clear, rect);
+    let block = Block::default().borders(Borders::ALL).title(" keybindings ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let lines = items.into_iter().map(Line::from).collect::<Vec<_>>();
     f.render_widget(Paragraph::new(lines), inner);
 }

@@ -14,11 +14,14 @@ pub fn stdin_is_tty() -> bool {
 
 /// Prompts on the terminal for `decl`'s value. `current` is shown as the
 /// existing value — pressing Enter keeps it; pass `None` when there's
-/// nothing to fall back to (`run`'s lazy-missing case: by definition, a
-/// variable only reaches this function empty-handed when override/env/
-/// cache/default all came up empty, so an empty answer just asks again).
-/// A `secret` declaration ignores `current` entirely and reads without
-/// echoing the input.
+/// nothing to fall back to. `run`'s lazy-missing case passes `decl.default`
+/// here (which may itself be `None`): a plain declaration only reaches
+/// this function empty-handed when override/env/cache/default all came up
+/// empty, but a `required` one reaches it whenever nothing but its own
+/// `default` would have resolved it — passing that default through as
+/// `current` is what lets it be confirmed with a bare Enter instead of
+/// retyping it. A `secret` declaration ignores `current` entirely and
+/// reads without echoing the input.
 pub fn ask(decl: &VarDecl, current: Option<&str>) -> io::Result<String> {
     if decl.secret {
         return ask_secret(decl);

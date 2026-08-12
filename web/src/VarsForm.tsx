@@ -2,15 +2,27 @@ import { useState, type FormEvent } from "react";
 import type { VarStatus } from "./types";
 
 interface VarsFormProps {
-  /** Only the *missing* declared variables — see App.tsx's `handleRun`,
-   * which never opens this at all when `fetchVars()` reports everything
-   * already resolved. */
+  /** For the pre-run gate (`handleRun`), only the *missing* declared
+   * variables — see App.tsx, which never opens this at all when
+   * `fetchVars()` reports everything already resolved. For the `c`/
+   * "configure" flow (`handleConfigure`), every declared non-secret
+   * variable in the document, resolved or not — see `fetchConfigureVars`. */
   vars: VarStatus[];
   onSubmit: (answers: Record<string, string>) => void;
   onCancel: () => void;
+  /** Defaults to the pre-run gate's own copy — `handleConfigure` overrides
+   * these three for the "configure every declared variable" flow, the
+   * browser counterpart to `meshfox configure`/the TUI's `c` key. */
+  title?: string;
+  hint?: string;
+  submitLabel?: string;
 }
 
 function initialValue(v: VarStatus): string {
+  // `value` carries a suggestion to pre-fill even when `resolved` is
+  // false — a `required` declaration's own `default`, offered so it can
+  // just be confirmed as-is (see crates/server/src/lib.rs's `var_status`).
+  if (v.value !== undefined) return v.value;
   if (v.type === "bool") return "false";
   if (v.type === "select") return v.choices?.[0] ?? "";
   return "";
@@ -24,7 +36,14 @@ function initialValue(v: VarStatus): string {
  * `secret` to the on-disk cache, so this only has to ask once per variable
  * (until the cache is cleared or a different value is needed).
  */
-export function VarsForm({ vars, onSubmit, onCancel }: VarsFormProps) {
+export function VarsForm({
+  vars,
+  onSubmit,
+  onCancel,
+  title = "Configure variables",
+  hint,
+  submitLabel = "run",
+}: VarsFormProps) {
   const [values, setValues] = useState<Record<string, string>>(() =>
     Object.fromEntries(vars.map((v) => [v.name, initialValue(v)])),
   );
@@ -36,14 +55,15 @@ export function VarsForm({ vars, onSubmit, onCancel }: VarsFormProps) {
     onSubmit(values);
   };
 
+  const defaultHint = `This canvas needs a few values before it can run — answered once, then remembered${
+    vars.some((v) => v.secret) ? " (secret ones aren't saved, and are asked for again next time)" : ""
+  }.`;
+
   return (
     <div className="vars-modal-backdrop" onClick={onCancel}>
       <form className="vars-modal" onClick={(e) => e.stopPropagation()} onSubmit={handleSubmit}>
-        <h3>Configure variables</h3>
-        <p className="vars-modal-hint">
-          This canvas needs a few values before it can run — answered once, then remembered
-          {vars.some((v) => v.secret) ? " (secret ones aren't saved, and are asked for again next time)" : ""}.
-        </p>
+        <h3>{title}</h3>
+        <p className="vars-modal-hint">{hint ?? defaultHint}</p>
         {vars.map((v, i) => (
           <label key={v.name} className="vars-modal-field">
             <span>{v.prompt}</span>
@@ -80,7 +100,7 @@ export function VarsForm({ vars, onSubmit, onCancel }: VarsFormProps) {
           <button type="button" onClick={onCancel}>
             cancel
           </button>
-          <button type="submit">run</button>
+          <button type="submit">{submitLabel}</button>
         </div>
       </form>
     </div>

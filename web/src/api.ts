@@ -22,6 +22,35 @@ export async function fetchVars(path: string[], block: string, withDeps: boolean
   return res.json();
 }
 
+/**
+ * Every declared *non-secret* `meshfox:var` in the whole document, in
+ * declaration order, regardless of which (if any) block's `env=`
+ * references it — the browser counterpart to `meshfox configure`, unlike
+ * `fetchVars` which is scoped to one block's own chain. Each entry's
+ * `resolved`/`value` reflect its current env/cache/default status (no
+ * overrides), same as `fetchVars`.
+ */
+export async function fetchConfigureVars(): Promise<VarStatus[]> {
+  const res = await fetch("/api/vars/configure");
+  if (!res.ok) throw new Error(`GET /api/vars/configure: ${res.status}`);
+  return res.json();
+}
+
+/**
+ * Saves `answers` (declared non-secret variable name -> value) to the
+ * on-disk cache — every entry is written, even one left unchanged from
+ * its current suggestion, same as `meshfox configure` always confirming
+ * whatever's answered. Doesn't run anything.
+ */
+export async function saveConfigureVars(answers: Record<string, string>): Promise<void> {
+  const res = await fetch("/api/vars/configure", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ vars: answers }),
+  });
+  if (!res.ok) throw new Error(`POST /api/vars/configure: ${res.status}`);
+}
+
 export async function saveCanvas(canvas: CanvasDoc): Promise<void> {
   const res = await fetch("/api/canvas", {
     method: "PUT",

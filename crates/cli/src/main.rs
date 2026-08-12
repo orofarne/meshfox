@@ -855,11 +855,14 @@ fn persist_set_overrides(decls: &[VarDecl], overrides: &HashMap<String, String>,
 /// (see SPEC.md's "Variables") — a block with no `env=` never resolves or
 /// prompts for anything, however many variables the document declares.
 /// Tries `overrides` (`--set`)/the process environment/the on-disk cache/
-/// each declaration's own `default` first (`resolve_block_env`); whatever
-/// that leaves missing gets a terminal prompt, its non-secret answer
-/// saved back to the cache so a later run of *any* block referencing the
-/// same variable doesn't ask again. Exits with an error instead of
-/// prompting when stdin isn't a terminal, same as `configure`.
+/// each declaration's own `default` first (`resolve_block_env` — a
+/// `required` declaration skips that last step, so it shows up here even
+/// when it has a `default`); whatever that leaves missing gets a terminal
+/// prompt — pre-filled with the declaration's own `default` so a
+/// `required` one can just be confirmed with Enter — its non-secret
+/// answer saved back to the cache so a later run of *any* block
+/// referencing the same variable doesn't ask again. Exits with an error
+/// instead of prompting when stdin isn't a terminal, same as `configure`.
 fn resolve_block_env_or_prompt(
     block: &meshfox_core::CodeBlock,
     decls: &[VarDecl],
@@ -883,7 +886,7 @@ fn resolve_block_env_or_prompt(
         std::process::exit(1);
     }
     for decl in &resolution.missing {
-        let value = prompt::ask(decl, None).unwrap_or_else(|e| {
+        let value = prompt::ask(decl, decl.default.as_deref()).unwrap_or_else(|e| {
             eprintln!("failed to read input: {e}");
             std::process::exit(1);
         });
