@@ -38,6 +38,7 @@ import { parseBody, type CodeSegment } from "./fence";
 import { MeshNode, resolveNodeColor, type MeshNodeData, type LiveBlockState } from "./MeshNode";
 import { VarsForm } from "./VarsForm";
 import { TtyPanel } from "./TtyPanel";
+import { NodeExpandPanel } from "./NodeExpandPanel";
 import { NodeSettings } from "./NodeSettings";
 import { DeleteNodeDialog } from "./DeleteNodeDialog";
 import { AutoLayoutConfirmDialog } from "./AutoLayoutConfirmDialog";
@@ -115,8 +116,10 @@ export default function App() {
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   // Set via `onInit` below — needed to call `setCenter` imperatively once
   // the canvas has actually loaded (see the initial-view effect further
-  // down). `App` itself sits outside `<ReactFlow>`'s own provider scope, so
-  // `useReactFlow()` isn't available here the way it is inside `MeshNode`.
+  // down). Predates main.tsx's app-wide `<ReactFlowProvider>` (added for
+  // NodeExpandPanel's `useReactFlow()` — see its own doc comment), which
+  // would make `useReactFlow()` reachable here too now; kept as `onInit`
+  // regardless, since this only ever needs the instance once, on load.
   const [flowInstance, setFlowInstance] = useState<ReactFlowInstance<Node<MeshNodeData>> | null>(null);
   // Only the very first load should recenter the view — not every
   // subsequent canvas reload (after a run, a save, a live-reload push),
@@ -162,6 +165,12 @@ export default function App() {
   // if any — see NodeSettings.tsx. Set right after a successful "add
   // child" too, so the new node's title is immediately editable.
   const [settingsNodeId, setSettingsNodeId] = useState<string | null>(null);
+  // Which node's body is expanded into a floating window (see
+  // NodeExpandPanel) — available read-only, unlike `settingsNodeId`. Looked
+  // up from `nodes` (the live React Flow state, not `canvas.nodes`) so the
+  // panel renders the exact same `MeshNodeData` — live run state, callbacks
+  // and all — the node's own inline box does.
+  const [expandedNodeId, setExpandedNodeId] = useState<string | null>(null);
   // Which node's delete-confirm dialog (see DeleteNodeDialog) is open, if
   // any — same "id, not the node itself" shape as `settingsNodeId`, for the
   // same reason: re-look-up from `canvas` on every render rather than risk
@@ -761,6 +770,7 @@ export default function App() {
             onRecheckConstraint: () => load(),
             onAddChild: () => handleAddChild(n.id),
             onOpenSettings: () => setSettingsNodeId(n.id),
+            onExpand: () => setExpandedNodeId(n.id),
             onSaveText: (text: string) => handleSaveText(n.id, text),
             canDelete: !!n.parent,
             onRequestDelete: () => setDeleteConfirmNodeId(n.id),
@@ -1007,6 +1017,8 @@ export default function App() {
     () => canvas?.nodes.find((n) => n.id === settingsNodeId),
     [canvas, settingsNodeId],
   );
+
+  const expandedNode = useMemo(() => nodes.find((n) => n.id === expandedNodeId), [nodes, expandedNodeId]);
 
   const deleteConfirmNode = useMemo(
     () => canvas?.nodes.find((n) => n.id === deleteConfirmNodeId),
@@ -1348,6 +1360,7 @@ export default function App() {
           onClose={() => setTtySession(null)}
         />
       )}
+      {expandedNode && <NodeExpandPanel node={expandedNode} onClose={() => setExpandedNodeId(null)} />}
       {settingsNode && (
         <NodeSettings
           // Keyed on id so a successful id rename remounts this modal fresh

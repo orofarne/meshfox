@@ -160,9 +160,10 @@ enum Command {
     /// deps-chain/cache/`meshfox:var` handling as `meshfox run`/`meshfox
     /// view`. A `tty` block hands the real terminal over to it, same as
     /// `meshfox run`'s own `tty` handling. Mouse support covers clicking a
-    /// tree row and scrolling the tree/document panes. Read + run only for
-    /// now — no structural editing (use `meshfox node ...` or the browser
-    /// UI's Edit mode for that).
+    /// tree row to select it (or its ▾/▸ marker to expand/collapse) and
+    /// scrolling the tree/document panes. Read + run only for now — no
+    /// structural editing (use `meshfox node ...` or the browser UI's Edit
+    /// mode for that).
     Tui {
         /// Path to the .canvas.md file. If omitted: auto-discover the
         /// single candidate in the current directory.

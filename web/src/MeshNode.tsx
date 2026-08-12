@@ -136,6 +136,11 @@ export interface MeshNodeData {
   onAddChild: () => void;
   /** Opens this node's settings modal (title/type/color/target/edges). */
   onOpenSettings: () => void;
+  /** Opens this node's body in a floating window (`NodeExpandPanel`) — same
+   * live content (run/kill buttons, streaming output) as the inline box,
+   * just bigger and not at the mercy of the canvas's current pan/zoom.
+   * Available read-only, unlike the edit-mode-only actions above. */
+  onExpand: () => void;
   /** Persists a full replacement of this node's raw Markdown body — the
    * inline text editor's auto-save. */
   onSaveText: (text: string) => void;
@@ -740,6 +745,36 @@ function MeshNodeBody({ data, nodeId }: { data: MeshNodeData; nodeId: string }) 
   );
 }
 
+/**
+ * Picks (and renders) a node's own body area by type — the same switch
+ * `MeshNode` uses for its inline box, factored out so `NodeExpandPanel`
+ * (the "expand into a floating window" view) can render *exactly* the
+ * same live, interactive body (run/kill buttons, streaming output, the
+ * deps rail) at a larger size, instead of a separate read-only copy that
+ * could drift from what the node itself shows.
+ */
+export function NodeBodyContent({ data, nodeId }: { data: MeshNodeData; nodeId: string }) {
+  if (data.nodeType === "group") return null;
+  if (data.nodeType === "file" && data.display === "code") {
+    return <FileCodePreview nodeId={nodeId} target={data.target} lang={data.lang} />;
+  }
+  if (data.nodeType === "file" || data.nodeType === "link") {
+    return (
+      <div className="mesh-node-body nopan">
+        {data.target ? (
+          <a href={data.target} target="_blank" rel="noreferrer">
+            {data.target}
+          </a>
+        ) : (
+          <em>no target</em>
+        )}
+      </div>
+    );
+  }
+  if (data.nodeType === "constraint") return <ConstraintBody data={data} />;
+  return <MeshNodeBody data={data} nodeId={nodeId} />;
+}
+
 export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeData }) {
   const [editingText, setEditingText] = useState(false);
   const isTextNode = data.nodeType === "text";
@@ -785,6 +820,16 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
             {data.title}
           </span>
           {data.nodeType === "constraint" && <ConstraintBadge status={data.constraintStatus} />}
+          {!isGroup && (
+            <button
+              type="button"
+              className="mesh-node-icon-button mesh-node-expand-icon nodrag"
+              onClick={data.onExpand}
+              title="Expand this node into a floating window"
+            >
+              ⛶
+            </button>
+          )}
           {data.editMode && (
             <span className="mesh-node-title-actions">
               {isTextNode && (
@@ -868,23 +913,7 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
           </button>
         </NodeToolbar>
       )}
-      {isTitleOnly ? null : data.nodeType === "group" ? null : data.nodeType === "file" && data.display === "code" ? (
-        <FileCodePreview nodeId={id} target={data.target} lang={data.lang} />
-      ) : data.nodeType === "file" || data.nodeType === "link" ? (
-        <div className="mesh-node-body nopan">
-          {data.target ? (
-            <a href={data.target} target="_blank" rel="noreferrer">
-              {data.target}
-            </a>
-          ) : (
-            <em>no target</em>
-          )}
-        </div>
-      ) : data.nodeType === "constraint" ? (
-        <ConstraintBody data={data} />
-      ) : (
-        <MeshNodeBody data={data} nodeId={id} />
-      )}
+      {isTitleOnly ? null : <NodeBodyContent data={data} nodeId={id} />}
       {editingText && (
         <NodeTextEditor
           initialText={data.text}

@@ -258,9 +258,13 @@ impl App {
         }
     }
 
-    /// Clicks select a tree row and focus that pane; the scroll wheel over
-    /// either the tree or the document pane moves/scrolls it. Nothing else
-    /// (run/kill buttons, clicking inside a `tty` handoff) is wired up yet.
+    /// Clicks select a tree row and focus that pane, same as before — except
+    /// a click that lands specifically on a row's own disclosure marker
+    /// (`▾`/`▸`, see `ui::render_tree`) toggles it expanded/collapsed
+    /// instead, same as clicking it with the keyboard (`enter`) would. The
+    /// scroll wheel over either the tree or the document pane moves/scrolls
+    /// it. Nothing else (run/kill buttons, clicking inside a `tty`
+    /// handoff) is wired up yet.
     pub fn on_mouse(&mut self, mouse: MouseEvent) {
         if self.var_prompt.is_some() || self.block_picker.is_some() {
             return; // modal is up — no pane underneath it to click through to
@@ -272,13 +276,28 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => {
                 if point_in(layout.tree, mouse.column, mouse.row) {
                     self.focus = Focus::Tree;
+                    let inner_x = layout.tree.x + 1; // left border
                     let inner_y = layout.tree.y + 1; // top border
                     if mouse.row >= inner_y {
                         let clicked = self.list_state.offset() + (mouse.row - inner_y) as usize;
-                        if clicked < self.rows.len() && clicked != self.selected {
-                            self.selected = clicked;
-                            self.doc_scroll = 0;
-                            self.render_current_document();
+                        if let Some(row) = self.rows.get(clicked) {
+                            // "  " * depth (indent) then a 2-column-wide
+                            // disclosure marker — see `ui::render_tree`'s
+                            // own `indent`/`disclosure` spans, which this
+                            // has to stay in step with.
+                            let disclosure_col = inner_x + row.depth as u16 * 2;
+                            let on_disclosure = row.has_children
+                                && mouse.column >= disclosure_col
+                                && mouse.column < disclosure_col + 2;
+
+                            if clicked != self.selected {
+                                self.selected = clicked;
+                                self.doc_scroll = 0;
+                                self.render_current_document();
+                            }
+                            if on_disclosure {
+                                self.toggle_expand();
+                            }
                         }
                     }
                 } else if point_in(layout.document, mouse.column, mouse.row) {

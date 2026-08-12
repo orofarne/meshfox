@@ -297,7 +297,7 @@ fn render_block_picker(f: &mut Frame, area: Rect, bp: &super::app::BlockPickerSt
 }
 
 fn render_help(f: &mut Frame, area: Rect) {
-    let rect = centered_rect(62, 22, area);
+    let rect = centered_rect(62, 23, area);
     f.render_widget(Clear, rect);
     let block = Block::default().borders(Borders::ALL).title(" keybindings ");
     let inner = block.inner(rect);
@@ -318,8 +318,9 @@ fn render_help(f: &mut Frame, area: Rect) {
         "?               toggle this help",
         "q / esc         quit",
         "",
-        "mouse: click a tree row to select it; scroll wheel over the",
-        "tree moves selection, over the document scrolls it",
+        "mouse: click a tree row to select it, or its ▾/▸ marker to",
+        "expand/collapse; scroll wheel over the tree moves selection,",
+        "over the document scrolls it",
         "",
         "running a `tty` block hands the real terminal over to it,",
         "same as `meshfox run` — this UI reappears once it exits",
