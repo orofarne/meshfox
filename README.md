@@ -239,6 +239,8 @@ Run it from a real terminal — `meshfox run README.md usage usage-tty vim-demo`
 ### Terminal viewer (experimental)
 <!-- meshfox:node id="usage-tui" -->
 
+![Terminal viewer screenshot](screenshot-tui.webp)
+
 `meshfox tui` is the browser UI's tree-and-block-runner experience without leaving the terminal — one more front door onto the same files, alongside `run` and `view`: a left pane walks the node tree (same `[run]`/`[cache]`/`[tty]` flags `meshfox list` prints, as badges), a right pane renders the selected node's body — headings/lists/tables, syntax-highlighted code fences (`syntect`), and local images (`ratatui-image`, real pixels on a terminal that supports it, half-block Unicode art everywhere else, tmux included). `type="include"` is resolved for browsing (same as the browser's `GET /api/canvas`, unlike `run`/`fmt`/`validate`'s raw-file-only scope), and a `file` node's `display="code"` shows the target's own content, same as the browser's read-only preview.
 
 `r` runs a node's block with its `deps=` chain first (same as the browser's "⛓ run chain"); `R` runs just that one block (the plain "run" button's counterpart). A node with more than one runnable block opens a picker first — there's no single obvious default to reach for. Output streams in live and stays visible once the run finishes, same `cache`/`meshfox:var` handling as `run`/`view` either way. A `tty` block hands the whole terminal over to it, exactly like `meshfox run`'s own `tty` handling (see above) — no in-app terminal emulator, this UI's own screen just steps aside and comes back once the block exits. Mouse support is deliberately partial for now: click a tree row to select it (or its `▾`/`▸` marker to expand/collapse it), scroll wheel over the tree or document pane.

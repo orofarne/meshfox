@@ -10,6 +10,7 @@
     "preview": "vite preview",
     "gen-icons": "node scripts/gen-icons.mjs",
     "gen-screenshot": "node scripts/gen-screenshot.mjs",
+    "gen-screenshot-tui": "node scripts/gen-screenshot-tui.mjs",
     "pretest:e2e": "npm run build",
     "test:e2e": "playwright test",
     "test:e2e:ui": "playwright test --ui"
