@@ -429,6 +429,20 @@ a {
   color: var(--fail);
 }
 
+/* The title bar's quick-run button (a node's own default block, or a
+ * runnable file node's interpreter) — same accent color a fenced block's
+ * own "run" button uses, so it reads as the same action just promoted up
+ * to the title bar. */
+.mesh-node-quick-run-icon {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.mesh-node-quick-run-icon:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 /* A node's own tags — small chip row right under the title bar, both
  * read-only and edit mode (they're diagram content, not an editing
  * control). */

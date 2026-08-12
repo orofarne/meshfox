@@ -75,6 +75,14 @@ of JSON, for readable diffs and hand-editability.
   - `lang="..."` — syntax-highlighting language hint for `display="code"`
     (e.g. `lang="rust"`). Optional; when omitted, the language is guessed
     from the target's file extension. Ignored when `display` isn't `code`.
+  - `interpreter="..."` — an executable (e.g. `interpreter="python"`) to run
+    against `target`, making the node runnable: `interpreter target` (the
+    target's path resolved relative to the canvas's own directory,
+    confined to it — same boundary `display="code"`/`include` targets are
+    resolved within). Optional; omitted means the node isn't runnable this
+    way. The web UI's "▷ run" button (next to "expand", in a runnable
+    node's title bar) invokes this the same way it does a `text` node's
+    default code block.
 
     ```
     <!-- meshfox:node type="file" display="code" lang="rust" -->
@@ -82,8 +90,14 @@ of JSON, for readable diffs and hand-editability.
     [main](./src/main.rs)
     ```
 
-  `link` nodes don't support `display`/`code` — their target is an external
-  URL, not something meshfox reads from disk.
+    ```
+    <!-- meshfox:node type="file" interpreter="python" -->
+
+    [seed data](./scripts/seed.py)
+    ```
+
+  `link` nodes don't support `display`/`code`/`interpreter` — their target
+  is an external URL, not something meshfox reads from or runs off disk.
 - **`include`** — same one-link body as `file`/`link`, but the target
   (another `.md` or `.canvas.md` file) is spliced in *dynamically* by
   whatever consumer resolves includes — never written back to disk.

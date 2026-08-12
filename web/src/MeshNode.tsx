@@ -6,7 +6,7 @@ import CodeMirror from "@uiw/react-codemirror";
 import { LanguageDescription } from "@codemirror/language";
 import { languages } from "@codemirror/language-data";
 import type { Extension } from "@codemirror/state";
-import { parseBody, type BodySegment, type CodeSegment } from "./fence";
+import { defaultBlockName, parseBody, type BodySegment, type CodeSegment } from "./fence";
 import { parseBlockRef, blockDomId } from "./deps";
 import { AnsiText } from "./AnsiText";
 import { NodeTextEditor, usePrefersDark } from "./NodeTextEditor";
@@ -111,6 +111,10 @@ export interface MeshNodeData {
   /** file-node syntax-highlighting language hint for `display: "code"`;
    * absent means auto-detect from the target's file extension. */
   lang?: string;
+  /** file-node only: an executable (e.g. "python") to run against
+   * `target` — present makes the node runnable via the title bar's "▷ run"
+   * button (see `App.tsx`'s `executeFileRun`). */
+  interpreter?: string;
   text: string;
   /** JSON Canvas color — either a hex string or a preset `"1"`-`"6"` (see
    * `resolveNodeColor`) — `undefined`/empty means no color was set. */
@@ -136,6 +140,9 @@ export interface MeshNodeData {
   onAddChild: () => void;
   /** Opens this node's settings modal (title/type/color/target/edges). */
   onOpenSettings: () => void;
+  /** file-node only — opens `target` in the OS's default application for
+   * it (the title bar's "↗ open" button). */
+  onOpenFile: () => void;
   /** Opens this node's body in a floating window (`NodeExpandPanel`) — same
    * live content (run/kill buttons, streaming output) as the inline box,
    * just bigger and not at the mercy of the canvas's current pan/zoom.
@@ -466,35 +473,40 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
   );
 }
 
-/** Live output (queued/running/done/killed, from the current run) takes
- * over from the cached copy in the file whenever one's in progress or just
- * finished — cleared back to the cached view once `App.tsx` reloads the
- * canvas after a persisted run, or never shown at all for a read-only run
- * beyond this component's own lifetime (a page reload loses it, same as
- * the transient-output behavior this replaces always had). */
+/** Live output (queued/running/done/killed, from the current run) — shared
+ * by `RunOutput` (a fenced block's own output, falling back to its cached
+ * copy when nothing's live — see below) and a runnable `file` node's own
+ * body (`NodeBodyContent`), which has no cached copy to fall back to at
+ * all. Never shown at all for a read-only run beyond this component's own
+ * lifetime (a page reload loses it, same as the transient-output behavior
+ * this replaces always had). */
+function LiveRunOutput({ live }: { live: LiveBlockState }) {
+  const label =
+    live.status === "killed" ? "killed" : live.status === "running" ? "running…" : `output · exit ${live.exitCode}`;
+  const exitState =
+    live.status === "killed" ? "killed" : live.status === "running" ? "running" : live.exitCode === 0 ? "ok" : "fail";
+  return (
+    <div className="mesh-code-output" data-exit={exitState}>
+      <div className="mesh-code-output-head">
+        {label}
+        <span className="mesh-code-output-transient"> · not saved</span>
+      </div>
+      {live.text && (
+        <pre>
+          <code><AnsiText text={live.text} /></code>
+        </pre>
+      )}
+    </div>
+  );
+}
+
+/** A fenced code block's own output: live (queued/running/done/killed, from
+ * the current run) takes over from the cached copy in the file whenever
+ * one's in progress or just finished — cleared back to the cached view once
+ * `App.tsx` reloads the canvas after a persisted run. */
 function RunOutput({ seg, live }: { seg: CodeSegment; live?: LiveBlockState }) {
   if (live && live.status !== "queued") {
-    const label =
-      live.status === "killed"
-        ? "killed"
-        : live.status === "running"
-          ? "running…"
-          : `output · exit ${live.exitCode}`;
-    const exitState =
-      live.status === "killed" ? "killed" : live.status === "running" ? "running" : live.exitCode === 0 ? "ok" : "fail";
-    return (
-      <div className="mesh-code-output" data-exit={exitState}>
-        <div className="mesh-code-output-head">
-          {label}
-          <span className="mesh-code-output-transient"> · not saved</span>
-        </div>
-        {live.text && (
-          <pre>
-            <code><AnsiText text={live.text} /></code>
-          </pre>
-        )}
-      </div>
-    );
+    return <LiveRunOutput live={live} />;
   }
   if (!live && seg.output) {
     return (
@@ -755,8 +767,19 @@ function MeshNodeBody({ data, nodeId }: { data: MeshNodeData; nodeId: string }) 
  */
 export function NodeBodyContent({ data, nodeId }: { data: MeshNodeData; nodeId: string }) {
   if (data.nodeType === "group") return null;
+  // A runnable file node's live run state is keyed under its own id in
+  // `liveBlocks` — same "the block shares its node's own id" convention a
+  // `text` node's sole implicit block already uses (see `App.tsx`'s
+  // `executeFileRun`). No cached copy to fall back to (unlike a fenced
+  // block's `seg.output`): a `file` node has no `cache` concept.
+  const fileRunLive = data.interpreter ? data.liveBlocks[nodeId] : undefined;
   if (data.nodeType === "file" && data.display === "code") {
-    return <FileCodePreview nodeId={nodeId} target={data.target} lang={data.lang} />;
+    return (
+      <>
+        <FileCodePreview nodeId={nodeId} target={data.target} lang={data.lang} />
+        {fileRunLive && <LiveRunOutput live={fileRunLive} />}
+      </>
+    );
   }
   if (data.nodeType === "file" || data.nodeType === "link") {
     return (
@@ -768,6 +791,7 @@ export function NodeBodyContent({ data, nodeId }: { data: MeshNodeData; nodeId: 
         ) : (
           <em>no target</em>
         )}
+        {fileRunLive && <LiveRunOutput live={fileRunLive} />}
       </div>
     );
   }
@@ -788,6 +812,23 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
   // avoids the layout jumping under the cursor mid-edit the moment the
   // first character is typed).
   const isTitleOnly = !data.editMode && isTextNode && data.text.trim() === "";
+
+  // The title bar's "▷ run" quick-run button: for a `text` node, its one
+  // unambiguous default block (explicit `default` flag or self-named, same
+  // rule `core::fence::default_block` uses — see `defaultBlockName`); for a
+  // runnable `file` node (`interpreter` set), the node's own id, matching
+  // the same "the block shares its node's own id" convention its live run
+  // state is keyed under (see `App.tsx`'s `executeFileRun`). `null` when
+  // neither applies (nothing to quick-run) — the button just isn't shown.
+  const quickRunBlockName =
+    isTextNode
+      ? defaultBlockName(data.text, id)
+      : data.nodeType === "file" && data.interpreter && data.target
+        ? id
+        : null;
+  const quickRunLive = quickRunBlockName ? data.liveBlocks[quickRunBlockName] : undefined;
+  const quickRunBusy = quickRunLive?.status === "queued" || quickRunLive?.status === "running";
+  const canOpenFile = data.nodeType === "file" && !!data.target;
 
   return (
     <div
@@ -820,6 +861,31 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
             {data.title}
           </span>
           {data.nodeType === "constraint" && <ConstraintBadge status={data.constraintStatus} />}
+          {quickRunBlockName && (
+            <button
+              type="button"
+              className="mesh-node-icon-button mesh-node-quick-run-icon nodrag"
+              disabled={quickRunBusy}
+              onClick={() => data.onRun(quickRunBlockName, false)}
+              title={quickRunBusy ? "running…" : `run ${quickRunBlockName}`}
+            >
+              ▷
+            </button>
+          )}
+          {canOpenFile && (
+            <button
+              type="button"
+              className="mesh-node-icon-button nodrag"
+              onClick={data.onOpenFile}
+              title="Open this file in the default application"
+            >
+              ↗
+            </button>
+          )}
+          {/* Always the rightmost of this trio — a node's icon set varies
+           * (run/open only show up for some node types), and keeping expand
+           * pinned last means its position doesn't shift around depending
+           * on which of the others happen to be present. */}
           {!isGroup && (
             <button
               type="button"

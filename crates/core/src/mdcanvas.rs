@@ -108,6 +108,9 @@ pub struct NodeMeta {
     /// `file`-node syntax-highlighting language hint. Same "omitted unless
     /// set" contract as `display`.
     pub lang: Option<String>,
+    /// `file`-node interpreter (see `Node::is_runnable_file`). Same
+    /// "omitted unless set" contract as `display`/`lang`.
+    pub interpreter: Option<String>,
     /// Free-form tags. Empty means "omitted" — same "caller passes through
     /// the existing value to keep it" contract as every other field here.
     pub tags: Vec<String>,
@@ -193,6 +196,7 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
                 _ => None,
             }),
             lang: seg.node_attrs.get("lang").cloned(),
+            interpreter: seg.node_attrs.get("interpreter").cloned(),
             text: body,
             constraint_status: None,
         });
@@ -321,6 +325,9 @@ fn render_node_line(canvas: &Canvas, node: &Node) -> String {
     if let Some(l) = &node.lang {
         parts.push(format!("lang=\"{l}\""));
     }
+    if let Some(i) = &node.interpreter {
+        parts.push(format!("interpreter=\"{i}\""));
+    }
     if !node.tags.is_empty() {
         parts.push(format!("tags=\"{}\"", node.tags.join(",")));
     }
@@ -410,6 +417,9 @@ pub fn set_node_meta(markdown: &str, node_id: &str, meta: &NodeMeta) -> Option<S
     }
     if let Some(l) = &meta.lang {
         parts.push(format!("lang=\"{l}\""));
+    }
+    if let Some(i) = &meta.interpreter {
+        parts.push(format!("interpreter=\"{i}\""));
     }
     if !meta.tags.is_empty() {
         parts.push(format!("tags=\"{}\"", meta.tags.join(",")));
@@ -544,7 +554,8 @@ pub fn rename_node_id(markdown: &str, old_id: &str, new_id: &str) -> Result<Stri
 
 /// Rewrites just node `old_id`'s own `meshfox:node` comment line's `id=`
 /// attribute to `new_id`, leaving every other attribute (`type`/`parent`/
-/// `x`/`y`/`w`/`h`/`color`/`display`/`lang`) exactly as it already was.
+/// `x`/`y`/`w`/`h`/`color`/`display`/`lang`/`interpreter`) exactly as it
+/// already was.
 /// Doesn't touch anything that *refers* to `old_id` elsewhere in the
 /// document — see `rename_node_id`, which sweeps those separately.
 fn set_node_id_attr(markdown: &str, old_id: &str, new_id: &str) -> Option<String> {
@@ -573,6 +584,9 @@ fn set_node_id_attr(markdown: &str, old_id: &str, new_id: &str) -> Option<String
     }
     if let Some(l) = seg.node_attrs.get("lang") {
         parts.push(format!("lang=\"{l}\""));
+    }
+    if let Some(i) = seg.node_attrs.get("interpreter") {
+        parts.push(format!("interpreter=\"{i}\""));
     }
     if let Some(t) = seg.node_attrs.get("tags") {
         parts.push(format!("tags=\"{t}\""));
@@ -1711,6 +1725,7 @@ Reused from Tests as well.
             node_type: None,
             display: None,
             lang: None,
+            interpreter: None,
             tags: Vec::new(),
         };
         let updated = set_node_meta(DOC, "tests", &meta).unwrap();

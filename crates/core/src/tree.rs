@@ -107,6 +107,7 @@ mod tests {
             target: None,
             display: None,
             lang: None,
+            interpreter: None,
             text: text.to_string(),
             constraint_status: None,
         }

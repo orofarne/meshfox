@@ -59,6 +59,9 @@ export interface CanvasNode {
   /** file-node only: syntax-highlighting language hint for display="code";
    * absent means auto-detect from the target's file extension. */
   lang?: string;
+  /** file-node only: an executable (e.g. "python") to run against
+   * `target`, making the node runnable — absent means it isn't. */
+  interpreter?: string;
   text: string;
   /** `constraint`-node only — see `ConstraintStatusDto`. */
   constraintStatus?: ConstraintStatusDto;

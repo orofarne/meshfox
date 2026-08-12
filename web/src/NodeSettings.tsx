@@ -71,6 +71,7 @@ export function NodeSettings({ node, allNodes, onChange, onRenameId, onClose }: 
   const [target, setTarget] = useState(node.target ?? "");
   const [display, setDisplay] = useState<"link" | "code">(node.display ?? "link");
   const [lang, setLang] = useState(node.lang ?? "");
+  const [interpreter, setInterpreter] = useState(node.interpreter ?? "");
   const [tags, setTags] = useState<string[]>(node.tags ?? []);
   const [extraParents, setExtraParents] = useState<ExtraEdgeDto[]>(node.extraParents ?? []);
   const [addSource, setAddSource] = useState("");
@@ -119,6 +120,7 @@ export function NodeSettings({ node, allNodes, onChange, onRenameId, onClose }: 
     if (nodeType === "file") {
       patch.display = display;
       patch.lang = lang;
+      patch.interpreter = interpreter;
     }
     return patch;
   };
@@ -142,7 +144,7 @@ export function NodeSettings({ node, allNodes, onChange, onRenameId, onClose }: 
     // `buildPatch` (new closures every render) — this should only re-fire
     // when something the user actually edited changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [title, nodeType, color, tags, target, display, lang, extraParents, isSaveable]);
+  }, [title, nodeType, color, tags, target, display, lang, interpreter, extraParents, isSaveable]);
 
   const handleClose = () => {
     if (pendingSave.current) clearTimeout(pendingSave.current);
@@ -236,6 +238,17 @@ export function NodeSettings({ node, allNodes, onChange, onRenameId, onClose }: 
               value={lang}
               onChange={(e) => setLang(e.target.value)}
               placeholder="auto-detect from file extension"
+            />
+          </label>
+        )}
+        {nodeType === "file" && (
+          <label className="vars-modal-field">
+            <span>Interpreter</span>
+            <input
+              type="text"
+              value={interpreter}
+              onChange={(e) => setInterpreter(e.target.value)}
+              placeholder="e.g. python — makes this node runnable"
             />
           </label>
         )}

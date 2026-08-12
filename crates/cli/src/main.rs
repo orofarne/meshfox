@@ -365,7 +365,7 @@ enum NodeCommand {
     /// Set a node's position/size/style fields (`mdcanvas::set_node_meta`)
     /// — `--x`/`--y`/`--w`/`--h` for a manual position/size override
     /// (`meshfox fmt` is the usual way to fill these in), `--color`/
-    /// `--type`/`--display`/`--lang` for style/type. Any field left unset
+    /// `--type`/`--display`/`--lang`/`--interpreter` for style/type. Any field left unset
     /// keeps its current value. `group` nodes never store a position
     /// (`fmt` skips them too, deriving their box from their children
     /// instead), so `--x`/`--y`/`--w`/`--h` are rejected for one.
@@ -395,6 +395,10 @@ enum NodeCommand {
         /// `file`-node syntax-highlighting language hint.
         #[arg(long)]
         lang: Option<String>,
+        /// `file`-node interpreter (e.g. `python`) — makes the node
+        /// runnable as `interpreter target`.
+        #[arg(long)]
+        interpreter: Option<String>,
     },
     /// Replace a node's whole set of extra incoming edges (`meshfox:edge
     /// from="..."` lines, `mdcanvas::set_node_edges`) — the
@@ -533,8 +537,8 @@ fn main() {
             NodeCommand::Body { canvas, node_id, file } => {
                 node_body(&canvas.unwrap_or_else(find_canvas), &node_id, file)
             }
-            NodeCommand::Meta { canvas, node_id, x, y, width, height, color, node_type, display, lang } => {
-                node_meta(&canvas.unwrap_or_else(find_canvas), &node_id, x, y, width, height, color, node_type, display, lang)
+            NodeCommand::Meta { canvas, node_id, x, y, width, height, color, node_type, display, lang, interpreter } => {
+                node_meta(&canvas.unwrap_or_else(find_canvas), &node_id, x, y, width, height, color, node_type, display, lang, interpreter)
             }
             NodeCommand::Edges { canvas, node_id, from, clear } => {
                 node_edges(&canvas.unwrap_or_else(find_canvas), &node_id, from, clear)
@@ -1365,6 +1369,7 @@ fn fmt(canvas_path: &PathBuf, force: bool) {
             node_type: None,
             display: node.display,
             lang: node.lang.clone(),
+            interpreter: node.interpreter.clone(),
             tags: node.tags.clone(),
         };
         if let Some(patched) = mdcanvas::set_node_meta(&updated, &node.id, &meta) {
@@ -1611,9 +1616,10 @@ fn node_meta(
     node_type: Option<String>,
     display: Option<String>,
     lang: Option<String>,
+    interpreter: Option<String>,
 ) {
     let raw = read_raw_or_exit(canvas_path);
-    match apply_node_meta(&raw, node_id, x, y, width, height, color, node_type, display, lang) {
+    match apply_node_meta(&raw, node_id, x, y, width, height, color, node_type, display, lang, interpreter) {
         Ok(updated) => {
             write_raw_or_exit(canvas_path, &updated);
             println!("meshfox node meta: updated {node_id:?} in {}", canvas_path.display());
@@ -1637,6 +1643,7 @@ fn apply_node_meta(
     node_type: Option<String>,
     display: Option<String>,
     lang: Option<String>,
+    interpreter: Option<String>,
 ) -> Result<String, String> {
     let canvas = Canvas::from_markdown(raw).map_err(|e| e.to_string())?;
     let node = canvas.node(node_id).ok_or_else(|| format!("no node {node_id:?}"))?;
@@ -1669,6 +1676,7 @@ fn apply_node_meta(
         node_type: parsed_type,
         display: parsed_display.or(node.display),
         lang: lang.or_else(|| node.lang.clone()),
+        interpreter: interpreter.or_else(|| node.interpreter.clone()),
         tags: node.tags.clone(),
     };
     let updated =
@@ -2118,7 +2126,7 @@ Shared body.
     #[test]
     fn meta_sets_given_fields_and_preserves_the_rest() {
         let updated =
-            apply_node_meta(TEST_DOC, "smoke-test", Some(10.0), None, None, None, None, None, None, None)
+            apply_node_meta(TEST_DOC, "smoke-test", Some(10.0), None, None, None, None, None, None, None, None)
                 .unwrap();
         let canvas = Canvas::from_markdown(&updated).unwrap();
         let node = canvas.node("smoke-test").unwrap();
@@ -2132,7 +2140,7 @@ Shared body.
     #[test]
     fn meta_rejects_a_position_on_a_group() {
         let err =
-            apply_node_meta(TEST_DOC, "tests", Some(1.0), None, None, None, None, None, None, None)
+            apply_node_meta(TEST_DOC, "tests", Some(1.0), None, None, None, None, None, None, None, None)
                 .unwrap_err();
         assert!(err.contains("group"), "unexpected error: {err}");
     }
@@ -2148,6 +2156,7 @@ Shared body.
             None,
             None,
             Some("bogus".to_string()),
+            None,
             None,
             None,
         )

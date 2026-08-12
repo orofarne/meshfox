@@ -425,6 +425,7 @@ async fn put_canvas(
             node_type: None,
             display: node.display,
             lang: node.lang.clone(),
+            interpreter: node.interpreter.clone(),
             tags: node.tags.clone(),
         };
         // Nodes spliced in from an included file have no `meshfox:node`
@@ -479,6 +480,7 @@ async fn clear_layout(State(state): State<Arc<AppState>>) -> Result<Json<Canvas>
             node_type: None,
             display: node.display,
             lang: node.lang.clone(),
+            interpreter: node.interpreter.clone(),
             tags: node.tags.clone(),
         };
         if let Some(patched) = mdcanvas::set_node_meta(&raw, &node.id, &meta) {
@@ -548,14 +550,17 @@ struct UpdateNodeRequest {
     display: Option<FileDisplay>,
     /// `file`-node syntax-highlighting language hint.
     lang: Option<String>,
+    /// `file`-node interpreter (see `meshfox_core::Node::is_runnable_file`)
+    /// — makes the node runnable via the web UI's "▷ run" button.
+    interpreter: Option<String>,
     /// Full replacement list of tags — `None` leaves them untouched,
     /// `Some(vec![])` clears them, same convention as `extraParents`.
     tags: Option<Vec<String>>,
 }
 
 /// Applies any of `title`/`nodeType`/`color`/`target`/`text`/`extraParents`/
-/// `display`/`lang`/`tags` present in the request to node `id`, validating
-/// the fully-patched
+/// `display`/`lang`/`interpreter`/`tags` present in the request to node
+/// `id`, validating the fully-patched
 /// document parses before saving anything — an invalid combination (e.g.
 /// `target` on a still-`text` node, or `nodeType: group` with a non-empty
 /// body) is rejected with `422` and leaves the file untouched, rather than
@@ -582,7 +587,7 @@ async fn update_node(
     // single link.
     let initial = parse_or_error(&raw)?;
     let initial_node = initial.node(&id).ok_or_else(not_found)?;
-    let (x, y, width, height, existing_color, existing_display, existing_lang, existing_tags) = (
+    let (x, y, width, height, existing_color, existing_display, existing_lang, existing_interpreter, existing_tags) = (
         initial_node.x,
         initial_node.y,
         initial_node.width,
@@ -590,11 +595,12 @@ async fn update_node(
         initial_node.color.clone(),
         initial_node.display,
         initial_node.lang.clone(),
+        initial_node.interpreter.clone(),
         initial_node.tags.clone(),
     );
-    // `display`/`lang` only mean anything on a `file` node — clear them
-    // (rather than leave a stale attribute behind) whenever this request
-    // moves the node to some other type.
+    // `display`/`lang`/`interpreter` only mean anything on a `file` node —
+    // clear them (rather than leave a stale attribute behind) whenever this
+    // request moves the node to some other type.
     let final_type = req.node_type.unwrap_or(initial_node.node_type);
     let mut title = initial_node.title.clone();
 
@@ -608,16 +614,21 @@ async fn update_node(
         || req.color.is_some()
         || req.display.is_some()
         || req.lang.is_some()
+        || req.interpreter.is_some()
         || req.tags.is_some()
     {
         // This also has the side effect of pinning the node's `id=`
         // attribute explicitly the moment any of its metadata changes,
         // same as any other first write-back (see `canvas.rs`'s doc
         // comment on `id`).
-        let (display, lang) = if final_type == NodeType::File {
-            (req.display.or(existing_display), req.lang.clone().or(existing_lang))
+        let (display, lang, interpreter) = if final_type == NodeType::File {
+            (
+                req.display.or(existing_display),
+                req.lang.clone().or(existing_lang),
+                req.interpreter.clone().or(existing_interpreter),
+            )
         } else {
-            (None, None)
+            (None, None, None)
         };
         let meta = NodeMeta {
             x,
@@ -628,6 +639,7 @@ async fn update_node(
             node_type: req.node_type,
             display,
             lang,
+            interpreter,
             tags: req.tags.clone().unwrap_or(existing_tags),
         };
         raw = mdcanvas::set_node_meta(&raw, &id, &meta).ok_or_else(not_found)?;
@@ -673,6 +685,39 @@ struct FileContentResponse {
     truncated: bool,
 }
 
+/// Resolves a `file`/`link` node's own link-target string to a real path on
+/// disk, relative to the canvas file's own directory, confined to it (same
+/// boundary `meshfox_core::include` enforces for include targets): a
+/// `../../etc/passwd` or an absolute path pointing outside that tree is
+/// rejected rather than read/run/opened, since the target string comes from
+/// the (possibly hand-edited) canvas file, not from a trusted source. Shared
+/// by every endpoint that touches a file node's target on disk — the
+/// `display="code"` preview, running it (a runnable `file` node's
+/// `interpreter`), and opening it in the OS's default application.
+fn resolve_confined_target(canvas_path: &std::path::Path, target: &str) -> Result<std::path::PathBuf, ApiError> {
+    // `Path::parent()` on a bare filename (e.g. `canvas.md`, no directory
+    // component) returns `Some("")`, not `None` — so a plain `unwrap_or(".")`
+    // never fires and we'd try to canonicalize an empty path, which fails
+    // with ENOENT. Treat that empty-parent case as "." too.
+    let canvas_dir = canvas_path.parent().filter(|p| !p.as_os_str().is_empty());
+    let canvas_dir = canvas_dir.unwrap_or(std::path::Path::new("."));
+    let canvas_dir = canvas_dir
+        .canonicalize()
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let candidate = canvas_dir.join(target);
+    let resolved = candidate
+        .canonicalize()
+        .map_err(|e| ApiError(StatusCode::NOT_FOUND, format!("{}: {e}", candidate.display())))?;
+    if !resolved.starts_with(&canvas_dir) {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            format!("{target:?} resolves outside the canvas directory"),
+        ));
+    }
+    Ok(resolved)
+}
+
 /// Read-only preview of a `file` node's target, for `display="code"`
 /// (see `SPEC.md`). Reads the file fresh from disk on every call — nothing
 /// here is cached or written back. The target is resolved relative to the
@@ -700,26 +745,7 @@ async fn get_node_file_content(
         ApiError(StatusCode::UNPROCESSABLE_ENTITY, format!("node {id:?} has no target"))
     })?;
 
-    // `Path::parent()` on a bare filename (e.g. `canvas.md`, no directory
-    // component) returns `Some("")`, not `None` — so a plain `unwrap_or(".")`
-    // never fires and we'd try to canonicalize an empty path, which fails
-    // with ENOENT. Treat that empty-parent case as "." too.
-    let canvas_dir = state.canvas_path.parent().filter(|p| !p.as_os_str().is_empty());
-    let canvas_dir = canvas_dir.unwrap_or(std::path::Path::new("."));
-    let canvas_dir = canvas_dir
-        .canonicalize()
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let candidate = canvas_dir.join(target);
-    let resolved = candidate
-        .canonicalize()
-        .map_err(|e| ApiError(StatusCode::NOT_FOUND, format!("{}: {e}", candidate.display())))?;
-    if !resolved.starts_with(&canvas_dir) {
-        return Err(ApiError(
-            StatusCode::FORBIDDEN,
-            format!("{target:?} resolves outside the canvas directory"),
-        ));
-    }
+    let resolved = resolve_confined_target(&state.canvas_path, target)?;
 
     let bytes = std::fs::read(&resolved)
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -740,6 +766,126 @@ async fn get_node_file_content(
     let content = String::from_utf8_lossy(slice).into_owned();
 
     Ok(Json(FileContentResponse { content, truncated }))
+}
+
+/// Runs a runnable `file` node's `interpreter target` (see
+/// `meshfox_core::Node::is_runnable_file`) — the counterpart to `run_block`
+/// for a node that has no fenced code of its own to run, just a target file
+/// on disk. Streams the same `RunEvent`s `run_block` does (`nodeId`/`block`
+/// both set to the node's own id, matching the "sole implicit block shares
+/// its node's id" convention `resolve_target` already uses for fenced
+/// blocks — see `crate::fence::is_default`), registered in `state.runs` the
+/// same way too, so the web UI's existing kill button and live-output
+/// handling work unchanged. No `deps=`/`cache`/`env=`/`tty` concepts apply
+/// here — a `file` node's body is just a link, nothing to chain, cache, or
+/// seize a terminal for.
+async fn run_file_node(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let raw = state.raw.lock().unwrap().clone();
+    let canvas = parse_or_error(&raw)?;
+    let node = canvas
+        .node(&id)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}")))?;
+    if !node.is_runnable_file() {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("node {id:?} isn't a runnable file node (needs type=\"file\", a target, and an interpreter)"),
+        ));
+    }
+    let interpreter = node.interpreter.clone().expect("checked by is_runnable_file");
+    let target = node.target.as_deref().expect("checked by is_runnable_file");
+    let resolved_path = resolve_confined_target(&state.canvas_path, target)?;
+
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let (kill_tx, mut kill_rx) = oneshot::channel::<()>();
+    state.runs.lock().unwrap().insert(run_id.clone(), kill_tx);
+
+    let stream = async_stream::stream! {
+        let _guard = RunGuard { state: Arc::clone(&state), run_id: run_id.clone() };
+        yield Ok::<_, io::Error>(ndjson_line(&RunEvent::Started { run_id: run_id.clone() }));
+        yield Ok(ndjson_line(&RunEvent::StepStart { node_id: id.clone(), block: id.clone() }));
+
+        let mut proc = match stream_exec::spawn_process(&interpreter, [resolved_path.as_os_str()]) {
+            Ok(p) => p,
+            Err(e) => {
+                yield Ok(ndjson_line(&RunEvent::Error { message: e.to_string() }));
+                return;
+            }
+        };
+
+        let exit_code = loop {
+            tokio::select! {
+                line = proc.output_rx.recv() => {
+                    match line {
+                        Some(text) => {
+                            yield Ok(ndjson_line(&RunEvent::Output {
+                                node_id: id.clone(),
+                                block: id.clone(),
+                                text,
+                            }));
+                        }
+                        None => {
+                            let status = proc.child.wait().await;
+                            break status.ok().and_then(|s| s.code()).unwrap_or(-1);
+                        }
+                    }
+                }
+                _ = &mut kill_rx => {
+                    let _ = proc.kill();
+                    let _ = proc.child.wait().await;
+                    yield Ok(ndjson_line(&RunEvent::Killed { node_id: id.clone(), block: id.clone() }));
+                    return;
+                }
+            }
+        };
+
+        yield Ok(ndjson_line(&RunEvent::StepEnd { node_id: id.clone(), block: id.clone(), exit_code }));
+        yield Ok(ndjson_line(&RunEvent::Done { exit_code }));
+    };
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-ndjson")
+        .body(Body::from_stream(stream))
+        .unwrap())
+}
+
+/// Opens a `file` node's target in the OS's default application for it
+/// (`open` on macOS, `xdg-open` on Linux, `start` on Windows — via the
+/// `open` crate, same one `meshfox view`'s own `--open` browser-launch
+/// already uses) — the web UI's "↗ open" button. Best-effort: spawns the
+/// opener and returns as soon as it has (not once whatever it opened has
+/// itself finished loading/exited), same as the browser-launch case.
+/// `spawn_blocking` because `open::that` shells out synchronously.
+async fn open_node_file(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let raw = state.raw.lock().unwrap().clone();
+    let canvas = parse_or_error(&raw)?;
+    let node = canvas
+        .node(&id)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}")))?;
+    if node.node_type != NodeType::File {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("node {id:?} is not a file node"),
+        ));
+    }
+    let target = node
+        .target
+        .as_deref()
+        .ok_or_else(|| ApiError(StatusCode::UNPROCESSABLE_ENTITY, format!("node {id:?} has no target")))?;
+    let resolved = resolve_confined_target(&state.canvas_path, target)?;
+
+    tokio::task::spawn_blocking(move || open::that(&resolved))
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("couldn't open the file: {e}")))?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1624,6 +1770,8 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/nodes/:id/reparent", post(reparent_node))
         .route("/api/nodes/:id/rename-id", post(rename_node_id))
         .route("/api/nodes/:id/file-content", get(get_node_file_content))
+        .route("/api/nodes/:id/run", post(run_file_node))
+        .route("/api/nodes/:id/open", post(open_node_file))
         .route("/api/vars", get(get_vars))
         .route("/api/run", post(run_block))
         .route("/api/run/tty", get(run_block_tty))
@@ -1862,5 +2010,165 @@ mod ws_tests {
         stream.read_to_string(&mut response).await.expect("read");
         let status_line = response.lines().next().expect("status line");
         status_line.split_whitespace().nth(1).expect("status code").parse().expect("numeric status")
+    }
+}
+
+#[cfg(test)]
+mod run_file_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    fn write_test_canvas(contents: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("meshfox-run-file-test-{}.canvas.md", uuid::Uuid::new_v4()));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    /// Posts an empty-body request to `path` and returns `(status, body)` —
+    /// same raw-`TcpStream` approach `ws_tests::reqwest_free_kill` uses.
+    /// `run_file_node`'s response streams as chunked transfer-encoding
+    /// (its body size isn't known upfront), so this de-chunks it before
+    /// handing the body back — a plain (non-streamed) error response is
+    /// just a body with no chunk framing at all, `dechunk` leaves that as
+    /// pass-through.
+    async fn post(addr: SocketAddr, path: &str) -> (u16, String) {
+        let request = format!("POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.expect("read");
+        let mut parts = response.splitn(2, "\r\n\r\n");
+        let head = parts.next().unwrap_or_default();
+        let raw_body = parts.next().unwrap_or_default();
+        let status = head
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let body = if head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+            dechunk(raw_body)
+        } else {
+            raw_body.to_string()
+        };
+        (status, body)
+    }
+
+    /// Decodes HTTP/1.1 chunked transfer-encoding — `<hex-size>\r\n<data>\r\n`
+    /// chunks, terminated by a zero-size chunk. Byte-indexed rather than
+    /// char-indexed would be more robust against a multi-byte character
+    /// split across a chunk boundary, but every chunk in these tests is
+    /// plain-ASCII NDJSON, so this is good enough for test purposes only.
+    fn dechunk(raw: &str) -> String {
+        let mut out = String::new();
+        let mut rest = raw;
+        loop {
+            let Some(nl) = rest.find("\r\n") else { break };
+            let Ok(size) = usize::from_str_radix(rest[..nl].trim(), 16) else { break };
+            rest = &rest[nl + 2..];
+            if size == 0 || size > rest.len() {
+                break;
+            }
+            out.push_str(&rest[..size]);
+            rest = &rest[size..].strip_prefix("\r\n").unwrap_or(rest);
+        }
+        out
+    }
+
+    fn ndjson_events(body: &str) -> Vec<serde_json::Value> {
+        body.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("valid RunEvent JSON"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn run_file_node_streams_output_and_exit_code() {
+        // Every test in this module runs concurrently and shares the same
+        // OS temp dir, so the target script's filename is namespaced with
+        // its own uuid rather than a fixed literal — otherwise a
+        // same-named target file from another test racing its own
+        // write/cleanup could shadow this one mid-run.
+        let script_name = format!("meshfox-run-file-test-{}-seed.sh", uuid::Uuid::new_v4());
+        let canvas_path = write_test_canvas(&format!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+             ## Seed\n<!-- meshfox:node id=\"seed\" type=\"file\" interpreter=\"bash\" -->\n\n\
+             [seed](./{script_name})\n"
+        ));
+        let target_path = canvas_path.with_file_name(&script_name);
+        std::fs::write(&target_path, "#!/bin/sh\necho hi from seed\n").unwrap();
+
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let (status, body) = post(addr, "/api/nodes/seed/run").await;
+        assert_eq!(status, 200);
+
+        let events = ndjson_events(&body);
+        assert_eq!(events[0]["type"], "started");
+        assert_eq!(events[1]["type"], "step-start");
+        assert_eq!(events[1]["nodeId"], "seed");
+        assert_eq!(events[1]["block"], "seed");
+        assert!(
+            events.iter().any(|e| e["type"] == "output" && e["text"] == "hi from seed"),
+            "expected an output event with the script's own stdout, got: {events:?}"
+        );
+        let step_end = events.iter().find(|e| e["type"] == "step-end").expect("a step-end event");
+        assert_eq!(step_end["exitCode"], 0);
+        assert_eq!(events.last().unwrap()["type"], "done");
+
+        let _ = std::fs::remove_file(&canvas_path);
+        let _ = std::fs::remove_file(&target_path);
+    }
+
+    #[tokio::test]
+    async fn run_file_node_rejects_a_node_with_no_interpreter() {
+        // `is_runnable_file` rejects this before the target is ever
+        // resolved on disk, so the (nonexistent) `./seed.sh` target is
+        // fine left unwritten — no risk of colliding with another test's
+        // own same-named file.
+        let canvas_path = write_test_canvas(concat!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Seed\n<!-- meshfox:node id=\"seed\" type=\"file\" -->\n\n",
+            "[seed](./seed.sh)\n",
+        ));
+
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let (status, body) = post(addr, "/api/nodes/seed/run").await;
+        assert_eq!(status, 422);
+        assert!(body.contains("isn't a runnable file node"), "unexpected body: {body}");
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn run_file_node_rejects_an_unknown_node() {
+        let canvas_path =
+            write_test_canvas("<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n");
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let (status, _) = post(addr, "/api/nodes/nope/run").await;
+        assert_eq!(status, 404);
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn open_node_file_rejects_a_non_file_node() {
+        let canvas_path =
+            write_test_canvas("<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n");
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let (status, body) = post(addr, "/api/nodes/root/open").await;
+        assert_eq!(status, 422);
+        assert!(body.contains("not a file node"), "unexpected body: {body}");
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn open_node_file_rejects_an_unknown_node() {
+        let canvas_path =
+            write_test_canvas("<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n");
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let (status, _) = post(addr, "/api/nodes/nope/open").await;
+        assert_eq!(status, 404);
+        let _ = std::fs::remove_file(&canvas_path);
     }
 }

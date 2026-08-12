@@ -70,6 +70,12 @@ export interface CodeSegment {
    * in this same node, `node-id/block-name` is a block elsewhere. See
    * `./deps.ts` for resolving these into concrete addresses. */
   deps: string[];
+  /** Mirrors `core::fence::CodeBlock.default` — the explicit `default`
+   * flag (`` ```bash name="run" default ``). A block also counts as this
+   * node's default when `name` equals the node's own id (see `MeshNode.tsx`'s
+   * `defaultBlockName`), whether or not this flag is set — same "explicit
+   * flag OR self-named" rule `core::fence::is_default` uses. */
+  default: boolean;
   code: string;
   output?: CachedOutput;
 }
@@ -226,6 +232,7 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
     const name = attrs.name ?? nodeId;
     const cache = attrs.cache !== undefined && attrs.cache !== "false";
     const tty = attrs.tty !== undefined && attrs.tty !== "false";
+    const isDefault = attrs.default !== undefined && attrs.default !== "false";
     const deps = (attrs.deps ?? "")
       .split(",")
       .map((s) => s.trim())
@@ -254,9 +261,26 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
       }
     }
 
-    segments.push({ type: "code", lang, name, cache, tty, deps, code: codeLines.join("\n"), output });
+    segments.push({ type: "code", lang, name, cache, tty, deps, default: isDefault, code: codeLines.join("\n"), output });
     i = cursor;
   }
   flushMarkdown();
   return segments;
+}
+
+/**
+ * The name of `nodeId`'s default runnable block, if it has exactly one —
+ * mirrors `core::fence::default_block`. A block qualifies via the explicit
+ * `default` flag or by sharing the node's own id (implicitly, via the sole
+ * unnamed fence, or explicitly via `name="<node-id>"` — see `parseBody`'s
+ * `nodeId` param). `null` both when no block qualifies and when more than
+ * one does (ambiguous — same as the Rust side, this just isn't eligible
+ * for the shortcut; `meshfox check` is what reports the conflict). Used to
+ * show the title bar's "▷ run" quick-run button (see `MeshNode.tsx`).
+ */
+export function defaultBlockName(markdown: string, nodeId: string): string | null {
+  const candidates = parseBody(markdown, nodeId).filter(
+    (seg): seg is CodeSegment => seg.type === "code" && (seg.default || seg.name === nodeId),
+  );
+  return candidates.length === 1 ? candidates[0].name : null;
 }

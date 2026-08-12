@@ -220,6 +220,11 @@ pub struct Node {
     /// the target's file extension.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lang: Option<String>,
+    /// `file`-node only: an executable (e.g. `"python"`) to run against
+    /// `target`, making the node runnable — see `Node::is_runnable_file`.
+    /// `None` means the node isn't runnable this way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interpreter: Option<String>,
     /// Markdown body between this heading (and its meshfox comments) and
     /// the next heading. For `group`, always empty. For `file`/`link`,
     /// always exactly the one Markdown link `target` was parsed from.
@@ -232,6 +237,18 @@ pub struct Node {
     /// every other node type always.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub constraint_status: Option<crate::constraint::ConstraintStatus>,
+}
+
+impl Node {
+    /// True for a `file` node with both a `target` and a non-empty
+    /// `interpreter` set — eligible to run as `interpreter target` (see
+    /// SPEC.md's "Node types"). `link`/every other type never qualifies,
+    /// same restriction `display`/`lang` already have.
+    pub fn is_runnable_file(&self) -> bool {
+        self.node_type == NodeType::File
+            && self.target.is_some()
+            && self.interpreter.as_deref().is_some_and(|i| !i.trim().is_empty())
+    }
 }
 
 impl Canvas {

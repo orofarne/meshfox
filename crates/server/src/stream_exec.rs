@@ -95,6 +95,32 @@ where
     Ok(SpawnedProcess { child, output_rx })
 }
 
+/// Spawns `program` (found via `PATH`, no shell involved) with `args`, as
+/// the leader of a fresh process group — same cancellable/streamed shape as
+/// `spawn_bash`, just without a shell or extra environment variables in
+/// between. Used to run a `file` node's `interpreter target` (see
+/// `meshfox_core::Node::is_runnable_file`), where `target` is a plain path
+/// string that has no business being interpreted by a shell.
+pub fn spawn_process<I, S>(program: &str, args: I) -> io::Result<SpawnedProcess>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let mut child = Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .process_group(0)
+        .spawn()?;
+
+    let (tx, output_rx) = mpsc::unbounded_channel();
+    spawn_line_reader(child.stdout.take().expect("piped stdout"), tx.clone());
+    spawn_line_reader(child.stderr.take().expect("piped stderr"), tx);
+
+    Ok(SpawnedProcess { child, output_rx })
+}
+
 fn spawn_line_reader<R>(reader: R, tx: mpsc::UnboundedSender<String>)
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -192,5 +218,25 @@ mod tests {
         assert!(!supports("ruby"));
         assert!(supports("bash"));
         assert!(supports("sh"));
+    }
+
+    #[tokio::test]
+    async fn spawn_process_runs_a_program_directly_with_args() {
+        let mut proc = spawn_process("echo", ["one", "two"]).unwrap();
+        let mut lines = Vec::new();
+        while let Some(line) = proc.output_rx.recv().await {
+            lines.push(line);
+        }
+        let status = proc.child.wait().await.unwrap();
+        assert_eq!(lines, vec!["one two"]);
+        assert_eq!(status.code(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn spawn_process_kill_terminates_it() {
+        let mut proc = spawn_process("sleep", ["30"]).unwrap();
+        proc.kill().unwrap();
+        let status = proc.child.wait().await.unwrap();
+        assert!(!status.success());
     }
 }

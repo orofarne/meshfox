@@ -18,6 +18,8 @@ import {
   fetchCanvas,
   saveCanvas,
   runBlockStream,
+  runFileStream,
+  openNodeFile,
   killRun,
   fetchVars,
   createNode,
@@ -409,16 +411,77 @@ export default function App() {
     [canvas, editMode, load, blockGraph, setNodes, patchLiveBlock],
   );
 
+  // Runs a runnable `file` node's `interpreter target` (see
+  // `api.ts`'s `runFileStream`) — the file-node counterpart to
+  // `executeRun`. A `file` node has no `deps=`/`env=`/`cache` concept, so
+  // there's no vars-modal gate (`handleRun` routes straight here for one,
+  // skipping `fetchVars`/`executeRun` entirely) and no reload afterward
+  // (nothing on disk changes). `blockName` is always `nodeId` itself, same
+  // "the block shares its node's own id" convention a `text` node's sole
+  // implicit block already uses — see `RunEvent`'s `nodeId`/`block`.
+  const executeFileRun = useCallback(
+    async (nodeId: string) => {
+      patchLiveBlock(nodeId, nodeId, { status: "queued", text: "" });
+      let runId: string | undefined;
+      try {
+        await runFileStream(nodeId, (event: RunEvent) => {
+          switch (event.type) {
+            case "started":
+              runId = event.runId;
+              break;
+            case "step-start":
+              patchLiveBlock(event.nodeId, event.block, { status: "running", text: "", exitCode: undefined, runId });
+              break;
+            case "output":
+              setNodes((nds) =>
+                nds.map((n) => {
+                  if (n.id !== event.nodeId) return n;
+                  const prev = n.data.liveBlocks[event.block] ?? { status: "running", text: "" };
+                  const text = prev.text ? `${prev.text}\n${event.text}` : event.text;
+                  return {
+                    ...n,
+                    data: { ...n.data, liveBlocks: { ...n.data.liveBlocks, [event.block]: { ...prev, text } } },
+                  };
+                }),
+              );
+              break;
+            case "step-end":
+              patchLiveBlock(event.nodeId, event.block, { status: "done", exitCode: event.exitCode, runId: undefined });
+              break;
+            case "killed":
+              patchLiveBlock(event.nodeId, event.block, { status: "killed", runId: undefined });
+              break;
+            case "error":
+              setError(event.message);
+              break;
+            case "done":
+              break;
+          }
+        });
+      } catch (e) {
+        setError(String(e));
+      }
+    },
+    [patchLiveBlock, setNodes],
+  );
+
   // Gate in front of `executeRun`: checks whether any declared
   // `meshfox:var` (see SPEC.md's "Variables") is still unresolved before
   // actually starting the run, and opens the modal to ask instead when
   // one is — the browser counterpart to the CLI's terminal prompt.
   // Fetches fresh every click rather than caching canvas-load-time
   // status, since an earlier run (this tab or another) may have just
-  // resolved something.
+  // resolved something. A runnable `file` node (see `CanvasNode.interpreter`)
+  // routes straight to `executeFileRun` instead — it has no fenced block,
+  // `deps=` chain, or `env=` to check `GET /api/vars` for.
   const handleRun = useCallback(
     async (nodeId: string, blockName: string, withDeps: boolean) => {
       if (!canvas) return;
+      const node = canvas.nodes.find((n) => n.id === nodeId);
+      if (node?.type === "file" && node.interpreter) {
+        await executeFileRun(nodeId);
+        return;
+      }
       const path = pathTo(canvas, nodeId);
       let statuses: VarStatus[];
       try {
@@ -434,7 +497,7 @@ export default function App() {
       }
       await executeRun(nodeId, blockName, withDeps);
     },
-    [canvas, executeRun],
+    [canvas, executeRun, executeFileRun],
   );
 
   // `tty` counterpart to `handleRun`: same "check `GET /api/vars` first,
@@ -499,6 +562,18 @@ export default function App() {
     },
     [setNodes],
   );
+
+  // Opens a `file` node's target in the OS's default application (the
+  // title bar's "↗ open" button) — fire-and-forget from the UI's point of
+  // view, just surfaced to the same error banner every other action here
+  // uses if the server couldn't spawn the opener.
+  const handleOpenFile = useCallback(async (nodeId: string) => {
+    try {
+      await openNodeFile(nodeId);
+    } catch (e) {
+      setError(String(e));
+    }
+  }, []);
 
   // Creates a new child node under `parentId` (empty body, no position —
   // the server's layout suggestion places it to the parent's right, see
@@ -761,6 +836,7 @@ export default function App() {
             constraintStatus: n.constraintStatus,
             display: n.display,
             lang: n.lang,
+            interpreter: n.interpreter,
             text: n.text,
             color: n.color,
             tags: n.tags,
@@ -768,6 +844,7 @@ export default function App() {
             onKill: (blockName: string) => handleKill(n.id, blockName),
             onRunTty: (blockName: string, withDeps: boolean) => handleRunTty(n.id, blockName, withDeps),
             onRecheckConstraint: () => load(),
+            onOpenFile: () => handleOpenFile(n.id),
             onAddChild: () => handleAddChild(n.id),
             onOpenSettings: () => setSettingsNodeId(n.id),
             onExpand: () => setExpandedNodeId(n.id),

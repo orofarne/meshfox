@@ -95,6 +95,8 @@ export interface NodePatch {
   display?: "link" | "code";
   /** file-node syntax-highlighting language hint — see `CanvasNode.lang`. */
   lang?: string;
+  /** file-node interpreter — see `CanvasNode.interpreter`. */
+  interpreter?: string;
   /** Full replacement list of tags — omit to leave them untouched, pass
    * `[]` to clear them. */
   tags?: string[];
@@ -269,6 +271,57 @@ export async function runBlockStream(
       buffered = buffered.slice(newlineAt + 1);
       if (line.trim()) onEvent(JSON.parse(line) as RunEvent);
     }
+  }
+}
+
+/**
+ * Runs a runnable `file` node's `interpreter target` (see
+ * `CanvasNode.interpreter`) — the counterpart to `runBlockStream` for a node
+ * that has no fenced code of its own, just a target file on disk. Streams
+ * the same `RunEvent` shape (`nodeId`/`block` both set to `nodeId` itself,
+ * same "the block shares its node's own id" convention a `text` node's sole
+ * implicit block already uses), registered the same way in the server's
+ * run registry — `killRun` works on it unchanged. No `withDeps`/`persist`:
+ * a `file` node has no `deps=` chain or cache to opt into.
+ */
+export async function runFileStream(nodeId: string, onEvent: (event: RunEvent) => void): Promise<void> {
+  const res = await fetch(`/api/nodes/${encodeURIComponent(nodeId)}/run`, { method: "POST" });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `POST /api/nodes/${nodeId}/run: ${res.status}`);
+  }
+  if (!res.body) {
+    throw new Error(`POST /api/nodes/${nodeId}/run: response had no body to stream`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffered = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffered += decoder.decode(value, { stream: true });
+    let newlineAt: number;
+    while ((newlineAt = buffered.indexOf("\n")) >= 0) {
+      const line = buffered.slice(0, newlineAt);
+      buffered = buffered.slice(newlineAt + 1);
+      if (line.trim()) onEvent(JSON.parse(line) as RunEvent);
+    }
+  }
+}
+
+/**
+ * Opens a `file` node's target in the OS's default application for it (the
+ * web UI's "↗ open" button) — best-effort, resolves once the opener has
+ * been spawned, not once whatever it opened has itself finished loading.
+ * Rejects (thrown error) for a non-file node, a node with no target, or a
+ * target outside the canvas directory.
+ */
+export async function openNodeFile(nodeId: string): Promise<void> {
+  const res = await fetch(`/api/nodes/${encodeURIComponent(nodeId)}/open`, { method: "POST" });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `POST /api/nodes/${nodeId}/open: ${res.status}`);
   }
 }
 
