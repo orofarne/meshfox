@@ -12,11 +12,17 @@ path = "src/main.rs"
 meshfox-core = { path = "../core" }
 meshfox-server = { path = "../server" }
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }
 rpassword = "7"
 tera = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+ratatui = "0.30.2"
+crossterm = "0.28.1"
+pulldown-cmark = "0.13.4"
+syntect = { version = "5.3.0", default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "regex-fancy"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
 
 [dev-dependencies]
 scraper = "0.20"

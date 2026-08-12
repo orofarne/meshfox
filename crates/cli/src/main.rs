@@ -18,6 +18,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 mod prompt;
+mod tui;
 
 /// `commit <hash> (<date>)`, captured at build time by `build.rs` from the
 /// repo `meshfox` was actually compiled in — not the crate's Cargo.toml
@@ -151,6 +152,21 @@ enum Command {
         /// wouldn't have).
         #[arg(long)]
         no_auto_exit: bool,
+    },
+    /// Experimental: an ncurses-style terminal viewer — browse the node
+    /// tree, read a node's rendered Markdown body (syntax-highlighted code,
+    /// local images shown inline where the terminal supports it), and run
+    /// blocks with live streamed output, right in the terminal. Same
+    /// deps-chain/cache/`meshfox:var` handling as `meshfox run`/`meshfox
+    /// view`. A `tty` block hands the real terminal over to it, same as
+    /// `meshfox run`'s own `tty` handling. Mouse support covers clicking a
+    /// tree row and scrolling the tree/document panes. Read + run only for
+    /// now — no structural editing (use `meshfox node ...` or the browser
+    /// UI's Edit mode for that).
+    Tui {
+        /// Path to the .canvas.md file. If omitted: auto-discover the
+        /// single candidate in the current directory.
+        canvas: Option<PathBuf>,
     },
     /// Validate that a file parses as a meshfox canvas — same checks
     /// `run`/`fmt`/`view` already do before touching anything (single root,
@@ -477,6 +493,10 @@ fn main() {
             }
             view(canvas_path, port, !no_open, !no_auto_exit)
         }
+        Command::Tui { canvas } => {
+            let canvas_path = canvas.unwrap_or_else(find_canvas);
+            tui(canvas_path)
+        }
         Command::Validate { canvas } => {
             let canvas_path = canvas.unwrap_or_else(find_canvas);
             validate(&canvas_path)
@@ -749,6 +769,17 @@ fn view(canvas_path: PathBuf, port: u16, open_browser: bool, auto_exit: bool) {
     });
     if let Err(e) = runtime.block_on(meshfox_server::run(canvas_path, port, open_browser, auto_exit)) {
         eprintln!("meshfox view: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn tui(canvas_path: PathBuf) {
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+        eprintln!("failed to start async runtime: {e}");
+        std::process::exit(1);
+    });
+    if let Err(e) = runtime.block_on(tui::run(canvas_path)) {
+        eprintln!("meshfox tui: {e}");
         std::process::exit(1);
     }
 }

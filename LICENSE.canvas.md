@@ -4,7 +4,7 @@
 
 meshfox itself is MIT-licensed (see [LICENSE](./LICENSE), also inlined below). This document tracks every third-party dependency pulled into the published binary/bundle — backend (Rust crates, `Cargo.toml`) and UI (npm packages, `web/package.json`) — and records the license-compatibility check against MIT.
 
-Only **direct** dependencies are listed by name below; the full transitive tree actually reachable from a *shipped* binary (321 Rust crates — normal-dependency edges only, dev/build-only trees excluded, since those never compile into what's published; 187 npm production packages) was checked programmatically and is summarized in "License compatibility" — nothing in it requires anything beyond attribution.
+Only **direct** dependencies are listed by name below; the full transitive tree actually reachable from a *shipped* binary (455 Rust crates — normal-dependency edges only, dev/build-only trees excluded, since those never compile into what's published; 187 npm production packages) was checked programmatically and is summarized in "License compatibility" — nothing in it requires anything beyond attribution. The Rust-side count jumped from 321 once `meshfox tui` (see "Usage") landed — syntax highlighting (`syntect`) and terminal image rendering (`ratatui-image`, `image`) both pull real transitive weight; `image`'s own default codec set was trimmed to just `png`/`jpeg`/`gif`/`webp`/`bmp` to keep that from growing further than it has to.
 
 ## MIT License
 <!-- meshfox:node id="license-file" type="file" display="code" -->
@@ -22,16 +22,21 @@ Direct dependencies across `crates/core`, `crates/server`, `crates/cli` (`cargo 
 | async-stream | MIT |
 | axum | MIT |
 | clap | MIT OR Apache-2.0 |
+| crossterm | MIT |
+| image | MIT OR Apache-2.0 |
 | libc | MIT OR Apache-2.0 |
 | mime_guess | MIT |
 | open | MIT |
 | portable-pty | MIT |
 | pulldown-cmark | MIT |
+| ratatui | MIT |
+| ratatui-image | MIT |
 | rpassword | Apache-2.0 |
 | rust-embed | MIT |
 | serde | MIT OR Apache-2.0 |
 | serde_json | MIT OR Apache-2.0 |
 | starlark | Apache-2.0 |
+| syntect | MIT |
 | tera | MIT |
 | thiserror | MIT OR Apache-2.0 |
 | tokio | MIT |
