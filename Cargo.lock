@@ -2057,6 +2057,7 @@ dependencies = [
  "image",
  "meshfox-core",
  "meshfox-server",
+ "open",
  "pulldown-cmark 0.13.4",
  "ratatui",
  "ratatui-image",

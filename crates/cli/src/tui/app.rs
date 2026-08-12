@@ -261,6 +261,7 @@ impl App {
             KeyCode::Char('r') => self.trigger_run(true).await,
             KeyCode::Char('R') => self.trigger_run(false).await,
             KeyCode::Char('K') => self.kill_running(),
+            KeyCode::Char('o') => self.trigger_open_file(),
             KeyCode::Char('c') => self.trigger_configure(),
             KeyCode::PageDown => self.scroll_document(10),
             KeyCode::PageUp => self.scroll_document(-10),
@@ -513,6 +514,54 @@ impl App {
 
     fn rebuild_display_canvas(&mut self) {
         self.display_canvas = resolve_includes(&self.canvas, &self.canvas_path);
+    }
+
+    /// Whether the currently selected row is a `file` node with a
+    /// `target` — same gate the web UI's `MeshNode` uses to decide
+    /// whether to render its "↗ open" button at all, used here so the
+    /// footer/help hint for `o` only shows up when it'd actually do
+    /// something (unlike `r`/`R`/`c`, which stay in the footer
+    /// unconditionally and just report "nothing runnable"/etc. if
+    /// pressed somewhere they don't apply — a *contextual* hint that
+    /// changed with every arrow-key move would just be noise for those).
+    pub fn selected_is_open_target(&self) -> bool {
+        self.rows
+            .get(self.selected)
+            .and_then(|row| self.display_canvas.node(&row.node_id))
+            .is_some_and(|node| node.node_type == NodeType::File && node.target.is_some())
+    }
+
+    /// `o` — opens the selected `file` node's `target` in the OS's own
+    /// default application for it (`open` on macOS, `xdg-open` on Linux,
+    /// `start` on Windows, via the `open` crate), the terminal
+    /// counterpart to the web UI's "↗ open" button
+    /// (`crates/server/src/lib.rs`'s `open_node_file` handler does the
+    /// same thing over HTTP, for the browser case). Resolved relative to
+    /// the canvas file's own directory, same `base_dir` join
+    /// `render_current_document`'s `display="code"` preview already
+    /// uses — no separate "must stay inside the canvas directory"
+    /// confinement check like the server's own `resolve_confined_target`,
+    /// since there's no network boundary to defend here: this is the
+    /// user's own local process, opening a file they can already reach
+    /// directly. Best-effort — spawns the opener and returns as soon as
+    /// it has, without waiting for it to exit.
+    fn trigger_open_file(&mut self) {
+        let Some(row) = self.rows.get(self.selected) else { return };
+        let Some(node) = self.display_canvas.node(&row.node_id) else { return };
+        if node.node_type != NodeType::File {
+            self.status = "not a file node".into();
+            return;
+        }
+        let Some(target) = &node.target else {
+            self.status = "file node has no target".into();
+            return;
+        };
+        let base_dir = self.canvas_path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+        let path = base_dir.join(target);
+        match open::that(&path) {
+            Ok(()) => self.status = format!("opened {}", path.display()),
+            Err(e) => self.status = format!("failed to open {}: {e}", path.display()),
+        }
     }
 
     // -- document rendering -------------------------------------------------

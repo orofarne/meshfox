@@ -223,6 +223,9 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     let mut hint = String::from(
         "tab focus · j/k move/scroll · enter expand · h/l collapse/expand · r run · R run (no deps) · K kill",
     );
+    if app.selected_is_open_target() {
+        hint.push_str(" · o open");
+    }
     if app.has_configurable_vars() {
         hint.push_str(" · c configure");
     }
@@ -353,6 +356,9 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         "  (a node with more than one block opens a picker first)",
         "K               kill the running block",
     ];
+    if app.selected_is_open_target() {
+        items.push("o               open this file node's target in the OS's default application");
+    }
     if app.has_configurable_vars() {
         items.push("c               configure every declared variable (see SPEC.md's \"Variables\")");
     }
