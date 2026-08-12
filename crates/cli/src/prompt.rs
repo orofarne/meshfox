@@ -56,7 +56,14 @@ pub fn ask(decl: &VarDecl, current: Option<&str>) -> io::Result<String> {
                     continue;
                 }
             },
-            VarType::String | VarType::Int => return Ok(input),
+            VarType::Int => match meshfox_core::validate_value(decl, &input) {
+                Ok(()) => return Ok(input),
+                Err(e) => {
+                    println!("{e}");
+                    continue;
+                }
+            },
+            VarType::String => return Ok(input),
         }
     }
 }

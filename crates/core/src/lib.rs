@@ -33,7 +33,7 @@ pub use staticgen::{Asset, EdgeView, NodeView, Position, SiteData};
 pub use tree::{RunnableBlock, TreeError};
 pub use varcache::VarCache;
 pub use vars::{
-    declared_vars, map_block_env, resolve as resolve_vars, resolve_block_env, validate_env_refs,
+    declared_vars, map_block_env, resolve as resolve_vars, resolve_block_env, validate_env_refs, validate_value,
     BlockEnvResolution, ResolvedVars, VarDecl, VarType, VarsError,
 };
 

@@ -836,6 +836,33 @@ fn run(canvas_path: &PathBuf, args: Vec<String>, no_deps: bool, set: Vec<(String
     runtime.block_on(run_async(canvas_path, args, no_deps, set));
 }
 
+/// `--set NAME=VALUE` is the one place a value can enter `resolve`'s
+/// `overrides` without ever passing through `prompt::ask`'s own
+/// type-aware handling (a `select`'s numbered menu, a `bool`'s y/n, an
+/// `int`'s own loop — see `prompt.rs`) — so this is where that same check
+/// (`meshfox_core::validate_value`) has to happen instead, before the
+/// value ever reaches the cache or a running block's environment. Only
+/// checks a `--set` naming a variable this document actually declares;
+/// one that doesn't (already accepted as an ordinary, non-`meshfox:var`
+/// environment override — see `resolve`) has no type to check it against.
+fn validate_set_overrides_or_exit(decls: &[VarDecl], overrides: &HashMap<String, String>) {
+    if let Err(e) = validate_set_overrides(decls, overrides) {
+        eprintln!("meshfox run: {e}");
+        std::process::exit(1);
+    }
+}
+
+/// The pure check `validate_set_overrides_or_exit` wraps — split out so
+/// it's testable without a subprocess (`std::process::exit` isn't).
+fn validate_set_overrides(decls: &[VarDecl], overrides: &HashMap<String, String>) -> Result<(), String> {
+    for (name, value) in overrides {
+        if let Some(decl) = decls.iter().find(|d| &d.name == name) {
+            meshfox_core::validate_value(decl, value).map_err(|e| format!("--set {name}={value:?} is invalid: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
 /// `--set NAME=VALUE` pins the cache regardless of whether anything in
 /// *this* invocation's chain actually references it — same as `cmake -D`
 /// always updating `CMakeCache.txt` — so a later plain `meshfox run`
@@ -975,6 +1002,7 @@ async fn run_async(canvas_path: &PathBuf, mut args: Vec<String>, no_deps: bool, 
     // variables just because *some* block somewhere declares one.
     let decls = declared_vars_or_exit(canvas_path, &raw);
     let overrides: HashMap<String, String> = set.into_iter().collect();
+    validate_set_overrides_or_exit(&decls, &overrides);
     let mut var_cache = load_var_cache_or_exit(canvas_path);
     persist_set_overrides(&decls, &overrides, &mut var_cache);
 
@@ -2219,5 +2247,71 @@ Shared body.
         assert_eq!(parse_display("link").unwrap(), FileDisplay::Link);
         assert_eq!(parse_display("code").unwrap(), FileDisplay::Code);
         assert!(parse_display("bogus").is_err());
+    }
+}
+
+#[cfg(test)]
+mod set_override_tests {
+    use super::*;
+
+    fn decl(name: &str, var_type: meshfox_core::VarType, choices: &[&str]) -> VarDecl {
+        VarDecl {
+            name: name.to_string(),
+            var_type,
+            prompt: name.to_string(),
+            default: None,
+            choices: choices.iter().map(|s| s.to_string()).collect(),
+            secret: false,
+            required: false,
+        }
+    }
+
+    #[test]
+    fn accepts_a_well_typed_set_for_every_declared_type() {
+        let decls = vec![
+            decl("COUNT", meshfox_core::VarType::Int, &[]),
+            decl("VERBOSE", meshfox_core::VarType::Bool, &[]),
+            decl("LEVEL", meshfox_core::VarType::Select, &["debug", "info"]),
+            decl("NAME", meshfox_core::VarType::String, &[]),
+        ];
+        let overrides = HashMap::from([
+            ("COUNT".to_string(), "42".to_string()),
+            ("VERBOSE".to_string(), "true".to_string()),
+            ("LEVEL".to_string(), "info".to_string()),
+            ("NAME".to_string(), "anything".to_string()),
+        ]);
+        assert!(validate_set_overrides(&decls, &overrides).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_non_integer_set_for_an_int_variable() {
+        let decls = vec![decl("COUNT", meshfox_core::VarType::Int, &[])];
+        let overrides = HashMap::from([("COUNT".to_string(), "not-a-number".to_string())]);
+        let err = validate_set_overrides(&decls, &overrides).unwrap_err();
+        assert!(err.contains("COUNT"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn rejects_a_set_outside_a_selects_own_choices() {
+        let decls = vec![decl("LEVEL", meshfox_core::VarType::Select, &["debug", "info"])];
+        let overrides = HashMap::from([("LEVEL".to_string(), "trace".to_string())]);
+        assert!(validate_set_overrides(&decls, &overrides).is_err());
+    }
+
+    #[test]
+    fn rejects_a_non_canonical_set_for_a_bool_variable() {
+        let decls = vec![decl("VERBOSE", meshfox_core::VarType::Bool, &[])];
+        let overrides = HashMap::from([("VERBOSE".to_string(), "yes".to_string())]);
+        assert!(validate_set_overrides(&decls, &overrides).is_err());
+    }
+
+    #[test]
+    fn ignores_a_set_for_a_name_this_document_never_declared() {
+        // An ordinary environment override with no matching `meshfox:var`
+        // has no type to check it against — same as `resolve`'s own
+        // handling of an override name it doesn't recognize.
+        let decls: Vec<VarDecl> = Vec::new();
+        let overrides = HashMap::from([("UNRELATED".to_string(), "whatever".to_string())]);
+        assert!(validate_set_overrides(&decls, &overrides).is_ok());
     }
 }

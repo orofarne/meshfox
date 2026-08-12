@@ -277,6 +277,24 @@ fn var_status(d: meshfox_core::VarDecl, resolved: &meshfox_core::ResolvedVars) -
     }
 }
 
+/// Validates every entry in `overrides` naming one of `decls` against that
+/// declaration's own `type` (`meshfox_core::validate_value`) — the one
+/// place a run request's `vars` bypasses whatever control the form that
+/// collected them used (a `select` dropdown, a `bool` checkbox), same
+/// concern `post_configure_vars` has its own copy of this check for.
+/// Shared by `run_block`/`run_block_tty`, both of which resolve `vars`
+/// straight into a spawned block's environment — an `int` field a client
+/// (or a hand-typed curl request) sent as `"not-a-number"` should fail the
+/// request outright, not run the block with a garbage value.
+fn validate_var_overrides(decls: &[meshfox_core::VarDecl], overrides: &HashMap<String, String>) -> Result<(), ApiError> {
+    for decl in decls {
+        if let Some(value) = overrides.get(&decl.name) {
+            meshfox_core::validate_value(decl, value).map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+        }
+    }
+    Ok(())
+}
+
 /// `GET /api/vars/configure` — every declared *non-secret* `meshfox:var`
 /// in the whole document, in declaration order, regardless of which (if
 /// any) block's `env=` actually references it. The browser counterpart to
@@ -325,10 +343,23 @@ async fn post_configure_vars(
     let canvas = parse_or_error(&raw)?;
     let decls = meshfox_core::declared_vars(&canvas)
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    let configurable: Vec<_> = decls.into_iter().filter(|d| !d.secret).collect();
+
+    // Validated before anything is saved — this is the one boundary none
+    // of the form's own controls (a `bool` checkbox, a `select` dropdown)
+    // can actually enforce, since a request can always bypass them
+    // entirely. An invalid entry anywhere in the batch fails the whole
+    // request rather than saving some fields and silently skipping
+    // others.
+    for decl in &configurable {
+        if let Some(value) = req.vars.get(&decl.name) {
+            meshfox_core::validate_value(decl, value).map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+        }
+    }
 
     let mut cache = state.vars_cache.lock().unwrap();
     let mut saved = 0;
-    for decl in decls.iter().filter(|d| !d.secret) {
+    for decl in &configurable {
         if let Some(value) = req.vars.get(&decl.name) {
             cache.set(&decl.name, value).map_err(|e| {
                 ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to save {}: {e}", decl.name))
@@ -1145,6 +1176,7 @@ async fn run_block(
     let decls = meshfox_core::declared_vars(&canvas)
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
     let relevant_decls: Vec<_> = decls.into_iter().filter(|d| needed.contains(&d.name)).collect();
+    validate_var_overrides(&relevant_decls, &req.vars)?;
     let resolved_vars = {
         let mut cache = state.vars_cache.lock().unwrap();
         let resolved = meshfox_core::resolve_vars(&relevant_decls, &req.vars, &cache);
@@ -1412,6 +1444,7 @@ async fn run_block_tty(
     let decls = meshfox_core::declared_vars(&canvas)
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
     let relevant_decls: Vec<_> = decls.into_iter().filter(|d| needed.contains(&d.name)).collect();
+    validate_var_overrides(&relevant_decls, &requested_vars)?;
     let resolved_vars = {
         let mut cache = state.vars_cache.lock().unwrap();
         let resolved = meshfox_core::resolve_vars(&relevant_decls, &requested_vars, &cache);
@@ -2357,7 +2390,7 @@ mod vars_endpoint_tests {
         assert_eq!(statuses[0]["value"], "/usr/local/bin");
 
         let _ = std::fs::remove_file(&canvas_path);
-        let _ = std::fs::remove_dir_all(meshfox_core::varcache::cache_path(&canvas_path).parent().unwrap());
+        let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));
     }
 
     #[tokio::test]
@@ -2374,7 +2407,7 @@ mod vars_endpoint_tests {
         assert_eq!(statuses[0]["value"], "/opt/confirmed");
 
         let _ = std::fs::remove_file(&canvas_path);
-        let _ = std::fs::remove_dir_all(meshfox_core::varcache::cache_path(&canvas_path).parent().unwrap());
+        let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));
     }
 
     /// A JSON POST, same head-parsing as `get` above — `/api/vars/configure`'s
@@ -2428,7 +2461,7 @@ mod vars_endpoint_tests {
         assert_eq!(statuses[1]["value"], "/usr/local/bin");
 
         let _ = std::fs::remove_file(&canvas_path);
-        let _ = std::fs::remove_dir_all(meshfox_core::varcache::cache_path(&canvas_path).parent().unwrap());
+        let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));
     }
 
     #[tokio::test]
@@ -2454,6 +2487,71 @@ mod vars_endpoint_tests {
         assert_eq!(cache.get("API_TOKEN"), None);
 
         let _ = std::fs::remove_file(&canvas_path);
-        let _ = std::fs::remove_dir_all(meshfox_core::varcache::cache_path(&canvas_path).parent().unwrap());
+        let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));
+    }
+
+    const TYPED_CANVAS: &str = concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "<!-- meshfox:var name=\"COUNT\" type=\"int\" -->\n",
+        "<!-- meshfox:var name=\"VERBOSE\" type=\"bool\" -->\n",
+        "<!-- meshfox:var name=\"LEVEL\" type=\"select\" choices=\"debug,info\" -->\n\n",
+        "```bash name=\"run\" env=\"$COUNT,$VERBOSE,$LEVEL\"\necho \"$COUNT $VERBOSE $LEVEL\"\n```\n",
+    );
+
+    #[tokio::test]
+    async fn post_configure_vars_rejects_an_invalid_value_for_every_type() {
+        for (name, bad) in [("COUNT", "not-a-number"), ("VERBOSE", "yes"), ("LEVEL", "trace")] {
+            let canvas_path = write_test_canvas(TYPED_CANVAS);
+            let addr = spawn_test_server(canvas_path.clone()).await;
+
+            let body_json = format!(r#"{{"vars":{{"{name}":"{bad}"}}}}"#);
+            let (status, body) = post_json(addr, "/api/vars/configure", &body_json).await;
+            assert_eq!(status, 422, "{name}={bad:?} should have been rejected, got body: {body}");
+            assert!(body.contains(name), "unexpected body: {body}");
+
+            let _ = std::fs::remove_file(&canvas_path);
+            let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));
+        }
+    }
+
+    #[tokio::test]
+    async fn post_configure_vars_saves_nothing_when_one_entry_in_the_batch_is_invalid() {
+        let canvas_path = write_test_canvas(TYPED_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, _) = post_json(
+            addr,
+            "/api/vars/configure",
+            r#"{"vars":{"COUNT":"42","VERBOSE":"not-a-bool","LEVEL":"debug"}}"#,
+        )
+        .await;
+        assert_eq!(status, 422);
+
+        // Validated before any of the batch is saved — COUNT/LEVEL being
+        // fine doesn't get them saved anyway once VERBOSE fails.
+        let cache = VarCache::load(&canvas_path).expect("load cache");
+        assert_eq!(cache.get("COUNT"), None);
+        assert_eq!(cache.get("LEVEL"), None);
+
+        let _ = std::fs::remove_file(&canvas_path);
+        let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));
+    }
+
+    #[tokio::test]
+    async fn run_block_rejects_an_invalid_typed_var_override() {
+        let canvas_path = write_test_canvas(TYPED_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, body) = post_json(
+            addr,
+            "/api/run",
+            r#"{"path":[],"block":"run","vars":{"COUNT":"not-a-number","VERBOSE":"true","LEVEL":"debug"}}"#,
+        )
+        .await;
+        assert_eq!(status, 422);
+        assert!(body.contains("COUNT"), "unexpected body: {body}");
+
+        let _ = std::fs::remove_file(&canvas_path);
+        let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));
     }
 }

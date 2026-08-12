@@ -1275,6 +1275,15 @@ a {
   opacity: 0.75;
 }
 
+/* Shown in place of the hint when submit is blocked by an invalid `int`
+ * field (see VarsForm.tsx's `isValidValue`) — same red the toolbar's own
+ * `.error` uses. */
+.vars-modal-error {
+  margin: 0;
+  font-size: 0.8rem;
+  color: #d33;
+}
+
 .vars-modal-field {
   display: flex;
   flex-direction: column;

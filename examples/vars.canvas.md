@@ -3,7 +3,7 @@
 <!-- meshfox:node id="root" x=0 y=0 w=280 h=60 -->
 
 Every `meshfox:var` setting, side by side — see SPEC.md's "Variables"
-section for the full writeup. All six are declared once here, in the
+section for the full writeup. All seven are declared once here, in the
 root node's own body:
 
 <!-- meshfox:var name="GREETING" prompt="Greeting?" default="Hello" -->
@@ -11,6 +11,7 @@ root node's own body:
 <!-- meshfox:var name="LOG_LEVEL" type="select" choices="debug,info,warn,error" default="info" -->
 <!-- meshfox:var name="REGION" type="select" choices="us-east-1,eu-west-1,ap-southeast-1" default="us-east-1" required -->
 <!-- meshfox:var name="VERBOSE" type="bool" default="false" -->
+<!-- meshfox:var name="RETRY_COUNT" prompt="Retry count?" type="int" default="3" -->
 <!-- meshfox:var name="API_TOKEN" secret -->
 
 A declaration on its own does nothing — only a block that opts in via its
@@ -119,8 +120,31 @@ verbose: false
 ```
 <!-- /meshfox:output -->
 
+## Int
+<!-- meshfox:node id="int-count" x=32 y=2832 w=440 h=566 -->
+
+`RETRY_COUNT` is `type="int"` with a `default` — same "resolves silently,
+`type` only shapes how a prompt would look" story as `LOG_LEVEL`/
+`VERBOSE` above, except an `int` prompt/form field is validated: only
+something that actually parses as a whole number is ever accepted (a
+terminal prompt keeps re-asking, the web form blocks submit, the TUI's
+own field only lets you type digits and a leading `+`/`-` in the first
+place) — see `meshfox_core::vars::validate_value`. Unlike `type`'s other
+values, this is real enforcement, not just a hint for how to ask.
+
+```bash name="retry" env="$RETRY_COUNT" cache
+echo "retrying up to $RETRY_COUNT time(s)"
+```
+<!-- meshfox:output name="retry" -->
+```text
+exit code: 0
+
+retrying up to 3 time(s)
+```
+<!-- /meshfox:output -->
+
 ## Secret
-<!-- meshfox:node id="secret-token" x=32 y=2832 w=440 h=588 -->
+<!-- meshfox:node id="secret-token" x=32 y=3458 w=440 h=588 -->
 
 `API_TOKEN` is `secret` — no `default`, never read from or written to
 the on-disk cache, never pre-filled anywhere. The only way to supply one
@@ -140,23 +164,24 @@ echo "calling the API with a token ${#API_TOKEN} characters long"
 ```
 
 ## Combined
-<!-- meshfox:node id="combined" x=32 y=3480 w=440 h=544 -->
+<!-- meshfox:node id="combined" x=32 y=4106 w=440 h=610 -->
 
 `env=` takes a comma-separated list — a single block can reference
 several declared variables at once, mixing plain, `required`, `select`,
-and `bool` ones freely. Each is still resolved independently (its own
-override/environment/cache/`default`, `required` skipping that last
-step same as anywhere else) — `env=` just collects whichever of them
-this one block actually needs into its process environment together.
+`bool`, and `int` ones freely. Each is still resolved independently (its
+own override/environment/cache/`default`, `required` skipping that last
+step, `int` validated on the way in, same as anywhere else) — `env=`
+just collects whichever of them this one block actually needs into its
+process environment together.
 
-```bash name="provision" env="$GREETING,$INSTALL_PATH,$LOG_LEVEL,$VERBOSE" cache
-echo "$GREETING! installing to $INSTALL_PATH (log level $LOG_LEVEL, verbose=$VERBOSE)"
+```bash name="provision" env="$GREETING,$INSTALL_PATH,$LOG_LEVEL,$VERBOSE,$RETRY_COUNT" cache
+echo "$GREETING! installing to $INSTALL_PATH (log level $LOG_LEVEL, verbose=$VERBOSE, retries=$RETRY_COUNT)"
 ```
 <!-- meshfox:output name="provision" -->
 ```text
 exit code: 0
 
-Hello! installing to /usr/local/bin (log level info, verbose=false)
+Hello! installing to /usr/local/bin (log level info, verbose=false, retries=3)
 ```
 <!-- /meshfox:output -->
 

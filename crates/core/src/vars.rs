@@ -114,6 +114,47 @@ fn build_var_decl(attrs: HashMap<String, String>) -> Result<VarDecl, VarsError> 
     Ok(VarDecl { name, var_type, prompt, default, choices, secret, required })
 }
 
+/// Whether `value` is an acceptable *fresh* answer for `decl`'s own
+/// `type` — `string` accepts anything; `int` must parse as a (signed)
+/// integer; `bool` must be exactly `"true"` or `"false"`, the canonical
+/// form every control that actually constrains a `bool` field already
+/// produces (the TUI's left/right toggle, the web `VarsForm`'s checkbox,
+/// the CLI prompt's own y/n handling); `select` must be exactly one of
+/// `choices`.
+///
+/// Deliberately *not* called anywhere in `resolve`/`resolve_block_env`
+/// themselves (see their own doc comments) — an already-cached, `--set`,
+/// or process-environment value can predate a stricter `type=`/
+/// `choices=` edit to the declaration, and resolution silently breaking
+/// every run over that would be worse than just using the stale value.
+/// This is for whoever is about to *accept a new answer* — an
+/// interactive prompt, `--set`, a submitted form/API request — to check
+/// before saving it, catching a bypass of a UI's own control (a `select`
+/// answered via a raw `--set REGION=mars` or a direct API call, say)
+/// that the control itself would never have produced.
+pub fn validate_value(decl: &VarDecl, value: &str) -> Result<(), String> {
+    match decl.var_type {
+        VarType::String => Ok(()),
+        VarType::Int => {
+            value.parse::<i64>().map(|_| ()).map_err(|_| format!("{:?} expects an integer, got {value:?}", decl.name))
+        }
+        VarType::Bool => {
+            if value == "true" || value == "false" {
+                Ok(())
+            } else {
+                Err(format!("{:?} expects true or false, got {value:?}", decl.name))
+            }
+        }
+        VarType::Select => {
+            if decl.choices.iter().any(|c| c == value) {
+                Ok(())
+            } else {
+                Err(format!("{:?} expects one of [{}], got {value:?}", decl.name, decl.choices.join(", ")))
+            }
+        }
+    }
+}
+
 /// Scans `markdown` (a node's own body text) for `meshfox:var` comments,
 /// fence-aware — a line inside a code fence (e.g. a worked example showing
 /// off the syntax itself) is never mistaken for a real declaration, same
@@ -410,6 +451,53 @@ mod tests {
             secret,
             required,
         }
+    }
+
+    fn typed_decl(name: &str, var_type: VarType, choices: &[&str]) -> VarDecl {
+        VarDecl {
+            name: name.to_string(),
+            var_type,
+            prompt: name.to_string(),
+            default: None,
+            choices: choices.iter().map(|s| s.to_string()).collect(),
+            secret: false,
+            required: false,
+        }
+    }
+
+    #[test]
+    fn validate_value_string_accepts_anything() {
+        let d = typed_decl("X", VarType::String, &[]);
+        assert!(validate_value(&d, "").is_ok());
+        assert!(validate_value(&d, "anything at all, really").is_ok());
+    }
+
+    #[test]
+    fn validate_value_int_requires_a_parseable_integer() {
+        let d = typed_decl("X", VarType::Int, &[]);
+        assert!(validate_value(&d, "42").is_ok());
+        assert!(validate_value(&d, "-7").is_ok());
+        assert!(validate_value(&d, "not a number").is_err());
+        assert!(validate_value(&d, "3.14").is_err());
+        assert!(validate_value(&d, "").is_err());
+    }
+
+    #[test]
+    fn validate_value_bool_requires_the_canonical_true_or_false() {
+        let d = typed_decl("X", VarType::Bool, &[]);
+        assert!(validate_value(&d, "true").is_ok());
+        assert!(validate_value(&d, "false").is_ok());
+        assert!(validate_value(&d, "yes").is_err());
+        assert!(validate_value(&d, "1").is_err());
+        assert!(validate_value(&d, "").is_err());
+    }
+
+    #[test]
+    fn validate_value_select_requires_membership_in_choices() {
+        let d = typed_decl("X", VarType::Select, &["debug", "info", "warn"]);
+        assert!(validate_value(&d, "info").is_ok());
+        assert!(validate_value(&d, "trace").is_err());
+        assert!(validate_value(&d, "").is_err());
     }
 
     #[test]

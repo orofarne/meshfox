@@ -275,10 +275,13 @@ impl App {
     /// field is focused (same as pressing Enter in an HTML text input
     /// submits its enclosing `<form>`, which is what the web UI's own
     /// `VarsForm` is). Editing a field is type-aware, same control each
-    /// type gets in `VarsForm`/the CLI's own line prompt: `String`/`Int`
-    /// take free text (type/backspace); `Bool` and `Select` are a
-    /// left/right toggle/cycle instead — typing a character or backspace
-    /// does nothing to those, since there's no text to edit.
+    /// type gets in `VarsForm`/the CLI's own line prompt: `String` takes
+    /// any text; `Int` only accepts digits (and a leading `-`) as they're
+    /// typed, so the field can't even hold something
+    /// `meshfox_core::validate_value` would reject by the time Enter is
+    /// pressed; `Bool`/`Select` are a left/right toggle/cycle instead —
+    /// typing a character or backspace does nothing to those, since
+    /// there's no text to edit.
     async fn on_var_form_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Enter => self.submit_var_form().await,
@@ -306,7 +309,20 @@ impl App {
             KeyCode::Char(c) => {
                 if let Some(vf) = &mut self.var_form {
                     let i = vf.selected;
-                    if matches!(vf.decls[i].var_type, VarType::String | VarType::Int) {
+                    let allowed = match vf.decls[i].var_type {
+                        VarType::String => true,
+                        // A leading `+`/`-` (once, only as the very first
+                        // character — same grammar `i64::from_str` itself
+                        // accepts, see `meshfox_core::validate_value`)
+                        // plus digits — anything else typed just doesn't
+                        // land, rather than landing and then failing
+                        // `validate_value` at submit time.
+                        VarType::Int => {
+                            c.is_ascii_digit() || ((c == '-' || c == '+') && vf.inputs[i].is_empty())
+                        }
+                        VarType::Bool | VarType::Select => false,
+                    };
+                    if allowed {
                         vf.inputs[i].push(c);
                     }
                 }
@@ -793,7 +809,32 @@ impl App {
     /// never written to the cache (still resolves for just this run via
     /// `run_overrides`, same as before), matching `vars::resolve`'s own
     /// secret handling.
+    ///
+    /// Validates every field first (`meshfox_core::validate_value`) —
+    /// `Bool`/`Select`'s own left/right controls already can't produce an
+    /// invalid value, and `Int`'s typed-character restriction
+    /// (`on_var_form_key`) already rules most of this out too, but an
+    /// empty or bare-`-` `Int` field can still slip through both of those
+    /// (there's nothing to *type* that's invalid about an empty field).
+    /// The whole form stays open — nothing is saved, nothing resumes — and
+    /// focus jumps to the first offending field, so it's obvious what to
+    /// fix.
     async fn submit_var_form(&mut self) {
+        {
+            let vf = self.var_form.as_ref().expect("guarded by on_key's is_some() check");
+            if let Some((i, e)) = vf
+                .decls
+                .iter()
+                .zip(vf.inputs.iter())
+                .enumerate()
+                .find_map(|(i, (d, v))| meshfox_core::validate_value(d, v).err().map(|e| (i, e)))
+            {
+                let vf = self.var_form.as_mut().unwrap();
+                vf.selected = i;
+                self.status = format!("meshfox: {e}");
+                return;
+            }
+        }
         let Some(vf) = self.var_form.take() else { return };
         for (decl, value) in vf.decls.iter().zip(vf.inputs.iter()) {
             if !decl.secret {
