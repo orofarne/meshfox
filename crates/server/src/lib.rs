@@ -456,15 +456,18 @@ async fn put_canvas(
 /// unchanged" meaning callers get by passing the node's own current value
 /// through, the way `put_canvas` does) — every other field is carried over
 /// from the node's current value so only the layout is actually cleared. A
-/// group's box is always derived, never stored, so there's nothing to
-/// clear on one; `include` nodes have no `meshfox:node` comment in this
-/// file at all, so `set_node_meta` no-ops for them the same as it does
-/// everywhere else.
+/// group's box is always derived, never stored, so there's nothing to clear
+/// on one. Unlike `put_canvas` (which only ever sees the *resolved* canvas,
+/// where an `include` node has already been rewritten to `text`/`group` by
+/// `include::resolve`), this reads straight off the raw, unresolved parse —
+/// here, an `include` node is still the node that *declares* the include
+/// right in this file, with its own real `meshfox:node` comment (position
+/// and all), so it must be cleared exactly like any other node.
 async fn clear_layout(State(state): State<Arc<AppState>>) -> Result<Json<Canvas>, ApiError> {
     let mut raw = state.raw.lock().unwrap().clone();
     let canvas = parse_or_error(&raw)?;
     for node in &canvas.nodes {
-        if node.node_type == NodeType::Group || node.node_type == NodeType::Include {
+        if node.node_type == NodeType::Group {
             continue;
         }
         let meta = NodeMeta {
@@ -1671,6 +1674,51 @@ async fn spawn_test_server(canvas_path: PathBuf) -> SocketAddr {
         axum::serve(listener, app).await.expect("server");
     });
     addr
+}
+
+#[cfg(test)]
+mod clear_layout_tests {
+    use super::*;
+
+    fn write_test_canvas(contents: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("meshfox-clear-layout-test-{}.canvas.md", uuid::Uuid::new_v4()));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    // Mirrors the real-world shape that triggered this: an `include` node
+    // (e.g. a "README" card pointing at another file) carries its own real,
+    // authored `x`/`y`/`w`/`h` right on its own `meshfox:node` comment, same
+    // as any other node — clicking the web UI's "Auto-layout" button is
+    // supposed to clear every node's stored position, this one included.
+    const CANVAS: &str = concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "## Section\n<!-- meshfox:node id=\"section\" -->\n\n",
+        "### README\n<!-- meshfox:node id=\"readme\" type=\"include\" x=392 y=300 w=280 h=108 -->\n\n",
+        "[readme](./other/README.md)\n",
+    );
+
+    #[tokio::test]
+    async fn clear_layout_clears_an_include_nodes_own_authored_position() {
+        let canvas_path = write_test_canvas(CANVAS);
+        let target_path = canvas_path.with_file_name("other-readme.md");
+        std::fs::write(&target_path, "included body\n").unwrap();
+        let canvas_path = write_test_canvas(&CANVAS.replace("./other/README.md", &target_path.display().to_string()));
+        let state = build_state(canvas_path.clone(), false).await.expect("valid test canvas");
+
+        let Json(cleared) = match clear_layout(State(state)).await {
+            Ok(json) => json,
+            Err(e) => panic!("clear-layout failed: {}", e.1),
+        };
+        let readme = cleared.node("readme").expect("readme node still present");
+
+        assert_eq!(readme.x, None, "include node's own authored x should be cleared");
+        assert_eq!(readme.y, None, "include node's own authored y should be cleared");
+
+        let _ = std::fs::remove_file(&canvas_path);
+        let _ = std::fs::remove_file(&target_path);
+    }
 }
 
 #[cfg(test)]

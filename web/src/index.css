@@ -1510,6 +1510,23 @@ a {
   color: #fff;
 }
 
+/* AutoLayoutConfirmDialog's "reset layout" button — destructive-in-a-good-way
+ * (it's just re-deriving layout, not deleting content), so styled with the
+ * app's own accent color rather than the delete dialog's `--fail` red.
+ * Scoped under `.vars-modal-actions` (matching `button[type="submit"]`
+ * right below) so it actually outranks `.vars-modal-actions button`'s own
+ * neutral border/color — a bare `.autolayout-confirm-button` loses that
+ * specificity fight and silently renders neutral at rest. */
+.vars-modal-actions .autolayout-confirm-button {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.vars-modal-actions .autolayout-confirm-button:hover {
+  background: var(--accent);
+  color: #fff;
+}
+
 /* DeleteNodeDialog.tsx — reuses `.vars-modal`'s backdrop/card/hint/actions
  * wholesale; only the stacked "what happens to the children" choice below
  * is genuinely new. */

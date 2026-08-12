@@ -8,7 +8,9 @@ interface AutoLayoutConfirmDialogProps {
  * App.tsx) — clearing every node's stored position/size is destructive (it
  * overwrites the file, not just this session's view), so this is the one
  * gate before `clearLayout` actually runs. Reuses `DeleteNodeDialog`'s modal
- * styling.
+ * styling, but not its red delete button — this reset re-derives layout
+ * rather than deleting anything, so its own `.autolayout-confirm-button`
+ * uses the app's orange accent instead.
  */
 export function AutoLayoutConfirmDialog({ onConfirm, onCancel }: AutoLayoutConfirmDialogProps) {
   return (
@@ -23,7 +25,7 @@ export function AutoLayoutConfirmDialog({ onConfirm, onCancel }: AutoLayoutConfi
           <button type="button" onClick={onCancel}>
             cancel
           </button>
-          <button type="button" className="node-settings-delete-button" onClick={onConfirm}>
+          <button type="button" className="autolayout-confirm-button" onClick={onConfirm}>
             reset layout
           </button>
         </div>
