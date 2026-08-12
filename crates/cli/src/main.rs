@@ -20,10 +20,11 @@ use std::path::{Path, PathBuf};
 mod prompt;
 mod tui;
 
-/// `commit <hash> (<date>)`, captured at build time by `build.rs` from the
-/// repo `meshfox` was actually compiled in — not the crate's Cargo.toml
-/// version, which doesn't change between commits.
-const VERSION: &str = concat!("commit ", env!("MESHFOX_GIT_COMMIT"), " (", env!("MESHFOX_GIT_DATE"), ")");
+/// `commit <hash> (<date>)`, or `<tag> (<date>)` for a build made from a
+/// release tag, captured at build time by `build.rs` from the repo `meshfox`
+/// was actually compiled in — not the crate's Cargo.toml version, which
+/// doesn't change between commits.
+const VERSION: &str = concat!(env!("MESHFOX_VERSION_LABEL"), " (", env!("MESHFOX_GIT_DATE"), ")");
 
 const MASCOT: &str = r"
 
