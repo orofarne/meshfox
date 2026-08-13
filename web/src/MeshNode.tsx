@@ -184,10 +184,34 @@ function sameNodeChainNames(segments: BodySegment[]): Set<string> {
   return chain;
 }
 
-const TYPE_ICON: Partial<Record<NodeType, string>> = {
-  file: "📎",
-  link: "🔗",
-};
+/** `file`/`link` nodes' title-bar type marker. Hand-drawn inline SVG rather
+ * than the 📎/🔗 emoji this used to be: those are color-emoji-presentation
+ * codepoints with no monochrome fallback in most font stacks, so unlike
+ * this app's other symbol-character icons they can't be steered back to a
+ * crisp vector glyph via `font-variant-emoji: text` (see index.css's `body`
+ * rule) — a color-emoji glyph is a bitmap, and React Flow's zoom (a CSS
+ * `transform: scale()`, not a font-size change) scales that bitmap into
+ * pixelated noise at a low enough zoom. An SVG sized in `em` and colored via
+ * `currentColor` scales cleanly at any zoom, same as the surrounding text. */
+function TypeIcon({ type }: { type: NodeType }) {
+  if (type === "file") {
+    return (
+      <svg className="mesh-node-type-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M15 5.5v9a3.5 3.5 0 1 1-7 0V7a2 2 0 1 1 4 0v7.5" />
+      </svg>
+    );
+  }
+  if (type === "link") {
+    return (
+      <svg className="mesh-node-type-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M9 15l6-6" />
+        <path d="M10.5 6.5l1-1a3.5 3.5 0 0 1 5 5l-1 1" />
+        <path d="M13.5 17.5l-1 1a3.5 3.5 0 0 1-5-5l1-1" />
+      </svg>
+    );
+  }
+  return null;
+}
 
 /** Rolls up every embedded constraint fence's result in a node into one
  * pass/fail summary for the title-bar pill — `undefined` when the node has
@@ -890,13 +914,13 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
       <Handle type="target" position={Position.Left} />
       {isTitleOnly ? (
         <div className="mesh-node-title mesh-node-title-centered nopan" data-level={data.level}>
-          {TYPE_ICON[data.nodeType] ? `${TYPE_ICON[data.nodeType]} ` : ""}
+          <TypeIcon type={data.nodeType} />
           {data.title}
         </div>
       ) : (
         <div className="mesh-node-title" data-level={data.level}>
           <span className="mesh-node-title-text nopan">
-            {TYPE_ICON[data.nodeType] ? `${TYPE_ICON[data.nodeType]} ` : ""}
+            <TypeIcon type={data.nodeType} />
             {data.title}
           </span>
           <ConstraintBadge status={constraintStatus} />
@@ -944,7 +968,7 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
                   onClick={() => setEditingText(true)}
                   title="Edit this node's Markdown text"
                 >
-                  ✏️
+                  ✏
                 </button>
               )}
               {isGroup && (

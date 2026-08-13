@@ -1362,7 +1362,7 @@ export default function App() {
                 : `All ${constraintStats.total} constraint${constraintStats.total === 1 ? "" : "s"} pass`
             }
           >
-            🛡️ {constraintStats.total - constraintStats.failed}/{constraintStats.total}
+            🛡 {constraintStats.total - constraintStats.failed}/{constraintStats.total}
           </span>
         )}
         {editMode ? (

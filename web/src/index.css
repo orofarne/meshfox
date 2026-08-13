@@ -86,6 +86,17 @@ body {
   font-family: "Fira Code", system-ui, -apple-system, "Segoe UI", sans-serif;
   background: var(--bg);
   color: var(--fg);
+  /* UI chrome (title-bar icon buttons, badges, toolbar) leans on plain
+   * Unicode symbols like ⛶/⚙/🗑 rather than an icon font, several of which
+   * default to color-emoji presentation. A color-emoji glyph is a bitmap,
+   * not the outline glyph the rest of the UI text uses, so React Flow's
+   * `transform: scale()` zoom (rather than a font-size change) scales it
+   * as a raster image — it pixelates into noise at a low enough zoom,
+   * unlike the surrounding vector text. Forcing text presentation here
+   * keeps every such glyph a scalable outline colored via `color` (as
+   * `.mesh-node-icon-button` already assumes) instead of a bitmap.
+   * `.mesh-node-body` opts back into color emoji for actual node content. */
+  font-variant-emoji: text;
 }
 
 a {
@@ -346,6 +357,22 @@ a {
   user-select: text;
 }
 
+/* `TypeIcon` in MeshNode.tsx (a `file`/`link` node's title-bar marker) — an
+ * SVG rather than a 📎/🔗 emoji character (see that component's comment for
+ * why), sized/positioned to sit inline with the title text it precedes. */
+.mesh-node-type-icon {
+  width: 0.85em;
+  height: 0.85em;
+  flex-shrink: 0;
+  margin-right: 0.3em;
+  vertical-align: -0.1em;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
 .mesh-node-title[data-level="1"] {
   font-size: 1.05rem;
 }
@@ -540,6 +567,11 @@ a {
    * ancestor `user-select: none` so a node's Markdown/code/output text is
    * selectable and copyable, in Edit mode or not. */
   user-select: text;
+  /* Opts back into color emoji for a node's own Markdown/code content —
+   * unlike the UI chrome, this text is authored by the user and any emoji
+   * in it is real content, not an icon glyph the `body` rule's
+   * `font-variant-emoji: text` is meant to flatten. */
+  font-variant-emoji: emoji;
 }
 
 /* A `file` node's `display: "code"` body — see `FileCodePreview` in
