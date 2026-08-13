@@ -271,6 +271,7 @@ Options:
 
 
 
+
 Run it from a real terminal — `meshfox tui README.md` (or just `meshfox tui`, auto-discovering the one canvas in the current directory) — `?` opens an in-app keybinding reference once it's up.
 
 ### Static export (experimental)

@@ -169,6 +169,7 @@ struct Renderer<'a> {
     list_stack: Vec<Option<u64>>, // Some(n) = ordered, next number; None = bullet
     quote_depth: usize,
     code_lang: Option<String>,
+    code_name: Option<String>,
     code_buf: String,
     table: Option<TableState>,
     pending_heading_style: Option<Style>,
@@ -194,6 +195,7 @@ impl<'a> Renderer<'a> {
             list_stack: Vec::new(),
             quote_depth: 0,
             code_lang: None,
+            code_name: None,
             code_buf: String::new(),
             table: None,
             pending_heading_style: None,
@@ -232,8 +234,21 @@ impl<'a> Renderer<'a> {
         self.flush_line();
         if !self.lines.is_empty() {
             let lines = std::mem::take(&mut self.lines);
-            self.segments.push(Segment::Text(lines));
+            self.push_segment(Segment::Text(lines));
         }
+    }
+
+    /// Pushes a block-level segment, with a blank line ahead of it whenever
+    /// it isn't the very first segment in the document — otherwise adjacent
+    /// blocks (a code fence right after a paragraph, two fences back to
+    /// back, ...) render with no gap and read as one merged block, since
+    /// `render_document` just stacks each segment's lines directly on top
+    /// of the next with no spacing of its own.
+    fn push_segment(&mut self, seg: Segment) {
+        if !self.segments.is_empty() {
+            self.segments.push(Segment::Text(vec![Line::from("")]));
+        }
+        self.segments.push(seg);
     }
 
     fn finish(mut self) -> Vec<Segment> {
@@ -263,7 +278,7 @@ impl<'a> Renderer<'a> {
             Event::HardBreak => self.flush_line(),
             Event::Rule => {
                 self.flush_paragraph();
-                self.segments.push(Segment::Text(vec![Line::from(Span::styled(
+                self.push_segment(Segment::Text(vec![Line::from(Span::styled(
                     "─".repeat(60),
                     Style::default().fg(Color::DarkGray),
                 ))]));
@@ -296,12 +311,21 @@ impl<'a> Renderer<'a> {
             }
             Tag::CodeBlock(kind) => {
                 self.flush_paragraph();
-                self.code_lang = Some(match kind {
+                let (lang, name) = match kind {
+                    // The info string carries meshfox's own attributes past
+                    // the language token (`name="..."`, `cache`, ...) — see
+                    // `meshfox_core::fence`, which this mirrors just enough
+                    // to pull out `name` for the block header below.
                     CodeBlockKind::Fenced(info) => {
-                        info.split_whitespace().next().unwrap_or("text").to_string()
+                        let mut tokens = meshfox_core::attrs::tokenize(&info).into_iter();
+                        let lang = tokens.next().unwrap_or_else(|| "text".to_string());
+                        let name = meshfox_core::attrs::attrs_from_tokens(tokens).remove("name");
+                        (lang, name)
                     }
-                    CodeBlockKind::Indented => "text".to_string(),
-                });
+                    CodeBlockKind::Indented => ("text".to_string(), None),
+                };
+                self.code_lang = Some(lang);
+                self.code_name = name;
                 self.code_buf.clear();
             }
             Tag::List(start) => {
@@ -326,13 +350,13 @@ impl<'a> Renderer<'a> {
                 self.flush_paragraph();
                 let alt = title.to_string();
                 if dest_url.starts_with("http://") || dest_url.starts_with("https://") {
-                    self.segments.push(Segment::Text(vec![Line::from(Span::styled(
+                    self.push_segment(Segment::Text(vec![Line::from(Span::styled(
                         format!("[image: {dest_url}]"),
                         Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
                     ))]));
                 } else {
                     let path = self.base_dir.join(dest_url.as_ref());
-                    self.segments.push(Segment::Image { path, alt });
+                    self.push_segment(Segment::Image { path, alt });
                 }
             }
             Tag::Table(alignments) => {
@@ -374,17 +398,31 @@ impl<'a> Renderer<'a> {
             }
             TagEnd::CodeBlock => {
                 let lang = self.code_lang.take().unwrap_or_default();
+                let name = self.code_name.take();
                 let code = std::mem::take(&mut self.code_buf);
                 let highlighted = self.hl.highlight(&lang, &code);
-                let framed: Vec<Line<'static>> = highlighted
-                    .into_iter()
-                    .map(|l| {
-                        let mut spans = vec![Span::styled("│ ", Style::default().fg(Color::DarkGray))];
-                        spans.extend(l.spans);
-                        Line::from(spans)
-                    })
-                    .collect();
-                self.segments.push(Segment::Text(framed));
+                let border = Style::default().fg(Color::DarkGray);
+                // Mirrors the web UI's code-block head (lang + run name) so
+                // it's clear at a glance what `r` would actually run, and
+                // doubles as a visual break between back-to-back fences —
+                // see `push_segment` for the blank-line half of that.
+                let label = match &name {
+                    Some(n) if n != &lang => format!(" {lang} · {n} "),
+                    Some(n) => format!(" {n} "),
+                    None => format!(" {lang} "),
+                };
+                // `┌` matches the box-drawing set ratatui's own pane
+                // borders already use (see `Borders::ALL` in ui.rs), so the
+                // corner reads as the same kind of line, not a stray glyph.
+                let mut framed: Vec<Line<'static>> =
+                    vec![Line::from(Span::styled(format!("┌─{label}──"), border))];
+                framed.extend(highlighted.into_iter().map(|l| {
+                    let mut spans = vec![Span::styled("│ ", border)];
+                    spans.extend(l.spans);
+                    Line::from(spans)
+                }));
+                framed.push(Line::from(Span::styled("└─", border)));
+                self.push_segment(Segment::Text(framed));
             }
             TagEnd::List(_) => {
                 self.list_stack.pop();
@@ -420,7 +458,7 @@ impl<'a> Renderer<'a> {
             }
             TagEnd::Table => {
                 if let Some(t) = self.table.take() {
-                    self.segments.push(Segment::Text(render_table(&t)));
+                    self.push_segment(Segment::Text(render_table(&t)));
                 }
             }
             _ => {}
