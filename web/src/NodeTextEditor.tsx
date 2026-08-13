@@ -3,21 +3,37 @@ import { createPortal } from "react-dom";
 import CodeMirror from "@uiw/react-codemirror";
 import { NodeBodyPreview } from "./MeshNode";
 import { meshfoxMarkdown } from "./meshfoxSyntax";
+import { THEME_CHANGE_EVENT } from "./theme";
 
 /** How long to wait after the last keystroke before auto-saving — see
  * NodeSettings.tsx's identical constant/rationale. */
 const AUTOSAVE_DELAY_MS = 700;
 
-/** Tracks the OS light/dark preference so CodeMirror's built-in theme
- * follows the same signal `index.css`'s `@media (prefers-color-scheme)`
- * already does for the rest of the app, rather than picking its own. */
+/** The effective theme right now: the toolbar's manual override (see
+ * theme.ts's `data-theme` attribute) if one is set, else the OS
+ * `prefers-color-scheme`. */
+function resolveDark(): boolean {
+  const override = document.documentElement.dataset.theme;
+  if (override === "dark") return true;
+  if (override === "light") return false;
+  return window.matchMedia("(prefers-color-scheme: dark)").matches;
+}
+
+/** Tracks the effective light/dark theme so CodeMirror's built-in theme
+ * follows the same signal `index.css`'s `@media (prefers-color-scheme)` +
+ * `data-theme` override already does for the rest of the app, rather than
+ * picking its own. */
 export function usePrefersDark(): boolean {
-  const [dark, setDark] = useState(() => window.matchMedia("(prefers-color-scheme: dark)").matches);
+  const [dark, setDark] = useState(resolveDark);
   useEffect(() => {
     const mq = window.matchMedia("(prefers-color-scheme: dark)");
-    const onChange = () => setDark(mq.matches);
+    const onChange = () => setDark(resolveDark());
     mq.addEventListener("change", onChange);
-    return () => mq.removeEventListener("change", onChange);
+    window.addEventListener(THEME_CHANGE_EVENT, onChange);
+    return () => {
+      mq.removeEventListener("change", onChange);
+      window.removeEventListener(THEME_CHANGE_EVENT, onChange);
+    };
   }, []);
   return dark;
 }

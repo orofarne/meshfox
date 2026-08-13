@@ -237,6 +237,16 @@ pub struct Node {
     /// node's constraints (or it has none), not that they passed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub constraint_results: Vec<crate::constraint::ConstraintStatus>,
+    /// Absolute directory a relative asset reference (an `![](...)` image,
+    /// or a plain link) inside this node's `text` should resolve against,
+    /// when that differs from the including document's own directory —
+    /// i.e. this node's body came from an `include` target that lives
+    /// elsewhere on disk (see `crate::include::resolve`). `None` for every
+    /// node that wasn't spliced in from an include, which keeps resolving
+    /// relative to the canvas file's own directory as before. Never set by
+    /// `mdcanvas::parse` itself, same as `constraint_results`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_base: Option<String>,
 }
 
 impl Node {

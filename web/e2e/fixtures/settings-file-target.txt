@@ -1,0 +1,1 @@
+a plain text file, used as a `file`-node target by web/e2e/settings.spec.ts

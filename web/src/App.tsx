@@ -49,6 +49,7 @@ import { AutoLayoutConfirmDialog } from "./AutoLayoutConfirmDialog";
 import { ReparentChoiceDialog } from "./ReparentChoiceDialog";
 import { DeletableEdge } from "./DeletableEdge";
 import { CanvasSourceEditor } from "./CanvasSourceEditor";
+import { getThemePreference, setThemePreference, type ThemePreference } from "./theme";
 
 const nodeTypes = { mesh: MeshNode };
 // "extra" is a real `meshfox:edge`; "tree" is the structural (nesting)
@@ -116,6 +117,19 @@ export default function App() {
   // the tree/`meshfox:edge` connectors — off by default so a canvas with no
   // `deps=` blocks looks exactly as it did before this existed.
   const [showDeps, setShowDeps] = useState(false);
+  // Toolbar's light/dark toggle (see theme.ts) — "system" (the default)
+  // follows the OS; initialized from localStorage rather than always
+  // "system" so a stored override survives a reload without a flash (see
+  // main.tsx's own `applyThemePreference` call, which sets the DOM
+  // attribute before this ever renders).
+  const [themePreference, setThemePreferenceState] = useState<ThemePreference>(getThemePreference);
+  const cycleTheme = useCallback(() => {
+    setThemePreferenceState((prev) => {
+      const next: ThemePreference = prev === "system" ? "light" : prev === "light" ? "dark" : "system";
+      setThemePreference(next);
+      return next;
+    });
+  }, []);
   const [nodes, setNodes, onNodesChange] = useNodesState<Node<MeshNodeData>>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   // Set via `onInit` below — needed to call `setCenter` imperatively once
@@ -888,6 +902,7 @@ export default function App() {
             text: n.text,
             color: n.color,
             tags: n.tags,
+            assetBase: n.assetBase,
             onRun: (blockName: string, withDeps: boolean) => handleRun(n.id, blockName, withDeps),
             onKill: (blockName: string) => handleKill(n.id, blockName),
             onRunTty: (blockName: string, withDeps: boolean) => handleRunTty(n.id, blockName, withDeps),
@@ -1414,9 +1429,28 @@ export default function App() {
           </button>
         )}
         {error && <span className="error">{error}</span>}
+        <button
+          className="deps-toggle theme-toggle"
+          onClick={cycleTheme}
+          title="Cycle the color theme: follow the OS, or pin light/dark regardless of it"
+        >
+          {themePreference === "system" ? "Theme: Auto" : themePreference === "light" ? "Theme: Light" : "Theme: Dark"}
+        </button>
       </div>
     ),
-    [editMode, sourceMode, sourceDirty, dirty, error, showDeps, constraintStats, hasConfigurableVars, handleConfigure],
+    [
+      editMode,
+      sourceMode,
+      sourceDirty,
+      dirty,
+      error,
+      showDeps,
+      constraintStats,
+      hasConfigurableVars,
+      handleConfigure,
+      themePreference,
+      cycleTheme,
+    ],
   );
 
   if (serverGone) {
@@ -1453,7 +1487,11 @@ export default function App() {
             // `color: inherit`) even when the OS is in dark mode, which
             // resolves `inherit` to this app's light `--fg` text color —
             // near-invisible light-gray icons on a near-white background.
-            colorMode="system"
+            // `themePreference`'s value ("system"/"light"/"dark") is
+            // exactly React Flow's own `colorMode` type, so the toolbar's
+            // manual override (see theme.ts) reaches these panels too,
+            // not just this app's own `--fg`/`--bg`-driven CSS.
+            colorMode={themePreference}
             nodesDraggable={editMode}
             // Dragging a new connection between handles creates an extra
             // `meshfox:edge` (see handleConnect) — only worth allowing once

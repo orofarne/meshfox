@@ -2,11 +2,17 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { ReactFlowProvider } from "@xyflow/react";
 import App from "./App";
+import { applyThemePreference, getThemePreference } from "./theme";
 import "@fontsource/fira-code/400.css";
 import "@fontsource/fira-code/500.css";
 import "@fontsource/fira-code/600.css";
 import "@fontsource/fira-code/700.css";
 import "./index.css";
+
+// Before the first render, not in an effect — an effect would paint one
+// frame in the OS-default theme first whenever a stored override disagrees
+// with it (e.g. OS is light, user pinned dark).
+applyThemePreference(getThemePreference());
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>

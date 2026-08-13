@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import { Handle, NodeResizer, NodeToolbar, Position, useReactFlow, type NodeProps } from "@xyflow/react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -14,17 +14,47 @@ import { fetchNodeFileContent } from "./api";
 import type { ConstraintStatusDto, NodeType } from "./types";
 
 /**
- * Shared by every `<ReactMarkdown>` in this file: a link in a node's
- * rendered body opens in a new tab rather than navigating the canvas
- * itself away from the app — `rel="noopener noreferrer"` is the standard
- * `target="_blank"` companion (the opened page otherwise gets a live
- * `window.opener` back to this one). `node` is react-markdown's own mdast
- * node for this element, not a real DOM attribute — destructured out so it
- * never reaches the native `<a>`.
+ * A relative `![](...)`/link target inside a node's rendered body normally
+ * resolves against the canvas file's own directory (see the server's
+ * `serve_canvas_relative_file`) — wrong once this node's body was spliced
+ * in from an `include` target that lives in a different directory (see
+ * `MeshNodeData.assetBase`, set from `crates/core/src/canvas.rs`'s
+ * `Node.asset_base`). Rewrites such a target to `/api/include-asset`,
+ * which resolves it against `assetBase` instead (still guarded server-side
+ * against arbitrary directories — see that handler's own doc comment).
+ * Left untouched: absolute URLs (`scheme:`), root-relative paths (`/...`),
+ * bare anchors (`#...`), and anything when `assetBase` is unset (every
+ * node that wasn't spliced in from an include, same as before).
  */
-const markdownComponents: Components = {
-  a: ({ node: _node, ...props }) => <a {...props} target="_blank" rel="noopener noreferrer" />,
-};
+function resolveAssetHref(href: string | undefined, assetBase: string | undefined): string | undefined {
+  if (!href || !assetBase) return href;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(href) || href.startsWith("/") || href.startsWith("#")) return href;
+  return `/api/include-asset?dir=${encodeURIComponent(assetBase)}&file=${encodeURIComponent(href)}`;
+}
+
+/**
+ * Builds this file's `<ReactMarkdown>` `components` — same shape
+ * everywhere (a link in a node's rendered body opens in a new tab rather
+ * than navigating the canvas itself away from the app; `rel=` is the
+ * standard `target="_blank"` companion, since the opened page otherwise
+ * gets a live `window.opener` back to this one), just with `img`/`a`
+ * targets resolved against `assetBase` first (see `resolveAssetHref`).
+ * `node` is react-markdown's own mdast node for the element, not a real
+ * DOM attribute — destructured out so it never reaches the native tag.
+ */
+function makeMarkdownComponents(assetBase: string | undefined): Components {
+  return {
+    a: ({ node: _node, href, ...props }) => (
+      <a {...props} href={resolveAssetHref(href, assetBase)} target="_blank" rel="noopener noreferrer" />
+    ),
+    img: ({ node: _node, src, ...props }) => <img {...props} src={resolveAssetHref(src, assetBase)} />,
+  };
+}
+
+/** `assetBase` is never set for the draft text `NodeBodyPreview` renders
+ * (an unsaved edit, not a resolved include), so it always resolves the
+ * same as before includes existed. */
+const markdownComponents = makeMarkdownComponents(undefined);
 
 /**
  * Live state of one block's most recent run, from `App.tsx`'s handling of
@@ -117,6 +147,14 @@ export interface MeshNodeData {
    * button (see `App.tsx`'s `executeFileRun`). */
   interpreter?: string;
   text: string;
+  /** Absolute directory a relative `img`/link target in `text` should
+   * resolve against, when it's not the canvas file's own directory — set
+   * when this node's body was spliced in from an `include` target that
+   * lives elsewhere on disk (see `resolveAssetHref`, and
+   * `crates/core/src/canvas.rs`'s `Node.asset_base`). `undefined` for
+   * every node that wasn't, which resolves exactly as before includes
+   * carried this field. */
+  assetBase?: string;
   /** JSON Canvas color — either a hex string or a preset `"1"`-`"6"` (see
    * `resolveNodeColor`) — `undefined`/empty means no color was set. */
   color?: string;
@@ -744,6 +782,7 @@ function ConstraintFenceBlock({
 function MeshNodeBody({ data, nodeId }: { data: MeshNodeData; nodeId: string }) {
   const segments = parseBody(data.text, nodeId);
   const wheelRef = useStopWheelIfScrollable<HTMLDivElement>();
+  const components = useMemo(() => makeMarkdownComponents(data.assetBase), [data.assetBase]);
 
   if (!data.showDeps) {
     let constraintIdx = 0;
@@ -752,7 +791,7 @@ function MeshNodeBody({ data, nodeId }: { data: MeshNodeData; nodeId: string }) 
         {segments.map((seg, i) => {
           if (seg.type === "markdown") {
             return (
-              <ReactMarkdown key={i} remarkPlugins={[remarkGfm]} components={markdownComponents}>
+              <ReactMarkdown key={i} remarkPlugins={[remarkGfm]} components={components}>
                 {seg.content}
               </ReactMarkdown>
             );
@@ -789,7 +828,7 @@ function MeshNodeBody({ data, nodeId }: { data: MeshNodeData; nodeId: string }) 
         if (seg.type === "markdown") {
           return (
             <div key={`md-${i}`} className="mesh-rail-content" style={{ gridRow: i + 1, gridColumn: 2 }}>
-              <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{seg.content}</ReactMarkdown>
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>{seg.content}</ReactMarkdown>
             </div>
           );
         }

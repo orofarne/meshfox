@@ -16,6 +16,12 @@ const SCROLL_PORT = 4591;
 // Third server + port for select.spec.ts — same reasoning as SCROLL_PORT
 // above, just its own fixture (select.canvas.md) and port.
 const SELECT_PORT = 4592;
+// Fourth server + port for settings.spec.ts — same reasoning again, its own
+// fixture (settings.canvas.md, one node per NodeSettings type/field
+// combination) and port, so its Edit-mode writes (or, if a regression
+// reintroduces one, unwanted writes) can't collide with any other suite's
+// canvas file.
+const SETTINGS_PORT = 4593;
 
 // Taller than Playwright's 720px default — the app's own `minZoom` (0.5)
 // is a hard floor on how far "fit view" can zoom out, and deps.canvas.md's
@@ -61,6 +67,11 @@ export default defineConfig({
       testMatch: /select\.spec\.ts/,
       use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${SELECT_PORT}` },
     },
+    {
+      name: `${browser}-settings`,
+      testMatch: /settings\.spec\.ts/,
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${SETTINGS_PORT}` },
+    },
   ]),
   webServer: [
     {
@@ -89,6 +100,12 @@ export default defineConfig({
     {
       command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view e2e/fixtures/select.canvas.md --port ${SELECT_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${SELECT_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view e2e/fixtures/settings.canvas.md --port ${SETTINGS_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${SETTINGS_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },

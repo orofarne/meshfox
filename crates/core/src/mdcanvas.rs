@@ -190,6 +190,7 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
             interpreter: seg.node_attrs.get("interpreter").cloned(),
             text: body,
             constraint_results: Vec::new(),
+            asset_base: None,
         });
     }
 

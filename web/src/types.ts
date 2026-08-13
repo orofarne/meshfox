@@ -1,6 +1,11 @@
 // Mirrors crates/core/src/canvas.rs's Node/Canvas (JSON shape, camelCase).
 
-export type NodeType = "text" | "file" | "link" | "group";
+// "include" only ever appears here as something the client *writes* (via
+// NodeSettings' type dropdown + `NodePatch.nodeType`) — the server always
+// resolves an include node into a "group" or "text" node before it's ever
+// sent back over `GET /api/canvas` (see crates/core/src/include.rs), so
+// `CanvasNode.type` itself never actually carries this value on read.
+export type NodeType = "text" | "file" | "link" | "group" | "include";
 
 /** One embedded ` ```starlark constraint ` fence's most recently evaluated
  * result — mirrors crates/core/src/constraint.rs's `ConstraintStatus`. A
@@ -71,6 +76,12 @@ export interface CanvasNode {
    * node's own body, in document order — see `ConstraintStatusDto`. Absent
    * or empty means this node has no constraint fences. */
   constraintResults?: ConstraintStatusDto[];
+  /** Absolute directory a relative asset reference (an `![](...)` image, or
+   * a plain link) in `text` should resolve against, when it's not the
+   * canvas file's own directory — set when this node's body was spliced in
+   * from an `include` target that lives elsewhere on disk (see
+   * `crates/core/src/include.rs`). Absent for every node that wasn't. */
+  assetBase?: string;
 }
 
 export interface CanvasDoc {

@@ -110,6 +110,7 @@ mod tests {
             interpreter: None,
             text: text.to_string(),
             constraint_results: Vec::new(),
+            asset_base: None,
         }
     }
 

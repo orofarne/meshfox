@@ -92,8 +92,16 @@ pub fn resolve(canvas: &Canvas, base_path: &Path) -> Result<Canvas, IncludeError
             .map_err(|e| IncludeError::NotFound(target_path.clone(), e))?;
 
         let mut ancestors = job.ancestors.clone();
-        ancestors.push(canon);
+        ancestors.push(canon.clone());
         let dir = target_path.parent().map(Path::to_path_buf).unwrap_or_default();
+        // `canon` is the canonicalized target *file*, so its parent is the
+        // canonicalized target *directory* — used (rather than the
+        // possibly-relative `dir`) so a relative asset reference (an
+        // `![](...)` image, a plain link) in the spliced text can be told
+        // apart from one that's relative to the including document's own
+        // directory instead (see `Node::asset_base`, and the server's
+        // `/api/include-asset` handler that resolves against it).
+        let asset_base = canon.parent().map(|p| p.to_string_lossy().into_owned());
 
         let is_canvas =
             target_path.to_string_lossy().ends_with(".canvas.md") || mdcanvas::has_marker(&contents);
@@ -117,6 +125,7 @@ pub fn resolve(canvas: &Canvas, base_path: &Path) -> Result<Canvas, IncludeError
                         .map(|e| ExtraEdge { from: format!("{prefix}{}", e.from), ..e.clone() })
                         .collect();
                     n.level = (n.level + level).min(6);
+                    n.asset_base = asset_base.clone();
                     n
                 })
                 .collect();
@@ -139,6 +148,7 @@ pub fn resolve(canvas: &Canvas, base_path: &Path) -> Result<Canvas, IncludeError
             nodes[idx].node_type = NodeType::Text;
             nodes[idx].target = None;
             nodes[idx].text = mdcanvas::shift_headings(&contents, level);
+            nodes[idx].asset_base = asset_base;
         }
     }
 
@@ -179,6 +189,11 @@ mod tests {
         assert!(spec.text.contains("#### Sub"));
         // No new nodes: plain markdown has no meshfox structure of its own.
         assert_eq!(resolved.nodes.len(), 2);
+        // A relative asset (e.g. `![](fig.png)`) in the target's body
+        // resolves against the target's own directory, not the including
+        // document's — recorded here so a consumer (the server) can serve
+        // it correctly instead of 404ing against the wrong directory.
+        assert_eq!(spec.asset_base.as_deref(), Some(tmp.canonicalize().unwrap().to_str().unwrap()));
 
         fs::remove_dir_all(&tmp).ok();
     }
@@ -208,6 +223,10 @@ mod tests {
         let spliced_root = resolved.node("child/root").unwrap();
         assert_eq!(spliced_root.parent.as_deref(), Some("child"));
         assert_eq!(spliced_root.level, 2 + 1); // child node is level 2
+        assert_eq!(
+            spliced_root.asset_base.as_deref(),
+            Some(tmp.canonicalize().unwrap().to_str().unwrap())
+        );
 
         let leaf = resolved.node("child/leaf").unwrap();
         assert_eq!(leaf.parent.as_deref(), Some("child/root"));

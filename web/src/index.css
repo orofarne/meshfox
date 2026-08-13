@@ -52,6 +52,46 @@
   }
 }
 
+/* The toolbar's manual light/dark override (see theme.ts) — `[data-theme]`
+ * is a more specific selector than the bare `:root` above, so either of
+ * these wins over the OS `prefers-color-scheme` regardless of source
+ * order, in both directions (pinning light on a dark OS, or dark on a
+ * light one). No `data-theme` attribute at all (the default, "system")
+ * leaves the plain rules above in sole control. */
+:root[data-theme="dark"] {
+  --bg: #0a0a0c;
+  --fg: #f2ede6;
+  --node-bg: #131316;
+  --node-border: #2c2620;
+  --accent: #ff6e15;
+  --code-bg: #19191c;
+  --code-head-bg: #211f1c;
+  --fail: #e56a6a;
+  --ok: #6fcf97;
+  --dep: #c68ae8;
+  --dep-flash: rgba(198, 138, 232, 0.32);
+  --syntax-tint: rgba(255, 110, 21, 0.12);
+  --syntax-attr: #d8b656;
+  --syntax-value: #6fcf97;
+}
+
+:root[data-theme="light"] {
+  --bg: #faf7f4;
+  --fg: #201a14;
+  --node-bg: #ffffff;
+  --node-border: #e5ddd2;
+  --accent: #ea580c;
+  --code-bg: #f4ede3;
+  --code-head-bg: #ece1d2;
+  --fail: #c22b2b;
+  --ok: #1b7a43;
+  --dep: #a05dd1;
+  --dep-flash: rgba(160, 93, 209, 0.28);
+  --syntax-tint: rgba(234, 88, 12, 0.07);
+  --syntax-attr: #96660a;
+  --syntax-value: #1b7a43;
+}
+
 /* React Flow's own default edge color/width (used by every edge with no
  * explicit `style.stroke` of its own — every structural `tree`/`smoothstep`
  * edge, and a `meshfox:edge` extra edge with no per-edge color override —
@@ -203,6 +243,12 @@ a {
   border-color: var(--dep);
   color: var(--dep);
   opacity: 1;
+}
+
+/* Pushes itself (and, being last, nothing else) to the toolbar's far right
+ * — `.toolbar` is a plain flex row, so one auto margin is enough. */
+.theme-toggle {
+  margin-left: auto;
 }
 
 .canvas-area {
@@ -567,11 +613,6 @@ a {
    * ancestor `user-select: none` so a node's Markdown/code/output text is
    * selectable and copyable, in Edit mode or not. */
   user-select: text;
-  /* Opts back into color emoji for a node's own Markdown/code content —
-   * unlike the UI chrome, this text is authored by the user and any emoji
-   * in it is real content, not an icon glyph the `body` rule's
-   * `font-variant-emoji: text` is meant to flatten. */
-  font-variant-emoji: emoji;
 }
 
 /* A `file` node's `display: "code"` body — see `FileCodePreview` in

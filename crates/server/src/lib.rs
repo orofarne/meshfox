@@ -452,14 +452,20 @@ fn parse_or_error(raw: &str) -> Result<Canvas, ApiError> {
 /// actually knows the browser's viewport size and each node's real
 /// rendered content height (see `web/src/autolayout.ts`); `meshfox fmt` is
 /// `crate::layout`'s only remaining caller.
-fn canvas_response(raw: &str, canvas_path: &std::path::Path) -> Result<Json<Canvas>, ApiError> {
+/// Parse + splice in every `include` node's target (see
+/// `meshfox_core::include`) — never written back to the file, so a client
+/// editing and PUTting this response back would silently drop any
+/// include-only content; the UI treats included subtrees as read-only for
+/// now. Shared by `canvas_response` and `get_include_asset` (the latter
+/// needs the resolved tree's `asset_base`s, not the JSON response itself).
+fn resolved_canvas(raw: &str, canvas_path: &std::path::Path) -> Result<Canvas, ApiError> {
     let canvas = parse_or_error(raw)?;
-    // Dynamically splice in every `include` node's target — never written
-    // back to the file (see `meshfox_core::include`), so a client editing
-    // and PUTting this response back would silently drop any include-only
-    // content; the UI treats included subtrees as read-only for now.
-    let mut canvas = meshfox_core::include::resolve(&canvas, canvas_path)
-        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    meshfox_core::include::resolve(&canvas, canvas_path)
+        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))
+}
+
+fn canvas_response(raw: &str, canvas_path: &std::path::Path) -> Result<Json<Canvas>, ApiError> {
+    let mut canvas = resolved_canvas(raw, canvas_path)?;
     // Every embedded constraint fence's script is meant to be cheap and
     // pure (no I/O, tick/heap/callstack-bounded — see
     // `constraint::evaluate`), so running them all on every fetch (rather
@@ -1778,6 +1784,66 @@ async fn watch_changes(State(state): State<Arc<AppState>>) -> Response {
         .unwrap()
 }
 
+#[derive(Deserialize)]
+struct IncludeAssetQuery {
+    /// A directory reported as some resolved node's `asset_base` (see
+    /// `meshfox_core::canvas::Node::asset_base`) — i.e. an `include`
+    /// target's own directory, which may sit anywhere on disk, not just
+    /// under the canvas file's directory. Re-checked against a fresh
+    /// resolve of the current document below rather than trusted outright,
+    /// so this can't be used to read arbitrary files off disk merely by
+    /// naming their directory in the query string.
+    dir: String,
+    /// Path of the actual asset, relative to `dir`.
+    file: String,
+}
+
+/// Backs a relative `![](...)` image (or link) inside an `include`d node's
+/// body — see `Node::asset_base`. `serve_canvas_relative_file` below only
+/// ever resolves against the *main* canvas file's own directory, which is
+/// wrong once a node's content was spliced in from a different directory
+/// (see `meshfox_core::include::resolve`); this is that directory's
+/// counterpart. `dir` is only honored if it's still one of the current
+/// document's actual resolved `asset_base`s — re-derived fresh from the
+/// on-disk file on every request, same as every other read here, so a
+/// stale or hand-crafted `dir` (one this document doesn't currently
+/// include) 404s instead of serving whatever happens to live there.
+async fn get_include_asset(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<IncludeAssetQuery>,
+) -> Response {
+    let raw = state.raw.lock().unwrap().clone();
+    let Ok(canvas) = resolved_canvas(&raw, &state.canvas_path) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let requested_dir = PathBuf::from(&q.dir);
+    let known = canvas
+        .nodes
+        .iter()
+        .filter_map(|n| n.asset_base.as_deref())
+        .any(|base| PathBuf::from(base) == requested_dir);
+    if !known {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let Ok(dir) = requested_dir.canonicalize() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let candidate = dir.join(&q.file);
+    let Ok(resolved) = candidate.canonicalize() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !resolved.starts_with(&dir) || !resolved.is_file() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let Ok(bytes) = std::fs::read(&resolved) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let mime = mime_guess::from_path(&resolved).first_or_octet_stream();
+    ([(header::CONTENT_TYPE, mime.as_ref().to_string())], bytes).into_response()
+}
+
 /// Serves the embedded web UI, falling back to `index.html` for any path
 /// that isn't a real asset (client-side routes) — or, if the UI was never
 /// built into this binary at all, a message saying so instead of a bare
@@ -1887,6 +1953,7 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/run/tty", get(run_block_tty))
         .route("/api/kill", post(kill_run))
         .route("/api/watch", get(watch_changes))
+        .route("/api/include-asset", get(get_include_asset))
         .fallback(serve_embedded)
         .with_state(state)
         .layer(CorsLayer::permissive())
