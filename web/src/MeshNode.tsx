@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Handle, NodeResizer, NodeToolbar, Position, useReactFlow, type NodeProps } from "@xyflow/react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -251,6 +251,11 @@ export interface MeshNodeData {
  * layout whether folded or not (nothing there to hide), so folding one
  * with no children would be a total no-op with a button to show for it —
  * see that render site's own gate on `MeshNodeData.hasChildren`. */
+// How far the pointer may move between `mousedown` and `mouseup` on a
+// node's title text and still count as a click-to-toggle-fold rather than
+// the start of a text-selection drag (see `MeshNode`'s `handleTitleClick`).
+const TITLE_CLICK_MOVE_THRESHOLD = 5;
+
 function FoldToggle({ folded, onToggle }: { folded: boolean; onToggle: () => void }) {
   return (
     <button
@@ -912,16 +917,31 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
   const quickRunBusy = quickRunLive?.status === "queued" || quickRunLive?.status === "running";
   const canOpenFile = data.nodeType === "file" && !!data.target;
   const constraintStatus = aggregateConstraintStatus(data.constraintResults);
-  // Extra way back to unfolded, alongside `FoldToggle` itself — a click
-  // (not drag: a text-selection drag still works, see below) anywhere on
-  // the title text of a *folded* node unfolds it too, since that's most
-  // of what's left to click on a folded node's now-compact row. Only ever
-  // unfolds, never folds: an *unfolded* node's title staying inert is what
-  // keeps a plain click there safe for text selection/dragging (Edit
-  // mode's own node-drag) — this only ever fires on a genuine click
-  // (mouseup without meaningful movement), which neither of those is.
-  const handleTitleClick = () => {
-    if (data.folded) data.onToggleFold();
+  // Clicking the title text toggles fold both ways now (alongside
+  // `FoldToggle` itself), but the title text is also meant to stay
+  // selectable (e.g. to copy it) — a plain `onClick` alone can't tell
+  // "clicked" from "dragged to select text then released over the same
+  // span", since the browser's `click` event fires either way. So this
+  // tracks the `mousedown` position (`titleMouseDownRef`) and only toggles
+  // if `mouseup` landed within `TITLE_CLICK_MOVE_THRESHOLD`px of it *and*
+  // there's no active text selection left behind — a genuine click, not a
+  // selection drag. No `data.hasChildren` gate here, same as before this
+  // toggled both ways: a childless `isTitleOnly` node's own row looks
+  // identical folded or not (no `FoldToggle` shown for it either — see
+  // that render condition below), but this stays its only way back to
+  // unfolded for the rare case a document explicitly authors `fold="true"`
+  // on one anyway (`App.tsx`'s `resolveDefaultFold` honors that override
+  // regardless of `canFold`).
+  const titleMouseDownRef = useRef<{ x: number; y: number } | null>(null);
+  const handleTitleMouseDown = (e: React.MouseEvent) => {
+    titleMouseDownRef.current = { x: e.clientX, y: e.clientY };
+  };
+  const handleTitleClick = (e: React.MouseEvent) => {
+    const start = titleMouseDownRef.current;
+    const moved = start ? Math.hypot(e.clientX - start.x, e.clientY - start.y) : 0;
+    if (moved > TITLE_CLICK_MOVE_THRESHOLD) return;
+    if (window.getSelection()?.toString()) return;
+    data.onToggleFold();
   };
 
   return (
@@ -965,7 +985,11 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
            * as a distinct class since this one must stay `white-space:
            * normal` (wrap, no ellipsis) for this layout's own "long title
            * wraps across a centered block" behavior. */}
-          <span className="mesh-node-title-centered-text" onClick={handleTitleClick}>
+          <span
+            className="mesh-node-title-centered-text"
+            onMouseDown={handleTitleMouseDown}
+            onClick={handleTitleClick}
+          >
             <TypeIcon type={data.nodeType} />
             {data.title}
           </span>
@@ -973,7 +997,11 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
       ) : (
         <div className="mesh-node-title" data-level={data.level}>
           <FoldToggle folded={data.folded} onToggle={data.onToggleFold} />
-          <span className="mesh-node-title-text nopan" onClick={handleTitleClick}>
+          <span
+            className="mesh-node-title-text nopan"
+            onMouseDown={handleTitleMouseDown}
+            onClick={handleTitleClick}
+          >
             <TypeIcon type={data.nodeType} />
             {data.title}
           </span>

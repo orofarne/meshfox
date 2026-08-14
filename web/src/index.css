@@ -423,13 +423,13 @@ a {
   font-size: 1.05rem;
 }
 
-/* A plain click on a *folded* node's own title text unfolds it too (see
- * MeshNode.tsx's `handleTitleClick`) — the pointer cursor is the only
- * visual hint of that, since the title text otherwise looks identical
- * folded or not. Unfolded, the default (text) cursor is left alone: a
- * click there does nothing extra, so nothing here should suggest it does. */
-.mesh-node[data-folded="true"] .mesh-node-title-text,
-.mesh-node[data-folded="true"] .mesh-node-title-centered-text {
+/* A plain click on a node's own title text toggles its fold, either
+ * direction (see MeshNode.tsx's `handleTitleClick`) — the pointer cursor is
+ * the only visual hint of that, since a click-to-fold and a drag-to-select
+ * both start the same way. Applies regardless of `data-folded`, unlike the
+ * old unfold-only version of this rule. */
+.mesh-node-title-text,
+.mesh-node-title-centered-text {
   cursor: pointer;
 }
 

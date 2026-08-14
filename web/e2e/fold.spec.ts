@@ -73,13 +73,30 @@ test("clicking the title of a folded node unfolds it too, not just the toggle", 
   await expect(node(page, "parent-node").locator(".mesh-node")).toHaveAttribute("data-folded", "false");
 });
 
-test("clicking the title of an already-unfolded node does nothing (doesn't fold it)", async ({ page }) => {
+test("clicking the title of an unfolded node folds it too, not just the toggle", async ({ page }) => {
   await expect(node(page, "parent-node").locator(".mesh-node")).toHaveAttribute("data-folded", "false");
 
   await node(page, "parent-node").locator(".mesh-node-title-text").click();
 
+  await expect(node(page, "parent-node").locator(".mesh-node")).toHaveAttribute("data-folded", "true");
+  await expect(node(page, "child-one")).toHaveCount(0);
+});
+
+test("dragging across the title text to select it doesn't fold the node", async ({ page }) => {
   await expect(node(page, "parent-node").locator(".mesh-node")).toHaveAttribute("data-folded", "false");
-  await expect(node(page, "child-one")).toBeVisible();
+  const title = node(page, "parent-node").locator(".mesh-node-title-text");
+  const box = await title.boundingBox();
+  if (!box) throw new Error("title has no box");
+
+  await page.mouse.move(box.x + 2, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width - 2, box.y + box.height / 2, { steps: 10 });
+  await page.mouse.up();
+
+  await expect
+    .poll(() => page.evaluate(() => window.getSelection()?.toString().length ?? 0))
+    .toBeGreaterThan(0);
+  await expect(node(page, "parent-node").locator(".mesh-node")).toHaveAttribute("data-folded", "false");
 });
 
 test("an auto-placed sibling reflows upward when a preceding subtree folds", async ({ page }) => {
