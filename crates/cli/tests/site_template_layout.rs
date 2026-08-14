@@ -164,6 +164,12 @@ const GAP_FIXTURE_CANVAS: &str = concat!(
     "<!-- meshfox:canvas -->\n",
     "# Root\n",
     "<!-- meshfox:node id=\"root\" -->\n",
+    // Every node in this fixture is folded shut by default (see
+    // `crates/core/src/staticgen.rs`'s `resolve_default_fold`) — this
+    // test is about the *expanded* layout, so it opts the whole document
+    // out via the `unfold` option, same as a reader clicking every node
+    // open would get.
+    "<!-- meshfox:option name=\"unfold\" -->\n",
     "\n",
     "## Short\n",
     "<!-- meshfox:node id=\"short\" -->\n",
@@ -235,6 +241,8 @@ const TWO_PARENTS_FIXTURE_CANVAS: &str = concat!(
     "<!-- meshfox:canvas -->\n",
     "# Root\n",
     "<!-- meshfox:node id=\"root\" -->\n",
+    // See GAP_FIXTURE_CANVAS's own comment — same reason.
+    "<!-- meshfox:option name=\"unfold\" -->\n",
     "\n",
     "## Parent One\n",
     "<!-- meshfox:node id=\"parent-one\" -->\n",
@@ -331,6 +339,8 @@ const DEEP_FIXTURE_CANVAS: &str = concat!(
     "<!-- meshfox:canvas -->\n",
     "# Root\n",
     "<!-- meshfox:node id=\"root\" -->\n",
+    // See GAP_FIXTURE_CANVAS's own comment — same reason.
+    "<!-- meshfox:option name=\"unfold\" -->\n",
     "\n",
     "## Wide\n",
     "<!-- meshfox:node id=\"wide\" -->\n",
@@ -400,6 +410,8 @@ const FIXTURE_CANVAS: &str = concat!(
     "<!-- meshfox:canvas -->\n",
     "# Root\n",
     "<!-- meshfox:node id=\"root\" -->\n",
+    // See GAP_FIXTURE_CANVAS's own comment — same reason.
+    "<!-- meshfox:option name=\"unfold\" -->\n",
     "\n",
     "## Frame\n",
     "<!-- meshfox:node id=\"frame\" type=\"group\" -->\n",
@@ -559,6 +571,8 @@ const CENTERING_FIXTURE_CANVAS: &str = concat!(
     "<!-- meshfox:canvas -->\n",
     "# Root\n",
     "<!-- meshfox:node id=\"root\" -->\n",
+    // See GAP_FIXTURE_CANVAS's own comment — same reason.
+    "<!-- meshfox:option name=\"unfold\" -->\n",
     "\n",
     "## Parent\n",
     "<!-- meshfox:node id=\"parent\" -->\n",
@@ -630,6 +644,8 @@ const EXTRA_EDGE_FIXTURE_CANVAS: &str = concat!(
     "<!-- meshfox:canvas -->\n",
     "# Root\n",
     "<!-- meshfox:node id=\"root\" -->\n",
+    // See GAP_FIXTURE_CANVAS's own comment — same reason.
+    "<!-- meshfox:option name=\"unfold\" -->\n",
     "\n",
     "## Wide\n",
     "<!-- meshfox:node id=\"wide\" -->\n",

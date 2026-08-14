@@ -138,16 +138,24 @@ pub struct NodeView {
     /// `file`/`link` node target (path or URL); `None` for every other type.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
-    /// `Some(true)` if every embedded ` ```starlark constraint ` fence in
-    /// this node's own body passed, `Some(false)` if any failed; `None` for
-    /// a node with no constraint fences at all. Skipped from the serialized
-    /// (and so Tera-visible) form entirely when `None`, rather than
-    /// serializing as JSON `null` — that's what lets a template tell "no
-    /// constraint here" apart from "a constraint evaluated to false" via
-    /// Tera's `is defined` test, since both would otherwise be equally
-    /// falsy in a plain `{% if %}`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub constraint_ok: Option<bool>,
+    /// Whether folding could hide anything about this node at all — a
+    /// title-only node (see `is_title_only_node`) with no children has no
+    /// body to hide and no subtree to collapse, so the template renders it
+    /// as a plain element with no disclosure control. Every other node
+    /// (real body content, or at least one child) is always `true` here
+    /// regardless of its own `folded` state. Mirrors `web/src/App.tsx`'s
+    /// `canFold`.
+    pub foldable: bool,
+    /// This node's default fold state on first render — `true` starts its
+    /// `<details>` closed (see `site-template/_macros.html.tera`), hiding
+    /// its own body and its whole `children` subtree until a reader clicks
+    /// it open; purely a client-side starting point; a reader's own
+    /// clicks aren't written back here (there's no build step to write
+    /// them back into). Always `false` when `foldable` is `false` — see
+    /// that field's own doc comment. Mirrors `web/src/App.tsx`'s
+    /// `resolveDefaultFold`, computed once for the whole tree by
+    /// `resolve_default_fold`.
+    pub folded: bool,
     /// This node's direct structural children, in document order — the
     /// whole tree hangs off `SiteData.root` through this field; a template
     /// walks it with a recursive macro (see `site-template/`).
@@ -213,21 +221,13 @@ pub struct Asset {
 /// docs) — pass `None` for a self-contained site meant to be opened as-is.
 pub fn build(canvas: &Canvas, canvas_dir: &Path, base_url: Option<&str>) -> (SiteData, Vec<Asset>) {
     let canvas_dir = canvas_dir.canonicalize().unwrap_or_else(|_| canvas_dir.to_path_buf());
-    let ctx = RenderCtx { canvas_dir: &canvas_dir, base_url };
-
-    // One node can carry several constraint fences; aggregate to "did every
-    // one of this node's own constraints pass" — presence in the map at
-    // all is what tells `build_node_view` this node has constraints to
-    // report on, absence means none.
-    let mut constraint_ok: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
-    for r in crate::constraint::evaluate(canvas) {
-        constraint_ok.entry(r.node_id).and_modify(|ok| *ok = *ok && r.ok).or_insert(r.ok);
-    }
 
     let root_node = canvas.nodes.iter().find(|n| n.parent.is_none()).expect("a parsed canvas always has a root");
+    let (folded_ids, foldable_ids) = resolve_default_fold(canvas, &root_node.id);
+    let ctx = RenderCtx { canvas_dir: &canvas_dir, base_url, folded_ids: &folded_ids, foldable_ids: &foldable_ids };
 
     let mut assets: Vec<Asset> = Vec::new();
-    let root = build_node_view(canvas, root_node, 0, &constraint_ok, &ctx, &mut assets);
+    let root = build_node_view(canvas, root_node, 0, &ctx, &mut assets);
     let edges = build_edges(canvas);
     let title = root.title.clone();
 
@@ -239,14 +239,7 @@ pub fn build(canvas: &Canvas, canvas_dir: &Path, base_url: Option<&str>) -> (Sit
     (SiteData { title, root, edges }, assets)
 }
 
-fn build_node_view(
-    canvas: &Canvas,
-    node: &Node,
-    depth: u32,
-    constraint_ok: &std::collections::HashMap<String, bool>,
-    ctx: &RenderCtx,
-    assets: &mut Vec<Asset>,
-) -> NodeView {
+fn build_node_view(canvas: &Canvas, node: &Node, depth: u32, ctx: &RenderCtx, assets: &mut Vec<Asset>) -> NodeView {
     let (html_body, target) = if node.node_type == NodeType::Group {
         (String::new(), None)
     } else if node.node_type == NodeType::File && node.display == Some(FileDisplay::Code) {
@@ -269,11 +262,10 @@ fn build_node_view(
         (Some((x, y)), Some(width), Some(height)) => Some(Position { x, y, width, height }),
         _ => None,
     };
-    let ok = constraint_ok.get(&node.id).copied();
     let children = canvas
         .children(&node.id)
         .into_iter()
-        .map(|c| build_node_view(canvas, c, depth + 1, constraint_ok, ctx, assets))
+        .map(|c| build_node_view(canvas, c, depth + 1, ctx, assets))
         .collect();
 
     NodeView {
@@ -287,9 +279,53 @@ fn build_node_view(
         tags: node.tags.clone(),
         html_body,
         target,
-        constraint_ok: ok,
+        foldable: ctx.foldable_ids.contains(node.id.as_str()),
+        folded: ctx.folded_ids.contains(node.id.as_str()),
         children,
     }
+}
+
+/// Whether `n` renders as an already-title-only, empty-bodied row — folding
+/// a node like this never changes its own row (there was never a body to
+/// hide), so it can only be worth folding for its subtree's sake (see
+/// `resolve_default_fold`, which is what actually decides foldability from
+/// this). Mirrors `web/src/App.tsx`'s `isTitleOnlyNode`.
+fn is_title_only_node(n: &Node) -> bool {
+    n.node_type == NodeType::Text && n.text.trim().is_empty()
+}
+
+/// The default fold state for every node in `canvas` on a static export's
+/// first render — a direct Rust port of `web/src/App.tsx`'s
+/// `resolveDefaultFold`/`canFold`, computed once here up front (rather than
+/// per node during the `build_node_view` walk, which doesn't have the whole
+/// tree's parent-links in scope) and consulted from `RenderCtx` as each
+/// `NodeView` is built. Returns `(folded_ids, foldable_ids)` — see
+/// `NodeView::folded`/`NodeView::foldable` for what each set backs.
+///
+/// A static export has no `localStorage` (there's no return visit to persist
+/// a reader's own fold clicks across, and no build-time reason to guess at
+/// one) — so unlike the web UI, this *is* the whole story: what a reader
+/// sees the moment the page loads, and the same every time.
+fn resolve_default_fold(canvas: &Canvas, root_id: &str) -> (std::collections::HashSet<String>, std::collections::HashSet<String>) {
+    let has_unfold_option = crate::options::declared_options(canvas).map(|opts| opts.iter().any(|o| o == "unfold")).unwrap_or(false);
+    // Ids that are somebody's structural `parent` — mirrors
+    // `web/src/App.tsx`'s `nodesWithChildren`.
+    let with_children: std::collections::HashSet<&str> = canvas.nodes.iter().filter_map(|n| n.parent.as_deref()).collect();
+
+    let mut folded = std::collections::HashSet::new();
+    let mut foldable = std::collections::HashSet::new();
+    for n in &canvas.nodes {
+        let can_fold = !is_title_only_node(n) || with_children.contains(n.id.as_str());
+        if can_fold {
+            foldable.insert(n.id.clone());
+        }
+        let has_explicit_size = n.width.is_some() || n.height.is_some();
+        let resolved = n.fold.unwrap_or_else(|| n.id != root_id && !has_unfold_option && !has_explicit_size && can_fold);
+        if resolved {
+            folded.insert(n.id.clone());
+        }
+    }
+    (folded, foldable)
 }
 
 /// Every `meshfox:edge` cross-reference — see the module doc comment.
@@ -322,6 +358,10 @@ fn build_edges(canvas: &Canvas) -> Vec<EdgeView> {
 struct RenderCtx<'a> {
     canvas_dir: &'a Path,
     base_url: Option<&'a str>,
+    /// See `resolve_default_fold` — computed once in `build`, consulted per
+    /// node by `build_node_view`.
+    folded_ids: &'a std::collections::HashSet<String>,
+    foldable_ids: &'a std::collections::HashSet<String>,
 }
 
 /// GFM-flavored Markdown -> HTML, with meshfox's own fence attributes
@@ -670,6 +710,71 @@ mod tests {
     }
 
     #[test]
+    fn root_never_folds_by_default() {
+        let c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\nhello\n");
+        let site = build_site(&c);
+        assert!(!site.find("root").unwrap().folded);
+    }
+
+    #[test]
+    fn a_plain_child_folds_by_default() {
+        let c = canvas("# Root\n\n## Child\n<!-- meshfox:node id=\"child\" -->\n\nbody\n");
+        let site = build_site(&c);
+        let child = site.find("child").unwrap();
+        assert!(child.foldable);
+        assert!(child.folded);
+    }
+
+    #[test]
+    fn the_unfold_option_flips_the_default_to_expanded() {
+        let c = canvas(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n<!-- meshfox:option name=\"unfold\" -->\n\nprose\n\n\
+             ## Child\n<!-- meshfox:node id=\"child\" -->\n\nbody\n",
+        );
+        let site = build_site(&c);
+        assert!(!site.find("child").unwrap().folded);
+    }
+
+    #[test]
+    fn an_explicit_fold_override_always_wins() {
+        // `fold="false"` keeps a child expanded despite the document's own
+        // default; `fold="true"` folds root despite root normally never
+        // folding by default.
+        let c = canvas(
+            "# Root\n<!-- meshfox:node id=\"root\" fold=\"true\" -->\n\n\
+             ## Child\n<!-- meshfox:node id=\"child\" fold=\"false\" -->\n\nbody\n",
+        );
+        let site = build_site(&c);
+        assert!(site.find("root").unwrap().folded);
+        assert!(!site.find("child").unwrap().folded);
+    }
+
+    #[test]
+    fn a_node_with_an_explicit_size_does_not_fold_by_default() {
+        let c = canvas("# Root\n\n## Child\n<!-- meshfox:node id=\"child\" x=10 y=20 w=200 h=80 -->\n\nbody\n");
+        let site = build_site(&c);
+        assert!(!site.find("child").unwrap().folded);
+    }
+
+    #[test]
+    fn a_childless_title_only_node_is_not_foldable_and_never_folds_by_default() {
+        let c = canvas("# Root\n\n## Child\n<!-- meshfox:node id=\"child\" -->\n");
+        let site = build_site(&c);
+        let child = site.find("child").unwrap();
+        assert!(!child.foldable);
+        assert!(!child.folded);
+    }
+
+    #[test]
+    fn a_title_only_node_with_children_is_foldable() {
+        let c = canvas("# Root\n\n## Child\n<!-- meshfox:node id=\"child\" -->\n\n### Grandchild\n<!-- meshfox:node id=\"grandchild\" -->\n\nbody\n");
+        let site = build_site(&c);
+        let child = site.find("child").unwrap();
+        assert!(child.foldable);
+        assert!(child.folded);
+    }
+
+    #[test]
     fn children_nest_under_their_structural_parent() {
         let c = canvas(
             "# Root\n\n## A\n<!-- meshfox:node id=\"a\" -->\n\n\
@@ -744,31 +849,6 @@ mod tests {
         let block = site.find("block").unwrap();
         assert!(block.html_body.contains("language-bash"), "{}", block.html_body);
         assert!(!block.html_body.contains("name="), "{}", block.html_body);
-    }
-
-    #[test]
-    fn constraint_ok_set_only_for_nodes_with_a_constraint_fence() {
-        let c = canvas(
-            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
-             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
-             ```starlark constraint\npass\n```\n",
-        );
-        let site = build_site(&c);
-        let check = site.find("check").unwrap();
-        assert_eq!(site.find("root").unwrap().constraint_ok, None);
-        assert_eq!(check.constraint_ok, Some(true));
-    }
-
-    #[test]
-    fn constraint_ok_is_false_if_any_of_a_node_s_fences_fail() {
-        let c = canvas(
-            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
-             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
-             ```starlark constraint name=\"a\"\npass\n```\n\n\
-             ```starlark constraint name=\"b\"\nfail(\"nope\")\n```\n",
-        );
-        let site = build_site(&c);
-        assert_eq!(site.find("check").unwrap().constraint_ok, Some(false));
     }
 
     #[test]

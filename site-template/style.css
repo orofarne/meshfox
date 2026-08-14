@@ -292,6 +292,12 @@ a {
 .tree > .node-row > .node.has-children::after {
   display: none;
 }
+/* A closed `<details>` hides its own `.node-children` sibling entirely
+   (see the folding section below) — with nothing left for this nub to
+   point at, draw it only while the subtree it connects to is visible. */
+.node.has-children:not([open])::after {
+  display: none;
+}
 
 /* A real, authored position/size overrides the flow-driven sizing above —
    it's the author's own explicit box, not something to cap or reflow. */
@@ -306,6 +312,49 @@ a {
   border-top: 1px dashed var(--accent);
   box-shadow: none;
   display: block;
+}
+
+/* --- Folding (native <details>, no JS) ---------------------------------
+   `_macros.html.tera` renders a `foldable` node's card as `<details>`
+   (`<summary>` standing in for `.node-title`) instead of a plain `<div>` —
+   closing it is what hides this node's own `.node-tags`/`.node-body` for
+   free (they're ordinary `<details>` content, native browser behavior,
+   nothing here to style for that part). What *is* here: resetting the
+   browser's own default disclosure triangle in favor of one that matches
+   the rest of the page's look, and — since `.node-children` sits *outside*
+   the `<details>` as a sibling, never nested inside it (see
+   `_macros.html.tera`'s own doc comment for why: nesting a child's whole
+   subtree inside an ancestor's padding box is the exact bug
+   `crates/cli/tests/site_template.rs` guards against) — hiding that
+   sibling whenever its own `.node` is closed. The general-sibling
+   combinator plus the live `[open]` attribute selector is what lets this
+   track the browser's own toggle with no JS or extra markup: closing a
+   `<details>` toggles `open` off immediately, and this selector re-matches
+   the instant it does. A non-foldable `.node` is always a plain `<div>`
+   with no `open` attribute at all, but per `NodeView::foldable`'s own
+   invariant it never has a `.node-children` sibling to hide either, so
+   this selector simply never matches one. */
+.node-row > .node:not([open]) ~ .node-children {
+  display: none;
+}
+
+summary.node-title {
+  cursor: pointer;
+  list-style: none;
+}
+summary.node-title::-webkit-details-marker {
+  display: none;
+}
+summary.node-title::before {
+  content: "\25be"; /* ▾ */
+  display: inline-block;
+  width: 0.7em;
+  flex-shrink: 0;
+  color: var(--muted);
+  font-size: 0.8em;
+}
+.node:not([open]) > summary.node-title::before {
+  content: "\25b8"; /* ▸ */
 }
 
 /* The JS-drawn overlay for meshfox:edge cross-references (see
@@ -339,25 +388,6 @@ a {
   font-size: 0.8rem;
   text-transform: uppercase;
   letter-spacing: 0.04em;
-}
-
-.badge {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 1.1rem;
-  height: 1.1rem;
-  border-radius: 50%;
-  font-size: 0.7rem;
-  color: #fff;
-}
-
-.badge.ok {
-  background: #16a34a;
-}
-
-.badge.fail {
-  background: #dc2626;
 }
 
 .node-tags:empty {

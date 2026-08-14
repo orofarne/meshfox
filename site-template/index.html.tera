@@ -146,6 +146,13 @@
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(drawEdges, 150);
   });
+  // Folding a node (native `<details>`, see _macros.html.tera/style.css —
+  // no JS of its own) moves every node below/beside it, which can move an
+  // edge endpoint too; `toggle` fires on the `<details>` itself for both
+  // directions (open and close), and bubbles, so one delegated listener
+  // catches every node's own toggle without needing to attach one per node
+  // or know which nodes are even foldable.
+  document.querySelector(".tree").addEventListener("toggle", drawEdges, true);
 })();
 </script>
 </body>
