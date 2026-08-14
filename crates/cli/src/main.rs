@@ -2037,6 +2037,27 @@ fn load_template_config(template_dir: &Path) -> TemplateConfig {
     })
 }
 
+/// `canvas_dir`'s repo HEAD, short form (e.g. `"a1b2c3d"`) — `None` when
+/// `canvas_dir` isn't inside a git working tree, or `git` itself isn't
+/// installed. A canvas exported outside any repo (or by a build machine
+/// without `git`) still gets a static site; it just has no `canvas_commit`
+/// for the template to show.
+fn canvas_git_commit(canvas_dir: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["-C", &canvas_dir.to_string_lossy(), "rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let commit = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if commit.is_empty() {
+        None
+    } else {
+        Some(commit)
+    }
+}
+
 /// Every `node` subcommand's last step before handing a patch back to be
 /// written: make sure it still parses — the same validate-before-commit
 /// shape every mutating `/api/nodes*` server handler uses.
@@ -2080,6 +2101,13 @@ fn static_cmd(canvas_path: &Path, template_dir: &Path, out_dir: &Path, force: bo
     let mut context = tera::Context::new();
     context.insert("site", &site);
     context.insert("icons", &config.icons);
+    // `meshfox_version` is always set (same string `--version` prints —
+    // whichever binary is running this export); `canvas_commit` is the
+    // canvas's own repo HEAD, short form, and `None` when `canvas_dir` isn't
+    // inside a git working tree — a template decides for itself whether to
+    // show either at all.
+    context.insert("meshfox_version", VERSION);
+    context.insert("canvas_commit", &canvas_git_commit(canvas_dir));
 
     // A proper glob-registered `Tera` instance, not a one-off render per
     // file: a template needs cross-file `{% import %}` to define the
