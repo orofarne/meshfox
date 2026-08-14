@@ -1,5 +1,8 @@
 /target
 node_modules/
+# `meshfox static` output for meshfox.orofarne.net (scripts/build-site.sh) —
+# built fresh by Cloudflare Pages on every deploy, never committed.
+/site-dist
 # crates/server embeds this directory at compile time (rust-embed) — keep
 # the directory itself tracked (via .gitkeep) so a fresh clone still
 # compiles before `npm run build` has ever run, but ignore actual build output.
