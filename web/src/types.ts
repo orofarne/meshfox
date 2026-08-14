@@ -57,6 +57,11 @@ export interface CanvasNode {
   width?: number;
   height?: number;
   color?: string;
+  /** Per-node fold-state override (`fold="true"`/`fold="false"` on
+   * `meshfox:node`) — see SPEC.md's "Options" section. Absent means "no
+   * override": follow the document's own default (`CanvasDoc.options`'
+   * `unfold`, see App.tsx's `resolveDefaultFold`). */
+  fold?: boolean;
   /** Free-form labels — purely descriptive, no structural meaning. Absent
    * or empty means "no tags". */
   tags?: string[];
@@ -86,6 +91,11 @@ export interface CanvasNode {
 
 export interface CanvasDoc {
   nodes: CanvasNode[];
+  /** Every `<!-- meshfox:option name="..." -->` this document declares
+   * (see `crates/core/src/options.rs`, SPEC.md's "Options" section) — e.g.
+   * `"unfold"`, which flips the web UI's own default fold state for the
+   * whole document. Absent/empty means none declared. */
+  options?: string[];
 }
 
 // Mirrors crates/server/src/lib.rs's `VarStatus` (JSON shape, camelCase) —

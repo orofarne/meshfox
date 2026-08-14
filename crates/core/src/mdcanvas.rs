@@ -112,6 +112,28 @@ pub struct NodeMeta {
     /// Free-form tags. Empty means "omitted" — same "caller passes through
     /// the existing value to keep it" contract as every other field here.
     pub tags: Vec<String>,
+    /// Per-node fold-state override (see `Node::fold`). Same "omitted
+    /// unless set" contract as `display`/`lang`/`interpreter` — `None`
+    /// omits `fold=` entirely (no override; follows the document
+    /// default), `Some(true)`/`Some(false)` write an explicit
+    /// `fold="true"`/`fold="false"`.
+    pub fold: Option<bool>,
+}
+
+/// Parses the `"true"`/`"false"`/`"default"` string sentinel used
+/// wherever a caller needs to distinguish "not touching `fold` at all"
+/// (simply not calling this — see `NodeMeta::fold`'s own doc comment)
+/// from "explicitly clearing it back to no override" (`"default"`,
+/// `Ok(None)`) — shared by the CLI's `node meta --fold` and the server's
+/// node-update endpoint so both interpret the same three spellings
+/// identically.
+pub fn parse_fold_override(raw: &str) -> Result<Option<bool>, String> {
+    match raw {
+        "true" => Ok(Some(true)),
+        "false" => Ok(Some(false)),
+        "default" => Ok(None),
+        other => Err(format!("fold must be \"true\", \"false\", or \"default\", got {other:?}")),
+    }
 }
 
 struct Segment {
@@ -179,6 +201,11 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
             width: seg.node_attrs.get("w").and_then(|v| v.parse().ok()),
             height: seg.node_attrs.get("h").and_then(|v| v.parse().ok()),
             color: seg.node_attrs.get("color").cloned(),
+            fold: seg.node_attrs.get("fold").and_then(|v| match v.as_str() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            }),
             tags: parse_tags(seg.node_attrs.get("tags")),
             target,
             display: seg.node_attrs.get("display").and_then(|v| match v.as_str() {
@@ -209,7 +236,7 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
         }
     }
 
-    Ok(Canvas { nodes })
+    Ok(Canvas { nodes, options: Vec::new() })
 }
 
 /// Builds an `ExtraEdge` for `from_id` out of a `meshfox:edge` line's raw
@@ -412,6 +439,9 @@ pub fn set_node_meta(markdown: &str, node_id: &str, meta: &NodeMeta) -> Option<S
     }
     if let Some(i) = &meta.interpreter {
         parts.push(format!("interpreter=\"{i}\""));
+    }
+    if let Some(f) = meta.fold {
+        parts.push(format!("fold=\"{f}\""));
     }
     if !meta.tags.is_empty() {
         parts.push(format!("tags=\"{}\"", meta.tags.join(",")));
@@ -714,6 +744,55 @@ pub fn set_node_edges(markdown: &str, node_id: &str, extra_parents: &[ExtraEdge]
             out.push_str(&markdown[insert_at..]);
         }
     }
+    Some(out)
+}
+
+/// Replaces the document's whole set of declared `meshfox:option` names
+/// (see `crate::options`, SPEC.md's "Options" — always root-only) with
+/// exactly one line per entry in `desired`, in the given order,
+/// consolidated at the very top of the root node's own body (right after
+/// its `meshfox:node`/`meshfox:edge` lines) regardless of where any
+/// previous declaration lived in the file. An empty slice removes every
+/// declaration. This is the write path behind the web UI's "document
+/// options" modal; hand-editing the plain comment syntax directly still
+/// works fine, this just gives the UI an equivalent way to do the same
+/// edit. Returns `None` only if the document has no root heading at all
+/// (never true for anything `parse` already accepted).
+pub fn set_document_options(markdown: &str, desired: &[String]) -> Option<String> {
+    let segments = scan(markdown);
+    let root = segments.first()?;
+    let body_start = root.body_span.start;
+    let body_end = root.body_span.end;
+    let body = &markdown[body_start..body_end];
+
+    let fence_ranges = crate::fence::fenced_byte_ranges(body);
+    let mut fi = 0;
+    let mut offset = 0;
+    let mut kept = String::with_capacity(body.len());
+    for line in body.split_inclusive('\n') {
+        let start = offset;
+        offset += line.len();
+        while fi < fence_ranges.len() && fence_ranges[fi].end <= start {
+            fi += 1;
+        }
+        let in_fence = fi < fence_ranges.len() && fence_ranges[fi].start <= start;
+        let is_option_line =
+            !in_fence && crate::options::parse_option_comment(line.trim_end_matches('\n')).is_some();
+        if !is_option_line {
+            kept.push_str(line);
+        }
+    }
+
+    let mut prefix = String::new();
+    for name in desired {
+        prefix.push_str(&format!("<!-- meshfox:option name=\"{name}\" -->\n"));
+    }
+
+    let mut out = String::with_capacity(markdown.len() + prefix.len() + kept.len());
+    out.push_str(&markdown[..body_start]);
+    out.push_str(&prefix);
+    out.push_str(&kept);
+    out.push_str(&markdown[body_end..]);
     Some(out)
 }
 
@@ -1718,6 +1797,7 @@ Reused from Tests as well.
             display: None,
             lang: None,
             interpreter: None,
+            fold: None,
             tags: Vec::new(),
         };
         let updated = set_node_meta(DOC, "tests", &meta).unwrap();
@@ -1825,6 +1905,36 @@ Reused from Tests as well.
         let n = c.node("diagram").unwrap();
         assert_eq!(n.display, Some(FileDisplay::Code));
         assert_eq!(n.lang.as_deref(), Some("rust"));
+    }
+
+    #[test]
+    fn fold_attribute_round_trips_through_parse_and_set_node_meta() {
+        let doc = "# Root\n\n## Section\n<!-- meshfox:node -->\n\nbody\n";
+        let c = parse(doc).unwrap();
+        assert_eq!(c.node("section").unwrap().fold, None);
+
+        let meta = NodeMeta { fold: Some(true), ..Default::default() };
+        let updated = set_node_meta(doc, "section", &meta).unwrap();
+        assert_eq!(parse(&updated).unwrap().node("section").unwrap().fold, Some(true));
+
+        let meta = NodeMeta { fold: Some(false), ..Default::default() };
+        let updated = set_node_meta(&updated, "section", &meta).unwrap();
+        assert_eq!(parse(&updated).unwrap().node("section").unwrap().fold, Some(false));
+
+        // `fold: None` omits the attribute entirely, clearing it back to
+        // "no override" — same "None omits" contract `color`/`display`
+        // already have.
+        let meta = NodeMeta { fold: None, ..Default::default() };
+        let updated = set_node_meta(&updated, "section", &meta).unwrap();
+        assert_eq!(parse(&updated).unwrap().node("section").unwrap().fold, None);
+    }
+
+    #[test]
+    fn parse_fold_override_accepts_true_false_default_and_rejects_garbage() {
+        assert_eq!(parse_fold_override("true"), Ok(Some(true)));
+        assert_eq!(parse_fold_override("false"), Ok(Some(false)));
+        assert_eq!(parse_fold_override("default"), Ok(None));
+        assert!(parse_fold_override("bogus").is_err());
     }
 
     #[test]
@@ -2027,6 +2137,48 @@ Reused from Tests as well.
         let c = parse(&removed).unwrap();
         assert!(c.node("shared-smoke").unwrap().extra_parents.is_empty());
         assert!(!removed.contains("meshfox:edge"));
+    }
+
+    #[test]
+    fn set_document_options_adds_where_none_existed() {
+        let added = set_document_options(DOC, &["unfold".to_string()]).unwrap();
+        assert_eq!(
+            crate::options::declared_options(&parse(&added).unwrap()).unwrap(),
+            vec!["unfold".to_string()]
+        );
+        // root's own prose is untouched
+        assert!(added.contains("Root body text."));
+        // unrelated nodes untouched
+        assert_eq!(parse(&added).unwrap().node("tests").unwrap().x, Some(0.0));
+    }
+
+    #[test]
+    fn set_document_options_replaces_an_existing_declaration() {
+        let doc = "# Root\n<!-- meshfox:node id=\"root\" -->\n<!-- meshfox:option name=\"unfold\" -->\n\nSome prose about the root.\n\n## Child\n<!-- meshfox:node id=\"child\" -->\n\nbody\n";
+        let replaced = set_document_options(doc, &["other".to_string()]).unwrap();
+        assert_eq!(
+            crate::options::declared_options(&parse(&replaced).unwrap()).unwrap(),
+            vec!["other".to_string()]
+        );
+        assert!(replaced.contains("Some prose about the root."));
+    }
+
+    #[test]
+    fn set_document_options_removes_every_declaration_when_given_an_empty_slice() {
+        let doc = "# Root\n<!-- meshfox:node id=\"root\" -->\n<!-- meshfox:option name=\"unfold\" -->\n\nprose\n";
+        let removed = set_document_options(doc, &[]).unwrap();
+        assert!(!removed.contains("meshfox:option"));
+        assert!(crate::options::declared_options(&parse(&removed).unwrap()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_document_options_preserves_an_unrecognized_declaration_it_was_told_to_keep() {
+        let doc = "# Root\n<!-- meshfox:node id=\"root\" -->\n<!-- meshfox:option name=\"some-future-option\" -->\n\nprose\n";
+        let updated = set_document_options(doc, &["some-future-option".to_string(), "unfold".to_string()]).unwrap();
+        assert_eq!(
+            crate::options::declared_options(&parse(&updated).unwrap()).unwrap(),
+            vec!["some-future-option".to_string(), "unfold".to_string()]
+        );
     }
 
     #[test]

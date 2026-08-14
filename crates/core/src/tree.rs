@@ -103,6 +103,7 @@ mod tests {
             width: None,
             height: None,
             color: None,
+            fold: None,
             tags: Vec::new(),
             target: None,
             display: None,
@@ -122,6 +123,7 @@ mod tests {
                 node("examples", Some("tests"), ""),
                 node("test1", Some("examples"), "```bash name=\"test1\"\necho hi\n```"),
             ],
+            options: Vec::new(),
         }
     }
 

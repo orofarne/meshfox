@@ -110,6 +110,13 @@ export function TtyPanel({ path, blockName, withDeps, persist, vars, onClose }: 
     term.loadAddon(fit);
     term.open(container);
     fit.fit();
+    // Without this, xterm.js leaves its own hidden input textarea
+    // unfocused until the user clicks into the terminal once — so the very
+    // keystrokes someone opening this panel to actually type something
+    // would send go nowhere until then. Focusing it the moment the panel
+    // opens is what makes it behave like a real terminal window grabbing
+    // focus on launch.
+    term.focus();
     termRef.current = term;
 
     const params = new URLSearchParams({
@@ -218,6 +225,22 @@ export function TtyPanel({ path, blockName, withDeps, persist, vars, onClose }: 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Restores focus the same way expanding back out of the collapsed pill
+  // (see `.mesh-tty-pill`'s `onClick` below) — otherwise it'd stay wherever
+  // the click that expanded it landed (the pill button itself), same
+  // "click first, then type" friction the mount-time `term.focus()` above
+  // exists to avoid. Skipped on the initial mount (`collapsed` starts
+  // `false`, so this would otherwise redundantly re-focus right after the
+  // effect above already did) via the `justMounted` ref.
+  const justMounted = useRef(true);
+  useEffect(() => {
+    if (justMounted.current) {
+      justMounted.current = false;
+      return;
+    }
+    if (!collapsed) termRef.current?.focus();
+  }, [collapsed]);
+
   const handleKill = () => {
     if (runIdRef.current) killRun(runIdRef.current).catch(() => {});
   };
@@ -252,7 +275,19 @@ export function TtyPanel({ path, blockName, withDeps, persist, vars, onClose }: 
             </button>
           </span>
         </div>
-        <div className="mesh-tty-body" ref={containerRef} />
+        <div className="mesh-tty-body">
+          {/* `containerRef` (the element passed to `term.open()`/observed
+           * for resize) deliberately isn't `.mesh-tty-body` itself: xterm's
+           * `FitAddon` sizes rows/cols off this element's own `clientHeight`/
+           * `clientWidth`, which *includes* CSS padding — putting padding
+           * directly here computed one row taller than the actual visible
+           * area really had room for, clipping the terminal's own bottom
+           * row under `.mesh-tty-body`'s padding. Padding lives on the
+           * outer, unmeasured wrapper instead; this inner element stays
+           * padding-free so `FitAddon`'s measurement is the true usable
+           * area. */}
+          <div className="mesh-tty-terminal" ref={containerRef} />
+        </div>
       </div>
       {collapsed && (
         <button type="button" className="mesh-tty-pill" onClick={() => setCollapsed(false)}>

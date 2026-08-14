@@ -80,7 +80,9 @@ pub fn compute(canvas: &Canvas) -> HashMap<String, LayoutBox> {
     let mut y_cursor = rh;
     for section in canvas.children(&root.id) {
         y_cursor += V_GAP;
-        let consumed = place_rightward(canvas, section, ROOT_CHILD_INDENT, y_cursor, &mut boxes);
+        // `None`: root's own direct children are never inside a group
+        // (root has no parent, so nothing above it could be one either).
+        let consumed = place_rightward(canvas, section, ROOT_CHILD_INDENT, y_cursor, None, &mut boxes);
         y_cursor += consumed;
     }
 
@@ -106,11 +108,22 @@ pub fn compute(canvas: &Canvas) -> HashMap<String, LayoutBox> {
 /// below), so a sibling section positioned purely synthetically has no way
 /// to know to route around it. Same tradeoff as the group case — acceptable
 /// for a "good enough default", not attempted for real layout quality.
+///
+/// `group_origin` is `Some((gx, gy))` exactly when `node`'s own *structural*
+/// parent is a `group` — `gx`/`gy` being that group's own just-resolved
+/// anchor (real or synthetic, doesn't matter — always concrete by the time
+/// it's passed down). A group member's own real `x`/`y` is relative to that
+/// anchor, not the whole document (see SPEC.md and
+/// `Canvas::resolve_absolute_position`, this pass's own top-down
+/// equivalent of the same rule) — `None` for anything not a direct group
+/// child leaves a real position exactly as authored, same as before this
+/// existed.
 fn place_rightward(
     canvas: &Canvas,
     node: &Node,
     x: f64,
     y: f64,
+    group_origin: Option<(f64, f64)>,
     boxes: &mut HashMap<String, LayoutBox>,
 ) -> f64 {
     let (w, h) = intrinsic_size(node);
@@ -123,9 +136,24 @@ fn place_rightward(
     // box — see `layout_groups`) could land anywhere in the document,
     // nowhere near the parent it's actually nested under.
     let (x, y) = match (node.x, node.y) {
-        (Some(rx), Some(ry)) => (rx, ry),
+        (Some(rx), Some(ry)) => match group_origin {
+            Some((gx, gy)) => (gx + rx, gy + ry),
+            None => (rx, ry),
+        },
         _ => (x, y),
     };
+    // Every *direct* child of a `group` gets this node's own just-resolved
+    // `(x, y)` as its `group_origin` — nested one level deeper (a group
+    // member's own child, say) reverts to plain absolute coordinates, since
+    // only a group's immediate members render inside its box (see
+    // `web/src/tree.ts`'s `deriveEdges`, which only suppresses the
+    // structural nesting line one level down too — deeper nesting still
+    // draws an ordinary arrow and lays out as an ordinary tree branch). A
+    // nested group's own members still compose correctly through this
+    // recursion: the inner group's own anchor (itself resolved via the
+    // *outer* group's `group_origin`, one call up) becomes `group_origin`
+    // for the inner group's own children in turn.
+    let children_group_origin = (node.node_type == NodeType::Group).then_some((x, y));
     let children = canvas.children(&node.id);
 
     if children.is_empty() {
@@ -151,7 +179,7 @@ fn place_rightward(
             cursor += V_GAP;
             span += V_GAP;
         }
-        let child_h = place_rightward(canvas, child, child_x, cursor, boxes);
+        let child_h = place_rightward(canvas, child, child_x, cursor, children_group_origin, boxes);
         cursor += child_h;
         span += child_h;
     }
@@ -183,8 +211,15 @@ fn layout_groups(canvas: &Canvas, boxes: &mut HashMap<String, LayoutBox>) {
 
     for group in groups {
         let members = subtree_ids(canvas, &group.id);
-        let member_boxes: Vec<LayoutBox> =
-            members.iter().filter_map(|id| member_box(canvas, id, boxes)).collect();
+        // `place_rightward` (above) already resolves *every* node's box to
+        // an absolute position, real or synthetic — including a group
+        // member's own real position, now correctly offset by its group's
+        // anchor (`group_origin`) rather than read as absolute directly.
+        // No separate re-derivation needed here, unlike before that
+        // existed: reading `node.x`/`node.y` straight from a group member
+        // would double-count (or, worse, just be wrong) now that those
+        // numbers are group-relative rather than document-absolute.
+        let member_boxes: Vec<LayoutBox> = members.iter().filter_map(|id| boxes.get(id).copied()).collect();
         if member_boxes.is_empty() {
             continue;
         }
@@ -208,24 +243,6 @@ fn layout_groups(canvas: &Canvas, boxes: &mut HashMap<String, LayoutBox>) {
             },
         );
     }
-}
-
-/// A group member's box for bounding-box purposes: its *real*, authored (or
-/// dragged) position/size when it has one, since that's what actually
-/// renders on screen — falling back to the synthetic tree-layout box
-/// (`boxes`, from `place_rightward`) only for a member that's still
-/// unpositioned. Without this, a group's box would track where its members
-/// *would* sit in a fresh auto-layout instead of where they actually are,
-/// so moving a real node (or the whole group, which moves its members —
-/// see the web client's group-drag handling) would silently leave the
-/// group's dashed frame behind.
-fn member_box(canvas: &Canvas, id: &str, boxes: &HashMap<String, LayoutBox>) -> Option<LayoutBox> {
-    let node = canvas.node(id)?;
-    if let (Some(x), Some(y)) = (node.x, node.y) {
-        let (width, height) = intrinsic_size(node);
-        return Some(LayoutBox { x, y, width, height });
-    }
-    boxes.get(id).copied()
 }
 
 /// Number of `parent` hops from `id` up to the root — unlike `.level`, this
@@ -474,6 +491,54 @@ mod tests {
         let canvas = parse(doc).unwrap();
         let boxes = compute(&canvas);
         assert!(boxes.contains_key("empty"));
+    }
+
+    #[test]
+    fn group_member_position_resolves_relative_to_the_groups_own_anchor() {
+        let doc = "# Root\n\n## Frame\n<!-- meshfox:node type=\"group\" x=1000 y=1000 -->\n\n### Member\n<!-- meshfox:node x=20 y=20 w=100 h=80 -->\n\nbody\n";
+        let canvas = parse(doc).unwrap();
+        let boxes = compute(&canvas);
+        let member = boxes.get("member").unwrap();
+        assert_eq!(member.x, 1020.0);
+        assert_eq!(member.y, 1020.0);
+    }
+
+    #[test]
+    fn dragging_a_groups_anchor_moves_an_auto_placed_member_without_rewriting_it() {
+        // Member has no explicit x/y at all in either fixture — moving the
+        // group's own anchor should move where the member's own synthetic
+        // placement lands too, without the member itself ever storing a
+        // real position of its own.
+        let near = "# Root\n\n## Frame\n<!-- meshfox:node type=\"group\" x=0 y=0 -->\n\n### Member\n<!-- meshfox:node -->\n\nbody\n";
+        let far = "# Root\n\n## Frame\n<!-- meshfox:node type=\"group\" x=5000 y=5000 -->\n\n### Member\n<!-- meshfox:node -->\n\nbody\n";
+        let near_boxes = compute(&parse(near).unwrap());
+        let far_boxes = compute(&parse(far).unwrap());
+        let member_near = near_boxes.get("member").unwrap();
+        let member_far = far_boxes.get("member").unwrap();
+        assert!(member_far.x > member_near.x + 4000.0);
+        assert!(member_far.y > member_near.y + 4000.0);
+    }
+
+    #[test]
+    fn nested_group_members_compound_through_both_group_anchors() {
+        let doc = "# Root\n<!-- meshfox:node id=\"root\" -->\n\n###### Outer\n<!-- meshfox:node id=\"outer\" type=\"group\" x=10 y=10 -->\n\n###### Inner\n<!-- meshfox:node id=\"inner\" type=\"group\" parent=\"outer\" x=5 y=5 -->\n\n###### Leaf\n<!-- meshfox:node id=\"leaf\" parent=\"inner\" x=2 y=2 w=50 h=40 -->\n\nbody\n";
+        let canvas = parse(doc).unwrap();
+        let boxes = compute(&canvas);
+        let leaf = boxes.get("leaf").unwrap();
+        assert_eq!(leaf.x, 17.0);
+        assert_eq!(leaf.y, 17.0);
+    }
+
+    #[test]
+    fn a_never_anchored_group_still_falls_back_to_synthetic_placement() {
+        // Regression for the common case (a group nobody's ever dragged) —
+        // group-relative coordinates only kick in once a group actually
+        // has a real anchor to be relative *to*.
+        let doc = "# Root\n\n## Frame\n<!-- meshfox:node type=\"group\" -->\n\n### Member\n<!-- meshfox:node -->\n\nbody\n";
+        let canvas = parse(doc).unwrap();
+        let boxes = compute(&canvas);
+        assert!(boxes.contains_key("frame"));
+        assert!(boxes.contains_key("member"));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Handle, NodeResizer, NodeToolbar, Position, useReactFlow, type NodeProps } from "@xyflow/react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -6,7 +6,7 @@ import CodeMirror from "@uiw/react-codemirror";
 import { LanguageDescription } from "@codemirror/language";
 import { languages } from "@codemirror/language-data";
 import type { Extension } from "@codemirror/state";
-import { defaultBlockName, parseBody, type BodySegment, type CodeSegment, type ConstraintSegment } from "./fence";
+import { defaultBlock, parseBody, type BodySegment, type CodeSegment, type ConstraintSegment } from "./fence";
 import { parseBlockRef, blockDomId } from "./deps";
 import { AnsiText } from "./AnsiText";
 import { NodeTextEditor, usePrefersDark } from "./NodeTextEditor";
@@ -123,11 +123,38 @@ export interface MeshNodeData {
    * not-yet-reloaded-away run; absent means "show the cached `seg.output`
    * from the file, if any". */
   liveBlocks: Record<string, LiveBlockState>;
-  /** Mirrors the toolbar's "show deps" toggle (see App.tsx) — same flag
-   * that gates the cross-node dependency arrows also gates this node's
-   * in-body rail (dots + connecting line for same-node `deps=` blocks),
-   * so both dependency visualizations turn on/off together. */
-  showDeps: boolean;
+  /** This node itself is folded — for a node with real body content, that
+   * means shrinking to a compact title-only row (no body, no run buttons);
+   * for an already-title-only node (empty body — see `isTitleOnly` at its
+   * one render site below), its own row never changes either way, since
+   * there was nothing in it to hide to begin with. Either way, every
+   * descendant (if it has any) is hidden entirely too (see App.tsx's
+   * `foldedNodeIds`/`visibleNodeIds`) — which is the *only* effect folding
+   * a title-only node has, and exactly why `hasChildren` below gates
+   * whether it even gets a toggle: with no children, folding one would do
+   * nothing at all. A session preference (this component's own click just
+   * flips `foldedNodeIds`, persisted to localStorage, never written to the
+   * file) — but the *default* it starts from on a canvas's first-ever open
+   * is the document's own, via a node's `fold=` attribute or the whole
+   * document's `unfold` option (see `App.tsx`'s `resolveDefaultFold`,
+   * SPEC.md's "Options" section). */
+  folded: boolean;
+  /** Whether this node has any structural children at all — irrelevant to
+   * whether a node with real body content gets a fold toggle (it always
+   * does, see `folded` above), but the one thing that decides it for an
+   * already-title-only node: folding one hides only its subtree (its own
+   * row is identical either way), so with no children there's nothing a
+   * toggle could do, and the title-only render branch below hides it in
+   * that case (mirrors the TUI's own `has_children`-gated marker, just
+   * scoped to this one node shape rather than every node). */
+  hasChildren: boolean;
+  onToggleFold: () => void;
+  /** True for the one node keyboard nav (j/k/h/l/Enter, see App.tsx)
+   * currently has focus on — distinct from React Flow's own mouse-driven
+   * `selected` (NodeResizer visibility, multi-select), so a keypress never
+   * silently changes what's selected for resize/multi-op purposes.
+   * Undefined/false for every other node. */
+  focused?: boolean;
   target?: string;
   /** Results of every embedded ` ```starlark constraint ` fence in this
    * node's own body, in document order (see `ConstraintStatusDto`) — matched
@@ -203,25 +230,6 @@ export interface MeshNodeData {
   [key: string]: unknown;
 }
 
-/** Names of code blocks that are either the source or the target of a
- * same-node `deps=` edge (a raw entry with no `node-id/` prefix) — used to
- * pick which rail dots get the "in a chain" treatment. Cross-node deps
- * aren't representable as a line inside this node (the other end isn't
- * rendered here), so they don't count. */
-function sameNodeChainNames(segments: BodySegment[]): Set<string> {
-  const codeSegs = segments.filter((s): s is CodeSegment => s.type === "code");
-  const names = new Set(codeSegs.map((s) => s.name));
-  const chain = new Set<string>();
-  for (const seg of codeSegs) {
-    for (const raw of seg.deps) {
-      if (raw.includes("/") || !names.has(raw)) continue;
-      chain.add(seg.name);
-      chain.add(raw);
-    }
-  }
-  return chain;
-}
-
 /** `file`/`link` nodes' title-bar type marker. Hand-drawn inline SVG rather
  * than the 📎/🔗 emoji this used to be: those are color-emoji-presentation
  * codepoints with no monochrome fallback in most font stacks, so unlike
@@ -231,6 +239,31 @@ function sameNodeChainNames(segments: BodySegment[]): Set<string> {
  * `transform: scale()`, not a font-size change) scales that bitmap into
  * pixelated noise at a low enough zoom. An SVG sized in `em` and colored via
  * `currentColor` scales cleanly at any zoom, same as the surrounding text. */
+/** The ▸/▾ fold marker — mirrors the TUI's own `▾`/`▸` row marker (see
+ * README's "Terminal viewer" section) as closely as a spatial canvas
+ * allows: folded shrinks this node to a title-only row and, if it has any,
+ * hides its whole subtree too (see App.tsx's `foldedNodeIds`). Rendered on
+ * every node with real body content — a leaf still gets one, same as any
+ * node with children, since its own body can be just as unwieldy as a
+ * whole subtree — but an already-title-only node (empty-bodied `text`
+ * node — see `isTitleOnly` at its normal render site below) only gets one
+ * when it has children: its own row is this exact compact single-line
+ * layout whether folded or not (nothing there to hide), so folding one
+ * with no children would be a total no-op with a button to show for it —
+ * see that render site's own gate on `MeshNodeData.hasChildren`. */
+function FoldToggle({ folded, onToggle }: { folded: boolean; onToggle: () => void }) {
+  return (
+    <button
+      type="button"
+      className="mesh-node-icon-button mesh-node-fold-toggle nodrag"
+      onClick={onToggle}
+      title={folded ? "Unfold this subtree" : "Fold this subtree"}
+    >
+      {folded ? "▸" : "▾"}
+    </button>
+  );
+}
+
 function TypeIcon({ type }: { type: NodeType }) {
   if (type === "file") {
     return (
@@ -722,21 +755,9 @@ export function NodeBodyPreview({ text }: { text: string }) {
 }
 
 /**
- * Renders a text node's body. With the toolbar's "show deps" toggle off,
- * this is just the plain stacked list of markdown/code segments (matches a
- * canvas with no `deps=` blocks exactly as before the rail existed).
- * Toggled on, it switches to a two-column CSS grid: a narrow left "rail"
- * with a dot per code block (plus a connecting line spanning from the
- * first to the last one), and the actual markdown/code content on the
- * right. Every segment — markdown included — gets an explicit `gridRow`
- * matching its position in document order, so the rail's dots line up with
- * their code block without any JS measurement: the grid's own auto row
- * sizing keeps both columns in lockstep as content (e.g. streaming output)
- * changes height. The line is purely a "these run in sequence" visual
- * thread, not a precise per-edge dependency graph — dots on blocks that
- * are part of an actual same-node `deps=` edge get the accent color (see
- * `sameNodeChainNames`); the exact edges are still spelled out in each
- * block's own "after: …" links.
+ * Renders a text node's body: the plain stacked list of markdown/code
+ * segments. Each block's own dependencies (if any) are spelled out inline
+ * via its "after: …" links.
  */
 
 /** One embedded ` ```starlark constraint ` fence within a node's body: its
@@ -784,76 +805,28 @@ function MeshNodeBody({ data, nodeId }: { data: MeshNodeData; nodeId: string }) 
   const wheelRef = useStopWheelIfScrollable<HTMLDivElement>();
   const components = useMemo(() => makeMarkdownComponents(data.assetBase), [data.assetBase]);
 
-  if (!data.showDeps) {
-    let constraintIdx = 0;
-    return (
-      <div className="mesh-node-body nopan" ref={wheelRef}>
-        {segments.map((seg, i) => {
-          if (seg.type === "markdown") {
-            return (
-              <ReactMarkdown key={i} remarkPlugins={[remarkGfm]} components={components}>
-                {seg.content}
-              </ReactMarkdown>
-            );
-          }
-          if (seg.type === "constraint") {
-            // Matched to `data.constraintResults` purely by position — both
-            // are built from the same document order (see
-            // `MeshNodeData.constraintResults`'s doc comment).
-            const status = data.constraintResults?.[constraintIdx];
-            constraintIdx += 1;
-            return (
-              <ConstraintFenceBlock key={`constraint-${i}`} seg={seg} status={status} onRecheck={data.onRecheckConstraint} />
-            );
-          }
-          return <RunnableCodeBlock key={seg.name} seg={seg} data={data} nodeId={nodeId} />;
-        })}
-      </div>
-    );
-  }
-
-  const chainNames = sameNodeChainNames(segments);
-  const codeRows = segments.map((seg, i) => (seg.type === "code" ? i : -1)).filter((i) => i !== -1);
-  let railConstraintIdx = 0;
-
+  let constraintIdx = 0;
   return (
-    <div className="mesh-node-body mesh-rail nopan" ref={wheelRef}>
-      {codeRows.length > 1 && (
-        <div
-          className="mesh-rail-line"
-          style={{ gridRow: `${codeRows[0] + 1} / ${codeRows[codeRows.length - 1] + 2}` }}
-        />
-      )}
+    <div className="mesh-node-body nopan" ref={wheelRef}>
       {segments.map((seg, i) => {
         if (seg.type === "markdown") {
           return (
-            <div key={`md-${i}`} className="mesh-rail-content" style={{ gridRow: i + 1, gridColumn: 2 }}>
-              <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>{seg.content}</ReactMarkdown>
-            </div>
+            <ReactMarkdown key={i} remarkPlugins={[remarkGfm]} components={components}>
+              {seg.content}
+            </ReactMarkdown>
           );
         }
         if (seg.type === "constraint") {
-          const status = data.constraintResults?.[railConstraintIdx];
-          railConstraintIdx += 1;
+          // Matched to `data.constraintResults` purely by position — both
+          // are built from the same document order (see
+          // `MeshNodeData.constraintResults`'s doc comment).
+          const status = data.constraintResults?.[constraintIdx];
+          constraintIdx += 1;
           return (
-            <div key={`constraint-${i}`} className="mesh-rail-content" style={{ gridRow: i + 1, gridColumn: 2 }}>
-              <ConstraintFenceBlock seg={seg} status={status} onRecheck={data.onRecheckConstraint} />
-            </div>
+            <ConstraintFenceBlock key={`constraint-${i}`} seg={seg} status={status} onRecheck={data.onRecheckConstraint} />
           );
         }
-        return (
-          <Fragment key={seg.name}>
-            <span
-              className="mesh-rail-dot"
-              data-in-chain={chainNames.has(seg.name)}
-              style={{ gridRow: i + 1, gridColumn: 1 }}
-              title={seg.deps.length ? `after: ${seg.deps.join(", ")}` : seg.name}
-            />
-            <div className="mesh-rail-content" style={{ gridRow: i + 1, gridColumn: 2 }}>
-              <RunnableCodeBlock seg={seg} data={data} nodeId={nodeId} />
-            </div>
-          </Fragment>
-        );
+        return <RunnableCodeBlock key={seg.name} seg={seg} data={data} nodeId={nodeId} />;
       })}
     </div>
   );
@@ -916,27 +889,48 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
 
   // The title bar's "▷ run" quick-run button: for a `text` node, its one
   // unambiguous default block (explicit `default` flag or self-named, same
-  // rule `core::fence::default_block` uses — see `defaultBlockName`); for a
+  // rule `core::fence::default_block` uses — see `defaultBlock`); for a
   // runnable `file` node (`interpreter` set), the node's own id, matching
   // the same "the block shares its node's own id" convention its live run
-  // state is keyed under (see `App.tsx`'s `executeFileRun`). `null` when
-  // neither applies (nothing to quick-run) — the button just isn't shown.
+  // state is keyed under (see `App.tsx`'s `executeFileRun`) — a file node
+  // is never `tty` (that's only ever a fenced block's own attribute, see
+  // `CodeSegment.tty`), so `quickRunIsTty` only checks `quickRunBlock`.
+  // `null` when neither applies (nothing to quick-run) — the button just
+  // isn't shown.
+  const quickRunBlock = isTextNode ? defaultBlock(data.text, id) : null;
   const quickRunBlockName =
-    isTextNode
-      ? defaultBlockName(data.text, id)
-      : data.nodeType === "file" && data.interpreter && data.target
-        ? id
-        : null;
+    quickRunBlock?.name ?? (data.nodeType === "file" && data.interpreter && data.target ? id : null);
+  // A `tty` block needs `onRunTty` (opens a real terminal over its own
+  // WebSocket), not `onRun` (the plain captured/streamed-output path) —
+  // the server rejects a `tty` block run over `/api/run` outright (see
+  // `crates/server/src/lib.rs`'s `run_block`). Mirrors `RunnableCodeBlock`'s
+  // own `seg.tty ? onRunTty : onRun` branch just above, which this button
+  // had drifted out of sync with (it always called `onRun`, unconditionally,
+  // until this).
+  const quickRunIsTty = quickRunBlock?.tty ?? false;
   const quickRunLive = quickRunBlockName ? data.liveBlocks[quickRunBlockName] : undefined;
   const quickRunBusy = quickRunLive?.status === "queued" || quickRunLive?.status === "running";
   const canOpenFile = data.nodeType === "file" && !!data.target;
   const constraintStatus = aggregateConstraintStatus(data.constraintResults);
+  // Extra way back to unfolded, alongside `FoldToggle` itself — a click
+  // (not drag: a text-selection drag still works, see below) anywhere on
+  // the title text of a *folded* node unfolds it too, since that's most
+  // of what's left to click on a folded node's now-compact row. Only ever
+  // unfolds, never folds: an *unfolded* node's title staying inert is what
+  // keeps a plain click there safe for text selection/dragging (Edit
+  // mode's own node-drag) — this only ever fires on a genuine click
+  // (mouseup without meaningful movement), which neither of those is.
+  const handleTitleClick = () => {
+    if (data.folded) data.onToggleFold();
+  };
 
   return (
     <div
       className="mesh-node"
       data-type={data.nodeType}
       data-suggested={data.suggested}
+      data-folded={data.folded}
+      data-focused={data.focused ?? false}
       style={{
         ...(nodeColor ? { borderColor: nodeColor, boxShadow: `inset 4px 0 0 ${nodeColor}` } : undefined),
         ...(data.maxHeight !== undefined ? { maxHeight: data.maxHeight } : undefined),
@@ -953,12 +947,33 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
       <Handle type="target" position={Position.Left} />
       {isTitleOnly ? (
         <div className="mesh-node-title mesh-node-title-centered nopan" data-level={data.level}>
-          <TypeIcon type={data.nodeType} />
-          {data.title}
+          {/* `FoldToggle` only if there's a subtree to fold: an
+           * empty-bodied text node's own row is this exact compact
+           * single-line layout whether folded or not (its body was never
+           * shown to begin with), so folding one with no children would be
+           * a total no-op with a button to show for it — but one *with*
+           * children still has real subtree content the toggle can hide,
+           * even though this row itself won't visibly change. See
+           * `MeshNodeData.hasChildren`. */}
+          {data.hasChildren && <FoldToggle folded={data.folded} onToggle={data.onToggleFold} />}
+          {/* The wrapper span below is still always worth keeping: plain,
+           * no styling of its own (inherits `nopan`/`user-select: text`/
+           * centering/wrapping straight from `.mesh-node-title-centered`
+           * above), it's just a stable, icon-free target for a click/drag
+           * meant for the title text — same idea as the normal (non-
+           * title-only) layout's `.mesh-node-title-text` just below, kept
+           * as a distinct class since this one must stay `white-space:
+           * normal` (wrap, no ellipsis) for this layout's own "long title
+           * wraps across a centered block" behavior. */}
+          <span className="mesh-node-title-centered-text" onClick={handleTitleClick}>
+            <TypeIcon type={data.nodeType} />
+            {data.title}
+          </span>
         </div>
       ) : (
         <div className="mesh-node-title" data-level={data.level}>
-          <span className="mesh-node-title-text nopan">
+          <FoldToggle folded={data.folded} onToggle={data.onToggleFold} />
+          <span className="mesh-node-title-text nopan" onClick={handleTitleClick}>
             <TypeIcon type={data.nodeType} />
             {data.title}
           </span>
@@ -968,8 +983,16 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
               type="button"
               className="mesh-node-icon-button mesh-node-quick-run-icon nodrag"
               disabled={quickRunBusy}
-              onClick={() => data.onRun(quickRunBlockName, false)}
-              title={quickRunBusy ? "running…" : `run ${quickRunBlockName}`}
+              onClick={() =>
+                quickRunIsTty ? data.onRunTty(quickRunBlockName, false) : data.onRun(quickRunBlockName, false)
+              }
+              title={
+                quickRunBusy
+                  ? "running…"
+                  : quickRunIsTty
+                    ? `open an interactive terminal for ${quickRunBlockName}`
+                    : `run ${quickRunBlockName}`
+              }
             >
               ▷
             </button>
@@ -982,20 +1005,6 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
               title="Open this file in the default application"
             >
               ↗
-            </button>
-          )}
-          {/* Always the rightmost of this trio — a node's icon set varies
-           * (run/open only show up for some node types), and keeping expand
-           * pinned last means its position doesn't shift around depending
-           * on which of the others happen to be present. */}
-          {!isGroup && (
-            <button
-              type="button"
-              className="mesh-node-icon-button mesh-node-expand-icon nodrag"
-              onClick={data.onExpand}
-              title="Expand this node into a floating window"
-            >
-              ⛶
             </button>
           )}
           {data.editMode && (
@@ -1040,6 +1049,22 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
               )}
             </span>
           )}
+          {/* Always the rightmost icon, editMode's own action group
+           * included — a node's icon set varies (run/open only show up
+           * for some node types, editMode adds a whole extra group), and
+           * keeping expand pinned last means its position doesn't shift
+           * depending on which of the others happen to be present. For a
+           * group, this opens a mini sub-canvas of its own members instead
+           * of a body panel (a group's own body is always empty) — see
+           * NodeExpandPanel.tsx. */}
+          <button
+            type="button"
+            className="mesh-node-icon-button mesh-node-expand-icon nodrag"
+            onClick={data.onExpand}
+            title={isGroup ? "Open this group's members in their own view" : "Expand this node into a floating window"}
+          >
+            ⛶
+          </button>
         </div>
       )}
       {data.tags && data.tags.length > 0 && (
@@ -1081,7 +1106,7 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
           </button>
         </NodeToolbar>
       )}
-      {isTitleOnly ? null : <NodeBodyContent data={data} nodeId={id} />}
+      {isTitleOnly || data.folded ? null : <NodeBodyContent data={data} nodeId={id} />}
       {editingText && (
         <NodeTextEditor
           initialText={data.text}

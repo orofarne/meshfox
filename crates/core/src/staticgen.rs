@@ -256,8 +256,17 @@ fn build_node_view(
         let target = node.target.as_deref().map(|t| resolve_link_url(t, ctx));
         (html_body, target)
     };
-    let position = match (node.x, node.y, node.width, node.height) {
-        (Some(x), Some(y), Some(width), Some(height)) => Some(Position { x, y, width, height }),
+    // `canvas.resolve_absolute_position` is exactly `(node.x, node.y)` for
+    // any node not nested under a `group` — it's only for a group member
+    // that this differs, resolving the member's own group-relative
+    // coordinate against its group's anchor (see
+    // `Canvas::resolve_absolute_position`). `None` (no real position, or a
+    // group ancestor with no anchor of its own) falls back to CSS flow same
+    // as before this existed — no heuristic invented here either way, per
+    // this module's own "all real or nothing" rule (see the module doc
+    // comment).
+    let position = match (canvas.resolve_absolute_position(&node.id), node.width, node.height) {
+        (Some((x, y)), Some(width), Some(height)) => Some(Position { x, y, width, height }),
         _ => None,
     };
     let ok = constraint_ok.get(&node.id).copied();
@@ -632,6 +641,32 @@ mod tests {
         let c = canvas("# Root\n<!-- meshfox:node id=\"root\" x=10 y=20 -->\n");
         let site = build_site(&c);
         assert!(site.find("root").unwrap().position.is_none());
+    }
+
+    #[test]
+    fn a_group_members_position_resolves_relative_to_its_anchored_group() {
+        let c = canvas(
+            "# Root\n\n## Frame\n<!-- meshfox:node id=\"frame\" type=\"group\" x=1000 y=1000 -->\n\n\
+             ### Member\n<!-- meshfox:node id=\"member\" x=20 y=20 w=100 h=80 -->\n\nbody\n",
+        );
+        let site = build_site(&c);
+        let pos = site.find("member").unwrap().position.expect("group has a real anchor");
+        assert_eq!((pos.x, pos.y, pos.width, pos.height), (1020.0, 1020.0, 100.0, 80.0));
+    }
+
+    #[test]
+    fn a_group_members_position_is_none_when_its_group_has_no_anchor() {
+        // Real x/y/w/h on the member itself, but the enclosing group has
+        // never been dragged — nothing for the member's own coordinate to
+        // be relative *to*, so this falls back to flowed CSS same as any
+        // other unpositioned node, rather than misreading the member's
+        // group-relative number as if it were absolute.
+        let c = canvas(
+            "# Root\n\n## Frame\n<!-- meshfox:node id=\"frame\" type=\"group\" -->\n\n\
+             ### Member\n<!-- meshfox:node id=\"member\" x=20 y=20 w=100 h=80 -->\n\nbody\n",
+        );
+        let site = build_site(&c);
+        assert!(site.find("member").unwrap().position.is_none());
     }
 
     #[test]

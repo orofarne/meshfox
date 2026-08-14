@@ -20,12 +20,23 @@ of JSON, for readable diffs and hand-editability.
   — unless overridden by `parent=` (below).
 - **`<!-- meshfox:node ... -->`** — right after a heading line. Turns the
   heading into a node and holds its bookkeeping as `key="value"` attributes:
-  `id`, `type`, `x`, `y`, `w`, `h`, `color`, `tags`, `parent`. All optional; a
+  `id`, `type`, `x`, `y`, `w`, `h`, `color`, `tags`, `parent`, `fold`. All optional; a
   bare `<!-- meshfox:node -->` is enough. `id` defaults to a slug of the
   heading text; only write it explicitly for a stable handle that survives
   renames (e.g. because an edge references it). First write-back (running a
   cached block, saving layout) pins the id used, so identity is stable
-  afterward. `tags="a,b,c"` is a comma-separated list of free-form labels —
+  afterward. `x`/`y` are absolute document coordinates for every node
+  *except* a direct child of a `group` node (see "Node types" below) — for
+  a group member, `x`/`y` are relative to that group's own `x`/`y` instead
+  (its own top-left corner), so moving the group moves every member with
+  it without rewriting each one's stored position. A group's own `x`/`y`
+  is an optional anchor, draggable like any other node's — but its `w`/`h`
+  stay always derived from its members' own resolved boxes, never stored,
+  even once it has an anchor. `fold="true"` or `fold="false"` overrides,
+  for this one node only, whether the web UI shows it folded or expanded
+  by default — see "Options" below for the document-wide default this
+  overrides. Omitted (the default) means "no override": follow the
+  document's own default. `tags="a,b,c"` is a comma-separated list of free-form labels —
   purely descriptive (no structural meaning), shown as small chips on the
   node in the web UI. `parent="other-id"` overrides the heading-nesting-implied
   parent — needed once a subtree is already `######` (H6, CommonMark's
@@ -63,7 +74,9 @@ of JSON, for readable diffs and hand-editability.
 
 - **`text`** (default) — freeform Markdown body.
 - **`group`** — purely organizational; body must be empty. Children are
-  whatever nests under it structurally (no separate containment mechanism).
+  whatever nests under it structurally (no separate containment mechanism);
+  a direct child's own `x`/`y` is relative to the group's, not absolute —
+  see `x`/`y` above.
 - **`file`** / **`link`** — body must be *exactly* one Markdown link and
   nothing else: `[label](target)`. A `file` node also accepts two optional
   display attributes on its `meshfox:node` line:
@@ -464,6 +477,39 @@ needs it.
   after `--set`/env/cache/default. A `--set` value is saved to the cache
   regardless of whether anything in the current invocation actually
   references it, same as `cmake -D` always updating `CMakeCache.txt`.
+
+## Options
+
+Document-wide settings that flip a default behavior for the whole canvas —
+distinct from `meshfox:var` (a value asked for from whoever runs the
+document) in that an option has no prompt and no value: it's either
+declared or it isn't. Declared as `<!-- meshfox:option name="..." -->`
+comments, **only inside the root node's own body** — same restriction as
+`meshfox:var`, and for the same reason: an option is always document-wide,
+never per-node. A `meshfox:option` found in any other node, one missing
+`name`, or the same `name` declared twice, is a `meshfox validate` error.
+
+    <!-- meshfox:option name="unfold" -->
+
+Currently defined options:
+
+- `unfold` — the web UI's default is every node folded to a compact
+  title-only chip except the root, so a large canvas opens navigable
+  rather than as a wall of expanded nodes; declaring `unfold` flips that
+  default to everything expanded. A single node can still override
+  whichever default applies to it with its own `fold=` attribute (see
+  "File structure" above) — the option only sets what an *unset* node
+  falls back to.
+
+An unrecognized `name` is not an error — options are meant to grow over
+time, and an older meshfox binary should still open a canvas written for a
+newer one, just without acting on whichever option it doesn't know about.
+
+Hand-editing the comment directly always works, but the web UI's toolbar
+also has an "options" button that toggles a known option (currently just
+`unfold`) without touching the file by hand — it writes the same comment.
+An unrecognized declaration already in the file is left exactly as-is
+either way, whichever recognized ones are also toggled alongside it.
 
 ## Cached output
 

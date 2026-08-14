@@ -52,6 +52,8 @@ Nobody has to type `x`/`y`/`w`/`h` by hand. There are two independent auto-layou
 
   Edit mode's toolbar has an **Auto-layout** button that clears every non-group node's stored `x`/`y`/`w`/`h` in the file outright (`POST /api/canvas/clear-layout`), reverting the whole document to auto-placed — behind a confirmation dialog, since it can't be undone from the UI. Useful for backing out of a bunch of hand-placed positions and letting the client lay everything out fresh.
 
+  Edit mode's toolbar also has an **⚙ options** button, next to Auto-layout: it toggles `meshfox:option` declarations (currently just `unfold`, which flips whether the canvas opens with every subtree expanded or folded to a compact outline by default) via `PUT /api/options`, writing the same comment hand-editing would. See SPEC.md's "Options".
+
 ## Variables
 <!-- meshfox:node id="variables" -->
 
@@ -132,7 +134,7 @@ reference elsewhere dangling, which is `validate`'s job to catch, not
 - `mv <node-id> <new-parent-id>` — move a node under a new structural parent in one step (the web UI needs two: link, then promote)
 - `rename <node-id> <title>` — change heading text only; id, heading level, and body untouched
 - `body <node-id> [--file <path>]` — replace a node's whole body, from a file or stdin
-- `meta <node-id> [--x --y --w --h --color --type --display --lang]` — set position/size/style; an omitted flag keeps the node's current value; `group` positions are rejected (their box is always derived, never stored, same as `fmt`)
+- `meta <node-id> [--x --y --w --h --color --type --display --lang --interpreter --fold]` — set position/size/style; an omitted flag keeps the node's current value; `--w`/`--h` on a `group` are rejected (its box is always derived from its members, same as `fmt`), but `--x`/`--y` are accepted — a group's own position is a real anchor its members' own `x`/`y` are relative to (see SPEC.md); `--fold true`/`--fold false` sets a per-node fold override, `--fold default` clears it back to following the document's own default (see SPEC.md's "Options" section)
 - `edges <node-id> [--from <id>]... [--clear]` — replace a node's extra (`meshfox:edge`) parents
 - `reorder` — resync sibling heading order in the file to match current x/y, the same resync the server runs on every UI save
 - `show <node-id>` — print a node's parent/children/extra-parents/type/position (read-only)
@@ -149,12 +151,13 @@ Structural edits to individual nodes in a canvas file: add, move, rename, delete
 Usage: meshfox node <COMMAND>
 
 Commands:
-  add      Add a new, empty-bodied child node under `parent-id`, as the last item in its existing subtree (`mdcanvas::insert_child_node`) — same as the web UI's "add child" button. No position is set, so it stays unpositioned — auto-placed by whatever's viewing it (the web UI's own client-side layout, or `meshfox fmt`) — until something gives it a real one. Prints the new node's id: a slug of `title`, de-duplicated against every id already in the file
+  add      Add a new, empty-bodied child node under `parent-id`, as the last item in its existing subtree (`mdcanvas::insert_child_node`) — same as the web UI's "add child" button. No position is set, so it stays unpositioned (auto-placed by whatever's viewing it — the web UI's own client-side layout, or `meshfox fmt`) until something gives it a real one. Prints the new node's id: a slug of `title`, de-duplicated against every id already in the file
   rm       Delete a node. By default the whole subtree goes with it (`mdcanvas::delete_node`), and any `meshfox:edge from="..."` elsewhere that pointed into the deleted subtree is dropped too, so the file can't be left with a dangling reference. `--keep-children` instead deletes just this node, promoting its direct children (and everything under them, untouched otherwise) to its own former parent (`mdcanvas::delete_node_reparent_children`). Refuses to delete the root either way
   mv       Move a node to a new structural parent (`mdcanvas::reparent_node`). That core function only ever promotes an *existing* extra-parent edge to structural parent — the web UI's two-step dance (drag a new edge onto the node, then promote it) — so this adds the `meshfox:edge from="new-parent-id"` line itself first, making the move a single atomic step from the CLI. Refuses to move the root, or to move a node into itself or one of its own descendants (would make the tree cyclic)
   rename   Rename a node's heading text, leaving its id, heading level, and body untouched (`mdcanvas::set_node_title`) — a node's id is pinned the first time it's written and never follows later title edits
+  set-id   Change a node's id (`mdcanvas::rename_node_id`) — the stable handle used for CLI/API addressing, `meshfox:edge from=`/`parent=` references, and `deps="node-id/block"` fence references. Rewrites every reference to the old id it can find: other nodes' `parent=` and `meshfox:edge from=` attributes are updated exactly (they're structurally tracked by the parser), and `deps=` references are updated best-effort (plain text, not parser-validated — run `meshfox validate` afterward to catch anything this missed, e.g. a reference that was already stale). Fails if `new-id` is empty, contains a `"` character, or is already used by another node
   body     Replace a node's whole Markdown body (`mdcanvas::set_node_body`) — what the web UI's in-node editor would send, if it had one yet (see README's roadmap; for now the UI can reposition and run, not edit text). For a `file`/`link` node the body is its one Markdown link (`[title](target)`); a `group` node's body must stay empty. Reads the new body from `--file`, or from stdin if `--file` is omitted
-  meta     Set a node's position/size/style fields (`mdcanvas::set_node_meta`) — `--x`/`--y`/`--w`/`--h` for a manual position/size override (`meshfox fmt` is the usual way to fill these in), `--color`/ `--type`/`--display`/`--lang` for style/type. Any field left unset keeps its current value. `group` nodes never store a position (`fmt` skips them too, deriving their box from their children instead), so `--x`/`--y`/`--w`/`--h` are rejected for one
+  meta     Set a node's position/size/style fields (`mdcanvas::set_node_meta`) — `--x`/`--y`/`--w`/`--h` for a manual position/size override (`meshfox fmt` is the usual way to fill these in), `--color`/ `--type`/`--display`/`--lang`/`--interpreter` for style/type. Any field left unset keeps its current value. `group` nodes never store a *size* (`fmt` skips them too, deriving their box from their children instead), so `--w`/`--h` are rejected for one — but a group's own *position* is a real anchor its members' own `x`/`y` are relative to, so `--x`/`--y` is allowed on a group same as any other node
   edges    Replace a node's whole set of extra incoming edges (`meshfox:edge from="..."` lines, `mdcanvas::set_node_edges`) — the non-structural, non-nesting cross-references JSON Canvas-style graphs use. The given `--from` list (repeatable) *replaces* whatever was already there, it doesn't add to it; `--clear` removes them all
   reorder  Reorder every parent's direct children in the file to match their canvas layout (`mdcanvas::reorder_by_position`, sorted by `y` then `x` among ties) — the same resync the server runs on every save from the web UI, exposed standalone for whenever positions changed by hand (or via `node meta`/`fmt`) and the on-disk heading order should catch up to match what's actually drawn
   show     Print one node's parent, children, extra parents, type, and position/style fields — a read-only lookup, since eyeballing the tree shape directly from the file gets harder the deeper it nests
@@ -164,6 +167,8 @@ Options:
   -h, --help  Print help
 ```
 <!-- /meshfox:output -->
+
+
 
 
 
@@ -223,7 +228,7 @@ rm -f /tmp/meshfox-fmt-demo.canvas.md
 ```text
 exit code: 0
 
-meshfox fmt: placed 0 node(s) in /tmp/meshfox-fmt-demo.canvas.md
+meshfox fmt: placed 4 node(s) in /tmp/meshfox-fmt-demo.canvas.md
 ```
 <!-- /meshfox:output -->
 

@@ -152,7 +152,7 @@ pub fn resolve(canvas: &Canvas, base_path: &Path) -> Result<Canvas, IncludeError
         }
     }
 
-    Ok(Canvas { nodes })
+    Ok(Canvas { nodes, options: Vec::new() })
 }
 
 #[cfg(test)]

@@ -15,7 +15,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{header, StatusCode, Uri},
     response::{IntoResponse, Response},
-    routing::{get, patch, post},
+    routing::{get, patch, post, put},
     Json, Router,
 };
 use meshfox_core::{
@@ -473,6 +473,12 @@ fn canvas_response(raw: &str, canvas_path: &std::path::Path) -> Result<Json<Canv
     // pass/fail badges current without a separate endpoint or a stale
     // on-disk cache to invalidate.
     meshfox_core::constraint::annotate_status(&mut canvas);
+    // Best-effort: a malformed `meshfox:option` declaration shouldn't break
+    // *viewing* the canvas (falls back to no options declared, same as if
+    // there were none at all) — `meshfox validate` is what surfaces that
+    // loudly, same split `vars`/constraint fences already have between
+    // "parses enough to view" and "fully valid".
+    canvas.options = meshfox_core::declared_options(&canvas).unwrap_or_default();
     Ok(Json(canvas))
 }
 
@@ -519,26 +525,32 @@ async fn put_canvas(
 ) -> Result<StatusCode, ApiError> {
     let mut raw = state.raw.lock().unwrap().clone();
     for node in &canvas.nodes {
-        // A group's box is always derived from its children by the UI, never
-        // authored — ignore whatever position it reports rather than let a
-        // computed value get written into the file as if it were real data.
         // Include nodes never reach the client as such (`get_canvas`
         // resolves them away first) but are skipped here too for the same
         // reason a stray unknown id already is below: `set_node_meta` finds
         // nothing to patch and no-ops, so this is belt-and-suspenders.
-        if node.node_type == NodeType::Group || node.node_type == NodeType::Include {
+        if node.node_type == NodeType::Include {
             continue;
         }
+        // A group's *size* is always derived from its members, never
+        // authored — ignore whatever width/height it reports rather than
+        // let a computed value get written into the file as if it were
+        // real data. Its own *position*, though, is now a real anchor a
+        // member's own `x`/`y` is relative to (see
+        // `Canvas::resolve_absolute_position`), draggable like any other
+        // node's — so only width/height are forced back to "unset" here.
+        let is_group = node.node_type == NodeType::Group;
         let meta = NodeMeta {
             x: node.x,
             y: node.y,
-            width: node.width,
-            height: node.height,
+            width: if is_group { None } else { node.width },
+            height: if is_group { None } else { node.height },
             color: node.color.clone(),
             node_type: None,
             display: node.display,
             lang: node.lang.clone(),
             interpreter: node.interpreter.clone(),
+            fold: node.fold,
             tags: node.tags.clone(),
         };
         // Nodes spliced in from an included file have no `meshfox:node`
@@ -558,8 +570,8 @@ async fn put_canvas(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Clears every non-group node's stored `x`/`y`/`width`/`height` back to
-/// unset, reverting the whole document to auto-placed (see
+/// Clears every node's stored `x`/`y`/`width`/`height` back to unset,
+/// reverting the whole document to auto-placed (see
 /// `web/src/autolayout.ts`) — the web UI's "Auto-layout" button, for
 /// starting over after a canvas's manual layout has gotten tangled.
 /// Destructive (there's no undo beyond the file's own version control), so
@@ -570,20 +582,23 @@ async fn put_canvas(
 /// unchanged" meaning callers get by passing the node's own current value
 /// through, the way `put_canvas` does) — every other field is carried over
 /// from the node's current value so only the layout is actually cleared. A
-/// group's box is always derived, never stored, so there's nothing to clear
-/// on one. Unlike `put_canvas` (which only ever sees the *resolved* canvas,
-/// where an `include` node has already been rewritten to `text`/`group` by
-/// `include::resolve`), this reads straight off the raw, unresolved parse —
-/// here, an `include` node is still the node that *declares* the include
-/// right in this file, with its own real `meshfox:node` comment (position
-/// and all), so it must be cleared exactly like any other node.
+/// group's own *size* is always derived, never stored, so there's nothing
+/// extra to clear on one there — but its own *position* (a real anchor its
+/// members' own `x`/`y` are relative to, see
+/// `Canvas::resolve_absolute_position`) is now clearable exactly like any
+/// other node's, so this no longer skips groups: clearing layout should
+/// fully revert a group to synthetic placement too, not leave a stale
+/// dragged anchor behind. Unlike `put_canvas` (which only ever sees the
+/// *resolved* canvas, where an `include` node has already been rewritten to
+/// `text`/`group` by `include::resolve`), this reads straight off the raw,
+/// unresolved parse — here, an `include` node is still the node that
+/// *declares* the include right in this file, with its own real
+/// `meshfox:node` comment (position and all), so it must be cleared exactly
+/// like any other node.
 async fn clear_layout(State(state): State<Arc<AppState>>) -> Result<Json<Canvas>, ApiError> {
     let mut raw = state.raw.lock().unwrap().clone();
     let canvas = parse_or_error(&raw)?;
     for node in &canvas.nodes {
-        if node.node_type == NodeType::Group {
-            continue;
-        }
         let meta = NodeMeta {
             x: None,
             y: None,
@@ -594,6 +609,7 @@ async fn clear_layout(State(state): State<Arc<AppState>>) -> Result<Json<Canvas>
             display: node.display,
             lang: node.lang.clone(),
             interpreter: node.interpreter.clone(),
+            fold: node.fold,
             tags: node.tags.clone(),
         };
         if let Some(patched) = mdcanvas::set_node_meta(&raw, &node.id, &meta) {
@@ -640,6 +656,38 @@ async fn create_node(
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct UpdateOptionsRequest {
+    options: Vec<String>,
+}
+
+/// `PUT /api/options` — replaces the document's whole set of declared
+/// `meshfox:option` names (see SPEC.md's "Options") with exactly
+/// `req.options`, in the given order; an empty list removes every
+/// declaration. The browser's "document options" toolbar button/modal is
+/// the only caller — the write-path counterpart to `GET /api/canvas`
+/// already surfacing `canvas.options` (`declared_options`, see
+/// `canvas_response` above). Unlike `meshfox:var` (never written by any
+/// endpoint — see `POST /api/vars/configure`'s own doc comment), an option
+/// is a bare presence flag with nothing to prompt for, so there's no
+/// reason not to let the UI toggle it directly rather than requiring a
+/// hand-edit of the file.
+async fn put_options(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<UpdateOptionsRequest>,
+) -> Result<Json<Canvas>, ApiError> {
+    let raw = state.raw.lock().unwrap().clone();
+    let updated = mdcanvas::set_document_options(&raw, &req.options)
+        .ok_or_else(|| ApiError(StatusCode::UNPROCESSABLE_ENTITY, "document has no root node".to_string()))?;
+    parse_or_error(&updated)?;
+    state
+        .save(&updated)
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    *state.raw.lock().unwrap() = updated.clone();
+    canvas_response(&updated, &state.canvas_path)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct UpdateNodeRequest {
     title: Option<String>,
     node_type: Option<NodeType>,
@@ -669,6 +717,66 @@ struct UpdateNodeRequest {
     /// Full replacement list of tags — `None` leaves them untouched,
     /// `Some(vec![])` clears them, same convention as `extraParents`.
     tags: Option<Vec<String>>,
+    /// Per-node fold-state override (see `meshfox_core::Node::fold`) —
+    /// `None` (the field not sent at all) leaves it untouched, same
+    /// convention as every other field here. Unlike those, though, this
+    /// one's own *target* type (`Option<bool>`) already has its own
+    /// "unset" state to reach — plain JSON `null` is indistinguishable
+    /// from an absent field to `serde`'s usual `Option<T>` handling, so
+    /// this is a string sentinel instead: `"true"`/`"false"` set an
+    /// explicit override, `"default"` clears back to "follow the
+    /// document's own default" (see `resolve_fold_override`).
+    fold: Option<String>,
+}
+
+/// `req.fold`'s string sentinel (see `UpdateNodeRequest::fold`'s own doc
+/// comment) resolved against `existing` (the node's current value, kept
+/// when nothing was sent) into the `Option<bool>` `Node::fold` itself
+/// wants. `422` for anything other than `"true"`/`"false"`/`"default"`.
+fn resolve_fold_override(raw: Option<&str>, existing: Option<bool>) -> Result<Option<bool>, ApiError> {
+    match raw {
+        None => Ok(existing),
+        Some(s) => meshfox_core::parse_fold_override(s)
+            .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e)),
+    }
+}
+
+#[cfg(test)]
+mod resolve_fold_override_tests {
+    use super::*;
+
+    fn expect_ok(result: Result<Option<bool>, ApiError>) -> Option<bool> {
+        match result {
+            Ok(v) => v,
+            Err(e) => panic!("unexpected error: {}", e.1),
+        }
+    }
+
+    #[test]
+    fn not_sent_keeps_the_existing_value() {
+        assert_eq!(expect_ok(resolve_fold_override(None, Some(true))), Some(true));
+        assert_eq!(expect_ok(resolve_fold_override(None, None)), None);
+    }
+
+    #[test]
+    fn true_and_false_set_an_explicit_override() {
+        assert_eq!(expect_ok(resolve_fold_override(Some("true"), None)), Some(true));
+        assert_eq!(expect_ok(resolve_fold_override(Some("false"), Some(true))), Some(false));
+    }
+
+    #[test]
+    fn default_clears_back_to_no_override() {
+        assert_eq!(expect_ok(resolve_fold_override(Some("default"), Some(true))), None);
+    }
+
+    #[test]
+    fn garbage_is_rejected() {
+        let err = match resolve_fold_override(Some("bogus"), None) {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e,
+        };
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+    }
 }
 
 /// Applies any of `title`/`nodeType`/`color`/`target`/`text`/`extraParents`/
@@ -700,7 +808,18 @@ async fn update_node(
     // single link.
     let initial = parse_or_error(&raw)?;
     let initial_node = initial.node(&id).ok_or_else(not_found)?;
-    let (x, y, width, height, existing_color, existing_display, existing_lang, existing_interpreter, existing_tags) = (
+    let (
+        x,
+        y,
+        width,
+        height,
+        existing_color,
+        existing_display,
+        existing_lang,
+        existing_interpreter,
+        existing_tags,
+        existing_fold,
+    ) = (
         initial_node.x,
         initial_node.y,
         initial_node.width,
@@ -710,6 +829,7 @@ async fn update_node(
         initial_node.lang.clone(),
         initial_node.interpreter.clone(),
         initial_node.tags.clone(),
+        initial_node.fold,
     );
     // `display`/`lang`/`interpreter` only mean anything on a `file` node —
     // clear them (rather than leave a stale attribute behind) whenever this
@@ -729,6 +849,7 @@ async fn update_node(
         || req.lang.is_some()
         || req.interpreter.is_some()
         || req.tags.is_some()
+        || req.fold.is_some()
     {
         // This also has the side effect of pinning the node's `id=`
         // attribute explicitly the moment any of its metadata changes,
@@ -753,6 +874,7 @@ async fn update_node(
             display,
             lang,
             interpreter,
+            fold: resolve_fold_override(req.fold.as_deref(), existing_fold)?,
             tags: req.tags.clone().unwrap_or(existing_tags),
         };
         raw = mdcanvas::set_node_meta(&raw, &id, &meta).ok_or_else(not_found)?;
@@ -1087,13 +1209,53 @@ async fn reparent_node(
             format!("{:?} is not one of {id:?}'s extra parents", req.new_parent_id),
         ));
     }
-    let updated = mdcanvas::reparent_node(&raw, &id, &req.new_parent_id).ok_or_else(|| {
+    // `mdcanvas::reparent_node` moves `id`'s markdown fragment verbatim,
+    // `x`/`y` attribute included — harmless when those are always absolute,
+    // but a move into, out of, or between groups now silently flips what
+    // those numbers *mean* (see `Canvas::resolve_absolute_position`) unless
+    // corrected here. Resolve the pre-move absolute position first, in the
+    // *old* parent chain...
+    let abs_before = canvas.resolve_absolute_position(&id);
+    let mut updated = mdcanvas::reparent_node(&raw, &id, &req.new_parent_id).ok_or_else(|| {
         ApiError(
             StatusCode::UNPROCESSABLE_ENTITY,
             format!("can't reparent {id:?} onto {:?} (would create a cycle)", req.new_parent_id),
         )
     })?;
-    parse_or_error(&updated)?;
+    let new_canvas = parse_or_error(&updated)?;
+    // ...then, once the *new* parent chain is known, convert it back into
+    // whatever frame `id` should now store its position in, so it stays
+    // visually put across the move instead of teleporting (e.g. jumping by
+    // a whole group anchor because its `x`/`y` is now read relative to a
+    // *different* group, or no group at all). `None` on either side (an
+    // unanchored group ancestor somewhere in the old or new chain — the
+    // common case for a group nobody's ever dragged) leaves the node's
+    // stored position untouched instead, a documented, bounded limitation
+    // rather than inventing a synthetic anchor mid-request.
+    if let Some((abs_x, abs_y)) = abs_before {
+        if let Some((local_x, local_y)) = new_canvas.absolute_to_local(&id, abs_x, abs_y) {
+            if let Some(new_node) = new_canvas.node(&id) {
+                if new_node.x != Some(local_x) || new_node.y != Some(local_y) {
+                    let meta = NodeMeta {
+                        x: Some(local_x),
+                        y: Some(local_y),
+                        width: new_node.width,
+                        height: new_node.height,
+                        color: new_node.color.clone(),
+                        node_type: None,
+                        display: new_node.display,
+                        lang: new_node.lang.clone(),
+                        interpreter: new_node.interpreter.clone(),
+                        fold: new_node.fold,
+                        tags: new_node.tags.clone(),
+                    };
+                    if let Some(patched) = mdcanvas::set_node_meta(&updated, &id, &meta) {
+                        updated = patched;
+                    }
+                }
+            }
+        }
+    }
     state
         .save(&updated)
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -1947,6 +2109,7 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/nodes/:id/file-content", get(get_node_file_content))
         .route("/api/nodes/:id/run", post(run_file_node))
         .route("/api/nodes/:id/open", post(open_node_file))
+        .route("/api/options", put(put_options))
         .route("/api/vars", get(get_vars))
         .route("/api/vars/configure", get(get_configure_vars).post(post_configure_vars))
         .route("/api/run", post(run_block))
@@ -2043,6 +2206,130 @@ mod clear_layout_tests {
 
         let _ = std::fs::remove_file(&canvas_path);
         let _ = std::fs::remove_file(&target_path);
+    }
+}
+
+/// `reparent_node`'s position-conversion behavior (see its own doc
+/// comment) — a group member's real `x`/`y` is relative to its group's own
+/// anchor, so moving a node into/out of/between groups has to convert its
+/// stored position, or it'd silently teleport (or land relative to the
+/// wrong frame) the instant it moves.
+#[cfg(test)]
+mod reparent_position_tests {
+    use super::*;
+
+    fn write_test_canvas(contents: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("meshfox-reparent-position-test-{}.canvas.md", uuid::Uuid::new_v4()));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    fn expect_ok(result: Result<Json<Canvas>, ApiError>) -> Canvas {
+        match result {
+            Ok(Json(canvas)) => canvas,
+            Err(e) => panic!("request failed: {}", e.1),
+        }
+    }
+
+    #[tokio::test]
+    async fn reparenting_into_a_group_converts_the_position_to_be_relative_to_it() {
+        // `wanderer` sits at absolute (1050, 1030) today, a plain top-level
+        // sibling of `frame` — visually just inside where frame's own
+        // anchor (1000, 1000) would place its box. Moving it in should
+        // rewrite its stored position to (50, 30): the same visual spot,
+        // now expressed relative to frame's own anchor.
+        const CANVAS: &str = concat!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Frame\n<!-- meshfox:node id=\"frame\" type=\"group\" x=1000 y=1000 -->\n\n",
+            "### Existing Member\n<!-- meshfox:node id=\"existing-member\" x=10 y=10 w=100 h=60 -->\n\nbody\n\n",
+            "## Wanderer\n<!-- meshfox:node id=\"wanderer\" x=1050 y=1030 w=100 h=60 -->\n",
+            "<!-- meshfox:edge from=\"frame\" -->\n\nbody\n",
+        );
+        let canvas_path = write_test_canvas(CANVAS);
+        let state = build_state(canvas_path.clone(), false).await.expect("valid test canvas");
+
+        let updated = expect_ok(
+            reparent_node(
+                State(state),
+                Path("wanderer".to_string()),
+                Json(ReparentNodeRequest { new_parent_id: "frame".to_string() }),
+            )
+            .await,
+        );
+        let wanderer = updated.node("wanderer").expect("wanderer still present");
+
+        assert_eq!(wanderer.parent.as_deref(), Some("frame"));
+        assert_eq!(wanderer.x, Some(50.0));
+        assert_eq!(wanderer.y, Some(30.0));
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn reparenting_out_of_a_group_converts_the_position_back_to_absolute() {
+        // `member` sits at (50, 30) relative to `frame`'s own (1000, 1000)
+        // anchor today — absolute (1050, 1030). Moving it to root (not a
+        // group) should rewrite its stored position to that absolute
+        // value, the same visual spot outside any group frame.
+        const CANVAS: &str = concat!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Frame\n<!-- meshfox:node id=\"frame\" type=\"group\" x=1000 y=1000 -->\n\n",
+            "### Member\n<!-- meshfox:node id=\"member\" x=50 y=30 w=100 h=60 -->\n",
+            "<!-- meshfox:edge from=\"root\" -->\n\nbody\n\n",
+            "## Elsewhere\n<!-- meshfox:node id=\"elsewhere\" -->\n\nbody\n",
+        );
+        let canvas_path = write_test_canvas(CANVAS);
+        let state = build_state(canvas_path.clone(), false).await.expect("valid test canvas");
+
+        let updated = expect_ok(
+            reparent_node(
+                State(state),
+                Path("member".to_string()),
+                Json(ReparentNodeRequest { new_parent_id: "root".to_string() }),
+            )
+            .await,
+        );
+        let member = updated.node("member").expect("member still present");
+
+        assert_eq!(member.parent.as_deref(), Some("root"));
+        assert_eq!(member.x, Some(1050.0));
+        assert_eq!(member.y, Some(1030.0));
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn reparenting_into_an_unanchored_group_leaves_the_position_untouched() {
+        // `frame` here has no anchor of its own (never dragged) — there's
+        // no frame to be relative *to*, so this is the documented,
+        // bounded fallback: `wanderer`'s stored position is left exactly
+        // as it was rather than inventing a synthetic anchor mid-request.
+        const CANVAS: &str = concat!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Frame\n<!-- meshfox:node id=\"frame\" type=\"group\" -->\n\n",
+            "### Existing Member\n<!-- meshfox:node id=\"existing-member\" -->\n\nbody\n\n",
+            "## Wanderer\n<!-- meshfox:node id=\"wanderer\" x=50 y=30 w=100 h=60 -->\n",
+            "<!-- meshfox:edge from=\"frame\" -->\n\nbody\n",
+        );
+        let canvas_path = write_test_canvas(CANVAS);
+        let state = build_state(canvas_path.clone(), false).await.expect("valid test canvas");
+
+        let updated = expect_ok(
+            reparent_node(
+                State(state),
+                Path("wanderer".to_string()),
+                Json(ReparentNodeRequest { new_parent_id: "frame".to_string() }),
+            )
+            .await,
+        );
+        let wanderer = updated.node("wanderer").expect("wanderer still present");
+
+        assert_eq!(wanderer.parent.as_deref(), Some("frame"));
+        assert_eq!(wanderer.x, Some(50.0));
+        assert_eq!(wanderer.y, Some(30.0));
+
+        let _ = std::fs::remove_file(&canvas_path);
     }
 }
 
@@ -2621,5 +2908,105 @@ mod vars_endpoint_tests {
 
         let _ = std::fs::remove_file(&canvas_path);
         let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));
+    }
+}
+
+#[cfg(test)]
+mod options_endpoint_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    fn write_test_canvas(contents: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("meshfox-options-test-{}.canvas.md", uuid::Uuid::new_v4()));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    async fn get(addr: SocketAddr, path: &str) -> (u16, String) {
+        let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.expect("read");
+        let mut parts = response.splitn(2, "\r\n\r\n");
+        let head = parts.next().unwrap_or_default();
+        let resp_body = parts.next().unwrap_or_default();
+        let status = head
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        (status, resp_body.to_string())
+    }
+
+    /// Same shape as `vars_endpoint_tests::post_json`, just with a `PUT`
+    /// request line — `PUT /api/options`'s response is a single JSON
+    /// object (the whole `Canvas`), not a stream.
+    async fn put_json(addr: SocketAddr, path: &str, body: &str) -> (u16, String) {
+        let request = format!(
+            "PUT {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.expect("read");
+        let mut parts = response.splitn(2, "\r\n\r\n");
+        let head = parts.next().unwrap_or_default();
+        let resp_body = parts.next().unwrap_or_default();
+        let status = head
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        (status, resp_body.to_string())
+    }
+
+    const PLAIN_CANVAS: &str =
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\nSome root prose.\n";
+
+    #[tokio::test]
+    async fn put_options_adds_a_declaration_and_persists_it_to_disk() {
+        let canvas_path = write_test_canvas(PLAIN_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, body) = put_json(addr, "/api/options", r#"{"options":["unfold"]}"#).await;
+        assert_eq!(status, 200);
+        let resp: serde_json::Value = serde_json::from_str(&body).expect("valid Canvas JSON");
+        assert_eq!(resp["options"], serde_json::json!(["unfold"]));
+
+        let on_disk = std::fs::read_to_string(&canvas_path).unwrap();
+        assert!(on_disk.contains(r#"meshfox:option name="unfold""#));
+        assert!(on_disk.contains("Some root prose."), "unrelated body text should survive: {on_disk}");
+
+        let (status, body) = get(addr, "/api/canvas").await;
+        assert_eq!(status, 200);
+        let resp: serde_json::Value = serde_json::from_str(&body).expect("valid Canvas JSON");
+        assert_eq!(resp["options"], serde_json::json!(["unfold"]));
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn put_options_removes_every_declaration_when_given_an_empty_list() {
+        let doc = "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n<!-- meshfox:option name=\"unfold\" -->\n\nprose\n";
+        let canvas_path = write_test_canvas(doc);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, body) = put_json(addr, "/api/options", r#"{"options":[]}"#).await;
+        assert_eq!(status, 200);
+        let resp: serde_json::Value = serde_json::from_str(&body).expect("valid Canvas JSON");
+        // `Canvas.options` is `skip_serializing_if = "Vec::is_empty"` — an
+        // empty result omits the field entirely rather than sending `[]`.
+        assert!(resp.get("options").is_none(), "unexpected body: {body}");
+
+        let on_disk = std::fs::read_to_string(&canvas_path).unwrap();
+        assert!(!on_disk.contains("meshfox:option"));
+
+        let _ = std::fs::remove_file(&canvas_path);
     }
 }

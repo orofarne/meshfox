@@ -368,9 +368,11 @@ enum NodeCommand {
     /// — `--x`/`--y`/`--w`/`--h` for a manual position/size override
     /// (`meshfox fmt` is the usual way to fill these in), `--color`/
     /// `--type`/`--display`/`--lang`/`--interpreter` for style/type. Any field left unset
-    /// keeps its current value. `group` nodes never store a position
-    /// (`fmt` skips them too, deriving their box from their children
-    /// instead), so `--x`/`--y`/`--w`/`--h` are rejected for one.
+    /// keeps its current value. `group` nodes never store a *size* (`fmt`
+    /// skips them too, deriving their box from their children instead), so
+    /// `--w`/`--h` are rejected for one — but a group's own *position* is a
+    /// real anchor its members' own `x`/`y` are relative to, so `--x`/`--y`
+    /// is allowed on a group same as any other node.
     Meta {
         /// Path to the .canvas.md file. If omitted: auto-discover the
         /// single candidate in the current directory.
@@ -400,6 +402,12 @@ enum NodeCommand {
         /// runnable as `interpreter target`.
         #[arg(long)]
         interpreter: Option<String>,
+        /// Per-node fold-state override (see SPEC.md's "Options" section):
+        /// `true`/`false` sets an explicit override, `default` clears it
+        /// back to following the document's own default. Omit this flag
+        /// entirely to leave whatever's already there untouched.
+        #[arg(long)]
+        fold: Option<String>,
     },
     /// Replace a node's whole set of extra incoming edges (`meshfox:edge
     /// from="..."` lines, `mdcanvas::set_node_edges`) — the
@@ -538,8 +546,8 @@ fn main() {
             NodeCommand::Body { canvas, node_id, file } => {
                 node_body(&canvas.unwrap_or_else(find_canvas), &node_id, file)
             }
-            NodeCommand::Meta { canvas, node_id, x, y, width, height, color, node_type, display, lang, interpreter } => {
-                node_meta(&canvas.unwrap_or_else(find_canvas), &node_id, x, y, width, height, color, node_type, display, lang, interpreter)
+            NodeCommand::Meta { canvas, node_id, x, y, width, height, color, node_type, display, lang, interpreter, fold } => {
+                node_meta(&canvas.unwrap_or_else(find_canvas), &node_id, x, y, width, height, color, node_type, display, lang, interpreter, fold)
             }
             NodeCommand::Edges { canvas, node_id, from, clear } => {
                 node_edges(&canvas.unwrap_or_else(find_canvas), &node_id, from, clear)
@@ -674,6 +682,14 @@ fn validate(canvas_path: &PathBuf) {
             // resolve to nothing instead of failing loudly (see
             // `vars::resolve_block_env`).
             if let Err(e) = meshfox_core::validate_env_refs(&canvas) {
+                eprintln!("meshfox validate: {}: {e}", canvas_path.display());
+                std::process::exit(1);
+            }
+            // Same idea for `meshfox:option` (unique name, declared in the
+            // root) — a misplaced or duplicated option should fail loudly
+            // here rather than just being silently ignored by whatever
+            // consumer reads `Canvas::options`.
+            if let Err(e) = meshfox_core::declared_options(&canvas) {
                 eprintln!("meshfox validate: {}: {e}", canvas_path.display());
                 std::process::exit(1);
             }
@@ -1385,9 +1401,27 @@ fn fmt(canvas_path: &PathBuf, force: bool) {
         let Some(b) = boxes.get(&node.id) else {
             continue;
         };
+        // `boxes` holds absolute positions (`layout::compute` resolves a
+        // group member's stored offset against its group's own anchor
+        // before inserting it here — see `place_rightward`'s
+        // `group_origin`), but a group member's own `x`/`y` attribute is
+        // stored *relative* to its group (see
+        // `Canvas::resolve_absolute_position`/SPEC.md), so writing `b.x`/
+        // `b.y` straight back would silently convert a correct relative
+        // offset into a wrong absolute one for any node nested under a
+        // group. `local_position_in_boxes` (below) walks the same group
+        // chain `Canvas::absolute_to_local` does, but subtracts each
+        // group ancestor's own freshly *computed* box (`boxes`, always
+        // present, real anchor or synthetic ideal spot — never "missing"
+        // the way a group's *stored* anchor can be) rather than its
+        // stored one — so this fills in a group member's position exactly
+        // like before this feature existed, whether or not its group has
+        // ever been dragged, just now correctly relative rather than
+        // absolute.
+        let (local_x, local_y) = local_position_in_boxes(&canvas, &boxes, &node.id, b.x, b.y);
         let meta = NodeMeta {
-            x: Some(if force || node.x.is_none() { b.x } else { node.x.unwrap() }),
-            y: Some(if force || node.y.is_none() { b.y } else { node.y.unwrap() }),
+            x: Some(if force || node.x.is_none() { local_x } else { node.x.unwrap() }),
+            y: Some(if force || node.y.is_none() { local_y } else { node.y.unwrap() }),
             width: Some(if force || node.width.is_none() {
                 b.width
             } else {
@@ -1403,6 +1437,7 @@ fn fmt(canvas_path: &PathBuf, force: bool) {
             display: node.display,
             lang: node.lang.clone(),
             interpreter: node.interpreter.clone(),
+            fold: node.fold,
             tags: node.tags.clone(),
         };
         if let Some(patched) = mdcanvas::set_node_meta(&updated, &node.id, &meta) {
@@ -1416,6 +1451,37 @@ fn fmt(canvas_path: &PathBuf, force: bool) {
         std::process::exit(1);
     });
     println!("meshfox fmt: placed {count} node(s) in {}", canvas_path.display());
+}
+
+/// Converts `id`'s freshly computed absolute box position (`abs_x`/`abs_y`,
+/// from `boxes` — always present for every node) into whatever frame `id`
+/// should store it in: relative to its nearest `group` ancestor's own
+/// *computed* box in `boxes`, same rule `Canvas::resolve_absolute_position`/
+/// `absolute_to_local` use for a group's *stored* anchor, but never `None`
+/// — `boxes` always has an entry for a group (real anchor or synthetic
+/// ideal spot, `place_rightward` inserts one unconditionally), unlike
+/// `Canvas`, which only knows a group's position once it's actually been
+/// authored.
+fn local_position_in_boxes(
+    canvas: &Canvas,
+    boxes: &std::collections::HashMap<String, layout::LayoutBox>,
+    id: &str,
+    abs_x: f64,
+    abs_y: f64,
+) -> (f64, f64) {
+    let (mut x, mut y) = (abs_x, abs_y);
+    let mut current = canvas.node(id).and_then(|n| n.parent.clone());
+    while let Some(parent_id) = current {
+        let Some(parent) = canvas.node(&parent_id) else { break };
+        if parent.node_type != NodeType::Group {
+            break;
+        }
+        let Some(parent_box) = boxes.get(&parent_id) else { break };
+        x -= parent_box.x;
+        y -= parent_box.y;
+        current = parent.parent.clone();
+    }
+    (x, y)
 }
 
 fn read_raw_or_exit(canvas_path: &Path) -> String {
@@ -1525,10 +1591,48 @@ fn apply_node_mv(raw: &str, node_id: &str, new_parent_id: &str) -> Result<String
     let with_edge = mdcanvas::set_node_edges(raw, node_id, &extra_parents)
         .ok_or_else(|| format!("failed to add edge to {node_id:?}"))?;
 
-    let updated = mdcanvas::reparent_node(&with_edge, node_id, new_parent_id).ok_or_else(|| {
+    // Same position-frame conversion the web UI's own reparent endpoint
+    // does (`crates/server/src/lib.rs::reparent_node`) — moving into, out
+    // of, or between groups silently flips what a real `x`/`y` *means* (see
+    // `Canvas::resolve_absolute_position`) unless corrected here too, since
+    // this is a separate front door onto the same `mdcanvas::reparent_node`
+    // primitive. Resolve the pre-move absolute position first...
+    let abs_before = canvas.resolve_absolute_position(node_id);
+    let mut updated = mdcanvas::reparent_node(&with_edge, node_id, new_parent_id).ok_or_else(|| {
         format!("can't move {node_id:?} under {new_parent_id:?} (would make the tree cyclic)")
     })?;
     validate_patch(&updated)?;
+    // ...then convert it back into whatever frame `node_id` should now
+    // store its position in, given its new parent chain. `None` on either
+    // side (an unanchored group ancestor in the old or new chain — the
+    // common case for a group nobody's ever dragged) leaves the node's
+    // stored position untouched, a documented, bounded limitation rather
+    // than inventing a synthetic anchor.
+    if let Some((abs_x, abs_y)) = abs_before {
+        let new_canvas = Canvas::from_markdown(&updated).map_err(|e| e.to_string())?;
+        if let Some((local_x, local_y)) = new_canvas.absolute_to_local(node_id, abs_x, abs_y) {
+            if let Some(new_node) = new_canvas.node(node_id) {
+                if new_node.x != Some(local_x) || new_node.y != Some(local_y) {
+                    let meta = NodeMeta {
+                        x: Some(local_x),
+                        y: Some(local_y),
+                        width: new_node.width,
+                        height: new_node.height,
+                        color: new_node.color.clone(),
+                        node_type: None,
+                        display: new_node.display,
+                        lang: new_node.lang.clone(),
+                        interpreter: new_node.interpreter.clone(),
+                        fold: new_node.fold,
+                        tags: new_node.tags.clone(),
+                    };
+                    if let Some(patched) = mdcanvas::set_node_meta(&updated, node_id, &meta) {
+                        updated = patched;
+                    }
+                }
+            }
+        }
+    }
     Ok(updated)
 }
 
@@ -1637,6 +1741,7 @@ fn parse_display(s: &str) -> Result<FileDisplay, String> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn node_meta(
     canvas_path: &Path,
     node_id: &str,
@@ -1649,9 +1754,10 @@ fn node_meta(
     display: Option<String>,
     lang: Option<String>,
     interpreter: Option<String>,
+    fold: Option<String>,
 ) {
     let raw = read_raw_or_exit(canvas_path);
-    match apply_node_meta(&raw, node_id, x, y, width, height, color, node_type, display, lang, interpreter) {
+    match apply_node_meta(&raw, node_id, x, y, width, height, color, node_type, display, lang, interpreter, fold) {
         Ok(updated) => {
             write_raw_or_exit(canvas_path, &updated);
             println!("meshfox node meta: updated {node_id:?} in {}", canvas_path.display());
@@ -1676,20 +1782,32 @@ fn apply_node_meta(
     display: Option<String>,
     lang: Option<String>,
     interpreter: Option<String>,
+    fold: Option<String>,
 ) -> Result<String, String> {
     let canvas = Canvas::from_markdown(raw).map_err(|e| e.to_string())?;
     let node = canvas.node(node_id).ok_or_else(|| format!("no node {node_id:?}"))?;
 
     let parsed_type = node_type.as_deref().map(parse_node_type).transpose()?;
     let parsed_display = display.as_deref().map(parse_display).transpose()?;
+    // Omitted entirely (`None`) keeps whatever's already there; passed as
+    // `"true"`/`"false"`/`"default"` resolves via the same shared sentinel
+    // parsing the server's own node-update endpoint uses (see
+    // `mdcanvas::parse_fold_override`).
+    let parsed_fold = match fold.as_deref() {
+        None => node.fold,
+        Some(s) => meshfox_core::parse_fold_override(s)?,
+    };
 
-    // A group's box is always derived from its children, never stored —
-    // same rule `fmt` follows — so reject an explicit position for one,
-    // whether it's already a group or is becoming one with this call.
+    // A group's *size* is always derived from its children, never stored —
+    // same rule `fmt` follows — so reject an explicit `--w`/`--h` for one,
+    // whether it's already a group or is becoming one with this call. Its
+    // own *position*, though, is a real anchor a member's own `x`/`y` is
+    // relative to (see `Canvas::resolve_absolute_position`), so `--x`/`--y`
+    // is allowed on a group same as any other node.
     let is_group = parsed_type.unwrap_or(node.node_type) == NodeType::Group;
-    if is_group && (x.is_some() || y.is_some() || width.is_some() || height.is_some()) {
+    if is_group && (width.is_some() || height.is_some()) {
         return Err(
-            "group nodes never store a position — their box is always derived from their children"
+            "group nodes never store a size — their box is always derived from their children"
                 .to_string(),
         );
     }
@@ -1698,17 +1816,21 @@ fn apply_node_meta(
     // passed for `type` (and always for `parent`) — every other field left
     // `None` here would simply be omitted from the rewritten line instead
     // of preserved, so any field not given on the command line is filled
-    // in from the node's current value, same as `fmt` already does.
+    // in from the node's current value, same as `fmt` already does. A
+    // group's own width/height stay forced to `None` (omitted) regardless
+    // of what the node's current value happens to be, same invariant the
+    // rejection above enforces on the command-line side.
     let meta = NodeMeta {
         x: x.or(node.x),
         y: y.or(node.y),
-        width: width.or(node.width),
-        height: height.or(node.height),
+        width: if is_group { None } else { width.or(node.width) },
+        height: if is_group { None } else { height.or(node.height) },
         color: color.or_else(|| node.color.clone()),
         node_type: parsed_type,
         display: parsed_display.or(node.display),
         lang: lang.or_else(|| node.lang.clone()),
         interpreter: interpreter.or_else(|| node.interpreter.clone()),
+        fold: parsed_fold,
         tags: node.tags.clone(),
     };
     let updated =
@@ -1806,6 +1928,19 @@ fn format_node_show(raw: &str, node_id: &str) -> Result<String, String> {
         fmt_opt_num(node.width),
         fmt_opt_num(node.height)
     ));
+    // A direct child of a `group` stores x/y relative to that group's own
+    // anchor, not absolute (see SPEC.md) — spelling out the resolved
+    // absolute position too avoids `position: x=... y=...` above reading
+    // as document-absolute when it isn't. Omitted for anything not nested
+    // under a group (there, `resolve_absolute_position` is exactly the raw
+    // x/y already shown, so repeating it would just be noise), and for a
+    // node whose group ancestor has no anchor of its own yet (nothing to
+    // resolve against).
+    if node.parent.as_deref().is_some_and(|p| canvas.node(p).is_some_and(|n| n.node_type == NodeType::Group)) {
+        if let Some((abs_x, abs_y)) = canvas.resolve_absolute_position(node_id) {
+            out.push_str(&format!("resolved position (absolute): x={abs_x} y={abs_y}\n"));
+        }
+    }
     if let Some(c) = &node.color {
         out.push_str(&format!("color: {c}\n"));
     }
@@ -2120,6 +2255,25 @@ Shared body.
     }
 
     #[test]
+    fn mv_converts_position_into_the_new_groups_frame() {
+        // Same position-frame conversion `crates/server`'s own reparent
+        // endpoint does, exercised through this separate CLI front door
+        // onto the same `mdcanvas::reparent_node` primitive.
+        const DOC: &str = concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Frame\n<!-- meshfox:node id=\"frame\" type=\"group\" x=1000 y=1000 -->\n\n",
+            "### Existing Member\n<!-- meshfox:node id=\"existing-member\" x=10 y=10 w=100 h=60 -->\n\nbody\n\n",
+            "## Wanderer\n<!-- meshfox:node id=\"wanderer\" x=1050 y=1030 w=100 h=60 -->\n\nbody\n",
+        );
+        let updated = apply_node_mv(DOC, "wanderer", "frame").unwrap();
+        let canvas = Canvas::from_markdown(&updated).unwrap();
+        let node = canvas.node("wanderer").unwrap();
+        assert_eq!(node.parent.as_deref(), Some("frame"));
+        assert_eq!(node.x, Some(50.0));
+        assert_eq!(node.y, Some(30.0));
+    }
+
+    #[test]
     fn mv_refuses_to_move_the_root() {
         let err = apply_node_mv(TEST_DOC, "root", "tests").unwrap_err();
         assert!(err.contains("root"), "unexpected error: {err}");
@@ -2158,7 +2312,7 @@ Shared body.
     #[test]
     fn meta_sets_given_fields_and_preserves_the_rest() {
         let updated =
-            apply_node_meta(TEST_DOC, "smoke-test", Some(10.0), None, None, None, None, None, None, None, None)
+            apply_node_meta(TEST_DOC, "smoke-test", Some(10.0), None, None, None, None, None, None, None, None, None)
                 .unwrap();
         let canvas = Canvas::from_markdown(&updated).unwrap();
         let node = canvas.node("smoke-test").unwrap();
@@ -2170,11 +2324,58 @@ Shared body.
     }
 
     #[test]
-    fn meta_rejects_a_position_on_a_group() {
+    fn meta_rejects_a_size_on_a_group() {
         let err =
-            apply_node_meta(TEST_DOC, "tests", Some(1.0), None, None, None, None, None, None, None, None)
+            apply_node_meta(TEST_DOC, "tests", None, None, Some(300.0), None, None, None, None, None, None, None)
                 .unwrap_err();
         assert!(err.contains("group"), "unexpected error: {err}");
+
+        let err =
+            apply_node_meta(TEST_DOC, "tests", None, None, None, Some(120.0), None, None, None, None, None, None)
+                .unwrap_err();
+        assert!(err.contains("group"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn meta_accepts_an_anchor_on_a_group() {
+        let updated =
+            apply_node_meta(TEST_DOC, "tests", Some(1000.0), Some(2000.0), None, None, None, None, None, None, None, None)
+                .unwrap();
+        let canvas = Canvas::from_markdown(&updated).unwrap();
+        let node = canvas.node("tests").unwrap();
+        assert_eq!(node.x, Some(1000.0));
+        assert_eq!(node.y, Some(2000.0));
+        // a group's size stays forever derived, never stored, even though
+        // its position can now be set.
+        assert_eq!(node.width, None);
+        assert_eq!(node.height, None);
+    }
+
+    #[test]
+    fn meta_sets_and_clears_a_fold_override() {
+        let updated = apply_node_meta(
+            TEST_DOC, "tests", None, None, None, None, None, None, None, None, None,
+            Some("true".to_string()),
+        )
+        .unwrap();
+        assert_eq!(Canvas::from_markdown(&updated).unwrap().node("tests").unwrap().fold, Some(true));
+
+        let updated = apply_node_meta(
+            &updated, "tests", None, None, None, None, None, None, None, None, None,
+            Some("default".to_string()),
+        )
+        .unwrap();
+        assert_eq!(Canvas::from_markdown(&updated).unwrap().node("tests").unwrap().fold, None);
+    }
+
+    #[test]
+    fn meta_rejects_an_unknown_fold_value() {
+        let err = apply_node_meta(
+            TEST_DOC, "tests", None, None, None, None, None, None, None, None, None,
+            Some("bogus".to_string()),
+        )
+        .unwrap_err();
+        assert!(err.contains("fold"), "unexpected error: {err}");
     }
 
     #[test]
@@ -2188,6 +2389,7 @@ Shared body.
             None,
             None,
             Some("bogus".to_string()),
+            None,
             None,
             None,
             None,
@@ -2223,6 +2425,29 @@ Shared body.
         assert!(text.contains("type: group"));
         assert!(text.contains("parent: root"));
         assert!(text.contains("children: smoke-test"));
+    }
+
+    #[test]
+    fn show_reports_a_group_members_resolved_absolute_position() {
+        const DOC: &str = concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Frame\n<!-- meshfox:node id=\"frame\" type=\"group\" x=1000 y=1000 -->\n\n",
+            "### Member\n<!-- meshfox:node id=\"member\" x=20 y=20 w=100 h=60 -->\n\nbody\n",
+        );
+        let text = format_node_show(DOC, "member").unwrap();
+        assert!(text.contains("position: x=20 y=20 w=100 h=60"), "{text}");
+        assert!(text.contains("resolved position (absolute): x=1020 y=1020"), "{text}");
+    }
+
+    #[test]
+    fn show_omits_resolved_position_when_the_group_has_no_anchor() {
+        const DOC: &str = concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Frame\n<!-- meshfox:node id=\"frame\" type=\"group\" -->\n\n",
+            "### Member\n<!-- meshfox:node id=\"member\" x=20 y=20 w=100 h=60 -->\n\nbody\n",
+        );
+        let text = format_node_show(DOC, "member").unwrap();
+        assert!(!text.contains("resolved position"), "{text}");
     }
 
     #[test]

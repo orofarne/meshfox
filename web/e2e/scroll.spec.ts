@@ -1,5 +1,5 @@
 import { test, expect, type Locator, type Page } from "@playwright/test";
-import { clickFitViewAndWait, viewportTransform } from "./helpers";
+import { clickFitViewAndWait, disableDefaultFold, viewportTransform } from "./helpers";
 
 // Drives web/e2e/fixtures/scroll.canvas.md — five single-node documents,
 // each sized via an explicit w=/h= so its overflow combination (none,
@@ -90,6 +90,10 @@ async function expectWheelScrolls(
 }
 
 test.beforeEach(async ({ page }) => {
+  // This suite is about scroll/pan physics inside a node's own body, not
+  // fold — every node here needs to be visible/expanded regardless of
+  // App.tsx's own fold-everything-but-root-by-default behavior.
+  await disableDefaultFold(page, "root");
   await page.goto("/");
   await page.waitForSelector(".mesh-node");
   // The app opens centered on the root node at a fixed, readable zoom (not

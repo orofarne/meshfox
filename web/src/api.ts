@@ -51,6 +51,24 @@ export async function saveConfigureVars(answers: Record<string, string>): Promis
   if (!res.ok) throw new Error(`POST /api/vars/configure: ${res.status}`);
 }
 
+/**
+ * Replaces the document's whole set of declared `meshfox:option` names
+ * (see SPEC.md's "Options") with exactly `options`, in the given order —
+ * an empty array removes every declaration. The write path behind the
+ * toolbar's "options" modal; unlike `meshfox:var` (never written by any
+ * endpoint), an option is a bare presence flag with nothing to prompt
+ * for, so there's no reason not to let the UI toggle it directly.
+ */
+export async function updateOptions(options: string[]): Promise<CanvasDoc> {
+  const res = await fetch("/api/options", {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ options }),
+  });
+  if (!res.ok) throw new Error(`PUT /api/options: ${res.status}`);
+  return res.json();
+}
+
 export async function saveCanvas(canvas: CanvasDoc): Promise<void> {
   const res = await fetch("/api/canvas", {
     method: "PUT",
@@ -129,6 +147,15 @@ export interface NodePatch {
   /** Full replacement list of tags — omit to leave them untouched, pass
    * `[]` to clear them. */
   tags?: string[];
+  /** Per-node fold-state override — see `CanvasNode.fold`. Omit to leave
+   * it untouched; otherwise a string sentinel (not a plain boolean,
+   * matching the server's own `UpdateNodeRequest.fold`): `"true"`/
+   * `"false"` sets an explicit override, `"default"` clears it back to
+   * following the document's own default. Plain JSON `null` can't stand
+   * in for "clear this back to unset" here — it's indistinguishable from
+   * "omitted" to the server's usual `Option<T>` handling — hence the
+   * sentinel string. */
+  fold?: "true" | "false" | "default";
 }
 
 /**

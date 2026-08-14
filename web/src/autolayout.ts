@@ -36,12 +36,27 @@
 // `touchedNodeIds`/`handleSaveLayout`).
 
 import type { CanvasDoc, CanvasNode } from "./types";
-import { findRoot, subtreeIds } from "./tree";
+import { findRoot, subtreeIds, visibleNodeIds } from "./tree";
 
 const H_GAP = 80;
 const V_GAP = 60;
 const GROUP_PADDING = 40;
 const GROUP_TITLE_SPACE = 40;
+/** A folded node's own box height, regardless of its real/measured content
+ * height — small enough to read as "just a title row" (comparable to
+ * `GROUP_TITLE_SPACE`), and forced into the stacking math below so a
+ * folded node's later siblings actually reflow up into the space its
+ * hidden subtree used to occupy, instead of leaving a gap the size of its
+ * un-folded content. */
+export const FOLDED_HEIGHT = 44;
+/** Vertical gap either side of a folded node (see `gapBetween`) — much
+ * tighter than `V_GAP`: a folded node's whole point is reading as one
+ * compact row among others, and `V_GAP`'s spacing (sized for a stack of
+ * full, expanded boxes) reads as an oversized, mostly-empty gap around
+ * something this small. Two *expanded* siblings still get the full
+ * `V_GAP` either way — only a gap actually touching a folded node
+ * shrinks. */
+const FOLDED_V_GAP = 16;
 /** Direct children of root get only a small nudge right of it, reading
  * top-to-bottom like a document's title followed by its headings — mirrors
  * `layout.rs`'s `ROOT_CHILD_INDENT`. */
@@ -79,6 +94,13 @@ export interface AutoLayoutInput {
   /** React Flow's own `node.measured.height` for a node that's been
    * rendered at least once, if any. */
   measuredHeight: (nodeId: string) => number | undefined;
+  /** Node ids whose subtree is currently folded (see App.tsx's fold
+   * feature) — a view-only concern, never written to the file. Every
+   * descendant of a folded node is excluded from this layout pass
+   * entirely, so an auto-placed sibling that comes after a folded subtree
+   * flows up to fill the gap; the folded node itself still gets a box
+   * (see `FOLDED_HEIGHT`), just a compact one. */
+  foldedNodeIds?: ReadonlySet<string>;
 }
 
 function directChildren(canvas: CanvasDoc, id: string): CanvasNode[] {
@@ -100,18 +122,39 @@ function widthForDepth(depth: number, viewportWidth: number): number {
   return depth <= 1 ? viewportWidth * WIDTH_RATIO_SHALLOW : viewportWidth * WIDTH_RATIO_DEEP;
 }
 
-/** A fresh layout for every node in `canvas`, keyed by node id — see the
- * module doc comment for the shape. */
-export function computeAutoLayout({ canvas, viewportWidth, measuredHeight }: AutoLayoutInput): Map<string, LayoutBox> {
+/** The vertical gap to leave between two vertically-stacked siblings (or,
+ * at the top level, between root and its first child) — `FOLDED_V_GAP`
+ * if either one is folded, `V_GAP` only when both are fully expanded. */
+function gapBetween(prevId: string, nextId: string, folded: ReadonlySet<string>): number {
+  return folded.has(prevId) || folded.has(nextId) ? FOLDED_V_GAP : V_GAP;
+}
+
+/** A fresh layout for every currently-visible node in `canvas` (excluding
+ * any folded node's descendants), keyed by node id — see the module doc
+ * comment for the shape. */
+export function computeAutoLayout({
+  canvas,
+  viewportWidth,
+  measuredHeight,
+  foldedNodeIds,
+}: AutoLayoutInput): Map<string, LayoutBox> {
   const boxes = new Map<string, LayoutBox>();
-  const root = findRoot(canvas);
+  const folded = foldedNodeIds ?? new Set<string>();
+  const visible = new Set(visibleNodeIds(canvas, folded));
+  const view: CanvasDoc = { ...canvas, nodes: canvas.nodes.filter((n) => visible.has(n.id)) };
+  const root = findRoot(view);
   if (!root) return boxes;
 
   // Real height/measured height/placeholder, in that order — clamped to
   // `cap` (depth ≥2 only) only when it isn't a real, authored height: the
-  // user's own explicit size is never second-guessed.
+  // user's own explicit size is never second-guessed. A folded node is the
+  // one exception: its own compact box always wins, even over a real
+  // authored height, since folding is a display-only override.
   function sizeFor(node: CanvasNode, depth: number): { width: number; height: number; maxHeight?: number } {
     const width = node.width ?? widthForDepth(depth, viewportWidth);
+    if (folded.has(node.id)) {
+      return { width, height: FOLDED_HEIGHT };
+    }
     if (node.height !== undefined) {
       return { width, height: node.height };
     }
@@ -126,12 +169,16 @@ export function computeAutoLayout({ canvas, viewportWidth, measuredHeight }: Aut
   boxes.set(root.id, { x: 0, y: 0, ...rootSize });
 
   let yCursor = rootSize.height;
-  for (const section of directChildren(canvas, root.id)) {
-    yCursor += V_GAP;
-    yCursor += placeRightward(canvas, section, ROOT_CHILD_INDENT, yCursor, 1, sizeFor, boxes);
+  let prevSiblingId = root.id;
+  for (const section of directChildren(view, root.id)) {
+    yCursor += gapBetween(prevSiblingId, section.id, folded);
+    // `null`: root's own direct children are never inside a group (root
+    // has no parent, so nothing above it could be one either).
+    yCursor += placeRightward(view, section, ROOT_CHILD_INDENT, yCursor, 1, null, sizeFor, boxes, folded);
+    prevSiblingId = section.id;
   }
 
-  layoutGroups(canvas, boxes, sizeFor);
+  layoutGroups(view, boxes, sizeFor);
   return boxes;
 }
 
@@ -140,18 +187,42 @@ export function computeAutoLayout({ canvas, viewportWidth, measuredHeight }: Aut
  * `depth + 1`, stacking vertically among themselves. Returns the total
  * vertical space the subtree consumed, so a caller placing multiple
  * siblings in the same column can advance its own cursor without
- * overlapping this one — mirrors `layout.rs`'s `place_rightward`. */
+ * overlapping this one — mirrors `layout.rs`'s `place_rightward`.
+ *
+ * `groupOrigin` is non-null exactly when `node`'s own structural parent is
+ * a `group` — its own just-resolved anchor, real or synthetic (always
+ * concrete by the time it's passed down). A group member's own real x/y is
+ * relative to that anchor, not the whole document (see SPEC.md and
+ * `layout.rs`'s own `place_rightward`, this pass's Rust equivalent) — null
+ * for anything not a direct group child leaves a real position exactly as
+ * authored, same as before this existed. */
 function placeRightward(
   canvas: CanvasDoc,
   node: CanvasNode,
   x: number,
   y: number,
   depth: number,
+  groupOrigin: { x: number; y: number } | null,
   sizeFor: (node: CanvasNode, depth: number) => { width: number; height: number; maxHeight?: number },
   boxes: Map<string, LayoutBox>,
+  folded: ReadonlySet<string>,
 ): number {
   const size = sizeFor(node, depth);
-  const [nx, ny] = node.x !== undefined && node.y !== undefined ? [node.x, node.y] : [x, y];
+  const [nx, ny] =
+    node.x !== undefined && node.y !== undefined
+      ? groupOrigin
+        ? [groupOrigin.x + node.x, groupOrigin.y + node.y]
+        : [node.x, node.y]
+      : [x, y];
+  // Every *direct* child of a `group` gets this node's own just-resolved
+  // (nx, ny) as its own `groupOrigin` — nested one level deeper (a group
+  // member's own child) reverts to plain absolute coordinates, matching
+  // `web/src/tree.ts`'s `deriveEdges`, which only suppresses the
+  // structural nesting line one level down too. A nested group's own
+  // members still compose correctly: the inner group's own anchor (itself
+  // resolved via the *outer* group's `groupOrigin`) becomes `groupOrigin`
+  // for the inner group's own children in turn.
+  const childGroupOrigin = node.type === "group" ? { x: nx, y: ny } : null;
   const children = directChildren(canvas, node.id);
 
   if (children.length === 0) {
@@ -164,10 +235,11 @@ function placeRightward(
   let span = 0;
   children.forEach((child, i) => {
     if (i > 0) {
-      cursor += V_GAP;
-      span += V_GAP;
+      const gap = gapBetween(children[i - 1].id, child.id, folded);
+      cursor += gap;
+      span += gap;
     }
-    const childH = placeRightward(canvas, child, childX, cursor, depth + 1, sizeFor, boxes);
+    const childH = placeRightward(canvas, child, childX, cursor, depth + 1, childGroupOrigin, sizeFor, boxes, folded);
     cursor += childH;
     span += childH;
   });
@@ -192,8 +264,14 @@ function layoutGroups(
     .sort((a, b) => treeDepth(canvas, b.id) - treeDepth(canvas, a.id));
 
   for (const group of groups) {
+    // `boxes` already holds an absolute position for every node, real or
+    // synthetic, group member or not — `placeRightward` above resolves a
+    // group member's own real x/y through `groupOrigin` rather than
+    // reading it as absolute directly, so there's nothing left to
+    // re-derive here (mirrors `layout.rs`'s own simplified `member_box`
+    // call site).
     const memberBoxes = subtreeIds(canvas, group.id)
-      .map((id) => memberBox(canvas, id, boxes, sizeFor))
+      .map((id) => boxes.get(id))
       .filter((b): b is LayoutBox => b !== undefined);
     if (memberBoxes.length === 0) continue;
     const minX = Math.min(...memberBoxes.map((b) => b.x));
@@ -209,21 +287,3 @@ function layoutGroups(
   }
 }
 
-/** A group member's box for bounding-box purposes: its real, authored (or
- * dragged) position/size when it has one — since that's what actually
- * renders on screen — falling back to the synthetic layout box only for a
- * member that's still unpositioned. Mirrors `layout.rs`'s `member_box`. */
-function memberBox(
-  canvas: CanvasDoc,
-  id: string,
-  boxes: Map<string, LayoutBox>,
-  sizeFor: (node: CanvasNode, depth: number) => { width: number; height: number; maxHeight?: number },
-): LayoutBox | undefined {
-  const node = canvas.nodes.find((n) => n.id === id);
-  if (!node) return undefined;
-  if (node.x !== undefined && node.y !== undefined) {
-    const size = sizeFor(node, treeDepth(canvas, id));
-    return { x: node.x, y: node.y, ...size };
-  }
-  return boxes.get(id);
-}

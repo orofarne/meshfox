@@ -36,6 +36,32 @@ export function subtreeIds(canvas: CanvasDoc, nodeId: string): string[] {
   return out;
 }
 
+/** Every node id reachable from the root without recursing into a folded
+ * node's children, in document (depth-first) order — mirrors the TUI's own
+ * `tree::flatten` (a folded node simply produces no rows for its subtree).
+ * Shared by the fold feature's node/edge filtering and by keyboard nav's
+ * j/k movement, so both walk the exact same "what's currently visible"
+ * order. */
+export function visibleNodeIds(canvas: CanvasDoc, foldedNodeIds: ReadonlySet<string>): string[] {
+  const root = findRoot(canvas);
+  if (!root) return [];
+  const childrenOf = new Map<string, CanvasNode[]>();
+  for (const n of canvas.nodes) {
+    if (!n.parent) continue;
+    const siblings = childrenOf.get(n.parent);
+    if (siblings) siblings.push(n);
+    else childrenOf.set(n.parent, [n]);
+  }
+  const out: string[] = [];
+  const visit = (node: CanvasNode) => {
+    out.push(node.id);
+    if (foldedNodeIds.has(node.id)) return;
+    for (const child of childrenOf.get(node.id) ?? []) visit(child);
+  };
+  visit(root);
+  return out;
+}
+
 export interface DerivedEdge {
   id: string;
   source: string;

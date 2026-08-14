@@ -1,5 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
-import { clickFitViewAndWait } from "./helpers";
+import { clickFitViewAndWait, disableDefaultFold } from "./helpers";
 
 // Drives web/e2e/fixtures/settings.canvas.md: one node per NodeSettings-
 // relevant type/field combination (see the fixture's own root body for the
@@ -42,6 +42,12 @@ function fetchRaw(page: Page): Promise<string> {
 }
 
 test.beforeEach(async ({ page }) => {
+  // This fixture nests real nodes (group-node -> group-child,
+  // include-canvas -> its own spliced children) that App.tsx's
+  // fold-everything-with-children-by-default behavior would otherwise
+  // hide on first load — this suite is about NodeSettings, not fold, so
+  // start from every node visible instead.
+  await disableDefaultFold(page, "root");
   await page.goto("/");
   await page.waitForSelector(".mesh-node");
   // Settings are Edit-mode-only (see MeshNode.tsx's gear icon) — every test

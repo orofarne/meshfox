@@ -1,5 +1,5 @@
 import { test, expect, type Locator, type Page } from "@playwright/test";
-import { clickFitViewAndWait } from "./helpers";
+import { clickFitViewAndWait, disableDefaultFold } from "./helpers";
 
 // Drives web/e2e/fixtures/deps.canvas.md through the real UI, in the
 // default read-only mode (never clicks "Edit"), so nothing here ever
@@ -12,6 +12,10 @@ function block(page: Page, nodeId: string, blockName: string): Locator {
 }
 
 test.beforeEach(async ({ page }) => {
+  // This suite is about deps/run-chain UI, not fold — every node here
+  // needs to be visible/expanded regardless of App.tsx's own
+  // fold-everything-but-root-by-default behavior.
+  await disableDefaultFold(page, "root");
   await page.goto("/");
   await page.waitForSelector(".mesh-node");
   // The app opens centered on the root node at a fixed zoom (see App.tsx's
@@ -69,15 +73,6 @@ test("the multiple-deps badge lists every dependency and each is a separate link
   await expect(links).toHaveCount(2);
   await expect(links.nth(0)).toHaveText("build-node/test");
   await expect(links.nth(1)).toHaveText("deploy-node/deploy");
-});
-
-test("the show-deps toggle draws a cross-node dependency arrow only when enabled", async ({ page }) => {
-  await expect(page.locator(".react-flow__edge.mesh-dep-edge")).toHaveCount(0);
-  await page.click("button.deps-toggle");
-  const edgeCount = await page.locator(".react-flow__edge.mesh-dep-edge").count();
-  expect(edgeCount).toBeGreaterThan(0);
-  await page.click("button.deps-toggle");
-  await expect(page.locator(".react-flow__edge.mesh-dep-edge")).toHaveCount(0);
 });
 
 test("clicking an after: link scrolls to and briefly highlights the dependency block", async ({ page }) => {

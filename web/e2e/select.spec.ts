@@ -1,5 +1,5 @@
 import { test, expect, type Locator, type Page } from "@playwright/test";
-import { clickFitViewAndWait, viewportTransform } from "./helpers";
+import { clickFitViewAndWait, disableDefaultFold, viewportTransform } from "./helpers";
 
 // Drives web/e2e/fixtures/select.canvas.md, in the default read-only mode
 // (never clicks "Edit") — the same everyday state a user browsing a canvas
@@ -51,6 +51,10 @@ async function dragSelect(page: Page, target: Locator) {
 }
 
 test.beforeEach(async ({ page }) => {
+  // This suite is about text-selection inside a node's title/body, not
+  // fold — every node here needs to be visible/expanded regardless of
+  // App.tsx's own fold-everything-but-root-by-default behavior.
+  await disableDefaultFold(page, "root");
   await page.goto("/");
   await page.waitForSelector(".mesh-node");
   // The app opens centered on the root node at a fixed zoom (see App.tsx's
@@ -96,7 +100,11 @@ test("title text is selectable when the node also has a body", async ({ page, br
 
 test("title text is selectable when the node has no body at all (title-only layout)", async ({ page }) => {
   await resetZoomToOne(page);
-  const title = page.locator('.react-flow__node[data-id="title-only-node"] .mesh-node-title-centered');
+  // `.mesh-node-title-centered-text` specifically, not the whole
+  // `.mesh-node-title-centered` title bar: it also holds the fold toggle
+  // button now (every node gets one — see MeshNode.tsx's `FoldToggle`),
+  // which would otherwise swallow a drag started right at its edge.
+  const title = page.locator('.react-flow__node[data-id="title-only-node"] .mesh-node-title-centered-text');
   await expect(title).toHaveText("Title Only Node");
 
   const before = await viewportTransform(page);

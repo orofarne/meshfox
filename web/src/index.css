@@ -423,14 +423,26 @@ a {
   font-size: 1.05rem;
 }
 
+/* A plain click on a *folded* node's own title text unfolds it too (see
+ * MeshNode.tsx's `handleTitleClick`) — the pointer cursor is the only
+ * visual hint of that, since the title text otherwise looks identical
+ * folded or not. Unfolded, the default (text) cursor is left alone: a
+ * click there does nothing extra, so nothing here should suggest it does. */
+.mesh-node[data-folded="true"] .mesh-node-title-text,
+.mesh-node[data-folded="true"] .mesh-node-title-centered-text {
+  cursor: pointer;
+}
+
 /* A heading-only node (empty body), read-only — see MeshNode.tsx's
  * `isTitleOnly`. Takes over the whole card instead of sitting in its
  * usual flex-shrink-0 row up top, so the title centers in what would
- * otherwise be a mostly-empty box. Unlike `.mesh-node-title-text` above,
- * this *is* the title bar's own root element (there's no separate inner
- * span to carry `nopan`/`user-select: text` — a title-only node has
- * nothing else in its title bar to keep draggable), so it carries both
- * itself; see `.mesh-node-title-text`'s comment for why both are needed. */
+ * otherwise be a mostly-empty box. Carries `nopan`/`user-select: text`
+ * itself (unlike the row layout, where `.mesh-node-title-text` carries
+ * them on its own inner span) since the fold toggle button next to the
+ * title is the only other thing in this title bar — the inner
+ * `.mesh-node-title-centered-text` span exists purely to give a click/drag
+ * something to target that excludes that button, and inherits both
+ * properties from here rather than repeating them. */
 .mesh-node-title-centered {
   flex: 1;
   border-bottom: none;
@@ -494,6 +506,16 @@ a {
   opacity: 1;
   border-color: var(--accent);
   color: var(--accent);
+}
+
+/* The ▸/▾ subtree fold marker (see MeshNode.tsx's `FoldToggle`) — sits
+ * ahead of the title text itself rather than among the trailing action
+ * icons, mirroring where an outline/tree view conventionally puts its own
+ * expand/collapse triangle. */
+.mesh-node-fold-toggle {
+  padding: 0.2rem 0.35rem;
+  margin-right: 0.1rem;
+  border-color: transparent;
 }
 
 /* Delete is destructive — its own hover color instead of the shared accent,
@@ -588,6 +610,16 @@ a {
 .mesh-node[data-suggested="true"]:not([data-type="group"]) {
   border-style: dashed;
   opacity: 0.9;
+}
+
+/* Keyboard-nav focus (see App.tsx's `focusedNodeId`/MeshNode.tsx's
+ * `data-focused`) — a solid outline in the accent color, deliberately
+ * distinct from React Flow's own mouse-driven `.selected` box-shadow, so
+ * "what a keypress just moved to" never reads as "what's selected for
+ * resize/multi-op purposes". */
+.mesh-node[data-focused="true"] {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .mesh-node-hint {
@@ -789,6 +821,17 @@ a {
   flex: 1;
   min-height: 0;
   padding: 0.4rem;
+  box-sizing: border-box;
+}
+
+/* The actual element passed to `term.open()` (see TtyPanel.tsx's own
+ * comment on why it's a separate, padding-free element from
+ * `.mesh-tty-body` above) — sized to fill exactly the padded space
+ * `.mesh-tty-body` leaves it, with nothing of its own for `FitAddon` to
+ * miscount. */
+.mesh-tty-terminal {
+  width: 100%;
+  height: 100%;
 }
 
 /* NodeExpandPanel — a node's own body (the exact same live content its
@@ -860,6 +903,28 @@ a {
   overflow: auto;
 }
 
+/* A group's mini sub-canvas (see NodeExpandPanel.tsx) gets a roomier panel
+ * than a plain node body — canvas content benefits from more space than a
+ * single node's markdown does. */
+.mesh-expand-panel-group {
+  width: min(1200px, 95vw);
+  height: min(800px, 90vh);
+}
+
+/* React Flow needs a definite pixel height from its container — `flex: 1`
+ * alone doesn't give `.mesh-expand-body` one for a nested `<ReactFlow>` to
+ * measure against, unlike the plain (`overflow: auto`, intrinsically
+ * sized) node-body content it holds otherwise. */
+.mesh-expand-panel-group .mesh-expand-body {
+  overflow: hidden;
+  position: relative;
+}
+
+.mesh-expand-panel-group .react-flow {
+  width: 100%;
+  height: 100%;
+}
+
 .mesh-tty-body .xterm,
 .mesh-tty-body .xterm-viewport {
   height: 100%;
@@ -882,49 +947,6 @@ a {
   cursor: pointer;
   font-size: 0.8rem;
   pointer-events: auto;
-}
-
-/* Left "rail" column of dots (one per code block) plus a connecting line —
- * a lightweight visual thread through a node's runnable blocks, distinct
- * from the precise per-edge "after: …" links each block still shows.
- * Every segment (markdown included) gets its own explicit grid row so the
- * rail lines up with its block without any JS measurement. */
-.mesh-rail {
-  display: grid;
-  grid-template-columns: 16px 1fr;
-  column-gap: 0.4rem;
-}
-
-.mesh-rail-content {
-  min-width: 0;
-}
-
-.mesh-rail-dot {
-  position: relative;
-  z-index: 1;
-  justify-self: center;
-  width: 9px;
-  height: 9px;
-  margin-top: 0.95rem;
-  border-radius: 50%;
-  background: var(--node-bg);
-  border: 2px solid var(--node-border);
-}
-
-/* A block that's the source or target of a same-node `deps=` edge — same
- * accent color as the "⛓ run chain" button and the "after: …" links, so
- * the rail reads as the same concept rather than a new one. */
-.mesh-rail-dot[data-in-chain="true"] {
-  border-color: var(--dep);
-  background: var(--dep);
-}
-
-.mesh-rail-line {
-  grid-column: 1;
-  justify-self: center;
-  width: 2px;
-  margin: 0.95rem 0;
-  background: var(--node-border);
 }
 
 .mesh-node-body pre,
@@ -1144,25 +1166,6 @@ a {
   border: none;
   border-radius: 0;
   border-top: 1px dashed var(--node-border);
-}
-
-/* Cross-node `deps=` arrows (toggled via the toolbar's "show deps" button)
- * — deliberately not just a recolored tree edge: dotted rather than
- * dashed, and thicker, so it reads as a different *kind* of relationship
- * (a run-order dependency) rather than a structural nesting/edge line. */
-.react-flow__edge.mesh-dep-edge .react-flow__edge-path {
-  stroke: var(--dep);
-  stroke-width: 2px;
-  stroke-dasharray: 1 5;
-  stroke-linecap: round;
-}
-
-.react-flow__edge.mesh-dep-edge .react-flow__edge-text {
-  fill: var(--dep);
-}
-
-.react-flow__edge.mesh-dep-edge .react-flow__edge-textbg {
-  fill: var(--bg);
 }
 
 /* Delete "×" at a deletable edge's midpoint — an extra (`meshfox:edge`)

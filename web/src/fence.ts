@@ -295,18 +295,26 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
 }
 
 /**
- * The name of `nodeId`'s default runnable block, if it has exactly one —
- * mirrors `core::fence::default_block`. A block qualifies via the explicit
+ * `nodeId`'s default runnable block, if it has exactly one — mirrors
+ * `core::fence::default_block`. A block qualifies via the explicit
  * `default` flag or by sharing the node's own id (implicitly, via the sole
  * unnamed fence, or explicitly via `name="<node-id>"` — see `parseBody`'s
  * `nodeId` param). `null` both when no block qualifies and when more than
  * one does (ambiguous — same as the Rust side, this just isn't eligible
- * for the shortcut; `meshfox check` is what reports the conflict). Used to
- * show the title bar's "▷ run" quick-run button (see `MeshNode.tsx`).
+ * for the shortcut; `meshfox check` is what reports the conflict). Returns
+ * the whole segment, not just its name, so a caller can also see its
+ * `tty` flag — see `defaultBlockName` below and `MeshNode.tsx`'s title bar
+ * "▷ run" quick-run button, which needs both.
  */
-export function defaultBlockName(markdown: string, nodeId: string): string | null {
+export function defaultBlock(markdown: string, nodeId: string): CodeSegment | null {
   const candidates = parseBody(markdown, nodeId).filter(
     (seg): seg is CodeSegment => seg.type === "code" && (seg.default || seg.name === nodeId),
   );
-  return candidates.length === 1 ? candidates[0].name : null;
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
+/** Just `defaultBlock`'s own name, for callers that don't need its `tty`
+ * flag too. */
+export function defaultBlockName(markdown: string, nodeId: string): string | null {
+  return defaultBlock(markdown, nodeId)?.name ?? null;
 }

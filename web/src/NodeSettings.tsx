@@ -74,6 +74,13 @@ export function NodeSettings({ node, allNodes, onChange, onRenameId, onClose }: 
   const [tags, setTags] = useState<string[]>(node.tags ?? []);
   const [extraParents, setExtraParents] = useState<ExtraEdgeDto[]>(node.extraParents ?? []);
   const [addSource, setAddSource] = useState("");
+  // Three states, not a checkbox: `node.fold` is itself optional (see
+  // `CanvasNode.fold`'s doc comment) — "not set" (follow the document's own
+  // default, `meshfox:option name="unfold"`) is a real, distinct value from
+  // "explicitly folded"/"explicitly expanded", and this control needs a way
+  // to get back to it, not just toggle between the other two.
+  const initialFold: "default" | "true" | "false" = node.fold === undefined ? "default" : node.fold ? "true" : "false";
+  const [fold, setFold] = useState<"default" | "true" | "false">(initialFold);
 
   const otherNodes = allNodes.filter((n) => n.id !== node.id);
   const addable = otherNodes.filter((n) => !extraParents.some((e) => e.from === n.id));
@@ -125,6 +132,7 @@ export function NodeSettings({ node, allNodes, onChange, onRenameId, onClose }: 
       if (lang !== (node.lang ?? "")) patch.lang = lang;
       if (interpreter !== (node.interpreter ?? "")) patch.interpreter = interpreter;
     }
+    if (fold !== initialFold) patch.fold = fold;
     return patch;
   };
 
@@ -270,6 +278,14 @@ export function NodeSettings({ node, allNodes, onChange, onRenameId, onClose }: 
               />
             ))}
           </div>
+        </label>
+        <label className="vars-modal-field">
+          <span>Fold</span>
+          <select value={fold} onChange={(e) => setFold(e.target.value as "default" | "true" | "false")}>
+            <option value="default">Document default</option>
+            <option value="true">Always folded</option>
+            <option value="false">Always expanded</option>
+          </select>
         </label>
         <div className="vars-modal-field">
           <span>Tags</span>

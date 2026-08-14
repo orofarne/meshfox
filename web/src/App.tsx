@@ -10,7 +10,6 @@ import {
   type Node,
   type Edge,
   type Connection,
-  type NodePositionChange,
   type ReactFlowInstance,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
@@ -24,6 +23,7 @@ import {
   fetchVars,
   fetchConfigureVars,
   saveConfigureVars,
+  updateOptions,
   createNode,
   updateNode,
   deleteNode,
@@ -34,13 +34,14 @@ import {
   type RunEvent,
   type NodePatch,
 } from "./api";
-import type { CanvasDoc, ExtraEdgeDto, VarStatus } from "./types";
-import { pathTo, deriveEdges, subtreeIds } from "./tree";
-import { computeAutoLayout, type LayoutBox } from "./autolayout";
-import { buildBlockGraph, resolveChain, crossNodeDepEdges, type BlockAddr } from "./deps";
+import type { CanvasDoc, CanvasNode, ExtraEdgeDto, VarStatus } from "./types";
+import { pathTo, deriveEdges, findRoot, visibleNodeIds } from "./tree";
+import { computeAutoLayout, FOLDED_HEIGHT, type LayoutBox } from "./autolayout";
+import { buildBlockGraph, resolveChain, type BlockAddr } from "./deps";
 import { parseBody, type CodeSegment } from "./fence";
 import { MeshNode, resolveNodeColor, type MeshNodeData, type LiveBlockState } from "./MeshNode";
 import { VarsForm } from "./VarsForm";
+import { DocumentOptions } from "./DocumentOptions";
 import { TtyPanel } from "./TtyPanel";
 import { NodeExpandPanel } from "./NodeExpandPanel";
 import { NodeSettings } from "./NodeSettings";
@@ -96,9 +97,152 @@ function isBlockCached(canvas: CanvasDoc, addr: BlockAddr): boolean {
   return seg?.cache ?? false;
 }
 
+/** Whether `n` renders as an already-title-only, empty-bodied row (see
+ * MeshNode.tsx's own `isTitleOnly`, computed independently there since it
+ * additionally accounts for `editMode` — a purely display-time concern
+ * this document-level default has no business depending on). Folding a
+ * node like this doesn't change its own row (there was never a body to
+ * hide), but it can still have real value if the node has children of its
+ * own — see `canFold`, which is what actually decides foldability. */
+function isTitleOnlyNode(n: CanvasNode): boolean {
+  return (n.type ?? "text") === "text" && n.text.trim() === "";
+}
+
+/** Ids that are somebody's structural `parent` — i.e. have at least one
+ * child — shared by `canFold` below and the keyboard handler's own h/l/
+ * Enter fold logic (App component), and by `MeshNodeData.hasChildren` (the
+ * one thing `FoldToggle`'s title-only render branch itself needs to know:
+ * MeshNode.tsx has no other way to tell "an empty node with children,
+ * worth folding for its subtree" apart from "an empty leaf, nothing to
+ * fold at all"). */
+function nodesWithChildren(canvas: CanvasDoc): Set<string> {
+  return new Set(canvas.nodes.map((n) => n.parent).filter((p): p is string => !!p));
+}
+
+/** Whether `n` can be folded at all. Folding a title-only node (see
+ * `isTitleOnlyNode`) never changes its own row — the fold toggle there
+ * only ever hides *its subtree* — so one with no children of its own has
+ * nothing folding could possibly do (no row change, no subtree) and isn't
+ * foldable; one with children still is, purely for that subtree's sake.
+ * Every other node is always foldable (its own body, if nothing else). */
+function canFold(n: CanvasNode, withChildren: ReadonlySet<string>): boolean {
+  return !isTitleOnlyNode(n) || withChildren.has(n.id);
+}
+
+/** The default folded set for `canvas` on its very first open (nothing
+ * saved in localStorage for it yet — see the restore effect below) — the
+ * document's own declared preference, not a hardcoded rule: a node's own
+ * `fold="true"`/`fold="false"` (see `CanvasNode.fold`) always wins when
+ * present. Absent that: root never folds by default; a node `canFold`
+ * says isn't foldable at all (a childless title-only node) never folds by
+ * default either, for the same reason; a node with a real, authored
+ * `width`/`height` doesn't fold by default either — an explicit size is a
+ * deliberate "show this much of it" the author already made, which
+ * folding it away on open would silently override; every other node
+ * folds by default unless the document declares the `unfold` option (see
+ * `CanvasDoc.options`, SPEC.md's "Options" section). Matches the TUI's
+ * own "collapsed outline, expand what you need" default unless a document
+ * opts out. */
+function resolveDefaultFold(canvas: CanvasDoc, rootId: string): Set<string> {
+  const hasUnfoldOption = canvas.options?.includes("unfold") ?? false;
+  const withChildren = nodesWithChildren(canvas);
+  const folded = new Set<string>();
+  for (const n of canvas.nodes) {
+    const hasExplicitSize = n.width !== undefined || n.height !== undefined;
+    const resolved =
+      n.fold !== undefined
+        ? n.fold
+        : n.id !== rootId && !hasUnfoldOption && !hasExplicitSize && canFold(n, withChildren);
+    if (resolved) folded.add(n.id);
+  }
+  return folded;
+}
+
+/** `n`'s React Flow `position` — relative to its group when it's a direct
+ * `group` child (see SPEC.md and `autolayout.ts`'s own `groupOrigin`
+ * threading), absolute otherwise. A real x/y is used as-is (it's already
+ * in whichever frame it needs to be, per the file format); an auto-placed
+ * node instead projects `computeAutoLayout`'s absolute `box` into the
+ * parent's frame by subtracting the parent's own absolute box — the one
+ * place a conversion is still needed, since `computeAutoLayout`'s internal
+ * map stays absolute throughout. Shared by both the canvas-load node-build
+ * effect and the measured-height reflow effect below, so a group member's
+ * position is computed exactly the same way in either place — the reflow
+ * effect used to skip this and write `box.x`/`box.y` straight back
+ * (correct for every node *except* a group member, whose `position` needs
+ * to stay parent-relative), which is what let `parentId`-composition
+ * double-count the group's own offset the moment a member's height was
+ * first measured. */
+function positionFor(
+  n: CanvasNode,
+  box: LayoutBox | undefined,
+  byId: Map<string, CanvasNode>,
+  boxes: Map<string, LayoutBox>,
+): { x: number; y: number } {
+  const groupParent = n.parent ? byId.get(n.parent) : undefined;
+  const isGroupMember = groupParent?.type === "group";
+  const parentBox = isGroupMember ? boxes.get(groupParent!.id) : undefined;
+  const x =
+    n.x !== undefined ? n.x : isGroupMember && box && parentBox ? box.x - parentBox.x : (box?.x ?? 0);
+  const y =
+    n.y !== undefined ? n.y : isGroupMember && box && parentBox ? box.y - parentBox.y : (box?.y ?? 0);
+  return { x, y };
+}
+
 export default function App() {
   const [canvas, setCanvas] = useState<CanvasDoc | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // A node's subtree folded to a compact title-only row — a view
+  // preference (never written to the file, see `handleSaveLayout`), one
+  // React state shared by the fold-toggle UI, keyboard nav's visible
+  // order, and the layout pass that reflows auto-placed siblings around a
+  // folded subtree (see `computeAutoLayout`'s `foldedNodeIds`). Persisted
+  // to localStorage per canvas (see the restore/persist effects below) so
+  // it survives a reload without polluting the document itself.
+  const [foldedNodeIds, setFoldedNodeIds] = useState<Set<string>>(new Set());
+  const foldedStorageKeyRef = useRef<string | null>(null);
+  const toggleFold = useCallback((id: string) => {
+    setFoldedNodeIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+  // Restores folded state for whichever canvas just loaded, keyed by its
+  // root node's id (stable across reloads/renames per SPEC.md — the only
+  // thing here that reliably identifies "this document" client-side).
+  // Runs once per distinct root id, not on every reload of the *same*
+  // canvas (e.g. after a save), so an in-session fold toggle isn't
+  // silently reverted by the reload that follows persisting it. The very
+  // first time a given canvas is opened (nothing saved for it yet), the
+  // document's own declared default applies (see `resolveDefaultFold`) —
+  // by default a "collapsed outline, expand what you need" view, same
+  // experience the TUI opens to, unless the document opts out via the
+  // `unfold` option.
+  useEffect(() => {
+    if (!canvas) return;
+    const rootId = findRoot(canvas)?.id;
+    if (!rootId) return;
+    const key = `meshfox-folded:${rootId}`;
+    if (foldedStorageKeyRef.current === key) return;
+    foldedStorageKeyRef.current = key;
+    try {
+      const raw = localStorage.getItem(key);
+      if (raw) {
+        setFoldedNodeIds(new Set(JSON.parse(raw)));
+        return;
+      }
+    } catch {
+      // fall through to the default below
+    }
+    setFoldedNodeIds(resolveDefaultFold(canvas, rootId));
+  }, [canvas]);
+  useEffect(() => {
+    const key = foldedStorageKeyRef.current;
+    if (!key) return;
+    localStorage.setItem(key, JSON.stringify([...foldedNodeIds]));
+  }, [foldedNodeIds]);
   // True from the moment a drag/resize changes a node's position/size
   // until the debounced auto-save (below) has actually persisted it —
   // drives the toolbar's "saving layout…" indicator.
@@ -113,10 +257,6 @@ export default function App() {
   // Whether CanvasSourceEditor has unsaved edits — disables the "done"
   // button so leaving Edit mode can't silently discard them.
   const [sourceDirty, setSourceDirty] = useState(false);
-  // Dependency arrows (see ./deps.ts) are drawn in a distinct style from
-  // the tree/`meshfox:edge` connectors — off by default so a canvas with no
-  // `deps=` blocks looks exactly as it did before this existed.
-  const [showDeps, setShowDeps] = useState(false);
   // Toolbar's light/dark toggle (see theme.ts) — "system" (the default)
   // follows the OS; initialized from localStorage rather than always
   // "system" so a stored override survives a reload without a flash (see
@@ -180,6 +320,11 @@ export default function App() {
   // the TUI's `c` key. Independent of `varsModal`: this isn't gating a
   // run, it can be opened any time the toolbar button is visible.
   const [configureVars, setConfigureVars] = useState<VarStatus[] | null>(null);
+  // Whether the toolbar's "options" modal (see DocumentOptions) is open —
+  // unlike `configureVars`, needs no fetch first: `canvas.options` (from
+  // `GET /api/canvas`'s own `declared_options` call) is already live in
+  // `canvas` state, so the button just flips this straight to `true`.
+  const [documentOptionsOpen, setDocumentOptionsOpen] = useState(false);
   // Set while a `tty` block's interactive terminal panel is open — see
   // `handleRunTty`/`TtyPanel`. Only one at a time (opening another closes
   // whatever's already open, same as `NodeTextEditor`'s single-editor
@@ -219,10 +364,20 @@ export default function App() {
 
   // Best-effort client-side mirror of crates/core/src/deps.rs — used only
   // to preview a run's dependency chain (so "running" indicators can light
-  // up on every block about to run, not just the clicked one) and to draw
-  // dependency arrows. The server remains the source of truth for actually
-  // resolving and executing the chain.
+  // up on every block about to run, not just the clicked one). The server
+  // remains the source of truth for actually resolving and executing the
+  // chain.
   const blockGraph = useMemo(() => (canvas ? buildBlockGraph(canvas) : new Map()), [canvas]);
+
+  // Every node id that's a structural parent of at least one other node —
+  // shared by the fold-marker's `hasChildren` prop (a title-only node
+  // needs one to have anything worth folding — see MeshNode.tsx's
+  // `FoldToggle`) and keyboard nav's own h/Enter fold logic (feature 5),
+  // so both agree on what "has a subtree" means.
+  const parentIdSet = useMemo(
+    () => (canvas ? nodesWithChildren(canvas) : new Set<string>()),
+    [canvas],
+  );
 
   const load = useCallback(async () => {
     try {
@@ -605,6 +760,25 @@ export default function App() {
 
   const handleConfigureCancel = useCallback(() => setConfigureVars(null), []);
 
+  // Toolbar "options" button's submit — replaces the document's whole
+  // declared `meshfox:option` set in one PUT (see `updateOptions`,
+  // SPEC.md's "Options"). Doesn't touch `foldedNodeIds` itself — the
+  // fold-restore effect above only ever applies `resolveDefaultFold` the
+  // very first time a given root id is seen with nothing in localStorage
+  // yet (see that effect's own comment), so toggling `unfold` here
+  // changes what a *fresh* browser/session opens to, not this session's
+  // already-resolved fold state.
+  const handleDocumentOptionsSubmit = useCallback(async (options: string[]) => {
+    setDocumentOptionsOpen(false);
+    try {
+      setCanvas(await updateOptions(options));
+    } catch (e) {
+      setError(String(e));
+    }
+  }, []);
+
+  const handleDocumentOptionsCancel = useCallback(() => setDocumentOptionsOpen(false), []);
+
   // Reads current state through `setNodes`'s updater rather than closing
   // over the `nodes` variable directly: `data.onKill` is bound once (when
   // the canvas-load effect below builds each node, which deliberately
@@ -831,14 +1005,25 @@ export default function App() {
       canvas,
       viewportWidth: viewportWidthRef.current,
       measuredHeight: (id) => measuredHeightsRef.current.get(id),
+      foldedNodeIds,
     });
+    const byId = new Map(canvas.nodes.map((n) => [n.id, n]));
     setNodes(
       canvas.nodes.map((n) => {
         const isGroup = n.type === "group";
+        const isFolded = foldedNodeIds.has(n.id);
         const suggested = n.x === undefined || n.y === undefined;
         const box: LayoutBox | undefined = boxes.get(n.id);
-        const x = n.x ?? box?.x ?? 0;
-        const y = n.y ?? box?.y ?? 0;
+        // A direct child of a `group` stores x/y relative to that group's
+        // own anchor, not absolute (see SPEC.md) — React Flow's own
+        // `parentId` already means exactly that for a node's `position`,
+        // so wiring it up here is what lets the framework move a dragged
+        // group's members along with it for free (no more manual delta
+        // rewrite, see the deleted `groupMoves` this replaced). See
+        // `positionFor` for how `x`/`y` themselves get computed.
+        const rawParent = n.parent ? byId.get(n.parent) : undefined;
+        const groupParent = rawParent?.type === "group" ? rawParent : undefined;
+        const { x, y } = positionFor(n, box, byId, boxes);
         const width = n.width ?? box?.width ?? 280;
         // A group's box is a computed wrapper around its members, not
         // something its own (essentially empty, `pointerEvents: none`) DOM
@@ -854,24 +1039,34 @@ export default function App() {
         // wrapper doesn't give that element's own `height: 100%` anything
         // definite to resolve against (confirmed directly — see the
         // `maxHeight` doc comment on `MeshNodeData` in MeshNode.tsx).
-        const height = isGroup ? box?.height : n.height;
-        const maxHeight = !isGroup && n.height === undefined ? box?.maxHeight : undefined;
+        const height = isGroup ? box?.height : isFolded ? FOLDED_HEIGHT : n.height;
+        const maxHeight = !isGroup && !isFolded && n.height === undefined ? box?.maxHeight : undefined;
         const style: CSSProperties | undefined = isGroup ? { pointerEvents: "none" } : undefined;
         return {
           id: n.id,
           type: "mesh",
+          // `parentId` is React Flow's own native parent/child nesting —
+          // once set, `position` above is relative to the parent (exactly
+          // what a group member's own x/y already means, see above) and
+          // dragging the parent moves every descendant with it automatically,
+          // no manual delta rewrite needed (unlike the old per-drag
+          // `groupMoves` synthesis this replaced). Deliberately no
+          // `extent: "parent"` — that would clamp a member inside the
+          // group's *current* (possibly stale) bounds, fighting the "box
+          // grows to fit whatever members do" model `layoutGroups` gives it.
+          ...(groupParent ? { parentId: groupParent.id } : {}),
           position: { x, y },
           width,
           height,
           // Groups are draggable like everything else (deferring to the
           // global `nodesDraggable` prop, which the Edit toggle controls),
-          // but a group's own position is never itself persisted — dragging
-          // one instead moves its whole subtree along with it (see
-          // `onNodesChangeAndMark`), and the group's box is then re-derived
-          // from its members' new positions on the next layout save (see
-          // `autolayout.ts`/`layout.rs`). Resizing stays off (no
-          // `NodeResizer` for groups, below) since the box is never
-          // authored directly either way.
+          // but a group's own position is only persisted once it's actually
+          // been dragged this session (see `handleSaveLayout`'s own
+          // `touchedNodeIds` check) — until then it stays whatever
+          // `layoutGroups` derives from its members. Resizing stays off (no
+          // `NodeResizer` for groups, below) since the box's *size* is
+          // always derived, never authored, even once a group has a real
+          // anchor of its own.
           //
           // React Flow gives every node wrapper `pointer-events: all` by
           // default (see its own NodeWrapper) — fine for an opaque node,
@@ -893,7 +1088,9 @@ export default function App() {
             maxHeight,
             editMode,
             liveBlocks: {},
-            showDeps,
+            folded: isFolded,
+            hasChildren: parentIdSet.has(n.id),
+            onToggleFold: () => toggleFold(n.id),
             target: n.target,
             constraintResults: n.constraintResults,
             display: n.display,
@@ -1020,10 +1217,11 @@ export default function App() {
   // members, so it has to track a member's corrected height too, unlike an
   // ordinary node's own `height`, deliberately left undefined so it keeps
   // auto-measuring from content) — never rebuilds `data` (that would reset
-  // each node's live run state for nothing). `measuredSignature` — not
-  // `nodes` itself — is the dependency so this doesn't re-run on every
-  // drag/selection change, only when it'd actually produce a different
-  // layout.
+  // each node's live run state for nothing), except for the `folded` flag
+  // itself, which this is also responsible for keeping in sync (see below).
+  // `measuredSignature`/`foldedNodeIds` — not `nodes` itself — are the
+  // dependencies so this doesn't re-run on every drag/selection change,
+  // only when it'd actually produce a different layout.
   const measuredSignature = useMemo(
     () =>
       nodes
@@ -1038,34 +1236,63 @@ export default function App() {
       canvas,
       viewportWidth: viewportWidthRef.current,
       measuredHeight: (id) => measuredHeightsRef.current.get(id),
+      foldedNodeIds,
     });
+    const byId = new Map(canvas.nodes.map((cn) => [cn.id, cn]));
     setNodes((prev) =>
       prev.map((n) => {
-        if (!n.data.suggested) return n;
-        const box = boxes.get(n.id);
-        if (!box) return n;
-        const isGroup = n.data.nodeType === "group";
-        const heightChanged = isGroup && n.height !== box.height;
-        if (
-          n.position.x === box.x &&
-          n.position.y === box.y &&
-          n.width === box.width &&
-          n.data.maxHeight === box.maxHeight &&
-          !heightChanged
-        ) {
-          return n;
+        const isFolded = foldedNodeIds.has(n.id);
+        if (n.data.suggested) {
+          const box = boxes.get(n.id);
+          const canvasNode = byId.get(n.id);
+          if (!box || !canvasNode) return n;
+          // `positionFor` handles a group member's box the same way the
+          // canvas-load effect above does — this branch used to write
+          // `box.x`/`box.y` straight back regardless, which was correct
+          // for every node *except* a group member (whose `position` has
+          // to stay relative to its parent once `parentId` is wired) —
+          // silently double-counting the group's own offset the moment a
+          // member's height was first measured (this effect's own
+          // trigger) undid the canvas-load effect's correct relative
+          // value.
+          const { x, y } = positionFor(canvasNode, box, byId, boxes);
+          const isGroup = n.data.nodeType === "group";
+          const heightChanged = isGroup && n.height !== box.height;
+          if (
+            n.position.x === x &&
+            n.position.y === y &&
+            n.width === box.width &&
+            n.data.maxHeight === box.maxHeight &&
+            n.data.folded === isFolded &&
+            !heightChanged
+          ) {
+            return n;
+          }
+          return {
+            ...n,
+            position: { x, y },
+            width: box.width,
+            height: isGroup ? box.height : n.height,
+            data: isGroup ? { ...n.data, folded: isFolded } : { ...n.data, maxHeight: box.maxHeight, folded: isFolded },
+          };
         }
+        // A real (authored/dragged) node never moves here — but its own
+        // rendered height still needs to collapse to a compact header when
+        // folded (and restore its authored height when unfolded), same
+        // compact size `computeAutoLayout`'s own `sizeFor` already reserves
+        // for this node's box, so a later auto-placed sibling reflows
+        // consistently either way.
+        if (n.data.folded === isFolded) return n;
+        const canvasHeight = canvas.nodes.find((cn) => cn.id === n.id)?.height;
         return {
           ...n,
-          position: { x: box.x, y: box.y },
-          width: box.width,
-          height: isGroup ? box.height : n.height,
-          data: isGroup ? n.data : { ...n.data, maxHeight: box.maxHeight },
+          height: isFolded ? FOLDED_HEIGHT : canvasHeight,
+          data: { ...n.data, folded: isFolded },
         };
       }),
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [canvas, measuredSignature]);
+  }, [canvas, measuredSignature, foldedNodeIds]);
 
   // Anchors the very first view on the root node's own top-left corner, a
   // fixed padding in from the canvas area's, at a fixed readable zoom (see
@@ -1092,12 +1319,9 @@ export default function App() {
     );
   }, [flowInstance, canvas, nodes]);
 
-  // Toggling Edit mode or "show deps" shouldn't rebuild the whole graph
-  // (that would reset any in-progress drag/selection) — just patch the
-  // flags every node reads. `showDeps` here is what gates each node's
-  // in-body dependency rail (see MeshNode); the cross-node arrows below
-  // are gated the same way, independently, since they live in `App`'s own
-  // edge list rather than per-node data.
+  // Toggling Edit mode shouldn't rebuild the whole graph (that would reset
+  // any in-progress drag/selection) — just patch the flags every node
+  // reads.
   //
   // Also re-wires `onRun`/`onKill`: those close over `handleRun`/
   // `handleKill`, which in turn close over `editMode` (whether a `cache`d
@@ -1115,7 +1339,6 @@ export default function App() {
         data: {
           ...n.data,
           editMode,
-          showDeps,
           onRun: (blockName: string, withDeps: boolean) => handleRun(n.id, blockName, withDeps),
           onKill: (blockName: string) => handleKill(n.id, blockName),
           onRunTty: (blockName: string, withDeps: boolean) => handleRunTty(n.id, blockName, withDeps),
@@ -1127,31 +1350,171 @@ export default function App() {
     setEdges((eds) =>
       eds.map((e) => (e.type === "extra" || e.type === "tree" ? { ...e, data: { ...e.data, editMode } } : e)),
     );
-  }, [editMode, showDeps, setNodes, setEdges, handleRun, handleKill, handleRunTty, load]);
+  }, [editMode, setNodes, setEdges, handleRun, handleKill, handleRunTty, load]);
 
-  // Dependency arrows (`deps=` on a fence, cross-node only — same-node deps
-  // are shown inline on the block instead, see MeshNode) — computed
-  // separately from `edges` state so toggling the button never disturbs the
-  // tree/`meshfox:edge` connectors or their positions. Styled distinctly
-  // (color + dash pattern) so a chain-of-computation arrow never reads as
-  // just another nesting line.
-  const depEdges: Edge[] = useMemo(() => {
-    if (!showDeps) return [];
-    return crossNodeDepEdges(blockGraph).map((e) => ({
-      id: e.id,
-      source: e.fromNodeId,
-      target: e.toNodeId,
-      label: `${e.fromBlock} → ${e.toBlock}`,
-      type: "smoothstep",
-      className: "mesh-dep-edge",
-      markerEnd: { type: MarkerType.ArrowClosed, color: "var(--dep)" },
-      selectable: false,
-      deletable: false,
-      zIndex: 1000,
-    }));
-  }, [blockGraph, showDeps]);
+  // Every node reachable without descending into a folded subtree, in
+  // document (depth-first) order — the same order keyboard nav's j/k walks
+  // (feature 5). The set derived from it is what's actually handed to React
+  // Flow, filtered from `nodes`/`edges` rather than baked into that state
+  // itself, so a fold toggle never has to rebuild (and thus reset the live
+  // run state of) anything that stays visible.
+  const visibleOrder = useMemo(
+    () => (canvas ? visibleNodeIds(canvas, foldedNodeIds) : []),
+    [canvas, foldedNodeIds],
+  );
+  const visibleNodeIdSet = useMemo(() => new Set(visibleOrder), [visibleOrder]);
+  const visibleNodes = useMemo(() => nodes.filter((n) => visibleNodeIdSet.has(n.id)), [nodes, visibleNodeIdSet]);
+  const visibleEdges = useMemo(
+    () => edges.filter((e) => visibleNodeIdSet.has(e.source) && visibleNodeIdSet.has(e.target)),
+    [edges, visibleNodeIdSet],
+  );
 
-  const displayEdges = useMemo(() => [...edges, ...depEdges], [edges, depEdges]);
+  // Keyboard-driven focus (j/k/h/l/Enter, see the keydown effect below) —
+  // deliberately separate from React Flow's own mouse-driven `selected`
+  // (NodeResizer visibility, multi-select), so a keypress never silently
+  // changes what's selected for resize/multi-op purposes. `nodeDepth`
+  // mirrors the TUI's own per-row depth (`tree::TreeRow.depth`) — how many
+  // `parent` hops from root, used by `h`'s "jump to the nearest preceding
+  // row at depth-1" (no stored parent-pointer needed, same linear scan the
+  // TUI's `collapse_or_to_parent` does over its own flat row list).
+  const [focusedNodeId, setFocusedNodeId] = useState<string | null>(null);
+  const nodeDepth = useMemo(() => {
+    if (!canvas) return new Map<string, number>();
+    return new Map(visibleOrder.map((id) => [id, pathTo(canvas, id).length]));
+  }, [canvas, visibleOrder]);
+  const focusNode = useCallback(
+    (id: string) => {
+      setFocusedNodeId(id);
+      const rfNode = flowInstance?.getNode(id);
+      if (flowInstance && rfNode) {
+        const w = rfNode.measured?.width ?? rfNode.width ?? 280;
+        const h = rfNode.measured?.height ?? rfNode.height ?? 160;
+        flowInstance.setCenter(rfNode.position.x + w / 2, rfNode.position.y + h / 2, {
+          zoom: flowInstance.getZoom(),
+          duration: 400,
+        });
+      }
+    },
+    [flowInstance],
+  );
+  useEffect(() => {
+    function isEditableTarget(el: Element | null): boolean {
+      if (!(el instanceof HTMLElement)) return false;
+      return el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable;
+    }
+    function onKeyDown(e: KeyboardEvent) {
+      if (isEditableTarget(document.activeElement)) return;
+      // Any modal/dialog open — keys here are for whatever it's showing,
+      // not canvas navigation. Belt-and-suspenders alongside the
+      // activeElement check above, since not every dialog necessarily
+      // focuses an input (e.g. a plain confirm dialog).
+      if (
+        sourceMode ||
+        settingsNodeId ||
+        ttySession ||
+        varsModal ||
+        configureVars ||
+        deleteConfirmNodeId ||
+        reparentPromptNodeId ||
+        expandedNodeId ||
+        autoLayoutConfirmOpen
+      ) {
+        return;
+      }
+      if (visibleOrder.length === 0) return;
+
+      // `e.code` (the physical key position, e.g. "KeyJ" for whatever key
+      // sits where a QWERTY "j" would) rather than `e.key` (the character
+      // that key actually produces under the *active* layout) — on a
+      // Cyrillic layout, the physical j/k/h/l keys produce "о"/"л"/"р"/"д",
+      // not "j"/"k"/"h"/"l", so checking `e.key` here silently never
+      // matched for anyone not on a Latin layout. Arrow keys and Enter
+      // have no such ambiguity (`e.code`'s "ArrowDown"/"Enter" already
+      // match `e.key`'s), so those still read `e.key` for clarity.
+      const isDown = e.code === "KeyJ" || e.key === "ArrowDown";
+      const isUp = e.code === "KeyK" || e.key === "ArrowUp";
+      const isRight = e.code === "KeyL" || e.key === "ArrowRight";
+      const isLeft = e.code === "KeyH" || e.key === "ArrowLeft";
+
+      if (isDown || isUp) {
+        e.preventDefault();
+        const delta = isDown ? 1 : -1;
+        const currentIndex = focusedNodeId ? visibleOrder.indexOf(focusedNodeId) : -1;
+        const nextIndex = Math.min(Math.max(currentIndex + delta, 0), visibleOrder.length - 1);
+        focusNode(visibleOrder[nextIndex]);
+        return;
+      }
+      if (!focusedNodeId) return;
+      // Whether the focused node supports folding at all (see `canFold`)
+      // — every node except an already-title-only one with no children,
+      // where folding could neither change its own row nor hide any
+      // subtree, so there's nothing for h/Enter to actually do.
+      const focusedNode = canvas?.nodes.find((n) => n.id === focusedNodeId);
+      const foldable = focusedNode ? canFold(focusedNode, parentIdSet) : false;
+      if (isRight) {
+        if (foldedNodeIds.has(focusedNodeId)) {
+          e.preventDefault();
+          toggleFold(focusedNodeId);
+        }
+        return;
+      }
+      if (isLeft) {
+        // Any foldable node can be folded, not just ones with children
+        // (see MeshNode.tsx's `FoldToggle`) — `h` folds the focused node
+        // first; pressed again once it's already folded (nothing left to
+        // collapse here), or on a node that was never foldable to begin
+        // with, it falls through to jumping up to the parent instead, same
+        // as the TUI's own `collapse_or_to_parent`.
+        if (foldable && !foldedNodeIds.has(focusedNodeId)) {
+          e.preventDefault();
+          toggleFold(focusedNodeId);
+          return;
+        }
+        const depth = nodeDepth.get(focusedNodeId);
+        if (depth === undefined || depth === 0) return;
+        const currentIndex = visibleOrder.indexOf(focusedNodeId);
+        for (let i = currentIndex - 1; i >= 0; i--) {
+          if (nodeDepth.get(visibleOrder[i]) === depth - 1) {
+            e.preventDefault();
+            focusNode(visibleOrder[i]);
+            break;
+          }
+        }
+        return;
+      }
+      if (e.key === "Enter" && foldable) {
+        e.preventDefault();
+        toggleFold(focusedNodeId);
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [
+    focusedNodeId,
+    visibleOrder,
+    nodeDepth,
+    foldedNodeIds,
+    focusNode,
+    toggleFold,
+    canvas,
+    parentIdSet,
+    sourceMode,
+    settingsNodeId,
+    ttySession,
+    varsModal,
+    configureVars,
+    deleteConfirmNodeId,
+    reparentPromptNodeId,
+    expandedNodeId,
+    autoLayoutConfirmOpen,
+  ]);
+  const focusedRenderNodes = useMemo(
+    () =>
+      visibleNodes.map((n) =>
+        (n.data.focused ?? false) === (n.id === focusedNodeId) ? n : { ...n, data: { ...n.data, focused: n.id === focusedNodeId } },
+      ),
+    [visibleNodes, focusedNodeId],
+  );
 
   const settingsNode = useMemo(
     () => canvas?.nodes.find((n) => n.id === settingsNodeId),
@@ -1191,42 +1554,17 @@ export default function App() {
 
   const onNodesChangeAndMark: typeof onNodesChange = useCallback(
     (changes) => {
-      // Dragging a group has nothing of its own to persist (its box is
-      // always re-derived from its members, see layout.rs) — so instead,
-      // moving it translates every descendant in its subtree by the same
-      // delta, turning "drag the group" into "drag all its members
-      // together". Synthesized as ordinary position changes (same shape
-      // React Flow itself emits) so they ride along through the exact same
-      // touched/dirty/gesture-end bookkeeping below as a real drag would.
-      const groupMoves = changes.filter(
-        (c): c is NodePositionChange =>
-          c.type === "position" &&
-          c.position !== undefined &&
-          nodes.find((n) => n.id === c.id)?.data.nodeType === "group",
-      );
-      let allChanges = changes;
-      if (groupMoves.length > 0 && canvas) {
-        const extra: NodePositionChange[] = [];
-        for (const move of groupMoves) {
-          const group = nodes.find((n) => n.id === move.id);
-          if (!group || !move.position) continue;
-          const dx = move.position.x - group.position.x;
-          const dy = move.position.y - group.position.y;
-          if (dx === 0 && dy === 0) continue;
-          for (const memberId of subtreeIds(canvas, move.id)) {
-            const member = nodes.find((n) => n.id === memberId);
-            if (!member) continue;
-            extra.push({
-              type: "position",
-              id: memberId,
-              position: { x: member.position.x + dx, y: member.position.y + dy },
-              dragging: move.dragging,
-            });
-          }
-        }
-        allChanges = [...changes, ...extra];
-      }
-      onNodesChange(allChanges);
+      // Dragging a group used to have nothing of its own to persist (its
+      // box was always re-derived from its members) and needed a manual
+      // delta rewrite of every descendant to move along with it. Neither
+      // is true anymore: group members are wired with React Flow's own
+      // `parentId` (see the node-building effect above), which moves them
+      // with their parent natively, and a group's own dragged position is
+      // now real, persistable data in its own right (see
+      // `handleSaveLayout`) — so `changes` needs no synthesis here at all,
+      // just the same touched/dirty/gesture-end bookkeeping every other
+      // node's drag already gets.
+      onNodesChange(changes);
       // React Flow also emits a `dimensions` change for every node purely
       // from its own passive remeasurement (e.g. right after `setNodes`
       // replaces the array with fresh object references — precisely what
@@ -1247,7 +1585,7 @@ export default function App() {
         (c.type === "position" && c.dragging === false) ||
         (c.type === "dimensions" && c.resizing === false);
       let touched = false;
-      for (const c of allChanges) {
+      for (const c of changes) {
         if (isUserDriven(c) && "id" in c) {
           touchedNodeIds.current.add(c.id);
           touched = true;
@@ -1256,7 +1594,7 @@ export default function App() {
       }
       if (touched) setDirty(true);
     },
-    [onNodesChange, nodes, canvas],
+    [onNodesChange],
   );
 
   // Intercepts a "remove" change (Backspace/Delete with an edge selected)
@@ -1288,18 +1626,36 @@ export default function App() {
 
   const handleSaveLayout = useCallback(async () => {
     if (!canvas) return;
-    // Group boxes are always derived (see layoutGroups) — never treat them
-    // as authored data to persist. Nor a node that's still showing its
+    // A group's *size* is always derived (see `layoutGroups`) — never
+    // treat it as authored data to persist. Its own *position*, though, is
+    // a real anchor now (see SPEC.md) — persisted exactly like any other
+    // node's, but only once it's actually been dragged this session
+    // (`touchedNodeIds`; a group is never `suggested`, so it'd otherwise
+    // always look "touched enough" to save). Every non-group node keeps
+    // the same rule as before: skip one that's still showing its
     // server-suggested position/size and that the user hasn't actually
     // touched — dragging one node shouldn't silently pin every other,
     // still-auto-placed node's suggested box into the file as if it were
-    // real authored data (see `touchedNodeIds`).
+    // real authored data. A group *member*'s own `n.position` is already
+    // group-relative here (React Flow's own `parentId` semantics — see the
+    // node-building effect above), so it's persisted verbatim, no delta
+    // math needed.
     const layout = new Map(
       nodes
-        .filter(
-          (n) => n.data.nodeType !== "group" && (!n.data.suggested || touchedNodeIds.current.has(n.id)),
+        .filter((n) =>
+          n.data.nodeType === "group"
+            ? touchedNodeIds.current.has(n.id)
+            : !n.data.suggested || touchedNodeIds.current.has(n.id),
         )
-        .map((n) => [n.id, { x: n.position.x, y: n.position.y, width: n.width, height: n.height }]),
+        .map((n) => [
+          n.id,
+          {
+            x: n.position.x,
+            y: n.position.y,
+            width: n.data.nodeType === "group" ? undefined : n.width,
+            height: n.data.nodeType === "group" ? undefined : n.height,
+          },
+        ]),
     );
     const updated: CanvasDoc = {
       ...canvas,
@@ -1399,6 +1755,13 @@ export default function App() {
               Auto-layout
             </button>
             <button
+              className="deps-toggle"
+              onClick={() => setDocumentOptionsOpen(true)}
+              title="Document-wide settings (see SPEC.md's Options) — e.g. whether the canvas opens with everything expanded by default"
+            >
+              ⚙ options
+            </button>
+            <button
               onClick={() => setEditMode(false)}
               disabled={sourceMode && sourceDirty}
               title={sourceMode && sourceDirty ? "Save or discard source changes first" : undefined}
@@ -1412,13 +1775,6 @@ export default function App() {
             <button onClick={() => setEditMode(true)}>Edit</button>
           </>
         )}
-        <button
-          className={showDeps ? "deps-toggle deps-toggle-active" : "deps-toggle"}
-          onClick={() => setShowDeps((s) => !s)}
-          title="Show/hide code-block dependencies (deps=): cross-node arrows and each node's in-body rail"
-        >
-          ⛓ {showDeps ? "hide deps" : "show deps"}
-        </button>
         {hasConfigurableVars && (
           <button
             className="deps-toggle"
@@ -1444,7 +1800,6 @@ export default function App() {
       sourceDirty,
       dirty,
       error,
-      showDeps,
       constraintStats,
       hasConfigurableVars,
       handleConfigure,
@@ -1474,8 +1829,8 @@ export default function App() {
           />
         ) : (
           <ReactFlow
-            nodes={nodes}
-            edges={displayEdges}
+            nodes={focusedRenderNodes}
+            edges={visibleEdges}
             onNodesChange={onNodesChangeAndMark}
             onEdgesChange={onEdgesChangeAndPersist}
             onConnect={handleConnect}
@@ -1528,6 +1883,13 @@ export default function App() {
           submitLabel="save"
         />
       )}
+      {documentOptionsOpen && canvas && (
+        <DocumentOptions
+          options={canvas.options ?? []}
+          onSubmit={handleDocumentOptionsSubmit}
+          onCancel={handleDocumentOptionsCancel}
+        />
+      )}
       {ttySession && (
         <TtyPanel
           key={`${ttySession.path.join("/")}/${ttySession.blockName}`}
@@ -1539,7 +1901,18 @@ export default function App() {
           onClose={() => setTtySession(null)}
         />
       )}
-      {expandedNode && <NodeExpandPanel node={expandedNode} onClose={() => setExpandedNodeId(null)} />}
+      {expandedNode && (
+        <NodeExpandPanel
+          node={expandedNode}
+          onClose={() => setExpandedNodeId(null)}
+          canvas={canvas}
+          nodes={nodes}
+          edges={edges}
+          onNodesChange={onNodesChangeAndMark}
+          onEdgesChange={onEdgesChangeAndPersist}
+          editMode={editMode}
+        />
+      )}
       {settingsNode && (
         <NodeSettings
           // Keyed on id so a successful id rename remounts this modal fresh

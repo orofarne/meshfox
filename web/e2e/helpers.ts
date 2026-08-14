@@ -27,3 +27,15 @@ export async function clickFitViewAndWait(page: Page) {
   await page.locator(".react-flow__controls-fitview").click();
   await expect.poll(() => viewportTransform(page)).not.toBe(before);
 }
+
+/** Neutralizes App.tsx's "fold everything with children except root by
+ * default" behavior for a suite that isn't itself about fold/collapse —
+ * pre-seeds localStorage (via `addInitScript`, so it's in place before the
+ * app's own restore effect ever runs) with an explicit *empty* folded set
+ * for `rootId`, which the app reads as "already has a saved (empty) state"
+ * and skips computing the default entirely. Call before `page.goto`. Only
+ * needed for a fixture with a non-root node that has children of its own
+ * (a flat fixture has nothing the default would ever fold). */
+export async function disableDefaultFold(page: Page, rootId: string) {
+  await page.addInitScript((key) => localStorage.setItem(key, "[]"), `meshfox-folded:${rootId}`);
+}

@@ -11,6 +11,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct Canvas {
     pub nodes: Vec<Node>,
+    /// Every `<!-- meshfox:option name="..." -->` this document declares
+    /// (see `crate::options`) — e.g. `unfold`, which flips the web UI's
+    /// own default fold state for the whole document. Never set by
+    /// `mdcanvas::parse` itself (a malformed declaration shouldn't break
+    /// basic parsing — `meshfox validate` is what surfaces that loudly, see
+    /// `options::declared_options`); populated by whichever consumer wants
+    /// it, same convention `Node::constraint_results`/`asset_base` already
+    /// use.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
 }
 
 /// JSON Canvas's four node types, plus meshfox's own `include` (see
@@ -201,6 +211,15 @@ pub struct Node {
     pub height: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
+    /// `fold="true"`/`fold="false"` on `meshfox:node` — an explicit
+    /// per-node override of the document's own default fold state (see
+    /// `Canvas::options`' `unfold` option and SPEC.md's "Options"
+    /// section), for a node whose subtree should always start folded (or
+    /// always expanded) regardless of what the rest of the document
+    /// defaults to. `None` means no override — the node just follows
+    /// whatever the document-wide default resolves to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fold: Option<bool>,
     /// Free-form labels (`tags="a,b,c"` on `meshfox:node`) — purely
     /// descriptive, no structural meaning (unlike `parent`/`extra_parents`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -278,6 +297,123 @@ impl Canvas {
             .iter()
             .filter(|n| n.parent.as_deref() == Some(id))
             .collect()
+    }
+
+    /// Absolute position for `id`, walking up through `group`-typed
+    /// ancestors accumulating each one's own real anchor — a group's own
+    /// `x`/`y` mean "top-left of this group's frame in its own parent's
+    /// frame" (see SPEC.md), so a member's stored `x`/`y` is relative to
+    /// its nearest group ancestor, not the whole document. Stops
+    /// (harmlessly leaving `x`/`y` untouched) at the first non-`group`
+    /// ancestor or the root, so this is exactly `(node.x, node.y)` for any
+    /// node that isn't nested under a group at all.
+    ///
+    /// `None` if `id` itself has no stored `x`/`y`, or any `group` ancestor
+    /// in the chain has no anchor of its own (never dragged) — an
+    /// intentional "no heuristic" answer: `layout`/the web client's own
+    /// auto-layout supply their own synthetic fallback for this case,
+    /// `staticgen` treats `None` as "not really positioned" (flows via
+    /// CSS instead of a fixed pixel position).
+    pub fn resolve_absolute_position(&self, id: &str) -> Option<(f64, f64)> {
+        let node = self.node(id)?;
+        let (mut x, mut y) = (node.x?, node.y?);
+        let mut current = node.parent.as_deref();
+        while let Some(parent_id) = current {
+            let parent = self.node(parent_id)?;
+            if parent.node_type != NodeType::Group {
+                break;
+            }
+            x += parent.x?;
+            y += parent.y?;
+            current = parent.parent.as_deref();
+        }
+        Some((x, y))
+    }
+
+    /// Inverse of `resolve_absolute_position`: converts an absolute
+    /// `(abs_x, abs_y)` into whatever frame `id` should store it in given
+    /// its *current* parent chain, subtracting each `group`-typed
+    /// ancestor's own anchor along the way. `None` under the same
+    /// "an ancestor group has no anchor yet" condition
+    /// `resolve_absolute_position` uses — the caller (e.g. a reparent) is
+    /// expected to leave the node's stored position untouched in that case
+    /// rather than inventing a synthetic one.
+    pub fn absolute_to_local(&self, id: &str, abs_x: f64, abs_y: f64) -> Option<(f64, f64)> {
+        let node = self.node(id)?;
+        let (mut x, mut y) = (abs_x, abs_y);
+        let mut current = node.parent.as_deref();
+        while let Some(parent_id) = current {
+            let parent = self.node(parent_id)?;
+            if parent.node_type != NodeType::Group {
+                break;
+            }
+            x -= parent.x?;
+            y -= parent.y?;
+            current = parent.parent.as_deref();
+        }
+        Some((x, y))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::mdcanvas::parse;
+
+    #[test]
+    fn resolve_absolute_position_adds_the_groups_own_anchor() {
+        let doc = "# Root\n\n## Frame\n<!-- meshfox:node type=\"group\" x=100 y=100 -->\n\n### Member\n<!-- meshfox:node x=20 y=20 -->\n\nbody\n";
+        let canvas = parse(doc).unwrap();
+        assert_eq!(canvas.resolve_absolute_position("member"), Some((120.0, 120.0)));
+    }
+
+    #[test]
+    fn resolve_absolute_position_is_none_when_a_group_ancestor_has_no_anchor() {
+        let doc = "# Root\n\n## Frame\n<!-- meshfox:node type=\"group\" -->\n\n### Member\n<!-- meshfox:node x=20 y=20 -->\n\nbody\n";
+        let canvas = parse(doc).unwrap();
+        assert_eq!(canvas.resolve_absolute_position("member"), None);
+    }
+
+    #[test]
+    fn resolve_absolute_position_is_none_when_the_node_itself_is_unpositioned() {
+        let doc = "# Root\n\n## Frame\n<!-- meshfox:node type=\"group\" x=100 y=100 -->\n\n### Member\n<!-- meshfox:node -->\n\nbody\n";
+        let canvas = parse(doc).unwrap();
+        assert_eq!(canvas.resolve_absolute_position("member"), None);
+    }
+
+    #[test]
+    fn resolve_absolute_position_is_plain_xy_for_a_node_not_nested_under_any_group() {
+        let doc = "# Root\n\n## Section\n<!-- meshfox:node x=50 y=60 -->\n\nbody\n";
+        let canvas = parse(doc).unwrap();
+        assert_eq!(canvas.resolve_absolute_position("section"), Some((50.0, 60.0)));
+    }
+
+    #[test]
+    fn resolve_absolute_position_compounds_through_nested_groups() {
+        let doc = "# Root\n\n###### Outer\n<!-- meshfox:node id=\"outer\" type=\"group\" x=10 y=10 -->\n\n###### Inner\n<!-- meshfox:node id=\"inner\" type=\"group\" parent=\"outer\" x=5 y=5 -->\n\n###### Leaf\n<!-- meshfox:node id=\"leaf\" parent=\"inner\" x=2 y=2 -->\n\nbody\n";
+        let canvas = parse(doc).unwrap();
+        assert_eq!(canvas.resolve_absolute_position("leaf"), Some((17.0, 17.0)));
+    }
+
+    #[test]
+    fn absolute_to_local_round_trips_through_resolve_absolute_position() {
+        let doc = "# Root\n\n## Frame\n<!-- meshfox:node type=\"group\" x=100 y=100 -->\n\n### Member\n<!-- meshfox:node x=20 y=20 -->\n\nbody\n";
+        let canvas = parse(doc).unwrap();
+        let (abs_x, abs_y) = canvas.resolve_absolute_position("member").unwrap();
+        assert_eq!(canvas.absolute_to_local("member", abs_x, abs_y), Some((20.0, 20.0)));
+    }
+
+    #[test]
+    fn absolute_to_local_is_none_when_a_group_ancestor_has_no_anchor() {
+        let doc = "# Root\n\n## Frame\n<!-- meshfox:node type=\"group\" -->\n\n### Member\n<!-- meshfox:node -->\n\nbody\n";
+        let canvas = parse(doc).unwrap();
+        assert_eq!(canvas.absolute_to_local("member", 200.0, 200.0), None);
+    }
+
+    #[test]
+    fn absolute_to_local_is_identity_for_a_node_not_nested_under_any_group() {
+        let doc = "# Root\n\n## Section\n<!-- meshfox:node -->\n\nbody\n";
+        let canvas = parse(doc).unwrap();
+        assert_eq!(canvas.absolute_to_local("section", 42.0, 43.0), Some((42.0, 43.0)));
     }
 }
 

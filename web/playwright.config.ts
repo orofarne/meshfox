@@ -22,6 +22,36 @@ const SELECT_PORT = 4592;
 // reintroduces one, unwanted writes) can't collide with any other suite's
 // canvas file.
 const SETTINGS_PORT = 4593;
+// Fifth server + port for fold.spec.ts — same reasoning again, its own
+// fixture (fold.canvas.md, a parent with two children plus an auto-placed
+// sibling) and port, so a fold-state localStorage key or a reload doesn't
+// collide with any other suite's server/canvas.
+const FOLD_PORT = 4594;
+// Sixth server + port for keyboard-nav.spec.ts — same reasoning again, its
+// own fixture (keyboard-nav.canvas.md) and port.
+const KEYBOARD_NAV_PORT = 4595;
+// Seventh server + port for group-drag.spec.ts — same reasoning again, its
+// own fixture (group-drag.canvas.md, a group with a real anchor plus two
+// real, group-relative members) and port, so its own Edit-mode drags never
+// collide with any other suite's server/canvas.
+const GROUP_DRAG_PORT = 4596;
+// Eighth server + port for group-enter.spec.ts — same reasoning again, its
+// own fixture (group-enter.canvas.md) and port.
+const GROUP_ENTER_PORT = 4597;
+// Ninth server + port for document-options.spec.ts — same reasoning
+// again, its own fixture (document-options.canvas.md) and port, so its
+// own `PUT /api/options` writes never collide with any other suite's
+// server/canvas.
+const DOCUMENT_OPTIONS_PORT = 4598;
+// Tenth server + port for default-fold.spec.ts — same reasoning again,
+// its own fixture (default-fold.canvas.md, deliberately undeclaring
+// `unfold` so `resolveDefaultFold`'s own default is what's under test)
+// and port.
+const DEFAULT_FOLD_PORT = 4599;
+// Eleventh server + port for quick-run.spec.ts — same reasoning again, its
+// own fixture (quick-run.canvas.md) and port, so its `tty` run never
+// collides with any other suite's server/canvas.
+const QUICK_RUN_PORT = 4600;
 
 // Taller than Playwright's 720px default — the app's own `minZoom` (0.5)
 // is a hard floor on how far "fit view" can zoom out, and deps.canvas.md's
@@ -50,27 +80,70 @@ export default defineConfig({
   },
   // One (deps/scroll/select) trio of projects per browser — `<browser>-deps`,
   // `<browser>-scroll`, `<browser>-select`, e.g. `chrome-deps`/`firefox-deps`.
+  // Every `testMatch` below is anchored to the *end* of the path, requiring
+  // a `/` or start-of-string right before the filename (`(^|\/)name\.spec\.ts$`)
+  // — a bare `$`-only anchor still isn't enough on its own: Playwright
+  // matches against each file's full path (test dir prefix and all), which
+  // an anchor covering the *whole* string would never match. Left fully
+  // unanchored (as this used to be), `/fold\.spec\.ts/` would also match
+  // `default-fold.spec.ts` (a valid substring), silently running it as
+  // part of the wrong project against the wrong fixture/server.
   projects: (
     [
       ["chrome", devices["Desktop Chrome"]],
       ["firefox", devices["Desktop Firefox"]],
     ] as const
   ).flatMap(([browser, device]) => [
-    { name: `${browser}-deps`, testMatch: /deps\.spec\.ts/, use: { ...device, viewport: VIEWPORT } },
+    { name: `${browser}-deps`, testMatch: /(^|\/)deps\.spec\.ts$/, use: { ...device, viewport: VIEWPORT } },
     {
       name: `${browser}-scroll`,
-      testMatch: /scroll\.spec\.ts/,
+      testMatch: /(^|\/)scroll\.spec\.ts$/,
       use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${SCROLL_PORT}` },
     },
     {
       name: `${browser}-select`,
-      testMatch: /select\.spec\.ts/,
+      testMatch: /(^|\/)select\.spec\.ts$/,
       use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${SELECT_PORT}` },
     },
     {
       name: `${browser}-settings`,
-      testMatch: /settings\.spec\.ts/,
+      testMatch: /(^|\/)settings\.spec\.ts$/,
       use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${SETTINGS_PORT}` },
+    },
+    {
+      name: `${browser}-fold`,
+      testMatch: /(^|\/)fold\.spec\.ts$/,
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${FOLD_PORT}` },
+    },
+    {
+      name: `${browser}-keyboard-nav`,
+      testMatch: /(^|\/)keyboard-nav\.spec\.ts$/,
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${KEYBOARD_NAV_PORT}` },
+    },
+    {
+      name: `${browser}-group-drag`,
+      testMatch: /(^|\/)group-drag\.spec\.ts$/,
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${GROUP_DRAG_PORT}` },
+    },
+    {
+      name: `${browser}-group-enter`,
+      testMatch: /(^|\/)group-enter\.spec\.ts$/,
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${GROUP_ENTER_PORT}` },
+    },
+    {
+      name: `${browser}-document-options`,
+      testMatch: /(^|\/)document-options\.spec\.ts$/,
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${DOCUMENT_OPTIONS_PORT}` },
+    },
+    {
+      name: `${browser}-default-fold`,
+      testMatch: /(^|\/)default-fold\.spec\.ts$/,
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${DEFAULT_FOLD_PORT}` },
+    },
+    {
+      name: `${browser}-quick-run`,
+      testMatch: /(^|\/)quick-run\.spec\.ts$/,
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${QUICK_RUN_PORT}` },
     },
   ]),
   webServer: [
@@ -106,6 +179,48 @@ export default defineConfig({
     {
       command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view e2e/fixtures/settings.canvas.md --port ${SETTINGS_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${SETTINGS_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view e2e/fixtures/fold.canvas.md --port ${FOLD_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${FOLD_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view e2e/fixtures/keyboard-nav.canvas.md --port ${KEYBOARD_NAV_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${KEYBOARD_NAV_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view e2e/fixtures/group-drag.canvas.md --port ${GROUP_DRAG_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${GROUP_DRAG_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view e2e/fixtures/group-enter.canvas.md --port ${GROUP_ENTER_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${GROUP_ENTER_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view e2e/fixtures/document-options.canvas.md --port ${DOCUMENT_OPTIONS_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${DOCUMENT_OPTIONS_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view e2e/fixtures/default-fold.canvas.md --port ${DEFAULT_FOLD_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${DEFAULT_FOLD_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view e2e/fixtures/quick-run.canvas.md --port ${QUICK_RUN_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${QUICK_RUN_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },

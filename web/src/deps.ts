@@ -92,30 +92,3 @@ export function resolveChain(graph: Map<string, BlockInfo>, target: BlockAddr): 
   return order;
 }
 
-export interface BlockDepEdge {
-  id: string;
-  fromNodeId: string;
-  fromBlock: string;
-  toNodeId: string;
-  toBlock: string;
-}
-
-/** Cross-node dependency edges, for drawing arrows — same-node deps aren't
- * included (there's nothing to connect: both ends are the same React Flow
- * node), and are shown as inline text on the block itself instead. */
-export function crossNodeDepEdges(graph: Map<string, BlockInfo>): BlockDepEdge[] {
-  const edges: BlockDepEdge[] = [];
-  for (const info of graph.values()) {
-    for (const dep of info.deps) {
-      if (dep.nodeId === info.addr.nodeId) continue;
-      edges.push({
-        id: `dep:${addrKey(dep)}->${addrKey(info.addr)}`,
-        fromNodeId: dep.nodeId,
-        fromBlock: dep.blockName,
-        toNodeId: info.addr.nodeId,
-        toBlock: info.addr.blockName,
-      });
-    }
-  }
-  return edges;
-}
