@@ -1181,26 +1181,41 @@ export default function App() {
         // routed through the plain Left/Right handle pair every node also
         // has (the "default" case below), a bezier's horizontal tangents
         // bow the curve sideways regardless of where the other endpoint
-        // actually is, which routinely sends it straight through whatever
-        // node sits between two endpoints stacked mostly vertically rather
-        // than side by side. Picking the vertical Top/Bottom pair instead
-        // (see MeshNode.tsx) for that case gives the curve a vertical
-        // tangent that runs past a between-node's side instead of through
-        // its middle. Absolute centers (`boxes`, already computed above
-        // for `positionFor`) rather than each node's own possibly-
-        // group-relative `position`, so this compares like with like
-        // regardless of nesting. Always an explicit id either way — same
-        // "no id given, just grab the first handle of that type" pitfall
-        // as the structural edges above, now that every node has more
-        // than one handle of each type. */
+        // actually is, which routinely cuts straight across a node's own
+        // box on the way there. Picking the vertical Top/Bottom pair
+        // instead (see MeshNode.tsx) avoids that whenever the two boxes'
+        // *y-ranges* don't overlap at all — a real gap the curve can stay
+        // inside of for its whole vertical travel, unlike a horizontal
+        // chord between two wide boxes with lots of shared x-range, which
+        // has nowhere to go but through one or both of them. Comparing
+        // actual box extents rather than center-to-center distance
+        // matters here: two wide boxes stacked with a real vertical gap
+        // between them can still have their *centers* mostly offset
+        // sideways (their width dwarfing the gap), which centroid
+        // comparison alone would misread as "these are side by side" and
+        // route horizontally anyway — straight through both. Symmetric
+        // check for the x-ranges not overlapping (classic side-by-side,
+        // already the common case the plain default handled correctly on
+        // its own) rounds this out; where both ranges overlap (one box's
+        // footprint genuinely overlaps the other's) there's no gap on
+        // either axis to route through, so this just keeps the plain
+        // default rather than attempting real obstacle-avoiding pathfinding.
+        // Absolute box extents (`boxes`, already computed above for
+        // `positionFor`) rather than each node's own possibly-group-
+        // relative `position`, so this compares like with like regardless
+        // of nesting. Always an explicit id either way — same "no id
+        // given, just grab the first handle of that type" pitfall as the
+        // structural edges above, now that every node has more than one
+        // handle of each type.
         const sourceBox = boxes.get(e.source);
         const targetBox = boxes.get(e.target);
         const handles: { sourceHandle: string; targetHandle: string } = (() => {
           if (sourceBox && targetBox) {
-            const dx = targetBox.x + targetBox.width / 2 - (sourceBox.x + sourceBox.width / 2);
-            const dy = targetBox.y + targetBox.height / 2 - (sourceBox.y + sourceBox.height / 2);
-            if (Math.abs(dy) > Math.abs(dx)) {
-              return dy > 0
+            const sourceBottom = sourceBox.y + sourceBox.height;
+            const targetBottom = targetBox.y + targetBox.height;
+            const yOverlaps = sourceBox.y < targetBottom && targetBox.y < sourceBottom;
+            if (!yOverlaps) {
+              return sourceBottom <= targetBox.y
                 ? { sourceHandle: "source-bottom", targetHandle: "target-top" }
                 : { sourceHandle: "source-top", targetHandle: "target-bottom" };
             }

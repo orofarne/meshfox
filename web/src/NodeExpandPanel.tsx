@@ -11,6 +11,7 @@ import {
   type OnEdgesChange,
 } from "@xyflow/react";
 import { NodeBodyContent, MeshNode, type MeshNodeData } from "./MeshNode";
+import { DeletableEdge } from "./DeletableEdge";
 import type { CanvasDoc } from "./types";
 import { subtreeIds } from "./tree";
 import type { ThemePreference } from "./theme";
@@ -38,6 +39,13 @@ interface NodeExpandPanelProps {
 }
 
 const nodeTypes = { mesh: MeshNode };
+// Same registration as App.tsx's own `<ReactFlow>` — without it, this
+// second, independent `<ReactFlow>` instance falls back to React Flow's
+// plain default edge component for every member edge, silently losing
+// `DeletableEdge`'s own delete button, click-to-open properties panel, and
+// per-edge styling (color/dash/arrowheads) the moment a group's members
+// are viewed through this panel instead of the main canvas.
+const edgeTypes = { extra: DeletableEdge, tree: DeletableEdge };
 
 /**
  * A node's own body, expanded into a floating window — same portal/fixed-
@@ -144,6 +152,7 @@ export function NodeExpandPanel({
                 onNodesChange={onNodesChange}
                 onEdgesChange={onEdgesChange}
                 nodeTypes={nodeTypes}
+                edgeTypes={edgeTypes}
                 nodesDraggable={editMode}
                 colorMode={themePreference}
                 fitView

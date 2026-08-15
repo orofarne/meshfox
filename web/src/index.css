@@ -1255,14 +1255,26 @@ a {
  * style/arrowheads (see DeletableEdge.tsx's EdgeEditorPanel) — same small
  * floating-card shape as .vars-modal, just anchored to the edge instead of
  * centered over the whole canvas, and with no backdrop since it's meant to
- * feel like a direct-manipulation control rather than a blocking dialog. */
+ * feel like a direct-manipulation control rather than a blocking dialog.
+ * Portaled straight to `document.body` (`position: fixed`, screen
+ * coordinates) rather than positioned in place through `EdgeLabelRenderer`
+ * — that container lives *inside* `.react-flow__viewport`, itself capped
+ * at a modest fixed z-index no `z-index` set here could ever climb above;
+ * a node's floating "+" button (`.mesh-node-add-child`'s `NodeToolbar`)
+ * portals *outside* that viewport and gets elevated well past it the
+ * moment its node is selected or dragged, which is what let it visibly
+ * bleed through this panel before. `z-index: 2100` matches
+ * `.vars-modal-backdrop` — same "always the topmost, most-focused
+ * control" footing, for the same reason. `top`/`left: 0` matter more than
+ * they look: DeletableEdge.tsx's inline `transform: translate(...)` is
+ * the only thing positioning this panel, and a `position: fixed` element
+ * with no inset properties of its own falls back to its *static* flow
+ * position — for a plain `<div>` appended as one of `document.body`'s
+ * many children (the rest of the app's own UI, unlike the small,
+ * otherwise-empty `EdgeLabelRenderer` container this used to live in),
+ * that's way below all of it, not the viewport origin the translate math
+ * assumes. */
 .mesh-edge-editor {
-  /* Same reason `.mesh-edge-delete` needs it — this panel's positioning
-   * parent, `.react-flow__edgelabel-renderer`, is a canvas-wide overlay
-   * with `pointer-events: none` so it doesn't block clicks meant for
-   * whatever's underneath; without restoring it here, none of this
-   * panel's own inputs/selects/buttons would be clickable. */
-  pointer-events: all;
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
@@ -1274,7 +1286,9 @@ a {
   border-radius: 8px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
   font-size: 0.8rem;
-  z-index: 10;
+  z-index: 2100;
+  top: 0;
+  left: 0;
 }
 
 .mesh-edge-editor-close {
@@ -1322,6 +1336,17 @@ a {
   display: flex;
   gap: 0.3rem;
   margin-top: 0.25rem;
+}
+
+/* This panel's own "Delete arrow" — replaces the on-canvas midpoint "×"
+ * for an extra edge (see DeletableEdge.tsx's own doc comment for why:
+ * that button routinely ended up buried under wherever another edge
+ * happened to cross it). `.node-settings-delete-button` for the shared
+ * destructive-action look; this rule just widens it to the panel's own
+ * fields and gives it some breathing room from the fields above. */
+.mesh-edge-editor-delete {
+  margin-top: 0.5rem;
+  width: 100%;
 }
 
 /* Pre-run "configure missing variables" modal (see VarsForm.tsx) — the

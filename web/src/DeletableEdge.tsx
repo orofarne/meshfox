@@ -1,9 +1,12 @@
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   BaseEdge,
   EdgeLabelRenderer,
   getBezierPath,
   getSmoothStepPath,
+  useReactFlow,
+  useViewport,
   type EdgeProps,
 } from "@xyflow/react";
 import type { ExtraEdgeDto } from "./types";
@@ -43,14 +46,21 @@ export interface DeletableEdgeData {
  * right-angle path shape the indented-tree layout expects) or, for an
  * extra (`meshfox:edge`) edge, a curved bezier instead — a deliberately
  * different, non-rectangular shape so it always reads as "an authored
- * cross-reference", never as another nesting line. Either way, a small "×"
- * button at the midpoint (visible only in edit mode) fires `data.onDelete`.
+ * cross-reference", never as another nesting line.
  *
- * An extra edge additionally gets: its `label` shown at the midpoint
- * whenever set (any mode — it's diagram content, not an editing control),
- * and, in edit mode, a click-to-open inline editor (see `EdgeEditorPanel`)
- * for that label plus color/line-style/arrowhead choices, reachable either
- * via the pencil-adjacent toolbar or by clicking the edge itself.
+ * A structural (`tree`) edge's only delete control is the small "×" button
+ * at its own midpoint (visible only in edit mode) — it has no properties
+ * panel of its own to hold one instead. An extra edge's midpoint "×" is
+ * dropped in favor of a "Delete" button inside its properties panel (see
+ * `EdgeEditorPanel`) instead: a floating button sitting right where two
+ * edges cross (routinely the case for a `meshfox:edge`, which can connect
+ * any two nodes anywhere on the canvas) ends up buried under whichever one
+ * painted last, effectively unclickable — the panel doesn't have that
+ * problem, since only one can ever be open at a time and it's always the
+ * topmost thing on screen (see that component's own doc comment). It also
+ * still gets its `label`, shown at the midpoint whenever set (any mode —
+ * it's diagram content, not an editing control), and, in edit mode, a
+ * click-to-open for that same panel by clicking the edge itself.
  */
 export function DeletableEdge({
   id,
@@ -110,14 +120,20 @@ export function DeletableEdge({
                 ))}
               </span>
             )}
-            <button
-              type="button"
-              className="mesh-edge-delete"
-              onClick={edgeData.onDelete}
-              title={edgeData.title}
-            >
-              ×
-            </button>
+            {/* An extra edge's own delete control lives in its properties
+             * panel instead (see `EdgeEditorPanel`'s own "Delete" button) —
+             * a structural `tree` edge has no such panel, so this stays its
+             * only way to delete. */}
+            {!edgeData.editable && (
+              <button
+                type="button"
+                className="mesh-edge-delete"
+                onClick={edgeData.onDelete}
+                title={edgeData.title}
+              >
+                ×
+              </button>
+            )}
           </div>
         </EdgeLabelRenderer>
       )}
@@ -141,9 +157,7 @@ export function DeletableEdge({
         </EdgeLabelRenderer>
       )}
       {open && canEdit && (
-        <EdgeLabelRenderer>
-          <EdgeEditorPanel data={edgeData!} x={labelX} y={labelY} onClose={() => setOpen(false)} />
-        </EdgeLabelRenderer>
+        <EdgeEditorPanel data={edgeData!} x={labelX} y={labelY} onClose={() => setOpen(false)} />
       )}
     </>
   );
@@ -159,7 +173,23 @@ const AUTOSAVE_DELAY_MS = 500;
 /** Inline "click the arrow" editor for one extra edge's label/color/line
  * style/arrowheads — every field auto-saves (debounced), same convention
  * `NodeSettings` uses for a node's own fields, just scoped to this one
- * popover instead of a modal. */
+ * popover instead of a modal.
+ *
+ * Portaled straight to `document.body` (`x`/`y` are flow-space coordinates,
+ * converted to screen ones below via `flowToScreenPosition`) rather than
+ * rendered through `EdgeLabelRenderer` in place, like every other floating
+ * overlay in this app (`NodeExpandPanel`/`TtyPanel`/`NodeTextEditor`) —
+ * `EdgeLabelRenderer`'s own container sits *inside* `.react-flow__viewport`,
+ * which is capped at a fixed z-index of its own; a node's floating "+"
+ * button (`NodeToolbar`, see MeshNode.tsx) portals *outside* that viewport
+ * entirely and gets elevated well above it the moment its node is selected
+ * or dragged, so no z-index set on this panel itself could ever have
+ * outranked it — confirmed the hard way (see the bug this fixed: the
+ * button visibly bled through this panel's own background). `useViewport`
+ * has no direct effect on the JSX below; it exists purely so this
+ * component re-renders (and so re-reads `flowToScreenPosition`, which
+ * itself isn't reactive) on every pan/zoom, keeping the panel glued to its
+ * edge instead of drifting from it the moment the canvas moves. */
 function EdgeEditorPanel({
   data,
   x,
@@ -171,6 +201,9 @@ function EdgeEditorPanel({
   y: number;
   onClose: () => void;
 }) {
+  const { flowToScreenPosition } = useReactFlow();
+  useViewport();
+  const { x: screenX, y: screenY } = flowToScreenPosition({ x, y });
   const [label, setLabel] = useState(data.label ?? "");
   const [color, setColor] = useState(data.color ?? "");
   const [lineStyle, setLineStyle] = useState<NonNullable<ExtraEdgeDto["style"]>>(data.style ?? "dashed");
@@ -219,12 +252,24 @@ function EdgeEditorPanel({
     onClose();
   };
 
-  return (
+  // No `onClose()` call needed here (unlike `handleClose` above) — removing
+  // the edge unmounts this panel along with it, once `data.onDelete()`
+  // drops it from `App.tsx`'s own edges. Any pending autosave is dropped
+  // rather than flushed first, same reasoning: about to be deleted, so
+  // there's nothing left for that write to matter to.
+  const handleDelete = () => {
+    if (pendingSave.current) {
+      clearTimeout(pendingSave.current);
+    }
+    data.onDelete();
+  };
+
+  return createPortal(
     <div
       className="mesh-edge-editor nodrag nopan"
       style={{
-        position: "absolute",
-        transform: `translate(-50%, -100%) translate(${x}px, ${y - 14}px)`,
+        position: "fixed",
+        transform: `translate(-50%, -100%) translate(${screenX}px, ${screenY - 14}px)`,
       }}
       onClick={(e) => e.stopPropagation()}
     >
@@ -288,6 +333,15 @@ function EdgeEditorPanel({
         <span>Tags</span>
         <TagEditor tags={tags} onChange={setTags} />
       </label>
-    </div>
+      <button
+        type="button"
+        className="mesh-edge-editor-delete node-settings-delete-button"
+        onClick={handleDelete}
+        title={data.title}
+      >
+        Delete arrow
+      </button>
+    </div>,
+    document.body,
   );
 }
