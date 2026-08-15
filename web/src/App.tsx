@@ -35,7 +35,7 @@ import {
   type NodePatch,
 } from "./api";
 import type { CanvasDoc, CanvasNode, ExtraEdgeDto, VarStatus } from "./types";
-import { pathTo, deriveEdges, findRoot, visibleNodeIds } from "./tree";
+import { pathTo, deriveEdges, findRoot, visibleNodeIds, subtreeIds } from "./tree";
 import { computeAutoLayout, FOLDED_HEIGHT, type LayoutBox } from "./autolayout";
 import { buildBlockGraph, resolveChain, type BlockAddr } from "./deps";
 import { parseBody, type CodeSegment } from "./fence";
@@ -207,14 +207,6 @@ export default function App() {
   // it survives a reload without polluting the document itself.
   const [foldedNodeIds, setFoldedNodeIds] = useState<Set<string>>(new Set());
   const foldedStorageKeyRef = useRef<string | null>(null);
-  const toggleFold = useCallback((id: string) => {
-    setFoldedNodeIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  }, []);
   // Restores folded state for whichever canvas just loaded, keyed by its
   // root node's id (stable across reloads/renames per SPEC.md — the only
   // thing here that reliably identifies "this document" client-side).
@@ -301,6 +293,65 @@ export default function App() {
   // node back to the placeholder height for a frame before re-measuring.
   // Kept in sync by the measured-height effect further down.
   const measuredHeightsRef = useRef<Map<string, number>>(new Map());
+  const toggleFold = useCallback(
+    (id: string) => {
+      const isUnfolding = foldedNodeIds.has(id);
+      setFoldedNodeIds((prev) => {
+        const next = new Set(prev);
+        if (next.has(id)) next.delete(id);
+        else next.add(id);
+        return next;
+      });
+      if (!isUnfolding || !canvas || !flowInstance) return;
+      // Unfolding can reveal a subtree wide enough that it no longer fits
+      // the current viewport at the current zoom — shift the camera so
+      // the just-unfolded node's own left edge lands near the viewport's
+      // own left edge (same left padding the very first view uses, see
+      // `INITIAL_VIEW_PADDING_X`), maximizing how much of the newly
+      // revealed content to its right actually ends up on screen.
+      // Computed directly via `computeAutoLayout` against the *resulting*
+      // folded set, rather than read back from `nodes`/React Flow's own
+      // store afterward — those only settle a render or two later, once
+      // the reflow effect further down reacts to this same
+      // `foldedNodeIds` change, which would mean either racing that
+      // effect or reading a stale, still-folded layout.
+      const nextFolded = new Set(foldedNodeIds);
+      nextFolded.delete(id);
+      const boxes = computeAutoLayout({
+        canvas,
+        viewportWidth: viewportWidthRef.current,
+        measuredHeight: (nodeId) => measuredHeightsRef.current.get(nodeId),
+        foldedNodeIds: nextFolded,
+      });
+      const nodeBox = boxes.get(id);
+      if (!nodeBox) return;
+      // The revealed subtree's own rightmost extent — every descendant
+      // that's now actually visible has an entry in `boxes`; one still
+      // hidden behind its own, separately folded subtree doesn't, and is
+      // rightly left out of this.
+      let maxX = nodeBox.x + nodeBox.width;
+      for (const descendantId of subtreeIds(canvas, id)) {
+        const box = boxes.get(descendantId);
+        if (box) maxX = Math.max(maxX, box.x + box.width);
+      }
+      // Whether it "fits" has to be judged against where the content
+      // actually sits on screen *right now*, not just whether it's
+      // narrower than the viewport in the abstract — content well within
+      // the viewport's own width can still be scrolled off past its
+      // right edge entirely (exactly what a group tucked far out to the
+      // right, itself unfolded for the first time, routinely is), and a
+      // width-only check would wrongly call that "already fits".
+      const viewport = flowInstance.getViewport();
+      const screenLeft = nodeBox.x * viewport.zoom + viewport.x;
+      const screenRight = maxX * viewport.zoom + viewport.x;
+      if (screenLeft >= 0 && screenRight <= viewportWidthRef.current) return;
+      flowInstance.setViewport(
+        { x: INITIAL_VIEW_PADDING_X - nodeBox.x * viewport.zoom, y: viewport.y, zoom: viewport.zoom },
+        { duration: 400 },
+      );
+    },
+    [foldedNodeIds, canvas, flowInstance],
+  );
   // Set only while the pre-run "configure variables" modal is open (see
   // VarsForm) — remembers which run to actually start once it's answered.
   // Independent of editMode: asking for run configuration isn't editing
@@ -1468,15 +1519,22 @@ export default function App() {
   // any in-progress drag/selection) — just patch the flags every node
   // reads.
   //
-  // Also re-wires `onRun`/`onKill`: those close over `handleRun`/
-  // `handleKill`, which in turn close over `editMode` (whether a `cache`d
-  // block's output actually gets persisted, and whether a run reloads the
-  // canvas afterward) — see `executeRun`. The *other* effect that builds
+  // Also re-wires `onRun`/`onKill`/`onToggleFold`: those close over
+  // `handleRun`/`handleKill`/`toggleFold`, which in turn close over
+  // `editMode`/`foldedNodeIds`/`canvas`/`flowInstance` (see `executeRun`
+  // and `toggleFold`'s own doc comment). The *other* effect that builds
   // these closures only runs when `canvas` itself changes, not on an
-  // Edit-mode toggle, so without refreshing them here too, every already
-  // rendered node's run button would keep calling the stale pre-toggle
-  // closure — quietly running with the *old* `editMode` (never persisting,
-  // never reloading) even though the toolbar now says "editing".
+  // Edit-mode toggle or a fold/unfold, so without refreshing them here
+  // too, every already-rendered node's run button (or fold toggle) would
+  // keep calling the stale pre-toggle closure — a run button quietly
+  // running with the *old* `editMode` (never persisting, never reloading)
+  // even though the toolbar now says "editing"; a fold toggle's own
+  // closure permanently stuck thinking `foldedNodeIds` is whatever it was
+  // on the very first canvas load (empty, before `resolveDefaultFold`
+  // even ran) — harmless for the toggle itself (its `setFoldedNodeIds`
+  // call uses the functional-updater form, immune to this), but exactly
+  // the trap its own "did this just reveal a subtree wider than the
+  // viewport" check fell into otherwise.
   useEffect(() => {
     setNodes((nds) =>
       nds.map((n) => ({
@@ -1487,6 +1545,7 @@ export default function App() {
           onRun: (blockName: string, withDeps: boolean) => handleRun(n.id, blockName, withDeps),
           onKill: (blockName: string) => handleKill(n.id, blockName),
           onRunTty: (blockName: string, withDeps: boolean) => handleRunTty(n.id, blockName, withDeps),
+          onToggleFold: () => toggleFold(n.id),
         },
       })),
     );
@@ -1495,7 +1554,7 @@ export default function App() {
     setEdges((eds) =>
       eds.map((e) => (e.type === "extra" || e.type === "tree" ? { ...e, data: { ...e.data, editMode } } : e)),
     );
-  }, [editMode, setNodes, setEdges, handleRun, handleKill, handleRunTty, load]);
+  }, [editMode, setNodes, setEdges, handleRun, handleKill, handleRunTty, toggleFold, load]);
 
   // Every node reachable without descending into a folded subtree, in
   // document (depth-first) order — the same order keyboard nav's j/k walks

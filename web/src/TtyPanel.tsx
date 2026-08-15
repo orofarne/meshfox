@@ -92,6 +92,16 @@ export function TtyPanel({ path, blockName, withDeps, persist, vars, onClose }: 
   const [activeBlock, setActiveBlock] = useState(blockName);
   const [collapsed, setCollapsed] = useState(false);
   const [canKill, setCanKill] = useState(false);
+  // True while the × button's own "still running — kill it?" confirmation
+  // is up — only the × goes through this; the header's dedicated "⏹ kill"
+  // button (see `handleKill` below) stays a direct, unconfirmed action,
+  // same as it always was. The two read as different enough gestures to
+  // warrant different gates: "kill" is reached for *specifically to* end
+  // the session, right there in plain sight next to the terminal's own
+  // output, while "×" is the same close affordance every other panel in
+  // this app has, where ending a live process is a side effect a user
+  // reaching for "close this window" might not expect.
+  const [confirmingClose, setConfirmingClose] = useState(false);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -248,6 +258,18 @@ export function TtyPanel({ path, blockName, withDeps, persist, vars, onClose }: 
     wsRef.current?.close();
     onClose();
   };
+  // The × button's own click handler — `canKill` (true from `started`
+  // until the run's own step-end/killed/error, see the WebSocket handler
+  // above) is exactly "is there a live process this would kill", so
+  // that's the gate: ask first when there is one, close straight away
+  // (nothing to lose) once the run's already finished on its own.
+  const handleCloseClick = () => {
+    if (canKill) {
+      setConfirmingClose(true);
+      return;
+    }
+    handleClose();
+  };
 
   return createPortal(
     // Unlike NodeTextEditor's backdrop, a click here never closes the
@@ -270,7 +292,7 @@ export function TtyPanel({ path, blockName, withDeps, persist, vars, onClose }: 
             <button type="button" onClick={() => setCollapsed(true)} title="Minimize — session keeps running">
               _
             </button>
-            <button type="button" onClick={handleClose} title="Close (ends the session if still running)">
+            <button type="button" onClick={handleCloseClick} title="Close (ends the session if still running)">
               ✕
             </button>
           </span>
@@ -293,6 +315,25 @@ export function TtyPanel({ path, blockName, withDeps, persist, vars, onClose }: 
         <button type="button" className="mesh-tty-pill" onClick={() => setCollapsed(false)}>
           ▶ {activeBlock} · {statusLabel(status, exitCode, errorMsg)}
         </button>
+      )}
+      {confirmingClose && (
+        <div className="vars-modal-backdrop" onClick={() => setConfirmingClose(false)}>
+          <div className="vars-modal" onClick={(e) => e.stopPropagation()}>
+            <h3>Close this session?</h3>
+            <p className="vars-modal-hint">
+              {activeBlock} is still running — closing this terminal kills it, same as closing a real terminal
+              window.
+            </p>
+            <div className="vars-modal-actions">
+              <button type="button" onClick={() => setConfirmingClose(false)}>
+                cancel
+              </button>
+              <button type="button" className="node-settings-delete-button" onClick={handleClose}>
+                close &amp; kill
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>,
     document.body,
