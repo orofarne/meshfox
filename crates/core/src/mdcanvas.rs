@@ -813,7 +813,8 @@ pub fn set_document_options(markdown: &str, desired: &[String]) -> Option<String
 /// the updated document and the new node's (uniquely slugged) id. No
 /// position is set, so the web client's own client-side auto-layout places
 /// it using the same tree-aware default every other position-less node
-/// gets, until it's dragged or `meshfox fmt` gives it a real one.
+/// gets, until it's dragged (or hand-authored/`node meta`-set) into a real
+/// one.
 ///
 /// `parent_id` already at CommonMark's level-6 heading ceiling (i.e. it's
 /// `######`) is handled, not rejected: the new node is still written as

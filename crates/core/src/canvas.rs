@@ -44,8 +44,8 @@ pub enum NodeType {
     /// the target is another Markdown (or `.canvas.md`) file whose content
     /// gets spliced in dynamically wherever a consumer resolves includes
     /// (`crate::include::resolve`, called by the server before serving
-    /// `GET /api/canvas`). Never resolved on disk: `run`/`fmt`/`validate`
-    /// parse the raw file and see the bare link, same as `file`/`link`.
+    /// `GET /api/canvas`). Never resolved on disk: `run`/`validate` parse
+    /// the raw file and see the bare link, same as `file`/`link`.
     Include,
 }
 

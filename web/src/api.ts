@@ -108,8 +108,8 @@ export async function saveCanvasSource(text: string): Promise<void> {
  * Adds a new, empty-bodied child node under `parentId`, titled `title` —
  * lands as the last item in the parent's existing subtree, with no
  * position set (the web client's own auto-layout, see `./autolayout.ts`,
- * places it same as any other position-less node, until it's dragged or
- * `meshfox fmt` gives it a real one). Returns the fresh canvas (same shape
+ * places it same as any other position-less node, until it's dragged into
+ * a real one). Returns the fresh canvas (same shape
  * `fetchCanvas` returns) so the caller can just `setCanvas` with it
  * directly.
  */

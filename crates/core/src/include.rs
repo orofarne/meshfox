@@ -2,7 +2,7 @@
 //!
 //! This never touches disk beyond *reading* include targets: `resolve`
 //! takes a parsed `Canvas` and returns a new one with every `include` node
-//! expanded in memory. `run`/`fmt`/`check` never call this — they work on
+//! expanded in memory. `run`/`check` never call this — they work on
 //! a single file's raw text directly, and see a bare `[label](target)`
 //! link, same as `file`/`link`. Only a consumer that wants the fully
 //! composed view (the server, before serving `GET /api/canvas`) calls it.

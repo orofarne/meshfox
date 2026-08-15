@@ -37,22 +37,13 @@ Status: **early bootstrap**. This document is itself a valid meshfox canvas — 
 ## Auto-layout
 <!-- meshfox:node id="auto-layout" -->
 
-Nobody has to type `x`/`y`/`w`/`h` by hand. There are two independent auto-layout engines now — one on demand in `meshfox fmt`, one live in the web UI for whatever's still unpositioned — deliberately not required to agree pixel-for-pixel; each leans on inputs the other doesn't have.
+Nobody has to type `x`/`y`/`w`/`h` by hand. The web UI lays out anything still unpositioned live, in the browser.
 
-- **On demand**: `meshfox fmt` runs `crates/core/src/layout.rs`'s tree-aware heuristic and actually writes the result into the file (via the usual surgical `set_node_meta` patch, one node at a time). The root and its direct children ("sections") read top-to-bottom with just a small nudge to the right, same as a document's title followed by its headings — not yet a real indent. From there down it's a classic indented tree view, the same shape as a file tree or a collapsed outline: each section's own content steps fully to the right of its parent, siblings at a given depth stack vertically, and further nesting keeps stepping right from there. Box size is estimated from each node's content (line count, whether it has a code fence, whether it needs a run-button row) rather than being a flat constant, so a stub and a node with a paragraph plus cached output don't come out the same size. It's a simple heuristic, not a publication-quality tree drawer — adversarial trees might still look rough:
+`GET /api/canvas` sends exactly what's in the file — no computed suggestion, no `suggestedX`/etc. over the wire. `web/src/autolayout.ts` fills in a box client-side for anything still missing a real position: sections (root and its direct children) read top-to-bottom with just a small nudge to the right, same as a document's title followed by its headings — not yet a real indent. From there down it's a classic indented tree view, the same shape as a file tree or a collapsed outline: each section's own content steps fully to the right of its parent, siblings at a given depth stack vertically without overlapping, and further nesting keeps stepping right from there, with a `group`'s box always the bounding box of its resolved members. Width is tier-based: root and its direct children share one width, `60%` of the viewport; everything deeper gets `55%`, uniformly regardless of how much deeper. Viewport width is read once, when the canvas loads — it doesn't recompute on window resize. Height is never estimated: it comes from React Flow's own measurement of each node's actual rendered content, live — the layout self-corrects as soon as a real measurement lands (and again later, e.g. as a running block's output grows). A depth-≥2 node additionally gets a `max-height` cap so one long block can't drag a whole subtree far from its parent; past the cap it scrolls internally (`.mesh-node-body`'s existing `overflow: auto`) instead of growing the box further. None of this is ever written to the file just from loading it — a node only gets its box persisted once it's actually been dragged/resized (see `touchedNodeIds` in `App.tsx`).
 
-  ```sh
-  meshfox fmt              # fills in position/size only for nodes missing one
-  meshfox fmt --force      # recomputes and overwrites every non-group node
-  ```
+Edit mode's toolbar has an **Auto-layout** button that clears every non-group node's stored `x`/`y`/`w`/`h` in the file outright (`POST /api/canvas/clear-layout`), reverting the whole document to auto-placed — behind a confirmation dialog, since it can't be undone from the UI. Useful for backing out of a bunch of hand-placed positions and letting the client lay everything out fresh.
 
-  `group` nodes are always skipped — their box is derived, never stored, whether or not `--force` is given. Without `--force`, a node keeps whatever it already has; `fmt` only fills gaps, so hand-placed (or already-formatted) nodes aren't disturbed by running it again — the second worked example above, for instance, is already fully positioned, so `meshfox fmt` on it is a no-op.
-
-- **Live in the browser**: `GET /api/canvas` sends exactly what's in the file — no computed suggestion, no `suggestedX`/etc. over the wire. `web/src/autolayout.ts` fills in a box client-side for anything still missing a real position, using the same overall tree shape as `layout.rs` (sections top-to-bottom, deeper nesting branching right, siblings stacked without overlap, a `group`'s box as the bounding box of its resolved members) but with real browser-only inputs instead of a text-length heuristic: root and its direct children share one width, `60%` of the viewport; everything deeper gets `40%`, uniformly regardless of how much deeper. Viewport width is read once, when the canvas loads — it doesn't recompute on window resize. Height is never estimated: it comes from React Flow's own measurement of each node's actual rendered content, live — the layout self-corrects as soon as a real measurement lands (and again later, e.g. as a running block's output grows). A depth-≥2 node additionally gets a `max-height` cap so one long block can't drag a whole subtree far from its parent; past the cap it scrolls internally (`.mesh-node-body`'s existing `overflow: auto`) instead of growing the box further. None of this is ever written to the file just from loading it — same "don't fight the user's own drag" rule as before (see `touchedNodeIds` in `App.tsx`), a node only gets its box persisted once it's actually been dragged/resized, or `meshfox fmt` gives it a real one.
-
-  Edit mode's toolbar has an **Auto-layout** button that clears every non-group node's stored `x`/`y`/`w`/`h` in the file outright (`POST /api/canvas/clear-layout`), reverting the whole document to auto-placed — behind a confirmation dialog, since it can't be undone from the UI. Useful for backing out of a bunch of hand-placed positions and letting the client lay everything out fresh.
-
-  Edit mode's toolbar also has an **⚙ options** button, next to Auto-layout: it toggles `meshfox:option` declarations (currently just `unfold`, which flips whether the canvas opens with every subtree expanded or folded to a compact outline by default) via `PUT /api/options`, writing the same comment hand-editing would. See SPEC.md's "Options".
+Edit mode's toolbar also has an **⚙ options** button, next to Auto-layout: it toggles `meshfox:option` declarations (currently just `unfold`, which flips whether the canvas opens with every subtree expanded or folded to a compact outline by default) via `PUT /api/options`, writing the same comment hand-editing would. See SPEC.md's "Options".
 
 ## Variables
 <!-- meshfox:node id="variables" -->
@@ -76,8 +67,14 @@ an example of the format it's describing.
 meshfox -h
 ```
 <!-- meshfox:output name="usage-help" -->
-```text
+````text
 exit code: 0
+
+
+ /\_/\
+( ¬‿¬ )──●──●──●
+  c c
+
 
 CLI and local web viewer/editor for a meshfox canvas. Run `meshfox spec` for the full .canvas.md format specification.
 
@@ -86,12 +83,13 @@ Usage: meshfox [OPTIONS] [COMMAND]
 Commands:
   run        Run one or more named code blocks
   configure  Interactively resolve every declared `meshfox:var` (see SPEC.md's "Variables") and save the answers to the on-disk cache (`.meshfox/<filename>.env`, next to the canvas file) so `run` doesn't have to ask again. Shows each variable's currently-resolved value as the prompt's own default — press Enter to keep it. Secret variables are never cached, so there's nothing for this to save for them; they're skipped here and asked for fresh at run time instead. Requires an interactive terminal
-  fmt        Fill in x/y/w/h for nodes that don't have them yet, using a simple tree-aware auto-layout (see `meshfox_core::layout`). Never touches `group` nodes — their box is always derived from their children, never stored — and by default leaves any node's position/size alone once it has one, so hand-placed nodes survive a format
   create     Create a new, empty canvas file: just the `meshfox:canvas` marker followed by a lone root heading (`#`) named after the file itself (its name with a trailing `.canvas.md`/`.md` stripped). Fails if the file already exists — this never overwrites
   view       Start the local web UI: canvas view, run buttons. Opens read-only — running a block is always allowed, but click "Edit" in the browser to unlock dragging, resizing, saving layout, and persisting a `cache`d block's output back into the file
-  validate   Validate that a file parses as a meshfox canvas — same checks `run`/`fmt`/`view` already do before touching anything (single root, no duplicate ids, no dangling `meshfox:edge` targets, `group`/ `file`/`link` body rules) — without executing anything or writing the file back. Exits non-zero on a parse error, so it's usable as a pre-commit/CI check
-  check      Run every embedded ` ```starlark constraint ` fence's Starlark contract against the document (see `crate::constraint`/SPEC.md's "Constraint fences") and report which passed. Distinct from `validate`: `validate` checks that the file *parses* as a well-formed canvas; `check` asks whether the document as a whole satisfies whatever rules its own constraint fences declare (e.g. "every node tagged `table` has exactly one `file` child") — implies `validate` first, since an unparseable file has no constraints to run. Exits non-zero if the file fails to parse or any constraint fails, so it's usable as a pre-commit/CI check alongside (or instead of) `validate`
-  list       Print every runnable code block in the canvas as an indented tree, each with a ready-to-paste `meshfox run <path...> <name>` — so you don't have to go spelunking through the file to find out what's runnable. Same raw-file-only scope as `run`/`fmt`/`validate` (no include resolution)
+  tui        Experimental: an ncurses-style terminal viewer — browse the node tree, read a node's rendered Markdown body (syntax-highlighted code, local images shown inline where the terminal supports it), and run blocks with live streamed output, right in the terminal. Same deps-chain/cache/`meshfox:var` handling as `meshfox run`/`meshfox view`. A `tty` block hands the real terminal over to it, same as `meshfox run`'s own `tty` handling. Mouse support covers clicking a tree row to select it (or its ▾/▸ marker to expand/collapse) and scrolling the tree/document panes. Read + run only for now — no structural editing (use `meshfox node ...` or the browser UI's Edit mode for that)
+  validate   Validate that a file parses as a meshfox canvas — same checks `run`/`view` already do before touching anything (single root, no duplicate ids, no dangling `meshfox:edge` targets, `group`/ `file`/`link` body rules) — without executing anything or writing the file back. Exits non-zero on a parse error, so it's usable as a pre-commit/CI check
+  check      Run every embedded ` ```starlark constraint ` fence's Starlark contract against the document (see `crate::constraint`/SPEC.md's "Constraint nodes") and report which passed. Distinct from `validate`: `validate` checks that the file *parses* as a well-formed canvas; `check` asks whether the document as a whole satisfies whatever rules its own constraint fences declare (e.g. "every node tagged `table` has exactly one `file` child") — implies `validate` first, since an unparseable file has no constraints to run. Exits non-zero if the file fails to parse or any constraint fails, so it's usable as a pre-commit/CI check alongside (or instead of) `validate`
+  list       Print every runnable code block in the canvas as an indented tree, each with a ready-to-paste `meshfox run <path...> <name>` — so you don't have to go spelunking through the file to find out what's runnable. Same raw-file-only scope as `run`/`validate` (no include resolution)
+  static     Experimental: export a canvas as a static site. Resolves includes (same as `validate`/`view`), turns the canvas's node tree into a recursive `SiteData` (context key `site`) and hands it to a user-supplied Tera template. A node with no real, authored `x`/`y`/`width`/`height` gets no computed position at all — the template renders it as an ordinary nested HTML element and the *browser* lays it out and sizes it from its real content (no pre-computed/estimated pixels to get wrong); a node that does have all four real values keeps rendering at exactly that authored pixel position. A structural (parent/child) connector between two flow-positioned nodes is drawn in pure CSS (they're always DOM-adjacent); everything else — a `meshfox:edge` cross-reference, or a structural edge touching a real-positioned node — is left for a small non-interactive JS pass in the template to measure and draw. Every `*.tera` file in `--template` (except one whose basename starts with `_`, a partial meant to be `{% import %}`ed rather than rendered standalone) is rendered and written to `--out` at the same relative path minus `.tera`; every other file is copied verbatim (CSS, fonts, ...) — except `template.toml` itself, the template's own config file (optional; a template with none gets an empty `base_url` and no `icons`), read from `--template`'s own directory and never copied to `--out`. A local image referenced from a node's Markdown body is copied alongside the output automatically; a `file`-type node's `display="code"` target is read once and inlined into the HTML directly (nothing left to fetch once static). See `site-template/` in this repo for a working example, including its own `template.toml`
   node       Structural edits to individual nodes in a canvas file: add, move, rename, delete, or set a node's body/position/style/edges — the CLI counterpart to the web UI's Edit-mode node operations (the same `mdcanvas` surgical patches `meshfox view`'s `/api/nodes*` routes use), for scripting/CI or whenever a hand-rewrite would risk getting heading depth, sibling order, or dangling-edge cleanup wrong. Every subcommand validates the fully-patched document still parses before writing it back, same as every other mutating command here
   spec       Print the full .canvas.md format specification (SPEC.md, embedded in this binary at compile time) — the canonical reference for the format, available offline wherever `meshfox` is installed
   help       Print this message or the help of the given subcommand(s)
@@ -105,7 +103,7 @@ Agent Usage:
   If you are an AI coding agent, run `meshfox --agent-help` before hand-editing a
   .canvas.md file. It covers when to prefer `meshfox node <verb>` over a raw text
   edit, how to run non-interactively, and other guidance not covered above.
-```
+````
 <!-- /meshfox:output -->
 
 #### Node commands
@@ -120,7 +118,7 @@ heading depth, moving a subtree without breaking its nesting, deleting a
 node without leaving a dangling `meshfox:edge` behind) can be scripted or
 run in CI without going through the browser, and without hand-rewriting
 Markdown heading levels yourself. Every subcommand takes an optional
-`--canvas <path>` (auto-discovered like `fmt`/`validate`/`list` when omitted)
+`--canvas <path>` (auto-discovered like `validate`/`list` when omitted)
 and validates the whole patched document still parses before writing it
 back — the same validate-before-commit shape every mutating server
 handler already uses. As with any other write in this file, running
@@ -134,7 +132,7 @@ reference elsewhere dangling, which is `validate`'s job to catch, not
 - `mv <node-id> <new-parent-id>` — move a node under a new structural parent in one step (the web UI needs two: link, then promote)
 - `rename <node-id> <title>` — change heading text only; id, heading level, and body untouched
 - `body <node-id> [--file <path>]` — replace a node's whole body, from a file or stdin
-- `meta <node-id> [--x --y --w --h --color --type --display --lang --interpreter --fold]` — set position/size/style; an omitted flag keeps the node's current value; `--w`/`--h` on a `group` are rejected (its box is always derived from its members, same as `fmt`), but `--x`/`--y` are accepted — a group's own position is a real anchor its members' own `x`/`y` are relative to (see SPEC.md); `--fold true`/`--fold false` sets a per-node fold override, `--fold default` clears it back to following the document's own default (see SPEC.md's "Options" section)
+- `meta <node-id> [--x --y --w --h --color --type --display --lang --interpreter --fold]` — set position/size/style; an omitted flag keeps the node's current value; `--w`/`--h` on a `group` are rejected (its box is always derived from its members), but `--x`/`--y` are accepted — a group's own position is a real anchor its members' own `x`/`y` are relative to (see SPEC.md); `--fold true`/`--fold false` sets a per-node fold override, `--fold default` clears it back to following the document's own default (see SPEC.md's "Options" section)
 - `edges <node-id> [--from <id>]... [--clear]` — replace a node's extra (`meshfox:edge`) parents
 - `reorder` — resync sibling heading order in the file to match current x/y, the same resync the server runs on every UI save
 - `show <node-id>` — print a node's parent/children/extra-parents/type/position (read-only)
@@ -151,15 +149,15 @@ Structural edits to individual nodes in a canvas file: add, move, rename, delete
 Usage: meshfox node <COMMAND>
 
 Commands:
-  add      Add a new, empty-bodied child node under `parent-id`, as the last item in its existing subtree (`mdcanvas::insert_child_node`) — same as the web UI's "add child" button. No position is set, so it stays unpositioned (auto-placed by whatever's viewing it — the web UI's own client-side layout, or `meshfox fmt`) until something gives it a real one. Prints the new node's id: a slug of `title`, de-duplicated against every id already in the file
+  add      Add a new, empty-bodied child node under `parent-id`, as the last item in its existing subtree (`mdcanvas::insert_child_node`) — same as the web UI's "add child" button. No position is set, so it stays unpositioned (auto-placed by the web UI's own client-side layout) until something gives it a real one — dragging it in the browser, or `node meta`. Prints the new node's id: a slug of `title`, de-duplicated against every id already in the file
   rm       Delete a node. By default the whole subtree goes with it (`mdcanvas::delete_node`), and any `meshfox:edge from="..."` elsewhere that pointed into the deleted subtree is dropped too, so the file can't be left with a dangling reference. `--keep-children` instead deletes just this node, promoting its direct children (and everything under them, untouched otherwise) to its own former parent (`mdcanvas::delete_node_reparent_children`). Refuses to delete the root either way
   mv       Move a node to a new structural parent (`mdcanvas::reparent_node`). That core function only ever promotes an *existing* extra-parent edge to structural parent — the web UI's two-step dance (drag a new edge onto the node, then promote it) — so this adds the `meshfox:edge from="new-parent-id"` line itself first, making the move a single atomic step from the CLI. Refuses to move the root, or to move a node into itself or one of its own descendants (would make the tree cyclic)
   rename   Rename a node's heading text, leaving its id, heading level, and body untouched (`mdcanvas::set_node_title`) — a node's id is pinned the first time it's written and never follows later title edits
   set-id   Change a node's id (`mdcanvas::rename_node_id`) — the stable handle used for CLI/API addressing, `meshfox:edge from=`/`parent=` references, and `deps="node-id/block"` fence references. Rewrites every reference to the old id it can find: other nodes' `parent=` and `meshfox:edge from=` attributes are updated exactly (they're structurally tracked by the parser), and `deps=` references are updated best-effort (plain text, not parser-validated — run `meshfox validate` afterward to catch anything this missed, e.g. a reference that was already stale). Fails if `new-id` is empty, contains a `"` character, or is already used by another node
   body     Replace a node's whole Markdown body (`mdcanvas::set_node_body`) — what the web UI's in-node editor would send, if it had one yet (see README's roadmap; for now the UI can reposition and run, not edit text). For a `file`/`link` node the body is its one Markdown link (`[title](target)`); a `group` node's body must stay empty. Reads the new body from `--file`, or from stdin if `--file` is omitted
-  meta     Set a node's position/size/style fields (`mdcanvas::set_node_meta`) — `--x`/`--y`/`--w`/`--h` for a manual position/size override (`meshfox fmt` is the usual way to fill these in), `--color`/ `--type`/`--display`/`--lang`/`--interpreter` for style/type. Any field left unset keeps its current value. `group` nodes never store a *size* (`fmt` skips them too, deriving their box from their children instead), so `--w`/`--h` are rejected for one — but a group's own *position* is a real anchor its members' own `x`/`y` are relative to, so `--x`/`--y` is allowed on a group same as any other node
+  meta     Set a node's position/size/style fields (`mdcanvas::set_node_meta`) — `--x`/`--y`/`--w`/`--h` for a manual position/size override, `--color`/`--type`/`--display`/`--lang`/`--interpreter` for style/type. Any field left unset keeps its current value. `group` nodes never store a *size* (its box is always derived from its children instead), so `--w`/`--h` are rejected for one — but a group's own *position* is a real anchor its members' own `x`/`y` are relative to, so `--x`/`--y` is allowed on a group same as any other node
   edges    Replace a node's whole set of extra incoming edges (`meshfox:edge from="..."` lines, `mdcanvas::set_node_edges`) — the non-structural, non-nesting cross-references JSON Canvas-style graphs use. The given `--from` list (repeatable) *replaces* whatever was already there, it doesn't add to it; `--clear` removes them all
-  reorder  Reorder every parent's direct children in the file to match their canvas layout (`mdcanvas::reorder_by_position`, sorted by `y` then `x` among ties) — the same resync the server runs on every save from the web UI, exposed standalone for whenever positions changed by hand (or via `node meta`/`fmt`) and the on-disk heading order should catch up to match what's actually drawn
+  reorder  Reorder every parent's direct children in the file to match their canvas layout (`mdcanvas::reorder_by_position`, sorted by `y` then `x` among ties) — the same resync the server runs on every save from the web UI, exposed standalone for whenever positions changed by hand (or via `node meta`) and the on-disk heading order should catch up to match what's actually drawn
   show     Print one node's parent, children, extra parents, type, and position/style fields — a read-only lookup, since eyeballing the tree shape directly from the file gets harder the deeper it nests
   help     Print this message or the help of the given subcommand(s)
 
@@ -167,6 +165,7 @@ Options:
   -h, --help  Print help
 ```
 <!-- /meshfox:output -->
+
 
 
 
@@ -214,24 +213,6 @@ Wed Aug 12 11:00:52 +04 2026
 ```
 <!-- /meshfox:output -->
 
-### Formatting a copy
-<!-- meshfox:node id="usage-fmt" -->
-
-`fmt` on a scratch copy, so this doesn't touch the tracked example file:
-
-```bash name="fmt-example" cache
-cp examples/hello.canvas.md /tmp/meshfox-fmt-demo.canvas.md
-meshfox fmt /tmp/meshfox-fmt-demo.canvas.md
-rm -f /tmp/meshfox-fmt-demo.canvas.md
-```
-<!-- meshfox:output name="fmt-example" -->
-```text
-exit code: 0
-
-meshfox fmt: placed 4 node(s) in /tmp/meshfox-fmt-demo.canvas.md
-```
-<!-- /meshfox:output -->
-
 ### Interactive (`tty`) blocks
 <!-- meshfox:node id="usage-tty" -->
 
@@ -248,7 +229,7 @@ Run it from a real terminal — `meshfox run README.md usage usage-tty vim-demo`
 
 ![Terminal viewer screenshot](screenshot-tui.webp)
 
-`meshfox tui` is the browser UI's tree-and-block-runner experience without leaving the terminal — one more front door onto the same files, alongside `run` and `view`: a left pane walks the node tree (same `[run]`/`[cache]`/`[tty]` flags `meshfox list` prints, as badges), a right pane renders the selected node's body — headings/lists/tables, syntax-highlighted code fences (`syntect`), and local images (`ratatui-image`, real pixels on a terminal that supports it, half-block Unicode art everywhere else, tmux included). `type="include"` is resolved for browsing (same as the browser's `GET /api/canvas`, unlike `run`/`fmt`/`validate`'s raw-file-only scope), and a `file` node's `display="code"` shows the target's own content, same as the browser's read-only preview.
+`meshfox tui` is the browser UI's tree-and-block-runner experience without leaving the terminal — one more front door onto the same files, alongside `run` and `view`: a left pane walks the node tree (same `[run]`/`[cache]`/`[tty]` flags `meshfox list` prints, as badges), a right pane renders the selected node's body — headings/lists/tables, syntax-highlighted code fences (`syntect`), and local images (`ratatui-image`, real pixels on a terminal that supports it, half-block Unicode art everywhere else, tmux included). `type="include"` is resolved for browsing (same as the browser's `GET /api/canvas`, unlike `run`/`validate`'s raw-file-only scope), and a `file` node's `display="code"` shows the target's own content, same as the browser's read-only preview.
 
 `r` runs a node's block with its `deps=` chain first (same as the browser's "⛓ run chain"); `R` runs just that one block (the plain "run" button's counterpart). A node with more than one runnable block opens a picker first — there's no single obvious default to reach for. Output streams in live and stays visible once the run finishes, same `cache`/`meshfox:var` handling as `run`/`view` either way. A `tty` block hands the whole terminal over to it, exactly like `meshfox run`'s own `tty` handling (see above) — no in-app terminal emulator, this UI's own screen just steps aside and comes back once the block exits. Mouse support is deliberately partial for now: click a tree row to select it (or its `▾`/`▸` marker to expand/collapse it), scroll wheel over the tree or document pane.
 
@@ -343,7 +324,7 @@ crates/
   server/   library crate: axum HTTP backend (load/save a canvas file,
             execute a block) + the built web/ UI, embedded at compile time
             via rust-embed. No [[bin]] of its own — meshfox-cli links it.
-  cli/      the only binary: `meshfox`. `run`/`fmt` use crates/core
+  cli/      the only binary: `meshfox`. `run` uses crates/core
             directly; `view` starts crates/server's backend (with the UI
             baked in) on localhost, read-only until the browser's "Edit"
             button is clicked. One executable, no separate server process
@@ -371,9 +352,8 @@ cargo test --workspace                   # run core's unit tests
 # run block "smoke" on the node reached via tests -> smoke-test
 cargo run -p meshfox-cli -- run examples/hello.canvas.md tests smoke-test smoke
 
-# validate, fmt, and view all take the canvas path the same way
+# validate and view both take the canvas path the same way
 cargo run -p meshfox-cli -- validate examples/hello.canvas.md
-cargo run -p meshfox-cli -- fmt examples/hello.canvas.md
 cargo run -p meshfox-cli -- view examples/hello.canvas.md   # UI + API on :4590, opens read-only,
                                                               # launches your browser (--no-open to skip)
 # (once meshfox is on your PATH: `meshfox view README.md`, `meshfox run

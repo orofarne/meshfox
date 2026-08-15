@@ -72,8 +72,8 @@ function dashArrayFor(style: ExtraEdgeDto["style"]): string | undefined {
  * its text is unreadable, clamped only by the global `minZoom` floor). `1`
  * renders every node's text at exactly the size its own CSS (`.mesh-node`'s
  * `font-size`, etc.) actually specifies — the same "designed" size a
- * hand-authored `w=`/`h=` node or `meshfox fmt`'s auto-layout sizes for —
- * so this is the zoom every node was implicitly sized to read well at. */
+ * hand-authored `w=`/`h=` node is sized for — so this is the zoom every
+ * node was implicitly sized to read well at. */
 const INITIAL_ZOOM = 1;
 
 /** How far the root node's own top-left corner sits from the canvas area's
@@ -1065,11 +1065,12 @@ export default function App() {
     if (!canvas) return;
     // The web client computes its own tree-aware default (see
     // `autolayout.ts`) for any node missing a real position/size — always,
-    // for `group`, whose box is never stored. `meshfox fmt` can write these
-    // into the file for anything but groups; see README's "Auto-layout"
-    // section. Not the server anymore (no more `suggested*` over the API):
-    // only the browser actually knows its own viewport width and each
-    // node's real rendered content height, neither of which the server has.
+    // for `group`, whose box is never stored. Dragging a node in the
+    // browser is the only way to give it a real position/size; see
+    // README's "Auto-layout" section. Not the server anymore (no more
+    // `suggested*` over the API): only the browser actually knows its own
+    // viewport width and each node's real rendered content height, neither
+    // of which the server has.
     const boxes = computeAutoLayout({
       canvas,
       viewportWidth: viewportWidthRef.current,

@@ -122,7 +122,7 @@ of JSON, for readable diffs and hand-editability.
 - **`include`** — same one-link body as `file`/`link`, but the target
   (another `.md` or `.canvas.md` file) is spliced in *dynamically* by
   whatever consumer resolves includes — never written back to disk.
-  `run`/`fmt`/`validate` see the bare link, same as `file`/`link`. See
+  `run`/`validate` see the bare link, same as `file`/`link`. See
   "Includes" below.
 
 Any other `type=` value, a non-empty `group` body, or a `file`/`link`/
@@ -139,7 +139,7 @@ fences" below.
 `type="include"` dynamically splices another file's content into this
 node, resolved fresh every time a consumer asks for it (e.g. the server,
 before serving `GET /api/canvas` to `meshfox view`) — nothing is ever
-written into the including file. `run`/`fmt`/`validate` operate on a single
+written into the including file. `run`/`validate` operate on a single
 file's raw text and never resolve includes; only `validate` reaches far
 enough in to catch a broken target, a parse error in it, or a cycle.
 
@@ -594,9 +594,6 @@ then the block name).
   for the node and another for the block; a node with a default block
   *and* other blocks besides gets the node-id shortcut printed on its own
   header line instead, alongside its other blocks' own lines.
-- `meshfox fmt [--force]` — fill in missing `x/y/w/h` via tree-aware
-  auto-layout (`--force` recomputes all; `group` nodes are always skipped,
-  their box is derived, never stored).
 - `meshfox view [--port] [--no-open]` — local web UI, read-only until
   "Edit" is clicked in the browser. A run's output streams into the
   browser live, line by line, as it happens, rather than appearing all at
@@ -612,7 +609,7 @@ then the block name).
   CI/pre-commit alongside (or instead of) `validate`.
 - `meshfox spec` — print this specification.
 
-`list`/`fmt`/`view`/`validate`/`check` take the canvas path as an optional
+`list`/`view`/`validate`/`check` take the canvas path as an optional
 positional argument; `run` takes it as an optional leading argument (recognized by its
 `.md` suffix, since node ids never have one). Omit it and any of them
 auto-discover the single `*.canvas.md` (or marked `*.md`) file in the

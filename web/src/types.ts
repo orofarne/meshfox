@@ -50,8 +50,8 @@ export interface CanvasNode {
   extraParents?: ExtraEdgeDto[];
   /** Absent means unpositioned — the web client lays such a node out
    * itself (see `./autolayout.ts`), never persisting the result unless the
-   * user actually drags/resizes it or `meshfox fmt` gives it a real one.
-   * The server sends exactly what's in the file, no computed fallback. */
+   * user actually drags/resizes it into a real one. The server sends
+   * exactly what's in the file, no computed fallback. */
   x?: number;
   y?: number;
   width?: number;

@@ -450,8 +450,7 @@ fn parse_or_error(raw: &str) -> Result<Canvas, ApiError> {
 /// wire exactly as parsed (no server-computed layout suggestion) — the web
 /// client lays those out itself, client-side, since it's the one that
 /// actually knows the browser's viewport size and each node's real
-/// rendered content height (see `web/src/autolayout.ts`); `meshfox fmt` is
-/// `crate::layout`'s only remaining caller.
+/// rendered content height (see `web/src/autolayout.ts`).
 /// Parse + splice in every `include` node's target (see
 /// `meshfox_core::include`) — never written back to the file, so a client
 /// editing and PUTting this response back would silently drop any

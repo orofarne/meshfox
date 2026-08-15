@@ -1,18 +1,17 @@
-// Client-side auto-layout for whatever's still unpositioned in the canvas —
-// crates/core/src/layout.rs's counterpart used to fill this role over the
-// API (`suggestedX`/etc.), but that heuristic-based estimate has no way to
+// Client-side auto-layout for whatever's still unpositioned in the canvas.
+// This is the only auto-layout meshfox has — there used to be a parallel
+// heuristic-based estimate on the Rust side (`crates/core/src/layout.rs`,
+// once used by the now-removed `meshfox fmt` command), but it had no way to
 // know the browser's actual viewport width or a node's real rendered
-// content height, both of which this module leans on directly. `layout.rs`
-// itself is untouched and still backs `meshfox fmt` — the two are
-// deliberately independent now, not required to agree pixel-for-pixel.
+// content height, both of which this module leans on directly, so it was
+// dropped in favor of this one. Coordinates are only ever set by dragging a
+// node in the web UI now; nothing hand-computes and writes them anymore.
 //
-// Same overall shape as `layout.rs::compute` (root + its direct children
-// read top-to-bottom in one column, deeper nesting branches right of its
-// own parent, siblings stack vertically without overlapping, a subtree's
-// full consumed height bubbles up to its parent so unrelated branches never
-// collide, a `group`'s box is always the bounding box of its resolved
-// members) — but swaps in real inputs for the two things `layout.rs` could
-// only estimate:
+// Root + its direct children read top-to-bottom in one column, deeper
+// nesting branches right of its own parent, siblings stack vertically
+// without overlapping, a subtree's full consumed height bubbles up to its
+// parent so unrelated branches never collide, a `group`'s box is always the
+// bounding box of its resolved members. Sizing:
 //   - width is tier-based, not content-estimated: root (tree depth 0) and
 //     its direct children (depth 1) all get the same width, a fraction of
 //     the viewport; everything deeper gets a narrower fraction, uniformly
@@ -30,10 +29,9 @@
 //     flows into the stacking math for free.
 //
 // A node with a real, authored position (`x`/`y`) — or, transitively, a
-// real `height` — anchors there instead of at the ideal synthetic spot,
-// same "don't fight the user's own drag" rule `layout.rs` has; nothing here
-// is ever written back to the file on its own (see App.tsx's
-// `touchedNodeIds`/`handleSaveLayout`).
+// real `height` — anchors there instead of at the ideal synthetic spot, so
+// this never fights the user's own drag; nothing here is ever written back
+// to the file on its own (see App.tsx's `touchedNodeIds`/`handleSaveLayout`).
 
 import type { CanvasDoc, CanvasNode } from "./types";
 import { findRoot, subtreeIds, visibleNodeIds } from "./tree";
@@ -67,7 +65,7 @@ const ROOT_CHILD_INDENT = 32;
 const WIDTH_RATIO_SHALLOW = 0.6;
 /** Everything deeper (depth ≥2) gets this fraction instead, uniformly
  * regardless of how much deeper. */
-const WIDTH_RATIO_DEEP = 0.4;
+const WIDTH_RATIO_DEEP = 0.55;
 /** A depth-≥2 node's content-driven height is capped here (see the module
  * doc comment) — root/depth-1 nodes are never capped. */
 const MAX_HEIGHT_DEEP = 480;

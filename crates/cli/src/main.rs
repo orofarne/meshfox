@@ -12,7 +12,7 @@
 //! block's output actually gets written back into the file, or just shown.
 
 use clap::{Parser, Subcommand};
-use meshfox_core::{layout, mdcanvas, Canvas, ExtraEdge, FileDisplay, NodeMeta, NodeType, VarDecl, VarCache};
+use meshfox_core::{mdcanvas, Canvas, ExtraEdge, FileDisplay, NodeMeta, NodeType, VarDecl, VarCache};
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -66,7 +66,7 @@ enum Command {
     /// canvas path is also accepted (`meshfox run
     /// examples/hello.canvas.md tests smoke-test smoke`), recognized
     /// because it ends in `.md` — node ids never do — so the same
-    /// positional-path convention as `fmt`/`view`/`validate` works here too
+    /// positional-path convention as `view`/`validate` works here too
     /// without an ambiguous variadic parse. Auto-discovery is used when no
     /// such argument is given.
     Run {
@@ -98,20 +98,6 @@ enum Command {
         /// Path to the .canvas.md file. If omitted: auto-discover the
         /// single candidate in the current directory.
         canvas: Option<PathBuf>,
-    },
-    /// Fill in x/y/w/h for nodes that don't have them yet, using a simple
-    /// tree-aware auto-layout (see `meshfox_core::layout`). Never touches
-    /// `group` nodes — their box is always derived from their children,
-    /// never stored — and by default leaves any node's position/size alone
-    /// once it has one, so hand-placed nodes survive a format.
-    Fmt {
-        /// Path to the .canvas.md file. If omitted: auto-discover the
-        /// single candidate in the current directory.
-        canvas: Option<PathBuf>,
-        /// Recompute and overwrite position/size for every node, not just
-        /// ones that don't have one yet.
-        #[arg(long)]
-        force: bool,
     },
     /// Create a new, empty canvas file: just the `meshfox:canvas` marker
     /// followed by a lone root heading (`#`) named after the file itself
@@ -171,7 +157,7 @@ enum Command {
         canvas: Option<PathBuf>,
     },
     /// Validate that a file parses as a meshfox canvas — same checks
-    /// `run`/`fmt`/`view` already do before touching anything (single root,
+    /// `run`/`view` already do before touching anything (single root,
     /// no duplicate ids, no dangling `meshfox:edge` targets, `group`/
     /// `file`/`link` body rules) — without executing anything or writing
     /// the file back. Exits non-zero on a parse error, so it's usable as a
@@ -200,7 +186,7 @@ enum Command {
     /// Print every runnable code block in the canvas as an indented tree,
     /// each with a ready-to-paste `meshfox run <path...> <name>` — so you
     /// don't have to go spelunking through the file to find out what's
-    /// runnable. Same raw-file-only scope as `run`/`fmt`/`validate` (no
+    /// runnable. Same raw-file-only scope as `run`/`validate` (no
     /// include resolution).
     List {
         /// Path to the .canvas.md file. If omitted: auto-discover the
@@ -272,10 +258,10 @@ enum NodeCommand {
     /// Add a new, empty-bodied child node under `parent-id`, as the last
     /// item in its existing subtree (`mdcanvas::insert_child_node`) — same
     /// as the web UI's "add child" button. No position is set, so it stays
-    /// unpositioned (auto-placed by whatever's viewing it — the web UI's
-    /// own client-side layout, or `meshfox fmt`) until something gives it a
-    /// real one. Prints the new node's id: a slug of `title`, de-duplicated
-    /// against every id already in the file.
+    /// unpositioned (auto-placed by the web UI's own client-side layout)
+    /// until something gives it a real one — dragging it in the browser, or
+    /// `node meta`. Prints the new node's id: a slug of `title`,
+    /// de-duplicated against every id already in the file.
     Add {
         /// Path to the .canvas.md file. If omitted: auto-discover the
         /// single candidate in the current directory.
@@ -365,14 +351,14 @@ enum NodeCommand {
         file: Option<PathBuf>,
     },
     /// Set a node's position/size/style fields (`mdcanvas::set_node_meta`)
-    /// — `--x`/`--y`/`--w`/`--h` for a manual position/size override
-    /// (`meshfox fmt` is the usual way to fill these in), `--color`/
-    /// `--type`/`--display`/`--lang`/`--interpreter` for style/type. Any field left unset
-    /// keeps its current value. `group` nodes never store a *size* (`fmt`
-    /// skips them too, deriving their box from their children instead), so
-    /// `--w`/`--h` are rejected for one — but a group's own *position* is a
-    /// real anchor its members' own `x`/`y` are relative to, so `--x`/`--y`
-    /// is allowed on a group same as any other node.
+    /// — `--x`/`--y`/`--w`/`--h` for a manual position/size override,
+    /// `--color`/`--type`/`--display`/`--lang`/`--interpreter` for
+    /// style/type. Any field left unset keeps its current value. `group`
+    /// nodes never store a *size* (its box is always derived from its
+    /// children instead), so `--w`/`--h` are rejected for one — but a
+    /// group's own *position* is a real anchor its members' own `x`/`y` are
+    /// relative to, so `--x`/`--y` is allowed on a group same as any other
+    /// node.
     Meta {
         /// Path to the .canvas.md file. If omitted: auto-discover the
         /// single candidate in the current directory.
@@ -433,8 +419,8 @@ enum NodeCommand {
     /// canvas layout (`mdcanvas::reorder_by_position`, sorted by `y` then
     /// `x` among ties) — the same resync the server runs on every save
     /// from the web UI, exposed standalone for whenever positions changed
-    /// by hand (or via `node meta`/`fmt`) and the on-disk heading order
-    /// should catch up to match what's actually drawn.
+    /// by hand (or via `node meta`) and the on-disk heading order should
+    /// catch up to match what's actually drawn.
     Reorder {
         /// Path to the .canvas.md file. If omitted: auto-discover the
         /// single candidate in the current directory.
@@ -481,10 +467,6 @@ fn main() {
         Command::Configure { canvas } => {
             let canvas_path = canvas.unwrap_or_else(find_canvas);
             configure(&canvas_path)
-        }
-        Command::Fmt { canvas, force } => {
-            let canvas_path = canvas.unwrap_or_else(find_canvas);
-            fmt(&canvas_path, force)
         }
         Command::Create { canvas } => create(&canvas),
         Command::View { canvas, port, no_open, create: create_if_missing, no_auto_exit } => {
@@ -1375,116 +1357,6 @@ fn run_command(path: &[String], name: &str, node_id: &str) -> String {
     format!("meshfox run {path_args}{name}")
 }
 
-fn fmt(canvas_path: &PathBuf, force: bool) {
-    let raw = std::fs::read_to_string(canvas_path).unwrap_or_else(|e| {
-        eprintln!("failed to read {}: {e}", canvas_path.display());
-        std::process::exit(1);
-    });
-    let canvas = Canvas::from_markdown(&raw).unwrap_or_else(|e| {
-        eprintln!("failed to parse {}: {e}", canvas_path.display());
-        std::process::exit(1);
-    });
-    let boxes = layout::compute(&canvas);
-
-    let mut updated = raw;
-    let mut count = 0;
-    for node in &canvas.nodes {
-        // A group's box is always derived from its children, never stored.
-        if node.node_type == NodeType::Group {
-            continue;
-        }
-        let complete =
-            node.x.is_some() && node.y.is_some() && node.width.is_some() && node.height.is_some();
-        if !force && complete {
-            continue;
-        }
-        let Some(b) = boxes.get(&node.id) else {
-            continue;
-        };
-        // `boxes` holds absolute positions (`layout::compute` resolves a
-        // group member's stored offset against its group's own anchor
-        // before inserting it here — see `place_rightward`'s
-        // `group_origin`), but a group member's own `x`/`y` attribute is
-        // stored *relative* to its group (see
-        // `Canvas::resolve_absolute_position`/SPEC.md), so writing `b.x`/
-        // `b.y` straight back would silently convert a correct relative
-        // offset into a wrong absolute one for any node nested under a
-        // group. `local_position_in_boxes` (below) walks the same group
-        // chain `Canvas::absolute_to_local` does, but subtracts each
-        // group ancestor's own freshly *computed* box (`boxes`, always
-        // present, real anchor or synthetic ideal spot — never "missing"
-        // the way a group's *stored* anchor can be) rather than its
-        // stored one — so this fills in a group member's position exactly
-        // like before this feature existed, whether or not its group has
-        // ever been dragged, just now correctly relative rather than
-        // absolute.
-        let (local_x, local_y) = local_position_in_boxes(&canvas, &boxes, &node.id, b.x, b.y);
-        let meta = NodeMeta {
-            x: Some(if force || node.x.is_none() { local_x } else { node.x.unwrap() }),
-            y: Some(if force || node.y.is_none() { local_y } else { node.y.unwrap() }),
-            width: Some(if force || node.width.is_none() {
-                b.width
-            } else {
-                node.width.unwrap()
-            }),
-            height: Some(if force || node.height.is_none() {
-                b.height
-            } else {
-                node.height.unwrap()
-            }),
-            color: node.color.clone(),
-            node_type: None,
-            display: node.display,
-            lang: node.lang.clone(),
-            interpreter: node.interpreter.clone(),
-            edge_label: node.edge_label.clone(),
-            fold: node.fold,
-            tags: node.tags.clone(),
-        };
-        if let Some(patched) = mdcanvas::set_node_meta(&updated, &node.id, &meta) {
-            updated = patched;
-            count += 1;
-        }
-    }
-
-    std::fs::write(canvas_path, &updated).unwrap_or_else(|e| {
-        eprintln!("failed to write {}: {e}", canvas_path.display());
-        std::process::exit(1);
-    });
-    println!("meshfox fmt: placed {count} node(s) in {}", canvas_path.display());
-}
-
-/// Converts `id`'s freshly computed absolute box position (`abs_x`/`abs_y`,
-/// from `boxes` — always present for every node) into whatever frame `id`
-/// should store it in: relative to its nearest `group` ancestor's own
-/// *computed* box in `boxes`, same rule `Canvas::resolve_absolute_position`/
-/// `absolute_to_local` use for a group's *stored* anchor, but never `None`
-/// — `boxes` always has an entry for a group (real anchor or synthetic
-/// ideal spot, `place_rightward` inserts one unconditionally), unlike
-/// `Canvas`, which only knows a group's position once it's actually been
-/// authored.
-fn local_position_in_boxes(
-    canvas: &Canvas,
-    boxes: &std::collections::HashMap<String, layout::LayoutBox>,
-    id: &str,
-    abs_x: f64,
-    abs_y: f64,
-) -> (f64, f64) {
-    let (mut x, mut y) = (abs_x, abs_y);
-    let mut current = canvas.node(id).and_then(|n| n.parent.clone());
-    while let Some(parent_id) = current {
-        let Some(parent) = canvas.node(&parent_id) else { break };
-        if parent.node_type != NodeType::Group {
-            break;
-        }
-        let Some(parent_box) = boxes.get(&parent_id) else { break };
-        x -= parent_box.x;
-        y -= parent_box.y;
-        current = parent.parent.clone();
-    }
-    (x, y)
-}
-
 fn read_raw_or_exit(canvas_path: &Path) -> String {
     std::fs::read_to_string(canvas_path).unwrap_or_else(|e| {
         eprintln!("failed to read {}: {e}", canvas_path.display());
@@ -1801,8 +1673,8 @@ fn apply_node_meta(
     };
 
     // A group's *size* is always derived from its children, never stored —
-    // same rule `fmt` follows — so reject an explicit `--w`/`--h` for one,
-    // whether it's already a group or is becoming one with this call. Its
+    // so reject an explicit `--w`/`--h` for one, whether it's already a
+    // group or is becoming one with this call. Its
     // own *position*, though, is a real anchor a member's own `x`/`y` is
     // relative to (see `Canvas::resolve_absolute_position`), so `--x`/`--y`
     // is allowed on a group same as any other node.
@@ -1818,10 +1690,10 @@ fn apply_node_meta(
     // passed for `type` (and always for `parent`) — every other field left
     // `None` here would simply be omitted from the rewritten line instead
     // of preserved, so any field not given on the command line is filled
-    // in from the node's current value, same as `fmt` already does. A
-    // group's own width/height stay forced to `None` (omitted) regardless
-    // of what the node's current value happens to be, same invariant the
-    // rejection above enforces on the command-line side.
+    // in from the node's current value. A group's own width/height stay
+    // forced to `None` (omitted) regardless of what the node's current
+    // value happens to be, same invariant the rejection above enforces on
+    // the command-line side.
     let meta = NodeMeta {
         x: x.or(node.x),
         y: y.or(node.y),
@@ -2071,8 +1943,8 @@ fn static_cmd(canvas_path: &Path, template_dir: &Path, out_dir: &Path, force: bo
         std::process::exit(1);
     });
     // Same as `validate`/`view`: splice in `include` nodes so the exported
-    // site shows the fully composed document, not the bare link `run`/`fmt`
-    // see in the raw file.
+    // site shows the fully composed document, not the bare link `run`
+    // sees in the raw file.
     let canvas = meshfox_core::include::resolve(&canvas, canvas_path).unwrap_or_else(|e| {
         eprintln!("meshfox static: {}: {e}", canvas_path.display());
         std::process::exit(1);
