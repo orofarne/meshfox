@@ -93,6 +93,7 @@ Commands:
   node           Structural edits to individual nodes in a canvas file: add, move, rename, delete, or set a node's body/position/style/edges — the CLI counterpart to the web UI's Edit-mode node operations (the same `mdcanvas` surgical patches `meshfox view`'s `/api/nodes*` routes use), for scripting/CI or whenever a hand-rewrite would risk getting heading depth, sibling order, or dangling-edge cleanup wrong. Every subcommand validates the fully-patched document still parses before writing it back, same as every other mutating command here
   spec           Print the full .canvas.md format specification (SPEC.md, embedded in this binary at compile time) — the canonical reference for the format, available offline wherever `meshfox` is installed
   check-updates  Check github.com/orofarne/meshfox's releases for a newer version than this binary and, if one exists, offer to download and install it in place (replacing the running executable). A no-op if this build wasn't made from a release tag (e.g. a local/dev build) — there's no version to compare against a release with, so it just says so and exits
+  completions    Print a shell completion script to stdout. Source it directly or write it to the completions directory your shell scans on startup, e.g. `meshfox completions zsh > ~/.zfunc/_meshfox` (with `~/.zfunc` on `fpath`), or `meshfox completions bash > /etc/bash_completion.d/meshfox`
   help           Print this message or the help of the given subcommand(s)
 
 Options:
@@ -204,7 +205,7 @@ position: x=? y=? w=? h=?
 Runs the `smoke` block in `examples/hello.canvas.md` for real, updating its cached output in place — the same surgical patch described above, not a simulation:
 
 ```bash name="run-example" cache
-meshfox run examples/hello.canvas.md tests smoke-test smoke
+meshfox examples/hello.canvas.md run tests smoke-test smoke
 ```
 <!-- meshfox:output name="run-example" -->
 ```text
@@ -212,7 +213,7 @@ exit code: 0
 
 ==> smoke
 hello from meshfox
-Wed Aug 12 11:00:52 +04 2026
+Sat Aug 15 18:01:48 +04 2026
 (exit 0)
 ```
 <!-- /meshfox:output -->
@@ -226,7 +227,7 @@ A block flagged `tty` hands its process a real interactive terminal instead of t
 vim
 ```
 
-Run it from a real terminal — `meshfox run README.md usage usage-tty vim-demo` — and it drops you straight into `vim` editing that scratch file, same as running `vim` directly would; `:wq` (or `:q!`) hands the terminal back same as it always does. `meshfox run` checks stdin/stdout are actually a terminal before starting a `tty` block and errors out otherwise, rather than hanging a script or CI job that happens to reach one. The web UI runs the same block over a real pseudo-terminal instead: clicking "run vim-demo" in `meshfox view` opens it as a floating terminal panel over the canvas rather than filling in the node's own inline output area.
+Run it from a real terminal — `meshfox README.md run usage usage-tty vim-demo` — and it drops you straight into `vim` editing that scratch file, same as running `vim` directly would; `:wq` (or `:q!`) hands the terminal back same as it always does. `meshfox run` checks stdin/stdout are actually a terminal before starting a `tty` block and errors out otherwise, rather than hanging a script or CI job that happens to reach one. The web UI runs the same block over a real pseudo-terminal instead: clicking "run vim-demo" in `meshfox view` opens it as a floating terminal panel over the canvas rather than filling in the node's own inline output area.
 
 ### Terminal viewer (experimental)
 <!-- meshfox:node id="usage-tui" -->

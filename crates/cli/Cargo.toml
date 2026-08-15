@@ -12,6 +12,7 @@ path = "src/main.rs"
 meshfox-core = { path = "../core" }
 meshfox-server = { path = "../server" }
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }
 rpassword = "7"
 tera = "1"

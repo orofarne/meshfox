@@ -62,16 +62,17 @@ enum Command {
     /// block explicitly flagged `default`, or one whose name already
     /// matches the node's own id) when it has exactly one — so a node
     /// that's really just "one thing to run" can be addressed without
-    /// repeating its id as a trailing block name too. An optional leading
-    /// canvas path is also accepted (`meshfox run
-    /// examples/hello.canvas.md tests smoke-test smoke`), recognized
-    /// because it ends in `.md` — node ids never do — so the same
-    /// positional-path convention as `view`/`validate` works here too
-    /// without an ambiguous variadic parse. Auto-discovery is used when no
-    /// such argument is given.
+    /// repeating its id as a trailing block name too. Auto-discovery is
+    /// used when no canvas path is given; pass one before the subcommand
+    /// instead of after it (`meshfox examples/hello.canvas.md run tests
+    /// smoke-test smoke`), or with `--canvas`, to name one explicitly.
     Run {
         #[arg(required = true, num_args = 1..)]
         args: Vec<String>,
+        /// Path to the .canvas.md file. If omitted: auto-discover the
+        /// single candidate in the current directory.
+        #[arg(long)]
+        canvas: Option<PathBuf>,
         /// Skip each requested block's `deps=` chain and run only the
         /// blocks named on the command line, in the order given — the CLI
         /// equivalent of the web UI's plain "run" button (as opposed to
@@ -264,6 +265,13 @@ enum Command {
         #[arg(short = 'y', long)]
         yes: bool,
     },
+    /// Print a shell completion script to stdout. Source it directly or
+    /// write it to the completions directory your shell scans on startup,
+    /// e.g. `meshfox completions zsh > ~/.zfunc/_meshfox` (with `~/.zfunc`
+    /// on `fpath`), or `meshfox completions bash > /etc/bash_completion.d/meshfox`.
+    Completions {
+        shell: clap_complete::Shell,
+    },
 }
 
 #[derive(Subcommand)]
@@ -452,8 +460,160 @@ enum NodeCommand {
     },
 }
 
+/// A leading `meshfox test.md run new-node-6` canvas path — recognized by
+/// the same ".md" convention `run`'s own leading-arg sniffing already uses
+/// (node ids/subcommand names never end in .md, see slugify) — spliced into
+/// whatever position the subcommand that follows actually expects a canvas
+/// path/`--canvas` in, before clap ever sees the argument list. Kept out of
+/// the `Cli`/`Command` derive entirely (rather than a top-level `Option`
+/// field next to `command`) because clap_complete's generated *shell*
+/// completions are position-based: an extra optional positional ahead of
+/// the subcommand shifts every subcommand one slot over in zsh's
+/// `_arguments`, so e.g. `meshfox run <TAB>` (no canvas) starts completing
+/// top-level subcommand names again instead of `run`'s own args. Doing the
+/// reordering here instead means every subcommand's shape — and the
+/// completions generated from it — is exactly what it was before this
+/// existed, whichever order the canvas path is actually typed in.
+fn splice_leading_canvas(mut args: Vec<String>) -> Vec<String> {
+    let has_leading_canvas =
+        args.len() >= 2 && !args[1].starts_with('-') && args[1].to_ascii_lowercase().ends_with(".md");
+    if !has_leading_canvas {
+        return args;
+    }
+    let canvas = args.remove(1);
+    match args.get(1).map(String::as_str) {
+        // No subcommand at all (`meshfox test.md`): leave it as the sole
+        // argument, handled below as "open it, same as `meshfox view`".
+        None => args.insert(1, canvas),
+        // `run` and `node <op> ...` take an explicit `--canvas` flag
+        // instead of their own leading positional — `run`'s own args are a
+        // free-form node-path/block-name list with nothing else to anchor
+        // a bare path against, and `node <op>`'s positional slot is two
+        // segments in (`node add`, `node rm`, ...), not on `node` itself.
+        Some("run") => {
+            args.insert(2, "--canvas".to_string());
+            args.insert(3, canvas);
+        }
+        Some("node") if args.len() >= 3 => {
+            args.insert(3, "--canvas".to_string());
+            args.insert(4, canvas);
+        }
+        // Every other subcommand (including a `node ...` with no op, or an
+        // unrecognized word — left for clap's own error to explain) takes
+        // its own canvas path as the positional right after its name.
+        _ => args.insert(2, canvas),
+    }
+    args
+}
+
+/// zsh's generated completion function is positional: each subcommand
+/// dispatches off a fixed word index (`$line[1]`/`$words[N]`), so it has no
+/// way to know a leading `meshfox test.md run ...` canvas path (see
+/// `splice_leading_canvas`) is there — it just sees "test.md" where it
+/// expects a subcommand name. bash's generated script is unaffected (it
+/// walks words looking for known subcommand tokens rather than reading
+/// fixed positions, so an extra leading word it doesn't recognize is
+/// simply skipped over) — only zsh gets patched here.
+///
+/// Renames clap_complete's generated `_meshfox` to `_meshfox_generated` and
+/// installs a small hand-written `_meshfox` in front of it that: detects a
+/// leading canvas word by the same ".md" convention `splice_leading_canvas`
+/// uses, reorders `words`/`CURRENT` the same way that function reorders
+/// `argv` (so `_meshfox_generated`'s untouched, still-fully-generated
+/// per-subcommand blocks see the shape they were generated for), and falls
+/// through to `_meshfox_generated` unchanged whenever no such canvas word
+/// is present. The `run`/`node <op>` vs. "every other subcommand" split
+/// here has to be kept in sync with `splice_leading_canvas` by hand if a
+/// future subcommand needs the same `--canvas`-flag-instead-of-positional
+/// treatment; everything else (the command list, every subcommand's own
+/// flags) stays fully generated and needs no maintenance here at all.
+const ZSH_CANVAS_DISPATCH: &str = r#"_meshfox() {
+    local w2="${words[2]:-}"
+    local canvas_word=""
+    case "${(L)w2}" in
+        -*) ;;
+        *.md) canvas_word="$w2" ;;
+    esac
+
+    if [[ -z "$canvas_word" ]]; then
+        if (( CURRENT == 2 )) && [[ "$w2" != -* ]]; then
+            _alternative \
+                'commands:meshfox subcommand:_meshfox_commands' \
+                'files:canvas path:_files -g "*.md"'
+            return
+        fi
+        _meshfox_generated "$@"
+        return
+    fi
+
+    if (( CURRENT == 3 )); then
+        _meshfox_commands
+        return
+    fi
+
+    local sub="${words[3]}"
+    local -a new_words
+    local new_current
+
+    case "$sub" in
+        run)
+            new_words=(meshfox run --canvas "$canvas_word" "${words[@]:3}")
+            new_current=$(( CURRENT + 1 ))
+            ;;
+        node)
+            if (( CURRENT == 4 )); then
+                new_words=(meshfox node "${words[@]:3}")
+                new_current=$(( CURRENT - 1 ))
+            else
+                new_words=(meshfox node "${words[4]}" --canvas "$canvas_word" "${words[@]:4}")
+                new_current=$(( CURRENT + 1 ))
+            fi
+            ;;
+        *)
+            new_words=(meshfox "$sub" "$canvas_word" "${words[@]:3}")
+            new_current=$CURRENT
+            ;;
+    esac
+
+    local -a words
+    local CURRENT
+    words=("${new_words[@]}")
+    CURRENT=$new_current
+    _meshfox_generated "$@"
+}
+
+"#;
+
+fn print_completions(shell: clap_complete::Shell) {
+    use clap::CommandFactory;
+    if shell != clap_complete::Shell::Zsh {
+        clap_complete::generate(shell, &mut Cli::command(), "meshfox", &mut std::io::stdout());
+        return;
+    }
+
+    let mut buf = Vec::new();
+    clap_complete::generate(shell, &mut Cli::command(), "meshfox", &mut buf);
+    let generated = String::from_utf8(buf).expect("clap_complete output is valid UTF-8");
+
+    let generated = generated.replacen("\n_meshfox() {\n", "\n_meshfox_generated() {\n", 1);
+    let tail = "if [ \"$funcstack[1]\" = \"_meshfox\" ]; then\n    _meshfox \"$@\"\nelse\n    compdef _meshfox meshfox\nfi\n";
+    let patched = generated.replacen(tail, &format!("{ZSH_CANVAS_DISPATCH}{tail}"), 1);
+    debug_assert!(patched.contains("_meshfox_generated() {"), "clap_complete's zsh output shape changed");
+    debug_assert!(patched.contains(ZSH_CANVAS_DISPATCH), "clap_complete's zsh tail block shape changed");
+
+    print!("{patched}");
+}
+
 fn main() {
-    let cli = Cli::parse();
+    let args = splice_leading_canvas(std::env::args().collect());
+
+    if args.len() == 2 && !args[1].starts_with('-') && args[1].to_ascii_lowercase().ends_with(".md") {
+        // A bare `meshfox test.md`, no subcommand: open it, same as
+        // clicking the file — `meshfox view`'s own defaults otherwise.
+        return view(PathBuf::from(&args[1]), 0, true, true);
+    }
+
+    let cli = Cli::parse_from(args);
 
     if cli.agent_help {
         print!("{}", include_str!("../../../AGENT_HELP.md"));
@@ -467,14 +627,8 @@ fn main() {
     };
 
     match command {
-        Command::Run { mut args, no_deps, set } => {
-            // A leading arg that looks like a canvas path (ends in .md —
-            // node ids never do, see slugify) takes the place auto-discovery
-            // would otherwise fill; only consumed when it leaves at least
-            // one arg behind for the path/block-names address.
-            let leading_canvas = (args.len() >= 2 && args[0].to_ascii_lowercase().ends_with(".md"))
-                .then(|| PathBuf::from(args.remove(0)));
-            let canvas_path = leading_canvas.unwrap_or_else(find_canvas);
+        Command::Run { args, canvas, no_deps, set } => {
+            let canvas_path = canvas.unwrap_or_else(find_canvas);
             run(&canvas_path, args, no_deps, set)
         }
         Command::Configure { canvas } => {
@@ -552,6 +706,7 @@ fn main() {
         },
         Command::Spec => print!("{}", include_str!("../../../SPEC.md")),
         Command::CheckUpdates { yes } => check_updates(yes),
+        Command::Completions { shell } => print_completions(shell),
     }
 }
 

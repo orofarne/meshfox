@@ -87,7 +87,12 @@ command line, if that's what's intended instead of the full chain.
 ## Canvas path
 
 Most commands take the canvas path as an optional trailing argument or
-`--canvas` flag. Omitting it auto-discovers the single `.canvas.md`
-candidate in the current directory — fine for a one-off in a directory known
-to have exactly one, but pass it explicitly whenever that's not certain, so
-behavior doesn't depend on what else happens to be in the directory.
+`--canvas` flag (`run` and `node <op>` only take `--canvas`, not a bare
+trailing path — their own positionals are node-id/block-name args instead).
+The path can also be given once, before the subcommand instead of after it
+— `meshfox path/to.canvas.md run tests smoke` — which a subcommand's own
+path/`--canvas` overrides if both are given. Omitting it entirely
+auto-discovers the single `.canvas.md` candidate in the current directory — fine for a one-off in a
+directory known to have exactly one, but pass it explicitly whenever that's
+not certain, so behavior doesn't depend on what else happens to be in the
+directory.

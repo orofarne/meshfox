@@ -425,7 +425,7 @@ code fences" above). Only variables a block actually lists in its own
 end up in its process environment (under whatever local name it asked
 for): running a block that declares no `env=` at all never touches
 `meshfox:var` resolution, however many variables the document as a whole
-declares. This is what keeps, say, `meshfox run README.md some-unrelated-block`
+declares. This is what keeps, say, `meshfox README.md run some-unrelated-block`
 from ever being asked about an `INSTALL_PATH` that only some *other*
 block in the document actually uses.
 
