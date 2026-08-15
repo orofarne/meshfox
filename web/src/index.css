@@ -38,7 +38,7 @@
     --bg: #0a0a0c;
     --fg: #f2ede6;
     --node-bg: #131316;
-    --node-border: #2c2620;
+    --node-border: #7a4620;
     --accent: #ff6e15;
     --code-bg: #19191c;
     --code-head-bg: #211f1c;
@@ -62,7 +62,7 @@
   --bg: #0a0a0c;
   --fg: #f2ede6;
   --node-bg: #131316;
-  --node-border: #2c2620;
+  --node-border: #7a4620;
   --accent: #ff6e15;
   --code-bg: #19191c;
   --code-head-bg: #211f1c;
@@ -351,6 +351,16 @@ a {
 .cm-meshfoxAttrValue,
 .cm-meshfoxAttrValue * {
   color: var(--syntax-value) !important;
+}
+
+/* MeshNode.tsx's extra top/bottom handles — alternate attachment points an
+ * extra edge's routing picks between (see App.tsx's edge-building effect),
+ * not a connect affordance of their own alongside the visible Left/Right
+ * handles: `opacity: 0` keeps them out of sight while leaving their DOM
+ * bounding box intact for React Flow's own edge-endpoint measurement. */
+.mesh-handle-routing {
+  opacity: 0;
+  pointer-events: none;
 }
 
 .mesh-node {
@@ -1317,7 +1327,13 @@ a {
 /* Pre-run "configure missing variables" modal (see VarsForm.tsx) — the
  * browser counterpart to `meshfox run`/`configure`'s terminal prompt.
  * Works the same regardless of read-only/Edit mode: it's local run
- * configuration, not a document edit. */
+ * configuration, not a document edit. Also reused by NodeSettings/
+ * DeleteNodeDialog/ReparentChoiceDialog/AutoLayoutConfirmDialog/
+ * DocumentOptions — every one of those is reachable from a member node
+ * *inside* a group's `.mesh-expand-panel` sub-canvas (its own gear/trash
+ * icons, or NodeExpandPanel's own "+ Add node"), so this needs to
+ * outrank that panel's own 2000 (and the text-editor/tty panels at the
+ * same level) or the dialog opens invisibly behind it. */
 .vars-modal-backdrop {
   position: fixed;
   inset: 0;
@@ -1325,7 +1341,7 @@ a {
   align-items: center;
   justify-content: center;
   background: rgba(0, 0, 0, 0.4);
-  z-index: 1000;
+  z-index: 2100;
 }
 
 .vars-modal {

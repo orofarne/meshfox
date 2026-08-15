@@ -1130,6 +1130,16 @@ export default function App() {
               id: e.id,
               source: e.source,
               target: e.target,
+              // Every node has more than one handle of each type now (see
+              // MeshNode.tsx's routing-only top/bottom pair, added for
+              // extra edges) — an explicit id here, matching the plain
+              // Left/Right ones every node still has, is what keeps this
+              // structural edge on them rather than React Flow's own
+              // "no id given, just use whichever handle of that type it
+              // finds first" fallback silently picking one of the new
+              // ones instead.
+              sourceHandle: "source-default",
+              targetHandle: "target-default",
               // Right-angle "elbow" routing to match the indented-tree-view
               // layout (see layout.rs) — nodes grow rightward with depth,
               // so a classic step/elbow connector reads better here than a
@@ -1148,6 +1158,8 @@ export default function App() {
             id: e.id,
             source: e.source,
             target: e.target,
+            sourceHandle: "source-default",
+            targetHandle: "target-default",
             type: "tree",
             markerEnd: { type: MarkerType.ArrowClosed },
             data: { editMode, title, onDelete: () => requestReparentEdge(e.target) },
@@ -1165,10 +1177,41 @@ export default function App() {
           e.arrowEnd === "none" ? undefined : { type: MarkerType.ArrowClosed, color: strokeColor };
         const markerStart =
           e.arrowStart === "arrow" ? { type: MarkerType.ArrowClosed, color: strokeColor } : undefined;
+        // An extra edge can connect any two nodes anywhere on the canvas —
+        // routed through the plain Left/Right handle pair every node also
+        // has (the "default" case below), a bezier's horizontal tangents
+        // bow the curve sideways regardless of where the other endpoint
+        // actually is, which routinely sends it straight through whatever
+        // node sits between two endpoints stacked mostly vertically rather
+        // than side by side. Picking the vertical Top/Bottom pair instead
+        // (see MeshNode.tsx) for that case gives the curve a vertical
+        // tangent that runs past a between-node's side instead of through
+        // its middle. Absolute centers (`boxes`, already computed above
+        // for `positionFor`) rather than each node's own possibly-
+        // group-relative `position`, so this compares like with like
+        // regardless of nesting. Always an explicit id either way — same
+        // "no id given, just grab the first handle of that type" pitfall
+        // as the structural edges above, now that every node has more
+        // than one handle of each type. */
+        const sourceBox = boxes.get(e.source);
+        const targetBox = boxes.get(e.target);
+        const handles: { sourceHandle: string; targetHandle: string } = (() => {
+          if (sourceBox && targetBox) {
+            const dx = targetBox.x + targetBox.width / 2 - (sourceBox.x + sourceBox.width / 2);
+            const dy = targetBox.y + targetBox.height / 2 - (sourceBox.y + sourceBox.height / 2);
+            if (Math.abs(dy) > Math.abs(dx)) {
+              return dy > 0
+                ? { sourceHandle: "source-bottom", targetHandle: "target-top" }
+                : { sourceHandle: "source-top", targetHandle: "target-bottom" };
+            }
+          }
+          return { sourceHandle: "source-default", targetHandle: "target-default" };
+        })();
         return {
           id: e.id,
           source: e.source,
           target: e.target,
+          ...handles,
           type: "extra",
           markerEnd,
           markerStart,
@@ -1911,6 +1954,8 @@ export default function App() {
           onNodesChange={onNodesChangeAndMark}
           onEdgesChange={onEdgesChangeAndPersist}
           editMode={editMode}
+          onAddChild={handleAddChild}
+          themePreference={themePreference}
         />
       )}
       {settingsNode && (

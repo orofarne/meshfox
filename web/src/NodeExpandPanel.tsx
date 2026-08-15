@@ -12,6 +12,8 @@ import {
 } from "@xyflow/react";
 import { NodeBodyContent, MeshNode, type MeshNodeData } from "./MeshNode";
 import type { CanvasDoc } from "./types";
+import { subtreeIds } from "./tree";
+import type { ThemePreference } from "./theme";
 
 interface NodeExpandPanelProps {
   node: Node<MeshNodeData>;
@@ -23,6 +25,16 @@ interface NodeExpandPanelProps {
   onNodesChange: OnNodesChange<Node<MeshNodeData>>;
   onEdgesChange: OnEdgesChange<Edge>;
   editMode: boolean;
+  /** Creates a new child node under the given parent id — wired to the same
+   * handler the main canvas's own "+" buttons use, so a group's title-bar
+   * "add child" control (unavailable in here, since the group itself isn't
+   * rendered as a node in this view — see below) has an equivalent. */
+  onAddChild: (parentId: string) => void;
+  /** Mirrors the main canvas's `<ReactFlow colorMode>` (see App.tsx) so this
+   * second, independent `<ReactFlow>` instance follows the same manual
+   * light/dark override instead of defaulting to `"system"` regardless of
+   * it. */
+  themePreference: ThemePreference;
 }
 
 const nodeTypes = { mesh: MeshNode };
@@ -44,23 +56,26 @@ const nodeTypes = { mesh: MeshNode };
  *
  * A `group` node has no body at all (`NodeBodyContent` returns `null` for
  * one) — for that type only, this instead opens a mini sub-canvas of the
- * group's own direct members: a second, independent `<ReactFlow>` (its own
+ * group's *entire* subtree (every descendant, not just direct members —
+ * see `subtreeIds`): a second, independent `<ReactFlow>` (its own
  * `<ReactFlowProvider>` — required for a second concurrent instance) fed a
  * filtered slice of the *same* `nodes`/`edges` state and the *same*
  * change handlers the main canvas uses, rather than a second copy of the
  * graph — so it's a filtered camera on one shared graph: dragging a member
- * here persists exactly like dragging it on the main canvas. A member's
- * own `position` is already relative to its group (see App.tsx's
+ * here persists exactly like dragging it on the main canvas. A direct
+ * member's own `position` is already relative to its group (see App.tsx's
  * `positionFor`), which is exactly what this view's own origin needs, so
- * no coordinate translation is needed either — only `parentId` is
- * stripped (the group itself isn't a node in this view, so there's
- * nothing left for it to compose against).
+ * no coordinate translation is needed for it either — only its `parentId`
+ * is stripped (the group itself isn't a node in this view, so there's
+ * nothing left for it to compose against). A deeper descendant keeps
+ * whatever `position`/`parentId` it already had on the main canvas — those
+ * only ever compose against another member that's *also* included here
+ * (its own ancestor chain up to the group), so they stay meaningful
+ * unmodified.
  *
- * v1 scope: only *direct* structural children — a member's own further
- * children (if it has any) stay out of this mini view and keep rendering
- * normally on the main canvas; opening a second panel from *inside* this
- * one (a nested group, or a plain node's own expand button) isn't wired
- * up yet either. Both are natural follow-ups, not attempted here.
+ * Opening a second panel from *inside* this one (a nested group's own
+ * expand button, or a plain node's) isn't wired up yet — a natural
+ * follow-up, not attempted here.
  */
 export function NodeExpandPanel({
   node,
@@ -71,25 +86,28 @@ export function NodeExpandPanel({
   onNodesChange,
   onEdgesChange,
   editMode,
+  onAddChild,
+  themePreference,
 }: NodeExpandPanelProps) {
   const { data } = node;
   const isGroup = data.nodeType === "group";
 
   const memberIds = useMemo(() => {
     if (!isGroup || !canvas) return new Set<string>();
-    return new Set(canvas.nodes.filter((n) => n.parent === node.id).map((n) => n.id));
+    return new Set(subtreeIds(canvas, node.id));
   }, [isGroup, canvas, node.id]);
 
   const memberNodes = useMemo(
     () =>
       nodes
         .filter((n) => memberIds.has(n.id))
-        // The group itself isn't rendered here, so a member's own
-        // `parentId` (pointing at it) has nothing to compose against —
-        // its `position` is used directly as this view's own absolute
-        // frame instead (see the doc comment above).
-        .map((n) => ({ ...n, parentId: undefined })),
-    [nodes, memberIds],
+        // Only a *direct* member's own `parentId` points at the group
+        // itself, which isn't rendered here — nothing left for it to
+        // compose against, so it's stripped (see the doc comment above). A
+        // deeper descendant's `parentId`, if any, points at another
+        // included member instead and stays untouched.
+        .map((n) => (n.parentId === node.id ? { ...n, parentId: undefined } : n)),
+    [nodes, memberIds, node.id],
   );
   const memberEdges = useMemo(
     () => edges.filter((e) => memberIds.has(e.source) && memberIds.has(e.target)),
@@ -104,6 +122,15 @@ export function NodeExpandPanel({
       >
         <div className="mesh-expand-head">
           <span className="mesh-expand-head-title">{data.title}</span>
+          {isGroup && editMode && (
+            <button
+              type="button"
+              onClick={() => onAddChild(node.id)}
+              title="Add a child node to this group"
+            >
+              + Add node
+            </button>
+          )}
           <button type="button" onClick={onClose} title="Close">
             ✕
           </button>
@@ -118,6 +145,7 @@ export function NodeExpandPanel({
                 onEdgesChange={onEdgesChange}
                 nodeTypes={nodeTypes}
                 nodesDraggable={editMode}
+                colorMode={themePreference}
                 fitView
               >
                 <Background />

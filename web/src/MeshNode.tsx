@@ -917,26 +917,35 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
   const quickRunBusy = quickRunLive?.status === "queued" || quickRunLive?.status === "running";
   const canOpenFile = data.nodeType === "file" && !!data.target;
   const constraintStatus = aggregateConstraintStatus(data.constraintResults);
-  // Clicking the title text toggles fold both ways now (alongside
-  // `FoldToggle` itself), but the title text is also meant to stay
-  // selectable (e.g. to copy it) — a plain `onClick` alone can't tell
-  // "clicked" from "dragged to select text then released over the same
-  // span", since the browser's `click` event fires either way. So this
-  // tracks the `mousedown` position (`titleMouseDownRef`) and only toggles
-  // if `mouseup` landed within `TITLE_CLICK_MOVE_THRESHOLD`px of it *and*
-  // there's no active text selection left behind — a genuine click, not a
-  // selection drag. No `data.hasChildren` gate here, same as before this
-  // toggled both ways: a childless `isTitleOnly` node's own row looks
-  // identical folded or not (no `FoldToggle` shown for it either — see
-  // that render condition below), but this stays its only way back to
-  // unfolded for the rare case a document explicitly authors `fold="true"`
-  // on one anyway (`App.tsx`'s `resolveDefaultFold` honors that override
-  // regardless of `canFold`).
+  // Clicking the title text toggles fold both ways in read-only mode
+  // (alongside `FoldToggle` itself), but the title text is also meant to
+  // stay selectable (e.g. to copy it) — a plain `onClick` alone can't
+  // tell "clicked" from "dragged to select text then released over the
+  // same span", since the browser's `click` event fires either way. So
+  // this tracks the `mousedown` position (`titleMouseDownRef`) and only
+  // toggles if `mouseup` landed within `TITLE_CLICK_MOVE_THRESHOLD`px of
+  // it *and* there's no active text selection left behind — a genuine
+  // click, not a selection drag. No `data.hasChildren` gate here, same
+  // as before this toggled both ways: a childless `isTitleOnly` node's
+  // own row looks identical folded or not (no `FoldToggle` shown for it
+  // either — see that render condition below), but this stays its only
+  // way back to unfolded for the rare case a document explicitly authors
+  // `fold="true"` on one anyway (`App.tsx`'s `resolveDefaultFold` honors
+  // that override regardless of `canFold`).
+  //
+  // In Edit mode this is disabled outright — `FoldToggle`'s own button
+  // is the only way to fold there. The title in Edit mode is also the
+  // node's drag handle (its own click/drag ambiguity above only guards
+  // against a *text-selection* drag, not a node-repositioning one), so a
+  // plain click there needs to stay a no-op: a user clicking-and-slightly-
+  // releasing while dragging the node into place shouldn't also
+  // accidentally fold it out from under them.
   const titleMouseDownRef = useRef<{ x: number; y: number } | null>(null);
   const handleTitleMouseDown = (e: React.MouseEvent) => {
     titleMouseDownRef.current = { x: e.clientX, y: e.clientY };
   };
   const handleTitleClick = (e: React.MouseEvent) => {
+    if (data.editMode) return;
     const start = titleMouseDownRef.current;
     const moved = start ? Math.hypot(e.clientX - start.x, e.clientY - start.y) : 0;
     if (moved > TITLE_CLICK_MOVE_THRESHOLD) return;
@@ -964,7 +973,35 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
           isVisible={data.editMode && selected}
         />
       )}
-      <Handle type="target" position={Position.Left} />
+      {/* Explicit `id`s on every handle, including these original two —
+       * once a node has more than one handle of a given type (see the
+       * routing-only ones below), React Flow no longer treats an edge's
+       * unset `sourceHandle`/`targetHandle` as "the one with no id": it
+       * just grabs the first handle of that type in render order,
+       * whichever one that happens to be (`getHandle` in
+       * `@xyflow/system`). Leaving these two id-less the first time this
+       * file grew extra handles silently reassigned every plain
+       * parent→child edge's source point to one of the new ones instead —
+       * everything below (App.tsx's edge-building effect included) now
+       * always passes an explicit id for exactly this reason. */}
+      <Handle type="target" id="target-default" position={Position.Left} />
+      {/* A `meshfox:edge` extra edge can connect any two nodes anywhere on
+       * the canvas, including ones stacked mostly vertically rather than
+       * side by side — routed through the plain Left/Right pair above,
+       * that case's bezier tangents (which always point horizontally)
+       * bow the curve out sideways regardless, often straight through
+       * whatever node happens to sit in between. App.tsx's edge-building
+       * effect picks these top/bottom handles instead whenever a pair of
+       * endpoints is more vertically than horizontally separated, giving
+       * the curve a vertical tangent that runs past a between-node's side
+       * rather than through its middle. Invisible (`mesh-handle-routing`,
+       * see index.css) — an alternate attachment point for that routing
+       * decision, not a new connect affordance alongside the visible
+       * Left/Right ones. */}
+      <Handle type="target" id="target-top" position={Position.Top} className="mesh-handle-routing" />
+      <Handle type="target" id="target-bottom" position={Position.Bottom} className="mesh-handle-routing" />
+      <Handle type="source" id="source-top" position={Position.Top} className="mesh-handle-routing" />
+      <Handle type="source" id="source-bottom" position={Position.Bottom} className="mesh-handle-routing" />
       {isTitleOnly ? (
         <div className="mesh-node-title mesh-node-title-centered nopan" data-level={data.level}>
           {/* `FoldToggle` only if there's a subtree to fold: an
@@ -1150,6 +1187,7 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
        * right, where exiting right is the natural direction. */}
       <Handle
         type="source"
+        id="source-default"
         position={data.level === 1 ? Position.Left : Position.Right}
       />
     </div>

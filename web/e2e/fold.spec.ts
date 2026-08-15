@@ -82,6 +82,38 @@ test("clicking the title of an unfolded node folds it too, not just the toggle",
   await expect(node(page, "child-one")).toHaveCount(0);
 });
 
+test("in Edit mode, clicking the title does nothing — only the fold toggle button works", async ({ page }) => {
+  // Edit mode makes every node draggable (`nodesDraggable`, see
+  // App.tsx's `<ReactFlow>`) — React Flow starts its own node-drag
+  // gesture on mousedown anywhere on a node *except* an element (or
+  // ancestor) carrying its `nodrag` class. `.mesh-node-title-text` only
+  // ever carries `nopan` (blocks canvas panning, relevant in read-only
+  // mode too — see the tests above), not `nodrag`, so in Edit mode a
+  // click there starts a node-drag instead of ever reaching this
+  // component's own `onClick` — unlike `.mesh-node-fold-toggle`, which
+  // does carry `nodrag` and keeps working. Deliberate, not an oversight:
+  // Edit mode's title needs to stay draggable (grabbing it is how a node
+  // gets repositioned), so only the dedicated toggle button folds there.
+  await page.getByRole("button", { name: "Edit" }).click();
+  await expect(node(page, "parent-node").locator(".mesh-node")).toHaveAttribute("data-folded", "false");
+
+  await node(page, "parent-node").locator(".mesh-node-title-text").click();
+  await expect(node(page, "parent-node").locator(".mesh-node")).toHaveAttribute("data-folded", "false");
+  await expect(node(page, "child-one")).toBeVisible();
+
+  await node(page, "parent-node").locator(".mesh-node-fold-toggle").click();
+  await expect(node(page, "parent-node").locator(".mesh-node")).toHaveAttribute("data-folded", "true");
+  await expect(node(page, "child-one")).toHaveCount(0);
+
+  // And back the other way — the toggle unfolds it again, but a title
+  // click on the now-folded node still doesn't.
+  await node(page, "parent-node").locator(".mesh-node-title-text").click();
+  await expect(node(page, "parent-node").locator(".mesh-node")).toHaveAttribute("data-folded", "true");
+
+  await node(page, "parent-node").locator(".mesh-node-fold-toggle").click();
+  await expect(node(page, "parent-node").locator(".mesh-node")).toHaveAttribute("data-folded", "false");
+});
+
 test("dragging across the title text to select it doesn't fold the node", async ({ page }) => {
   await expect(node(page, "parent-node").locator(".mesh-node")).toHaveAttribute("data-folded", "false");
   const title = node(page, "parent-node").locator(".mesh-node-title-text");
