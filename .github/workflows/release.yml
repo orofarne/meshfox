@@ -16,13 +16,10 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            asset_name: meshfox-linux-x86_64
           - target: x86_64-apple-darwin
             os: macos-latest
-            asset_name: meshfox-macos-x86_64
           - target: aarch64-apple-darwin
             os: macos-latest
-            asset_name: meshfox-macos-arm64
 
     runs-on: ${{ matrix.os }}
 
@@ -59,17 +56,21 @@ jobs:
       - name: Package binary
         run: |
           set -euo pipefail
-          staging="${{ matrix.asset_name }}"
+          # The staging dir's name becomes the path prefix inside the
+          # tarball, so it must be exactly the target triple — that's what
+          # `meshfox check-updates` (self_update's default target
+          # matching, get_target()) expects to find the binary under.
+          staging="${{ matrix.target }}"
           mkdir -p "$staging"
           cp "target/${{ matrix.target }}/release/meshfox" "$staging/"
           cp README.md LICENSE "$staging/"
-          tar czf "$staging.tar.gz" "$staging"
+          tar czf "meshfox-${{ matrix.target }}.tar.gz" "$staging"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.asset_name }}
-          path: ${{ matrix.asset_name }}.tar.gz
+          name: meshfox-${{ matrix.target }}
+          path: meshfox-${{ matrix.target }}.tar.gz
           if-no-files-found: error
 
   release:

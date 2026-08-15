@@ -38,7 +38,7 @@ const MASCOT: &str = r"
     name = "meshfox",
     before_help = MASCOT,
     about = "CLI and local web viewer/editor for a meshfox canvas. Run `meshfox spec` for the full .canvas.md format specification.",
-    after_help = "Agent Usage:\n  If you are an AI coding agent, run `meshfox --agent-help` before hand-editing a\n  .canvas.md file. It covers when to prefer `meshfox node <verb>` over a raw text\n  edit, how to run non-interactively, and other guidance not covered above.",
+    after_help = "Website: https://meshfox.orofarne.net/\n\nAgent Usage:\n  If you are an AI coding agent, run `meshfox --agent-help` before hand-editing a\n  .canvas.md file. It covers when to prefer `meshfox node <verb>` over a raw text\n  edit, how to run non-interactively, and other guidance not covered above.",
     version = VERSION
 )]
 struct Cli {
@@ -251,6 +251,19 @@ enum Command {
     /// this binary at compile time) — the canonical reference for the
     /// format, available offline wherever `meshfox` is installed.
     Spec,
+    /// Check github.com/orofarne/meshfox's releases for a newer version
+    /// than this binary and, if one exists, offer to download and install
+    /// it in place (replacing the running executable). A no-op if this
+    /// build wasn't made from a release tag (e.g. a local/dev build) —
+    /// there's no version to compare against a release with, so it just
+    /// says so and exits.
+    CheckUpdates {
+        /// Install the update without asking for confirmation first.
+        /// Required when stdin isn't an interactive terminal, since
+        /// there's no one to confirm with.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -538,6 +551,55 @@ fn main() {
             NodeCommand::Show { canvas, node_id } => node_show(&canvas.unwrap_or_else(find_canvas), &node_id),
         },
         Command::Spec => print!("{}", include_str!("../../../SPEC.md")),
+        Command::CheckUpdates { yes } => check_updates(yes),
+    }
+}
+
+/// `MESHFOX_VERSION_LABEL` (see its own doc comment above `VERSION`) is
+/// either a release tag like `v0.2.1` or `commit <hash>` for a build made
+/// off-tag. Only the former has anything to compare against a GitHub
+/// release, so that's what distinguishes the two here rather than trying
+/// to parse `commit ...` as a non-version and fall through.
+fn check_updates(yes: bool) {
+    let label = env!("MESHFOX_VERSION_LABEL");
+    let is_release_tag = label.starts_with('v') && label[1..].starts_with(|c: char| c.is_ascii_digit());
+    if !is_release_tag {
+        println!(
+            "meshfox check-updates: this build ({label}) wasn't made from a release tag, so \
+             there's no version to compare against a GitHub release."
+        );
+        return;
+    }
+    let current_version = &label[1..];
+
+    if !yes && !prompt::stdin_is_tty() {
+        eprintln!(
+            "meshfox check-updates: requires an interactive terminal to confirm an update \
+             (stdin isn't one) — pass --yes to update without asking"
+        );
+        std::process::exit(1);
+    }
+
+    let result = self_update::backends::github::Update::configure()
+        .repo_owner("orofarne")
+        .repo_name("meshfox")
+        .bin_name("meshfox")
+        .bin_path_in_archive("{{ target }}/meshfox")
+        .current_version(current_version)
+        .no_confirm(yes)
+        .show_download_progress(true)
+        .build()
+        .and_then(|update| update.update());
+
+    match result {
+        Ok(self_update::Status::UpToDate(v)) => println!("meshfox: already up to date (v{v})"),
+        Ok(self_update::Status::Updated(v)) => {
+            println!("meshfox: updated to v{v} — restart meshfox to use it")
+        }
+        Err(e) => {
+            eprintln!("meshfox check-updates: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
