@@ -1437,6 +1437,7 @@ fn fmt(canvas_path: &PathBuf, force: bool) {
             display: node.display,
             lang: node.lang.clone(),
             interpreter: node.interpreter.clone(),
+            edge_label: node.edge_label.clone(),
             fold: node.fold,
             tags: node.tags.clone(),
         };
@@ -1623,6 +1624,7 @@ fn apply_node_mv(raw: &str, node_id: &str, new_parent_id: &str) -> Result<String
                         display: new_node.display,
                         lang: new_node.lang.clone(),
                         interpreter: new_node.interpreter.clone(),
+                        edge_label: new_node.edge_label.clone(),
                         fold: new_node.fold,
                         tags: new_node.tags.clone(),
                     };
@@ -1830,6 +1832,7 @@ fn apply_node_meta(
         display: parsed_display.or(node.display),
         lang: lang.or_else(|| node.lang.clone()),
         interpreter: interpreter.or_else(|| node.interpreter.clone()),
+        edge_label: node.edge_label.clone(),
         fold: parsed_fold,
         tags: node.tags.clone(),
     };

@@ -243,6 +243,16 @@ pub struct Node {
     /// `None` means the node isn't runnable this way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interpreter: Option<String>,
+    /// Label text for the *structural* edge from `parent` into this node
+    /// (`edgeLabel=` on `meshfox:node`) — the implicit nesting edge has no
+    /// dedicated line of its own the way an `ExtraEdge` does (see
+    /// `ExtraEdge::label`), so this lives on the child end instead: "the
+    /// label of the edge that points at me". `None` for the root (no
+    /// incoming edge to label) and for every node that's never had one set.
+    /// Purely descriptive text — unlike `ExtraEdge`, a structural edge has
+    /// no color/style/arrowhead attributes to go with it (see SPEC.md).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_label: Option<String>,
     /// Markdown body between this heading (and its meshfox comments) and
     /// the next heading. For `group`, always empty. For `file`/`link`,
     /// always exactly the one Markdown link `target` was parsed from.

@@ -20,7 +20,8 @@ of JSON, for readable diffs and hand-editability.
   — unless overridden by `parent=` (below).
 - **`<!-- meshfox:node ... -->`** — right after a heading line. Turns the
   heading into a node and holds its bookkeeping as `key="value"` attributes:
-  `id`, `type`, `x`, `y`, `w`, `h`, `color`, `tags`, `parent`, `fold`. All optional; a
+  `id`, `type`, `x`, `y`, `w`, `h`, `color`, `tags`, `parent`, `fold`,
+  `edgeLabel`. All optional; a
   bare `<!-- meshfox:node -->` is enough. `id` defaults to a slug of the
   heading text; only write it explicitly for a stable handle that survives
   renames (e.g. because an edge references it). First write-back (running a
@@ -46,7 +47,14 @@ of JSON, for readable diffs and hand-editability.
   working — every deeper node just keeps writing `######` and disambiguates
   with `parent=` instead of heading depth. Written automatically ("add
   child" in the UI reaches for it exactly when it's needed); hand-editing it
-  is only for restructuring an already-flattened deep subtree.
+  is only for restructuring an already-flattened deep subtree. `edgeLabel=`
+  is arrow text for the *structural* edge from this node's own parent into
+  it — the implicit nesting edge has no line of its own to carry attributes
+  the way a `meshfox:edge` does (below), so it lives here instead, on the
+  child end: "the label of the edge that points at me". Unlike a
+  `meshfox:edge`, a structural edge has no color/style/arrowhead attributes
+  of its own — just this one piece of text. Omitted means no label, same as
+  every other optional attribute here.
 - **`<!-- meshfox:edge from="other-id" ... -->`** — one per line, right
   after a node's `meshfox:node` line. Declares an extra incoming edge from
   another node, for graphs that aren't a clean nesting tree. Any number

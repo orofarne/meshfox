@@ -550,6 +550,7 @@ async fn put_canvas(
             display: node.display,
             lang: node.lang.clone(),
             interpreter: node.interpreter.clone(),
+            edge_label: node.edge_label.clone(),
             fold: node.fold,
             tags: node.tags.clone(),
         };
@@ -609,6 +610,7 @@ async fn clear_layout(State(state): State<Arc<AppState>>) -> Result<Json<Canvas>
             display: node.display,
             lang: node.lang.clone(),
             interpreter: node.interpreter.clone(),
+            edge_label: node.edge_label.clone(),
             fold: node.fold,
             tags: node.tags.clone(),
         };
@@ -717,6 +719,12 @@ struct UpdateNodeRequest {
     /// Full replacement list of tags — `None` leaves them untouched,
     /// `Some(vec![])` clears them, same convention as `extraParents`.
     tags: Option<Vec<String>>,
+    /// Structural-edge label (see `meshfox_core::Node::edge_label`) — the
+    /// text shown on the implicit edge from this node's parent into it.
+    /// `None` (key not sent) leaves it untouched; `Some("")` (sent, empty)
+    /// clears it back to unset rather than writing a literal `edgeLabel=""`
+    /// — see this field's own handling in `update_node`.
+    edge_label: Option<String>,
     /// Per-node fold-state override (see `meshfox_core::Node::fold`) —
     /// `None` (the field not sent at all) leaves it untouched, same
     /// convention as every other field here. Unlike those, though, this
@@ -819,6 +827,7 @@ async fn update_node(
         existing_interpreter,
         existing_tags,
         existing_fold,
+        existing_edge_label,
     ) = (
         initial_node.x,
         initial_node.y,
@@ -830,6 +839,7 @@ async fn update_node(
         initial_node.interpreter.clone(),
         initial_node.tags.clone(),
         initial_node.fold,
+        initial_node.edge_label.clone(),
     );
     // `display`/`lang`/`interpreter` only mean anything on a `file` node —
     // clear them (rather than leave a stale attribute behind) whenever this
@@ -850,6 +860,7 @@ async fn update_node(
         || req.interpreter.is_some()
         || req.tags.is_some()
         || req.fold.is_some()
+        || req.edge_label.is_some()
     {
         // This also has the side effect of pinning the node's `id=`
         // attribute explicitly the moment any of its metadata changes,
@@ -864,6 +875,18 @@ async fn update_node(
         } else {
             (None, None, None)
         };
+        // Unlike `color` (which would happily store and write back a
+        // literal `color=""` if sent empty), an empty `edgeLabel` clears
+        // the attribute entirely rather than leaving that cruft behind —
+        // the client (see `web/src/DeletableEdge.tsx`) always sends this
+        // key explicitly (never omitted) whenever the label actually
+        // changed, including changing it *to* empty, so there's no
+        // "not sent at all" case to conflate this with.
+        let edge_label = match &req.edge_label {
+            None => existing_edge_label,
+            Some(s) if s.trim().is_empty() => None,
+            Some(s) => Some(s.clone()),
+        };
         let meta = NodeMeta {
             x,
             y,
@@ -874,6 +897,7 @@ async fn update_node(
             display,
             lang,
             interpreter,
+            edge_label,
             fold: resolve_fold_override(req.fold.as_deref(), existing_fold)?,
             tags: req.tags.clone().unwrap_or(existing_tags),
         };
@@ -1246,6 +1270,7 @@ async fn reparent_node(
                         display: new_node.display,
                         lang: new_node.lang.clone(),
                         interpreter: new_node.interpreter.clone(),
+                        edge_label: new_node.edge_label.clone(),
                         fold: new_node.fold,
                         tags: new_node.tags.clone(),
                     };

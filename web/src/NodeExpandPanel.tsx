@@ -153,6 +153,11 @@ export function NodeExpandPanel({
                 onEdgesChange={onEdgesChange}
                 nodeTypes={nodeTypes}
                 edgeTypes={edgeTypes}
+                // Matches the main canvas's own override (see App.tsx's
+                // `<ReactFlow>`) — without it, an uncolored edge's
+                // arrowhead here falls back to React Flow's flat gray
+                // default instead of this app's own accent.
+                defaultMarkerColor="var(--accent)"
                 nodesDraggable={editMode}
                 colorMode={themePreference}
                 fitView

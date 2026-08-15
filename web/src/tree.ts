@@ -68,8 +68,10 @@ export interface DerivedEdge {
   target: string;
   /** false for the implicit nesting edge, true for a `meshfox:edge` extra. */
   extra: boolean;
-  /** Per-edge styling — only ever set when `extra` is true (see
-   * `ExtraEdgeDto`). */
+  /** Structural (`extra: false`) edge: `CanvasNode.edgeLabel` off the
+   * *target* node — its only real per-edge attribute, no color/style/
+   * arrowheads to go with it. Extra (`extra: true`) edge: `ExtraEdgeDto`'s
+   * own `label`, alongside every other styling field below. */
   label?: string;
   color?: string;
   style?: "solid" | "dashed" | "dotted";
@@ -90,7 +92,13 @@ export function deriveEdges(canvas: CanvasDoc): DerivedEdge[] {
       // regardless of type, so those are never suppressed.
       const isGroupParent = byId.get(n.parent)?.type === "group";
       if (!isGroupParent) {
-        edges.push({ id: `${n.parent}->${n.id}`, source: n.parent, target: n.id, extra: false });
+        edges.push({
+          id: `${n.parent}->${n.id}`,
+          source: n.parent,
+          target: n.id,
+          extra: false,
+          label: n.edgeLabel,
+        });
       }
     }
     for (const extra of n.extraParents ?? []) {

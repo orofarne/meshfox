@@ -109,6 +109,9 @@ pub struct NodeMeta {
     /// `file`-node interpreter (see `Node::is_runnable_file`). Same
     /// "omitted unless set" contract as `display`/`lang`.
     pub interpreter: Option<String>,
+    /// Structural-edge label (see `Node::edge_label`). Same "omitted unless
+    /// set" contract as `display`/`lang`/`interpreter`.
+    pub edge_label: Option<String>,
     /// Free-form tags. Empty means "omitted" — same "caller passes through
     /// the existing value to keep it" contract as every other field here.
     pub tags: Vec<String>,
@@ -215,6 +218,7 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
             }),
             lang: seg.node_attrs.get("lang").cloned(),
             interpreter: seg.node_attrs.get("interpreter").cloned(),
+            edge_label: seg.node_attrs.get("edgeLabel").cloned(),
             text: body,
             constraint_results: Vec::new(),
             asset_base: None,
@@ -347,6 +351,9 @@ fn render_node_line(canvas: &Canvas, node: &Node) -> String {
     if let Some(i) = &node.interpreter {
         parts.push(format!("interpreter=\"{i}\""));
     }
+    if let Some(l) = &node.edge_label {
+        parts.push(format!("edgeLabel=\"{l}\""));
+    }
     if !node.tags.is_empty() {
         parts.push(format!("tags=\"{}\"", node.tags.join(",")));
     }
@@ -439,6 +446,9 @@ pub fn set_node_meta(markdown: &str, node_id: &str, meta: &NodeMeta) -> Option<S
     }
     if let Some(i) = &meta.interpreter {
         parts.push(format!("interpreter=\"{i}\""));
+    }
+    if let Some(l) = &meta.edge_label {
+        parts.push(format!("edgeLabel=\"{l}\""));
     }
     if let Some(f) = meta.fold {
         parts.push(format!("fold=\"{f}\""));
@@ -1797,6 +1807,7 @@ Reused from Tests as well.
             display: None,
             lang: None,
             interpreter: None,
+            edge_label: None,
             fold: None,
             tags: Vec::new(),
         };

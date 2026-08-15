@@ -84,6 +84,12 @@ const INITIAL_ZOOM = 1;
 const INITIAL_VIEW_PADDING_X = 80;
 const INITIAL_VIEW_PADDING_Y = 80;
 
+/** Perpendicular spacing (flow-space px, so it scales naturally with zoom
+ * like everything else on the canvas) between two extra edges that share
+ * the same unordered node pair — see the edge-building effect's own
+ * `parallelOffsets` map, and `DeletableEdge.tsx`'s use of `data.parallelOffset`. */
+const PARALLEL_EDGE_OFFSET = 24;
+
 /** Whether `addr`'s own fence opted into `cache` — i.e. whether running it
  * could have changed anything on disk worth reloading for. Used to decide
  * whether an edit-mode run needs to reload the canvas at all afterward;
@@ -968,6 +974,18 @@ export default function App() {
     [canvas],
   );
 
+  // Sets (or, given `""`, clears) a structural edge's own label —
+  // `edgeLabel=` on the *child* node's `meshfox:node`, the only per-edge
+  // attribute a plain parent→child edge has (see CanvasNode.edgeLabel's
+  // own doc comment for why it lives there rather than on a dedicated
+  // edge object the way `ExtraEdgeDto`'s does) — the new structural-edge
+  // properties panel's "ok".
+  const updateStructuralEdgeLabel = useCallback((nodeId: string, label: string) => {
+    updateNode(nodeId, { edgeLabel: label })
+      .then(setCanvas)
+      .catch((e) => setError(String(e)));
+  }, []);
+
   // Dragging a new connection between two node handles (edit mode only,
   // see `nodesConnectable` on <ReactFlow>) adds an extra `meshfox:edge` —
   // the canvas-native way to create one, alongside NodeSettings' "add
@@ -1115,54 +1133,98 @@ export default function App() {
         };
       }),
     );
+    const derivedEdges = deriveEdges(canvas);
+    // Two extra edges sharing the same *unordered* node pair — in
+    // practice always exactly a mutual link, `A->B` declared alongside
+    // `B->A` (an `extraParents` entry can't repeat the same `from` twice
+    // under one node, so that's the only way to actually get two here) —
+    // get identical `sourceX/Y`/`targetX/Y` regardless of which one is
+    // which (both resolve to the exact same pair of handle points, see
+    // the routing comment below), so a plain bezier between them draws
+    // the exact same curve twice, on top of itself: indistinguishable
+    // from one edge, and unclickable for anything but whichever rendered
+    // last. `DeletableEdge.tsx`'s `getParallelBezierPath` offsets a
+    // curve's own control point perpendicular to *its own* source→target
+    // line — which already flips sign between `A->B` and `B->A`
+    // (reversing direction negates the perpendicular), so giving every
+    // edge in the group the exact same signed offset value below (not
+    // alternating it per edge) is what lands `A->B`'s control point and
+    // `B->A`'s on opposite sides of the line they share. A structural
+    // edge never needs this: each node has exactly one `parent`, so two
+    // structural edges can never share an unordered pair to begin with.
+    const parallelOffsets = new Map<string, number>();
+    {
+      const groups = new Map<string, string[]>();
+      for (const e of derivedEdges) {
+        if (!e.extra) continue;
+        const key = [e.source, e.target].sort().join(" ");
+        const group = groups.get(key);
+        if (group) group.push(e.id);
+        else groups.set(key, [e.id]);
+      }
+      for (const ids of groups.values()) {
+        if (ids.length < 2) continue;
+        // Same signed value for every edge in the group, deliberately not
+        // alternated per edge — see this block's own doc comment above
+        // for why an earlier, alternating-by-index version of this
+        // canceled itself back out to zero separation instead.
+        for (const id of ids) parallelOffsets.set(id, PARALLEL_EDGE_OFFSET);
+      }
+    }
     setEdges(
-      deriveEdges(canvas).map((e) => {
+      derivedEdges.map((e) => {
         if (!e.extra) {
           // Deleting a structural (nesting) edge means reparenting the
           // node (moving its heading block) — only offered when there's
           // somewhere for it to go: another declared incoming edge
-          // (`extraParents`) to promote in its place. With none, this stays
-          // a plain, non-deletable edge exactly as before this existed.
+          // (`extraParents`) to promote in its place; see this edge's own
+          // properties panel (`canDelete` below), reached the same way an
+          // extra edge's is (click the edge, in edit mode). With no
+          // candidate, `canDelete` is false and that panel's own "Delete"
+          // button doesn't render — same accessibility rule as before this
+          // had a panel at all, just relocated (see DeletableEdge.tsx's
+          // own doc comment for why an on-canvas midpoint button doesn't
+          // work well here).
           const targetNode = canvas.nodes.find((n) => n.id === e.target);
           const candidates = (targetNode?.extraParents ?? []).map((p) => p.from);
-          if (candidates.length === 0) {
-            return {
-              id: e.id,
-              source: e.source,
-              target: e.target,
-              // Every node has more than one handle of each type now (see
-              // MeshNode.tsx's routing-only top/bottom pair, added for
-              // extra edges) — an explicit id here, matching the plain
-              // Left/Right ones every node still has, is what keeps this
-              // structural edge on them rather than React Flow's own
-              // "no id given, just use whichever handle of that type it
-              // finds first" fallback silently picking one of the new
-              // ones instead.
-              sourceHandle: "source-default",
-              targetHandle: "target-default",
-              // Right-angle "elbow" routing to match the indented-tree-view
-              // layout (see layout.rs) — nodes grow rightward with depth,
-              // so a classic step/elbow connector reads better here than a
-              // bezier.
-              type: "smoothstep",
-              markerEnd: { type: MarkerType.ArrowClosed },
-              deletable: false,
-              selectable: false,
-            };
-          }
           const title =
-            candidates.length === 1
-              ? `Delete this link — "${canvas.nodes.find((n) => n.id === candidates[0])?.title ?? candidates[0]}" becomes the new parent`
-              : `Delete this link — choose which of its ${candidates.length} other edges becomes the new parent`;
+            candidates.length === 0
+              ? ""
+              : candidates.length === 1
+                ? `Delete this link — "${canvas.nodes.find((n) => n.id === candidates[0])?.title ?? candidates[0]}" becomes the new parent`
+                : `Delete this link — choose which of its ${candidates.length} other edges becomes the new parent`;
           return {
             id: e.id,
             source: e.source,
             target: e.target,
+            // Every node has more than one handle of each type now (see
+            // MeshNode.tsx's routing-only top/bottom pair, added for
+            // extra edges) — an explicit id here, matching the plain
+            // Left/Right ones every node still has, is what keeps this
+            // structural edge on them rather than React Flow's own
+            // "no id given, just use whichever handle of that type it
+            // finds first" fallback silently picking one of the new
+            // ones instead.
             sourceHandle: "source-default",
             targetHandle: "target-default",
+            // Right-angle "elbow" routing to match the indented-tree-view
+            // layout (see layout.rs) — nodes grow rightward with depth,
+            // so a classic step/elbow connector reads better here than a
+            // bezier. `"tree"` (not the built-in `"smoothstep"`) even for
+            // one with nothing to delete — every structural edge is
+            // clickable now (see `edgeTypes` in App.tsx's own
+            // `<ReactFlow>`, both map to `DeletableEdge`), since its label
+            // is editable regardless of whether it's also deletable.
             type: "tree",
             markerEnd: { type: MarkerType.ArrowClosed },
-            data: { editMode, title, onDelete: () => requestReparentEdge(e.target) },
+            data: {
+              editMode,
+              canDelete: candidates.length > 0,
+              title,
+              label: e.label,
+              onDelete: () => requestReparentEdge(e.target),
+              onUpdateLabel: (label: string) => updateStructuralEdgeLabel(e.target, label),
+            },
           };
         }
         // Per-edge styling (label/color/line-style/arrow ends) — see
@@ -1173,10 +1235,33 @@ export default function App() {
         // this "non-rectangular" unlike a structural `tree` edge).
         const strokeColor = e.color ? resolveNodeColor(e.color) : undefined;
         const dash = dashArrayFor(e.style);
+        // `color` is only ever included on the marker object below when
+        // there's an actual value to put there — never sent as an
+        // explicit `color: undefined`, unlike an earlier version of this
+        // that rendered every uncolored edge's arrowhead invisible.
+        // React Flow's own `createMarkerIds` (`@xyflow/system`) builds
+        // each marker definition as `{ color: marker.color || defaultColor,
+        // ...marker }` — spreading `marker` *after* that computed
+        // fallback, so a `color` key present on our own object at all
+        // (even set to `undefined`) clobbers the fallback right back to
+        // `undefined` regardless of its value, which its own
+        // `ArrowClosedSymbol` component then turns into a literal inline
+        // `style="stroke:none;fill:none"` (its own default parameter,
+        // `color = 'none'`, only kicks in for a JS `undefined` *value*,
+        // not for the key being altogether missing — a distinct thing
+        // from what got clobbered here) — invisible, and an inline style
+        // beats any CSS fallback rule regardless of specificity. Omitting
+        // the key outright instead lets `defaultColor` (`--xy-edge-
+        // stroke-default`, the same accent-colored default every other
+        // edge already uses) through as intended.
         const markerEnd =
-          e.arrowEnd === "none" ? undefined : { type: MarkerType.ArrowClosed, color: strokeColor };
+          e.arrowEnd === "none"
+            ? undefined
+            : { type: MarkerType.ArrowClosed, ...(strokeColor ? { color: strokeColor } : {}) };
         const markerStart =
-          e.arrowStart === "arrow" ? { type: MarkerType.ArrowClosed, color: strokeColor } : undefined;
+          e.arrowStart === "arrow"
+            ? { type: MarkerType.ArrowClosed, ...(strokeColor ? { color: strokeColor } : {}) }
+            : undefined;
         // An extra edge can connect any two nodes anywhere on the canvas —
         // routed through the plain Left/Right handle pair every node also
         // has (the "default" case below), a bezier's horizontal tangents
@@ -1234,6 +1319,7 @@ export default function App() {
           data: {
             editMode,
             editable: true,
+            canDelete: true,
             title: "Remove this edge",
             onDelete: () => removeExtraEdge(e.target, e.source),
             onUpdate: (patch: Partial<Omit<ExtraEdgeDto, "from">>) =>
@@ -1244,6 +1330,7 @@ export default function App() {
             arrowStart: e.arrowStart,
             arrowEnd: e.arrowEnd,
             tags: e.tags,
+            parallelOffset: parallelOffsets.get(e.id) ?? 0,
           },
         };
       }),
@@ -1659,9 +1746,11 @@ export default function App() {
   // for either deletable-edge kind, persisting server-side instead of
   // forwarding it to React Flow's own local state — the subsequent canvas
   // reload is what actually drops it from `edges`, keeping the file the
-  // single source of truth. A structural edge with nothing to promote in
-  // its place never generates a "remove" change at all (`deletable: false`,
-  // set above), so nothing needs filtering for those.
+  // single source of truth. Every structural edge is selectable now (its
+  // label is editable regardless of whether it's also deletable — see its
+  // own `canDelete`), so Backspace on one with nothing to promote in its
+  // place *does* reach here — `requestReparentEdge` itself is what no-ops
+  // on an empty candidate list, not this filter.
   const onEdgesChangeAndPersist: typeof onEdgesChange = useCallback(
     (changes) => {
       const toForward = changes.filter((change) => {
@@ -1905,6 +1994,18 @@ export default function App() {
             // manual override (see theme.ts) reaches these panels too,
             // not just this app's own `--fg`/`--bg`-driven CSS.
             colorMode={themePreference}
+            // React Flow's own default (a flat gray, `#b1b1b7`) for an
+            // arrowhead with no explicit per-edge `color` — the common
+            // case, most edges never set one. `var(--accent)` matches
+            // this app's own edge-stroke default (see index.css's
+            // `--xy-edge-stroke-default` override) instead, so an
+            // uncolored edge's arrowhead doesn't clash with its own line.
+            // A literal CSS custom property reference works fine as an
+            // inline style value (which is what this ultimately becomes —
+            // see `createMarkerIds`/`ArrowClosedSymbol` in
+            // `@xyflow/system`/`@xyflow/react`), resolving through the
+            // cascade like any other `var()`, light/dark theme included.
+            defaultMarkerColor="var(--accent)"
             nodesDraggable={editMode}
             // Dragging a new connection between handles creates an extra
             // `meshfox:edge` (see handleConnect) — only worth allowing once

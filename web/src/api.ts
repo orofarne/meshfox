@@ -144,6 +144,12 @@ export interface NodePatch {
   lang?: string;
   /** file-node interpreter — see `CanvasNode.interpreter`. */
   interpreter?: string;
+  /** Structural-edge label — see `CanvasNode.edgeLabel`. Omit to leave it
+   * untouched; an explicit `""` clears it back to unset (see this field's
+   * own handling in the server's `update_node`) — unlike `fold`, there's
+   * no separate sentinel needed here since a caller only ever sends this
+   * key at all when the label actually changed (see DeletableEdge.tsx). */
+  edgeLabel?: string;
   /** Full replacement list of tags — omit to leave them untouched, pass
    * `[]` to clear them. */
   tags?: string[];

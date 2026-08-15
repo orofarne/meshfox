@@ -76,6 +76,13 @@ export interface CanvasNode {
   /** file-node only: an executable (e.g. "python") to run against
    * `target`, making the node runnable — absent means it isn't. */
   interpreter?: string;
+  /** Label text for the *structural* edge from `parent` into this node
+   * (`edgeLabel=` on `meshfox:node`) — see `crates/core/src/canvas.rs`'s
+   * `Node.edge_label`. Absent for the root and for any node that's never
+   * had one set. Purely descriptive text; unlike `ExtraEdgeDto`, a
+   * structural edge has no color/style/arrowhead attributes to go with
+   * it. */
+  edgeLabel?: string;
   text: string;
   /** Results of every embedded ` ```starlark constraint ` fence in this
    * node's own body, in document order — see `ConstraintStatusDto`. Absent
