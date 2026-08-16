@@ -9,6 +9,12 @@
 
 [Website](https://meshfox.orofarne.net/) · [GitHub](https://github.com/orofarne/meshfox) · [Download binary](https://github.com/orofarne/meshfox/releases)
 
+Install on Linux/macOS in one line:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/orofarne/meshfox/main/scripts/install.sh | sh
+```
+
 <!-- meshfox:var name="INSTALL_PATH" prompt="Install prefix?" default="/usr/local/bin" -->
 
 An executable canvas: a hierarchical, node-based document where nodes hold Markdown, and code blocks inside that Markdown can be run — with their output optionally cached right next to the code.
@@ -490,6 +496,6 @@ meshfox is MIT-licensed.
 [LICENSE](./LICENSE)
 
 ### Dependency licenses
-<!-- meshfox:node id="license-deps" type="link" -->
+<!-- meshfox:node id="license-deps" type="include" -->
 
 [LICENSE.canvas.md](./LICENSE.canvas.md)
