@@ -182,6 +182,14 @@ export interface MeshNodeData {
    * every node that wasn't, which resolves exactly as before includes
    * carried this field. */
   assetBase?: string;
+  /** `true` when `text` is actually a plain-Markdown `include` target's
+   * transcluded content, not this node's own real text — there's no
+   * well-defined way to write a per-node body edit here back to the real
+   * target file, so the title bar's pencil button opens Source mode
+   * (already scoped to this node's own id, which doubles as the
+   * include's `nodeId`) instead of the normal inline editor. See
+   * `crates/core/src/canvas.rs`'s `Node.plain_markdown_include`. */
+  plainMarkdownInclude?: boolean;
   /** JSON Canvas color — either a hex string or a preset `"1"`-`"6"` (see
    * `resolveNodeColor`) — `undefined`/empty means no color was set. */
   color?: string;
@@ -217,6 +225,11 @@ export interface MeshNodeData {
   /** Persists a full replacement of this node's raw Markdown body — the
    * inline text editor's auto-save. */
   onSaveText: (text: string) => void;
+  /** `plainMarkdownInclude` nodes only — opens Source mode scoped to this
+   * node's own id (the include's `nodeId`) instead of the inline text
+   * editor, since that's the only place this content can actually be
+   * edited (see `plainMarkdownInclude`'s own doc comment). */
+  onOpenSourceMode: (includeNodeId: string) => void;
   /** `false` for the root — it can't be deleted (there'd be nothing left
    * to re-root the document at), so the title bar's trash button is
    * hidden entirely rather than shown disabled. */
@@ -1123,16 +1136,26 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
           )}
           {data.editMode && (
             <span className="mesh-node-title-actions">
-              {isTextNode && (
-                <button
-                  type="button"
-                  className="mesh-node-icon-button nodrag"
-                  onClick={() => setEditingText(true)}
-                  title="Edit this node's Markdown text"
-                >
-                  ✏
-                </button>
-              )}
+              {isTextNode &&
+                (data.plainMarkdownInclude ? (
+                  <button
+                    type="button"
+                    className="mesh-node-icon-button nodrag"
+                    onClick={() => data.onOpenSourceMode(id)}
+                    title="This content comes from an included file — edit it in Source mode"
+                  >
+                    ⇥
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className="mesh-node-icon-button nodrag"
+                    onClick={() => setEditingText(true)}
+                    title="Edit this node's Markdown text"
+                  >
+                    ✏
+                  </button>
+                ))}
               {isGroup && (
                 <button
                   type="button"

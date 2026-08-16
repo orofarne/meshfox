@@ -272,6 +272,16 @@ export default function App() {
   // Whether CanvasSourceEditor has unsaved edits — disables the "done"
   // button so leaving Edit mode can't silently discard them.
   const [sourceDirty, setSourceDirty] = useState(false);
+  // Which file CanvasSourceEditor should open on — an include's own
+  // `nodeId` (see `IncludeManifestEntry`), or `undefined` for the
+  // document itself (the toolbar's plain "Source" toggle). Set by
+  // `handleOpenSourceMode` (a `plainMarkdownInclude` node's title-bar
+  // button, since that content can only ever be edited via its own real
+  // file — see `MeshNode.tsx`'s `plainMarkdownInclude`), consumed once by
+  // `CanvasSourceEditor`'s own initial-selection prop and not touched
+  // again while Source mode stays open (switching files from there on is
+  // that component's own picker's job).
+  const [sourceInitialInclude, setSourceInitialInclude] = useState<string | undefined>(undefined);
   // Toolbar's light/dark toggle (see theme.ts) — "system" (the default)
   // follows the OS; initialized from localStorage rather than always
   // "system" so a stored override survives a reload without a flash (see
@@ -535,7 +545,15 @@ export default function App() {
   }, [editMode]);
 
   useEffect(() => {
-    if (!sourceMode) setSourceDirty(false);
+    if (!sourceMode) {
+      setSourceDirty(false);
+      // Whichever file a `plainMarkdownInclude` redirect (see
+      // `handleOpenSourceMode`) pointed CanvasSourceEditor at shouldn't
+      // linger for next time — covers every way out of Source mode
+      // (the editor's own Cancel/Save, and the toolbar's own toggle,
+      // which don't each need their own copy of this reset).
+      setSourceInitialInclude(undefined);
+    }
   }, [sourceMode]);
 
   // CanvasSourceEditor's Save succeeded — the file changed from underneath
@@ -979,6 +997,16 @@ export default function App() {
     }
   }, []);
 
+  // A `plainMarkdownInclude` node's title-bar button (see `MeshNode.tsx`):
+  // that content has no per-node write path of its own (see
+  // `Node.plain_markdown_include`'s own doc comment), so this opens
+  // Source mode pre-scoped to the include's real file instead of trying
+  // (and failing) to save an inline edit.
+  const handleOpenSourceMode = useCallback((includeNodeId: string) => {
+    setSourceInitialInclude(includeNodeId);
+    setSourceMode(true);
+  }, []);
+
   // Removes one extra incoming edge (`meshfox:edge from="sourceNodeId"`)
   // from `targetNodeId` — shared by DeletableEdge's own "×" button (on a
   // real extra edge) and `onEdgesChangeAndPersist`'s keyboard-delete
@@ -1187,6 +1215,7 @@ export default function App() {
             color: n.color,
             tags: n.tags,
             assetBase: n.assetBase,
+            plainMarkdownInclude: n.plainMarkdownInclude,
             onRun: (blockName: string, withDeps: boolean) => handleRun(n.id, blockName, withDeps),
             onKill: (blockName: string) => handleKill(n.id, blockName),
             onRunTty: (blockName: string, withDeps: boolean) => handleRunTty(n.id, blockName, withDeps),
@@ -1196,6 +1225,7 @@ export default function App() {
             onOpenSettings: () => setSettingsNodeId(n.id),
             onExpand: () => setExpandedNodeId(n.id),
             onSaveText: (text: string) => handleSaveText(n.id, text),
+            onOpenSourceMode: handleOpenSourceMode,
             canDelete: !!n.parent,
             onRequestDelete: () => setDeleteConfirmNodeId(n.id),
           },
@@ -2047,6 +2077,7 @@ export default function App() {
       <div className="canvas-area">
         {sourceMode ? (
           <CanvasSourceEditor
+            initialInclude={sourceInitialInclude}
             onSaved={handleSourceSaved}
             onClose={() => setSourceMode(false)}
             onDirtyChange={setSourceDirty}

@@ -158,6 +158,7 @@ pub fn resolve(canvas: &Canvas, base_path: &Path) -> Result<Canvas, IncludeError
             nodes[idx].target = None;
             nodes[idx].text = mdcanvas::shift_headings(&contents, level);
             nodes[idx].asset_base = asset_base;
+            nodes[idx].plain_markdown_include = true;
         }
     }
 
@@ -323,6 +324,10 @@ mod tests {
         let spec = resolved.node("spec").unwrap();
         assert_eq!(spec.node_type, NodeType::Text);
         assert!(spec.target.is_none());
+        // Marks this node's body as belonging to the target file, not its
+        // own — the signal a client (e.g. the web UI) uses to steer a
+        // would-be per-node body editor toward Source mode instead.
+        assert!(spec.plain_markdown_include);
         // Spec's own H1 (level 1) becomes level 1+2=3 (spec node is level 2).
         assert!(spec.text.contains("### Spec Title"));
         assert!(spec.text.contains("#### Sub"));
@@ -358,10 +363,15 @@ mod tests {
 
         let include_node = resolved.node("child").unwrap();
         assert_eq!(include_node.node_type, NodeType::Group);
+        assert!(!include_node.plain_markdown_include);
 
         let spliced_root = resolved.node("child/root").unwrap();
         assert_eq!(spliced_root.parent.as_deref(), Some("child"));
         assert_eq!(spliced_root.level, 2 + 1); // child node is level 2
+        // A canvas-include descendant has its own real on-disk identity
+        // (origin_path/origin_id) and is safely per-node-editable — not
+        // the same "can't write this back" case plain-Markdown is.
+        assert!(!spliced_root.plain_markdown_include);
         assert_eq!(
             spliced_root.asset_base.as_deref(),
             Some(tmp.canonicalize().unwrap().to_str().unwrap())

@@ -224,6 +224,7 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
             asset_base: None,
             origin_path: None,
             origin_id: None,
+            plain_markdown_include: false,
         });
     }
 
@@ -368,6 +369,20 @@ fn fmt_num(n: f64) -> String {
     } else {
         format!("{n}")
     }
+}
+
+/// Byte offset in `markdown` where node `node_id`'s own body starts —
+/// right after its heading and `meshfox:node` comment (if any), same
+/// `body_span.start` `set_node_body` below patches in place. `None` if
+/// `node_id` doesn't exist. For a consumer that wants to place a cursor
+/// at "the start of this node's content" (e.g. a source-code editor
+/// jumping to the selected node) without needing to know anything about
+/// `Segment`/`scan` themselves, which stay private to this module.
+pub fn node_body_offset(markdown: &str, node_id: &str) -> Option<usize> {
+    let segments = scan(markdown);
+    let ids = assign_ids(&segments).ok()?;
+    let idx = ids.iter().position(|id| id == node_id)?;
+    Some(segments[idx].body_span.start)
 }
 
 /// Replace just the body of node `node_id` with `new_body`, leaving the
@@ -1780,6 +1795,25 @@ Reused from Tests as well.
         let rendered = render(&c1);
         let c2 = parse(&rendered).unwrap();
         assert_eq!(c1, c2);
+    }
+
+    #[test]
+    fn node_body_offset_points_at_the_start_of_the_bodys_own_span() {
+        // `body_span` (same one `set_node_body` patches in place) starts
+        // right after the heading/`meshfox:node` comment — its own leading
+        // blank line included, same as `set_node_body`'s own replacement
+        // logic trims off before use (see `Node::text`).
+        let offset = node_body_offset(DOC, "smoke-test").unwrap();
+        assert!(
+            DOC[offset..].trim_start().starts_with("A trivial check."),
+            "landed at: {:?}",
+            &DOC[offset..offset + 20]
+        );
+
+        let root_offset = node_body_offset(DOC, "root").unwrap();
+        assert!(DOC[root_offset..].trim_start().starts_with("Root body text."));
+
+        assert_eq!(node_body_offset(DOC, "does-not-exist"), None);
     }
 
     #[test]

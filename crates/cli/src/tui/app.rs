@@ -26,6 +26,7 @@ use ratatui_image::protocol::Protocol;
 use super::ui;
 
 use super::markdown::{self, Highlighter, Segment};
+use super::source_editor::{self, SourceEditorOutcome, SourceEditorState};
 use super::tree::{self, TreeRow};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -137,6 +138,11 @@ pub struct App {
     pub status: String,
     pub show_help: bool,
     pub should_quit: bool,
+    /// The fullscreen raw-source editor (`e`) — `Some` takes over
+    /// rendering entirely (see `ui::render`) instead of the usual 3-pane
+    /// layout, same "one thing at a time" precedence `var_form`/
+    /// `block_picker` already have over the base keymap (see `on_key`).
+    pub source_editor: Option<SourceEditorState>,
     /// Aggregate `(total, failed)` across every embedded constraint fence
     /// in `display_canvas`, computed alongside it (see
     /// `resolve_includes`/`rebuild_display_canvas`) — `None` when the
@@ -224,6 +230,7 @@ impl App {
             status: String::new(),
             show_help: false,
             should_quit: false,
+            source_editor: None,
             constraint_stats,
         };
         app.render_current_document();
@@ -231,6 +238,14 @@ impl App {
     }
 
     pub async fn on_key(&mut self, key: KeyEvent) {
+        if let Some(se) = &mut self.source_editor {
+            match se.on_key(key) {
+                SourceEditorOutcome::Stay => {}
+                SourceEditorOutcome::Close => self.source_editor = None,
+                SourceEditorOutcome::Save => self.save_source_editor(),
+            }
+            return;
+        }
         if self.var_form.is_some() {
             self.on_var_form_key(key).await;
             return;
@@ -272,6 +287,7 @@ impl App {
             KeyCode::Char('K') => self.kill_running(),
             KeyCode::Char('o') => self.trigger_open_file(),
             KeyCode::Char('c') => self.trigger_configure(),
+            KeyCode::Char('e') => self.open_source_editor(),
             KeyCode::PageDown => self.scroll_document(10),
             KeyCode::PageUp => self.scroll_document(-10),
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => self.scroll_document(10),
@@ -572,6 +588,102 @@ impl App {
             Ok(()) => self.status = format!("opened {}", path.display()),
             Err(e) => self.status = format!("failed to open {}: {e}", path.display()),
         }
+    }
+
+    // -- source editor --------------------------------------------------
+
+    /// `e` — opens the fullscreen source editor (`source_editor.rs`) on
+    /// whichever real file the selected node's content actually lives in,
+    /// with the cursor at that node's own body. Mirrors the server's own
+    /// `locate_node` (`crates/server/src/lib.rs`): a node found directly
+    /// in `display_canvas` with no `origin_path`/`origin_id` of its own
+    /// lives in the primary document (including a canvas-`include` node
+    /// itself, which by then is a `group` with an empty body — nothing
+    /// node-specific to jump to beyond its own heading, same as any other
+    /// node); one that does carry an origin is a canvas-`include`
+    /// descendant, with a real separate on-disk identity; and
+    /// `plain_markdown_include` (see that field's own doc comment) is the
+    /// one case with no per-node identity inside its target at all — just
+    /// opens that file at the top.
+    fn open_source_editor(&mut self) {
+        let Some(row) = self.rows.get(self.selected) else { return };
+        let node_id = row.node_id.clone();
+        let Some(node) = self.display_canvas.node(&node_id) else { return };
+
+        let (path, is_canvas, local_id): (PathBuf, bool, Option<String>) =
+            if let (Some(p), Some(local)) = (&node.origin_path, &node.origin_id) {
+                (PathBuf::from(p), true, Some(local.clone()))
+            } else if node.plain_markdown_include {
+                match meshfox_core::include::list_includes(&self.canvas, &self.canvas_path)
+                    .into_iter()
+                    .find(|i| i.node_id == node_id)
+                {
+                    Some(info) => (info.path, false, None),
+                    None => {
+                        self.status = "couldn't resolve this include's target file".into();
+                        return;
+                    }
+                }
+            } else {
+                (self.canvas_path.clone(), true, Some(node_id))
+            };
+
+        let files = meshfox_core::include::list_includes(&self.canvas, &self.canvas_path);
+
+        // Cursor placement needs the *target file's own raw text* (to
+        // convert a byte offset into a row/col) — read once here and
+        // again inside `SourceEditorState::open`, rather than plumbing it
+        // through, since that constructor is also the file-switcher's
+        // own reload path and shouldn't need a cursor argument for that
+        // case.
+        let cursor = local_id
+            .as_deref()
+            .zip(std::fs::read_to_string(&path).ok())
+            .and_then(|(id, raw)| {
+                mdcanvas::node_body_offset(&raw, id).map(|off| source_editor::byte_offset_to_cursor(&raw, off))
+            })
+            .unwrap_or_default();
+
+        match SourceEditorState::open(self.canvas_path.clone(), path, is_canvas, cursor, files) {
+            Ok(state) => self.source_editor = Some(state),
+            Err(e) => self.status = format!("failed to open source editor: {e}"),
+        }
+    }
+
+    /// `Ctrl-s` inside the source editor — validates (as a canvas, only
+    /// when `is_canvas`; a plain-Markdown include target has no such
+    /// requirement — see `SourceEditorState::is_canvas`'s own doc
+    /// comment) and writes to disk, exactly mirroring the server's
+    /// `put_canvas_raw`/`SourceFile` split. Refreshes `display_canvas`
+    /// (and `raw`/`canvas`, if the primary document was what got saved)
+    /// afterward, same as any other on-disk change here, so the tree/
+    /// document panes reflect the edit the moment the editor closes.
+    fn save_source_editor(&mut self) {
+        let Some(se) = &mut self.source_editor else { return };
+        let text = se.editor.lines.to_string();
+        if se.is_canvas {
+            if let Err(e) = Canvas::from_markdown(&text) {
+                se.error = Some(e.to_string());
+                return;
+            }
+        }
+        if let Err(e) = std::fs::write(&se.path, &text) {
+            se.error = Some(format!("failed to write {}: {e}", se.path.display()));
+            return;
+        }
+        let is_primary = se.path == self.canvas_path;
+        se.mark_saved();
+        if is_primary {
+            self.raw = text.clone();
+            if let Ok(reparsed) = Canvas::from_markdown(&text) {
+                self.canvas = reparsed;
+            }
+        }
+        self.rebuild_display_canvas();
+        self.rebuild_rows();
+        self.render_current_document();
+        self.status = "saved".into();
+        self.source_editor = None;
     }
 
     // -- document rendering -------------------------------------------------

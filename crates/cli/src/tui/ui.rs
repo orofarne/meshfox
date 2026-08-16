@@ -8,9 +8,20 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 use ratatui_image::Image;
 
+use edtui::{EditorView, LineNumbers, SyntaxHighlighter};
+
 use super::app::{App, Focus};
 use super::markdown::Segment;
+use super::source_editor::SourceEditorState;
 use meshfox_core::{NodeType, VarType};
+
+/// Theme/language edtui's own bundled `syntect` highlighting uses for the
+/// source editor — always Markdown, since that's what every file this
+/// editor can open (a canvas or a plain-Markdown include target) actually
+/// is. "dracula" is the theme edtui's own docs/examples default to; not
+/// otherwise meaningful here.
+const SOURCE_EDITOR_THEME: &str = "dracula";
+const SOURCE_EDITOR_LANG: &str = "md";
 
 const OUTPUT_HEIGHT: u16 = 9;
 const FOOTER_HEIGHT: u16 = 1;
@@ -45,6 +56,15 @@ pub fn compute_layout(area: Rect) -> PaneLayout {
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
+
+    // The source editor is a genuine full-terminal takeover, not an
+    // overlay on top of the usual 3-pane layout — see `source_editor.rs`'s
+    // own module docs.
+    if let Some(se) = &mut app.source_editor {
+        render_source_editor(f, area, se);
+        return;
+    }
+
     let layout = compute_layout(area);
 
     render_tree(f, layout.tree, app);
@@ -226,7 +246,7 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
 
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     let mut hint = String::from(
-        "tab focus · j/k move/scroll · enter expand · h/l collapse/expand · r run · R run (no deps) · K kill",
+        "tab focus · j/k move/scroll · enter expand · h/l collapse/expand · r run · R run (no deps) · K kill · e edit",
     );
     if app.selected_is_open_target() {
         hint.push_str(" · o open");
@@ -373,6 +393,8 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         "R               run this node's block only (skip deps)",
         "  (a node with more than one block opens a picker first)",
         "K               kill the running block",
+        "e               edit this node's own file, full-screen (Ctrl-s save,",
+        "                Ctrl-f switch file, esc close)",
     ];
     if app.selected_is_open_target() {
         items.push("o               open this file node's target in the OS's default application");
@@ -402,4 +424,65 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
 
     let lines = items.into_iter().map(Line::from).collect::<Vec<_>>();
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The fullscreen source editor (`e`) — header (which file, dirty state),
+/// the `edtui` buffer itself, and a footer (error, or the keybinding
+/// hint) — plus the file-switcher (`Ctrl-f`) as a `render_block_picker`-
+/// style overlay on top when open.
+fn render_source_editor(f: &mut Frame, area: Rect, se: &mut SourceEditorState) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
+        .split(area);
+
+    let kind = if se.is_canvas { "canvas" } else { "plain markdown" };
+    let dirty = if se.dirty() { " [modified]" } else { "" };
+    let header = Line::from(vec![
+        Span::styled(format!(" {} ", se.path.display()), Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(format!("({kind}){dirty}"), Style::default().fg(Color::DarkGray)),
+    ]);
+    f.render_widget(Paragraph::new(header), chunks[0]);
+
+    let syntax_highlighter = SyntaxHighlighter::new(SOURCE_EDITOR_THEME, SOURCE_EDITOR_LANG).ok();
+    let view = EditorView::new(&mut se.editor).line_numbers(LineNumbers::Absolute).wrap(true);
+    let view = match syntax_highlighter {
+        Some(h) => view.syntax_highlighter(Some(h)),
+        None => view,
+    };
+    f.render_widget(view, chunks[1]);
+
+    let footer = match &se.error {
+        Some(msg) => Line::from(Span::styled(msg.as_str(), Style::default().fg(Color::Red))),
+        None => Line::from(Span::styled(
+            "Ctrl-s save · Ctrl-f switch file · esc close (vim keys inside the buffer)",
+            Style::default().fg(Color::DarkGray),
+        )),
+    };
+    f.render_widget(Paragraph::new(footer), chunks[2]);
+
+    if se.file_picker_open {
+        render_source_file_picker(f, area, se);
+    }
+}
+
+fn render_source_file_picker(f: &mut Frame, area: Rect, se: &SourceEditorState) {
+    let count = se.files.len() + 1; // +1 for "this document"
+    let height = (count as u16 + 2).min(area.height);
+    let rect = centered_rect(64, height, area);
+    f.render_widget(Clear, rect);
+    let block = Block::default().borders(Borders::ALL).title(" switch file ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let mut items = vec![ListItem::new(Line::from("this document"))];
+    items.extend(se.files.iter().map(|inc| {
+        let indent = "  ".repeat(inc.depth as usize);
+        ListItem::new(Line::from(format!("{indent}↳ {} ({})", inc.title, inc.target)))
+    }));
+
+    let mut state = ListState::default();
+    state.select(Some(se.file_picker_selected));
+    let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    f.render_stateful_widget(list, inner, &mut state);
 }

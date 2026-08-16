@@ -94,6 +94,18 @@ export interface CanvasNode {
    * from an `include` target that lives elsewhere on disk (see
    * `crates/core/src/include.rs`). Absent for every node that wasn't. */
   assetBase?: string;
+  /** `true` when this node's `text` is actually a plain-Markdown `include`
+   * target's transcluded content (shifted headings and all — see
+   * `crates/core/src/include.rs`'s `resolve`), not this node's own real
+   * text — unlike a canvas-`include` descendant (which has a real,
+   * separate on-disk identity and is safely editable per-node), there's
+   * no well-defined way to write a per-node body edit here back to "the
+   * target file". `NodeTextEditor`'s caller uses this to redirect into
+   * Source mode (already scoped to this node's own id, which doubles as
+   * the include's `nodeId` — see `fetchIncludes`) instead of opening the
+   * normal inline editor, which could only ever fail to save. Absent
+   * (falsy) for every other node. */
+  plainMarkdownInclude?: boolean;
 }
 
 export interface CanvasDoc {

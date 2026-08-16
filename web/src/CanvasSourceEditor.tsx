@@ -5,6 +5,12 @@ import { usePrefersDark } from "./NodeTextEditor";
 import { meshfoxMarkdown } from "./meshfoxSyntax";
 
 interface CanvasSourceEditorProps {
+  /** Seeds the file picker's initial selection — an include's own
+   * `nodeId` (see `IncludeManifestEntry`), or `undefined` for the
+   * document itself. Read once, on mount, same as any other React
+   * `useState` initializer: switching files after that is the picker's
+   * own job (`handleSelect`), not this prop's. */
+  initialInclude?: string;
   /** Fires once a save actually succeeds — the caller should reload the
    * parsed canvas and switch back to the graph view. Fired the same way
    * regardless of which file was actually saved (the primary document or
@@ -44,9 +50,9 @@ const PRIMARY = "primary";
  * include, however deeply nested, to view/edit *its* raw text instead —
  * still one file at a time, since that's what's actually on disk.
  */
-export function CanvasSourceEditor({ onSaved, onClose, onDirtyChange }: CanvasSourceEditorProps) {
+export function CanvasSourceEditor({ initialInclude, onSaved, onClose, onDirtyChange }: CanvasSourceEditorProps) {
   const [includes, setIncludes] = useState<IncludeManifestEntry[]>([]);
-  const [selected, setSelected] = useState(PRIMARY);
+  const [selected, setSelected] = useState(initialInclude ?? PRIMARY);
   const [text, setText] = useState<string | null>(null);
   const [original, setOriginal] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);

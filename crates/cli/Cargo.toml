@@ -19,11 +19,18 @@ tera = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 ratatui = "0.30.2"
-crossterm = "0.28.1"
+# Pinned to match what ratatui 0.30.2 itself already pulls transitively
+# (via ratatui-crossterm) and what `edtui` (see below) depends on directly
+# — keeping this at 0.28.x would mean two distinct, mutually-incompatible
+# `crossterm::event::KeyEvent` types in the same binary (edtui's own
+# `Into<KeyInput>` conversion is only implemented for its own 0.29
+# KeyEvent), since Cargo can't unify a 0.x major-version bump on its own.
+crossterm = "0.29.0"
 pulldown-cmark = "0.13.4"
 syntect = { version = "5.3.0", default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "regex-fancy"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
+edtui = "0.11.6"
 open = "5"
 self_update = { version = "0.44.0", default-features = false, features = ["ureq", "rustls", "archive-tar", "compression-flate2"] }
 headless_chrome = { version = "1.0.22", features = ["fetch"] }

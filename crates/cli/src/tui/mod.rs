@@ -4,11 +4,14 @@
 //! deps-chain/cache/`meshfox:var` handling as `meshfox run`/`meshfox view`.
 //! A `tty` block hands the real terminal over to its process, same as
 //! `meshfox run` does (see `run_tty_handoff` below) — no in-app terminal
-//! emulator. Read + run only in this first cut — no structural editing
-//! (that's `meshfox node ...`/the browser UI's Edit mode).
+//! emulator. `e` opens a fullscreen raw-source editor on the selected
+//! node's own file (`source_editor`) — the terminal counterpart to the
+//! web UI's Source mode; still no *structural* editing (that's `meshfox
+//! node ...`/the browser UI's Edit mode's dedicated node operations).
 
 mod app;
 mod markdown;
+mod source_editor;
 mod tree;
 mod ui;
 

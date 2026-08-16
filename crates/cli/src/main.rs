@@ -150,9 +150,12 @@ enum Command {
     /// view`. A `tty` block hands the real terminal over to it, same as
     /// `meshfox run`'s own `tty` handling. Mouse support covers clicking a
     /// tree row to select it (or its ▾/▸ marker to expand/collapse) and
-    /// scrolling the tree/document panes. Read + run only for now — no
-    /// structural editing (use `meshfox node ...` or the browser UI's Edit
-    /// mode for that).
+    /// scrolling the tree/document panes. `e` opens a fullscreen raw-source
+    /// editor (vim-style input, syntax highlighting, `Ctrl-f` to switch
+    /// between the document and any `include`d file) on the selected
+    /// node's own file — the terminal counterpart to the browser UI's
+    /// Source mode. Still no *structural* editing beyond that (use
+    /// `meshfox node ...` or the browser UI's Edit mode for that).
     Tui {
         /// Path to the .canvas.md file. If omitted: auto-discover the
         /// single candidate in the current directory.

@@ -294,6 +294,22 @@ pub struct Node {
     pub origin_path: Option<String>,
     #[serde(skip)]
     pub origin_id: Option<String>,
+    /// `true` for a `text` node whose body is actually a plain-Markdown
+    /// `include` target's transcluded content (shifted headings and all —
+    /// see `crate::include::resolve`), not this node's own real text.
+    /// Unlike a canvas-`include` descendant (which keeps a real, separate
+    /// on-disk identity via `origin_path`/`origin_id` and is safely
+    /// editable through the normal per-node write path), this node's id
+    /// and body both belong to the *including* document — there's no
+    /// well-defined way to write a per-node body edit back to "the
+    /// target file", since the target has no meshfox structure of its
+    /// own to address. `false` for every other node, including a
+    /// canvas-include descendant. Sent over the wire (unlike
+    /// `origin_path`/`origin_id`) so a client can steer a would-be editor
+    /// toward the whole-file Source-mode view of the real target file
+    /// instead of a per-node body editor that can only ever fail to save.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub plain_markdown_include: bool,
 }
 
 impl Node {

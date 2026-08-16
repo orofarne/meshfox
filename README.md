@@ -255,7 +255,9 @@ Run it from a real terminal — `meshfox README.md run usage usage-tty vim-demo`
 
 `r` runs a node's block with its `deps=` chain first (same as the browser's "⛓ run chain"); `R` runs just that one block (the plain "run" button's counterpart). A node with more than one runnable block opens a picker first — there's no single obvious default to reach for. Output streams in live and stays visible once the run finishes, same `cache`/`meshfox:var` handling as `run`/`view` either way. A `tty` block hands the whole terminal over to it, exactly like `meshfox run`'s own `tty` handling (see above) — no in-app terminal emulator, this UI's own screen just steps aside and comes back once the block exits. Mouse support is deliberately partial for now: click a tree row to select it (or its `▾`/`▸` marker to expand/collapse it), scroll wheel over the tree or document pane.
 
-Read + run only in this first cut — no structural editing (`meshfox node ...`, or the browser UI's Edit mode, for that).
+`e` opens the selected node's own file full-screen — the terminal counterpart to the browser UI's Source mode, built on [`edtui`](https://docs.rs/edtui) (vim-style modal input, syntax highlighting via a second `syntect` instance) rather than this UI's own single-key command style, since editing free text needs a real cursor/buffer, not a handful of one-shot bindings. `Ctrl-s` saves (validated as a canvas first, unless the file is a plain-Markdown `include` target, which has no such structure to hold it to); `Ctrl-f` opens a picker over the document plus every `include` it reaches, however deeply nested, to switch which file's raw text is open; `esc` leaves (a second press discards unsaved edits — the first just warns). Same routing the browser UI's Edit mode already does for a dragged/dropped-in node: a node spliced in from a canvas `include` opens *its own* file at *its own* id, not the including document.
+
+No *structural* editing beyond that in this first cut (`meshfox node ...`, or the browser UI's Edit mode's dedicated node operations, for that).
 
 ```bash name="tui-help" cache
 meshfox tui -h
@@ -264,7 +266,7 @@ meshfox tui -h
 ```text
 exit code: 0
 
-Experimental: an ncurses-style terminal viewer — browse the node tree, read a node's rendered Markdown body (syntax-highlighted code, local images shown inline where the terminal supports it), and run blocks with live streamed output, right in the terminal. Same deps-chain/cache/`meshfox:var` handling as `meshfox run`/`meshfox view`. A `tty` block hands the real terminal over to it, same as `meshfox run`'s own `tty` handling. Mouse support covers clicking a tree row to select it (or its ▾/▸ marker to expand/collapse) and scrolling the tree/document panes. Read + run only for now — no structural editing (use `meshfox node ...` or the browser UI's Edit mode for that)
+Experimental: an ncurses-style terminal viewer — browse the node tree, read a node's rendered Markdown body (syntax-highlighted code, local images shown inline where the terminal supports it), and run blocks with live streamed output, right in the terminal. Same deps-chain/cache/`meshfox:var` handling as `meshfox run`/`meshfox view`. A `tty` block hands the real terminal over to it, same as `meshfox run`'s own `tty` handling. Mouse support covers clicking a tree row to select it (or its ▾/▸ marker to expand/collapse) and scrolling the tree/document panes. `e` opens a fullscreen raw-source editor (vim-style input, syntax highlighting, `Ctrl-f` to switch between the document and any `include`d file) on the selected node's own file — the terminal counterpart to the browser UI's Source mode. Still no *structural* editing beyond that (use `meshfox node ...` or the browser UI's Edit mode for that)
 
 Usage: meshfox tui [CANVAS]
 
@@ -275,6 +277,8 @@ Options:
   -h, --help  Print help
 ```
 <!-- /meshfox:output -->
+
+
 
 
 
