@@ -1103,6 +1103,20 @@ a {
   cursor: default;
 }
 
+/* The code block's own ▸/▾ collapse toggle (`FoldToggle`, reused from a
+ * node's title bar — see MeshNode.tsx's `RunnableCodeBlock`/
+ * `ConstraintFenceBlock`) sits ahead of the language label same as it does
+ * ahead of a node's own title, so it needs to opt back out of the plain
+ * `.mesh-code-block-head button` pill styling above (accent border/color) —
+ * same override `.mesh-node-fold-toggle` already gets in a node's title
+ * bar, just re-declared here since this is a more specific selector. */
+.mesh-code-block-head .mesh-node-fold-toggle {
+  padding: 0.2rem 0.35rem;
+  margin-right: 0.1rem;
+  border-color: transparent;
+  color: inherit;
+}
+
 /* A block with `deps=` always runs its whole dependency chain first — this
  * button needs to visibly read as "more than one thing is about to run",
  * not just a recolor, so it also gets its own icon/label (see MeshNode). */

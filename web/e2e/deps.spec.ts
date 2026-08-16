@@ -29,7 +29,10 @@ test.beforeEach(async ({ page }) => {
 });
 
 test("a block without deps gets a plain run button", async ({ page }) => {
-  const btn = block(page, "build-node", "build").locator("button");
+  // `.locator("button")` alone would also match the block's own fold
+  // toggle (see MeshNode.tsx's `RunnableCodeBlock`) — filtered to the run
+  // button specifically by its "run …" text.
+  const btn = block(page, "build-node", "build").locator("button", { hasText: "run" });
   await expect(btn).toHaveText("run build");
   await expect(btn).not.toHaveClass(/mesh-run-chain/);
   await expect(block(page, "build-node", "build").locator(".mesh-code-deps")).toHaveCount(0);
@@ -91,7 +94,7 @@ test("a lone unnamed fence is runnable, implicitly named after its node", async 
   // block(page, "implicit-node", "implicit-node") — the fence has no
   // `name=`, so its effective (and DOM-id) name is the node's own id.
   const block_ = block(page, "implicit-node", "implicit-node");
-  const btn = block_.locator("button");
+  const btn = block_.locator("button", { hasText: "run" });
   await expect(btn).toHaveText("run implicit-node");
   await expect(btn).not.toHaveClass(/mesh-run-chain/);
 
@@ -101,7 +104,7 @@ test("a lone unnamed fence is runnable, implicitly named after its node", async 
 
 test("output streams in as it happens, not all at once at the end", async ({ page }) => {
   const slow = block(page, "slow-node", "slow");
-  await slow.locator("button").click();
+  await slow.locator("button", { hasText: "run" }).click();
 
   await expect(slow.locator(".mesh-code-output")).toContainText("tick 1", { timeout: 3_000 });
   // `slow` takes ~5s end to end (five 1s ticks) — right after the first
@@ -134,7 +137,7 @@ test("Kill stops a running block, and the rest of its chain never starts", async
   // The process is really gone, not just abandoned client-side — running
   // `slow` again should behave like a completely fresh run, not one still
   // tangled up with the killed one.
-  await slow.locator("button").click();
+  await slow.locator("button", { hasText: "run" }).click();
   await expect(slow.locator(".mesh-code-output")).toContainText("tick 1", { timeout: 3_000 });
   await expect(slow.locator(".mesh-code-output")).toContainText("finished", { timeout: 8_000 });
 });

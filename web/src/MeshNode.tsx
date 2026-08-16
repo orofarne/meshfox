@@ -256,13 +256,26 @@ export interface MeshNodeData {
 // the start of a text-selection drag (see `MeshNode`'s `handleTitleClick`).
 const TITLE_CLICK_MOVE_THRESHOLD = 5;
 
-function FoldToggle({ folded, onToggle }: { folded: boolean; onToggle: () => void }) {
+function FoldToggle({
+  folded,
+  onToggle,
+  foldedTitle = "Unfold this subtree",
+  unfoldedTitle = "Fold this subtree",
+}: {
+  folded: boolean;
+  onToggle: () => void;
+  /** Override for a non-node caller (a code block's own collapse toggle —
+   * see `ConstraintFenceBlock`/`RunnableCodeBlock`) — same ▸/▾ marker and
+   * button styling, just not literally "a subtree" there. */
+  foldedTitle?: string;
+  unfoldedTitle?: string;
+}) {
   return (
     <button
       type="button"
       className="mesh-node-icon-button mesh-node-fold-toggle nodrag"
       onClick={onToggle}
-      title={folded ? "Unfold this subtree" : "Fold this subtree"}
+      title={folded ? foldedTitle : unfoldedTitle}
     >
       {folded ? "▸" : "▾"}
     </button>
@@ -474,6 +487,12 @@ export function resolveNodeColor(color: string | undefined): string | undefined 
 const JUMP_HIGHLIGHT_MS = 1200;
 
 function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData; nodeId: string }) {
+  // Expanded by default (unlike a constraint fence — see
+  // `ConstraintFenceBlock`): a runnable block's own code and output are
+  // usually the point of reading a node at all. The run/chain/kill buttons
+  // in the head stay available either way, so collapsing one doesn't stop
+  // it from being run — just hides its source and output until reopened.
+  const [expanded, setExpanded] = useState(true);
   const live = data.liveBlocks[seg.name];
   const queued = live?.status === "queued";
   const running = live?.status === "running";
@@ -530,6 +549,12 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
   return (
     <div className="mesh-code-block" id={blockDomId({ nodeId, blockName: seg.name })}>
       <div className="mesh-code-block-head">
+        <FoldToggle
+          folded={!expanded}
+          onToggle={() => setExpanded((e) => !e)}
+          foldedTitle="Show the code"
+          unfoldedTitle="Hide the code"
+        />
         <span className="mesh-code-lang">{seg.lang}</span>
         {seg.tty && (
           <span className="mesh-tty-badge" title="Runs in a real interactive terminal, not captured/streamed output">
@@ -564,28 +589,32 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
           </button>
         )}
       </div>
-      {hasDeps && (
-        <div className="mesh-code-deps">
-          after:{" "}
-          {seg.deps.map((raw, i) => (
-            <span key={raw}>
-              {i > 0 && ", "}
-              <button
-                type="button"
-                className="mesh-dep-link"
-                onClick={() => jumpTo(raw)}
-                title={`jump to ${raw}`}
-              >
-                {raw}
-              </button>
-            </span>
-          ))}
-        </div>
+      {expanded && (
+        <>
+          {hasDeps && (
+            <div className="mesh-code-deps">
+              after:{" "}
+              {seg.deps.map((raw, i) => (
+                <span key={raw}>
+                  {i > 0 && ", "}
+                  <button
+                    type="button"
+                    className="mesh-dep-link"
+                    onClick={() => jumpTo(raw)}
+                    title={`jump to ${raw}`}
+                  >
+                    {raw}
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+          <pre>
+            <code>{seg.code}</code>
+          </pre>
+          {!seg.tty && <RunOutput seg={seg} live={live} />}
+        </>
       )}
-      <pre>
-        <code>{seg.code}</code>
-      </pre>
-      {!seg.tty && <RunOutput seg={seg} live={live} />}
     </div>
   );
 }
@@ -772,6 +801,15 @@ export function NodeBodyPreview({ text }: { text: string }) {
  * once evaluated and failing, every `fail(msg)` the script raised, right
  * under the code (the same information the title-bar badge's tooltip has,
  * but readable without hovering, and not truncated to one line).
+ *
+ * Collapsed by default: the title-bar `ConstraintBadge` already carries the
+ * pass/fail signal for the node as a whole, so the raw Starlark itself is
+ * rarely what a reader actually came for — except right when it's failing,
+ * which is exactly when the detail here (not just the badge's tooltip) is
+ * the point, so a failing fence starts expanded instead. This is only the
+ * *initial* state on mount; a manual toggle afterward stays put (a later
+ * `recheck` doesn't collapse it back out from under whoever just opened
+ * it).
  */
 function ConstraintFenceBlock({
   seg,
@@ -782,24 +820,35 @@ function ConstraintFenceBlock({
   status: ConstraintStatusDto | undefined;
   onRecheck: () => void;
 }) {
+  const [expanded, setExpanded] = useState(() => !(status?.ok ?? true));
   return (
     <div className="mesh-code-block">
       <div className="mesh-code-block-head">
+        <FoldToggle
+          folded={!expanded}
+          onToggle={() => setExpanded((e) => !e)}
+          foldedTitle="Show the Starlark source"
+          unfoldedTitle="Hide the Starlark source"
+        />
         <span className="mesh-code-lang">starlark{seg.name ? ` · ${seg.name}` : ""}</span>
         <button onClick={onRecheck} title="Re-fetch the canvas and re-evaluate every constraint">
           ↻ recheck
         </button>
       </div>
-      <pre>
-        <code>{seg.code}</code>
-      </pre>
-      {status && !status.ok && (
-        <div className="mesh-code-output" data-exit="fail">
-          <div className="mesh-code-output-head">{status.messages.length} failing</div>
+      {expanded && (
+        <>
           <pre>
-            <code>{status.messages.join("\n")}</code>
+            <code>{seg.code}</code>
           </pre>
-        </div>
+          {status && !status.ok && (
+            <div className="mesh-code-output" data-exit="fail">
+              <div className="mesh-code-output-head">{status.messages.length} failing</div>
+              <pre>
+                <code>{status.messages.join("\n")}</code>
+              </pre>
+            </div>
+          )}
+        </>
       )}
     </div>
   );
