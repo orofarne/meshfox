@@ -90,6 +90,23 @@ const INITIAL_VIEW_PADDING_Y = 80;
  * `parallelOffsets` map, and `DeletableEdge.tsx`'s use of `data.parallelOffset`. */
 const PARALLEL_EDGE_OFFSET = 24;
 
+/** Grid step (px) that a persisted `x`/`y`/`width`/`height` is rounded to
+ * (see `snapToGrid`, used by `handleSaveLayout`) — React Flow's own
+ * drag/resize events carry high-precision floats
+ * (e.g. `123.4578921...`), which would otherwise turn every tiny nudge into
+ * noisy diff churn in the saved `.canvas.md`. Divides evenly into
+ * `autolayout.ts`'s own spacing constants (`H_GAP`, `V_GAP`,
+ * `ROOT_CHILD_INDENT`, `GROUP_PADDING`), so auto-placed boxes already land
+ * on-grid and never visibly shift the first time they're touched and saved. */
+const LAYOUT_GRID = 4;
+
+/** Rounds `value` to the nearest `LAYOUT_GRID` step — applied only when
+ * persisting a node's box (`handleSaveLayout`), never to React Flow's own
+ * live position/size, so dragging itself stays exactly as smooth as before. */
+function snapToGrid(value: number): number {
+  return Math.round(value / LAYOUT_GRID) * LAYOUT_GRID;
+}
+
 /** Whether `addr`'s own fence opted into `cache` — i.e. whether running it
  * could have changed anything on disk worth reloading for. Used to decide
  * whether an edit-mode run needs to reload the canvas at all afterward;
@@ -1857,10 +1874,10 @@ export default function App() {
         .map((n) => [
           n.id,
           {
-            x: n.position.x,
-            y: n.position.y,
-            width: n.data.nodeType === "group" ? undefined : n.width,
-            height: n.data.nodeType === "group" ? undefined : n.height,
+            x: snapToGrid(n.position.x),
+            y: snapToGrid(n.position.y),
+            width: n.data.nodeType === "group" || n.width === undefined ? undefined : snapToGrid(n.width),
+            height: n.data.nodeType === "group" || n.height === undefined ? undefined : snapToGrid(n.height),
           },
         ]),
     );
