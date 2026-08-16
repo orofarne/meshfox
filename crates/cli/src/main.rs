@@ -11,7 +11,7 @@
 //! whole point of a canvas) — Edit only controls whether a `cache`d
 //! block's output actually gets written back into the file, or just shown.
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use meshfox_core::{mdcanvas, Canvas, ExtraEdge, FileDisplay, NodeMeta, NodeType, VarDecl, VarCache};
 use std::collections::HashMap;
 use std::io::IsTerminal;
@@ -50,6 +50,29 @@ struct Cli {
 
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+/// A canvas path, accepted either as a positional argument or via
+/// `--canvas` — the two are equivalent and mutually exclusive. Kept as a
+/// shared, flattened block so every subcommand that has a positional slot
+/// free for it (i.e. every one except `run` and `node <op>`, whose own
+/// positional slot is taken by other arguments — see `splice_leading_canvas`)
+/// accepts both spellings the same way.
+#[derive(Args)]
+struct CanvasOpt {
+    /// Path to the .canvas.md file. If omitted: auto-discover the single
+    /// candidate in the current directory.
+    canvas: Option<PathBuf>,
+    /// Same as the positional argument above, spelled as a flag — for
+    /// parity with `run`/`node <op>`, which only accept this form.
+    #[arg(long = "canvas", value_name = "CANVAS", conflicts_with = "canvas")]
+    canvas_flag: Option<PathBuf>,
+}
+
+impl CanvasOpt {
+    fn resolve(self) -> Option<PathBuf> {
+        self.canvas.or(self.canvas_flag)
+    }
 }
 
 #[derive(Subcommand)]
@@ -97,9 +120,8 @@ enum Command {
     /// them; they're skipped here and asked for fresh at run time instead.
     /// Requires an interactive terminal.
     Configure {
-        /// Path to the .canvas.md file. If omitted: auto-discover the
-        /// single candidate in the current directory.
-        canvas: Option<PathBuf>,
+        #[command(flatten)]
+        canvas: CanvasOpt,
     },
     /// Create a new, empty canvas file: just the `meshfox:canvas` marker
     /// followed by a lone root heading (`#`) named after the file itself
@@ -107,18 +129,21 @@ enum Command {
     /// file already exists — this never overwrites.
     Create {
         /// Path for the new .canvas.md file, e.g. `meshfox create
-        /// hello.canvas.md`.
-        canvas: PathBuf,
+        /// hello.canvas.md`. May also be passed via `--canvas`. Required
+        /// (either way) — there's nothing to auto-discover for a file that
+        /// doesn't exist yet.
+        canvas: Option<PathBuf>,
+        /// Same as the positional argument above, spelled as a flag.
+        #[arg(long = "canvas", value_name = "CANVAS", conflicts_with = "canvas")]
+        canvas_flag: Option<PathBuf>,
     },
     /// Start the local web UI: canvas view, run buttons. Opens read-only —
     /// running a block is always allowed, but click "Edit" in the browser
     /// to unlock dragging, resizing, saving layout, and persisting a
     /// `cache`d block's output back into the file.
     View {
-        /// Path to the .canvas.md file, e.g. `meshfox view README.md`. If
-        /// omitted: auto-discover the single candidate in the current
-        /// directory.
-        canvas: Option<PathBuf>,
+        #[command(flatten)]
+        canvas: CanvasOpt,
         /// Port to listen on. If omitted, a random free port is chosen —
         /// pass this explicitly to pin a stable port (e.g. for scripts).
         #[arg(long, default_value_t = 0)]
@@ -157,9 +182,8 @@ enum Command {
     /// Source mode. Still no *structural* editing beyond that (use
     /// `meshfox node ...` or the browser UI's Edit mode for that).
     Tui {
-        /// Path to the .canvas.md file. If omitted: auto-discover the
-        /// single candidate in the current directory.
-        canvas: Option<PathBuf>,
+        #[command(flatten)]
+        canvas: CanvasOpt,
     },
     /// Validate that a file parses as a meshfox canvas — same checks
     /// `run`/`view` already do before touching anything (single root,
@@ -168,9 +192,8 @@ enum Command {
     /// the file back. Exits non-zero on a parse error, so it's usable as a
     /// pre-commit/CI check.
     Validate {
-        /// Path to the .canvas.md file. If omitted: auto-discover the
-        /// single candidate in the current directory.
-        canvas: Option<PathBuf>,
+        #[command(flatten)]
+        canvas: CanvasOpt,
     },
     /// Run every embedded ` ```starlark constraint ` fence's Starlark
     /// contract against the document (see `crate::constraint`/SPEC.md's
@@ -189,9 +212,8 @@ enum Command {
     /// any constraint fails, so it's usable as a pre-commit/CI check
     /// alongside (or instead of) `validate`.
     Check {
-        /// Path to the .canvas.md file. If omitted: auto-discover the
-        /// single candidate in the current directory.
-        canvas: Option<PathBuf>,
+        #[command(flatten)]
+        canvas: CanvasOpt,
     },
     /// Print every runnable code block in the canvas as an indented tree,
     /// each with a ready-to-paste `meshfox run <path...> <name>` — so you
@@ -199,9 +221,8 @@ enum Command {
     /// runnable. Same raw-file-only scope as `run`/`validate` (no
     /// include resolution).
     List {
-        /// Path to the .canvas.md file. If omitted: auto-discover the
-        /// single candidate in the current directory.
-        canvas: Option<PathBuf>,
+        #[command(flatten)]
+        canvas: CanvasOpt,
     },
     /// Experimental: export a canvas as a static site. Resolves includes
     /// (same as `validate`/`view`), turns the canvas's node tree into a
@@ -231,9 +252,8 @@ enum Command {
     /// `site-template/` in this repo for a working example, including its
     /// own `template.toml`.
     Static {
-        /// Path to the .canvas.md file. If omitted: auto-discover the
-        /// single candidate in the current directory.
-        canvas: Option<PathBuf>,
+        #[command(flatten)]
+        canvas: CanvasOpt,
         /// Template directory.
         #[arg(short, long)]
         template: PathBuf,
@@ -262,9 +282,8 @@ enum Command {
     /// flow/document order (headings by depth, tags, body, target,
     /// standard A4 pagination).
     Pdf {
-        /// Path to the .canvas.md file. If omitted: auto-discover the
-        /// single candidate in the current directory.
-        canvas: Option<PathBuf>,
+        #[command(flatten)]
+        canvas: CanvasOpt,
         /// Output PDF path. Defaults to the canvas filename with its
         /// extension replaced by `.pdf`, in the same directory.
         #[arg(short, long)]
@@ -677,12 +696,18 @@ fn main() {
             run(&canvas_path, args, no_deps, set)
         }
         Command::Configure { canvas } => {
-            let canvas_path = canvas.unwrap_or_else(find_canvas);
+            let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
             configure(&canvas_path)
         }
-        Command::Create { canvas } => create(&canvas),
+        Command::Create { canvas, canvas_flag } => {
+            let Some(canvas_path) = canvas.or(canvas_flag) else {
+                eprintln!("meshfox create: a canvas path is required (positional, or --canvas)");
+                std::process::exit(1);
+            };
+            create(&canvas_path)
+        }
         Command::View { canvas, port, no_open, create: create_if_missing, no_auto_exit } => {
-            let canvas_path = match canvas {
+            let canvas_path = match canvas.resolve() {
                 Some(p) => p,
                 None => {
                     if create_if_missing {
@@ -702,27 +727,27 @@ fn main() {
             view(canvas_path, port, !no_open, !no_auto_exit)
         }
         Command::Tui { canvas } => {
-            let canvas_path = canvas.unwrap_or_else(find_canvas);
+            let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
             tui(canvas_path)
         }
         Command::Validate { canvas } => {
-            let canvas_path = canvas.unwrap_or_else(find_canvas);
+            let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
             validate(&canvas_path)
         }
         Command::Check { canvas } => {
-            let canvas_path = canvas.unwrap_or_else(find_canvas);
+            let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
             check(&canvas_path)
         }
         Command::List { canvas } => {
-            let canvas_path = canvas.unwrap_or_else(find_canvas);
+            let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
             list(&canvas_path)
         }
         Command::Static { canvas, template, out, force } => {
-            let canvas_path = canvas.unwrap_or_else(find_canvas);
+            let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
             static_cmd(&canvas_path, &template, &out, force)
         }
         Command::Pdf { canvas, out, force, mode } => {
-            let canvas_path = canvas.unwrap_or_else(find_canvas);
+            let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
             pdf_cmd(&canvas_path, out.as_deref(), force, mode)
         }
         Command::Node { command } => match command {

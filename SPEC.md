@@ -676,8 +676,18 @@ then the block name).
   CI/pre-commit alongside (or instead of) `validate`.
 - `meshfox spec` — print this specification.
 
-`list`/`view`/`validate`/`check` take the canvas path as an optional
-positional argument; `run` takes it as an optional leading argument (recognized by its
-`.md` suffix, since node ids never have one). Omit it and any of them
+`list`/`view`/`validate`/`check` (and every other subcommand with a
+positional slot free for it — `configure`/`create`/`tui`/`static`/`pdf`)
+take the canvas path either as an optional positional argument or via
+`--canvas` (the two are mutually exclusive — pick one). `run` and `node
+<op>`, whose own positional slot is taken by other arguments, accept only
+`--canvas`. Any command can also take it as a single leading argument
+before the subcommand itself — `meshfox path/to.canvas.md validate` —
+recognized by its `.md` suffix, since node ids never have one; that leading
+form is spliced into whichever of the two shapes the subcommand that
+follows actually expects, before it overrides the subcommand's own
+path/`--canvas` if both are given. Omit it entirely and any of them
 auto-discover the single `*.canvas.md` (or marked `*.md`) file in the
-current directory.
+current directory — except `create`, which always requires an explicit
+path, since there's nothing to auto-discover for a file that doesn't exist
+yet.
