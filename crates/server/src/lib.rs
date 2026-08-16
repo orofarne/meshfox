@@ -42,6 +42,34 @@ mod pty_exec;
 #[folder = "../../web/dist"]
 struct WebAssets;
 
+/// Finds the first embedded `web/dist` asset whose own filename starts with
+/// `prefix` and ends with `suffix` — `pub` so `meshfox-cli`'s `pdf` command
+/// can reuse the exact same embedded Fira Code bytes this crate already
+/// carries for the web UI (`web/src/main.tsx`'s own `@fontsource/fira-code`
+/// imports), rather than a second `include_bytes!`-embedded copy of its
+/// own. A prefix/suffix match (not an exact path) because Vite
+/// content-hashes every built asset's filename (`fira-code-latin-400-
+/// normal-DGosTW8U.woff2`) — there's no fixed path to ask for directly.
+///
+/// `None` either because nothing matches, or because the web UI hasn't
+/// been built into this binary yet (`web/dist` empty — the exact same gap
+/// `serve_embedded`'s own `WebAssets::get("index.html")` fallback already
+/// handles) — a caller embedding a font this way should degrade
+/// gracefully (skip that `@font-face`, let the page's own CSS fallback
+/// stack take over) rather than treat this as an error: `cargo build
+/// -p meshfox-cli` on its own, without `web/` ever being built, is a
+/// supported workflow (see this crate's own module doc comment) that
+/// shouldn't break `meshfox pdf` just because of that.
+pub fn find_web_asset(prefix: &str, suffix: &str) -> Option<Vec<u8>> {
+    WebAssets::iter()
+        .find(|path| {
+            let name = path.rsplit('/').next().unwrap_or(path);
+            name.starts_with(prefix) && name.ends_with(suffix)
+        })
+        .and_then(|path| WebAssets::get(&path))
+        .map(|file| file.data.into_owned())
+}
+
 struct AppState {
     canvas_path: PathBuf,
     raw: Mutex<String>,

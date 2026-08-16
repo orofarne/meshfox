@@ -1,0 +1,490 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>diagram</title>
+<style>
+@font-face {
+  font-family: "Fira Code";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 400;
+  src: url(fonts/fira-code-latin-400-normal.woff2) format("woff2");
+  unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD;
+}
+@font-face {
+  font-family: "Fira Code";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 400;
+  src: url(fonts/fira-code-cyrillic-400-normal.woff2) format("woff2");
+  unicode-range: U+0301,U+0400-045F,U+0490-0491,U+04B0-04B1,U+2116;
+}
+@font-face {
+  font-family: "Fira Code";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 700;
+  src: url(fonts/fira-code-latin-700-normal.woff2) format("woff2");
+  unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD;
+}
+@font-face {
+  font-family: "Fira Code";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 700;
+  src: url(fonts/fira-code-cyrillic-700-normal.woff2) format("woff2");
+  unicode-range: U+0301,U+0400-045F,U+0490-0491,U+04B0-04B1,U+2116;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { background: #ffffff; }
+.canvas {
+  position: relative;
+}
+.node {
+  position: absolute;
+  background: #ffffff;
+  border: 1.5pt solid #999999;
+  border-radius: 4pt;
+  padding: 8pt;
+  overflow: hidden;
+  font-family: "Fira Code", system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 8.5pt;
+  line-height: 1.4;
+}
+.node.type-group {
+  background: transparent;
+  border-style: dashed;
+}
+.node-title { font-weight: 700; font-size: 9.5pt; margin-bottom: 4pt; }
+.node-tags { margin-bottom: 4pt; }
+.tag { display: inline-block; font-size: 6.5pt; color: #767676; margin: 0 4pt 2pt 0; }
+.node-body p { margin: 0 0 6pt; }
+.node-body img { max-width: 100%; }
+.node-body pre {
+  background: #f4f4f4;
+  border: 0.5pt solid #ddd;
+  border-radius: 3pt;
+  padding: 4pt 6pt;
+  font-size: 7.5pt;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0 0 6pt;
+}
+.node-body code { font-family: "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.node-body table { border-collapse: collapse; width: 100%; margin: 0 0 6pt; font-size: 7.5pt; }
+.node-body th, .node-body td { border: 0.5pt solid #ccc; padding: 2pt 4pt; text-align: left; }
+.edge-overlay { position: absolute; top: 0; left: 0; pointer-events: none; }
+</style>
+</head>
+<body>
+
+<div class="canvas" id="canvas"></div>
+
+<script>
+// Every node's real body, always shown in full — regardless of the
+// document's own fold state (see `pdf::render::DiagramTreeNode`'s own doc
+// comment) — so a node with no real, authored position needs its layout
+// computed *after* the browser has actually rendered that content: no
+// heuristic can guess a Markdown body's real height in general (the exact
+// problem `web/src/autolayout.ts`'s own module doc comment explains this
+// project already learned the hard way once). This script is that same
+// algorithm, ported to run right here against real measured
+// `offsetHeight`s instead of guessed constants — `pdf::render` ships it
+// nothing but the raw tree; every pixel comes from this pass. Once done,
+// it publishes the real page size on `window.__meshfoxDiagramWidth`/
+// `Height` — `pdf::browser::print_diagram` polls for those before calling
+// `Page.printToPDF`, since Rust has no way to know the size up front either
+// any more.
+(function () {
+  var tree = {{ tree | json_encode | safe }};
+  var edges = {{ edges | json_encode | safe }};
+
+  var H_GAP = 80, V_GAP = 60, ROOT_CHILD_INDENT = 32;
+  var WIDTH_SHALLOW = 340, WIDTH_DEEP = 300;
+  var MAX_HEIGHT_DEEP = 480;
+  var PADDING = 40;
+  var GROUP_PADDING = 40, GROUP_TITLE_SPACE = 40;
+
+  var canvas = document.getElementById("canvas");
+  var boxEls = {};
+
+  // Every character actually appearing anywhere in the tree — used to
+  // force-load every `@font-face` subset (Latin, Cyrillic, ...) this page
+  // actually needs before measuring anything (see below), not just
+  // whichever one `document.fonts.load`'s own default sample text covers.
+  function allNodeText(node) {
+    var parts = [node.title, node.tags.join(" "), node.html_body];
+    node.children.forEach(function (c) { parts.push(allNodeText(c)); });
+    return parts.join(" ");
+  }
+
+  function createBox(node, depth) {
+    var el = document.createElement("div");
+    el.className = "node type-" + node.node_type;
+    el.id = "node-" + node.id;
+    var width = node.position ? node.position.width : (depth <= 1 ? WIDTH_SHALLOW : WIDTH_DEEP);
+    el.style.width = width + "px";
+    // Height is never taken from an authored `h=` (only `x`/`y`/`width` —
+    // spatial placement — are honored from a real position; see `sizeFor`
+    // below) — every box always auto-sizes to its own real content instead,
+    // so nothing here is ever clipped/hidden by a width/height a node
+    // happened to be given back when its box only ever showed a title, not
+    // real body content.
+    if (depth >= 2) {
+      el.style.maxHeight = MAX_HEIGHT_DEEP + "px";
+    }
+    if (node.border_color) el.style.borderColor = node.border_color;
+
+    var title = document.createElement("div");
+    title.className = "node-title";
+    title.textContent = node.title;
+    el.appendChild(title);
+
+    if (node.tags.length) {
+      var tagsEl = document.createElement("div");
+      tagsEl.className = "node-tags";
+      node.tags.forEach(function (t) {
+        var tagEl = document.createElement("span");
+        tagEl.className = "tag";
+        tagEl.textContent = t;
+        tagsEl.appendChild(tagEl);
+      });
+      el.appendChild(tagsEl);
+    }
+
+    if (node.node_type !== "group" && node.html_body) {
+      var body = document.createElement("div");
+      body.className = "node-body";
+      body.innerHTML = node.html_body;
+      el.appendChild(body);
+    }
+
+    canvas.appendChild(el);
+    boxEls[node.id] = el;
+    node.children.forEach(function (c) { createBox(c, depth + 1); });
+  }
+  createBox(tree, 0);
+
+  function waitForImages() {
+    var pending = [];
+    canvas.querySelectorAll("img").forEach(function (img) {
+      if (!img.complete) {
+        pending.push(new Promise(function (resolve) {
+          img.addEventListener("load", resolve);
+          img.addEventListener("error", resolve);
+        }));
+      }
+    });
+    return Promise.all(pending);
+  }
+
+  // Every box's height gets measured once below and then locked in via an
+  // inline `style.height` — if Fira Code (a `@font-face` web font, see
+  // above) hadn't actually finished loading yet at that point, the browser
+  // measures text against its fallback font's metrics instead, and the
+  // *real* font swapping in afterward (different line-wrapping, different
+  // line height) then silently overflows a box whose height was already
+  // fixed against the wrong measurement — clipped text with no error, easy
+  // to miss. `document.fonts.ready` alone isn't a reliable enough signal
+  // for this: it can resolve before the browser has actually recognized
+  // these freshly-inserted nodes need the font at all, so `load()` is
+  // called explicitly first (covering every glyph actually on this page,
+  // not just the default single-space sample `load()` checks by default —
+  // Latin and Cyrillic both need to trigger their own `@font-face` subset).
+  // A couple of `requestAnimationFrame` ticks after all of that still
+  // matters too: a resolved load Promise only means the font bytes are in
+  // memory, not that this page has actually been laid out/painted with
+  // them yet.
+  var sampleText = allNodeText(tree);
+  function nextFrame() {
+    return new Promise(function (resolve) { requestAnimationFrame(function () { requestAnimationFrame(resolve); }); });
+  }
+  Promise.all([
+    document.fonts.load('400 12px "Fira Code"', sampleText),
+    document.fonts.load('700 12px "Fira Code"', sampleText),
+    document.fonts.ready,
+    waitForImages(),
+  ]).then(nextFrame).then(function () {
+    var positions = {};
+
+    function sizeFor(node, depth) {
+      var el = boxEls[node.id];
+      var width = node.position ? node.position.width : (depth <= 1 ? WIDTH_SHALLOW : WIDTH_DEEP);
+      // Always the real measured content height — never `node.position.
+      // height` — see `createBox`'s own comment for why.
+      var height = el.offsetHeight;
+      return { width: width, height: height };
+    }
+
+    // Mirrors `pdf::render`'s own former Rust port of `autolayout.ts`'s
+    // `placeRightward`: a node with a real, authored position keeps it
+    // exactly (resolved against `groupOrigin` when its structural parent
+    // is a group — see SPEC.md); everything else is placed here, one
+    // column further right per depth, siblings stacked vertically.
+    function placeRightward(node, x, y, depth, groupOrigin) {
+      var size = sizeFor(node, depth);
+      var nx, ny;
+      if (node.position) {
+        if (groupOrigin) { nx = groupOrigin.x + node.position.x; ny = groupOrigin.y + node.position.y; }
+        else { nx = node.position.x; ny = node.position.y; }
+      } else {
+        nx = x; ny = y;
+      }
+      var childGroupOrigin = node.node_type === "group" ? { x: nx, y: ny } : null;
+
+      if (!node.children.length) {
+        positions[node.id] = { x: nx, y: ny, width: size.width, height: size.height };
+        return size.height;
+      }
+
+      var childX = nx + size.width + H_GAP;
+      var cursor = ny, span = 0;
+      node.children.forEach(function (child, i) {
+        if (i > 0) { cursor += V_GAP; span += V_GAP; }
+        var consumed = placeRightward(child, childX, cursor, depth + 1, childGroupOrigin);
+        cursor += consumed; span += consumed;
+      });
+      var consumed = Math.max(span, size.height);
+      var nodeY = node.position ? ny : ny + (consumed - size.height) / 2;
+      positions[node.id] = { x: nx, y: nodeY, width: size.width, height: size.height };
+      return consumed;
+    }
+
+    var rootSize = sizeFor(tree, 0);
+    positions[tree.id] = { x: 0, y: 0, width: rootSize.width, height: rootSize.height };
+    var yCursor = rootSize.height;
+    tree.children.forEach(function (child) {
+      yCursor += V_GAP;
+      yCursor += placeRightward(child, ROOT_CHILD_INDENT, yCursor, 1, null);
+    });
+
+    // Every group's own box becomes the bounding box of its full subtree,
+    // deepest groups first so a group-of-groups sees its nested group's
+    // already-resolved box — mirrors `autolayout.ts`'s `layoutGroups`.
+    function collectGroups(node, depth, out) {
+      if (node.node_type === "group") out.push({ node: node, depth: depth });
+      node.children.forEach(function (c) { collectGroups(c, depth + 1, out); });
+    }
+    function collectSubtreePositions(node, out) {
+      node.children.forEach(function (c) {
+        if (positions[c.id]) out.push(positions[c.id]);
+        collectSubtreePositions(c, out);
+      });
+    }
+    var groups = [];
+    collectGroups(tree, 0, groups);
+    groups.sort(function (a, b) { return b.depth - a.depth; });
+    groups.forEach(function (g) {
+      var members = [];
+      collectSubtreePositions(g.node, members);
+      if (!members.length) return;
+      var minX = Math.min.apply(null, members.map(function (m) { return m.x; }));
+      var minY = Math.min.apply(null, members.map(function (m) { return m.y; }));
+      var maxX = Math.max.apply(null, members.map(function (m) { return m.x + m.width; }));
+      var maxY = Math.max.apply(null, members.map(function (m) { return m.y + m.height; }));
+      positions[g.node.id] = {
+        x: minX - GROUP_PADDING,
+        y: minY - GROUP_PADDING - GROUP_TITLE_SPACE,
+        width: maxX - minX + GROUP_PADDING * 2,
+        height: maxY - minY + GROUP_PADDING * 2 + GROUP_TITLE_SPACE,
+      };
+    });
+
+    var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    Object.keys(positions).forEach(function (id) {
+      var p = positions[id];
+      minX = Math.min(minX, p.x);
+      minY = Math.min(minY, p.y);
+      maxX = Math.max(maxX, p.x + p.width);
+      maxY = Math.max(maxY, p.y + p.height);
+    });
+    minX -= PADDING;
+    minY -= PADDING;
+    var totalWidth = Math.max(maxX - minX + PADDING, 1);
+    var totalHeight = Math.max(maxY - minY + PADDING, 1);
+
+    Object.keys(positions).forEach(function (id) {
+      var p = positions[id], el = boxEls[id];
+      el.style.left = (p.x - minX) + "px";
+      el.style.top = (p.y - minY) + "px";
+      el.style.width = p.width + "px";
+      el.style.height = p.height + "px";
+    });
+    canvas.style.width = totalWidth + "px";
+    canvas.style.height = totalHeight + "px";
+
+    drawEdges();
+
+    window.__meshfoxDiagramWidth = totalWidth;
+    window.__meshfoxDiagramHeight = totalHeight;
+  });
+
+  // Draws every connector (structural parent->child and `meshfox:edge`
+  // cross-references alike — both were already flattened into one shape by
+  // `pdf::render::DiagramEdge`) as an SVG overlay, the same curved-bezier +
+  // arrowhead approach `site-template/index.html.tera`'s own `drawEdges()`
+  // uses for cross-reference edges on the live site — reused here almost
+  // verbatim since every box on this page is absolutely positioned with a
+  // shared `.canvas` origin, exactly like that script already assumes. Runs
+  // after the layout pass above has applied every box's final position.
+  function drawEdges() {
+    if (!edges.length) return;
+
+    function svgEl(tag) {
+      return document.createElementNS("http://www.w3.org/2000/svg", tag);
+    }
+
+    var overlay = svgEl("svg");
+    overlay.setAttribute("class", "edge-overlay");
+    overlay.setAttribute("width", canvas.offsetWidth);
+    overlay.setAttribute("height", canvas.offsetHeight);
+    var defs = svgEl("defs");
+    overlay.appendChild(defs);
+
+    function nodeBox(el) {
+      var left = el.offsetLeft, top = el.offsetTop, width = el.offsetWidth, height = el.offsetHeight;
+      return { left: left, top: top, width: width, height: height, right: left + width, bottom: top + height,
+               cx: left + width / 2, cy: top + height / 2 };
+    }
+
+    // Which side of a node its own structural "source" handle sits on —
+    // ports `web/src/MeshNode.tsx`'s own `<Handle type="source" id=
+    // "source-default" position={data.level === 1 ? Position.Left :
+    // Position.Right} />` verbatim: root's own children stack in a column
+    // below it (see `autolayout.ts`'s `ROOT_CHILD_INDENT`), so its own
+    // connector runs down its *left* side rather than branching right the
+    // way every deeper node's own children do. The *target* side is always
+    // "left" regardless (`target-default` is unconditionally
+    // `Position.Left`) — every node accepts an incoming structural
+    // connector on its left, full stop.
+    function structuralSourceSide(nodeId) {
+      return nodeId === tree.id ? "left" : "right";
+    }
+
+    // A `meshfox:edge` cross-reference's own handle sides — ports
+    // `web/src/App.tsx`'s own edge-building effect verbatim: connect
+    // top<->bottom when the two boxes' Y-ranges don't overlap at all (so a
+    // mostly-vertical pair gets a vertical tangent that runs past a
+    // between-node's side rather than through its middle), otherwise fall
+    // back to the same left/right convention `structuralSourceSide` uses.
+    function crossReferenceSides(fromId, a, b) {
+      var yOverlaps = a.top < b.bottom && b.top < a.bottom;
+      if (!yOverlaps) {
+        return a.bottom <= b.top ? { source: "bottom", target: "top" } : { source: "top", target: "bottom" };
+      }
+      return { source: structuralSourceSide(fromId), target: "left" };
+    }
+
+    function pointForSide(box, side) {
+      if (side === "left") return { x: box.left, y: box.cy };
+      if (side === "right") return { x: box.right, y: box.cy };
+      if (side === "top") return { x: box.cx, y: box.top };
+      return { x: box.cx, y: box.bottom };
+    }
+
+    // A cubic bezier whose control points extend from each endpoint in its
+    // own handle's facing direction — the same shape `@xyflow/react`'s own
+    // `getBezierPath` produces for a given `Position`, just computed
+    // directly rather than importing that package (an ES module meant for
+    // bundling into `web/`'s own Vite build, not something this
+    // template's plain embedded `<script>` can pull in — this page has no
+    // JS bundler step of its own the way `web/` does).
+    function bezierPath(start, sourceSide, end, targetSide) {
+      var dist = Math.max(Math.hypot(end.x - start.x, end.y - start.y) * 0.5, 40);
+      function offset(side) {
+        if (side === "left") return { dx: -dist, dy: 0 };
+        if (side === "right") return { dx: dist, dy: 0 };
+        if (side === "top") return { dx: 0, dy: -dist };
+        return { dx: 0, dy: dist };
+      }
+      var c1 = offset(sourceSide), c2 = offset(targetSide);
+      return "M " + start.x + " " + start.y +
+        " C " + (start.x + c1.dx) + " " + (start.y + c1.dy) +
+        " " + (end.x + c2.dx) + " " + (end.y + c2.dy) +
+        " " + end.x + " " + end.y;
+    }
+
+    // A right-angle "elbow" path — the same shape `@xyflow/react`'s own
+    // `getSmoothStepPath` produces for a structural (`"tree"`) edge there
+    // (see `web/src/DeletableEdge.tsx`'s own doc comment: "a classic
+    // step/elbow connector reads better here than a bezier" for a
+    // rightward-branching tree) — covering the two side combinations
+    // `structuralSourceSide` ever actually produces (right->left for an
+    // ordinary node, left->left for root's own column of children), with a
+    // straight line as a defensive fallback for anything else (a real,
+    // authored position can in principle put a child anywhere, unlike the
+    // live UI's own auto-layout, which never has to route around that).
+    function elbowPath(start, sourceSide, end, targetSide) {
+      if (sourceSide === "right" && targetSide === "left") {
+        var midX = (start.x + end.x) / 2;
+        return "M " + start.x + " " + start.y + " L " + midX + " " + start.y + " L " + midX + " " + end.y + " L " + end.x + " " + end.y;
+      }
+      if (sourceSide === "left" && targetSide === "left") {
+        var outX = Math.min(start.x, end.x) - 30;
+        return "M " + start.x + " " + start.y + " L " + outX + " " + start.y + " L " + outX + " " + end.y + " L " + end.x + " " + end.y;
+      }
+      return "M " + start.x + " " + start.y + " L " + end.x + " " + end.y;
+    }
+
+    edges.forEach(function (edge, i) {
+      var from = document.getElementById("node-" + edge.from);
+      var to = document.getElementById("node-" + edge.to);
+      if (!from || !to) return;
+
+      var structural = edge.structural;
+      var a = nodeBox(from), b = nodeBox(to);
+      var sides = structural
+        ? { source: structuralSourceSide(edge.from), target: "left" }
+        : crossReferenceSides(edge.from, a, b);
+      var start = pointForSide(a, sides.source);
+      var end = pointForSide(b, sides.target);
+      var color = edge.color || "#999999";
+      var markerId = "mesh-arrow-" + i;
+      if (edge.arrow_end) {
+        var marker = svgEl("marker");
+        marker.setAttribute("id", markerId);
+        marker.setAttribute("viewBox", "0 0 10 10");
+        marker.setAttribute("refX", "9");
+        marker.setAttribute("refY", "5");
+        marker.setAttribute("markerWidth", "7");
+        marker.setAttribute("markerHeight", "7");
+        marker.setAttribute("orient", "auto");
+        var head = svgEl("path");
+        head.setAttribute("d", "M0,0 L10,5 L0,10 z");
+        head.setAttribute("fill", color);
+        marker.appendChild(head);
+        defs.appendChild(marker);
+      }
+
+      var d = structural ? elbowPath(start, sides.source, end, sides.target) : bezierPath(start, sides.source, end, sides.target);
+
+      var path = svgEl("path");
+      path.setAttribute("d", d);
+      path.setAttribute("fill", "none");
+      path.setAttribute("stroke", color);
+      path.setAttribute("stroke-width", edge.style === "solid" ? "1.2" : "1.6");
+      if (edge.style === "dashed") path.setAttribute("stroke-dasharray", "7,5");
+      else if (edge.style === "dotted") path.setAttribute("stroke-dasharray", "1.5,4");
+      if (edge.arrow_end) path.setAttribute("marker-end", "url(#" + markerId + ")");
+      overlay.appendChild(path);
+
+      if (edge.label) {
+        var label = svgEl("text");
+        label.setAttribute("x", (start.x + end.x) / 2);
+        label.setAttribute("y", (start.y + end.y) / 2 - 4);
+        label.setAttribute("text-anchor", "middle");
+        label.setAttribute("font-size", "7pt");
+        label.setAttribute("font-family", "-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif");
+        label.setAttribute("fill", color);
+        label.textContent = edge.label;
+        overlay.appendChild(label);
+      }
+    });
+
+    canvas.appendChild(overlay);
+  }
+})();
+</script>
+</body>
+</html>

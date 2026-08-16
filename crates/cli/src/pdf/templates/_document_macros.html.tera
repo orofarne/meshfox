@@ -1,0 +1,36 @@
+{# Recursive node renderer for `document.html.tera`'s flow-order body: every
+   node (positioned or not — `pdf::render` never even passes position data
+   here) is a plain block, headings sized by real tree depth, capped at 6
+   like `crates/core/src/staticgen.rs`'s own depth convention. No folding —
+   a PDF reader can't click to expand a `<details>`, so nothing is ever
+   collapsed here unlike `site-template/_macros.html.tera`'s live-site
+   macro this is a print-only sibling of.
+
+   Deliberately flat, not indented: a child renders as an ordinary sibling
+   `.node` block right after its parent's own, with no `.node-children`
+   wrapper/left border the way an earlier version of this template drew one
+   — depth already reads from the heading size alone, and a wide (rather
+   than ever-narrowing) content column matters more for a body that can hold
+   tables/code fences. A node with children instead ends its own block with
+   a jump-link row (`id="node-{{ n.id }}"` on every node is what those
+   `#node-<id>` anchors target) pointing at each child's own heading, so the
+   parent/child relationship a reader lost by not being able to see
+   indentation is still one click away. #}
+{% macro node(n) -%}
+<div class="node type-{{ n.node_type }}" id="node-{{ n.id }}">
+  <div class="node-title {% if n.depth == 0 %}depth-0{% elif n.depth == 1 %}depth-1{% elif n.depth == 2 %}depth-2{% elif n.depth == 3 %}depth-3{% elif n.depth == 4 %}depth-4{% elif n.depth == 5 %}depth-5{% else %}depth-6{% endif %}">{{ n.title }}</div>
+  {%- if n.tags %}
+  <div class="node-tags">{% for t in n.tags %}<span class="tag">{{ t }}</span>{% endfor %}</div>
+  {%- endif %}
+  {%- if n.target %}
+  <p class="node-target"><a href="{{ n.target }}">{{ n.target }}</a></p>
+  {%- endif %}
+  {%- if n.node_type != "group" and n.html_body %}
+  <div class="node-body">{{ n.html_body | safe }}</div>
+  {%- endif %}
+  {%- if n.children %}
+  <p class="node-children-links">{% for child in n.children %}<a href="#node-{{ child.id }}">{{ child.title }}</a>{% if not loop.last %} &middot; {% endif %}{% endfor %}</p>
+  {%- endif %}
+</div>
+{%- for child in n.children %}{{ self::node(n=child) }}{% endfor %}
+{%- endmacro node %}

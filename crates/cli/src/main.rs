@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
+mod pdf;
 mod prompt;
 mod tui;
 
@@ -235,6 +236,42 @@ enum Command {
         /// Overwrite an existing, non-empty `--out` directory.
         #[arg(long)]
         force: bool,
+    },
+    /// Experimental: export a canvas as a PDF, via a real (headless)
+    /// Chrome/Chromium — a system install is used if one can be found
+    /// (`CHROME` env var, common binary names on `PATH`, well-known
+    /// install locations); otherwise a pinned Chromium build is downloaded
+    /// once and cached for next time. Two kinds of pages, both by default:
+    /// a canvas page — every node at its own box, full body always shown
+    /// (never folded, regardless of the document's own fold settings); a
+    /// real authored `x`/`y`/`width` is kept exactly, everything else
+    /// auto-laid-out the same way the live web UI would place it, but
+    /// height always auto-sizes to the node's own real content, authored
+    /// or not, so nothing is ever clipped — printed at true 1:1 CSS-px
+    /// scale on its own custom-sized page rather than scaled to fit a
+    /// fixed paper size, with connectors for both structural parent/child
+    /// and `meshfox:edge` cross-references; then the full node tree in
+    /// flow/document order (headings by depth, tags, body, target,
+    /// standard A4 pagination).
+    Pdf {
+        /// Path to the .canvas.md file. If omitted: auto-discover the
+        /// single candidate in the current directory.
+        canvas: Option<PathBuf>,
+        /// Output PDF path. Defaults to the canvas filename with its
+        /// extension replaced by `.pdf`, in the same directory.
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// Overwrite an existing `--out` file.
+        #[arg(long)]
+        force: bool,
+        /// Render only the canvas page or only the document page(s)
+        /// instead of both (the default: canvas page first, then the
+        /// document page(s)). A node with no real, authored
+        /// `x`/`y`/`width`/`height` is auto-laid-out on the canvas page the
+        /// same way the live web UI would place it, so this always has
+        /// something to render.
+        #[arg(long, value_enum)]
+        mode: Option<pdf::Mode>,
     },
     /// Structural edits to individual nodes in a canvas file: add, move,
     /// rename, delete, or set a node's body/position/style/edges — the CLI
@@ -675,6 +712,10 @@ fn main() {
         Command::Static { canvas, template, out, force } => {
             let canvas_path = canvas.unwrap_or_else(find_canvas);
             static_cmd(&canvas_path, &template, &out, force)
+        }
+        Command::Pdf { canvas, out, force, mode } => {
+            let canvas_path = canvas.unwrap_or_else(find_canvas);
+            pdf_cmd(&canvas_path, out.as_deref(), force, mode)
         }
         Command::Node { command } => match command {
             NodeCommand::Add { canvas, parent_id, title } => {
@@ -2251,6 +2292,57 @@ fn static_cmd(canvas_path: &Path, template_dir: &Path, out_dir: &Path, force: bo
     }
 
     println!("meshfox static: wrote {count} file(s) to {}", out_dir.display());
+}
+
+/// `out`'s default (`--out` omitted): `canvas_path`'s own filename with its
+/// extension replaced by `.pdf`, same directory — mirrors `static_cmd`'s
+/// `--out` handling in spirit (a sensible default next to the source file),
+/// though `static`'s own default is a fixed `site` dirname since it has no
+/// input filename stem worth reusing the same way a single output file does
+/// here.
+fn pdf_cmd(canvas_path: &Path, out: Option<&Path>, force: bool, mode: Option<pdf::Mode>) {
+    let raw = read_raw_or_exit(canvas_path);
+    let canvas = Canvas::from_markdown(&raw).unwrap_or_else(|e| {
+        eprintln!("failed to parse {}: {e}", canvas_path.display());
+        std::process::exit(1);
+    });
+    // Same as `static`/`validate`/`view`: splice in `include` nodes so the
+    // exported PDF shows the fully composed document, not the bare link
+    // `run` sees in the raw file.
+    let canvas = meshfox_core::include::resolve(&canvas, canvas_path).unwrap_or_else(|e| {
+        eprintln!("meshfox pdf: {}: {e}", canvas_path.display());
+        std::process::exit(1);
+    });
+
+    let out_path = out.map(PathBuf::from).unwrap_or_else(|| canvas_path.with_extension("pdf"));
+    if out_path.exists() && !force {
+        eprintln!("meshfox pdf: {} already exists (pass --force to overwrite)", out_path.display());
+        std::process::exit(1);
+    }
+
+    // Same "bare filename has an empty, not missing, parent" edge case
+    // `static_cmd` handles — a canvas passed as just `README.md` (no
+    // directory component) resolves relative images against the current
+    // directory.
+    let canvas_dir = canvas_path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let bytes = pdf::generate(&canvas, canvas_dir, mode).unwrap_or_else(|e| {
+        eprintln!("meshfox pdf: {e}");
+        std::process::exit(1);
+    });
+
+    if let Some(parent) = out_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).unwrap_or_else(|e| {
+                eprintln!("meshfox pdf: failed to create {}: {e}", parent.display());
+                std::process::exit(1);
+            });
+        }
+    }
+    std::fs::write(&out_path, &bytes).unwrap_or_else(|e| {
+        eprintln!("meshfox pdf: failed to write {}: {e}", out_path.display());
+        std::process::exit(1);
+    });
+    println!("meshfox pdf: wrote {}", out_path.display());
 }
 
 /// Recursively copies every non-`.tera` file under `dir` (a subtree of
