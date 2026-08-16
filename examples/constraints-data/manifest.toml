@@ -1,0 +1,4 @@
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+meshfox-core = { path = "../core" }

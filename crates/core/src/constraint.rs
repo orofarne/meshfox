@@ -19,8 +19,30 @@
 //! adversarial script can't hang or blow up whatever's calling `evaluate`
 //! (`meshfox check`, or the server evaluating every constraint on every
 //! canvas load).
+//!
+//! Every node also exposes `.text` (its own raw Markdown body -- already
+//! part of the document, just not previously threaded into the sandbox)
+//! and, for a `file`-type node, `.content()`/`.json()`/`.yaml()`/`.toml()`/
+//! `.csv()` -- the bytes its target already points at on disk (see
+//! `crate::file_read`, confined to `base_dir` the same way the server's
+//! `display="code"` preview is), parsed and re-expressed as Starlark
+//! values. This is the sandbox's *only* window onto anything outside the
+//! document: the target was a choice the document's own author already
+//! made (visible right there as the node's link), and `evaluate`/
+//! `annotate_status` only resolve targets when their caller opts in by
+//! passing a `base_dir` -- `None` (e.g. every test below, or any consumer
+//! evaluating a canvas that was never read from a real file) makes every
+//! one of these calls return `None`, same as a `file` node with no target
+//! or one that fails to resolve/parse. All five are computed once per
+//! `evaluate` call (while building the prelude, not lazily mid-script), so
+//! one `evaluate` run means at most one disk read and one parse attempt
+//! per parser per `file` node, however many constraint fences the document
+//! has -- but also means that cost is paid for every `file` node in a
+//! canvas with at least one constraint fence, whether or not any fence
+//! actually calls these methods.
 
-use crate::canvas::{Canvas, Node};
+use crate::canvas::{Canvas, Node, NodeType};
+use std::path::Path;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::{Globals, GlobalsBuilder, LibraryExtension, Module};
 use starlark::eval::Evaluator;
@@ -133,8 +155,19 @@ fn globals() -> Globals {
 /// document order (node order, then fence order within a node). Each fence
 /// gets its own fresh Starlark heap/module — nothing persists between
 /// them, so one constraint's globals or state can't leak into another's.
-pub fn evaluate(canvas: &Canvas) -> Vec<ConstraintResult> {
-    let prelude = build_prelude(canvas);
+///
+/// `base_dir` is the directory a `file`-type node's target resolves
+/// against (confined to it — see `crate::file_read`), for `.content()`/
+/// `.json()`/`.yaml()`/`.toml()`/`.csv()`; `None` when `canvas` wasn't read
+/// from a real file (an in-memory/test canvas, or a caller that doesn't
+/// want constraints touching disk at all), which makes every one of those
+/// calls return `None` rather than erroring. A node spliced in from an
+/// `include` target resolves against *its own* directory instead
+/// (`Node::asset_base`, set by `include::resolve` — same as any other
+/// relative reference in an included node's body) — `base_dir` is only
+/// the fallback for a `file` node that lives directly in `canvas` itself.
+pub fn evaluate(canvas: &Canvas, base_dir: Option<&Path>) -> Vec<ConstraintResult> {
+    let prelude = build_prelude(canvas, base_dir);
     let globals = globals();
     let mut results = Vec::new();
     for node in &canvas.nodes {
@@ -151,10 +184,10 @@ pub fn evaluate(canvas: &Canvas) -> Vec<ConstraintResult> {
 /// results into its own `constraint_results` — never set by
 /// `mdcanvas::parse` itself, only by whatever consumer wants it (the
 /// server, before serving `GET /api/canvas`), populated by a consumer
-/// rather than by parsing.
-pub fn annotate_status(canvas: &mut Canvas) {
+/// rather than by parsing. `base_dir` is forwarded to `evaluate` as-is.
+pub fn annotate_status(canvas: &mut Canvas, base_dir: Option<&Path>) {
     let mut by_node: std::collections::HashMap<String, Vec<ConstraintStatus>> = std::collections::HashMap::new();
-    for result in evaluate(canvas) {
+    for result in evaluate(canvas, base_dir) {
         by_node.entry(result.node_id.clone()).or_default().push(result.into());
     }
     for node in &mut canvas.nodes {
@@ -206,8 +239,10 @@ fn evaluate_one(
 /// `doc` is exactly the same shape as any node a script reaches through
 /// `.children()`, just the one with no `parent`. Built fresh from the
 /// `Canvas` for every `evaluate` call (not held onto or reused across
-/// calls), so a script can never see a stale document.
-fn build_prelude(canvas: &Canvas) -> String {
+/// calls), so a script can never see a stale document. `base_dir` is only
+/// used here, to resolve each `file`-type node's target once up front —
+/// see `file_data_literals`.
+fn build_prelude(canvas: &Canvas, base_dir: Option<&Path>) -> String {
     let mut out = String::new();
     out.push_str(
         "def _children_of(id):\n\
@@ -229,17 +264,23 @@ fn build_prelude(canvas: &Canvas) -> String {
          def _nodes_with_tag(tag):\n\
          \x20   return [n for n in _nodes if tag in n.tags]\n\
          \n\
-         def _make_node(id, title, type, parent, tags):\n\
+         def _make_node(id, title, type, parent, tags, text, _content, _json, _yaml, _toml, _csv):\n\
          \x20   return struct(\n\
          \x20       id = id,\n\
          \x20       title = title,\n\
          \x20       type = type,\n\
          \x20       parent = parent,\n\
          \x20       tags = tags,\n\
+         \x20       text = text,\n\
          \x20       children = lambda: _children_of(id),\n\
          \x20       descendants = lambda: _descendants_of(id),\n\
          \x20       node = _node_by_id,\n\
          \x20       nodes_with_tag = _nodes_with_tag,\n\
+         \x20       content = lambda: _content,\n\
+         \x20       json = lambda: _json,\n\
+         \x20       yaml = lambda: _yaml,\n\
+         \x20       toml = lambda: _toml,\n\
+         \x20       csv = lambda: _csv,\n\
          \x20   )\n\
          \n",
     );
@@ -251,19 +292,126 @@ fn build_prelude(canvas: &Canvas) -> String {
             Some(p) => star_str(p),
             None => "None".to_string(),
         };
+        let file_data = file_data_literals(n, base_dir);
         let _ = writeln!(
             out,
-            "    _make_node(id={}, title={}, type={}, parent={}, tags=[{}]),",
+            "    _make_node(id={}, title={}, type={}, parent={}, tags=[{}], text={}, \
+             _content={}, _json={}, _yaml={}, _toml={}, _csv={}),",
             star_str(&n.id),
             star_str(&n.title),
             star_str(n.node_type.as_str()),
             parent,
             tags,
+            star_str(&n.text),
+            file_data.content,
+            file_data.json,
+            file_data.yaml,
+            file_data.toml,
+            file_data.csv,
         );
     }
     out.push_str("]\n\n");
     out.push_str("doc = [n for n in _nodes if n.parent == None][0]\n\n");
     out
+}
+
+/// The Starlark-literal-source form of a `file`-type node's target: its raw
+/// content (for `.content()`), plus the same content re-parsed three ways
+/// (for `.json()`/`.yaml()`/`.toml()`) and, separately, as tabular data
+/// (for `.csv()`) — each `"None"` (the literal, not absence-of-a-field) if
+/// the node isn't a `file` node, has no target, the target doesn't resolve
+/// under `base_dir` (see `crate::file_read::preview`), or that particular
+/// parse fails. A node calling `.json()` on a `.toml` file just gets `None`
+/// back, same as calling it on a node with no target at all — the script
+/// decides what that means, same as any other `fail`-worthy condition.
+struct FileDataLiterals {
+    content: String,
+    json: String,
+    yaml: String,
+    toml: String,
+    csv: String,
+}
+
+fn file_data_literals(node: &Node, base_dir: Option<&Path>) -> FileDataLiterals {
+    let none = || FileDataLiterals {
+        content: "None".to_string(),
+        json: "None".to_string(),
+        yaml: "None".to_string(),
+        toml: "None".to_string(),
+        csv: "None".to_string(),
+    };
+    if node.node_type != NodeType::File {
+        return none();
+    }
+    // A node spliced in from an `include` target resolves its own relative
+    // references against *that* target's directory, not the top-level
+    // canvas's — same as any other relative reference in an included
+    // node's body (see `Node::asset_base`); `base_dir` is only the
+    // fallback for a `file` node that lives directly in the document
+    // `evaluate` was called on.
+    let dir = node.asset_base.as_deref().map(Path::new).or(base_dir);
+    let (Some(dir), Some(target)) = (dir, node.target.as_deref()) else {
+        return none();
+    };
+    let Ok(preview) = crate::file_read::preview(dir, target) else {
+        return none();
+    };
+
+    let as_lit = |parsed: Option<serde_json::Value>| match parsed {
+        Some(v) => json_value_to_starlark(&v),
+        None => "None".to_string(),
+    };
+
+    FileDataLiterals {
+        content: star_str(&preview.content),
+        json: as_lit(serde_json::from_str(&preview.content).ok()),
+        yaml: as_lit(serde_norway::from_str(&preview.content).ok()),
+        toml: as_lit(toml::from_str(&preview.content).ok()),
+        csv: as_lit(parse_csv(&preview.content)),
+    }
+}
+
+/// A `serde_json::Value` re-expressed as a Starlark literal expression —
+/// how every parsed `file` node's data reaches the sandbox (see
+/// `file_data_literals`), same "generate source text, not runtime values"
+/// approach `build_prelude` already uses for node fields. Numbers pass
+/// through `serde_json::Number`'s own `Display`, which already renders
+/// exactly the token Starlark expects (`123`, `-4`, `1.5`, ...).
+fn json_value_to_starlark(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Null => "None".to_string(),
+        serde_json::Value::Bool(b) => if *b { "True" } else { "False" }.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => star_str(s),
+        serde_json::Value::Array(items) => {
+            let parts: Vec<String> = items.iter().map(json_value_to_starlark).collect();
+            format!("[{}]", parts.join(", "))
+        }
+        serde_json::Value::Object(map) => {
+            let parts: Vec<String> =
+                map.iter().map(|(k, v)| format!("{}: {}", star_str(k), json_value_to_starlark(v))).collect();
+            format!("{{{}}}", parts.join(", "))
+        }
+    }
+}
+
+/// CSV text parsed into a `Value::Array` of `Value::Object` rows, each
+/// keyed by header — the shape `.csv()` hands to a constraint. `None` for
+/// anything that doesn't parse as CSV (including "no header row"), rather
+/// than a partial result.
+fn parse_csv(content: &str) -> Option<serde_json::Value> {
+    let mut reader = csv::ReaderBuilder::new().from_reader(content.as_bytes());
+    let headers = reader.headers().ok()?.clone();
+    let mut rows = Vec::new();
+    for record in reader.records() {
+        let record = record.ok()?;
+        let mut row = serde_json::Map::new();
+        for (header, cell) in headers.iter().zip(record.iter()) {
+            row.insert(header.to_string(), serde_json::Value::String(cell.to_string()));
+        }
+        rows.push(serde_json::Value::Object(row));
+    }
+    Some(serde_json::Value::Array(rows))
 }
 
 /// A Starlark double-quoted string literal for `s` — same escaping rules
@@ -305,7 +453,7 @@ mod tests {
              ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
              ```starlark constraint\npass\n```\n",
         );
-        let results = evaluate(&c);
+        let results = evaluate(&c, None);
         assert_eq!(results.len(), 1);
         assert!(results[0].ok, "{:?}", results[0].messages);
         assert!(results[0].messages.is_empty());
@@ -319,7 +467,7 @@ mod tests {
              ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
              ```starlark constraint\nfail(\"first\")\nfail(\"second\")\n```\n",
         );
-        let results = evaluate(&c);
+        let results = evaluate(&c, None);
         assert!(!results[0].ok);
         assert_eq!(results[0].messages, vec!["first".to_string(), "second".to_string()]);
     }
@@ -333,7 +481,7 @@ mod tests {
              ## Example\n<!-- meshfox:node id=\"example\" -->\n\n\
              ```starlark\nfail(\"not actually run\")\n```\n",
         );
-        assert!(evaluate(&c).is_empty());
+        assert!(evaluate(&c, None).is_empty());
     }
 
     #[test]
@@ -349,7 +497,7 @@ mod tests {
              ```starlark constraint\npass\n```\n\n\
              More prose after.\n",
         );
-        let results = evaluate(&c);
+        let results = evaluate(&c, None);
         assert_eq!(results.len(), 1);
         assert!(results[0].ok, "{:?}", results[0].messages);
     }
@@ -362,7 +510,7 @@ mod tests {
              ```starlark constraint\npass\n```\n\n\
              ```starlark constraint\nfail(\"second one\")\n```\n",
         );
-        let results = evaluate(&c);
+        let results = evaluate(&c, None);
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].label, "check#1");
         assert!(results[0].ok);
@@ -377,7 +525,7 @@ mod tests {
              ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
              ```starlark constraint name=\"table-shape\"\npass\n```\n",
         );
-        let results = evaluate(&c);
+        let results = evaluate(&c, None);
         assert_eq!(results[0].label, "check/table-shape");
     }
 
@@ -395,7 +543,7 @@ mod tests {
              \x20       fail(n.id + \": expected exactly one file child, got \" + str(len(files)))\n\
              ```\n",
         );
-        let results = evaluate(&c);
+        let results = evaluate(&c, None);
         assert!(results[0].ok, "{:?}", results[0].messages);
     }
 
@@ -412,7 +560,7 @@ mod tests {
              \x20       fail(n.id + \": expected exactly one file child, got \" + str(len(files)))\n\
              ```\n",
         );
-        let results = evaluate(&c);
+        let results = evaluate(&c, None);
         assert!(!results[0].ok);
         assert_eq!(results[0].messages, vec!["table: expected exactly one file child, got 0".to_string()]);
     }
@@ -428,7 +576,7 @@ mod tests {
              ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
              ```starlark constraint\nif len(self.nodes_with_tag(\"table\")) != 1:\n\x20   fail(\"expected one\")\n```\n",
         );
-        let results = evaluate(&c);
+        let results = evaluate(&c, None);
         assert!(results[0].ok, "{:?}", results[0].messages);
     }
 
@@ -442,7 +590,7 @@ mod tests {
              \x20   fail(\"self is wrong: \" + self.id)\n\
              ```\n",
         );
-        let results = evaluate(&c);
+        let results = evaluate(&c, None);
         assert!(results[0].ok, "{:?}", results[0].messages);
     }
 
@@ -474,7 +622,7 @@ mod tests {
              ### Unrelated table\n<!-- meshfox:node id=\"unrelated-table\" tags=\"table\" -->\n\n\
              body\n",
         );
-        let results = evaluate(&c);
+        let results = evaluate(&c, None);
         assert!(results[0].ok, "{:?}", results[0].messages);
     }
 
@@ -493,7 +641,7 @@ mod tests {
              ### User Data\n<!-- meshfox:node id=\"user-data\" parent=\"check\" -->\n\n\
              #### Schedule\n<!-- meshfox:node id=\"schedule\" tags=\"table\" -->\n\nbody\n",
         );
-        let results = evaluate(&c);
+        let results = evaluate(&c, None);
         assert!(!results[0].ok);
         assert_eq!(results[0].messages, vec!["schedule: expected exactly one file child, got 0".to_string()]);
     }
@@ -505,7 +653,7 @@ mod tests {
              ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
              ```starlark constraint\nthis is not valid starlark(((\n```\n",
         );
-        let results = evaluate(&c);
+        let results = evaluate(&c, None);
         assert!(!results[0].ok);
         assert_eq!(results[0].messages.len(), 1);
     }
@@ -520,7 +668,7 @@ mod tests {
              ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
              ```starlark constraint\nfor i in range(100000000):\n\x20   pass\n```\n",
         );
-        let results = evaluate(&c);
+        let results = evaluate(&c, None);
         assert!(!results[0].ok);
         assert_eq!(results[0].messages.len(), 1);
     }
@@ -537,14 +685,14 @@ mod tests {
              \x20   fail(\"title mismatch: \" + n.title)\n\
              ```\n",
         );
-        let results = evaluate(&c);
+        let results = evaluate(&c, None);
         assert!(results[0].ok, "{:?}", results[0].messages);
     }
 
     #[test]
     fn nodes_without_constraint_fences_are_not_evaluated() {
         let c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\nsome text\n");
-        assert!(evaluate(&c).is_empty());
+        assert!(evaluate(&c, None).is_empty());
     }
 
     #[test]
@@ -557,7 +705,7 @@ mod tests {
         assert!(c.node("root").unwrap().constraint_results.is_empty());
         assert!(c.node("check").unwrap().constraint_results.is_empty());
 
-        annotate_status(&mut c);
+        annotate_status(&mut c, None);
 
         assert!(c.node("root").unwrap().constraint_results.is_empty());
         let results = &c.node("check").unwrap().constraint_results;
@@ -573,7 +721,7 @@ mod tests {
              ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
              ```starlark constraint\npass\n```\n",
         );
-        annotate_status(&mut c);
+        annotate_status(&mut c, None);
         let results = &c.node("check").unwrap().constraint_results;
         assert!(results[0].ok);
         assert!(results[0].messages.is_empty());
@@ -587,12 +735,219 @@ mod tests {
              ```starlark constraint name=\"a\"\npass\n```\n\n\
              ```starlark constraint name=\"b\"\nfail(\"nope\")\n```\n",
         );
-        annotate_status(&mut c);
+        annotate_status(&mut c, None);
         let results = &c.node("check").unwrap().constraint_results;
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].label, "check/a");
         assert!(results[0].ok);
         assert_eq!(results[1].label, "check/b");
         assert!(!results[1].ok);
+    }
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("meshfox-constraint-test-{tag}-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn self_text_exposes_the_node_s_own_markdown_body() {
+        let c = canvas(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
+             Some prose right here.\n\n\
+             ```starlark constraint\nif \"Some prose\" not in self.text:\n\x20   fail(\"missing prose\")\n```\n",
+        );
+        let results = evaluate(&c, None);
+        assert!(results[0].ok, "{:?}", results[0].messages);
+    }
+
+    #[test]
+    fn file_node_content_reads_its_target_confined_to_base_dir() {
+        let dir = tmp_dir("content");
+        std::fs::write(dir.join("data.txt"), "hello from disk").unwrap();
+        let c = canvas(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+             ## Data\n<!-- meshfox:node id=\"data\" type=\"file\" -->\n\n[data](data.txt)\n\n\
+             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
+             ```starlark constraint\n\
+             if doc.node(\"data\").content() != \"hello from disk\":\n\
+             \x20   fail(\"unexpected content: \" + str(doc.node(\"data\").content()))\n\
+             ```\n",
+        );
+        let results = evaluate(&c, Some(&dir));
+        assert!(results[0].ok, "{:?}", results[0].messages);
+    }
+
+    #[test]
+    fn file_node_content_resolves_against_asset_base_not_the_top_level_base_dir() {
+        // Mirrors a `file` node spliced in from an `include` target: its
+        // own relative reference resolves against *that* target's
+        // directory (`Node::asset_base`, set by `include::resolve`), not
+        // the top-level document's own directory `evaluate` was called
+        // with -- a real bug caught by actually running `meshfox check`
+        // through README.md's real include chain (LICENSE.canvas.md and
+        // examples/constraints.canvas.md, both included), not by any
+        // in-memory test alone.
+        let included_dir = tmp_dir("asset-base-included");
+        std::fs::write(included_dir.join("data.txt"), "from the included file's own directory").unwrap();
+        let unrelated_dir = tmp_dir("asset-base-unrelated");
+
+        let mut c = canvas(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+             ## Data\n<!-- meshfox:node id=\"data\" type=\"file\" -->\n\n[data](data.txt)\n\n\
+             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
+             ```starlark constraint\n\
+             if doc.node(\"data\").content() != \"from the included file's own directory\":\n\
+             \x20   fail(\"unexpected content: \" + str(doc.node(\"data\").content()))\n\
+             ```\n",
+        );
+        c.node_mut("data").unwrap().asset_base = Some(included_dir.to_string_lossy().into_owned());
+
+        // `base_dir` here is a real directory, just not the right one --
+        // proof `asset_base` takes priority over it rather than being
+        // ignored.
+        let results = evaluate(&c, Some(&unrelated_dir));
+        assert!(results[0].ok, "{:?}", results[0].messages);
+    }
+
+    #[test]
+    fn file_node_content_is_none_without_a_base_dir() {
+        let dir = tmp_dir("no-base-dir");
+        std::fs::write(dir.join("data.txt"), "hello").unwrap();
+        let c = canvas(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+             ## Data\n<!-- meshfox:node id=\"data\" type=\"file\" -->\n\n[data](data.txt)\n\n\
+             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
+             ```starlark constraint\n\
+             if doc.node(\"data\").content() != None:\n\
+             \x20   fail(\"expected None with no base_dir\")\n\
+             ```\n",
+        );
+        // No base_dir passed at all -- same as an in-memory canvas that was
+        // never read from a real file.
+        let results = evaluate(&c, None);
+        assert!(results[0].ok, "{:?}", results[0].messages);
+    }
+
+    #[test]
+    fn file_node_content_is_none_for_a_target_outside_base_dir() {
+        let dir = tmp_dir("escape");
+        let c = canvas(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+             ## Data\n<!-- meshfox:node id=\"data\" type=\"file\" -->\n\n[data](../../../../../etc/passwd)\n\n\
+             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
+             ```starlark constraint\n\
+             if doc.node(\"data\").content() != None:\n\
+             \x20   fail(\"escaping target should not resolve\")\n\
+             ```\n",
+        );
+        let results = evaluate(&c, Some(&dir));
+        assert!(results[0].ok, "{:?}", results[0].messages);
+    }
+
+    #[test]
+    fn non_file_node_methods_all_return_none() {
+        let dir = tmp_dir("non-file");
+        let c = canvas(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
+             ```starlark constraint\n\
+             if self.content() != None or self.json() != None or self.yaml() != None or self.toml() != None or self.csv() != None:\n\
+             \x20   fail(\"a plain node should expose no file data\")\n\
+             ```\n",
+        );
+        let results = evaluate(&c, Some(&dir));
+        assert!(results[0].ok, "{:?}", results[0].messages);
+    }
+
+    #[test]
+    fn file_node_json_parses_its_target_into_a_starlark_dict() {
+        let dir = tmp_dir("json");
+        std::fs::write(dir.join("pkg.json"), r#"{"name": "demo", "count": 3, "tags": ["a", "b"]}"#).unwrap();
+        let c = canvas(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+             ## Pkg\n<!-- meshfox:node id=\"pkg\" type=\"file\" -->\n\n[pkg](pkg.json)\n\n\
+             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
+             ```starlark constraint\n\
+             data = doc.node(\"pkg\").json()\n\
+             if data[\"name\"] != \"demo\" or data[\"count\"] != 3 or data[\"tags\"] != [\"a\", \"b\"]:\n\
+             \x20   fail(\"unexpected json: \" + str(data))\n\
+             ```\n",
+        );
+        let results = evaluate(&c, Some(&dir));
+        assert!(results[0].ok, "{:?}", results[0].messages);
+    }
+
+    #[test]
+    fn file_node_yaml_parses_its_target_into_a_starlark_dict() {
+        let dir = tmp_dir("yaml");
+        std::fs::write(dir.join("data.yaml"), "name: demo\ncount: 3\n").unwrap();
+        let c = canvas(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+             ## Data\n<!-- meshfox:node id=\"data\" type=\"file\" -->\n\n[data](data.yaml)\n\n\
+             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
+             ```starlark constraint\n\
+             data = doc.node(\"data\").yaml()\n\
+             if data[\"name\"] != \"demo\" or data[\"count\"] != 3:\n\
+             \x20   fail(\"unexpected yaml: \" + str(data))\n\
+             ```\n",
+        );
+        let results = evaluate(&c, Some(&dir));
+        assert!(results[0].ok, "{:?}", results[0].messages);
+    }
+
+    #[test]
+    fn file_node_toml_parses_its_target_into_a_starlark_dict() {
+        let dir = tmp_dir("toml");
+        std::fs::write(dir.join("Cargo.toml"), "[dependencies]\nanyhow = \"1\"\nserde = \"1\"\n").unwrap();
+        let c = canvas(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+             ## Manifest\n<!-- meshfox:node id=\"manifest\" type=\"file\" -->\n\n[Cargo.toml](Cargo.toml)\n\n\
+             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
+             ```starlark constraint\n\
+             deps = doc.node(\"manifest\").toml()[\"dependencies\"]\n\
+             if \"anyhow\" not in deps or \"serde\" not in deps:\n\
+             \x20   fail(\"missing expected deps: \" + str(deps))\n\
+             ```\n",
+        );
+        let results = evaluate(&c, Some(&dir));
+        assert!(results[0].ok, "{:?}", results[0].messages);
+    }
+
+    #[test]
+    fn file_node_csv_parses_rows_keyed_by_header() {
+        let dir = tmp_dir("csv");
+        std::fs::write(dir.join("data.csv"), "name,license\nanyhow,MIT\nserde,MIT\n").unwrap();
+        let c = canvas(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+             ## Data\n<!-- meshfox:node id=\"data\" type=\"file\" -->\n\n[data](data.csv)\n\n\
+             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
+             ```starlark constraint\n\
+             rows = doc.node(\"data\").csv()\n\
+             if len(rows) != 2 or rows[0][\"name\"] != \"anyhow\" or rows[1][\"license\"] != \"MIT\":\n\
+             \x20   fail(\"unexpected rows: \" + str(rows))\n\
+             ```\n",
+        );
+        let results = evaluate(&c, Some(&dir));
+        assert!(results[0].ok, "{:?}", results[0].messages);
+    }
+
+    #[test]
+    fn file_node_json_is_none_when_the_target_does_not_parse_as_json() {
+        let dir = tmp_dir("bad-json");
+        std::fs::write(dir.join("notes.txt"), "just some prose, not json").unwrap();
+        let c = canvas(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+             ## Notes\n<!-- meshfox:node id=\"notes\" type=\"file\" -->\n\n[notes](notes.txt)\n\n\
+             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
+             ```starlark constraint\n\
+             if doc.node(\"notes\").json() != None:\n\
+             \x20   fail(\"expected None for unparseable json\")\n\
+             ```\n",
+        );
+        let results = evaluate(&c, Some(&dir));
+        assert!(results[0].ok, "{:?}", results[0].messages);
     }
 }

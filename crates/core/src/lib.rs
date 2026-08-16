@@ -11,6 +11,7 @@ pub mod constraint;
 pub mod deps;
 pub mod exec;
 pub mod fence;
+pub mod file_read;
 pub mod include;
 pub mod mdcanvas;
 pub mod options;
@@ -25,6 +26,7 @@ pub use constraint::{evaluate as evaluate_constraints, ConstraintResult, Constra
 pub use deps::{BlockAddr, DepsError};
 pub use exec::{executor_for, is_supported_lang, Executor};
 pub use fence::{scan_code_blocks, scan_runnable_blocks, BlockRef, CodeBlock, EnvRef};
+pub use file_read::{confine, preview, ConfineError, FilePreview, PreviewError, FILE_PREVIEW_MAX_BYTES};
 pub use include::IncludeError;
 pub use mdcanvas::{parse_fold_override, NodeMeta, ParseError};
 pub use options::{declared_options, OptionsError};

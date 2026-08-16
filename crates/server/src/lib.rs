@@ -493,13 +493,18 @@ fn resolved_canvas(raw: &str, canvas_path: &std::path::Path) -> Result<Canvas, A
 
 fn canvas_response(raw: &str, canvas_path: &std::path::Path) -> Result<Json<Canvas>, ApiError> {
     let mut canvas = resolved_canvas(raw, canvas_path)?;
-    // Every embedded constraint fence's script is meant to be cheap and
-    // pure (no I/O, tick/heap/callstack-bounded — see
-    // `constraint::evaluate`), so running them all on every fetch (rather
-    // than only on an explicit `meshfox check`) is safe and keeps the UI's
-    // pass/fail badges current without a separate endpoint or a stale
-    // on-disk cache to invalidate.
-    meshfox_core::constraint::annotate_status(&mut canvas);
+    // Every embedded constraint fence's script itself is cheap and pure
+    // (tick/heap/callstack-bounded — see `constraint::evaluate`); the only
+    // I/O it can trigger is a `file`-type node's own already-declared
+    // target, capped the same way the `display="code"` preview is (see
+    // `meshfox_core::file_read`). Running every constraint on every fetch
+    // (rather than only on an explicit `meshfox check`) is still safe and
+    // keeps the UI's pass/fail badges current without a separate endpoint
+    // or a stale on-disk cache to invalidate — just no longer free of disk
+    // reads for a document whose constraints reach into `file` nodes.
+    let canvas_dir = canvas_path.parent().filter(|p| !p.as_os_str().is_empty());
+    let canvas_dir = Some(canvas_dir.unwrap_or(std::path::Path::new(".")));
+    meshfox_core::constraint::annotate_status(&mut canvas, canvas_dir);
     // Best-effort: a malformed `meshfox:option` declaration shouldn't break
     // *viewing* the canvas (falls back to no options declared, same as if
     // there were none at all) — `meshfox validate` is what surfaces that
@@ -1211,19 +1216,13 @@ async fn update_node(
     canvas_response(&response_raw, &state.canvas_path)
 }
 
-/// Cap on how much of a `file` node's target we'll read for a `display=
-/// "code"` preview — large enough for any real source file, small enough
-/// that a node accidentally pointed at, say, a data dump doesn't try to hand
-/// the whole thing to the browser.
-const FILE_CONTENT_MAX_BYTES: usize = 1_000_000;
-
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct FileContentResponse {
     content: String,
-    /// `true` if `content` was cut off at `FILE_CONTENT_MAX_BYTES` — the UI
-    /// uses this to show a "truncated" note rather than implying the
-    /// preview is the whole file.
+    /// `true` if `content` was cut off at
+    /// `meshfox_core::FILE_PREVIEW_MAX_BYTES` — the UI uses this to show a
+    /// "truncated" note rather than implying the preview is the whole file.
     truncated: bool,
 }
 
@@ -1235,7 +1234,10 @@ struct FileContentResponse {
 /// the (possibly hand-edited) canvas file, not from a trusted source. Shared
 /// by every endpoint that touches a file node's target on disk — the
 /// `display="code"` preview, running it (a runnable `file` node's
-/// `interpreter`), and opening it in the OS's default application.
+/// `interpreter`), and opening it in the OS's default application. Thin
+/// `ApiError`-flavored wrapper around `meshfox_core::file_read::confine`,
+/// the one copy of this confinement logic (also used by `staticgen`'s
+/// static export and `constraint`'s `.content()`/`.json()`/...).
 fn resolve_confined_target(canvas_path: &std::path::Path, target: &str) -> Result<std::path::PathBuf, ApiError> {
     // `Path::parent()` on a bare filename (e.g. `canvas.md`, no directory
     // component) returns `Some("")`, not `None` — so a plain `unwrap_or(".")`
@@ -1243,21 +1245,16 @@ fn resolve_confined_target(canvas_path: &std::path::Path, target: &str) -> Resul
     // with ENOENT. Treat that empty-parent case as "." too.
     let canvas_dir = canvas_path.parent().filter(|p| !p.as_os_str().is_empty());
     let canvas_dir = canvas_dir.unwrap_or(std::path::Path::new("."));
-    let canvas_dir = canvas_dir
-        .canonicalize()
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let candidate = canvas_dir.join(target);
-    let resolved = candidate
-        .canonicalize()
-        .map_err(|e| ApiError(StatusCode::NOT_FOUND, format!("{}: {e}", candidate.display())))?;
-    if !resolved.starts_with(&canvas_dir) {
-        return Err(ApiError(
+    meshfox_core::confine(canvas_dir, target).map_err(|e| match e {
+        meshfox_core::ConfineError::DirNotFound(_, e) => ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        meshfox_core::ConfineError::TargetNotFound(p, e) => {
+            ApiError(StatusCode::NOT_FOUND, format!("{}: {e}", p.display()))
+        }
+        meshfox_core::ConfineError::Outside(_) => ApiError(
             StatusCode::FORBIDDEN,
             format!("{target:?} resolves outside the canvas directory"),
-        ));
-    }
-    Ok(resolved)
+        ),
+    })
 }
 
 /// Read-only preview of a `file` node's target, for `display="code"`
@@ -1287,27 +1284,27 @@ async fn get_node_file_content(
         ApiError(StatusCode::UNPROCESSABLE_ENTITY, format!("node {id:?} has no target"))
     })?;
 
-    let resolved = resolve_confined_target(&state.canvas_path, target)?;
-
-    let bytes = std::fs::read(&resolved)
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    // A null byte anywhere in a representative prefix is a cheap, standard
-    // "this isn't text" heuristic (same one `file`/git use) — good enough to
-    // keep an accidental image/binary target from getting shoved into a
-    // code editor as mangled text.
-    let sample_len = bytes.len().min(8000);
-    if bytes[..sample_len].contains(&0) {
-        return Err(ApiError(
+    let canvas_dir = state.canvas_path.parent().filter(|p| !p.as_os_str().is_empty());
+    let canvas_dir = canvas_dir.unwrap_or(std::path::Path::new("."));
+    let preview = meshfox_core::preview(canvas_dir, target).map_err(|e| match e {
+        meshfox_core::PreviewError::Confine(meshfox_core::ConfineError::DirNotFound(_, e)) => {
+            ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        }
+        meshfox_core::PreviewError::Confine(meshfox_core::ConfineError::TargetNotFound(p, e)) => {
+            ApiError(StatusCode::NOT_FOUND, format!("{}: {e}", p.display()))
+        }
+        meshfox_core::PreviewError::Confine(meshfox_core::ConfineError::Outside(_)) => ApiError(
+            StatusCode::FORBIDDEN,
+            format!("{target:?} resolves outside the canvas directory"),
+        ),
+        meshfox_core::PreviewError::Read(_, e) => ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        meshfox_core::PreviewError::Binary => ApiError(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "target looks like a binary file, can't preview it as code".to_string(),
-        ));
-    }
+        ),
+    })?;
 
-    let truncated = bytes.len() > FILE_CONTENT_MAX_BYTES;
-    let slice = &bytes[..bytes.len().min(FILE_CONTENT_MAX_BYTES)];
-    let content = String::from_utf8_lossy(slice).into_owned();
-
-    Ok(Json(FileContentResponse { content, truncated }))
+    Ok(Json(FileContentResponse { content: preview.content, truncated: preview.truncated }))
 }
 
 /// Runs a runnable `file` node's `interpreter target` (see

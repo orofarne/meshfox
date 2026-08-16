@@ -963,7 +963,10 @@ fn validate(canvas_path: &PathBuf) {
 /// (`meshfox_core::constraint::annotate_status`, called after
 /// `include::resolve` there too), so a constraint living inside an
 /// included canvas is checked here as well, under its namespaced
-/// `{include_id}/{original_id}`.
+/// `{include_id}/{original_id}`. Also passes the canvas's own directory as
+/// `base_dir`, so a constraint's `.content()`/`.json()`/`.yaml()`/
+/// `.toml()`/`.csv()` on a `file`-type node can actually resolve that
+/// node's target (see `meshfox_core::constraint`).
 fn check(canvas_path: &PathBuf) {
     let raw = std::fs::read_to_string(canvas_path).unwrap_or_else(|e| {
         eprintln!("failed to read {}: {e}", canvas_path.display());
@@ -978,7 +981,9 @@ fn check(canvas_path: &PathBuf) {
         std::process::exit(1);
     });
 
-    let results = meshfox_core::evaluate_constraints(&canvas);
+    let canvas_dir = canvas_path.parent().filter(|p| !p.as_os_str().is_empty());
+    let canvas_dir = Some(canvas_dir.unwrap_or(std::path::Path::new(".")));
+    let results = meshfox_core::evaluate_constraints(&canvas, canvas_dir);
     if results.is_empty() {
         println!("meshfox check: {} ok (no constraints)", canvas_path.display());
         return;

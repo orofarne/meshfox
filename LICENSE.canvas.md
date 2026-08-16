@@ -4,7 +4,7 @@
 
 meshfox itself is MIT-licensed (see [LICENSE](./LICENSE), also inlined below). This document tracks every third-party dependency pulled into the published binary/bundle — backend (Rust crates, `Cargo.toml`) and UI (npm packages, `web/package.json`) — and records the license-compatibility check against MIT.
 
-Only **direct** dependencies are listed by name below; the full transitive tree actually reachable from a *shipped* binary (611 Rust crates — normal-dependency edges only, dev/build-only trees excluded, since those never compile into what's published; 187 npm production packages) was checked programmatically and is summarized in "License compatibility" — nothing in it requires anything beyond attribution, with one weak-copyleft exception noted below. The Rust-side count jumped from 321 once `meshfox tui` (see "Usage") landed — syntax highlighting (`syntect`) and terminal image rendering (`ratatui-image`, `image`) both pull real transitive weight; `image`'s own default codec set was trimmed to just `png`/`jpeg`/`gif`/`webp`/`bmp` to keep that from growing further than it has to. It grew by another 27 once `meshfox check-updates` (see "Usage") landed — `self_update`'s GitHub-release polling, tarball extraction, and TLS (`rustls`, built with the `ureq` HTTP backend rather than `reqwest`, to keep that addition as small as it can be) each pull their own small tree. It grew by another 62 once `meshfox pdf` (see "Usage") landed — `headless_chrome` (drives a real Chrome/Chromium to print the HTML `static` export to PDF, downloading a pinned Chromium build via its own `fetch` feature when no system browser is found) and `lopdf` (merges the diagram-overview and document-flow pages into one PDF) each pull their own tree. One of `headless_chrome`'s transitive deps, `option-ext` (via `directories`/`dirs-sys`, used to locate the Chromium download cache), is MPL-2.0 rather than MIT — weak, file-level copyleft that only obligates keeping *that crate's own* source available/modifiable if redistributed in modified form; it doesn't extend to the rest of this binary, unlike the MPL-2.0 crates mentioned above that never reach the binary at all. `meshfox pdf` also gave both its own printed pages and `meshfox static`'s own site-template the same font the web UI already uses (`crates/cli/src/pdf/templates/`'s CSS, `site-template/style.css`). `pdf`'s own copy isn't a second embedded copy at all: `web/dist` (Vite's build output) is already embedded into this same binary via `rust-embed` for the web UI's own sake (`crates/server`'s `WebAssets`), so `meshfox_server::find_web_asset` just pulls the same `@fontsource/fira-code` bytes back out of that already-embedded bundle at PDF-generation time (weights 400/700, `latin`+`cyrillic` subsets — `pdf` runs against arbitrary canvases, so it keeps both this project's own content actually mixes) rather than shipping a redundant `include_bytes!`-embedded copy of its own; if `web/` hasn't been built into this particular binary, the lookup just comes back empty and that `@font-face` silently falls through to the page's own CSS fallback stack instead of failing the export. `site-template/fonts/` is a separate, genuine copy (loose files, `latin` only, weights 400/500/600/700 — that template is this repo's own working example, used to publish README.md itself, all-English) since a static-site export has no already-compiled binary to borrow bytes from — copied straight from the same npm package's own build, own `fonts/LICENSE` alongside it, same OFL-1.1 font-file-level attribution requirement as the npm entry below. A template built for other content can add back whatever subsets it needs (`latin-ext`/`cyrillic-ext` — Central/Eastern-European accented Latin, historic/extended Cyrillic — neither this repo's own template nor `pdf` needs).
+Only **direct** dependencies are listed by name below; the full transitive tree actually reachable from a *shipped* binary (615 Rust crates — normal-dependency edges only, dev/build-only trees excluded, since those never compile into what's published; 187 npm production packages) was checked programmatically and is summarized in "License compatibility" — nothing in it requires anything beyond attribution, with one weak-copyleft exception noted below. The Rust-side count jumped from 321 once `meshfox tui` (see "Usage") landed — syntax highlighting (`syntect`) and terminal image rendering (`ratatui-image`, `image`) both pull real transitive weight; `image`'s own default codec set was trimmed to just `png`/`jpeg`/`gif`/`webp`/`bmp` to keep that from growing further than it has to. It grew by another 27 once `meshfox check-updates` (see "Usage") landed — `self_update`'s GitHub-release polling, tarball extraction, and TLS (`rustls`, built with the `ureq` HTTP backend rather than `reqwest`, to keep that addition as small as it can be) each pull their own small tree. It grew by another 62 once `meshfox pdf` (see "Usage") landed — `headless_chrome` (drives a real Chrome/Chromium to print the HTML `static` export to PDF, downloading a pinned Chromium build via its own `fetch` feature when no system browser is found) and `lopdf` (merges the diagram-overview and document-flow pages into one PDF) each pull their own tree. One of `headless_chrome`'s transitive deps, `option-ext` (via `directories`/`dirs-sys`, used to locate the Chromium download cache), is MPL-2.0 rather than MIT — weak, file-level copyleft that only obligates keeping *that crate's own* source available/modifiable if redistributed in modified form; it doesn't extend to the rest of this binary, unlike the MPL-2.0 crates mentioned above that never reach the binary at all. `meshfox pdf` also gave both its own printed pages and `meshfox static`'s own site-template the same font the web UI already uses (`crates/cli/src/pdf/templates/`'s CSS, `site-template/style.css`). `pdf`'s own copy isn't a second embedded copy at all: `web/dist` (Vite's build output) is already embedded into this same binary via `rust-embed` for the web UI's own sake (`crates/server`'s `WebAssets`), so `meshfox_server::find_web_asset` just pulls the same `@fontsource/fira-code` bytes back out of that already-embedded bundle at PDF-generation time (weights 400/700, `latin`+`cyrillic` subsets — `pdf` runs against arbitrary canvases, so it keeps both this project's own content actually mixes) rather than shipping a redundant `include_bytes!`-embedded copy of its own; if `web/` hasn't been built into this particular binary, the lookup just comes back empty and that `@font-face` silently falls through to the page's own CSS fallback stack instead of failing the export. `site-template/fonts/` is a separate, genuine copy (loose files, `latin` only, weights 400/500/600/700 — that template is this repo's own working example, used to publish README.md itself, all-English) since a static-site export has no already-compiled binary to borrow bytes from — copied straight from the same npm package's own build, own `fonts/LICENSE` alongside it, same OFL-1.1 font-file-level attribution requirement as the npm entry below. A template built for other content can add back whatever subsets it needs (`latin-ext`/`cyrillic-ext` — Central/Eastern-European accented Latin, historic/extended Cyrillic — neither this repo's own template nor `pdf` needs). It grew by another 4 once constraint fences gained read access to a `file`-type node's own already-declared target (`.content()`/`.json()`/`.yaml()`/`.toml()`/`.csv()` — see "Constraint fences") — JSON and TOML parsing already leaned on `serde_json`/`toml` (both already direct deps for other reasons), so only `.yaml()`/`.csv()` needed new ones: `csv` (plus its own small `csv-core`) and `serde_norway` (plus its own `unsafe-libyaml-norway`) — the latter a maintained fork of `serde_yaml`, which upstream itself now points people away from.
 
 ## MIT License
 <!-- meshfox:node id="license-file" type="file" display="code" -->
@@ -24,6 +24,7 @@ Direct dependencies across `crates/core`, `crates/server`, `crates/cli` (`cargo 
 | clap | MIT OR Apache-2.0 |
 | clap_complete | MIT OR Apache-2.0 |
 | crossterm | MIT |
+| csv | Unlicense OR MIT |
 | headless_chrome | MIT |
 | image | MIT OR Apache-2.0 |
 | libc | MIT OR Apache-2.0 |
@@ -39,6 +40,7 @@ Direct dependencies across `crates/core`, `crates/server`, `crates/cli` (`cargo 
 | self_update | MIT |
 | serde | MIT OR Apache-2.0 |
 | serde_json | MIT OR Apache-2.0 |
+| serde_norway | MIT OR Apache-2.0 |
 | starlark | Apache-2.0 |
 | syntect | MIT |
 | tera | MIT |
@@ -47,6 +49,64 @@ Direct dependencies across `crates/core`, `crates/server`, `crates/cli` (`cargo 
 | toml | MIT OR Apache-2.0 |
 | tower-http | MIT |
 | uuid | Apache-2.0 OR MIT |
+
+Cross-checked against the three manifests below (`core`/`server`/`cli` Cargo.toml, read via `.toml()` — see `examples/constraints.canvas.md`): every crate in each one's own `[dependencies]` (skipping workspace-internal path deps like `meshfox-core`) must have a row in the table above.
+
+```starlark constraint name="every-direct-dep-is-documented"
+def _table_names(text):
+    names = []
+    for raw_line in text.split("\n"):
+        line = raw_line.strip()
+        if not line.startswith("|"):
+            continue
+        cells = line.split("|")
+        if len(cells) < 3:
+            continue
+        name = cells[1].strip()
+        if name == "" or name == "Crate" or name.startswith("-"):
+            continue
+        names.append(name)
+    return names
+
+def _real_deps(dep_table):
+    names = []
+    for name in dep_table:
+        v = dep_table[name]
+        if type(v) == "dict" and "path" in v:
+            continue  # workspace-internal crate, not third-party
+        names.append(name)
+    return names
+
+manifests = [c for c in self.children() if c.type == "file"]
+documented = _table_names(self.text)
+actual = {}
+for m in manifests:
+    data = m.toml()
+    if data == None or "dependencies" not in data:
+        fail(m.id + ": could not read/parse Cargo.toml")
+    else:
+        for name in _real_deps(data["dependencies"]):
+            actual[name] = True
+
+for name in actual:
+    if name not in documented:
+        fail(name + " is a direct dependency (cargo) but has no entry in the table above")
+```
+
+### core/Cargo.toml
+<!-- meshfox:node id="core-cargo-toml" type="file" -->
+
+[core/Cargo.toml](crates/core/Cargo.toml)
+
+### server/Cargo.toml
+<!-- meshfox:node id="server-cargo-toml" type="file" -->
+
+[server/Cargo.toml](crates/server/Cargo.toml)
+
+### cli/Cargo.toml
+<!-- meshfox:node id="cli-cargo-toml" type="file" -->
+
+[cli/Cargo.toml](crates/cli/Cargo.toml)
 
 ## UI dependencies (npm)
 <!-- meshfox:node id="ui-deps" -->
@@ -81,4 +141,39 @@ Direct `devDependencies` — build/test tooling only, never shipped:
 | @vitejs/plugin-react | MIT |
 | typescript | Apache-2.0 |
 | vite | MIT |
+
+Cross-checked against `package.json` below (`web/package.json`, read via `.json()`): every key under both `dependencies` and `devDependencies` must have a row in one of the two tables above.
+
+```starlark constraint name="every-direct-dep-is-documented"
+def _table_names(text):
+    names = []
+    for raw_line in text.split("\n"):
+        line = raw_line.strip()
+        if not line.startswith("|"):
+            continue
+        cells = line.split("|")
+        if len(cells) < 3:
+            continue
+        name = cells[1].strip()
+        if name == "" or name == "Package" or name.startswith("-"):
+            continue
+        names.append(name)
+    return names
+
+pkg_nodes = [c for c in self.children() if c.type == "file"]
+pkg = pkg_nodes[0].json() if len(pkg_nodes) == 1 else None
+if pkg == None:
+    fail("package.json: could not find/read/parse web/package.json")
+else:
+    documented = _table_names(self.text)
+    actual = list(pkg.get("dependencies", {}).keys()) + list(pkg.get("devDependencies", {}).keys())
+    for name in actual:
+        if name not in documented:
+            fail(name + " is a direct dependency (npm) but has no entry in either table above")
+```
+
+### package.json
+<!-- meshfox:node id="package-json" type="file" -->
+
+[package.json](web/package.json)
 

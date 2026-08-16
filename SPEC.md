@@ -336,7 +336,8 @@ The script sees:
 - On every node (both of the above, and any node reached through them):
   - **`.id`**, **`.title`**, **`.type`** (a string, e.g. `"file"`),
     **`.parent`** (a string, or `None` for the root), **`.tags`** (a list
-    of strings) — plain read-only fields.
+    of strings), **`.text`** (its own raw Markdown body, unrendered) —
+    plain read-only fields.
   - **`.children()`** — its direct structural children (same tree
     `Canvas::children` walks — not extra `meshfox:edge` parents).
   - **`.descendants()`** — everything in its subtree (children, their
@@ -350,20 +351,50 @@ The script sees:
     `self.descendants()` filtered by tag when a constraint should only
     govern its own subtree; reach for this only when a rule is genuinely
     document-wide.
+  - **`.content()`** — a `file`-type node's own target, read fresh off
+    disk and confined to the canvas's own directory (same boundary/cap the
+    `display="code"` preview uses — see "Node types"), as a plain
+    string. **`.json()`**/**`.yaml()`**/**`.toml()`** parse that same
+    content each their own way, handed back as nested Starlark
+    dicts/lists/strings/numbers/bools; **`.csv()`** parses it as tabular
+    data instead — a list of dicts, one per row, keyed by header. All five
+    return `None` — not an error — for anything that isn't a `file` node,
+    has no target, doesn't resolve, or (for the four parsers) doesn't
+    parse that way; a constraint decides for itself whether that's
+    `fail`-worthy. This is the sandbox's one deliberate window onto
+    something outside the document itself — but only a target the
+    document's own author already committed to in the node's own link, and
+    only when whatever's running `meshfox check` chose to make disk access
+    available at all (see below).
 - **`fail(msg)`** — records a violation *without* stopping the script, so
   one constraint can report every offending node in a single run instead of
   just the first. A script that never calls `fail` passes.
 
 Beyond these, and Starlark's own built-ins (`len`, `range`, string
-methods, list/dict comprehensions, ...), the sandbox has nothing: no file
-I/O, no network, no way to see any other node's fully-resolved include
-tree, and no way to mutate the document — a constraint only ever reads and
-reports. Evaluation is resource-bounded (instruction count, call depth,
-heap size); a script that times out or errors (syntax error, unbound
-name, ...) counts as a failing constraint, with that error as its one
-message. Each constraint fence gets its own fresh sandbox — nothing
-persists between them, and nothing carries over between one `meshfox
-check` run and the next.
+methods, list/dict comprehensions, ...), the sandbox has nothing: no
+network, no way to see any other node's fully-resolved include tree, and
+no way to mutate the document — a constraint only ever reads and reports.
+The only I/O it can trigger at all is the five `file`-node methods above,
+and even those don't run arbitrary code or touch an arbitrary path: the
+target was the document author's own choice, visible right there as the
+node's link, and the read only happens when the tool driving `meshfox
+check` (or the server, evaluating every constraint on every canvas load)
+passes it a base directory to resolve targets against in the first place —
+an in-memory canvas that was never read from a real file makes every one
+of these calls return `None`. A `file` node spliced in from an `include`
+target resolves its own target against *that* target's own directory
+instead, same as any other relative reference in an included node's body
+— the tool-supplied base directory is only the fallback for a `file` node
+that lives directly in the document being checked. Evaluation is
+resource-bounded (instruction
+count, call depth, heap size); a script that times out or errors (syntax
+error, unbound name, ...) counts as a failing constraint, with that error
+as its one message. Each constraint fence gets its own fresh sandbox —
+nothing persists between them, and nothing carries over between one
+`meshfox check` run and the next; every `file`-node target that exists in
+the document is read and parsed once per `meshfox check` run (while
+preparing the fences to evaluate, not lazily per-fence), whether or not
+any fence actually calls these methods on it.
 
 `meshfox check` runs every constraint fence in the document and reports
 pass/fail per fence, exiting non-zero if any fails (or if the file doesn't

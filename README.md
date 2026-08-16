@@ -56,6 +56,16 @@ Edit mode's toolbar also has an **⚙ options** button, next to Auto-layout: it 
 
 Document-scoped config values a canvas wants from whoever runs it — declared once as `<!-- meshfox:var ... -->` comments in the root node (this document declares exactly one, `INSTALL_PATH`, right above "Concept" — invisible here since it's an HTML comment, same as every other bit of meshfox bookkeeping). Declaring one doesn't put it in any block's environment by itself, though — a block has to opt in with its own `env=` fence attribute to actually reference it (`env="$INSTALL_PATH"`, see "Install" below), and only blocks that do ever resolve or prompt for anything: running any *other* block in this file never asks about `INSTALL_PATH`, however many blocks elsewhere might use it. Asked for interactively the first time some block's `env=` actually needs it, then remembered in a local `.meshfox/<filename>.env` cache (`.gitignore`d, analogous to CMake's `CMakeCache.txt`) so it's not asked for again by any block referencing it afterward. `meshfox configure` walks every declared variable up front regardless of `env=` usage; `meshfox run --set NAME=value` supplies one non-interactively (e.g. for CI); the web UI shows a small form in place of a prompt, scoped to just the clicked block's own chain, only for whatever isn't already resolved. See SPEC.md's "Variables" for the full writeup, including `secret` (never cached, always re-asked) and the `int`/`bool`/`select` types.
 
+## Constraints
+<!-- meshfox:node id="constraints" -->
+
+A ` ```starlark constraint ` fence is a sandboxed Starlark contract living right in a node's own Markdown body — a way to assert invariants a canvas should hold (e.g. "every node tagged `table` has exactly one `file` child"), checked by `meshfox check` rather than only by convention. See SPEC.md's "Constraint fences" (included above, under "File format") for the full reference. The worked example below actually runs — `meshfox check examples/constraints.canvas.md` from the repo root — and includes the newest piece: a constraint reading a `file`-type node's own already-declared target (`.content()`/`.json()`/`.yaml()`/`.toml()`/`.csv()`), the same mechanism `LICENSE.canvas.md` below uses for real, to keep this project's own dependency tables honest.
+
+### Worked example
+<!-- meshfox:node id="constraints-example" type="include" -->
+
+[examples/constraints.canvas.md](./examples/constraints.canvas.md)
+
 ## Usage
 <!-- meshfox:node id="usage" -->
 

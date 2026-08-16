@@ -427,20 +427,22 @@ fn add_target_blank(html: &str) -> String {
     out
 }
 
-/// A relative reference resolved under `canvas_dir` and confined to it,
-/// mirroring `crates/server/src/lib.rs`'s `serve_canvas_relative_file`/
-/// `get_node_file_content`: canonicalized, then rejected unless it still
-/// starts with `canvas_dir` (so a `../../etc/passwd`-style target — or an
-/// absolute path pointing outside the tree — resolves to `None` rather than
-/// escaping it) and is a real file. `canvas_dir` is assumed already
-/// canonicalized (see `build`).
+/// A relative reference resolved under `canvas_dir` and confined to it —
+/// `crate::file_read::confine` (also used by the server's own file-node
+/// endpoints and `constraint`'s `.content()`/`.json()`/...), plus this
+/// module's own two extra requirements: query/fragment stripped first (a
+/// Markdown link can carry a `#section` a bare filesystem path never
+/// would), and the result must be a real file, not a directory. `None` for
+/// anything that doesn't resolve — an escaping target, a missing one, or
+/// one that's a directory — same "leave it alone" fallback every caller
+/// here already takes.
 fn resolve_canvas_relative(url: &str, canvas_dir: &Path) -> Option<PathBuf> {
     let clean = url.split(['?', '#']).next().unwrap_or(url);
     if clean.is_empty() {
         return None;
     }
-    let resolved = canvas_dir.join(clean).canonicalize().ok()?;
-    (resolved.starts_with(canvas_dir) && resolved.is_file()).then_some(resolved)
+    let resolved = crate::file_read::confine(canvas_dir, clean).ok()?;
+    resolved.is_file().then_some(resolved)
 }
 
 /// `resolved`'s path relative to `canvas_dir`, using forward slashes
@@ -494,17 +496,14 @@ fn resolve_link_url(url: &str, ctx: &RenderCtx) -> String {
     }
 }
 
-/// Same cap the server's `get_node_file_content` reads at most, for a
-/// `display="code"` preview.
-const FILE_CONTENT_MAX_BYTES: usize = 1_000_000;
-
 /// Inline `<pre><code>` replacement for a `file`-type node's `display="code"`
 /// preview (`web/src/MeshNode.tsx`'s `FileCodePreview`, backed there by a
 /// live `GET /api/nodes/:id/file-content` fetch — nothing to fetch from
-/// once static, so this reads the target once at build time instead, same
-/// confinement/binary-sniff/size-cap as that route). Falls back to a plain
-/// link (same as the web UI falls back to an error message) when the
-/// target is missing, unreadable, outside `canvas_dir`, or looks binary.
+/// once static, so this reads the target once at build time instead, via
+/// `crate::file_read::preview` — same confinement/binary-sniff/size-cap as
+/// that route). Falls back to a plain link (same as the web UI falls back
+/// to an error message) when the target is missing, unreadable, outside
+/// `canvas_dir`, or looks binary.
 fn render_file_code(node: &Node, canvas_dir: &Path) -> String {
     let Some(target) = node.target.as_deref() else {
         return "<p><em>no target</em></p>".to_string();
@@ -512,23 +511,11 @@ fn render_file_code(node: &Node, canvas_dir: &Path) -> String {
     let fallback_link =
         || format!("<p><a target=\"_blank\" rel=\"noopener noreferrer\" href=\"{0}\">{0}</a></p>", html_escape(target));
 
-    let Some(resolved) = resolve_canvas_relative(target, canvas_dir) else {
+    let Ok(preview) = crate::file_read::preview(canvas_dir, target) else {
         return fallback_link();
     };
-    let Ok(bytes) = std::fs::read(&resolved) else {
-        return fallback_link();
-    };
-    // Same cheap "null byte in a representative prefix" heuristic the
-    // server route uses to keep an accidental binary target from getting
-    // shoved into a code block as mangled text.
-    let sample_len = bytes.len().min(8000);
-    if bytes[..sample_len].contains(&0) {
-        return fallback_link();
-    }
-
-    let truncated = bytes.len() > FILE_CONTENT_MAX_BYTES;
-    let slice = &bytes[..bytes.len().min(FILE_CONTENT_MAX_BYTES)];
-    let content = String::from_utf8_lossy(slice);
+    let truncated = preview.truncated;
+    let content = preview.content;
     let lang = node.lang.clone().unwrap_or_else(|| guess_lang(target));
     let class_attr = if lang.is_empty() { String::new() } else { format!(" class=\"language-{}\"", html_escape(&lang)) };
     let note = if truncated { "<p class=\"file-preview-truncated\">(truncated)</p>" } else { "" };

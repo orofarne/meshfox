@@ -967,7 +967,9 @@ fn resolve_includes(canvas: &Canvas, canvas_path: &Path) -> Canvas {
     // `meshfox_core::constraint::annotate_status`) so `tree::flatten` and
     // `constraint_stats` below can read pass/fail straight off the tree
     // without re-evaluating it themselves.
-    meshfox_core::constraint::annotate_status(&mut resolved);
+    let canvas_dir = canvas_path.parent().filter(|p| !p.as_os_str().is_empty());
+    let canvas_dir = Some(canvas_dir.unwrap_or(Path::new(".")));
+    meshfox_core::constraint::annotate_status(&mut resolved, canvas_dir);
     resolved
 }
 
