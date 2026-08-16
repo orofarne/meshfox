@@ -57,7 +57,10 @@ struct Job {
 /// used to resolve top-level include targets relative to its directory.
 pub fn resolve(canvas: &Canvas, base_path: &Path) -> Result<Canvas, IncludeError> {
     let mut nodes = canvas.nodes.clone();
-    let base_dir = base_path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let base_dir = base_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
     let base_ancestors: Vec<PathBuf> = base_path.canonicalize().into_iter().collect();
 
     let mut queue: Vec<Job> = nodes
@@ -93,7 +96,10 @@ pub fn resolve(canvas: &Canvas, base_path: &Path) -> Result<Canvas, IncludeError
 
         let mut ancestors = job.ancestors.clone();
         ancestors.push(canon.clone());
-        let dir = target_path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let dir = target_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
         // `canon` is the canonicalized target *file*, so its parent is the
         // canonicalized target *directory* — used (rather than the
         // possibly-relative `dir`) so a relative asset reference (an
@@ -103,8 +109,8 @@ pub fn resolve(canvas: &Canvas, base_path: &Path) -> Result<Canvas, IncludeError
         // `/api/include-asset` handler that resolves against it).
         let asset_base = canon.parent().map(|p| p.to_string_lossy().into_owned());
 
-        let is_canvas =
-            target_path.to_string_lossy().ends_with(".canvas.md") || mdcanvas::has_marker(&contents);
+        let is_canvas = target_path.to_string_lossy().ends_with(".canvas.md")
+            || mdcanvas::has_marker(&contents);
 
         if is_canvas {
             let included = mdcanvas::parse(&contents)
@@ -131,7 +137,10 @@ pub fn resolve(canvas: &Canvas, base_path: &Path) -> Result<Canvas, IncludeError
                     n.extra_parents = n
                         .extra_parents
                         .iter()
-                        .map(|e| ExtraEdge { from: format!("{prefix}{}", e.from), ..e.clone() })
+                        .map(|e| ExtraEdge {
+                            from: format!("{prefix}{}", e.from),
+                            ..e.clone()
+                        })
                         .collect();
                     n.level = (n.level + level).min(6);
                     n.asset_base = asset_base.clone();
@@ -162,7 +171,10 @@ pub fn resolve(canvas: &Canvas, base_path: &Path) -> Result<Canvas, IncludeError
         }
     }
 
-    Ok(Canvas { nodes, options: Vec::new() })
+    Ok(Canvas {
+        nodes,
+        options: Vec::new(),
+    })
 }
 
 /// One `include` node reachable from `canvas` (transitively — an include
@@ -209,7 +221,10 @@ struct ListJob {
 /// without ever splicing content in — `base_path` is the file `canvas` was
 /// parsed from, same as `resolve`.
 pub fn list_includes(canvas: &Canvas, base_path: &Path) -> Vec<IncludeInfo> {
-    let base_dir = base_path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let base_dir = base_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
     let base_ancestors: Vec<PathBuf> = base_path.canonicalize().into_iter().collect();
 
     let mut queue: Vec<ListJob> = canvas
@@ -256,8 +271,8 @@ pub fn list_includes(canvas: &Canvas, base_path: &Path) -> Vec<IncludeInfo> {
             continue;
         }
         let contents = std::fs::read_to_string(&canon).ok();
-        let is_canvas =
-            target_path.to_string_lossy().ends_with(".canvas.md") || contents.as_deref().is_some_and(mdcanvas::has_marker);
+        let is_canvas = target_path.to_string_lossy().ends_with(".canvas.md")
+            || contents.as_deref().is_some_and(mdcanvas::has_marker);
 
         if is_canvas {
             if let Some(parsed) = contents.as_deref().and_then(|c| mdcanvas::parse(c).ok()) {
@@ -310,7 +325,11 @@ mod tests {
     fn includes_plain_markdown_as_shifted_body_text() {
         let tmp = std::env::temp_dir().join(format!("meshfox-include-test-{}", std::process::id()));
         fs::create_dir_all(&tmp).unwrap();
-        let target = write(&tmp, "spec.md", "# Spec Title\n\nSome body.\n\n## Sub\nmore\n");
+        let target = write(
+            &tmp,
+            "spec.md",
+            "# Spec Title\n\nSome body.\n\n## Sub\nmore\n",
+        );
         let base = write(
             &tmp,
             "root.canvas.md",
@@ -337,14 +356,18 @@ mod tests {
         // resolves against the target's own directory, not the including
         // document's — recorded here so a consumer (the server) can serve
         // it correctly instead of 404ing against the wrong directory.
-        assert_eq!(spec.asset_base.as_deref(), Some(tmp.canonicalize().unwrap().to_str().unwrap()));
+        assert_eq!(
+            spec.asset_base.as_deref(),
+            Some(tmp.canonicalize().unwrap().to_str().unwrap())
+        );
 
         fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
     fn includes_canvas_as_namespaced_children() {
-        let tmp = std::env::temp_dir().join(format!("meshfox-include-test-{}", std::process::id() + 1));
+        let tmp =
+            std::env::temp_dir().join(format!("meshfox-include-test-{}", std::process::id() + 1));
         fs::create_dir_all(&tmp).unwrap();
         let _target = write(
             &tmp,
@@ -368,9 +391,9 @@ mod tests {
         let spliced_root = resolved.node("child/root").unwrap();
         assert_eq!(spliced_root.parent.as_deref(), Some("child"));
         assert_eq!(spliced_root.level, 2 + 1); // child node is level 2
-        // A canvas-include descendant has its own real on-disk identity
-        // (origin_path/origin_id) and is safely per-node-editable — not
-        // the same "can't write this back" case plain-Markdown is.
+                                               // A canvas-include descendant has its own real on-disk identity
+                                               // (origin_path/origin_id) and is safely per-node-editable — not
+                                               // the same "can't write this back" case plain-Markdown is.
         assert!(!spliced_root.plain_markdown_include);
         assert_eq!(
             spliced_root.asset_base.as_deref(),
@@ -385,7 +408,8 @@ mod tests {
 
     #[test]
     fn detects_include_cycles() {
-        let tmp = std::env::temp_dir().join(format!("meshfox-include-test-{}", std::process::id() + 2));
+        let tmp =
+            std::env::temp_dir().join(format!("meshfox-include-test-{}", std::process::id() + 2));
         fs::create_dir_all(&tmp).unwrap();
         write(
             &tmp,
@@ -401,16 +425,24 @@ mod tests {
         let raw = fs::read_to_string(&base).unwrap();
         let canvas = Canvas::from_markdown(&raw).unwrap();
         let err = resolve(&canvas, &base).unwrap_err();
-        assert!(matches!(err, IncludeError::Cycle(_)), "expected Cycle, got {err:?}");
+        assert!(
+            matches!(err, IncludeError::Cycle(_)),
+            "expected Cycle, got {err:?}"
+        );
 
         fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
     fn list_includes_reports_a_top_level_canvas_include() {
-        let tmp = std::env::temp_dir().join(format!("meshfox-list-includes-test-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("meshfox-list-includes-test-{}", std::process::id()));
         fs::create_dir_all(&tmp).unwrap();
-        write(&tmp, "child.canvas.md", "<!-- meshfox:canvas -->\n# Child\n<!-- meshfox:node id=\"root\" -->\n\nbody\n");
+        write(
+            &tmp,
+            "child.canvas.md",
+            "<!-- meshfox:canvas -->\n# Child\n<!-- meshfox:node id=\"root\" -->\n\nbody\n",
+        );
         let base = write(
             &tmp,
             "root.canvas.md",
@@ -426,16 +458,26 @@ mod tests {
         assert_eq!(includes[0].title, "Child");
         assert_eq!(includes[0].depth, 0);
         assert!(includes[0].is_canvas);
-        assert_eq!(includes[0].path, tmp.join("child.canvas.md").canonicalize().unwrap());
+        assert_eq!(
+            includes[0].path,
+            tmp.join("child.canvas.md").canonicalize().unwrap()
+        );
 
         fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
     fn list_includes_reports_a_nested_include_at_depth_one_with_a_composed_id() {
-        let tmp = std::env::temp_dir().join(format!("meshfox-list-includes-test-{}", std::process::id() + 1));
+        let tmp = std::env::temp_dir().join(format!(
+            "meshfox-list-includes-test-{}",
+            std::process::id() + 1
+        ));
         fs::create_dir_all(&tmp).unwrap();
-        write(&tmp, "grandchild.canvas.md", "<!-- meshfox:canvas -->\n# Grandchild\n<!-- meshfox:node -->\n\nbody\n");
+        write(
+            &tmp,
+            "grandchild.canvas.md",
+            "<!-- meshfox:canvas -->\n# Grandchild\n<!-- meshfox:node -->\n\nbody\n",
+        );
         write(
             &tmp,
             "child.canvas.md",
@@ -457,14 +499,20 @@ mod tests {
         assert_eq!(includes[0].depth, 0);
         assert_eq!(includes[1].node_id, "child/nested");
         assert_eq!(includes[1].depth, 1);
-        assert_eq!(includes[1].path, tmp.join("grandchild.canvas.md").canonicalize().unwrap());
+        assert_eq!(
+            includes[1].path,
+            tmp.join("grandchild.canvas.md").canonicalize().unwrap()
+        );
 
         fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
     fn list_includes_reports_a_plain_markdown_target_as_not_a_canvas() {
-        let tmp = std::env::temp_dir().join(format!("meshfox-list-includes-test-{}", std::process::id() + 2));
+        let tmp = std::env::temp_dir().join(format!(
+            "meshfox-list-includes-test-{}",
+            std::process::id() + 2
+        ));
         fs::create_dir_all(&tmp).unwrap();
         write(&tmp, "notes.md", "# Notes\n\nprose\n");
         let base = write(
@@ -485,7 +533,10 @@ mod tests {
 
     #[test]
     fn list_includes_does_not_loop_forever_on_a_cycle() {
-        let tmp = std::env::temp_dir().join(format!("meshfox-list-includes-test-{}", std::process::id() + 3));
+        let tmp = std::env::temp_dir().join(format!(
+            "meshfox-list-includes-test-{}",
+            std::process::id() + 3
+        ));
         fs::create_dir_all(&tmp).unwrap();
         write(
             &tmp,

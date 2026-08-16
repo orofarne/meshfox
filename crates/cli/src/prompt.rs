@@ -72,7 +72,11 @@ fn print_prompt(decl: &VarDecl, current: Option<&str>) -> io::Result<()> {
     if decl.var_type == VarType::Select {
         println!("{}", decl.prompt);
         for (i, choice) in decl.choices.iter().enumerate() {
-            let marker = if current == Some(choice.as_str()) { "*" } else { " " };
+            let marker = if current == Some(choice.as_str()) {
+                "*"
+            } else {
+                " "
+            };
             println!("  {marker} {}) {choice}", i + 1);
         }
         print!("> ");

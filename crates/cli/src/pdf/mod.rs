@@ -67,7 +67,8 @@ pub fn generate(canvas: &Canvas, canvas_dir: &Path, mode: Option<Mode>) -> Resul
     let (site, assets) = staticgen::build(canvas, canvas_dir, None);
 
     let work_dir = render::temp_work_dir();
-    std::fs::create_dir_all(&work_dir).map_err(|e| format!("failed to create a temp directory: {e}"))?;
+    std::fs::create_dir_all(&work_dir)
+        .map_err(|e| format!("failed to create a temp directory: {e}"))?;
     let result = generate_in(&site, &assets, mode, &work_dir);
     std::fs::remove_dir_all(&work_dir).ok();
     result
@@ -96,7 +97,11 @@ fn generate_in(
 
     let document_pdf = if want_document {
         let document_html = render::write_document_page(site, work_dir)?;
-        Some(browser::print_file(&browser, &document_html, browser::document_options())?)
+        Some(browser::print_file(
+            &browser,
+            &document_html,
+            browser::document_options(),
+        )?)
     } else {
         None
     };

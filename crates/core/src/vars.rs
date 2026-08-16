@@ -98,11 +98,19 @@ fn build_var_decl(attrs: HashMap<String, String>) -> Result<VarDecl, VarsError> 
     let name = attrs.get("name").cloned().ok_or(VarsError::MissingName)?;
     let var_type = match attrs.get("type") {
         None => VarType::String,
-        Some(t) => VarType::parse(t).ok_or_else(|| VarsError::UnknownType(name.clone(), t.clone()))?,
+        Some(t) => {
+            VarType::parse(t).ok_or_else(|| VarsError::UnknownType(name.clone(), t.clone()))?
+        }
     };
     let choices: Vec<String> = attrs
         .get("choices")
-        .map(|v| v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect())
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        })
         .unwrap_or_default();
     if var_type == VarType::Select && choices.is_empty() {
         return Err(VarsError::SelectMissingChoices(name));
@@ -111,7 +119,15 @@ fn build_var_decl(attrs: HashMap<String, String>) -> Result<VarDecl, VarsError> 
     let required = attrs.get("required").map(|v| v != "false").unwrap_or(false);
     let prompt = attrs.get("prompt").cloned().unwrap_or_else(|| name.clone());
     let default = attrs.get("default").cloned();
-    Ok(VarDecl { name, var_type, prompt, default, choices, secret, required })
+    Ok(VarDecl {
+        name,
+        var_type,
+        prompt,
+        default,
+        choices,
+        secret,
+        required,
+    })
 }
 
 /// Whether `value` is an acceptable *fresh* answer for `decl`'s own
@@ -135,21 +151,29 @@ fn build_var_decl(attrs: HashMap<String, String>) -> Result<VarDecl, VarsError> 
 pub fn validate_value(decl: &VarDecl, value: &str) -> Result<(), String> {
     match decl.var_type {
         VarType::String => Ok(()),
-        VarType::Int => {
-            value.parse::<i64>().map(|_| ()).map_err(|_| format!("{:?} expects an integer, got {value:?}", decl.name))
-        }
+        VarType::Int => value
+            .parse::<i64>()
+            .map(|_| ())
+            .map_err(|_| format!("{:?} expects an integer, got {value:?}", decl.name)),
         VarType::Bool => {
             if value == "true" || value == "false" {
                 Ok(())
             } else {
-                Err(format!("{:?} expects true or false, got {value:?}", decl.name))
+                Err(format!(
+                    "{:?} expects true or false, got {value:?}",
+                    decl.name
+                ))
             }
         }
         VarType::Select => {
             if decl.choices.iter().any(|c| c == value) {
                 Ok(())
             } else {
-                Err(format!("{:?} expects one of [{}], got {value:?}", decl.name, decl.choices.join(", ")))
+                Err(format!(
+                    "{:?} expects one of [{}], got {value:?}",
+                    decl.name,
+                    decl.choices.join(", ")
+                ))
             }
         }
     }
@@ -269,8 +293,20 @@ pub fn resolve(
             .get(&decl.name)
             .cloned()
             .or_else(|| std::env::var(&decl.name).ok())
-            .or_else(|| if decl.secret { None } else { cache.get(&decl.name).map(str::to_string) })
-            .or_else(|| if decl.required { None } else { decl.default.clone() });
+            .or_else(|| {
+                if decl.secret {
+                    None
+                } else {
+                    cache.get(&decl.name).map(str::to_string)
+                }
+            })
+            .or_else(|| {
+                if decl.required {
+                    None
+                } else {
+                    decl.default.clone()
+                }
+            });
         match found {
             Some(v) => {
                 values.insert(decl.name.clone(), v);
@@ -307,9 +343,16 @@ pub fn resolve_block_env(
     cache: &crate::varcache::VarCache,
 ) -> BlockEnvResolution {
     let needed: HashSet<&str> = env_refs.iter().map(|e| e.var_name.as_str()).collect();
-    let relevant: Vec<VarDecl> = decls.iter().filter(|d| needed.contains(d.name.as_str())).cloned().collect();
+    let relevant: Vec<VarDecl> = decls
+        .iter()
+        .filter(|d| needed.contains(d.name.as_str()))
+        .cloned()
+        .collect();
     let resolved = resolve(&relevant, overrides, cache);
-    BlockEnvResolution { env: map_block_env(env_refs, &resolved.values), missing: resolved.missing }
+    BlockEnvResolution {
+        env: map_block_env(env_refs, &resolved.values),
+        missing: resolved.missing,
+    }
 }
 
 /// Projects already-resolved declared-variable values (keyed by their own
@@ -319,10 +362,17 @@ pub fn resolve_block_env(
 /// resolved a whole run chain's worth of variables at once (e.g. the
 /// server, before streaming any output) doesn't need to re-run `resolve`
 /// per block just to relabel them.
-pub fn map_block_env(env_refs: &[crate::fence::EnvRef], resolved_values: &HashMap<String, String>) -> HashMap<String, String> {
+pub fn map_block_env(
+    env_refs: &[crate::fence::EnvRef],
+    resolved_values: &HashMap<String, String>,
+) -> HashMap<String, String> {
     env_refs
         .iter()
-        .filter_map(|er| resolved_values.get(&er.var_name).map(|v| (er.local_name.clone(), v.clone())))
+        .filter_map(|er| {
+            resolved_values
+                .get(&er.var_name)
+                .map(|v| (er.local_name.clone(), v.clone()))
+        })
         .collect()
 }
 
@@ -395,7 +445,10 @@ mod tests {
     #[test]
     fn select_without_choices_is_an_error() {
         let md = "<!-- meshfox:var name=\"X\" type=\"select\" -->\n";
-        assert_eq!(scan_var_decls(md).unwrap_err(), VarsError::SelectMissingChoices("X".to_string()));
+        assert_eq!(
+            scan_var_decls(md).unwrap_err(),
+            VarsError::SelectMissingChoices("X".to_string())
+        );
     }
 
     #[test]
@@ -434,7 +487,10 @@ mod tests {
             "<!-- meshfox:var name=\"X\" default=\"2\" -->\n",
         );
         let c = canvas(doc);
-        assert_eq!(declared_vars(&c).unwrap_err(), VarsError::DuplicateName("X".to_string()));
+        assert_eq!(
+            declared_vars(&c).unwrap_err(),
+            VarsError::DuplicateName("X".to_string())
+        );
     }
 
     fn decl(name: &str, default: Option<&str>, secret: bool) -> VarDecl {
@@ -507,18 +563,30 @@ mod tests {
         overrides.insert("X".to_string(), "override-val".to_string());
         let cache = VarCache::in_memory();
         let resolved = resolve(&decls, &overrides, &cache);
-        assert_eq!(resolved.values.get("X").map(String::as_str), Some("override-val"));
+        assert_eq!(
+            resolved.values.get("X").map(String::as_str),
+            Some("override-val")
+        );
         assert!(resolved.missing.is_empty());
     }
 
     #[test]
     fn resolve_falls_back_to_cache_then_default() {
-        let decls = vec![decl("X", Some("default-val"), false), decl("Y", Some("default-val"), false)];
+        let decls = vec![
+            decl("X", Some("default-val"), false),
+            decl("Y", Some("default-val"), false),
+        ];
         let mut cache = VarCache::in_memory();
         cache.set("X", "cached-val").unwrap();
         let resolved = resolve(&decls, &HashMap::new(), &cache);
-        assert_eq!(resolved.values.get("X").map(String::as_str), Some("cached-val"));
-        assert_eq!(resolved.values.get("Y").map(String::as_str), Some("default-val"));
+        assert_eq!(
+            resolved.values.get("X").map(String::as_str),
+            Some("cached-val")
+        );
+        assert_eq!(
+            resolved.values.get("Y").map(String::as_str),
+            Some("default-val")
+        );
     }
 
     #[test]
@@ -534,7 +602,9 @@ mod tests {
     fn resolve_never_reads_a_secret_from_cache() {
         let decls = vec![decl("TOKEN", None, true)];
         let mut cache = VarCache::in_memory();
-        cache.values_mut_for_test().insert("TOKEN".to_string(), "leaked".to_string());
+        cache
+            .values_mut_for_test()
+            .insert("TOKEN".to_string(), "leaked".to_string());
         let resolved = resolve(&decls, &HashMap::new(), &cache);
         assert!(resolved.values.is_empty());
         assert_eq!(resolved.missing.len(), 1);
@@ -563,7 +633,10 @@ mod tests {
         let mut cache = VarCache::in_memory();
         cache.set("X", "default-val").unwrap();
         let resolved = resolve(&decls, &HashMap::new(), &cache);
-        assert_eq!(resolved.values.get("X").map(String::as_str), Some("default-val"));
+        assert_eq!(
+            resolved.values.get("X").map(String::as_str),
+            Some("default-val")
+        );
         assert!(resolved.missing.is_empty());
     }
 
@@ -574,7 +647,10 @@ mod tests {
         overrides.insert("X".to_string(), "override-val".to_string());
         let cache = VarCache::in_memory();
         let resolved = resolve(&decls, &overrides, &cache);
-        assert_eq!(resolved.values.get("X").map(String::as_str), Some("override-val"));
+        assert_eq!(
+            resolved.values.get("X").map(String::as_str),
+            Some("override-val")
+        );
         assert!(resolved.missing.is_empty());
     }
 
@@ -598,20 +674,30 @@ mod tests {
         );
         assert_eq!(
             validate_env_refs(&canvas(doc)).unwrap_err(),
-            VarsError::UndeclaredEnvVar("install".to_string(), "install".to_string(), "INSTALL_PATH".to_string())
+            VarsError::UndeclaredEnvVar(
+                "install".to_string(),
+                "install".to_string(),
+                "INSTALL_PATH".to_string()
+            )
         );
     }
 
     #[test]
     fn resolve_block_env_only_touches_referenced_vars() {
-        let decls = vec![decl("INSTALL_PATH", Some("/usr/local/bin"), false), decl("UNRELATED", None, false)];
+        let decls = vec![
+            decl("INSTALL_PATH", Some("/usr/local/bin"), false),
+            decl("UNRELATED", None, false),
+        ];
         let env_refs = vec![crate::fence::EnvRef {
             local_name: "INSTALL_PATH".to_string(),
             var_name: "INSTALL_PATH".to_string(),
         }];
         let cache = VarCache::in_memory();
         let resolution = resolve_block_env(&env_refs, &decls, &HashMap::new(), &cache);
-        assert_eq!(resolution.env.get("INSTALL_PATH").map(String::as_str), Some("/usr/local/bin"));
+        assert_eq!(
+            resolution.env.get("INSTALL_PATH").map(String::as_str),
+            Some("/usr/local/bin")
+        );
         // UNRELATED is missing (no default) but was never asked for by this
         // block's env=, so it must not show up as something to prompt for.
         assert!(resolution.missing.is_empty());
@@ -620,10 +706,16 @@ mod tests {
     #[test]
     fn resolve_block_env_renames_to_the_local_name() {
         let decls = vec![decl("INSTALL_PATH", Some("/opt"), false)];
-        let env_refs = vec![crate::fence::EnvRef { local_name: "PREFIX".to_string(), var_name: "INSTALL_PATH".to_string() }];
+        let env_refs = vec![crate::fence::EnvRef {
+            local_name: "PREFIX".to_string(),
+            var_name: "INSTALL_PATH".to_string(),
+        }];
         let cache = VarCache::in_memory();
         let resolution = resolve_block_env(&env_refs, &decls, &HashMap::new(), &cache);
-        assert_eq!(resolution.env.get("PREFIX").map(String::as_str), Some("/opt"));
+        assert_eq!(
+            resolution.env.get("PREFIX").map(String::as_str),
+            Some("/opt")
+        );
         assert!(!resolution.env.contains_key("INSTALL_PATH"));
     }
 
@@ -642,7 +734,12 @@ mod tests {
 
     #[test]
     fn resolve_block_env_treats_a_required_default_as_missing() {
-        let decls = vec![required_decl("INSTALL_PATH", Some("/usr/local/bin"), false, true)];
+        let decls = vec![required_decl(
+            "INSTALL_PATH",
+            Some("/usr/local/bin"),
+            false,
+            true,
+        )];
         let env_refs = vec![crate::fence::EnvRef {
             local_name: "INSTALL_PATH".to_string(),
             var_name: "INSTALL_PATH".to_string(),
@@ -651,6 +748,9 @@ mod tests {
         let resolution = resolve_block_env(&env_refs, &decls, &HashMap::new(), &cache);
         assert!(resolution.env.is_empty());
         assert_eq!(resolution.missing, vec![decls[0].clone()]);
-        assert_eq!(resolution.missing[0].default.as_deref(), Some("/usr/local/bin"));
+        assert_eq!(
+            resolution.missing[0].default.as_deref(),
+            Some("/usr/local/bin")
+        );
     }
 }

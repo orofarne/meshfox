@@ -19,7 +19,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn unique_dir(tag: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("meshfox-pdf-cmd-test-{tag}-{nanos}-{n}"))
 }
@@ -44,7 +47,10 @@ fn system_browser_available() -> bool {
 }
 
 fn page_count(pdf_bytes: &[u8]) -> usize {
-    lopdf::Document::load_mem(pdf_bytes).expect("output must be a well-formed PDF").get_pages().len()
+    lopdf::Document::load_mem(pdf_bytes)
+        .expect("output must be a well-formed PDF")
+        .get_pages()
+        .len()
 }
 
 const OUTLINE_CANVAS: &str = concat!(
@@ -87,8 +93,13 @@ fn renders_a_pdf_for_a_plain_outline_canvas() {
     write_file(&canvas_path, OUTLINE_CANVAS);
     let out_path = unique_dir("out").join("doc.pdf");
 
-    let status =
-        meshfox().arg("pdf").arg(&canvas_path).arg("--out").arg(&out_path).status().expect("failed to run meshfox");
+    let status = meshfox()
+        .arg("pdf")
+        .arg(&canvas_path)
+        .arg("--out")
+        .arg(&out_path)
+        .status()
+        .expect("failed to run meshfox");
     assert!(status.success());
 
     let bytes = std::fs::read(&out_path).unwrap();
@@ -129,11 +140,22 @@ fn a_canvas_with_no_authored_position_still_gets_a_default_mode_canvas_page() {
     write_file(&canvas_path, OUTLINE_CANVAS);
 
     let canvas_only_pages = run_pdf(&canvas_path, &dir.join("canvas-only.pdf"), Some("canvas"));
-    let document_only_pages = run_pdf(&canvas_path, &dir.join("document-only.pdf"), Some("document"));
+    let document_only_pages = run_pdf(
+        &canvas_path,
+        &dir.join("document-only.pdf"),
+        Some("document"),
+    );
     let default_pages = run_pdf(&canvas_path, &dir.join("default.pdf"), None);
 
-    assert_eq!(canvas_only_pages, 1, "--mode canvas is always exactly one page");
-    assert_eq!(default_pages, canvas_only_pages + document_only_pages, "default mode is canvas + document, always");
+    assert_eq!(
+        canvas_only_pages, 1,
+        "--mode canvas is always exactly one page"
+    );
+    assert_eq!(
+        default_pages,
+        canvas_only_pages + document_only_pages,
+        "default mode is canvas + document, always"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -151,11 +173,19 @@ fn authored_positions_do_not_change_the_default_mode_page_count() {
 
     let plain_canvas_path = unique_dir("canvas-plain").join("doc.canvas.md");
     write_file(&plain_canvas_path, OUTLINE_CANVAS);
-    let plain_pages = run_pdf(&plain_canvas_path, &unique_dir("out-plain").join("doc.pdf"), None);
+    let plain_pages = run_pdf(
+        &plain_canvas_path,
+        &unique_dir("out-plain").join("doc.pdf"),
+        None,
+    );
 
     let positioned_canvas_path = unique_dir("canvas-positioned").join("doc.canvas.md");
     write_file(&positioned_canvas_path, POSITIONED_CANVAS);
-    let positioned_pages = run_pdf(&positioned_canvas_path, &unique_dir("out-positioned").join("doc.pdf"), None);
+    let positioned_pages = run_pdf(
+        &positioned_canvas_path,
+        &unique_dir("out-positioned").join("doc.pdf"),
+        None,
+    );
 
     assert_eq!(plain_pages, positioned_pages);
 
@@ -172,19 +202,25 @@ fn mode_document_page_count_is_unaffected_by_authored_positions() {
 
     let plain_canvas_path = unique_dir("canvas-mode-doc-plain").join("doc.canvas.md");
     write_file(&plain_canvas_path, OUTLINE_CANVAS);
-    let plain_pages = run_pdf(&plain_canvas_path, &unique_dir("out-mode-doc-plain").join("doc.pdf"), Some("document"));
+    let plain_pages = run_pdf(
+        &plain_canvas_path,
+        &unique_dir("out-mode-doc-plain").join("doc.pdf"),
+        Some("document"),
+    );
 
     let positioned_canvas_path = unique_dir("canvas-mode-doc-positioned").join("doc.canvas.md");
     write_file(&positioned_canvas_path, POSITIONED_CANVAS);
-    let positioned_pages =
-        run_pdf(&positioned_canvas_path, &unique_dir("out-mode-doc-positioned").join("doc.pdf"), Some("document"));
+    let positioned_pages = run_pdf(
+        &positioned_canvas_path,
+        &unique_dir("out-mode-doc-positioned").join("doc.pdf"),
+        Some("document"),
+    );
 
     assert_eq!(plain_pages, positioned_pages);
 
     let _ = std::fs::remove_dir_all(plain_canvas_path.parent().unwrap());
     let _ = std::fs::remove_dir_all(positioned_canvas_path.parent().unwrap());
 }
-
 
 #[test]
 fn refuses_to_clobber_an_existing_out_file_without_force() {
@@ -195,10 +231,19 @@ fn refuses_to_clobber_an_existing_out_file_without_force() {
     let out_path = unique_dir("out-clobber").join("doc.pdf");
     write_file(&out_path, "leftover, not a real PDF");
 
-    let without_force =
-        meshfox().arg("pdf").arg(&canvas_path).arg("--out").arg(&out_path).status().expect("failed to run meshfox");
+    let without_force = meshfox()
+        .arg("pdf")
+        .arg(&canvas_path)
+        .arg("--out")
+        .arg(&out_path)
+        .status()
+        .expect("failed to run meshfox");
     assert!(!without_force.success());
-    assert_eq!(std::fs::read_to_string(&out_path).unwrap(), "leftover, not a real PDF", "must survive the refused run");
+    assert_eq!(
+        std::fs::read_to_string(&out_path).unwrap(),
+        "leftover, not a real PDF",
+        "must survive the refused run"
+    );
 
     let _ = std::fs::remove_dir_all(canvas_path.parent().unwrap());
     let _ = std::fs::remove_dir_all(out_path.parent().unwrap());
@@ -215,11 +260,19 @@ fn defaults_the_out_path_to_the_canvas_filename_with_a_pdf_extension() {
     let canvas_path = dir.join("doc.canvas.md");
     write_file(&canvas_path, OUTLINE_CANVAS);
 
-    let status = meshfox().arg("pdf").arg(&canvas_path).status().expect("failed to run meshfox");
+    let status = meshfox()
+        .arg("pdf")
+        .arg(&canvas_path)
+        .status()
+        .expect("failed to run meshfox");
     assert!(status.success());
 
     let default_out = dir.join("doc.canvas.pdf");
-    assert!(default_out.exists(), "expected {} to exist", default_out.display());
+    assert!(
+        default_out.exists(),
+        "expected {} to exist",
+        default_out.display()
+    );
     assert!(std::fs::read(&default_out).unwrap().starts_with(b"%PDF-"));
 
     let _ = std::fs::remove_dir_all(&dir);

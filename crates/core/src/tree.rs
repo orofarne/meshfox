@@ -125,7 +125,11 @@ mod tests {
                 node("root", None, ""),
                 node("tests", Some("root"), ""),
                 node("examples", Some("tests"), ""),
-                node("test1", Some("examples"), "```bash name=\"test1\"\necho hi\n```"),
+                node(
+                    "test1",
+                    Some("examples"),
+                    "```bash name=\"test1\"\necho hi\n```",
+                ),
             ],
             options: Vec::new(),
         }
@@ -167,7 +171,11 @@ mod tests {
         // straight into `meshfox run <path...> <name>`.
         assert_eq!(
             blocks[0].path,
-            vec!["tests".to_string(), "examples".to_string(), "test1".to_string()]
+            vec![
+                "tests".to_string(),
+                "examples".to_string(),
+                "test1".to_string()
+            ]
         );
         assert_eq!(blocks[0].node_id, "test1");
         assert_eq!(blocks[0].block.name.as_deref(), Some("test1"));
@@ -194,7 +202,10 @@ mod tests {
         );
         let c = Canvas::from_markdown(doc).unwrap();
         let blocks = c.list_runnable().unwrap();
-        let names: Vec<_> = blocks.iter().map(|b| b.block.name.clone().unwrap()).collect();
+        let names: Vec<_> = blocks
+            .iter()
+            .map(|b| b.block.name.clone().unwrap())
+            .collect();
         assert_eq!(names, vec!["a1", "b1"]);
         assert_eq!(blocks[0].path, vec!["a".to_string()]);
         assert_eq!(blocks[1].path, vec!["b".to_string()]);

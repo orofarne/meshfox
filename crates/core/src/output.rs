@@ -38,7 +38,11 @@ fn safe_fence_len(body: &str) -> usize {
 }
 
 fn render_output_block(name: &str, output: &ExecOutput) -> String {
-    let body = format!("exit code: {}\n\n{}", output.exit_code, output.output.trim_end());
+    let body = format!(
+        "exit code: {}\n\n{}",
+        output.exit_code,
+        output.output.trim_end()
+    );
     let fence = "`".repeat(safe_fence_len(&body));
     format!(
         "{start}\n{fence}text\n{body}\n{fence}\n{end}\n",
@@ -56,7 +60,9 @@ fn render_output_block(name: &str, output: &ExecOutput) -> String {
 /// that case.
 pub fn write_output(markdown: &str, block_name: &str, output: &ExecOutput) -> Option<String> {
     let blocks = scan_runnable_blocks(block_name, markdown);
-    let block = blocks.iter().find(|b| b.name.as_deref() == Some(block_name))?;
+    let block = blocks
+        .iter()
+        .find(|b| b.name.as_deref() == Some(block_name))?;
     let insert_point = block.span.end;
     let rendered = render_output_block(block_name, output);
     let marker = start_marker(block_name);
@@ -154,7 +160,8 @@ mod tests {
 
         // A full canvas parse must not treat the embedded fake heading /
         // meshfox:node comment as real structure.
-        let canvas = crate::mdcanvas::parse(&format!("# Root\n<!-- meshfox:node -->\n\n{updated}")).unwrap();
+        let canvas =
+            crate::mdcanvas::parse(&format!("# Root\n<!-- meshfox:node -->\n\n{updated}")).unwrap();
         assert_eq!(canvas.nodes.len(), 1);
     }
 }

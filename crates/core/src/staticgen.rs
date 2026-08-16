@@ -220,11 +220,22 @@ pub struct Asset {
 /// prefixed onto whatever relative reference is left over (see module
 /// docs) — pass `None` for a self-contained site meant to be opened as-is.
 pub fn build(canvas: &Canvas, canvas_dir: &Path, base_url: Option<&str>) -> (SiteData, Vec<Asset>) {
-    let canvas_dir = canvas_dir.canonicalize().unwrap_or_else(|_| canvas_dir.to_path_buf());
+    let canvas_dir = canvas_dir
+        .canonicalize()
+        .unwrap_or_else(|_| canvas_dir.to_path_buf());
 
-    let root_node = canvas.nodes.iter().find(|n| n.parent.is_none()).expect("a parsed canvas always has a root");
+    let root_node = canvas
+        .nodes
+        .iter()
+        .find(|n| n.parent.is_none())
+        .expect("a parsed canvas always has a root");
     let (folded_ids, foldable_ids) = resolve_default_fold(canvas, &root_node.id);
-    let ctx = RenderCtx { canvas_dir: &canvas_dir, base_url, folded_ids: &folded_ids, foldable_ids: &foldable_ids };
+    let ctx = RenderCtx {
+        canvas_dir: &canvas_dir,
+        base_url,
+        folded_ids: &folded_ids,
+        foldable_ids: &foldable_ids,
+    };
 
     let mut assets: Vec<Asset> = Vec::new();
     let root = build_node_view(canvas, root_node, 0, &ctx, &mut assets);
@@ -239,7 +250,13 @@ pub fn build(canvas: &Canvas, canvas_dir: &Path, base_url: Option<&str>) -> (Sit
     (SiteData { title, root, edges }, assets)
 }
 
-fn build_node_view(canvas: &Canvas, node: &Node, depth: u32, ctx: &RenderCtx, assets: &mut Vec<Asset>) -> NodeView {
+fn build_node_view(
+    canvas: &Canvas,
+    node: &Node,
+    depth: u32,
+    ctx: &RenderCtx,
+    assets: &mut Vec<Asset>,
+) -> NodeView {
     let (html_body, target) = if node.node_type == NodeType::Group {
         (String::new(), None)
     } else if node.node_type == NodeType::File && node.display == Some(FileDisplay::Code) {
@@ -258,8 +275,17 @@ fn build_node_view(canvas: &Canvas, node: &Node, depth: u32, ctx: &RenderCtx, as
     // as before this existed — no heuristic invented here either way, per
     // this module's own "all real or nothing" rule (see the module doc
     // comment).
-    let position = match (canvas.resolve_absolute_position(&node.id), node.width, node.height) {
-        (Some((x, y)), Some(width), Some(height)) => Some(Position { x, y, width, height }),
+    let position = match (
+        canvas.resolve_absolute_position(&node.id),
+        node.width,
+        node.height,
+    ) {
+        (Some((x, y)), Some(width), Some(height)) => Some(Position {
+            x,
+            y,
+            width,
+            height,
+        }),
         _ => None,
     };
     let children = canvas
@@ -306,11 +332,23 @@ fn is_title_only_node(n: &Node) -> bool {
 /// a reader's own fold clicks across, and no build-time reason to guess at
 /// one) — so unlike the web UI, this *is* the whole story: what a reader
 /// sees the moment the page loads, and the same every time.
-fn resolve_default_fold(canvas: &Canvas, root_id: &str) -> (std::collections::HashSet<String>, std::collections::HashSet<String>) {
-    let has_unfold_option = crate::options::declared_options(canvas).map(|opts| opts.iter().any(|o| o == "unfold")).unwrap_or(false);
+fn resolve_default_fold(
+    canvas: &Canvas,
+    root_id: &str,
+) -> (
+    std::collections::HashSet<String>,
+    std::collections::HashSet<String>,
+) {
+    let has_unfold_option = crate::options::declared_options(canvas)
+        .map(|opts| opts.iter().any(|o| o == "unfold"))
+        .unwrap_or(false);
     // Ids that are somebody's structural `parent` — mirrors
     // `web/src/App.tsx`'s `nodesWithChildren`.
-    let with_children: std::collections::HashSet<&str> = canvas.nodes.iter().filter_map(|n| n.parent.as_deref()).collect();
+    let with_children: std::collections::HashSet<&str> = canvas
+        .nodes
+        .iter()
+        .filter_map(|n| n.parent.as_deref())
+        .collect();
 
     let mut folded = std::collections::HashSet::new();
     let mut foldable = std::collections::HashSet::new();
@@ -320,7 +358,9 @@ fn resolve_default_fold(canvas: &Canvas, root_id: &str) -> (std::collections::Ha
             foldable.insert(n.id.clone());
         }
         let has_explicit_size = n.width.is_some() || n.height.is_some();
-        let resolved = n.fold.unwrap_or_else(|| n.id != root_id && !has_unfold_option && !has_explicit_size && can_fold);
+        let resolved = n.fold.unwrap_or_else(|| {
+            n.id != root_id && !has_unfold_option && !has_explicit_size && can_fold
+        });
         if resolved {
             folded.insert(n.id.clone());
         }
@@ -345,7 +385,10 @@ fn build_edges(canvas: &Canvas) -> Vec<EdgeView> {
                 label: extra.label.clone(),
                 color: extra.color.clone(),
                 style: extra.style.map(|s| s.as_str()).unwrap_or("dashed"),
-                arrow_end: extra.arrow_end.map(|a| matches!(a, ArrowEnd::Arrow)).unwrap_or(true),
+                arrow_end: extra
+                    .arrow_end
+                    .map(|a| matches!(a, ArrowEnd::Arrow))
+                    .unwrap_or(true),
             });
         }
     }
@@ -373,17 +416,39 @@ struct RenderCtx<'a> {
 fn render_markdown(text: &str, ctx: &RenderCtx, assets: &mut Vec<Asset>) -> String {
     use pulldown_cmark::{html, Event, Options, Parser, Tag};
     let stripped = crate::fence::strip_fence_attrs(text);
-    let options =
-        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_FOOTNOTES | Options::ENABLE_TASKLISTS;
+    let options = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_TASKLISTS;
     let events: Vec<Event> = Parser::new_ext(&stripped, options)
         .map(|event| match event {
-            Event::Start(Tag::Image { link_type, dest_url, title, id }) => {
+            Event::Start(Tag::Image {
+                link_type,
+                dest_url,
+                title,
+                id,
+            }) => {
                 let new_url = resolve_image_url(&dest_url, ctx, assets);
-                Event::Start(Tag::Image { link_type, dest_url: new_url.into(), title, id })
+                Event::Start(Tag::Image {
+                    link_type,
+                    dest_url: new_url.into(),
+                    title,
+                    id,
+                })
             }
-            Event::Start(Tag::Link { link_type, dest_url, title, id }) => {
+            Event::Start(Tag::Link {
+                link_type,
+                dest_url,
+                title,
+                id,
+            }) => {
                 let new_url = resolve_link_url(&dest_url, ctx);
-                Event::Start(Tag::Link { link_type, dest_url: new_url.into(), title, id })
+                Event::Start(Tag::Link {
+                    link_type,
+                    dest_url: new_url.into(),
+                    title,
+                    id,
+                })
             }
             other => other,
         })
@@ -451,7 +516,11 @@ fn resolve_canvas_relative(url: &str, canvas_dir: &Path) -> Option<PathBuf> {
 /// came out of `resolve_canvas_relative`, which already guarantees the
 /// `canvas_dir` prefix.
 fn dest_rel_for(resolved: &Path, canvas_dir: &Path) -> String {
-    resolved.strip_prefix(canvas_dir).unwrap_or(resolved).to_string_lossy().replace('\\', "/")
+    resolved
+        .strip_prefix(canvas_dir)
+        .unwrap_or(resolved)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 /// True for anything this module leaves untouched no matter what: an
@@ -459,7 +528,11 @@ fn dest_rel_for(resolved: &Path, canvas_dir: &Path) -> String {
 /// ...), or a root-absolute path (ambiguous once site root and repo root
 /// are different things — not this module's call to resolve).
 fn is_external_or_absolute(url: &str) -> bool {
-    url.starts_with('#') || url.starts_with('/') || url.contains("://") || url.starts_with("mailto:") || url.starts_with("data:")
+    url.starts_with('#')
+        || url.starts_with('/')
+        || url.contains("://")
+        || url.starts_with("mailto:")
+        || url.starts_with("data:")
 }
 
 /// A Markdown image's `src`: copies the referenced local file (queuing an
@@ -475,7 +548,10 @@ fn resolve_image_url(url: &str, ctx: &RenderCtx, assets: &mut Vec<Asset>) -> Str
     match resolve_canvas_relative(url, ctx.canvas_dir) {
         Some(resolved) => {
             let dest_rel = dest_rel_for(&resolved, ctx.canvas_dir);
-            assets.push(Asset { source: resolved, dest_rel: dest_rel.clone() });
+            assets.push(Asset {
+                source: resolved,
+                dest_rel: dest_rel.clone(),
+            });
             dest_rel
         }
         None => url.to_string(),
@@ -491,7 +567,11 @@ fn resolve_link_url(url: &str, ctx: &RenderCtx) -> String {
         return url.to_string();
     }
     match ctx.base_url {
-        Some(base) => format!("{}/{}", base.trim_end_matches('/'), url.trim_start_matches("./")),
+        Some(base) => format!(
+            "{}/{}",
+            base.trim_end_matches('/'),
+            url.trim_start_matches("./")
+        ),
         None => url.to_string(),
     }
 }
@@ -508,8 +588,12 @@ fn render_file_code(node: &Node, canvas_dir: &Path) -> String {
     let Some(target) = node.target.as_deref() else {
         return "<p><em>no target</em></p>".to_string();
     };
-    let fallback_link =
-        || format!("<p><a target=\"_blank\" rel=\"noopener noreferrer\" href=\"{0}\">{0}</a></p>", html_escape(target));
+    let fallback_link = || {
+        format!(
+            "<p><a target=\"_blank\" rel=\"noopener noreferrer\" href=\"{0}\">{0}</a></p>",
+            html_escape(target)
+        )
+    };
 
     let Ok(preview) = crate::file_read::preview(canvas_dir, target) else {
         return fallback_link();
@@ -517,9 +601,20 @@ fn render_file_code(node: &Node, canvas_dir: &Path) -> String {
     let truncated = preview.truncated;
     let content = preview.content;
     let lang = node.lang.clone().unwrap_or_else(|| guess_lang(target));
-    let class_attr = if lang.is_empty() { String::new() } else { format!(" class=\"language-{}\"", html_escape(&lang)) };
-    let note = if truncated { "<p class=\"file-preview-truncated\">(truncated)</p>" } else { "" };
-    format!("<pre><code{class_attr}>{}</code></pre>{note}", html_escape(&content))
+    let class_attr = if lang.is_empty() {
+        String::new()
+    } else {
+        format!(" class=\"language-{}\"", html_escape(&lang))
+    };
+    let note = if truncated {
+        "<p class=\"file-preview-truncated\">(truncated)</p>"
+    } else {
+        ""
+    };
+    format!(
+        "<pre><code{class_attr}>{}</code></pre>{note}",
+        html_escape(&content)
+    )
 }
 
 /// Extension-based language guess for a `display="code"` preview whose node
@@ -529,7 +624,11 @@ fn render_file_code(node: &Node, canvas_dir: &Path) -> String {
 /// map); an unrecognized extension gets no `class` at all, same as
 /// CodeMirror returning no match there.
 fn guess_lang(path: &str) -> String {
-    let ext = Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
     match ext.as_str() {
         "rs" => "rust",
         "py" => "python",
@@ -594,7 +693,10 @@ mod tests {
     /// same pattern `include.rs`'s own tests use, `tag` keeping concurrent
     /// tests in this module from colliding on the same path.
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("meshfox-staticgen-test-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-staticgen-test-{tag}-{}",
+            std::process::id()
+        ));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -605,7 +707,9 @@ mod tests {
 
     #[test]
     fn maps_basic_node_fields() {
-        let c = canvas("# Root\n<!-- meshfox:node id=\"root\" color=\"red\" tags=\"a,b\" -->\n\nhello\n");
+        let c = canvas(
+            "# Root\n<!-- meshfox:node id=\"root\" color=\"red\" tags=\"a,b\" -->\n\nhello\n",
+        );
         let site = build_site(&c);
         let root = site.find("root").unwrap();
         assert_eq!(root.title, "Root");
@@ -650,8 +754,15 @@ mod tests {
     fn a_fully_positioned_node_keeps_its_exact_authored_position() {
         let c = canvas("# Root\n<!-- meshfox:node id=\"root\" x=10 y=20 w=200 h=80 -->\n");
         let site = build_site(&c);
-        let pos = site.find("root").unwrap().position.expect("all four values were set");
-        assert_eq!((pos.x, pos.y, pos.width, pos.height), (10.0, 20.0, 200.0, 80.0));
+        let pos = site
+            .find("root")
+            .unwrap()
+            .position
+            .expect("all four values were set");
+        assert_eq!(
+            (pos.x, pos.y, pos.width, pos.height),
+            (10.0, 20.0, 200.0, 80.0)
+        );
     }
 
     #[test]
@@ -677,8 +788,15 @@ mod tests {
              ### Member\n<!-- meshfox:node id=\"member\" x=20 y=20 w=100 h=80 -->\n\nbody\n",
         );
         let site = build_site(&c);
-        let pos = site.find("member").unwrap().position.expect("group has a real anchor");
-        assert_eq!((pos.x, pos.y, pos.width, pos.height), (1020.0, 1020.0, 100.0, 80.0));
+        let pos = site
+            .find("member")
+            .unwrap()
+            .position
+            .expect("group has a real anchor");
+        assert_eq!(
+            (pos.x, pos.y, pos.width, pos.height),
+            (1020.0, 1020.0, 100.0, 80.0)
+        );
     }
 
     #[test]
@@ -738,7 +856,9 @@ mod tests {
 
     #[test]
     fn a_node_with_an_explicit_size_does_not_fold_by_default() {
-        let c = canvas("# Root\n\n## Child\n<!-- meshfox:node id=\"child\" x=10 y=20 w=200 h=80 -->\n\nbody\n");
+        let c = canvas(
+            "# Root\n\n## Child\n<!-- meshfox:node id=\"child\" x=10 y=20 w=200 h=80 -->\n\nbody\n",
+        );
         let site = build_site(&c);
         assert!(!site.find("child").unwrap().folded);
     }
@@ -834,7 +954,11 @@ mod tests {
         );
         let site = build_site(&c);
         let block = site.find("block").unwrap();
-        assert!(block.html_body.contains("language-bash"), "{}", block.html_body);
+        assert!(
+            block.html_body.contains("language-bash"),
+            "{}",
+            block.html_body
+        );
         assert!(!block.html_body.contains("name="), "{}", block.html_body);
     }
 
@@ -867,10 +991,20 @@ mod tests {
         let c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n![Screenshot](shot.png)\n");
 
         let (site, assets) = build(&c, &dir, None);
-        assert!(site.find("root").unwrap().html_body.contains("src=\"shot.png\""), "{}", site.find("root").unwrap().html_body);
+        assert!(
+            site.find("root")
+                .unwrap()
+                .html_body
+                .contains("src=\"shot.png\""),
+            "{}",
+            site.find("root").unwrap().html_body
+        );
         assert_eq!(assets.len(), 1);
         assert_eq!(assets[0].dest_rel, "shot.png");
-        assert_eq!(fs::read(&assets[0].source).unwrap(), b"not a real png, just bytes");
+        assert_eq!(
+            fs::read(&assets[0].source).unwrap(),
+            b"not a real png, just bytes"
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -881,7 +1015,14 @@ mod tests {
         let c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n![x](../../etc/passwd)\n");
 
         let (site, assets) = build(&c, &dir, None);
-        assert!(site.find("root").unwrap().html_body.contains("src=\"../../etc/passwd\""), "{}", site.find("root").unwrap().html_body);
+        assert!(
+            site.find("root")
+                .unwrap()
+                .html_body
+                .contains("src=\"../../etc/passwd\""),
+            "{}",
+            site.find("root").unwrap().html_body
+        );
         assert!(assets.is_empty());
 
         fs::remove_dir_all(&dir).ok();
@@ -890,10 +1031,19 @@ mod tests {
     #[test]
     fn external_image_url_is_never_queued_as_an_asset() {
         let dir = temp_dir("image-external");
-        let c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n![x](https://example.com/x.png)\n");
+        let c = canvas(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n![x](https://example.com/x.png)\n",
+        );
 
         let (site, assets) = build(&c, &dir, None);
-        assert!(site.find("root").unwrap().html_body.contains("src=\"https://example.com/x.png\""), "{}", site.find("root").unwrap().html_body);
+        assert!(
+            site.find("root")
+                .unwrap()
+                .html_body
+                .contains("src=\"https://example.com/x.png\""),
+            "{}",
+            site.find("root").unwrap().html_body
+        );
         assert!(assets.is_empty());
 
         fs::remove_dir_all(&dir).ok();
@@ -929,8 +1079,16 @@ mod tests {
 
         let (site, _assets) = build(&c, &dir, None);
         let src = site.find("src").unwrap();
-        assert!(src.html_body.contains("&lt;script&gt;"), "{}", src.html_body);
-        assert!(!src.html_body.contains("<script>alert"), "{}", src.html_body);
+        assert!(
+            src.html_body.contains("&lt;script&gt;"),
+            "{}",
+            src.html_body
+        );
+        assert!(
+            !src.html_body.contains("<script>alert"),
+            "{}",
+            src.html_body
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -947,7 +1105,11 @@ mod tests {
         let (site, _assets) = build(&c, &dir, None);
         let src = site.find("src").unwrap();
         assert!(!src.html_body.contains("<pre>"), "{}", src.html_body);
-        assert!(src.html_body.contains("href=\"blob.bin\""), "{}", src.html_body);
+        assert!(
+            src.html_body.contains("href=\"blob.bin\""),
+            "{}",
+            src.html_body
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -962,7 +1124,11 @@ mod tests {
 
         let (site, _assets) = build(&c, &dir, None);
         let src = site.find("src").unwrap();
-        assert!(src.html_body.contains("href=\"nope.rs\""), "{}", src.html_body);
+        assert!(
+            src.html_body.contains("href=\"nope.rs\""),
+            "{}",
+            src.html_body
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -973,7 +1139,14 @@ mod tests {
         let c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n[LICENSE](./LICENSE)\n");
 
         let (site, _assets) = build(&c, &dir, Some("https://example.com/repo"));
-        assert!(site.find("root").unwrap().html_body.contains("href=\"https://example.com/repo/LICENSE\""), "{}", site.find("root").unwrap().html_body);
+        assert!(
+            site.find("root")
+                .unwrap()
+                .html_body
+                .contains("href=\"https://example.com/repo/LICENSE\""),
+            "{}",
+            site.find("root").unwrap().html_body
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -985,7 +1158,14 @@ mod tests {
         let c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n![Screenshot](shot.png)\n");
 
         let (site, assets) = build(&c, &dir, Some("https://example.com/repo"));
-        assert!(site.find("root").unwrap().html_body.contains("src=\"shot.png\""), "{}", site.find("root").unwrap().html_body);
+        assert!(
+            site.find("root")
+                .unwrap()
+                .html_body
+                .contains("src=\"shot.png\""),
+            "{}",
+            site.find("root").unwrap().html_body
+        );
         assert_eq!(assets.len(), 1);
 
         fs::remove_dir_all(&dir).ok();
@@ -997,7 +1177,14 @@ mod tests {
         let c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n[meshfox](https://github.com/example/meshfox)\n");
 
         let (site, _assets) = build(&c, &dir, Some("https://example.com/repo"));
-        assert!(site.find("root").unwrap().html_body.contains("href=\"https://github.com/example/meshfox\""), "{}", site.find("root").unwrap().html_body);
+        assert!(
+            site.find("root")
+                .unwrap()
+                .html_body
+                .contains("href=\"https://github.com/example/meshfox\""),
+            "{}",
+            site.find("root").unwrap().html_body
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -1012,7 +1199,10 @@ mod tests {
 
         let (site, _assets) = build(&c, &dir, Some("https://example.com/repo"));
         let homepage = site.find("homepage").unwrap();
-        assert_eq!(homepage.target.as_deref(), Some("https://example.com/repo/docs/home.html"));
+        assert_eq!(
+            homepage.target.as_deref(),
+            Some("https://example.com/repo/docs/home.html")
+        );
 
         fs::remove_dir_all(&dir).ok();
     }

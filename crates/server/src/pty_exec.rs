@@ -82,7 +82,12 @@ where
 {
     let pty_system = native_pty_system();
     let pair = pty_system
-        .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+        .openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
         .map_err(to_io_error)?;
 
     let mut cmd = CommandBuilder::new("bash");
@@ -100,8 +105,7 @@ where
 
     let pid = child
         .process_id()
-        .ok_or_else(|| io::Error::other("pty child has no pid"))?
-        as i32;
+        .ok_or_else(|| io::Error::other("pty child has no pid"))? as i32;
 
     let mut reader = pair.master.try_clone_reader().map_err(to_io_error)?;
     let mut writer = pair.master.take_writer().map_err(to_io_error)?;
@@ -134,17 +138,31 @@ where
     let (resize_tx, mut resize_rx) = mpsc::unbounded_channel::<(u16, u16)>();
     std::thread::spawn(move || {
         while let Some((cols, rows)) = resize_rx.blocking_recv() {
-            let _ = master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+            let _ = master.resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            });
         }
     });
 
     let (exit_tx, exit_rx) = oneshot::channel();
     std::thread::spawn(move || {
-        let code = child.wait().map(|status| status.exit_code() as i32).unwrap_or(-1);
+        let code = child
+            .wait()
+            .map(|status| status.exit_code() as i32)
+            .unwrap_or(-1);
         let _ = exit_tx.send(code);
     });
 
-    Ok(PtyProcess { output_rx, input_tx, resize_tx, pid, exit_rx: Some(exit_rx) })
+    Ok(PtyProcess {
+        output_rx,
+        input_tx,
+        resize_tx,
+        pid,
+        exit_rx: Some(exit_rx),
+    })
 }
 
 fn to_io_error(e: anyhow::Error) -> io::Error {
@@ -196,7 +214,13 @@ mod tests {
 
     #[tokio::test]
     async fn injects_extra_env_vars_on_top_of_the_inherited_ones() {
-        let mut proc = spawn_bash("echo \"$INSTALL_PATH\"", [("INSTALL_PATH", "/opt/meshfox")], 80, 24).unwrap();
+        let mut proc = spawn_bash(
+            "echo \"$INSTALL_PATH\"",
+            [("INSTALL_PATH", "/opt/meshfox")],
+            80,
+            24,
+        )
+        .unwrap();
         let mut collected = Vec::new();
         while let Some(chunk) = proc.output_rx.recv().await {
             collected.extend_from_slice(&chunk);

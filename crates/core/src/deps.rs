@@ -42,12 +42,18 @@ pub enum DepsError {
     #[error("node {0:?} block {1:?}: `tty` and `cache` are mutually exclusive — an interactive session isn't the kind of deterministic exit-code-plus-text `cache` can save/replay")]
     CacheTtyConflict(String, String),
     #[error("{}: only a `tty` block may depend on another `tty` block (depended on by {})", .dependency.key(), .dependent.key())]
-    TtyDependencyRequiresTty { dependent: BlockAddr, dependency: BlockAddr },
+    TtyDependencyRequiresTty {
+        dependent: BlockAddr,
+        dependency: BlockAddr,
+    },
 }
 
 fn resolve_ref(owner_node_id: &str, r: &BlockRef) -> BlockAddr {
     BlockAddr {
-        node_id: r.node_id.clone().unwrap_or_else(|| owner_node_id.to_string()),
+        node_id: r
+            .node_id
+            .clone()
+            .unwrap_or_else(|| owner_node_id.to_string()),
         block_name: r.block_name.clone(),
     }
 }
@@ -107,7 +113,10 @@ fn visit(
             // non-interactive chain. Only a `tty` block may depend on
             // another one (see SPEC.md's "Runnable code fences").
             if find_block(canvas, &dep_addr)?.tty {
-                return Err(DepsError::TtyDependencyRequiresTty { dependent: addr, dependency: dep_addr });
+                return Err(DepsError::TtyDependencyRequiresTty {
+                    dependent: addr,
+                    dependency: dep_addr,
+                });
             }
         }
         visit(canvas, dep_addr, order, visited, stack)?;
@@ -158,7 +167,10 @@ mod tests {
         let chain = resolve_chain(&c, BlockAddr::new("root", "test")).unwrap();
         assert_eq!(
             chain,
-            vec![BlockAddr::new("root", "build"), BlockAddr::new("root", "test")]
+            vec![
+                BlockAddr::new("root", "build"),
+                BlockAddr::new("root", "test")
+            ]
         );
     }
 
@@ -265,7 +277,9 @@ mod tests {
             "```bash name=\"root\"\necho a\n```\n\n",
             "```bash name=\"other\" default\necho b\n```\n",
         ));
-        assert!(matches!(validate(&c), Err(DepsError::MultipleDefaults(node, _)) if node == "root"));
+        assert!(
+            matches!(validate(&c), Err(DepsError::MultipleDefaults(node, _)) if node == "root")
+        );
     }
 
     #[test]
@@ -287,7 +301,10 @@ mod tests {
             "```bash name=\"shell\" tty\nbash\n```\n\n",
             "```bash name=\"build\" deps=\"shell\"\necho build\n```\n",
         ));
-        assert!(matches!(validate(&c), Err(DepsError::TtyDependencyRequiresTty { .. })));
+        assert!(matches!(
+            validate(&c),
+            Err(DepsError::TtyDependencyRequiresTty { .. })
+        ));
     }
 
     #[test]
@@ -299,7 +316,10 @@ mod tests {
         ));
         assert!(validate(&c).is_ok());
         let chain = resolve_chain(&c, BlockAddr::new("root", "b")).unwrap();
-        assert_eq!(chain, vec![BlockAddr::new("root", "a"), BlockAddr::new("root", "b")]);
+        assert_eq!(
+            chain,
+            vec![BlockAddr::new("root", "a"), BlockAddr::new("root", "b")]
+        );
     }
 
     #[test]

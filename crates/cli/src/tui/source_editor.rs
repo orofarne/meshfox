@@ -120,8 +120,11 @@ impl SourceEditorState {
                 KeyCode::Char('s') => return SourceEditorOutcome::Save,
                 KeyCode::Char('f') => {
                     self.file_picker_open = true;
-                    self.file_picker_selected =
-                        if self.path == self.primary_path { 0 } else { self.current_file_index().map(|i| i + 1).unwrap_or(0) };
+                    self.file_picker_selected = if self.path == self.primary_path {
+                        0
+                    } else {
+                        self.current_file_index().map(|i| i + 1).unwrap_or(0)
+                    };
                     return SourceEditorOutcome::Stay;
                 }
                 _ => {}
@@ -134,7 +137,8 @@ impl SourceEditorState {
         if key.code == KeyCode::Esc && self.editor.mode == EditorMode::Normal {
             if self.dirty() && !self.pending_discard {
                 self.pending_discard = true;
-                self.error = Some("unsaved changes — Ctrl-s to save, or Esc again to discard".to_string());
+                self.error =
+                    Some("unsaved changes — Ctrl-s to save, or Esc again to discard".to_string());
                 return SourceEditorOutcome::Stay;
             }
             return SourceEditorOutcome::Close;
@@ -161,13 +165,18 @@ impl SourceEditorState {
             KeyCode::Enter => {
                 self.file_picker_open = false;
                 if self.dirty() {
-                    self.error = Some("save or discard changes before switching files (Ctrl-s, or Esc twice)".to_string());
+                    self.error = Some(
+                        "save or discard changes before switching files (Ctrl-s, or Esc twice)"
+                            .to_string(),
+                    );
                     return;
                 }
                 let target = if self.file_picker_selected == 0 {
                     Some((self.primary_path.clone(), true))
                 } else {
-                    self.files.get(self.file_picker_selected - 1).map(|i| (i.path.clone(), i.is_canvas))
+                    self.files
+                        .get(self.file_picker_selected - 1)
+                        .map(|i| (i.path.clone(), i.is_canvas))
                 };
                 if let Some((path, is_canvas)) = target {
                     self.switch_to(path, is_canvas);

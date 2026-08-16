@@ -37,9 +37,18 @@ impl Highlighter {
     pub fn new() -> Self {
         let syntax_set = SyntaxSet::load_defaults_newlines();
         let theme_set = ThemeSet::load_defaults();
-        let theme = theme_set.themes.get("base16-ocean.dark").cloned().unwrap_or_else(|| {
-            theme_set.themes.values().next().cloned().expect("syntect ships at least one theme")
-        });
+        let theme = theme_set
+            .themes
+            .get("base16-ocean.dark")
+            .cloned()
+            .unwrap_or_else(|| {
+                theme_set
+                    .themes
+                    .values()
+                    .next()
+                    .cloned()
+                    .expect("syntect ships at least one theme")
+            });
         Highlighter { syntax_set, theme }
     }
 
@@ -56,15 +65,28 @@ impl Highlighter {
     /// node's own explicit `lang=` when it has one, otherwise the syntax is
     /// guessed from the target path's extension, same as the browser UI's
     /// preview does.
-    pub fn highlight_file(&self, lang_hint: Option<&str>, path: &std::path::Path, code: &str) -> Vec<Line<'static>> {
+    pub fn highlight_file(
+        &self,
+        lang_hint: Option<&str>,
+        path: &std::path::Path,
+        code: &str,
+    ) -> Vec<Line<'static>> {
         let syntax = lang_hint
             .and_then(|l| self.syntax_set.find_syntax_by_token(l))
-            .or_else(|| path.extension().and_then(|e| e.to_str()).and_then(|e| self.syntax_set.find_syntax_by_extension(e)))
+            .or_else(|| {
+                path.extension()
+                    .and_then(|e| e.to_str())
+                    .and_then(|e| self.syntax_set.find_syntax_by_extension(e))
+            })
             .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text());
         self.highlight_with(syntax, code)
     }
 
-    fn highlight_with(&self, syntax: &syntect::parsing::SyntaxReference, code: &str) -> Vec<Line<'static>> {
+    fn highlight_with(
+        &self,
+        syntax: &syntect::parsing::SyntaxReference,
+        code: &str,
+    ) -> Vec<Line<'static>> {
         let mut h = HighlightLines::new(syntax, &self.theme);
         let mut lines = Vec::new();
         for line in syntect::util::LinesWithEndings::from(code) {
@@ -127,7 +149,9 @@ const HEADING_COLORS: [Color; 6] = [
 
 fn heading_style(level: HeadingLevel) -> Style {
     let idx = (level as usize).saturating_sub(1).min(5);
-    let mut style = Style::default().fg(HEADING_COLORS[idx]).add_modifier(Modifier::BOLD);
+    let mut style = Style::default()
+        .fg(HEADING_COLORS[idx])
+        .add_modifier(Modifier::BOLD);
     if level == HeadingLevel::H1 {
         style = style.add_modifier(Modifier::UNDERLINED);
     }
@@ -213,11 +237,16 @@ impl<'a> Renderer<'a> {
                 Inline::Emphasis => style.add_modifier(Modifier::ITALIC),
                 Inline::Strong => style.add_modifier(Modifier::BOLD),
                 Inline::Strikethrough => style.add_modifier(Modifier::CROSSED_OUT),
-                Inline::Code => style.bg(Color::Rgb(40, 42, 54)).fg(Color::Rgb(255, 184, 108)),
-                Inline::Link => style.fg(Color::LightBlue).add_modifier(Modifier::UNDERLINED),
+                Inline::Code => style
+                    .bg(Color::Rgb(40, 42, 54))
+                    .fg(Color::Rgb(255, 184, 108)),
+                Inline::Link => style
+                    .fg(Color::LightBlue)
+                    .add_modifier(Modifier::UNDERLINED),
             };
         }
-        self.current.push(Span::styled(text.to_string(), style.patch(extra)));
+        self.current
+            .push(Span::styled(text.to_string(), style.patch(extra)));
     }
 
     fn flush_line(&mut self) {
@@ -346,13 +375,17 @@ impl<'a> Renderer<'a> {
             Tag::Strong => self.inline_stack.push(Inline::Strong),
             Tag::Strikethrough => self.inline_stack.push(Inline::Strikethrough),
             Tag::Link { .. } => self.inline_stack.push(Inline::Link),
-            Tag::Image { dest_url, title, .. } => {
+            Tag::Image {
+                dest_url, title, ..
+            } => {
                 self.flush_paragraph();
                 let alt = title.to_string();
                 if dest_url.starts_with("http://") || dest_url.starts_with("https://") {
                     self.push_segment(Segment::Text(vec![Line::from(Span::styled(
                         format!("[image: {dest_url}]"),
-                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
                     ))]));
                 } else {
                     let path = self.base_dir.join(dest_url.as_ref());
@@ -493,14 +526,21 @@ fn render_table(t: &TableState) -> Vec<Line<'static>> {
             let cell = row.get(i).map(String::as_str).unwrap_or("");
             let align = t.alignments.get(i).copied().unwrap_or(Alignment::None);
             let text = pad(cell, *w, align);
-            let style = if ri == 0 { Style::default().add_modifier(Modifier::BOLD) } else { Style::default() };
+            let style = if ri == 0 {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
             spans.push(Span::styled(text, style));
             spans.push(Span::raw(" │ "));
         }
         lines.push(Line::from(spans));
         if ri == 0 {
             let rule: String = widths.iter().map(|w| "─".repeat(w + 3)).collect();
-            lines.push(Line::from(Span::styled(rule, Style::default().fg(Color::DarkGray))));
+            lines.push(Line::from(Span::styled(
+                rule,
+                Style::default().fg(Color::DarkGray),
+            )));
         }
     }
     lines

@@ -97,7 +97,10 @@ impl ExtraEdge {
     /// A bare edge with no styling — same shape a plain `meshfox:edge
     /// from="..."` line (or the old `Vec<String>` form) parses to.
     pub fn new(from: impl Into<String>) -> Self {
-        ExtraEdge { from: from.into(), ..Default::default() }
+        ExtraEdge {
+            from: from.into(),
+            ..Default::default()
+        }
     }
 }
 
@@ -320,7 +323,10 @@ impl Node {
     pub fn is_runnable_file(&self) -> bool {
         self.node_type == NodeType::File
             && self.target.is_some()
-            && self.interpreter.as_deref().is_some_and(|i| !i.trim().is_empty())
+            && self
+                .interpreter
+                .as_deref()
+                .is_some_and(|i| !i.trim().is_empty())
     }
 }
 
@@ -407,7 +413,10 @@ mod tests {
     fn resolve_absolute_position_adds_the_groups_own_anchor() {
         let doc = "# Root\n\n## Frame\n<!-- meshfox:node type=\"group\" x=100 y=100 -->\n\n### Member\n<!-- meshfox:node x=20 y=20 -->\n\nbody\n";
         let canvas = parse(doc).unwrap();
-        assert_eq!(canvas.resolve_absolute_position("member"), Some((120.0, 120.0)));
+        assert_eq!(
+            canvas.resolve_absolute_position("member"),
+            Some((120.0, 120.0))
+        );
     }
 
     #[test]
@@ -428,7 +437,10 @@ mod tests {
     fn resolve_absolute_position_is_plain_xy_for_a_node_not_nested_under_any_group() {
         let doc = "# Root\n\n## Section\n<!-- meshfox:node x=50 y=60 -->\n\nbody\n";
         let canvas = parse(doc).unwrap();
-        assert_eq!(canvas.resolve_absolute_position("section"), Some((50.0, 60.0)));
+        assert_eq!(
+            canvas.resolve_absolute_position("section"),
+            Some((50.0, 60.0))
+        );
     }
 
     #[test]
@@ -443,7 +455,10 @@ mod tests {
         let doc = "# Root\n\n## Frame\n<!-- meshfox:node type=\"group\" x=100 y=100 -->\n\n### Member\n<!-- meshfox:node x=20 y=20 -->\n\nbody\n";
         let canvas = parse(doc).unwrap();
         let (abs_x, abs_y) = canvas.resolve_absolute_position("member").unwrap();
-        assert_eq!(canvas.absolute_to_local("member", abs_x, abs_y), Some((20.0, 20.0)));
+        assert_eq!(
+            canvas.absolute_to_local("member", abs_x, abs_y),
+            Some((20.0, 20.0))
+        );
     }
 
     #[test]
@@ -457,7 +472,10 @@ mod tests {
     fn absolute_to_local_is_identity_for_a_node_not_nested_under_any_group() {
         let doc = "# Root\n\n## Section\n<!-- meshfox:node -->\n\nbody\n";
         let canvas = parse(doc).unwrap();
-        assert_eq!(canvas.absolute_to_local("section", 42.0, 43.0), Some((42.0, 43.0)));
+        assert_eq!(
+            canvas.absolute_to_local("section", 42.0, 43.0),
+            Some((42.0, 43.0))
+        );
     }
 }
 

@@ -20,7 +20,10 @@ pub fn cache_path(canvas_path: &Path) -> PathBuf {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
-    let file_name = canvas_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let file_name = canvas_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     dir.join(".meshfox").join(format!("{file_name}.env"))
 }
 
@@ -47,12 +50,18 @@ impl VarCache {
             Err(e) if e.kind() == io::ErrorKind::NotFound => HashMap::new(),
             Err(e) => return Err(e),
         };
-        Ok(VarCache { path: Some(path), entries })
+        Ok(VarCache {
+            path: Some(path),
+            entries,
+        })
     }
 
     /// A cache backed by nothing on disk — for tests.
     pub fn in_memory() -> VarCache {
-        VarCache { path: None, entries: HashMap::new() }
+        VarCache {
+            path: None,
+            entries: HashMap::new(),
+        }
     }
 
     pub fn get(&self, name: &str) -> Option<&str> {
@@ -67,7 +76,9 @@ impl VarCache {
     }
 
     fn save(&self) -> io::Result<()> {
-        let Some(path) = &self.path else { return Ok(()) };
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -124,7 +135,8 @@ mod tests {
 
     #[test]
     fn missing_cache_file_loads_as_empty() {
-        let dir = std::env::temp_dir().join(format!("meshfox-varcache-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("meshfox-varcache-test-{}", std::process::id()));
         let canvas_path = dir.join("nonexistent.canvas.md");
         let cache = VarCache::load(&canvas_path).unwrap();
         assert_eq!(cache.get("X"), None);

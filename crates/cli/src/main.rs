@@ -12,7 +12,9 @@
 //! block's output actually gets written back into the file, or just shown.
 
 use clap::{Args, Parser, Subcommand};
-use meshfox_core::{mdcanvas, Canvas, ExtraEdge, FileDisplay, NodeMeta, NodeType, VarDecl, VarCache};
+use meshfox_core::{
+    mdcanvas, Canvas, ExtraEdge, FileDisplay, NodeMeta, NodeType, VarCache, VarDecl,
+};
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -25,7 +27,12 @@ mod tui;
 /// release tag, captured at build time by `build.rs` from the repo `meshfox`
 /// was actually compiled in — not the crate's Cargo.toml version, which
 /// doesn't change between commits.
-const VERSION: &str = concat!(env!("MESHFOX_VERSION_LABEL"), " (", env!("MESHFOX_GIT_DATE"), ")");
+const VERSION: &str = concat!(
+    env!("MESHFOX_VERSION_LABEL"),
+    " (",
+    env!("MESHFOX_GIT_DATE"),
+    ")"
+);
 
 const MASCOT: &str = r"
 
@@ -333,9 +340,7 @@ enum Command {
     /// write it to the completions directory your shell scans on startup,
     /// e.g. `meshfox completions zsh > ~/.zfunc/_meshfox` (with `~/.zfunc`
     /// on `fpath`), or `meshfox completions bash > /etc/bash_completion.d/meshfox`.
-    Completions {
-        shell: clap_complete::Shell,
-    },
+    Completions { shell: clap_complete::Shell },
 }
 
 #[derive(Subcommand)]
@@ -539,8 +544,9 @@ enum NodeCommand {
 /// completions generated from it — is exactly what it was before this
 /// existed, whichever order the canvas path is actually typed in.
 fn splice_leading_canvas(mut args: Vec<String>) -> Vec<String> {
-    let has_leading_canvas =
-        args.len() >= 2 && !args[1].starts_with('-') && args[1].to_ascii_lowercase().ends_with(".md");
+    let has_leading_canvas = args.len() >= 2
+        && !args[1].starts_with('-')
+        && args[1].to_ascii_lowercase().ends_with(".md");
     if !has_leading_canvas {
         return args;
     }
@@ -651,7 +657,12 @@ const ZSH_CANVAS_DISPATCH: &str = r#"_meshfox() {
 fn print_completions(shell: clap_complete::Shell) {
     use clap::CommandFactory;
     if shell != clap_complete::Shell::Zsh {
-        clap_complete::generate(shell, &mut Cli::command(), "meshfox", &mut std::io::stdout());
+        clap_complete::generate(
+            shell,
+            &mut Cli::command(),
+            "meshfox",
+            &mut std::io::stdout(),
+        );
         return;
     }
 
@@ -662,8 +673,14 @@ fn print_completions(shell: clap_complete::Shell) {
     let generated = generated.replacen("\n_meshfox() {\n", "\n_meshfox_generated() {\n", 1);
     let tail = "if [ \"$funcstack[1]\" = \"_meshfox\" ]; then\n    _meshfox \"$@\"\nelse\n    compdef _meshfox meshfox\nfi\n";
     let patched = generated.replacen(tail, &format!("{ZSH_CANVAS_DISPATCH}{tail}"), 1);
-    debug_assert!(patched.contains("_meshfox_generated() {"), "clap_complete's zsh output shape changed");
-    debug_assert!(patched.contains(ZSH_CANVAS_DISPATCH), "clap_complete's zsh tail block shape changed");
+    debug_assert!(
+        patched.contains("_meshfox_generated() {"),
+        "clap_complete's zsh output shape changed"
+    );
+    debug_assert!(
+        patched.contains(ZSH_CANVAS_DISPATCH),
+        "clap_complete's zsh tail block shape changed"
+    );
 
     print!("{patched}");
 }
@@ -671,7 +688,8 @@ fn print_completions(shell: clap_complete::Shell) {
 fn main() {
     let args = splice_leading_canvas(std::env::args().collect());
 
-    if args.len() == 2 && !args[1].starts_with('-') && args[1].to_ascii_lowercase().ends_with(".md") {
+    if args.len() == 2 && !args[1].starts_with('-') && args[1].to_ascii_lowercase().ends_with(".md")
+    {
         // A bare `meshfox test.md`, no subcommand: open it, same as
         // clicking the file — `meshfox view`'s own defaults otherwise.
         return view(PathBuf::from(&args[1]), 0, true, true);
@@ -691,7 +709,12 @@ fn main() {
     };
 
     match command {
-        Command::Run { args, canvas, no_deps, set } => {
+        Command::Run {
+            args,
+            canvas,
+            no_deps,
+            set,
+        } => {
             let canvas_path = canvas.unwrap_or_else(find_canvas);
             run(&canvas_path, args, no_deps, set)
         }
@@ -699,14 +722,23 @@ fn main() {
             let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
             configure(&canvas_path)
         }
-        Command::Create { canvas, canvas_flag } => {
+        Command::Create {
+            canvas,
+            canvas_flag,
+        } => {
             let Some(canvas_path) = canvas.or(canvas_flag) else {
                 eprintln!("meshfox create: a canvas path is required (positional, or --canvas)");
                 std::process::exit(1);
             };
             create(&canvas_path)
         }
-        Command::View { canvas, port, no_open, create: create_if_missing, no_auto_exit } => {
+        Command::View {
+            canvas,
+            port,
+            no_open,
+            create: create_if_missing,
+            no_auto_exit,
+        } => {
             let canvas_path = match canvas.resolve() {
                 Some(p) => p,
                 None => {
@@ -742,41 +774,96 @@ fn main() {
             let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
             list(&canvas_path)
         }
-        Command::Static { canvas, template, out, force } => {
+        Command::Static {
+            canvas,
+            template,
+            out,
+            force,
+        } => {
             let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
             static_cmd(&canvas_path, &template, &out, force)
         }
-        Command::Pdf { canvas, out, force, mode } => {
+        Command::Pdf {
+            canvas,
+            out,
+            force,
+            mode,
+        } => {
             let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
             pdf_cmd(&canvas_path, out.as_deref(), force, mode)
         }
         Command::Node { command } => match command {
-            NodeCommand::Add { canvas, parent_id, title } => {
-                node_add(&canvas.unwrap_or_else(find_canvas), &parent_id, &title)
-            }
-            NodeCommand::Rm { canvas, node_id, keep_children } => {
-                node_rm(&canvas.unwrap_or_else(find_canvas), &node_id, keep_children)
-            }
-            NodeCommand::Mv { canvas, node_id, new_parent_id } => {
-                node_mv(&canvas.unwrap_or_else(find_canvas), &node_id, &new_parent_id)
-            }
-            NodeCommand::Rename { canvas, node_id, title } => {
-                node_rename(&canvas.unwrap_or_else(find_canvas), &node_id, &title)
-            }
-            NodeCommand::SetId { canvas, node_id, new_id } => {
-                node_set_id(&canvas.unwrap_or_else(find_canvas), &node_id, &new_id)
-            }
-            NodeCommand::Body { canvas, node_id, file } => {
-                node_body(&canvas.unwrap_or_else(find_canvas), &node_id, file)
-            }
-            NodeCommand::Meta { canvas, node_id, x, y, width, height, color, node_type, display, lang, interpreter, fold } => {
-                node_meta(&canvas.unwrap_or_else(find_canvas), &node_id, x, y, width, height, color, node_type, display, lang, interpreter, fold)
-            }
-            NodeCommand::Edges { canvas, node_id, from, clear } => {
-                node_edges(&canvas.unwrap_or_else(find_canvas), &node_id, from, clear)
-            }
+            NodeCommand::Add {
+                canvas,
+                parent_id,
+                title,
+            } => node_add(&canvas.unwrap_or_else(find_canvas), &parent_id, &title),
+            NodeCommand::Rm {
+                canvas,
+                node_id,
+                keep_children,
+            } => node_rm(&canvas.unwrap_or_else(find_canvas), &node_id, keep_children),
+            NodeCommand::Mv {
+                canvas,
+                node_id,
+                new_parent_id,
+            } => node_mv(
+                &canvas.unwrap_or_else(find_canvas),
+                &node_id,
+                &new_parent_id,
+            ),
+            NodeCommand::Rename {
+                canvas,
+                node_id,
+                title,
+            } => node_rename(&canvas.unwrap_or_else(find_canvas), &node_id, &title),
+            NodeCommand::SetId {
+                canvas,
+                node_id,
+                new_id,
+            } => node_set_id(&canvas.unwrap_or_else(find_canvas), &node_id, &new_id),
+            NodeCommand::Body {
+                canvas,
+                node_id,
+                file,
+            } => node_body(&canvas.unwrap_or_else(find_canvas), &node_id, file),
+            NodeCommand::Meta {
+                canvas,
+                node_id,
+                x,
+                y,
+                width,
+                height,
+                color,
+                node_type,
+                display,
+                lang,
+                interpreter,
+                fold,
+            } => node_meta(
+                &canvas.unwrap_or_else(find_canvas),
+                &node_id,
+                x,
+                y,
+                width,
+                height,
+                color,
+                node_type,
+                display,
+                lang,
+                interpreter,
+                fold,
+            ),
+            NodeCommand::Edges {
+                canvas,
+                node_id,
+                from,
+                clear,
+            } => node_edges(&canvas.unwrap_or_else(find_canvas), &node_id, from, clear),
             NodeCommand::Reorder { canvas } => node_reorder(&canvas.unwrap_or_else(find_canvas)),
-            NodeCommand::Show { canvas, node_id } => node_show(&canvas.unwrap_or_else(find_canvas), &node_id),
+            NodeCommand::Show { canvas, node_id } => {
+                node_show(&canvas.unwrap_or_else(find_canvas), &node_id)
+            }
         },
         Command::Spec => print!("{}", include_str!("../../../SPEC.md")),
         Command::CheckUpdates { yes } => check_updates(yes),
@@ -791,7 +878,8 @@ fn main() {
 /// to parse `commit ...` as a non-version and fall through.
 fn check_updates(yes: bool) {
     let label = env!("MESHFOX_VERSION_LABEL");
-    let is_release_tag = label.starts_with('v') && label[1..].starts_with(|c: char| c.is_ascii_digit());
+    let is_release_tag =
+        label.starts_with('v') && label[1..].starts_with(|c: char| c.is_ascii_digit());
     if !is_release_tag {
         println!(
             "meshfox check-updates: this build ({label}) wasn't made from a release tag, so \
@@ -890,7 +978,10 @@ fn configure(canvas_path: &PathBuf) {
                  time a run needs them."
             );
         } else {
-            println!("meshfox configure: {} declares no variables", canvas_path.display());
+            println!(
+                "meshfox configure: {} declares no variables",
+                canvas_path.display()
+            );
         }
         return;
     }
@@ -1013,7 +1104,10 @@ fn check(canvas_path: &PathBuf) {
     let canvas_dir = Some(canvas_dir.unwrap_or(std::path::Path::new(".")));
     let results = meshfox_core::evaluate_constraints(&canvas, canvas_dir);
     if results.is_empty() {
-        println!("meshfox check: {} ok (no constraints)", canvas_path.display());
+        println!(
+            "meshfox check: {} ok (no constraints)",
+            canvas_path.display()
+        );
         return;
     }
 
@@ -1070,8 +1164,14 @@ fn write_canvas_template(canvas_path: &Path) {
 /// just the default root-heading text, not a format invariant (an id
 /// derived from a heading never has to match the filename, see SPEC.md).
 fn canvas_title(path: &Path) -> String {
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    name.strip_suffix(".canvas.md").or_else(|| name.strip_suffix(".md")).unwrap_or(&name).to_string()
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    name.strip_suffix(".canvas.md")
+        .or_else(|| name.strip_suffix(".md"))
+        .unwrap_or(&name)
+        .to_string()
 }
 
 fn view(canvas_path: PathBuf, port: u16, open_browser: bool, auto_exit: bool) {
@@ -1079,7 +1179,12 @@ fn view(canvas_path: PathBuf, port: u16, open_browser: bool, auto_exit: bool) {
         eprintln!("failed to start async runtime: {e}");
         std::process::exit(1);
     });
-    if let Err(e) = runtime.block_on(meshfox_server::run(canvas_path, port, open_browser, auto_exit)) {
+    if let Err(e) = runtime.block_on(meshfox_server::run(
+        canvas_path,
+        port,
+        open_browser,
+        auto_exit,
+    )) {
         eprintln!("meshfox view: {e}");
         std::process::exit(1);
     }
@@ -1160,10 +1265,14 @@ fn validate_set_overrides_or_exit(decls: &[VarDecl], overrides: &HashMap<String,
 
 /// The pure check `validate_set_overrides_or_exit` wraps — split out so
 /// it's testable without a subprocess (`std::process::exit` isn't).
-fn validate_set_overrides(decls: &[VarDecl], overrides: &HashMap<String, String>) -> Result<(), String> {
+fn validate_set_overrides(
+    decls: &[VarDecl],
+    overrides: &HashMap<String, String>,
+) -> Result<(), String> {
     for (name, value) in overrides {
         if let Some(decl) = decls.iter().find(|d| &d.name == name) {
-            meshfox_core::validate_value(decl, value).map_err(|e| format!("--set {name}={value:?} is invalid: {e}"))?;
+            meshfox_core::validate_value(decl, value)
+                .map_err(|e| format!("--set {name}={value:?} is invalid: {e}"))?;
         }
     }
     Ok(())
@@ -1173,7 +1282,11 @@ fn validate_set_overrides(decls: &[VarDecl], overrides: &HashMap<String, String>
 /// *this* invocation's chain actually references it — same as `cmake -D`
 /// always updating `CMakeCache.txt` — so a later plain `meshfox run`
 /// (even for a different block) doesn't need `--set` again.
-fn persist_set_overrides(decls: &[VarDecl], overrides: &HashMap<String, String>, cache: &mut VarCache) {
+fn persist_set_overrides(
+    decls: &[VarDecl],
+    overrides: &HashMap<String, String>,
+    cache: &mut VarCache,
+) {
     for (name, value) in overrides {
         if decls.iter().any(|d| &d.name == name && !d.secret) {
             cache.set(name, value).unwrap_or_else(|e| {
@@ -1292,7 +1405,12 @@ async fn run_tty_block(code: &str, envs: &HashMap<String, String>) -> std::io::R
 /// `bash` itself, so a hung child (`sleep`, a server it started, ...)
 /// doesn't survive as an orphan — and stops there, persisting whatever
 /// earlier steps already completed.
-async fn run_async(canvas_path: &PathBuf, mut args: Vec<String>, no_deps: bool, set: Vec<(String, String)>) {
+async fn run_async(
+    canvas_path: &PathBuf,
+    mut args: Vec<String>,
+    no_deps: bool,
+    set: Vec<(String, String)>,
+) {
     let block_arg = args.pop().expect("clap requires at least one arg");
     let path: Vec<&str> = args.iter().map(String::as_str).collect();
     let block_names: Vec<&str> = block_arg.split(',').map(str::trim).collect();
@@ -1313,7 +1431,8 @@ async fn run_async(canvas_path: &PathBuf, mut args: Vec<String>, no_deps: bool, 
     persist_set_overrides(&decls, &overrides, &mut var_cache);
 
     let mut had_failure = false;
-    let mut already_ran: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut already_ran: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
     for name in block_names {
         // Re-parse each iteration so a block run earlier in this loop
         // (which may have patched `raw`) is reflected before the next one.
@@ -1349,7 +1468,10 @@ async fn run_async(canvas_path: &PathBuf, mut args: Vec<String>, no_deps: bool, 
             });
 
             let Some(node) = canvas.node(&addr.node_id) else {
-                eprintln!("error running {:?}: node {:?} not found", addr.block_name, addr.node_id);
+                eprintln!(
+                    "error running {:?}: node {:?} not found",
+                    addr.block_name, addr.node_id
+                );
                 had_failure = true;
                 break;
             };
@@ -1396,14 +1518,15 @@ async fn run_async(canvas_path: &PathBuf, mut args: Vec<String>, no_deps: bool, 
                     }
                 }
             } else {
-                let mut proc = match meshfox_server::stream_exec::spawn_bash(&block.code, &block_env) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("error running {:?}: {e}", addr.block_name);
-                        had_failure = true;
-                        break;
-                    }
-                };
+                let mut proc =
+                    match meshfox_server::stream_exec::spawn_bash(&block.code, &block_env) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("error running {:?}: {e}", addr.block_name);
+                            had_failure = true;
+                            break;
+                        }
+                    };
 
                 loop {
                     tokio::select! {
@@ -1442,8 +1565,13 @@ async fn run_async(canvas_path: &PathBuf, mut args: Vec<String>, no_deps: bool, 
             // into the file for a document `run` was pointed at without
             // ever being validated first.
             if block.cache && !block.tty {
-                let result = meshfox_core::ExecOutput { exit_code, output: full_output };
-                if let Some(updated) = meshfox_core::write_output(&node_text, &addr.block_name, &result) {
+                let result = meshfox_core::ExecOutput {
+                    exit_code,
+                    output: full_output,
+                };
+                if let Some(updated) =
+                    meshfox_core::write_output(&node_text, &addr.block_name, &result)
+                {
                     if let Some(patched) = mdcanvas::set_node_body(&raw, &addr.node_id, &updated) {
                         raw = patched;
                     }
@@ -1484,7 +1612,10 @@ fn list(canvas_path: &PathBuf) {
         std::process::exit(1);
     });
     if blocks.is_empty() {
-        println!("meshfox list: no runnable blocks in {}", canvas_path.display());
+        println!(
+            "meshfox list: no runnable blocks in {}",
+            canvas_path.display()
+        );
         return;
     }
 
@@ -1500,7 +1631,11 @@ fn list(canvas_path: &PathBuf) {
     for b in &blocks {
         match groups.last_mut() {
             Some(g) if g.path == b.path.as_slice() => g.blocks.push(b),
-            _ => groups.push(Group { path: &b.path, node_id: &b.node_id, blocks: vec![b] }),
+            _ => groups.push(Group {
+                path: &b.path,
+                node_id: &b.node_id,
+                blocks: vec![b],
+            }),
         }
     }
 
@@ -1521,9 +1656,14 @@ fn list(canvas_path: &PathBuf) {
     let mut last_path: Vec<String> = Vec::new();
 
     for g in &groups {
-        let default = g.blocks.len() == 1 && meshfox_core::fence::is_default(&g.blocks[0].block, g.node_id);
+        let default =
+            g.blocks.len() == 1 && meshfox_core::fence::is_default(&g.blocks[0].block, g.node_id);
         let collapse = !g.path.is_empty() && default;
-        let header_depth = if collapse { g.path.len() - 1 } else { g.path.len() };
+        let header_depth = if collapse {
+            g.path.len() - 1
+        } else {
+            g.path.len()
+        };
 
         for depth in 0..header_depth {
             if depth >= last_path.len() || last_path[depth] != g.path[depth] {
@@ -1536,7 +1676,11 @@ fn list(canvas_path: &PathBuf) {
                     .then(|| format!("meshfox run {}", g.path[..=depth].join(" ")));
                 headers.push((
                     lines.len(),
-                    Line { indent: depth, label: g.path[depth].clone(), command },
+                    Line {
+                        indent: depth,
+                        label: g.path[depth].clone(),
+                        command,
+                    },
                 ));
             }
         }
@@ -1591,7 +1735,8 @@ fn print_line(line: &Line, max_width: usize) {
 /// "no" here, same as `resolve_target`'s runtime fallback — `meshfox
 /// validate` is what reports the conflict.
 fn has_default(node_id: &str, blocks: &[&meshfox_core::RunnableBlock]) -> bool {
-    let code_blocks: Vec<meshfox_core::CodeBlock> = blocks.iter().map(|b| b.block.clone()).collect();
+    let code_blocks: Vec<meshfox_core::CodeBlock> =
+        blocks.iter().map(|b| b.block.clone()).collect();
     meshfox_core::fence::default_block(node_id, &code_blocks)
         .ok()
         .flatten()
@@ -1660,7 +1805,11 @@ fn run_command(path: &[String], name: &str, node_id: &str) -> String {
     if !path.is_empty() && name == node_id {
         return format!("meshfox run {}", path.join(" "));
     }
-    let path_args = if path.is_empty() { String::new() } else { format!("{} ", path.join(" ")) };
+    let path_args = if path.is_empty() {
+        String::new()
+    } else {
+        format!("{} ", path.join(" "))
+    };
     format!("meshfox run {path_args}{name}")
 }
 
@@ -1683,7 +1832,10 @@ fn node_add(canvas_path: &Path, parent_id: &str, title: &str) {
     match apply_node_add(&raw, parent_id, title) {
         Ok((updated, new_id)) => {
             write_raw_or_exit(canvas_path, &updated);
-            println!("meshfox node add: added {new_id:?} under {parent_id:?} in {}", canvas_path.display());
+            println!(
+                "meshfox node add: added {new_id:?} under {parent_id:?} in {}",
+                canvas_path.display()
+            );
         }
         Err(e) => {
             eprintln!("meshfox node add: {e} ({})", canvas_path.display());
@@ -1709,7 +1861,11 @@ fn node_rm(canvas_path: &Path, node_id: &str, keep_children: bool) {
             write_raw_or_exit(canvas_path, &updated);
             println!(
                 "meshfox node rm: deleted {node_id:?}{} in {}",
-                if keep_children { " (children promoted)" } else { "" },
+                if keep_children {
+                    " (children promoted)"
+                } else {
+                    ""
+                },
                 canvas_path.display()
             );
         }
@@ -1722,7 +1878,9 @@ fn node_rm(canvas_path: &Path, node_id: &str, keep_children: bool) {
 
 fn apply_node_rm(raw: &str, node_id: &str, keep_children: bool) -> Result<String, String> {
     let canvas = Canvas::from_markdown(raw).map_err(|e| e.to_string())?;
-    let node = canvas.node(node_id).ok_or_else(|| format!("no node {node_id:?}"))?;
+    let node = canvas
+        .node(node_id)
+        .ok_or_else(|| format!("no node {node_id:?}"))?;
     if node.parent.is_none() {
         return Err("can't delete the root node".to_string());
     }
@@ -1741,7 +1899,10 @@ fn node_mv(canvas_path: &Path, node_id: &str, new_parent_id: &str) {
     match apply_node_mv(&raw, node_id, new_parent_id) {
         Ok(updated) => {
             write_raw_or_exit(canvas_path, &updated);
-            println!("meshfox node mv: moved {node_id:?} under {new_parent_id:?} in {}", canvas_path.display());
+            println!(
+                "meshfox node mv: moved {node_id:?} under {new_parent_id:?} in {}",
+                canvas_path.display()
+            );
         }
         Err(e) => {
             eprintln!("meshfox node mv: {e} ({})", canvas_path.display());
@@ -1752,7 +1913,9 @@ fn node_mv(canvas_path: &Path, node_id: &str, new_parent_id: &str) {
 
 fn apply_node_mv(raw: &str, node_id: &str, new_parent_id: &str) -> Result<String, String> {
     let canvas = Canvas::from_markdown(raw).map_err(|e| e.to_string())?;
-    let node = canvas.node(node_id).ok_or_else(|| format!("no node {node_id:?}"))?;
+    let node = canvas
+        .node(node_id)
+        .ok_or_else(|| format!("no node {node_id:?}"))?;
     if node.parent.is_none() {
         return Err("can't move the root node".to_string());
     }
@@ -1778,9 +1941,10 @@ fn apply_node_mv(raw: &str, node_id: &str, new_parent_id: &str) -> Result<String
     // this is a separate front door onto the same `mdcanvas::reparent_node`
     // primitive. Resolve the pre-move absolute position first...
     let abs_before = canvas.resolve_absolute_position(node_id);
-    let mut updated = mdcanvas::reparent_node(&with_edge, node_id, new_parent_id).ok_or_else(|| {
-        format!("can't move {node_id:?} under {new_parent_id:?} (would make the tree cyclic)")
-    })?;
+    let mut updated =
+        mdcanvas::reparent_node(&with_edge, node_id, new_parent_id).ok_or_else(|| {
+            format!("can't move {node_id:?} under {new_parent_id:?} (would make the tree cyclic)")
+        })?;
     validate_patch(&updated)?;
     // ...then convert it back into whatever frame `node_id` should now
     // store its position in, given its new parent chain. `None` on either
@@ -1822,7 +1986,10 @@ fn node_rename(canvas_path: &Path, node_id: &str, title: &str) {
     match apply_node_rename(&raw, node_id, title) {
         Ok(updated) => {
             write_raw_or_exit(canvas_path, &updated);
-            println!("meshfox node rename: renamed {node_id:?} in {}", canvas_path.display());
+            println!(
+                "meshfox node rename: renamed {node_id:?} in {}",
+                canvas_path.display()
+            );
         }
         Err(e) => {
             eprintln!("meshfox node rename: {e} ({})", canvas_path.display());
@@ -1832,8 +1999,8 @@ fn node_rename(canvas_path: &Path, node_id: &str, title: &str) {
 }
 
 fn apply_node_rename(raw: &str, node_id: &str, title: &str) -> Result<String, String> {
-    let updated =
-        mdcanvas::set_node_title(raw, node_id, title).ok_or_else(|| format!("no node {node_id:?}"))?;
+    let updated = mdcanvas::set_node_title(raw, node_id, title)
+        .ok_or_else(|| format!("no node {node_id:?}"))?;
     validate_patch(&updated)?;
     Ok(updated)
 }
@@ -1843,7 +2010,10 @@ fn node_set_id(canvas_path: &Path, node_id: &str, new_id: &str) {
     match apply_node_set_id(&raw, node_id, new_id) {
         Ok(updated) => {
             write_raw_or_exit(canvas_path, &updated);
-            println!("meshfox node set-id: renamed {node_id:?} to {new_id:?} in {}", canvas_path.display());
+            println!(
+                "meshfox node set-id: renamed {node_id:?} to {new_id:?} in {}",
+                canvas_path.display()
+            );
             if let Ok(canvas) = Canvas::from_markdown(&updated) {
                 if let Err(e) = meshfox_core::deps::validate(&canvas) {
                     eprintln!(
@@ -1876,17 +2046,22 @@ fn node_body(canvas_path: &Path, node_id: &str, file: Option<PathBuf>) {
         None => {
             use std::io::Read;
             let mut buf = String::new();
-            std::io::stdin().read_to_string(&mut buf).unwrap_or_else(|e| {
-                eprintln!("failed to read stdin: {e}");
-                std::process::exit(1);
-            });
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .unwrap_or_else(|e| {
+                    eprintln!("failed to read stdin: {e}");
+                    std::process::exit(1);
+                });
             buf
         }
     };
     match apply_node_body(&raw, node_id, &new_body) {
         Ok(updated) => {
             write_raw_or_exit(canvas_path, &updated);
-            println!("meshfox node body: updated {node_id:?} in {}", canvas_path.display());
+            println!(
+                "meshfox node body: updated {node_id:?} in {}",
+                canvas_path.display()
+            );
         }
         Err(e) => {
             eprintln!("meshfox node body: {e} ({})", canvas_path.display());
@@ -1896,8 +2071,8 @@ fn node_body(canvas_path: &Path, node_id: &str, file: Option<PathBuf>) {
 }
 
 fn apply_node_body(raw: &str, node_id: &str, new_body: &str) -> Result<String, String> {
-    let updated =
-        mdcanvas::set_node_body(raw, node_id, new_body).ok_or_else(|| format!("no node {node_id:?}"))?;
+    let updated = mdcanvas::set_node_body(raw, node_id, new_body)
+        .ok_or_else(|| format!("no node {node_id:?}"))?;
     validate_patch(&updated)?;
     Ok(updated)
 }
@@ -1909,7 +2084,9 @@ fn parse_node_type(s: &str) -> Result<NodeType, String> {
         "link" => Ok(NodeType::Link),
         "group" => Ok(NodeType::Group),
         "include" => Ok(NodeType::Include),
-        _ => Err(format!("unknown --type {s:?} (expected text/file/link/group/include)")),
+        _ => Err(format!(
+            "unknown --type {s:?} (expected text/file/link/group/include)"
+        )),
     }
 }
 
@@ -1921,7 +2098,6 @@ fn parse_display(s: &str) -> Result<FileDisplay, String> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn node_meta(
     canvas_path: &Path,
@@ -1938,10 +2114,26 @@ fn node_meta(
     fold: Option<String>,
 ) {
     let raw = read_raw_or_exit(canvas_path);
-    match apply_node_meta(&raw, node_id, x, y, width, height, color, node_type, display, lang, interpreter, fold) {
+    match apply_node_meta(
+        &raw,
+        node_id,
+        x,
+        y,
+        width,
+        height,
+        color,
+        node_type,
+        display,
+        lang,
+        interpreter,
+        fold,
+    ) {
         Ok(updated) => {
             write_raw_or_exit(canvas_path, &updated);
-            println!("meshfox node meta: updated {node_id:?} in {}", canvas_path.display());
+            println!(
+                "meshfox node meta: updated {node_id:?} in {}",
+                canvas_path.display()
+            );
         }
         Err(e) => {
             eprintln!("meshfox node meta: {e} ({})", canvas_path.display());
@@ -1966,7 +2158,9 @@ fn apply_node_meta(
     fold: Option<String>,
 ) -> Result<String, String> {
     let canvas = Canvas::from_markdown(raw).map_err(|e| e.to_string())?;
-    let node = canvas.node(node_id).ok_or_else(|| format!("no node {node_id:?}"))?;
+    let node = canvas
+        .node(node_id)
+        .ok_or_else(|| format!("no node {node_id:?}"))?;
 
     let parsed_type = node_type.as_deref().map(parse_node_type).transpose()?;
     let parsed_display = display.as_deref().map(parse_display).transpose()?;
@@ -2005,7 +2199,11 @@ fn apply_node_meta(
         x: x.or(node.x),
         y: y.or(node.y),
         width: if is_group { None } else { width.or(node.width) },
-        height: if is_group { None } else { height.or(node.height) },
+        height: if is_group {
+            None
+        } else {
+            height.or(node.height)
+        },
         color: color.or_else(|| node.color.clone()),
         node_type: parsed_type,
         display: parsed_display.or(node.display),
@@ -2015,8 +2213,8 @@ fn apply_node_meta(
         fold: parsed_fold,
         tags: node.tags.clone(),
     };
-    let updated =
-        mdcanvas::set_node_meta(raw, node_id, &meta).ok_or_else(|| format!("no node {node_id:?}"))?;
+    let updated = mdcanvas::set_node_meta(raw, node_id, &meta)
+        .ok_or_else(|| format!("no node {node_id:?}"))?;
     validate_patch(&updated)?;
     Ok(updated)
 }
@@ -2041,7 +2239,10 @@ fn node_edges(canvas_path: &Path, node_id: &str, from: Vec<String>, clear: bool)
 }
 
 fn apply_node_edges(raw: &str, node_id: &str, extra_parents: &[String]) -> Result<String, String> {
-    let edges: Vec<ExtraEdge> = extra_parents.iter().map(|p| ExtraEdge::new(p.as_str())).collect();
+    let edges: Vec<ExtraEdge> = extra_parents
+        .iter()
+        .map(|p| ExtraEdge::new(p.as_str()))
+        .collect();
     let updated = mdcanvas::set_node_edges(raw, node_id, &edges)
         .ok_or_else(|| format!("no node {node_id:?}"))?;
     validate_patch(&updated)?;
@@ -2053,7 +2254,10 @@ fn node_reorder(canvas_path: &Path) {
     match apply_node_reorder(&raw) {
         Ok(updated) => {
             write_raw_or_exit(canvas_path, &updated);
-            println!("meshfox node reorder: resynced sibling order in {}", canvas_path.display());
+            println!(
+                "meshfox node reorder: resynced sibling order in {}",
+                canvas_path.display()
+            );
         }
         Err(e) => {
             eprintln!("meshfox node reorder: {e} ({})", canvas_path.display());
@@ -2063,7 +2267,8 @@ fn node_reorder(canvas_path: &Path) {
 }
 
 fn apply_node_reorder(raw: &str) -> Result<String, String> {
-    let updated = mdcanvas::reorder_by_position(raw).ok_or_else(|| "failed to parse".to_string())?;
+    let updated =
+        mdcanvas::reorder_by_position(raw).ok_or_else(|| "failed to parse".to_string())?;
     validate_patch(&updated)?;
     Ok(updated)
 }
@@ -2083,24 +2288,41 @@ fn node_show(canvas_path: &Path, node_id: &str) {
 /// trailing newline per line, so the caller can just `print!` it as-is).
 fn format_node_show(raw: &str, node_id: &str) -> Result<String, String> {
     let canvas = Canvas::from_markdown(raw).map_err(|e| e.to_string())?;
-    let node = canvas.node(node_id).ok_or_else(|| format!("no node {node_id:?}"))?;
+    let node = canvas
+        .node(node_id)
+        .ok_or_else(|| format!("no node {node_id:?}"))?;
 
     let mut out = String::new();
     out.push_str(&format!("id: {}\n", node.id));
     out.push_str(&format!("title: {}\n", node.title));
     out.push_str(&format!("type: {}\n", node.node_type.as_str()));
-    out.push_str(&format!("parent: {}\n", node.parent.as_deref().unwrap_or("(root)")));
-    let children: Vec<&str> = canvas.children(&node.id).iter().map(|n| n.id.as_str()).collect();
+    out.push_str(&format!(
+        "parent: {}\n",
+        node.parent.as_deref().unwrap_or("(root)")
+    ));
+    let children: Vec<&str> = canvas
+        .children(&node.id)
+        .iter()
+        .map(|n| n.id.as_str())
+        .collect();
     out.push_str(&format!(
         "children: {}\n",
-        if children.is_empty() { "(none)".to_string() } else { children.join(", ") }
+        if children.is_empty() {
+            "(none)".to_string()
+        } else {
+            children.join(", ")
+        }
     ));
     out.push_str(&format!(
         "extra parents: {}\n",
         if node.extra_parents.is_empty() {
             "(none)".to_string()
         } else {
-            node.extra_parents.iter().map(|e| e.from.as_str()).collect::<Vec<_>>().join(", ")
+            node.extra_parents
+                .iter()
+                .map(|e| e.from.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         }
     ));
     out.push_str(&format!(
@@ -2118,9 +2340,15 @@ fn format_node_show(raw: &str, node_id: &str) -> Result<String, String> {
     // x/y already shown, so repeating it would just be noise), and for a
     // node whose group ancestor has no anchor of its own yet (nothing to
     // resolve against).
-    if node.parent.as_deref().is_some_and(|p| canvas.node(p).is_some_and(|n| n.node_type == NodeType::Group)) {
+    if node.parent.as_deref().is_some_and(|p| {
+        canvas
+            .node(p)
+            .is_some_and(|n| n.node_type == NodeType::Group)
+    }) {
         if let Some((abs_x, abs_y)) = canvas.resolve_absolute_position(node_id) {
-            out.push_str(&format!("resolved position (absolute): x={abs_x} y={abs_y}\n"));
+            out.push_str(&format!(
+                "resolved position (absolute): x={abs_x} y={abs_y}\n"
+            ));
         }
     }
     if let Some(c) = &node.color {
@@ -2226,7 +2454,13 @@ fn load_template_config(template_dir: &Path) -> TemplateConfig {
 /// for the template to show.
 fn canvas_git_commit(canvas_dir: &Path) -> Option<String> {
     let output = std::process::Command::new("git")
-        .args(["-C", &canvas_dir.to_string_lossy(), "rev-parse", "--short", "HEAD"])
+        .args([
+            "-C",
+            &canvas_dir.to_string_lossy(),
+            "rev-parse",
+            "--short",
+            "HEAD",
+        ])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -2258,12 +2492,17 @@ fn static_cmd(canvas_path: &Path, template_dir: &Path, out_dir: &Path, force: bo
     });
 
     if !template_dir.is_dir() {
-        eprintln!("meshfox static: {} is not a directory", template_dir.display());
+        eprintln!(
+            "meshfox static: {} is not a directory",
+            template_dir.display()
+        );
         std::process::exit(1);
     }
 
-    let out_non_empty =
-        out_dir.exists() && std::fs::read_dir(out_dir).map(|mut d| d.next().is_some()).unwrap_or(false);
+    let out_non_empty = out_dir.exists()
+        && std::fs::read_dir(out_dir)
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
     if out_non_empty && !force {
         eprintln!(
             "meshfox static: {} already exists and is not empty (pass --force to overwrite)",
@@ -2278,8 +2517,12 @@ fn static_cmd(canvas_path: &Path, template_dir: &Path, out_dir: &Path, force: bo
     // `meshfox_server::get_node_file_content` handles — a canvas passed as
     // just `README.md` (no directory component) resolves relative images/
     // `display="code"` targets against the current directory.
-    let canvas_dir = canvas_path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
-    let (site, assets) = meshfox_core::staticgen::build(&canvas, canvas_dir, config.base_url.as_deref());
+    let canvas_dir = canvas_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let (site, assets) =
+        meshfox_core::staticgen::build(&canvas, canvas_dir, config.base_url.as_deref());
     let mut context = tera::Context::new();
     context.insert("site", &site);
     context.insert("icons", &config.icons);
@@ -2298,7 +2541,10 @@ fn static_cmd(canvas_path: &Path, template_dir: &Path, out_dir: &Path, force: bo
     // in every page.
     let glob = format!("{}/**/*.tera", template_dir.display());
     let tera = tera::Tera::new(&glob).unwrap_or_else(|e| {
-        eprintln!("meshfox static: failed to load templates from {}: {e}", template_dir.display());
+        eprintln!(
+            "meshfox static: failed to load templates from {}: {e}",
+            template_dir.display()
+        );
         std::process::exit(1);
     });
 
@@ -2308,7 +2554,10 @@ fn static_cmd(canvas_path: &Path, template_dir: &Path, out_dir: &Path, force: bo
         // template (`{% import "_macros.html.tera" as macros %}`), never
         // rendered as its own output page. Same convention Jekyll/
         // Eleventy use for includes/partials.
-        let is_partial = Path::new(name).file_name().and_then(|f| f.to_str()).is_some_and(|b| b.starts_with('_'));
+        let is_partial = Path::new(name)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .is_some_and(|b| b.starts_with('_'));
         if is_partial {
             continue;
         }
@@ -2316,7 +2565,11 @@ fn static_cmd(canvas_path: &Path, template_dir: &Path, out_dir: &Path, force: bo
             eprintln!("meshfox static: failed to render {name}: {e}");
             std::process::exit(1);
         });
-        write_output_file(&out_dir.join(Path::new(name).with_extension("")), rendered.as_bytes()).unwrap_or_else(|e| {
+        write_output_file(
+            &out_dir.join(Path::new(name).with_extension("")),
+            rendered.as_bytes(),
+        )
+        .unwrap_or_else(|e| {
             eprintln!("meshfox static: {e}");
             std::process::exit(1);
         });
@@ -2330,7 +2583,10 @@ fn static_cmd(canvas_path: &Path, template_dir: &Path, out_dir: &Path, force: bo
 
     for asset in &assets {
         let bytes = std::fs::read(&asset.source).unwrap_or_else(|e| {
-            eprintln!("meshfox static: failed to read {}: {e}", asset.source.display());
+            eprintln!(
+                "meshfox static: failed to read {}: {e}",
+                asset.source.display()
+            );
             std::process::exit(1);
         });
         write_output_file(&out_dir.join(&asset.dest_rel), &bytes).unwrap_or_else(|e| {
@@ -2340,7 +2596,10 @@ fn static_cmd(canvas_path: &Path, template_dir: &Path, out_dir: &Path, force: bo
         count += 1;
     }
 
-    println!("meshfox static: wrote {count} file(s) to {}", out_dir.display());
+    println!(
+        "meshfox static: wrote {count} file(s) to {}",
+        out_dir.display()
+    );
 }
 
 /// `out`'s default (`--out` omitted): `canvas_path`'s own filename with its
@@ -2363,9 +2622,14 @@ fn pdf_cmd(canvas_path: &Path, out: Option<&Path>, force: bool, mode: Option<pdf
         std::process::exit(1);
     });
 
-    let out_path = out.map(PathBuf::from).unwrap_or_else(|| canvas_path.with_extension("pdf"));
+    let out_path = out
+        .map(PathBuf::from)
+        .unwrap_or_else(|| canvas_path.with_extension("pdf"));
     if out_path.exists() && !force {
-        eprintln!("meshfox pdf: {} already exists (pass --force to overwrite)", out_path.display());
+        eprintln!(
+            "meshfox pdf: {} already exists (pass --force to overwrite)",
+            out_path.display()
+        );
         std::process::exit(1);
     }
 
@@ -2373,7 +2637,10 @@ fn pdf_cmd(canvas_path: &Path, out: Option<&Path>, force: bool, mode: Option<pdf
     // `static_cmd` handles — a canvas passed as just `README.md` (no
     // directory component) resolves relative images against the current
     // directory.
-    let canvas_dir = canvas_path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let canvas_dir = canvas_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let bytes = pdf::generate(&canvas, canvas_dir, mode).unwrap_or_else(|e| {
         eprintln!("meshfox pdf: {e}");
         std::process::exit(1);
@@ -2404,7 +2671,9 @@ fn pdf_cmd(canvas_path: &Path, out: Option<&Path>, force: bool, mode: Option<pdf
 /// Returns the number of files copied.
 fn copy_template_assets(root: &Path, dir: &Path, out_root: &Path) -> Result<usize, String> {
     let mut count = 0;
-    for entry in std::fs::read_dir(dir).map_err(|e| format!("failed to read {}: {e}", dir.display()))? {
+    for entry in
+        std::fs::read_dir(dir).map_err(|e| format!("failed to read {}: {e}", dir.display()))?
+    {
         let entry = entry.map_err(|e| format!("failed to read {}: {e}", dir.display()))?;
         let path = entry.path();
         if path.is_dir() {
@@ -2417,8 +2686,11 @@ fn copy_template_assets(root: &Path, dir: &Path, out_root: &Path) -> Result<usiz
         if path == root.join(TEMPLATE_CONFIG_FILE) {
             continue;
         }
-        let rel = path.strip_prefix(root).expect("walked from root, so always a prefix");
-        let bytes = std::fs::read(&path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+        let rel = path
+            .strip_prefix(root)
+            .expect("walked from root, so always a prefix");
+        let bytes =
+            std::fs::read(&path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
         write_output_file(&out_root.join(rel), &bytes)?;
         count += 1;
     }
@@ -2427,13 +2699,16 @@ fn copy_template_assets(root: &Path, dir: &Path, out_root: &Path) -> Result<usiz
 
 fn write_output_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
     }
     std::fs::write(path, bytes).map_err(|e| format!("failed to write {}: {e}", path.display()))
 }
 
 fn validate_patch(updated: &str) -> Result<(), String> {
-    Canvas::from_markdown(updated).map(|_| ()).map_err(|e| e.to_string())
+    Canvas::from_markdown(updated)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -2468,7 +2743,10 @@ Shared body.
         let (updated, new_id) = apply_node_add(TEST_DOC, "tests", "New Check").unwrap();
         assert_eq!(new_id, "new-check");
         let canvas = Canvas::from_markdown(&updated).unwrap();
-        assert_eq!(canvas.node("new-check").unwrap().parent.as_deref(), Some("tests"));
+        assert_eq!(
+            canvas.node("new-check").unwrap().parent.as_deref(),
+            Some("tests")
+        );
     }
 
     #[test]
@@ -2485,7 +2763,11 @@ Shared body.
         assert!(canvas.node("smoke-test").is_none());
         // dangling edge from shared-smoke into the deleted subtree is
         // cleaned up too, so the result still parses.
-        assert!(canvas.node("shared-smoke").unwrap().extra_parents.is_empty());
+        assert!(canvas
+            .node("shared-smoke")
+            .unwrap()
+            .extra_parents
+            .is_empty());
     }
 
     #[test]
@@ -2493,7 +2775,10 @@ Shared body.
         let updated = apply_node_rm(TEST_DOC, "tests", true).unwrap();
         let canvas = Canvas::from_markdown(&updated).unwrap();
         assert!(canvas.node("tests").is_none());
-        assert_eq!(canvas.node("smoke-test").unwrap().parent.as_deref(), Some("root"));
+        assert_eq!(
+            canvas.node("smoke-test").unwrap().parent.as_deref(),
+            Some("root")
+        );
     }
 
     #[test]
@@ -2548,7 +2833,12 @@ Shared body.
 
     #[test]
     fn rename_changes_title_but_not_id_or_body() {
-        let original_text = Canvas::from_markdown(TEST_DOC).unwrap().node("smoke-test").unwrap().text.clone();
+        let original_text = Canvas::from_markdown(TEST_DOC)
+            .unwrap()
+            .node("smoke-test")
+            .unwrap()
+            .text
+            .clone();
         let updated = apply_node_rename(TEST_DOC, "smoke-test", "Renamed").unwrap();
         let canvas = Canvas::from_markdown(&updated).unwrap();
         let node = canvas.node("smoke-test").unwrap();
@@ -2572,9 +2862,21 @@ Shared body.
 
     #[test]
     fn meta_sets_given_fields_and_preserves_the_rest() {
-        let updated =
-            apply_node_meta(TEST_DOC, "smoke-test", Some(10.0), None, None, None, None, None, None, None, None, None)
-                .unwrap();
+        let updated = apply_node_meta(
+            TEST_DOC,
+            "smoke-test",
+            Some(10.0),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let canvas = Canvas::from_markdown(&updated).unwrap();
         let node = canvas.node("smoke-test").unwrap();
         assert_eq!(node.x, Some(10.0));
@@ -2586,22 +2888,58 @@ Shared body.
 
     #[test]
     fn meta_rejects_a_size_on_a_group() {
-        let err =
-            apply_node_meta(TEST_DOC, "tests", None, None, Some(300.0), None, None, None, None, None, None, None)
-                .unwrap_err();
+        let err = apply_node_meta(
+            TEST_DOC,
+            "tests",
+            None,
+            None,
+            Some(300.0),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
         assert!(err.contains("group"), "unexpected error: {err}");
 
-        let err =
-            apply_node_meta(TEST_DOC, "tests", None, None, None, Some(120.0), None, None, None, None, None, None)
-                .unwrap_err();
+        let err = apply_node_meta(
+            TEST_DOC,
+            "tests",
+            None,
+            None,
+            None,
+            Some(120.0),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
         assert!(err.contains("group"), "unexpected error: {err}");
     }
 
     #[test]
     fn meta_accepts_an_anchor_on_a_group() {
-        let updated =
-            apply_node_meta(TEST_DOC, "tests", Some(1000.0), Some(2000.0), None, None, None, None, None, None, None, None)
-                .unwrap();
+        let updated = apply_node_meta(
+            TEST_DOC,
+            "tests",
+            Some(1000.0),
+            Some(2000.0),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let canvas = Canvas::from_markdown(&updated).unwrap();
         let node = canvas.node("tests").unwrap();
         assert_eq!(node.x, Some(1000.0));
@@ -2615,24 +2953,68 @@ Shared body.
     #[test]
     fn meta_sets_and_clears_a_fold_override() {
         let updated = apply_node_meta(
-            TEST_DOC, "tests", None, None, None, None, None, None, None, None, None,
+            TEST_DOC,
+            "tests",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
             Some("true".to_string()),
         )
         .unwrap();
-        assert_eq!(Canvas::from_markdown(&updated).unwrap().node("tests").unwrap().fold, Some(true));
+        assert_eq!(
+            Canvas::from_markdown(&updated)
+                .unwrap()
+                .node("tests")
+                .unwrap()
+                .fold,
+            Some(true)
+        );
 
         let updated = apply_node_meta(
-            &updated, "tests", None, None, None, None, None, None, None, None, None,
+            &updated,
+            "tests",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
             Some("default".to_string()),
         )
         .unwrap();
-        assert_eq!(Canvas::from_markdown(&updated).unwrap().node("tests").unwrap().fold, None);
+        assert_eq!(
+            Canvas::from_markdown(&updated)
+                .unwrap()
+                .node("tests")
+                .unwrap()
+                .fold,
+            None
+        );
     }
 
     #[test]
     fn meta_rejects_an_unknown_fold_value() {
         let err = apply_node_meta(
-            TEST_DOC, "tests", None, None, None, None, None, None, None, None, None,
+            TEST_DOC,
+            "tests",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
             Some("bogus".to_string()),
         )
         .unwrap_err();
@@ -2661,22 +3043,33 @@ Shared body.
 
     #[test]
     fn edges_replaces_the_extra_parent_list() {
-        let updated = apply_node_edges(TEST_DOC, "shared-smoke", &["examples".to_string()]).unwrap();
+        let updated =
+            apply_node_edges(TEST_DOC, "shared-smoke", &["examples".to_string()]).unwrap();
         let canvas = Canvas::from_markdown(&updated).unwrap();
-        assert_eq!(canvas.node("shared-smoke").unwrap().extra_parents, vec![ExtraEdge::new("examples")]);
+        assert_eq!(
+            canvas.node("shared-smoke").unwrap().extra_parents,
+            vec![ExtraEdge::new("examples")]
+        );
     }
 
     #[test]
     fn edges_empty_list_clears_them() {
         let updated = apply_node_edges(TEST_DOC, "shared-smoke", &[]).unwrap();
         let canvas = Canvas::from_markdown(&updated).unwrap();
-        assert!(canvas.node("shared-smoke").unwrap().extra_parents.is_empty());
+        assert!(canvas
+            .node("shared-smoke")
+            .unwrap()
+            .extra_parents
+            .is_empty());
     }
 
     #[test]
     fn reorder_is_idempotent_when_already_sorted() {
         let updated = apply_node_reorder(TEST_DOC).unwrap();
-        assert_eq!(Canvas::from_markdown(&updated).unwrap().nodes.len(), Canvas::from_markdown(TEST_DOC).unwrap().nodes.len());
+        assert_eq!(
+            Canvas::from_markdown(&updated).unwrap().nodes.len(),
+            Canvas::from_markdown(TEST_DOC).unwrap().nodes.len()
+        );
     }
 
     #[test]
@@ -2697,7 +3090,10 @@ Shared body.
         );
         let text = format_node_show(DOC, "member").unwrap();
         assert!(text.contains("position: x=20 y=20 w=100 h=60"), "{text}");
-        assert!(text.contains("resolved position (absolute): x=1020 y=1020"), "{text}");
+        assert!(
+            text.contains("resolved position (absolute): x=1020 y=1020"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -2778,7 +3174,11 @@ mod set_override_tests {
 
     #[test]
     fn rejects_a_set_outside_a_selects_own_choices() {
-        let decls = vec![decl("LEVEL", meshfox_core::VarType::Select, &["debug", "info"])];
+        let decls = vec![decl(
+            "LEVEL",
+            meshfox_core::VarType::Select,
+            &["debug", "info"],
+        )];
         let overrides = HashMap::from([("LEVEL".to_string(), "trace".to_string())]);
         assert!(validate_set_overrides(&decls, &overrides).is_err());
     }

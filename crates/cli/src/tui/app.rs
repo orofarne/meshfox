@@ -163,7 +163,10 @@ pub struct App {
 /// "every declared variable" form (where it's the actual point: show
 /// what's already resolved, not just the bare `default`).
 fn current_value(decl: &VarDecl, cache: &VarCache) -> Option<String> {
-    std::env::var(&decl.name).ok().or_else(|| cache.get(&decl.name).map(str::to_string)).or_else(|| decl.default.clone())
+    std::env::var(&decl.name)
+        .ok()
+        .or_else(|| cache.get(&decl.name).map(str::to_string))
+        .or_else(|| decl.default.clone())
 }
 
 /// A var form field's starting value, coerced to something its own
@@ -179,7 +182,12 @@ fn current_value(decl: &VarDecl, cache: &VarCache) -> Option<String> {
 fn initial_field_input(decl: &VarDecl, cache: &VarCache) -> String {
     let suggestion = current_value(decl, cache);
     match decl.var_type {
-        VarType::Bool => if suggestion.as_deref() == Some("true") { "true" } else { "false" }.to_string(),
+        VarType::Bool => if suggestion.as_deref() == Some("true") {
+            "true"
+        } else {
+            "false"
+        }
+        .to_string(),
         VarType::Select => match suggestion {
             Some(v) if decl.choices.iter().any(|c| c == &v) => v,
             _ => decl.choices.first().cloned().unwrap_or_default(),
@@ -280,8 +288,12 @@ impl App {
                 Focus::Document => self.scroll_document(1),
             },
             KeyCode::Enter if self.focus == Focus::Tree => self.toggle_expand(),
-            KeyCode::Left | KeyCode::Char('h') if self.focus == Focus::Tree => self.collapse_or_to_parent(),
-            KeyCode::Right | KeyCode::Char('l') if self.focus == Focus::Tree => self.expand_selected(),
+            KeyCode::Left | KeyCode::Char('h') if self.focus == Focus::Tree => {
+                self.collapse_or_to_parent()
+            }
+            KeyCode::Right | KeyCode::Char('l') if self.focus == Focus::Tree => {
+                self.expand_selected()
+            }
             KeyCode::Char('r') => self.trigger_run(true).await,
             KeyCode::Char('R') => self.trigger_run(false).await,
             KeyCode::Char('K') => self.kill_running(),
@@ -290,8 +302,12 @@ impl App {
             KeyCode::Char('e') => self.open_source_editor(),
             KeyCode::PageDown => self.scroll_document(10),
             KeyCode::PageUp => self.scroll_document(-10),
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => self.scroll_document(10),
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => self.scroll_document(-10),
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.scroll_document(10)
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.scroll_document(-10)
+            }
             _ => {}
         }
     }
@@ -344,7 +360,8 @@ impl App {
                         // land, rather than landing and then failing
                         // `validate_value` at submit time.
                         VarType::Int => {
-                            c.is_ascii_digit() || ((c == '-' || c == '+') && vf.inputs[i].is_empty())
+                            c.is_ascii_digit()
+                                || ((c == '-' || c == '+') && vf.inputs[i].is_empty())
                         }
                         VarType::Bool | VarType::Select => false,
                     };
@@ -369,7 +386,12 @@ impl App {
         let i = vf.selected;
         match vf.decls[i].var_type {
             VarType::Bool => {
-                vf.inputs[i] = if vf.inputs[i] == "true" { "false" } else { "true" }.to_string();
+                vf.inputs[i] = if vf.inputs[i] == "true" {
+                    "false"
+                } else {
+                    "true"
+                }
+                .to_string();
             }
             VarType::Select => {
                 let choices = &vf.decls[i].choices;
@@ -377,7 +399,11 @@ impl App {
                     return;
                 }
                 let len = choices.len() as i32;
-                let current = choices.iter().position(|c| c == &vf.inputs[i]).map(|p| p as i32).unwrap_or(0);
+                let current = choices
+                    .iter()
+                    .position(|c| c == &vf.inputs[i])
+                    .map(|p| p as i32)
+                    .unwrap_or(0);
                 let next = (current + dir).rem_euclid(len) as usize;
                 vf.inputs[i] = choices[next].clone();
             }
@@ -398,7 +424,9 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                let Some(bp) = self.block_picker.take() else { return };
+                let Some(bp) = self.block_picker.take() else {
+                    return;
+                };
                 let name = bp.blocks[bp.selected].name.clone();
                 self.start_run(bp.node_id, name, bp.with_deps).await;
             }
@@ -491,7 +519,9 @@ impl App {
     }
 
     fn toggle_expand(&mut self) {
-        let Some(row) = self.rows.get(self.selected) else { return };
+        let Some(row) = self.rows.get(self.selected) else {
+            return;
+        };
         if !row.has_children {
             return;
         }
@@ -504,7 +534,9 @@ impl App {
     }
 
     fn expand_selected(&mut self) {
-        let Some(row) = self.rows.get(self.selected) else { return };
+        let Some(row) = self.rows.get(self.selected) else {
+            return;
+        };
         if row.has_children && !row.expanded {
             self.expanded.insert(row.node_id.clone());
             self.rebuild_rows();
@@ -512,7 +544,9 @@ impl App {
     }
 
     fn collapse_or_to_parent(&mut self) {
-        let Some(row) = self.rows.get(self.selected) else { return };
+        let Some(row) = self.rows.get(self.selected) else {
+            return;
+        };
         if row.has_children && row.expanded {
             self.expanded.remove(&row.node_id);
             self.rebuild_rows();
@@ -520,7 +554,10 @@ impl App {
         }
         if row.depth > 0 {
             let target_depth = row.depth - 1;
-            if let Some(pos) = self.rows[..self.selected].iter().rposition(|r| r.depth == target_depth) {
+            if let Some(pos) = self.rows[..self.selected]
+                .iter()
+                .rposition(|r| r.depth == target_depth)
+            {
                 self.selected = pos;
                 self.doc_scroll = 0;
                 self.render_current_document();
@@ -572,8 +609,12 @@ impl App {
     /// directly. Best-effort — spawns the opener and returns as soon as
     /// it has, without waiting for it to exit.
     fn trigger_open_file(&mut self) {
-        let Some(row) = self.rows.get(self.selected) else { return };
-        let Some(node) = self.display_canvas.node(&row.node_id) else { return };
+        let Some(row) = self.rows.get(self.selected) else {
+            return;
+        };
+        let Some(node) = self.display_canvas.node(&row.node_id) else {
+            return;
+        };
         if node.node_type != NodeType::File {
             self.status = "not a file node".into();
             return;
@@ -582,7 +623,11 @@ impl App {
             self.status = "file node has no target".into();
             return;
         };
-        let base_dir = self.canvas_path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+        let base_dir = self
+            .canvas_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
         let path = base_dir.join(target);
         match open::that(&path) {
             Ok(()) => self.status = format!("opened {}", path.display()),
@@ -606,9 +651,13 @@ impl App {
     /// one case with no per-node identity inside its target at all — just
     /// opens that file at the top.
     fn open_source_editor(&mut self) {
-        let Some(row) = self.rows.get(self.selected) else { return };
+        let Some(row) = self.rows.get(self.selected) else {
+            return;
+        };
         let node_id = row.node_id.clone();
-        let Some(node) = self.display_canvas.node(&node_id) else { return };
+        let Some(node) = self.display_canvas.node(&node_id) else {
+            return;
+        };
 
         let (path, is_canvas, local_id): (PathBuf, bool, Option<String>) =
             if let (Some(p), Some(local)) = (&node.origin_path, &node.origin_id) {
@@ -640,7 +689,8 @@ impl App {
             .as_deref()
             .zip(std::fs::read_to_string(&path).ok())
             .and_then(|(id, raw)| {
-                mdcanvas::node_body_offset(&raw, id).map(|off| source_editor::byte_offset_to_cursor(&raw, off))
+                mdcanvas::node_body_offset(&raw, id)
+                    .map(|off| source_editor::byte_offset_to_cursor(&raw, off))
             })
             .unwrap_or_default();
 
@@ -659,7 +709,9 @@ impl App {
     /// afterward, same as any other on-disk change here, so the tree/
     /// document panes reflect the edit the moment the editor closes.
     fn save_source_editor(&mut self) {
-        let Some(se) = &mut self.source_editor else { return };
+        let Some(se) = &mut self.source_editor else {
+            return;
+        };
         let text = se.editor.lines.to_string();
         if se.is_canvas {
             if let Err(e) = Canvas::from_markdown(&text) {
@@ -691,9 +743,17 @@ impl App {
     fn render_current_document(&mut self) {
         self.doc_segments.clear();
         self.doc_images.clear();
-        let Some(row) = self.rows.get(self.selected) else { return };
-        let Some(node) = self.display_canvas.node(&row.node_id) else { return };
-        let base_dir = self.canvas_path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+        let Some(row) = self.rows.get(self.selected) else {
+            return;
+        };
+        let Some(node) = self.display_canvas.node(&row.node_id) else {
+            return;
+        };
+        let base_dir = self
+            .canvas_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
 
         // `file` nodes with `display="code"` (see SPEC.md) show the
         // target's own file content, read fresh off disk — same as the
@@ -704,7 +764,11 @@ impl App {
                 let path = base_dir.join(target);
                 self.doc_segments = match std::fs::read_to_string(&path) {
                     Ok(content) => {
-                        vec![Segment::Text(self.highlighter.highlight_file(node.lang.as_deref(), &path, &content))]
+                        vec![Segment::Text(self.highlighter.highlight_file(
+                            node.lang.as_deref(),
+                            &path,
+                            &content,
+                        ))]
                     }
                     Err(e) => vec![Segment::Text(vec![Line::from(Span::styled(
                         format!("failed to read {}: {e}", path.display()),
@@ -743,10 +807,13 @@ impl App {
             self.status = "a run is already in progress — press K to kill it first".into();
             return;
         }
-        let Some(row) = self.rows.get(self.selected) else { return };
+        let Some(row) = self.rows.get(self.selected) else {
+            return;
+        };
         let node_id = row.node_id.clone();
         let Some(node) = self.canvas.node(&node_id) else {
-            self.status = "this comes from an `include` — open its own file to run its blocks".into();
+            self.status =
+                "this comes from an `include` — open its own file to run its blocks".into();
             return;
         };
         let node_text = node.text.clone();
@@ -757,20 +824,39 @@ impl App {
         }
 
         if blocks.len() == 1 {
-            let name = blocks[0].name.clone().expect("scan_runnable_blocks always names its blocks");
+            let name = blocks[0]
+                .name
+                .clone()
+                .expect("scan_runnable_blocks always names its blocks");
             self.start_run(node_id, name, with_deps).await;
             return;
         }
 
-        let default_name = fence::default_block(&node_id, &blocks).ok().flatten().and_then(|b| b.name.clone());
+        let default_name = fence::default_block(&node_id, &blocks)
+            .ok()
+            .flatten()
+            .and_then(|b| b.name.clone());
         let choices = blocks
             .iter()
             .map(|b| {
-                let name = b.name.clone().expect("scan_runnable_blocks always names its blocks");
-                BlockChoice { is_default: Some(&name) == default_name.as_ref(), name, cache: b.cache, tty: b.tty }
+                let name = b
+                    .name
+                    .clone()
+                    .expect("scan_runnable_blocks always names its blocks");
+                BlockChoice {
+                    is_default: Some(&name) == default_name.as_ref(),
+                    name,
+                    cache: b.cache,
+                    tty: b.tty,
+                }
             })
             .collect();
-        self.block_picker = Some(BlockPickerState { node_id, blocks: choices, selected: 0, with_deps });
+        self.block_picker = Some(BlockPickerState {
+            node_id,
+            blocks: choices,
+            selected: 0,
+            with_deps,
+        });
     }
 
     async fn start_run(&mut self, node_id: String, block_name: String, with_deps: bool) {
@@ -808,86 +894,112 @@ impl App {
     /// for a missing `meshfox:var` (returns, waiting on the prompt), or the
     /// chain runs out (marks `self.run` finished — see `RunState::finished`).
     async fn advance_run(&mut self) {
-        loop {
-            let Some((idx, len)) = self.run.as_ref().map(|r| (r.idx, r.chain.len())) else { return };
-            if idx >= len {
-                let (killed, had_failure) =
-                    self.run.as_ref().map(|r| (r.killed, r.had_failure)).unwrap_or_default();
-                self.status = if killed {
-                    "run killed".into()
-                } else if had_failure {
-                    "run finished with a failure".into()
-                } else {
-                    "run finished".into()
-                };
-                if let Some(run) = &mut self.run {
-                    run.finished = true;
-                }
+        let Some((idx, len)) = self.run.as_ref().map(|r| (r.idx, r.chain.len())) else {
+            return;
+        };
+        if idx >= len {
+            let (killed, had_failure) = self
+                .run
+                .as_ref()
+                .map(|r| (r.killed, r.had_failure))
+                .unwrap_or_default();
+            self.status = if killed {
+                "run killed".into()
+            } else if had_failure {
+                "run finished with a failure".into()
+            } else {
+                "run finished".into()
+            };
+            if let Some(run) = &mut self.run {
+                run.finished = true;
+            }
+            return;
+        }
+
+        let addr = self.run.as_ref().unwrap().chain[idx].clone();
+        let Some(node) = self.canvas.node(&addr.node_id) else {
+            self.status = format!("node {:?} not found", addr.node_id);
+            if let Some(run) = &mut self.run {
+                run.finished = true;
+                run.had_failure = true;
+            }
+            return;
+        };
+        let node_text = node.text.clone();
+        let Some(block) = scan_runnable_blocks(&addr.node_id, &node_text)
+            .into_iter()
+            .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()))
+        else {
+            self.status = format!(
+                "block {:?} not found in {:?}",
+                addr.block_name, addr.node_id
+            );
+            if let Some(run) = &mut self.run {
+                run.finished = true;
+                run.had_failure = true;
+            }
+            return;
+        };
+
+        let resolution = resolve_block_env(
+            &block.env,
+            &self.decls,
+            &self.run_overrides,
+            &self.var_cache,
+        );
+        if !resolution.missing.is_empty() {
+            let inputs = resolution
+                .missing
+                .iter()
+                .map(|d| initial_field_input(d, &self.var_cache))
+                .collect();
+            self.var_form = Some(VarFormState {
+                decls: resolution.missing,
+                inputs,
+                selected: 0,
+                configuring: false,
+            });
+            return;
+        }
+
+        // `tty` hands the *real* terminal over to the child, same as
+        // `meshfox run` does — see `mod.rs::run_tty_handoff`, which is
+        // what actually leaves the alternate screen/raw mode, runs it,
+        // and comes back. `App` never touches the terminal itself, so
+        // it just parks the request and returns; `mod.rs`'s loop picks
+        // `pending_tty` up before its next `select!` and calls
+        // `resume_after_tty` once the child exits.
+        if block.tty {
+            if let Some(run) = &mut self.run {
+                run.lines.push(format!(
+                    "==> {} (interactive — handing over the terminal)",
+                    addr.block_name
+                ));
+            }
+            self.pending_tty = Some(PendingTty {
+                block_name: addr.block_name.clone(),
+                code: block.code.clone(),
+                env: resolution.env,
+            });
+            return;
+        }
+
+        match meshfox_server::stream_exec::spawn_bash(&block.code, &resolution.env) {
+            Ok(proc) => {
+                let run = self.run.as_mut().unwrap();
+                run.proc = Some(proc);
+                run.current_node_text = node_text;
+                run.full_output.clear();
+                run.lines.push(format!("==> {}", addr.block_name));
                 return;
             }
-
-            let addr = self.run.as_ref().unwrap().chain[idx].clone();
-            let Some(node) = self.canvas.node(&addr.node_id) else {
-                self.status = format!("node {:?} not found", addr.node_id);
+            Err(e) => {
+                self.status = format!("failed to run {:?}: {e}", addr.block_name);
                 if let Some(run) = &mut self.run {
                     run.finished = true;
                     run.had_failure = true;
                 }
                 return;
-            };
-            let node_text = node.text.clone();
-            let Some(block) = scan_runnable_blocks(&addr.node_id, &node_text)
-                .into_iter()
-                .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()))
-            else {
-                self.status = format!("block {:?} not found in {:?}", addr.block_name, addr.node_id);
-                if let Some(run) = &mut self.run {
-                    run.finished = true;
-                    run.had_failure = true;
-                }
-                return;
-            };
-
-            let resolution = resolve_block_env(&block.env, &self.decls, &self.run_overrides, &self.var_cache);
-            if !resolution.missing.is_empty() {
-                let inputs = resolution.missing.iter().map(|d| initial_field_input(d, &self.var_cache)).collect();
-                self.var_form = Some(VarFormState { decls: resolution.missing, inputs, selected: 0, configuring: false });
-                return;
-            }
-
-            // `tty` hands the *real* terminal over to the child, same as
-            // `meshfox run` does — see `mod.rs::run_tty_handoff`, which is
-            // what actually leaves the alternate screen/raw mode, runs it,
-            // and comes back. `App` never touches the terminal itself, so
-            // it just parks the request and returns; `mod.rs`'s loop picks
-            // `pending_tty` up before its next `select!` and calls
-            // `resume_after_tty` once the child exits.
-            if block.tty {
-                if let Some(run) = &mut self.run {
-                    run.lines.push(format!("==> {} (interactive — handing over the terminal)", addr.block_name));
-                }
-                self.pending_tty =
-                    Some(PendingTty { block_name: addr.block_name.clone(), code: block.code.clone(), env: resolution.env });
-                return;
-            }
-
-            match meshfox_server::stream_exec::spawn_bash(&block.code, &resolution.env) {
-                Ok(proc) => {
-                    let run = self.run.as_mut().unwrap();
-                    run.proc = Some(proc);
-                    run.current_node_text = node_text;
-                    run.full_output.clear();
-                    run.lines.push(format!("==> {}", addr.block_name));
-                    return;
-                }
-                Err(e) => {
-                    self.status = format!("failed to run {:?}: {e}", addr.block_name);
-                    if let Some(run) = &mut self.run {
-                        run.finished = true;
-                        run.had_failure = true;
-                    }
-                    return;
-                }
             }
         }
     }
@@ -921,24 +1033,43 @@ impl App {
                 run.full_output.push('\n');
             }
             None => {
-                let mut proc = self.run.as_mut().unwrap().proc.take().expect("output channel closed without a process");
+                let mut proc = self
+                    .run
+                    .as_mut()
+                    .unwrap()
+                    .proc
+                    .take()
+                    .expect("output channel closed without a process");
                 let status = proc.child.wait().await;
                 let exit_code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
 
                 let (addr, node_text, full_output) = {
                     let run = self.run.as_ref().unwrap();
-                    (run.chain[run.idx].clone(), run.current_node_text.clone(), run.full_output.clone())
+                    (
+                        run.chain[run.idx].clone(),
+                        run.current_node_text.clone(),
+                        run.full_output.clone(),
+                    )
                 };
-                self.run.as_mut().unwrap().lines.push(format!("(exit {exit_code})"));
+                self.run
+                    .as_mut()
+                    .unwrap()
+                    .lines
+                    .push(format!("(exit {exit_code})"));
 
                 if let Some(block) = scan_runnable_blocks(&addr.node_id, &node_text)
                     .into_iter()
                     .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()))
                 {
                     if block.cache {
-                        let result = ExecOutput { exit_code, output: full_output };
+                        let result = ExecOutput {
+                            exit_code,
+                            output: full_output,
+                        };
                         if let Some(updated) = write_output(&node_text, &addr.block_name, &result) {
-                            if let Some(patched) = mdcanvas::set_node_body(&self.raw, &addr.node_id, &updated) {
+                            if let Some(patched) =
+                                mdcanvas::set_node_body(&self.raw, &addr.node_id, &updated)
+                            {
                                 self.raw = patched;
                                 let _ = std::fs::write(&self.canvas_path, &self.raw);
                                 if let Ok(reparsed) = Canvas::from_markdown(&self.raw) {
@@ -992,7 +1123,10 @@ impl App {
     /// fix.
     async fn submit_var_form(&mut self) {
         {
-            let vf = self.var_form.as_ref().expect("guarded by on_key's is_some() check");
+            let vf = self
+                .var_form
+                .as_ref()
+                .expect("guarded by on_key's is_some() check");
             if let Some((i, e)) = vf
                 .decls
                 .iter()
@@ -1006,7 +1140,9 @@ impl App {
                 return;
             }
         }
-        let Some(vf) = self.var_form.take() else { return };
+        let Some(vf) = self.var_form.take() else {
+            return;
+        };
         for (decl, value) in vf.decls.iter().zip(vf.inputs.iter()) {
             if !decl.secret {
                 let _ = self.var_cache.set(&decl.name, value);
@@ -1040,11 +1176,20 @@ impl App {
         }
         let decls: Vec<VarDecl> = self.decls.iter().filter(|d| !d.secret).cloned().collect();
         if decls.is_empty() {
-            self.status = "meshfox: this canvas declares no configurable (non-secret) variable(s)".into();
+            self.status =
+                "meshfox: this canvas declares no configurable (non-secret) variable(s)".into();
             return;
         }
-        let inputs = decls.iter().map(|d| initial_field_input(d, &self.var_cache)).collect();
-        self.var_form = Some(VarFormState { decls, inputs, selected: 0, configuring: true });
+        let inputs = decls
+            .iter()
+            .map(|d| initial_field_input(d, &self.var_cache))
+            .collect();
+        self.var_form = Some(VarFormState {
+            decls,
+            inputs,
+            selected: 0,
+            configuring: true,
+        });
     }
 
     /// Whether the footer/help hint for `c` (configure) should be shown at
@@ -1057,7 +1202,9 @@ impl App {
     }
 
     fn cancel_var_form(&mut self) {
-        let Some(vf) = self.var_form.take() else { return };
+        let Some(vf) = self.var_form.take() else {
+            return;
+        };
         if vf.configuring {
             self.status = "configure cancelled".into();
             return;
@@ -1074,7 +1221,8 @@ impl App {
 /// unresolved canvas rather than refusing to show anything — the rest of
 /// the document is still worth browsing even if one `include` is broken.
 fn resolve_includes(canvas: &Canvas, canvas_path: &Path) -> Canvas {
-    let mut resolved = meshfox_core::include::resolve(canvas, canvas_path).unwrap_or_else(|_| canvas.clone());
+    let mut resolved =
+        meshfox_core::include::resolve(canvas, canvas_path).unwrap_or_else(|_| canvas.clone());
     // Populates every node's `constraint_results` (see
     // `meshfox_core::constraint::annotate_status`) so `tree::flatten` and
     // `constraint_stats` below can read pass/fail straight off the tree
@@ -1089,7 +1237,11 @@ fn resolve_includes(canvas: &Canvas, canvas_path: &Path) -> Canvas {
 /// (already `annotate_status`-ed by `resolve_includes`) — `None` when there
 /// are none at all. See `App::constraint_stats`.
 fn constraint_stats(canvas: &Canvas) -> Option<(usize, usize)> {
-    let results: Vec<_> = canvas.nodes.iter().flat_map(|n| n.constraint_results.iter()).collect();
+    let results: Vec<_> = canvas
+        .nodes
+        .iter()
+        .flat_map(|n| n.constraint_results.iter())
+        .collect();
     if results.is_empty() {
         return None;
     }
@@ -1098,9 +1250,16 @@ fn constraint_stats(canvas: &Canvas) -> Option<(usize, usize)> {
 }
 
 fn load_image_protocol(picker: &mut Picker, path: &Path) -> Option<Protocol> {
-    let dyn_img = image::ImageReader::open(path).ok()?.with_guessed_format().ok()?.decode().ok()?;
+    let dyn_img = image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .decode()
+        .ok()?;
     let budget = ratatui::layout::Size::new(56, 24);
-    picker.new_protocol(dyn_img, budget, ratatui_image::Resize::Fit(None)).ok()
+    picker
+        .new_protocol(dyn_img, budget, ratatui_image::Resize::Fit(None))
+        .ok()
 }
 
 fn point_in(rect: Rect, x: u16, y: u16) -> bool {

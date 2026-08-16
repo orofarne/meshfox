@@ -24,7 +24,10 @@ use scraper::{Html, Selector};
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn unique_dir(tag: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("meshfox-site-template-test-{tag}-{nanos}-{n}"))
 }
@@ -99,13 +102,21 @@ fn no_node_card_is_nested_inside_another_nodes_card() {
     // contain another `.node` card as a descendant — every node's card
     // sizes and draws its border independently of how deep it's nested.
     let node_in_node = Selector::parse(".node .node").unwrap();
-    assert_eq!(doc.select(&node_in_node).count(), 0, "a .node card must never be nested inside another .node card");
+    assert_eq!(
+        doc.select(&node_in_node).count(),
+        0,
+        "a .node card must never be nested inside another .node card"
+    );
 
     // Same bug, other direction: the children container must not be
     // nested inside a card either (it needs to be a *sibling* of `.node`,
     // not a descendant — see `_macros.html.tera`'s doc comment).
     let children_in_node = Selector::parse(".node .node-children").unwrap();
-    assert_eq!(doc.select(&children_in_node).count(), 0, ".node-children must never be nested inside a .node card");
+    assert_eq!(
+        doc.select(&children_in_node).count(),
+        0,
+        ".node-children must never be nested inside a .node card"
+    );
 
     // Sanity: every node from the fixture actually made it into the page,
     // one `.node` card each (root, frame, section, leaf, sibling).
@@ -151,7 +162,13 @@ fn data_depth_matches_the_trees_real_depth_not_the_heading_level() {
 
     let depth_of = |doc: &Html, id: &str| -> String {
         let sel = Selector::parse(&format!("#node-{id}")).unwrap();
-        doc.select(&sel).next().unwrap().value().attr("data-depth").unwrap().to_string()
+        doc.select(&sel)
+            .next()
+            .unwrap()
+            .value()
+            .attr("data-depth")
+            .unwrap()
+            .to_string()
     };
     assert_eq!(depth_of(&doc, "root"), "0");
     assert_eq!(depth_of(&doc, "frame"), "1");
@@ -170,11 +187,17 @@ fn only_roots_own_children_block_gets_the_root_children_class() {
     // larger-indent `.node-children` instead.
     let root_children_sel = Selector::parse(".node-children.root-children").unwrap();
     let matches: Vec<_> = doc.select(&root_children_sel).collect();
-    assert_eq!(matches.len(), 1, "exactly one .node-children.root-children (root's own)");
+    assert_eq!(
+        matches.len(),
+        1,
+        "exactly one .node-children.root-children (root's own)"
+    );
 
     let direct_node_sel = Selector::parse(":scope > .node-row > .node").unwrap();
-    let ids: Vec<String> =
-        matches[0].select(&direct_node_sel).map(|n| n.value().attr("id").unwrap().to_string()).collect();
+    let ids: Vec<String> = matches[0]
+        .select(&direct_node_sel)
+        .map(|n| n.value().attr("id").unwrap().to_string())
+        .collect();
     assert_eq!(ids, vec!["node-frame", "node-sibling"]);
 }
 
@@ -184,7 +207,13 @@ fn shallow_and_deep_width_tier_classes_match_depth() {
 
     let class_of = |doc: &Html, id: &str| -> String {
         let sel = Selector::parse(&format!("#node-{id}")).unwrap();
-        doc.select(&sel).next().unwrap().value().attr("class").unwrap().to_string()
+        doc.select(&sel)
+            .next()
+            .unwrap()
+            .value()
+            .attr("class")
+            .unwrap()
+            .to_string()
     };
     // depth <=1 (root, its direct children) -> .shallow; depth >=2 -> .deep.
     assert!(class_of(&doc, "root").contains("shallow"));

@@ -58,12 +58,18 @@ pub fn is_default(block: &CodeBlock, node_id: &str) -> bool {
 /// resolution (`meshfox run`'s node-id shortcut), treat it the same as "no
 /// default available" — same convention as any other ambiguous case here
 /// (e.g. multiple unnamed fences).
-pub fn default_block<'a>(node_id: &str, blocks: &'a [CodeBlock]) -> Result<Option<&'a CodeBlock>, Vec<String>> {
+pub fn default_block<'a>(
+    node_id: &str,
+    blocks: &'a [CodeBlock],
+) -> Result<Option<&'a CodeBlock>, Vec<String>> {
     let defaults: Vec<&CodeBlock> = blocks.iter().filter(|b| is_default(b, node_id)).collect();
     match defaults.len() {
         0 => Ok(None),
         1 => Ok(Some(defaults[0])),
-        _ => Err(defaults.iter().map(|b| b.name.clone().unwrap_or_default()).collect()),
+        _ => Err(defaults
+            .iter()
+            .map(|b| b.name.clone().unwrap_or_default())
+            .collect()),
     }
 }
 
@@ -131,7 +137,10 @@ fn parse_env_ref(s: &str) -> EnvRef {
         },
         None => {
             let var_name = strip_dollar(s.trim()).to_string();
-            EnvRef { local_name: var_name.clone(), var_name }
+            EnvRef {
+                local_name: var_name.clone(),
+                var_name,
+            }
         }
     }
 }
@@ -199,9 +208,7 @@ fn fence_open(line: &str) -> Option<(char, usize, &str)> {
 
 fn fence_close(line: &str, ch: char, min_len: usize) -> bool {
     let trimmed = line.trim();
-    !trimmed.is_empty()
-        && trimmed.chars().all(|c| c == ch)
-        && trimmed.chars().count() >= min_len
+    !trimmed.is_empty() && trimmed.chars().all(|c| c == ch) && trimmed.chars().count() >= min_len
 }
 
 /// All top-level fences in `markdown`, in document order. Content already
@@ -254,7 +261,10 @@ pub(crate) fn scan_raw_fences(markdown: &str) -> Vec<RawFence> {
 /// heading/structure scanner finds starting inside one of these ranges is
 /// fence content, not real document structure.
 pub(crate) fn fenced_byte_ranges(markdown: &str) -> Vec<Range<usize>> {
-    scan_raw_fences(markdown).into_iter().map(|f| f.span).collect()
+    scan_raw_fences(markdown)
+        .into_iter()
+        .map(|f| f.span)
+        .collect()
 }
 
 /// All runnable code blocks (backtick fences with a `name` attribute) in
@@ -281,7 +291,10 @@ pub fn scan_code_blocks(markdown: &str) -> Vec<CodeBlock> {
 /// today's behavior for any unnamed fence.
 pub fn scan_runnable_blocks(node_id: &str, markdown: &str) -> Vec<CodeBlock> {
     let candidates = candidate_fences(markdown);
-    let unnamed_count = candidates.iter().filter(|(_, _, attrs)| !attrs.contains_key("name")).count();
+    let unnamed_count = candidates
+        .iter()
+        .filter(|(_, _, attrs)| !attrs.contains_key("name"))
+        .count();
     let solo_unnamed = unnamed_count == 1;
 
     candidates
@@ -314,7 +327,11 @@ pub fn scan_runnable_blocks(node_id: &str, markdown: &str) -> Vec<CodeBlock> {
 fn candidate_fences(markdown: &str) -> Vec<(RawFence, String, HashMap<String, String>)> {
     scan_raw_fences(markdown)
         .into_iter()
-        .filter(|f| f.delim_char == '`' && !f.info.is_empty() && !is_cached_output_fence(markdown, f.span.start))
+        .filter(|f| {
+            f.delim_char == '`'
+                && !f.info.is_empty()
+                && !is_cached_output_fence(markdown, f.span.start)
+        })
         .map(|f| {
             let (lang, attrs) = parse_info_string(&f.info);
             (f, lang, attrs)
@@ -337,7 +354,12 @@ fn is_cached_output_fence(markdown: &str, fence_start: usize) -> bool {
         .starts_with("<!-- meshfox:output")
 }
 
-fn build_code_block(f: RawFence, lang: String, attrs: HashMap<String, String>, name: String) -> CodeBlock {
+fn build_code_block(
+    f: RawFence,
+    lang: String,
+    attrs: HashMap<String, String>,
+    name: String,
+) -> CodeBlock {
     let cache = attrs.get("cache").map(|v| v != "false").unwrap_or(false);
     let default = attrs.get("default").map(|v| v != "false").unwrap_or(false);
     let tty = attrs.get("tty").map(|v| v != "false").unwrap_or(false);
@@ -383,11 +405,18 @@ pub fn scan_constraint_blocks(markdown: &str) -> Vec<ConstraintBlock> {
             if lang != "starlark" {
                 return None;
             }
-            let is_constraint = attrs.get("constraint").map(|v| v != "false").unwrap_or(false);
+            let is_constraint = attrs
+                .get("constraint")
+                .map(|v| v != "false")
+                .unwrap_or(false);
             if !is_constraint {
                 return None;
             }
-            Some(ConstraintBlock { name: attrs.get("name").cloned(), code: f.code.clone(), span: f.span.clone() })
+            Some(ConstraintBlock {
+                name: attrs.get("name").cloned(),
+                code: f.code.clone(),
+                span: f.span.clone(),
+            })
         })
         .collect()
 }
@@ -409,7 +438,9 @@ pub fn strip_fence_attrs(markdown: &str) -> String {
     for fence in &fences {
         out.push_str(&markdown[cursor..fence.span.start]);
         let (lang, _attrs) = parse_info_string(&fence.info);
-        let delim: String = std::iter::repeat(fence.delim_char).take(fence.delim_len).collect();
+        let delim: String = std::iter::repeat(fence.delim_char)
+            .take(fence.delim_len)
+            .collect();
         out.push_str(&delim);
         out.push_str(&lang);
         out.push('\n');
@@ -469,7 +500,10 @@ mod tests {
         // body (e.g. spliced in via `include`).
         let md = "    ```bash name=\"build\" cache\n    echo hi\n    ```\n";
         assert!(scan_code_blocks(md).is_empty());
-        assert!(scan_constraint_blocks("    ```starlark constraint\n    fail(\"x\")\n    ```\n").is_empty());
+        assert!(
+            scan_constraint_blocks("    ```starlark constraint\n    fail(\"x\")\n    ```\n")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -566,7 +600,10 @@ mod tests {
         // without needing scan_runnable_blocks's fallback at all.
         let md = "```bash name=\"my-node\"\necho hi\n```\n";
         assert_eq!(scan_code_blocks(md)[0].name.as_deref(), Some("my-node"));
-        assert_eq!(scan_runnable_blocks("my-node", md)[0].name.as_deref(), Some("my-node"));
+        assert_eq!(
+            scan_runnable_blocks("my-node", md)[0].name.as_deref(),
+            Some("my-node")
+        );
     }
 
     #[test]
@@ -582,7 +619,10 @@ mod tests {
         assert_eq!(
             deps,
             &vec![
-                BlockRef { node_id: None, block_name: "build".to_string() },
+                BlockRef {
+                    node_id: None,
+                    block_name: "build".to_string()
+                },
                 BlockRef {
                     node_id: Some("other-node".to_string()),
                     block_name: "test".to_string()
@@ -608,14 +648,26 @@ mod tests {
     fn env_parses_bare_dollar_as_pass_through() {
         let md = "```bash name=\"install\" env=\"$INSTALL_PATH\"\necho hi\n```\n";
         let env = &scan_code_blocks(md)[0].env;
-        assert_eq!(env, &vec![EnvRef { local_name: "INSTALL_PATH".to_string(), var_name: "INSTALL_PATH".to_string() }]);
+        assert_eq!(
+            env,
+            &vec![EnvRef {
+                local_name: "INSTALL_PATH".to_string(),
+                var_name: "INSTALL_PATH".to_string()
+            }]
+        );
     }
 
     #[test]
     fn env_dollar_prefix_is_optional_for_pass_through() {
         let md = "```bash name=\"install\" env=\"INSTALL_PATH\"\necho hi\n```\n";
         let env = &scan_code_blocks(md)[0].env;
-        assert_eq!(env, &vec![EnvRef { local_name: "INSTALL_PATH".to_string(), var_name: "INSTALL_PATH".to_string() }]);
+        assert_eq!(
+            env,
+            &vec![EnvRef {
+                local_name: "INSTALL_PATH".to_string(),
+                var_name: "INSTALL_PATH".to_string()
+            }]
+        );
     }
 
     #[test]
@@ -625,8 +677,14 @@ mod tests {
         assert_eq!(
             env,
             &vec![
-                EnvRef { local_name: "PREFIX".to_string(), var_name: "INSTALL_PATH".to_string() },
-                EnvRef { local_name: "MODE2".to_string(), var_name: "MODE".to_string() },
+                EnvRef {
+                    local_name: "PREFIX".to_string(),
+                    var_name: "INSTALL_PATH".to_string()
+                },
+                EnvRef {
+                    local_name: "MODE2".to_string(),
+                    var_name: "MODE".to_string()
+                },
             ]
         );
     }
@@ -638,9 +696,18 @@ mod tests {
         assert_eq!(
             env,
             &vec![
-                EnvRef { local_name: "A".to_string(), var_name: "A".to_string() },
-                EnvRef { local_name: "B".to_string(), var_name: "B".to_string() },
-                EnvRef { local_name: "C".to_string(), var_name: "D".to_string() },
+                EnvRef {
+                    local_name: "A".to_string(),
+                    var_name: "A".to_string()
+                },
+                EnvRef {
+                    local_name: "B".to_string(),
+                    var_name: "B".to_string()
+                },
+                EnvRef {
+                    local_name: "C".to_string(),
+                    var_name: "D".to_string()
+                },
             ]
         );
     }
@@ -667,7 +734,8 @@ mod tests {
 
     #[test]
     fn tty_flag_parses_bare_and_explicit_false() {
-        let md = "```bash name=\"x\" tty\necho hi\n```\n\n```bash name=\"y\" tty=false\necho hi\n```\n";
+        let md =
+            "```bash name=\"x\" tty\necho hi\n```\n\n```bash name=\"y\" tty=false\necho hi\n```\n";
         let blocks = scan_code_blocks(md);
         assert!(blocks[0].tty);
         assert!(!blocks[1].tty);
@@ -687,7 +755,8 @@ mod tests {
 
     #[test]
     fn default_block_finds_the_sole_qualifying_block() {
-        let md = "```bash name=\"build\"\necho a\n```\n\n```bash name=\"run\" default\necho b\n```\n";
+        let md =
+            "```bash name=\"build\"\necho a\n```\n\n```bash name=\"run\" default\necho b\n```\n";
         let blocks = scan_code_blocks(md);
         let default = default_block("node", &blocks).unwrap();
         assert_eq!(default.unwrap().name.as_deref(), Some("run"));
@@ -705,7 +774,8 @@ mod tests {
         // "node" is both explicitly named after the node id (implicit
         // default) and there's a second block explicitly flagged default
         // too — only one is allowed.
-        let md = "```bash name=\"node\"\necho a\n```\n\n```bash name=\"run\" default\necho b\n```\n";
+        let md =
+            "```bash name=\"node\"\necho a\n```\n\n```bash name=\"run\" default\necho b\n```\n";
         let blocks = scan_code_blocks(md);
         let err = default_block("node", &blocks).unwrap_err();
         assert_eq!(err.len(), 2);
@@ -725,7 +795,10 @@ mod tests {
     fn span_covers_whole_fence() {
         let md = "```bash name=\"a\"\necho a\n```\nafter";
         let blocks = scan_code_blocks(md);
-        assert_eq!(&md[blocks[0].span.clone()], "```bash name=\"a\"\necho a\n```");
+        assert_eq!(
+            &md[blocks[0].span.clone()],
+            "```bash name=\"a\"\necho a\n```"
+        );
     }
 
     #[test]
@@ -754,7 +827,8 @@ mod tests {
     fn arbitrary_backtick_runs_in_content_do_not_confuse_a_long_enough_fence() {
         // Simulates cached command output containing runs of backticks up
         // to length 5; a 6-backtick wrapper must stay intact around it.
-        let md = "``````text\nexit code: 0\n\n# not a heading\n```\n````\n`````\ntail\n``````\nafter\n";
+        let md =
+            "``````text\nexit code: 0\n\n# not a heading\n```\n````\n`````\ntail\n``````\nafter\n";
         let raw = scan_raw_fences(md);
         assert_eq!(raw.len(), 1);
         assert!(raw[0].code.contains("# not a heading"));

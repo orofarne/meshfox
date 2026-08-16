@@ -10,7 +10,9 @@ fn git_output(args: &[&str]) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    String::from_utf8(output.stdout).ok().map(|s| s.trim().to_string())
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 /// The tag this build was made from, if any: `GITHUB_REF_NAME` when the
@@ -29,11 +31,13 @@ fn main() {
     let label = match release_tag() {
         Some(tag) => tag,
         None => {
-            let commit = git_output(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
+            let commit = git_output(&["rev-parse", "--short=12", "HEAD"])
+                .unwrap_or_else(|| "unknown".to_string());
             format!("commit {commit}")
         }
     };
-    let date = git_output(&["log", "-1", "--format=%cd", "--date=short"]).unwrap_or_else(|| "unknown".to_string());
+    let date = git_output(&["log", "-1", "--format=%cd", "--date=short"])
+        .unwrap_or_else(|| "unknown".to_string());
 
     println!("cargo:rustc-env=MESHFOX_VERSION_LABEL={label}");
     println!("cargo:rustc-env=MESHFOX_GIT_DATE={date}");

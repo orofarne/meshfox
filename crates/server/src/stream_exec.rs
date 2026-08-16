@@ -170,7 +170,8 @@ mod tests {
 
     #[tokio::test]
     async fn injects_extra_env_vars_on_top_of_the_inherited_ones() {
-        let mut proc = spawn_bash("echo \"$INSTALL_PATH\"", [("INSTALL_PATH", "/opt/meshfox")]).unwrap();
+        let mut proc =
+            spawn_bash("echo \"$INSTALL_PATH\"", [("INSTALL_PATH", "/opt/meshfox")]).unwrap();
         let mut lines = Vec::new();
         while let Some(line) = proc.output_rx.recv().await {
             lines.push(line);
@@ -210,7 +211,10 @@ mod tests {
         // `kill(pid, 0)` sends no signal — it just checks whether anything
         // in that group still exists.
         let still_alive = unsafe { libc::kill(-pgid, 0) } == 0;
-        assert!(!still_alive, "a process in the killed group is still running");
+        assert!(
+            !still_alive,
+            "a process in the killed group is still running"
+        );
     }
 
     #[tokio::test]

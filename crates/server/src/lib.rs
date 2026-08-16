@@ -33,10 +33,10 @@ use std::time::Duration;
 use tokio::sync::{broadcast, oneshot};
 use tower_http::cors::CorsLayer;
 
+mod pty_exec;
 /// `pub` so `meshfox-cli` can reuse the same async spawn/kill primitives
 /// for `meshfox run`'s real-time output — see its `main.rs`.
 pub mod stream_exec;
-mod pty_exec;
 
 #[derive(RustEmbed)]
 #[folder = "../../web/dist"]
@@ -129,7 +129,10 @@ struct TabGuard {
 impl Drop for TabGuard {
     fn drop(&mut self) {
         let remaining = self.state.open_tabs.fetch_sub(1, Ordering::SeqCst) - 1;
-        if remaining == 0 && self.state.auto_exit && self.state.ever_connected.load(Ordering::SeqCst) {
+        if remaining == 0
+            && self.state.auto_exit
+            && self.state.ever_connected.load(Ordering::SeqCst)
+        {
             let state = Arc::clone(&self.state);
             tokio::spawn(async move {
                 tokio::time::sleep(AUTO_EXIT_GRACE).await;
@@ -154,16 +157,22 @@ impl Drop for TabGuard {
 /// nothing looks different and nothing is sent.
 fn spawn_file_watcher(state: Arc<AppState>) {
     std::thread::spawn(move || {
-        let mut last_mtime = std::fs::metadata(&state.canvas_path).and_then(|m| m.modified()).ok();
+        let mut last_mtime = std::fs::metadata(&state.canvas_path)
+            .and_then(|m| m.modified())
+            .ok();
         loop {
             std::thread::sleep(Duration::from_millis(500));
-            let Ok(meta) = std::fs::metadata(&state.canvas_path) else { continue };
+            let Ok(meta) = std::fs::metadata(&state.canvas_path) else {
+                continue;
+            };
             let Ok(mtime) = meta.modified() else { continue };
             if Some(mtime) == last_mtime {
                 continue;
             }
             last_mtime = Some(mtime);
-            let Ok(contents) = std::fs::read_to_string(&state.canvas_path) else { continue };
+            let Ok(contents) = std::fs::read_to_string(&state.canvas_path) else {
+                continue;
+            };
             let mut raw = state.raw.lock().unwrap();
             if *raw != contents {
                 *raw = contents;
@@ -269,17 +278,27 @@ async fn get_vars(
 ) -> Result<Json<Vec<VarStatus>>, ApiError> {
     let raw = state.raw.lock().unwrap().clone();
     let canvas = parse_or_error(&raw)?;
-    let path: Vec<&str> = if query.path.is_empty() { Vec::new() } else { query.path.split(',').collect() };
+    let path: Vec<&str> = if query.path.is_empty() {
+        Vec::new()
+    } else {
+        query.path.split(',').collect()
+    };
     let chain = meshfox_core::resolve_run_chain(&canvas, &path, &query.block, !query.no_deps)?;
     let needed = meshfox_core::env_var_names_for_chain(&canvas, &chain);
 
     let decls = meshfox_core::declared_vars(&canvas)
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
-    let relevant: Vec<_> = decls.into_iter().filter(|d| needed.contains(&d.name)).collect();
+    let relevant: Vec<_> = decls
+        .into_iter()
+        .filter(|d| needed.contains(&d.name))
+        .collect();
 
     let cache = state.vars_cache.lock().unwrap();
     let resolved = meshfox_core::resolve_vars(&relevant, &HashMap::new(), &cache);
-    let statuses = relevant.into_iter().map(|d| var_status(d, &resolved)).collect();
+    let statuses = relevant
+        .into_iter()
+        .map(|d| var_status(d, &resolved))
+        .collect();
     Ok(Json(statuses))
 }
 
@@ -314,10 +333,14 @@ fn var_status(d: meshfox_core::VarDecl, resolved: &meshfox_core::ResolvedVars) -
 /// straight into a spawned block's environment — an `int` field a client
 /// (or a hand-typed curl request) sent as `"not-a-number"` should fail the
 /// request outright, not run the block with a garbage value.
-fn validate_var_overrides(decls: &[meshfox_core::VarDecl], overrides: &HashMap<String, String>) -> Result<(), ApiError> {
+fn validate_var_overrides(
+    decls: &[meshfox_core::VarDecl],
+    overrides: &HashMap<String, String>,
+) -> Result<(), ApiError> {
     for decl in decls {
         if let Some(value) = overrides.get(&decl.name) {
-            meshfox_core::validate_value(decl, value).map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+            meshfox_core::validate_value(decl, value)
+                .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e))?;
         }
     }
     Ok(())
@@ -331,7 +354,9 @@ fn validate_var_overrides(decls: &[meshfox_core::VarDecl], overrides: &HashMap<S
 /// block's chain, and a `secret` declaration is left out entirely — same
 /// as the CLI, asking for one that's never cached and immediately
 /// discarded again wouldn't do anything useful.
-async fn get_configure_vars(State(state): State<Arc<AppState>>) -> Result<Json<Vec<VarStatus>>, ApiError> {
+async fn get_configure_vars(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<VarStatus>>, ApiError> {
     let raw = state.raw.lock().unwrap().clone();
     let canvas = parse_or_error(&raw)?;
     let decls = meshfox_core::declared_vars(&canvas)
@@ -340,7 +365,10 @@ async fn get_configure_vars(State(state): State<Arc<AppState>>) -> Result<Json<V
 
     let cache = state.vars_cache.lock().unwrap();
     let resolved = meshfox_core::resolve_vars(&configurable, &HashMap::new(), &cache);
-    let statuses = configurable.into_iter().map(|d| var_status(d, &resolved)).collect();
+    let statuses = configurable
+        .into_iter()
+        .map(|d| var_status(d, &resolved))
+        .collect();
     Ok(Json(statuses))
 }
 
@@ -381,7 +409,8 @@ async fn post_configure_vars(
     // others.
     for decl in &configurable {
         if let Some(value) = req.vars.get(&decl.name) {
-            meshfox_core::validate_value(decl, value).map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+            meshfox_core::validate_value(decl, value)
+                .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e))?;
         }
     }
 
@@ -390,7 +419,10 @@ async fn post_configure_vars(
     for decl in &configurable {
         if let Some(value) = req.vars.get(&decl.name) {
             cache.set(&decl.name, value).map_err(|e| {
-                ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to save {}: {e}", decl.name))
+                ApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to save {}: {e}", decl.name),
+                )
             })?;
             saved += 1;
         }
@@ -409,13 +441,26 @@ struct KillRequest {
 /// fences" section for the full protocol. Emitted for the requested block
 /// and, automatically, every block its `deps=` chain pulls in first.
 #[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", rename_all = "kebab-case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
 enum RunEvent {
     /// Always first. `runId` is what `/api/kill` takes to cancel this run.
-    Started { run_id: String },
-    StepStart { node_id: String, block: String },
+    Started {
+        run_id: String,
+    },
+    StepStart {
+        node_id: String,
+        block: String,
+    },
     /// One line of merged stdout/stderr, as it's produced.
-    Output { node_id: String, block: String, text: String },
+    Output {
+        node_id: String,
+        block: String,
+        text: String,
+    },
     /// `/api/run/tty`'s WebSocket only: emitted right after `StepStart` for
     /// a `tty` step, instead of any `Output`. From here until the matching
     /// `StepEnd`, every other WebSocket frame for this run is raw pty I/O,
@@ -425,21 +470,35 @@ enum RunEvent {
     /// (`{"cols":..,"rows":..}`), not a `RunEvent`. See SPEC.md's
     /// "Interactive (`tty`) blocks" — `/api/run`'s plain NDJSON stream
     /// never runs a `tty` block to begin with, so it never emits this.
-    TtyStart { node_id: String, block: String },
-    StepEnd { node_id: String, block: String, exit_code: i32 },
+    TtyStart {
+        node_id: String,
+        block: String,
+    },
+    StepEnd {
+        node_id: String,
+        block: String,
+        exit_code: i32,
+    },
     /// Terminal for this run — no `Done` follows. Emitted for whichever
     /// step was actively running when `/api/kill` fired; later chain steps
     /// (if any) never start.
-    Killed { node_id: String, block: String },
+    Killed {
+        node_id: String,
+        block: String,
+    },
     /// Terminal for this run — something failed before/without a step
     /// producing a normal exit code (bad node/block reference, no
     /// executor for the language, an I/O error spawning the process).
-    Error { message: String },
+    Error {
+        message: String,
+    },
     /// Terminal for this run. `exitCode` mirrors whichever step ran last —
     /// the requested block's own, unless an earlier dependency failed and
     /// stopped the chain first (same stop-on-failure rule `meshfox run`
     /// already has).
-    Done { exit_code: i32 },
+    Done {
+        exit_code: i32,
+    },
 }
 
 fn ndjson_line(event: &RunEvent) -> Bytes {
@@ -468,7 +527,8 @@ impl From<RunError> for ApiError {
 }
 
 fn parse_or_error(raw: &str) -> Result<Canvas, ApiError> {
-    Canvas::from_markdown(raw).map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))
+    Canvas::from_markdown(raw)
+        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))
 }
 
 /// Builds the same response shape `GET /api/canvas` returns (parse, splice
@@ -543,13 +603,19 @@ struct LocatedNode {
 fn locate_node(state: &AppState, primary_raw: &str, id: &str) -> Result<LocatedNode, ApiError> {
     let primary = parse_or_error(primary_raw)?;
     if primary.node(id).is_some() {
-        return Ok(LocatedNode { origin: None, raw: primary_raw.to_string(), local_id: id.to_string() });
+        return Ok(LocatedNode {
+            origin: None,
+            raw: primary_raw.to_string(),
+            local_id: id.to_string(),
+        });
     }
     // Not in `state`'s own raw text — maybe it's spliced in from an
     // include. Resolve fully (splices every include, however deeply
     // nested) and look it up there instead.
     let resolved = resolved_canvas(primary_raw, &state.canvas_path)?;
-    let node = resolved.node(id).ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}")))?;
+    let node = resolved
+        .node(id)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}")))?;
     let origin_path = node.origin_path.clone().ok_or_else(|| {
         ApiError(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -560,11 +626,21 @@ fn locate_node(state: &AppState, primary_raw: &str, id: &str) -> Result<LocatedN
             ),
         )
     })?;
-    let local_id = node.origin_id.clone().expect("origin_path is always set together with origin_id");
+    let local_id = node
+        .origin_id
+        .clone()
+        .expect("origin_path is always set together with origin_id");
     let raw = std::fs::read_to_string(&origin_path).map_err(|e| {
-        ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to read include target {origin_path}: {e}"))
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to read include target {origin_path}: {e}"),
+        )
     })?;
-    Ok(LocatedNode { origin: Some(PathBuf::from(origin_path)), raw, local_id })
+    Ok(LocatedNode {
+        origin: Some(PathBuf::from(origin_path)),
+        raw,
+        local_id,
+    })
 }
 
 /// Writes `raw` back to wherever `located` says it actually came from —
@@ -578,11 +654,14 @@ fn locate_node(state: &AppState, primary_raw: &str, id: &str) -> Result<LocatedN
 fn commit_located(state: &AppState, located: &LocatedNode, raw: &str) -> Result<(), ApiError> {
     match &located.origin {
         None => {
-            state.save(raw).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            state
+                .save(raw)
+                .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
             *state.raw.lock().unwrap() = raw.to_string();
         }
         Some(path) => {
-            std::fs::write(path, raw).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            std::fs::write(path, raw)
+                .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         }
     }
     Ok(())
@@ -605,7 +684,9 @@ struct IncludeManifestEntry {
 /// `?include=` param): the primary document's own entry is implicit (the
 /// picker's own "this document" option), everything here is an
 /// alternative to it.
-async fn get_includes(State(state): State<Arc<AppState>>) -> Result<Json<Vec<IncludeManifestEntry>>, ApiError> {
+async fn get_includes(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<IncludeManifestEntry>>, ApiError> {
     let raw = state.raw.lock().unwrap().clone();
     let canvas = parse_or_error(&raw)?;
     let entries = meshfox_core::include::list_includes(&canvas, &state.canvas_path)
@@ -647,13 +728,18 @@ enum SourceFile {
 /// since-removed or now-broken include) is a 404, same as any other
 /// stale-id case elsewhere in this file.
 fn resolve_source_file(state: &AppState, include: Option<&str>) -> Result<SourceFile, ApiError> {
-    let Some(include_id) = include else { return Ok(SourceFile::Primary) };
+    let Some(include_id) = include else {
+        return Ok(SourceFile::Primary);
+    };
     let raw = state.raw.lock().unwrap().clone();
     let canvas = parse_or_error(&raw)?;
     meshfox_core::include::list_includes(&canvas, &state.canvas_path)
         .into_iter()
         .find(|i| i.node_id == include_id)
-        .map(|i| SourceFile::Include { path: i.path, is_canvas: i.is_canvas })
+        .map(|i| SourceFile::Include {
+            path: i.path,
+            is_canvas: i.is_canvas,
+        })
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no include {include_id:?}")))
 }
 
@@ -668,8 +754,12 @@ async fn get_canvas_raw(
 ) -> Result<String, ApiError> {
     match resolve_source_file(&state, query.include.as_deref())? {
         SourceFile::Primary => Ok(state.raw.lock().unwrap().clone()),
-        SourceFile::Include { path, .. } => std::fs::read_to_string(&path)
-            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to read {}: {e}", path.display()))),
+        SourceFile::Include { path, .. } => std::fs::read_to_string(&path).map_err(|e| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to read {}: {e}", path.display()),
+            )
+        }),
     }
 }
 
@@ -686,7 +776,13 @@ async fn put_canvas_raw(
     body: String,
 ) -> Result<StatusCode, ApiError> {
     let target = resolve_source_file(&state, query.include.as_deref())?;
-    if !matches!(target, SourceFile::Include { is_canvas: false, .. }) {
+    if !matches!(
+        target,
+        SourceFile::Include {
+            is_canvas: false,
+            ..
+        }
+    ) {
         parse_or_error(&body)?;
     }
     match target {
@@ -697,7 +793,8 @@ async fn put_canvas_raw(
             *state.raw.lock().unwrap() = body;
         }
         SourceFile::Include { path, .. } => {
-            std::fs::write(&path, &body).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            std::fs::write(&path, &body)
+                .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         }
     }
     Ok(StatusCode::NO_CONTENT)
@@ -739,7 +836,9 @@ async fn put_canvas(
         // `meshfox:node` identity of its own) is skipped rather than
         // failing the whole batch, same "no-op for what doesn't apply"
         // tolerance `set_node_meta` returning `None` already had here.
-        let Ok(located) = locate_node(&state, &primary_raw, &node.id) else { continue };
+        let Ok(located) = locate_node(&state, &primary_raw, &node.id) else {
+            continue;
+        };
         // A group's *size* is always derived from its members, never
         // authored — ignore whatever width/height it reports rather than
         // let a computed value get written into the file as if it were
@@ -764,12 +863,16 @@ async fn put_canvas(
         };
         match &located.origin {
             None => {
-                if let Some(patched) = mdcanvas::set_node_meta(&primary_out, &located.local_id, &meta) {
+                if let Some(patched) =
+                    mdcanvas::set_node_meta(&primary_out, &located.local_id, &meta)
+                {
                     primary_out = patched;
                 }
             }
             Some(path) => {
-                let current = included_out.entry(path.clone()).or_insert_with(|| located.raw.clone());
+                let current = included_out
+                    .entry(path.clone())
+                    .or_insert_with(|| located.raw.clone());
                 if let Some(patched) = mdcanvas::set_node_meta(current, &located.local_id, &meta) {
                     *current = patched;
                 }
@@ -796,7 +899,8 @@ async fn put_canvas(
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     *state.raw.lock().unwrap() = primary_out;
     for (path, raw) in &included_out {
-        std::fs::write(path, raw).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        std::fs::write(path, raw)
+            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -879,8 +983,15 @@ async fn create_node(
     // it first so the new node is actually written into the file the
     // parent lives in, same as editing an existing node there already is.
     let located = locate_node(&state, &primary_raw, &req.parent_id)?;
-    let (updated, _new_id) = mdcanvas::insert_child_node(&located.raw, &located.local_id, &req.title)
-        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {:?}", req.parent_id)))?;
+    let (updated, _new_id) =
+        mdcanvas::insert_child_node(&located.raw, &located.local_id, &req.title).ok_or_else(
+            || {
+                ApiError(
+                    StatusCode::NOT_FOUND,
+                    format!("no node {:?}", req.parent_id),
+                )
+            },
+        )?;
     // Insertion can't actually break parsing, but validate anyway — same
     // validate-before-commit shape every other mutating endpoint here uses.
     parse_or_error(&updated)?;
@@ -911,8 +1022,12 @@ async fn put_options(
     Json(req): Json<UpdateOptionsRequest>,
 ) -> Result<Json<Canvas>, ApiError> {
     let raw = state.raw.lock().unwrap().clone();
-    let updated = mdcanvas::set_document_options(&raw, &req.options)
-        .ok_or_else(|| ApiError(StatusCode::UNPROCESSABLE_ENTITY, "document has no root node".to_string()))?;
+    let updated = mdcanvas::set_document_options(&raw, &req.options).ok_or_else(|| {
+        ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "document has no root node".to_string(),
+        )
+    })?;
     parse_or_error(&updated)?;
     state
         .save(&updated)
@@ -974,7 +1089,10 @@ struct UpdateNodeRequest {
 /// comment) resolved against `existing` (the node's current value, kept
 /// when nothing was sent) into the `Option<bool>` `Node::fold` itself
 /// wants. `422` for anything other than `"true"`/`"false"`/`"default"`.
-fn resolve_fold_override(raw: Option<&str>, existing: Option<bool>) -> Result<Option<bool>, ApiError> {
+fn resolve_fold_override(
+    raw: Option<&str>,
+    existing: Option<bool>,
+) -> Result<Option<bool>, ApiError> {
     match raw {
         None => Ok(existing),
         Some(s) => meshfox_core::parse_fold_override(s)
@@ -995,19 +1113,31 @@ mod resolve_fold_override_tests {
 
     #[test]
     fn not_sent_keeps_the_existing_value() {
-        assert_eq!(expect_ok(resolve_fold_override(None, Some(true))), Some(true));
+        assert_eq!(
+            expect_ok(resolve_fold_override(None, Some(true))),
+            Some(true)
+        );
         assert_eq!(expect_ok(resolve_fold_override(None, None)), None);
     }
 
     #[test]
     fn true_and_false_set_an_explicit_override() {
-        assert_eq!(expect_ok(resolve_fold_override(Some("true"), None)), Some(true));
-        assert_eq!(expect_ok(resolve_fold_override(Some("false"), Some(true))), Some(false));
+        assert_eq!(
+            expect_ok(resolve_fold_override(Some("true"), None)),
+            Some(true)
+        );
+        assert_eq!(
+            expect_ok(resolve_fold_override(Some("false"), Some(true))),
+            Some(false)
+        );
     }
 
     #[test]
     fn default_clears_back_to_no_override() {
-        assert_eq!(expect_ok(resolve_fold_override(Some("default"), Some(true))), None);
+        assert_eq!(
+            expect_ok(resolve_fold_override(Some("default"), Some(true))),
+            None
+        );
     }
 
     #[test]
@@ -1065,7 +1195,10 @@ async fn update_node(
                             ),
                         ));
                     }
-                    Ok(ExtraEdge { from: from_located.local_id, ..e.clone() })
+                    Ok(ExtraEdge {
+                        from: from_located.local_id,
+                        ..e.clone()
+                    })
                 })
                 .collect::<Result<Vec<_>, ApiError>>()
         })
@@ -1238,7 +1371,10 @@ struct FileContentResponse {
 /// `ApiError`-flavored wrapper around `meshfox_core::file_read::confine`,
 /// the one copy of this confinement logic (also used by `staticgen`'s
 /// static export and `constraint`'s `.content()`/`.json()`/...).
-fn resolve_confined_target(canvas_path: &std::path::Path, target: &str) -> Result<std::path::PathBuf, ApiError> {
+fn resolve_confined_target(
+    canvas_path: &std::path::Path,
+    target: &str,
+) -> Result<std::path::PathBuf, ApiError> {
     // `Path::parent()` on a bare filename (e.g. `canvas.md`, no directory
     // component) returns `Some("")`, not `None` — so a plain `unwrap_or(".")`
     // never fires and we'd try to canonicalize an empty path, which fails
@@ -1246,7 +1382,9 @@ fn resolve_confined_target(canvas_path: &std::path::Path, target: &str) -> Resul
     let canvas_dir = canvas_path.parent().filter(|p| !p.as_os_str().is_empty());
     let canvas_dir = canvas_dir.unwrap_or(std::path::Path::new("."));
     meshfox_core::confine(canvas_dir, target).map_err(|e| match e {
-        meshfox_core::ConfineError::DirNotFound(_, e) => ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        meshfox_core::ConfineError::DirNotFound(_, e) => {
+            ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        }
         meshfox_core::ConfineError::TargetNotFound(p, e) => {
             ApiError(StatusCode::NOT_FOUND, format!("{}: {e}", p.display()))
         }
@@ -1281,10 +1419,16 @@ async fn get_node_file_content(
         ));
     }
     let target = node.target.as_deref().ok_or_else(|| {
-        ApiError(StatusCode::UNPROCESSABLE_ENTITY, format!("node {id:?} has no target"))
+        ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("node {id:?} has no target"),
+        )
     })?;
 
-    let canvas_dir = state.canvas_path.parent().filter(|p| !p.as_os_str().is_empty());
+    let canvas_dir = state
+        .canvas_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty());
     let canvas_dir = canvas_dir.unwrap_or(std::path::Path::new("."));
     let preview = meshfox_core::preview(canvas_dir, target).map_err(|e| match e {
         meshfox_core::PreviewError::Confine(meshfox_core::ConfineError::DirNotFound(_, e)) => {
@@ -1297,14 +1441,19 @@ async fn get_node_file_content(
             StatusCode::FORBIDDEN,
             format!("{target:?} resolves outside the canvas directory"),
         ),
-        meshfox_core::PreviewError::Read(_, e) => ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        meshfox_core::PreviewError::Read(_, e) => {
+            ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        }
         meshfox_core::PreviewError::Binary => ApiError(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "target looks like a binary file, can't preview it as code".to_string(),
         ),
     })?;
 
-    Ok(Json(FileContentResponse { content: preview.content, truncated: preview.truncated }))
+    Ok(Json(FileContentResponse {
+        content: preview.content,
+        truncated: preview.truncated,
+    }))
 }
 
 /// Runs a runnable `file` node's `interpreter target` (see
@@ -1333,7 +1482,10 @@ async fn run_file_node(
             format!("node {id:?} isn't a runnable file node (needs type=\"file\", a target, and an interpreter)"),
         ));
     }
-    let interpreter = node.interpreter.clone().expect("checked by is_runnable_file");
+    let interpreter = node
+        .interpreter
+        .clone()
+        .expect("checked by is_runnable_file");
     let target = node.target.as_deref().expect("checked by is_runnable_file");
     let resolved_path = resolve_confined_target(&state.canvas_path, target)?;
 
@@ -1413,16 +1565,23 @@ async fn open_node_file(
             format!("node {id:?} is not a file node"),
         ));
     }
-    let target = node
-        .target
-        .as_deref()
-        .ok_or_else(|| ApiError(StatusCode::UNPROCESSABLE_ENTITY, format!("node {id:?} has no target")))?;
+    let target = node.target.as_deref().ok_or_else(|| {
+        ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("node {id:?} has no target"),
+        )
+    })?;
     let resolved = resolve_confined_target(&state.canvas_path, target)?;
 
     tokio::task::spawn_blocking(move || open::that(&resolved))
         .await
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("couldn't open the file: {e}")))?;
+        .map_err(|e| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("couldn't open the file: {e}"),
+            )
+        })?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1525,13 +1684,23 @@ async fn reparent_node(
             "can't reparent the root node".to_string(),
         ));
     }
-    canvas
-        .node(local_parent_id)
-        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {:?}", req.new_parent_id)))?;
-    if !node.extra_parents.iter().any(|e| &e.from == local_parent_id) {
+    canvas.node(local_parent_id).ok_or_else(|| {
+        ApiError(
+            StatusCode::NOT_FOUND,
+            format!("no node {:?}", req.new_parent_id),
+        )
+    })?;
+    if !node
+        .extra_parents
+        .iter()
+        .any(|e| &e.from == local_parent_id)
+    {
         return Err(ApiError(
             StatusCode::UNPROCESSABLE_ENTITY,
-            format!("{:?} is not one of {id:?}'s extra parents", req.new_parent_id),
+            format!(
+                "{:?} is not one of {id:?}'s extra parents",
+                req.new_parent_id
+            ),
         ));
     }
     // `mdcanvas::reparent_node` moves `id`'s markdown fragment verbatim,
@@ -1545,12 +1714,16 @@ async fn reparent_node(
     // that (per the check above) never leaves this same file, so it
     // cancels out.
     let abs_before = canvas.resolve_absolute_position(local_id);
-    let mut updated = mdcanvas::reparent_node(&raw, local_id, local_parent_id).ok_or_else(|| {
-        ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!("can't reparent {id:?} onto {:?} (would create a cycle)", req.new_parent_id),
-        )
-    })?;
+    let mut updated =
+        mdcanvas::reparent_node(&raw, local_id, local_parent_id).ok_or_else(|| {
+            ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!(
+                    "can't reparent {id:?} onto {:?} (would create a cycle)",
+                    req.new_parent_id
+                ),
+            )
+        })?;
     let new_canvas = parse_or_error(&updated)?;
     // ...then, once the *new* parent chain is known, convert it back into
     // whatever frame `id` should now store its position in, so it stays
@@ -1616,15 +1789,16 @@ async fn rename_node_id(
     // existing (possibly-namespaced) one — used verbatim as the new local
     // id in whichever file `id` lives in; `include::resolve` re-derives
     // the composed, namespaced form from it next time regardless.
-    let updated = mdcanvas::rename_node_id(&located.raw, &located.local_id, &req.new_id).map_err(|e| {
-        let status = match e {
-            mdcanvas::RenameIdError::NotFound(_) => StatusCode::NOT_FOUND,
-            mdcanvas::RenameIdError::AlreadyExists(_)
-            | mdcanvas::RenameIdError::Empty
-            | mdcanvas::RenameIdError::InvalidChar => StatusCode::UNPROCESSABLE_ENTITY,
-        };
-        ApiError(status, e.to_string())
-    })?;
+    let updated =
+        mdcanvas::rename_node_id(&located.raw, &located.local_id, &req.new_id).map_err(|e| {
+            let status = match e {
+                mdcanvas::RenameIdError::NotFound(_) => StatusCode::NOT_FOUND,
+                mdcanvas::RenameIdError::AlreadyExists(_)
+                | mdcanvas::RenameIdError::Empty
+                | mdcanvas::RenameIdError::InvalidChar => StatusCode::UNPROCESSABLE_ENTITY,
+            };
+            ApiError(status, e.to_string())
+        })?;
     parse_or_error(&updated)?;
     commit_located(&state, &located, &updated)?;
     let response_raw = state.raw.lock().unwrap().clone();
@@ -1675,7 +1849,10 @@ async fn run_block(
     let needed = meshfox_core::env_var_names_for_chain(&canvas, &chain);
     let decls = meshfox_core::declared_vars(&canvas)
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
-    let relevant_decls: Vec<_> = decls.into_iter().filter(|d| needed.contains(&d.name)).collect();
+    let relevant_decls: Vec<_> = decls
+        .into_iter()
+        .filter(|d| needed.contains(&d.name))
+        .collect();
     validate_var_overrides(&relevant_decls, &req.vars)?;
     let resolved_vars = {
         let mut cache = state.vars_cache.lock().unwrap();
@@ -1850,7 +2027,10 @@ async fn run_block(
 /// `deps::visit`) means a chain can only ever contain one if the
 /// originally-requested block itself is `tty` too, but this checks every
 /// entry anyway rather than leaning on that invariant staying true forever.
-fn find_tty_block(canvas: &Canvas, chain: &[meshfox_core::BlockAddr]) -> Option<meshfox_core::BlockAddr> {
+fn find_tty_block(
+    canvas: &Canvas,
+    chain: &[meshfox_core::BlockAddr],
+) -> Option<meshfox_core::BlockAddr> {
     chain
         .iter()
         .find(|addr| {
@@ -1925,7 +2105,11 @@ async fn run_block_tty(
 ) -> Result<Response, ApiError> {
     let raw_snapshot = state.raw.lock().unwrap().clone();
     let canvas = parse_or_error(&raw_snapshot)?;
-    let path: Vec<&str> = if query.path.is_empty() { Vec::new() } else { query.path.split(',').collect() };
+    let path: Vec<&str> = if query.path.is_empty() {
+        Vec::new()
+    } else {
+        query.path.split(',').collect()
+    };
     let chain = meshfox_core::resolve_run_chain(&canvas, &path, &query.block, !query.no_deps)?;
     let persist = query.persist;
     let (cols, rows) = (query.cols.max(1), query.rows.max(1));
@@ -1943,7 +2127,10 @@ async fn run_block_tty(
     let needed = meshfox_core::env_var_names_for_chain(&canvas, &chain);
     let decls = meshfox_core::declared_vars(&canvas)
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
-    let relevant_decls: Vec<_> = decls.into_iter().filter(|d| needed.contains(&d.name)).collect();
+    let relevant_decls: Vec<_> = decls
+        .into_iter()
+        .filter(|d| needed.contains(&d.name))
+        .collect();
     validate_var_overrides(&relevant_decls, &requested_vars)?;
     let resolved_vars = {
         let mut cache = state.vars_cache.lock().unwrap();
@@ -1968,7 +2155,17 @@ async fn run_block_tty(
     state.runs.lock().unwrap().insert(run_id.clone(), kill_tx);
 
     Ok(ws.on_upgrade(move |socket| {
-        run_tty_chain(socket, state, run_id, chain, resolved_vars, persist, cols, rows, kill_rx)
+        run_tty_chain(
+            socket,
+            state,
+            run_id,
+            chain,
+            resolved_vars,
+            persist,
+            cols,
+            rows,
+            kill_rx,
+        )
     }))
 }
 
@@ -2003,9 +2200,19 @@ async fn run_tty_chain(
     rows: u16,
     mut kill_rx: oneshot::Receiver<()>,
 ) {
-    let _guard = RunGuard { state: Arc::clone(&state), run_id: run_id.clone() };
+    let _guard = RunGuard {
+        state: Arc::clone(&state),
+        run_id: run_id.clone(),
+    };
 
-    if !send_event(&mut socket, &RunEvent::Started { run_id: run_id.clone() }).await {
+    if !send_event(
+        &mut socket,
+        &RunEvent::Started {
+            run_id: run_id.clone(),
+        },
+    )
+    .await
+    {
         return;
     }
 
@@ -2014,17 +2221,33 @@ async fn run_tty_chain(
     let mut killed = false;
 
     for addr in &chain {
-        if !send_event(&mut socket, &RunEvent::StepStart { node_id: addr.node_id.clone(), block: addr.block_name.clone() }).await
+        if !send_event(
+            &mut socket,
+            &RunEvent::StepStart {
+                node_id: addr.node_id.clone(),
+                block: addr.block_name.clone(),
+            },
+        )
+        .await
         {
             return;
         }
 
         // Re-parse so an earlier step's freshly-patched cache is visible
         // before this one runs — same reasoning `run_block` already has.
-        let node_text = match Canvas::from_markdown(&raw).ok().and_then(|c| c.node(&addr.node_id).map(|n| n.text.clone())) {
+        let node_text = match Canvas::from_markdown(&raw)
+            .ok()
+            .and_then(|c| c.node(&addr.node_id).map(|n| n.text.clone()))
+        {
             Some(text) => text,
             None => {
-                send_event(&mut socket, &RunEvent::Error { message: format!("node {:?} not found", addr.node_id) }).await;
+                send_event(
+                    &mut socket,
+                    &RunEvent::Error {
+                        message: format!("node {:?} not found", addr.node_id),
+                    },
+                )
+                .await;
                 break;
             }
         };
@@ -2034,7 +2257,12 @@ async fn run_tty_chain(
         else {
             send_event(
                 &mut socket,
-                &RunEvent::Error { message: format!("no runnable block named {:?} in node {:?}", addr.block_name, addr.node_id) },
+                &RunEvent::Error {
+                    message: format!(
+                        "no runnable block named {:?} in node {:?}",
+                        addr.block_name, addr.node_id
+                    ),
+                },
             )
             .await;
             break;
@@ -2044,11 +2272,27 @@ async fn run_tty_chain(
         let mut full_output = String::new();
 
         let exit_code = if block.tty {
-            if !send_event(&mut socket, &RunEvent::TtyStart { node_id: addr.node_id.clone(), block: addr.block_name.clone() }).await
+            if !send_event(
+                &mut socket,
+                &RunEvent::TtyStart {
+                    node_id: addr.node_id.clone(),
+                    block: addr.block_name.clone(),
+                },
+            )
+            .await
             {
                 return;
             }
-            match relay_tty_step(&mut socket, &block.code, &block_env, cols, rows, &mut kill_rx).await {
+            match relay_tty_step(
+                &mut socket,
+                &block.code,
+                &block_env,
+                cols,
+                rows,
+                &mut kill_rx,
+            )
+            .await
+            {
                 TtyStepOutcome::Exited(code) => code,
                 TtyStepOutcome::Killed => {
                     killed = true;
@@ -2061,7 +2305,13 @@ async fn run_tty_chain(
             let mut proc = match stream_exec::spawn_bash(&block.code, &block_env) {
                 Ok(p) => p,
                 Err(e) => {
-                    send_event(&mut socket, &RunEvent::Error { message: e.to_string() }).await;
+                    send_event(
+                        &mut socket,
+                        &RunEvent::Error {
+                            message: e.to_string(),
+                        },
+                    )
+                    .await;
                     break;
                 }
             };
@@ -2098,12 +2348,26 @@ async fn run_tty_chain(
         };
 
         if killed {
-            send_event(&mut socket, &RunEvent::Killed { node_id: addr.node_id.clone(), block: addr.block_name.clone() }).await;
+            send_event(
+                &mut socket,
+                &RunEvent::Killed {
+                    node_id: addr.node_id.clone(),
+                    block: addr.block_name.clone(),
+                },
+            )
+            .await;
             break;
         }
 
-        if !send_event(&mut socket, &RunEvent::StepEnd { node_id: addr.node_id.clone(), block: addr.block_name.clone(), exit_code })
-            .await
+        if !send_event(
+            &mut socket,
+            &RunEvent::StepEnd {
+                node_id: addr.node_id.clone(),
+                block: addr.block_name.clone(),
+                exit_code,
+            },
+        )
+        .await
         {
             return;
         }
@@ -2114,8 +2378,12 @@ async fn run_tty_chain(
         // writing a `tty` step's (empty) `full_output` into the file for a
         // document that reached this endpoint without being validated.
         if persist && block.cache && !block.tty {
-            let result = ExecOutput { exit_code, output: full_output };
-            if let Some(updated) = meshfox_core::write_output(&node_text, &addr.block_name, &result) {
+            let result = ExecOutput {
+                exit_code,
+                output: full_output,
+            };
+            if let Some(updated) = meshfox_core::write_output(&node_text, &addr.block_name, &result)
+            {
                 if let Some(patched) = mdcanvas::set_node_body(&raw, &addr.node_id, &updated) {
                     raw = patched;
                 }
@@ -2131,13 +2399,25 @@ async fn run_tty_chain(
         match state.save(&raw) {
             Ok(()) => *state.raw.lock().unwrap() = raw,
             Err(e) => {
-                send_event(&mut socket, &RunEvent::Error { message: e.to_string() }).await;
+                send_event(
+                    &mut socket,
+                    &RunEvent::Error {
+                        message: e.to_string(),
+                    },
+                )
+                .await;
             }
         }
     }
 
     if !killed {
-        send_event(&mut socket, &RunEvent::Done { exit_code: final_exit_code }).await;
+        send_event(
+            &mut socket,
+            &RunEvent::Done {
+                exit_code: final_exit_code,
+            },
+        )
+        .await;
     }
 }
 
@@ -2169,7 +2449,13 @@ async fn relay_tty_step(
     let mut pty = match pty_exec::spawn_bash(code, envs, cols, rows) {
         Ok(p) => p,
         Err(e) => {
-            send_event(socket, &RunEvent::Error { message: e.to_string() }).await;
+            send_event(
+                socket,
+                &RunEvent::Error {
+                    message: e.to_string(),
+                },
+            )
+            .await;
             return TtyStepOutcome::Exited(-1);
         }
     };
@@ -2361,11 +2647,7 @@ async fn serve_canvas_relative_file(state: &AppState, path: &str) -> Option<Resp
 
     let bytes = std::fs::read(&resolved).ok()?;
     let mime = mime_guess::from_path(&resolved).first_or_octet_stream();
-    Some((
-        [(header::CONTENT_TYPE, mime.as_ref().to_string())],
-        bytes,
-    )
-        .into_response())
+    Some(([(header::CONTENT_TYPE, mime.as_ref().to_string())], bytes).into_response())
 }
 
 async fn serve_embedded(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
@@ -2410,7 +2692,10 @@ async fn serve_embedded(State(state): State<Arc<AppState>>, uri: Uri) -> Respons
 async fn build_state(canvas_path: PathBuf, auto_exit: bool) -> std::io::Result<Arc<AppState>> {
     let raw = std::fs::read_to_string(&canvas_path)?;
     if let Err(e) = Canvas::from_markdown(&raw) {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            e.to_string(),
+        ));
     }
 
     let vars_cache = VarCache::load(&canvas_path)?;
@@ -2443,7 +2728,10 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/nodes/:id/open", post(open_node_file))
         .route("/api/options", put(put_options))
         .route("/api/vars", get(get_vars))
-        .route("/api/vars/configure", get(get_configure_vars).post(post_configure_vars))
+        .route(
+            "/api/vars/configure",
+            get(get_configure_vars).post(post_configure_vars),
+        )
         .route("/api/run", post(run_block))
         .route("/api/run/tty", get(run_block_tty))
         .route("/api/kill", post(kill_run))
@@ -2459,14 +2747,22 @@ fn build_app(state: Arc<AppState>) -> Router {
 /// closed — see `TabGuard`). `port` of `0` asks the OS to assign a free
 /// port instead — the actual bound port is read back from the listener
 /// below.
-pub async fn run(canvas_path: PathBuf, port: u16, open_browser: bool, auto_exit: bool) -> std::io::Result<()> {
+pub async fn run(
+    canvas_path: PathBuf,
+    port: u16,
+    open_browser: bool,
+    auto_exit: bool,
+) -> std::io::Result<()> {
     let state = build_state(canvas_path.clone(), auto_exit).await?;
     spawn_file_watcher(Arc::clone(&state));
     let app = build_app(state);
 
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).await?;
     let addr = listener.local_addr()?;
-    println!("meshfox: serving {} on http://{addr}", canvas_path.display());
+    println!(
+        "meshfox: serving {} on http://{addr}",
+        canvas_path.display()
+    );
 
     if open_browser {
         // Best-effort: no browser, no display, or an unsupported platform
@@ -2486,9 +2782,13 @@ pub async fn run(canvas_path: PathBuf, port: u16, open_browser: bool, auto_exit:
 /// (`println!`, browser-opening, auto-exit).
 #[cfg(test)]
 async fn spawn_test_server(canvas_path: PathBuf) -> SocketAddr {
-    let state = build_state(canvas_path, false).await.expect("valid test canvas");
+    let state = build_state(canvas_path, false)
+        .await
+        .expect("valid test canvas");
     let app = build_app(state);
-    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await.expect("bind");
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind");
     let addr = listener.local_addr().expect("local_addr");
     tokio::spawn(async move {
         axum::serve(listener, app).await.expect("server");
@@ -2502,7 +2802,10 @@ mod clear_layout_tests {
 
     fn write_test_canvas(contents: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
-        path.push(format!("meshfox-clear-layout-test-{}.canvas.md", uuid::Uuid::new_v4()));
+        path.push(format!(
+            "meshfox-clear-layout-test-{}.canvas.md",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::write(&path, contents).unwrap();
         path
     }
@@ -2524,8 +2827,12 @@ mod clear_layout_tests {
         let canvas_path = write_test_canvas(CANVAS);
         let target_path = canvas_path.with_file_name("other-readme.md");
         std::fs::write(&target_path, "included body\n").unwrap();
-        let canvas_path = write_test_canvas(&CANVAS.replace("./other/README.md", &target_path.display().to_string()));
-        let state = build_state(canvas_path.clone(), false).await.expect("valid test canvas");
+        let canvas_path = write_test_canvas(
+            &CANVAS.replace("./other/README.md", &target_path.display().to_string()),
+        );
+        let state = build_state(canvas_path.clone(), false)
+            .await
+            .expect("valid test canvas");
 
         let Json(cleared) = match clear_layout(State(state)).await {
             Ok(json) => json,
@@ -2533,8 +2840,14 @@ mod clear_layout_tests {
         };
         let readme = cleared.node("readme").expect("readme node still present");
 
-        assert_eq!(readme.x, None, "include node's own authored x should be cleared");
-        assert_eq!(readme.y, None, "include node's own authored y should be cleared");
+        assert_eq!(
+            readme.x, None,
+            "include node's own authored x should be cleared"
+        );
+        assert_eq!(
+            readme.y, None,
+            "include node's own authored y should be cleared"
+        );
 
         let _ = std::fs::remove_file(&canvas_path);
         let _ = std::fs::remove_file(&target_path);
@@ -2552,7 +2865,10 @@ mod reparent_position_tests {
 
     fn write_test_canvas(contents: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
-        path.push(format!("meshfox-reparent-position-test-{}.canvas.md", uuid::Uuid::new_v4()));
+        path.push(format!(
+            "meshfox-reparent-position-test-{}.canvas.md",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::write(&path, contents).unwrap();
         path
     }
@@ -2579,13 +2895,17 @@ mod reparent_position_tests {
             "<!-- meshfox:edge from=\"frame\" -->\n\nbody\n",
         );
         let canvas_path = write_test_canvas(CANVAS);
-        let state = build_state(canvas_path.clone(), false).await.expect("valid test canvas");
+        let state = build_state(canvas_path.clone(), false)
+            .await
+            .expect("valid test canvas");
 
         let updated = expect_ok(
             reparent_node(
                 State(state),
                 Path("wanderer".to_string()),
-                Json(ReparentNodeRequest { new_parent_id: "frame".to_string() }),
+                Json(ReparentNodeRequest {
+                    new_parent_id: "frame".to_string(),
+                }),
             )
             .await,
         );
@@ -2612,13 +2932,17 @@ mod reparent_position_tests {
             "## Elsewhere\n<!-- meshfox:node id=\"elsewhere\" -->\n\nbody\n",
         );
         let canvas_path = write_test_canvas(CANVAS);
-        let state = build_state(canvas_path.clone(), false).await.expect("valid test canvas");
+        let state = build_state(canvas_path.clone(), false)
+            .await
+            .expect("valid test canvas");
 
         let updated = expect_ok(
             reparent_node(
                 State(state),
                 Path("member".to_string()),
-                Json(ReparentNodeRequest { new_parent_id: "root".to_string() }),
+                Json(ReparentNodeRequest {
+                    new_parent_id: "root".to_string(),
+                }),
             )
             .await,
         );
@@ -2645,13 +2969,17 @@ mod reparent_position_tests {
             "<!-- meshfox:edge from=\"frame\" -->\n\nbody\n",
         );
         let canvas_path = write_test_canvas(CANVAS);
-        let state = build_state(canvas_path.clone(), false).await.expect("valid test canvas");
+        let state = build_state(canvas_path.clone(), false)
+            .await
+            .expect("valid test canvas");
 
         let updated = expect_ok(
             reparent_node(
                 State(state),
                 Path("wanderer".to_string()),
-                Json(ReparentNodeRequest { new_parent_id: "frame".to_string() }),
+                Json(ReparentNodeRequest {
+                    new_parent_id: "frame".to_string(),
+                }),
             )
             .await,
         );
@@ -2704,7 +3032,10 @@ mod include_edit_tests {
     /// `child/root`/`child/leaf` once resolved), in a fresh temp dir shared
     /// by both files — returns the primary document's own path.
     fn write_base_and_child_canvas() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("meshfox-include-edit-test-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-include-edit-test-{}",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("child.canvas.md"),
@@ -2731,18 +3062,25 @@ mod include_edit_tests {
         let base_path = write_base_and_child_canvas();
         let child_path = base_path.parent().unwrap().join("child.canvas.md");
         let base_before = std::fs::read_to_string(&base_path).unwrap();
-        let state = build_state(base_path.clone(), false).await.expect("valid test canvas");
+        let state = build_state(base_path.clone(), false)
+            .await
+            .expect("valid test canvas");
 
         let mut req = blank_update_request();
         req.text = Some("new leaf body".to_string());
-        let updated = expect_ok(update_node(State(state), Path("child/leaf".to_string()), Json(req)).await);
+        let updated =
+            expect_ok(update_node(State(state), Path("child/leaf".to_string()), Json(req)).await);
 
-        let leaf = updated.node("child/leaf").expect("child/leaf still present");
+        let leaf = updated
+            .node("child/leaf")
+            .expect("child/leaf still present");
         assert_eq!(leaf.text, "new leaf body");
         // The primary document itself is untouched — the edit landed in
         // `child.canvas.md`, addressed there by its own local id `leaf`.
         assert_eq!(std::fs::read_to_string(&base_path).unwrap(), base_before);
-        assert!(std::fs::read_to_string(&child_path).unwrap().contains("new leaf body"));
+        assert!(std::fs::read_to_string(&child_path)
+            .unwrap()
+            .contains("new leaf body"));
 
         let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
     }
@@ -2751,20 +3089,30 @@ mod include_edit_tests {
     async fn create_node_under_an_included_parent_writes_into_the_included_file() {
         let base_path = write_base_and_child_canvas();
         let child_path = base_path.parent().unwrap().join("child.canvas.md");
-        let state = build_state(base_path.clone(), false).await.expect("valid test canvas");
+        let state = build_state(base_path.clone(), false)
+            .await
+            .expect("valid test canvas");
 
         let updated = expect_ok(
             create_node(
                 State(state),
-                Json(CreateNodeRequest { parent_id: "child/root".to_string(), title: "New Kid".to_string() }),
+                Json(CreateNodeRequest {
+                    parent_id: "child/root".to_string(),
+                    title: "New Kid".to_string(),
+                }),
             )
             .await,
         );
 
-        let new_node =
-            updated.nodes.iter().find(|n| n.title == "New Kid").expect("new node present in the response");
+        let new_node = updated
+            .nodes
+            .iter()
+            .find(|n| n.title == "New Kid")
+            .expect("new node present in the response");
         assert_eq!(new_node.parent.as_deref(), Some("child/root"));
-        assert!(std::fs::read_to_string(&child_path).unwrap().contains("New Kid"));
+        assert!(std::fs::read_to_string(&child_path)
+            .unwrap()
+            .contains("New Kid"));
 
         let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
     }
@@ -2774,16 +3122,24 @@ mod include_edit_tests {
         let base_path = write_base_and_child_canvas();
         let child_path = base_path.parent().unwrap().join("child.canvas.md");
         let base_before = std::fs::read_to_string(&base_path).unwrap();
-        let state = build_state(base_path.clone(), false).await.expect("valid test canvas");
+        let state = build_state(base_path.clone(), false)
+            .await
+            .expect("valid test canvas");
 
         let updated = expect_ok(
-            remove_node(State(state), Path("child/leaf".to_string()), Query(DeleteNodeQuery { children: None }))
-                .await,
+            remove_node(
+                State(state),
+                Path("child/leaf".to_string()),
+                Query(DeleteNodeQuery { children: None }),
+            )
+            .await,
         );
 
         assert!(updated.node("child/leaf").is_none());
         assert_eq!(std::fs::read_to_string(&base_path).unwrap(), base_before);
-        assert!(!std::fs::read_to_string(&child_path).unwrap().contains("Leaf"));
+        assert!(!std::fs::read_to_string(&child_path)
+            .unwrap()
+            .contains("Leaf"));
 
         let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
     }
@@ -2791,19 +3147,25 @@ mod include_edit_tests {
     #[tokio::test]
     async fn rename_node_id_renames_within_the_included_file() {
         let base_path = write_base_and_child_canvas();
-        let state = build_state(base_path.clone(), false).await.expect("valid test canvas");
+        let state = build_state(base_path.clone(), false)
+            .await
+            .expect("valid test canvas");
 
         let updated = expect_ok(
             rename_node_id(
                 State(state),
                 Path("child/leaf".to_string()),
-                Json(RenameNodeIdRequest { new_id: "renamed-leaf".to_string() }),
+                Json(RenameNodeIdRequest {
+                    new_id: "renamed-leaf".to_string(),
+                }),
             )
             .await,
         );
 
         assert!(updated.node("child/leaf").is_none());
-        let renamed = updated.node("child/renamed-leaf").expect("renamed node present under its new namespaced id");
+        let renamed = updated
+            .node("child/renamed-leaf")
+            .expect("renamed node present under its new namespaced id");
         assert_eq!(renamed.title, "Leaf");
 
         let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
@@ -2811,7 +3173,10 @@ mod include_edit_tests {
 
     #[tokio::test]
     async fn update_node_on_a_plain_markdown_include_rejects_a_text_edit_with_a_clear_reason() {
-        let dir = std::env::temp_dir().join(format!("meshfox-include-edit-test-md-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-include-edit-test-md-{}",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("notes.md"), "# Notes\n\nsome prose\n").unwrap();
         let base_path = dir.join("base.canvas.md");
@@ -2824,13 +3189,19 @@ mod include_edit_tests {
         )
         .unwrap();
         let base_before = std::fs::read_to_string(&base_path).unwrap();
-        let state = build_state(base_path.clone(), false).await.expect("valid test canvas");
+        let state = build_state(base_path.clone(), false)
+            .await
+            .expect("valid test canvas");
 
         let mut req = blank_update_request();
         req.text = Some("clobbered".to_string());
         let err = expect_err(update_node(State(state), Path("notes".to_string()), Json(req)).await);
         assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(err.1.contains("include target file"), "unexpected message: {}", err.1);
+        assert!(
+            err.1.contains("include target file"),
+            "unexpected message: {}",
+            err.1
+        );
         // Nothing was written — the link is still there, not clobbered.
         assert_eq!(std::fs::read_to_string(&base_path).unwrap(), base_before);
 
@@ -2840,9 +3211,18 @@ mod include_edit_tests {
     #[tokio::test]
     async fn update_node_on_an_unknown_id_still_404s() {
         let base_path = write_base_and_child_canvas();
-        let state = build_state(base_path.clone(), false).await.expect("valid test canvas");
+        let state = build_state(base_path.clone(), false)
+            .await
+            .expect("valid test canvas");
 
-        let err = expect_err(update_node(State(state), Path("nope".to_string()), Json(blank_update_request())).await);
+        let err = expect_err(
+            update_node(
+                State(state),
+                Path("nope".to_string()),
+                Json(blank_update_request()),
+            )
+            .await,
+        );
         assert_eq!(err.0, StatusCode::NOT_FOUND);
 
         let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
@@ -2853,7 +3233,9 @@ mod include_edit_tests {
         let base_path = write_base_and_child_canvas();
         let child_path = base_path.parent().unwrap().join("child.canvas.md");
         let base_before = std::fs::read_to_string(&base_path).unwrap();
-        let state = build_state(base_path.clone(), false).await.expect("valid test canvas");
+        let state = build_state(base_path.clone(), false)
+            .await
+            .expect("valid test canvas");
 
         let primary_raw = state.raw.lock().unwrap().clone();
         let mut canvas = resolved_canvas(&primary_raw, &state.canvas_path)
@@ -2870,7 +3252,10 @@ mod include_edit_tests {
         // `child.canvas.md`, addressed there by its own local id `leaf`.
         assert_eq!(std::fs::read_to_string(&base_path).unwrap(), base_before);
         let child_after = std::fs::read_to_string(&child_path).unwrap();
-        assert!(child_after.contains("id=\"leaf\" x=123 y=456"), "child file: {child_after}");
+        assert!(
+            child_after.contains("id=\"leaf\" x=123 y=456"),
+            "child file: {child_after}"
+        );
 
         let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
     }
@@ -2878,9 +3263,13 @@ mod include_edit_tests {
     #[tokio::test]
     async fn get_includes_lists_the_child_canvas_include() {
         let base_path = write_base_and_child_canvas();
-        let state = build_state(base_path.clone(), false).await.expect("valid test canvas");
+        let state = build_state(base_path.clone(), false)
+            .await
+            .expect("valid test canvas");
 
-        let Json(entries) = get_includes(State(state)).await.unwrap_or_else(|e| panic!("failed: {}", e.1));
+        let Json(entries) = get_includes(State(state))
+            .await
+            .unwrap_or_else(|e| panic!("failed: {}", e.1));
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].node_id, "child");
@@ -2897,17 +3286,27 @@ mod include_edit_tests {
         let base_path = write_base_and_child_canvas();
         let child_path = base_path.parent().unwrap().join("child.canvas.md");
         let base_before = std::fs::read_to_string(&base_path).unwrap();
-        let state = build_state(base_path.clone(), false).await.expect("valid test canvas");
-
-        let source = get_canvas_raw(State(state.clone()), Query(SourceFileQuery { include: Some("child".to_string()) }))
+        let state = build_state(base_path.clone(), false)
             .await
-            .unwrap_or_else(|e| panic!("get failed: {}", e.1));
+            .expect("valid test canvas");
+
+        let source = get_canvas_raw(
+            State(state.clone()),
+            Query(SourceFileQuery {
+                include: Some("child".to_string()),
+            }),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("get failed: {}", e.1));
         assert_eq!(source, std::fs::read_to_string(&child_path).unwrap());
 
-        let new_source = format!("{source}\n## Extra\n<!-- meshfox:node id=\"extra\" -->\n\nmore\n");
+        let new_source =
+            format!("{source}\n## Extra\n<!-- meshfox:node id=\"extra\" -->\n\nmore\n");
         let status = put_canvas_raw(
             State(state),
-            Query(SourceFileQuery { include: Some("child".to_string()) }),
+            Query(SourceFileQuery {
+                include: Some("child".to_string()),
+            }),
             new_source.clone(),
         )
         .await
@@ -2924,9 +3323,18 @@ mod include_edit_tests {
     #[tokio::test]
     async fn source_mode_rejects_an_unknown_include_id() {
         let base_path = write_base_and_child_canvas();
-        let state = build_state(base_path.clone(), false).await.expect("valid test canvas");
+        let state = build_state(base_path.clone(), false)
+            .await
+            .expect("valid test canvas");
 
-        let err = match get_canvas_raw(State(state), Query(SourceFileQuery { include: Some("nope".to_string()) })).await {
+        let err = match get_canvas_raw(
+            State(state),
+            Query(SourceFileQuery {
+                include: Some("nope".to_string()),
+            }),
+        )
+        .await
+        {
             Ok(_) => panic!("expected an error"),
             Err(e) => e,
         };
@@ -2937,7 +3345,10 @@ mod include_edit_tests {
 
     #[tokio::test]
     async fn source_mode_on_a_plain_markdown_include_skips_canvas_validation() {
-        let dir = std::env::temp_dir().join(format!("meshfox-include-edit-test-md-source-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-include-edit-test-md-source-{}",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("notes.md"), "# Notes\n\nsome prose\n").unwrap();
         let base_path = dir.join("base.canvas.md");
@@ -2949,7 +3360,9 @@ mod include_edit_tests {
             ),
         )
         .unwrap();
-        let state = build_state(base_path.clone(), false).await.expect("valid test canvas");
+        let state = build_state(base_path.clone(), false)
+            .await
+            .expect("valid test canvas");
 
         // Ordinary prose with no single H1 root and no `meshfox:node`
         // structure at all — would fail `parse_or_error` as a canvas, and
@@ -2958,13 +3371,18 @@ mod include_edit_tests {
         let new_prose = "Just some words.\n\nNo heading here at all.\n";
         let status = put_canvas_raw(
             State(state),
-            Query(SourceFileQuery { include: Some("notes".to_string()) }),
+            Query(SourceFileQuery {
+                include: Some("notes".to_string()),
+            }),
             new_prose.to_string(),
         )
         .await
         .unwrap_or_else(|e| panic!("put failed: {}", e.1));
         assert_eq!(status, StatusCode::NO_CONTENT);
-        assert_eq!(std::fs::read_to_string(dir.join("notes.md")).unwrap(), new_prose);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("notes.md")).unwrap(),
+            new_prose
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2982,7 +3400,10 @@ mod ws_tests {
 
     fn write_test_canvas(contents: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
-        path.push(format!("meshfox-tty-test-{}.canvas.md", uuid::Uuid::new_v4()));
+        path.push(format!(
+            "meshfox-tty-test-{}.canvas.md",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::write(&path, contents).unwrap();
         path
     }
@@ -2993,7 +3414,9 @@ mod ws_tests {
     async fn next_event(ws: &mut TestSocket) -> serde_json::Value {
         loop {
             match ws.next().await.expect("socket open").expect("no ws error") {
-                WsMessage::Text(t) => return serde_json::from_str(&t).expect("valid RunEvent JSON"),
+                WsMessage::Text(t) => {
+                    return serde_json::from_str(&t).expect("valid RunEvent JSON")
+                }
                 _ => continue,
             }
         }
@@ -3013,7 +3436,9 @@ mod ws_tests {
                         return String::from_utf8_lossy(&collected).into_owned();
                     }
                 }
-                WsMessage::Text(t) => panic!("unexpected RunEvent while waiting for pty output: {t}"),
+                WsMessage::Text(t) => {
+                    panic!("unexpected RunEvent while waiting for pty output: {t}")
+                }
                 _ => continue,
             }
         }
@@ -3032,7 +3457,9 @@ mod ws_tests {
         let canvas_path = write_test_canvas(TTY_CANVAS);
         let addr = spawn_test_server(canvas_path.clone()).await;
         let url = format!("ws://{addr}/api/run/tty?path=shell&block=interactive&cols=80&rows=24");
-        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("connect");
 
         let started = next_event(&mut ws).await;
         assert_eq!(started["type"], "started");
@@ -3051,7 +3478,9 @@ mod ws_tests {
         // process's own "ready" line before typing anything.
         read_until(&mut ws, "ready").await;
 
-        ws.send(WsMessage::Binary(b"hello\n".to_vec().into())).await.expect("send input");
+        ws.send(WsMessage::Binary(b"hello\n".to_vec().into()))
+            .await
+            .expect("send input");
         read_until(&mut ws, "got: hello").await;
 
         let step_end = next_event(&mut ws).await;
@@ -3074,7 +3503,9 @@ mod ws_tests {
         ));
         let addr = spawn_test_server(canvas_path.clone()).await;
         let url = format!("ws://{addr}/api/run/tty?path=shell&block=interactive&cols=80&rows=24");
-        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("connect");
 
         let started = next_event(&mut ws).await;
         let run_id = started["runId"].as_str().expect("runId").to_string();
@@ -3110,7 +3541,12 @@ mod ws_tests {
         let mut response = String::new();
         stream.read_to_string(&mut response).await.expect("read");
         let status_line = response.lines().next().expect("status line");
-        status_line.split_whitespace().nth(1).expect("status code").parse().expect("numeric status")
+        status_line
+            .split_whitespace()
+            .nth(1)
+            .expect("status code")
+            .parse()
+            .expect("numeric status")
     }
 }
 
@@ -3122,7 +3558,10 @@ mod run_file_tests {
 
     fn write_test_canvas(contents: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
-        path.push(format!("meshfox-run-file-test-{}.canvas.md", uuid::Uuid::new_v4()));
+        path.push(format!(
+            "meshfox-run-file-test-{}.canvas.md",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::write(&path, contents).unwrap();
         path
     }
@@ -3149,7 +3588,10 @@ mod run_file_tests {
             .and_then(|l| l.split_whitespace().nth(1))
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        let body = if head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+        let body = if head
+            .to_ascii_lowercase()
+            .contains("transfer-encoding: chunked")
+        {
             dechunk(raw_body)
         } else {
             raw_body.to_string()
@@ -3167,7 +3609,9 @@ mod run_file_tests {
         let mut rest = raw;
         loop {
             let Some(nl) = rest.find("\r\n") else { break };
-            let Ok(size) = usize::from_str_radix(rest[..nl].trim(), 16) else { break };
+            let Ok(size) = usize::from_str_radix(rest[..nl].trim(), 16) else {
+                break;
+            };
             rest = &rest[nl + 2..];
             if size == 0 || size > rest.len() {
                 break;
@@ -3211,10 +3655,15 @@ mod run_file_tests {
         assert_eq!(events[1]["nodeId"], "seed");
         assert_eq!(events[1]["block"], "seed");
         assert!(
-            events.iter().any(|e| e["type"] == "output" && e["text"] == "hi from seed"),
+            events
+                .iter()
+                .any(|e| e["type"] == "output" && e["text"] == "hi from seed"),
             "expected an output event with the script's own stdout, got: {events:?}"
         );
-        let step_end = events.iter().find(|e| e["type"] == "step-end").expect("a step-end event");
+        let step_end = events
+            .iter()
+            .find(|e| e["type"] == "step-end")
+            .expect("a step-end event");
         assert_eq!(step_end["exitCode"], 0);
         assert_eq!(events.last().unwrap()["type"], "done");
 
@@ -3237,15 +3686,19 @@ mod run_file_tests {
         let addr = spawn_test_server(canvas_path.clone()).await;
         let (status, body) = post(addr, "/api/nodes/seed/run").await;
         assert_eq!(status, 422);
-        assert!(body.contains("isn't a runnable file node"), "unexpected body: {body}");
+        assert!(
+            body.contains("isn't a runnable file node"),
+            "unexpected body: {body}"
+        );
 
         let _ = std::fs::remove_file(&canvas_path);
     }
 
     #[tokio::test]
     async fn run_file_node_rejects_an_unknown_node() {
-        let canvas_path =
-            write_test_canvas("<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n");
+        let canvas_path = write_test_canvas(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
+        );
         let addr = spawn_test_server(canvas_path.clone()).await;
         let (status, _) = post(addr, "/api/nodes/nope/run").await;
         assert_eq!(status, 404);
@@ -3254,8 +3707,9 @@ mod run_file_tests {
 
     #[tokio::test]
     async fn open_node_file_rejects_a_non_file_node() {
-        let canvas_path =
-            write_test_canvas("<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n");
+        let canvas_path = write_test_canvas(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
+        );
         let addr = spawn_test_server(canvas_path.clone()).await;
         let (status, body) = post(addr, "/api/nodes/root/open").await;
         assert_eq!(status, 422);
@@ -3265,8 +3719,9 @@ mod run_file_tests {
 
     #[tokio::test]
     async fn open_node_file_rejects_an_unknown_node() {
-        let canvas_path =
-            write_test_canvas("<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n");
+        let canvas_path = write_test_canvas(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
+        );
         let addr = spawn_test_server(canvas_path.clone()).await;
         let (status, _) = post(addr, "/api/nodes/nope/open").await;
         assert_eq!(status, 404);
@@ -3278,7 +3733,12 @@ mod run_file_tests {
 mod var_status_tests {
     use super::*;
 
-    fn decl(name: &str, default: Option<&str>, required: bool, secret: bool) -> meshfox_core::VarDecl {
+    fn decl(
+        name: &str,
+        default: Option<&str>,
+        required: bool,
+        secret: bool,
+    ) -> meshfox_core::VarDecl {
         meshfox_core::VarDecl {
             name: name.to_string(),
             var_type: meshfox_core::VarType::String,
@@ -3293,7 +3753,11 @@ mod var_status_tests {
     #[test]
     fn required_with_default_offers_it_unresolved() {
         let d = decl("X", Some("default-val"), true, false);
-        let resolved = meshfox_core::resolve_vars(std::slice::from_ref(&d), &HashMap::new(), &VarCache::in_memory());
+        let resolved = meshfox_core::resolve_vars(
+            std::slice::from_ref(&d),
+            &HashMap::new(),
+            &VarCache::in_memory(),
+        );
         let status = var_status(d, &resolved);
         assert!(!status.resolved);
         assert_eq!(status.value.as_deref(), Some("default-val"));
@@ -3304,7 +3768,8 @@ mod var_status_tests {
         let d = decl("X", Some("default-val"), true, false);
         let mut cache = VarCache::in_memory();
         cache.set("X", "confirmed-val").unwrap();
-        let resolved = meshfox_core::resolve_vars(std::slice::from_ref(&d), &HashMap::new(), &cache);
+        let resolved =
+            meshfox_core::resolve_vars(std::slice::from_ref(&d), &HashMap::new(), &cache);
         let status = var_status(d, &resolved);
         assert!(status.resolved);
         assert_eq!(status.value.as_deref(), Some("confirmed-val"));
@@ -3313,7 +3778,11 @@ mod var_status_tests {
     #[test]
     fn plain_declaration_with_default_still_resolves_silently() {
         let d = decl("X", Some("default-val"), false, false);
-        let resolved = meshfox_core::resolve_vars(std::slice::from_ref(&d), &HashMap::new(), &VarCache::in_memory());
+        let resolved = meshfox_core::resolve_vars(
+            std::slice::from_ref(&d),
+            &HashMap::new(),
+            &VarCache::in_memory(),
+        );
         let status = var_status(d, &resolved);
         assert!(status.resolved);
         assert_eq!(status.value.as_deref(), Some("default-val"));
@@ -3322,7 +3791,11 @@ mod var_status_tests {
     #[test]
     fn required_secret_never_sends_its_default_either() {
         let d = decl("TOKEN", Some("default-val"), true, true);
-        let resolved = meshfox_core::resolve_vars(std::slice::from_ref(&d), &HashMap::new(), &VarCache::in_memory());
+        let resolved = meshfox_core::resolve_vars(
+            std::slice::from_ref(&d),
+            &HashMap::new(),
+            &VarCache::in_memory(),
+        );
         let status = var_status(d, &resolved);
         assert!(!status.resolved);
         assert_eq!(status.value, None);
@@ -3337,7 +3810,10 @@ mod vars_endpoint_tests {
 
     fn write_test_canvas(contents: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
-        path.push(format!("meshfox-vars-test-{}.canvas.md", uuid::Uuid::new_v4()));
+        path.push(format!(
+            "meshfox-vars-test-{}.canvas.md",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::write(&path, contents).unwrap();
         path
     }
@@ -3375,7 +3851,8 @@ mod vars_endpoint_tests {
 
         let (status, body) = get(addr, "/api/vars?block=install").await;
         assert_eq!(status, 200);
-        let statuses: Vec<serde_json::Value> = serde_json::from_str(&body).expect("valid VarStatus JSON");
+        let statuses: Vec<serde_json::Value> =
+            serde_json::from_str(&body).expect("valid VarStatus JSON");
         assert_eq!(statuses.len(), 1);
         assert_eq!(statuses[0]["name"], "INSTALL_PATH");
         assert_eq!(statuses[0]["resolved"], false);
@@ -3389,12 +3866,15 @@ mod vars_endpoint_tests {
     async fn get_vars_reports_a_required_var_resolved_once_cached() {
         let canvas_path = write_test_canvas(REQUIRED_CANVAS);
         let mut cache = VarCache::load(&canvas_path).expect("load cache");
-        cache.set("INSTALL_PATH", "/opt/confirmed").expect("seed cache");
+        cache
+            .set("INSTALL_PATH", "/opt/confirmed")
+            .expect("seed cache");
 
         let addr = spawn_test_server(canvas_path.clone()).await;
         let (status, body) = get(addr, "/api/vars?block=install").await;
         assert_eq!(status, 200);
-        let statuses: Vec<serde_json::Value> = serde_json::from_str(&body).expect("valid VarStatus JSON");
+        let statuses: Vec<serde_json::Value> =
+            serde_json::from_str(&body).expect("valid VarStatus JSON");
         assert_eq!(statuses[0]["resolved"], true);
         assert_eq!(statuses[0]["value"], "/opt/confirmed");
 
@@ -3443,8 +3923,12 @@ mod vars_endpoint_tests {
 
         let (status, body) = get(addr, "/api/vars/configure").await;
         assert_eq!(status, 200);
-        let statuses: Vec<serde_json::Value> = serde_json::from_str(&body).expect("valid VarStatus JSON");
-        let names: Vec<&str> = statuses.iter().map(|s| s["name"].as_str().unwrap()).collect();
+        let statuses: Vec<serde_json::Value> =
+            serde_json::from_str(&body).expect("valid VarStatus JSON");
+        let names: Vec<&str> = statuses
+            .iter()
+            .map(|s| s["name"].as_str().unwrap())
+            .collect();
         assert_eq!(names, vec!["GREETING", "INSTALL_PATH"]);
         assert_eq!(statuses[0]["resolved"], true);
         assert_eq!(statuses[0]["value"], "Hello");
@@ -3492,13 +3976,20 @@ mod vars_endpoint_tests {
 
     #[tokio::test]
     async fn post_configure_vars_rejects_an_invalid_value_for_every_type() {
-        for (name, bad) in [("COUNT", "not-a-number"), ("VERBOSE", "yes"), ("LEVEL", "trace")] {
+        for (name, bad) in [
+            ("COUNT", "not-a-number"),
+            ("VERBOSE", "yes"),
+            ("LEVEL", "trace"),
+        ] {
             let canvas_path = write_test_canvas(TYPED_CANVAS);
             let addr = spawn_test_server(canvas_path.clone()).await;
 
             let body_json = format!(r#"{{"vars":{{"{name}":"{bad}"}}}}"#);
             let (status, body) = post_json(addr, "/api/vars/configure", &body_json).await;
-            assert_eq!(status, 422, "{name}={bad:?} should have been rejected, got body: {body}");
+            assert_eq!(
+                status, 422,
+                "{name}={bad:?} should have been rejected, got body: {body}"
+            );
             assert!(body.contains(name), "unexpected body: {body}");
 
             let _ = std::fs::remove_file(&canvas_path);
@@ -3556,7 +4047,10 @@ mod options_endpoint_tests {
 
     fn write_test_canvas(contents: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
-        path.push(format!("meshfox-options-test-{}.canvas.md", uuid::Uuid::new_v4()));
+        path.push(format!(
+            "meshfox-options-test-{}.canvas.md",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::write(&path, contents).unwrap();
         path
     }
@@ -3618,7 +4112,10 @@ mod options_endpoint_tests {
 
         let on_disk = std::fs::read_to_string(&canvas_path).unwrap();
         assert!(on_disk.contains(r#"meshfox:option name="unfold""#));
-        assert!(on_disk.contains("Some root prose."), "unrelated body text should survive: {on_disk}");
+        assert!(
+            on_disk.contains("Some root prose."),
+            "unrelated body text should survive: {on_disk}"
+        );
 
         let (status, body) = get(addr, "/api/canvas").await;
         assert_eq!(status, 200);

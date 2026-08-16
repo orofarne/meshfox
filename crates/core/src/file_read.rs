@@ -86,7 +86,10 @@ mod tests {
     use super::*;
 
     fn tmp_dir(tag: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let dir = std::env::temp_dir().join(format!("meshfox-file-read-test-{tag}-{nanos}"));
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -106,7 +109,10 @@ mod tests {
         let sibling = tmp_dir("escape-sibling");
         fs::write(sibling.join("secret.txt"), "nope").unwrap();
         let rel = pathdiff(&sibling.join("secret.txt"), &dir);
-        assert!(matches!(confine(&dir, &rel), Err(ConfineError::Outside(_)) | Err(ConfineError::TargetNotFound(..))));
+        assert!(matches!(
+            confine(&dir, &rel),
+            Err(ConfineError::Outside(_)) | Err(ConfineError::TargetNotFound(..))
+        ));
     }
 
     #[test]
@@ -118,13 +124,20 @@ mod tests {
         assert!(!p.truncated);
 
         fs::write(dir.join("bin.dat"), [0u8, 1, 2, 3]).unwrap();
-        assert!(matches!(preview(&dir, "bin.dat"), Err(PreviewError::Binary)));
+        assert!(matches!(
+            preview(&dir, "bin.dat"),
+            Err(PreviewError::Binary)
+        ));
     }
 
     /// Minimal `..`-based relative path from `base` to `target`, just
     /// enough for the escape test above (both are flat temp dirs, so one
     /// `..` always suffices).
     fn pathdiff(target: &Path, base: &Path) -> String {
-        format!("../{}/{}", base.file_name().unwrap().to_str().unwrap(), target.file_name().unwrap().to_str().unwrap())
+        format!(
+            "../{}/{}",
+            base.file_name().unwrap().to_str().unwrap(),
+            target.file_name().unwrap().to_str().unwrap()
+        )
     }
 }

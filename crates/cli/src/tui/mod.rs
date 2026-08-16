@@ -24,7 +24,9 @@ use std::time::Duration;
 
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
@@ -87,7 +89,11 @@ pub async fn run(canvas_path: PathBuf) -> io::Result<()> {
     };
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
 
     result
@@ -106,8 +112,14 @@ async fn main_loop(
         }
 
         if let Some(pending) = app.pending_tty.take() {
-            let exit_code =
-                run_tty_handoff(terminal, input_paused, &pending.block_name, &pending.code, &pending.env).await?;
+            let exit_code = run_tty_handoff(
+                terminal,
+                input_paused,
+                &pending.block_name,
+                &pending.code,
+                &pending.env,
+            )
+            .await?;
             app.resume_after_tty(exit_code).await;
             continue;
         }
@@ -151,13 +163,21 @@ async fn run_tty_handoff(
     tokio::time::sleep(Duration::from_millis(80)).await;
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     println!("==> {block_name}");
 
     let exit_code = run_tty_block(code, env).await;
 
     enable_raw_mode()?;
-    execute!(terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    )?;
     // The alternate screen's own saved contents are stale after leaving
     // and re-entering it — force a full repaint on the next `draw` rather
     // than a diff against what's actually on screen now (the child's own

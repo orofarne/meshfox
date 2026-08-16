@@ -60,9 +60,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn unique_dir(tag: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("meshfox-site-template-layout-test-{tag}-{nanos}-{n}"))
+    std::env::temp_dir().join(format!(
+        "meshfox-site-template-layout-test-{tag}-{nanos}-{n}"
+    ))
 }
 
 fn write_file(path: &Path, contents: &str) {
@@ -89,8 +94,13 @@ fn playwright_core_entry() -> Option<PathBuf> {
 /// object) against the result, returning that object's entries as
 /// `KEY=value` string pairs (kept deliberately dumb — no JSON parsing
 /// dependency needed in this crate just for a few tests).
-fn build_and_inspect(tag: &str, canvas_md: &str, eval_js: &str) -> std::collections::HashMap<String, String> {
-    let playwright_core = playwright_core_entry().expect("caller must check playwright_core_entry() first");
+fn build_and_inspect(
+    tag: &str,
+    canvas_md: &str,
+    eval_js: &str,
+) -> std::collections::HashMap<String, String> {
+    let playwright_core =
+        playwright_core_entry().expect("caller must check playwright_core_entry() first");
 
     let canvas_path = unique_dir(&format!("canvas-{tag}")).join("doc.canvas.md");
     write_file(&canvas_path, canvas_md);
@@ -131,7 +141,10 @@ await browser.close();
 "#,
     );
     write_file(&script_path, &script);
-    let output = Command::new("node").arg(&script_path).output().expect("failed to run node");
+    let output = Command::new("node")
+        .arg(&script_path)
+        .output()
+        .expect("failed to run node");
     let _ = std::fs::remove_dir_all(script_path.parent().unwrap());
     assert!(
         output.status.success(),
@@ -147,7 +160,11 @@ await browser.close();
 }
 
 fn parse_kv(output: &str) -> std::collections::HashMap<String, String> {
-    output.lines().filter_map(|line| line.split_once('=')).map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    output
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
 }
 
 /// A real bug this guards against: README.md's "Architecture" section has
@@ -211,7 +228,12 @@ fn a_short_card_with_a_tall_branch_pushes_the_next_sibling_below_the_branch_with
           childBBottom: document.getElementById("node-child-b").getBoundingClientRect().bottom,
         }"#,
     );
-    let get = |k: &str| -> f64 { kv.get(k).unwrap_or_else(|| panic!("missing {k}")).parse().unwrap() };
+    let get = |k: &str| -> f64 {
+        kv.get(k)
+            .unwrap_or_else(|| panic!("missing {k}"))
+            .parse()
+            .unwrap()
+    };
 
     let short_height = get("shortHeight");
     let next_top = get("nextTop");
@@ -227,7 +249,10 @@ fn a_short_card_with_a_tall_branch_pushes_the_next_sibling_below_the_branch_with
     // ...and the gap after the branch ends should be a normal sibling gap,
     // not a further, unexplained void stacked on top of it.
     let gap = next_top - child_b_bottom;
-    assert!(gap < 40.0, "gap between \"Short\"'s branch and \"Next\" should be a normal sibling gap: {gap}px");
+    assert!(
+        gap < 40.0,
+        "gap between \"Short\"'s branch and \"Next\" should be a normal sibling gap: {gap}px"
+    );
 }
 
 /// Two depth-1 parents in a row — "Parent One" has a tall branch (three
@@ -315,8 +340,14 @@ fn different_depth_one_parents_own_branches_do_not_collide() {
     // Parent One's own branch (A, B, C) must not overlap Parent Two's own
     // branch (D, E) — every one of A/B/C's vertical range must end before
     // every one of D/E's vertical range begins.
-    let parent_one_bottom = rects[0..3].iter().map(|(_, _, b)| *b).fold(f64::MIN, f64::max);
-    let parent_two_top = rects[3..5].iter().map(|(_, t, _)| *t).fold(f64::MAX, f64::min);
+    let parent_one_bottom = rects[0..3]
+        .iter()
+        .map(|(_, _, b)| *b)
+        .fold(f64::MIN, f64::max);
+    let parent_two_top = rects[3..5]
+        .iter()
+        .map(|(_, t, _)| *t)
+        .fold(f64::MAX, f64::min);
     assert!(
         parent_two_top >= parent_one_bottom - 0.5,
         "Parent One's branch (bottom={parent_one_bottom}) must not collide with Parent Two's branch (top={parent_two_top}): {rects:?}"
@@ -325,7 +356,10 @@ fn different_depth_one_parents_own_branches_do_not_collide() {
     // Sanity: A/B/C really do form one tightly-packed, non-overlapping
     // branch among themselves too.
     for pair in rects[0..3].windows(2) {
-        assert!(pair[1].1 >= pair[0].2 - 0.5, "Parent One's own children must not overlap each other: {rects:?}");
+        assert!(
+            pair[1].1 >= pair[0].2 - 0.5,
+            "Parent One's own children must not overlap each other: {rects:?}"
+        );
     }
 }
 
@@ -381,21 +415,36 @@ fn width_tiers_are_reached_and_deep_content_branches_right_of_its_real_parent() 
           deepPosition: getComputedStyle(document.getElementById("node-deep")).position,
         }"#,
     );
-    let get = |k: &str| -> f64 { kv.get(k).unwrap_or_else(|| panic!("missing {k}")).parse().unwrap() };
+    let get = |k: &str| -> f64 {
+        kv.get(k)
+            .unwrap_or_else(|| panic!("missing {k}"))
+            .parse()
+            .unwrap()
+    };
 
     let wide_width = get("wideWidth");
     let deep_width = get("deepWidth");
     // A generous tolerance (not exact-pixel), but nowhere near a squeezed
     // fraction of it — the actual regression check.
-    assert!(wide_width > 700.0, "\"Wide\" should render close to its 840px tier, not squeezed: {wide_width}px");
-    assert!(deep_width > 450.0, "\"Deep\" should render close to its 560px tier, not squeezed: {deep_width}px");
+    assert!(
+        wide_width > 700.0,
+        "\"Wide\" should render close to its 840px tier, not squeezed: {wide_width}px"
+    );
+    assert!(
+        deep_width > 450.0,
+        "\"Deep\" should render close to its 560px tier, not squeezed: {deep_width}px"
+    );
 
     // "Deep" (depth >=2) is an ordinary flowed flex item — pure CSS, never
     // repositioned by any script. Every `.node` has `position: relative`
     // (an anchor for the connector nub pseudo-element, see style.css), but
     // that's not the same as being *positioned* by anything: no inline
     // `left`/`top` here at all.
-    assert_eq!(kv.get("deepPosition").map(String::as_str), Some("relative"), "a depth >=2 node is never repositioned by script anymore — pure CSS flow");
+    assert_eq!(
+        kv.get("deepPosition").map(String::as_str),
+        Some("relative"),
+        "a depth >=2 node is never repositioned by script anymore — pure CSS flow"
+    );
     // Branches right of "Wide"'s own real right edge by exactly
     // `.node-row`'s own `gap` (1.75rem = 28px).
     let gap = get("deepLeft") - get("wideRight");
@@ -457,14 +506,25 @@ fn root_and_its_direct_children_share_a_column_with_only_a_small_nudge() {
           frameRight: document.getElementById("node-frame").getBoundingClientRect().right,
         }"#,
     );
-    let get = |k: &str| -> f64 { kv.get(k).unwrap_or_else(|| panic!("missing {k}")).parse().unwrap() };
+    let get = |k: &str| -> f64 {
+        kv.get(k)
+            .unwrap_or_else(|| panic!("missing {k}"))
+            .parse()
+            .unwrap()
+    };
 
     // Nobody is ever repositioned by script — every `.node` has
     // `position: relative` (an anchor for its own connector nub, see
     // style.css), but none has an inline `left`/`top` here.
     assert_eq!(kv.get("rootPosition").map(String::as_str), Some("relative"));
-    assert_eq!(kv.get("framePosition").map(String::as_str), Some("relative"));
-    assert_eq!(kv.get("sectionPosition").map(String::as_str), Some("relative"));
+    assert_eq!(
+        kv.get("framePosition").map(String::as_str),
+        Some("relative")
+    );
+    assert_eq!(
+        kv.get("sectionPosition").map(String::as_str),
+        Some("relative")
+    );
 
     // Frame/Sibling's own small nudge right of root (`.root-children`'s
     // 1rem margin-left) — well under the full branch-right gap (28px).
@@ -472,8 +532,14 @@ fn root_and_its_direct_children_share_a_column_with_only_a_small_nudge() {
     let frame_left = get("frameLeft");
     let sibling_left = get("siblingLeft");
     let nudge = frame_left - root_left;
-    assert!(nudge > 0.0 && nudge < 20.0, "Frame should get only a small nudge right of root, not a full branch step: {nudge}px");
-    assert_eq!(frame_left, sibling_left, "Frame and Sibling should share the same small nudge");
+    assert!(
+        nudge > 0.0 && nudge < 20.0,
+        "Frame should get only a small nudge right of root, not a full branch step: {nudge}px"
+    );
+    assert_eq!(
+        frame_left, sibling_left,
+        "Frame and Sibling should share the same small nudge"
+    );
 
     // Frame directly follows root in the same column — right below its
     // card, a normal small sibling gap.
@@ -528,15 +594,37 @@ fn structural_connectors_are_pure_css_with_the_correct_handle_sides() {
         }"#,
     );
 
-    assert_eq!(kv.get("overlayExists").map(String::as_str), Some("no"), "no meshfox:edge cross-references in this fixture, so the JS overlay must not exist at all");
-    assert_eq!(kv.get("rootNubDisplay").map(String::as_str), Some("none"), "root's own card must not get a right-side connector nub");
-    assert_ne!(kv.get("frameNubDisplay").map(String::as_str), Some("none"), "Frame has a child branching right of it, so it must get a right-side connector nub");
+    assert_eq!(
+        kv.get("overlayExists").map(String::as_str),
+        Some("no"),
+        "no meshfox:edge cross-references in this fixture, so the JS overlay must not exist at all"
+    );
+    assert_eq!(
+        kv.get("rootNubDisplay").map(String::as_str),
+        Some("none"),
+        "root's own card must not get a right-side connector nub"
+    );
+    assert_ne!(
+        kv.get("frameNubDisplay").map(String::as_str),
+        Some("none"),
+        "Frame has a child branching right of it, so it must get a right-side connector nub"
+    );
 
     let transparent = |c: &str| c == "rgba(0, 0, 0, 0)" || c == "transparent";
     assert!(!transparent(kv.get("frameNubColor").unwrap()), "Frame's own right-side connector nub must actually be visible (a real color, not transparent)");
-    assert!(!transparent(kv.get("frameTwigColor").unwrap()), "Frame's own row must draw a twig connecting it to root's left-side guide line");
-    assert!(!transparent(kv.get("sectionTwigColor").unwrap()), "Section's own row must draw a twig connecting it to Frame's right-side nub");
-    assert_eq!(kv.get("leafNubContent").map(String::as_str), Some("none"), "a leaf (no children) must get no connector nub at all");
+    assert!(
+        !transparent(kv.get("frameTwigColor").unwrap()),
+        "Frame's own row must draw a twig connecting it to root's left-side guide line"
+    );
+    assert!(
+        !transparent(kv.get("sectionTwigColor").unwrap()),
+        "Section's own row must draw a twig connecting it to Frame's right-side nub"
+    );
+    assert_eq!(
+        kv.get("leafNubContent").map(String::as_str),
+        Some("none"),
+        "a leaf (no children) must get no connector nub at all"
+    );
 }
 
 #[test]
@@ -556,7 +644,12 @@ fn a_real_gap_separates_a_card_from_its_first_child() {
           frameTop: document.getElementById("node-frame").getBoundingClientRect().top,
         }"#,
     );
-    let get = |k: &str| -> f64 { kv.get(k).unwrap_or_else(|| panic!("missing {k}")).parse().unwrap() };
+    let get = |k: &str| -> f64 {
+        kv.get(k)
+            .unwrap_or_else(|| panic!("missing {k}"))
+            .parse()
+            .unwrap()
+    };
 
     let gap = get("frameTop") - get("rootBottom");
     assert!(gap > 4.0, "root's own card and its first child (Frame) must have a real gap between them, not run together: {gap}px");
@@ -614,7 +707,12 @@ fn depth_two_children_group_is_centered_against_its_immovable_parent() {
           cBottom: document.getElementById("node-c").getBoundingClientRect().bottom,
         }"#,
     );
-    let get = |k: &str| -> f64 { kv.get(k).unwrap_or_else(|| panic!("missing {k}")).parse().unwrap() };
+    let get = |k: &str| -> f64 {
+        kv.get(k)
+            .unwrap_or_else(|| panic!("missing {k}"))
+            .parse()
+            .unwrap()
+    };
 
     let parent_center = get("parentTop") + get("parentHeight") / 2.0;
     let group_center = (get("aTop") + get("cBottom")) / 2.0;
@@ -722,7 +820,10 @@ await browser.close();
 "#,
     );
     write_file(&script_path, &script);
-    let output = Command::new("node").arg(&script_path).output().expect("failed to run node");
+    let output = Command::new("node")
+        .arg(&script_path)
+        .output()
+        .expect("failed to run node");
     let _ = std::fs::remove_dir_all(script_path.parent().unwrap());
     assert!(
         output.status.success(),
@@ -731,12 +832,20 @@ await browser.close();
         String::from_utf8_lossy(&output.stderr)
     );
     let kv = parse_kv(&String::from_utf8_lossy(&output.stdout));
-    let get = |k: &str| -> f64 { kv.get(k).unwrap_or_else(|| panic!("missing {k}")).parse().unwrap() };
+    let get = |k: &str| -> f64 {
+        kv.get(k)
+            .unwrap_or_else(|| panic!("missing {k}"))
+            .parse()
+            .unwrap()
+    };
 
     let path_shift = get("pathShift");
     let node_shift = get("nodeShift");
     // Sanity: the scroll actually happened and moved the node.
-    assert!(node_shift > 50.0, "scrolling .canvas-wrap should have visibly moved node-deeper: node_shift={node_shift}px");
+    assert!(
+        node_shift > 50.0,
+        "scrolling .canvas-wrap should have visibly moved node-deeper: node_shift={node_shift}px"
+    );
     // The overlay's own path must have shifted by the same amount — glued
     // to the node it connects, not left behind in viewport coordinates.
     assert!(

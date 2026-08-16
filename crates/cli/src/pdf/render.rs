@@ -39,7 +39,10 @@ const DIAGRAM_TEMPLATE: &str = include_str!("templates/diagram.html.tera");
 /// and copied assets — same pattern `crates/cli/tests/site_template_layout.rs`'s
 /// own `unique_dir` uses.
 pub fn temp_work_dir() -> PathBuf {
-    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     std::env::temp_dir().join(format!("meshfox-pdf-{}-{nanos}", std::process::id()))
 }
 
@@ -48,7 +51,8 @@ pub fn temp_work_dir() -> PathBuf {
 /// exactly what `static_cmd` does for a real static-site export.
 pub fn copy_assets(assets: &[Asset], work_dir: &Path) -> Result<(), String> {
     for asset in assets {
-        let bytes = std::fs::read(&asset.source).map_err(|e| format!("{}: {e}", asset.source.display()))?;
+        let bytes =
+            std::fs::read(&asset.source).map_err(|e| format!("{}: {e}", asset.source.display()))?;
         write_file(&work_dir.join(&asset.dest_rel), &bytes)?;
     }
     Ok(())
@@ -82,10 +86,22 @@ pub fn copy_assets(assets: &[Asset], work_dir: &Path) -> Result<(), String> {
 /// needed here either, same reasoning `site-template/fonts/`'s own
 /// (separately, loose-file) trim already applied.
 const FONT_LOOKUPS: &[(&str, &str)] = &[
-    ("fira-code-cyrillic-400-normal-", "fira-code-cyrillic-400-normal.woff2"),
-    ("fira-code-cyrillic-700-normal-", "fira-code-cyrillic-700-normal.woff2"),
-    ("fira-code-latin-400-normal-", "fira-code-latin-400-normal.woff2"),
-    ("fira-code-latin-700-normal-", "fira-code-latin-700-normal.woff2"),
+    (
+        "fira-code-cyrillic-400-normal-",
+        "fira-code-cyrillic-400-normal.woff2",
+    ),
+    (
+        "fira-code-cyrillic-700-normal-",
+        "fira-code-cyrillic-700-normal.woff2",
+    ),
+    (
+        "fira-code-latin-400-normal-",
+        "fira-code-latin-400-normal.woff2",
+    ),
+    (
+        "fira-code-latin-700-normal-",
+        "fira-code-latin-700-normal.woff2",
+    ),
 ];
 
 pub fn copy_fonts(work_dir: &Path) -> Result<(), String> {
@@ -109,7 +125,9 @@ pub fn write_document_page(site: &SiteData, work_dir: &Path) -> Result<PathBuf, 
 
     let mut context = tera::Context::new();
     context.insert("site", site);
-    let html = tera.render("document.html.tera", &context).map_err(|e| format!("pdf document template: {e}"))?;
+    let html = tera
+        .render("document.html.tera", &context)
+        .map_err(|e| format!("pdf document template: {e}"))?;
 
     let path = work_dir.join("document.html");
     write_file(&path, html.as_bytes())?;
@@ -135,12 +153,15 @@ pub fn write_diagram_page(site: &SiteData, work_dir: &Path) -> Result<PathBuf, S
     }
 
     let mut tera = tera::Tera::default();
-    tera.add_raw_template("diagram.html.tera", DIAGRAM_TEMPLATE).map_err(|e| format!("pdf diagram template: {e}"))?;
+    tera.add_raw_template("diagram.html.tera", DIAGRAM_TEMPLATE)
+        .map_err(|e| format!("pdf diagram template: {e}"))?;
 
     let mut context = tera::Context::new();
     context.insert("tree", &tree);
     context.insert("edges", &edges);
-    let html = tera.render("diagram.html.tera", &context).map_err(|e| format!("pdf diagram template: {e}"))?;
+    let html = tera
+        .render("diagram.html.tera", &context)
+        .map_err(|e| format!("pdf diagram template: {e}"))?;
 
     let path = work_dir.join("diagram.html");
     write_file(&path, html.as_bytes())?;
@@ -176,7 +197,11 @@ fn build_diagram_tree(node: &NodeView) -> DiagramTreeNode {
         node_type: node.node_type,
         // A `group` never has a body (same rule `staticgen`/the document
         // page follow) — nothing for the script to show there either way.
-        html_body: if node.node_type == "group" { String::new() } else { node.html_body.clone() },
+        html_body: if node.node_type == "group" {
+            String::new()
+        } else {
+            node.html_body.clone()
+        },
         border_color: node.color.as_deref().and_then(resolve_color_hex),
         position: node.position,
         children: node.children.iter().map(build_diagram_tree).collect(),
@@ -196,8 +221,14 @@ fn collect_ids<'a>(node: &'a NodeView, out: &mut HashSet<&'a str>) {
 /// palette values. `None` for anything else (malformed input shouldn't fail
 /// the whole export — it just renders with no explicit color).
 fn resolve_color_hex(color: &str) -> Option<String> {
-    const PRESETS: [(&str, &str); 6] =
-        [("1", "#c22b2b"), ("2", "#d9822b"), ("3", "#d9c02b"), ("4", "#3d9e4f"), ("5", "#3d6ef5"), ("6", "#a05dd1")];
+    const PRESETS: [(&str, &str); 6] = [
+        ("1", "#c22b2b"),
+        ("2", "#d9822b"),
+        ("3", "#d9c02b"),
+        ("4", "#3d9e4f"),
+        ("5", "#3d6ef5"),
+        ("6", "#a05dd1"),
+    ];
     if let Some((_, hex)) = PRESETS.iter().find(|(preset, _)| *preset == color) {
         return Some((*hex).to_string());
     }
@@ -207,7 +238,8 @@ fn resolve_color_hex(color: &str) -> Option<String> {
 
 fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
     }
     std::fs::write(path, bytes).map_err(|e| format!("failed to write {}: {e}", path.display()))
 }
@@ -287,10 +319,20 @@ mod tests {
     use super::*;
 
     fn pos(x: f64, y: f64, w: f64, h: f64) -> Position {
-        Position { x, y, width: w, height: h }
+        Position {
+            x,
+            y,
+            width: w,
+            height: h,
+        }
     }
 
-    fn node(id: &str, node_type: &'static str, position: Option<Position>, children: Vec<NodeView>) -> NodeView {
+    fn node(
+        id: &str,
+        node_type: &'static str,
+        position: Option<Position>,
+        children: Vec<NodeView>,
+    ) -> NodeView {
         NodeView {
             id: id.into(),
             title: id.into(),
@@ -314,7 +356,11 @@ mod tests {
 
     #[test]
     fn the_diagram_tree_carries_every_node_and_its_real_position() {
-        let root = text_node("root", None, vec![text_node("a", Some(pos(500.0, 500.0, 90.0, 40.0)), vec![])]);
+        let root = text_node(
+            "root",
+            None,
+            vec![text_node("a", Some(pos(500.0, 500.0, 90.0, 40.0)), vec![])],
+        );
         let tree = build_diagram_tree(&root);
         assert_eq!(tree.id, "root");
         assert!(tree.position.is_none());
@@ -322,7 +368,10 @@ mod tests {
         let a = &tree.children[0];
         assert_eq!(a.id, "a");
         let a_pos = a.position.expect("a has a real position");
-        assert_eq!((a_pos.x, a_pos.y, a_pos.width, a_pos.height), (500.0, 500.0, 90.0, 40.0));
+        assert_eq!(
+            (a_pos.x, a_pos.y, a_pos.width, a_pos.height),
+            (500.0, 500.0, 90.0, 40.0)
+        );
     }
 
     #[test]
@@ -344,7 +393,11 @@ mod tests {
 
     #[test]
     fn structural_edges_cover_every_parent_child_pair() {
-        let root = text_node("root", None, vec![text_node("a", None, vec![]), text_node("b", None, vec![])]);
+        let root = text_node(
+            "root",
+            None,
+            vec![text_node("a", None, vec![]), text_node("b", None, vec![])],
+        );
         let mut edges = Vec::new();
         collect_structural_edges(&root, &mut edges);
         assert_eq!(edges.len(), 2);
@@ -355,21 +408,43 @@ mod tests {
         // Mirrors `web/src/tree.ts`'s own `isGroupParent` suppression: a
         // group already shows containment spatially, so a connector line
         // on top of it would just be clutter.
-        let group = node("frame", "group", None, vec![text_node("member", None, vec![])]);
+        let group = node(
+            "frame",
+            "group",
+            None,
+            vec![text_node("member", None, vec![])],
+        );
         let root = text_node("root", None, vec![group]);
         let mut edges = Vec::new();
         collect_structural_edges(&root, &mut edges);
         // root -> frame survives (root isn't a group); frame -> member does not.
         assert_eq!(edges.len(), 1);
-        assert_eq!((edges[0].from.as_str(), edges[0].to.as_str()), ("root", "frame"));
+        assert_eq!(
+            (edges[0].from.as_str(), edges[0].to.as_str()),
+            ("root", "frame")
+        );
     }
 
     #[test]
     fn cross_edge_is_dropped_when_either_end_is_unknown() {
         let node_ids: HashSet<&str> = ["a", "b"].into_iter().collect();
         let edges = vec![
-            EdgeView { from: "a".into(), to: "b".into(), label: None, color: None, style: "dashed", arrow_end: true },
-            EdgeView { from: "a".into(), to: "c".into(), label: None, color: None, style: "dashed", arrow_end: true },
+            EdgeView {
+                from: "a".into(),
+                to: "b".into(),
+                label: None,
+                color: None,
+                style: "dashed",
+                arrow_end: true,
+            },
+            EdgeView {
+                from: "a".into(),
+                to: "c".into(),
+                label: None,
+                color: None,
+                style: "dashed",
+                arrow_end: true,
+            },
         ];
         let out = cross_edges(&edges, &node_ids);
         assert_eq!(out.len(), 1);
@@ -381,8 +456,13 @@ mod tests {
         let mut a = text_node("a", None, vec![]);
         a.html_body = "<p>hello from a</p>".to_string();
         let root = text_node("root", None, vec![a]);
-        let site = SiteData { title: "t".into(), root, edges: vec![] };
-        let dir = std::env::temp_dir().join(format!("meshfox-pdf-render-test-{}", std::process::id()));
+        let site = SiteData {
+            title: "t".into(),
+            root,
+            edges: vec![],
+        };
+        let dir =
+            std::env::temp_dir().join(format!("meshfox-pdf-render-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
         let path = write_diagram_page(&site, &dir).unwrap();
@@ -397,8 +477,15 @@ mod tests {
     fn document_page_links_a_parent_to_each_child_with_no_indent_wrapper() {
         let child = text_node("child", None, vec![]);
         let root = text_node("root", None, vec![child]);
-        let site = SiteData { title: "t".into(), root, edges: vec![] };
-        let dir = std::env::temp_dir().join(format!("meshfox-pdf-render-doc-test-{}", std::process::id()));
+        let site = SiteData {
+            title: "t".into(),
+            root,
+            edges: vec![],
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-pdf-render-doc-test-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
 
         let path = write_document_page(&site, &dir).unwrap();
@@ -406,8 +493,14 @@ mod tests {
 
         assert!(html.contains("id=\"node-root\""), "{html}");
         assert!(html.contains("id=\"node-child\""), "{html}");
-        assert!(html.contains("href=\"#node-child\""), "the parent must link to its child: {html}");
-        assert!(!html.contains("class=\"node-children\""), "the old indent/left-border wrapper must be gone: {html}");
+        assert!(
+            html.contains("href=\"#node-child\""),
+            "the parent must link to its child: {html}"
+        );
+        assert!(
+            !html.contains("class=\"node-children\""),
+            "the old indent/left-border wrapper must be gone: {html}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -17,11 +17,16 @@ pub fn concat(pdfs: &[Vec<u8>]) -> Result<Vec<u8>, String> {
     let mut all_objects: BTreeMap<ObjectId, Object> = BTreeMap::new();
 
     for bytes in pdfs {
-        let mut doc = Document::load_mem(bytes).map_err(|e| format!("failed to read a PDF to merge: {e}"))?;
+        let mut doc =
+            Document::load_mem(bytes).map_err(|e| format!("failed to read a PDF to merge: {e}"))?;
         doc.renumber_objects_with(max_id);
         max_id = doc.max_id + 1;
 
-        for (id, object) in doc.get_pages().into_values().map(|id| (id, doc.get_object(id).unwrap().to_owned())) {
+        for (id, object) in doc
+            .get_pages()
+            .into_values()
+            .map(|id| (id, doc.get_object(id).unwrap().to_owned()))
+        {
             all_pages.insert(id, object);
         }
         all_objects.extend(doc.objects);
@@ -65,18 +70,30 @@ pub fn concat(pdfs: &[Vec<u8>]) -> Result<Vec<u8>, String> {
         }
     }
     pages_dict.set("Count", all_pages.len() as u32);
-    pages_dict.set("Kids", all_pages.keys().map(|id| Object::Reference(*id)).collect::<Vec<_>>());
-    merged.objects.insert(pages_id, Object::Dictionary(pages_dict));
+    pages_dict.set(
+        "Kids",
+        all_pages
+            .keys()
+            .map(|id| Object::Reference(*id))
+            .collect::<Vec<_>>(),
+    );
+    merged
+        .objects
+        .insert(pages_id, Object::Dictionary(pages_dict));
 
     catalog_dict.set("Pages", pages_id);
-    merged.objects.insert(catalog_id, Object::Dictionary(catalog_dict));
+    merged
+        .objects
+        .insert(catalog_id, Object::Dictionary(catalog_dict));
     merged.trailer.set("Root", catalog_id);
 
     merged.max_id = merged.objects.len() as u32;
     merged.renumber_objects();
 
     let mut out = Vec::new();
-    merged.save_to(&mut out).map_err(|e| format!("failed to write the merged PDF: {e}"))?;
+    merged
+        .save_to(&mut out)
+        .map_err(|e| format!("failed to write the merged PDF: {e}"))?;
     Ok(out)
 }
 
@@ -88,8 +105,11 @@ mod tests {
     fn one_page_pdf(text: &str) -> Vec<u8> {
         let mut doc = Document::with_version("1.5");
         let pages_id = doc.new_object_id();
-        let font_id = doc.add_object(dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Courier" });
-        let resources_id = doc.add_object(dictionary! { "Font" => dictionary! { "F1" => font_id } });
+        let font_id = doc.add_object(
+            dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Courier" },
+        );
+        let resources_id =
+            doc.add_object(dictionary! { "Font" => dictionary! { "F1" => font_id } });
         let content = Content {
             operations: vec![
                 Operation::new("BT", vec![]),
@@ -107,7 +127,12 @@ mod tests {
             "Resources" => resources_id,
             "MediaBox" => vec![0.into(), 0.into(), 200.into(), 200.into()],
         });
-        doc.objects.insert(pages_id, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1 }));
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(
+                dictionary! { "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1 },
+            ),
+        );
         let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
         doc.trailer.set("Root", catalog_id);
         let mut bytes = Vec::new();

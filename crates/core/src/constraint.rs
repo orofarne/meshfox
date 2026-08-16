@@ -42,11 +42,11 @@
 //! actually calls these methods.
 
 use crate::canvas::{Canvas, Node, NodeType};
-use std::path::Path;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::{Globals, GlobalsBuilder, LibraryExtension, Module};
 use starlark::eval::Evaluator;
 use starlark::syntax::{AstModule, Dialect};
+use std::path::Path;
 
 /// `Dialect::Standard` alone only allows `for`/`if` inside a `def` (as in a
 /// Bazel BUILD file) — too restrictive for a short predicate script that's
@@ -97,7 +97,11 @@ pub struct ConstraintStatus {
 
 impl From<ConstraintResult> for ConstraintStatus {
     fn from(r: ConstraintResult) -> Self {
-        ConstraintStatus { label: r.label, ok: r.ok, messages: r.messages }
+        ConstraintStatus {
+            label: r.label,
+            ok: r.ok,
+            messages: r.messages,
+        }
     }
 }
 
@@ -186,9 +190,13 @@ pub fn evaluate(canvas: &Canvas, base_dir: Option<&Path>) -> Vec<ConstraintResul
 /// server, before serving `GET /api/canvas`), populated by a consumer
 /// rather than by parsing. `base_dir` is forwarded to `evaluate` as-is.
 pub fn annotate_status(canvas: &mut Canvas, base_dir: Option<&Path>) {
-    let mut by_node: std::collections::HashMap<String, Vec<ConstraintStatus>> = std::collections::HashMap::new();
+    let mut by_node: std::collections::HashMap<String, Vec<ConstraintStatus>> =
+        std::collections::HashMap::new();
     for result in evaluate(canvas, base_dir) {
-        by_node.entry(result.node_id.clone()).or_default().push(result.into());
+        by_node
+            .entry(result.node_id.clone())
+            .or_default()
+            .push(result.into());
     }
     for node in &mut canvas.nodes {
         if let Some(results) = by_node.remove(&node.id) {
@@ -209,16 +217,23 @@ fn evaluate_one(
     let title = node.title.clone();
     let label = label_for(&node_id, block.name.as_deref(), index, total_in_node);
 
-    let source = format!("{prelude}self = doc.node({})\n{}\n", star_str(&node_id), block.code);
+    let source = format!(
+        "{prelude}self = doc.node({})\n{}\n",
+        star_str(&node_id),
+        block.code
+    );
     let violations = Violations::default();
 
     let outcome: Result<(), String> = Module::with_temp_heap(|module| {
         let ast = AstModule::parse(&format!("{label}.star"), source, &dialect())
             .map_err(|e| e.to_string())?;
         let mut eval = Evaluator::new(&module);
-        eval.set_max_callstack_size(MAX_CALLSTACK).map_err(|e| e.to_string())?;
-        eval.set_max_heap_size(MAX_HEAP_BYTES).map_err(|e| e.to_string())?;
-        eval.set_max_tick_count(MAX_TICKS).map_err(|e| e.to_string())?;
+        eval.set_max_callstack_size(MAX_CALLSTACK)
+            .map_err(|e| e.to_string())?;
+        eval.set_max_heap_size(MAX_HEAP_BYTES)
+            .map_err(|e| e.to_string())?;
+        eval.set_max_tick_count(MAX_TICKS)
+            .map_err(|e| e.to_string())?;
         eval.extra = Some(&violations);
         eval.eval_module(ast, globals).map_err(|e| e.to_string())?;
         Ok(())
@@ -230,7 +245,13 @@ fn evaluate_one(
         messages.push(e);
     }
 
-    ConstraintResult { node_id, title, label, ok, messages }
+    ConstraintResult {
+        node_id,
+        title,
+        label,
+        ok,
+        messages,
+    }
 }
 
 /// Starlark source defining `doc` — the document's root node — and every
@@ -287,7 +308,12 @@ fn build_prelude(canvas: &Canvas, base_dir: Option<&Path>) -> String {
 
     out.push_str("_nodes = [\n");
     for n in &canvas.nodes {
-        let tags = n.tags.iter().map(|t| star_str(t)).collect::<Vec<_>>().join(", ");
+        let tags = n
+            .tags
+            .iter()
+            .map(|t| star_str(t))
+            .collect::<Vec<_>>()
+            .join(", ");
         let parent = match &n.parent {
             Some(p) => star_str(p),
             None => "None".to_string(),
@@ -388,8 +414,10 @@ fn json_value_to_starlark(v: &serde_json::Value) -> String {
             format!("[{}]", parts.join(", "))
         }
         serde_json::Value::Object(map) => {
-            let parts: Vec<String> =
-                map.iter().map(|(k, v)| format!("{}: {}", star_str(k), json_value_to_starlark(v))).collect();
+            let parts: Vec<String> = map
+                .iter()
+                .map(|(k, v)| format!("{}: {}", star_str(k), json_value_to_starlark(v)))
+                .collect();
             format!("{{{}}}", parts.join(", "))
         }
     }
@@ -407,7 +435,10 @@ fn parse_csv(content: &str) -> Option<serde_json::Value> {
         let record = record.ok()?;
         let mut row = serde_json::Map::new();
         for (header, cell) in headers.iter().zip(record.iter()) {
-            row.insert(header.to_string(), serde_json::Value::String(cell.to_string()));
+            row.insert(
+                header.to_string(),
+                serde_json::Value::String(cell.to_string()),
+            );
         }
         rows.push(serde_json::Value::Object(row));
     }
@@ -469,7 +500,10 @@ mod tests {
         );
         let results = evaluate(&c, None);
         assert!(!results[0].ok);
-        assert_eq!(results[0].messages, vec!["first".to_string(), "second".to_string()]);
+        assert_eq!(
+            results[0].messages,
+            vec!["first".to_string(), "second".to_string()]
+        );
     }
 
     #[test]
@@ -562,7 +596,10 @@ mod tests {
         );
         let results = evaluate(&c, None);
         assert!(!results[0].ok);
-        assert_eq!(results[0].messages, vec!["table: expected exactly one file child, got 0".to_string()]);
+        assert_eq!(
+            results[0].messages,
+            vec!["table: expected exactly one file child, got 0".to_string()]
+        );
     }
 
     #[test]
@@ -643,7 +680,10 @@ mod tests {
         );
         let results = evaluate(&c, None);
         assert!(!results[0].ok);
-        assert_eq!(results[0].messages, vec!["schedule: expected exactly one file child, got 0".to_string()]);
+        assert_eq!(
+            results[0].messages,
+            vec!["schedule: expected exactly one file child, got 0".to_string()]
+        );
     }
 
     #[test]
@@ -745,7 +785,10 @@ mod tests {
     }
 
     fn tmp_dir(tag: &str) -> std::path::PathBuf {
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let dir = std::env::temp_dir().join(format!("meshfox-constraint-test-{tag}-{nanos}"));
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -791,7 +834,11 @@ mod tests {
         // examples/constraints.canvas.md, both included), not by any
         // in-memory test alone.
         let included_dir = tmp_dir("asset-base-included");
-        std::fs::write(included_dir.join("data.txt"), "from the included file's own directory").unwrap();
+        std::fs::write(
+            included_dir.join("data.txt"),
+            "from the included file's own directory",
+        )
+        .unwrap();
         let unrelated_dir = tmp_dir("asset-base-unrelated");
 
         let mut c = canvas(
@@ -865,7 +912,11 @@ mod tests {
     #[test]
     fn file_node_json_parses_its_target_into_a_starlark_dict() {
         let dir = tmp_dir("json");
-        std::fs::write(dir.join("pkg.json"), r#"{"name": "demo", "count": 3, "tags": ["a", "b"]}"#).unwrap();
+        std::fs::write(
+            dir.join("pkg.json"),
+            r#"{"name": "demo", "count": 3, "tags": ["a", "b"]}"#,
+        )
+        .unwrap();
         let c = canvas(
             "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
              ## Pkg\n<!-- meshfox:node id=\"pkg\" type=\"file\" -->\n\n[pkg](pkg.json)\n\n\
@@ -901,7 +952,11 @@ mod tests {
     #[test]
     fn file_node_toml_parses_its_target_into_a_starlark_dict() {
         let dir = tmp_dir("toml");
-        std::fs::write(dir.join("Cargo.toml"), "[dependencies]\nanyhow = \"1\"\nserde = \"1\"\n").unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[dependencies]\nanyhow = \"1\"\nserde = \"1\"\n",
+        )
+        .unwrap();
         let c = canvas(
             "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
              ## Manifest\n<!-- meshfox:node id=\"manifest\" type=\"file\" -->\n\n[Cargo.toml](Cargo.toml)\n\n\
@@ -919,7 +974,11 @@ mod tests {
     #[test]
     fn file_node_csv_parses_rows_keyed_by_header() {
         let dir = tmp_dir("csv");
-        std::fs::write(dir.join("data.csv"), "name,license\nanyhow,MIT\nserde,MIT\n").unwrap();
+        std::fs::write(
+            dir.join("data.csv"),
+            "name,license\nanyhow,MIT\nserde,MIT\n",
+        )
+        .unwrap();
         let c = canvas(
             "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
              ## Data\n<!-- meshfox:node id=\"data\" type=\"file\" -->\n\n[data](data.csv)\n\n\

@@ -51,7 +51,12 @@ pub fn compute_layout(area: Rect) -> PaneLayout {
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(chunks[0]);
 
-    PaneLayout { tree: main[0], document: main[1], output: chunks[1], footer: chunks[2] }
+    PaneLayout {
+        tree: main[0],
+        document: main[1],
+        output: chunks[1],
+        footer: chunks[2],
+    }
 }
 
 pub fn render(f: &mut Frame, app: &mut App) {
@@ -122,7 +127,11 @@ fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
             if row.has_tty {
                 flags.push("tty");
             }
-            let badge = if flags.is_empty() { String::new() } else { format!("  [{}]", flags.join(",")) };
+            let badge = if flags.is_empty() {
+                String::new()
+            } else {
+                format!("  [{}]", flags.join(","))
+            };
             let constraint_mark = match row.constraint_ok {
                 Some(true) => Span::styled("  ✓", Style::default().fg(Color::Green)),
                 Some(false) => Span::styled("  ✗", Style::default().fg(Color::Red)),
@@ -131,7 +140,10 @@ fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
             let line = Line::from(vec![
                 Span::raw(indent),
                 Span::styled(disclosure, Style::default().fg(Color::DarkGray)),
-                Span::styled(type_marker(row.node_type), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    type_marker(row.node_type),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::raw(row.title.clone()),
                 constraint_mark,
                 Span::styled(badge, Style::default().fg(Color::Green)),
@@ -149,7 +161,10 @@ fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
                 .border_style(pane_border(app.focus == Focus::Tree))
                 .title(format!(
                     " {} ",
-                    app.canvas_path.file_name().and_then(|n| n.to_str()).unwrap_or("canvas")
+                    app.canvas_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("canvas")
                 )),
         )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
@@ -158,7 +173,11 @@ fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn render_document(f: &mut Frame, area: Rect, app: &App) {
-    let title = app.rows.get(app.selected).map(|r| r.title.as_str()).unwrap_or("");
+    let title = app
+        .rows
+        .get(app.selected)
+        .map(|r| r.title.as_str())
+        .unwrap_or("");
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(pane_border(app.focus == Focus::Document))
@@ -188,7 +207,12 @@ fn render_document(f: &mut Frame, area: Rect, app: &App) {
                 let visible = &lines[skip as usize..];
                 skip = 0;
                 let height = (visible.len() as u16).min(bottom - y);
-                let rect = Rect { x: inner.x, y, width: inner.width, height };
+                let rect = Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height,
+                };
                 let text = Text::from(visible.to_vec());
                 f.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), rect);
                 y += height;
@@ -201,7 +225,14 @@ fn render_document(f: &mut Frame, area: Rect, app: &App) {
                     continue;
                 }
                 let height = rows.saturating_sub(skip).min(bottom - y);
-                let rect = Rect { x: inner.x, y, width: inner.width.min(protocol.map(|p| p.size().width).unwrap_or(inner.width)), height };
+                let rect = Rect {
+                    x: inner.x,
+                    y,
+                    width: inner
+                        .width
+                        .min(protocol.map(|p| p.size().width).unwrap_or(inner.width)),
+                    height,
+                };
                 match protocol {
                     Some(p) => f.render_widget(Image::new(p), rect),
                     None => f.render_widget(
@@ -232,9 +263,17 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
     let text: Text = if let Some(run) = &app.run {
         let take = inner.height as usize;
         let start = run.lines.len().saturating_sub(take);
-        Text::from(run.lines[start..].iter().map(|l| Line::from(l.as_str())).collect::<Vec<_>>())
+        Text::from(
+            run.lines[start..]
+                .iter()
+                .map(|l| Line::from(l.as_str()))
+                .collect::<Vec<_>>(),
+        )
     } else if !app.status.is_empty() {
-        Text::from(Line::from(Span::styled(app.status.as_str(), Style::default().fg(Color::Yellow))))
+        Text::from(Line::from(Span::styled(
+            app.status.as_str(),
+            Style::default().fg(Color::Yellow),
+        )))
     } else {
         Text::from(Line::from(Span::styled(
             "select a node and press r to run its block (R to run without deps)",
@@ -261,7 +300,13 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         let (text, color) = if failed > 0 {
             (format!("{failed}/{total} constraints failing"), Color::Red)
         } else {
-            (format!("all {total} constraint{} pass", if total == 1 { "" } else { "s" }), Color::Green)
+            (
+                format!(
+                    "all {total} constraint{} pass",
+                    if total == 1 { "" } else { "s" }
+                ),
+                Color::Green,
+            )
         };
         spans.push(Span::styled(text, Style::default().fg(color)));
         spans.push(Span::styled("  ·  ", Style::default().fg(Color::DarkGray)));
@@ -276,7 +321,12 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let height = height.min(area.height);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
-    Rect { x, y, width, height }
+    Rect {
+        x,
+        y,
+        width,
+        height,
+    }
 }
 
 /// Every field in `vf` at once, one per row — arrow keys/Tab move which
@@ -287,7 +337,11 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
     let height = (vf.decls.len() as u16 + 4).min(area.height);
     let rect = centered_rect(64, height, area);
     f.render_widget(Clear, rect);
-    let title = if vf.configuring { " configure variables " } else { " variables needed " };
+    let title = if vf.configuring {
+        " configure variables "
+    } else {
+        " variables needed "
+    };
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(rect);
     f.render_widget(block, rect);
@@ -340,7 +394,10 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
         "↑/↓/tab field · ←/→ toggle/cycle · enter confirm all · esc cancel run"
     };
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(esc_hint, Style::default().fg(Color::DarkGray)))),
+        Paragraph::new(Line::from(Span::styled(
+            esc_hint,
+            Style::default().fg(Color::DarkGray),
+        ))),
         rows[1],
     );
 }
@@ -349,8 +406,14 @@ fn render_block_picker(f: &mut Frame, area: Rect, bp: &super::app::BlockPickerSt
     let height = (bp.blocks.len() as u16 + 4).min(area.height);
     let rect = centered_rect(56, height, area);
     f.render_widget(Clear, rect);
-    let mode = if bp.with_deps { "run (with deps)" } else { "run (no deps)" };
-    let block = Block::default().borders(Borders::ALL).title(format!(" {} — which block? ", mode));
+    let mode = if bp.with_deps {
+        "run (with deps)"
+    } else {
+        "run (no deps)"
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} — which block? ", mode));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
@@ -368,7 +431,11 @@ fn render_block_picker(f: &mut Frame, area: Rect, bp: &super::app::BlockPickerSt
             if b.tty {
                 flags.push("tty");
             }
-            let badge = if flags.is_empty() { String::new() } else { format!("  [{}]", flags.join(",")) };
+            let badge = if flags.is_empty() {
+                String::new()
+            } else {
+                format!("  [{}]", flags.join(","))
+            };
             ListItem::new(Line::from(vec![
                 Span::raw(b.name.clone()),
                 Span::styled(badge, Style::default().fg(Color::Green)),
@@ -400,7 +467,9 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         items.push("o               open this file node's target in the OS's default application");
     }
     if app.has_configurable_vars() {
-        items.push("c               configure every declared variable (see SPEC.md's \"Variables\")");
+        items.push(
+            "c               configure every declared variable (see SPEC.md's \"Variables\")",
+        );
     }
     items.extend([
         "PageUp/Down     scroll the document pane",
@@ -418,7 +487,9 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
 
     let rect = centered_rect(62, items.len() as u16 + 2, area);
     f.render_widget(Clear, rect);
-    let block = Block::default().borders(Borders::ALL).title(" keybindings ");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" keybindings ");
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
@@ -433,19 +504,35 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
 fn render_source_editor(f: &mut Frame, area: Rect, se: &mut SourceEditorState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
         .split(area);
 
-    let kind = if se.is_canvas { "canvas" } else { "plain markdown" };
+    let kind = if se.is_canvas {
+        "canvas"
+    } else {
+        "plain markdown"
+    };
     let dirty = if se.dirty() { " [modified]" } else { "" };
     let header = Line::from(vec![
-        Span::styled(format!(" {} ", se.path.display()), Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled(format!("({kind}){dirty}"), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!(" {} ", se.path.display()),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("({kind}){dirty}"),
+            Style::default().fg(Color::DarkGray),
+        ),
     ]);
     f.render_widget(Paragraph::new(header), chunks[0]);
 
     let syntax_highlighter = SyntaxHighlighter::new(SOURCE_EDITOR_THEME, SOURCE_EDITOR_LANG).ok();
-    let view = EditorView::new(&mut se.editor).line_numbers(LineNumbers::Absolute).wrap(true);
+    let view = EditorView::new(&mut se.editor)
+        .line_numbers(LineNumbers::Absolute)
+        .wrap(true);
     let view = match syntax_highlighter {
         Some(h) => view.syntax_highlighter(Some(h)),
         None => view,
@@ -471,14 +558,19 @@ fn render_source_file_picker(f: &mut Frame, area: Rect, se: &SourceEditorState) 
     let height = (count as u16 + 2).min(area.height);
     let rect = centered_rect(64, height, area);
     f.render_widget(Clear, rect);
-    let block = Block::default().borders(Borders::ALL).title(" switch file ");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" switch file ");
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
     let mut items = vec![ListItem::new(Line::from("this document"))];
     items.extend(se.files.iter().map(|inc| {
         let indent = "  ".repeat(inc.depth as usize);
-        ListItem::new(Line::from(format!("{indent}↳ {} ({})", inc.title, inc.target)))
+        ListItem::new(Line::from(format!(
+            "{indent}↳ {} ({})",
+            inc.title, inc.target
+        )))
     }));
 
     let mut state = ListState::default();

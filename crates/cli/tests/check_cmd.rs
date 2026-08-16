@@ -12,7 +12,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn unique_dir(tag: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("meshfox-check-test-{tag}-{nanos}-{n}"))
 }
@@ -48,14 +51,23 @@ fn check_catches_a_failing_constraint_inside_an_included_canvas() {
     );
 
     let output = meshfox().arg("check").arg(&base).output().unwrap();
-    assert!(!output.status.success(), "expected a non-zero exit for a failing constraint");
+    assert!(
+        !output.status.success(),
+        "expected a non-zero exit for a failing constraint"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     // The constraint lives in the spliced-in node, addressed under its
     // namespaced id — proof `check` actually reached inside the include
     // rather than only looking at `base.canvas.md`'s own (constraint-free)
     // content.
-    assert!(stderr.contains("child/root"), "expected the namespaced label in stderr, got: {stderr}");
-    assert!(stderr.contains("always fails"), "expected the fail() message in stderr, got: {stderr}");
+    assert!(
+        stderr.contains("child/root"),
+        "expected the namespaced label in stderr, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("always fails"),
+        "expected the fail() message in stderr, got: {stderr}"
+    );
 }
 
 #[test]
@@ -75,7 +87,11 @@ fn check_passes_when_the_included_canvas_has_no_constraints() {
     );
 
     let output = meshfox().arg("check").arg(&base).output().unwrap();
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -91,5 +107,8 @@ fn check_reports_a_broken_include_target_instead_of_silently_ignoring_it() {
     );
 
     let output = meshfox().arg("check").arg(&base).output().unwrap();
-    assert!(!output.status.success(), "expected a non-zero exit for a broken include target");
+    assert!(
+        !output.status.success(),
+        "expected a non-zero exit for a broken include target"
+    );
 }

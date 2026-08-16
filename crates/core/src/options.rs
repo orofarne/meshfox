@@ -26,7 +26,9 @@ pub enum OptionsError {
     NotInRoot(String, String),
 }
 
-pub(crate) fn parse_option_comment(line: &str) -> Option<std::collections::HashMap<String, String>> {
+pub(crate) fn parse_option_comment(
+    line: &str,
+) -> Option<std::collections::HashMap<String, String>> {
     let trimmed = line.trim();
     let inner = trimmed.strip_prefix("<!--")?.strip_suffix("-->")?.trim();
     let rest = inner.strip_prefix("meshfox:option")?;
@@ -52,7 +54,12 @@ pub fn scan_option_decls(markdown: &str) -> Result<Vec<String>, OptionsError> {
             continue;
         }
         if let Some(attrs) = parse_option_comment(line) {
-            names.push(attrs.get("name").cloned().ok_or(OptionsError::MissingName)?);
+            names.push(
+                attrs
+                    .get("name")
+                    .cloned()
+                    .ok_or(OptionsError::MissingName)?,
+            );
         }
     }
     Ok(names)
@@ -101,7 +108,8 @@ mod tests {
 
     #[test]
     fn ignores_an_option_comment_inside_a_fence() {
-        let names = scan_option_decls("```\n<!-- meshfox:option name=\"unfold\" -->\n```\n").unwrap();
+        let names =
+            scan_option_decls("```\n<!-- meshfox:option name=\"unfold\" -->\n```\n").unwrap();
         assert!(names.is_empty());
     }
 
@@ -109,7 +117,10 @@ mod tests {
     fn declared_options_reads_only_the_root_node() {
         let doc = "# Root\n<!-- meshfox:node id=\"root\" -->\n<!-- meshfox:option name=\"unfold\" -->\n\nbody\n\n## Child\n<!-- meshfox:node id=\"child\" -->\n\nbody\n";
         let canvas = parse(doc).unwrap();
-        assert_eq!(declared_options(&canvas).unwrap(), vec!["unfold".to_string()]);
+        assert_eq!(
+            declared_options(&canvas).unwrap(),
+            vec!["unfold".to_string()]
+        );
     }
 
     #[test]
@@ -117,7 +128,10 @@ mod tests {
         let doc = "# Root\n<!-- meshfox:node id=\"root\" -->\n\nbody\n\n## Child\n<!-- meshfox:node id=\"child\" -->\n<!-- meshfox:option name=\"unfold\" -->\n\nbody\n";
         let canvas = parse(doc).unwrap();
         let err = declared_options(&canvas).unwrap_err();
-        assert_eq!(err, OptionsError::NotInRoot("unfold".to_string(), "child".to_string()));
+        assert_eq!(
+            err,
+            OptionsError::NotInRoot("unfold".to_string(), "child".to_string())
+        );
     }
 
     #[test]

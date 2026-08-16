@@ -14,7 +14,10 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 /// A fresh, not-yet-existing directory under the system temp dir — created
 /// on demand by `write_file`'s `create_dir_all`, not here.
 fn unique_dir(tag: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("meshfox-static-test-{tag}-{nanos}-{n}"))
 }
@@ -73,7 +76,10 @@ fn renders_tera_files_and_copies_other_assets() {
     assert!(index.contains("root:"), "{index}");
     assert!(index.contains("child:"), "{index}");
     assert!(index.contains("language-bash"), "{index}");
-    assert!(!index.contains("name=\"build\""), "fence attrs should be stripped: {index}");
+    assert!(
+        !index.contains("name=\"build\""),
+        "fence attrs should be stripped: {index}"
+    );
 
     let css = std::fs::read_to_string(out_dir.join("style.css")).unwrap();
     assert_eq!(css, "body { color: red; }\n");
@@ -117,7 +123,10 @@ fn recursive_macro_partial_is_imported_but_never_rendered_as_its_own_page() {
     // Both the root and the (recursively rendered) child must appear.
     assert!(index.contains("id=\"node-root\""), "{index}");
     assert!(index.contains("id=\"node-child\""), "{index}");
-    assert!(!out_dir.join("_macros.html").exists(), "a partial must not become its own output page");
+    assert!(
+        !out_dir.join("_macros.html").exists(),
+        "a partial must not become its own output page"
+    );
 
     let _ = std::fs::remove_dir_all(&template_dir);
     let _ = std::fs::remove_dir_all(canvas_path.parent().unwrap());
@@ -138,7 +147,10 @@ fn template_toml_supplies_base_url_and_icons_but_is_never_copied_to_out() {
     // A real (if tiny) asset `icons` points at — proves `template.toml`
     // itself doesn't need to be the only new file in the template dir for
     // this to work.
-    write_file(&template_dir.join("favicon.ico"), "not a real ico, just bytes");
+    write_file(
+        &template_dir.join("favicon.ico"),
+        "not a real ico, just bytes",
+    );
 
     let canvas_path = unique_dir("canvas-config").join("doc.canvas.md");
     // A plain Markdown link in the root's own body — the kind `base_url`
@@ -161,12 +173,24 @@ fn template_toml_supplies_base_url_and_icons_but_is_never_copied_to_out() {
     assert!(status.success());
 
     let index = std::fs::read_to_string(out_dir.join("index.html")).unwrap();
-    assert!(index.contains(r#"<link rel="icon" href="favicon.ico">"#), "{index}");
+    assert!(
+        index.contains(r#"<link rel="icon" href="favicon.ico">"#),
+        "{index}"
+    );
     // base_url from template.toml, not a CLI flag (static no longer has one).
-    assert!(index.contains(r#"href="https://example.com/repo/LICENSE""#), "{index}");
+    assert!(
+        index.contains(r#"href="https://example.com/repo/LICENSE""#),
+        "{index}"
+    );
 
-    assert!(out_dir.join("favicon.ico").exists(), "an ordinary asset icons points at is still copied verbatim");
-    assert!(!out_dir.join("template.toml").exists(), "template.toml is the template's own config, not one of its pages/assets");
+    assert!(
+        out_dir.join("favicon.ico").exists(),
+        "an ordinary asset icons points at is still copied verbatim"
+    );
+    assert!(
+        !out_dir.join("template.toml").exists(),
+        "template.toml is the template's own config, not one of its pages/assets"
+    );
 
     let _ = std::fs::remove_dir_all(&template_dir);
     let _ = std::fs::remove_dir_all(canvas_path.parent().unwrap());
@@ -201,7 +225,10 @@ fn a_template_with_no_template_toml_gets_an_empty_config() {
     assert!(status.success());
 
     let index = std::fs::read_to_string(out_dir.join("index.html")).unwrap();
-    assert!(index.contains("icons::end"), "no template.toml means no icons at all: {index}");
+    assert!(
+        index.contains("icons::end"),
+        "no template.toml means no icons at all: {index}"
+    );
 
     let _ = std::fs::remove_dir_all(&template_dir);
     let _ = std::fs::remove_dir_all(canvas_path.parent().unwrap());

@@ -26,7 +26,9 @@ pub use constraint::{evaluate as evaluate_constraints, ConstraintResult, Constra
 pub use deps::{BlockAddr, DepsError};
 pub use exec::{executor_for, is_supported_lang, Executor};
 pub use fence::{scan_code_blocks, scan_runnable_blocks, BlockRef, CodeBlock, EnvRef};
-pub use file_read::{confine, preview, ConfineError, FilePreview, PreviewError, FILE_PREVIEW_MAX_BYTES};
+pub use file_read::{
+    confine, preview, ConfineError, FilePreview, PreviewError, FILE_PREVIEW_MAX_BYTES,
+};
 pub use include::IncludeError;
 pub use mdcanvas::{parse_fold_override, NodeMeta, ParseError};
 pub use options::{declared_options, OptionsError};
@@ -35,8 +37,8 @@ pub use staticgen::{Asset, EdgeView, NodeView, Position, SiteData};
 pub use tree::{RunnableBlock, TreeError};
 pub use varcache::VarCache;
 pub use vars::{
-    declared_vars, map_block_env, resolve as resolve_vars, resolve_block_env, validate_env_refs, validate_value,
-    BlockEnvResolution, ResolvedVars, VarDecl, VarType, VarsError,
+    declared_vars, map_block_env, resolve as resolve_vars, resolve_block_env, validate_env_refs,
+    validate_value, BlockEnvResolution, ResolvedVars, VarDecl, VarType, VarsError,
 };
 
 use thiserror::Error;
@@ -85,7 +87,11 @@ pub fn run_block(canvas: &Canvas, path: &[&str], block_name: &str) -> Result<Run
 /// walking a root-relative path — what `resolve_run_chain`'s output is
 /// meant to be fed into, since a dependency chain is a list of `BlockAddr`
 /// (node id + block name), not root-relative paths.
-pub fn run_block_by_id(canvas: &Canvas, node_id: &str, block_name: &str) -> Result<RunOutcome, RunError> {
+pub fn run_block_by_id(
+    canvas: &Canvas,
+    node_id: &str,
+    block_name: &str,
+) -> Result<RunOutcome, RunError> {
     let node = canvas
         .node(node_id)
         .ok_or_else(|| TreeError::NodeNotFound(node_id.to_string()))?;
@@ -149,12 +155,20 @@ pub fn resolve_run_chain(
 /// `vars::resolve_block_env`/`vars::map_block_env`) — a chain whose blocks
 /// declare no `env=` at all yields an empty set, meaning nothing about
 /// `meshfox:var` is even looked at for that run.
-pub fn env_var_names_for_chain(canvas: &Canvas, chain: &[BlockAddr]) -> std::collections::HashSet<String> {
+pub fn env_var_names_for_chain(
+    canvas: &Canvas,
+    chain: &[BlockAddr],
+) -> std::collections::HashSet<String> {
     let mut needed = std::collections::HashSet::new();
     for addr in chain {
-        let Some(node) = canvas.node(&addr.node_id) else { continue };
+        let Some(node) = canvas.node(&addr.node_id) else {
+            continue;
+        };
         let blocks = scan_runnable_blocks(&addr.node_id, &node.text);
-        if let Some(block) = blocks.iter().find(|b| b.name.as_deref() == Some(addr.block_name.as_str())) {
+        if let Some(block) = blocks
+            .iter()
+            .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()))
+        {
             needed.extend(block.env.iter().map(|er| er.var_name.clone()));
         }
     }
@@ -186,13 +200,18 @@ fn resolve_target(canvas: &Canvas, path: &[&str], block_name: &str) -> Result<Bl
         }
     }
 
-    Err(RunError::BlockNotFound(block_name.to_string(), node.id.clone()))
+    Err(RunError::BlockNotFound(
+        block_name.to_string(),
+        node.id.clone(),
+    ))
 }
 
 fn has_runnable_block(canvas: &Canvas, node_id: &str, block_name: &str) -> bool {
-    canvas
-        .node(node_id)
-        .is_some_and(|n| scan_runnable_blocks(node_id, &n.text).iter().any(|b| b.name.as_deref() == Some(block_name)))
+    canvas.node(node_id).is_some_and(|n| {
+        scan_runnable_blocks(node_id, &n.text)
+            .iter()
+            .any(|b| b.name.as_deref() == Some(block_name))
+    })
 }
 
 /// The name of `node_id`'s default block, if it has exactly one (see
@@ -203,7 +222,11 @@ fn has_runnable_block(canvas: &Canvas, node_id: &str, block_name: &str) -> bool 
 fn default_block_name(canvas: &Canvas, node_id: &str) -> Option<String> {
     let node = canvas.node(node_id)?;
     let blocks = scan_runnable_blocks(node_id, &node.text);
-    fence::default_block(node_id, &blocks).ok().flatten()?.name.clone()
+    fence::default_block(node_id, &blocks)
+        .ok()
+        .flatten()?
+        .name
+        .clone()
 }
 
 #[cfg(test)]
@@ -289,7 +312,11 @@ mod tests {
         // trailing block name is still required.
         assert!(run_block(&canvas, &["tests"], "e2e").is_err());
         assert_eq!(
-            run_block(&canvas, &["tests", "e2e"], "run").unwrap().result.output.trim(),
+            run_block(&canvas, &["tests", "e2e"], "run")
+                .unwrap()
+                .result
+                .output
+                .trim(),
             "ran"
         );
     }
@@ -308,7 +335,11 @@ mod tests {
         assert!(run_block(&canvas, &["tests"], "smoke").is_err());
         // The real address still works, same as always.
         assert_eq!(
-            run_block(&canvas, &["tests", "smoke"], "check").unwrap().result.output.trim(),
+            run_block(&canvas, &["tests", "smoke"], "check")
+                .unwrap()
+                .result
+                .output
+                .trim(),
             "hi"
         );
     }
@@ -324,7 +355,10 @@ mod tests {
         let chain = resolve_run_chain(&canvas, &["tests"], "test", true).unwrap();
         assert_eq!(
             chain,
-            vec![BlockAddr::new("tests", "build"), BlockAddr::new("tests", "test")]
+            vec![
+                BlockAddr::new("tests", "build"),
+                BlockAddr::new("tests", "test")
+            ]
         );
     }
 
@@ -358,6 +392,9 @@ mod tests {
         let canvas = Canvas::from_markdown(doc).unwrap();
         let chain = vec![BlockAddr::new("tests", "a"), BlockAddr::new("tests", "b")];
         let needed = env_var_names_for_chain(&canvas, &chain);
-        assert_eq!(needed, ["X".to_string(), "Y".to_string()].into_iter().collect());
+        assert_eq!(
+            needed,
+            ["X".to_string(), "Y".to_string()].into_iter().collect()
+        );
     }
 }

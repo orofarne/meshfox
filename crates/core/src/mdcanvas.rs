@@ -31,7 +31,9 @@
 //! producing a document from scratch.
 
 use crate::attrs::parse_attrs;
-use crate::canvas::{slugify, ArrowEnd, Canvas, EdgeLineStyle, ExtraEdge, FileDisplay, Node, NodeType};
+use crate::canvas::{
+    slugify, ArrowEnd, Canvas, EdgeLineStyle, ExtraEdge, FileDisplay, Node, NodeType,
+};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use thiserror::Error;
@@ -57,7 +59,9 @@ pub enum ParseError {
     MultipleRoots,
     #[error("duplicate node id {0:?}")]
     DuplicateId(String),
-    #[error("node {0:?} declares an edge from={1:?} but no node with that id exists in the document")]
+    #[error(
+        "node {0:?} declares an edge from={1:?} but no node with that id exists in the document"
+    )]
     UnknownParent(String, String),
     #[error("node {0:?} declares parent={1:?} but no node with that id exists in the document")]
     UnknownExplicitParent(String, String),
@@ -67,7 +71,9 @@ pub enum ParseError {
     UnknownNodeType(String, String),
     #[error("group node {0:?} must have an empty body (groups are purely organizational)")]
     GroupHasBody(String),
-    #[error("{1} node {0:?} must have a body that is exactly one Markdown link, e.g. [label](target)")]
+    #[error(
+        "{1} node {0:?} must have a body that is exactly one Markdown link, e.g. [label](target)"
+    )]
     InvalidLinkBody(String, &'static str),
 }
 
@@ -135,7 +141,9 @@ pub fn parse_fold_override(raw: &str) -> Result<Option<bool>, String> {
         "true" => Ok(Some(true)),
         "false" => Ok(Some(false)),
         "default" => Ok(None),
-        other => Err(format!("fold must be \"true\", \"false\", or \"default\", got {other:?}")),
+        other => Err(format!(
+            "fold must be \"true\", \"false\", or \"default\", got {other:?}"
+        )),
     }
 }
 
@@ -172,9 +180,7 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
             Some("link") => NodeType::Link,
             Some("group") => NodeType::Group,
             Some("include") => NodeType::Include,
-            Some(other) => {
-                return Err(ParseError::UnknownNodeType(id.clone(), other.to_string()))
-            }
+            Some(other) => return Err(ParseError::UnknownNodeType(id.clone(), other.to_string())),
         };
 
         let body = markdown[seg.body_span.clone()].trim().to_string();
@@ -211,11 +217,14 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
             }),
             tags: parse_tags(seg.node_attrs.get("tags")),
             target,
-            display: seg.node_attrs.get("display").and_then(|v| match v.as_str() {
-                "link" => Some(FileDisplay::Link),
-                "code" => Some(FileDisplay::Code),
-                _ => None,
-            }),
+            display: seg
+                .node_attrs
+                .get("display")
+                .and_then(|v| match v.as_str() {
+                    "link" => Some(FileDisplay::Link),
+                    "code" => Some(FileDisplay::Code),
+                    _ => None,
+                }),
             lang: seg.node_attrs.get("lang").cloned(),
             interpreter: seg.node_attrs.get("interpreter").cloned(),
             edge_label: seg.node_attrs.get("edgeLabel").cloned(),
@@ -231,19 +240,25 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
     let id_set: HashSet<&str> = ids.iter().map(String::as_str).collect();
     for (seg, id) in segments.iter().zip(ids.iter()) {
         for edge in &seg.edge_attrs {
-            let Some(from) = edge.get("from") else { continue };
+            let Some(from) = edge.get("from") else {
+                continue;
+            };
             for parent_id in from.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                 if !id_set.contains(parent_id) {
                     return Err(ParseError::UnknownParent(id.clone(), parent_id.to_string()));
                 }
                 if let Some(node) = nodes.iter_mut().find(|n| &n.id == id) {
-                    node.extra_parents.push(extra_edge_from_attrs(edge, parent_id));
+                    node.extra_parents
+                        .push(extra_edge_from_attrs(edge, parent_id));
                 }
             }
         }
     }
 
-    Ok(Canvas { nodes, options: Vec::new() })
+    Ok(Canvas {
+        nodes,
+        options: Vec::new(),
+    })
 }
 
 /// Builds an `ExtraEdge` for `from_id` out of a `meshfox:edge` line's raw
@@ -267,8 +282,14 @@ fn extra_edge_from_attrs(attrs: &HashMap<String, String>, from_id: &str) -> Extr
 /// trimming whitespace and dropping empty entries — shared by node and
 /// edge parsing. `None` (attribute absent) is just an empty list.
 fn parse_tags(v: Option<&String>) -> Vec<String> {
-    v.map(|s| s.split(',').map(str::trim).filter(|t| !t.is_empty()).map(str::to_string).collect())
-        .unwrap_or_default()
+    v.map(|s| {
+        s.split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 pub fn render(canvas: &Canvas) -> String {
@@ -546,13 +567,14 @@ pub fn rename_node_id(markdown: &str, old_id: &str, new_id: &str) -> Result<Stri
         return Ok(markdown.to_string());
     }
 
-    let canvas = Canvas::from_markdown(markdown).map_err(|_| RenameIdError::NotFound(old_id.to_string()))?;
+    let canvas =
+        Canvas::from_markdown(markdown).map_err(|_| RenameIdError::NotFound(old_id.to_string()))?;
     if canvas.node(new_id).is_some() {
         return Err(RenameIdError::AlreadyExists(new_id.to_string()));
     }
 
-    let mut result =
-        set_node_id_attr(markdown, old_id, new_id).ok_or_else(|| RenameIdError::NotFound(old_id.to_string()))?;
+    let mut result = set_node_id_attr(markdown, old_id, new_id)
+        .ok_or_else(|| RenameIdError::NotFound(old_id.to_string()))?;
 
     // Sweep explicit `parent="old_id"` attributes (structural, but only
     // ever written once a subtree hits the level-6 heading ceiling —
@@ -586,7 +608,10 @@ pub fn rename_node_id(markdown: &str, old_id: &str, new_id: &str) -> Result<Stri
             .iter()
             .map(|e| {
                 if e.from == old_id {
-                    ExtraEdge { from: new_id.to_string(), ..e.clone() }
+                    ExtraEdge {
+                        from: new_id.to_string(),
+                        ..e.clone()
+                    }
                 } else {
                     e.clone()
                 }
@@ -676,8 +701,14 @@ fn rewrite_deps_node_id(markdown: &str, old_id: &str, new_id: &str) -> String {
     let mut last = 0;
     for f in &fences {
         let attrs = crate::attrs::parse_attrs(&f.info);
-        let Some(deps) = attrs.get("deps") else { continue };
-        if !deps.split(',').map(str::trim).any(|s| s.starts_with(&prefix)) {
+        let Some(deps) = attrs.get("deps") else {
+            continue;
+        };
+        if !deps
+            .split(',')
+            .map(str::trim)
+            .any(|s| s.starts_with(&prefix))
+        {
             continue;
         }
         let new_deps = deps
@@ -698,7 +729,11 @@ fn rewrite_deps_node_id(markdown: &str, old_id: &str, new_id: &str) -> String {
             .unwrap_or(f.span.start + f.info.len());
         let old_line = &markdown[f.span.start..info_line_end];
         let new_line = if old_line.contains(&format!("deps=\"{deps}\"")) {
-            old_line.replacen(&format!("deps=\"{deps}\""), &format!("deps=\"{new_deps}\""), 1)
+            old_line.replacen(
+                &format!("deps=\"{deps}\""),
+                &format!("deps=\"{new_deps}\""),
+                1,
+            )
         } else {
             old_line.replacen(&format!("deps={deps}"), &format!("deps={new_deps}"), 1)
         };
@@ -741,7 +776,11 @@ fn render_edge_line(e: &ExtraEdge) -> String {
 /// (`meshfox:edge from="..."` lines) with one line per entry in
 /// `extra_parents`, in the given order — an empty slice removes the block
 /// entirely. Leaves the heading, `meshfox:node` line, and body untouched.
-pub fn set_node_edges(markdown: &str, node_id: &str, extra_parents: &[ExtraEdge]) -> Option<String> {
+pub fn set_node_edges(
+    markdown: &str,
+    node_id: &str,
+    extra_parents: &[ExtraEdge],
+) -> Option<String> {
     let segments = scan(markdown);
     let ids = assign_ids(&segments).ok()?;
     let idx = ids.iter().position(|id| id == node_id)?;
@@ -803,8 +842,8 @@ pub fn set_document_options(markdown: &str, desired: &[String]) -> Option<String
             fi += 1;
         }
         let in_fence = fi < fence_ranges.len() && fence_ranges[fi].start <= start;
-        let is_option_line =
-            !in_fence && crate::options::parse_option_comment(line.trim_end_matches('\n')).is_some();
+        let is_option_line = !in_fence
+            && crate::options::parse_option_comment(line.trim_end_matches('\n')).is_some();
         if !is_option_line {
             kept.push_str(line);
         }
@@ -864,7 +903,9 @@ pub fn insert_child_node(markdown: &str, parent_id: &str, title: &str) -> Option
     block.push_str(title);
     block.push('\n');
     if needs_explicit_parent {
-        block.push_str(&format!("<!-- meshfox:node id=\"{new_id}\" parent=\"{parent_id}\" -->\n"));
+        block.push_str(&format!(
+            "<!-- meshfox:node id=\"{new_id}\" parent=\"{parent_id}\" -->\n"
+        ));
     } else {
         block.push_str(&format!("<!-- meshfox:node id=\"{new_id}\" -->\n"));
     }
@@ -950,7 +991,8 @@ pub fn delete_node_reparent_children(markdown: &str, node_id: &str) -> Option<St
             })
             .collect();
         if edges.iter().any(|e| e.from == node_id) {
-            let filtered: Vec<ExtraEdge> = edges.into_iter().filter(|e| e.from != node_id).collect();
+            let filtered: Vec<ExtraEdge> =
+                edges.into_iter().filter(|e| e.from != node_id).collect();
             result = set_node_edges(&result, id, &filtered)?;
         }
     }
@@ -1118,7 +1160,11 @@ pub fn reparent_node(markdown: &str, node_id: &str, new_parent_id: &str) -> Opti
     let needs_explicit_parent = new_level <= new_parent_level;
     let delta = new_level as i16 - old_level as i16;
 
-    fragment = set_node_parent_attr(&fragment, node_id, needs_explicit_parent.then_some(new_parent_id))?;
+    fragment = set_node_parent_attr(
+        &fragment,
+        node_id,
+        needs_explicit_parent.then_some(new_parent_id),
+    )?;
     if delta != 0 {
         let flen = fragment.len();
         fragment = shift_headings_range(&fragment, 0..flen, delta as i8);
@@ -1148,8 +1194,12 @@ pub fn reparent_node(markdown: &str, node_id: &str, new_parent_id: &str) -> Opti
     // The promoted relationship is now expressed structurally — drop the
     // now-redundant `meshfox:edge from="new_parent_id"` line from
     // node_id's own extra parents; every other extra parent is untouched.
-    let remaining: Vec<ExtraEdge> =
-        node.extra_parents.iter().filter(|e| e.from != new_parent_id).cloned().collect();
+    let remaining: Vec<ExtraEdge> = node
+        .extra_parents
+        .iter()
+        .filter(|e| e.from != new_parent_id)
+        .cloned()
+        .collect();
     result = set_node_edges(&result, node_id, &remaining)?;
 
     Some(result)
@@ -1205,8 +1255,10 @@ pub fn delete_node(markdown: &str, node_id: &str) -> Option<String> {
             })
             .collect();
         if edges.iter().any(|e| deleted_ids.contains(&e.from)) {
-            let filtered: Vec<ExtraEdge> =
-                edges.into_iter().filter(|e| !deleted_ids.contains(&e.from)).collect();
+            let filtered: Vec<ExtraEdge> = edges
+                .into_iter()
+                .filter(|e| !deleted_ids.contains(&e.from))
+                .collect();
             result = set_node_edges(&result, id, &filtered)?;
         }
     }
@@ -1235,7 +1287,11 @@ pub fn reorder_by_position(markdown: &str) -> Option<String> {
     let parents = resolve_parent_ids(&segments, &ids).ok()?;
     let canvas = parse(markdown).ok()?;
 
-    let id_index: HashMap<&str, usize> = ids.iter().enumerate().map(|(i, id)| (id.as_str(), i)).collect();
+    let id_index: HashMap<&str, usize> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id.as_str(), i))
+        .collect();
     let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
     for (i, parent) in parents.iter().enumerate() {
         if let Some(&pidx) = parent.as_deref().and_then(|p| id_index.get(p)) {
@@ -1265,21 +1321,33 @@ pub fn reorder_by_position(markdown: &str) -> Option<String> {
         kids.sort_by(|&a, &b| {
             let ya = nodes[a].y.unwrap_or(f64::INFINITY);
             let yb = nodes[b].y.unwrap_or(f64::INFINITY);
-            ya.partial_cmp(&yb).unwrap_or(std::cmp::Ordering::Equal).then_with(|| {
-                let xa = nodes[a].x.unwrap_or(f64::INFINITY);
-                let xb = nodes[b].x.unwrap_or(f64::INFINITY);
-                xa.partial_cmp(&xb).unwrap_or(std::cmp::Ordering::Equal)
-            })
+            ya.partial_cmp(&yb)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    let xa = nodes[a].x.unwrap_or(f64::INFINITY);
+                    let xb = nodes[b].x.unwrap_or(f64::INFINITY);
+                    xa.partial_cmp(&xb).unwrap_or(std::cmp::Ordering::Equal)
+                })
         });
         for ci in kids {
-            out.push_str(&build(ci, markdown, segments, ids, parents, nodes, children));
+            out.push_str(&build(
+                ci, markdown, segments, ids, parents, nodes, children,
+            ));
         }
         out
     }
 
     let mut out = String::with_capacity(markdown.len());
     out.push_str(&markdown[..segments.first()?.heading_span.start]);
-    out.push_str(&build(0, markdown, &segments, &ids, &parents, &canvas.nodes, &children));
+    out.push_str(&build(
+        0,
+        markdown,
+        &segments,
+        &ids,
+        &parents,
+        &canvas.nodes,
+        &children,
+    ));
     Some(out)
 }
 
@@ -1294,8 +1362,15 @@ pub fn reorder_by_position(markdown: &str) -> Option<String> {
 /// which is the only place that actually writes the attribute. The root
 /// (the very first segment) never gets an override: it's the one node
 /// whose parent must stay `None` no matter what a stray attribute says.
-fn resolve_parent_ids(segments: &[Segment], ids: &[String]) -> Result<Vec<Option<String>>, ParseError> {
-    let id_index: HashMap<&str, usize> = ids.iter().enumerate().map(|(i, id)| (id.as_str(), i)).collect();
+fn resolve_parent_ids(
+    segments: &[Segment],
+    ids: &[String],
+) -> Result<Vec<Option<String>>, ParseError> {
+    let id_index: HashMap<&str, usize> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id.as_str(), i))
+        .collect();
 
     let mut stack: Vec<(u8, String)> = Vec::new();
     let mut parents = Vec::with_capacity(segments.len());
@@ -1310,7 +1385,10 @@ fn resolve_parent_ids(segments: &[Segment], ids: &[String]) -> Result<Vec<Option
             match seg.node_attrs.get("parent") {
                 Some(explicit) => {
                     if !id_index.contains_key(explicit.as_str()) {
-                        return Err(ParseError::UnknownExplicitParent(id.clone(), explicit.clone()));
+                        return Err(ParseError::UnknownExplicitParent(
+                            id.clone(),
+                            explicit.clone(),
+                        ));
                     }
                     Some(explicit.clone())
                 }
@@ -1351,15 +1429,23 @@ fn resolve_parent_ids(segments: &[Segment], ids: &[String]) -> Result<Vec<Option
 /// sibling. Shared by `insert_child_node` (finds where to append a new
 /// last child) and `delete_node` (finds where a deleted subtree ends).
 fn subtree_end_idx(ids: &[String], parents: &[Option<String>], idx: usize) -> Option<usize> {
-    let id_index: HashMap<&str, usize> = ids.iter().enumerate().map(|(i, x)| (x.as_str(), i)).collect();
+    let id_index: HashMap<&str, usize> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, x)| (x.as_str(), i))
+        .collect();
     let id = ids[idx].as_str();
     let is_descendant = |mut i: usize| -> bool {
         loop {
-            let Some(p) = parents[i].as_deref() else { return false };
+            let Some(p) = parents[i].as_deref() else {
+                return false;
+            };
             if p == id {
                 return true;
             }
-            let Some(&pi) = id_index.get(p) else { return false };
+            let Some(&pi) = id_index.get(p) else {
+                return false;
+            };
             i = pi;
         }
     };
@@ -1384,7 +1470,11 @@ fn assign_ids(segments: &[Segment]) -> Result<Vec<String>, ParseError> {
 
 fn unique_slug(title: &str, used: &HashSet<String>) -> String {
     let base = slugify(title);
-    let base = if base.is_empty() { "node".to_string() } else { base };
+    let base = if base.is_empty() {
+        "node".to_string()
+    } else {
+        base
+    };
     if !used.contains(&base) {
         return base;
     }
@@ -1579,7 +1669,10 @@ fn scan(markdown: &str) -> Vec<Segment> {
             }
         }
 
-        let body_start = lines.get(cursor).map(|&(off, _)| off).unwrap_or(markdown.len());
+        let body_start = lines
+            .get(cursor)
+            .map(|&(off, _)| off)
+            .unwrap_or(markdown.len());
         let body_end = heading_line_idx
             .get(pos + 1)
             .map(|&next_idx| lines[next_idx].0)
@@ -1662,7 +1755,10 @@ Reused from Tests as well.
         let c = parse(doc).unwrap();
         assert_eq!(c.node("root").unwrap().tags, vec!["a", "b", "c"]);
         assert!(c.node("child").unwrap().tags.is_empty());
-        assert_eq!(c.node("child").unwrap().extra_parents[0].tags, vec!["x", "y"]);
+        assert_eq!(
+            c.node("child").unwrap().extra_parents[0].tags,
+            vec!["x", "y"]
+        );
     }
 
     #[test]
@@ -1670,24 +1766,41 @@ Reused from Tests as well.
         let doc = "# Root\n<!-- meshfox:node id=\"root\" tags=\"a,b\" -->\n";
         let c = parse(doc).unwrap();
         let rendered = render(&c);
-        assert_eq!(parse(&rendered).unwrap().node("root").unwrap().tags, vec!["a", "b"]);
+        assert_eq!(
+            parse(&rendered).unwrap().node("root").unwrap().tags,
+            vec!["a", "b"]
+        );
 
         // set_node_meta with a different tag list overwrites it...
-        let meta = NodeMeta { tags: vec!["only".to_string()], ..Default::default() };
+        let meta = NodeMeta {
+            tags: vec!["only".to_string()],
+            ..Default::default()
+        };
         let updated = set_node_meta(doc, "root", &meta).unwrap();
-        assert_eq!(parse(&updated).unwrap().node("root").unwrap().tags, vec!["only"]);
+        assert_eq!(
+            parse(&updated).unwrap().node("root").unwrap().tags,
+            vec!["only"]
+        );
 
         // ...and an empty list drops the attribute entirely, not just empties it.
         let cleared = set_node_meta(doc, "root", &NodeMeta::default()).unwrap();
         assert!(!cleared.contains("tags="));
-        assert!(parse(&cleared).unwrap().node("root").unwrap().tags.is_empty());
+        assert!(parse(&cleared)
+            .unwrap()
+            .node("root")
+            .unwrap()
+            .tags
+            .is_empty());
     }
 
     #[test]
     fn set_node_id_attr_preserves_tags() {
         let doc = "# Root\n<!-- meshfox:node id=\"root\" tags=\"a,b\" -->\n";
         let updated = rename_node_id(doc, "root", "renamed").unwrap();
-        assert_eq!(parse(&updated).unwrap().node("renamed").unwrap().tags, vec!["a", "b"]);
+        assert_eq!(
+            parse(&updated).unwrap().node("renamed").unwrap().tags,
+            vec!["a", "b"]
+        );
     }
 
     #[test]
@@ -1786,7 +1899,10 @@ Reused from Tests as well.
     #[test]
     fn errors_on_cyclic_explicit_parent() {
         let doc = "# Root\n\n## A\n<!-- meshfox:node id=\"a\" parent=\"b\" -->\n\n## B\n<!-- meshfox:node id=\"b\" parent=\"a\" -->\n";
-        assert_eq!(parse(doc).unwrap_err(), ParseError::CyclicParent("a".to_string()));
+        assert_eq!(
+            parse(doc).unwrap_err(),
+            ParseError::CyclicParent("a".to_string())
+        );
     }
 
     #[test]
@@ -1811,7 +1927,9 @@ Reused from Tests as well.
         );
 
         let root_offset = node_body_offset(DOC, "root").unwrap();
-        assert!(DOC[root_offset..].trim_start().starts_with("Root body text."));
+        assert!(DOC[root_offset..]
+            .trim_start()
+            .starts_with("Root body text."));
 
         assert_eq!(node_body_offset(DOC, "does-not-exist"), None);
     }
@@ -1942,7 +2060,8 @@ Reused from Tests as well.
 
     #[test]
     fn set_node_meta_writes_display_and_lang() {
-        let doc = "# Root\n\n## Diagram\n<!-- meshfox:node type=\"file\" -->\n\n[main](./main.rs)\n";
+        let doc =
+            "# Root\n\n## Diagram\n<!-- meshfox:node type=\"file\" -->\n\n[main](./main.rs)\n";
         let meta = NodeMeta {
             display: Some(FileDisplay::Code),
             lang: Some("rust".to_string()),
@@ -1961,18 +2080,33 @@ Reused from Tests as well.
         let c = parse(doc).unwrap();
         assert_eq!(c.node("section").unwrap().fold, None);
 
-        let meta = NodeMeta { fold: Some(true), ..Default::default() };
+        let meta = NodeMeta {
+            fold: Some(true),
+            ..Default::default()
+        };
         let updated = set_node_meta(doc, "section", &meta).unwrap();
-        assert_eq!(parse(&updated).unwrap().node("section").unwrap().fold, Some(true));
+        assert_eq!(
+            parse(&updated).unwrap().node("section").unwrap().fold,
+            Some(true)
+        );
 
-        let meta = NodeMeta { fold: Some(false), ..Default::default() };
+        let meta = NodeMeta {
+            fold: Some(false),
+            ..Default::default()
+        };
         let updated = set_node_meta(&updated, "section", &meta).unwrap();
-        assert_eq!(parse(&updated).unwrap().node("section").unwrap().fold, Some(false));
+        assert_eq!(
+            parse(&updated).unwrap().node("section").unwrap().fold,
+            Some(false)
+        );
 
         // `fold: None` omits the attribute entirely, clearing it back to
         // "no override" — same "None omits" contract `color`/`display`
         // already have.
-        let meta = NodeMeta { fold: None, ..Default::default() };
+        let meta = NodeMeta {
+            fold: None,
+            ..Default::default()
+        };
         let updated = set_node_meta(&updated, "section", &meta).unwrap();
         assert_eq!(parse(&updated).unwrap().node("section").unwrap().fold, None);
     }
@@ -1998,7 +2132,8 @@ Reused from Tests as well.
 
     #[test]
     fn include_node_parses_target_from_single_link() {
-        let doc = "# Root\n\n## Spec\n<!-- meshfox:node type=\"include\" -->\n\n[spec](./SPEC.md)\n";
+        let doc =
+            "# Root\n\n## Spec\n<!-- meshfox:node type=\"include\" -->\n\n[spec](./SPEC.md)\n";
         let c = parse(doc).unwrap();
         let n = c.node("spec").unwrap();
         assert_eq!(n.node_type, NodeType::Include);
@@ -2083,7 +2218,11 @@ Reused from Tests as well.
         let md = "# Root\n\n## Check\n<!-- meshfox:node -->\n\nsee below\n\n```starlark constraint\npass\n```\n";
         let c = parse(md).unwrap();
         assert_eq!(c.node("check").unwrap().node_type, NodeType::Text);
-        assert!(c.node("check").unwrap().text.contains("```starlark constraint\npass\n```"));
+        assert!(c
+            .node("check")
+            .unwrap()
+            .text
+            .contains("```starlark constraint\npass\n```"));
     }
 
     #[test]
@@ -2167,18 +2306,23 @@ Reused from Tests as well.
         // add where none existed
         let added = set_node_edges(DOC, "tests", &[ExtraEdge::new("examples")]).unwrap();
         let c = parse(&added).unwrap();
-        assert_eq!(c.node("tests").unwrap().extra_parents, vec![ExtraEdge::new("examples")]);
+        assert_eq!(
+            c.node("tests").unwrap().extra_parents,
+            vec![ExtraEdge::new("examples")]
+        );
 
         // replace an existing set
-        let replaced =
-            set_node_edges(DOC, "shared-smoke", &[ExtraEdge::new("examples")]).unwrap();
+        let replaced = set_node_edges(DOC, "shared-smoke", &[ExtraEdge::new("examples")]).unwrap();
         let c = parse(&replaced).unwrap();
         assert_eq!(
             c.node("shared-smoke").unwrap().extra_parents,
             vec![ExtraEdge::new("examples")]
         );
         // unrelated node untouched
-        assert_eq!(c.node("root").unwrap().extra_parents, Vec::<ExtraEdge>::new());
+        assert_eq!(
+            c.node("root").unwrap().extra_parents,
+            Vec::<ExtraEdge>::new()
+        );
 
         // remove entirely
         let removed = set_node_edges(DOC, "shared-smoke", &[]).unwrap();
@@ -2216,13 +2360,19 @@ Reused from Tests as well.
         let doc = "# Root\n<!-- meshfox:node id=\"root\" -->\n<!-- meshfox:option name=\"unfold\" -->\n\nprose\n";
         let removed = set_document_options(doc, &[]).unwrap();
         assert!(!removed.contains("meshfox:option"));
-        assert!(crate::options::declared_options(&parse(&removed).unwrap()).unwrap().is_empty());
+        assert!(crate::options::declared_options(&parse(&removed).unwrap())
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
     fn set_document_options_preserves_an_unrecognized_declaration_it_was_told_to_keep() {
         let doc = "# Root\n<!-- meshfox:node id=\"root\" -->\n<!-- meshfox:option name=\"some-future-option\" -->\n\nprose\n";
-        let updated = set_document_options(doc, &["some-future-option".to_string(), "unfold".to_string()]).unwrap();
+        let updated = set_document_options(
+            doc,
+            &["some-future-option".to_string(), "unfold".to_string()],
+        )
+        .unwrap();
         assert_eq!(
             crate::options::declared_options(&parse(&updated).unwrap()).unwrap(),
             vec!["some-future-option".to_string(), "unfold".to_string()]
@@ -2239,7 +2389,10 @@ Reused from Tests as well.
         assert_eq!(n.level, 3);
         assert_eq!(n.text, "");
         // existing nodes (including tests' existing child) are untouched
-        assert_eq!(c.node("smoke-test").unwrap().parent.as_deref(), Some("tests"));
+        assert_eq!(
+            c.node("smoke-test").unwrap().parent.as_deref(),
+            Some("tests")
+        );
         assert_eq!(c.node("examples").unwrap().parent.as_deref(), Some("root"));
         // lands after every existing descendant of `tests` (i.e. after
         // smoke-test), not spliced in the middle of the subtree
@@ -2329,13 +2482,22 @@ Reused from Tests as well.
         // ceiling) to make sure the new subtree-boundary logic still knows
         // where n6's own subtree ends and doesn't swallow it.
         let (doc, n6) = nest_to_heading_ceiling();
-        let n5 = parse(&doc).unwrap().node(&n6).unwrap().parent.clone().unwrap();
+        let n5 = parse(&doc)
+            .unwrap()
+            .node(&n6)
+            .unwrap()
+            .parent
+            .clone()
+            .unwrap();
         let (doc, sibling) = insert_child_node(&doc, &n5, "Sibling of N6").unwrap();
         let (doc, n7) = insert_child_node(&doc, &n6, "N7").unwrap();
 
         let c = parse(&doc).unwrap();
         assert_eq!(c.node(&n7).unwrap().parent.as_deref(), Some(n6.as_str()));
-        assert_eq!(c.node(&sibling).unwrap().parent.as_deref(), Some(n5.as_str()));
+        assert_eq!(
+            c.node(&sibling).unwrap().parent.as_deref(),
+            Some(n5.as_str())
+        );
     }
 
     #[test]
@@ -2343,7 +2505,10 @@ Reused from Tests as well.
         let (doc, n6) = nest_to_heading_ceiling();
         let (doc, n7) = insert_child_node(&doc, &n6, "N7").unwrap();
 
-        let meta = NodeMeta { x: Some(42.0), ..Default::default() };
+        let meta = NodeMeta {
+            x: Some(42.0),
+            ..Default::default()
+        };
         let updated = set_node_meta(&doc, &n7, &meta).unwrap();
         let c = parse(&updated).unwrap();
         assert_eq!(c.node(&n7).unwrap().parent.as_deref(), Some(n6.as_str()));
@@ -2391,7 +2556,7 @@ Reused from Tests as well.
         let c = parse(&updated).unwrap();
         assert!(c.node("tests").is_none());
         assert!(c.node("smoke-test").is_none()); // descendant, also gone
-        // unrelated sibling subtree untouched
+                                                 // unrelated sibling subtree untouched
         assert!(c.node("examples").is_some());
         assert!(c.node("shared-smoke").is_some());
     }
@@ -2533,7 +2698,10 @@ Reused from Tests as well.
         let updated = delete_node_reparent_children(&doc, "tests").unwrap();
         let c = parse(&updated).unwrap();
         assert!(c.node("tests").is_none());
-        assert_eq!(c.node("smoke-test").unwrap().parent.as_deref(), Some("root"));
+        assert_eq!(
+            c.node("smoke-test").unwrap().parent.as_deref(),
+            Some("root")
+        );
         assert_eq!(c.node(&second).unwrap().parent.as_deref(), Some("root"));
         // original document order (smoke-test was already there; "second"
         // was appended after it) is preserved among the promoted siblings —
@@ -2580,7 +2748,13 @@ Reused from Tests as well.
         // means n7 now fits under plain heading-outline inference again
         // (level 6 directly follows level 5) — no explicit `parent=` left.
         let (doc, n6) = nest_to_heading_ceiling();
-        let n5 = parse(&doc).unwrap().node(&n6).unwrap().parent.clone().unwrap();
+        let n5 = parse(&doc)
+            .unwrap()
+            .node(&n6)
+            .unwrap()
+            .parent
+            .clone()
+            .unwrap();
         let (doc, n7) = insert_child_node(&doc, &n6, "N7").unwrap();
 
         let updated = delete_node_reparent_children(&doc, &n6).unwrap();
@@ -2735,7 +2909,10 @@ Reused from Tests as well.
         // fails to parse (a dangling `from=`).
         let updated = rename_node_id(DOC, "tests", "checks").unwrap();
         let c = parse(&updated).unwrap();
-        assert_eq!(c.node("shared-smoke").unwrap().extra_parents, vec![ExtraEdge::new("checks")]);
+        assert_eq!(
+            c.node("shared-smoke").unwrap().extra_parents,
+            vec![ExtraEdge::new("checks")]
+        );
     }
 
     #[test]
@@ -2769,8 +2946,14 @@ Reused from Tests as well.
         assert_eq!(
             blocks[0].deps,
             vec![
-                crate::fence::BlockRef { node_id: Some("build".to_string()), block_name: "build".to_string() },
-                crate::fence::BlockRef { node_id: None, block_name: "other".to_string() },
+                crate::fence::BlockRef {
+                    node_id: Some("build".to_string()),
+                    block_name: "build".to_string()
+                },
+                crate::fence::BlockRef {
+                    node_id: None,
+                    block_name: "other".to_string()
+                },
             ]
         );
     }
