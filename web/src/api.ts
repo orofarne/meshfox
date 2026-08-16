@@ -78,22 +78,54 @@ export async function saveCanvas(canvas: CanvasDoc): Promise<void> {
   if (!res.ok) throw new Error(`PUT /api/canvas: ${res.status}`);
 }
 
-/** The whole document's raw Markdown text, verbatim — what the toolbar's
- * "Source" mode edits. */
-export async function fetchCanvasSource(): Promise<string> {
-  const res = await fetch("/api/canvas/raw");
+/**
+ * One `include` reachable from the document (however deeply nested,
+ * however the primary document reached it), resolved to the file it
+ * points at but without splicing its content in — powers Source mode's
+ * file picker (`includeNodeId` below), alongside the implicit "this
+ * document" option that isn't in this list. `depth` is 0 for an include
+ * declared directly in the primary document, 1 for one nested inside a
+ * depth-0 include's own target, and so on — enough to indent a flat list
+ * into a tree client-side. `isCanvas` is `false` for a plain-Markdown
+ * target (nothing to open in Source mode as its own file — see
+ * `NodeSettings`' read-only note on that case) or a broken/cyclic one.
+ */
+export interface IncludeManifestEntry {
+  nodeId: string;
+  title: string;
+  target: string;
+  depth: number;
+  isCanvas: boolean;
+}
+
+export async function fetchIncludes(): Promise<IncludeManifestEntry[]> {
+  const res = await fetch("/api/includes");
+  if (!res.ok) throw new Error(`GET /api/includes: ${res.status}`);
+  return res.json();
+}
+
+/** The raw Markdown text of the document itself, verbatim — what the
+ * toolbar's "Source" mode edits by default. Pass an `IncludeManifestEntry`'s
+ * `nodeId` (from `fetchIncludes`) to read that include's own target file
+ * instead. */
+export async function fetchCanvasSource(includeNodeId?: string): Promise<string> {
+  const url = includeNodeId ? `/api/canvas/raw?include=${encodeURIComponent(includeNodeId)}` : "/api/canvas/raw";
+  const res = await fetch(url);
   if (!res.ok) throw new Error(`GET /api/canvas/raw: ${res.status}`);
   return res.text();
 }
 
 /**
- * Overwrites the whole document with `text`, verbatim. The server rejects
- * (422, nothing written) anything that doesn't parse — the thrown error's
- * message is the parser's, suitable to show right next to Source mode's
- * Save button so an invalid edit is never silently lost or half-applied.
+ * Overwrites the whole document (or, with `includeNodeId`, an include
+ * target's own file — see `fetchCanvasSource`) with `text`, verbatim. The
+ * server rejects (422, nothing written) anything that doesn't parse — the
+ * thrown error's message is the parser's, suitable to show right next to
+ * Source mode's Save button so an invalid edit is never silently lost or
+ * half-applied.
  */
-export async function saveCanvasSource(text: string): Promise<void> {
-  const res = await fetch("/api/canvas/raw", {
+export async function saveCanvasSource(text: string, includeNodeId?: string): Promise<void> {
+  const url = includeNodeId ? `/api/canvas/raw?include=${encodeURIComponent(includeNodeId)}` : "/api/canvas/raw";
+  const res = await fetch(url, {
     method: "PUT",
     headers: { "content-type": "text/plain" },
     body: text,

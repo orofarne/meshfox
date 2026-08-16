@@ -177,9 +177,14 @@ enum Command {
     /// satisfies whatever rules its own constraint fences declare (e.g.
     /// "every node tagged `table` has exactly one `file` child") — implies
     /// `validate` first, since an unparseable file has no constraints to
-    /// run. Exits non-zero if the file fails to parse or any constraint
-    /// fails, so it's usable as a pre-commit/CI check alongside (or
-    /// instead of) `validate`.
+    /// run. Resolves includes first (same as `validate`/`view`/`static`),
+    /// so a constraint sees the fully composed document — including one
+    /// that lives inside an included canvas, evaluated against its
+    /// namespaced `{include_id}/{original_id}` — same tree the web UI
+    /// checks, not just this file in isolation. Exits non-zero if the file
+    /// (or any include target) fails to parse, an include is broken, or
+    /// any constraint fails, so it's usable as a pre-commit/CI check
+    /// alongside (or instead of) `validate`.
     Check {
         /// Path to the .canvas.md file. If omitted: auto-discover the
         /// single candidate in the current directory.
@@ -950,14 +955,25 @@ fn validate(canvas_path: &PathBuf) {
 /// Runs every embedded constraint fence's Starlark contract
 /// (`meshfox_core::constraint::evaluate`) and reports pass/fail per fence,
 /// same exit-code convention as every other check here (non-zero if the
-/// file doesn't parse, or if any constraint fails) — usable in CI/pre-commit
-/// alongside `validate`.
+/// file doesn't parse, an include is broken, or any constraint fails) —
+/// usable in CI/pre-commit alongside `validate`. Resolves includes first
+/// (same as `validate`/`view`/`static`) so a constraint runs against the
+/// fully composed document rather than just this file in isolation — the
+/// same tree `meshfox view`/the tui already evaluate constraints against
+/// (`meshfox_core::constraint::annotate_status`, called after
+/// `include::resolve` there too), so a constraint living inside an
+/// included canvas is checked here as well, under its namespaced
+/// `{include_id}/{original_id}`.
 fn check(canvas_path: &PathBuf) {
     let raw = std::fs::read_to_string(canvas_path).unwrap_or_else(|e| {
         eprintln!("failed to read {}: {e}", canvas_path.display());
         std::process::exit(1);
     });
     let canvas = Canvas::from_markdown(&raw).unwrap_or_else(|e| {
+        eprintln!("meshfox check: {}: {e}", canvas_path.display());
+        std::process::exit(1);
+    });
+    let canvas = meshfox_core::include::resolve(&canvas, canvas_path).unwrap_or_else(|e| {
         eprintln!("meshfox check: {}: {e}", canvas_path.display());
         std::process::exit(1);
     });

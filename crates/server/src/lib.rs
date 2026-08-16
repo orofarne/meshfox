@@ -514,27 +514,187 @@ async fn get_canvas(State(state): State<Arc<AppState>>) -> Result<Json<Canvas>, 
     canvas_response(&raw, &state.canvas_path)
 }
 
-/// The document's raw Markdown text, verbatim — what the UI's Source-mode
-/// editor loads. Unlike `get_canvas`, this does *not* splice in `include`s;
-/// it's the actual on-disk bytes this file owns.
-async fn get_canvas_raw(State(state): State<Arc<AppState>>) -> String {
-    state.raw.lock().unwrap().clone()
+/// Which physical file (and node id *in that file*) a mutating endpoint
+/// should actually read/patch/write for a given node id as seen in the
+/// composed/resolved canvas the UI displays — `state`'s own document
+/// itself, or, for a node spliced in from a canvas `include`, the include
+/// target's own file, addressed by its un-namespaced id there
+/// (`Node::origin_path`/`origin_id`, set by `include::resolve`). Every
+/// mutating endpoint below routes through this first instead of assuming
+/// `id` lives in `state`'s own raw text — that assumption is what made
+/// editing an included subtree fail with a spurious "no node" before.
+struct LocatedNode {
+    /// `None` for `state`'s own document (already cached as
+    /// `state.canvas_path`/`state.raw`); `Some(path)` for an include
+    /// target — `raw` below is read fresh from disk each time rather than
+    /// cached in `AppState`, since it isn't the file this server session
+    /// "owns".
+    origin: Option<PathBuf>,
+    raw: String,
+    /// `id`, translated to whatever it's actually called in `raw`.
+    local_id: String,
 }
 
-/// Overwrites the whole document with `body`, verbatim — the Source-mode
-/// editor's Save button. Rejects (422, nothing written) anything that
-/// doesn't parse, same validate-before-commit guarantee every other
-/// mutating endpoint here gives; that's what keeps the editor from ever
-/// persisting invalid Markdown.
+fn locate_node(state: &AppState, primary_raw: &str, id: &str) -> Result<LocatedNode, ApiError> {
+    let primary = parse_or_error(primary_raw)?;
+    if primary.node(id).is_some() {
+        return Ok(LocatedNode { origin: None, raw: primary_raw.to_string(), local_id: id.to_string() });
+    }
+    // Not in `state`'s own raw text — maybe it's spliced in from an
+    // include. Resolve fully (splices every include, however deeply
+    // nested) and look it up there instead.
+    let resolved = resolved_canvas(primary_raw, &state.canvas_path)?;
+    let node = resolved.node(id).ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}")))?;
+    let origin_path = node.origin_path.clone().ok_or_else(|| {
+        ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "node {id:?} lives inside an included canvas that can't be edited from here yet \
+                 (it was included as plain Markdown rather than a .canvas.md, so it has no node \
+                 identity of its own to write back to — open its own file directly to edit it)"
+            ),
+        )
+    })?;
+    let local_id = node.origin_id.clone().expect("origin_path is always set together with origin_id");
+    let raw = std::fs::read_to_string(&origin_path).map_err(|e| {
+        ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to read include target {origin_path}: {e}"))
+    })?;
+    Ok(LocatedNode { origin: Some(PathBuf::from(origin_path)), raw, local_id })
+}
+
+/// Writes `raw` back to wherever `located` says it actually came from —
+/// `state`'s own file (also updating its in-memory cache, same as every
+/// mutating endpoint already did) or an include target's file directly
+/// (never cached — see `LocatedNode::origin`). The caller still has to
+/// re-read `state.raw`/call `canvas_response` afterward for the response:
+/// for an include target, that's what actually picks the edit back up
+/// (`include::resolve` always reads the target fresh from disk), the same
+/// way a follow-up `GET /api/canvas` would.
+fn commit_located(state: &AppState, located: &LocatedNode, raw: &str) -> Result<(), ApiError> {
+    match &located.origin {
+        None => {
+            state.save(raw).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            *state.raw.lock().unwrap() = raw.to_string();
+        }
+        Some(path) => {
+            std::fs::write(path, raw).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IncludeManifestEntry {
+    node_id: String,
+    title: String,
+    target: String,
+    depth: u32,
+    is_canvas: bool,
+}
+
+/// Every `include` reachable from the document (however deeply nested),
+/// resolved to the file it points at but without splicing anything in
+/// (`meshfox_core::include::list_includes`) — what powers the Source-mode
+/// editor's file picker (see `get_canvas_raw`/`put_canvas_raw`'s own
+/// `?include=` param): the primary document's own entry is implicit (the
+/// picker's own "this document" option), everything here is an
+/// alternative to it.
+async fn get_includes(State(state): State<Arc<AppState>>) -> Result<Json<Vec<IncludeManifestEntry>>, ApiError> {
+    let raw = state.raw.lock().unwrap().clone();
+    let canvas = parse_or_error(&raw)?;
+    let entries = meshfox_core::include::list_includes(&canvas, &state.canvas_path)
+        .into_iter()
+        .map(|i| IncludeManifestEntry {
+            node_id: i.node_id,
+            title: i.title,
+            target: i.target,
+            depth: i.depth,
+            is_canvas: i.is_canvas,
+        })
+        .collect();
+    Ok(Json(entries))
+}
+
+#[derive(Debug, Deserialize)]
+struct SourceFileQuery {
+    /// An include's own `nodeId` (see `get_includes`) — absent means the
+    /// primary document itself.
+    #[serde(default)]
+    include: Option<String>,
+}
+
+/// Which file Source mode is actually pointed at — `state`'s own document,
+/// always canvas-shaped, or an include target, which is only required to
+/// parse as a canvas itself when it's a *canvas* include (`is_canvas`) —
+/// a plain-Markdown include target is, by definition, ordinary prose with
+/// no `meshfox:canvas` structure to hold it to (see `crate::include`'s own
+/// module docs), so validating it as one would reject perfectly good text.
+enum SourceFile {
+    Primary,
+    Include { path: PathBuf, is_canvas: bool },
+}
+
+/// Resolves `query`'s optional `?include=<nodeId>` to the file Source mode
+/// should actually read/write. Recomputes the include's target path fresh
+/// every call (via `list_includes`) rather than trusting a client-supplied
+/// path — `include` naming something that no longer resolves (a
+/// since-removed or now-broken include) is a 404, same as any other
+/// stale-id case elsewhere in this file.
+fn resolve_source_file(state: &AppState, include: Option<&str>) -> Result<SourceFile, ApiError> {
+    let Some(include_id) = include else { return Ok(SourceFile::Primary) };
+    let raw = state.raw.lock().unwrap().clone();
+    let canvas = parse_or_error(&raw)?;
+    meshfox_core::include::list_includes(&canvas, &state.canvas_path)
+        .into_iter()
+        .find(|i| i.node_id == include_id)
+        .map(|i| SourceFile::Include { path: i.path, is_canvas: i.is_canvas })
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no include {include_id:?}")))
+}
+
+/// The document's raw Markdown text, verbatim — what the UI's Source-mode
+/// editor loads. Unlike `get_canvas`, this does *not* splice in `include`s;
+/// it's the actual on-disk bytes this file owns. `?include=<nodeId>` (see
+/// `get_includes`) switches to an include target's own raw text instead,
+/// read fresh from disk (never cached, unlike the primary document).
+async fn get_canvas_raw(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<SourceFileQuery>,
+) -> Result<String, ApiError> {
+    match resolve_source_file(&state, query.include.as_deref())? {
+        SourceFile::Primary => Ok(state.raw.lock().unwrap().clone()),
+        SourceFile::Include { path, .. } => std::fs::read_to_string(&path)
+            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to read {}: {e}", path.display()))),
+    }
+}
+
+/// Overwrites the whole document (or, with `?include=<nodeId>`, an include
+/// target's own file — see `get_canvas_raw`) with `body`, verbatim — the
+/// Source-mode editor's Save button. Rejects (422, nothing written)
+/// anything that doesn't parse *as a canvas* — skipped for a plain-Markdown
+/// include target (see `SourceFile`), which has no such requirement to
+/// begin with — same validate-before-commit guarantee every other
+/// mutating endpoint here gives for what it does validate.
 async fn put_canvas_raw(
     State(state): State<Arc<AppState>>,
+    Query(query): Query<SourceFileQuery>,
     body: String,
 ) -> Result<StatusCode, ApiError> {
-    parse_or_error(&body)?;
-    state
-        .save(&body)
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    *state.raw.lock().unwrap() = body;
+    let target = resolve_source_file(&state, query.include.as_deref())?;
+    if !matches!(target, SourceFile::Include { is_canvas: false, .. }) {
+        parse_or_error(&body)?;
+    }
+    match target {
+        SourceFile::Primary => {
+            state
+                .save(&body)
+                .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            *state.raw.lock().unwrap() = body;
+        }
+        SourceFile::Include { path, .. } => {
+            std::fs::write(&path, &body).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -550,7 +710,16 @@ async fn put_canvas(
     State(state): State<Arc<AppState>>,
     Json(canvas): Json<Canvas>,
 ) -> Result<StatusCode, ApiError> {
-    let mut raw = state.raw.lock().unwrap().clone();
+    let primary_raw = state.raw.lock().unwrap().clone();
+    // Same routing every other mutating endpoint does (see `locate_node`):
+    // a node here may have been spliced in from an include, in which case
+    // its `meshfox:node` comment lives in a different file entirely.
+    // Batched up per file (rather than one `locate_node`/write per node)
+    // so a drag/resize touching several nodes in the same included canvas
+    // patches that file's raw text incrementally and writes it once.
+    let mut primary_out = primary_raw.clone();
+    let mut included_out: HashMap<PathBuf, String> = HashMap::new();
+
     for node in &canvas.nodes {
         // Include nodes never reach the client as such (`get_canvas`
         // resolves them away first) but are skipped here too for the same
@@ -559,6 +728,13 @@ async fn put_canvas(
         if node.node_type == NodeType::Include {
             continue;
         }
+        // A node the client posted back that no longer resolves to
+        // anything (deleted meanwhile, or an include target that can't be
+        // located — e.g. plain-Markdown include content, which has no
+        // `meshfox:node` identity of its own) is skipped rather than
+        // failing the whole batch, same "no-op for what doesn't apply"
+        // tolerance `set_node_meta` returning `None` already had here.
+        let Ok(located) = locate_node(&state, &primary_raw, &node.id) else { continue };
         // A group's *size* is always derived from its members, never
         // authored — ignore whatever width/height it reports rather than
         // let a computed value get written into the file as if it were
@@ -581,20 +757,42 @@ async fn put_canvas(
             fold: node.fold,
             tags: node.tags.clone(),
         };
-        // Nodes spliced in from an included file have no `meshfox:node`
-        // comment in *this* file, so this is a no-op for them too — their
-        // layout isn't persisted anywhere yet (see `get_canvas`).
-        if let Some(patched) = mdcanvas::set_node_meta(&raw, &node.id, &meta) {
-            raw = patched;
+        match &located.origin {
+            None => {
+                if let Some(patched) = mdcanvas::set_node_meta(&primary_out, &located.local_id, &meta) {
+                    primary_out = patched;
+                }
+            }
+            Some(path) => {
+                let current = included_out.entry(path.clone()).or_insert_with(|| located.raw.clone());
+                if let Some(patched) = mdcanvas::set_node_meta(current, &located.local_id, &meta) {
+                    *current = patched;
+                }
+            }
         }
     }
-    if let Some(reordered) = mdcanvas::reorder_by_position(&raw) {
-        raw = reordered;
+
+    if let Some(reordered) = mdcanvas::reorder_by_position(&primary_out) {
+        primary_out = reordered;
     }
+    for raw in included_out.values_mut() {
+        if let Some(reordered) = mdcanvas::reorder_by_position(raw) {
+            *raw = reordered;
+        }
+    }
+
+    parse_or_error(&primary_out)?;
+    for raw in included_out.values() {
+        parse_or_error(raw)?;
+    }
+
     state
-        .save(&raw)
+        .save(&primary_out)
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    *state.raw.lock().unwrap() = raw;
+    *state.raw.lock().unwrap() = primary_out;
+    for (path, raw) in &included_out {
+        std::fs::write(path, raw).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -670,17 +868,20 @@ async fn create_node(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateNodeRequest>,
 ) -> Result<Json<Canvas>, ApiError> {
-    let raw = state.raw.lock().unwrap().clone();
-    let (updated, _new_id) = mdcanvas::insert_child_node(&raw, &req.parent_id, &req.title)
+    let primary_raw = state.raw.lock().unwrap().clone();
+    // `parentId` may itself name a node spliced in from an include (e.g.
+    // adding a child under something inside an included canvas) — locate
+    // it first so the new node is actually written into the file the
+    // parent lives in, same as editing an existing node there already is.
+    let located = locate_node(&state, &primary_raw, &req.parent_id)?;
+    let (updated, _new_id) = mdcanvas::insert_child_node(&located.raw, &located.local_id, &req.title)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {:?}", req.parent_id)))?;
     // Insertion can't actually break parsing, but validate anyway — same
     // validate-before-commit shape every other mutating endpoint here uses.
     parse_or_error(&updated)?;
-    state
-        .save(&updated)
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    *state.raw.lock().unwrap() = updated.clone();
-    canvas_response(&updated, &state.canvas_path)
+    commit_located(&state, &located, &updated)?;
+    let response_raw = state.raw.lock().unwrap().clone();
+    canvas_response(&response_raw, &state.canvas_path)
 }
 
 #[derive(Debug, Deserialize)]
@@ -826,7 +1027,44 @@ async fn update_node(
     Path(id): Path<String>,
     Json(req): Json<UpdateNodeRequest>,
 ) -> Result<Json<Canvas>, ApiError> {
-    let mut raw = state.raw.lock().unwrap().clone();
+    let primary_raw = state.raw.lock().unwrap().clone();
+    // `id` may name a node spliced in from an include — route the whole
+    // edit to the file it actually lives in (see `locate_node`) instead
+    // of always patching `state`'s own document.
+    let located = locate_node(&state, &primary_raw, &id)?;
+    let mut raw = located.raw.clone();
+    let local_id = located.local_id.clone();
+
+    // A `from=` in `extraParents` names another node the same way `id`
+    // itself was named — the composed/possibly-namespaced id the UI
+    // showed it as — so it needs the same translation before it can be
+    // written into `local_id`'s own file, and can only ever name a node
+    // in that *same* file (an edge can't cross an include boundary: a
+    // `meshfox:edge from="..."` is only ever resolved against its own
+    // document's own id set — see `mdcanvas::parse`).
+    let extra_parents_local = req
+        .extra_parents
+        .as_ref()
+        .map(|edges| {
+            edges
+                .iter()
+                .map(|e| {
+                    let from_located = locate_node(&state, &primary_raw, &e.from)?;
+                    if from_located.origin != located.origin {
+                        return Err(ApiError(
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            format!(
+                                "can't add an edge from {:?} to {id:?} — they live in different \
+                                 files (an edge can't cross an include boundary)",
+                                e.from
+                            ),
+                        ));
+                    }
+                    Ok(ExtraEdge { from: from_located.local_id, ..e.clone() })
+                })
+                .collect::<Result<Vec<_>, ApiError>>()
+        })
+        .transpose()?;
 
     let not_found = || ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}"));
 
@@ -842,7 +1080,26 @@ async fn update_node(
     // already say `file`/`link` while the body briefly still isn't a
     // single link.
     let initial = parse_or_error(&raw)?;
-    let initial_node = initial.node(&id).ok_or_else(not_found)?;
+    let initial_node = initial.node(&local_id).ok_or_else(not_found)?;
+    // A plain-Markdown `include` node keeps its own id post-resolve (see
+    // `include::resolve`'s module doc), so `locate_node` above found it
+    // right here in the primary document — but its *body*, as the client
+    // just saw it via `GET /api/canvas`, is the include target's own
+    // (shifted-headings) content, not what's actually stored here (a bare
+    // `[label](target)` link). Writing that back as `text` would silently
+    // try to overwrite the link with the target's whole content — reject
+    // it with a clear reason up front rather than relying on the later
+    // `parse_or_error` to incidentally catch it as a mangled link body.
+    if initial_node.node_type == NodeType::Include && req.text.is_some() {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "node {id:?} is a plain-Markdown include — its shown body comes from the include \
+                 target file, not from here; open that file directly to edit it (use `target` \
+                 here to change which file it links to instead)"
+            ),
+        ));
+    }
     let (
         x,
         y,
@@ -875,7 +1132,7 @@ async fn update_node(
     let mut title = initial_node.title.clone();
 
     if let Some(new_title) = &req.title {
-        raw = mdcanvas::set_node_title(&raw, &id, new_title).ok_or_else(not_found)?;
+        raw = mdcanvas::set_node_title(&raw, &local_id, new_title).ok_or_else(not_found)?;
         title = new_title.clone();
     }
 
@@ -928,31 +1185,30 @@ async fn update_node(
             fold: resolve_fold_override(req.fold.as_deref(), existing_fold)?,
             tags: req.tags.clone().unwrap_or(existing_tags),
         };
-        raw = mdcanvas::set_node_meta(&raw, &id, &meta).ok_or_else(not_found)?;
+        raw = mdcanvas::set_node_meta(&raw, &local_id, &meta).ok_or_else(not_found)?;
     }
 
     if let Some(target) = &req.target {
         let body = format!("[{title}]({target})");
-        raw = mdcanvas::set_node_body(&raw, &id, &body).ok_or_else(not_found)?;
+        raw = mdcanvas::set_node_body(&raw, &local_id, &body).ok_or_else(not_found)?;
     }
 
     if let Some(text) = &req.text {
-        raw = mdcanvas::set_node_body(&raw, &id, text).ok_or_else(not_found)?;
+        raw = mdcanvas::set_node_body(&raw, &local_id, text).ok_or_else(not_found)?;
     }
 
-    if let Some(extra_parents) = &req.extra_parents {
-        raw = mdcanvas::set_node_edges(&raw, &id, extra_parents).ok_or_else(not_found)?;
+    if let Some(extra_parents) = &extra_parents_local {
+        raw = mdcanvas::set_node_edges(&raw, &local_id, extra_parents).ok_or_else(not_found)?;
     }
 
     // Validate the whole patched document before committing anything —
-    // none of the writes above touched `state.raw`/disk yet.
+    // none of the writes above touched `state.raw`/disk (or the include
+    // target's) yet.
     parse_or_error(&raw)?;
 
-    state
-        .save(&raw)
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    *state.raw.lock().unwrap() = raw.clone();
-    canvas_response(&raw, &state.canvas_path)
+    commit_located(&state, &located, &raw)?;
+    let response_raw = state.raw.lock().unwrap().clone();
+    canvas_response(&response_raw, &state.canvas_path)
 }
 
 /// Cap on how much of a `file` node's target we'll read for a `display=
@@ -1196,10 +1452,12 @@ async fn remove_node(
     Path(id): Path<String>,
     Query(query): Query<DeleteNodeQuery>,
 ) -> Result<Json<Canvas>, ApiError> {
-    let raw = state.raw.lock().unwrap().clone();
-    let canvas = parse_or_error(&raw)?;
+    let primary_raw = state.raw.lock().unwrap().clone();
+    let located = locate_node(&state, &primary_raw, &id)?;
+    let local_id = &located.local_id;
+    let canvas = parse_or_error(&located.raw)?;
     let node = canvas
-        .node(&id)
+        .node(local_id)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}")))?;
     if node.parent.is_none() {
         return Err(ApiError(
@@ -1209,17 +1467,15 @@ async fn remove_node(
     }
     let reparent = query.children.as_deref() == Some("reparent");
     let updated = if reparent {
-        mdcanvas::delete_node_reparent_children(&raw, &id)
+        mdcanvas::delete_node_reparent_children(&located.raw, local_id)
     } else {
-        mdcanvas::delete_node(&raw, &id)
+        mdcanvas::delete_node(&located.raw, local_id)
     }
     .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}")))?;
     parse_or_error(&updated)?;
-    state
-        .save(&updated)
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    *state.raw.lock().unwrap() = updated.clone();
-    canvas_response(&updated, &state.canvas_path)
+    commit_located(&state, &located, &updated)?;
+    let response_raw = state.raw.lock().unwrap().clone();
+    canvas_response(&response_raw, &state.canvas_path)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1240,10 +1496,31 @@ async fn reparent_node(
     Path(id): Path<String>,
     Json(req): Json<ReparentNodeRequest>,
 ) -> Result<Json<Canvas>, ApiError> {
-    let raw = state.raw.lock().unwrap().clone();
+    let primary_raw = state.raw.lock().unwrap().clone();
+    let located = locate_node(&state, &primary_raw, &id)?;
+    let located_parent = locate_node(&state, &primary_raw, &req.new_parent_id)?;
+    // In practice this can't actually happen — an extra-parent `from=` is
+    // only ever resolved against its own document's own id set (see
+    // `update_node`'s same check), so `id`'s declared extra parents can
+    // never point outside whichever file `id` itself lives in. Checked
+    // anyway, defensively, rather than relying on that invariant holding.
+    if located.origin != located_parent.origin {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "can't reparent {id:?} onto {:?} — they live in different files \
+                 (reparenting across an include boundary isn't supported)",
+                req.new_parent_id
+            ),
+        ));
+    }
+    let raw = located.raw.clone();
+    let local_id = &located.local_id;
+    let local_parent_id = &located_parent.local_id;
+
     let canvas = parse_or_error(&raw)?;
     let node = canvas
-        .node(&id)
+        .node(local_id)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}")))?;
     if node.parent.is_none() {
         return Err(ApiError(
@@ -1252,9 +1529,9 @@ async fn reparent_node(
         ));
     }
     canvas
-        .node(&req.new_parent_id)
+        .node(local_parent_id)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {:?}", req.new_parent_id)))?;
-    if !node.extra_parents.iter().any(|e| e.from == req.new_parent_id) {
+    if !node.extra_parents.iter().any(|e| &e.from == local_parent_id) {
         return Err(ApiError(
             StatusCode::UNPROCESSABLE_ENTITY,
             format!("{:?} is not one of {id:?}'s extra parents", req.new_parent_id),
@@ -1265,9 +1542,13 @@ async fn reparent_node(
     // but a move into, out of, or between groups now silently flips what
     // those numbers *mean* (see `Canvas::resolve_absolute_position`) unless
     // corrected here. Resolve the pre-move absolute position first, in the
-    // *old* parent chain...
-    let abs_before = canvas.resolve_absolute_position(&id);
-    let mut updated = mdcanvas::reparent_node(&raw, &id, &req.new_parent_id).ok_or_else(|| {
+    // *old* parent chain — within `local_id`'s own file is the right frame
+    // for this even when it's an include target: any outer group anchor
+    // from the including document applies equally before and after a move
+    // that (per the check above) never leaves this same file, so it
+    // cancels out.
+    let abs_before = canvas.resolve_absolute_position(local_id);
+    let mut updated = mdcanvas::reparent_node(&raw, local_id, local_parent_id).ok_or_else(|| {
         ApiError(
             StatusCode::UNPROCESSABLE_ENTITY,
             format!("can't reparent {id:?} onto {:?} (would create a cycle)", req.new_parent_id),
@@ -1284,8 +1565,8 @@ async fn reparent_node(
     // stored position untouched instead, a documented, bounded limitation
     // rather than inventing a synthetic anchor mid-request.
     if let Some((abs_x, abs_y)) = abs_before {
-        if let Some((local_x, local_y)) = new_canvas.absolute_to_local(&id, abs_x, abs_y) {
-            if let Some(new_node) = new_canvas.node(&id) {
+        if let Some((local_x, local_y)) = new_canvas.absolute_to_local(local_id, abs_x, abs_y) {
+            if let Some(new_node) = new_canvas.node(local_id) {
                 if new_node.x != Some(local_x) || new_node.y != Some(local_y) {
                     let meta = NodeMeta {
                         x: Some(local_x),
@@ -1301,18 +1582,16 @@ async fn reparent_node(
                         fold: new_node.fold,
                         tags: new_node.tags.clone(),
                     };
-                    if let Some(patched) = mdcanvas::set_node_meta(&updated, &id, &meta) {
+                    if let Some(patched) = mdcanvas::set_node_meta(&updated, local_id, &meta) {
                         updated = patched;
                     }
                 }
             }
         }
     }
-    state
-        .save(&updated)
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    *state.raw.lock().unwrap() = updated.clone();
-    canvas_response(&updated, &state.canvas_path)
+    commit_located(&state, &located, &updated)?;
+    let response_raw = state.raw.lock().unwrap().clone();
+    canvas_response(&response_raw, &state.canvas_path)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1334,8 +1613,13 @@ async fn rename_node_id(
     Path(id): Path<String>,
     Json(req): Json<RenameNodeIdRequest>,
 ) -> Result<Json<Canvas>, ApiError> {
-    let raw = state.raw.lock().unwrap().clone();
-    let updated = mdcanvas::rename_node_id(&raw, &id, &req.new_id).map_err(|e| {
+    let primary_raw = state.raw.lock().unwrap().clone();
+    let located = locate_node(&state, &primary_raw, &id)?;
+    // `req.newId` is a fresh id being assigned, not a reference to an
+    // existing (possibly-namespaced) one — used verbatim as the new local
+    // id in whichever file `id` lives in; `include::resolve` re-derives
+    // the composed, namespaced form from it next time regardless.
+    let updated = mdcanvas::rename_node_id(&located.raw, &located.local_id, &req.new_id).map_err(|e| {
         let status = match e {
             mdcanvas::RenameIdError::NotFound(_) => StatusCode::NOT_FOUND,
             mdcanvas::RenameIdError::AlreadyExists(_)
@@ -1345,11 +1629,9 @@ async fn rename_node_id(
         ApiError(status, e.to_string())
     })?;
     parse_or_error(&updated)?;
-    state
-        .save(&updated)
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    *state.raw.lock().unwrap() = updated.clone();
-    canvas_response(&updated, &state.canvas_path)
+    commit_located(&state, &located, &updated)?;
+    let response_raw = state.raw.lock().unwrap().clone();
+    canvas_response(&response_raw, &state.canvas_path)
 }
 
 /// Runs the requested block plus — automatically, same as the CLI, unless
@@ -2153,6 +2435,7 @@ fn build_app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/canvas", get(get_canvas).put(put_canvas))
         .route("/api/canvas/raw", get(get_canvas_raw).put(put_canvas_raw))
+        .route("/api/includes", get(get_includes))
         .route("/api/canvas/clear-layout", post(clear_layout))
         .route("/api/nodes", post(create_node))
         .route("/api/nodes/:id", patch(update_node).delete(remove_node))
@@ -2382,6 +2665,311 @@ mod reparent_position_tests {
         assert_eq!(wanderer.y, Some(30.0));
 
         let _ = std::fs::remove_file(&canvas_path);
+    }
+}
+
+#[cfg(test)]
+mod include_edit_tests {
+    use super::*;
+
+    fn blank_update_request() -> UpdateNodeRequest {
+        UpdateNodeRequest {
+            title: None,
+            node_type: None,
+            color: None,
+            target: None,
+            text: None,
+            extra_parents: None,
+            display: None,
+            lang: None,
+            interpreter: None,
+            tags: None,
+            edge_label: None,
+            fold: None,
+        }
+    }
+
+    fn expect_ok(result: Result<Json<Canvas>, ApiError>) -> Canvas {
+        match result {
+            Ok(Json(canvas)) => canvas,
+            Err(e) => panic!("request failed: {}", e.1),
+        }
+    }
+
+    fn expect_err(result: Result<Json<Canvas>, ApiError>) -> ApiError {
+        match result {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e,
+        }
+    }
+
+    /// A primary `base.canvas.md` including `child.canvas.md` (namespaced
+    /// `child/root`/`child/leaf` once resolved), in a fresh temp dir shared
+    /// by both files — returns the primary document's own path.
+    fn write_base_and_child_canvas() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("meshfox-include-edit-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("child.canvas.md"),
+            concat!(
+                "<!-- meshfox:canvas -->\n# Child\n<!-- meshfox:node id=\"root\" -->\n\nintro\n\n",
+                "## Leaf\n<!-- meshfox:node id=\"leaf\" -->\n\nleaf body\n",
+            ),
+        )
+        .unwrap();
+        let base_path = dir.join("base.canvas.md");
+        std::fs::write(
+            &base_path,
+            concat!(
+                "<!-- meshfox:canvas -->\n# Base\n<!-- meshfox:node id=\"base\" -->\n\n",
+                "## Child\n<!-- meshfox:node id=\"child\" type=\"include\" -->\n\n[child](./child.canvas.md)\n",
+            ),
+        )
+        .unwrap();
+        base_path
+    }
+
+    #[tokio::test]
+    async fn update_node_edits_an_included_nodes_own_file_not_the_primary_one() {
+        let base_path = write_base_and_child_canvas();
+        let child_path = base_path.parent().unwrap().join("child.canvas.md");
+        let base_before = std::fs::read_to_string(&base_path).unwrap();
+        let state = build_state(base_path.clone(), false).await.expect("valid test canvas");
+
+        let mut req = blank_update_request();
+        req.text = Some("new leaf body".to_string());
+        let updated = expect_ok(update_node(State(state), Path("child/leaf".to_string()), Json(req)).await);
+
+        let leaf = updated.node("child/leaf").expect("child/leaf still present");
+        assert_eq!(leaf.text, "new leaf body");
+        // The primary document itself is untouched — the edit landed in
+        // `child.canvas.md`, addressed there by its own local id `leaf`.
+        assert_eq!(std::fs::read_to_string(&base_path).unwrap(), base_before);
+        assert!(std::fs::read_to_string(&child_path).unwrap().contains("new leaf body"));
+
+        let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn create_node_under_an_included_parent_writes_into_the_included_file() {
+        let base_path = write_base_and_child_canvas();
+        let child_path = base_path.parent().unwrap().join("child.canvas.md");
+        let state = build_state(base_path.clone(), false).await.expect("valid test canvas");
+
+        let updated = expect_ok(
+            create_node(
+                State(state),
+                Json(CreateNodeRequest { parent_id: "child/root".to_string(), title: "New Kid".to_string() }),
+            )
+            .await,
+        );
+
+        let new_node =
+            updated.nodes.iter().find(|n| n.title == "New Kid").expect("new node present in the response");
+        assert_eq!(new_node.parent.as_deref(), Some("child/root"));
+        assert!(std::fs::read_to_string(&child_path).unwrap().contains("New Kid"));
+
+        let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn remove_node_deletes_from_the_included_file_and_leaves_the_primary_document_alone() {
+        let base_path = write_base_and_child_canvas();
+        let child_path = base_path.parent().unwrap().join("child.canvas.md");
+        let base_before = std::fs::read_to_string(&base_path).unwrap();
+        let state = build_state(base_path.clone(), false).await.expect("valid test canvas");
+
+        let updated = expect_ok(
+            remove_node(State(state), Path("child/leaf".to_string()), Query(DeleteNodeQuery { children: None }))
+                .await,
+        );
+
+        assert!(updated.node("child/leaf").is_none());
+        assert_eq!(std::fs::read_to_string(&base_path).unwrap(), base_before);
+        assert!(!std::fs::read_to_string(&child_path).unwrap().contains("Leaf"));
+
+        let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn rename_node_id_renames_within_the_included_file() {
+        let base_path = write_base_and_child_canvas();
+        let state = build_state(base_path.clone(), false).await.expect("valid test canvas");
+
+        let updated = expect_ok(
+            rename_node_id(
+                State(state),
+                Path("child/leaf".to_string()),
+                Json(RenameNodeIdRequest { new_id: "renamed-leaf".to_string() }),
+            )
+            .await,
+        );
+
+        assert!(updated.node("child/leaf").is_none());
+        let renamed = updated.node("child/renamed-leaf").expect("renamed node present under its new namespaced id");
+        assert_eq!(renamed.title, "Leaf");
+
+        let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn update_node_on_a_plain_markdown_include_rejects_a_text_edit_with_a_clear_reason() {
+        let dir = std::env::temp_dir().join(format!("meshfox-include-edit-test-md-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("notes.md"), "# Notes\n\nsome prose\n").unwrap();
+        let base_path = dir.join("base.canvas.md");
+        std::fs::write(
+            &base_path,
+            concat!(
+                "<!-- meshfox:canvas -->\n# Base\n<!-- meshfox:node id=\"base\" -->\n\n",
+                "## Notes\n<!-- meshfox:node id=\"notes\" type=\"include\" -->\n\n[notes](./notes.md)\n",
+            ),
+        )
+        .unwrap();
+        let base_before = std::fs::read_to_string(&base_path).unwrap();
+        let state = build_state(base_path.clone(), false).await.expect("valid test canvas");
+
+        let mut req = blank_update_request();
+        req.text = Some("clobbered".to_string());
+        let err = expect_err(update_node(State(state), Path("notes".to_string()), Json(req)).await);
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(err.1.contains("include target file"), "unexpected message: {}", err.1);
+        // Nothing was written — the link is still there, not clobbered.
+        assert_eq!(std::fs::read_to_string(&base_path).unwrap(), base_before);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn update_node_on_an_unknown_id_still_404s() {
+        let base_path = write_base_and_child_canvas();
+        let state = build_state(base_path.clone(), false).await.expect("valid test canvas");
+
+        let err = expect_err(update_node(State(state), Path("nope".to_string()), Json(blank_update_request())).await);
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn put_canvas_persists_a_dragged_included_nodes_position_into_its_own_file() {
+        let base_path = write_base_and_child_canvas();
+        let child_path = base_path.parent().unwrap().join("child.canvas.md");
+        let base_before = std::fs::read_to_string(&base_path).unwrap();
+        let state = build_state(base_path.clone(), false).await.expect("valid test canvas");
+
+        let primary_raw = state.raw.lock().unwrap().clone();
+        let mut canvas = resolved_canvas(&primary_raw, &state.canvas_path)
+            .unwrap_or_else(|e| panic!("resolve failed: {}", e.1));
+        canvas.node_mut("child/leaf").expect("child/leaf present").x = Some(123.0);
+        canvas.node_mut("child/leaf").expect("child/leaf present").y = Some(456.0);
+
+        let status = put_canvas(State(state), Json(canvas))
+            .await
+            .unwrap_or_else(|e| panic!("put_canvas failed: {}", e.1));
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // The primary document is untouched — the position landed in
+        // `child.canvas.md`, addressed there by its own local id `leaf`.
+        assert_eq!(std::fs::read_to_string(&base_path).unwrap(), base_before);
+        let child_after = std::fs::read_to_string(&child_path).unwrap();
+        assert!(child_after.contains("id=\"leaf\" x=123 y=456"), "child file: {child_after}");
+
+        let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn get_includes_lists_the_child_canvas_include() {
+        let base_path = write_base_and_child_canvas();
+        let state = build_state(base_path.clone(), false).await.expect("valid test canvas");
+
+        let Json(entries) = get_includes(State(state)).await.unwrap_or_else(|e| panic!("failed: {}", e.1));
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].node_id, "child");
+        assert_eq!(entries[0].title, "Child");
+        assert_eq!(entries[0].target, "./child.canvas.md");
+        assert_eq!(entries[0].depth, 0);
+        assert!(entries[0].is_canvas);
+
+        let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn source_mode_reads_and_writes_an_included_files_own_raw_text() {
+        let base_path = write_base_and_child_canvas();
+        let child_path = base_path.parent().unwrap().join("child.canvas.md");
+        let base_before = std::fs::read_to_string(&base_path).unwrap();
+        let state = build_state(base_path.clone(), false).await.expect("valid test canvas");
+
+        let source = get_canvas_raw(State(state.clone()), Query(SourceFileQuery { include: Some("child".to_string()) }))
+            .await
+            .unwrap_or_else(|e| panic!("get failed: {}", e.1));
+        assert_eq!(source, std::fs::read_to_string(&child_path).unwrap());
+
+        let new_source = format!("{source}\n## Extra\n<!-- meshfox:node id=\"extra\" -->\n\nmore\n");
+        let status = put_canvas_raw(
+            State(state),
+            Query(SourceFileQuery { include: Some("child".to_string()) }),
+            new_source.clone(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("put failed: {}", e.1));
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        assert_eq!(std::fs::read_to_string(&child_path).unwrap(), new_source);
+        // The primary document was never touched by any of this.
+        assert_eq!(std::fs::read_to_string(&base_path).unwrap(), base_before);
+
+        let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn source_mode_rejects_an_unknown_include_id() {
+        let base_path = write_base_and_child_canvas();
+        let state = build_state(base_path.clone(), false).await.expect("valid test canvas");
+
+        let err = match get_canvas_raw(State(state), Query(SourceFileQuery { include: Some("nope".to_string()) })).await {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e,
+        };
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn source_mode_on_a_plain_markdown_include_skips_canvas_validation() {
+        let dir = std::env::temp_dir().join(format!("meshfox-include-edit-test-md-source-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("notes.md"), "# Notes\n\nsome prose\n").unwrap();
+        let base_path = dir.join("base.canvas.md");
+        std::fs::write(
+            &base_path,
+            concat!(
+                "<!-- meshfox:canvas -->\n# Base\n<!-- meshfox:node id=\"base\" -->\n\n",
+                "## Notes\n<!-- meshfox:node id=\"notes\" type=\"include\" -->\n\n[notes](./notes.md)\n",
+            ),
+        )
+        .unwrap();
+        let state = build_state(base_path.clone(), false).await.expect("valid test canvas");
+
+        // Ordinary prose with no single H1 root and no `meshfox:node`
+        // structure at all — would fail `parse_or_error` as a canvas, and
+        // must not be asked to pass as one, since a plain-Markdown include
+        // target never has to be canvas-shaped in the first place.
+        let new_prose = "Just some words.\n\nNo heading here at all.\n";
+        let status = put_canvas_raw(
+            State(state),
+            Query(SourceFileQuery { include: Some("notes".to_string()) }),
+            new_prose.to_string(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("put failed: {}", e.1));
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(std::fs::read_to_string(dir.join("notes.md")).unwrap(), new_prose);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

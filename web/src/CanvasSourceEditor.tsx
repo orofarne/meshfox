@@ -1,12 +1,15 @@
 import { useEffect, useState } from "react";
 import CodeMirror from "@uiw/react-codemirror";
-import { fetchCanvasSource, saveCanvasSource } from "./api";
+import { fetchCanvasSource, fetchIncludes, saveCanvasSource, type IncludeManifestEntry } from "./api";
 import { usePrefersDark } from "./NodeTextEditor";
 import { meshfoxMarkdown } from "./meshfoxSyntax";
 
 interface CanvasSourceEditorProps {
   /** Fires once a save actually succeeds — the caller should reload the
-   * parsed canvas and switch back to the graph view. */
+   * parsed canvas and switch back to the graph view. Fired the same way
+   * regardless of which file was actually saved (the primary document or
+   * an include's own target — see `selected` below): either way, a fresh
+   * `GET /api/canvas` reflects it. */
   onSaved: () => void;
   /** Leaves Source mode without saving. Prompts for confirmation itself if
    * there are unsaved edits, so the caller can wire this straight to a
@@ -17,6 +20,12 @@ interface CanvasSourceEditorProps {
   onDirtyChange?: (dirty: boolean) => void;
 }
 
+/** `"primary"` (the document itself) or an include's own `nodeId` (see
+ * `IncludeManifestEntry`) — kept as a plain string rather than
+ * `string | undefined` so it works directly as a controlled `<select>`
+ * value. */
+const PRIMARY = "primary";
+
 /**
  * Full-document raw Markdown editor — the toolbar's "Source" mode,
  * alongside the per-node body editor (NodeTextEditor). Unlike that one,
@@ -26,8 +35,18 @@ interface CanvasSourceEditorProps {
  * server validates the full document parses before writing anything —
  * a rejected save leaves both the file and this editor's contents
  * untouched, with the parser's own error shown so it's fixable.
+ *
+ * A document that pulls in other files via `include` (see SPEC.md) is
+ * still just one *visual* canvas — the graph view already lets an
+ * included subtree's nodes be dragged/edited transparently, writing back
+ * to whichever file they actually live in. The picker below is Source
+ * mode's own equivalent: pick "this document" (the default) or any
+ * include, however deeply nested, to view/edit *its* raw text instead —
+ * still one file at a time, since that's what's actually on disk.
  */
 export function CanvasSourceEditor({ onSaved, onClose, onDirtyChange }: CanvasSourceEditorProps) {
+  const [includes, setIncludes] = useState<IncludeManifestEntry[]>([]);
+  const [selected, setSelected] = useState(PRIMARY);
   const [text, setText] = useState<string | null>(null);
   const [original, setOriginal] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -35,13 +54,21 @@ export function CanvasSourceEditor({ onSaved, onClose, onDirtyChange }: CanvasSo
   const dark = usePrefersDark();
 
   useEffect(() => {
-    fetchCanvasSource()
+    fetchIncludes()
+      .then(setIncludes)
+      .catch(() => setIncludes([])); // non-fatal: the picker just won't offer any include
+  }, []);
+
+  useEffect(() => {
+    setText(null);
+    setError(null);
+    fetchCanvasSource(selected === PRIMARY ? undefined : selected)
       .then((t) => {
         setText(t);
         setOriginal(t);
       })
       .catch((e) => setError(String(e)));
-  }, []);
+  }, [selected]);
 
   const dirty = text !== null && text !== original;
 
@@ -49,9 +76,17 @@ export function CanvasSourceEditor({ onSaved, onClose, onDirtyChange }: CanvasSo
     onDirtyChange?.(dirty);
   }, [dirty, onDirtyChange]);
 
+  const confirmDiscardIfDirty = () => !dirty || window.confirm("Discard unsaved source changes?");
+
   const handleClose = () => {
-    if (dirty && !window.confirm("Discard unsaved source changes?")) return;
+    if (!confirmDiscardIfDirty()) return;
     onClose();
+  };
+
+  const handleSelect = (nodeId: string) => {
+    if (nodeId === selected) return;
+    if (!confirmDiscardIfDirty()) return;
+    setSelected(nodeId);
   };
 
   const handleSave = async () => {
@@ -59,7 +94,7 @@ export function CanvasSourceEditor({ onSaved, onClose, onDirtyChange }: CanvasSo
     setSaving(true);
     setError(null);
     try {
-      await saveCanvasSource(text);
+      await saveCanvasSource(text, selected === PRIMARY ? undefined : selected);
       onSaved();
     } catch (e) {
       setError(String(e));
@@ -72,6 +107,23 @@ export function CanvasSourceEditor({ onSaved, onClose, onDirtyChange }: CanvasSo
     <div className="mesh-source-editor">
       <div className="mesh-source-editor-toolbar">
         <span className="mesh-source-editor-label">Editing raw Markdown source</span>
+        {includes.length > 0 && (
+          <select
+            className="mesh-source-editor-file-select"
+            value={selected}
+            onChange={(e) => handleSelect(e.target.value)}
+            disabled={saving}
+          >
+            <option value={PRIMARY}>This document</option>
+            {includes.map((inc) => (
+              <option key={inc.nodeId} value={inc.nodeId}>
+                {"  ".repeat(inc.depth + 1)}
+                {"↳ "}
+                {inc.title} ({inc.target})
+              </option>
+            ))}
+          </select>
+        )}
         {error && <span className="error">{error}</span>}
         <div className="mesh-source-editor-actions">
           <button type="button" onClick={handleClose} disabled={saving}>
@@ -87,6 +139,7 @@ export function CanvasSourceEditor({ onSaved, onClose, onDirtyChange }: CanvasSo
           <div className="mesh-source-editor-loading">Loading…</div>
         ) : (
           <CodeMirror
+            key={selected}
             value={text}
             height="100%"
             theme={dark ? "dark" : "light"}

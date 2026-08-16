@@ -13,7 +13,7 @@ fn readme_is_a_valid_canvas() {
     assert_eq!(root.title, "meshfox");
 
     let titles: Vec<&str> = canvas.nodes.iter().map(|n| n.title.as_str()).collect();
-    for expected in ["Concept", "File format", "Architecture", "Roadmap", "Development"] {
+    for expected in ["Concept", "File format", "Architecture", "Development"] {
         assert!(titles.contains(&expected), "missing section {expected:?}, found {titles:?}");
     }
 

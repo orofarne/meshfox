@@ -168,6 +168,17 @@ pub(crate) struct RawFence {
 }
 
 fn fence_open(line: &str) -> Option<(char, usize, &str)> {
+    // CommonMark: 4+ spaces of indentation makes a line part of an
+    // *indented* code block, not a fence — this is how SPEC.md "escapes"
+    // its own illustrative fence examples (see e.g. "Constraint fences",
+    // "Runnable code fences") so they read as inert documentation rather
+    // than being picked up as real runnable/constraint blocks, including
+    // once spliced into another document via `include` (a plain-Markdown
+    // include target's body is scanned exactly like any other node's).
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent >= 4 {
+        return None;
+    }
     let trimmed = line.trim_start();
     let ch = trimmed.chars().next()?;
     if ch != '`' && ch != '~' {
@@ -447,6 +458,28 @@ mod tests {
     fn ignores_fences_without_name() {
         let md = "```bash\necho hi\n```\n";
         assert!(scan_code_blocks(md).is_empty());
+    }
+
+    #[test]
+    fn ignores_a_four_space_indented_fence_as_an_indented_code_block_not_a_fence() {
+        // Same trick SPEC.md itself uses to show a fence's literal syntax
+        // as inert documentation (see "Constraint fences", "Runnable code
+        // fences") rather than a real runnable/constraint block — must
+        // stay inert even once that text is scanned as another node's own
+        // body (e.g. spliced in via `include`).
+        let md = "    ```bash name=\"build\" cache\n    echo hi\n    ```\n";
+        assert!(scan_code_blocks(md).is_empty());
+        assert!(scan_constraint_blocks("    ```starlark constraint\n    fail(\"x\")\n    ```\n").is_empty());
+    }
+
+    #[test]
+    fn still_recognizes_a_fence_indented_by_up_to_three_spaces() {
+        // e.g. nested one level under a Markdown list item — CommonMark's
+        // indented-code-block rule only kicks in at 4+ spaces.
+        let md = "  ```bash name=\"build\" cache\n  echo hi\n  ```\n";
+        let blocks = scan_code_blocks(md);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].code, "  echo hi");
     }
 
     #[test]

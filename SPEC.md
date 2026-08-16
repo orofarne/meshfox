@@ -162,6 +162,42 @@ An included file can itself declare includes; those are resolved too,
 with a cycle (A includes B includes A) reported as an error rather than
 recursing forever.
 
+### What crosses the include boundary
+
+Position (`x`/`y`) needs no special handling: a spliced node's coordinates
+are already relative to its nearest `group` ancestor (see "File structure"
+above), and the include node itself becomes a `group`, so an included
+subtree lays out correctly with no rewriting at all. A structural
+`meshfox:edge` inside the included content is rewritten to the namespaced
+id automatically, same as `parent`.
+
+Two other features interact with includes very differently, because one
+runs against the raw single file and the other against the fully composed
+tree:
+
+- **Runnable-fence `deps=`** (see "Runnable code fences") never crosses an
+  include boundary, deliberately: `run`/`list`/`deps::validate` all work
+  on one file's raw text (per "Includes" above), so a `deps=` reference is
+  only ever resolved against that same file's own, un-namespaced node
+  ids. A block inside an included canvas can't be depended on from the
+  including document, or vice versa — and an *internal* cross-node
+  `deps="other-node/block"` reference inside a file stays valid whether
+  that file is run standalone or spliced into a parent, precisely because
+  it's never evaluated post-splice.
+- **Constraint fences** (see "Constraint fences") are the opposite: `meshfox
+  view`, the terminal viewer, and `meshfox check` all evaluate constraints
+  against the fully resolved, composed document — so a constraint fence
+  living inside an included canvas is checked there too, and `self`/
+  `doc.children()`/`.descendants()`/`.nodes_with_tag(...)` navigation from
+  it sees the same spliced-in tree everything else does. The one thing
+  that *doesn't* survive splicing is a constraint script that hardcodes a
+  literal node id (`doc.node("some-id")`): once the file it's written in
+  gets included elsewhere, that id is renamed to
+  `{include_id}/{original_id}` and the hardcoded reference stops
+  resolving. Prefer relative navigation (`self`, `.children()`,
+  `.descendants()`) or tag lookups (`.nodes_with_tag(...)`) over a literal
+  id in any constraint that might end up inside an included file.
+
 ## Runnable code fences
 
 Lives inside a node's Markdown text, as fence-info-string attributes:

@@ -113,6 +113,8 @@ mod tests {
             text: text.to_string(),
             constraint_results: Vec::new(),
             asset_base: None,
+            origin_path: None,
+            origin_id: None,
         }
     }
 

@@ -222,6 +222,8 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
             text: body,
             constraint_results: Vec::new(),
             asset_base: None,
+            origin_path: None,
+            origin_id: None,
         });
     }
 

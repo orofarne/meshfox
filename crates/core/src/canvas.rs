@@ -276,6 +276,24 @@ pub struct Node {
     /// `mdcanvas::parse` itself, same as `constraint_results`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asset_base: Option<String>,
+    /// Where this node's own content actually lives on disk, when that
+    /// differs from the document being viewed — i.e. this node was
+    /// spliced in from a canvas `include` target (`crate::include::resolve`).
+    /// `origin_path` is that target file's own canonical path; `origin_id`
+    /// is this node's id *within that file*, before `include::resolve`
+    /// namespaced it to `{include_id}/{original_id}` (see `Node::id`).
+    /// `None` for every node that lives directly in the document being
+    /// viewed, including the `include` node itself (only its *spliced-in
+    /// descendants* get an origin). Never set by `mdcanvas::parse`, and
+    /// never sent over the wire (`#[serde(skip)]`, unlike `asset_base`) —
+    /// this is a same-process breadcrumb for a consumer that wants to
+    /// *write back* to the right file (the server's mutating endpoints
+    /// re-derive it themselves by resolving again, rather than trusting a
+    /// client-echoed path).
+    #[serde(skip)]
+    pub origin_path: Option<String>,
+    #[serde(skip)]
+    pub origin_id: Option<String>,
 }
 
 impl Node {
