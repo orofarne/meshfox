@@ -301,17 +301,140 @@ async fn get_vars(
     // (see `meshfox_core::varout`) — so the pre-run form must never offer
     // one as a field, regardless of whether it's currently "resolved".
     let relevant: Vec<_> = decls
-        .into_iter()
+        .iter()
         .filter(|d| needed.contains(&d.name) && d.from.is_none())
+        .cloned()
         .collect();
 
+    // A `choices_var`/`default_var` chain reaching a `from=`-computed
+    // variable can't be known without actually running that variable's
+    // own source block — nothing else about a status check like this one
+    // ever executes anything, but there's no other way to show real
+    // choices instead of an empty dropdown. Scoped to only the source
+    // blocks `relevant`'s own fields actually need this way (see
+    // `materialize_choices_and_defaults`), never a `from=` variable only
+    // ever reached through an ordinary `env=` — that one's value is still
+    // computed during the real run, same as always.
+    let computed = materialize_choices_and_defaults(&canvas, &decls, &relevant).await;
+
     let cache = state.vars_cache.lock().unwrap();
-    let resolved = meshfox_core::resolve_vars(&relevant, &HashMap::new(), &cache, &HashMap::new());
+    let closure =
+        meshfox_core::close_over_var_refs(&decls, relevant.iter().map(|d| d.name.as_str()));
+    let decls_for_resolve: Vec<_> = decls
+        .iter()
+        .filter(|d| closure.contains(d.name.as_str()))
+        .cloned()
+        .collect();
+    let resolved = meshfox_core::resolve_vars(&decls_for_resolve, &HashMap::new(), &cache, &computed);
+    // A decl that needed prompting carries its own *materialized*
+    // default/choices (substituted from `default_var`/`choices_var`) in
+    // `resolved.missing`, not the raw `relevant` copy — see
+    // `vars::resolve`'s own doc comment.
+    let missing_by_name: HashMap<&str, &meshfox_core::VarDecl> =
+        resolved.missing.iter().map(|d| (d.name.as_str(), d)).collect();
     let statuses = relevant
         .into_iter()
-        .map(|d| var_status(d, &resolved))
+        .map(|d| {
+            let materialized = missing_by_name
+                .get(d.name.as_str())
+                .map(|m| (*m).clone())
+                .unwrap_or(d);
+            var_status(materialized, &resolved)
+        })
         .collect();
     Ok(Json(statuses))
+}
+
+/// Runs whichever `from=` source blocks are needed — transitively, via
+/// `default_var`/`choices_var` (see `meshfox_core::close_over_var_refs`) —
+/// to materialize real `choices`/`default` for `for_decls`, the variables
+/// about to be shown as fields. A `from=` variable only ever reached
+/// through an ordinary `env=` (not through another displayed field's own
+/// `default_var`/`choices_var`) is deliberately left alone — its value is
+/// still computed during the real run, never speculatively during a
+/// status check.
+///
+/// Each source's own full `deps=` chain is run too (in order), same as a
+/// real run would — but with no `env=` of its own resolved for any of
+/// these steps (an empty environment, besides the usual
+/// `MESHFOX_VARS_OUT`): a script meant to populate a dropdown's choices
+/// is expected to be a self-contained, read-only query (`aws
+/// list-regions`, `git branch -l`, ...), not one needing its own
+/// document-declared input. A step that fails, or that itself needs
+/// input this can't supply, just means whichever field(s) depended on it
+/// stay without real choices this round — the same graceful "not yet
+/// resolvable" fallback `vars::resolve` already has for any other
+/// unresolvable `default_var`/`choices_var` reference, not a hard error
+/// for the whole status check.
+async fn materialize_choices_and_defaults(
+    canvas: &Canvas,
+    decls: &[meshfox_core::VarDecl],
+    for_decls: &[meshfox_core::VarDecl],
+) -> HashMap<String, String> {
+    let mut chain: Vec<meshfox_core::BlockAddr> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for d in for_decls {
+        for name in meshfox_core::close_over_var_refs(decls, [d.name.as_str()]) {
+            let Some(from) = decls
+                .iter()
+                .find(|x| x.name == name)
+                .and_then(|x| x.from.clone())
+            else {
+                continue;
+            };
+            let addr =
+                meshfox_core::BlockAddr::new(from.node_id.unwrap_or_default(), from.block_name);
+            if let Ok(steps) = meshfox_core::deps::resolve_chain(canvas, addr) {
+                for step in steps {
+                    let key = (step.node_id.clone(), step.block_name.clone());
+                    if seen.insert(key) {
+                        chain.push(step);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut computed = HashMap::new();
+    for addr in chain {
+        if let Some(values) = run_from_source_for_status(canvas, &addr).await {
+            computed.extend(values);
+        }
+    }
+    computed
+}
+
+/// Runs a single block to completion for `materialize_choices_and_defaults`
+/// — no streaming (the caller only needs whatever it wrote to its own
+/// vars-out file, not to show progress), and its output is otherwise
+/// discarded. `None` on a nonzero exit, an unsupported language, or any
+/// I/O failure — never fatal for the caller, which just leaves the
+/// affected field(s) without real choices/a default this round.
+async fn run_from_source_for_status(
+    canvas: &Canvas,
+    addr: &meshfox_core::BlockAddr,
+) -> Option<HashMap<String, String>> {
+    let node = canvas.node(&addr.node_id)?;
+    let block = meshfox_core::scan_runnable_blocks(&addr.node_id, &node.text)
+        .into_iter()
+        .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()))?;
+    if !stream_exec::supports(&block.lang) {
+        return None;
+    }
+    let path = meshfox_core::allocate_vars_out_path();
+    let mut env = HashMap::new();
+    env.insert(
+        meshfox_core::VARS_OUT_ENV.to_string(),
+        path.display().to_string(),
+    );
+    let mut proc = stream_exec::spawn_bash(&block.code, &env).ok()?;
+    while proc.output_rx.recv().await.is_some() {}
+    let status = proc.child.wait().await.ok()?;
+    if !status.success() {
+        let _ = meshfox_core::read_and_cleanup_vars_out(&path);
+        return None;
+    }
+    meshfox_core::read_and_cleanup_vars_out(&path).ok()
 }
 
 /// Builds one `VarStatus` from a declaration and the already-computed
@@ -374,17 +497,40 @@ async fn get_configure_vars(
     let decls = meshfox_core::declared_vars(&canvas)
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
     // Same reasoning as `get_vars`: a `from`-declared variable is computed,
-    // never something to configure by hand.
+    // never something to configure by hand. A `session` variable is never
+    // cached at all, so there's nothing here to configure either.
     let configurable: Vec<_> = decls
-        .into_iter()
-        .filter(|d| !d.secret && d.from.is_none())
+        .iter()
+        .filter(|d| !d.secret && !d.session && d.from.is_none())
+        .cloned()
         .collect();
 
+    // Same reasoning as `get_vars`: a `choices_var`/`default_var` chain
+    // reaching a `from=`-computed variable needs that variable's own
+    // source block actually run to show real choices instead of an empty
+    // dropdown.
+    let computed = materialize_choices_and_defaults(&canvas, &decls, &configurable).await;
+
     let cache = state.vars_cache.lock().unwrap();
-    let resolved = meshfox_core::resolve_vars(&configurable, &HashMap::new(), &cache, &HashMap::new());
+    let closure =
+        meshfox_core::close_over_var_refs(&decls, configurable.iter().map(|d| d.name.as_str()));
+    let decls_for_resolve: Vec<_> = decls
+        .iter()
+        .filter(|d| closure.contains(d.name.as_str()))
+        .cloned()
+        .collect();
+    let resolved = meshfox_core::resolve_vars(&decls_for_resolve, &HashMap::new(), &cache, &computed);
+    let missing_by_name: HashMap<&str, &meshfox_core::VarDecl> =
+        resolved.missing.iter().map(|d| (d.name.as_str(), d)).collect();
     let statuses = configurable
         .into_iter()
-        .map(|d| var_status(d, &resolved))
+        .map(|d| {
+            let materialized = missing_by_name
+                .get(d.name.as_str())
+                .map(|m| (*m).clone())
+                .unwrap_or(d);
+            var_status(materialized, &resolved)
+        })
         .collect();
     Ok(Json(statuses))
 }
@@ -416,7 +562,10 @@ async fn post_configure_vars(
     let canvas = parse_or_error(&raw)?;
     let decls = meshfox_core::declared_vars(&canvas)
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
-    let configurable: Vec<_> = decls.into_iter().filter(|d| !d.secret).collect();
+    let configurable: Vec<_> = decls
+        .into_iter()
+        .filter(|d| !d.secret && !d.session)
+        .collect();
 
     // Validated before anything is saved — this is the one boundary none
     // of the form's own controls (a `bool` checkbox, a `select` dropdown)
@@ -1905,7 +2054,10 @@ async fn run_block(
             ));
         }
         for (name, value) in &req.vars {
-            if relevant_decls.iter().any(|d| &d.name == name && !d.secret) {
+            if relevant_decls
+                .iter()
+                .any(|d| &d.name == name && !d.secret && !d.session)
+            {
                 let _ = cache.set(name, value);
             }
         }
@@ -2254,7 +2406,10 @@ async fn run_block_tty(
             ));
         }
         for (name, value) in &requested_vars {
-            if relevant_decls.iter().any(|d| &d.name == name && !d.secret) {
+            if relevant_decls
+                .iter()
+                .any(|d| &d.name == name && !d.secret && !d.session)
+            {
                 let _ = cache.set(name, value);
             }
         }
@@ -3970,6 +4125,9 @@ mod var_status_tests {
             secret,
             required,
             from: None,
+            session: false,
+            default_var: None,
+            choices_var: None,
         }
     }
 
@@ -4165,6 +4323,99 @@ mod vars_endpoint_tests {
         // required, no default fallback allowed
         assert_eq!(statuses[1]["resolved"], false);
         assert_eq!(statuses[1]["value"], "/usr/local/bin");
+
+        let _ = std::fs::remove_file(&canvas_path);
+        let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));
+    }
+
+    const DYNAMIC_CHOICES_CANVAS: &str = concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "<!-- meshfox:var name=\"REGIONS_LIST\" from=\"root/list-regions\" -->\n",
+        "<!-- meshfox:var name=\"REGION\" type=\"select\" choices_var=\"REGIONS_LIST\" -->\n\n",
+        "```bash name=\"list-regions\"\necho \"REGIONS_LIST=us-east-1,eu-west-1\" >> \"$MESHFOX_VARS_OUT\"\n```\n\n",
+        "```bash name=\"use-region\" env=\"$REGION\"\necho \"$REGION\"\n```\n",
+    );
+
+    // Regression test for a bug reported against `examples/vars.canvas.md`'s
+    // "Dynamic choices" node: the web UI's "Configure variables" modal
+    // showed `REGION`'s `<select>` with zero options, because `GET
+    // /api/vars` never executes anything, so a `choices_var` chain
+    // through a `from=`-computed variable had no way to ever resolve —
+    // unlike the CLI/TUI, which resolve lazily mid-chain and so had
+    // already run `list-regions` by the time `REGION` needed its choices.
+    #[tokio::test]
+    async fn get_vars_materializes_choices_var_through_a_from_computed_variable() {
+        let canvas_path = write_test_canvas(DYNAMIC_CHOICES_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, body) = get(addr, "/api/vars?block=use-region").await;
+        assert_eq!(status, 200);
+        let statuses: Vec<serde_json::Value> =
+            serde_json::from_str(&body).expect("valid VarStatus JSON");
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0]["name"], "REGION");
+        assert_eq!(
+            statuses[0]["choices"],
+            serde_json::json!(["us-east-1", "eu-west-1"])
+        );
+
+        let _ = std::fs::remove_file(&canvas_path);
+        let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));
+    }
+
+    #[tokio::test]
+    async fn get_configure_vars_materializes_choices_var_through_a_from_computed_variable() {
+        let canvas_path = write_test_canvas(DYNAMIC_CHOICES_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, body) = get(addr, "/api/vars/configure").await;
+        assert_eq!(status, 200);
+        let statuses: Vec<serde_json::Value> =
+            serde_json::from_str(&body).expect("valid VarStatus JSON");
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0]["name"], "REGION");
+        assert_eq!(
+            statuses[0]["choices"],
+            serde_json::json!(["us-east-1", "eu-west-1"])
+        );
+
+        let _ = std::fs::remove_file(&canvas_path);
+        let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));
+    }
+
+    const SESSION_CANVAS: &str = concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "<!-- meshfox:var name=\"DEPLOY_CONFIG\" type=\"select\" choices=\"staging,prod\" required session -->\n\n",
+        "```bash name=\"deploy\" env=\"$DEPLOY_CONFIG\"\necho \"$DEPLOY_CONFIG\"\n```\n",
+    );
+
+    #[tokio::test]
+    async fn get_vars_still_offers_a_session_variable_before_a_run() {
+        let canvas_path = write_test_canvas(SESSION_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, body) = get(addr, "/api/vars?block=deploy").await;
+        assert_eq!(status, 200);
+        let statuses: Vec<serde_json::Value> =
+            serde_json::from_str(&body).expect("valid VarStatus JSON");
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0]["name"], "DEPLOY_CONFIG");
+        assert_eq!(statuses[0]["resolved"], false);
+
+        let _ = std::fs::remove_file(&canvas_path);
+        let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));
+    }
+
+    #[tokio::test]
+    async fn get_configure_vars_excludes_a_session_variable() {
+        let canvas_path = write_test_canvas(SESSION_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, body) = get(addr, "/api/vars/configure").await;
+        assert_eq!(status, 200);
+        let statuses: Vec<serde_json::Value> =
+            serde_json::from_str(&body).expect("valid VarStatus JSON");
+        assert!(statuses.is_empty());
 
         let _ = std::fs::remove_file(&canvas_path);
         let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));

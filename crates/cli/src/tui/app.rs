@@ -1528,7 +1528,7 @@ impl App {
             return;
         };
         for (decl, value) in vf.decls.iter().zip(vf.inputs.iter()) {
-            if !decl.secret {
+            if !decl.secret && !decl.session {
                 let _ = self.var_cache.set(&decl.name, value);
             }
             self.run_overrides.insert(decl.name.clone(), value.clone());
@@ -1540,13 +1540,13 @@ impl App {
         }
     }
 
-    /// `c` — walks every declared non-secret variable in the whole
-    /// document (regardless of which, if any, block currently references
-    /// it via `env=`), same scope `meshfox configure` covers, all shown at
-    /// once with each one's currently-resolved value as the pre-filled
-    /// suggestion. Confirming (even unchanged) writes it to the cache —
-    /// the browser counterpart is `VarsForm` opened from the toolbar's
-    /// "configure" button; see `crates/server/src/lib.rs`'s
+    /// `c` — walks every declared non-secret, non-session variable in the
+    /// whole document (regardless of which, if any, block currently
+    /// references it via `env=`), same scope `meshfox configure` covers,
+    /// all shown at once with each one's currently-resolved value as the
+    /// pre-filled suggestion. Confirming (even unchanged) writes it to the
+    /// cache — the browser counterpart is `VarsForm` opened from the
+    /// toolbar's "configure" button; see `crates/server/src/lib.rs`'s
     /// `/api/vars/configure`. A no-op (past a status message) when
     /// there's nothing configurable, or while a run/another form/the
     /// block picker is already active.
@@ -1558,10 +1558,16 @@ impl App {
             self.status = "a run is already in progress — press K to kill it first".into();
             return;
         }
-        let decls: Vec<VarDecl> = self.decls.iter().filter(|d| !d.secret).cloned().collect();
+        let decls: Vec<VarDecl> = self
+            .decls
+            .iter()
+            .filter(|d| !d.secret && !d.session)
+            .cloned()
+            .collect();
         if decls.is_empty() {
             self.status =
-                "meshfox: this canvas declares no configurable (non-secret) variable(s)".into();
+                "meshfox: this canvas declares no configurable (non-secret, non-session) variable(s)"
+                    .into();
             return;
         }
         let inputs = decls
@@ -1578,11 +1584,11 @@ impl App {
 
     /// Whether the footer/help hint for `c` (configure) should be shown at
     /// all — same "configurable" definition `trigger_configure` itself
-    /// uses (declared, non-secret; a document that declares only secret
-    /// variables has nothing `c` could usefully do, same as the CLI's own
-    /// `configure` skipping them).
+    /// uses (declared, non-secret, non-session; a document that declares
+    /// only secret/session variables has nothing `c` could usefully do,
+    /// same as the CLI's own `configure` skipping them).
     pub fn has_configurable_vars(&self) -> bool {
-        self.decls.iter().any(|d| !d.secret)
+        self.decls.iter().any(|d| !d.secret && !d.session)
     }
 
     fn cancel_var_form(&mut self) {

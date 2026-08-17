@@ -16,13 +16,13 @@ fixture modified on disk; `git checkout` it back afterward if that
 matters to you.
 
 ## Frame
-<!-- meshfox:node id="frame" type="group" x=1720.831240007559 y=960.4156200037798 -->
+<!-- meshfox:node id="frame" type="group" x=2080 y=1144 -->
 
 ### Member Two
 <!-- meshfox:node id="member-two" x=20 y=160 w=200 h=100 -->
 
 Second member.
 ### Member One
-<!-- meshfox:node id="member-one" x=1189.4368883344323 y=531.2912588896215 w=200 h=100 -->
+<!-- meshfox:node id="member-one" x=1188 y=532 w=200 h=100 -->
 
 First member.

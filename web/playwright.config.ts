@@ -56,6 +56,10 @@ const QUICK_RUN_PORT = 4600;
 // its own fixture (edge-routing.canvas.md, a root with two children, one
 // of which has a child of its own) and port.
 const EDGE_ROUTING_PORT = 4601;
+// Thirteenth server + port for vars-form.spec.ts — same reasoning again,
+// its own fixture (vars-form.canvas.md, a `choices_var` chain reaching a
+// `from=`-computed variable) and port.
+const VARS_FORM_PORT = 4602;
 
 // Taller than Playwright's 720px default — the app's own `minZoom` (0.5)
 // is a hard floor on how far "fit view" can zoom out, and deps.canvas.md's
@@ -154,6 +158,11 @@ export default defineConfig({
       testMatch: /(^|\/)edge-routing\.spec\.ts$/,
       use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${EDGE_ROUTING_PORT}` },
     },
+    {
+      name: `${browser}-vars-form`,
+      testMatch: /(^|\/)vars-form\.spec\.ts$/,
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${VARS_FORM_PORT}` },
+    },
   ]),
   webServer: [
     {
@@ -236,6 +245,12 @@ export default defineConfig({
     {
       command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view e2e/fixtures/edge-routing.canvas.md --port ${EDGE_ROUTING_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${EDGE_ROUTING_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view e2e/fixtures/vars-form.canvas.md --port ${VARS_FORM_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${VARS_FORM_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },

@@ -3,7 +3,7 @@
 <!-- meshfox:node id="root" x=0 y=0 w=280 h=60 -->
 
 Every `meshfox:var` setting, side by side — see SPEC.md's "Variables"
-section for the full writeup. All seven are declared once here, in the
+section for the full writeup. All ten are declared once here, in the
 root node's own body:
 
 <!-- meshfox:var name="GREETING" prompt="Greeting?" default="Hello" -->
@@ -14,6 +14,9 @@ root node's own body:
 <!-- meshfox:var name="RETRY_COUNT" prompt="Retry count?" type="int" default="3" -->
 <!-- meshfox:var name="API_TOKEN" secret -->
 <!-- meshfox:var name="RESOURCE_ID" from="computed/create" -->
+<!-- meshfox:var name="DEPLOY_CONFIG" prompt="Deploy which config?" type="select" choices="staging,canary,prod" required session -->
+<!-- meshfox:var name="REGIONS_LIST" from="dynamic-choices/list-regions" -->
+<!-- meshfox:var name="REGION_DYNAMIC" type="select" choices_var="REGIONS_LIST" required session -->
 
 A declaration on its own does nothing — only a block that opts in via its
 own `env=` attribute ever resolves or prompts for one, and only for
@@ -191,8 +194,47 @@ using resource-42
 ```
 <!-- /meshfox:output -->
 
+## Session
+<!-- meshfox:node id="session-demo" x=32 y=4686 w=440 h=478 -->
+
+`DEPLOY_CONFIG` is `type="select"` with `required session` — unlike a
+plain `required` variable (whose confirmation is cached and reused
+forever after), `session` means the answer is never written to the
+on-disk cache at all, so every separate `meshfox run` invocation asks
+again. Referenced by more than one block in the *same* invocation, it's
+still only ever prompted for once — `session` only skips the cache, not
+the same once-per-invocation reuse every other variable already gets.
+Deliberately without `cache` here, same reason `secret-token` above has
+none: this needs a fresh interactive answer (or `--set`) every run, so
+there's no single "settled" output to freeze into the file.
+
+```bash name="deploy" env="$DEPLOY_CONFIG"
+echo "deploying to $DEPLOY_CONFIG"
+```
+
+## Dynamic choices
+<!-- meshfox:node id="dynamic-choices" x=32 y=5188 w=440 h=520 -->
+
+`REGION_DYNAMIC` has `choices_var="REGIONS_LIST"` instead of a literal
+`choices=` — and `REGIONS_LIST` is itself `from=`-computed by
+`list-regions` below, so `REGION_DYNAMIC`'s own options ultimately come
+from actually running a script, not a hardcoded list. Running `use-region`
+automatically runs `list-regions` first (the same implicit-dependency
+mechanism `from=` always gets, followed transitively through
+`choices_var`) — `REGION_DYNAMIC` itself still needs an interactive
+answer (or `--set`) once its choices are known, so this is also without
+`cache`.
+
+```bash name="list-regions"
+echo "REGIONS_LIST=us-east-1,eu-west-1,ap-southeast-1" >> "$MESHFOX_VARS_OUT"
+```
+
+```bash name="use-region" env="$REGION_DYNAMIC"
+echo "using $REGION_DYNAMIC"
+```
+
 ## Combined
-<!-- meshfox:node id="combined" x=32 y=4686 w=440 h=610 -->
+<!-- meshfox:node id="combined" x=32 y=5766 w=440 h=610 -->
 
 `env=` takes a comma-separated list — a single block can reference
 several declared variables at once, mixing plain, `required`, `select`,

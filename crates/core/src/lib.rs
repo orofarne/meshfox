@@ -43,8 +43,9 @@ pub use varout::{
     read_and_cleanup as read_and_cleanup_vars_out, VARS_OUT_ENV,
 };
 pub use vars::{
-    declared_vars, map_block_env, resolve as resolve_vars, resolve_block_env, validate_env_refs,
-    validate_value, BlockEnvResolution, ResolvedVars, VarDecl, VarType, VarsError,
+    close_over_var_refs, declared_vars, map_block_env, resolve as resolve_vars,
+    resolve_block_env, validate_env_refs, validate_value, validate_var_refs, BlockEnvResolution,
+    ResolvedVars, VarDecl, VarType, VarsError,
 };
 
 use thiserror::Error;
@@ -183,7 +184,17 @@ pub fn env_var_names_for_chain(
             needed.extend(block.env.iter().map(|er| er.var_name.clone()));
         }
     }
-    needed
+    // Not just the names literally in each block's own env= -- a var
+    // referenced only indirectly, through another (directly-referenced)
+    // var's own `default_var`/`choices_var`, still needs to be resolved
+    // (and, if `from=`-computed, its own source block still needs to
+    // run) for that other var's dynamic default/choices to ever be
+    // materialized. A malformed declaration here degrades to "no
+    // closure, just the literal names" rather than erroring -- the same
+    // graceful-degradation posture `vars::resolve` itself takes; a real
+    // parse error is `meshfox validate`'s job to report, not this one's.
+    let decls = vars::declared_vars(canvas).unwrap_or_default();
+    vars::close_over_var_refs(&decls, needed.iter().map(String::as_str))
 }
 
 /// Resolves `path` + `block_name` to the block to actually address: tries
@@ -406,6 +417,24 @@ mod tests {
         assert_eq!(
             needed,
             ["X".to_string(), "Y".to_string()].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn env_var_names_for_chain_includes_a_default_var_reference_not_in_any_env() {
+        let doc = concat!(
+            "# Project\n\n",
+            "<!-- meshfox:var name=\"BASE\" default=\"1\" -->\n",
+            "<!-- meshfox:var name=\"X\" default_var=\"BASE\" -->\n\n",
+            "## Tests\n<!-- meshfox:node -->\n\n",
+            "```bash name=\"build\" env=\"$X\"\necho build\n```\n",
+        );
+        let canvas = Canvas::from_markdown(doc).unwrap();
+        let chain = vec![BlockAddr::new("tests", "build")];
+        let needed = env_var_names_for_chain(&canvas, &chain);
+        assert_eq!(
+            needed,
+            ["X".to_string(), "BASE".to_string()].into_iter().collect()
         );
     }
 }

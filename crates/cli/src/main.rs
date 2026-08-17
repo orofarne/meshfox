@@ -973,15 +973,17 @@ fn configure(canvas_path: &PathBuf) {
         std::process::exit(1);
     });
     let decls = declared_vars_or_exit(canvas_path, &raw);
-    let secret_count = decls.iter().filter(|d| d.secret).count();
-    let configurable: Vec<&VarDecl> = decls.iter().filter(|d| !d.secret).collect();
+    // `secret` and `session` are both never cached -- `configure`'s whole
+    // job is walking the cache, so neither has anything for it to do.
+    let skipped_count = decls.iter().filter(|d| d.secret || d.session).count();
+    let configurable: Vec<&VarDecl> = decls.iter().filter(|d| !d.secret && !d.session).collect();
 
     if configurable.is_empty() {
-        if secret_count > 0 {
+        if skipped_count > 0 {
             println!(
-                "meshfox configure: {secret_count} declared variable(s) are secret — never \
-                 cached, so there's nothing to save for them; they're asked for fresh every \
-                 time a run needs them."
+                "meshfox configure: {skipped_count} declared variable(s) are secret/session — \
+                 never cached, so there's nothing to save for them; they're asked for fresh \
+                 every time a run needs them."
             );
         } else {
             println!(
@@ -998,9 +1000,9 @@ fn configure(canvas_path: &PathBuf) {
     }
 
     let mut cache = load_var_cache_or_exit(canvas_path);
-    if secret_count > 0 {
+    if skipped_count > 0 {
         println!(
-            "({secret_count} secret variable(s) skipped — never cached, always asked fresh at run time)"
+            "({skipped_count} secret/session variable(s) skipped -- never cached, always asked fresh at run time)"
         );
     }
 
@@ -1052,6 +1054,13 @@ fn validate(canvas_path: &PathBuf) {
             // resolve to nothing instead of failing loudly (see
             // `vars::resolve_block_env`).
             if let Err(e) = meshfox_core::validate_env_refs(&canvas) {
+                eprintln!("meshfox validate: {}: {e}", canvas_path.display());
+                std::process::exit(1);
+            }
+            // Same idea again for `default_var=`/`choices_var=`: every
+            // reference must name a real declared variable, and the
+            // reference graph must be acyclic.
+            if let Err(e) = meshfox_core::validate_var_refs(&canvas) {
                 eprintln!("meshfox validate: {}: {e}", canvas_path.display());
                 std::process::exit(1);
             }
@@ -1294,7 +1303,10 @@ fn persist_set_overrides(
     cache: &mut VarCache,
 ) {
     for (name, value) in overrides {
-        if decls.iter().any(|d| &d.name == name && !d.secret) {
+        if decls
+            .iter()
+            .any(|d| &d.name == name && !d.secret && !d.session)
+        {
             cache.set(name, value).unwrap_or_else(|e| {
                 eprintln!("failed to save {name}: {e}");
                 std::process::exit(1);
@@ -1318,7 +1330,7 @@ fn persist_set_overrides(
 fn resolve_block_env_or_prompt(
     block: &meshfox_core::CodeBlock,
     decls: &[VarDecl],
-    overrides: &HashMap<String, String>,
+    overrides: &mut HashMap<String, String>,
     computed: &HashMap<String, String>,
     cache: &mut VarCache,
 ) -> HashMap<String, String> {
@@ -1362,12 +1374,20 @@ fn resolve_block_env_or_prompt(
             eprintln!("failed to read input: {e}");
             std::process::exit(1);
         });
-        if !decl.secret {
+        if !decl.secret && !decl.session {
             cache.set(&decl.name, &value).unwrap_or_else(|e| {
                 eprintln!("failed to save {}: {e}", decl.name);
                 std::process::exit(1);
             });
         }
+        // Fed back into `overrides` regardless of secret/session -- it's
+        // already checked ahead of the cache in `resolve()`, so this is
+        // what keeps a later block in the *same* invocation from
+        // re-prompting for a variable that skips the cache (secret,
+        // session, or both). A plain variable ends up here too, which is
+        // harmless (it's already in `cache` by now, so the next lookup
+        // would find it there anyway).
+        overrides.insert(decl.name.clone(), value.clone());
         // A block could (unusually) reference the same declared variable
         // under more than one local name — fill in every one of them.
         for er in block.env.iter().filter(|er| er.var_name == decl.name) {
@@ -1451,7 +1471,7 @@ async fn run_async(
     // (see `resolve_block_env_or_prompt`) — never the whole document's
     // variables just because *some* block somewhere declares one.
     let decls = declared_vars_or_exit(canvas_path, &raw);
-    let overrides: HashMap<String, String> = set.into_iter().collect();
+    let mut overrides: HashMap<String, String> = set.into_iter().collect();
     validate_set_overrides_or_exit(&decls, &overrides);
     let mut var_cache = load_var_cache_or_exit(canvas_path);
     persist_set_overrides(&decls, &overrides, &mut var_cache);
@@ -1528,7 +1548,7 @@ async fn run_async(
             }
 
             let mut block_env =
-                resolve_block_env_or_prompt(&block, &decls, &overrides, &computed, &mut var_cache);
+                resolve_block_env_or_prompt(&block, &decls, &mut overrides, &computed, &mut var_cache);
             // If some declared variable is `from=`-sourced from *this*
             // block, give it a fresh output file to write `NAME=value`
             // lines to — see `meshfox_core::varout`. Ordinary blocks (the
@@ -3256,6 +3276,9 @@ mod set_override_tests {
             secret: false,
             required: false,
             from: None,
+            session: false,
+            default_var: None,
+            choices_var: None,
         }
     }
 

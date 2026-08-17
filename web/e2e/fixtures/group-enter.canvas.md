@@ -27,7 +27,7 @@ modified and that matters to you.
 Second member.
 
 ### Member One
-<!-- meshfox:node id="member-one" x=290 y=182 w=200 h=100 -->
+<!-- meshfox:node id="member-one" x=336 y=208 w=200 h=100 -->
 
 First member.
 

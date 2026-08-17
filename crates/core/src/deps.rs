@@ -7,11 +7,15 @@
 //! `resolve_chain`.
 //!
 //! A block's own `env=` can also pull in an extra, *implicit* dependency:
-//! any declared variable it references that's `from=`-computed (see
+//! any declared variable it references (directly, or indirectly through
+//! another var's `default_var`/`choices_var` — see
+//! `crate::vars::close_over_var_refs`) that's `from=`-computed (see
 //! `crate::vars::VarDecl::from`) needs its source block to have already
 //! run — `visit` folds that in as just another edge, right alongside
-//! `deps=`, so cycle detection and the `tty`-ambush guard both cover it for
-//! free.
+//! `deps=`, so cycle detection covers it for free. A `tty` block may be a
+//! dependency (explicit or implicit) of any other block, `tty` or not —
+//! each runner already hands the terminal/pty over at exactly that point
+//! in the chain and continues once it exits.
 
 use crate::canvas::Canvas;
 use crate::fence::{scan_runnable_blocks, BlockRef};
@@ -49,11 +53,6 @@ pub enum DepsError {
     MultipleDefaults(String, Vec<String>),
     #[error("node {0:?} block {1:?}: `tty` and `cache` are mutually exclusive — an interactive session isn't the kind of deterministic exit-code-plus-text `cache` can save/replay")]
     CacheTtyConflict(String, String),
-    #[error("{}: only a `tty` block may depend on another `tty` block (depended on by {})", .dependency.key(), .dependent.key())]
-    TtyDependencyRequiresTty {
-        dependent: BlockAddr,
-        dependency: BlockAddr,
-    },
     #[error(transparent)]
     Vars(#[from] crate::vars::VarsError),
 }
@@ -98,10 +97,8 @@ pub fn resolve_from_chain(canvas: &Canvas, target: BlockAddr) -> Result<Vec<Bloc
     Ok(order)
 }
 
-/// Fetches the `CodeBlock` `addr` addresses, owned — used both by `visit`
-/// (for the node currently being expanded) and, before recursing into a
-/// dependency, to check *its* `tty` flag without waiting for its own turn
-/// through `visit` (see the `tty` check below).
+/// Fetches the `CodeBlock` `addr` addresses, owned — used by `visit` for
+/// the node currently being expanded.
 fn find_block(canvas: &Canvas, addr: &BlockAddr) -> Result<crate::fence::CodeBlock, DepsError> {
     let node = canvas
         .node(&addr.node_id)
@@ -148,10 +145,16 @@ fn visit(
     } else {
         Vec::new()
     };
-    for env_ref in &block.env {
+    // Not just the names literally in `block.env` — a var referenced only
+    // indirectly, through another (directly-referenced) var's own
+    // `default_var`/`choices_var`, still needs its `from=` source to have
+    // run first, or that other var's dynamic default/choices could never
+    // be materialized. See `vars::close_over_var_refs`.
+    let env_names = block.env.iter().map(|e| e.var_name.as_str());
+    for name in crate::vars::close_over_var_refs(decls, env_names) {
         if let Some(from) = decls
             .iter()
-            .find(|d| d.name == env_ref.var_name)
+            .find(|d| d.name == name)
             .and_then(|d| d.from.as_ref())
         {
             dep_addrs.push(resolve_ref(&addr.node_id, from));
@@ -159,21 +162,6 @@ fn visit(
     }
 
     for dep_addr in dep_addrs {
-        if !block.tty {
-            // A `tty` block seizes the whole terminal/UI when it runs — a
-            // non-`tty` block auto-running one as a dependency would mean
-            // an unrequested interactive step ambushing an otherwise
-            // non-interactive chain. Only a `tty` block may depend on
-            // another one (see SPEC.md's "Runnable code fences") —
-            // applies the same way to an implicit `from=` edge as to an
-            // explicit `deps=` one.
-            if find_block(canvas, &dep_addr)?.tty {
-                return Err(DepsError::TtyDependencyRequiresTty {
-                    dependent: addr,
-                    dependency: dep_addr,
-                });
-            }
-        }
         visit(canvas, dep_addr, decls, follow_deps, order, visited, stack)?;
     }
     stack.pop();
@@ -350,16 +338,21 @@ mod tests {
     }
 
     #[test]
-    fn validate_catches_a_non_tty_block_depending_on_a_tty_block() {
+    fn a_non_tty_block_may_depend_on_a_tty_block() {
+        // Each runner already hands the terminal/pty over at exactly this
+        // point in the chain and continues once it exits -- there's
+        // nothing left this restriction was actually protecting against.
         let c = canvas(concat!(
             "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
             "```bash name=\"shell\" tty\nbash\n```\n\n",
             "```bash name=\"build\" deps=\"shell\"\necho build\n```\n",
         ));
-        assert!(matches!(
-            validate(&c),
-            Err(DepsError::TtyDependencyRequiresTty { .. })
-        ));
+        assert!(validate(&c).is_ok());
+        let chain = resolve_chain(&c, BlockAddr::new("root", "build")).unwrap();
+        assert_eq!(
+            chain,
+            vec![BlockAddr::new("root", "shell"), BlockAddr::new("root", "build")]
+        );
     }
 
     #[test]
@@ -400,6 +393,29 @@ mod tests {
             chain,
             vec![
                 BlockAddr::new("root", "provision"),
+                BlockAddr::new("root", "deploy"),
+            ]
+        );
+    }
+
+    #[test]
+    fn chain_includes_a_from_source_reached_only_through_choices_var() {
+        // `deploy`'s own env= only names REGION -- REGIONS_LIST is only
+        // reachable via REGION's own choices_var, but its `from=` source
+        // still has to run before `deploy` does, or REGION could never
+        // get its choices materialized.
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "<!-- meshfox:var name=\"REGIONS_LIST\" from=\"list-regions\" -->\n",
+            "<!-- meshfox:var name=\"REGION\" type=\"select\" choices_var=\"REGIONS_LIST\" -->\n\n",
+            "```bash name=\"list-regions\" cache\necho us,eu\n```\n\n",
+            "```bash name=\"deploy\" env=\"$REGION\"\necho deploy\n```\n",
+        ));
+        let chain = resolve_chain(&c, BlockAddr::new("root", "deploy")).unwrap();
+        assert_eq!(
+            chain,
+            vec![
+                BlockAddr::new("root", "list-regions"),
                 BlockAddr::new("root", "deploy"),
             ]
         );

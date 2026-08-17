@@ -275,14 +275,14 @@ Lives inside a node's Markdown text, as fence-info-string attributes:
   from its own stdin expecting a real terminal (`ssh`, `git commit`'s
   editor, a REPL, a curses UI). Mutually exclusive with `cache` (`meshfox
   validate` error) — an interactive session isn't the deterministic
-  "exit code plus text" `cache` saves/replays. A `tty` block may only be a
-  `deps=` target of *another* `tty` block (`meshfox validate` error
-  otherwise) — a non-interactive chain auto-running one as a dependency
-  would mean an unrequested interactive step ambushing it; two chained
-  `tty` blocks just hand the terminal over twice, back to back, in
-  dependency order (each still running its own `deps=` first, same as any
-  other block). See "Interactive (`tty`) blocks" below for how the CLI and
-  web UI actually run one.
+  "exit code plus text" `cache` saves/replays. A `tty` block may be a
+  `deps=`/`from=` target of *any* other block, `tty` or not — each runner
+  (CLI, TUI, the web UI) already hands the terminal/pty over at exactly
+  that point in the chain and continues once it exits, the same way two
+  chained `tty` blocks already hand it over twice, back to back (each
+  still running its own `deps=` first, same as any other block). See
+  "Interactive (`tty`) blocks" below for how the CLI and web UI actually
+  run one.
 
 Supported languages: `bash` (`sh` is an alias for it). A fence in any other
 language never counts as runnable at all — not with an explicit `name=`,
@@ -487,7 +487,30 @@ Attributes:
 - `prompt` — question text to show when asking for a value; defaults to
   `name` itself.
 - `default` — used if nothing else resolves the variable (see below).
-- `choices` — comma-separated; required when `type="select"`.
+  Mutually exclusive with `default_var` (`meshfox validate` error).
+- `default_var` — `default_var="OTHER_NAME"`: this variable's own
+  `default` comes from another declared variable's *resolved* value
+  instead of a literal string — e.g. a default install path computed by
+  actually running `pwd` in some relevant directory (declare that as its
+  own `from=`-computed variable, then reference it here by name). Not a
+  `$`-prefixed overload of `default=` itself — `default=`'s value is
+  genuinely freeform text, where a `$name` convention would be ambiguous
+  with a literal default that happens to look like one (unlike `env=`'s
+  dollar-stripping, which is safe only because an `env=` entry is *always*
+  a name reference, never literal text). Mutually exclusive with a literal
+  `default` and with `from=` (`meshfox validate` error either way) — a
+  computed variable is never prompted for, so it has no `default` to
+  supply in the first place.
+- `choices` — comma-separated; required when `type="select"` and
+  `choices_var` isn't given. Mutually exclusive with `choices_var`
+  (`meshfox validate` error).
+- `choices_var` — `choices_var="OTHER_NAME"`, same idea as `default_var`
+  but for `choices` (the referenced variable's resolved value is split the
+  same comma-separated way a literal `choices=` already is) — e.g. a
+  `select`'s options populated by actually running `aws list-regions`.
+  Requires `type="select"`, same as a literal `choices=` does. Mutually
+  exclusive with a literal `choices` and with `from=`, same reasoning as
+  `default_var`.
 - `secret` — flag (`secret` or `secret=true`). A secret variable is
   never read from or written to the on-disk cache (see below) and never
   pre-filled anywhere — the only way to supply one without an
@@ -505,17 +528,33 @@ Attributes:
   variable with a `default` is simply used, never prompted for, unless it
   has no `default` at all (in which case it always needs an answer either
   way).
+- `session` — flag (`session` or `session=true`). Never read from or
+  written to the on-disk cache — unlike `secret`, input isn't masked; this
+  is about *lifetime* (never remembered past the current `meshfox run`
+  invocation), not confidentiality. Combined with `required`, this
+  guarantees a real prompt on *every* run rather than silently falling
+  back to a cached/default answer — e.g. picking which of several
+  configurations to deploy, every time. A plain `session` without
+  `required` still silently resolves from `--set`/the environment/a
+  `default` when one of those supplies it, exactly like any other
+  declaration — it just never *remembers* the answer for next time. A
+  variable referenced by more than one block in a single `meshfox run`
+  invocation is still only ever prompted for once *within that
+  invocation* — `session` only skips the cache, not the same
+  once-per-invocation reuse every other variable already gets (see
+  "Consumption" below). Mutually exclusive with `from=` (a computed value
+  is already never cached, so `session` on it would be a no-op).
 - `from` — `from="node-id/block-name"` (or a bare `from="block-name"`,
   meaning a block in the root node — the same shorthand `deps=`'s
   same-node form uses). Makes this a **computed** variable: instead of
   being prompted/defaulted/cached, its value comes from actually running
   the named block and reading back what it wrote to its own
   `MESHFOX_VARS_OUT` file — see "Computed variables (`from=`)" below.
-  Mutually exclusive with `default`, `required`, and `secret` (a
-  `meshfox validate` error to combine any of them with `from`) — none of
-  those mean anything for a value that's never cached, defaulted, or
-  prompted for. `type`/`choices` still apply, validated against whatever
-  the source block actually produced.
+  Mutually exclusive with `default`/`default_var`, `required`, `secret`,
+  `session`, and `choices_var` (a `meshfox validate` error to combine any
+  of them with `from`) — none of those mean anything for a value that's
+  never cached, defaulted, or prompted for. `type`/`choices` still apply,
+  validated against whatever the source block actually produced.
 
 ### Consumption (`env=`)
 
@@ -535,22 +574,25 @@ block in the document actually uses.
 block runs — not the whole document's variables up front. If the same
 variable is referenced by more than one block in a single invocation
 (directly or via `deps=`), it's only ever resolved/prompted for once: the
-first block to need it answers the prompt, which is immediately cached,
-so every later block referencing the same variable in that same
-invocation just reads the cached answer.
+first block to need it answers the prompt, which is immediately fed back
+into that invocation's own resolved-answers (the same override slot
+`--set` occupies, not necessarily the on-disk cache — see `session`
+below), so every later block referencing the same variable in that same
+invocation just reads it from there without asking again.
 
 ### Resolution
 
 Resolving one declared variable (for whichever block's `env=` asked for
 it) tries, in order: an explicit override (`meshfox run --set
 NAME=value`, or a value submitted through the web UI's form) → the
-process environment → the on-disk cache (skipped entirely for `secret`)
-→ the declaration's own `default` (skipped entirely for `required` — see
-above). Whatever isn't resolved by any of those needs an interactive
-answer — a terminal prompt for the CLI, a form for the web UI — which,
-for a non-secret variable, is then written to the cache so a later run of
-*any* block referencing the same variable doesn't ask again (this is what
-turns a `required` variable's mandatory first confirmation into an
+process environment → the on-disk cache (skipped entirely for `secret`/
+`session`) → the declaration's own `default` (skipped entirely for
+`required` — see above). Whatever isn't resolved by any of those needs an
+interactive answer — a terminal prompt for the CLI, a form for the web
+UI — which, for a non-secret, non-session variable, is then written to
+the cache so a later run of *any* block referencing the same variable
+doesn't ask again (this is what turns a `required` variable's mandatory
+first confirmation into an
 ordinary cache hit on every run after).
 
 The cache lives at `<dir>/.meshfox/<filename>.env`, next to the canvas
@@ -558,8 +600,8 @@ file itself (e.g. `examples/hello.canvas.md` ->
 `examples/.meshfox/hello.canvas.md.env`) — a plain `NAME=value`-per-line
 file, meant to be `.gitignore`d, the same way `CMakeCache.txt` usually
 is. It's safe to hand-edit or delete: deleting it just means every
-non-secret variable gets asked about again next time some block's `env=`
-needs it.
+non-secret, non-session variable gets asked about again next time some
+block's `env=` needs it.
 
 ### Computed variables (`from=`)
 
@@ -617,11 +659,55 @@ and reading back what that block produced:
   computed one. Consequently `meshfox configure` and the web UI's pre-run
   vars form never offer a `from`-declared variable as a field.
 
+### Dynamic `default`/`choices` (`default_var=`/`choices_var=`)
+
+`default_var=`/`choices_var=` (see above) let one variable's `default`/
+`choices` come from *another* declared variable's resolved value instead
+of a literal string — and since that other variable can itself be
+`from=`-computed, this is how a `select`'s options (or a text field's
+suggested default) end up actually coming from running a script:
+
+    <!-- meshfox:var name="REGIONS_LIST" from="aws/list-regions" -->
+    <!-- meshfox:var name="REGION" type="select" choices_var="REGIONS_LIST" -->
+
+    ```bash name="list-regions"
+    aws ec2 describe-regions --query 'Regions[].RegionName' --output text | tr '\t' ',' >> "$MESHFOX_VARS_OUT"
+    ```
+
+    ```bash name="deploy" env="$REGION"
+    echo "deploying to $REGION"
+    ```
+
+- **Implicit ordering, transitively.** `REGION` here doesn't declare
+  `from=` itself, but resolving it requires `REGIONS_LIST` to already be
+  resolved — so a block referencing `REGION` via `env=` gets an implicit
+  dependency on `aws/list-regions` (via `REGIONS_LIST`'s own `from=`) the
+  same way it would if it referenced `REGIONS_LIST` directly. This chains
+  arbitrarily deep: a `default_var`/`choices_var` reference is followed
+  transitively, in both dependency-ordering and "which variables does this
+  block actually need resolved" scoping, wherever either matters.
+- **Substitution, not delegation.** Once `REGIONS_LIST` resolves, its
+  value becomes `REGION`'s own effective `choices` (split the same
+  comma-separated way a literal `choices=` is) for exactly this
+  resolution — `REGION` still goes through its own full override/env/
+  cache/default/prompt chain afterward, using that substituted value
+  where a literal `choices=`/`default=` would otherwise sit. If the
+  reference isn't resolvable yet (rare in practice, since the expected
+  `default_var`/`choices_var` target is `from=`-computed and therefore
+  already guaranteed resolved by the ordering above), the referencing
+  variable is simply deferred rather than shown with stale or empty
+  choices.
+- Mutually exclusive with the corresponding literal attribute
+  (`default`/`choices`) and with `from=` — see each attribute's own
+  entry above. `meshfox validate` catches a `default_var`/`choices_var`
+  naming a variable nothing declares, and a reference cycle.
+
 ### CLI
 
 - `meshfox configure [canvas]` — the one place that *does* walk every
-  declared non-secret variable in the whole document, regardless of
-  which (if any) block currently references it — showing its
+  declared non-secret, non-session variable in the whole document,
+  regardless of which (if any) block currently references it — showing
+  its
   currently-resolved value (cache / env / default) as the prompt's own
   default, and writing whatever you answer (even if unchanged) back to
   the cache. The explicit "set these up now" step, the same role
