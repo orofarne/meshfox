@@ -71,6 +71,7 @@ export function NodeSettings({ node, allNodes, onChange, onRenameId, onClose }: 
   const [display, setDisplay] = useState<"link" | "code">(node.display ?? "link");
   const [lang, setLang] = useState(node.lang ?? "");
   const [interpreter, setInterpreter] = useState(node.interpreter ?? "");
+  const [preview, setPreview] = useState(node.preview ?? false);
   const [tags, setTags] = useState<string[]>(node.tags ?? []);
   const [extraParents, setExtraParents] = useState<ExtraEdgeDto[]>(node.extraParents ?? []);
   const [addSource, setAddSource] = useState("");
@@ -132,6 +133,7 @@ export function NodeSettings({ node, allNodes, onChange, onRenameId, onClose }: 
       if (lang !== (node.lang ?? "")) patch.lang = lang;
       if (interpreter !== (node.interpreter ?? "")) patch.interpreter = interpreter;
     }
+    if (nodeType === "link" && preview !== (node.preview ?? false)) patch.preview = preview;
     if (fold !== initialFold) patch.fold = fold;
     return patch;
   };
@@ -244,6 +246,16 @@ export function NodeSettings({ node, allNodes, onChange, onRenameId, onClose }: 
               value={lang}
               onChange={(e) => setLang(e.target.value)}
               placeholder="auto-detect from file extension"
+            />
+          </label>
+        )}
+        {nodeType === "link" && (
+          <label className="vars-modal-field">
+            <span>Show social preview below the link</span>
+            <input
+              type="checkbox"
+              checked={preview}
+              onChange={(e) => setPreview(e.target.checked)}
             />
           </label>
         )}

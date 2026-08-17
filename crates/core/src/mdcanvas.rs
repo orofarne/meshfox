@@ -69,6 +69,8 @@ pub enum ParseError {
     CyclicParent(String),
     #[error("node {0:?} has unknown type={1:?} (expected text, file, link, group, or include)")]
     UnknownNodeType(String, String),
+    #[error("node {0:?} sets preview= but only link nodes support a social preview")]
+    PreviewRequiresLinkType(String),
     #[error("group node {0:?} must have an empty body (groups are purely organizational)")]
     GroupHasBody(String),
     #[error(
@@ -115,6 +117,12 @@ pub struct NodeMeta {
     /// `file`-node interpreter (see `Node::is_runnable_file`). Same
     /// "omitted unless set" contract as `display`/`lang`.
     pub interpreter: Option<String>,
+    /// `link`-node social preview toggle (see `Node::preview`). `None`
+    /// omits `preview=` entirely (off); same "caller passes through the
+    /// existing value to keep it" contract as `display`/`lang`/
+    /// `interpreter` — `Some(false)` also omits (it's the default), only
+    /// `Some(true)` writes `preview="true"`.
+    pub preview: Option<bool>,
     /// Structural-edge label (see `Node::edge_label`). Same "omitted unless
     /// set" contract as `display`/`lang`/`interpreter`.
     pub edge_label: Option<String>,
@@ -182,6 +190,9 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
             Some("include") => NodeType::Include,
             Some(other) => return Err(ParseError::UnknownNodeType(id.clone(), other.to_string())),
         };
+        if node_type != NodeType::Link && seg.node_attrs.contains_key("preview") {
+            return Err(ParseError::PreviewRequiresLinkType(id.clone()));
+        }
 
         let body = markdown[seg.body_span.clone()].trim().to_string();
         let target = match node_type {
@@ -227,6 +238,7 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
                 }),
             lang: seg.node_attrs.get("lang").cloned(),
             interpreter: seg.node_attrs.get("interpreter").cloned(),
+            preview: seg.node_attrs.get("preview").map(|v| v == "true").unwrap_or(false),
             edge_label: seg.node_attrs.get("edgeLabel").cloned(),
             text: body,
             constraint_results: Vec::new(),
@@ -375,6 +387,9 @@ fn render_node_line(canvas: &Canvas, node: &Node) -> String {
     if let Some(i) = &node.interpreter {
         parts.push(format!("interpreter=\"{i}\""));
     }
+    if node.preview {
+        parts.push("preview=\"true\"".to_string());
+    }
     if let Some(l) = &node.edge_label {
         parts.push(format!("edgeLabel=\"{l}\""));
     }
@@ -484,6 +499,9 @@ pub fn set_node_meta(markdown: &str, node_id: &str, meta: &NodeMeta) -> Option<S
     }
     if let Some(i) = &meta.interpreter {
         parts.push(format!("interpreter=\"{i}\""));
+    }
+    if let Some(true) = meta.preview {
+        parts.push("preview=\"true\"".to_string());
     }
     if let Some(l) = &meta.edge_label {
         parts.push(format!("edgeLabel=\"{l}\""));
@@ -1962,6 +1980,7 @@ Reused from Tests as well.
             display: None,
             lang: None,
             interpreter: None,
+            preview: None,
             edge_label: None,
             fold: None,
             tags: Vec::new(),
@@ -2128,6 +2147,72 @@ Reused from Tests as well.
             c.node("homepage").unwrap().target.as_deref(),
             Some("https://example.com")
         );
+    }
+
+    #[test]
+    fn link_node_parses_preview() {
+        let doc = "# Root\n\n## Homepage\n<!-- meshfox:node type=\"link\" preview=\"true\" -->\n\n[site](https://example.com)\n";
+        let c = parse(doc).unwrap();
+        assert!(c.node("homepage").unwrap().preview);
+    }
+
+    #[test]
+    fn link_node_defaults_to_no_preview() {
+        let doc = "# Root\n\n## Homepage\n<!-- meshfox:node type=\"link\" -->\n\n[site](https://example.com)\n";
+        let c = parse(doc).unwrap();
+        assert!(!c.node("homepage").unwrap().preview);
+    }
+
+    #[test]
+    fn preview_on_a_non_link_node_is_a_parse_error() {
+        let doc = "# Root\n\n## Diagram\n<!-- meshfox:node type=\"file\" preview=\"true\" -->\n\n[main](./main.rs)\n";
+        assert_eq!(
+            parse(doc).unwrap_err(),
+            ParseError::PreviewRequiresLinkType("diagram".to_string())
+        );
+
+        let text_doc =
+            "# Root\n\n## Notes\n<!-- meshfox:node preview=\"true\" -->\n\nsome text\n";
+        assert_eq!(
+            parse(text_doc).unwrap_err(),
+            ParseError::PreviewRequiresLinkType("notes".to_string())
+        );
+    }
+
+    #[test]
+    fn render_roundtrips_link_preview() {
+        let doc = "# Root\n\n## Homepage\n<!-- meshfox:node type=\"link\" preview=\"true\" -->\n\n[site](https://example.com)\n";
+        let c = parse(doc).unwrap();
+        let rendered = render(&c);
+        assert!(rendered.contains("preview=\"true\""));
+        assert_eq!(parse(&rendered).unwrap(), c);
+    }
+
+    #[test]
+    fn render_omits_default_no_preview() {
+        let doc = "# Root\n\n## Homepage\n<!-- meshfox:node type=\"link\" -->\n\n[site](https://example.com)\n";
+        let c = parse(doc).unwrap();
+        let rendered = render(&c);
+        assert!(!rendered.contains("preview="));
+    }
+
+    #[test]
+    fn set_node_meta_writes_and_clears_preview() {
+        let doc = "# Root\n\n## Homepage\n<!-- meshfox:node type=\"link\" -->\n\n[site](https://example.com)\n";
+        let meta = NodeMeta {
+            preview: Some(true),
+            ..Default::default()
+        };
+        let updated = set_node_meta(doc, "homepage", &meta).unwrap();
+        assert!(parse(&updated).unwrap().node("homepage").unwrap().preview);
+
+        let meta = NodeMeta {
+            preview: Some(false),
+            ..Default::default()
+        };
+        let cleared = set_node_meta(&updated, "homepage", &meta).unwrap();
+        assert!(!cleared.contains("preview="));
+        assert!(!parse(&cleared).unwrap().node("homepage").unwrap().preview);
     }
 
     #[test]

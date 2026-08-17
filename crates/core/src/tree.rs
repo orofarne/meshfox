@@ -109,6 +109,7 @@ mod tests {
             display: None,
             lang: None,
             interpreter: None,
+            preview: false,
             edge_label: None,
             text: text.to_string(),
             constraint_results: Vec::new(),

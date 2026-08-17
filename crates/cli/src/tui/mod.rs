@@ -30,7 +30,7 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use app::App;
+use app::{App, LinkPreviewMsg};
 
 pub async fn run(canvas_path: PathBuf) -> io::Result<()> {
     // Raw mode + the alternate screen go up *before* `App::new` — it calls
@@ -49,7 +49,10 @@ pub async fn run(canvas_path: PathBuf) -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = match App::new(canvas_path) {
+    let (link_preview_tx, mut link_preview_rx) =
+        tokio::sync::mpsc::unbounded_channel::<LinkPreviewMsg>();
+
+    let result = match App::new(canvas_path, link_preview_tx) {
         Ok(mut app) => {
             // `crossterm::event::read()` is blocking, so reading happens on
             // its own OS thread — the main loop stays async and can
@@ -87,7 +90,15 @@ pub async fn run(canvas_path: PathBuf) -> io::Result<()> {
             let (reload_tx, mut reload_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
             spawn_file_watcher(app.canvas_path.clone(), Arc::clone(&app.known_raw), reload_tx);
 
-            main_loop(&mut terminal, &mut app, &mut input_rx, &paused, &mut reload_rx).await
+            main_loop(
+                &mut terminal,
+                &mut app,
+                &mut input_rx,
+                &paused,
+                &mut reload_rx,
+                &mut link_preview_rx,
+            )
+            .await
         }
         Err(e) => Err(e),
     };
@@ -150,6 +161,7 @@ async fn main_loop(
     input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
     input_paused: &Arc<AtomicBool>,
     reload_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    link_preview_rx: &mut tokio::sync::mpsc::UnboundedReceiver<LinkPreviewMsg>,
 ) -> io::Result<()> {
     loop {
         terminal.draw(|f| ui::render(f, app))?;
@@ -187,6 +199,9 @@ async fn main_loop(
             }
             Some(content) = reload_rx.recv() => {
                 app.on_external_change(content);
+            }
+            Some(msg) = link_preview_rx.recv() => {
+                app.on_link_preview_msg(msg);
             }
         }
     }

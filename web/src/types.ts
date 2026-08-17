@@ -76,6 +76,11 @@ export interface CanvasNode {
   /** file-node only: an executable (e.g. "python") to run against
    * `target`, making the node runnable — absent means it isn't. */
   interpreter?: string;
+  /** link-node only: whether to fetch and show an OpenGraph social preview
+   * (title/description/image) below the link. Absent means off (the
+   * default) — meshfox omits the default from the wire format, same as
+   * `type`. */
+  preview?: boolean;
   /** Label text for the *structural* edge from `parent` into this node
    * (`edgeLabel=` on `meshfox:node`) — see `crates/core/src/canvas.rs`'s
    * `Node.edge_label`. Absent for the root and for any node that's never

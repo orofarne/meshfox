@@ -176,6 +176,8 @@ export interface NodePatch {
   lang?: string;
   /** file-node interpreter — see `CanvasNode.interpreter`. */
   interpreter?: string;
+  /** link-node social preview toggle — see `CanvasNode.preview`. */
+  preview?: boolean;
   /** Structural-edge label — see `CanvasNode.edgeLabel`. Omit to leave it
    * untouched; an explicit `""` clears it back to unset (see this field's
    * own handling in the server's `update_node`) — unlike `fold`, there's
@@ -258,6 +260,30 @@ export async function fetchNodeFileContent(id: string): Promise<NodeFileContent>
     throw new Error(text || `GET /api/nodes/${id}/file-content: ${res.status}`);
   }
   return res.json();
+}
+
+export interface LinkPreview {
+  title?: string;
+  description?: string;
+  image?: string;
+}
+
+/**
+ * Fetches (or returns the server's already-cached) OpenGraph preview for
+ * `url` — used by `LinkPreviewCard` for a `link` node with `preview: true`.
+ * Never throws for a fetch/SSRF failure on the server side (that's just
+ * `{ preview: null }`, meaning "nothing to show"); only throws for an
+ * actual request-level failure (network error, non-2xx from the endpoint
+ * itself).
+ */
+export async function fetchLinkPreview(url: string): Promise<LinkPreview | null> {
+  const res = await fetch(`/api/link-preview?url=${encodeURIComponent(url)}`);
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `GET /api/link-preview: ${res.status}`);
+  }
+  const data: { preview: LinkPreview | null } = await res.json();
+  return data.preview;
 }
 
 /**

@@ -680,6 +680,47 @@ a {
   font-size: 0.78rem;
 }
 
+/* A `link` node's `preview: true` OpenGraph card — see `LinkPreviewCard` in
+ * MeshNode.tsx. The whole card is the link (same target as the plain `<a>`
+ * above it), styled to read as one clickable unit rather than a nested
+ * link-within-body. */
+.mesh-link-preview-card {
+  display: flex;
+  flex-direction: column;
+  margin-top: 0.5rem;
+  border: 1px solid var(--node-border);
+  border-radius: 6px;
+  overflow: hidden;
+  text-decoration: none;
+  color: inherit;
+}
+
+.mesh-link-preview-card:hover {
+  border-color: var(--accent);
+}
+
+.mesh-link-preview-image {
+  width: 100%;
+  max-height: 12rem;
+  object-fit: cover;
+  display: block;
+}
+
+.mesh-link-preview-text {
+  padding: 0.5rem 0.6rem;
+}
+
+.mesh-link-preview-title {
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+
+.mesh-link-preview-description {
+  margin-top: 0.2rem;
+  font-size: 0.78rem;
+  opacity: 0.75;
+}
+
 /* NodeTextEditor is rendered via a portal (into document.body), as a
  * fixed, centered overlay — not inline inside the node's own box, whose
  * size is rarely enough room for a real code editor and is at the mercy of

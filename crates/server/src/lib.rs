@@ -33,6 +33,11 @@ use std::time::Duration;
 use tokio::sync::{broadcast, oneshot};
 use tower_http::cors::CorsLayer;
 
+/// `pub` so `meshfox-cli`'s TUI can reuse the same SSRF-safe fetch +
+/// OpenGraph parsing + cache in-process (see its own `App` struct) rather
+/// than duplicating it — the TUI doesn't talk to `meshfox serve` over
+/// HTTP, it links this crate as a plain library.
+pub mod link_preview;
 mod pty_exec;
 /// `pub` so `meshfox-cli` can reuse the same async spawn/kill primitives
 /// for `meshfox run`'s real-time output — see its `main.rs`.
@@ -101,6 +106,9 @@ struct AppState {
     /// server, which cycles through pages with brief all-tabs-closed gaps
     /// between tests that a real user closing their last tab wouldn't have.
     auto_exit: bool,
+    /// `link` node social-preview cache (see `link_preview`) — one entry
+    /// per URL, alive for exactly this process's lifetime.
+    link_preview_cache: link_preview::PreviewCache,
 }
 
 impl AppState {
@@ -857,6 +865,7 @@ async fn put_canvas(
             display: node.display,
             lang: node.lang.clone(),
             interpreter: node.interpreter.clone(),
+            preview: Some(node.preview),
             edge_label: node.edge_label.clone(),
             fold: node.fold,
             tags: node.tags.clone(),
@@ -944,6 +953,7 @@ async fn clear_layout(State(state): State<Arc<AppState>>) -> Result<Json<Canvas>
             display: node.display,
             lang: node.lang.clone(),
             interpreter: node.interpreter.clone(),
+            preview: Some(node.preview),
             edge_label: node.edge_label.clone(),
             fold: node.fold,
             tags: node.tags.clone(),
@@ -1064,6 +1074,10 @@ struct UpdateNodeRequest {
     /// `file`-node interpreter (see `meshfox_core::Node::is_runnable_file`)
     /// — makes the node runnable via the web UI's "▷ run" button.
     interpreter: Option<String>,
+    /// `link`-node social preview toggle (see `meshfox_core::Node::preview`)
+    /// — `None` leaves the existing value untouched, same "not sent"
+    /// convention as every other field here.
+    preview: Option<bool>,
     /// Full replacement list of tags — `None` leaves them untouched,
     /// `Some(vec![])` clears them, same convention as `extraParents`.
     tags: Option<Vec<String>>,
@@ -1247,6 +1261,7 @@ async fn update_node(
         existing_display,
         existing_lang,
         existing_interpreter,
+        existing_preview,
         existing_tags,
         existing_fold,
         existing_edge_label,
@@ -1259,13 +1274,15 @@ async fn update_node(
         initial_node.display,
         initial_node.lang.clone(),
         initial_node.interpreter.clone(),
+        initial_node.preview,
         initial_node.tags.clone(),
         initial_node.fold,
         initial_node.edge_label.clone(),
     );
     // `display`/`lang`/`interpreter` only mean anything on a `file` node —
     // clear them (rather than leave a stale attribute behind) whenever this
-    // request moves the node to some other type.
+    // request moves the node to some other type. `preview` is the same idea
+    // but for `link` nodes.
     let final_type = req.node_type.unwrap_or(initial_node.node_type);
     let mut title = initial_node.title.clone();
 
@@ -1280,6 +1297,7 @@ async fn update_node(
         || req.display.is_some()
         || req.lang.is_some()
         || req.interpreter.is_some()
+        || req.preview.is_some()
         || req.tags.is_some()
         || req.fold.is_some()
         || req.edge_label.is_some()
@@ -1296,6 +1314,11 @@ async fn update_node(
             )
         } else {
             (None, None, None)
+        };
+        let preview = if final_type == NodeType::Link {
+            Some(req.preview.unwrap_or(existing_preview))
+        } else {
+            None
         };
         // Unlike `color` (which would happily store and write back a
         // literal `color=""` if sent empty), an empty `edgeLabel` clears
@@ -1319,6 +1342,7 @@ async fn update_node(
             display,
             lang,
             interpreter,
+            preview,
             edge_label,
             fold: resolve_fold_override(req.fold.as_deref(), existing_fold)?,
             tags: req.tags.clone().unwrap_or(existing_tags),
@@ -1748,6 +1772,7 @@ async fn reparent_node(
                         display: new_node.display,
                         lang: new_node.lang.clone(),
                         interpreter: new_node.interpreter.clone(),
+                        preview: Some(new_node.preview),
                         edge_label: new_node.edge_label.clone(),
                         fold: new_node.fold,
                         tags: new_node.tags.clone(),
@@ -2684,6 +2709,39 @@ async fn serve_embedded(State(state): State<Arc<AppState>>, uri: Uri) -> Respons
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct LinkPreviewQuery {
+    url: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LinkPreviewResponse {
+    /// `None` means no preview is available — the fetch was blocked (SSRF
+    /// check), failed, or the target isn't HTML. Deliberately not
+    /// distinguished any further than that in the response (see
+    /// `link_preview`'s own module doc): this endpoint takes an
+    /// attacker-controllable URL from the canvas, so it must not double as
+    /// a network probe an attacker could use to learn *why* a given
+    /// internal address failed.
+    preview: Option<link_preview::PreviewMeta>,
+}
+
+/// `GET /api/link-preview?url=<url>` — fetches (or returns the
+/// already-cached) OpenGraph preview for a `link` node's target. Doesn't
+/// require `url` to belong to any node in the current document; the web
+/// UI only ever calls this for a node whose own `preview` attribute is on,
+/// but the endpoint itself just takes a URL, same trust boundary as the
+/// node attribute itself (both are only ever attacker-controlled canvas
+/// content, never a secret).
+async fn get_link_preview(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<LinkPreviewQuery>,
+) -> Json<LinkPreviewResponse> {
+    let preview = state.link_preview_cache.get_or_fetch(&query.url).await;
+    Json(LinkPreviewResponse { preview })
+}
+
 /// Serves `canvas_path` on `127.0.0.1:<port>` until the process is killed
 /// (or, when `auto_exit` is on, until every `/api/watch`-connected tab has
 /// closed — see `TabGuard`). `port` of `0` asks the OS to assign a free
@@ -2710,6 +2768,7 @@ async fn build_state(canvas_path: PathBuf, auto_exit: bool) -> std::io::Result<A
         ever_connected: AtomicBool::new(false),
         change_tx,
         auto_exit,
+        link_preview_cache: link_preview::PreviewCache::new(),
     }))
 }
 
@@ -2732,6 +2791,7 @@ fn build_app(state: Arc<AppState>) -> Router {
             "/api/vars/configure",
             get(get_configure_vars).post(post_configure_vars),
         )
+        .route("/api/link-preview", get(get_link_preview))
         .route("/api/run", post(run_block))
         .route("/api/run/tty", get(run_block_tty))
         .route("/api/kill", post(kill_run))
@@ -3008,6 +3068,7 @@ mod include_edit_tests {
             display: None,
             lang: None,
             interpreter: None,
+            preview: None,
             tags: None,
             edge_label: None,
             fold: None,
@@ -4140,6 +4201,81 @@ mod options_endpoint_tests {
 
         let on_disk = std::fs::read_to_string(&canvas_path).unwrap();
         assert!(!on_disk.contains("meshfox:option"));
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+}
+
+#[cfg(test)]
+mod link_preview_endpoint_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    fn write_test_canvas(contents: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "meshfox-link-preview-endpoint-test-{}.canvas.md",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    const CANVAS: &str =
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\nbody\n";
+
+    /// Bare `TcpStream` GET, same "no full HTTP client crate" approach
+    /// `ws_tests::reqwest_free_kill` uses — returns `(status, body)`.
+    async fn get(addr: SocketAddr, path: &str) -> (u16, String) {
+        let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.expect("read");
+        let mut parts = response.splitn(2, "\r\n\r\n");
+        let head = parts.next().unwrap_or("");
+        let body = parts.next().unwrap_or("").to_string();
+        let status = head
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        (status, body)
+    }
+
+    /// A loopback target is rejected by the SSRF check before it's ever
+    /// connected to (see `link_preview::tests` for the direct, offline unit
+    /// tests of that check) — the endpoint itself degrades this to a null
+    /// preview rather than a request-level error, same as any other fetch
+    /// failure (see `LinkPreviewResponse`'s own doc comment): a caller
+    /// can't tell "blocked" apart from "unreachable" apart from "not
+    /// HTML", by design.
+    #[tokio::test]
+    async fn blocked_target_returns_a_null_preview_not_an_error() {
+        let canvas_path = write_test_canvas(CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, body) = get(addr, "/api/link-preview?url=http%3A%2F%2F127.0.0.1%3A1%2F").await;
+        assert_eq!(status, 200);
+        assert_eq!(body, r#"{"preview":null}"#);
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    /// A malformed `url` query value is still just a `String` to the
+    /// extractor (no format validation happens until `fetch_og_preview`
+    /// parses it) — same null-preview degradation as any other rejected
+    /// target, not a 4xx.
+    #[tokio::test]
+    async fn malformed_url_also_returns_a_null_preview() {
+        let canvas_path = write_test_canvas(CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, body) = get(addr, "/api/link-preview?url=not-a-url").await;
+        assert_eq!(status, 200);
+        assert_eq!(body, r#"{"preview":null}"#);
 
         let _ = std::fs::remove_file(&canvas_path);
     }

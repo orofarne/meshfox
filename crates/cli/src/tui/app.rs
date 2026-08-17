@@ -9,6 +9,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use meshfox_server::link_preview::{self, PreviewMeta};
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use meshfox_core::deps::BlockAddr;
 use meshfox_core::fence::{self, scan_runnable_blocks};
@@ -18,7 +20,7 @@ use meshfox_core::vars::{declared_vars, resolve_block_env, VarDecl, VarType};
 use meshfox_core::{Canvas, FileDisplay, NodeType, VarCache};
 use meshfox_server::stream_exec::SpawnedProcess;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::ListState;
 use ratatui_image::picker::Picker;
@@ -170,6 +172,52 @@ pub struct App {
     /// it's just dropped in that case. Mirrors the web UI's
     /// `pendingExternalChange` (`web/src/App.tsx`).
     pub pending_external_change: Option<String>,
+    /// `link`+`preview` social-preview fetch — SSRF-safe, in-process (see
+    /// `meshfox_server::link_preview`), shared with whatever background
+    /// task is currently fetching via `Arc`. Same "alive for exactly this
+    /// process's lifetime" cache contract as the web server's own copy
+    /// (`crates/server/src/lib.rs`'s `AppState::link_preview_cache`) — this
+    /// is a separate instance since the TUI doesn't run through `AppState`
+    /// at all, never shared across processes either way.
+    pub link_preview_cache: Arc<link_preview::PreviewCache>,
+    /// Where a background fetch (see `maybe_fetch_link_preview`/
+    /// `maybe_fetch_link_preview_image`) reports back once it's done —
+    /// consumed by `mod.rs`'s `main_loop`, which forwards each message to
+    /// `on_link_preview_msg`. Cloned into every spawned fetch task.
+    pub link_preview_tx: tokio::sync::mpsc::UnboundedSender<LinkPreviewMsg>,
+    /// URLs a metadata fetch has already been kicked off for — gates
+    /// `maybe_fetch_link_preview` against re-spawning one on every
+    /// selection change while the first is still in flight (or already
+    /// failed — a failure is never retried within this session, same as
+    /// the web server's own cache). Never cleared; outlives any single
+    /// `render_current_document` call, unlike `doc_segments`/`doc_images`.
+    pub link_preview_requested: HashSet<String>,
+    /// Loaded OpenGraph metadata, keyed by page URL — only ever gains
+    /// entries (a failed fetch just never appears here; see
+    /// `link_preview_requested`), so "no entry" means "nothing to show
+    /// yet, whether still loading or already failed" — deliberately not
+    /// distinguished any further in the UI (see `render_current_document`).
+    pub link_preview_meta: HashMap<String, PreviewMeta>,
+    /// Same "requested" gate as `link_preview_requested`, but for a
+    /// preview's own `og:image` bytes (a second, independent fetch —  see
+    /// `maybe_fetch_link_preview_image`), keyed by the image URL.
+    pub link_preview_image_requested: HashSet<String>,
+    /// Decoded preview images, keyed by image URL rather than a local path
+    /// (unlike `doc_images` — there's no file on disk here). Re-cloned
+    /// into `doc_images` under a synthetic path on every
+    /// `render_current_document` call so the existing `Segment::Image`
+    /// render path (`ui.rs`) can show it with no changes of its own —
+    /// `Protocol` is cheap to clone (see `ratatui_image::protocol`).
+    pub link_preview_image: HashMap<String, Protocol>,
+}
+
+/// A background link-preview fetch's result, reported back through
+/// `App::link_preview_tx` into `mod.rs`'s `main_loop` (same shape as the
+/// existing `reload_rx`/output-line channels) — never sent at all on
+/// failure, see `App::link_preview_requested`'s own doc comment.
+pub enum LinkPreviewMsg {
+    Meta { url: String, meta: PreviewMeta },
+    Image { url: String, image: image::DynamicImage },
 }
 
 /// A non-secret declaration's currently-resolved value with no overrides
@@ -217,7 +265,10 @@ fn initial_field_input(decl: &VarDecl, cache: &VarCache) -> String {
 }
 
 impl App {
-    pub fn new(canvas_path: PathBuf) -> io::Result<App> {
+    pub fn new(
+        canvas_path: PathBuf,
+        link_preview_tx: tokio::sync::mpsc::UnboundedSender<LinkPreviewMsg>,
+    ) -> io::Result<App> {
         let raw = std::fs::read_to_string(&canvas_path)?;
         let canvas = Canvas::from_markdown(&raw).map_err(|e| io::Error::other(e.to_string()))?;
         let decls = declared_vars(&canvas).unwrap_or_default();
@@ -263,6 +314,12 @@ impl App {
             constraint_stats,
             known_raw,
             pending_external_change: None,
+            link_preview_cache: Arc::new(link_preview::PreviewCache::new()),
+            link_preview_tx,
+            link_preview_requested: HashSet::new(),
+            link_preview_meta: HashMap::new(),
+            link_preview_image_requested: HashSet::new(),
+            link_preview_image: HashMap::new(),
         };
         app.render_current_document();
         Ok(app)
@@ -871,6 +928,126 @@ impl App {
             let protocol = load_image_protocol(&mut self.picker, &path);
             self.doc_images.insert(path, protocol);
         }
+
+        if node.node_type == NodeType::Link && node.preview {
+            if let Some(target) = node.target.clone() {
+                self.append_link_preview(&target);
+            }
+        }
+    }
+
+    /// Appends a `link`+`preview` node's OpenGraph preview (title/
+    /// description/image) after its plain link body — kicks off the
+    /// metadata fetch (and, once that lands, the image fetch) if not
+    /// already in flight (see `maybe_fetch_link_preview`/
+    /// `maybe_fetch_link_preview_image`), but renders nothing extra until
+    /// (and unless) a result actually lands — same "just show the plain
+    /// link" fallback this pane already has for a missing/broken target.
+    /// Reuses the ordinary `Segment::Image`/`doc_images` render path
+    /// (`ui.rs`) for the image itself, keyed by a synthetic path (there's
+    /// no file on disk here) rather than a real one.
+    fn append_link_preview(&mut self, target: &str) {
+        self.maybe_fetch_link_preview(target.to_string());
+        let Some(meta) = self.link_preview_meta.get(target).cloned() else {
+            return;
+        };
+
+        let mut lines = vec![Line::from("")];
+        if let Some(title) = &meta.title {
+            lines.push(Line::from(Span::styled(
+                title.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+        }
+        if let Some(description) = &meta.description {
+            lines.push(Line::from(Span::styled(
+                description.clone(),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        if lines.len() > 1 {
+            self.doc_segments.push(Segment::Text(lines));
+        }
+
+        if let Some(image_url) = &meta.image {
+            self.maybe_fetch_link_preview_image(image_url.clone());
+            if let Some(protocol) = self.link_preview_image.get(image_url).cloned() {
+                let path = link_preview_image_path(image_url);
+                self.doc_images.insert(path.clone(), Some(protocol));
+                self.doc_segments.push(Segment::Image {
+                    path,
+                    alt: "preview image".to_string(),
+                });
+            }
+        }
+    }
+
+    /// Kicks off `url`'s OpenGraph metadata fetch in the background (see
+    /// `link_preview` module doc for the SSRF hardening) unless one's
+    /// already in flight or already landed — `link_preview_requested`
+    /// gates against re-spawning on every selection change, and is never
+    /// cleared, so a prior failure isn't retried within this session
+    /// either (same cache contract the web server's own copy has). Result
+    /// (if any — a failure sends nothing) arrives via `link_preview_tx`,
+    /// handled by `on_link_preview_msg`.
+    fn maybe_fetch_link_preview(&mut self, url: String) {
+        if !self.link_preview_requested.insert(url.clone()) {
+            return;
+        }
+        let cache = Arc::clone(&self.link_preview_cache);
+        let tx = self.link_preview_tx.clone();
+        tokio::spawn(async move {
+            if let Some(meta) = cache.get_or_fetch(&url).await {
+                let _ = tx.send(LinkPreviewMsg::Meta { url, meta });
+            }
+        });
+    }
+
+    /// Same idea as `maybe_fetch_link_preview`, but for a loaded preview's
+    /// own `og:image` bytes — a second, independent SSRF-safe fetch (see
+    /// `link_preview::fetch_image_bytes`), decoded here in the background
+    /// task (cheap enough for one small preview image) and handed back as
+    /// a plain `image::DynamicImage`; building the actual `Protocol` still
+    /// has to happen on the main thread (`on_link_preview_msg`), since
+    /// that needs `&mut self.picker`.
+    fn maybe_fetch_link_preview_image(&mut self, url: String) {
+        if !self.link_preview_image_requested.insert(url.clone()) {
+            return;
+        }
+        let tx = self.link_preview_tx.clone();
+        tokio::spawn(async move {
+            let Ok(bytes) = link_preview::fetch_image_bytes(&url).await else {
+                return;
+            };
+            let Ok(image) = image::load_from_memory(&bytes) else {
+                return;
+            };
+            let _ = tx.send(LinkPreviewMsg::Image { url, image });
+        });
+    }
+
+    /// Applies a background link-preview fetch's result (see
+    /// `LinkPreviewMsg`) — called from `mod.rs`'s `main_loop`. Just updates
+    /// the cache and re-renders the currently selected node's document
+    /// pane; if the fetch that just landed belongs to some other node than
+    /// whatever's selected now, this is a harmless no-op-ish redraw rather
+    /// than something that needs special-casing away.
+    pub fn on_link_preview_msg(&mut self, msg: LinkPreviewMsg) {
+        match msg {
+            LinkPreviewMsg::Meta { url, meta } => {
+                self.link_preview_meta.insert(url, meta);
+            }
+            LinkPreviewMsg::Image { url, image } => {
+                let budget = ratatui::layout::Size::new(56, 24);
+                if let Ok(protocol) =
+                    self.picker
+                        .new_protocol(image, budget, ratatui_image::Resize::Fit(None))
+                {
+                    self.link_preview_image.insert(url, protocol);
+                }
+            }
+        }
+        self.render_current_document();
     }
 
     // -- running blocks -----------------------------------------------------
@@ -1326,6 +1503,14 @@ fn constraint_stats(canvas: &Canvas) -> Option<(usize, usize)> {
     }
     let failed = results.iter().filter(|r| !r.ok).count();
     Some((results.len(), failed))
+}
+
+/// A synthetic `doc_images` key for a `link` node's preview image — there's
+/// no real file on disk to key it by (unlike every other `Segment::Image`),
+/// so this just needs to be stable and collision-free per image URL, not an
+/// actual path anything ever opens.
+fn link_preview_image_path(image_url: &str) -> PathBuf {
+    PathBuf::from(format!("meshfox-link-preview:{image_url}"))
 }
 
 fn load_image_protocol(picker: &mut Picker, path: &Path) -> Option<Protocol> {

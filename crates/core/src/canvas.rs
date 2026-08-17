@@ -246,6 +246,15 @@ pub struct Node {
     /// `None` means the node isn't runnable this way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interpreter: Option<String>,
+    /// `link`-node only: whether to fetch and show an OpenGraph social
+    /// preview (title/description/image) below the link, cached in memory
+    /// for the life of the server/TUI process. `false` (the default) for
+    /// every node, including every other node type — setting `preview=` on
+    /// a non-`link` node is a parse error (see `mdcanvas::ParseError`),
+    /// unlike `display`/`lang`/`interpreter` above which are only
+    /// documented as file-only, not enforced.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub preview: bool,
     /// Label text for the *structural* edge from `parent` into this node
     /// (`edgeLabel=` on `meshfox:node`) — the implicit nesting edge has no
     /// dedicated line of its own the way an `ExtraEdge` does (see

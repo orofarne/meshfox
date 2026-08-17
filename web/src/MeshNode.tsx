@@ -10,7 +10,7 @@ import { defaultBlock, parseBody, type BodySegment, type CodeSegment, type Const
 import { parseBlockRef, blockDomId } from "./deps";
 import { AnsiText } from "./AnsiText";
 import { NodeTextEditor, usePrefersDark } from "./NodeTextEditor";
-import { fetchNodeFileContent } from "./api";
+import { fetchNodeFileContent, fetchLinkPreview, type LinkPreview } from "./api";
 import type { ConstraintStatusDto, NodeType } from "./types";
 
 /**
@@ -173,6 +173,9 @@ export interface MeshNodeData {
    * `target` — present makes the node runnable via the title bar's "▷ run"
    * button (see `App.tsx`'s `executeFileRun`). */
   interpreter?: string;
+  /** link-node only: shows an OpenGraph social preview card (title/
+   * description/image) below the link — see `LinkPreviewCard`. */
+  preview?: boolean;
   text: string;
   /** Absolute directory a relative `img`/link target in `text` should
    * resolve against, when it's not the canvas file's own directory — set
@@ -764,6 +767,65 @@ function FileCodePreview({ nodeId, target, lang }: { nodeId: string; target?: st
   );
 }
 
+/** Module-level so remounting the same node (a canvas re-layout, or
+ * expanding it into `NodeExpandPanel`) doesn't re-request a preview this
+ * tab has already seen — the server itself already caches per-process
+ * (see `crates/server/src/link_preview.rs`), this just avoids the
+ * redundant round trip. Keyed by URL, not node id, so two link nodes
+ * pointing at the same target share one fetch. */
+const linkPreviewCache = new Map<string, Promise<LinkPreview | null>>();
+
+function getLinkPreview(url: string): Promise<LinkPreview | null> {
+  let pending = linkPreviewCache.get(url);
+  if (!pending) {
+    pending = fetchLinkPreview(url).catch(() => null);
+    linkPreviewCache.set(url, pending);
+  }
+  return pending;
+}
+
+/**
+ * A `link` node's `preview: true` card: fetches (or reuses the
+ * already-cached, see `getLinkPreview`) OpenGraph title/description/image
+ * for `target` and renders it below the plain link. Renders nothing at all
+ * once loaded if the server had nothing to show (blocked, unreachable, not
+ * HTML, no OG tags) — same "just degrade to the plain link" spirit as
+ * `FileCodePreview`'s own error fallback, just without even a hint
+ * message, since "no preview" for an arbitrary link is unremarkable.
+ */
+function LinkPreviewCard({ target }: { target: string }) {
+  const [preview, setPreview] = useState<LinkPreview | null | "loading">("loading");
+
+  useEffect(() => {
+    let cancelled = false;
+    setPreview("loading");
+    getLinkPreview(target).then((result) => {
+      if (!cancelled) setPreview(result);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [target]);
+
+  if (preview === "loading") {
+    return <p className="mesh-node-hint">loading preview…</p>;
+  }
+  if (!preview || (!preview.title && !preview.description && !preview.image)) {
+    return null;
+  }
+  return (
+    <a href={target} target="_blank" rel="noreferrer" className="mesh-link-preview-card nodrag">
+      {preview.image && <img src={preview.image} alt="" className="mesh-link-preview-image" />}
+      {(preview.title || preview.description) && (
+        <div className="mesh-link-preview-text">
+          {preview.title && <div className="mesh-link-preview-title">{preview.title}</div>}
+          {preview.description && <div className="mesh-link-preview-description">{preview.description}</div>}
+        </div>
+      )}
+    </a>
+  );
+}
+
 /**
  * Read-only preview of a node's Markdown body — same segment parsing
  * (`parseBody`) and Markdown rendering `MeshNodeBody` uses, but code blocks
@@ -932,6 +994,9 @@ export function NodeBodyContent({ data, nodeId }: { data: MeshNodeData; nodeId: 
           </a>
         ) : (
           <em>no target</em>
+        )}
+        {data.nodeType === "link" && data.preview && data.target && (
+          <LinkPreviewCard target={data.target} />
         )}
         {fileRunLive && <LiveRunOutput live={fileRunLive} />}
       </div>

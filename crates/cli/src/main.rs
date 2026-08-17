@@ -478,6 +478,10 @@ enum NodeCommand {
         /// runnable as `interpreter target`.
         #[arg(long)]
         interpreter: Option<String>,
+        /// `link`-node social preview toggle: `true` shows an OpenGraph
+        /// preview card below the link, `false` (the default) doesn't.
+        #[arg(long)]
+        preview: Option<bool>,
         /// Per-node fold-state override (see SPEC.md's "Options" section):
         /// `true`/`false` sets an explicit override, `default` clears it
         /// back to following the document's own default. Omit this flag
@@ -839,6 +843,7 @@ fn main() {
                 display,
                 lang,
                 interpreter,
+                preview,
                 fold,
             } => node_meta(
                 &canvas.unwrap_or_else(find_canvas),
@@ -852,6 +857,7 @@ fn main() {
                 display,
                 lang,
                 interpreter,
+                preview,
                 fold,
             ),
             NodeCommand::Edges {
@@ -1967,6 +1973,7 @@ fn apply_node_mv(raw: &str, node_id: &str, new_parent_id: &str) -> Result<String
                         display: new_node.display,
                         lang: new_node.lang.clone(),
                         interpreter: new_node.interpreter.clone(),
+                        preview: Some(new_node.preview),
                         edge_label: new_node.edge_label.clone(),
                         fold: new_node.fold,
                         tags: new_node.tags.clone(),
@@ -2111,6 +2118,7 @@ fn node_meta(
     display: Option<String>,
     lang: Option<String>,
     interpreter: Option<String>,
+    preview: Option<bool>,
     fold: Option<String>,
 ) {
     let raw = read_raw_or_exit(canvas_path);
@@ -2126,6 +2134,7 @@ fn node_meta(
         display,
         lang,
         interpreter,
+        preview,
         fold,
     ) {
         Ok(updated) => {
@@ -2155,6 +2164,7 @@ fn apply_node_meta(
     display: Option<String>,
     lang: Option<String>,
     interpreter: Option<String>,
+    preview: Option<bool>,
     fold: Option<String>,
 ) -> Result<String, String> {
     let canvas = Canvas::from_markdown(raw).map_err(|e| e.to_string())?;
@@ -2164,6 +2174,9 @@ fn apply_node_meta(
 
     let parsed_type = node_type.as_deref().map(parse_node_type).transpose()?;
     let parsed_display = display.as_deref().map(parse_display).transpose()?;
+    if preview.is_some() && parsed_type.unwrap_or(node.node_type) != NodeType::Link {
+        return Err("--preview only applies to link nodes".to_string());
+    }
     // Omitted entirely (`None`) keeps whatever's already there; passed as
     // `"true"`/`"false"`/`"default"` resolves via the same shared sentinel
     // parsing the server's own node-update endpoint uses (see
@@ -2209,6 +2222,7 @@ fn apply_node_meta(
         display: parsed_display.or(node.display),
         lang: lang.or_else(|| node.lang.clone()),
         interpreter: interpreter.or_else(|| node.interpreter.clone()),
+        preview: Some(preview.unwrap_or(node.preview)),
         edge_label: node.edge_label.clone(),
         fold: parsed_fold,
         tags: node.tags.clone(),
@@ -2359,6 +2373,9 @@ fn format_node_show(raw: &str, node_id: &str) -> Result<String, String> {
     }
     if let Some(d) = node.display {
         out.push_str(&format!("display: {}\n", d.as_str()));
+    }
+    if node.preview {
+        out.push_str("preview: true\n");
     }
     if let Some(l) = &node.lang {
         out.push_str(&format!("lang: {l}\n"));
@@ -2875,6 +2892,7 @@ Shared body.
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let canvas = Canvas::from_markdown(&updated).unwrap();
@@ -2901,6 +2919,7 @@ Shared body.
             None,
             None,
             None,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("group"), "unexpected error: {err}");
@@ -2912,6 +2931,7 @@ Shared body.
             None,
             None,
             Some(120.0),
+            None,
             None,
             None,
             None,
@@ -2930,6 +2950,7 @@ Shared body.
             "tests",
             Some(1000.0),
             Some(2000.0),
+            None,
             None,
             None,
             None,
@@ -2964,6 +2985,7 @@ Shared body.
             None,
             None,
             None,
+            None,
             Some("true".to_string()),
         )
         .unwrap();
@@ -2979,6 +3001,7 @@ Shared body.
         let updated = apply_node_meta(
             &updated,
             "tests",
+            None,
             None,
             None,
             None,
@@ -3015,6 +3038,7 @@ Shared body.
             None,
             None,
             None,
+            None,
             Some("bogus".to_string()),
         )
         .unwrap_err();
@@ -3032,6 +3056,7 @@ Shared body.
             None,
             None,
             Some("bogus".to_string()),
+            None,
             None,
             None,
             None,

@@ -119,6 +119,29 @@ of JSON, for readable diffs and hand-editability.
 
   `link` nodes don't support `display`/`code`/`interpreter` — their target
   is an external URL, not something meshfox reads from or runs off disk.
+  A `link` node accepts its own single attribute instead:
+  - `preview="true"` — fetches the target's OpenGraph metadata
+    (title/description/image) and shows it as a card below the plain
+    link, in both the web UI and the terminal viewer. `false` (the
+    default, omitted from the file) shows just the plain link, same as
+    before this attribute existed. Setting `preview=` on a non-`link`
+    node is a parse error, same as an unknown `type=`.
+
+    Fetched over the network on first view and cached in memory for the
+    life of the `meshfox view`/`meshfox tui` process — not persisted, not
+    shared across processes, and never retried within that process once a
+    fetch has failed. Since a canvas file's `link` targets are often
+    attacker-controllable (the file itself may come from an untrusted
+    source), the fetch is hardened against SSRF: only `http`/`https`,
+    resolved addresses that are loopback/private/link-local/etc. are
+    rejected before ever connecting, and redirects are followed manually
+    with the same check re-run on every hop.
+
+    ```
+    <!-- meshfox:node type="link" preview="true" -->
+
+    [meshfox](https://github.com/orofarne/meshfox)
+    ```
 - **`include`** — same one-link body as `file`/`link`, but the target
   (another `.md` or `.canvas.md` file) is spliced in *dynamically* by
   whatever consumer resolves includes — never written back to disk.

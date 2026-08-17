@@ -1211,6 +1211,7 @@ export default function App() {
             display: n.display,
             lang: n.lang,
             interpreter: n.interpreter,
+            preview: n.preview,
             text: n.text,
             color: n.color,
             tags: n.tags,
