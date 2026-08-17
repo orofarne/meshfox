@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use meshfox_core::deps::BlockAddr;
@@ -150,6 +151,25 @@ pub struct App {
     /// nothing rather than a vacuous "0/0" (same convention the web UI's
     /// toolbar badge uses).
     pub constraint_stats: Option<(usize, usize)>,
+    /// The last content of `canvas_path` either loaded from or written to
+    /// disk by *this* process — shared with the background file-watcher
+    /// thread (`mod.rs`'s `spawn_file_watcher`) purely so it can tell an
+    /// external edit apart from its own write-back landing on disk, same
+    /// "compare against what we last wrote" trick the web server's own
+    /// watcher uses (`crates/server/src/lib.rs`'s `spawn_file_watcher`).
+    /// Every place that writes `self.raw` to `canvas_path` must update
+    /// this right after, or the watcher will (harmlessly, but
+    /// distractingly) mistake that write for an external change.
+    pub known_raw: Arc<Mutex<String>>,
+    /// An external change to `canvas_path` that arrived while
+    /// `source_editor` was open — applying it immediately could yank the
+    /// document out from under an in-progress edit (or, worse, get
+    /// silently clobbered the moment the editor saves). Parked here
+    /// instead and applied once the editor closes without saving; a save
+    /// makes it stale (the editor's own write is now what's on disk), so
+    /// it's just dropped in that case. Mirrors the web UI's
+    /// `pendingExternalChange` (`web/src/App.tsx`).
+    pub pending_external_change: Option<String>,
 }
 
 /// A non-secret declaration's currently-resolved value with no overrides
@@ -212,6 +232,7 @@ impl App {
         // just renders nothing, silently. Half-blocks are pure Unicode +
         // color, so they render everywhere, tmux included.
         let picker = Picker::halfblocks();
+        let known_raw = Arc::new(Mutex::new(raw.clone()));
 
         let mut app = App {
             canvas_path,
@@ -240,6 +261,8 @@ impl App {
             should_quit: false,
             source_editor: None,
             constraint_stats,
+            known_raw,
+            pending_external_change: None,
         };
         app.render_current_document();
         Ok(app)
@@ -249,7 +272,12 @@ impl App {
         if let Some(se) = &mut self.source_editor {
             match se.on_key(key) {
                 SourceEditorOutcome::Stay => {}
-                SourceEditorOutcome::Close => self.source_editor = None,
+                SourceEditorOutcome::Close => {
+                    self.source_editor = None;
+                    if let Some(pending) = self.pending_external_change.take() {
+                        self.apply_external_reload(pending);
+                    }
+                }
                 SourceEditorOutcome::Save => self.save_source_editor(),
             }
             return;
@@ -579,6 +607,50 @@ impl App {
         self.constraint_stats = constraint_stats(&self.display_canvas);
     }
 
+    /// Applies an edit to `canvas_path` made by something other than this
+    /// process — reported by the background file-watcher thread (see
+    /// `mod.rs`'s `spawn_file_watcher`) via `known_raw`. Deferred instead
+    /// (into `pending_external_change`) rather than applied here if the
+    /// source editor is open on this same file; see that field's own doc
+    /// comment. Mirrors the web UI's own reload-on-change
+    /// (`web/src/App.tsx`'s `watchChanges` callback), including leaving
+    /// the currently selected node/scroll position alone where possible
+    /// (`rebuild_rows` re-finds the same node id rather than resetting to
+    /// the top).
+    /// Entry point for the background file-watcher's notifications (see
+    /// `mod.rs`'s `main_loop`) — defers to `pending_external_change`
+    /// instead of applying immediately while the source editor is open on
+    /// this file (see that field's doc comment), applies right away
+    /// otherwise.
+    pub fn on_external_change(&mut self, content: String) {
+        if self.source_editor.is_some() {
+            self.pending_external_change = Some(content);
+            self.status = "file changed on disk — will reload once the editor closes".into();
+            return;
+        }
+        self.apply_external_reload(content);
+    }
+
+    fn apply_external_reload(&mut self, content: String) {
+        if content == self.raw {
+            return;
+        }
+        self.raw = content;
+        match Canvas::from_markdown(&self.raw) {
+            Ok(parsed) => {
+                self.canvas = parsed;
+                self.decls = declared_vars(&self.canvas).unwrap_or_default();
+                self.rebuild_display_canvas();
+                self.rebuild_rows();
+                self.render_current_document();
+                self.status = "reloaded — file changed on disk".into();
+            }
+            Err(e) => {
+                self.status = format!("file changed on disk but failed to parse: {e}");
+            }
+        }
+    }
+
     /// Whether the currently selected row is a `file` node with a
     /// `target` — same gate the web UI's `MeshNode` uses to decide
     /// whether to render its "↗ open" button at all, used here so the
@@ -730,6 +802,12 @@ impl App {
             if let Ok(reparsed) = Canvas::from_markdown(&text) {
                 self.canvas = reparsed;
             }
+            *self.known_raw.lock().unwrap() = self.raw.clone();
+            // Whatever arrived externally while the editor was open is now
+            // stale — this save just overwrote it on disk with the
+            // editor's own buffer, same "last write wins" behavior a save
+            // conflicting with a concurrent external edit already has.
+            self.pending_external_change = None;
         }
         self.rebuild_display_canvas();
         self.rebuild_rows();
@@ -1072,6 +1150,7 @@ impl App {
                             {
                                 self.raw = patched;
                                 let _ = std::fs::write(&self.canvas_path, &self.raw);
+                                *self.known_raw.lock().unwrap() = self.raw.clone();
                                 if let Ok(reparsed) = Canvas::from_markdown(&self.raw) {
                                     self.canvas = reparsed;
                                     self.rebuild_display_canvas();

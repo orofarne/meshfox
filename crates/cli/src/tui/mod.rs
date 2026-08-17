@@ -83,7 +83,11 @@ pub async fn run(canvas_path: PathBuf) -> io::Result<()> {
                     Err(_) => break,
                 }
             });
-            main_loop(&mut terminal, &mut app, &mut input_rx, &paused).await
+
+            let (reload_tx, mut reload_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            spawn_file_watcher(app.canvas_path.clone(), Arc::clone(&app.known_raw), reload_tx);
+
+            main_loop(&mut terminal, &mut app, &mut input_rx, &paused, &mut reload_rx).await
         }
         Err(e) => Err(e),
     };
@@ -99,11 +103,53 @@ pub async fn run(canvas_path: PathBuf) -> io::Result<()> {
     result
 }
 
+/// Polls `canvas_path`'s mtime every 500ms on its own OS thread — same
+/// cadence and same "diff the actual content, not just the mtime" trick as
+/// the web server's own `spawn_file_watcher`
+/// (`crates/server/src/lib.rs`) — and pushes the new content through
+/// `reload_tx` whenever it differs from `known_raw`, which it also
+/// updates so it doesn't re-report a change this process just wrote
+/// itself (see `App::known_raw`'s doc comment for who else writes to it).
+fn spawn_file_watcher(
+    canvas_path: PathBuf,
+    known_raw: Arc<std::sync::Mutex<String>>,
+    reload_tx: tokio::sync::mpsc::UnboundedSender<String>,
+) {
+    std::thread::spawn(move || {
+        let mut last_mtime = std::fs::metadata(&canvas_path)
+            .and_then(|m| m.modified())
+            .ok();
+        loop {
+            std::thread::sleep(Duration::from_millis(500));
+            let Ok(meta) = std::fs::metadata(&canvas_path) else {
+                continue;
+            };
+            let Ok(mtime) = meta.modified() else { continue };
+            if Some(mtime) == last_mtime {
+                continue;
+            }
+            last_mtime = Some(mtime);
+            let Ok(contents) = std::fs::read_to_string(&canvas_path) else {
+                continue;
+            };
+            let mut raw = known_raw.lock().unwrap();
+            if *raw != contents {
+                *raw = contents.clone();
+                drop(raw);
+                if reload_tx.send(contents).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+}
+
 async fn main_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
     input_paused: &Arc<AtomicBool>,
+    reload_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
 ) -> io::Result<()> {
     loop {
         terminal.draw(|f| ui::render(f, app))?;
@@ -138,6 +184,9 @@ async fn main_loop(
                 app.run.as_mut().unwrap().proc.as_mut().unwrap().output_rx.recv().await
             }, if has_proc => {
                 app.on_output_line(line).await;
+            }
+            Some(content) = reload_rx.recv() => {
+                app.on_external_change(content);
             }
         }
     }
