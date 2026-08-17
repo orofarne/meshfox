@@ -99,6 +99,13 @@ pub struct RunState {
     /// starts. Only `proc.is_some()` (never this flag) gates whether the
     /// event loop still polls it for output.
     pub finished: bool,
+    /// Set by `advance_run` right before spawning the *current* step,
+    /// only when that step is a `from=` target for some declared
+    /// variable — the vars-out file path it was handed, plus which
+    /// declarations to extract from it. Consumed (and cleared) once that
+    /// step's exit code is known, by `on_output_line`/`resume_after_tty` —
+    /// see `meshfox_core::varout`.
+    pub pending_vars_out: Option<(PathBuf, Vec<VarDecl>)>,
 }
 
 pub struct App {
@@ -118,6 +125,12 @@ pub struct App {
     pub decls: Vec<VarDecl>,
     pub var_cache: VarCache,
     pub run_overrides: HashMap<String, String>,
+    /// Values produced by `from=` source blocks already run earlier in the
+    /// *current* run — kept separate from `run_overrides` so a computed
+    /// variable can never be impersonated by a form answer; see
+    /// `vars::resolve`'s doc comment. Cleared at the start of every new run
+    /// (`start_run`), same as `run_overrides`.
+    pub run_computed: HashMap<String, String>,
     pub expanded: HashSet<String>,
     pub rows: Vec<TreeRow>,
     pub selected: usize,
@@ -293,6 +306,7 @@ impl App {
             decls,
             var_cache,
             run_overrides: HashMap::new(),
+            run_computed: HashMap::new(),
             expanded,
             rows,
             selected: 0,
@@ -1116,16 +1130,22 @@ impl App {
 
     async fn start_run(&mut self, node_id: String, block_name: String, with_deps: bool) {
         let target = BlockAddr::new(node_id, block_name);
-        let chain = if with_deps {
-            match meshfox_core::deps::resolve_chain(&self.canvas, target) {
-                Ok(c) => c,
-                Err(e) => {
-                    self.status = format!("dependency error: {e}");
-                    return;
-                }
-            }
+        // Even with `with_deps` false (the plain "run", skipping `deps=`),
+        // the target's own `from=` sources still have to run first — a
+        // computed variable has no value at all otherwise, unlike a
+        // `deps=` dependency that might already have fresh cached output.
+        // See `meshfox_core::resolve_run_chain`'s own doc comment.
+        let chain_result = if with_deps {
+            meshfox_core::deps::resolve_chain(&self.canvas, target)
         } else {
-            vec![target]
+            meshfox_core::deps::resolve_from_chain(&self.canvas, target)
+        };
+        let chain = match chain_result {
+            Ok(c) => c,
+            Err(e) => {
+                self.status = format!("dependency error: {e}");
+                return;
+            }
         };
 
         self.run = Some(RunState {
@@ -1138,8 +1158,10 @@ impl App {
             had_failure: false,
             killed: false,
             finished: false,
+            pending_vars_out: None,
         });
         self.run_overrides.clear();
+        self.run_computed.clear();
         self.status.clear();
         self.advance_run().await;
     }
@@ -1196,12 +1218,35 @@ impl App {
             return;
         };
 
-        let resolution = resolve_block_env(
+        let mut resolution = resolve_block_env(
             &block.env,
             &self.decls,
             &self.run_overrides,
             &self.var_cache,
+            &self.run_computed,
         );
+        // A `from`-declared (computed) variable is never prompted for —
+        // chain resolution (`start_run`) already guarantees its source
+        // block runs first, so still having no value here is a hard
+        // failure (the source failed, or didn't produce it), not
+        // something a form can fix.
+        if !resolution.unresolved_from.is_empty() {
+            let names: Vec<&str> = resolution
+                .unresolved_from
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect();
+            self.status = format!(
+                "computed variable(s) {} have no value — their from= source block either \
+                 didn't run, failed, or didn't produce them",
+                names.join(", ")
+            );
+            if let Some(run) = &mut self.run {
+                run.finished = true;
+                run.had_failure = true;
+            }
+            return;
+        }
         if !resolution.missing.is_empty() {
             let inputs = resolution
                 .missing
@@ -1215,6 +1260,28 @@ impl App {
                 configuring: false,
             });
             return;
+        }
+
+        // If some declared variable is `from=`-sourced from *this* block,
+        // give it a fresh output file to write `NAME=value` lines to —
+        // see `meshfox_core::varout`. Ordinary blocks never see this env
+        // var at all.
+        let from_decls: Vec<VarDecl> = meshfox_core::from_targets(&self.decls, &addr)
+            .into_iter()
+            .cloned()
+            .collect();
+        let vars_out_path = if from_decls.is_empty() {
+            None
+        } else {
+            let path = meshfox_core::allocate_vars_out_path();
+            resolution.env.insert(
+                meshfox_core::VARS_OUT_ENV.to_string(),
+                path.display().to_string(),
+            );
+            Some(path)
+        };
+        if let Some(run) = &mut self.run {
+            run.pending_vars_out = vars_out_path.map(|p| (p, from_decls));
         }
 
         // `tty` hands the *real* terminal over to the child, same as
@@ -1259,14 +1326,73 @@ impl App {
         }
     }
 
+    /// Reads back whatever the step that just finished wrote to its own
+    /// vars-out file (if `advance_run` gave it one — i.e. it was a `from=`
+    /// target for something), type-validates each declared value, and
+    /// folds it into `self.run_computed` for whatever later step in this
+    /// run declared `from=` it. Only trusted on a `0` exit. Always clears
+    /// `pending_vars_out` (there's nothing left to consume it once this
+    /// step is done, tty or not). Returns whether anything about this went
+    /// wrong — the caller treats that the same as a nonzero exit.
+    fn apply_pending_vars_out(&mut self, exit_code: i32) -> bool {
+        let Some((path, from_decls)) = self
+            .run
+            .as_mut()
+            .and_then(|r| r.pending_vars_out.take())
+        else {
+            return false;
+        };
+        let produced = match meshfox_core::read_and_cleanup_vars_out(&path) {
+            Ok(produced) => produced,
+            Err(e) => {
+                self.status = format!("failed to read computed variables: {e}");
+                return true;
+            }
+        };
+        if exit_code != 0 {
+            return false; // handled by the caller's own exit-code check
+        }
+        let mut had_error = false;
+        for decl in &from_decls {
+            match produced.get(&decl.name) {
+                Some(value) => match meshfox_core::validate_value(decl, value) {
+                    Ok(()) => {
+                        self.run_computed.insert(decl.name.clone(), value.clone());
+                    }
+                    Err(e) => {
+                        self.status = format!("computed variable {:?} is invalid: {e}", decl.name);
+                        had_error = true;
+                    }
+                },
+                None => {
+                    self.status = format!(
+                        "block produced no value for {:?} (declared from=\"{}\")",
+                        decl.name,
+                        decl.from
+                            .as_ref()
+                            .map(|f| format!(
+                                "{}/{}",
+                                f.node_id.as_deref().unwrap_or(""),
+                                f.block_name
+                            ))
+                            .unwrap_or_default()
+                    );
+                    had_error = true;
+                }
+            }
+        }
+        had_error
+    }
+
     /// Called by `mod.rs` once a `tty` handoff's child has exited —
     /// `tty`/`cache` are mutually exclusive (a `meshfox validate` error),
     /// so there's never cached output to write back for this step, unlike
     /// `on_output_line`'s non-tty completion path.
     pub async fn resume_after_tty(&mut self, exit_code: i32) {
+        let from_value_error = self.apply_pending_vars_out(exit_code);
         if let Some(run) = &mut self.run {
             run.lines.push(format!("(exited {exit_code})"));
-            if exit_code != 0 {
+            if exit_code != 0 || from_value_error {
                 run.had_failure = true;
                 run.idx = run.chain.len();
             } else {
@@ -1312,6 +1438,8 @@ impl App {
                     .lines
                     .push(format!("(exit {exit_code})"));
 
+                let from_value_error = self.apply_pending_vars_out(exit_code);
+
                 if let Some(block) = scan_runnable_blocks(&addr.node_id, &node_text)
                     .into_iter()
                     .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()))
@@ -1340,7 +1468,7 @@ impl App {
                 }
 
                 let run = self.run.as_mut().unwrap();
-                if exit_code != 0 {
+                if exit_code != 0 || from_value_error {
                     run.had_failure = true;
                     run.idx = run.chain.len();
                 } else {

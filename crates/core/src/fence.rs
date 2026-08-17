@@ -83,7 +83,7 @@ pub struct BlockRef {
     pub block_name: String,
 }
 
-fn parse_block_ref(s: &str) -> BlockRef {
+pub(crate) fn parse_block_ref(s: &str) -> BlockRef {
     match s.split_once('/') {
         Some((node_id, block_name)) => BlockRef {
             node_id: Some(node_id.to_string()),

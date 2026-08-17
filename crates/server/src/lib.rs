@@ -296,13 +296,17 @@ async fn get_vars(
 
     let decls = meshfox_core::declared_vars(&canvas)
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    // A `from`-declared (computed) variable is never something a human
+    // fills in — it's produced by running its own source block mid-chain
+    // (see `meshfox_core::varout`) — so the pre-run form must never offer
+    // one as a field, regardless of whether it's currently "resolved".
     let relevant: Vec<_> = decls
         .into_iter()
-        .filter(|d| needed.contains(&d.name))
+        .filter(|d| needed.contains(&d.name) && d.from.is_none())
         .collect();
 
     let cache = state.vars_cache.lock().unwrap();
-    let resolved = meshfox_core::resolve_vars(&relevant, &HashMap::new(), &cache);
+    let resolved = meshfox_core::resolve_vars(&relevant, &HashMap::new(), &cache, &HashMap::new());
     let statuses = relevant
         .into_iter()
         .map(|d| var_status(d, &resolved))
@@ -369,10 +373,15 @@ async fn get_configure_vars(
     let canvas = parse_or_error(&raw)?;
     let decls = meshfox_core::declared_vars(&canvas)
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
-    let configurable: Vec<_> = decls.into_iter().filter(|d| !d.secret).collect();
+    // Same reasoning as `get_vars`: a `from`-declared variable is computed,
+    // never something to configure by hand.
+    let configurable: Vec<_> = decls
+        .into_iter()
+        .filter(|d| !d.secret && d.from.is_none())
+        .collect();
 
     let cache = state.vars_cache.lock().unwrap();
-    let resolved = meshfox_core::resolve_vars(&configurable, &HashMap::new(), &cache);
+    let resolved = meshfox_core::resolve_vars(&configurable, &HashMap::new(), &cache, &HashMap::new());
     let statuses = configurable
         .into_iter()
         .map(|d| var_status(d, &resolved))
@@ -1875,13 +1884,19 @@ async fn run_block(
     let decls = meshfox_core::declared_vars(&canvas)
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
     let relevant_decls: Vec<_> = decls
-        .into_iter()
+        .iter()
         .filter(|d| needed.contains(&d.name))
+        .cloned()
         .collect();
     validate_var_overrides(&relevant_decls, &req.vars)?;
-    let resolved_vars = {
+    // `computed` (the empty map here) means every `from`-declared decl in
+    // `relevant_decls` lands in `resolved.unresolved_from`, not `missing` —
+    // it's not an error yet, just not resolvable until its own source
+    // block runs, mid-chain, below.
+    let mut resolved_vars = {
         let mut cache = state.vars_cache.lock().unwrap();
-        let resolved = meshfox_core::resolve_vars(&relevant_decls, &req.vars, &cache);
+        let resolved =
+            meshfox_core::resolve_vars(&relevant_decls, &req.vars, &cache, &HashMap::new());
         if !resolved.missing.is_empty() {
             let names: Vec<&str> = resolved.missing.iter().map(|d| d.name.as_str()).collect();
             return Err(ApiError(
@@ -1955,7 +1970,23 @@ async fn run_block(
             // Only this block's own `env=` list, relabeled to its local
             // names — not the whole chain's resolved variables — same
             // "opt-in per block" scoping the CLI applies.
-            let block_env = meshfox_core::map_block_env(&block.env, &resolved_vars);
+            let mut block_env = meshfox_core::map_block_env(&block.env, &resolved_vars);
+            // If some declared variable is `from=`-sourced from *this*
+            // block, give it a fresh output file to write `NAME=value`
+            // lines to (see `meshfox_core::varout`) — read back below,
+            // once its exit code is known, and folded into
+            // `resolved_vars` for whatever later step needs it.
+            let from_decls = meshfox_core::from_targets(&decls, addr);
+            let vars_out_path = if from_decls.is_empty() {
+                None
+            } else {
+                let path = meshfox_core::allocate_vars_out_path();
+                block_env.insert(
+                    meshfox_core::VARS_OUT_ENV.to_string(),
+                    path.display().to_string(),
+                );
+                Some(path)
+            };
             let mut proc = match stream_exec::spawn_bash(&block.code, &block_env) {
                 Ok(p) => p,
                 Err(e) => {
@@ -2007,6 +2038,52 @@ async fn run_block(
             }));
             final_exit_code = exit_code;
 
+            // Read back whatever this step wrote to its own vars-out file
+            // (if it had one) and fold the type-validated values straight
+            // into `resolved_vars`, so a later step's `map_block_env` call
+            // sees them. Only trusted on a `0` exit.
+            let mut from_value_error = false;
+            if let Some(path) = &vars_out_path {
+                match meshfox_core::read_and_cleanup_vars_out(path) {
+                    Ok(produced) if exit_code == 0 => {
+                        for decl in &from_decls {
+                            match produced.get(&decl.name) {
+                                Some(value) => match meshfox_core::validate_value(decl, value) {
+                                    Ok(()) => {
+                                        resolved_vars.insert(decl.name.clone(), value.clone());
+                                    }
+                                    Err(e) => {
+                                        yield Ok(ndjson_line(&RunEvent::Error {
+                                            message: format!(
+                                                "computed variable {:?} is invalid: {e}",
+                                                decl.name
+                                            ),
+                                        }));
+                                        from_value_error = true;
+                                    }
+                                },
+                                None => {
+                                    yield Ok(ndjson_line(&RunEvent::Error {
+                                        message: format!(
+                                            "block {:?} produced no value for {:?} (declared from=\"{}/{}\")",
+                                            addr.block_name, decl.name, addr.node_id, addr.block_name
+                                        ),
+                                    }));
+                                    from_value_error = true;
+                                }
+                            }
+                        }
+                    }
+                    Ok(_) => {} // nonzero exit — handled by the check below
+                    Err(e) => {
+                        yield Ok(ndjson_line(&RunEvent::Error {
+                            message: format!("failed to read computed variables: {e}"),
+                        }));
+                        from_value_error = true;
+                    }
+                }
+            }
+
             if persist && block.cache {
                 let result = ExecOutput { exit_code, output: full_output };
                 if let Some(updated) = meshfox_core::write_output(&node_text, &addr.block_name, &result) {
@@ -2016,7 +2093,7 @@ async fn run_block(
                 }
             }
 
-            if exit_code != 0 {
+            if exit_code != 0 || from_value_error {
                 break;
             }
         }
@@ -2153,13 +2230,22 @@ async fn run_block_tty(
     let decls = meshfox_core::declared_vars(&canvas)
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
     let relevant_decls: Vec<_> = decls
-        .into_iter()
+        .iter()
         .filter(|d| needed.contains(&d.name))
+        .cloned()
         .collect();
     validate_var_overrides(&relevant_decls, &requested_vars)?;
+    // `computed` (the empty map here) means a `from`-declared decl in
+    // `relevant_decls` lands in `unresolved_from`, not `missing` — it's
+    // resolved incrementally, mid-chain, by `run_tty_chain` instead.
     let resolved_vars = {
         let mut cache = state.vars_cache.lock().unwrap();
-        let resolved = meshfox_core::resolve_vars(&relevant_decls, &requested_vars, &cache);
+        let resolved = meshfox_core::resolve_vars(
+            &relevant_decls,
+            &requested_vars,
+            &cache,
+            &HashMap::new(),
+        );
         if !resolved.missing.is_empty() {
             let names: Vec<&str> = resolved.missing.iter().map(|d| d.name.as_str()).collect();
             return Err(ApiError(
@@ -2185,6 +2271,7 @@ async fn run_block_tty(
             state,
             run_id,
             chain,
+            decls,
             resolved_vars,
             persist,
             cols,
@@ -2219,7 +2306,8 @@ async fn run_tty_chain(
     state: Arc<AppState>,
     run_id: String,
     chain: Vec<meshfox_core::BlockAddr>,
-    resolved_vars: HashMap<String, String>,
+    decls: Vec<meshfox_core::VarDecl>,
+    mut resolved_vars: HashMap<String, String>,
     persist: bool,
     cols: u16,
     rows: u16,
@@ -2293,7 +2381,22 @@ async fn run_tty_chain(
             break;
         };
 
-        let block_env = meshfox_core::map_block_env(&block.env, &resolved_vars);
+        let mut block_env = meshfox_core::map_block_env(&block.env, &resolved_vars);
+        // If some declared variable is `from=`-sourced from *this* block
+        // (tty or not), give it a fresh output file to write `NAME=value`
+        // lines to (see `meshfox_core::varout`) — read back below, once
+        // its exit code is known.
+        let from_decls = meshfox_core::from_targets(&decls, addr);
+        let vars_out_path = if from_decls.is_empty() {
+            None
+        } else {
+            let path = meshfox_core::allocate_vars_out_path();
+            block_env.insert(
+                meshfox_core::VARS_OUT_ENV.to_string(),
+                path.display().to_string(),
+            );
+            Some(path)
+        };
         let mut full_output = String::new();
 
         let exit_code = if block.tty {
@@ -2398,6 +2501,64 @@ async fn run_tty_chain(
         }
         final_exit_code = exit_code;
 
+        // Read back whatever this step wrote to its own vars-out file (if
+        // it had one) and fold the type-validated values straight into
+        // `resolved_vars`, so a later step's `map_block_env` call sees
+        // them. Only trusted on a `0` exit.
+        let mut from_value_error = false;
+        if let Some(path) = &vars_out_path {
+            match meshfox_core::read_and_cleanup_vars_out(path) {
+                Ok(produced) if exit_code == 0 => {
+                    for decl in &from_decls {
+                        match produced.get(&decl.name) {
+                            Some(value) => match meshfox_core::validate_value(decl, value) {
+                                Ok(()) => {
+                                    resolved_vars.insert(decl.name.clone(), value.clone());
+                                }
+                                Err(e) => {
+                                    send_event(
+                                        &mut socket,
+                                        &RunEvent::Error {
+                                            message: format!(
+                                                "computed variable {:?} is invalid: {e}",
+                                                decl.name
+                                            ),
+                                        },
+                                    )
+                                    .await;
+                                    from_value_error = true;
+                                }
+                            },
+                            None => {
+                                send_event(
+                                    &mut socket,
+                                    &RunEvent::Error {
+                                        message: format!(
+                                            "block {:?} produced no value for {:?} (declared from=\"{}/{}\")",
+                                            addr.block_name, decl.name, addr.node_id, addr.block_name
+                                        ),
+                                    },
+                                )
+                                .await;
+                                from_value_error = true;
+                            }
+                        }
+                    }
+                }
+                Ok(_) => {} // nonzero exit — handled by the check below
+                Err(e) => {
+                    send_event(
+                        &mut socket,
+                        &RunEvent::Error {
+                            message: format!("failed to read computed variables: {e}"),
+                        },
+                    )
+                    .await;
+                    from_value_error = true;
+                }
+            }
+        }
+
         // `tty` and `cache` are mutually exclusive (a `meshfox validate`
         // error) — `!block.tty` here is belt-and-suspenders against ever
         // writing a `tty` step's (empty) `full_output` into the file for a
@@ -2415,7 +2576,7 @@ async fn run_tty_chain(
             }
         }
 
-        if exit_code != 0 {
+        if exit_code != 0 || from_value_error {
             break;
         }
     }
@@ -3808,6 +3969,7 @@ mod var_status_tests {
             choices: Vec::new(),
             secret,
             required,
+            from: None,
         }
     }
 
@@ -3818,6 +3980,7 @@ mod var_status_tests {
             std::slice::from_ref(&d),
             &HashMap::new(),
             &VarCache::in_memory(),
+            &HashMap::new(),
         );
         let status = var_status(d, &resolved);
         assert!(!status.resolved);
@@ -3829,8 +3992,12 @@ mod var_status_tests {
         let d = decl("X", Some("default-val"), true, false);
         let mut cache = VarCache::in_memory();
         cache.set("X", "confirmed-val").unwrap();
-        let resolved =
-            meshfox_core::resolve_vars(std::slice::from_ref(&d), &HashMap::new(), &cache);
+        let resolved = meshfox_core::resolve_vars(
+            std::slice::from_ref(&d),
+            &HashMap::new(),
+            &cache,
+            &HashMap::new(),
+        );
         let status = var_status(d, &resolved);
         assert!(status.resolved);
         assert_eq!(status.value.as_deref(), Some("confirmed-val"));
@@ -3843,6 +4010,7 @@ mod var_status_tests {
             std::slice::from_ref(&d),
             &HashMap::new(),
             &VarCache::in_memory(),
+            &HashMap::new(),
         );
         let status = var_status(d, &resolved);
         assert!(status.resolved);
@@ -3856,6 +4024,7 @@ mod var_status_tests {
             std::slice::from_ref(&d),
             &HashMap::new(),
             &VarCache::in_memory(),
+            &HashMap::new(),
         );
         let status = var_status(d, &resolved);
         assert!(!status.resolved);

@@ -5,9 +5,17 @@
 //! `crate::fence::BlockRef`). Running a block automatically runs its full
 //! transitive dependency chain first, in dependency order; see
 //! `resolve_chain`.
+//!
+//! A block's own `env=` can also pull in an extra, *implicit* dependency:
+//! any declared variable it references that's `from=`-computed (see
+//! `crate::vars::VarDecl::from`) needs its source block to have already
+//! run — `visit` folds that in as just another edge, right alongside
+//! `deps=`, so cycle detection and the `tty`-ambush guard both cover it for
+//! free.
 
 use crate::canvas::Canvas;
 use crate::fence::{scan_runnable_blocks, BlockRef};
+use crate::vars::VarDecl;
 use thiserror::Error;
 
 /// Fully resolved address of a runnable block: which node it lives in, and
@@ -46,6 +54,8 @@ pub enum DepsError {
         dependent: BlockAddr,
         dependency: BlockAddr,
     },
+    #[error(transparent)]
+    Vars(#[from] crate::vars::VarsError),
 }
 
 fn resolve_ref(owner_node_id: &str, r: &BlockRef) -> BlockAddr {
@@ -60,13 +70,31 @@ fn resolve_ref(owner_node_id: &str, r: &BlockRef) -> BlockAddr {
 
 /// Topologically-sorted list of blocks to run so that every (transitive)
 /// dependency of `target` runs before it, with no duplicates — the last
-/// entry is always `target` itself. Errors on a reference to a block that
-/// doesn't exist, or a dependency cycle.
+/// entry is always `target` itself. Includes both `deps=` edges and
+/// implicit `from=` edges (see the module doc comment). Errors on a
+/// reference to a block that doesn't exist, or a dependency cycle.
 pub fn resolve_chain(canvas: &Canvas, target: BlockAddr) -> Result<Vec<BlockAddr>, DepsError> {
+    let decls = crate::vars::declared_vars(canvas)?;
     let mut order = Vec::new();
     let mut visited = std::collections::HashSet::new();
     let mut stack: Vec<BlockAddr> = Vec::new();
-    visit(canvas, target, &mut order, &mut visited, &mut stack)?;
+    visit(canvas, target, &decls, true, &mut order, &mut visited, &mut stack)?;
+    Ok(order)
+}
+
+/// Same as `resolve_chain`, but ignoring `deps=` entirely — only `target`'s
+/// transitive `from=` sources. For the `--no-deps`/`with_deps=false` case
+/// (see `resolve_run_chain` in `crate::lib`): unlike a `deps=` dependency,
+/// which might already have fresh cached output (a legitimate reason to
+/// skip rerunning it), a `from=`-declared variable has no value at all
+/// until its source block has run — skipping that edge is never a valid
+/// choice, so it's included even when the caller opted out of `deps=`.
+pub fn resolve_from_chain(canvas: &Canvas, target: BlockAddr) -> Result<Vec<BlockAddr>, DepsError> {
+    let decls = crate::vars::declared_vars(canvas)?;
+    let mut order = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    let mut stack: Vec<BlockAddr> = Vec::new();
+    visit(canvas, target, &decls, false, &mut order, &mut visited, &mut stack)?;
     Ok(order)
 }
 
@@ -84,9 +112,15 @@ fn find_block(canvas: &Canvas, addr: &BlockAddr) -> Result<crate::fence::CodeBlo
         .ok_or_else(|| DepsError::BlockNotFound(addr.node_id.clone(), addr.block_name.clone()))
 }
 
+/// `follow_deps` gates whether `block.deps` (`deps=`) edges are walked;
+/// implicit `from=` edges (any declared variable `block.env` references
+/// whose `VarDecl::from` is set) are always walked regardless — see
+/// `resolve_chain`/`resolve_from_chain`.
 fn visit(
     canvas: &Canvas,
     addr: BlockAddr,
+    decls: &[VarDecl],
+    follow_deps: bool,
     order: &mut Vec<BlockAddr>,
     visited: &mut std::collections::HashSet<String>,
     stack: &mut Vec<BlockAddr>,
@@ -104,14 +138,35 @@ fn visit(
     let block = find_block(canvas, &addr)?;
 
     stack.push(addr.clone());
-    for dep_ref in &block.deps {
-        let dep_addr = resolve_ref(&addr.node_id, dep_ref);
+
+    let mut dep_addrs: Vec<BlockAddr> = if follow_deps {
+        block
+            .deps
+            .iter()
+            .map(|d| resolve_ref(&addr.node_id, d))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    for env_ref in &block.env {
+        if let Some(from) = decls
+            .iter()
+            .find(|d| d.name == env_ref.var_name)
+            .and_then(|d| d.from.as_ref())
+        {
+            dep_addrs.push(resolve_ref(&addr.node_id, from));
+        }
+    }
+
+    for dep_addr in dep_addrs {
         if !block.tty {
             // A `tty` block seizes the whole terminal/UI when it runs — a
             // non-`tty` block auto-running one as a dependency would mean
             // an unrequested interactive step ambushing an otherwise
             // non-interactive chain. Only a `tty` block may depend on
-            // another one (see SPEC.md's "Runnable code fences").
+            // another one (see SPEC.md's "Runnable code fences") —
+            // applies the same way to an implicit `from=` edge as to an
+            // explicit `deps=` one.
             if find_block(canvas, &dep_addr)?.tty {
                 return Err(DepsError::TtyDependencyRequiresTty {
                     dependent: addr,
@@ -119,7 +174,7 @@ fn visit(
                 });
             }
         }
-        visit(canvas, dep_addr, order, visited, stack)?;
+        visit(canvas, dep_addr, decls, follow_deps, order, visited, stack)?;
     }
     stack.pop();
 
@@ -330,5 +385,113 @@ mod tests {
             "```bash name=\"b\" deps=\"a\"\necho b\n```\n",
         ));
         assert!(validate(&c).is_err());
+    }
+
+    #[test]
+    fn chain_includes_a_from_source_as_an_implicit_dependency() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "<!-- meshfox:var name=\"RESOURCE_ID\" from=\"provision\" -->\n\n",
+            "```bash name=\"provision\" cache\necho id=abc\n```\n\n",
+            "```bash name=\"deploy\" env=\"$RESOURCE_ID\"\necho deploy\n```\n",
+        ));
+        let chain = resolve_chain(&c, BlockAddr::new("root", "deploy")).unwrap();
+        assert_eq!(
+            chain,
+            vec![
+                BlockAddr::new("root", "provision"),
+                BlockAddr::new("root", "deploy"),
+            ]
+        );
+    }
+
+    #[test]
+    fn chain_only_pulls_in_a_from_source_when_env_actually_references_it() {
+        // `provision` is a `from=` target for RESOURCE_ID, but this block
+        // never references RESOURCE_ID via its own env= — so it must not
+        // gain an implicit dependency on it.
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "<!-- meshfox:var name=\"RESOURCE_ID\" from=\"provision\" -->\n\n",
+            "```bash name=\"provision\" cache\necho id=abc\n```\n\n",
+            "```bash name=\"unrelated\"\necho hi\n```\n",
+        ));
+        let chain = resolve_chain(&c, BlockAddr::new("root", "unrelated")).unwrap();
+        assert_eq!(chain, vec![BlockAddr::new("root", "unrelated")]);
+    }
+
+    #[test]
+    fn chain_dedupes_a_from_source_shared_with_an_explicit_dep() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "<!-- meshfox:var name=\"RESOURCE_ID\" from=\"provision\" -->\n\n",
+            "```bash name=\"provision\" cache\necho id=abc\n```\n\n",
+            "```bash name=\"deploy\" deps=\"provision\" env=\"$RESOURCE_ID\"\necho deploy\n```\n",
+        ));
+        let chain = resolve_chain(&c, BlockAddr::new("root", "deploy")).unwrap();
+        assert_eq!(
+            chain,
+            vec![
+                BlockAddr::new("root", "provision"),
+                BlockAddr::new("root", "deploy"),
+            ]
+        );
+    }
+
+    #[test]
+    fn detects_a_cycle_through_a_from_edge() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "<!-- meshfox:var name=\"X\" from=\"a\" -->\n\n",
+            "```bash name=\"a\" env=\"$X\"\necho a\n```\n",
+        ));
+        let err = resolve_chain(&c, BlockAddr::new("root", "a")).unwrap_err();
+        assert!(matches!(err, DepsError::Cycle(_)));
+    }
+
+    #[test]
+    fn validate_catches_a_from_target_that_does_not_exist() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "<!-- meshfox:var name=\"X\" from=\"nope\" -->\n\n",
+            "```bash name=\"a\" env=\"$X\"\necho a\n```\n",
+        ));
+        assert_eq!(
+            validate(&c).unwrap_err(),
+            DepsError::BlockNotFound("root".to_string(), "nope".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_from_chain_ignores_deps_but_still_includes_from_sources() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "<!-- meshfox:var name=\"RESOURCE_ID\" from=\"provision\" -->\n\n",
+            "```bash name=\"build\" cache\necho build\n```\n\n",
+            "```bash name=\"provision\" cache\necho id=abc\n```\n\n",
+            "```bash name=\"deploy\" deps=\"build\" env=\"$RESOURCE_ID\"\necho deploy\n```\n",
+        ));
+        let chain = resolve_from_chain(&c, BlockAddr::new("root", "deploy")).unwrap();
+        // `build` (a plain deps= dependency) is skipped, but `provision`
+        // (a from= source) is not — it's the only way RESOURCE_ID could
+        // ever get a value.
+        assert_eq!(
+            chain,
+            vec![
+                BlockAddr::new("root", "provision"),
+                BlockAddr::new("root", "deploy"),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_from_chain_is_just_the_target_when_it_has_no_from_refs() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```bash name=\"build\" cache\necho build\n```\n\n",
+            "```bash name=\"deploy\" deps=\"build\"\necho deploy\n```\n",
+        ));
+        let chain = resolve_from_chain(&c, BlockAddr::new("root", "deploy")).unwrap();
+        assert_eq!(chain, vec![BlockAddr::new("root", "deploy")]);
     }
 }

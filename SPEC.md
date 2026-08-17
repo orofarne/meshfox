@@ -505,6 +505,17 @@ Attributes:
   variable with a `default` is simply used, never prompted for, unless it
   has no `default` at all (in which case it always needs an answer either
   way).
+- `from` — `from="node-id/block-name"` (or a bare `from="block-name"`,
+  meaning a block in the root node — the same shorthand `deps=`'s
+  same-node form uses). Makes this a **computed** variable: instead of
+  being prompted/defaulted/cached, its value comes from actually running
+  the named block and reading back what it wrote to its own
+  `MESHFOX_VARS_OUT` file — see "Computed variables (`from=`)" below.
+  Mutually exclusive with `default`, `required`, and `secret` (a
+  `meshfox validate` error to combine any of them with `from`) — none of
+  those mean anything for a value that's never cached, defaulted, or
+  prompted for. `type`/`choices` still apply, validated against whatever
+  the source block actually produced.
 
 ### Consumption (`env=`)
 
@@ -549,6 +560,62 @@ file, meant to be `.gitignore`d, the same way `CMakeCache.txt` usually
 is. It's safe to hand-edit or delete: deleting it just means every
 non-secret variable gets asked about again next time some block's `env=`
 needs it.
+
+### Computed variables (`from=`)
+
+A `meshfox:var` with `from=` (see above) never goes through the
+override/env/cache/default/prompt chain the rest of this section
+describes — its value is *computed*, by running its `from=` block first
+and reading back what that block produced:
+
+    <!-- meshfox:var name="RESOURCE_ID" from="provision/create" -->
+
+    ```bash name="create"
+    id=$(some-tool create-thing)
+    echo "RESOURCE_ID=$id" >> "$MESHFOX_VARS_OUT"
+    ```
+
+    ```bash name="deploy" env="$RESOURCE_ID"
+    echo "deploying $RESOURCE_ID"
+    ```
+
+- **Why not just read the block's own environment?** A process's
+  environment is gone the moment it exits, regardless of what language it
+  was written in — there's no portable way to peek at a finished child's
+  env from outside. Instead, whenever a block being run is a `from=`
+  target for some declared variable, meshfox hands it a fresh, empty file
+  and tells it where via the `MESHFOX_VARS_OUT` environment variable —
+  the block is expected to append `NAME=value` lines to it (same
+  `KEY=value`-per-line format the var cache uses) before exiting. A
+  temp file, not a pipe: no `mkfifo`/blocking-open deadlock risk, no
+  kernel pipe-buffer size limit, and it works the same on every platform
+  meshfox runs on. This needs zero per-language support in meshfox itself
+  — the same reason CI systems facing the identical problem (GitHub
+  Actions' `$GITHUB_OUTPUT`, etc.) converged on the same shape. A block
+  that isn't a `from=` target for anything never sees `MESHFOX_VARS_OUT`
+  at all.
+- **Only trusted on a `0` exit.** A nonzero exit fails the run the same
+  way any other step's nonzero exit does — whatever the block wrote (or
+  didn't write) to its vars-out file is never read. A `0` exit that
+  didn't produce a value for some variable declared `from=` it is also a
+  hard failure, not silently treated as "still missing" — a computed
+  variable is never prompted for, so there'd be nothing else to fall back
+  to.
+- **Ordering.** A block's `from=` target is an *implicit* dependency,
+  exactly like an explicit `deps=` entry — running (or resolving the
+  chain for) any block whose `env=` references a `from=`-declared
+  variable automatically runs that variable's source block first. Unlike
+  `deps=`, this edge is never skipped by `--no-deps`/the web UI's plain
+  "run" (as opposed to "run chain") button: a `deps=` dependency might
+  already have fresh cached output, a legitimate reason to skip rerunning
+  it, but a `from=`-declared variable has no value at all until its
+  source runs, so skipping that edge is never a meaningful choice.
+- **Never user-suppliable.** `--set`/a submitted web form/the process
+  environment/the on-disk cache can never resolve a `from`-declared
+  variable, even if they name it — only an actual run of its `from=`
+  block can, so a stale or hand-typed value can never impersonate a
+  computed one. Consequently `meshfox configure` and the web UI's pre-run
+  vars form never offer a `from`-declared variable as a field.
 
 ### CLI
 

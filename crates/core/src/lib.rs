@@ -9,6 +9,7 @@ pub mod attrs;
 pub mod canvas;
 pub mod constraint;
 pub mod deps;
+mod dotenv;
 pub mod exec;
 pub mod fence;
 pub mod file_read;
@@ -19,6 +20,7 @@ pub mod output;
 pub mod staticgen;
 pub mod tree;
 pub mod varcache;
+pub mod varout;
 pub mod vars;
 
 pub use canvas::{ArrowEnd, Canvas, EdgeLineStyle, ExtraEdge, FileDisplay, Node, NodeType};
@@ -36,6 +38,10 @@ pub use output::{write_output, ExecOutput};
 pub use staticgen::{Asset, EdgeView, NodeView, Position, SiteData};
 pub use tree::{RunnableBlock, TreeError};
 pub use varcache::VarCache;
+pub use varout::{
+    allocate_path as allocate_vars_out_path, from_targets,
+    read_and_cleanup as read_and_cleanup_vars_out, VARS_OUT_ENV,
+};
 pub use vars::{
     declared_vars, map_block_env, resolve as resolve_vars, resolve_block_env, validate_env_refs,
     validate_value, BlockEnvResolution, ResolvedVars, VarDecl, VarType, VarsError,
@@ -127,13 +133,18 @@ fn run_block_in(node: &Node, block_name: &str) -> Result<RunOutcome, RunError> {
 /// Resolve `path` + `block_name` to a `BlockAddr`, then, if `with_deps` is
 /// set, expand it into the full run order — every block it transitively
 /// `deps=`-depends on, in dependency order, ending with the target itself
-/// (see `deps::resolve_chain`). With `with_deps` false, the chain is just
-/// the target alone — for a caller that wants to run *this* block only,
-/// skipping whatever it `deps=` on (e.g. the web UI's plain "run" button
-/// next to "run chain", or the CLI's `--no-deps`). Feed the result to
-/// `run_block_by_id`, one at a time, re-parsing the canvas between steps if
-/// any step's cached output is applied back to the source first (mirrors
-/// how the CLI already runs a list of independently-requested blocks).
+/// (see `deps::resolve_chain`). With `with_deps` false, `deps=` is skipped
+/// — for a caller that wants to run *this* block only (e.g. the web UI's
+/// plain "run" button next to "run chain", or the CLI's `--no-deps`) — but
+/// the target's transitive `from=` sources (see `vars::VarDecl::from`,
+/// `deps::resolve_from_chain`) are included either way: unlike a `deps=`
+/// dependency, which might already have fresh cached output, a
+/// `from=`-declared variable has no value at all until its source block
+/// runs, so skipping that edge is never something `--no-deps` can mean.
+/// Feed the result to `run_block_by_id`, one at a time, re-parsing the
+/// canvas between steps if any step's cached output is applied back to the
+/// source first (mirrors how the CLI already runs a list of
+/// independently-requested blocks).
 pub fn resolve_run_chain(
     canvas: &Canvas,
     path: &[&str],
@@ -144,7 +155,7 @@ pub fn resolve_run_chain(
     if with_deps {
         Ok(deps::resolve_chain(canvas, target)?)
     } else {
-        Ok(vec![target])
+        Ok(deps::resolve_from_chain(canvas, target)?)
     }
 }
 

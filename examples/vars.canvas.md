@@ -13,6 +13,7 @@ root node's own body:
 <!-- meshfox:var name="VERBOSE" type="bool" default="false" -->
 <!-- meshfox:var name="RETRY_COUNT" prompt="Retry count?" type="int" default="3" -->
 <!-- meshfox:var name="API_TOKEN" secret -->
+<!-- meshfox:var name="RESOURCE_ID" from="computed/create" -->
 
 A declaration on its own does nothing — only a block that opts in via its
 own `env=` attribute ever resolves or prompts for one, and only for
@@ -163,8 +164,35 @@ persisted anywhere.
 echo "calling the API with a token ${#API_TOKEN} characters long"
 ```
 
+## Computed
+<!-- meshfox:node id="computed" x=32 y=4106 w=440 h=520 -->
+
+`RESOURCE_ID` has `from="computed/create"` instead of a `default` —
+its value comes from actually running the `create` block below and
+reading back what it wrote to `$MESHFOX_VARS_OUT` (a `NAME=value`-per-line
+file meshfox hands every `from=` source block a fresh path to), not from
+any override/environment/cache/prompt. Running `use-it` automatically
+runs `create` first — `from=` is an implicit dependency, the same as an
+explicit `deps=` entry — and fails the whole run if `create` exits
+nonzero or never writes `RESOURCE_ID`.
+
+```bash name="create"
+echo "RESOURCE_ID=resource-42" >> "$MESHFOX_VARS_OUT"
+```
+
+```bash name="use-it" env="$RESOURCE_ID" cache
+echo "using $RESOURCE_ID"
+```
+<!-- meshfox:output name="use-it" -->
+```text
+exit code: 0
+
+using resource-42
+```
+<!-- /meshfox:output -->
+
 ## Combined
-<!-- meshfox:node id="combined" x=32 y=4106 w=440 h=610 -->
+<!-- meshfox:node id="combined" x=32 y=4686 w=440 h=610 -->
 
 `env=` takes a comma-separated list — a single block can reference
 several declared variables at once, mixing plain, `required`, `select`,

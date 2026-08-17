@@ -46,7 +46,7 @@ impl VarCache {
     pub fn load(canvas_path: &Path) -> io::Result<VarCache> {
         let path = cache_path(canvas_path);
         let entries = match std::fs::read_to_string(&path) {
-            Ok(contents) => parse_env(&contents),
+            Ok(contents) => crate::dotenv::parse(&contents),
             Err(e) if e.kind() == io::ErrorKind::NotFound => HashMap::new(),
             Err(e) => return Err(e),
         };
@@ -101,20 +101,6 @@ impl VarCache {
     pub(crate) fn values_mut_for_test(&mut self) -> &mut HashMap<String, String> {
         &mut self.entries
     }
-}
-
-fn parse_env(contents: &str) -> HashMap<String, String> {
-    contents
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                return None;
-            }
-            let (k, v) = line.split_once('=')?;
-            Some((k.trim().to_string(), v.trim().to_string()))
-        })
-        .collect()
 }
 
 #[cfg(test)]

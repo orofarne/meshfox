@@ -1319,12 +1319,32 @@ fn resolve_block_env_or_prompt(
     block: &meshfox_core::CodeBlock,
     decls: &[VarDecl],
     overrides: &HashMap<String, String>,
+    computed: &HashMap<String, String>,
     cache: &mut VarCache,
 ) -> HashMap<String, String> {
     if block.env.is_empty() {
         return HashMap::new();
     }
-    let mut resolution = meshfox_core::resolve_block_env(&block.env, decls, overrides, cache);
+    let mut resolution =
+        meshfox_core::resolve_block_env(&block.env, decls, overrides, cache, computed);
+    // A `from`-declared (computed) variable is never prompted for — if its
+    // source block hasn't produced a value by the time this block needs
+    // it, that's a hard failure (chain ordering should have run the source
+    // first; see `deps::resolve_chain`'s implicit `from=` edges), not
+    // something a human can answer.
+    if !resolution.unresolved_from.is_empty() {
+        let names: Vec<&str> = resolution
+            .unresolved_from
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        eprintln!(
+            "meshfox run: computed variable(s) {} have no value — their from= source block \
+             either didn't run, failed, or didn't produce them",
+            names.join(", ")
+        );
+        std::process::exit(1);
+    }
     if resolution.missing.is_empty() {
         return resolution.env;
     }
@@ -1435,6 +1455,11 @@ async fn run_async(
     validate_set_overrides_or_exit(&decls, &overrides);
     let mut var_cache = load_var_cache_or_exit(canvas_path);
     persist_set_overrides(&decls, &overrides, &mut var_cache);
+    // Values produced by `from=` source blocks already run earlier in this
+    // invocation — kept entirely separate from `overrides` (`--set`) so a
+    // computed variable can never be impersonated by a command-line flag;
+    // see `vars::resolve`'s doc comment.
+    let mut computed: HashMap<String, String> = HashMap::new();
 
     let mut had_failure = false;
     let mut already_ran: std::collections::HashSet<(String, String)> =
@@ -1502,7 +1527,23 @@ async fn run_async(
                 break;
             }
 
-            let block_env = resolve_block_env_or_prompt(&block, &decls, &overrides, &mut var_cache);
+            let mut block_env =
+                resolve_block_env_or_prompt(&block, &decls, &overrides, &computed, &mut var_cache);
+            // If some declared variable is `from=`-sourced from *this*
+            // block, give it a fresh output file to write `NAME=value`
+            // lines to — see `meshfox_core::varout`. Ordinary blocks (the
+            // overwhelming majority) never see this env var at all.
+            let from_decls = meshfox_core::from_targets(&decls, &addr);
+            let vars_out_path = if from_decls.is_empty() {
+                None
+            } else {
+                let path = meshfox_core::allocate_vars_out_path();
+                block_env.insert(
+                    meshfox_core::VARS_OUT_ENV.to_string(),
+                    path.display().to_string(),
+                );
+                Some(path)
+            };
             println!("==> {}", addr.block_name);
 
             let mut full_output = String::new();
@@ -1565,6 +1606,51 @@ async fn run_async(
             };
             println!("(exit {exit_code})");
 
+            // Read back whatever this block wrote to its own vars-out file
+            // (if it was a `from=` target for anything) and fold the
+            // (type-validated) values into `computed`, for whatever later
+            // step in this same chain declared `from=` this block. Only
+            // trusted on a `0` exit — see SPEC.md's "Variables".
+            let mut from_value_error = false;
+            if let Some(path) = &vars_out_path {
+                match meshfox_core::read_and_cleanup_vars_out(path) {
+                    Ok(produced) if exit_code == 0 => {
+                        for decl in &from_decls {
+                            match produced.get(&decl.name) {
+                                Some(value) => match meshfox_core::validate_value(decl, value) {
+                                    Ok(()) => {
+                                        computed.insert(decl.name.clone(), value.clone());
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "error running {:?}: computed variable {:?} is invalid: {e}",
+                                            addr.block_name, decl.name
+                                        );
+                                        from_value_error = true;
+                                    }
+                                },
+                                None => {
+                                    eprintln!(
+                                        "error running {:?}: block produced no value for {:?} \
+                                         (declared from=\"{}/{}\")",
+                                        addr.block_name, decl.name, addr.node_id, addr.block_name
+                                    );
+                                    from_value_error = true;
+                                }
+                            }
+                        }
+                    }
+                    Ok(_) => {} // nonzero exit — handled by the check below, don't also validate
+                    Err(e) => {
+                        eprintln!(
+                            "error running {:?}: failed to read computed variables: {e}",
+                            addr.block_name
+                        );
+                        from_value_error = true;
+                    }
+                }
+            }
+
             // `tty` and `cache` are mutually exclusive (a `meshfox
             // validate` error) — `block.tty` here is belt-and-suspenders
             // against writing a `tty` block's (empty) `full_output` back
@@ -1584,7 +1670,7 @@ async fn run_async(
                 }
             }
 
-            if exit_code != 0 {
+            if exit_code != 0 || from_value_error {
                 had_failure = true;
                 // Running what depends on a failed step wouldn't mean
                 // anything — stop this chain, move on to the next
@@ -3169,6 +3255,7 @@ mod set_override_tests {
             choices: choices.iter().map(|s| s.to_string()).collect(),
             secret: false,
             required: false,
+            from: None,
         }
     }
 
