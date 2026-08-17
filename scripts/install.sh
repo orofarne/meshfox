@@ -19,10 +19,17 @@ set -eu
 REPO="orofarne/meshfox"
 BIN_NAME="meshfox"
 INSTALL_DIR="${HOME}/.local/bin"
+INSTALL_DIR_EXPLICIT=false
 VERSION="latest"
 TARGET=""
 ASSUME_YES=false
 MODIFY_PATH=true
+
+MASCOT='
+ /\_/\
+( ¬‿¬ )──●──●──●
+  c c
+'
 
 err() {
     echo "meshfox-install: error: $*" >&2
@@ -57,6 +64,7 @@ while [ $# -gt 0 ]; do
         --install-dir)
             [ $# -ge 2 ] || err "--install-dir requires an argument"
             INSTALL_DIR="$2"
+            INSTALL_DIR_EXPLICIT=true
             shift
             ;;
         --version)
@@ -118,9 +126,76 @@ download() {
     fi
 }
 
+prompt_install_dir() {
+    [ "$INSTALL_DIR_EXPLICIT" = false ] || return 0
+    [ "$ASSUME_YES" = false ] || return 0
+    [ -t 0 ] && [ -t 1 ] || return 0
+
+    printf 'meshfox-install: install directory? [%s] ' "$INSTALL_DIR"
+    read -r reply || reply=""
+    [ -n "$reply" ] && INSTALL_DIR="$reply"
+}
+
+find_existing() {
+    existing_bin=""
+    if command -v "$BIN_NAME" >/dev/null 2>&1; then
+        existing_bin="$(command -v "$BIN_NAME")"
+    elif [ -x "${INSTALL_DIR}/${BIN_NAME}" ]; then
+        existing_bin="${INSTALL_DIR}/${BIN_NAME}"
+    fi
+}
+
+offer_existing() {
+    find_existing
+    [ -n "$existing_bin" ] || return 0
+
+    existing_version="$("$existing_bin" --version 2>/dev/null || echo "unknown version")"
+    info "found an existing install: ${existing_bin} (${existing_version})"
+
+    [ "$ASSUME_YES" = false ] || return 0
+    [ -t 0 ] && [ -t 1 ] || return 0
+
+    echo "  1) self-update it in place (${BIN_NAME} check-updates)"
+    echo "  2) install a fresh copy anyway"
+    echo "  3) exit"
+    while true; do
+        printf 'Choice [1/2/3]: '
+        read -r reply || reply=""
+        case "$reply" in
+            1) exec "$existing_bin" check-updates -y ;;
+            2) return 0 ;;
+            3) err "installation aborted" ;;
+            *) echo "please enter 1, 2, or 3" ;;
+        esac
+    done
+}
+
+confirm_install() {
+    printf '%s\n' "$MASCOT"
+    echo "meshfox installer"
+    echo "------------------"
+    echo "Version:      ${VERSION}"
+    echo "Target:       ${TARGET}"
+    echo "Install path: ${INSTALL_DIR}"
+    echo "------------------"
+
+    [ "$ASSUME_YES" = false ] || return 0
+    [ -t 0 ] && [ -t 1 ] || return 0
+
+    printf 'Proceed with installation? [Y/n] '
+    read -r reply || reply=""
+    case "$reply" in
+        [nN]*) err "installation aborted" ;;
+        *) ;;
+    esac
+}
+
 detect_target
 need_cmd tar
 need_cmd mktemp
+
+offer_existing
+prompt_install_dir
 
 archive="${BIN_NAME}-${TARGET}.tar.gz"
 if [ "$VERSION" = "latest" ]; then
@@ -128,6 +203,8 @@ if [ "$VERSION" = "latest" ]; then
 else
     url="https://github.com/${REPO}/releases/download/${VERSION}/${archive}"
 fi
+
+confirm_install
 
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
