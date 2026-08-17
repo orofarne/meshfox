@@ -126,13 +126,22 @@ download() {
     fi
 }
 
+
+# Piped through `curl | sh`, stdin is the script itself, not a terminal, so
+# `[ -t 0 ]` alone would make every prompt below silently skip itself. Read
+# from the controlling terminal directly instead, so prompts still work in
+# that (extremely common) invocation style.
+tty_available() {
+    [ -t 1 ] && [ -r /dev/tty ] && [ -w /dev/tty ]
+}
+
 prompt_install_dir() {
     [ "$INSTALL_DIR_EXPLICIT" = false ] || return 0
     [ "$ASSUME_YES" = false ] || return 0
-    [ -t 0 ] && [ -t 1 ] || return 0
+    tty_available || return 0
 
     printf 'meshfox-install: install directory? [%s] ' "$INSTALL_DIR"
-    read -r reply || reply=""
+    read -r reply </dev/tty || reply=""
     [ -n "$reply" ] && INSTALL_DIR="$reply"
 }
 
@@ -153,14 +162,14 @@ offer_existing() {
     info "found an existing install: ${existing_bin} (${existing_version})"
 
     [ "$ASSUME_YES" = false ] || return 0
-    [ -t 0 ] && [ -t 1 ] || return 0
+    tty_available || return 0
 
     echo "  1) self-update it in place (${BIN_NAME} check-updates)"
     echo "  2) install a fresh copy anyway"
     echo "  3) exit"
     while true; do
         printf 'Choice [1/2/3]: '
-        read -r reply || reply=""
+        read -r reply </dev/tty || reply=""
         case "$reply" in
             1) exec "$existing_bin" check-updates -y ;;
             2) return 0 ;;
@@ -180,10 +189,10 @@ confirm_install() {
     echo "------------------"
 
     [ "$ASSUME_YES" = false ] || return 0
-    [ -t 0 ] && [ -t 1 ] || return 0
+    tty_available || return 0
 
     printf 'Proceed with installation? [Y/n] '
-    read -r reply || reply=""
+    read -r reply </dev/tty || reply=""
     case "$reply" in
         [nN]*) err "installation aborted" ;;
         *) ;;
@@ -263,9 +272,9 @@ else
     do_add=false
     if [ "$ASSUME_YES" = true ]; then
         do_add=true
-    elif [ -t 0 ] && [ -t 1 ]; then
+    elif tty_available; then
         printf 'meshfox-install: add %s to PATH by modifying %s? [Y/n] ' "$INSTALL_DIR" "$rcfile"
-        read -r reply || reply=""
+        read -r reply </dev/tty || reply=""
         case "$reply" in
             [nN]*) do_add=false ;;
             *) do_add=true ;;
