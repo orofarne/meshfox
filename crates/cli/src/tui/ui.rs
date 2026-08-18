@@ -333,6 +333,31 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 /// row is focused (highlighted), typing edits only that row's value, and
 /// Enter submits every row's current value together, same "whole form at
 /// once" shape as the web UI's `VarsForm` rather than one field at a time.
+/// Keeps a growing text field's own cursor on screen — `List`/`Line`
+/// (unlike edtui's own source editor, see `source_editor.rs`'s
+/// `prime_viewport`) never wrap or scroll on their own, so a value once it
+/// outgrew the row's width used to just push its trailing cursor marker
+/// off the right edge of the terminal, with no way to bring it back into
+/// view (TODO.canvas.md: "Горизонтальная промотка в TUI-редакторе").
+/// Every field this renders only ever grows/shrinks from its own right end
+/// (`push`/`pop` — see `App::on_key`), so the tail is always where the
+/// action (and the cursor right after it) is — showing the last `max`
+/// characters keeps that in view, at the cost of scrolling the *front* of
+/// a long value out of sight instead; a leading "…" marks when that's
+/// happened. `max` is a character count, not a byte count — matches every
+/// other width calculation in this module (see e.g. `masked` above).
+fn tail_fit(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    if max <= 1 {
+        return chars[chars.len() - max..].iter().collect();
+    }
+    let start = chars.len() - (max - 1);
+    format!("…{}", chars[start..].iter().collect::<String>())
+}
+
 fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
     let height = (vf.decls.len() as u16 + 4).min(area.height);
     let rect = centered_rect(64, height, area);
@@ -376,8 +401,11 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
                     format!("{shown}{}", if i == vf.selected { "_" } else { "" })
                 }
             };
+            let prefix = format!("{}: ", decl.prompt);
+            let value_budget = (inner.width as usize).saturating_sub(prefix.chars().count());
+            let value = tail_fit(&value, value_budget);
             ListItem::new(Line::from(vec![
-                Span::raw(format!("{}: ", decl.prompt)),
+                Span::raw(prefix),
                 Span::styled(value, Style::default().fg(Color::LightGreen)),
             ]))
         })
@@ -577,4 +605,51 @@ fn render_source_file_picker(f: &mut Frame, area: Rect, se: &SourceEditorState) 
     state.select(Some(se.file_picker_selected));
     let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     f.render_stateful_widget(list, inner, &mut state);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tail_fit_leaves_a_short_value_untouched() {
+        assert_eq!(tail_fit("hello", 10), "hello");
+        assert_eq!(tail_fit("hello", 5), "hello");
+    }
+
+    #[test]
+    fn tail_fit_truncates_from_the_front_with_a_leading_ellipsis() {
+        assert_eq!(tail_fit("hello world", 5), "…orld");
+        assert_eq!(tail_fit("hello world", 1), "d");
+        assert_eq!(tail_fit("hello world", 0), "");
+    }
+
+    // TODO.canvas.md: "Горизонтальная промотка в TUI-редакторе" — typing a
+    // value long enough to outgrow its row used to just push the trailing
+    // cursor marker (`render_var_form`'s `"{shown}_"`) off the right edge
+    // of the terminal for good: a plain `List`/`Line` never wraps or
+    // scrolls on its own the way edtui's source editor does. Simulates the
+    // actual interaction — pushing one character at a time, exactly like
+    // `App::on_key`'s `vf.inputs[i].push(c)` — rather than just checking
+    // one fixed long string, since the bug was specifically about a value
+    // that *grows past* the visible width mid-typing, not one that already
+    // starts too long.
+    #[test]
+    fn typing_past_the_row_width_keeps_the_cursor_marker_visible() {
+        let budget = 10;
+        let mut value = String::new();
+        for ch in "this is a lot longer than the row".chars() {
+            value.push(ch);
+            let shown = format!("{value}_"); // mirrors render_var_form's own "{shown}{cursor}"
+            let fitted = tail_fit(&shown, budget);
+            assert!(
+                fitted.chars().count() <= budget,
+                "fitted value {fitted:?} exceeds the {budget}-char budget"
+            );
+            assert!(
+                fitted.ends_with('_'),
+                "cursor marker fell out of view while typing {value:?}, got {fitted:?}"
+            );
+        }
+    }
 }
