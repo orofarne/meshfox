@@ -208,7 +208,9 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
             return Err(ParseError::PreviewRequiresLinkType(id.clone()));
         }
 
-        let body = markdown[seg.body_span.clone()].trim().to_string();
+        let body = crate::comment::strip(&markdown[seg.body_span.clone()])
+            .trim()
+            .to_string();
         let target = match node_type {
             NodeType::Group => {
                 if !body.is_empty() {
@@ -1995,6 +1997,42 @@ Reused from Tests as well.
                 block_name: "build".to_string()
             }]
         );
+    }
+
+    #[test]
+    fn meshfox_comment_regions_are_stripped_from_a_nodes_text() {
+        let doc = concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "Visible.\n\n",
+            "<!-- meshfox:comment -->This only shows in a plain Markdown renderer.",
+            "<!-- /meshfox:comment -->\n\n",
+            "Also visible.\n",
+        );
+        let c = parse(doc).unwrap();
+        let text = &c.node("root").unwrap().text;
+        assert!(!text.contains("plain Markdown renderer"));
+        assert!(!text.contains("meshfox:comment"));
+        assert!(text.contains("Visible."));
+        assert!(text.contains("Also visible."));
+    }
+
+    #[test]
+    fn a_meshfox_comment_region_can_make_an_otherwise_invalid_file_body_valid() {
+        // A `file`/`link`/`include` node's body must be exactly one
+        // Markdown link — a `meshfox:comment`-wrapped blurb alongside it
+        // (context for someone reading the raw file outside meshfox)
+        // shouldn't count against that, since it's not real body content
+        // as far as meshfox itself is concerned.
+        let doc = concat!(
+            "# Root\n\n",
+            "## Diagram\n<!-- meshfox:node type=\"file\" -->\n\n",
+            "<!-- meshfox:comment -->See the architecture doc:<!-- /meshfox:comment -->\n",
+            "[architecture](./architecture.png)\n",
+        );
+        let c = parse(doc).unwrap();
+        let n = c.node("diagram").unwrap();
+        assert_eq!(n.target.as_deref(), Some("./architecture.png"));
+        assert_eq!(n.text, "[architecture](./architecture.png)");
     }
 
     #[test]

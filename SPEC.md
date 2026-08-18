@@ -785,6 +785,43 @@ disables its own color output (`cargo`, `git`, plain `ls`) prints plain
 text here unless it's told to force color (`--color=always`, or a script
 emitting raw escape codes itself).
 
+## Comments
+
+    <!-- meshfox:comment -->Any text<!-- /meshfox:comment -->
+
+`meshfox:comment`/`/meshfox:comment` are, by themselves, nothing but two
+ordinary HTML comments — invisible to any Markdown renderer, meshfox
+included. The text sitting *between* them, though, is completely ordinary
+Markdown as far as a plain renderer (GitHub, a text editor's preview, ...)
+is concerned, so it renders there like any other paragraph — but meshfox's
+own tooling (the web UI, the TUI, `static`/`pdf` export, `meshfox run`'s
+prompts) recognizes the marker pair and drops the whole region, markers and
+text alike, before a node's body ever reaches any of them. A node's raw
+Markdown on disk always keeps the region intact either way; only what
+meshfox itself *shows* strips it.
+
+That makes it the place to put context meant only for someone reading the
+raw file outside meshfox — most commonly a short "this is a meshfox
+document" note, since meshfox's own UI already makes that obvious just by
+existing. `meshfox create` (and `meshfox view --create`) writes exactly
+that as the new file's root body:
+
+    <!-- meshfox:canvas -->
+    # My Project
+
+    <!-- meshfox:comment -->
+    > This is a [meshfox](https://meshfox.orofarne.net/) document — open it
+    > with `meshfox view` (or `meshfox tui`) for the interactive canvas.
+    > This note is only visible here, in a plain Markdown viewer.
+    <!-- /meshfox:comment -->
+
+A `file`/`link`/`include` node's body rule ("exactly one Markdown link") is
+checked *after* stripping — a comment-wrapped blurb alongside the link
+doesn't count against it. Fence-aware, same as heading/node-comment
+scanning elsewhere in this spec: a marker written literally inside a code
+fence (e.g. showing someone this exact syntax) is left alone rather than
+treated as a real region.
+
 ## Minimal example
 
 ````markdown

@@ -1163,12 +1163,23 @@ fn create(canvas_path: &Path) {
     println!("meshfox create: wrote {}", canvas_path.display());
 }
 
+/// A short note, wrapped in a `meshfox:comment` marker pair (see SPEC.md's
+/// "Comments"), that a freshly `create`d file's root body opens with:
+/// invisible in meshfox's own tooling (web UI, TUI, `static`/`pdf`), but
+/// shown normally by a plain Markdown renderer — exactly the audience that
+/// doesn't already know this is a meshfox document from looking at it.
+const NEW_CANVAS_NOTE: &str = "<!-- meshfox:comment -->\n> This is a [meshfox](https://meshfox.orofarne.net/) document — open it with `meshfox view` (or `meshfox tui`) for the interactive canvas. This note is only visible here, in a plain Markdown viewer.\n<!-- /meshfox:comment -->";
+
 /// The empty-canvas template shared by `create` and `view --create`: the
-/// `meshfox:canvas` marker plus a lone root heading named after the file
-/// itself, so the new file is immediately valid and auto-discoverable.
+/// `meshfox:canvas` marker, a lone root heading named after the file
+/// itself (so the new file is immediately valid and auto-discoverable),
+/// and `NEW_CANVAS_NOTE` as the root's own body.
 fn write_canvas_template(canvas_path: &Path) {
     let title = canvas_title(canvas_path);
-    let content = format!("{}\n# {title}\n", mdcanvas::CANVAS_MARKER);
+    let content = format!(
+        "{}\n# {title}\n\n{NEW_CANVAS_NOTE}\n",
+        mdcanvas::CANVAS_MARKER
+    );
     std::fs::write(canvas_path, content).unwrap_or_else(|e| {
         eprintln!("failed to write {}: {e}", canvas_path.display());
         std::process::exit(1);

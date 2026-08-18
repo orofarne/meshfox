@@ -7,6 +7,7 @@
 
 pub mod attrs;
 pub mod canvas;
+pub mod comment;
 pub mod constraint;
 pub mod deps;
 mod dotenv;
