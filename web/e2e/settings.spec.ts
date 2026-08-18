@@ -92,3 +92,56 @@ for (const nodeId of NODE_IDS) {
     expect(await fetchRaw(page)).toBe(before);
   });
 }
+
+// TODO.canvas.md: "Смена id при создании ноды" — create a new node, then in
+// the settings modal that opens for it right away, change *both* its title
+// and its id, then "ok". Repro'd as a 404 ("no node ...") from the field
+// patch that follows the rename. Root cause: NodeSettings' `handleOk`
+// renames the id first, then commits every other changed field via a
+// separate `onChange` call — App.tsx used to build that second call's own
+// target id from a `settingsNode.id` closure captured when *this specific*
+// modal instance was rendered, i.e. the *pre-rename* id, since a successful
+// rename remounts a fresh `NodeSettings` (`key={settingsNode.id}`) without
+// waiting for this still-running "ok" handler to finish — so the field
+// patch landed on an id the rename had just made stale. Fixed by having
+// `NodeSettings` itself pass its post-rename id straight to `onChange`
+// instead of leaving the caller to infer it. Cleans up the node it creates
+// so this suite's fixture stays byte-for-byte reusable across runs, same as
+// every other test above.
+test("renaming the id and changing another field in the same 'ok' click both land on the same node", async ({
+  page,
+}) => {
+  const before = await fetchRaw(page);
+
+  // The "+" button is portaled via `NodeToolbar` into React Flow's shared
+  // top-level layer (see MeshNode.tsx), not nested under the node's own
+  // `[data-id]` element — so it can't be scoped to a specific node by DOM
+  // nesting. Which parent gets the new child doesn't matter for this test.
+  await page.locator(".mesh-node-add-child").first().click();
+
+  await expect(page.locator(".node-settings-modal")).toBeVisible();
+  const titleInput = page.locator(".vars-modal-field", { hasText: "Title" }).locator("input");
+  const idInput = page.locator(".vars-modal-field", { hasText: "ID" }).locator("input");
+  await expect(idInput).toHaveValue("new-node");
+
+  await titleInput.fill("My title");
+  await idInput.fill("my-title");
+  await page.locator(".vars-modal-actions button", { hasText: "ok" }).click();
+
+  await expect(page.locator(".node-settings-modal")).toHaveCount(0);
+  await expect(page.locator(".error")).toHaveCount(0);
+  const raw = await fetchRaw(page);
+  expect(raw).toContain('id="my-title"');
+  expect(raw).toContain("My title");
+
+  // `DELETE` alone doesn't guarantee coming back byte-for-byte (it's not
+  // meant to — `insert_child_node`/`delete_node` aren't exact inverses down
+  // to whitespace), so restore the fixture's exact original text directly
+  // via Source mode's own save endpoint instead, same as every other test
+  // above expects to find the file in.
+  await page.evaluate(
+    (raw) => fetch("/api/canvas/raw", { method: "PUT", headers: { "content-type": "text/plain" }, body: raw }),
+    before,
+  );
+  expect(await fetchRaw(page)).toBe(before);
+});

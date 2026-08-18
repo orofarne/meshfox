@@ -558,21 +558,30 @@ a {
   cursor: default;
 }
 
-/* A node's own tags — small chip row right under the title bar, both
- * read-only and edit mode (they're diagram content, not an editing
- * control). */
+/* A node's own tags — inline in the title row, right after the title text
+ * (see MeshNode.tsx's `nodeTags`), both read-only and edit mode (they're
+ * diagram content, not an editing control). Deliberately `nowrap`: this
+ * has to stay exactly one line tall so a folded node's real rendered
+ * height keeps matching autolayout's fixed `FOLDED_HEIGHT` regardless of
+ * how many tags it carries (that's the whole reason this moved out of its
+ * own row below the title — see `nodeTags`'s comment); `min-width: 0` is
+ * what lets it actually shrink (a flex item's default min-width is its
+ * content width, which would otherwise refuse to give ground to the title
+ * text's own ellipsis) if there's ever too little room for both. */
 .mesh-node-tags {
-  flex-shrink: 0;
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  align-items: center;
   gap: 0.3rem;
-  padding: 0.4rem 0.75rem 0;
+  min-width: 0;
+  overflow: hidden;
 }
 
 /* Read-only tag chip — shared by a node's own tags (above) and an extra
  * edge's tags (see DeletableEdge.tsx); purely a display, no remove button
  * (compare `.tag-chip`, the editable kind used inside TagEditor). */
 .mesh-tag-chip {
+  flex-shrink: 0;
   font-size: 0.72rem;
   line-height: 1.4;
   padding: 0.05rem 0.5rem;

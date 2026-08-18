@@ -924,10 +924,14 @@ export default function App() {
     [canvas],
   );
 
-  // NodeSettings' auto-save — fired (debounced) as fields change, and once
-  // more when the modal closes. Never closes the modal itself; errors
-  // (e.g. the server rejecting an invalid type/target combination) are
-  // just surfaced, since the user is likely still mid-edit.
+  // NodeSettings' "ok" commit for every field except the id (see
+  // `handleNodeIdChange` for that one) — passed straight through as its
+  // `onChange` prop, `id` supplied by `NodeSettings` itself rather than a
+  // closure captured here (see that prop's own doc comment for why: a
+  // same-click id rename makes any id captured at render time go stale
+  // before this fires). Never closes the modal itself; errors (e.g. the
+  // server rejecting an invalid type/target combination) are just
+  // surfaced, since the user is likely still mid-edit.
   const handleNodeSettingsChange = useCallback(async (id: string, patch: NodePatch) => {
     try {
       const updated = await updateNode(id, patch);
@@ -1502,7 +1506,24 @@ export default function App() {
           // value.
           const { x, y } = positionFor(canvasNode, box, byId, boxes);
           const isGroup = n.data.nodeType === "group";
-          const heightChanged = isGroup && n.height !== box.height;
+          // A group's own height always tracks its members' derived box.
+          // A plain suggested node's is deliberately `undefined` while
+          // unfolded (auto-measured from content — see the canvas-load
+          // effect above) and `FOLDED_HEIGHT` while folded, computed fresh
+          // from `isFolded` rather than carried over from `n.height`: that
+          // used to just pass `n.height` through unfolded too, which is
+          // fine *unless* it was last set to an explicit `FOLDED_HEIGHT` by
+          // the canvas-load effect (any full canvas reload — e.g. creating
+          // an unrelated node elsewhere — while this one happened to be
+          // folded writes exactly that number). Unfolding afterward flipped
+          // `data.folded` back to `false` here (so its body starts
+          // rendering again) but left that stale explicit height in place,
+          // clamping the box to its folded size regardless — the node's
+          // fold toggle visibly changed, the body was back in the DOM, but
+          // the box itself never grew to show it (TODO.canvas.md:
+          // "Проблема с разворачиванием ноды при редактировании").
+          const nextHeight = isGroup ? box.height : isFolded ? FOLDED_HEIGHT : undefined;
+          const heightChanged = n.height !== nextHeight;
           if (
             n.position.x === x &&
             n.position.y === y &&
@@ -1517,7 +1538,7 @@ export default function App() {
             ...n,
             position: { x, y },
             width: box.width,
-            height: isGroup ? box.height : n.height,
+            height: nextHeight,
             data: isGroup ? { ...n.data, folded: isFolded } : { ...n.data, maxHeight: box.maxHeight, folded: isFolded },
           };
         }
@@ -2192,7 +2213,7 @@ export default function App() {
           key={settingsNode.id}
           node={settingsNode}
           allNodes={canvas?.nodes ?? []}
-          onChange={(patch) => handleNodeSettingsChange(settingsNode.id, patch)}
+          onChange={handleNodeSettingsChange}
           onRenameId={handleNodeIdChange}
           onClose={() => setSettingsNodeId(null)}
         />

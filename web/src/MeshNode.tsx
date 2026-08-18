@@ -1080,6 +1080,27 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
     data.onToggleFold();
   };
 
+  // Rendered inline in the title row, right after the title text, in both
+  // layouts below — not as a separate row underneath it (TODO.canvas.md:
+  // "Тэги в заголовке"). A folded node's box height is a fixed constant
+  // (`FOLDED_HEIGHT` in autolayout.ts) that assumes the title row is the
+  // *whole* box; a below-title tags row rendered regardless of fold state
+  // (there was nothing gating it on `data.folded`, unlike the body) added
+  // real height autolayout never accounted for, so a folded, tagged node's
+  // actual rendered box silently grew past its allotted slot and
+  // overlapped whatever autolayout placed right after it. Living inside
+  // the title row instead means a folded node's real height still matches
+  // `FOLDED_HEIGHT` exactly, tagged or not.
+  const nodeTags = data.tags && data.tags.length > 0 && (
+    <span className="mesh-node-tags">
+      {data.tags.map((t) => (
+        <span className="mesh-tag-chip" key={t}>
+          {t}
+        </span>
+      ))}
+    </span>
+  );
+
   return (
     <div
       className="mesh-node"
@@ -1157,6 +1178,7 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
             <TypeIcon type={data.nodeType} />
             {data.title}
           </span>
+          {nodeTags}
         </div>
       ) : (
         <div className="mesh-node-title" data-level={data.level}>
@@ -1169,6 +1191,7 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
             <TypeIcon type={data.nodeType} />
             {data.title}
           </span>
+          {nodeTags}
           <ConstraintBadge status={constraintStatus} />
           {quickRunBlockName && (
             <button
@@ -1267,15 +1290,6 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
           >
             ⛶
           </button>
-        </div>
-      )}
-      {data.tags && data.tags.length > 0 && (
-        <div className="mesh-node-tags">
-          {data.tags.map((t) => (
-            <span className="mesh-tag-chip" key={t}>
-              {t}
-            </span>
-          ))}
         </div>
       )}
       {/* A node's counterpart to the settings gear, but kept as a floating

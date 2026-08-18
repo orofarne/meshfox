@@ -11,10 +11,11 @@ folding `parent-node` visibly move `sibling-node` up to fill the gap its
 hidden children used to occupy. Declares `unfold` (see SPEC.md's
 "Options") so every test here starts from "nothing folded" and drives the
 fold toggle explicitly, rather than starting from the client's own
-folded-by-default state.
+folded-by-default state. `parent-node` carries tags — see the "no overlap"
+test below (TODO.canvas.md: "Тэги в заголовке").
 
 ## Parent Node
-<!-- meshfox:node id="parent-node" -->
+<!-- meshfox:node id="parent-node" tags="alpha, beta" -->
 
 A node with children — folding this hides both of them and shrinks this
 node itself to a title-only row.
@@ -34,3 +35,4 @@ Second child, hidden while `parent-node` is folded.
 
 Auto-placed sibling of Parent Node — used to check that folding Parent
 Node lets this node reflow upward into the space it vacates.
+

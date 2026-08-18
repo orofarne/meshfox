@@ -10,8 +10,13 @@ interface NodeSettingsProps {
    * (titles to show, ids to send) — excludes `node` itself. */
   allNodes: CanvasNode[];
   /** Commits every field except the id (see `onRenameId`) — fired once, by
-   * the "ok" button, not per keystroke. */
-  onChange: (patch: NodePatch) => void;
+   * the "ok" button, not per keystroke. Takes the node's *current* id
+   * explicitly (rather than the caller closing over `node.id` itself):
+   * `handleOk` below may have just renamed the node in the same click, and
+   * a parent-side closure captured at render time goes stale the moment
+   * that rename remounts this component under its new id — see `handleOk`'s
+   * own comment. */
+  onChange: (id: string, patch: NodePatch) => void;
   /** Renames the node's own id — a separate commit from `onChange`, unlike
    * every other field here: it needs a uniqueness check and rewrites
    * references in other nodes, so it isn't just "one more patch field".
@@ -148,6 +153,18 @@ export function NodeSettings({ node, allNodes, onChange, onRenameId, onClose }: 
   // with the error shown rather than closing on a half-applied change.
   // Every other changed field commits together in one `onChange` call —
   // skipped entirely (no request at all) when nothing actually changed.
+  //
+  // `onChange` gets the node's id *after* whatever rename just happened,
+  // not `node.id` (this component's own original prop) — App.tsx's
+  // `onChange` closure is bound to whichever id was current when *this*
+  // component instance was rendered, and a successful rename remounts a
+  // fresh instance under the new id (see `App.tsx`'s `key={settingsNode.id}`)
+  // without waiting for this still-running async handler. Passing the
+  // post-rename id explicitly is what keeps this "ok" click's own patch
+  // request targeting the node it actually just renamed, instead of the id
+  // that rename just made stale — that mismatch used to 404 ("no node
+  // ...") whenever a single "ok" both renamed the id and changed another
+  // field at once.
   const handleOk = async () => {
     if (!isSaveable) return;
     const trimmedId = id.trim();
@@ -164,7 +181,7 @@ export function NodeSettings({ node, allNodes, onChange, onRenameId, onClose }: 
       setSaving(false);
     }
     const patch = buildPatch();
-    if (Object.keys(patch).length > 0) onChange(patch);
+    if (Object.keys(patch).length > 0) onChange(trimmedId, patch);
     onClose();
   };
 

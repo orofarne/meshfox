@@ -1589,10 +1589,11 @@ async fn get_node_file_content(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<FileContentResponse>, ApiError> {
-    let raw = state.raw.lock().unwrap().clone();
-    let canvas = parse_or_error(&raw)?;
+    let primary_raw = state.raw.lock().unwrap().clone();
+    let located = locate_node(&state, &primary_raw, &id)?;
+    let canvas = parse_or_error(&located.raw)?;
     let node = canvas
-        .node(&id)
+        .node(&located.local_id)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}")))?;
     if node.node_type != NodeType::File {
         return Err(ApiError(
@@ -1607,10 +1608,8 @@ async fn get_node_file_content(
         )
     })?;
 
-    let canvas_dir = state
-        .canvas_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty());
+    let canvas_path = located.origin.as_deref().unwrap_or(&state.canvas_path);
+    let canvas_dir = canvas_path.parent().filter(|p| !p.as_os_str().is_empty());
     let canvas_dir = canvas_dir.unwrap_or(std::path::Path::new("."));
     let preview = meshfox_core::preview(canvas_dir, target).map_err(|e| match e {
         meshfox_core::PreviewError::Confine(meshfox_core::ConfineError::DirNotFound(_, e)) => {
@@ -1653,10 +1652,11 @@ async fn run_file_node(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
-    let raw = state.raw.lock().unwrap().clone();
-    let canvas = parse_or_error(&raw)?;
+    let primary_raw = state.raw.lock().unwrap().clone();
+    let located = locate_node(&state, &primary_raw, &id)?;
+    let canvas = parse_or_error(&located.raw)?;
     let node = canvas
-        .node(&id)
+        .node(&located.local_id)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}")))?;
     if !node.is_runnable_file() {
         return Err(ApiError(
@@ -1669,7 +1669,8 @@ async fn run_file_node(
         .clone()
         .expect("checked by is_runnable_file");
     let target = node.target.as_deref().expect("checked by is_runnable_file");
-    let resolved_path = resolve_confined_target(&state.canvas_path, target)?;
+    let canvas_path = located.origin.as_deref().unwrap_or(&state.canvas_path);
+    let resolved_path = resolve_confined_target(canvas_path, target)?;
 
     let run_id = uuid::Uuid::new_v4().to_string();
     let (kill_tx, mut kill_rx) = oneshot::channel::<()>();
@@ -1736,10 +1737,11 @@ async fn open_node_file(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let raw = state.raw.lock().unwrap().clone();
-    let canvas = parse_or_error(&raw)?;
+    let primary_raw = state.raw.lock().unwrap().clone();
+    let located = locate_node(&state, &primary_raw, &id)?;
+    let canvas = parse_or_error(&located.raw)?;
     let node = canvas
-        .node(&id)
+        .node(&located.local_id)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}")))?;
     if node.node_type != NodeType::File {
         return Err(ApiError(
@@ -1753,7 +1755,8 @@ async fn open_node_file(
             format!("node {id:?} has no target"),
         )
     })?;
-    let resolved = resolve_confined_target(&state.canvas_path, target)?;
+    let canvas_path = located.origin.as_deref().unwrap_or(&state.canvas_path);
+    let resolved = resolve_confined_target(canvas_path, target)?;
 
     tokio::task::spawn_blocking(move || open::that(&resolved))
         .await
@@ -4103,6 +4106,52 @@ mod run_file_tests {
         let (status, _) = post(addr, "/api/nodes/nope/open").await;
         assert_eq!(status, 404);
         let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn open_node_file_resolves_a_nodes_id_across_an_include() {
+        // `open_node_file` used to look `id` up only in the primary
+        // document's own raw text, so a node spliced in from a canvas
+        // `include` — addressed by its namespaced id, e.g. "child/note" —
+        // always 404'd even though it exists (TODO.canvas.md: "Открытие
+        // файала во вложенном канвасе"). It should route through
+        // `locate_node`, same as every mutating endpoint already does.
+        // `note` isn't a `file` node, so a *found*-but-rejected 422 proves
+        // the lookup now succeeds, without this test ever invoking the OS
+        // opener the way a real `file` node target would.
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-open-include-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("child.canvas.md"),
+            concat!(
+                "<!-- meshfox:canvas -->\n# Child\n<!-- meshfox:node id=\"root\" -->\n\n",
+                "## Note\n<!-- meshfox:node id=\"note\" -->\n\nnot a file node\n",
+            ),
+        )
+        .unwrap();
+        let canvas_path = dir.join("base.canvas.md");
+        std::fs::write(
+            &canvas_path,
+            concat!(
+                "<!-- meshfox:canvas -->\n# Base\n<!-- meshfox:node id=\"base\" -->\n\n",
+                "## Child\n<!-- meshfox:node id=\"child\" type=\"include\" -->\n\n[child](./child.canvas.md)\n",
+            ),
+        )
+        .unwrap();
+
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let (status, body) = post(addr, "/api/nodes/child%2Fnote/open").await;
+        assert_eq!(
+            status, 422,
+            "expected the included node to be found (and rejected only for not \
+             being a file node), got: {body}"
+        );
+        assert!(body.contains("not a file node"), "unexpected body: {body}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

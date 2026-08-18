@@ -83,6 +83,7 @@ impl SourceEditorState {
         let raw = std::fs::read_to_string(&path)?;
         let mut editor = EditorState::new(Lines::from(raw.as_str()));
         editor.cursor = cursor;
+        prime_viewport(&mut editor);
         Ok(SourceEditorState {
             primary_path,
             path,
@@ -202,6 +203,33 @@ impl SourceEditorState {
     }
 }
 
+/// Works around an `edtui` quirk that otherwise left the source editor
+/// showing the top of the file even though the cursor opened correctly
+/// deep inside it (TODO.canvas.md: "Скролл в TUI"): `EditorView::render`
+/// only scrolls the viewport to follow the cursor once it already knows
+/// how many rows fit on screen (its own internal `num_rows`), and that
+/// count is normally only ever *learned* by actually rendering once — it
+/// starts at `0`, and `edtui`'s own scroll-into-view logic explicitly
+/// no-ops whenever it's still `0`. So the very first real frame after
+/// opening on a cursor far down the file rendered with the viewport still
+/// stuck at the top, and nothing ever forced a second frame to fix it —
+/// this app only redraws in response to an event (see `mod.rs`'s main
+/// loop), so a user who just opened the editor and looked, without
+/// pressing another key, saw that stuck first frame indefinitely, cursor
+/// position correct internally the whole time.
+///
+/// Fixes it via `EditorState::set_viewport_height` — a public escape
+/// hatch `edtui` itself documents as normally unnecessary ("set
+/// automatically during render") for exactly this kind of exception: tell
+/// it how many rows are available up front, matching
+/// `ui::render_source_editor`'s own header(1)/body/footer(1) split, so
+/// the *first* real render already has a real row count to scroll
+/// against instead of `0`.
+fn prime_viewport(editor: &mut EditorState) {
+    let (_cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    editor.set_viewport_height(rows.saturating_sub(2) as usize);
+}
+
 /// Converts a byte offset in `text` (e.g. from
 /// `meshfox_core::mdcanvas::node_body_offset`) to an edtui cursor position
 /// — `Index2`'s `row`/`col` count *lines*/*chars*, not bytes. Skips a
@@ -250,5 +278,44 @@ mod tests {
         let text = "line0\nline1\nline2";
         let offset = text.find("ne2").unwrap();
         assert_eq!(byte_offset_to_cursor(text, offset), Index2::new(2, 2));
+    }
+
+    // TODO.canvas.md: "Скролл в TUI" — opening the source editor with the
+    // cursor already deep in a long file left the *very first* rendered
+    // frame scrolled to the top regardless (see `prime_viewport`'s own doc
+    // comment for the underlying `edtui` mechanics). Without the fix, a
+    // cursor row past the visible height renders with no on-screen cursor
+    // position at all on that first frame (`cursor_screen_position()` is
+    // `None` — the row isn't among the ones actually drawn) and the
+    // viewport offset stays `(0, 0)`; with it, that very first frame
+    // already scrolls to keep the cursor visible.
+    #[test]
+    fn prime_viewport_makes_the_first_real_render_already_scrolled_to_the_cursor() {
+        use edtui::EditorView;
+        use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+
+        let text = (0..200)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut editor = EditorState::new(Lines::from(text.as_str()));
+        editor.cursor = Index2::new(150, 0);
+        prime_viewport(&mut editor);
+
+        // Same shape `crossterm::terminal::size()`'s test-environment
+        // fallback implies (see `prime_viewport`): an 80x24 terminal, minus
+        // the source editor's own header/footer rows.
+        let area = Rect::new(0, 0, 80, 22);
+        let mut buf = Buffer::empty(area);
+        EditorView::new(&mut editor).wrap(true).render(area, &mut buf);
+
+        assert!(
+            editor.cursor_screen_position().is_some(),
+            "cursor should already be on screen on the first real render"
+        );
+        assert!(
+            editor.viewport_offset().1 > 0,
+            "viewport should already have scrolled down to the cursor, not stayed at the top"
+        );
     }
 }

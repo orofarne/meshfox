@@ -17,11 +17,11 @@ curl -fsSL https://raw.githubusercontent.com/orofarne/meshfox/main/scripts/insta
 
 <!-- meshfox:var name="INSTALL_PATH" prompt="Install prefix?" default="/usr/local/bin" -->
 
-An executable canvas: a hierarchical, node-based document where nodes hold Markdown, and code blocks inside that Markdown can be run — with their output optionally cached right next to the code.
+An interactive canvas: a hierarchical, node-based document where nodes hold Markdown, and code blocks inside that Markdown can be run — with their output optionally cached right next to the code.
 
-Status: **early bootstrap**. This document is itself a valid meshfox canvas — every `##` section here is a node, nested under this root. The leading HTML comment above the title is the `meshfox:canvas` marker (see [SPEC.md](./SPEC.md), or browse this file with `meshfox view` — "File format" below includes it live); it's what lets tooling recognize this as a canvas despite the plain `.md` extension.
+Status: **early bootstrap**.
 
-![Screenshot](screenshot.webp)
+This document is itself a valid meshfox canvas — every `##` section here is a node, nested under this root. See [SPEC.md](./SPEC.md) for more details.
 
 ## Concept
 <!-- meshfox:node id="concept" -->
@@ -245,6 +245,37 @@ vim
 ```
 
 Run it from a real terminal — `meshfox README.md run usage usage-tty vim-demo` — and it drops you straight into `vim` editing that scratch file, same as running `vim` directly would; `:wq` (or `:q!`) hands the terminal back same as it always does. `meshfox run` checks stdin/stdout are actually a terminal before starting a `tty` block and errors out otherwise, rather than hanging a script or CI job that happens to reach one. The web UI runs the same block over a real pseudo-terminal instead: clicking "run vim-demo" in `meshfox view` opens it as a floating terminal panel over the canvas rather than filling in the node's own inline output area.
+
+### Browser UI (`view`)
+<!-- meshfox:node id="browser-ui-view" -->
+
+`meshfox view` starts a small local web server and opens the canvas in the browser: the node tree laid out spatially, with run buttons on every runnable block. It opens read-only — running a block is always allowed (you're still explicitly clicking "run"), but a `cache`d block's output isn't written back to the file, and nodes can't be dragged/resized/saved, until "Edit" is clicked. Edit mode also unlocks the Auto-layout and ⚙ options toolbar buttons (see "Auto-layout" above) and the on-canvas node-settings modal. Output streams into the browser live as a block runs, not just once it's finished, and a running block gets a Kill button, for when one hangs. See "Interactive (`tty`) blocks" above for how a `tty`-flagged block behaves here instead — a floating terminal panel rather than inline output.
+
+![Screenshot](screenshot.webp)
+
+```bash name="view-help" cache
+meshfox view -h
+```
+<!-- meshfox:output name="view-help" -->
+```text
+exit code: 0
+
+Start the local web UI: canvas view, run buttons. Opens read-only — running a block is always allowed, but click "Edit" in the browser to unlock dragging, resizing, saving layout, and persisting a `cache`d block's output back into the file
+
+Usage: meshfox view [OPTIONS] [CANVAS]
+
+Arguments:
+  [CANVAS]  Path to the .canvas.md file. If omitted: auto-discover the single candidate in the current directory
+
+Options:
+      --canvas <CANVAS>  Same as the positional argument above, spelled as a flag — for parity with `run`/`node <op>`, which only accept this form
+      --port <PORT>      Port to listen on. If omitted, a random free port is chosen — pass this explicitly to pin a stable port (e.g. for scripts) [default: 0]
+      --no-open          Don't automatically open a browser tab
+      --create           If the file doesn't exist yet, create it (same empty template as `create`) before opening it. Requires an explicit path — has nothing to auto-discover when the file isn't there yet. A no-op if the file already exists
+      --no-auto-exit     Don't exit automatically once every browser tab connected to this server has closed. `meshfox view` is meant to run only as long as something's actually looking at it, so by default it exits a few seconds after the last tab goes away; pass this to keep it running headless instead (e.g. scripts/tests that cycle through pages with brief all-tabs-closed gaps a real user wouldn't have)
+  -h, --help             Print help
+```
+<!-- /meshfox:output -->
 
 ### Terminal viewer (experimental)
 <!-- meshfox:node id="usage-tui" -->
