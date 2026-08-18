@@ -180,14 +180,21 @@ enum Command {
     /// blocks with live streamed output, right in the terminal. Same
     /// deps-chain/cache/`meshfox:var` handling as `meshfox run`/`meshfox
     /// view`. A `tty` block hands the real terminal over to it, same as
-    /// `meshfox run`'s own `tty` handling. Mouse support covers clicking a
-    /// tree row to select it (or its ▾/▸ marker to expand/collapse) and
-    /// scrolling the tree/document panes. `e` opens a fullscreen raw-source
-    /// editor (vim-style input, syntax highlighting, `Ctrl-f` to switch
-    /// between the document and any `include`d file) on the selected
-    /// node's own file — the terminal counterpart to the browser UI's
-    /// Source mode. Still no *structural* editing beyond that (use
-    /// `meshfox node ...` or the browser UI's Edit mode for that).
+    /// `meshfox run`'s own `tty` handling. The tree/document panes' own
+    /// mouse support covers clicking a tree row to select it (or its ▾/▸
+    /// marker to expand/collapse) and scrolling either pane; each row's
+    /// title is also colored to match the node's own `color=`. `e` opens a
+    /// fullscreen raw-source editor (vim-style modal input via `edtui`,
+    /// meshfox-specific syntax highlighting, full mouse support — click to
+    /// position the cursor, drag to select, scroll to move the viewport)
+    /// on the selected node's own file — the terminal counterpart to the
+    /// browser UI's Source mode. `Ctrl-f` switches
+    /// between the document and any `include`d file; `Ctrl-n` turns the
+    /// heading under the cursor into a node in one keystroke; `Ctrl-p`
+    /// suggests attributes for the current `meshfox:node`/`meshfox:edge`
+    /// comment or runnable-fence line. Still no *structural* editing
+    /// beyond that (use `meshfox
+    /// node ...` or the browser UI's Edit mode for that).
     Tui {
         #[command(flatten)]
         canvas: CanvasOpt,

@@ -23,6 +23,13 @@ pub struct TreeRow {
     /// only when every one of them passed, `None` when the node has no
     /// constraint fences at all.
     pub constraint_ok: Option<bool>,
+    /// The node's own `color` attribute, verbatim (a JSON-Canvas preset
+    /// `"1"`-`"6"` or a literal `#rrggbb` hex string) — resolved to an
+    /// actual `ratatui::style::Color` at render time, not here (see
+    /// `ui::render_tree`), same "keep the raw value on the model, resolve
+    /// it where it's drawn" split `web/src/MeshNode.tsx`'s `resolveNodeColor`
+    /// already uses. `None` means no color was set.
+    pub color: Option<String>,
 }
 
 pub fn flatten(canvas: &Canvas, expanded: &HashSet<String>) -> Vec<TreeRow> {
@@ -61,6 +68,7 @@ fn visit(
         has_cache: blocks.iter().any(|b| b.cache),
         has_tty: blocks.iter().any(|b| b.tty),
         constraint_ok,
+        color: node.color.clone(),
     });
 
     if has_children && is_expanded {

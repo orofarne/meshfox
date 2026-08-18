@@ -14,9 +14,49 @@
 
 use std::path::PathBuf;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use edtui::{EditorEventHandler, EditorMode, EditorState, Index2, Lines};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
+use edtui::actions::{AppendNewline, InsertChar};
+use edtui::{EditorEventHandler, EditorMode, EditorState, Highlight, Index2, Lines};
 use meshfox_core::include::IncludeInfo;
+use ratatui::style::{Color, Modifier, Style};
+
+/// Every attribute name `crates/core/src/mdcanvas.rs`'s `parse` actually
+/// reads off a `meshfox:node` comment (`NodeMeta`'s own fields plus the
+/// explicit `parent=` override) — the source of truth for both the
+/// highlighter (`meshfox_highlights`) and the attribute-suggestion popup
+/// (`SourceEditorState::open_attr_suggest`) below. Kept as a hand-copied
+/// list rather than importing anything from `meshfox_core` (there's no
+/// single existing list to import — the real parser reads each attribute
+/// individually, by name, at its own call site) — out of sync only risks a
+/// missing/stale *suggestion*, never a parse-correctness bug, since
+/// neither consumer here writes anything the real parser doesn't already
+/// accept on its own.
+const NODE_ATTRS: &[&str] = &[
+    "id",
+    "type",
+    "x",
+    "y",
+    "w",
+    "h",
+    "color",
+    "tags",
+    "parent",
+    "display",
+    "lang",
+    "interpreter",
+    "preview",
+    "fold",
+    "edgeLabel",
+];
+/// `meshfox:edge`'s own attribute vocabulary (`mdcanvas.rs`'s edge-attr
+/// parsing, `canvas.rs`'s `ExtraEdge`/style enums) — `from` is required,
+/// the rest optional styling.
+const EDGE_ATTRS: &[&str] = &["from", "label", "color", "style", "arrowStart", "arrowEnd", "tags"];
+/// A runnable fence's own attribute vocabulary (`crates/core/src/fence.rs`)
+/// — value-taking (`name="..."`) vs. bare presence flags (`cache`, no
+/// `=value` at all) need different insertion shapes, see `AttrCandidate`.
+const FENCE_VALUE_ATTRS: &[&str] = &["name", "deps", "env"];
+const FENCE_FLAG_ATTRS: &[&str] = &["cache", "tty", "default"];
 
 /// What the caller (`App::on_key`) should do after handing a keypress to
 /// the editor.
@@ -65,6 +105,46 @@ pub struct SourceEditorState {
     /// other keypress, so it only ever fires as an immediate follow-up,
     /// never a "leftover" confirmation from several edits ago.
     pending_discard: bool,
+    /// `Ctrl-p` popup — TODO.canvas.md: "Саджесты... в TUI". `open_attr_suggest`
+    /// fills `attr_suggest_kind`/`attr_suggest_candidates` from whatever
+    /// `meshfox:node`/`meshfox:edge`/fence-attribute line the cursor is
+    /// currently on; `on_attr_suggest_key` drives selection while this is
+    /// `true`.
+    pub attr_suggest_open: bool,
+    attr_suggest_kind: AttrKind,
+    pub attr_suggest_candidates: Vec<AttrCandidate>,
+    pub attr_suggest_selected: usize,
+}
+
+/// Which attribute vocabulary a suggestible line belongs to — see
+/// `detect_attr_context`/`attr_candidates`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttrKind {
+    Node,
+    Edge,
+    Fence,
+}
+
+impl AttrKind {
+    fn label(self) -> &'static str {
+        match self {
+            AttrKind::Node => "node",
+            AttrKind::Edge => "edge",
+            AttrKind::Fence => "fence",
+        }
+    }
+}
+
+/// One entry in the `Ctrl-p` popup. `is_flag` distinguishes a bare
+/// presence flag (a runnable fence's `cache`/`tty`/`default` — inserted as
+/// just the bare word) from a `key="value"`-shaped attribute (every
+/// `meshfox:node`/`meshfox:edge` attribute, plus a fence's own
+/// `name`/`deps`/`env` — inserted as `key=""` with the cursor landing
+/// between the quotes, ready to type the value).
+#[derive(Debug, Clone, Copy)]
+pub struct AttrCandidate {
+    pub name: &'static str,
+    pub is_flag: bool,
 }
 
 impl SourceEditorState {
@@ -83,6 +163,7 @@ impl SourceEditorState {
         let raw = std::fs::read_to_string(&path)?;
         let mut editor = EditorState::new(Lines::from(raw.as_str()));
         editor.cursor = cursor;
+        editor.highlights = meshfox_highlights(&raw);
         prime_viewport(&mut editor);
         Ok(SourceEditorState {
             primary_path,
@@ -96,6 +177,10 @@ impl SourceEditorState {
             file_picker_selected: 0,
             error: None,
             pending_discard: false,
+            attr_suggest_open: false,
+            attr_suggest_kind: AttrKind::Node,
+            attr_suggest_candidates: Vec::new(),
+            attr_suggest_selected: 0,
         })
     }
 
@@ -116,6 +201,10 @@ impl SourceEditorState {
             self.on_file_picker_key(key);
             return SourceEditorOutcome::Stay;
         }
+        if self.attr_suggest_open {
+            self.on_attr_suggest_key(key);
+            return SourceEditorOutcome::Stay;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('s') => return SourceEditorOutcome::Save,
@@ -126,6 +215,25 @@ impl SourceEditorState {
                     } else {
                         self.current_file_index().map(|i| i + 1).unwrap_or(0)
                     };
+                    return SourceEditorOutcome::Stay;
+                }
+                // TODO.canvas.md: "Саджесты и подсветка синтаксиса в TUI",
+                // item 3 — turns the heading the cursor's on into a node in
+                // one keypress (a bare `<!-- meshfox:node -->` is already
+                // enough: no id= means the parser derives one from the
+                // title's own slug, see "Если не задан id...").
+                KeyCode::Char('n') => {
+                    match self.insert_node_below_heading() {
+                        Ok(()) => self.error = None,
+                        Err(msg) => self.error = Some(msg.to_string()),
+                    }
+                    return SourceEditorOutcome::Stay;
+                }
+                // Item 2 — opens the attribute-suggestion popup for
+                // whatever meshfox:node/meshfox:edge/fence-attribute line
+                // the cursor's currently on.
+                KeyCode::Char('p') => {
+                    self.open_attr_suggest();
                     return SourceEditorOutcome::Stay;
                 }
                 _ => {}
@@ -147,7 +255,25 @@ impl SourceEditorState {
         self.pending_discard = false;
         self.error = None;
         self.events.on_key_event(key, &mut self.editor);
+        self.refresh_meshfox_highlights();
         SourceEditorOutcome::Stay
+    }
+
+    /// `vim mouse=a`-style mouse support (TODO.canvas.md: "Поддержка мыши в
+    /// редакторе TUI") — click to position the cursor, drag to select
+    /// (auto-switches to Visual mode, same as `on_key`'s own `v` would),
+    /// scroll to move the viewport. Entirely `edtui`'s own `mouse-support`
+    /// feature (already enabled by default — see `EditorEventHandler::
+    /// on_mouse_event`); this is just the wiring `App::on_mouse` needed to
+    /// reach it instead of falling through to the tree/document pane
+    /// hit-testing underneath. No-op while the file picker overlay is open
+    /// — same as `on_key`'s own picker branch, it has no mouse handling of
+    /// its own yet.
+    pub fn on_mouse(&mut self, mouse: MouseEvent) {
+        if self.file_picker_open || self.attr_suggest_open {
+            return;
+        }
+        self.events.on_mouse_event(mouse, &mut self.editor);
     }
 
     fn current_file_index(&self) -> Option<usize> {
@@ -196,11 +322,294 @@ impl SourceEditorState {
             }
         };
         self.editor = EditorState::new(Lines::from(raw.as_str()));
+        self.editor.highlights = meshfox_highlights(&raw);
         self.original = raw;
         self.path = path;
         self.is_canvas = is_canvas;
         self.error = None;
     }
+
+    /// Recomputes `self.editor.highlights` from the buffer's current text
+    /// — called after anything that could have changed it (a real
+    /// keystroke, an attribute/node-comment insertion below), so the
+    /// meshfox-specific coloring (see `meshfox_highlights`) never goes
+    /// stale relative to what's actually on screen.
+    fn refresh_meshfox_highlights(&mut self) {
+        self.editor.highlights = meshfox_highlights(&self.editor.lines.to_string());
+    }
+
+    /// TODO.canvas.md: "Саджесты и подсветка синтаксиса в TUI", item 3 —
+    /// `Ctrl-n`. Turns the heading the cursor's currently on into a node:
+    /// appends a bare `<!-- meshfox:node -->` line right below it. Bare is
+    /// deliberate, not a shortcut: no `id=` means the parser derives one
+    /// from the heading's own title slug (see "Если не задан id в
+    /// meshfox:node, использовать заоголовок"), so this one line is
+    /// already a fully valid, addressable node — nothing further to fill
+    /// in unless the user wants to override something.
+    fn insert_node_below_heading(&mut self) -> Result<(), &'static str> {
+        let text = self.editor.lines.to_string();
+        let row = self.editor.cursor.row;
+        let line = text.lines().nth(row).ok_or("no line here")?;
+        if !line.trim_start().starts_with('#') {
+            return Err("place the cursor on a heading line to turn it into a node");
+        }
+        if text
+            .lines()
+            .nth(row + 1)
+            .is_some_and(|l| l.trim_start().starts_with("<!-- meshfox:node"))
+        {
+            return Err("this heading is already a node");
+        }
+        // `AppendNewline` inserts right below `cursor.row` regardless of
+        // `cursor.col` (it resets that to 0 itself) — no repositioning
+        // needed first.
+        self.editor.execute(AppendNewline(1));
+        type_str(&mut self.editor, "<!-- meshfox:node -->");
+        self.refresh_meshfox_highlights();
+        Ok(())
+    }
+
+    /// `Ctrl-p` — opens the attribute-suggestion popup for whatever
+    /// `meshfox:node`/`meshfox:edge`/fence-attribute line the cursor is
+    /// currently on (`detect_attr_context`), pre-filtered to only the
+    /// attributes that line doesn't already have (`attr_candidates`).
+    fn open_attr_suggest(&mut self) {
+        let text = self.editor.lines.to_string();
+        let row = self.editor.cursor.row;
+        let Some(line) = text.lines().nth(row) else {
+            self.error = Some("no line here".to_string());
+            return;
+        };
+        let Some(kind) = detect_attr_context(line) else {
+            self.error = Some(
+                "place the cursor on a meshfox:node/meshfox:edge comment or a fence's opening line"
+                    .to_string(),
+            );
+            return;
+        };
+        let candidates = attr_candidates(kind, line);
+        if candidates.is_empty() {
+            self.error = Some("every known attribute is already on this line".to_string());
+            return;
+        }
+        self.attr_suggest_kind = kind;
+        self.attr_suggest_candidates = candidates;
+        self.attr_suggest_selected = 0;
+        self.attr_suggest_open = true;
+        self.error = None;
+    }
+
+    /// Which vocabulary the currently-open popup is suggesting from — for
+    /// `ui::render_attr_suggest_popup`'s own title.
+    pub fn attr_suggest_label(&self) -> &'static str {
+        self.attr_suggest_kind.label()
+    }
+
+    fn on_attr_suggest_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.attr_suggest_selected = self.attr_suggest_selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.attr_suggest_selected = (self.attr_suggest_selected + 1)
+                    .min(self.attr_suggest_candidates.len().saturating_sub(1));
+            }
+            KeyCode::Esc => self.attr_suggest_open = false,
+            KeyCode::Enter => {
+                self.attr_suggest_open = false;
+                if let Some(candidate) = self
+                    .attr_suggest_candidates
+                    .get(self.attr_suggest_selected)
+                    .copied()
+                {
+                    self.insert_attr_candidate(candidate);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Types `candidate` in at the right spot for `self.attr_suggest_kind`
+    /// — just before a `meshfox:node`/`meshfox:edge` comment's closing
+    /// `-->` (typing it at the raw end of line would land *after* the
+    /// comment closes, breaking it), or at the true end of a fence's own
+    /// attribute line. `x`/`y`/`w`/`h` get a bare `=0` (the on-disk
+    /// convention every existing coordinate already uses — see `DOC` in
+    /// `mdcanvas.rs`'s own tests — not a quoted string); every other
+    /// value-taking attribute gets `=""` with the cursor left between the
+    /// quotes, ready to type; a bare flag (fence `cache`/`tty`/`default`)
+    /// gets just its own word, nothing to fill in.
+    fn insert_attr_candidate(&mut self, candidate: AttrCandidate) {
+        let text = self.editor.lines.to_string();
+        let row = self.editor.cursor.row;
+        let Some(line) = text.lines().nth(row) else {
+            return;
+        };
+        let col = insertion_col(line, self.attr_suggest_kind);
+        self.editor.cursor = Index2::new(row, col);
+        if candidate.is_flag {
+            type_str(&mut self.editor, &format!(" {}", candidate.name));
+        } else if matches!(candidate.name, "x" | "y" | "w" | "h") {
+            type_str(&mut self.editor, &format!(" {}=0", candidate.name));
+        } else {
+            type_str(&mut self.editor, &format!(" {}=\"\"", candidate.name));
+            self.editor.cursor.col -= 1; // land between the quotes
+        }
+        self.refresh_meshfox_highlights();
+    }
+}
+
+/// Where `insert_attr_candidate` types a new attribute in `line` — right
+/// before a node/edge comment's closing `-->` (so the new attribute lands
+/// *inside* the comment, not after it), or the plain end of line for a
+/// fence's own attribute line (nothing closes it).
+fn insertion_col(line: &str, kind: AttrKind) -> usize {
+    if kind != AttrKind::Fence {
+        if let Some(close) = line.rfind("-->") {
+            return line[..close].trim_end().chars().count();
+        }
+    }
+    line.chars().count()
+}
+
+/// Which attribute vocabulary (if any) the cursor's current line belongs
+/// to — a `meshfox:node`/`meshfox:edge` comment, or a fence's own opening
+/// line (any line starting with a code-fence delimiter; a closing fence
+/// has no attributes to suggest, but detecting the difference isn't worth
+/// the complexity here — `attr_candidates` on one just offers every fence
+/// attribute, harmlessly unused if the popup's dismissed).
+fn detect_attr_context(line: &str) -> Option<AttrKind> {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("<!-- meshfox:node") {
+        Some(AttrKind::Node)
+    } else if trimmed.starts_with("<!-- meshfox:edge") {
+        Some(AttrKind::Edge)
+    } else if trimmed.starts_with("```") {
+        Some(AttrKind::Fence)
+    } else {
+        None
+    }
+}
+
+/// `kind`'s full attribute vocabulary, minus whatever `line` already has —
+/// a value attribute counts as present if `"name="` appears anywhere in
+/// the line (covers both `id="..."` and the bare-numeric `x=0` form); a
+/// flag attribute counts as present if it appears as its own whitespace-
+/// delimited word. Best-effort, same spirit as `meshfox_highlights` below
+/// — a suggestion list, not the real parser.
+fn attr_candidates(kind: AttrKind, line: &str) -> Vec<AttrCandidate> {
+    let (value_attrs, flag_attrs): (&[&str], &[&str]) = match kind {
+        AttrKind::Node => (NODE_ATTRS, &[]),
+        AttrKind::Edge => (EDGE_ATTRS, &[]),
+        AttrKind::Fence => (FENCE_VALUE_ATTRS, FENCE_FLAG_ATTRS),
+    };
+    let value_present = |name: &str| line.contains(&format!("{name}="));
+    let flag_present = |name: &str| line.split_whitespace().any(|tok| tok == name);
+    value_attrs
+        .iter()
+        .filter(|n| !value_present(n))
+        .map(|&name| AttrCandidate { name, is_flag: false })
+        .chain(
+            flag_attrs
+                .iter()
+                .filter(|n| !flag_present(n))
+                .map(|&name| AttrCandidate { name, is_flag: true }),
+        )
+        .collect()
+}
+
+/// Types `s` in at the cursor, one character at a time, via `edtui`'s own
+/// public `InsertChar` action — the same path a real keystroke takes (see
+/// `EditorEventHandler::on_key_event`), so it lands in the same undo/
+/// dot-repeat machinery, rather than reconstructing and replacing the
+/// whole buffer.
+fn type_str(editor: &mut EditorState, s: &str) {
+    for c in s.chars() {
+        editor.execute(InsertChar(c));
+    }
+}
+
+/// TODO.canvas.md: "Саджесты и подсветка синтаксиса в TUI", item 1 —
+/// highlights every `<!-- meshfox:... -->`/`<!-- /meshfox:... -->` marker
+/// comment (the whole thing, one bold accent color) plus each `key=`
+/// attribute name inside one (a second color), on top of whatever the
+/// buffer's ordinary Markdown syntax highlighting already does (custom
+/// `EditorState::highlights` are applied after the syntax highlighter's
+/// own base styling — see `edtui`'s own render pipeline — so these always
+/// win). Recomputed from scratch on every call rather than incrementally
+/// — cheap enough (a handful of linear string scans) that there's no
+/// reason to track what changed.
+///
+/// Scoped to `meshfox:` comment lines only, not a runnable fence's own
+/// `name="..."`/`cache` attribute line — code-fence content already reads
+/// visually distinct (its own syntax highlighting, different indentation
+/// context), and parsing an attribute line's exact boundaries safely
+/// alongside arbitrary fence-language syntax highlighting underneath adds
+/// real risk for comparatively little extra clarity; the `Ctrl-p`
+/// suggestion popup still covers fence attributes even though this
+/// doesn't highlight them.
+fn meshfox_highlights(text: &str) -> Vec<Highlight> {
+    let marker_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let key_style = Style::default().fg(Color::LightCyan);
+
+    let mut highlights = Vec::new();
+    let mut line_start = 0usize;
+    for line in text.split_inclusive('\n') {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        if let (Some(open), Some(close)) = (content.find("<!--"), content.rfind("-->")) {
+            let comment_end = close + "-->".len();
+            if open < close && content[open..comment_end].contains("meshfox:") {
+                highlights.push(Highlight::new(
+                    byte_offset_to_cursor(text, line_start + open),
+                    byte_offset_to_cursor(text, line_start + comment_end - 1),
+                    marker_style,
+                ));
+
+                let inner_start = open + "<!--".len();
+                let inner = &content[inner_start..close];
+                for (rel, token) in whitespace_tokens_with_offsets(inner) {
+                    let Some(eq) = token.find('=') else { continue };
+                    let key = &token[..eq];
+                    if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphabetic()) {
+                        continue;
+                    }
+                    let key_start = line_start + inner_start + rel;
+                    let key_end = key_start + key.len();
+                    highlights.push(Highlight::new(
+                        byte_offset_to_cursor(text, key_start),
+                        byte_offset_to_cursor(text, key_end - 1),
+                        key_style,
+                    ));
+                }
+            }
+        }
+        line_start += line.len();
+    }
+    highlights
+}
+
+/// Whitespace-delimited tokens in `s`, each paired with its own byte
+/// offset from the start of `s` — `str::split_whitespace` alone doesn't
+/// give offsets, and re-`find`ing each token back in `s` (the obvious
+/// alternative) breaks the moment the same token appears twice. Safe to
+/// slice with (never lands mid-character): every boundary here comes from
+/// `char_indices`, which only ever yields real char-boundary offsets.
+fn whitespace_tokens_with_offsets(s: &str) -> Vec<(usize, &str)> {
+    let mut out = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, c) in s.char_indices() {
+        if c.is_whitespace() {
+            if let Some(st) = start.take() {
+                out.push((st, &s[st..i]));
+            }
+        } else if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(st) = start {
+        out.push((st, &s[st..]));
+    }
+    out
 }
 
 /// Works around an `edtui` quirk that otherwise left the source editor
@@ -317,5 +726,239 @@ mod tests {
             editor.viewport_offset().1 > 0,
             "viewport should already have scrolled down to the cursor, not stayed at the top"
         );
+    }
+
+    // TODO.canvas.md: "Поддержка мыши в редакторе TUI" — `on_mouse` is
+    // mostly just wiring onto `edtui`'s own already-working mouse support
+    // (see `on_mouse`'s own doc comment); what these two tests actually
+    // cover is the wiring itself (crossterm's `MouseEvent` reaches
+    // `EditorState` correctly through it) and the one guard this file adds
+    // on top (no mouse handling while the file picker overlay is open).
+    fn open_test_editor(text: &str) -> SourceEditorState {
+        use edtui::EditorView;
+        use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+
+        let path = std::env::temp_dir().join(format!(
+            "meshfox-source-editor-mouse-test-{}.md",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, text).unwrap();
+        let mut se =
+            SourceEditorState::open(path.clone(), path, false, Index2::new(0, 0), Vec::new())
+                .unwrap();
+        // Same requirement `prime_viewport`'s own test documents: a real
+        // render populates `screen_area`/`viewport`, which mouse
+        // coordinate mapping needs.
+        let area = Rect::new(0, 0, 80, 22);
+        let mut buf = Buffer::empty(area);
+        EditorView::new(&mut se.editor).wrap(true).render(area, &mut buf);
+        se
+    }
+
+    fn left_click_at(row: u16, column: u16) -> MouseEvent {
+        use crossterm::event::MouseEventKind;
+        MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn on_mouse_positions_the_cursor_on_a_left_click() {
+        let mut se = open_test_editor("abc\ndef\nghi");
+        assert_eq!(se.editor.cursor, Index2::new(0, 0));
+
+        se.on_mouse(left_click_at(1, 1));
+
+        assert_eq!(se.editor.cursor, Index2::new(1, 1));
+        let _ = std::fs::remove_file(&se.path);
+    }
+
+    #[test]
+    fn on_mouse_does_nothing_while_the_file_picker_is_open() {
+        let mut se = open_test_editor("abc\ndef\nghi");
+        se.file_picker_open = true;
+
+        se.on_mouse(left_click_at(1, 1));
+
+        assert_eq!(se.editor.cursor, Index2::new(0, 0));
+        let _ = std::fs::remove_file(&se.path);
+    }
+
+    // TODO.canvas.md: "Саджесты и подсветка синтаксиса в TUI", item 1.
+    #[test]
+    fn meshfox_highlights_covers_the_whole_marker_comment() {
+        let text = "# Root\n<!-- meshfox:node id=\"root\" -->\n\nbody\n";
+        let highlights = meshfox_highlights(text);
+        let marker = highlights
+            .iter()
+            .find(|h| h.start == Index2::new(1, 0))
+            .expect("a highlight starting at the comment's own line");
+        // "<!-- meshfox:node id=\"root\" -->" is 31 chars long; `end` is
+        // inclusive, so the last char (the closing `>`) is at col 30.
+        assert_eq!(marker.end, Index2::new(1, 30));
+    }
+
+    #[test]
+    fn meshfox_highlights_covers_each_attribute_key() {
+        let text = "<!-- meshfox:node id=\"root\" color=\"1\" -->\n";
+        let highlights = meshfox_highlights(text);
+        // "id" starts right after "<!-- meshfox:node " (18 chars in).
+        let id_key = highlights
+            .iter()
+            .find(|h| h.start == Index2::new(0, 18))
+            .expect("a highlight for the `id` key");
+        assert_eq!(id_key.end, Index2::new(0, 19)); // "id" is 2 chars, inclusive end
+    }
+
+    #[test]
+    fn meshfox_highlights_ignores_a_plain_prose_line() {
+        let text = "# Root\n\njust some text, no markers here\n";
+        assert!(meshfox_highlights(text).is_empty());
+    }
+
+    #[test]
+    fn meshfox_highlights_covers_a_bare_closing_marker_with_no_attributes() {
+        let text = "<!-- /meshfox:output -->\n";
+        let highlights = meshfox_highlights(text);
+        assert_eq!(highlights.len(), 1, "just the marker span, no attribute keys");
+        assert_eq!(highlights[0].start, Index2::new(0, 0));
+    }
+
+    // TODO.canvas.md: "Саджесты и подсветка синтаксиса в TUI", item 3.
+    #[test]
+    fn ctrl_n_turns_a_heading_into_a_node() {
+        let mut se = open_test_editor("# Root\n\n## Section\n\nbody\n");
+        se.editor.cursor = Index2::new(2, 0); // "## Section"
+
+        se.insert_node_below_heading().unwrap();
+
+        let text = se.editor.lines.to_string();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[2], "## Section");
+        assert_eq!(lines[3], "<!-- meshfox:node -->");
+        let _ = std::fs::remove_file(&se.path);
+    }
+
+    #[test]
+    fn ctrl_n_refuses_off_a_non_heading_line() {
+        let mut se = open_test_editor("# Root\n\nplain body text\n");
+        se.editor.cursor = Index2::new(2, 0);
+
+        let err = se.insert_node_below_heading().unwrap_err();
+
+        assert!(err.contains("heading"));
+        assert_eq!(se.editor.lines.to_string(), "# Root\n\nplain body text\n");
+        let _ = std::fs::remove_file(&se.path);
+    }
+
+    #[test]
+    fn ctrl_n_refuses_a_heading_thats_already_a_node() {
+        let mut se = open_test_editor("# Root\n<!-- meshfox:node id=\"root\" -->\n\nbody\n");
+        se.editor.cursor = Index2::new(0, 0);
+
+        let err = se.insert_node_below_heading().unwrap_err();
+
+        assert!(err.contains("already a node"));
+        let _ = std::fs::remove_file(&se.path);
+    }
+
+    // TODO.canvas.md: "Саджесты и подсветка синтаксиса в TUI", item 2.
+    #[test]
+    fn detect_attr_context_recognizes_node_edge_and_fence_lines() {
+        assert_eq!(
+            detect_attr_context("<!-- meshfox:node id=\"root\" -->"),
+            Some(AttrKind::Node)
+        );
+        assert_eq!(
+            detect_attr_context("<!-- meshfox:edge from=\"root\" -->"),
+            Some(AttrKind::Edge)
+        );
+        assert_eq!(detect_attr_context("```bash name=\"build\""), Some(AttrKind::Fence));
+        assert_eq!(detect_attr_context("just a body line"), None);
+    }
+
+    #[test]
+    fn attr_candidates_excludes_attributes_already_on_the_line() {
+        let names: Vec<&str> = attr_candidates(AttrKind::Node, "<!-- meshfox:node id=\"root\" x=0 -->")
+            .iter()
+            .map(|c| c.name)
+            .collect();
+        assert!(!names.contains(&"id"));
+        assert!(!names.contains(&"x")); // bare-numeric form is still detected
+        assert!(names.contains(&"color"));
+        assert!(names.contains(&"y"));
+    }
+
+    #[test]
+    fn attr_candidates_for_a_fence_separates_flags_from_value_attrs() {
+        let candidates = attr_candidates(AttrKind::Fence, "```bash");
+        let cache = candidates
+            .iter()
+            .find(|c| c.name == "cache")
+            .expect("cache offered");
+        assert!(cache.is_flag);
+        let name = candidates.iter().find(|c| c.name == "name").expect("name offered");
+        assert!(!name.is_flag);
+    }
+
+    #[test]
+    fn attr_candidates_for_a_fence_excludes_a_flag_already_present() {
+        let candidates = attr_candidates(AttrKind::Fence, "```bash cache");
+        assert!(!candidates.iter().any(|c| c.name == "cache"));
+        assert!(candidates.iter().any(|c| c.name == "tty"));
+    }
+
+    #[test]
+    fn insertion_col_lands_right_before_the_closing_arrow() {
+        assert_eq!(
+            insertion_col("<!-- meshfox:node id=\"root\" -->", AttrKind::Node),
+            27 // right after the closing quote of id="root", before " -->"
+        );
+        assert_eq!(insertion_col("```bash name=\"build\"", AttrKind::Fence), 20);
+    }
+
+    #[test]
+    fn open_attr_suggest_and_insert_attr_candidate_end_to_end() {
+        let mut se = open_test_editor("<!-- meshfox:node id=\"root\" -->\n");
+        se.editor.cursor = Index2::new(0, 0);
+
+        se.open_attr_suggest();
+        assert!(se.attr_suggest_open);
+        assert!(!se.attr_suggest_candidates.iter().any(|c| c.name == "id"));
+
+        let color_idx = se
+            .attr_suggest_candidates
+            .iter()
+            .position(|c| c.name == "color")
+            .expect("color offered");
+        se.attr_suggest_selected = color_idx;
+        se.on_attr_suggest_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(!se.attr_suggest_open);
+        assert_eq!(
+            se.editor.lines.to_string(),
+            "<!-- meshfox:node id=\"root\" color=\"\" -->\n"
+        );
+        // Cursor landed between the new attribute's quotes.
+        assert_eq!(se.editor.cursor, Index2::new(0, 35));
+        let _ = std::fs::remove_file(&se.path);
+    }
+
+    #[test]
+    fn insert_attr_candidate_gives_x_y_w_h_a_bare_numeric_default() {
+        let mut se = open_test_editor("<!-- meshfox:node id=\"root\" -->\n");
+        se.insert_attr_candidate(AttrCandidate { name: "x", is_flag: false });
+
+        assert_eq!(
+            se.editor.lines.to_string(),
+            "<!-- meshfox:node id=\"root\" x=0 -->\n"
+        );
+        let _ = std::fs::remove_file(&se.path);
     }
 }

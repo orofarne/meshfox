@@ -41,7 +41,7 @@
 
 mod browser;
 mod merge;
-mod render;
+pub(crate) mod render;
 
 use meshfox_core::staticgen;
 use meshfox_core::Canvas;

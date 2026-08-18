@@ -534,14 +534,26 @@ impl App {
         }
     }
 
-    /// Clicks select a tree row and focus that pane, same as before — except
-    /// a click that lands specifically on a row's own disclosure marker
-    /// (`▾`/`▸`, see `ui::render_tree`) toggles it expanded/collapsed
-    /// instead, same as clicking it with the keyboard (`enter`) would. The
-    /// scroll wheel over either the tree or the document pane moves/scrolls
-    /// it. Nothing else (run/kill buttons, clicking inside a `tty`
-    /// handoff) is wired up yet.
+    /// While the fullscreen source editor is open, every mouse event is
+    /// entirely its own — `SourceEditorState::on_mouse` (`edtui`'s own
+    /// `mouse-support` feature, already enabled) handles click-to-position-
+    /// cursor, drag-to-select, and scroll, same "vim `mouse=a`" shape this
+    /// TODO item asked for — same early-return split `on_key` already has
+    /// for it, so the tree/document hit-testing below never runs against
+    /// coordinates that actually landed on the editor's own overlay.
+    ///
+    /// Otherwise: clicks select a tree row and focus that pane, same as
+    /// before — except a click that lands specifically on a row's own
+    /// disclosure marker (`▾`/`▸`, see `ui::render_tree`) toggles it
+    /// expanded/collapsed instead, same as clicking it with the keyboard
+    /// (`enter`) would. The scroll wheel over either the tree or the
+    /// document pane moves/scrolls it. Nothing else (run/kill buttons,
+    /// clicking inside a `tty` handoff) is wired up yet.
     pub fn on_mouse(&mut self, mouse: MouseEvent) {
+        if let Some(se) = &mut self.source_editor {
+            se.on_mouse(mouse);
+            return;
+        }
         if self.var_form.is_some() || self.block_picker.is_some() {
             return; // modal is up — no pane underneath it to click through to
         }

@@ -219,8 +219,10 @@ fn collect_ids<'a>(node: &'a NodeView, out: &mut HashSet<&'a str>) {
 /// numbered presets or a literal `#rrggbb` hex string — same convention
 /// `web/src/MeshNode.tsx`'s `resolveNodeColor`/`COLOR_PRESETS` uses, same
 /// palette values. `None` for anything else (malformed input shouldn't fail
-/// the whole export — it just renders with no explicit color).
-fn resolve_color_hex(color: &str) -> Option<String> {
+/// the whole export — it just renders with no explicit color). `pub(crate)`
+/// — also used by the TUI's tree pane (`tui::ui::render_tree`) to resolve a
+/// row's color the same way.
+pub(crate) fn resolve_color_hex(color: &str) -> Option<String> {
     const PRESETS: [(&str, &str); 6] = [
         ("1", "#c22b2b"),
         ("2", "#d9822b"),

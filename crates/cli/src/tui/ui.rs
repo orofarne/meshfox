@@ -13,7 +13,24 @@ use edtui::{EditorView, LineNumbers, SyntaxHighlighter};
 use super::app::{App, Focus};
 use super::markdown::Segment;
 use super::source_editor::SourceEditorState;
+use crate::pdf::render::resolve_color_hex;
 use meshfox_core::{NodeType, VarType};
+
+/// Resolves a `meshfox:node`/`meshfox:edge` `color` attribute (a JSON-Canvas
+/// preset `"1"`-`"6"` or a literal `#rrggbb` hex string — `resolve_color_hex`
+/// handles the preset lookup, always returning a `#rrggbb` string either
+/// way) to an actual terminal color for the tree pane. `None` for anything
+/// that isn't a valid color — same "malformed input just renders with no
+/// explicit color" fallback `resolve_color_hex`'s own callers already rely
+/// on, rather than erroring.
+fn tree_row_color(color: Option<&str>) -> Option<Color> {
+    let hex = resolve_color_hex(color?)?;
+    let hex = hex.strip_prefix('#')?;
+    let r = u8::from_str_radix(hex.get(0..2)?, 16).ok()?;
+    let g = u8::from_str_radix(hex.get(2..4)?, 16).ok()?;
+    let b = u8::from_str_radix(hex.get(4..6)?, 16).ok()?;
+    Some(Color::Rgb(r, g, b))
+}
 
 /// Theme/language edtui's own bundled `syntect` highlighting uses for the
 /// source editor — always Markdown, since that's what every file this
@@ -137,6 +154,10 @@ fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
                 Some(false) => Span::styled("  ✗", Style::default().fg(Color::Red)),
                 None => Span::raw(""),
             };
+            let title_style = match tree_row_color(row.color.as_deref()) {
+                Some(c) => Style::default().fg(c),
+                None => Style::default(),
+            };
             let line = Line::from(vec![
                 Span::raw(indent),
                 Span::styled(disclosure, Style::default().fg(Color::DarkGray)),
@@ -144,7 +165,7 @@ fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
                     type_marker(row.node_type),
                     Style::default().fg(Color::DarkGray),
                 ),
-                Span::raw(row.title.clone()),
+                Span::styled(row.title.clone(), title_style),
                 constraint_mark,
                 Span::styled(badge, Style::default().fg(Color::Green)),
             ]);
@@ -489,7 +510,8 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         "  (a node with more than one block opens a picker first)",
         "K               kill the running block",
         "e               edit this node's own file, full-screen (Ctrl-s save,",
-        "                Ctrl-f switch file, esc close)",
+        "                Ctrl-f switch file, Ctrl-n heading->node, Ctrl-p",
+        "                suggest attributes, mouse click/drag/scroll, esc close)",
     ];
     if app.selected_is_open_target() {
         items.push("o               open this file node's target in the OS's default application");
@@ -570,7 +592,8 @@ fn render_source_editor(f: &mut Frame, area: Rect, se: &mut SourceEditorState) {
     let footer = match &se.error {
         Some(msg) => Line::from(Span::styled(msg.as_str(), Style::default().fg(Color::Red))),
         None => Line::from(Span::styled(
-            "Ctrl-s save · Ctrl-f switch file · esc close (vim keys inside the buffer)",
+            "Ctrl-s save · Ctrl-f switch file · Ctrl-n heading→node · Ctrl-p suggest params · \
+             esc close (vim keys inside the buffer)",
             Style::default().fg(Color::DarkGray),
         )),
     };
@@ -579,6 +602,40 @@ fn render_source_editor(f: &mut Frame, area: Rect, se: &mut SourceEditorState) {
     if se.file_picker_open {
         render_source_file_picker(f, area, se);
     }
+    if se.attr_suggest_open {
+        render_attr_suggest_popup(f, area, se);
+    }
+}
+
+/// TODO.canvas.md: "Саджесты и подсветка синтаксиса в TUI", item 2 —
+/// `Ctrl-p`'s popup, same floating-`List`-over-`Clear` shape as
+/// `render_source_file_picker` right above. Each row shows the attribute
+/// name with a trailing `=` for a value-taking one (nothing for a bare
+/// fence flag — see `AttrCandidate::is_flag`), so the list itself hints at
+/// what selecting it will actually type.
+fn render_attr_suggest_popup(f: &mut Frame, area: Rect, se: &SourceEditorState) {
+    let height = (se.attr_suggest_candidates.len() as u16 + 2).min(area.height);
+    let rect = centered_rect(36, height, area);
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} attribute ", se.attr_suggest_label()));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let items: Vec<ListItem> = se
+        .attr_suggest_candidates
+        .iter()
+        .map(|c| {
+            let suffix = if c.is_flag { "" } else { "=" };
+            ListItem::new(Line::from(format!("{}{suffix}", c.name)))
+        })
+        .collect();
+
+    let mut state = ListState::default();
+    state.select(Some(se.attr_suggest_selected));
+    let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    f.render_stateful_widget(list, inner, &mut state);
 }
 
 fn render_source_file_picker(f: &mut Frame, area: Rect, se: &SourceEditorState) {
@@ -610,6 +667,28 @@ fn render_source_file_picker(f: &mut Frame, area: Rect, se: &SourceEditorState) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // TODO.canvas.md: "Цвета в TUI" — a node's own `color` (a JSON-Canvas
+    // preset "1"-"6" or a literal `#rrggbb` hex) should color its title in
+    // the tree pane, same palette the web UI and the PDF export already
+    // use (`resolve_color_hex`).
+    #[test]
+    fn tree_row_color_resolves_a_numbered_preset() {
+        assert_eq!(tree_row_color(Some("1")), Some(Color::Rgb(0xc2, 0x2b, 0x2b)));
+        assert_eq!(tree_row_color(Some("4")), Some(Color::Rgb(0x3d, 0x9e, 0x4f)));
+    }
+
+    #[test]
+    fn tree_row_color_resolves_a_literal_hex_string() {
+        assert_eq!(tree_row_color(Some("#a05dd1")), Some(Color::Rgb(0xa0, 0x5d, 0xd1)));
+    }
+
+    #[test]
+    fn tree_row_color_is_none_for_unset_or_malformed_input() {
+        assert_eq!(tree_row_color(None), None);
+        assert_eq!(tree_row_color(Some("not-a-color")), None);
+        assert_eq!(tree_row_color(Some("#zzzzzz")), None);
+    }
 
     #[test]
     fn tail_fit_leaves_a_short_value_untouched() {
