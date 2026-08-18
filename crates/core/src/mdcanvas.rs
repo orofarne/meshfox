@@ -1462,6 +1462,110 @@ pub fn reorder_by_position(markdown: &str) -> Option<String> {
     Some(out)
 }
 
+#[derive(Debug, Error, PartialEq)]
+pub enum MoveSiblingError {
+    #[error("no node {0:?}")]
+    NotFound(String),
+    #[error("node {0:?} and target {1:?} don't share the same structural parent")]
+    NotSiblings(String, String),
+    #[error("a node can't be moved relative to itself")]
+    SameNode,
+}
+
+/// Which side of `target_id` `move_sibling` places `id` on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveSiblingPosition {
+    Before,
+    After,
+}
+
+/// Moves node `id`'s whole structural subtree to sit immediately before or
+/// after `target_id`'s subtree, among the same parent's children — the
+/// mechanism `insert_child_node` doesn't have (it only ever appends a new
+/// child as the *last* sibling) and unpositioned nodes otherwise have no
+/// way to get at all: their document order (heading order in the file) is
+/// their only sibling order, and nothing short of hand-editing the raw
+/// file could change it before this (see TODO.canvas.md: "Механизм
+/// изменения порядка нод при авторазмещении"). A positioned node can
+/// already get a new relative order indirectly, by dragging to a new
+/// `x`/`y` and letting `reorder_by_position` resync — this is the same
+/// underlying rearrangement, just addressed by sibling id instead of by
+/// coordinate, so it works for positioned and unpositioned siblings alike
+/// (position itself, if either has one, is left untouched either way).
+///
+/// `id` and `target_id` must already be siblings (same structural parent)
+/// — moving to sit among a *different* parent's children is
+/// `reparent_node`'s job; combining the two would mean this also has to
+/// relevel the moved fragment, the exact extra complexity `reparent_node`
+/// already carries on its own. Every descendant of `id` moves with it, as
+/// one rigid unit, same as `reparent_node`'s own fragment.
+pub fn move_sibling(
+    markdown: &str,
+    id: &str,
+    target_id: &str,
+    position: MoveSiblingPosition,
+) -> Result<String, MoveSiblingError> {
+    if id == target_id {
+        return Err(MoveSiblingError::SameNode);
+    }
+    let segments = scan(markdown);
+    let ids = assign_ids(&segments).map_err(|_| MoveSiblingError::NotFound(id.to_string()))?;
+    let parents =
+        resolve_parent_ids(&segments, &ids).map_err(|_| MoveSiblingError::NotFound(id.to_string()))?;
+
+    let idx = ids
+        .iter()
+        .position(|x| x == id)
+        .ok_or_else(|| MoveSiblingError::NotFound(id.to_string()))?;
+    let target_idx = ids
+        .iter()
+        .position(|x| x == target_id)
+        .ok_or_else(|| MoveSiblingError::NotFound(target_id.to_string()))?;
+    if parents[idx] != parents[target_idx] {
+        return Err(MoveSiblingError::NotSiblings(
+            id.to_string(),
+            target_id.to_string(),
+        ));
+    }
+
+    let start = segments[idx].heading_span.start;
+    let end = subtree_end_idx(&ids, &parents, idx)
+        .map(|j| segments[j].heading_span.start)
+        .unwrap_or(markdown.len());
+    let fragment = &markdown[start..end];
+
+    let mut without_node = String::with_capacity(markdown.len() - (end - start));
+    without_node.push_str(&markdown[..start]);
+    without_node.push_str(&markdown[end..]);
+
+    // Re-scan the id-less document to find target_id's own (possibly
+    // shifted, if it came after id) position in it.
+    let rescanned = scan(&without_node);
+    let rescanned_ids =
+        assign_ids(&rescanned).map_err(|_| MoveSiblingError::NotFound(target_id.to_string()))?;
+    let rescanned_parents = resolve_parent_ids(&rescanned, &rescanned_ids)
+        .map_err(|_| MoveSiblingError::NotFound(target_id.to_string()))?;
+    let new_target_idx = rescanned_ids
+        .iter()
+        .position(|x| x == target_id)
+        .ok_or_else(|| MoveSiblingError::NotFound(target_id.to_string()))?;
+
+    let insert_at = match position {
+        MoveSiblingPosition::Before => rescanned[new_target_idx].heading_span.start,
+        MoveSiblingPosition::After => {
+            subtree_end_idx(&rescanned_ids, &rescanned_parents, new_target_idx)
+                .map(|j| rescanned[j].heading_span.start)
+                .unwrap_or(without_node.len())
+        }
+    };
+
+    let mut result = String::with_capacity(without_node.len() + fragment.len());
+    result.push_str(&without_node[..insert_at]);
+    result.push_str(fragment);
+    result.push_str(&without_node[insert_at..]);
+    Ok(result)
+}
+
 /// Resolves each segment's structural parent id — normally the nearest
 /// preceding segment with a strictly smaller heading level (the classic
 /// Markdown-outline rule that `insert_child_node` relies on too), but an
@@ -2966,6 +3070,96 @@ Reused from Tests as well.
     #[test]
     fn reorder_by_position_missing_root_is_none() {
         assert_eq!(reorder_by_position("not a heading at all"), None);
+    }
+
+    fn abc_doc() -> &'static str {
+        concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## A\n<!-- meshfox:node id=\"a\" -->\n\nbody a\n\n",
+            "## B\n<!-- meshfox:node id=\"b\" -->\n\nbody b\n\n",
+            "## C\n<!-- meshfox:node id=\"c\" -->\n\nbody c\n",
+        )
+    }
+
+    fn doc_order(markdown: &str) -> Vec<String> {
+        parse(markdown)
+            .unwrap()
+            .nodes
+            .iter()
+            .map(|n| n.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn move_sibling_moves_before_a_target() {
+        let updated = move_sibling(abc_doc(), "c", "a", MoveSiblingPosition::Before).unwrap();
+        assert_eq!(doc_order(&updated), vec!["root", "c", "a", "b"]);
+    }
+
+    #[test]
+    fn move_sibling_moves_after_a_target() {
+        let updated = move_sibling(abc_doc(), "a", "c", MoveSiblingPosition::After).unwrap();
+        assert_eq!(doc_order(&updated), vec!["root", "b", "c", "a"]);
+    }
+
+    #[test]
+    fn move_sibling_is_unaffected_by_target_position_relative_to_the_moved_node() {
+        // Moving something *earlier* in the file (target comes after it)
+        // must re-find the target's shifted position correctly, not the
+        // stale one from before extraction.
+        let updated = move_sibling(abc_doc(), "a", "b", MoveSiblingPosition::After).unwrap();
+        assert_eq!(doc_order(&updated), vec!["root", "b", "a", "c"]);
+    }
+
+    #[test]
+    fn move_sibling_carries_every_descendant_along_as_one_unit() {
+        let doc = concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## A\n<!-- meshfox:node id=\"a\" -->\n\n",
+            "### A Child\n<!-- meshfox:node id=\"a-child\" -->\n\nbody\n\n",
+            "## B\n<!-- meshfox:node id=\"b\" -->\n\nbody b\n",
+        );
+        let updated = move_sibling(doc, "a", "b", MoveSiblingPosition::After).unwrap();
+        assert_eq!(doc_order(&updated), vec!["root", "b", "a", "a-child"]);
+        let c = parse(&updated).unwrap();
+        assert_eq!(c.node("a-child").unwrap().parent.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn move_sibling_rejects_nodes_with_different_parents() {
+        let doc = concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## A\n<!-- meshfox:node id=\"a\" -->\n\n",
+            "### A Child\n<!-- meshfox:node id=\"a-child\" -->\n\nbody\n\n",
+            "## B\n<!-- meshfox:node id=\"b\" -->\n\nbody b\n",
+        );
+        assert_eq!(
+            move_sibling(doc, "a-child", "b", MoveSiblingPosition::Before),
+            Err(MoveSiblingError::NotSiblings(
+                "a-child".to_string(),
+                "b".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn move_sibling_rejects_the_same_node_as_its_own_target() {
+        assert_eq!(
+            move_sibling(abc_doc(), "a", "a", MoveSiblingPosition::Before),
+            Err(MoveSiblingError::SameNode)
+        );
+    }
+
+    #[test]
+    fn move_sibling_rejects_missing_nodes() {
+        assert_eq!(
+            move_sibling(abc_doc(), "does-not-exist", "a", MoveSiblingPosition::Before),
+            Err(MoveSiblingError::NotFound("does-not-exist".to_string()))
+        );
+        assert_eq!(
+            move_sibling(abc_doc(), "a", "does-not-exist", MoveSiblingPosition::Before),
+            Err(MoveSiblingError::NotFound("does-not-exist".to_string()))
+        );
     }
 
     #[test]

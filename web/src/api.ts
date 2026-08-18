@@ -308,6 +308,30 @@ export async function reparentNode(id: string, newParentId: string): Promise<Can
 }
 
 /**
+ * Moves `id`'s whole subtree to sit immediately before or after another
+ * sibling under the same structural parent (`mdcanvas::move_sibling`) — an
+ * auto-placed node's only lever for changing its own order among siblings,
+ * since it has no `x`/`y` to drag (see `MeshNode.tsx`'s ↑/↓ buttons, shown
+ * only for one of those). Pass exactly one of `before`/`after`. The server
+ * rejects (thrown error) two nodes that aren't siblings.
+ */
+export async function moveSibling(
+  id: string,
+  target: { before: string } | { after: string },
+): Promise<CanvasDoc> {
+  const res = await fetch(`/api/nodes/${encodeURIComponent(id)}/move`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(target),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `POST /api/nodes/${id}/move: ${res.status}`);
+  }
+  return res.json();
+}
+
+/**
  * Changes `id`'s own id to `newId` — rewrites every reference the server
  * tracks structurally (other nodes' `parent=`/`meshfox:edge from=`), plus
  * best-effort text rewrites of `deps="id/block"` fence references

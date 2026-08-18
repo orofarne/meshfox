@@ -215,6 +215,18 @@ export interface MeshNodeData {
   /** Creates a new child node under this one — the "+" button (inline in
    * the title bar for a group, floating at the right edge otherwise). */
   onAddChild: () => void;
+  /** Moves this node's own heading immediately before/after its previous/
+   * next sibling (`mdcanvas::move_sibling`, via `App.tsx`'s
+   * `handleMoveSibling`) — an auto-placed node's only lever for changing
+   * its own order among siblings, since it has no `x`/`y` to drag; a
+   * positioned one gets a new order automatically (`reorder_by_position`)
+   * just by being dragged, so its own ↑/↓ buttons stay hidden instead.
+   * `undefined` when there's no such sibling to move past (already
+   * first/last among its parent's children, or this node isn't
+   * auto-placed at all) — hides the corresponding button entirely rather
+   * than showing it disabled. */
+  onMoveUp?: () => void;
+  onMoveDown?: () => void;
   /** Opens this node's settings modal (title/type/color/target/edges). */
   onOpenSettings: () => void;
   /** file-node only — opens `target` in the OS's default application for
@@ -1252,6 +1264,26 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
                   title="Add a child node to this group"
                 >
                   +
+                </button>
+              )}
+              {data.onMoveUp && (
+                <button
+                  type="button"
+                  className="mesh-node-icon-button mesh-node-move-up nodrag"
+                  onClick={data.onMoveUp}
+                  title="Move this node before its previous sibling"
+                >
+                  ↑
+                </button>
+              )}
+              {data.onMoveDown && (
+                <button
+                  type="button"
+                  className="mesh-node-icon-button mesh-node-move-down nodrag"
+                  onClick={data.onMoveDown}
+                  title="Move this node after its next sibling"
+                >
+                  ↓
                 </button>
               )}
               <button

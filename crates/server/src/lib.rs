@@ -1952,6 +1952,78 @@ async fn reparent_node(
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct MoveSiblingRequest {
+    /// Exactly one of these must be set — the id of the sibling to move
+    /// `id` immediately next to.
+    before: Option<String>,
+    after: Option<String>,
+}
+
+/// Moves node `id`'s whole subtree to sit immediately before or after
+/// another sibling under the same structural parent
+/// (`mdcanvas::move_sibling`) — the web UI's up/down reorder buttons for
+/// an auto-placed (unpositioned) node, and `meshfox node move`'s server
+/// counterpart. Exactly one of `before`/`after` must be given. `404` if
+/// either id doesn't exist; `422` if the request names neither or both
+/// fields, or if the two nodes aren't siblings (same structural parent) —
+/// moving to sit among a *different* parent's children is
+/// `reparent_node`'s job, not this one's.
+async fn move_sibling(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<MoveSiblingRequest>,
+) -> Result<Json<Canvas>, ApiError> {
+    let (target_id, position) = match (req.before, req.after) {
+        (Some(t), None) => (t, mdcanvas::MoveSiblingPosition::Before),
+        (None, Some(t)) => (t, mdcanvas::MoveSiblingPosition::After),
+        _ => {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "exactly one of `before`/`after` must be set".to_string(),
+            ));
+        }
+    };
+
+    let primary_raw = state.raw.lock().unwrap().clone();
+    let located = locate_node(&state, &primary_raw, &id)?;
+    let located_target = locate_node(&state, &primary_raw, &target_id)?;
+    // Same defensive check `reparent_node` makes: in practice this can't
+    // actually happen, since `mdcanvas::move_sibling` requires the two
+    // ids to share a structural parent, and a parent/child relationship
+    // never crosses an include boundary — checked anyway rather than
+    // relying on that invariant holding.
+    if located.origin != located_target.origin {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "can't move {id:?} relative to {target_id:?} — they live in different files"
+            ),
+        ));
+    }
+
+    let updated = mdcanvas::move_sibling(
+        &located.raw,
+        &located.local_id,
+        &located_target.local_id,
+        position,
+    )
+    .map_err(|e| {
+        let status = match e {
+            mdcanvas::MoveSiblingError::NotFound(_) => StatusCode::NOT_FOUND,
+            mdcanvas::MoveSiblingError::NotSiblings(_, _) | mdcanvas::MoveSiblingError::SameNode => {
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
+        };
+        ApiError(status, e.to_string())
+    })?;
+    parse_or_error(&updated)?;
+    commit_located(&state, &located, &updated)?;
+    let response_raw = state.raw.lock().unwrap().clone();
+    canvas_response(&response_raw, &state.canvas_path)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RenameNodeIdRequest {
     new_id: String,
 }
@@ -3148,6 +3220,7 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/nodes", post(create_node))
         .route("/api/nodes/:id", patch(update_node).delete(remove_node))
         .route("/api/nodes/:id/reparent", post(reparent_node))
+        .route("/api/nodes/:id/move", post(move_sibling))
         .route("/api/nodes/:id/rename-id", post(rename_node_id))
         .route("/api/nodes/:id/clear-id", post(clear_node_id))
         .route("/api/nodes/:id/file-content", get(get_node_file_content))
@@ -3419,6 +3492,159 @@ mod reparent_position_tests {
 
         let _ = std::fs::remove_file(&canvas_path);
     }
+
+    const ABC_CANVAS: &str = concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "## A\n<!-- meshfox:node id=\"a\" -->\n\nbody a\n\n",
+        "## B\n<!-- meshfox:node id=\"b\" -->\n\nbody b\n\n",
+        "## C\n<!-- meshfox:node id=\"c\" -->\n\nbody c\n",
+    );
+
+    fn order(canvas: &Canvas) -> Vec<&str> {
+        canvas.nodes.iter().map(|n| n.id.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn move_sibling_moves_a_node_before_a_target() {
+        let canvas_path = write_test_canvas(ABC_CANVAS);
+        let state = build_state(canvas_path.clone(), false)
+            .await
+            .expect("valid test canvas");
+
+        let updated = expect_ok(
+            move_sibling(
+                State(state),
+                Path("c".to_string()),
+                Json(MoveSiblingRequest {
+                    before: Some("a".to_string()),
+                    after: None,
+                }),
+            )
+            .await,
+        );
+        assert_eq!(order(&updated), vec!["root", "c", "a", "b"]);
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn move_sibling_moves_a_node_after_a_target() {
+        let canvas_path = write_test_canvas(ABC_CANVAS);
+        let state = build_state(canvas_path.clone(), false)
+            .await
+            .expect("valid test canvas");
+
+        let updated = expect_ok(
+            move_sibling(
+                State(state),
+                Path("a".to_string()),
+                Json(MoveSiblingRequest {
+                    before: None,
+                    after: Some("c".to_string()),
+                }),
+            )
+            .await,
+        );
+        assert_eq!(order(&updated), vec!["root", "b", "c", "a"]);
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn move_sibling_rejects_a_non_sibling_target() {
+        let canvas: &str = concat!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## A\n<!-- meshfox:node id=\"a\" -->\n\n",
+            "### A Child\n<!-- meshfox:node id=\"a-child\" -->\n\nbody\n\n",
+            "## B\n<!-- meshfox:node id=\"b\" -->\n\nbody b\n",
+        );
+        let canvas_path = write_test_canvas(canvas);
+        let state = build_state(canvas_path.clone(), false)
+            .await
+            .expect("valid test canvas");
+
+        let err = match move_sibling(
+            State(state),
+            Path("a-child".to_string()),
+            Json(MoveSiblingRequest {
+                before: Some("b".to_string()),
+                after: None,
+            }),
+        )
+        .await
+        {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e,
+        };
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn move_sibling_rejects_a_request_naming_neither_or_both_of_before_after() {
+        let canvas_path = write_test_canvas(ABC_CANVAS);
+        let state = build_state(canvas_path.clone(), false)
+            .await
+            .expect("valid test canvas");
+
+        let err = match move_sibling(
+            State(state.clone()),
+            Path("c".to_string()),
+            Json(MoveSiblingRequest {
+                before: None,
+                after: None,
+            }),
+        )
+        .await
+        {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e,
+        };
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let err = match move_sibling(
+            State(state),
+            Path("c".to_string()),
+            Json(MoveSiblingRequest {
+                before: Some("a".to_string()),
+                after: Some("b".to_string()),
+            }),
+        )
+        .await
+        {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e,
+        };
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn move_sibling_on_an_unknown_id_404s() {
+        let canvas_path = write_test_canvas(ABC_CANVAS);
+        let state = build_state(canvas_path.clone(), false)
+            .await
+            .expect("valid test canvas");
+
+        let err = match move_sibling(
+            State(state),
+            Path("does-not-exist".to_string()),
+            Json(MoveSiblingRequest {
+                before: Some("a".to_string()),
+                after: None,
+            }),
+        )
+        .await
+        {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e,
+        };
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
 }
 
 #[cfg(test)]
@@ -3596,6 +3822,59 @@ mod include_edit_tests {
             .node("child/renamed-leaf")
             .expect("renamed node present under its new namespaced id");
         assert_eq!(renamed.title, "Leaf");
+
+        let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn move_sibling_resolves_within_the_included_file() {
+        // `write_base_and_child_canvas`'s child only has one child of its
+        // own ("leaf") — not enough siblings to move anything relative to.
+        // Give it a second one first via the ordinary create-node path.
+        let base_path = write_base_and_child_canvas();
+        let child_path = base_path.parent().unwrap().join("child.canvas.md");
+        let state = build_state(base_path.clone(), false)
+            .await
+            .expect("valid test canvas");
+
+        expect_ok(
+            create_node(
+                State(state.clone()),
+                Json(CreateNodeRequest {
+                    parent_id: "child/root".to_string(),
+                    title: "Second Leaf".to_string(),
+                }),
+            )
+            .await,
+        );
+
+        let updated = expect_ok(
+            move_sibling(
+                State(state),
+                Path("child/second-leaf".to_string()),
+                Json(MoveSiblingRequest {
+                    before: Some("child/leaf".to_string()),
+                    after: None,
+                }),
+            )
+            .await,
+        );
+
+        let root = updated.node("child/root").expect("child/root present");
+        let order: Vec<&str> = updated
+            .nodes
+            .iter()
+            .filter(|n| n.parent.as_deref() == Some(&root.id))
+            .map(|n| n.id.as_str())
+            .collect();
+        assert_eq!(order, vec!["child/second-leaf", "child/leaf"]);
+        // The move landed in the include target's own file, not the
+        // primary document — same "writes into the include target, not
+        // base.canvas.md" contract every other mutating endpoint here
+        // already has — with the reordering visible in its raw heading
+        // order too, not just the resolved response.
+        let child_raw = std::fs::read_to_string(&child_path).unwrap();
+        assert!(child_raw.find("id=\"second-leaf\"").unwrap() < child_raw.find("id=\"leaf\"").unwrap());
 
         let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
     }

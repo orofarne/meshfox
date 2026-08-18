@@ -509,6 +509,27 @@ enum NodeCommand {
         #[arg(long)]
         clear: bool,
     },
+    /// Moves a node's whole subtree to sit immediately before or after
+    /// another sibling under the same structural parent
+    /// (`mdcanvas::move_sibling`) — the on-disk heading order is a node's
+    /// *only* sibling order until it also has a real `x`/`y` (see `node
+    /// reorder`), so this is the CLI's way to change it directly instead of
+    /// hand-editing the file. Exactly one of `--before`/`--after` is
+    /// required. Fails if the two nodes aren't siblings — moving to a
+    /// *different* parent's children is `node mv`'s job.
+    Move {
+        /// Path to the .canvas.md file. If omitted: auto-discover the
+        /// single candidate in the current directory.
+        #[arg(long)]
+        canvas: Option<PathBuf>,
+        node_id: String,
+        /// Move `node-id` to sit immediately before this sibling.
+        #[arg(long)]
+        before: Option<String>,
+        /// Move `node-id` to sit immediately after this sibling.
+        #[arg(long)]
+        after: Option<String>,
+    },
     /// Reorder every parent's direct children in the file to match their
     /// canvas layout (`mdcanvas::reorder_by_position`, sorted by `y` then
     /// `x` among ties) — the same resync the server runs on every save
@@ -866,6 +887,17 @@ fn main() {
                 from,
                 clear,
             } => node_edges(&canvas.unwrap_or_else(find_canvas), &node_id, from, clear),
+            NodeCommand::Move {
+                canvas,
+                node_id,
+                before,
+                after,
+            } => node_move(
+                &canvas.unwrap_or_else(find_canvas),
+                &node_id,
+                before,
+                after,
+            ),
             NodeCommand::Reorder { canvas } => node_reorder(&canvas.unwrap_or_else(find_canvas)),
             NodeCommand::Show { canvas, node_id } => {
                 node_show(&canvas.unwrap_or_else(find_canvas), &node_id)
@@ -2380,6 +2412,41 @@ fn apply_node_edges(raw: &str, node_id: &str, extra_parents: &[String]) -> Resul
     Ok(updated)
 }
 
+fn node_move(canvas_path: &Path, node_id: &str, before: Option<String>, after: Option<String>) {
+    let raw = read_raw_or_exit(canvas_path);
+    match apply_node_move(&raw, node_id, before.as_deref(), after.as_deref()) {
+        Ok((updated, target_id, position)) => {
+            write_raw_or_exit(canvas_path, &updated);
+            println!(
+                "meshfox node move: moved {node_id:?} {position} {target_id:?} in {}",
+                canvas_path.display()
+            );
+        }
+        Err(e) => {
+            eprintln!("meshfox node move: {e} ({})", canvas_path.display());
+            std::process::exit(1);
+        }
+    }
+}
+
+fn apply_node_move(
+    raw: &str,
+    node_id: &str,
+    before: Option<&str>,
+    after: Option<&str>,
+) -> Result<(String, String, &'static str), String> {
+    let (target_id, position, label) = match (before, after) {
+        (Some(t), None) => (t, mdcanvas::MoveSiblingPosition::Before, "before"),
+        (None, Some(t)) => (t, mdcanvas::MoveSiblingPosition::After, "after"),
+        (None, None) => return Err("exactly one of --before/--after is required".to_string()),
+        (Some(_), Some(_)) => return Err("--before and --after are mutually exclusive".to_string()),
+    };
+    let updated =
+        mdcanvas::move_sibling(raw, node_id, target_id, position).map_err(|e| e.to_string())?;
+    validate_patch(&updated)?;
+    Ok((updated, target_id.to_string(), label))
+}
+
 fn node_reorder(canvas_path: &Path) {
     let raw = read_raw_or_exit(canvas_path);
     match apply_node_reorder(&raw) {
@@ -3203,6 +3270,55 @@ Shared body.
             .unwrap()
             .extra_parents
             .is_empty());
+    }
+
+    #[test]
+    fn move_before_reorders_siblings() {
+        // "examples" comes after "tests" in TEST_DOC — move it before.
+        let (updated, target_id, label) =
+            apply_node_move(TEST_DOC, "examples", Some("tests"), None).unwrap();
+        assert_eq!(target_id, "tests");
+        assert_eq!(label, "before");
+        let order: Vec<String> = Canvas::from_markdown(&updated)
+            .unwrap()
+            .nodes
+            .iter()
+            .map(|n| n.id.clone())
+            .collect();
+        assert_eq!(order[1], "examples");
+        assert!(order.iter().position(|i| i == "examples").unwrap()
+            < order.iter().position(|i| i == "tests").unwrap());
+    }
+
+    #[test]
+    fn move_after_reorders_siblings() {
+        let (updated, ..) = apply_node_move(TEST_DOC, "tests", None, Some("examples")).unwrap();
+        let order: Vec<String> = Canvas::from_markdown(&updated)
+            .unwrap()
+            .nodes
+            .iter()
+            .map(|n| n.id.clone())
+            .collect();
+        assert!(order.iter().position(|i| i == "examples").unwrap()
+            < order.iter().position(|i| i == "tests").unwrap());
+    }
+
+    #[test]
+    fn move_requires_exactly_one_of_before_after() {
+        let err = apply_node_move(TEST_DOC, "examples", None, None).unwrap_err();
+        assert!(err.contains("exactly one"), "unexpected error: {err}");
+
+        let err = apply_node_move(TEST_DOC, "examples", Some("tests"), Some("root")).unwrap_err();
+        assert!(err.contains("mutually exclusive"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn move_rejects_non_siblings() {
+        let err = apply_node_move(TEST_DOC, "smoke-test", Some("examples"), None).unwrap_err();
+        assert!(
+            err.contains("parent"),
+            "expected a not-siblings error, got: {err}"
+        );
     }
 
     #[test]

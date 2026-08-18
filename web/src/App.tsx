@@ -30,6 +30,7 @@ import {
   reparentNode,
   renameNodeId,
   clearNodeId,
+  moveSibling,
   watchChanges,
   clearLayout,
   type RunEvent,
@@ -942,6 +943,16 @@ export default function App() {
     }
   }, []);
 
+  // MeshNode's ↑/↓ sibling-reorder buttons (auto-placed nodes only — see
+  // `MeshNodeData.onMoveUp`/`onMoveDown`) — same fire-and-surface-globally
+  // error handling as `handleNodeSettingsChange` above, nothing local to
+  // revert since the buttons themselves aren't a form.
+  const handleMoveSibling = useCallback((id: string, target: { before: string } | { after: string }) => {
+    moveSibling(id, target)
+      .then(setCanvas)
+      .catch((e) => setError(String(e)));
+  }, []);
+
   // NodeSettings' ID field commit — unlike `handleNodeSettingsChange`, this
   // rejects (rethrows) on failure so the field itself can show the error
   // and revert, rather than just surfacing the global error banner. On
@@ -1159,6 +1170,18 @@ export default function App() {
         // `positionFor` for how `x`/`y` themselves get computed.
         const rawParent = n.parent ? byId.get(n.parent) : undefined;
         const groupParent = rawParent?.type === "group" ? rawParent : undefined;
+        // Document-order neighbors among the same structural parent's
+        // children — an auto-placed node's own heading order (see
+        // `suggested` above) is its *only* sibling order, and moving it
+        // past its immediate neighbor either way is exactly what
+        // `mdcanvas::move_sibling` does. `undefined` at either end (already
+        // first/last) hides the corresponding button entirely rather than
+        // showing it disabled.
+        const siblings = canvas.nodes.filter((s) => s.parent === n.parent);
+        const siblingIdx = siblings.findIndex((s) => s.id === n.id);
+        const prevSibling = siblingIdx > 0 ? siblings[siblingIdx - 1] : undefined;
+        const nextSibling =
+          siblingIdx >= 0 && siblingIdx < siblings.length - 1 ? siblings[siblingIdx + 1] : undefined;
         const { x, y } = positionFor(n, box, byId, boxes);
         const width = n.width ?? box?.width ?? 280;
         // A group's box is a computed wrapper around its members, not
@@ -1244,6 +1267,14 @@ export default function App() {
             onRecheckConstraint: () => load(),
             onOpenFile: () => handleOpenFile(n.id),
             onAddChild: () => handleAddChild(n.id),
+            onMoveUp:
+              suggested && prevSibling
+                ? () => handleMoveSibling(n.id, { before: prevSibling.id })
+                : undefined,
+            onMoveDown:
+              suggested && nextSibling
+                ? () => handleMoveSibling(n.id, { after: nextSibling.id })
+                : undefined,
             onOpenSettings: () => setSettingsNodeId(n.id),
             onExpand: () => setExpandedNodeId(n.id),
             onSaveText: (text: string) => handleSaveText(n.id, text),
