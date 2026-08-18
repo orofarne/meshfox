@@ -1544,6 +1544,10 @@ a {
   opacity: 1;
 }
 
+.tag-editor-input-wrap {
+  position: relative;
+}
+
 .tag-editor input {
   width: 100%;
   margin-top: 0.35rem;
@@ -1553,6 +1557,44 @@ a {
   border-radius: 4px;
   background: var(--bg);
   color: var(--fg);
+}
+
+/* Autocomplete dropdown for a tag already used elsewhere in the document
+ * (see TagEditor.tsx's `suggestions`) — floats below the input rather than
+ * pushing layout around, same idea as `.node-settings-id-hint`. */
+.tag-editor-suggestions {
+  position: absolute;
+  z-index: 1;
+  top: 100%;
+  left: 0;
+  right: 0;
+  margin: 0.15rem 0 0;
+  padding: 0.25rem;
+  list-style: none;
+  border: 1px solid var(--node-border);
+  border-radius: 4px;
+  background: var(--bg);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  max-height: 8rem;
+  overflow-y: auto;
+}
+
+.tag-editor-suggestions button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  font-size: 0.82rem;
+  padding: 0.25rem 0.4rem;
+  border: none;
+  border-radius: 3px;
+  background: none;
+  color: var(--fg);
+  cursor: pointer;
+}
+
+.tag-editor-suggestions button:hover {
+  background: var(--node-border);
 }
 
 .node-settings-add-edge {

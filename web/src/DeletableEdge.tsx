@@ -36,6 +36,10 @@ export interface DeletableEdgeData {
   arrowStart?: ExtraEdgeDto["arrowStart"];
   arrowEnd?: ExtraEdgeDto["arrowEnd"];
   tags?: string[];
+  /** Every distinct tag already used anywhere in the document — offered as
+   * suggestions by this edge's own `TagEditor` (see App.tsx's
+   * `documentTags`). Extra-edge-only, like `tags` itself. */
+  existingTags?: string[];
   /** Perpendicular offset (flow-space px) from the straight source→target
    * line — set only for an extra edge that shares its node pair with
    * another (a mutual/multiple link — see App.tsx's `parallelOffsets`),
@@ -292,7 +296,7 @@ function EdgeEditorPanel({ data, onClose }: { data: DeletableEdgeData; onClose: 
             </label>
             <label className="vars-modal-field">
               <span>Tags</span>
-              <TagEditor tags={tags} onChange={setTags} />
+              <TagEditor tags={tags} onChange={setTags} suggestions={data.existingTags ?? []} />
             </label>
           </>
         )}

@@ -66,6 +66,11 @@ const VARS_FORM_PORT = 4602;
 // port, so its own ↑/↓ reorder writes never collide with any other
 // suite's server/canvas.
 const MOVE_SIBLING_PORT = 4603;
+// Fifteenth server + port for clear-node-layout.spec.ts — same reasoning
+// again, its own fixture (clear-node-layout.canvas.md, one positioned and
+// one auto-placed node) and port, so its own ↺ reset writes never collide
+// with any other suite's server/canvas.
+const CLEAR_NODE_LAYOUT_PORT = 4604;
 
 // Taller than Playwright's 720px default — the app's own `minZoom` (0.5)
 // is a hard floor on how far "fit view" can zoom out, and deps.canvas.md's
@@ -174,6 +179,11 @@ export default defineConfig({
       testMatch: /(^|\/)move-sibling\.spec\.ts$/,
       use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${MOVE_SIBLING_PORT}` },
     },
+    {
+      name: `${browser}-clear-node-layout`,
+      testMatch: /(^|\/)clear-node-layout\.spec\.ts$/,
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${CLEAR_NODE_LAYOUT_PORT}` },
+    },
   ]),
   webServer: [
     {
@@ -268,6 +278,12 @@ export default defineConfig({
     {
       command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view e2e/fixtures/move-sibling.canvas.md --port ${MOVE_SIBLING_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${MOVE_SIBLING_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view e2e/fixtures/clear-node-layout.canvas.md --port ${CLEAR_NODE_LAYOUT_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${CLEAR_NODE_LAYOUT_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },

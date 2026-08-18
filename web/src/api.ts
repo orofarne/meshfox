@@ -308,6 +308,23 @@ export async function reparentNode(id: string, newParentId: string): Promise<Can
 }
 
 /**
+ * Drops `id`'s own authored `x`/`y`/`w`/`h`, reverting it to auto-placement
+ * (`mdcanvas::set_node_meta` with position/size fields unset) — every other
+ * field (color/type/tags/...) is preserved exactly. The web UI's own
+ * per-node counterpart to the toolbar's whole-document "Auto-layout"
+ * button (`clearLayout` below) — see `MeshNode.tsx`'s ↺ button, shown only
+ * for a node that actually has a position to clear.
+ */
+export async function clearNodeLayout(id: string): Promise<CanvasDoc> {
+  const res = await fetch(`/api/nodes/${encodeURIComponent(id)}/clear-layout`, { method: "POST" });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `POST /api/nodes/${id}/clear-layout: ${res.status}`);
+  }
+  return res.json();
+}
+
+/**
  * Moves `id`'s whole subtree to sit immediately before or after another
  * sibling under the same structural parent (`mdcanvas::move_sibling`) — an
  * auto-placed node's only lever for changing its own order among siblings,

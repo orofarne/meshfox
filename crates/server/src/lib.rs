@@ -1127,6 +1127,45 @@ async fn clear_layout(State(state): State<Arc<AppState>>) -> Result<Json<Canvas>
     canvas_response(&raw, &state.canvas_path)
 }
 
+/// Clears node `id`'s own authored `x`/`y`/`w`/`h`, reverting it to
+/// auto-placement — the same per-node operation `clear_layout` above runs
+/// over every node in the document at once, narrowed to just this one
+/// (every other field — color/type/tags/...— is preserved exactly, same
+/// as there). `404` if `id` doesn't exist. Unlike `clear_layout`, this
+/// routes through `locate_node`/`commit_located` so it works on a node
+/// spliced in from an `include` too.
+async fn clear_node_layout(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Canvas>, ApiError> {
+    let primary_raw = state.raw.lock().unwrap().clone();
+    let located = locate_node(&state, &primary_raw, &id)?;
+    let canvas = parse_or_error(&located.raw)?;
+    let node = canvas
+        .node(&located.local_id)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}")))?;
+    let meta = NodeMeta {
+        x: None,
+        y: None,
+        width: None,
+        height: None,
+        color: node.color.clone(),
+        node_type: None,
+        display: node.display,
+        lang: node.lang.clone(),
+        interpreter: node.interpreter.clone(),
+        preview: Some(node.preview),
+        edge_label: node.edge_label.clone(),
+        fold: node.fold,
+        tags: node.tags.clone(),
+    };
+    let updated = mdcanvas::set_node_meta(&located.raw, &located.local_id, &meta)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}")))?;
+    commit_located(&state, &located, &updated)?;
+    let response_raw = state.raw.lock().unwrap().clone();
+    canvas_response(&response_raw, &state.canvas_path)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateNodeRequest {
@@ -3221,6 +3260,7 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/nodes/:id", patch(update_node).delete(remove_node))
         .route("/api/nodes/:id/reparent", post(reparent_node))
         .route("/api/nodes/:id/move", post(move_sibling))
+        .route("/api/nodes/:id/clear-layout", post(clear_node_layout))
         .route("/api/nodes/:id/rename-id", post(rename_node_id))
         .route("/api/nodes/:id/clear-id", post(clear_node_id))
         .route("/api/nodes/:id/file-content", get(get_node_file_content))
@@ -3352,6 +3392,58 @@ mod clear_layout_tests {
 
         let _ = std::fs::remove_file(&canvas_path);
         let _ = std::fs::remove_file(&target_path);
+    }
+
+    // TODO.canvas.md: "Способ удалить координаты для конкретной ноды" —
+    // `clear_node_layout` is `clear_layout` narrowed to one id.
+    const TWO_POSITIONED: &str = concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "## A\n<!-- meshfox:node id=\"a\" x=10 y=20 w=100 h=60 color=\"1\" tags=\"keep-me\" -->\n\nbody a\n\n",
+        "## B\n<!-- meshfox:node id=\"b\" x=200 y=300 w=100 h=60 -->\n\nbody b\n",
+    );
+
+    #[tokio::test]
+    async fn clear_node_layout_clears_only_the_target_nodes_position() {
+        let canvas_path = write_test_canvas(TWO_POSITIONED);
+        let state = build_state(canvas_path.clone(), false)
+            .await
+            .expect("valid test canvas");
+
+        let Json(updated) = match clear_node_layout(State(state), Path("a".to_string())).await {
+            Ok(json) => json,
+            Err(e) => panic!("clear-layout failed: {}", e.1),
+        };
+
+        let a = updated.node("a").expect("a still present");
+        assert_eq!(a.x, None);
+        assert_eq!(a.y, None);
+        assert_eq!(a.width, None);
+        assert_eq!(a.height, None);
+        // Every other field survives untouched.
+        assert_eq!(a.color.as_deref(), Some("1"));
+        assert_eq!(a.tags, vec!["keep-me".to_string()]);
+        // The sibling's own position is a separate node — untouched.
+        let b = updated.node("b").expect("b still present");
+        assert_eq!(b.x, Some(200.0));
+        assert_eq!(b.y, Some(300.0));
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn clear_node_layout_on_an_unknown_id_404s() {
+        let canvas_path = write_test_canvas(TWO_POSITIONED);
+        let state = build_state(canvas_path.clone(), false)
+            .await
+            .expect("valid test canvas");
+
+        let err = match clear_node_layout(State(state), Path("does-not-exist".to_string())).await {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e,
+        };
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_file(&canvas_path);
     }
 }
 
@@ -3877,6 +3969,52 @@ mod include_edit_tests {
         assert!(child_raw.find("id=\"second-leaf\"").unwrap() < child_raw.find("id=\"leaf\"").unwrap());
 
         let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn clear_node_layout_resolves_within_the_included_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-clear-node-layout-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let child_path = dir.join("child.canvas.md");
+        std::fs::write(
+            &child_path,
+            concat!(
+                "<!-- meshfox:canvas -->\n# Child\n<!-- meshfox:node id=\"root\" -->\n\nintro\n\n",
+                "## Leaf\n<!-- meshfox:node id=\"leaf\" x=50 y=60 w=100 h=60 -->\n\nleaf body\n",
+            ),
+        )
+        .unwrap();
+        let base_path = dir.join("base.canvas.md");
+        std::fs::write(
+            &base_path,
+            concat!(
+                "<!-- meshfox:canvas -->\n# Base\n<!-- meshfox:node id=\"base\" -->\n\n",
+                "## Child\n<!-- meshfox:node id=\"child\" type=\"include\" -->\n\n[child](./child.canvas.md)\n",
+            ),
+        )
+        .unwrap();
+        let base_before = std::fs::read_to_string(&base_path).unwrap();
+        let state = build_state(base_path.clone(), false)
+            .await
+            .expect("valid test canvas");
+
+        let Json(updated) =
+            match clear_node_layout(State(state), Path("child/leaf".to_string())).await {
+                Ok(json) => json,
+                Err(e) => panic!("clear-layout failed: {}", e.1),
+            };
+        let leaf = updated.node("child/leaf").expect("child/leaf present");
+        assert_eq!(leaf.x, None);
+        assert_eq!(leaf.y, None);
+        // Landed in the include target's own file, not the primary
+        // document — same contract every other mutating endpoint here has.
+        assert_eq!(std::fs::read_to_string(&base_path).unwrap(), base_before);
+        assert!(!std::fs::read_to_string(&child_path).unwrap().contains("x=50"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn expect_ok_clear(result: Result<Json<ClearNodeIdResponse>, ApiError>) -> ClearNodeIdResponse {

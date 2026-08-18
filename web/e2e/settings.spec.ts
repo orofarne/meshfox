@@ -211,3 +211,27 @@ test("the id-suggestion hint still appears for an auto-generated id that picked 
   );
   expect(await fetchRaw(page)).toBe(before);
 });
+
+// TODO.canvas.md: "Tag suggest" — the Tags field autocompletes from every
+// tag already used elsewhere in the document ("text-styled" carries
+// tags="alpha, beta" in this fixture), not just whatever's already on the
+// node being edited.
+test("the Tags field suggests tags already used elsewhere in the document", async ({ page }) => {
+  await openSettings(page, "text-plain");
+  const tagInput = page.locator(".tag-editor input");
+
+  await tagInput.fill("al");
+  await expect(page.locator(".tag-editor-suggestions button", { hasText: "alpha" })).toBeVisible();
+  await expect(page.locator(".tag-editor-suggestions button", { hasText: "beta" })).toHaveCount(0);
+
+  await page.locator(".tag-editor-suggestions button", { hasText: "alpha" }).click();
+  await expect(page.locator(".tag-chip", { hasText: "alpha" })).toBeVisible();
+  // "alpha" is already added — no longer offered, even though it still
+  // matches; "beta" (not yet added, and also contains "a") still is.
+  await tagInput.fill("a");
+  await expect(page.locator(".tag-editor-suggestions button", { hasText: "alpha", exact: true })).toHaveCount(0);
+  await expect(page.locator(".tag-editor-suggestions button", { hasText: "beta" })).toBeVisible();
+
+  await page.locator(".vars-modal-actions button", { hasText: "cancel" }).click();
+  await expect(page.locator(".node-settings-modal")).toHaveCount(0);
+});

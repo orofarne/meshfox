@@ -31,6 +31,7 @@ import {
   renameNodeId,
   clearNodeId,
   moveSibling,
+  clearNodeLayout,
   watchChanges,
   clearLayout,
   type RunEvent,
@@ -953,6 +954,15 @@ export default function App() {
       .catch((e) => setError(String(e)));
   }, []);
 
+  // MeshNode's ↺ "reset to auto-layout" button (positioned nodes only —
+  // see `MeshNodeData.onClearLayout`) — same fire-and-surface-globally
+  // error handling as the two callbacks above.
+  const handleClearNodeLayout = useCallback((id: string) => {
+    clearNodeLayout(id)
+      .then(setCanvas)
+      .catch((e) => setError(String(e)));
+  }, []);
+
   // NodeSettings' ID field commit — unlike `handleNodeSettingsChange`, this
   // rejects (rethrows) on failure so the field itself can show the error
   // and revert, rather than just surfacing the global error banner. On
@@ -1140,6 +1150,11 @@ export default function App() {
   // not run on every drag.
   useEffect(() => {
     if (!canvas) return;
+    // Every distinct tag already used anywhere in the document — offered
+    // as suggestions by `TagEditor` (node settings computes this itself
+    // from its own `allNodes` prop; an extra edge's own tags editor has no
+    // such prop, so it gets this instead — see `DeletableEdgeData.existingTags`).
+    const documentTags = Array.from(new Set(canvas.nodes.flatMap((n) => n.tags ?? [])));
     // The web client computes its own tree-aware default (see
     // `autolayout.ts`) for any node missing a real position/size — always,
     // for `group`, whose box is never stored. Dragging a node in the
@@ -1275,6 +1290,7 @@ export default function App() {
               suggested && nextSibling
                 ? () => handleMoveSibling(n.id, { after: nextSibling.id })
                 : undefined,
+            onClearLayout: suggested ? undefined : () => handleClearNodeLayout(n.id),
             onOpenSettings: () => setSettingsNodeId(n.id),
             onExpand: () => setExpandedNodeId(n.id),
             onSaveText: (text: string) => handleSaveText(n.id, text),
@@ -1482,6 +1498,7 @@ export default function App() {
             arrowStart: e.arrowStart,
             arrowEnd: e.arrowEnd,
             tags: e.tags,
+            existingTags: documentTags,
             parallelOffset: parallelOffsets.get(e.id) ?? 0,
           },
         };

@@ -116,6 +116,10 @@ export function NodeSettings({ node, allNodes, onChange, onRenameId, onClearId, 
   const addable = otherNodes.filter((n) => !extraParents.some((e) => e.from === n.id));
   const addSourceValue = addable.some((n) => n.id === addSource) ? addSource : addable[0]?.id ?? "";
   const titleOf = (nodeId: string) => allNodes.find((n) => n.id === nodeId)?.title ?? nodeId;
+  // Every distinct tag already used anywhere in the document (this node's
+  // own original tags included) — offered as suggestions by the Tags
+  // field below (see `TagEditor`'s own `suggestions` prop).
+  const documentTags = Array.from(new Set(allNodes.flatMap((n) => n.tags ?? []).concat(node.tags ?? [])));
 
   // See `initialTitle` above: the hint only shows while the id still looks
   // auto-generated (never diverged), and only when the current title's
@@ -357,7 +361,7 @@ export function NodeSettings({ node, allNodes, onChange, onRenameId, onClearId, 
         </label>
         <div className="vars-modal-field">
           <span>Tags</span>
-          <TagEditor tags={tags} onChange={setTags} />
+          <TagEditor tags={tags} onChange={setTags} suggestions={documentTags} />
         </div>
         <div className="vars-modal-field">
           <span>Incoming edges (extra)</span>

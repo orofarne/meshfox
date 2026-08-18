@@ -227,6 +227,13 @@ export interface MeshNodeData {
    * than showing it disabled. */
   onMoveUp?: () => void;
   onMoveDown?: () => void;
+  /** Drops this node's own authored `x`/`y`/`w`/`h`, reverting it to
+   * auto-placement (`mdcanvas::set_node_meta`, via `App.tsx`'s
+   * `handleClearNodeLayout`) — the per-node counterpart to the toolbar's
+   * whole-document "Auto-layout" button. `undefined` for an already
+   * auto-placed (`suggested`) node — hides the button entirely, since
+   * there's nothing authored there to clear. */
+  onClearLayout?: () => void;
   /** Opens this node's settings modal (title/type/color/target/edges). */
   onOpenSettings: () => void;
   /** file-node only — opens `target` in the OS's default application for
@@ -1284,6 +1291,16 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
                   title="Move this node after its next sibling"
                 >
                   ↓
+                </button>
+              )}
+              {data.onClearLayout && (
+                <button
+                  type="button"
+                  className="mesh-node-icon-button mesh-node-clear-layout nodrag"
+                  onClick={data.onClearLayout}
+                  title="Reset to auto-layout (clears this node's saved position/size)"
+                >
+                  ↺
                 </button>
               )}
               <button

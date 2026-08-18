@@ -463,6 +463,13 @@ enum NodeCommand {
         width: Option<f64>,
         #[arg(long = "h")]
         height: Option<f64>,
+        /// Drops any authored `x`/`y`/`w`/`h`, reverting the node to
+        /// auto-placement (the web UI's own client-side layout picks a
+        /// position/size for it again, same as a node that never had one)
+        /// — mutually exclusive with `--x`/`--y`/`--w`/`--h` in the same
+        /// call.
+        #[arg(long)]
+        clear_position: bool,
         #[arg(long)]
         color: Option<String>,
         /// `text` (the default), `file`, `link`, `group`, or `include`.
@@ -859,6 +866,7 @@ fn main() {
                 y,
                 width,
                 height,
+                clear_position,
                 color,
                 node_type,
                 display,
@@ -873,6 +881,7 @@ fn main() {
                 y,
                 width,
                 height,
+                clear_position,
                 color,
                 node_type,
                 display,
@@ -2262,6 +2271,7 @@ fn node_meta(
     y: Option<f64>,
     width: Option<f64>,
     height: Option<f64>,
+    clear_position: bool,
     color: Option<String>,
     node_type: Option<String>,
     display: Option<String>,
@@ -2278,6 +2288,7 @@ fn node_meta(
         y,
         width,
         height,
+        clear_position,
         color,
         node_type,
         display,
@@ -2308,6 +2319,7 @@ fn apply_node_meta(
     y: Option<f64>,
     width: Option<f64>,
     height: Option<f64>,
+    clear_position: bool,
     color: Option<String>,
     node_type: Option<String>,
     display: Option<String>,
@@ -2320,6 +2332,12 @@ fn apply_node_meta(
     let node = canvas
         .node(node_id)
         .ok_or_else(|| format!("no node {node_id:?}"))?;
+
+    if clear_position && (x.is_some() || y.is_some() || width.is_some() || height.is_some()) {
+        return Err(
+            "--clear-position is mutually exclusive with --x/--y/--w/--h".to_string(),
+        );
+    }
 
     let parsed_type = node_type.as_deref().map(parse_node_type).transpose()?;
     let parsed_display = display.as_deref().map(parse_display).transpose()?;
@@ -2358,10 +2376,14 @@ fn apply_node_meta(
     // value happens to be, same invariant the rejection above enforces on
     // the command-line side.
     let meta = NodeMeta {
-        x: x.or(node.x),
-        y: y.or(node.y),
-        width: if is_group { None } else { width.or(node.width) },
-        height: if is_group {
+        x: if clear_position { None } else { x.or(node.x) },
+        y: if clear_position { None } else { y.or(node.y) },
+        width: if is_group || clear_position {
+            None
+        } else {
+            width.or(node.width)
+        },
+        height: if is_group || clear_position {
             None
         } else {
             height.or(node.height)
@@ -3070,6 +3092,7 @@ Shared body.
             None,
             None,
             None,
+            false,
             None,
             None,
             None,
@@ -3097,6 +3120,7 @@ Shared body.
             None,
             Some(300.0),
             None,
+            false,
             None,
             None,
             None,
@@ -3115,6 +3139,7 @@ Shared body.
             None,
             None,
             Some(120.0),
+            false,
             None,
             None,
             None,
@@ -3136,6 +3161,7 @@ Shared body.
             Some(2000.0),
             None,
             None,
+            false,
             None,
             None,
             None,
@@ -3164,6 +3190,7 @@ Shared body.
             None,
             None,
             None,
+            false,
             None,
             None,
             None,
@@ -3189,6 +3216,7 @@ Shared body.
             None,
             None,
             None,
+            false,
             None,
             None,
             None,
@@ -3217,6 +3245,7 @@ Shared body.
             None,
             None,
             None,
+            false,
             None,
             None,
             None,
@@ -3230,6 +3259,60 @@ Shared body.
     }
 
     #[test]
+    fn meta_clear_position_drops_x_y_w_h_and_preserves_everything_else() {
+        let updated = apply_node_meta(
+            TEST_DOC,
+            "smoke-test",
+            None,
+            None,
+            None,
+            None,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let canvas = Canvas::from_markdown(&updated).unwrap();
+        let node = canvas.node("smoke-test").unwrap();
+        assert_eq!(node.x, None);
+        assert_eq!(node.y, None);
+        assert_eq!(node.width, None);
+        assert_eq!(node.height, None);
+        // untouched fields keep their prior value.
+        assert_eq!(node.color.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn meta_clear_position_rejects_being_combined_with_an_explicit_x_y_w_h() {
+        let err = apply_node_meta(
+            TEST_DOC,
+            "smoke-test",
+            Some(10.0),
+            None,
+            None,
+            None,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("mutually exclusive"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn meta_rejects_an_unknown_type_value() {
         let err = apply_node_meta(
             TEST_DOC,
@@ -3238,6 +3321,7 @@ Shared body.
             None,
             None,
             None,
+            false,
             None,
             Some("bogus".to_string()),
             None,
