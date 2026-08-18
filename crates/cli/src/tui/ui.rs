@@ -193,6 +193,33 @@ fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_stateful_widget(list, area, &mut app.list_state);
 }
 
+/// How much of a `Segment::Text`'s already-wrapped `total` rows (see
+/// `render_document` — always `Paragraph::line_count(width)`, the *actual*
+/// wrapped row count, never the raw `lines.len()`) to draw this pass:
+/// `row_offset` for `Paragraph::scroll` (applied post-wrap, so it can land
+/// partway through one long logical line, not just before/after one) and
+/// `height` for the rect, already clamped to whatever vertical room is
+/// left in the pane.
+struct TextLayout {
+    row_offset: u16,
+    height: u16,
+}
+
+/// `None` means this whole segment is above the current scroll position —
+/// the caller should skip it, carrying `skip - total` forward as the
+/// remaining skip for the next segment (mirrors `render_document`'s own
+/// loop, which is why this doesn't return the reduced skip itself: the
+/// caller already has `skip` in scope to subtract from directly).
+fn wrapped_text_layout(total: u16, skip: u16, available: u16) -> Option<TextLayout> {
+    if skip >= total {
+        return None;
+    }
+    Some(TextLayout {
+        row_offset: skip,
+        height: (total - skip).min(available),
+    })
+}
+
 fn render_document(f: &mut Frame, area: Rect, app: &App) {
     let title = app
         .rows
@@ -220,23 +247,44 @@ fn render_document(f: &mut Frame, area: Rect, app: &App) {
         }
         match seg {
             Segment::Text(lines) => {
-                let take = lines.len() as u16;
-                if skip >= take {
-                    skip -= take;
-                    continue;
-                }
-                let visible = &lines[skip as usize..];
+                // A segment's own *rendered* (word-wrapped, `inner.width`)
+                // row count can be well past `lines.len()` — a single
+                // long logical `Line` (a wordy bullet point, say) wraps
+                // into several screen rows on its own. Sizing this
+                // segment's `rect`/advancing `y` by `lines.len()` instead
+                // (as this used to) starves `Paragraph`'s own wrapping of
+                // the rows it actually needs, silently clipping the rest —
+                // and, since `y` then advances by too little, every
+                // segment after it ends up drawn overlapping the tail of
+                // this one instead of below it. `line_count` runs the
+                // exact wrapping `Paragraph` itself will use to render
+                // (unlike a hand-rolled `width()/inner.width` estimate,
+                // which can disagree with it at word-boundary edge cases),
+                // so measuring and rendering never disagree on a segment's
+                // own height. `skip`/scrolling now also count wrapped
+                // rows, via `Paragraph::scroll`'s own row offset (applied
+                // post-wrap) rather than slicing `lines` itself, since a
+                // partial skip can now land *inside* one long logical line
+                // — not just before/after one, like it always could when
+                // "line" and "row" were still the same thing.
+                let paragraph = Paragraph::new(Text::from(lines.clone())).wrap(Wrap { trim: false });
+                let total = paragraph.line_count(inner.width) as u16;
+                let layout = match wrapped_text_layout(total, skip, bottom - y) {
+                    None => {
+                        skip -= total;
+                        continue;
+                    }
+                    Some(l) => l,
+                };
                 skip = 0;
-                let height = (visible.len() as u16).min(bottom - y);
                 let rect = Rect {
                     x: inner.x,
                     y,
                     width: inner.width,
-                    height,
+                    height: layout.height,
                 };
-                let text = Text::from(visible.to_vec());
-                f.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), rect);
-                y += height;
+                f.render_widget(paragraph.scroll((layout.row_offset, 0)), rect);
+                y += layout.height;
             }
             Segment::Image { path, alt } => {
                 let protocol = app.doc_images.get(path).and_then(|o| o.as_ref());
@@ -667,6 +715,144 @@ fn render_source_file_picker(f: &mut Frame, area: Rect, se: &SourceEditorState) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A real bug, found live: the document pane used to size a
+    // `Segment::Text`'s rect (and advance `y`) by its raw `lines.len()`
+    // rather than how many rows it actually needs once word-wrapped to
+    // the pane's width — a single long bullet point (common in prose,
+    // rare in this codebase's own short example bodies, which is why this
+    // went unnoticed) wraps into several screen rows but was only ever
+    // given one, so `Paragraph`'s own wrapping silently clipped the rest,
+    // and every segment after it drew overlapping the tail of this one
+    // instead of below it (reported against README.md's own new "Source
+    // editor keybindings" node, whose long bullets tripped this exactly).
+    #[test]
+    fn wrapped_text_layout_renders_a_whole_segment_when_it_fits() {
+        let layout = wrapped_text_layout(3, 0, 10).expect("segment is below the scroll offset");
+        assert_eq!(layout.row_offset, 0);
+        assert_eq!(layout.height, 3);
+    }
+
+    #[test]
+    fn wrapped_text_layout_skips_a_whole_segment_entirely_scrolled_past() {
+        assert!(wrapped_text_layout(3, 5, 10).is_none());
+    }
+
+    #[test]
+    fn wrapped_text_layout_can_land_partway_through_a_long_wrapped_line() {
+        // `skip` (2) is less than `total` (5) — this used to only be
+        // reachable at all between whole *logical* lines; now that a
+        // segment's "rows" are wrapped rows, a scroll offset can land
+        // inside what's still just one long `Line` underneath.
+        let layout = wrapped_text_layout(5, 2, 10).unwrap();
+        assert_eq!(layout.row_offset, 2);
+        assert_eq!(layout.height, 3);
+    }
+
+    #[test]
+    fn wrapped_text_layout_clamps_height_to_the_room_left_in_the_pane() {
+        let layout = wrapped_text_layout(5, 0, 2).unwrap();
+        assert_eq!(layout.height, 2);
+    }
+
+    #[test]
+    fn a_long_wrapped_line_is_not_clipped_when_measured_with_line_count() {
+        use ratatui::buffer::Buffer;
+        use ratatui::widgets::Widget;
+
+        let long_line = "word ".repeat(40); // wraps to several rows at width 20
+        let paragraph =
+            Paragraph::new(Text::from(vec![Line::from(long_line.trim().to_string())]))
+                .wrap(Wrap { trim: false });
+        let width = 20u16;
+        let total = paragraph.line_count(width) as u16;
+        assert!(total > 1, "this line should need more than one wrapped row");
+
+        let area = Rect::new(0, 0, width, total);
+        let mut buf = Buffer::empty(area);
+        paragraph.render(area, &mut buf);
+
+        // The very last wrapped row (what a too-short rect, sized by
+        // `lines.len()` instead of `line_count`, used to cut off) must
+        // still have real content in it, not be left blank.
+        let last_row: String = (0..width)
+            .map(|x| {
+                buf.cell((x, total - 1))
+                    .and_then(|c| c.symbol().chars().next())
+                    .unwrap_or(' ')
+            })
+            .collect();
+        assert!(
+            !last_row.trim().is_empty(),
+            "the last wrapped row should still have visible text, got {last_row:?}"
+        );
+    }
+
+    // Same bug, end to end through `render_document` itself this time
+    // (the tests above cover the two pieces it's built from in isolation)
+    // — a real `App` over a real canvas file whose root body has one long
+    // bullet plus a short line right after it, rendered through a real
+    // `Terminal`/`TestBackend`. Both the long line's own tail and the
+    // short line after it must actually appear somewhere on screen — the
+    // pre-fix version clipped the former and drew the latter overlapping
+    // the former's own last (visible) row instead of below it.
+    #[test]
+    fn render_document_does_not_clip_a_long_wrapped_line_or_the_segment_after_it() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-render-document-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.canvas.md");
+        // Distinct, numbered tokens rather than one repeated word — a
+        // repeated word's own tail ("...docious") would still show up even
+        // if every repetition past the first got clipped, since it's a
+        // substring of the *first* one too; numbered tokens can't lie
+        // about which repetitions actually survived.
+        let long_line: String = (1..=8).map(|n| format!("TOKEN{n:02}")).collect::<Vec<_>>().join(" ");
+        std::fs::write(
+            &path,
+            format!(
+                "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n{long_line}\n\nTAIL-MARKER-LINE\n"
+            ),
+        )
+        .unwrap();
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = App::new(path, tx).expect("valid test canvas");
+
+        let backend = TestBackend::new(20, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let area = Rect::new(0, 0, 20, 20);
+        terminal.draw(|f| render_document(f, area, &app)).unwrap();
+
+        let buf = terminal.backend().buffer();
+        let mut screen = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if let Some(cell) = buf.cell((x, y)) {
+                    screen.push_str(cell.symbol());
+                }
+            }
+            screen.push('\n');
+        }
+        assert!(
+            screen.contains("TOKEN08"),
+            "the long line's own last wrapped row should still be on screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("TAIL-MARKER-LINE"),
+            "the short segment after the long line should be on screen, not hidden behind it:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     // TODO.canvas.md: "Цвета в TUI" — a node's own `color` (a JSON-Canvas
     // preset "1"-"6" or a literal `#rrggbb` hex) should color its title in

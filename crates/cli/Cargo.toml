@@ -18,7 +18,7 @@ rpassword = "7"
 tera = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-ratatui = "0.30.2"
+ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
 # Pinned to match what ratatui 0.30.2 itself already pulls transitively
 # (via ratatui-crossterm) and what `edtui` (see below) depends on directly
 # — keeping this at 0.28.x would mean two distinct, mutually-incompatible
