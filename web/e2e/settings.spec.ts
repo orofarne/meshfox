@@ -145,3 +145,69 @@ test("renaming the id and changing another field in the same 'ok' click both lan
   );
   expect(await fetchRaw(page)).toBe(before);
 });
+
+// TODO.canvas.md: "Если не задан id в meshfox:node, использовать заоголовок"
+// — the ID field can be left empty on "ok", which drops the node's explicit
+// `id=` attribute entirely rather than rejecting the click as incomplete.
+// "text-plain"'s id ("text-plain") deliberately doesn't match its title's
+// slug ("plain-text" — see the fixture) so this also exercises the rename +
+// reference-sweep path (`text-styled` carries `meshfox:edge from="text-plain"`),
+// not just the trivial "id already equals slug(title)" case.
+test("leaving the ID field empty on 'ok' clears the explicit id back to the title's slug", async ({ page }) => {
+  const before = await fetchRaw(page);
+
+  await openSettings(page, "text-plain");
+  const idInput = page.locator(".vars-modal-field", { hasText: "ID" }).locator("input");
+  await idInput.fill("");
+  await clickOk(page);
+
+  await expect(page.locator(".error")).toHaveCount(0);
+  const raw = await fetchRaw(page);
+  expect(raw).not.toContain('id="text-plain"');
+  expect(raw).not.toContain('from="text-plain"');
+  expect(raw).toContain('from="plain-text"');
+  // The node itself is still there, just under the slug-derived id — the
+  // client re-fetched it under the new id rather than losing track of it.
+  await expect(page.locator('.react-flow__node[data-id="plain-text"]')).toBeVisible();
+
+  await page.evaluate(
+    (raw) => fetch("/api/canvas/raw", { method: "PUT", headers: { "content-type": "text/plain" }, body: raw }),
+    before,
+  );
+  expect(await fetchRaw(page)).toBe(before);
+});
+
+// TODO.canvas.md: same item — the id-suggestion hint used to stop appearing
+// forever on any node whose auto-generated id picked up a `-2`/`-3`... dedup
+// suffix (`insert_child_node`'s own collision handling), since the gate only
+// ever compared against the bare, unsuffixed slug. Two default-titled "New
+// Node" children in a row reproduces the suffix; editing the second one's
+// title should still offer to update its id.
+test("the id-suggestion hint still appears for an auto-generated id that picked up a dedup suffix", async ({
+  page,
+}) => {
+  const before = await fetchRaw(page);
+
+  await page.locator(".mesh-node-add-child").first().click();
+  await expect(page.locator(".node-settings-modal")).toBeVisible();
+  await page.locator(".vars-modal-actions button", { hasText: "ok" }).click();
+  await expect(page.locator(".node-settings-modal")).toHaveCount(0);
+
+  await page.locator(".mesh-node-add-child").first().click();
+  await expect(page.locator(".node-settings-modal")).toBeVisible();
+  const idInput = page.locator(".vars-modal-field", { hasText: "ID" }).locator("input");
+  await expect(idInput).toHaveValue("new-node-2");
+
+  const titleInput = page.locator(".vars-modal-field", { hasText: "Title" }).locator("input");
+  await titleInput.fill("Another Node");
+  await expect(page.locator(".node-settings-id-hint")).toContainText("another-node");
+
+  await page.locator(".vars-modal-actions button", { hasText: "cancel" }).click();
+  await expect(page.locator(".node-settings-modal")).toHaveCount(0);
+
+  await page.evaluate(
+    (raw) => fetch("/api/canvas/raw", { method: "PUT", headers: { "content-type": "text/plain" }, body: raw }),
+    before,
+  );
+  expect(await fetchRaw(page)).toBe(before);
+});

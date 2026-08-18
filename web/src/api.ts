@@ -328,6 +328,28 @@ export async function renameNodeId(id: string, newId: string): Promise<CanvasDoc
   return res.json();
 }
 
+/**
+ * Drops `id`'s own explicit id, handing it back to the parser's title-slug
+ * fallback (no `id=` attribute in the `meshfox:node` comment at all, same
+ * as a hand-written one that never had one) — the "leave the ID field
+ * empty" case in `NodeSettings`. Can't fail the way `renameNodeId` can
+ * (empty/invalid/colliding): the derived id is always a fresh slug of the
+ * node's own title, deduplicated server-side. Returns the id the node
+ * actually ends up with — usually unchanged (an untouched id is already
+ * `slug(title)`), but the caller (same "id might have just changed out
+ * from under this component" situation `renameNodeId` already has) needs
+ * to know for sure rather than assume.
+ */
+export async function clearNodeId(id: string): Promise<{ id: string; doc: CanvasDoc }> {
+  const res = await fetch(`/api/nodes/${encodeURIComponent(id)}/clear-id`, { method: "POST" });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `POST /api/nodes/${id}/clear-id: ${res.status}`);
+  }
+  const body: { id: string; canvas: CanvasDoc } = await res.json();
+  return { id: body.id, doc: body.canvas };
+}
+
 // Mirrors crates/server/src/lib.rs's `RunEvent` (JSON shape, camelCase) —
 // one of these per line of /api/run's streamed `application/x-ndjson`
 // response body. `started` is always first; `killed`/`error`/`done` are

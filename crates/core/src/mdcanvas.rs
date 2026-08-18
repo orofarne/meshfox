@@ -77,6 +77,20 @@ pub enum ParseError {
         "{1} node {0:?} must have a body that is exactly one Markdown link, e.g. [label](target)"
     )]
     InvalidLinkBody(String, &'static str),
+    #[error("id {0:?} contains a forbidden character (a `\"`, a `,`, or a control character)")]
+    InvalidId(String),
+}
+
+/// Characters an id can never contain, whether typed by hand in an explicit
+/// `id="..."` attribute or passed to `rename_node_id`/`clear_node_id`: `"`
+/// would corrupt the attribute's own quoting (see `attrs.rs`, which has no
+/// escaping), and `,` would be silently torn into multiple ids wherever an
+/// id list is comma-split (`meshfox:edge from="a,b"`, `deps="id/block,..."`
+/// — see `rewrite_deps_node_id` below). Control characters (tab, newline,
+/// ...) are rejected too, out of caution — nothing legitimate needs one in
+/// an id. Plain spaces and any non-Latin script are fine.
+fn id_has_forbidden_char(id: &str) -> bool {
+    id.chars().any(|c| c == '"' || c == ',' || c.is_control())
 }
 
 impl Canvas {
@@ -560,7 +574,7 @@ pub enum RenameIdError {
     AlreadyExists(String),
     #[error("id can't be empty")]
     Empty,
-    #[error("id can't contain a `\"` character")]
+    #[error("id can't contain a `\"`, a `,`, or a control character")]
     InvalidChar,
 }
 
@@ -578,7 +592,7 @@ pub fn rename_node_id(markdown: &str, old_id: &str, new_id: &str) -> Result<Stri
     if new_id.is_empty() {
         return Err(RenameIdError::Empty);
     }
-    if new_id.contains('"') {
+    if id_has_forbidden_char(new_id) {
         return Err(RenameIdError::InvalidChar);
     }
     if new_id == old_id {
@@ -591,7 +605,7 @@ pub fn rename_node_id(markdown: &str, old_id: &str, new_id: &str) -> Result<Stri
         return Err(RenameIdError::AlreadyExists(new_id.to_string()));
     }
 
-    let mut result = set_node_id_attr(markdown, old_id, new_id)
+    let mut result = set_node_id_attr(markdown, old_id, Some(new_id))
         .ok_or_else(|| RenameIdError::NotFound(old_id.to_string()))?;
 
     // Sweep explicit `parent="old_id"` attributes (structural, but only
@@ -644,19 +658,92 @@ pub fn rename_node_id(markdown: &str, old_id: &str, new_id: &str) -> Result<Stri
     Ok(result)
 }
 
+#[derive(Debug, Error, PartialEq)]
+pub enum ClearIdError {
+    #[error("no node {0:?}")]
+    NotFound(String),
+}
+
+/// Removes node `id`'s explicit `id="..."` attribute, handing it back to
+/// the parser's own title-slug fallback (`assign_ids`: no `id=` attribute
+/// means "derive one from a slug of the title", the same rule a hand-
+/// written `meshfox:node` comment with no `id` gets for free). Returns the
+/// document plus the id the node actually has afterward — usually a slug
+/// of its current title, but re-derived fresh each time rather than
+/// memoized, so it stays correct if the title's since diverged from
+/// whatever the id used to be.
+///
+/// If that derived slug happens to already equal `id` (the common case: an
+/// explicit id nobody's touched since the node was created, still just
+/// `slug(title)`), this only drops the now-redundant attribute — nothing
+/// refers to the id by name, so there's nothing else to rewrite. Otherwise
+/// this is `rename_node_id(markdown, id, &derived)` (same reference sweep
+/// across `parent=`/`meshfox:edge from=`/`deps=`) with the `id=` attribute
+/// additionally omitted rather than written out — *if* that's actually
+/// safe (see below); falls back to leaving the attribute explicit
+/// otherwise, rather than ever risk writing back a document that no
+/// longer parses.
+///
+/// `derived_id` is computed against every *other* id already in the
+/// document, but `assign_ids` itself resolves implicit (no `id=`) ids
+/// sequentially, in document order, each one only checked against implicit
+/// ids resolved *earlier* in the same pass — not the whole document up
+/// front. So an id-less node can end up "stealing" a slug some other,
+/// still-explicit node later in the file also needs, turning what looked
+/// like a safe dedup into a hard duplicate-id parse error once this node
+/// no longer has an explicit id pinning it in place. Rare (needs a
+/// specific ordering plus a title-slug collision), but real, so this
+/// always re-parses the id-less candidate and only accepts it if the
+/// document still parses with this node resolving to exactly
+/// `derived_id`.
+pub fn clear_node_id(markdown: &str, id: &str) -> Result<(String, String), ClearIdError> {
+    let canvas =
+        Canvas::from_markdown(markdown).map_err(|_| ClearIdError::NotFound(id.to_string()))?;
+    let node = canvas
+        .node(id)
+        .ok_or_else(|| ClearIdError::NotFound(id.to_string()))?;
+
+    let segments = scan(markdown);
+    let ids = assign_ids(&segments).map_err(|_| ClearIdError::NotFound(id.to_string()))?;
+    let used: HashSet<String> = ids.iter().filter(|i| i.as_str() != id).cloned().collect();
+    let derived_id = unique_slug(&node.title, &used);
+
+    let renamed = if derived_id == id {
+        markdown.to_string()
+    } else {
+        rename_node_id(markdown, id, &derived_id).map_err(|_| ClearIdError::NotFound(id.to_string()))?
+    };
+
+    if let Some(candidate) = set_node_id_attr(&renamed, &derived_id, None) {
+        if Canvas::from_markdown(&candidate)
+            .is_ok_and(|c| c.node(&derived_id).is_some())
+        {
+            return Ok((candidate, derived_id));
+        }
+    }
+    Ok((renamed, derived_id))
+}
+
 /// Rewrites just node `old_id`'s own `meshfox:node` comment line's `id=`
 /// attribute to `new_id`, leaving every other attribute (`type`/`parent`/
 /// `x`/`y`/`w`/`h`/`color`/`display`/`lang`/`interpreter`) exactly as it
 /// already was.
 /// Doesn't touch anything that *refers* to `old_id` elsewhere in the
 /// document — see `rename_node_id`, which sweeps those separately.
-fn set_node_id_attr(markdown: &str, old_id: &str, new_id: &str) -> Option<String> {
+///
+/// `new_id: None` omits the `id=` attribute entirely instead of writing
+/// one — used by `clear_node_id` to let the parser's own title-slug
+/// fallback (`assign_ids`) take back over.
+fn set_node_id_attr(markdown: &str, old_id: &str, new_id: Option<&str>) -> Option<String> {
     let segments = scan(markdown);
     let ids = assign_ids(&segments).ok()?;
     let idx = ids.iter().position(|id| id == old_id)?;
     let seg = &segments[idx];
 
-    let mut parts = vec![format!("id=\"{new_id}\"")];
+    let mut parts = Vec::new();
+    if let Some(new_id) = new_id {
+        parts.push(format!("id=\"{new_id}\""));
+    }
     if let Some(t) = seg.node_attrs.get("type") {
         parts.push(format!("type=\"{t}\""));
     }
@@ -683,7 +770,11 @@ fn set_node_id_attr(markdown: &str, old_id: &str, new_id: &str) -> Option<String
     if let Some(t) = seg.node_attrs.get("tags") {
         parts.push(format!("tags=\"{t}\""));
     }
-    let line = format!("<!-- meshfox:node {} -->", parts.join(" "));
+    let line = if parts.is_empty() {
+        "<!-- meshfox:node -->".to_string()
+    } else {
+        format!("<!-- meshfox:node {} -->", parts.join(" "))
+    };
 
     let mut out = String::with_capacity(markdown.len() + line.len() + 1);
     match &seg.node_line_span {
@@ -1475,7 +1566,12 @@ fn assign_ids(segments: &[Segment]) -> Result<Vec<String>, ParseError> {
     let mut ids = Vec::with_capacity(segments.len());
     for seg in segments {
         let id = match seg.node_attrs.get("id") {
-            Some(v) => v.clone(),
+            Some(v) => {
+                if id_has_forbidden_char(v) {
+                    return Err(ParseError::InvalidId(v.clone()));
+                }
+                v.clone()
+            }
             None => unique_slug(&seg.title, &used),
         };
         if !used.insert(id.clone()) {
@@ -1826,6 +1922,79 @@ Reused from Tests as well.
         let doc = "# Root\n\n## My Section\n<!-- meshfox:node -->\n\nbody\n";
         let c = parse(doc).unwrap();
         assert_eq!(c.node("my-section").unwrap().title, "My Section");
+    }
+
+    #[test]
+    fn auto_id_from_title_dedupes_on_collision_at_parse_time() {
+        // Two headings, same title, neither with an explicit id — the
+        // second must not collide with the first's derived slug (mirrors
+        // `insert_child_node`'s own dedup, but exercised through
+        // `assign_ids`/`parse` directly rather than the node-creation path).
+        let doc =
+            "# Root\n\n## My Section\n<!-- meshfox:node -->\n\na\n\n## My Section\n<!-- meshfox:node -->\n\nb\n";
+        let c = parse(doc).unwrap();
+        assert_eq!(c.node("my-section").unwrap().text.trim(), "a");
+        assert_eq!(c.node("my-section-2").unwrap().text.trim(), "b");
+    }
+
+    #[test]
+    fn auto_id_from_title_falls_back_to_node_when_title_has_no_alphanumeric_characters() {
+        // `slugify("---")` is empty, so `unique_slug` substitutes "node" —
+        // two such headings must still dedupe against each other instead
+        // of silently colliding into the same id.
+        let doc = "# Root\n\n## ---\n<!-- meshfox:node -->\n\na\n\n## !!!\n<!-- meshfox:node -->\n\nb\n";
+        let c = parse(doc).unwrap();
+        assert_eq!(c.node("node").unwrap().text.trim(), "a");
+        assert_eq!(c.node("node-2").unwrap().text.trim(), "b");
+    }
+
+    #[test]
+    fn explicit_id_containing_a_comma_is_a_parse_error() {
+        // A comma silently tears an id apart wherever a comma-separated id
+        // list is parsed (`meshfox:edge from="a,b"`, `deps="id/block,..."`
+        // — see `rewrite_deps_node_id`) — rejecting it at parse time turns
+        // that into a loud, obvious error instead of a silently-wrong edge.
+        let doc = "# Root\n<!-- meshfox:node id=\"root\" -->\n\n## Section\n<!-- meshfox:node id=\"a,b\" -->\n";
+        assert_eq!(
+            parse(doc).unwrap_err(),
+            ParseError::InvalidId("a,b".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_id_with_a_space_or_non_latin_script_parses_fine() {
+        let doc = concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Section One\n<!-- meshfox:node id=\"has space\" -->\n<!-- meshfox:edge from=\"root\" -->\n\n",
+            "## Section Two\n<!-- meshfox:node id=\"раздел\" -->\n<!-- meshfox:edge from=\"has space\" -->\n",
+        );
+        let c = parse(doc).unwrap();
+        assert!(c.node("has space").is_some());
+        assert_eq!(
+            c.node("раздел").unwrap().extra_parents,
+            vec![ExtraEdge::new("has space")]
+        );
+    }
+
+    #[test]
+    fn a_node_id_containing_a_space_resolves_as_a_deps_reference() {
+        let doc = concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Build Step\n<!-- meshfox:node id=\"build step\" -->\n\n",
+            "```bash name=\"build\" cache\necho build\n```\n\n",
+            "## Deploy\n<!-- meshfox:node id=\"deploy\" -->\n\n",
+            "```bash name=\"deploy\" deps=\"build step/build\"\necho deploy\n```\n",
+        );
+        let c = parse(doc).unwrap();
+        let deploy = c.node("deploy").unwrap();
+        let blocks = crate::fence::scan_runnable_blocks("deploy", &deploy.text);
+        assert_eq!(
+            blocks[0].deps,
+            vec![crate::fence::BlockRef {
+                node_id: Some("build step".to_string()),
+                block_name: "build".to_string()
+            }]
+        );
     }
 
     #[test]
@@ -2988,6 +3157,25 @@ Reused from Tests as well.
     }
 
     #[test]
+    fn rename_node_id_rejects_a_comma() {
+        assert_eq!(
+            rename_node_id(DOC, "tests", "a,b"),
+            Err(RenameIdError::InvalidChar)
+        );
+    }
+
+    #[test]
+    fn rename_node_id_accepts_a_space_or_non_latin_script() {
+        let updated = rename_node_id(DOC, "tests", "has space").unwrap();
+        let c = parse(&updated).unwrap();
+        assert_eq!(c.node("has space").unwrap().title, "Tests");
+
+        let updated = rename_node_id(DOC, "tests", "раздел").unwrap();
+        let c = parse(&updated).unwrap();
+        assert_eq!(c.node("раздел").unwrap().title, "Tests");
+    }
+
+    #[test]
     fn rename_node_id_sweeps_meshfox_edge_from_references() {
         // "shared-smoke" declares `<!-- meshfox:edge from="tests" -->` —
         // renaming "tests" must update that reference too, or the document
@@ -3040,6 +3228,88 @@ Reused from Tests as well.
                     block_name: "other".to_string()
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn clear_node_id_drops_the_attribute_when_the_id_already_matches_the_title_slug() {
+        // "tests" is already exactly `slugify("Tests")` — clearing it has
+        // nothing to rename, just the now-redundant attribute to drop.
+        let (updated, new_id) = clear_node_id(DOC, "tests").unwrap();
+        assert_eq!(new_id, "tests");
+        assert!(!updated.contains(r#"id="tests""#));
+        let c = parse(&updated).unwrap();
+        assert_eq!(c.node("tests").unwrap().title, "Tests");
+        // Everything that referenced "tests" by id must still resolve —
+        // clearing shouldn't have silently broken cross-references.
+        assert_eq!(
+            c.node("shared-smoke").unwrap().extra_parents,
+            vec![ExtraEdge::new("tests")]
+        );
+    }
+
+    #[test]
+    fn clear_node_id_rederives_and_sweeps_references_when_the_id_diverged_from_the_title() {
+        // Give "tests" a custom id that no longer matches its title's
+        // slug — clearing it now must (a) actually rename it back to
+        // `slugify(title)` and (b) sweep every reference to the old id,
+        // exactly like `rename_node_id` does.
+        let renamed = rename_node_id(DOC, "tests", "custom-id").unwrap();
+        let (updated, new_id) = clear_node_id(&renamed, "custom-id").unwrap();
+        assert_eq!(new_id, "tests");
+        assert!(!updated.contains(r#"id="tests""#));
+        assert!(!updated.contains("custom-id"));
+        let c = parse(&updated).unwrap();
+        assert_eq!(c.node("tests").unwrap().title, "Tests");
+        assert_eq!(
+            c.node("shared-smoke").unwrap().extra_parents,
+            vec![ExtraEdge::new("tests")]
+        );
+    }
+
+    #[test]
+    fn clear_node_id_dedupes_the_derived_slug_against_other_ids() {
+        // Renaming "tests" to something whose title-slug ("examples")
+        // would collide with the unrelated "examples" node already in
+        // DOC (which comes *later* in the document) — clearing it must
+        // fall back to the same `-2` dedup `unique_slug` uses everywhere
+        // else, and the result must actually still parse (see
+        // `clear_node_id`'s own doc comment on why that's not a given:
+        // this exact setup — an id-less node whose title-slug matches a
+        // later node's still-explicit id — is precisely the case where
+        // going fully id-less would otherwise re-derive a colliding id at
+        // parse time instead).
+        let doc = rename_node_id(DOC, "tests", "renamed-tests").unwrap();
+        let doc = set_node_title(&doc, "renamed-tests", "Examples").unwrap();
+        let (updated, new_id) = clear_node_id(&doc, "renamed-tests").unwrap();
+        assert_eq!(new_id, "examples-2");
+        let c = parse(&updated).unwrap();
+        assert!(c.node("examples-2").is_some());
+        assert!(c.node("examples").is_some());
+    }
+
+    #[test]
+    fn clear_node_id_keeps_an_explicit_attribute_when_going_id_less_would_reparse_wrong() {
+        // Same setup as the dedup test above: going fully id-less here
+        // would make `assign_ids` re-derive plain "examples" for this
+        // node (it comes first in the file, so it "wins" the bare slug
+        // before the real "examples" node is even reached) — a silent
+        // swap of *which* node answers to "examples" at best, a
+        // duplicate-id parse error at worst. `clear_node_id` must detect
+        // this and keep an explicit `id="examples-2"` instead of dropping
+        // the attribute.
+        let doc = rename_node_id(DOC, "tests", "renamed-tests").unwrap();
+        let doc = set_node_title(&doc, "renamed-tests", "Examples").unwrap();
+        let (updated, new_id) = clear_node_id(&doc, "renamed-tests").unwrap();
+        assert_eq!(new_id, "examples-2");
+        assert!(updated.contains(r#"id="examples-2""#));
+    }
+
+    #[test]
+    fn clear_node_id_rejects_missing_node() {
+        assert_eq!(
+            clear_node_id(DOC, "does-not-exist"),
+            Err(ClearIdError::NotFound("does-not-exist".to_string()))
         );
     }
 }

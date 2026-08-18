@@ -29,6 +29,7 @@ import {
   deleteNode,
   reparentNode,
   renameNodeId,
+  clearNodeId,
   watchChanges,
   clearLayout,
   type RunEvent,
@@ -955,6 +956,22 @@ export default function App() {
       touchedNodeIds.current.delete(id);
       touchedNodeIds.current.add(newId);
     }
+  }, []);
+
+  // NodeSettings' "leave the ID field empty" commit — same "id might have
+  // just changed out from under this component" bookkeeping as
+  // `handleNodeIdChange` above, except the resulting id isn't known up
+  // front (it's whatever the server derived from the title), so it comes
+  // back from `clearNodeId` itself rather than being passed in.
+  const handleNodeIdClear = useCallback(async (id: string) => {
+    const { id: newId, doc } = await clearNodeId(id);
+    setCanvas(doc);
+    setSettingsNodeId((cur) => (cur === id ? newId : cur));
+    if (touchedNodeIds.current.has(id)) {
+      touchedNodeIds.current.delete(id);
+      touchedNodeIds.current.add(newId);
+    }
+    return newId;
   }, []);
 
   // Deletes a node — `mode` is the delete-confirm dialog's choice of what
@@ -2215,6 +2232,7 @@ export default function App() {
           allNodes={canvas?.nodes ?? []}
           onChange={handleNodeSettingsChange}
           onRenameId={handleNodeIdChange}
+          onClearId={handleNodeIdClear}
           onClose={() => setSettingsNodeId(null)}
         />
       )}

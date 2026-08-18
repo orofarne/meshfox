@@ -1991,6 +1991,54 @@ async fn rename_node_id(
     canvas_response(&response_raw, &state.canvas_path)
 }
 
+#[derive(Debug, Serialize)]
+struct ClearNodeIdResponse {
+    /// The id node `id` (the path param) actually has *after* clearing —
+    /// usually unchanged in practice (an untouched auto-generated id is
+    /// already `slug(title)`, so there's nothing to rename, just the now-
+    /// redundant attribute to drop), but potentially a freshly-derived
+    /// slug if the title's since diverged. Composed with its include
+    /// namespace already, same shape as every id in `canvas` — the client
+    /// has no other way to learn it, since it isn't necessarily the id it
+    /// asked to clear.
+    id: String,
+    canvas: Canvas,
+}
+
+/// Removes node `id`'s own explicit `id="..."` attribute
+/// (`mdcanvas::clear_node_id`), handing it back to the parser's title-slug
+/// fallback — the same rule a hand-written `meshfox:node` comment with no
+/// `id=` at all already gets. `404` if `id` doesn't exist; can't otherwise
+/// fail the way `rename_node_id` can (empty/invalid/colliding), since the
+/// derived id is always a slug of the node's own already-valid title,
+/// deduplicated against every other id already in the document.
+async fn clear_node_id(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ClearNodeIdResponse>, ApiError> {
+    let primary_raw = state.raw.lock().unwrap().clone();
+    let located = locate_node(&state, &primary_raw, &id)?;
+    let (updated, local_new_id) = mdcanvas::clear_node_id(&located.raw, &located.local_id)
+        .map_err(|e| ApiError(StatusCode::NOT_FOUND, e.to_string()))?;
+    parse_or_error(&updated)?;
+    commit_located(&state, &located, &updated)?;
+    let response_raw = state.raw.lock().unwrap().clone();
+    let Json(canvas) = canvas_response(&response_raw, &state.canvas_path)?;
+    let new_id = match &located.origin {
+        None => local_new_id,
+        Some(origin) => canvas
+            .nodes
+            .iter()
+            .find(|n| {
+                n.origin_id.as_deref() == Some(local_new_id.as_str())
+                    && n.origin_path.as_deref() == origin.to_str()
+            })
+            .map(|n| n.id.clone())
+            .unwrap_or(local_new_id),
+    };
+    Ok(Json(ClearNodeIdResponse { id: new_id, canvas }))
+}
+
 /// Runs the requested block plus — automatically, same as the CLI, unless
 /// `no_deps` is set — every block it transitively `deps=`-depends on, in
 /// dependency order, stopping early if a step exits non-zero (running what
@@ -3101,6 +3149,7 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/nodes/:id", patch(update_node).delete(remove_node))
         .route("/api/nodes/:id/reparent", post(reparent_node))
         .route("/api/nodes/:id/rename-id", post(rename_node_id))
+        .route("/api/nodes/:id/clear-id", post(clear_node_id))
         .route("/api/nodes/:id/file-content", get(get_node_file_content))
         .route("/api/nodes/:id/run", post(run_file_node))
         .route("/api/nodes/:id/open", post(open_node_file))
@@ -3547,6 +3596,133 @@ mod include_edit_tests {
             .node("child/renamed-leaf")
             .expect("renamed node present under its new namespaced id");
         assert_eq!(renamed.title, "Leaf");
+
+        let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
+    }
+
+    fn expect_ok_clear(result: Result<Json<ClearNodeIdResponse>, ApiError>) -> ClearNodeIdResponse {
+        match result {
+            Ok(Json(body)) => body,
+            Err(e) => panic!("request failed: {}", e.1),
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_node_id_drops_the_attribute_on_the_primary_document() {
+        let base_path = write_base_and_child_canvas();
+        let state = build_state(base_path.clone(), false)
+            .await
+            .expect("valid test canvas");
+
+        let body = expect_ok_clear(clear_node_id(State(state), Path("base".to_string())).await);
+
+        assert_eq!(body.id, "base");
+        assert!(body.canvas.node("base").is_some());
+        assert!(!std::fs::read_to_string(&base_path)
+            .unwrap()
+            .contains(r#"id="base""#));
+
+        let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn clear_node_id_resolves_within_the_included_file_and_reports_the_namespaced_id() {
+        let base_path = write_base_and_child_canvas();
+        let child_path = base_path.parent().unwrap().join("child.canvas.md");
+        let state = build_state(base_path.clone(), false)
+            .await
+            .expect("valid test canvas");
+
+        // "leaf"'s id is already `slugify("Leaf")` — clearing it should be
+        // a no-op rename, just dropping the now-redundant attribute, still
+        // reachable under the same namespaced id afterward.
+        let body = expect_ok_clear(clear_node_id(State(state), Path("child/leaf".to_string())).await);
+
+        assert_eq!(body.id, "child/leaf");
+        assert!(body.canvas.node("child/leaf").is_some());
+        assert!(!std::fs::read_to_string(&child_path).unwrap().contains(r#"id="leaf""#));
+        // The primary document itself is untouched — same "writes into the
+        // include target, not base.canvas.md" contract every other
+        // mutating endpoint here already has.
+        assert!(!std::fs::read_to_string(&base_path).unwrap().contains("leaf"));
+
+        let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn clear_node_id_rederives_from_the_title_when_the_id_had_diverged() {
+        let base_path = write_base_and_child_canvas();
+        let state = build_state(base_path.clone(), false)
+            .await
+            .expect("valid test canvas");
+
+        expect_ok(
+            rename_node_id(
+                State(state.clone()),
+                Path("child/leaf".to_string()),
+                Json(RenameNodeIdRequest {
+                    new_id: "custom-id".to_string(),
+                }),
+            )
+            .await,
+        );
+
+        let body =
+            expect_ok_clear(clear_node_id(State(state), Path("child/custom-id".to_string())).await);
+
+        assert_eq!(body.id, "child/leaf");
+        assert!(body.canvas.node("child/leaf").is_some());
+        assert!(body.canvas.node("child/custom-id").is_none());
+
+        let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn clear_node_id_on_an_unknown_id_404s() {
+        let base_path = write_base_and_child_canvas();
+        let state = build_state(base_path.clone(), false)
+            .await
+            .expect("valid test canvas");
+
+        let err = match clear_node_id(State(state), Path("does-not-exist".to_string())).await {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e,
+        };
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_node_id_containing_a_space_round_trips_through_rename_and_update() {
+        // TODO.canvas.md: ids in arbitrary scripts/with spaces shouldn't
+        // break routing (`Path<String>` extraction) or reference tracking
+        // — exercised here on the primary document; the client's own
+        // `encodeURIComponent` on every id-bearing request handles the
+        // transport side (see `web/src/api.ts`).
+        let base_path = write_base_and_child_canvas();
+        let state = build_state(base_path.clone(), false)
+            .await
+            .expect("valid test canvas");
+
+        expect_ok(
+            rename_node_id(
+                State(state.clone()),
+                Path("base".to_string()),
+                Json(RenameNodeIdRequest {
+                    new_id: "has space".to_string(),
+                }),
+            )
+            .await,
+        );
+
+        let mut req = blank_update_request();
+        req.text = Some("updated via a spaced id".to_string());
+        let updated = expect_ok(update_node(State(state), Path("has space".to_string()), Json(req)).await);
+        assert_eq!(
+            updated.node("has space").unwrap().text,
+            "updated via a spaced id"
+        );
 
         let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
     }
