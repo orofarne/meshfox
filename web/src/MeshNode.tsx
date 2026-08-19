@@ -196,6 +196,12 @@ export interface MeshNodeData {
   /** JSON Canvas color — either a hex string or a preset `"1"`-`"6"` (see
    * `resolveNodeColor`) — `undefined`/empty means no color was set. */
   color?: string;
+  /** `color`, or, when unset, a fallback derived from this node's tags
+   * against the document's `meshfox:tag-color` defaults — see
+   * `CanvasNode.effectiveColor`. Rendering (the title-bar accent below)
+   * uses this, not `color` — `color` alone stays the raw value NodeSettings
+   * edits. */
+  effectiveColor?: string;
   /** Free-form labels, shown as small chips under the title — purely
    * descriptive, no structural meaning. */
   tags?: string[];
@@ -1028,7 +1034,7 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
   const [editingText, setEditingText] = useState(false);
   const isTextNode = data.nodeType === "text";
   const isGroup = data.nodeType === "group";
-  const nodeColor = resolveNodeColor(data.color);
+  const nodeColor = resolveNodeColor(data.effectiveColor ?? data.color);
   // A heading-only node (no body Markdown at all) has nothing to show in
   // its body area — while read-only, that's just dead space under a
   // left-aligned title, so it gets a distinct, centered-title layout

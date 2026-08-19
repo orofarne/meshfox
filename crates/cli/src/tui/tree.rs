@@ -23,12 +23,15 @@ pub struct TreeRow {
     /// only when every one of them passed, `None` when the node has no
     /// constraint fences at all.
     pub constraint_ok: Option<bool>,
-    /// The node's own `color` attribute, verbatim (a JSON-Canvas preset
-    /// `"1"`-`"6"` or a literal `#rrggbb` hex string) — resolved to an
-    /// actual `ratatui::style::Color` at render time, not here (see
-    /// `ui::render_tree`), same "keep the raw value on the model, resolve
-    /// it where it's drawn" split `web/src/MeshNode.tsx`'s `resolveNodeColor`
-    /// already uses. `None` means no color was set.
+    /// `node.effective_color` — the node's own explicit `color=`, or (see
+    /// `meshfox_core::tag_colors::effective_color`) a fallback derived from
+    /// its tags against the document's `meshfox:tag-color` defaults.
+    /// Still a JSON-Canvas preset `"1"`-`"6"` or a literal `#rrggbb` hex
+    /// string either way — resolved to an actual `ratatui::style::Color`
+    /// at render time, not here (see `ui::render_tree`), same "keep the raw
+    /// value on the model, resolve it where it's drawn" split
+    /// `web/src/MeshNode.tsx`'s `resolveNodeColor` already uses. `None`
+    /// means neither applies.
     pub color: Option<String>,
     /// The node's own `tags` attribute, verbatim — empty means none.
     pub tags: Vec<String>,
@@ -70,7 +73,7 @@ fn visit(
         has_cache: blocks.iter().any(|b| b.cache),
         has_tty: blocks.iter().any(|b| b.tty),
         constraint_ok,
-        color: node.color.clone(),
+        color: node.effective_color.clone(),
         tags: node.tags.clone(),
     });
 
@@ -78,5 +81,29 @@ fn visit(
         for child in children {
             visit(canvas, child, depth + 1, expanded, rows);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // TODO.canvas.md: "Node colour by tag" — `TreeRow.color` reads
+    // `node.effective_color`, populated by the caller (`App`'s
+    // `resolve_includes`) before `flatten` ever runs, same as
+    // `constraint_results`.
+    #[test]
+    fn flatten_uses_a_nodes_effective_color_not_its_raw_color() {
+        let mut canvas = meshfox_core::Canvas::from_markdown(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n",
+            "<!-- meshfox:tag-color tag=\"bug\" color=\"1\" -->\n\n",
+            "## Child\n<!-- meshfox:node id=\"child\" tags=\"bug\" -->\n\nbody\n",
+        ))
+        .unwrap();
+        meshfox_core::annotate_effective_colors(&mut canvas);
+
+        let rows = flatten(&canvas, &HashSet::new());
+        let child = rows.iter().find(|r| r.node_id == "child").unwrap();
+        assert_eq!(child.color.as_deref(), Some("1"));
     }
 }

@@ -57,6 +57,13 @@ export interface CanvasNode {
   width?: number;
   height?: number;
   color?: string;
+  /** This node's own `color`, or, when absent, a fallback derived from its
+   * tags against the document's `meshfox:tag-color` defaults — mirrors
+   * `crates/core/src/canvas.rs`'s `Node.effective_color`
+   * (`crates/core/src/tag_colors.rs`). Always present when `color` is;
+   * use this (not `color`) for anything that *renders* a node's color —
+   * `color` itself stays the raw, editable value (see NodeSettings). */
+  effectiveColor?: string;
   /** Per-node fold-state override (`fold="true"`/`fold="false"` on
    * `meshfox:node`) — see SPEC.md's "Options" section. Absent means "no
    * override": follow the document's own default (`CanvasDoc.options`'

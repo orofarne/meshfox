@@ -737,7 +737,52 @@ fn canvas_response(raw: &str, canvas_path: &std::path::Path) -> Result<Json<Canv
     // loudly, same split `vars`/constraint fences already have between
     // "parses enough to view" and "fully valid".
     canvas.options = meshfox_core::declared_options(&canvas).unwrap_or_default();
+    // Same best-effort split for `meshfox:tag-color` — a malformed
+    // declaration just means no node falls back to a tag-derived color
+    // this fetch, not a broken canvas view.
+    meshfox_core::annotate_effective_colors(&mut canvas);
     Ok(Json(canvas))
+}
+
+// TODO.canvas.md: "Node colour by tag" — `canvas_response`'s own
+// `annotate_effective_colors` call.
+#[cfg(test)]
+mod canvas_response_tag_color_tests {
+    use super::*;
+
+    fn expect_ok(result: Result<Json<Canvas>, ApiError>) -> Canvas {
+        match result {
+            Ok(Json(canvas)) => canvas,
+            Err(e) => panic!("unexpected error: {}", e.1),
+        }
+    }
+
+    #[test]
+    fn a_node_with_no_explicit_color_gets_effective_color_from_its_tag() {
+        let raw = concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n",
+            "<!-- meshfox:tag-color tag=\"bug\" color=\"1\" -->\n\n",
+            "## Child\n<!-- meshfox:node id=\"child\" tags=\"bug\" -->\n\nbody\n",
+        );
+        let canvas = expect_ok(canvas_response(raw, std::path::Path::new("test.canvas.md")));
+        let child = canvas.nodes.iter().find(|n| n.id == "child").unwrap();
+        assert_eq!(child.color, None);
+        assert_eq!(child.effective_color.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn a_malformed_tag_color_declaration_does_not_break_the_response() {
+        // Missing color= makes `declared_tag_colors` error — best-effort
+        // display shouldn't break the whole canvas fetch over it.
+        let raw = concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n",
+            "<!-- meshfox:tag-color tag=\"bug\" -->\n\n",
+            "## Child\n<!-- meshfox:node id=\"child\" tags=\"bug\" -->\n\nbody\n",
+        );
+        let canvas = expect_ok(canvas_response(raw, std::path::Path::new("test.canvas.md")));
+        let child = canvas.nodes.iter().find(|n| n.id == "child").unwrap();
+        assert_eq!(child.effective_color, None);
+    }
 }
 
 async fn get_canvas(State(state): State<Arc<AppState>>) -> Result<Json<Canvas>, ApiError> {

@@ -1642,6 +1642,12 @@ fn resolve_includes(canvas: &Canvas, canvas_path: &Path) -> Canvas {
     let canvas_dir = canvas_path.parent().filter(|p| !p.as_os_str().is_empty());
     let canvas_dir = Some(canvas_dir.unwrap_or(Path::new(".")));
     meshfox_core::constraint::annotate_status(&mut resolved, canvas_dir);
+    // Same "populate before flatten reads it" idiom as `constraint_results`
+    // right above, for `meshfox:tag-color` (TODO.canvas.md: "Node colour by
+    // tag") — best-effort, a malformed declaration just means no node
+    // falls back to a tag-derived color, same split `meshfox validate`
+    // otherwise catches loudly.
+    meshfox_core::annotate_effective_colors(&mut resolved);
     resolved
 }
 

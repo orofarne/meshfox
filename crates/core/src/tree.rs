@@ -113,6 +113,7 @@ mod tests {
             edge_label: None,
             text: text.to_string(),
             constraint_results: Vec::new(),
+            effective_color: None,
             asset_base: None,
             origin_path: None,
             origin_id: None,

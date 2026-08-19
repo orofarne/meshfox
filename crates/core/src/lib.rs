@@ -19,6 +19,7 @@ pub mod mdcanvas;
 pub mod options;
 pub mod output;
 pub mod staticgen;
+pub mod tag_colors;
 pub mod tree;
 pub mod varcache;
 pub mod varout;
@@ -37,6 +38,9 @@ pub use mdcanvas::{parse_fold_override, NodeMeta, ParseError};
 pub use options::{declared_options, OptionsError};
 pub use output::{write_output, ExecOutput};
 pub use staticgen::{Asset, EdgeView, NodeView, Position, SiteData};
+pub use tag_colors::{
+    annotate_effective_colors, declared_tag_colors, effective_color, TagColorError,
+};
 pub use tree::{RunnableBlock, TreeError};
 pub use varcache::VarCache;
 pub use varout::{
@@ -70,6 +74,9 @@ pub fn validate_known_attrs(markdown: &str) -> Result<(), UnknownAttrError> {
         return Err(e);
     }
     if let Some(e) = fence::unknown_fence_attr(markdown) {
+        return Err(e);
+    }
+    if let Some(e) = tag_colors::unknown_tag_color_attr(markdown) {
         return Err(e);
     }
     Ok(())

@@ -1273,6 +1273,7 @@ export default function App() {
             preview: n.preview,
             text: n.text,
             color: n.color,
+            effectiveColor: n.effectiveColor,
             tags: n.tags,
             assetBase: n.assetBase,
             plainMarkdownInclude: n.plainMarkdownInclude,

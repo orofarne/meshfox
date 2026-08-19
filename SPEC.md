@@ -762,6 +762,37 @@ also has an "options" button that toggles a known option (currently just
 An unrecognized declaration already in the file is left exactly as-is
 either way, whichever recognized ones are also toggled alongside it.
 
+## Tag colors
+
+A node's `color=` (a JSON-Canvas preset `"1"`-`"6"` or a literal
+`#rrggbb` hex string) is normally set per node. `meshfox:tag-color`
+declares a document-wide default instead: any node carrying a given tag,
+with no `color=` of its own, picks up that tag's color automatically.
+Same placement restriction as `meshfox:var`/`meshfox:option` — **only
+inside the root node's own body** — and the same reasoning: the default
+applies to the whole document, not one node.
+
+    <!-- meshfox:tag-color tag="bug" color="1" -->
+    <!-- meshfox:tag-color tag="feature" color="4" -->
+
+One declaration per tag rather than one comment listing every tag — a
+tag name may contain spaces or other characters a bare `key="value"`
+token can't safely stand in for, so `tag=` and `color=` each get their
+own quoted value.
+
+Precedence, checked in this order:
+
+1. The node's own explicit `color=`, if it has one — always wins.
+2. Otherwise, the color declared for the first of the node's own `tags`
+   (in the order written on that node) that has one.
+3. Otherwise, no color — same as today.
+
+A `meshfox:tag-color` missing `tag=` or `color=`, or the same `tag`
+declared twice, is a `meshfox validate` error — every other reader
+(`run`/`view`/`tui`, the server) falls back to no tag-derived colors at
+all rather than breaking, same best-effort split `meshfox:option` above
+has between "parses enough to view" and "fully valid".
+
 ## Cached output
 
 Running a `cache`d block writes/updates a fenced block immediately after the

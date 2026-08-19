@@ -127,6 +127,10 @@ pub struct NodeView {
     /// comment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position: Option<Position>,
+    /// The node's own explicit `color`, or a fallback derived from its
+    /// tags against the document's `meshfox:tag-color` defaults — whatever
+    /// `node.effective_color` already resolved to (`crate::tag_colors`).
+    /// `None` when neither applies, or the caller never annotated it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
     pub tags: Vec<String>,
@@ -230,11 +234,13 @@ pub fn build(canvas: &Canvas, canvas_dir: &Path, base_url: Option<&str>) -> (Sit
         .find(|n| n.parent.is_none())
         .expect("a parsed canvas always has a root");
     let (folded_ids, foldable_ids) = resolve_default_fold(canvas, &root_node.id);
+    let tag_colors = crate::tag_colors::declared_tag_colors(canvas).unwrap_or_default();
     let ctx = RenderCtx {
         canvas_dir: &canvas_dir,
         base_url,
         folded_ids: &folded_ids,
         foldable_ids: &foldable_ids,
+        tag_colors: &tag_colors,
     };
 
     let mut assets: Vec<Asset> = Vec::new();
@@ -301,7 +307,7 @@ fn build_node_view(
         node_type: node.node_type.as_str(),
         depth,
         position,
-        color: node.color.clone(),
+        color: crate::tag_colors::effective_color(node, ctx.tag_colors).map(str::to_string),
         tags: node.tags.clone(),
         html_body,
         target,
@@ -405,6 +411,13 @@ struct RenderCtx<'a> {
     /// node by `build_node_view`.
     folded_ids: &'a std::collections::HashSet<String>,
     foldable_ids: &'a std::collections::HashSet<String>,
+    /// This document's own `meshfox:tag-color` defaults (see
+    /// `crate::tag_colors`) — computed once in `build`, consulted per node
+    /// by `build_node_view` via `tag_colors::effective_color`. A malformed
+    /// declaration just resolves to empty here (no node falls back to a
+    /// tag-derived color, same as if none were declared) — `meshfox
+    /// validate` is what surfaces that loudly, not a site/PDF export.
+    tag_colors: &'a std::collections::HashMap<String, String>,
 }
 
 /// GFM-flavored Markdown -> HTML, with meshfox's own fence attributes
@@ -719,6 +732,31 @@ mod tests {
         assert_eq!(root.tags, vec!["a".to_string(), "b".to_string()]);
         assert!(root.html_body.contains("hello"));
         assert_eq!(site.title, "Root");
+    }
+
+    // TODO.canvas.md: "Node colour by tag" — `build`'s own resolution of
+    // `NodeView.color`, end to end through `declared_tag_colors`/
+    // `effective_color`.
+    #[test]
+    fn a_node_with_no_explicit_color_falls_back_to_its_first_matching_tags_color() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n",
+            "<!-- meshfox:tag-color tag=\"bug\" color=\"1\" -->\n\n",
+            "## Child\n<!-- meshfox:node id=\"child\" tags=\"untagged,bug\" -->\n\nbody\n",
+        ));
+        let site = build_site(&c);
+        assert_eq!(site.find("child").unwrap().color.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn an_explicit_color_wins_over_a_tag_default() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n",
+            "<!-- meshfox:tag-color tag=\"bug\" color=\"1\" -->\n\n",
+            "## Child\n<!-- meshfox:node id=\"child\" color=\"3\" tags=\"bug\" -->\n\nbody\n",
+        ));
+        let site = build_site(&c);
+        assert_eq!(site.find("child").unwrap().color.as_deref(), Some("3"));
     }
 
     #[test]

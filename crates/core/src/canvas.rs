@@ -278,6 +278,17 @@ pub struct Node {
     /// node's constraints (or it has none), not that they passed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub constraint_results: Vec<crate::constraint::ConstraintStatus>,
+    /// This node's own `color`, or, when unset, whatever
+    /// `crate::tag_colors::effective_color` derives from its tags against
+    /// the document's declared `meshfox:tag-color` defaults — display
+    /// only, same "never set by `mdcanvas::parse` itself, only by whatever
+    /// consumer wants it" convention as `constraint_results` right above.
+    /// `None` means neither an explicit color nor a matching tag default
+    /// applies (or this consumer never bothered to populate it), same as
+    /// `color` being unset always used to mean everywhere before this
+    /// field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_color: Option<String>,
     /// Absolute directory a relative asset reference (an `![](...)` image,
     /// or a plain link) inside this node's `text` should resolve against,
     /// when that differs from the including document's own directory —
