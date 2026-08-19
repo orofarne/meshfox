@@ -9,7 +9,9 @@
 
 use std::path::{Path, PathBuf};
 
-use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{
+    Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
+};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use syntect::easy::HighlightLines;
@@ -22,7 +24,19 @@ use syntect::parsing::SyntaxSet;
 /// bottom, never nested past what indentation-as-text already conveys.
 pub enum Segment {
     Text(Vec<Line<'static>>),
-    Image { path: PathBuf, alt: String },
+    Image {
+        path: PathBuf,
+        alt: String,
+        /// `{width=NN%}`/`{height=NN%}` right after the image (see
+        /// `meshfox_core::image_attrs`) — a terminal has no pixel grid to
+        /// map an absolute `width=300` onto, so only the `%` form is
+        /// honored here: it scales `app::load_image_protocol`'s own fixed
+        /// size budget. A literal `width=300` (no `%`) is parsed but has
+        /// no effect in the TUI — same "narrow support, no crash" fallback
+        /// the rest of this syntax uses elsewhere.
+        width_percent: Option<u32>,
+        height_percent: Option<u32>,
+    },
 }
 
 /// Loads syntect's bundled (compiled-in, no on-disk assets) syntax/theme
@@ -147,6 +161,37 @@ const HEADING_COLORS: [Color; 6] = [
     Color::Gray,
 ];
 
+/// Icon, label, and terminal color for a GFM alert blockquote's title
+/// line (`Tag::BlockQuote(Some(kind))`) — same five roles and, loosely,
+/// the same colors as `site-template/style.css`'s own `--alert-*`
+/// variables, so the type reads the same way across every renderer.
+fn alert_style(kind: BlockQuoteKind) -> (&'static str, &'static str, Color) {
+    match kind {
+        BlockQuoteKind::Note => ("ℹ", "Note", Color::LightBlue),
+        BlockQuoteKind::Tip => ("💡", "Tip", Color::LightGreen),
+        BlockQuoteKind::Important => ("❗", "Important", Color::LightMagenta),
+        BlockQuoteKind::Warning => ("⚠", "Warning", Color::LightYellow),
+        BlockQuoteKind::Caution => ("🛑", "Caution", Color::LightRed),
+    }
+}
+
+/// An inline footnote-reference marker (`Event::FootnoteReference`) —
+/// real Unicode superscript when every character of `label` has one (see
+/// `meshfox_core::subsup::to_unicode`; true for the common case of a
+/// plain numeric label like `"1"`), falling back to a bracketed literal
+/// (`[note]`) otherwise, same "don't half-transliterate" fallback the
+/// `~sub~`/`^sup^` syntax itself uses. Doesn't attempt to renumber labels
+/// into sequential display order the way `pulldown-cmark`'s own HTML
+/// writer does — this is a single streaming pass with no lookahead across
+/// the whole document, and in practice a footnote's own label is already
+/// written as the sequence number a document's author wants shown.
+fn footnote_reference_marker(label: &str) -> String {
+    match meshfox_core::subsup::to_unicode(label, meshfox_core::subsup::Script::Sup) {
+        Some(sup) => sup,
+        None => format!("[{label}]"),
+    }
+}
+
 fn heading_style(level: HeadingLevel) -> Style {
     let idx = (level as usize).saturating_sub(1).min(5);
     let mut style = Style::default()
@@ -167,7 +212,21 @@ fn heading_style(level: HeadingLevel) -> Style {
 /// document viewer, not a browser.
 pub fn render(md: &str, base_dir: &Path, hl: &Highlighter) -> Vec<Segment> {
     let mut renderer = Renderer::new(base_dir, hl);
-    let options = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH;
+    // `ENABLE_GFM` is what makes `pulldown-cmark` recognize `> [!NOTE]`/...
+    // alert blockquotes (`Tag::BlockQuote(Some(kind))`, marker line
+    // already stripped) — see `start`'s own `Tag::BlockQuote` arm below.
+    // `ENABLE_TASKLISTS`/`ENABLE_FOOTNOTES` are handled by `event`'s own
+    // `Event::TaskListMarker`/`Event::FootnoteReference` arms and `start`'s
+    // `Tag::FootnoteDefinition` arm — without a handler for the events they
+    // introduce, turning these flags on with no further changes would have
+    // been a regression (a checkbox/footnote marker silently dropped
+    // instead of showing as plain literal text), which is why they weren't
+    // enabled here before now.
+    let options = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_GFM
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_FOOTNOTES;
     for event in Parser::new_ext(md, options) {
         renderer.event(event);
     }
@@ -197,6 +256,18 @@ struct Renderer<'a> {
     code_buf: String,
     table: Option<TableState>,
     pending_heading_style: Option<Style>,
+    /// Parallel stack to `quote_depth` — which (if any) GFM alert kind
+    /// each currently-open blockquote is, so `TagEnd::BlockQuote` can pop
+    /// in step. Only ever read at `Tag::BlockQuote`'s own start (to print
+    /// the title line); nothing downstream needs the current top.
+    alert_stack: Vec<Option<BlockQuoteKind>>,
+    /// Set right after pushing a `Segment::Image` — the very next
+    /// `Event::Text`, if it matches `meshfox_core::image_attrs`'s narrow
+    /// `{width=..}`/`{height=..}` grammar, is consumed as sizing for that
+    /// image instead of being rendered as literal text (see `event`).
+    /// Cleared on every other event so only a marker written with no gap
+    /// right after the image counts.
+    pending_image_attrs: bool,
 }
 
 struct TableState {
@@ -223,6 +294,8 @@ impl<'a> Renderer<'a> {
             code_buf: String::new(),
             table: None,
             pending_heading_style: None,
+            alert_stack: Vec::new(),
+            pending_image_attrs: false,
         }
     }
 
@@ -285,7 +358,54 @@ impl<'a> Renderer<'a> {
         self.segments
     }
 
+    /// Applies a `{width=NN%}`/`{height=NN%}` marker (see
+    /// `pending_image_attrs`) to the `Segment::Image` just pushed —
+    /// always the last segment at this point, since nothing else can run
+    /// between pushing it and the very next event being checked. Only the
+    /// `%` form has any effect (see `Segment::Image`'s own doc comment).
+    fn apply_pending_image_attrs(&mut self, attrs: &meshfox_core::image_attrs::ImageAttrs) {
+        let Some(Segment::Image {
+            width_percent,
+            height_percent,
+            ..
+        }) = self.segments.last_mut()
+        else {
+            return;
+        };
+        if let Some(w) = attrs.width {
+            if w.percent {
+                *width_percent = Some(w.value);
+            }
+        }
+        if let Some(h) = attrs.height {
+            if h.percent {
+                *height_percent = Some(h.value);
+            }
+        }
+    }
+
     fn event(&mut self, ev: Event) {
+        // `pending_image_attrs` (see its own doc comment) only ever
+        // applies to the very next event, and only if that event is
+        // `Text` — anything else (another tag, a line break, ...) means
+        // there was no `{width=..}` marker right after the image, so the
+        // flag is cleared unconditionally here rather than only on a
+        // successful match.
+        if let Event::Text(t) = &ev {
+            if self.pending_image_attrs {
+                self.pending_image_attrs = false;
+                if let Some((attrs, consumed)) = meshfox_core::image_attrs::parse(t) {
+                    self.apply_pending_image_attrs(&attrs);
+                    let rest = t[consumed..].to_string();
+                    if !rest.is_empty() {
+                        self.push_text(&meshfox_core::subsup::render_unicode(&rest), Style::default());
+                    }
+                    return;
+                }
+            }
+        } else {
+            self.pending_image_attrs = false;
+        }
         match ev {
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => self.end(tag),
@@ -293,9 +413,11 @@ impl<'a> Renderer<'a> {
                 if self.code_lang.is_some() {
                     self.code_buf.push_str(&t);
                 } else if let Some(table) = &mut self.table {
-                    table.current_cell.push_str(&t);
+                    table
+                        .current_cell
+                        .push_str(&meshfox_core::subsup::render_unicode(&t));
                 } else {
-                    self.push_text(&t, Style::default());
+                    self.push_text(&meshfox_core::subsup::render_unicode(&t), Style::default());
                 }
             }
             Event::Code(t) => {
@@ -311,6 +433,31 @@ impl<'a> Renderer<'a> {
                     "─".repeat(60),
                     Style::default().fg(Color::DarkGray),
                 ))]));
+            }
+            // Fires right after `Start(Item)` for a task-list item — same
+            // spot the item's own bullet/number marker was just pushed
+            // into `self.current` by `Tag::Item` below, so this simply
+            // appends the checkbox right after it (`• [ ] text`/`1. [x]
+            // text`) rather than replacing the bullet outright.
+            Event::TaskListMarker(checked) => {
+                let (text, style) = if checked {
+                    ("[x] ", Style::default().fg(Color::LightGreen))
+                } else {
+                    ("[ ] ", Style::default())
+                };
+                self.current.push(Span::styled(text, style));
+            }
+            // A footnote *reference* (the inline `[^1]` citation, not its
+            // definition — see `Tag::FootnoteDefinition` below). Rendered
+            // as real Unicode superscript when the label's characters all
+            // have one (true for the common case of a plain numeric
+            // label), same `subsup::to_unicode` fallback-to-bracketed-
+            // literal the sub/superscript syntax itself uses when a
+            // character has no small-form glyph — so `[^note]` reads as
+            // `[note]` rather than a silently-dropped reference.
+            Event::FootnoteReference(label) => {
+                let marker = footnote_reference_marker(&label);
+                self.push_text(&marker, Style::default().fg(Color::Cyan));
             }
             // meshfox's own bookkeeping (`meshfox:node`/`meshfox:output`/...)
             // lives entirely in HTML comments — invisible in any normal
@@ -334,9 +481,44 @@ impl<'a> Renderer<'a> {
                 self.inline_stack.pop();
                 self.pending_heading_style = Some(heading_style(level));
             }
-            Tag::BlockQuote(_) => {
+            Tag::BlockQuote(kind) => {
                 self.flush_paragraph();
                 self.quote_depth += 1;
+                self.alert_stack.push(kind);
+                // GFM alert (`> [!NOTE]`/...) — `pulldown-cmark` (with
+                // `Options::ENABLE_GFM`) already stripped the marker line
+                // and handed us the kind directly, so there's no text to
+                // parse here: just a title line, at this quote's own
+                // indent, styled per kind. The body underneath renders as
+                // an ordinary indented blockquote, unchanged.
+                if let Some(kind) = kind {
+                    let (icon, label, color) = alert_style(kind);
+                    let indent = self.indent();
+                    self.lines.push(Line::from(vec![
+                        Span::raw(indent),
+                        Span::styled(
+                            format!("{icon} {label}"),
+                            Style::default().fg(color).add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
+                }
+            }
+            // A footnote *definition* — the block the reference (`Event::
+            // FootnoteReference` above) points at, wherever in the
+            // document it's actually written (often the bottom, but
+            // nothing requires that). Rendered as its own segment: a
+            // bracketed label line (`[1]`, literal — not superscript here,
+            // unlike the inline reference marker; a label heading its own
+            // block reads clearer as plain bracketed text than floating
+            // superscript characters would) followed by the definition's
+            // own body, which flows in normally via the ordinary
+            // paragraph/text handling right after this.
+            Tag::FootnoteDefinition(label) => {
+                self.flush_paragraph();
+                self.lines.push(Line::from(Span::styled(
+                    format!("[{label}]"),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                )));
             }
             Tag::CodeBlock(kind) => {
                 self.flush_paragraph();
@@ -396,10 +578,20 @@ impl<'a> Renderer<'a> {
                     // cache key here, same idea as `app::
                     // link_preview_image_path`'s synthetic path).
                     let path = std::path::PathBuf::from(dest_url.as_ref());
-                    self.push_segment(Segment::Image { path, alt });
+                    self.push_segment(Segment::Image {
+                        path,
+                        alt,
+                        width_percent: None,
+                        height_percent: None,
+                    });
                 } else {
                     let path = self.base_dir.join(dest_url.as_ref());
-                    self.push_segment(Segment::Image { path, alt });
+                    self.push_segment(Segment::Image {
+                        path,
+                        alt,
+                        width_percent: None,
+                        height_percent: None,
+                    });
                 }
             }
             Tag::Table(alignments) => {
@@ -438,6 +630,7 @@ impl<'a> Renderer<'a> {
             TagEnd::BlockQuote(_) => {
                 self.flush_line();
                 self.quote_depth = self.quote_depth.saturating_sub(1);
+                self.alert_stack.pop();
             }
             TagEnd::CodeBlock => {
                 let lang = self.code_lang.take().unwrap_or_default();
@@ -503,6 +696,12 @@ impl<'a> Renderer<'a> {
                 if let Some(t) = self.table.take() {
                     self.push_segment(Segment::Text(render_table(&t)));
                 }
+            }
+            TagEnd::Image => {
+                self.pending_image_attrs = true;
+            }
+            TagEnd::FootnoteDefinition => {
+                self.flush_paragraph();
             }
             _ => {}
         }
@@ -571,7 +770,7 @@ mod tests {
         let hl = Highlighter::new();
         let md = "![a pixel](data:image/png;base64,iVBORw0KGgo=)\n";
         let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
-        let Segment::Image { path, alt } = segments
+        let Segment::Image { path, alt, .. } = segments
             .into_iter()
             .find(|s| matches!(s, Segment::Image { .. }))
             .expect("a data: URL should produce a Segment::Image")
@@ -588,5 +787,163 @@ mod tests {
         let md = "![x](https://example.com/pic.png)\n";
         let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
         assert!(!segments.iter().any(|s| matches!(s, Segment::Image { .. })));
+    }
+
+    fn line_text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn segment_text(segments: &[Segment]) -> String {
+        segments
+            .iter()
+            .flat_map(|s| match s {
+                Segment::Text(lines) => lines.iter().map(line_text).collect::<Vec<_>>(),
+                Segment::Image { .. } => vec![],
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    // TODO.canvas.md: "Формальные граматики для meshfox:*" subtree ->
+    // "Атрибуты картинок в markdown" — `{width=NN%}`/`{height=NN%}` right
+    // after an image becomes a sizing hint on the resulting
+    // `Segment::Image`; only the `%` form has any effect in the TUI (see
+    // `app::image_size_budget`).
+    #[test]
+    fn image_percent_attrs_become_a_sizing_hint() {
+        let hl = Highlighter::new();
+        let md = "![alt](pic.png){width=50% height=25%}\n";
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        let Segment::Image {
+            width_percent,
+            height_percent,
+            ..
+        } = segments
+            .into_iter()
+            .find(|s| matches!(s, Segment::Image { .. }))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(width_percent, Some(50));
+        assert_eq!(height_percent, Some(25));
+    }
+
+    #[test]
+    fn image_absolute_attrs_are_parsed_but_have_no_tui_effect() {
+        let hl = Highlighter::new();
+        let md = "![alt](pic.png){width=300}\n";
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        let Segment::Image { width_percent, .. } = segments
+            .into_iter()
+            .find(|s| matches!(s, Segment::Image { .. }))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(width_percent, None);
+    }
+
+    #[test]
+    fn text_right_after_an_image_with_no_attrs_marker_is_rendered_normally() {
+        let hl = Highlighter::new();
+        let md = "![alt](pic.png) just text\n";
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        assert!(segment_text(&segments).contains("just text"));
+    }
+
+    // TODO.canvas.md: same subtree -> "Подстрочный/надстрочный".
+    #[test]
+    fn subscript_and_superscript_render_as_unicode_small_forms() {
+        let hl = Highlighter::new();
+        let md = "H~2~O and x^n^\n";
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        assert_eq!(segment_text(&segments), "H₂O and xⁿ");
+    }
+
+    #[test]
+    fn subsup_falls_back_to_literal_when_not_fully_mapped_to_unicode() {
+        let hl = Highlighter::new();
+        let md = "x~query~\n";
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        assert_eq!(segment_text(&segments), "x~query~");
+    }
+
+    #[test]
+    fn subsup_never_applies_inside_a_code_block() {
+        let hl = Highlighter::new();
+        let md = "```text\nx~2~\n```\n";
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        assert!(segment_text(&segments).contains("x~2~"));
+    }
+
+    // TODO.canvas.md: same subtree -> "Admonition/callout-блоки" (GFM
+    // variant).
+    #[test]
+    fn a_gfm_alert_blockquote_gets_a_styled_title_line() {
+        let hl = Highlighter::new();
+        let md = "> [!WARNING]\n> be careful\n";
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        let text = segment_text(&segments);
+        assert!(text.contains("Warning"), "{text}");
+        assert!(text.contains("be careful"), "{text}");
+        assert!(!text.contains("[!WARNING]"), "{text}");
+    }
+
+    #[test]
+    fn an_ordinary_blockquote_gets_no_title_line() {
+        let hl = Highlighter::new();
+        let md = "> just a quote\n";
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        let text = segment_text(&segments);
+        assert!(text.contains("just a quote"), "{text}");
+        assert!(!text.contains("Note"), "{text}");
+    }
+
+    // Follow-up to the comparison table in MARKDOWN.md: task lists and
+    // footnotes were parsed-but-unhandled (`Options::ENABLE_TASKLISTS`/
+    // `ENABLE_FOOTNOTES` were off) — enabling the flags with no event
+    // handling would have silently dropped the checkbox/reference marker
+    // rather than showing plain literal text, a regression from the prior
+    // no-flag behavior. These tests cover the new handling instead.
+    #[test]
+    fn task_list_items_show_a_checkbox_after_their_bullet() {
+        let hl = Highlighter::new();
+        let md = "- [ ] todo\n- [x] done\n";
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        let text = segment_text(&segments);
+        assert!(text.contains("[ ] todo"), "{text}");
+        assert!(text.contains("[x] done"), "{text}");
+    }
+
+    #[test]
+    fn a_numeric_footnote_reference_renders_as_unicode_superscript() {
+        let hl = Highlighter::new();
+        let md = "See[^1].\n\n[^1]: A note.\n";
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        let text = segment_text(&segments);
+        assert!(text.contains("See¹."), "{text}");
+        assert!(!text.contains("[^1]"), "{text}");
+    }
+
+    #[test]
+    fn a_footnote_definition_gets_a_bracketed_label_and_its_body() {
+        let hl = Highlighter::new();
+        let md = "See[^1].\n\n[^1]: A note.\n";
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        let text = segment_text(&segments);
+        assert!(text.contains("[1]"), "{text}");
+        assert!(text.contains("A note."), "{text}");
+    }
+
+    #[test]
+    fn a_named_footnote_reference_falls_back_to_a_bracketed_label() {
+        let hl = Highlighter::new();
+        // 'q' has no superscript Unicode glyph, so "note" (which does map
+        // fully) is deliberately not used here — want the fallback path.
+        let md = "See[^query].\n\n[^query]: A note.\n";
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        let text = segment_text(&segments);
+        assert!(text.contains("See[query]."), "{text}");
     }
 }

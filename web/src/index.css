@@ -31,6 +31,14 @@
   --syntax-tint: rgba(234, 88, 12, 0.07);
   --syntax-attr: #96660a;
   --syntax-value: #1b7a43;
+  /* GFM alert (`> [!NOTE]`/...) colors — see `.markdown-alert-*` below,
+   * same five roles GitHub itself uses (and `site-template/style.css`'s
+   * own `--alert-*` mirror for the static/PDF export). */
+  --alert-note: #0969da;
+  --alert-tip: #1a7f37;
+  --alert-important: #8250df;
+  --alert-warning: #9a6700;
+  --alert-caution: #cf222e;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -49,6 +57,11 @@
     --syntax-tint: rgba(255, 110, 21, 0.12);
     --syntax-attr: #d8b656;
     --syntax-value: #6fcf97;
+    --alert-note: #58a6ff;
+    --alert-tip: #3fb950;
+    --alert-important: #a371f7;
+    --alert-warning: #d29922;
+    --alert-caution: #f85149;
   }
 }
 
@@ -73,6 +86,11 @@
   --syntax-tint: rgba(255, 110, 21, 0.12);
   --syntax-attr: #d8b656;
   --syntax-value: #6fcf97;
+  --alert-note: #58a6ff;
+  --alert-tip: #3fb950;
+  --alert-important: #a371f7;
+  --alert-warning: #d29922;
+  --alert-caution: #f85149;
 }
 
 :root[data-theme="light"] {
@@ -90,6 +108,11 @@
   --syntax-tint: rgba(234, 88, 12, 0.07);
   --syntax-attr: #96660a;
   --syntax-value: #1b7a43;
+  --alert-note: #0969da;
+  --alert-tip: #1a7f37;
+  --alert-important: #8250df;
+  --alert-warning: #9a6700;
+  --alert-caution: #cf222e;
 }
 
 /* React Flow's own default edge color/width (used by every edge with no
@@ -1040,6 +1063,66 @@ a {
   border-radius: 4px;
   font-family: "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 0.85em;
+}
+
+.mesh-node-body sub,
+.mesh-node-body sup {
+  font-size: 0.75em;
+}
+
+/* GFM alert blockquotes (`> [!NOTE]`/...) — `remarkGfmAlerts.ts` strips
+ * the `[!TYPE]` marker line and adds one of these classes; the label/icon
+ * is pure CSS (`::before`), same as `site-template/style.css`'s mirror
+ * for the static/PDF export, so both look the same with no extra DOM. */
+.mesh-node-body blockquote[class^="markdown-alert-"] {
+  border-left: 3px solid var(--alert-color, var(--node-border));
+  border-radius: 6px;
+  padding: 0.6rem 0.9rem;
+  margin: 0.6rem 0;
+  background: var(--code-bg);
+}
+
+.mesh-node-body blockquote[class^="markdown-alert-"]::before {
+  display: block;
+  font-weight: 600;
+  font-size: 0.8rem;
+  margin-bottom: 0.3rem;
+  color: var(--alert-color, var(--fg));
+}
+
+.mesh-node-body .markdown-alert-note {
+  --alert-color: var(--alert-note);
+}
+.mesh-node-body .markdown-alert-note::before {
+  content: "ℹ Note";
+}
+
+.mesh-node-body .markdown-alert-tip {
+  --alert-color: var(--alert-tip);
+}
+.mesh-node-body .markdown-alert-tip::before {
+  content: "💡 Tip";
+}
+
+.mesh-node-body .markdown-alert-important {
+  --alert-color: var(--alert-important);
+}
+.mesh-node-body .markdown-alert-important::before {
+  content: "❗ Important";
+}
+
+.mesh-node-body .markdown-alert-warning {
+  --alert-color: var(--alert-warning);
+}
+.mesh-node-body .markdown-alert-warning::before {
+  content: "⚠ Warning";
+}
+
+.mesh-node-body .markdown-alert-caution {
+  --alert-color: var(--alert-caution);
+}
+.mesh-node-body .markdown-alert-caution::before {
+  content: "🛑 Caution";
 }
 
 /* One runnable fence: language label + run button, right above its own

@@ -426,15 +426,30 @@ struct RenderCtx<'a> {
 /// `class="language-..."`, and every image/link URL rewritten per `ctx`
 /// (see `resolve_image_url`/`resolve_link_url`). Every link additionally
 /// gets `target="_blank"` (see `add_target_blank`).
+///
+/// Also handles two of meshfox's own narrow Markdown extensions (see
+/// SPEC.md's "Formal grammar" / TODO.canvas.md's `image-attrs` and
+/// `sub-superscript` tasks) that `pulldown-cmark` has no built-in support
+/// for — `{width=..}`/`{height=..}` right after an image (`image_attrs`)
+/// and `~sub~`/`^sup^` (`subsup`) — plus GFM alert blockquotes
+/// (`> [!NOTE]`/...), which `Options::ENABLE_GFM` *does* parse and render
+/// natively (as `<blockquote class="markdown-alert-note">`, no marker
+/// text left behind); `site-template/style.css`'s own `.markdown-alert-*`
+/// rules are what actually style those, nothing more is needed here.
 fn render_markdown(text: &str, ctx: &RenderCtx, assets: &mut Vec<Asset>) -> String {
-    use pulldown_cmark::{html, Event, Options, Parser, Tag};
+    use pulldown_cmark::{html, Event, Options, Parser, Tag, TagEnd};
     let stripped = crate::fence::strip_fence_attrs(text);
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_FOOTNOTES
-        | Options::ENABLE_TASKLISTS;
-    let events: Vec<Event> = Parser::new_ext(&stripped, options)
-        .map(|event| match event {
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_GFM;
+    let raw: Vec<Event> = Parser::new_ext(&stripped, options).collect();
+    let mut events: Vec<Event> = Vec::with_capacity(raw.len());
+    let mut in_code = false;
+    let mut i = 0;
+    while i < raw.len() {
+        match raw[i].clone() {
             Event::Start(Tag::Image {
                 link_type,
                 dest_url,
@@ -442,12 +457,39 @@ fn render_markdown(text: &str, ctx: &RenderCtx, assets: &mut Vec<Asset>) -> Stri
                 id,
             }) => {
                 let new_url = resolve_image_url(&dest_url, ctx, assets);
-                Event::Start(Tag::Image {
+                let mut image_events = vec![Event::Start(Tag::Image {
                     link_type,
                     dest_url: new_url.into(),
                     title,
                     id,
-                })
+                })];
+                i += 1;
+                loop {
+                    let ev = raw[i].clone();
+                    let is_end = matches!(ev, Event::End(TagEnd::Image));
+                    image_events.push(ev);
+                    i += 1;
+                    if is_end {
+                        break;
+                    }
+                }
+                let mut attrs = crate::image_attrs::ImageAttrs::default();
+                if let Some(Event::Text(t)) = raw.get(i) {
+                    if let Some((parsed, consumed)) = crate::image_attrs::parse(t) {
+                        attrs = parsed;
+                        let rest = t[consumed..].to_string();
+                        i += 1;
+                        if !rest.is_empty() {
+                            events.extend(subsup_events(&rest));
+                        }
+                    }
+                }
+                let mut img_html = String::new();
+                html::push_html(&mut img_html, image_events.into_iter());
+                if !attrs.is_empty() {
+                    img_html = splice_img_attrs(&img_html, &attrs);
+                }
+                events.push(Event::Html(img_html.into()));
             }
             Event::Start(Tag::Link {
                 link_type,
@@ -456,19 +498,92 @@ fn render_markdown(text: &str, ctx: &RenderCtx, assets: &mut Vec<Asset>) -> Stri
                 id,
             }) => {
                 let new_url = resolve_link_url(&dest_url, ctx);
-                Event::Start(Tag::Link {
+                events.push(Event::Start(Tag::Link {
                     link_type,
                     dest_url: new_url.into(),
                     title,
                     id,
-                })
+                }));
+                i += 1;
             }
-            other => other,
-        })
-        .collect();
+            event @ Event::Start(Tag::CodeBlock(_)) => {
+                in_code = true;
+                events.push(event);
+                i += 1;
+            }
+            event @ Event::End(TagEnd::CodeBlock) => {
+                in_code = false;
+                events.push(event);
+                i += 1;
+            }
+            Event::Text(t) if !in_code => {
+                events.extend(subsup_events(&t));
+                i += 1;
+            }
+            event => {
+                events.push(event);
+                i += 1;
+            }
+        }
+    }
     let mut out = String::new();
     html::push_html(&mut out, events.into_iter());
     add_target_blank(&out)
+}
+
+/// Splits `text` on `crate::subsup`'s `~sub~`/`^sup^` syntax and turns
+/// each marked run into a raw `<sub>`/`<sup>` HTML event (content
+/// HTML-escaped — these bypass `pulldown-cmark`'s own escaping, since
+/// they're never real Markdown text nodes) alongside ordinary `Text`
+/// events for everything in between. A single `Text` event in, in
+/// general several events out — hence `extend` at each call site rather
+/// than a plain `map`.
+fn subsup_events(text: &str) -> Vec<pulldown_cmark::Event<'static>> {
+    use crate::subsup::{scan, Piece, Script};
+    use pulldown_cmark::Event;
+    scan(text)
+        .into_iter()
+        .map(|piece| match piece {
+            Piece::Text(t) => Event::Text(t.to_string().into()),
+            Piece::Marked(Script::Sub, inner) => {
+                Event::Html(format!("<sub>{}</sub>", escape_html_text(inner)).into())
+            }
+            Piece::Marked(Script::Sup, inner) => {
+                Event::Html(format!("<sup>{}</sup>", escape_html_text(inner)).into())
+            }
+        })
+        .collect()
+}
+
+/// Minimal HTML-escaping for text dropped into a raw `Event::Html` chunk
+/// (`subsup_events` above) — `pulldown-cmark`'s own escaping only applies
+/// to `Event::Text`, never to `Event::Html`, which is emitted verbatim.
+fn escape_html_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Inserts ` width=".."`/` height=".."` (see `image_attrs::html_attrs`)
+/// into an already-rendered `<img ... />` tag, right before its trailing
+/// `/>` — the one spot `pulldown-cmark`'s own HTML writer always ends an
+/// image tag with, self-closing slash included, regardless of which of
+/// `alt`/`title` it did or didn't have to write first.
+fn splice_img_attrs(img_html: &str, attrs: &crate::image_attrs::ImageAttrs) -> String {
+    match img_html.rfind("/>") {
+        Some(idx) => {
+            let prefix = img_html[..idx].trim_end();
+            format!("{prefix}{} />", crate::image_attrs::html_attrs(attrs))
+        }
+        None => img_html.to_string(),
+    }
 }
 
 /// Adds `target="_blank" rel="noopener noreferrer"` to every rendered
@@ -784,6 +899,92 @@ mod tests {
             body.contains("<a target=\"_blank\" rel=\"noopener noreferrer\" href=\"https://github.com/example/meshfox\">"),
             "{body}"
         );
+    }
+
+    // TODO.canvas.md: "Формальные граматики для meshfox:*" subtree ->
+    // "Атрибуты картинок в markdown" — `{width=..}`/`{height=..}` right
+    // after an image (`crate::image_attrs`), spliced into the rendered
+    // `<img>` tag.
+    #[test]
+    fn image_size_attrs_become_html_width_height() {
+        let c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n![alt](pic.png){width=300 height=50%}\n");
+        let (site, _assets) = build(&c, Path::new("/nonexistent-meshfox-test-dir"), None);
+        let body = &site.find("root").unwrap().html_body;
+        assert!(
+            body.contains(r#"<img src="pic.png" alt="alt" width="300" height="50%" />"#),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn text_right_after_an_image_with_no_size_attrs_is_left_alone() {
+        let c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n![alt](pic.png) not attrs\n");
+        let (site, _assets) = build(&c, Path::new("/nonexistent-meshfox-test-dir"), None);
+        let body = &site.find("root").unwrap().html_body;
+        assert!(body.contains("not attrs"), "{body}");
+        assert!(!body.contains("width="), "{body}");
+    }
+
+    #[test]
+    fn leftover_text_after_a_partial_image_attrs_match_still_renders() {
+        let c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n![alt](pic.png){width=300} tail\n");
+        let (site, _assets) = build(&c, Path::new("/nonexistent-meshfox-test-dir"), None);
+        let body = &site.find("root").unwrap().html_body;
+        assert!(body.contains(r#"width="300""#), "{body}");
+        assert!(body.contains("tail"), "{body}");
+    }
+
+    // TODO.canvas.md: same subtree -> "Подстрочный/надстрочный".
+    #[test]
+    fn subscript_and_superscript_render_as_sub_sup_tags() {
+        let c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\nH~2~O and x^n^\n");
+        let site = build_site(&c);
+        let body = &site.find("root").unwrap().html_body;
+        assert!(body.contains("H<sub>2</sub>O"), "{body}");
+        assert!(body.contains("x<sup>n</sup>"), "{body}");
+    }
+
+    #[test]
+    fn subsup_markup_never_applies_inside_a_code_block() {
+        let c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n```text\nx~2~\n```\n");
+        let site = build_site(&c);
+        let body = &site.find("root").unwrap().html_body;
+        assert!(body.contains("x~2~"), "{body}");
+        assert!(!body.contains("<sub>"), "{body}");
+    }
+
+    #[test]
+    fn doubled_tilde_strikethrough_is_unaffected_by_subsup() {
+        let c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n~~gone~~\n");
+        let site = build_site(&c);
+        let body = &site.find("root").unwrap().html_body;
+        assert!(body.contains("<del>gone</del>"), "{body}");
+        assert!(!body.contains("<sub>"), "{body}");
+    }
+
+    // TODO.canvas.md: same subtree -> "Admonition/callout-блоки" (GFM
+    // variant) — `Options::ENABLE_GFM` parses `> [!NOTE]`/... natively,
+    // stripping the marker line and giving the blockquote a
+    // `markdown-alert-*` class; `site-template/style.css` styles it.
+    #[test]
+    fn a_gfm_alert_blockquote_gets_its_type_class_and_no_marker_text() {
+        let c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n> [!WARNING]\n> be careful\n");
+        let site = build_site(&c);
+        let body = &site.find("root").unwrap().html_body;
+        assert!(
+            body.contains(r#"<blockquote class="markdown-alert-warning">"#),
+            "{body}"
+        );
+        assert!(body.contains("be careful"), "{body}");
+        assert!(!body.contains("[!WARNING]"), "{body}");
+    }
+
+    #[test]
+    fn an_ordinary_blockquote_is_unaffected_by_gfm_alerts() {
+        let c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n> just a quote\n");
+        let site = build_site(&c);
+        let body = &site.find("root").unwrap().html_body;
+        assert!(body.contains("<blockquote>\n<p>just a quote"), "{body}");
     }
 
     #[test]

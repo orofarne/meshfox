@@ -40,6 +40,11 @@ This document is itself a valid meshfox canvas — every `##` section here is a 
 
 [SPEC.md](./SPEC.md)
 
+## Markdown extensions
+<!-- meshfox:node id="markdown-extensions-doc" type="include" -->
+
+[MARKDOWN.md](./MARKDOWN.md)
+
 ## Auto-layout
 <!-- meshfox:node id="auto-layout" -->
 

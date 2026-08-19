@@ -373,7 +373,7 @@ fn render_document(f: &mut Frame, area: Rect, app: &App) {
                 f.render_widget(paragraph.scroll((layout.row_offset, 0)), rect);
                 y += layout.height;
             }
-            Segment::Image { path, alt } => {
+            Segment::Image { path, alt, .. } => {
                 let protocol = app.doc_images.get(path).and_then(|o| o.as_ref());
                 let rows = protocol.map(|p| p.size().height).unwrap_or(1);
                 if skip >= rows {

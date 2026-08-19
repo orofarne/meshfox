@@ -2,6 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Handle, NodeResizer, NodeToolbar, Position, useReactFlow, type NodeProps } from "@xyflow/react";
 import ReactMarkdown, { defaultUrlTransform, type Components, type UrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import remarkImageAttrs from "./remarkImageAttrs";
+import remarkSubSup from "./remarkSubSup";
+import remarkGfmAlerts from "./remarkGfmAlerts";
 import CodeMirror from "@uiw/react-codemirror";
 import { LanguageDescription } from "@codemirror/language";
 import { languages } from "@codemirror/language-data";
@@ -886,7 +889,7 @@ export function NodeBodyPreview({ text }: { text: string }) {
           return (
             <ReactMarkdown
               key={i}
-              remarkPlugins={[remarkGfm]}
+              remarkPlugins={[remarkGfm, remarkImageAttrs, remarkSubSup, remarkGfmAlerts]}
               components={markdownComponents}
               urlTransform={allowDataImageUrls}
             >
@@ -989,7 +992,7 @@ function MeshNodeBody({ data, nodeId }: { data: MeshNodeData; nodeId: string }) 
           return (
             <ReactMarkdown
               key={i}
-              remarkPlugins={[remarkGfm]}
+              remarkPlugins={[remarkGfm, remarkImageAttrs, remarkSubSup, remarkGfmAlerts]}
               components={components}
               urlTransform={allowDataImageUrls}
             >

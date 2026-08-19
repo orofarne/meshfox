@@ -59,6 +59,14 @@
   --accent-default: #ea580c;
   --code-bg: #f4ede3;
   --link: #c2410c;
+  /* GFM alert (`> [!NOTE]`/...) colors — see `.markdown-alert-*` below.
+     Same five roles GitHub itself uses, kept close to its own values so
+     the type reads the same way it does anywhere else GFM alerts show up. */
+  --alert-note: #0969da;
+  --alert-tip: #1a7f37;
+  --alert-important: #8250df;
+  --alert-warning: #9a6700;
+  --alert-caution: #cf222e;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -71,6 +79,11 @@
     --accent-default: #ff6e15;
     --code-bg: #19191c;
     --link: #ff9a52;
+    --alert-note: #58a6ff;
+    --alert-tip: #3fb950;
+    --alert-important: #a371f7;
+    --alert-warning: #d29922;
+    --alert-caution: #f85149;
   }
 }
 
@@ -510,6 +523,67 @@ summary.node-title::before {
   border: 1px solid var(--border);
   padding: 0.25rem 0.5rem;
   text-align: left;
+}
+
+.node-body sub,
+.node-body sup {
+  font-size: 0.75em;
+}
+
+/* GFM alert blockquotes (`> [!NOTE]`/...) — `pulldown-cmark` (with
+   `Options::ENABLE_GFM`) already strips the `[!TYPE]` marker line and
+   gives the `<blockquote>` one of these classes; the type label/icon
+   below is pure CSS (`::before`), since the marker text itself never
+   reaches the rendered HTML at all. */
+.node-body blockquote[class^="markdown-alert-"] {
+  border-left: 3px solid var(--alert-color, var(--border));
+  border-radius: 6px;
+  padding: 0.6rem 0.9rem;
+  margin: 0.75rem 0;
+  background: var(--code-bg);
+}
+
+.node-body blockquote[class^="markdown-alert-"]::before {
+  display: block;
+  font-weight: 600;
+  font-size: 0.8rem;
+  margin-bottom: 0.3rem;
+  color: var(--alert-color, var(--muted));
+}
+
+.node-body .markdown-alert-note {
+  --alert-color: var(--alert-note);
+}
+.node-body .markdown-alert-note::before {
+  content: "ℹ Note";
+}
+
+.node-body .markdown-alert-tip {
+  --alert-color: var(--alert-tip);
+}
+.node-body .markdown-alert-tip::before {
+  content: "💡 Tip";
+}
+
+.node-body .markdown-alert-important {
+  --alert-color: var(--alert-important);
+}
+.node-body .markdown-alert-important::before {
+  content: "❗ Important";
+}
+
+.node-body .markdown-alert-warning {
+  --alert-color: var(--alert-warning);
+}
+.node-body .markdown-alert-warning::before {
+  content: "⚠ Warning";
+}
+
+.node-body .markdown-alert-caution {
+  --alert-color: var(--alert-caution);
+}
+.node-body .markdown-alert-caution::before {
+  content: "🛑 Caution";
 }
 
 .site-footer {

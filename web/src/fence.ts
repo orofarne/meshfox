@@ -114,6 +114,22 @@ function isBookkeepingCommentLine(line: string): boolean {
   return /^<!--\s*\/?meshfox:\S+.*-->$/.test(line.trim());
 }
 
+/**
+ * True only when `line`'s leading indentation is under 4 spaces —
+ * mirrors `core::fence::fence_open`'s own indent check (CommonMark: 4+
+ * spaces of indentation makes a line part of an *indented* code block,
+ * not a fence opener; this is how SPEC.md's own illustrative fence
+ * examples, e.g. under "Runnable code fences", read as inert
+ * documentation instead of being picked up as real runnable blocks).
+ * Only the space-character count matters here, same as the Rust side —
+ * a tab isn't treated as indentation for this check.
+ */
+function fenceIndentOk(line: string): boolean {
+  let spaces = 0;
+  while (spaces < line.length && line[spaces] === " ") spaces++;
+  return spaces < 4;
+}
+
 /** Languages `crate::exec` actually knows how to run — mirrors
  * `core::exec::is_supported_lang`. A fence in any other language (`yaml`,
  * `starlark`, ...) is never runnable here, named or not: without this
@@ -137,11 +153,11 @@ function countUnnamedCandidateFences(markdown: string): number {
   let count = 0;
   let i = 0;
   while (i < lines.length) {
-    const trimmed = lines[i].trimStart();
-    if (!trimmed.startsWith("```")) {
+    if (!fenceIndentOk(lines[i]) || !lines[i].trimStart().startsWith("```")) {
       i++;
       continue;
     }
+    const trimmed = lines[i].trimStart();
     const info = trimmed.slice(3).trim();
     let j = i + 1;
     let closed = false;
@@ -201,14 +217,14 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
 
   let i = 0;
   while (i < lines.length) {
-    const trimmed = lines[i].trimStart();
-    if (!trimmed.startsWith("```")) {
+    if (!fenceIndentOk(lines[i]) || !lines[i].trimStart().startsWith("```")) {
       if (!isBookkeepingCommentLine(lines[i])) {
         mdBuffer.push(lines[i]);
       }
       i++;
       continue;
     }
+    const trimmed = lines[i].trimStart();
 
     const info = trimmed.slice(3).trim();
     let j = i + 1;

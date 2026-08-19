@@ -853,6 +853,137 @@ scanning elsewhere in this spec: a marker written literally inside a code
 fence (e.g. showing someone this exact syntax) is left alone rather than
 treated as a real region.
 
+## Formal grammar
+
+Reference EBNF for every `meshfox:*` construct described above, collected in
+one place. This is documentation only — kept in sync by hand with the actual
+parsers (`crates/core/src/{mdcanvas,vars,options,tag_colors,fence,attrs,comment,output}.rs`
+and the mirrored bits of the web/TS side), not generated from either one or
+used to generate either one. The syntax is simple and stable enough
+(single-line constructs, no nesting) that a parser generator would only buy
+correctness on the Rust side, while the web/TS side still needs its own
+hand-written reader regardless — the same reasoning already applied to
+*future* extensions. Treat a mismatch between this grammar and the code as a
+bug, usually in this grammar rather than the code.
+
+Notation: `::=` defines, `|` alternation, `[x]` optional, `{x}` zero-or-more,
+`'x'` a literal, `<x>` a prose-described terminal.
+
+### Lexical building blocks
+
+Shared by every construct's attribute list (`crates/core/src/attrs.rs`):
+
+    attr-list   ::= { ws attr }
+    attr        ::= key '=' value | key
+    key         ::= key-char { key-char }
+    key-char    ::= <any character except whitespace, '=', '"'>
+    value       ::= '"' { <any character except '"'> } '"' | bare-value
+    bare-value  ::= <one or more characters, none of them whitespace>
+    ws          ::= <one or more whitespace characters>
+
+A bare `key` with no `=value` is a flag, equivalent to `key="true"`. An
+unquoted `value` can't itself contain whitespace — there's no escape for
+that, only wrapping it in `"..."` instead. Attribute order is never
+significant; the same key written twice keeps whichever occurrence the
+tokenizer's map-insert resolves to last (last write wins) — not itself a
+parse error, though a specific construct's own semantic rules below may
+still reject the result.
+
+### Markers
+
+Every `meshfox:*` construct is an HTML comment, matched line-by-line, and
+**fence-aware**: a marker written literally inside a code fence (a
+documentation example, cached output that happens to contain one, ...) is
+never treated as a real one. That scanning rule is a document-structure
+property, not part of any single line's own grammar, so it's stated once
+here instead of being repeated per construct below.
+
+    node-marker      ::= '<!--' ws 'meshfox:node' attr-list ws '-->'
+    edge-marker      ::= '<!--' ws 'meshfox:edge' attr-list ws '-->'
+    canvas-marker    ::= '<!--' ws 'meshfox:canvas' ws '-->'
+    var-marker       ::= '<!--' ws 'meshfox:var' attr-list ws '-->'
+    option-marker    ::= '<!--' ws 'meshfox:option' attr-list ws '-->'
+    tag-color-marker ::= '<!--' ws 'meshfox:tag-color' attr-list ws '-->'
+    output-open      ::= '<!--' ws 'meshfox:output' attr-list ws '-->'
+    output-close     ::= '<!--' ws '/meshfox:output' ws '-->'
+    comment-open     ::= '<!--' ws 'meshfox:comment' ws '-->'
+    comment-close    ::= '<!--' ws '/meshfox:comment' ws '-->'
+
+`ws` around the tag name/`-->` above may match zero characters in practice
+(the parser trims, it doesn't require padding) — written as `ws` rather than
+`[ws]` only to reuse the same rule name as `attr-list`.
+
+### Attribute vocabularies
+
+Each construct restricts `attr-list` (above) to its own known keys — the
+vocabulary `meshfox validate`'s `unknown_*_attr` checks enforce, though every
+*other* consumer (`run`/`view`/`tui`, the server) keeps silently accepting an
+unrecognized key, for forward/backward compatibility across format versions
+(see "Options" above).
+
+    node-attr      ::= 'id' | 'type' | 'x' | 'y' | 'w' | 'h' | 'color'
+                     | 'tags' | 'parent' | 'fold' | 'edgeLabel' | 'display'
+                     | 'lang' | 'interpreter' | 'preview'
+    edge-attr      ::= 'from' | 'label' | 'color' | 'style' | 'arrowStart'
+                     | 'arrowEnd' | 'tags'
+    var-attr       ::= 'name' | 'type' | 'prompt' | 'default' | 'default_var'
+                     | 'choices' | 'choices_var' | 'secret' | 'required'
+                     | 'session' | 'from'
+    option-attr    ::= 'name'
+    tag-color-attr ::= 'tag' | 'color'
+    output-attr    ::= 'name'
+
+`display`/`lang`/`interpreter`/`preview` only mean something when `type` is
+`file`/`link` (see "Node types"); `meshfox validate` enforces that
+cross-attribute constraint separately — this grammar only fixes the set of
+keys a line may use, not which combinations of them make sense together
+(same for every other "mutually exclusive with..." rule described in prose
+above, e.g. `default`/`default_var`/`from` on a `meshfox:var`).
+
+### Fence info strings
+
+A code fence's info string (the text right after the opening ` ``` `) uses
+the same `attr-list` grammar, with the fence's language as an unnamed
+leading token instead of a `key=value` pair (`crates/core/src/fence.rs`):
+
+    fence-info      ::= lang [ ws attr-list ]
+    lang            ::= bare-value
+
+    runnable-attr   ::= 'name' | 'cache' | 'default' | 'deps' | 'env' | 'tty'
+    constraint-attr ::= 'constraint' | 'name'
+
+A runnable fence additionally requires `lang` to be `bash` or `sh` (see
+"Runnable code fences"); a constraint fence requires `lang = 'starlark'`
+*and* the bare `constraint` flag (see "Constraint fences") — again,
+cross-cutting rules enforced by the fence scanner/`meshfox validate`, not
+expressible in `fence-info` alone.
+
+### Values with their own inner structure
+
+A handful of attribute *values* are themselves small comma-separated
+grammars, layered on top of `value` (above) rather than on `attr-list`
+itself:
+
+    tag-list     ::= tag { ',' tag }
+    tag          ::= <one or more characters, none of them ',' or '"'>
+
+    deps-list    ::= deps-entry { ',' deps-entry }
+    deps-entry   ::= [ node-id '/' ] block-name
+
+    env-list     ::= env-entry { ',' env-entry }
+    env-entry    ::= [ '$' ] var-name [ '=' [ '$' ] var-name ]
+
+    choices-list ::= choice { ',' choice }
+    choice       ::= <one or more characters, none of them ','>
+
+`tags=` (on a node or edge), `deps=`, `env=`, and `choices=` (plus
+`choices_var=`'s resolved value, split the same way) each use one of these
+— see each attribute's own entry above for what the pieces mean.
+
+Ordinary Markdown (a node's own body) and Starlark (a constraint fence's own
+script) are each a complete grammar of their own — CommonMark and Starlark
+respectively — and out of scope here.
+
 ## Minimal example
 
 ````markdown

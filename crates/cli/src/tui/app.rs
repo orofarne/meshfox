@@ -952,16 +952,22 @@ impl App {
 
         self.doc_segments = markdown::render(&node.text, &base_dir, &self.highlighter);
 
-        let paths: Vec<PathBuf> = self
+        let images: Vec<(PathBuf, Option<u32>, Option<u32>)> = self
             .doc_segments
             .iter()
             .filter_map(|s| match s {
-                Segment::Image { path, .. } => Some(path.clone()),
+                Segment::Image {
+                    path,
+                    width_percent,
+                    height_percent,
+                    ..
+                } => Some((path.clone(), *width_percent, *height_percent)),
                 Segment::Text(_) => None,
             })
             .collect();
-        for path in paths {
-            let protocol = load_image_protocol(&mut self.picker, &path);
+        for (path, width_percent, height_percent) in images {
+            let protocol =
+                load_image_protocol(&mut self.picker, &path, width_percent, height_percent);
             self.doc_images.insert(path, protocol);
         }
 
@@ -1013,6 +1019,8 @@ impl App {
                 self.doc_segments.push(Segment::Image {
                     path,
                     alt: "preview image".to_string(),
+                    width_percent: None,
+                    height_percent: None,
                 });
             }
         }
@@ -1698,7 +1706,12 @@ fn decode_data_url_image(url: &str) -> Option<image::DynamicImage> {
 /// own `Tag::Image` handling) — same "no file on disk to key it by"
 /// situation `link_preview_image_path` already has, just without a
 /// prefix: a `data:` URL can't collide with a real relative path.
-fn load_image_protocol(picker: &mut Picker, path: &Path) -> Option<Protocol> {
+fn load_image_protocol(
+    picker: &mut Picker,
+    path: &Path,
+    width_percent: Option<u32>,
+    height_percent: Option<u32>,
+) -> Option<Protocol> {
     let dyn_img = match path.to_str().filter(|s| s.starts_with("data:")) {
         Some(data_url) => decode_data_url_image(data_url)?,
         None => image::ImageReader::open(path)
@@ -1708,10 +1721,33 @@ fn load_image_protocol(picker: &mut Picker, path: &Path) -> Option<Protocol> {
             .decode()
             .ok()?,
     };
-    let budget = ratatui::layout::Size::new(56, 24);
+    let budget = image_size_budget(width_percent, height_percent);
     picker
         .new_protocol(dyn_img, budget, ratatui_image::Resize::Fit(None))
         .ok()
+}
+
+/// TODO.canvas.md: "Формальные граматики для meshfox:*" subtree ->
+/// "Атрибуты картинок в markdown" — this terminal's own fixed 56x24
+/// "how big can an image get" budget, scaled by a `{width=NN%}`/
+/// `{height=NN%}` hint (see `markdown::Segment::Image`). There's no
+/// pixel grid a literal `width=300` (no `%`) could map onto without
+/// knowing the terminal's own font metrics, so only the percent form has
+/// any effect — an absolute value is silently ignored, same fallback
+/// every other unsupported bit of this narrow syntax gets rather than
+/// guessing. Clamped well away from zero/overflow at either end.
+fn image_size_budget(
+    width_percent: Option<u32>,
+    height_percent: Option<u32>,
+) -> ratatui::layout::Size {
+    let mut budget = ratatui::layout::Size::new(56, 24);
+    if let Some(pct) = width_percent {
+        budget.width = ((budget.width as u32 * pct) / 100).clamp(1, 500) as u16;
+    }
+    if let Some(pct) = height_percent {
+        budget.height = ((budget.height as u32 * pct) / 100).clamp(1, 500) as u16;
+    }
+    budget
 }
 
 fn point_in(rect: Rect, x: u16, y: u16) -> bool {
@@ -1749,6 +1785,29 @@ mod tests {
     fn load_image_protocol_loads_a_data_url_without_touching_disk() {
         let mut picker = Picker::halfblocks();
         let path = PathBuf::from(ONE_PIXEL_PNG_DATA_URL);
-        assert!(load_image_protocol(&mut picker, &path).is_some());
+        assert!(load_image_protocol(&mut picker, &path, None, None).is_some());
+    }
+
+    // TODO.canvas.md: "Формальные граматики для meshfox:*" subtree ->
+    // "Атрибуты картинок в markdown" — `image_size_budget`'s own scaling
+    // of the fixed 56x24 budget by a `{width=NN%}`/`{height=NN%}` hint.
+    #[test]
+    fn image_size_budget_defaults_to_the_fixed_budget() {
+        let budget = image_size_budget(None, None);
+        assert_eq!((budget.width, budget.height), (56, 24));
+    }
+
+    #[test]
+    fn image_size_budget_scales_by_percent() {
+        let budget = image_size_budget(Some(50), Some(50));
+        assert_eq!((budget.width, budget.height), (28, 12));
+    }
+
+    #[test]
+    fn image_size_budget_clamps_away_from_zero_and_overflow() {
+        let tiny = image_size_budget(Some(0), Some(0));
+        assert!(tiny.width >= 1 && tiny.height >= 1);
+        let huge = image_size_budget(Some(10_000), Some(10_000));
+        assert!(huge.width <= 500 && huge.height <= 500);
     }
 }

@@ -76,6 +76,12 @@ const CLEAR_NODE_LAYOUT_PORT = 4604;
 // own node-body/source saves never collide with any other suite's
 // server/canvas.
 const IMAGE_PASTE_PORT = 4605;
+// Seventeenth server + port for markdown-extensions.spec.ts — same
+// reasoning again, its own fixture (markdown-extensions.canvas.md, one
+// bare root exercising image-attrs/subsup/GFM-alert markup) and port;
+// this suite never writes to its canvas, but every other one still gets
+// its own server, so this one does too.
+const MARKDOWN_EXTENSIONS_PORT = 4606;
 
 // Taller than Playwright's 720px default — the app's own `minZoom` (0.5)
 // is a hard floor on how far "fit view" can zoom out, and deps.canvas.md's
@@ -194,6 +200,11 @@ export default defineConfig({
       testMatch: /(^|\/)image-paste\.spec\.ts$/,
       use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${IMAGE_PASTE_PORT}` },
     },
+    {
+      name: `${browser}-markdown-extensions`,
+      testMatch: /(^|\/)markdown-extensions\.spec\.ts$/,
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${MARKDOWN_EXTENSIONS_PORT}` },
+    },
   ]),
   webServer: [
     {
@@ -300,6 +311,12 @@ export default defineConfig({
     {
       command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view e2e/fixtures/image-paste.canvas.md --port ${IMAGE_PASTE_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${IMAGE_PASTE_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view e2e/fixtures/markdown-extensions.canvas.md --port ${MARKDOWN_EXTENSIONS_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${MARKDOWN_EXTENSIONS_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
