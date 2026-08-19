@@ -147,6 +147,24 @@ fn split_choices(s: &str) -> Vec<String> {
         .collect()
 }
 
+/// Every attribute name `build_var_decl` actually reads off a
+/// `meshfox:var` comment — the vocabulary `unknown_var_attr` (below,
+/// `meshfox validate`-only, see `attrs::UnknownAttrError`'s own doc
+/// comment) diffs a declaration's own attribute keys against.
+const VAR_ATTRS: &[&str] = &[
+    "name",
+    "type",
+    "choices",
+    "choices_var",
+    "secret",
+    "required",
+    "session",
+    "prompt",
+    "default",
+    "default_var",
+    "from",
+];
+
 fn parse_var_comment(line: &str) -> Option<HashMap<String, String>> {
     let trimmed = line.trim();
     let inner = trimmed.strip_prefix("<!--")?.strip_suffix("-->")?.trim();
@@ -312,6 +330,38 @@ pub fn scan_var_decls(markdown: &str) -> Result<Vec<VarDecl>, VarsError> {
         }
     }
     Ok(decls)
+}
+
+/// `meshfox validate`-only: the first `meshfox:var` comment attribute
+/// anywhere in `markdown` that isn't in `VAR_ATTRS`. Same fence-aware
+/// line scan as `scan_var_decls`, kept separate rather than folded into
+/// it (or `build_var_decl`'s own `VarsError`) since every other reader
+/// needs to keep silently accepting an attribute it doesn't recognize —
+/// see `attrs::UnknownAttrError`'s own doc comment.
+pub fn unknown_var_attr(markdown: &str) -> Option<crate::attrs::UnknownAttrError> {
+    let fence_ranges = crate::fence::fenced_byte_ranges(markdown);
+    let mut fi = 0;
+    let mut offset = 0;
+    for line in markdown.split('\n') {
+        let start = offset;
+        offset += line.len() + 1;
+        while fi < fence_ranges.len() && fence_ranges[fi].end <= start {
+            fi += 1;
+        }
+        if fi < fence_ranges.len() && fence_ranges[fi].start <= start {
+            continue;
+        }
+        if let Some(attrs) = parse_var_comment(line) {
+            if let Some(attr) = crate::attrs::first_unknown(&attrs, VAR_ATTRS) {
+                let name = attrs.get("name").cloned().unwrap_or_else(|| "<unnamed>".to_string());
+                return Some(crate::attrs::UnknownAttrError {
+                    context: format!("the meshfox:var comment for {name:?}"),
+                    attr: attr.to_string(),
+                });
+            }
+        }
+    }
+    None
 }
 
 /// Every variable `canvas` declares, in document order — always from the
@@ -1651,5 +1701,28 @@ mod tests {
             validate_var_refs(&canvas(doc)),
             Err(VarsError::VarRefCycle(_))
         ));
+    }
+
+    // TODO.canvas.md: "Ошибка при неизвестных параметрах в validate" —
+    // `unknown_var_attr` is `validate`-only, same split as
+    // `mdcanvas::unknown_node_edge_attr`.
+    #[test]
+    fn unknown_var_attr_is_none_for_known_attributes_only() {
+        let md = "<!-- meshfox:var name=\"X\" type=\"int\" default=\"1\" required -->\n";
+        assert_eq!(unknown_var_attr(md), None);
+    }
+
+    #[test]
+    fn unknown_var_attr_catches_a_typo_d_attribute() {
+        let md = "<!-- meshfox:var name=\"X\" defualt=\"1\" -->\n";
+        let err = unknown_var_attr(md).expect("defualt is not a known attribute");
+        assert_eq!(err.attr, "defualt");
+        assert!(err.context.contains('X'));
+    }
+
+    #[test]
+    fn unknown_var_attr_ignores_a_meshfox_var_comment_written_inside_a_fence() {
+        let md = "```\n<!-- meshfox:var name=\"X\" defualt=\"1\" -->\n```\n";
+        assert_eq!(unknown_var_attr(md), None);
     }
 }

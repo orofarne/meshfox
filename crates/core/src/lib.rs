@@ -49,6 +49,32 @@ pub use vars::{
     ResolvedVars, VarDecl, VarType, VarsError,
 };
 
+pub use attrs::UnknownAttrError;
+
+/// `meshfox validate`-only: fails on the first `meshfox:node`/
+/// `meshfox:edge`/`meshfox:var`/`meshfox:option`/runnable-fence attribute
+/// anywhere in `markdown` that its own construct doesn't recognize —
+/// every other reader (`run`/`view`/`tui`/the server) keeps silently
+/// accepting one it doesn't know, so a canvas written against a newer
+/// format version still opens (see `attrs::UnknownAttrError`'s own doc
+/// comment for why this is a separate pass rather than living in any of
+/// those constructs' own parse-time error types).
+pub fn validate_known_attrs(markdown: &str) -> Result<(), UnknownAttrError> {
+    if let Some(e) = mdcanvas::unknown_node_edge_attr(markdown) {
+        return Err(e);
+    }
+    if let Some(e) = vars::unknown_var_attr(markdown) {
+        return Err(e);
+    }
+    if let Some(e) = options::unknown_option_attr(markdown) {
+        return Err(e);
+    }
+    if let Some(e) = fence::unknown_fence_attr(markdown) {
+        return Err(e);
+    }
+    Ok(())
+}
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -437,5 +463,36 @@ mod tests {
             needed,
             ["X".to_string(), "BASE".to_string()].into_iter().collect()
         );
+    }
+
+    // TODO.canvas.md: "Ошибка при неизвестных параметрах в validate" —
+    // `validate_known_attrs` just chains each construct's own
+    // `unknown_*_attr` check; these confirm it actually reaches every one
+    // of them, not just node/edge.
+    #[test]
+    fn validate_known_attrs_is_ok_for_a_document_using_only_known_attrs() {
+        assert_eq!(validate_known_attrs(DOC), Ok(()));
+    }
+
+    #[test]
+    fn validate_known_attrs_catches_an_unknown_var_attribute_even_with_clean_node_attrs() {
+        let doc = "# Project\n<!-- meshfox:var name=\"X\" defualt=\"1\" -->\n\nbody\n";
+        let err = validate_known_attrs(doc).unwrap_err();
+        assert_eq!(err.attr, "defualt");
+    }
+
+    #[test]
+    fn validate_known_attrs_catches_an_unknown_option_attribute() {
+        let doc = "# Project\n<!-- meshfox:option nme=\"unfold\" -->\n\nbody\n";
+        let err = validate_known_attrs(doc).unwrap_err();
+        assert_eq!(err.attr, "nme");
+    }
+
+    #[test]
+    fn validate_known_attrs_catches_an_unknown_fence_attribute() {
+        let doc =
+            "# Project\n\nbody\n\n```bash name=\"build\" cach\ncargo build\n```\n";
+        let err = validate_known_attrs(doc).unwrap_err();
+        assert_eq!(err.attr, "cach");
     }
 }

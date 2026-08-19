@@ -192,8 +192,9 @@ enum Command {
     /// between the document and any `include`d file; `Ctrl-n` turns the
     /// heading under the cursor into a node in one keystroke; `Ctrl-p`
     /// suggests attributes for the current `meshfox:node`/`meshfox:edge`
-    /// comment or runnable-fence line. Still no *structural* editing
-    /// beyond that (use `meshfox
+    /// comment or runnable-fence line, or, with the cursor inside a
+    /// `tags=` value, tags already used elsewhere in the document. Still
+    /// no *structural* editing beyond that (use `meshfox
     /// node ...` or the browser UI's Edit mode for that).
     Tui {
         #[command(flatten)]
@@ -1117,6 +1118,16 @@ fn validate(canvas_path: &PathBuf) {
             // here rather than just being silently ignored by whatever
             // consumer reads `Canvas::options`.
             if let Err(e) = meshfox_core::declared_options(&canvas) {
+                eprintln!("meshfox validate: {}: {e}", canvas_path.display());
+                std::process::exit(1);
+            }
+            // `validate`-only, unlike every check above: an attribute
+            // name a construct doesn't recognize (a typo, most likely)
+            // — every other reader keeps silently accepting one it
+            // doesn't know, for forward/backward compatibility between
+            // format versions (see `validate_known_attrs`'s own doc
+            // comment).
+            if let Err(e) = meshfox_core::validate_known_attrs(&raw) {
                 eprintln!("meshfox validate: {}: {e}", canvas_path.display());
                 std::process::exit(1);
             }

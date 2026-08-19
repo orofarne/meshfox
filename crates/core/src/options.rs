@@ -26,6 +26,11 @@ pub enum OptionsError {
     NotInRoot(String, String),
 }
 
+/// `meshfox:option`'s only attribute — `unknown_option_attr` (below,
+/// `meshfox validate`-only) diffs a declaration's own attribute keys
+/// against this.
+const OPTION_ATTRS: &[&str] = &["name"];
+
 pub(crate) fn parse_option_comment(
     line: &str,
 ) -> Option<std::collections::HashMap<String, String>> {
@@ -63,6 +68,36 @@ pub fn scan_option_decls(markdown: &str) -> Result<Vec<String>, OptionsError> {
         }
     }
     Ok(names)
+}
+
+/// `meshfox validate`-only: the first `meshfox:option` comment attribute
+/// anywhere in `markdown` that isn't `name` — same fence-aware line scan
+/// as `scan_option_decls`, kept separate for the same reason
+/// `vars::unknown_var_attr` is (see `attrs::UnknownAttrError`'s own doc
+/// comment).
+pub fn unknown_option_attr(markdown: &str) -> Option<crate::attrs::UnknownAttrError> {
+    let fence_ranges = crate::fence::fenced_byte_ranges(markdown);
+    let mut fi = 0;
+    let mut offset = 0;
+    for line in markdown.split('\n') {
+        let start = offset;
+        offset += line.len() + 1;
+        while fi < fence_ranges.len() && fence_ranges[fi].end <= start {
+            fi += 1;
+        }
+        if fi < fence_ranges.len() && fence_ranges[fi].start <= start {
+            continue;
+        }
+        if let Some(attrs) = parse_option_comment(line) {
+            if let Some(attr) = crate::attrs::first_unknown(&attrs, OPTION_ATTRS) {
+                return Some(crate::attrs::UnknownAttrError {
+                    context: "a meshfox:option comment".to_string(),
+                    attr: attr.to_string(),
+                });
+            }
+        }
+    }
+    None
 }
 
 /// Every option `canvas` declares, in document order — always from the
@@ -140,5 +175,23 @@ mod tests {
         let canvas = parse(doc).unwrap();
         let err = declared_options(&canvas).unwrap_err();
         assert_eq!(err, OptionsError::DuplicateName("unfold".to_string()));
+    }
+
+    // TODO.canvas.md: "Ошибка при неизвестных параметрах в validate" —
+    // `unknown_option_attr` is `validate`-only, same split as
+    // `mdcanvas::unknown_node_edge_attr`.
+    #[test]
+    fn unknown_option_attr_is_none_for_name_only() {
+        assert_eq!(
+            unknown_option_attr("<!-- meshfox:option name=\"unfold\" -->\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn unknown_option_attr_catches_a_typo_d_attribute() {
+        let err = unknown_option_attr("<!-- meshfox:option nme=\"unfold\" -->\n")
+            .expect("nme is not a known attribute");
+        assert_eq!(err.attr, "nme");
     }
 }

@@ -354,6 +354,34 @@ fn is_cached_output_fence(markdown: &str, fence_start: usize) -> bool {
         .starts_with("<!-- meshfox:output")
 }
 
+/// Every attribute name `build_code_block` actually reads off a runnable
+/// fence's own info string — the vocabulary `unknown_fence_attr` (below,
+/// `meshfox validate`-only, see `attrs::UnknownAttrError`'s own doc
+/// comment) diffs a fence's own attribute keys against. Also what
+/// `crates/cli/src/tui/source_editor.rs`'s `Ctrl-p` popup mirrors as
+/// `FENCE_VALUE_ATTRS`/`FENCE_FLAG_ATTRS` (split there only because the
+/// popup needs to know which shape to insert — irrelevant here, where
+/// every key is just a key).
+const FENCE_ATTRS: &[&str] = &["name", "deps", "env", "cache", "tty", "default"];
+
+/// `meshfox validate`-only: the first runnable fence anywhere in
+/// `markdown` with an attribute not in `FENCE_ATTRS` — checked over every
+/// *candidate* fence (`candidate_fences`, before `scan_code_blocks`'s own
+/// `name=`-required filter), so a typo'd attribute on an otherwise-unnamed
+/// fence still gets caught.
+pub fn unknown_fence_attr(markdown: &str) -> Option<crate::attrs::UnknownAttrError> {
+    for (_, _, attrs) in candidate_fences(markdown) {
+        if let Some(attr) = crate::attrs::first_unknown(&attrs, FENCE_ATTRS) {
+            let label = attrs.get("name").cloned().unwrap_or_else(|| "<unnamed>".to_string());
+            return Some(crate::attrs::UnknownAttrError {
+                context: format!("the runnable fence {label:?}"),
+                attr: attr.to_string(),
+            });
+        }
+    }
+    None
+}
+
 fn build_code_block(
     f: RawFence,
     lang: String,
@@ -897,5 +925,37 @@ mod tests {
     fn strip_fence_attrs_leaves_plain_text_untouched() {
         let md = "just prose, no fences\n";
         assert_eq!(strip_fence_attrs(md), md);
+    }
+
+    // TODO.canvas.md: "Ошибка при неизвестных параметрах в validate" —
+    // `unknown_fence_attr` is `validate`-only, same split as
+    // `mdcanvas::unknown_node_edge_attr`.
+    #[test]
+    fn unknown_fence_attr_is_none_for_known_attributes_only() {
+        let md = "```bash name=\"build\" cache deps=\"other\"\ncargo build\n```\n";
+        assert_eq!(unknown_fence_attr(md), None);
+    }
+
+    #[test]
+    fn unknown_fence_attr_catches_a_typo_d_attribute() {
+        let md = "```bash name=\"build\" cach\ncargo build\n```\n";
+        let err = unknown_fence_attr(md).expect("cach is not a known attribute");
+        assert_eq!(err.attr, "cach");
+        assert!(err.context.contains("build"));
+    }
+
+    #[test]
+    fn unknown_fence_attr_also_checks_an_unnamed_fence() {
+        let md = "```bash cach\ncargo build\n```\n";
+        let err = unknown_fence_attr(md).expect("cach is not a known attribute");
+        assert_eq!(err.attr, "cach");
+    }
+
+    #[test]
+    fn unknown_fence_attr_ignores_an_unsupported_language() {
+        // `yaml` isn't `is_supported_lang`, so this is never a candidate
+        // fence at all — a typo'd key here is just prose to meshfox.
+        let md = "```yaml cach\nkey: value\n```\n";
+        assert_eq!(unknown_fence_attr(md), None);
     }
 }

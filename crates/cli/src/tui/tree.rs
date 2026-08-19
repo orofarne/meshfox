@@ -30,6 +30,8 @@ pub struct TreeRow {
     /// it where it's drawn" split `web/src/MeshNode.tsx`'s `resolveNodeColor`
     /// already uses. `None` means no color was set.
     pub color: Option<String>,
+    /// The node's own `tags` attribute, verbatim — empty means none.
+    pub tags: Vec<String>,
 }
 
 pub fn flatten(canvas: &Canvas, expanded: &HashSet<String>) -> Vec<TreeRow> {
@@ -69,6 +71,7 @@ fn visit(
         has_tty: blocks.iter().any(|b| b.tty),
         constraint_ok,
         color: node.color.clone(),
+        tags: node.tags.clone(),
     });
 
     if has_children && is_expanded {

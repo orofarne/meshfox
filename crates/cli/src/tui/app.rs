@@ -849,7 +849,17 @@ impl App {
             })
             .unwrap_or_default();
 
-        match SourceEditorState::open(self.canvas_path.clone(), path, is_canvas, cursor, files) {
+        let mut all_tags: Vec<String> = self
+            .display_canvas
+            .nodes
+            .iter()
+            .flat_map(|n| n.tags.iter().chain(n.extra_parents.iter().flat_map(|e| e.tags.iter())))
+            .cloned()
+            .collect();
+        all_tags.sort();
+        all_tags.dedup();
+
+        match SourceEditorState::open(self.canvas_path.clone(), path, is_canvas, cursor, files, all_tags) {
             Ok(state) => self.source_editor = Some(state),
             Err(e) => self.status = format!("failed to open source editor: {e}"),
         }

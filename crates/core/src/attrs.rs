@@ -53,9 +53,60 @@ pub fn parse_attrs(s: &str) -> HashMap<String, String> {
     attrs_from_tokens(tokenize(s))
 }
 
+/// `meshfox validate`-only: an attribute name found on a `meshfox:node`/
+/// `meshfox:edge`/`meshfox:var`/`meshfox:option` comment or a runnable
+/// fence's own info string that isn't part of that construct's known
+/// vocabulary. Every other reader (`run`/`view`/`tui`/the server, and
+/// `mdcanvas::parse`/`vars`/`options`/`fence` parsing in general) keeps
+/// silently accepting an attribute it doesn't recognize — that's the
+/// forward/backward-compatibility behavior a format needs between
+/// versions. Only `validate` is meant to catch a typo'd attribute name
+/// loudly, so this lives as a separate, `validate`-only pass over each
+/// construct's own already-parsed attribute map, not folded into the real
+/// parsers' own error types.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown attribute {attr:?} on {context}")]
+pub struct UnknownAttrError {
+    pub context: String,
+    pub attr: String,
+}
+
+/// The first key in `attrs` that isn't in `known` (alphabetical, so the
+/// rare case of more than one unknown attribute on the same line is at
+/// least deterministic) — the shared building block every
+/// `unknown_*_attr` check (`mdcanvas`, `vars`, `options`, `fence`) filters
+/// its own already-parsed attribute map through.
+pub fn first_unknown<'a>(attrs: &'a HashMap<String, String>, known: &[&str]) -> Option<&'a str> {
+    let mut unknown: Vec<&str> = attrs
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !known.contains(k))
+        .collect();
+    unknown.sort_unstable();
+    unknown.into_iter().next()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_unknown_ignores_known_keys() {
+        let attrs = parse_attrs(r#"id="root" color="1""#);
+        assert_eq!(first_unknown(&attrs, &["id", "color"]), None);
+    }
+
+    #[test]
+    fn first_unknown_finds_a_typo_d_attribute() {
+        let attrs = parse_attrs(r#"id="root" colr="1""#);
+        assert_eq!(first_unknown(&attrs, &["id", "color"]), Some("colr"));
+    }
+
+    #[test]
+    fn first_unknown_is_deterministic_with_more_than_one_unknown() {
+        let attrs = parse_attrs(r#"zzz="1" aaa="2""#);
+        assert_eq!(first_unknown(&attrs, &[]), Some("aaa"));
+    }
 
     #[test]
     fn parses_quoted_and_bare_and_flag() {

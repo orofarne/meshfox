@@ -13,6 +13,7 @@ use edtui::{EditorView, LineNumbers, SyntaxHighlighter};
 use super::app::{App, Focus};
 use super::markdown::Segment;
 use super::source_editor::SourceEditorState;
+use super::tree::TreeRow;
 use crate::pdf::render::resolve_color_hex;
 use meshfox_core::{NodeType, VarType};
 
@@ -30,6 +31,85 @@ fn tree_row_color(color: Option<&str>) -> Option<Color> {
     let g = u8::from_str_radix(hex.get(2..4)?, 16).ok()?;
     let b = u8::from_str_radix(hex.get(4..6)?, 16).ok()?;
     Some(Color::Rgb(r, g, b))
+}
+
+/// Everything a tree row's title line is made of, flattened into
+/// individually-wrappable words, each carrying its own style — the title's
+/// own words, then (if present) the constraint mark, each tag, and the
+/// runnable/cache/tty badge, in that order. Keeping this as a flat word
+/// list (rather than a handful of pre-joined strings) is what lets
+/// `wrap_word_indices` below wrap the *whole* row — title, tags, and badge
+/// alike — instead of only the title while silently clipping the rest.
+fn tree_row_words(row: &TreeRow, title_style: Style) -> Vec<(String, Style)> {
+    let mut words: Vec<(String, Style)> = row
+        .title
+        .split_whitespace()
+        .map(|w| (w.to_string(), title_style))
+        .collect();
+    match row.constraint_ok {
+        Some(true) => words.push(("✓".to_string(), Style::default().fg(Color::Green))),
+        Some(false) => words.push(("✗".to_string(), Style::default().fg(Color::Red))),
+        None => {}
+    }
+    for tag in &row.tags {
+        words.push((format!("#{tag}"), Style::default().fg(Color::Cyan)));
+    }
+    let mut flags = Vec::new();
+    if row.runnable_count > 0 {
+        flags.push("run");
+    }
+    if row.has_cache {
+        flags.push("cache");
+    }
+    if row.has_tty {
+        flags.push("tty");
+    }
+    if !flags.is_empty() {
+        words.push((
+            format!("[{}]", flags.join(",")),
+            Style::default().fg(Color::Green),
+        ));
+    }
+    words
+}
+
+/// Greedy word-wrap over a row's own words (by index, so callers keep
+/// ownership of the words themselves): packs as many as fit within
+/// `first_width` on the first output row, `cont_width` on every row after
+/// (the tree pane's continuation rows lose the disclosure/type-marker
+/// prefix the first row has, so they get more room). A single word wider
+/// than its own row's budget still gets a whole row to itself rather than
+/// being split mid-word — same "don't break tokens" choice `ratatui`'s own
+/// `WordWrapper` defaults to, and what keeps e.g. a lone long tag legible.
+fn wrap_word_indices(word_widths: &[usize], first_width: usize, cont_width: usize) -> Vec<Vec<usize>> {
+    if word_widths.is_empty() {
+        return vec![Vec::new()];
+    }
+    let mut result: Vec<Vec<usize>> = Vec::new();
+    let mut current: Vec<usize> = Vec::new();
+    let mut current_width = 0usize;
+    let mut budget = first_width.max(1);
+    for (i, &w) in word_widths.iter().enumerate() {
+        let needed = if current.is_empty() {
+            w
+        } else {
+            current_width + 1 + w
+        };
+        if !current.is_empty() && needed > budget {
+            result.push(current);
+            current = Vec::new();
+            current_width = 0;
+            budget = cont_width.max(1);
+        }
+        current_width = if current.is_empty() {
+            w
+        } else {
+            current_width + 1 + w
+        };
+        current.push(i);
+    }
+    result.push(current);
+    result
 }
 
 /// Theme/language edtui's own bundled `syntect` highlighting uses for the
@@ -122,6 +202,9 @@ fn type_marker(t: NodeType) -> &'static str {
 }
 
 fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
+    // Borders on both sides of the list eat 2 columns of `area.width`.
+    let content_width = area.width.saturating_sub(2) as usize;
+
     let items: Vec<ListItem> = app
         .rows
         .iter()
@@ -134,42 +217,46 @@ fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
             } else {
                 "▸ "
             };
-            let mut flags = Vec::new();
-            if row.runnable_count > 0 {
-                flags.push("run");
-            }
-            if row.has_cache {
-                flags.push("cache");
-            }
-            if row.has_tty {
-                flags.push("tty");
-            }
-            let badge = if flags.is_empty() {
-                String::new()
-            } else {
-                format!("  [{}]", flags.join(","))
-            };
-            let constraint_mark = match row.constraint_ok {
-                Some(true) => Span::styled("  ✓", Style::default().fg(Color::Green)),
-                Some(false) => Span::styled("  ✗", Style::default().fg(Color::Red)),
-                None => Span::raw(""),
-            };
+            let type_mark = type_marker(row.node_type);
             let title_style = match tree_row_color(row.color.as_deref()) {
                 Some(c) => Style::default().fg(c),
                 None => Style::default(),
             };
-            let line = Line::from(vec![
-                Span::raw(indent),
-                Span::styled(disclosure, Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    type_marker(row.node_type),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(row.title.clone(), title_style),
-                constraint_mark,
-                Span::styled(badge, Style::default().fg(Color::Green)),
-            ]);
-            ListItem::new(line)
+
+            let words = tree_row_words(row, title_style);
+            let word_widths: Vec<usize> = words.iter().map(|(t, _)| t.chars().count()).collect();
+            // Row 0 also carries the indent + disclosure marker + type
+            // marker; continuation rows only re-indent by the disclosure
+            // marker's own width, so wrapped text still lines up under it.
+            let first_width = content_width
+                .saturating_sub(indent.chars().count() + disclosure.chars().count() + type_mark.chars().count());
+            let cont_width = content_width.saturating_sub(indent.chars().count() + disclosure.chars().count());
+            let wrapped = wrap_word_indices(&word_widths, first_width, cont_width);
+
+            let lines: Vec<Line> = wrapped
+                .iter()
+                .enumerate()
+                .map(|(row_i, word_indices)| {
+                    let mut spans = Vec::new();
+                    if row_i == 0 {
+                        spans.push(Span::raw(indent.clone()));
+                        spans.push(Span::styled(disclosure, Style::default().fg(Color::DarkGray)));
+                        spans.push(Span::styled(type_mark, Style::default().fg(Color::DarkGray)));
+                    } else {
+                        spans.push(Span::raw(format!("{indent}{}", " ".repeat(disclosure.chars().count()))));
+                    }
+                    for (i, &wi) in word_indices.iter().enumerate() {
+                        if i > 0 {
+                            spans.push(Span::raw(" "));
+                        }
+                        let (text, style) = &words[wi];
+                        spans.push(Span::styled(text.clone(), *style));
+                    }
+                    Line::from(spans)
+                })
+                .collect();
+
+            ListItem::new(Text::from(lines))
         })
         .collect();
 
@@ -559,7 +646,7 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         "K               kill the running block",
         "e               edit this node's own file, full-screen (Ctrl-s save,",
         "                Ctrl-f switch file, Ctrl-n heading->node, Ctrl-p",
-        "                suggest attributes, mouse click/drag/scroll, esc close)",
+        "                suggest attributes/tags, mouse click/drag/scroll, esc close)",
     ];
     if app.selected_is_open_target() {
         items.push("o               open this file node's target in the OS's default application");
@@ -653,6 +740,9 @@ fn render_source_editor(f: &mut Frame, area: Rect, se: &mut SourceEditorState) {
     if se.attr_suggest_open {
         render_attr_suggest_popup(f, area, se);
     }
+    if se.tag_suggest_open {
+        render_tag_suggest_popup(f, area, se);
+    }
 }
 
 /// TODO.canvas.md: "Саджесты и подсветка синтаксиса в TUI", item 2 —
@@ -682,6 +772,31 @@ fn render_attr_suggest_popup(f: &mut Frame, area: Rect, se: &SourceEditorState) 
 
     let mut state = ListState::default();
     state.select(Some(se.attr_suggest_selected));
+    let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    f.render_stateful_widget(list, inner, &mut state);
+}
+
+/// TODO.canvas.md: "Саджест по тегам в TUI" — `Ctrl-p`'s other popup
+/// shape, shown instead of `render_attr_suggest_popup` when the cursor was
+/// inside a `tags="..."` value (see `SourceEditorState::open_attr_suggest`).
+/// Same floating-`List`-over-`Clear` layout, candidates are already plain
+/// tag strings so there's no per-item suffix logic to branch on.
+fn render_tag_suggest_popup(f: &mut Frame, area: Rect, se: &SourceEditorState) {
+    let height = (se.tag_suggest_candidates.len() as u16 + 2).min(area.height);
+    let rect = centered_rect(36, height, area);
+    f.render_widget(Clear, rect);
+    let block = Block::default().borders(Borders::ALL).title(" tag ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let items: Vec<ListItem> = se
+        .tag_suggest_candidates
+        .iter()
+        .map(|t| ListItem::new(Line::from(format!("#{t}"))))
+        .collect();
+
+    let mut state = ListState::default();
+    state.select(Some(se.tag_suggest_selected));
     let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     f.render_stateful_widget(list, inner, &mut state);
 }
@@ -854,6 +969,118 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // TODO.canvas.md: "Tags in TUI" — end to end through `render_tree`
+    // itself, over a real `App`/canvas, mirroring the `render_document`
+    // integration test above.
+    #[test]
+    fn render_tree_shows_a_nodes_tags_next_to_its_title() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-render-tree-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.canvas.md");
+        std::fs::write(
+            &path,
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" tags=\"bag,improvement\" -->\n",
+        )
+        .unwrap();
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(path, tx).expect("valid test canvas");
+
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let area = Rect::new(0, 0, 40, 10);
+        terminal.draw(|f| render_tree(f, area, &mut app)).unwrap();
+
+        let buf = terminal.backend().buffer();
+        let mut screen = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if let Some(cell) = buf.cell((x, y)) {
+                    screen.push_str(cell.symbol());
+                }
+            }
+            screen.push('\n');
+        }
+        assert!(
+            screen.contains("#bag #improvement"),
+            "the node's tags should show up next to its title:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // TODO.canvas.md: "Переносы строк в дереве нод в TUI" — end to end
+    // through `render_tree` itself: a node with a long title, tags, and a
+    // runnable+cache badge, in a pane too narrow for any of it to fit on
+    // one row. Before wrapping, `List`'s own no-wrap rendering would just
+    // clip everything past the pane's width — this asserts the title's
+    // own tail, every tag, and the badge all still show up somewhere on
+    // screen (on wrapped continuation rows), not silently dropped.
+    #[test]
+    fn render_tree_wraps_a_long_title_instead_of_clipping_it_or_its_tags_and_badge() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-render-tree-wrap-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.canvas.md");
+        std::fs::write(
+            &path,
+            "<!-- meshfox:canvas -->\n\
+             # ALFA BRAVO CHARLIE DELTA ECHO\n\
+             <!-- meshfox:node id=\"root\" tags=\"bag,improvement\" -->\n\
+             \n\
+             ```bash name=\"build\" cache\n\
+             cargo build\n\
+             ```\n",
+        )
+        .unwrap();
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(path, tx).expect("valid test canvas");
+
+        // Narrow enough that "ALFA BRAVO CHARLIE DELTA ECHO  #bag #improvement  [run,cache]"
+        // (73+ chars) cannot possibly fit on one row.
+        let backend = TestBackend::new(20, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let area = Rect::new(0, 0, 20, 10);
+        terminal.draw(|f| render_tree(f, area, &mut app)).unwrap();
+
+        let buf = terminal.backend().buffer();
+        let mut screen = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if let Some(cell) = buf.cell((x, y)) {
+                    screen.push_str(cell.symbol());
+                }
+            }
+            screen.push('\n');
+        }
+        for needle in ["ALFA", "ECHO", "#bag", "#improvement", "[run,cache]"] {
+            assert!(
+                screen.contains(needle),
+                "{needle:?} should still be visible somewhere on screen, wrapped rather than clipped:\n{screen}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // TODO.canvas.md: "Цвета в TUI" — a node's own `color` (a JSON-Canvas
     // preset "1"-"6" or a literal `#rrggbb` hex) should color its title in
     // the tree pane, same palette the web UI and the PDF export already
@@ -874,6 +1101,45 @@ mod tests {
         assert_eq!(tree_row_color(None), None);
         assert_eq!(tree_row_color(Some("not-a-color")), None);
         assert_eq!(tree_row_color(Some("#zzzzzz")), None);
+    }
+
+    // TODO.canvas.md: "Переносы строк в дереве нод в TUI" — a title (plus
+    // its tags/badge) too long for the pane should wrap onto more rows,
+    // not get silently clipped by `List`'s own no-wrap rendering.
+    #[test]
+    fn wrap_word_indices_packs_everything_on_one_row_when_it_fits() {
+        let widths = [4, 2, 5]; // e.g. "Root", "✓", "#bag" — 4+1+2+1+5 = 13
+        assert_eq!(wrap_word_indices(&widths, 20, 20), vec![vec![0, 1, 2]]);
+    }
+
+    #[test]
+    fn wrap_word_indices_wraps_to_a_new_row_when_the_budget_is_exceeded() {
+        // First row (narrow: room for one 4-wide word only) gets just the
+        // title; both remaining words then fit together on the wider
+        // continuation row.
+        let widths = [4, 3, 3];
+        assert_eq!(wrap_word_indices(&widths, 4, 10), vec![vec![0], vec![1, 2]]);
+    }
+
+    #[test]
+    fn wrap_word_indices_uses_the_narrower_continuation_budget_after_the_first_row() {
+        // First row has less room (disclosure/type marker prefix); second
+        // word alone fits the wider first budget but not appended after
+        // the first word, so it starts row 2 — which then has *more* room
+        // than row 1, fitting the third word too.
+        let widths = [3, 3, 3];
+        assert_eq!(wrap_word_indices(&widths, 3, 10), vec![vec![0], vec![1, 2]]);
+    }
+
+    #[test]
+    fn wrap_word_indices_gives_an_oversized_single_word_its_own_row_without_splitting_it() {
+        let widths = [20];
+        assert_eq!(wrap_word_indices(&widths, 5, 5), vec![vec![0]]);
+    }
+
+    #[test]
+    fn wrap_word_indices_of_no_words_is_a_single_empty_row() {
+        assert_eq!(wrap_word_indices(&[], 20, 20), vec![Vec::<usize>::new()]);
     }
 
     #[test]

@@ -169,6 +169,58 @@ pub fn parse_fold_override(raw: &str) -> Result<Option<bool>, String> {
     }
 }
 
+/// Every attribute name `parse` actually reads off a `meshfox:node`
+/// comment (`NodeMeta`'s own fields plus the explicit `parent=` override)
+/// — the canonical vocabulary `unknown_node_edge_attr` (below, `validate`-
+/// only) diffs a comment's own attribute keys against. Also what
+/// `crates/cli/src/tui/source_editor.rs`'s `Ctrl-p` popup mirrors, for the
+/// same reason that file's own copy explains: no single list survived
+/// there to import before this one existed to import from.
+pub const NODE_ATTRS: &[&str] = &[
+    "id",
+    "type",
+    "x",
+    "y",
+    "w",
+    "h",
+    "color",
+    "tags",
+    "parent",
+    "display",
+    "lang",
+    "interpreter",
+    "preview",
+    "fold",
+    "edgeLabel",
+];
+/// `meshfox:edge`'s own attribute vocabulary — `from` is required, the
+/// rest optional styling (`canvas.rs`'s `ExtraEdge`/style enums).
+pub const EDGE_ATTRS: &[&str] = &["from", "label", "color", "style", "arrowStart", "arrowEnd", "tags"];
+
+/// `meshfox validate`-only (see `attrs::UnknownAttrError`'s own doc
+/// comment for why this is a separate pass rather than part of `parse`
+/// itself): the first `meshfox:node`/`meshfox:edge` comment attribute
+/// anywhere in `markdown` that isn't in `NODE_ATTRS`/`EDGE_ATTRS`.
+pub fn unknown_node_edge_attr(markdown: &str) -> Option<crate::attrs::UnknownAttrError> {
+    for seg in scan(markdown) {
+        if let Some(attr) = crate::attrs::first_unknown(&seg.node_attrs, NODE_ATTRS) {
+            return Some(crate::attrs::UnknownAttrError {
+                context: format!("the meshfox:node comment under heading {:?}", seg.title),
+                attr: attr.to_string(),
+            });
+        }
+        for edge in &seg.edge_attrs {
+            if let Some(attr) = crate::attrs::first_unknown(edge, EDGE_ATTRS) {
+                return Some(crate::attrs::UnknownAttrError {
+                    context: format!("a meshfox:edge comment under heading {:?}", seg.title),
+                    attr: attr.to_string(),
+                });
+            }
+        }
+    }
+    None
+}
+
 struct Segment {
     level: u8,
     title: String,
@@ -3543,5 +3595,36 @@ Reused from Tests as well.
             clear_node_id(DOC, "does-not-exist"),
             Err(ClearIdError::NotFound("does-not-exist".to_string()))
         );
+    }
+
+    // TODO.canvas.md: "Ошибка при неизвестных параметрах в validate" —
+    // `unknown_node_edge_attr` is a `validate`-only check, separate from
+    // `parse` itself (which must keep silently accepting an attribute it
+    // doesn't recognize, for forward/backward format compatibility).
+    #[test]
+    fn unknown_node_edge_attr_is_none_for_a_document_using_only_known_attrs() {
+        assert_eq!(unknown_node_edge_attr(DOC), None);
+    }
+
+    #[test]
+    fn unknown_node_edge_attr_catches_a_typo_d_node_attribute() {
+        let doc = "# Root\n<!-- meshfox:node id=\"root\" colr=\"1\" -->\n\nbody\n";
+        let err = unknown_node_edge_attr(doc).expect("colr is not a known attribute");
+        assert_eq!(err.attr, "colr");
+        assert!(err.context.contains("Root"));
+    }
+
+    #[test]
+    fn unknown_node_edge_attr_catches_a_typo_d_edge_attribute() {
+        let doc = "# Root\n<!-- meshfox:node id=\"root\" -->\n\n## Child\n<!-- meshfox:node id=\"child\" -->\n<!-- meshfox:edge form=\"root\" -->\n\nbody\n";
+        let err = unknown_node_edge_attr(doc).expect("form (typo for from) is not known");
+        assert_eq!(err.attr, "form");
+        assert!(err.context.contains("Child"));
+    }
+
+    #[test]
+    fn unknown_node_edge_attr_ignores_a_meshfox_node_comment_written_inside_a_fence() {
+        let doc = "# Root\n<!-- meshfox:node id=\"root\" -->\n\n```\n<!-- meshfox:node id=\"x\" colr=\"1\" -->\n```\n";
+        assert_eq!(unknown_node_edge_attr(doc), None);
     }
 }

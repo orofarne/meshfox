@@ -18,40 +18,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use edtui::actions::{AppendNewline, InsertChar};
 use edtui::{EditorEventHandler, EditorMode, EditorState, Highlight, Index2, Lines};
 use meshfox_core::include::IncludeInfo;
+use meshfox_core::mdcanvas::{EDGE_ATTRS, NODE_ATTRS};
 use ratatui::style::{Color, Modifier, Style};
 
-/// Every attribute name `crates/core/src/mdcanvas.rs`'s `parse` actually
-/// reads off a `meshfox:node` comment (`NodeMeta`'s own fields plus the
-/// explicit `parent=` override) — the source of truth for both the
-/// highlighter (`meshfox_highlights`) and the attribute-suggestion popup
-/// (`SourceEditorState::open_attr_suggest`) below. Kept as a hand-copied
-/// list rather than importing anything from `meshfox_core` (there's no
-/// single existing list to import — the real parser reads each attribute
-/// individually, by name, at its own call site) — out of sync only risks a
-/// missing/stale *suggestion*, never a parse-correctness bug, since
-/// neither consumer here writes anything the real parser doesn't already
-/// accept on its own.
-const NODE_ATTRS: &[&str] = &[
-    "id",
-    "type",
-    "x",
-    "y",
-    "w",
-    "h",
-    "color",
-    "tags",
-    "parent",
-    "display",
-    "lang",
-    "interpreter",
-    "preview",
-    "fold",
-    "edgeLabel",
-];
-/// `meshfox:edge`'s own attribute vocabulary (`mdcanvas.rs`'s edge-attr
-/// parsing, `canvas.rs`'s `ExtraEdge`/style enums) — `from` is required,
-/// the rest optional styling.
-const EDGE_ATTRS: &[&str] = &["from", "label", "color", "style", "arrowStart", "arrowEnd", "tags"];
 /// A runnable fence's own attribute vocabulary (`crates/core/src/fence.rs`)
 /// — value-taking (`name="..."`) vs. bare presence flags (`cache`, no
 /// `=value` at all) need different insertion shapes, see `AttrCandidate`.
@@ -114,6 +83,21 @@ pub struct SourceEditorState {
     attr_suggest_kind: AttrKind,
     pub attr_suggest_candidates: Vec<AttrCandidate>,
     pub attr_suggest_selected: usize,
+    /// Every distinct tag used anywhere in the currently loaded canvas
+    /// (nodes and extra edges alike), computed once by the caller
+    /// (`App::open_source_editor`) when the editor opens — the candidate
+    /// source for the `tags="..."`-value flavor of `Ctrl-p` below.
+    /// TODO.canvas.md: "Саджест по тегам в TUI".
+    all_tags: Vec<String>,
+    /// Same `Ctrl-p` popup mechanism as `attr_suggest_*`, but triggered
+    /// instead when the cursor sits inside an already-typed `tags="..."`
+    /// value (`open_attr_suggest` picks between the two) — candidates are
+    /// tag names already used elsewhere in the document, not attribute
+    /// names, and picking one inserts the tag name plus a trailing comma
+    /// rather than a `key=""` template.
+    pub tag_suggest_open: bool,
+    pub tag_suggest_candidates: Vec<String>,
+    pub tag_suggest_selected: usize,
 }
 
 /// Which attribute vocabulary a suggestible line belongs to — see
@@ -159,6 +143,7 @@ impl SourceEditorState {
         is_canvas: bool,
         cursor: Index2,
         files: Vec<IncludeInfo>,
+        all_tags: Vec<String>,
     ) -> std::io::Result<Self> {
         let raw = std::fs::read_to_string(&path)?;
         let mut editor = EditorState::new(Lines::from(raw.as_str()));
@@ -181,6 +166,10 @@ impl SourceEditorState {
             attr_suggest_kind: AttrKind::Node,
             attr_suggest_candidates: Vec::new(),
             attr_suggest_selected: 0,
+            all_tags,
+            tag_suggest_open: false,
+            tag_suggest_candidates: Vec::new(),
+            tag_suggest_selected: 0,
         })
     }
 
@@ -199,6 +188,10 @@ impl SourceEditorState {
     pub fn on_key(&mut self, key: KeyEvent) -> SourceEditorOutcome {
         if self.file_picker_open {
             self.on_file_picker_key(key);
+            return SourceEditorOutcome::Stay;
+        }
+        if self.tag_suggest_open {
+            self.on_tag_suggest_key(key);
             return SourceEditorOutcome::Stay;
         }
         if self.attr_suggest_open {
@@ -270,7 +263,7 @@ impl SourceEditorState {
     /// — same as `on_key`'s own picker branch, it has no mouse handling of
     /// its own yet.
     pub fn on_mouse(&mut self, mouse: MouseEvent) {
-        if self.file_picker_open || self.attr_suggest_open {
+        if self.file_picker_open || self.attr_suggest_open || self.tag_suggest_open {
             return;
         }
         self.events.on_mouse_event(mouse, &mut self.editor);
@@ -373,6 +366,14 @@ impl SourceEditorState {
     /// `meshfox:node`/`meshfox:edge`/fence-attribute line the cursor is
     /// currently on (`detect_attr_context`), pre-filtered to only the
     /// attributes that line doesn't already have (`attr_candidates`).
+    ///
+    /// TODO.canvas.md: "Саджест по тегам в TUI" — but first, on a node/edge
+    /// line, checks whether the cursor sits inside an already-typed
+    /// `tags="..."` value (`tags_value_range`); if so this delegates to
+    /// `open_tag_suggest` instead, which offers tag *values* rather than
+    /// attribute names — the natural reading of "cursor is inside the tags
+    /// value" as *intent* to add another tag, not to add a whole new
+    /// attribute.
     fn open_attr_suggest(&mut self) {
         let text = self.editor.lines.to_string();
         let row = self.editor.cursor.row;
@@ -387,6 +388,15 @@ impl SourceEditorState {
             );
             return;
         };
+        if kind != AttrKind::Fence {
+            if let Some((start, end)) = tags_value_range(line) {
+                let col = self.editor.cursor.col;
+                if col >= start && col <= end {
+                    self.open_tag_suggest(line, start, end);
+                    return;
+                }
+            }
+        }
         let candidates = attr_candidates(kind, line);
         if candidates.is_empty() {
             self.error = Some("every known attribute is already on this line".to_string());
@@ -397,6 +407,80 @@ impl SourceEditorState {
         self.attr_suggest_selected = 0;
         self.attr_suggest_open = true;
         self.error = None;
+    }
+
+    /// Offers every tag in `self.all_tags` not already present in the
+    /// `tags="..."` value spanning `[value_start, value_end)` (char
+    /// columns) on `line`.
+    fn open_tag_suggest(&mut self, line: &str, value_start: usize, value_end: usize) {
+        let value: String = line.chars().skip(value_start).take(value_end - value_start).collect();
+        let present: std::collections::HashSet<&str> =
+            value.split(',').map(str::trim).filter(|t| !t.is_empty()).collect();
+        let candidates: Vec<String> = self
+            .all_tags
+            .iter()
+            .filter(|t| !present.contains(t.as_str()))
+            .cloned()
+            .collect();
+        if candidates.is_empty() {
+            self.error = Some("no other tags used elsewhere in the document".to_string());
+            return;
+        }
+        self.tag_suggest_candidates = candidates;
+        self.tag_suggest_selected = 0;
+        self.tag_suggest_open = true;
+        self.error = None;
+    }
+
+    fn on_tag_suggest_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.tag_suggest_selected = self.tag_suggest_selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.tag_suggest_selected = (self.tag_suggest_selected + 1)
+                    .min(self.tag_suggest_candidates.len().saturating_sub(1));
+            }
+            KeyCode::Esc => self.tag_suggest_open = false,
+            KeyCode::Enter => {
+                self.tag_suggest_open = false;
+                if let Some(tag) = self.tag_suggest_candidates.get(self.tag_suggest_selected).cloned() {
+                    self.insert_tag_candidate(&tag);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Inserts `tag` into the current line's `tags="..."` value, right
+    /// before the closing quote — independent of the cursor's own exact
+    /// sub-position within the value, same "the line matters, not the
+    /// column" choice `insert_attr_candidate` already makes. A leading
+    /// comma is added only if the value isn't already empty or
+    /// comma-terminated; a trailing comma always follows, so the cursor
+    /// lands ready to pick (or type) the next tag — mirroring what
+    /// clicking a suggestion in the web UI's tag editor does. The trailing
+    /// comma is harmless if left dangling (`parse_tags` filters out empty
+    /// entries), so there's no need to clean it up on save.
+    fn insert_tag_candidate(&mut self, tag: &str) {
+        let text = self.editor.lines.to_string();
+        let row = self.editor.cursor.row;
+        let Some(line) = text.lines().nth(row) else {
+            return;
+        };
+        let Some((start, end)) = tags_value_range(line) else {
+            return;
+        };
+        let value: String = line.chars().skip(start).take(end - start).collect();
+        let needs_leading_comma = !value.trim_end().is_empty() && !value.trim_end().ends_with(',');
+        self.editor.cursor = Index2::new(row, end);
+        let insertion = if needs_leading_comma {
+            format!(",{tag},")
+        } else {
+            format!("{tag},")
+        };
+        type_str(&mut self.editor, &insertion);
+        self.refresh_meshfox_highlights();
     }
 
     /// Which vocabulary the currently-open popup is suggesting from — for
@@ -470,6 +554,23 @@ fn insertion_col(line: &str, kind: AttrKind) -> usize {
         }
     }
     line.chars().count()
+}
+
+/// Locates a `tags="..."` attribute's value on `line`, as a char-column
+/// range — `start` right after the opening quote, `end` at the closing
+/// quote (so `end - start` chars sit strictly between them; `start ==
+/// end` for an empty value, `tags=""`). `None` if the line has no `tags=`
+/// at all, or the value's closing quote is missing. Char columns, not byte
+/// offsets — matches `insertion_col`/`Index2` elsewhere in this file.
+fn tags_value_range(line: &str) -> Option<(usize, usize)> {
+    let key = "tags=\"";
+    let start_byte = line.find(key)?;
+    let value_start_byte = start_byte + key.len();
+    let rest = &line[value_start_byte..];
+    let close_byte_in_rest = rest.find('"')?;
+    let start_col = line[..value_start_byte].chars().count();
+    let end_col = start_col + rest[..close_byte_in_rest].chars().count();
+    Some((start_col, end_col))
 }
 
 /// Which attribute vocabulary (if any) the cursor's current line belongs
@@ -735,6 +836,10 @@ mod tests {
     // `EditorState` correctly through it) and the one guard this file adds
     // on top (no mouse handling while the file picker overlay is open).
     fn open_test_editor(text: &str) -> SourceEditorState {
+        open_test_editor_with_tags(text, Vec::new())
+    }
+
+    fn open_test_editor_with_tags(text: &str, all_tags: Vec<String>) -> SourceEditorState {
         use edtui::EditorView;
         use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
 
@@ -746,9 +851,15 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::write(&path, text).unwrap();
-        let mut se =
-            SourceEditorState::open(path.clone(), path, false, Index2::new(0, 0), Vec::new())
-                .unwrap();
+        let mut se = SourceEditorState::open(
+            path.clone(),
+            path,
+            false,
+            Index2::new(0, 0),
+            Vec::new(),
+            all_tags,
+        )
+        .unwrap();
         // Same requirement `prime_viewport`'s own test documents: a real
         // render populates `screen_area`/`viewport`, which mouse
         // coordinate mapping needs.
@@ -958,6 +1069,103 @@ mod tests {
         assert_eq!(
             se.editor.lines.to_string(),
             "<!-- meshfox:node id=\"root\" x=0 -->\n"
+        );
+        let _ = std::fs::remove_file(&se.path);
+    }
+
+    // TODO.canvas.md: "Саджест по тегам в TUI" — `Ctrl-p`'s tag-value
+    // flavor, taken when the cursor sits inside an already-typed
+    // `tags="..."` value rather than on the rest of the line.
+    #[test]
+    fn tags_value_range_finds_the_value_between_the_quotes() {
+        let line = "<!-- meshfox:node id=\"root\" tags=\"bag,improvement\" -->";
+        let (start, end) = tags_value_range(line).expect("tags= present");
+        let value: String = line.chars().skip(start).take(end - start).collect();
+        assert_eq!(value, "bag,improvement");
+    }
+
+    #[test]
+    fn tags_value_range_is_none_without_a_tags_attribute() {
+        assert_eq!(tags_value_range("<!-- meshfox:node id=\"root\" -->"), None);
+    }
+
+    #[test]
+    fn open_attr_suggest_offers_tag_values_when_the_cursor_sits_inside_the_tags_value() {
+        let line = "<!-- meshfox:node id=\"root\" tags=\"bag\" -->\n";
+        let mut se = open_test_editor_with_tags(
+            line,
+            vec!["bag".to_string(), "improvement".to_string(), "docs".to_string()],
+        );
+        let (start, end) = tags_value_range(line.trim_end()).unwrap();
+        se.editor.cursor = Index2::new(0, (start + end) / 2);
+
+        se.open_attr_suggest();
+
+        assert!(se.tag_suggest_open);
+        assert!(!se.attr_suggest_open);
+        assert!(!se.tag_suggest_candidates.contains(&"bag".to_string())); // already on this node
+        assert!(se.tag_suggest_candidates.contains(&"improvement".to_string()));
+        assert!(se.tag_suggest_candidates.contains(&"docs".to_string()));
+        let _ = std::fs::remove_file(&se.path);
+    }
+
+    #[test]
+    fn open_attr_suggest_still_offers_attribute_names_when_the_cursor_is_outside_the_tags_value() {
+        let mut se = open_test_editor_with_tags(
+            "<!-- meshfox:node id=\"root\" tags=\"bag\" -->\n",
+            vec!["bag".to_string(), "improvement".to_string()],
+        );
+        se.editor.cursor = Index2::new(0, 0); // well before `tags=`
+
+        se.open_attr_suggest();
+
+        assert!(se.attr_suggest_open);
+        assert!(!se.tag_suggest_open);
+        let _ = std::fs::remove_file(&se.path);
+    }
+
+    #[test]
+    fn insert_tag_candidate_appends_with_a_leading_comma_when_the_value_is_non_empty() {
+        let mut se = open_test_editor("<!-- meshfox:node id=\"root\" tags=\"bag\" -->\n");
+        se.insert_tag_candidate("improvement");
+
+        assert_eq!(
+            se.editor.lines.to_string(),
+            "<!-- meshfox:node id=\"root\" tags=\"bag,improvement,\" -->\n"
+        );
+        let _ = std::fs::remove_file(&se.path);
+    }
+
+    #[test]
+    fn insert_tag_candidate_omits_the_leading_comma_for_an_empty_value() {
+        let mut se = open_test_editor("<!-- meshfox:node id=\"root\" tags=\"\" -->\n");
+        se.insert_tag_candidate("bag");
+
+        assert_eq!(
+            se.editor.lines.to_string(),
+            "<!-- meshfox:node id=\"root\" tags=\"bag,\" -->\n"
+        );
+        let _ = std::fs::remove_file(&se.path);
+    }
+
+    #[test]
+    fn open_tag_suggest_and_insert_tag_candidate_end_to_end() {
+        let line = "<!-- meshfox:node id=\"root\" tags=\"bag\" -->\n";
+        let mut se =
+            open_test_editor_with_tags(line, vec!["bag".to_string(), "improvement".to_string()]);
+        let (start, _end) = tags_value_range(line.trim_end()).unwrap();
+        se.editor.cursor = Index2::new(0, start);
+
+        se.open_attr_suggest();
+        assert!(se.tag_suggest_open);
+        assert_eq!(se.tag_suggest_candidates, vec!["improvement".to_string()]);
+
+        se.on_tag_suggest_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(!se.tag_suggest_open);
+        assert_eq!(
+            se.editor.lines.to_string(),
+            "<!-- meshfox:node id=\"root\" tags=\"bag,improvement,\" -->\n"
         );
         let _ = std::fs::remove_file(&se.path);
     }
