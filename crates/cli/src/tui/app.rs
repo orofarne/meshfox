@@ -1675,13 +1675,39 @@ fn link_preview_image_path(image_url: &str) -> PathBuf {
     PathBuf::from(format!("meshfox-link-preview:{image_url}"))
 }
 
+/// TODO.canvas.md: "Base64 image" — a `data:image/...;base64,...` URL,
+/// consistent with `crate::pdf`/`staticgen`'s own already-working pass-
+/// through (a browser/headless-Chrome decodes it natively there) and with
+/// the web UI's `img` `urlTransform`. Decoded synchronously and entirely
+/// in memory — unlike `App::maybe_fetch_link_preview_image`'s async fetch,
+/// there's no network round-trip to wait on, the bytes are already right
+/// there in the document.
+fn decode_data_url_image(url: &str) -> Option<image::DynamicImage> {
+    let rest = url.strip_prefix("data:")?;
+    let (meta, payload) = rest.split_once(',')?;
+    if !meta.ends_with(";base64") {
+        return None;
+    }
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, payload).ok()?;
+    image::load_from_memory(&bytes).ok()
+}
+
+/// `path` is a real file for every ordinary `Segment::Image`, but a
+/// `data:` URL string doubling as its own synthetic cache key for one
+/// pasted/embedded directly in the document (see `markdown::Renderer`'s
+/// own `Tag::Image` handling) — same "no file on disk to key it by"
+/// situation `link_preview_image_path` already has, just without a
+/// prefix: a `data:` URL can't collide with a real relative path.
 fn load_image_protocol(picker: &mut Picker, path: &Path) -> Option<Protocol> {
-    let dyn_img = image::ImageReader::open(path)
-        .ok()?
-        .with_guessed_format()
-        .ok()?
-        .decode()
-        .ok()?;
+    let dyn_img = match path.to_str().filter(|s| s.starts_with("data:")) {
+        Some(data_url) => decode_data_url_image(data_url)?,
+        None => image::ImageReader::open(path)
+            .ok()?
+            .with_guessed_format()
+            .ok()?
+            .decode()
+            .ok()?,
+    };
     let budget = ratatui::layout::Size::new(56, 24);
     picker
         .new_protocol(dyn_img, budget, ratatui_image::Resize::Fit(None))
@@ -1690,4 +1716,39 @@ fn load_image_protocol(picker: &mut Picker, path: &Path) -> Option<Protocol> {
 
 fn point_in(rect: Rect, x: u16, y: u16) -> bool {
     x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // TODO.canvas.md: "Base64 image" — `decode_data_url_image`/
+    // `load_image_protocol`'s own `data:` branch. `Picker::halfblocks()`
+    // needs no real terminal (see its own construction above in
+    // `App::new`), so this runs fine in CI, same as everywhere else in
+    // this file that already relies on it.
+    const ONE_PIXEL_PNG_DATA_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+    #[test]
+    fn decode_data_url_image_decodes_a_valid_base64_png() {
+        let img = decode_data_url_image(ONE_PIXEL_PNG_DATA_URL).expect("valid data: URL");
+        assert_eq!((img.width(), img.height()), (1, 1));
+    }
+
+    #[test]
+    fn decode_data_url_image_rejects_a_non_base64_data_url() {
+        assert!(decode_data_url_image("data:image/png,not-base64-payload").is_none());
+    }
+
+    #[test]
+    fn decode_data_url_image_rejects_a_garbage_payload() {
+        assert!(decode_data_url_image("data:image/png;base64,not valid base64!!!").is_none());
+    }
+
+    #[test]
+    fn load_image_protocol_loads_a_data_url_without_touching_disk() {
+        let mut picker = Picker::halfblocks();
+        let path = PathBuf::from(ONE_PIXEL_PNG_DATA_URL);
+        assert!(load_image_protocol(&mut picker, &path).is_some());
+    }
 }

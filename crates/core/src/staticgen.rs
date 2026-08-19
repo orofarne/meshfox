@@ -759,6 +759,22 @@ mod tests {
         assert_eq!(site.find("child").unwrap().color.as_deref(), Some("3"));
     }
 
+    // TODO.canvas.md: "Base64 image" — a `data:` image `src` must pass
+    // through `resolve_image_url` byte-for-byte, same as any other
+    // external URL (`is_external_or_absolute`): a browser/headless-Chrome
+    // decodes it natively, there's no local file to queue as an `Asset`.
+    #[test]
+    fn a_data_url_image_src_passes_through_unresolved_and_unqueued() {
+        let c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n![x](data:image/png;base64,iVBORw0KGgo=)\n");
+        let (site, assets) = build(&c, Path::new("/nonexistent-meshfox-test-dir"), None);
+        let body = &site.find("root").unwrap().html_body;
+        assert!(
+            body.contains("src=\"data:image/png;base64,iVBORw0KGgo=\""),
+            "{body}"
+        );
+        assert!(assets.is_empty(), "a data: URL has no local file to copy");
+    }
+
     #[test]
     fn a_rendered_link_opens_in_a_new_tab() {
         let c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n[meshfox](https://github.com/example/meshfox)\n");

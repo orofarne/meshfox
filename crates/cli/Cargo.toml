@@ -30,6 +30,10 @@ pulldown-cmark = "0.13.4"
 syntect = { version = "5.3.0", default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "regex-fancy"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
+# Already resolved transitively (headless_chrome's own dep chain) — pinned
+# to the same 0.22.x here so the TUI's own `data:` image decoding
+# (`tui::app::decode_data_url_image`) doesn't pull in a second copy.
+base64 = "0.22"
 edtui = "0.11.6"
 open = "5"
 self_update = { version = "0.44.0", default-features = false, features = ["ureq", "rustls", "archive-tar", "compression-flate2"] }

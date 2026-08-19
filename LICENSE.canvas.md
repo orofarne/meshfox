@@ -21,6 +21,7 @@ Direct dependencies across `crates/core`, `crates/server`, `crates/cli` (`cargo 
 | anyhow | MIT OR Apache-2.0 |
 | async-stream | MIT |
 | axum | MIT |
+| base64 | MIT OR Apache-2.0 |
 | clap | MIT OR Apache-2.0 |
 | clap_complete | MIT OR Apache-2.0 |
 | crossterm | MIT |

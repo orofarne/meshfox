@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import CodeMirror from "@uiw/react-codemirror";
 import { NodeBodyPreview } from "./MeshNode";
 import { meshfoxMarkdown } from "./meshfoxSyntax";
+import { imagePaste } from "./imagePaste";
 import { THEME_CHANGE_EVENT } from "./theme";
 
 /** How long to wait after the last keystroke before auto-saving — see
@@ -109,7 +110,7 @@ export function NodeTextEditor({ initialText, onChange, onClose }: NodeTextEdito
               value={text}
               height="100%"
               theme={dark ? "dark" : "light"}
-              extensions={[meshfoxMarkdown]}
+              extensions={[meshfoxMarkdown, imagePaste]}
               onChange={setText}
               autoFocus
             />

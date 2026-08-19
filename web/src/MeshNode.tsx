@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Handle, NodeResizer, NodeToolbar, Position, useReactFlow, type NodeProps } from "@xyflow/react";
-import ReactMarkdown, { type Components } from "react-markdown";
+import ReactMarkdown, { defaultUrlTransform, type Components, type UrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import CodeMirror from "@uiw/react-codemirror";
 import { LanguageDescription } from "@codemirror/language";
@@ -31,6 +31,23 @@ function resolveAssetHref(href: string | undefined, assetBase: string | undefine
   if (/^[a-z][a-z0-9+.-]*:/i.test(href) || href.startsWith("/") || href.startsWith("#")) return href;
   return `/api/include-asset?dir=${encodeURIComponent(assetBase)}&file=${encodeURIComponent(href)}`;
 }
+
+/**
+ * `react-markdown`'s own `defaultUrlTransform` strips any URL scheme
+ * outside `http(s)`/`irc(s)`/`mailto`/`xmpp` down to `""` — a sensible
+ * default (blocks a `javascript:`/`data:text/html` link), but it also
+ * silently blanks a `data:image/...;base64,...` `<img src>` (TODO.canvas.md:
+ * "Base64 image"), which is exactly the wire format `Node.effectiveColor`'s
+ * sibling scheme uses on purpose. Scoped to `key === "src"` — react-markdown
+ * calls this per-attribute with the *property* name, not the tag, but `src`
+ * is only ever an image's own source here (never a link's `href`, which
+ * stays under the strict default) — so a pasted image renders, without
+ * loosening what a plain link is allowed to point at.
+ */
+const allowDataImageUrls: UrlTransform = (url, key, node) => {
+  if (key === "src" && url.startsWith("data:image/")) return url;
+  return defaultUrlTransform(url);
+};
 
 /**
  * Builds this file's `<ReactMarkdown>` `components` — same shape
@@ -867,7 +884,12 @@ export function NodeBodyPreview({ text }: { text: string }) {
       {segments.map((seg, i) => {
         if (seg.type === "markdown") {
           return (
-            <ReactMarkdown key={i} remarkPlugins={[remarkGfm]} components={markdownComponents}>
+            <ReactMarkdown
+              key={i}
+              remarkPlugins={[remarkGfm]}
+              components={markdownComponents}
+              urlTransform={allowDataImageUrls}
+            >
               {seg.content}
             </ReactMarkdown>
           );
@@ -965,7 +987,12 @@ function MeshNodeBody({ data, nodeId }: { data: MeshNodeData; nodeId: string }) 
       {segments.map((seg, i) => {
         if (seg.type === "markdown") {
           return (
-            <ReactMarkdown key={i} remarkPlugins={[remarkGfm]} components={components}>
+            <ReactMarkdown
+              key={i}
+              remarkPlugins={[remarkGfm]}
+              components={components}
+              urlTransform={allowDataImageUrls}
+            >
               {seg.content}
             </ReactMarkdown>
           );

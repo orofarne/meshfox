@@ -542,6 +542,15 @@ cargo build --workspace --release
 echo "binary: target/release/meshfox"
 ```
 
+### Full check
+<!-- meshfox:node id="full-check" -->
+
+Run unit and e2e tests:
+
+```bash deps="unit-tests/run,e2e-tests/run,release-build/release-build"
+echo "done"
+```
+
 ### Install
 <!-- meshfox:node id="install" -->
 

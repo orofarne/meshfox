@@ -387,6 +387,16 @@ impl<'a> Renderer<'a> {
                             .fg(Color::DarkGray)
                             .add_modifier(Modifier::ITALIC),
                     ))]));
+                } else if dest_url.starts_with("data:") {
+                    // Same `Segment::Image`/`doc_images` path as a real
+                    // file — `app::load_image_protocol` decodes this one
+                    // from the URL's own base64 payload instead of reading
+                    // `path` off disk (there's nothing on disk to read;
+                    // the whole data: URL string is just a stable, unique
+                    // cache key here, same idea as `app::
+                    // link_preview_image_path`'s synthetic path).
+                    let path = std::path::PathBuf::from(dest_url.as_ref());
+                    self.push_segment(Segment::Image { path, alt });
                 } else {
                     let path = self.base_dir.join(dest_url.as_ref());
                     self.push_segment(Segment::Image { path, alt });
@@ -544,4 +554,39 @@ fn render_table(t: &TableState) -> Vec<Line<'static>> {
         }
     }
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // TODO.canvas.md: "Base64 image" — a `data:` image URL becomes an
+    // ordinary `Segment::Image`, same as a real local file, so
+    // `app::load_image_protocol` can pick it up through the exact same
+    // `doc_images` path (see that function's own `data:` branch) — not
+    // the inert "[image: url]" text `http(s)://` gets, and not treated as
+    // a relative filesystem path to join under `base_dir`.
+    #[test]
+    fn a_data_url_image_becomes_a_segment_image_keyed_by_the_url_itself() {
+        let hl = Highlighter::new();
+        let md = "![a pixel](data:image/png;base64,iVBORw0KGgo=)\n";
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        let Segment::Image { path, alt } = segments
+            .into_iter()
+            .find(|s| matches!(s, Segment::Image { .. }))
+            .expect("a data: URL should produce a Segment::Image")
+        else {
+            unreachable!()
+        };
+        assert_eq!(path, PathBuf::from("data:image/png;base64,iVBORw0KGgo="));
+        assert_eq!(alt, "");
+    }
+
+    #[test]
+    fn an_http_image_is_still_inert_text_not_a_segment_image() {
+        let hl = Highlighter::new();
+        let md = "![x](https://example.com/pic.png)\n";
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        assert!(!segments.iter().any(|s| matches!(s, Segment::Image { .. })));
+    }
 }

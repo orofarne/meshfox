@@ -71,6 +71,11 @@ const MOVE_SIBLING_PORT = 4603;
 // one auto-placed node) and port, so its own ↺ reset writes never collide
 // with any other suite's server/canvas.
 const CLEAR_NODE_LAYOUT_PORT = 4604;
+// Sixteenth server + port for image-paste.spec.ts — same reasoning again,
+// its own fixture (image-paste.canvas.md, one bare root) and port, so its
+// own node-body/source saves never collide with any other suite's
+// server/canvas.
+const IMAGE_PASTE_PORT = 4605;
 
 // Taller than Playwright's 720px default — the app's own `minZoom` (0.5)
 // is a hard floor on how far "fit view" can zoom out, and deps.canvas.md's
@@ -184,6 +189,11 @@ export default defineConfig({
       testMatch: /(^|\/)clear-node-layout\.spec\.ts$/,
       use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${CLEAR_NODE_LAYOUT_PORT}` },
     },
+    {
+      name: `${browser}-image-paste`,
+      testMatch: /(^|\/)image-paste\.spec\.ts$/,
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${IMAGE_PASTE_PORT}` },
+    },
   ]),
   webServer: [
     {
@@ -284,6 +294,12 @@ export default defineConfig({
     {
       command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view e2e/fixtures/clear-node-layout.canvas.md --port ${CLEAR_NODE_LAYOUT_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${CLEAR_NODE_LAYOUT_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view e2e/fixtures/image-paste.canvas.md --port ${IMAGE_PASTE_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${IMAGE_PASTE_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
