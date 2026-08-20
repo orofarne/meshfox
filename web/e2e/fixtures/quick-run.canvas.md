@@ -8,8 +8,12 @@ Fixture canvas for the Playwright quick-run suite
 button (see MeshNode.tsx) routes a `tty`-flagged default block through
 `onRunTty` (opens a real terminal), not `onRun` (which the server
 rejects outright for a `tty` block — see `crates/server/src/lib.rs`'s
-`run_block`). Declares `unfold` so both nodes below render fully
-expanded, matching this suite's own visibility assumptions.
+`run_block`), and that it runs the default block's full `deps=` chain
+first (same as the block-level "⛓ run chain" button), not the block
+alone — it used to call `onRun`/`onRunTty` with `withDeps` hardcoded to
+`false`, silently skipping `deps=` no matter what. Declares `unfold` so
+every node below renders fully expanded, matching this suite's own
+visibility assumptions.
 
 ## Monitor
 <!-- meshfox:node id="monitor" -->
@@ -33,4 +37,24 @@ quick-run to go through `onRunTty` regardless of the block's own flag.
 
 ```bash
 echo hello
+```
+
+## Dependency
+<!-- meshfox:node id="dep-source" -->
+
+Pulled in by "Chained" below's default block, via `deps=`.
+
+```bash name="setup"
+echo dep-ran
+```
+
+## Chained
+<!-- meshfox:node id="chained" -->
+
+Its default (sole, unnamed) block declares `deps="dep-source/setup"` — the
+quick-run button here should run that dependency first, same as clicking
+"⛓ run chain" on the block itself would.
+
+```bash deps="dep-source/setup"
+echo chained-ran
 ```

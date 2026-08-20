@@ -32,3 +32,11 @@ test("quick-run on a plain (non-tty) default block still streams output the norm
   await expect(page.locator(".mesh-tty-panel")).toHaveCount(0);
   await expect(page.locator(".error")).toHaveCount(0);
 });
+
+test("quick-run on a default block with deps runs its dependency chain first, not just the block itself", async ({ page }) => {
+  await node(page, "chained").locator(".mesh-node-quick-run-icon").click();
+
+  await expect(node(page, "dep-source").locator(".mesh-code-block")).toContainText("dep-ran");
+  await expect(node(page, "chained").locator(".mesh-code-block")).toContainText("chained-ran");
+  await expect(page.locator(".error")).toHaveCount(0);
+});

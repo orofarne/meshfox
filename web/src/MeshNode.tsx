@@ -1417,15 +1417,15 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
               disabled={quickRunBusy}
               onClick={() =>
                 quickRunIsTty
-                  ? data.onRunTty(quickRunBlockName, false, quickRunAutoclose)
-                  : data.onRun(quickRunBlockName, false)
+                  ? data.onRunTty(quickRunBlockName, true, quickRunAutoclose)
+                  : data.onRun(quickRunBlockName, true)
               }
               title={
                 quickRunBusy
                   ? "running…"
                   : quickRunIsTty
-                    ? `open an interactive terminal for ${quickRunBlockName}`
-                    : `run ${quickRunBlockName}`
+                    ? `runs its dependency chain first, then opens an interactive terminal for ${quickRunBlockName}`
+                    : `⛓ runs its dependency chain first, then ${quickRunBlockName}`
               }
             >
               ▷
