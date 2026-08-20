@@ -151,8 +151,22 @@ fn visit(
     // indirectly, through another (directly-referenced) var's own
     // `default_var`/`choices_var`, still needs its `from=` source to have
     // run first, or that other var's dynamic default/choices could never
-    // be materialized. See `vars::close_over_var_refs`.
-    let env_names = block.env.iter().map(|e| e.var_name.as_str());
+    // be materialized. See `vars::close_over_var_refs`. A block's own
+    // `interpreter=` can reference a declared variable too (`$NAME` — see
+    // `crate::exec::interpreter_var_refs`) and needs exactly the same
+    // treatment: running the block at all requires knowing what to spawn,
+    // so a `from=`-computed interpreter path is just as much an implicit
+    // dependency as one referenced via `env=`.
+    let interpreter_names = block
+        .interpreter
+        .as_deref()
+        .map(crate::exec::interpreter_var_refs)
+        .unwrap_or_default();
+    let env_names = block
+        .env
+        .iter()
+        .map(|e| e.var_name.as_str())
+        .chain(interpreter_names.iter().map(String::as_str));
     for name in crate::vars::close_over_var_refs(decls, env_names) {
         if let Some(from) = decls
             .iter()
@@ -430,6 +444,24 @@ mod tests {
                 BlockAddr::new("root", "provision"),
                 BlockAddr::new("root", "deploy"),
             ]
+        );
+    }
+
+    #[test]
+    fn chain_includes_a_from_source_reached_only_through_interpreter() {
+        // `run`'s own `env=` never mentions PYTHON at all -- it's only
+        // referenced via `interpreter="$PYTHON -u"` -- but `setup`'s
+        // computed value is still needed before `run` can even be spawned.
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "<!-- meshfox:var name=\"PYTHON\" from=\"setup\" -->\n\n",
+            "```bash name=\"setup\" cache\necho PYTHON=/usr/bin/python3\n```\n\n",
+            "```python name=\"run\" interpreter=\"$PYTHON -u\"\nprint('hi')\n```\n",
+        ));
+        let chain = resolve_chain(&c, BlockAddr::new("root", "run")).unwrap();
+        assert_eq!(
+            chain,
+            vec![BlockAddr::new("root", "setup"), BlockAddr::new("root", "run"),]
         );
     }
 

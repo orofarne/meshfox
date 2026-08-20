@@ -1403,30 +1403,34 @@ fn persist_set_overrides(
     }
 }
 
-/// Resolves *only* the declared variables `block`'s own `env=` references
-/// (see SPEC.md's "Variables") — a block with no `env=` never resolves or
-/// prompts for anything, however many variables the document declares.
-/// Tries `overrides` (`--set`)/the process environment/the on-disk cache/
-/// each declaration's own `default` first (`resolve_block_env` — a
-/// `required` declaration skips that last step, so it shows up here even
-/// when it has a `default`); whatever that leaves missing gets a terminal
-/// prompt — pre-filled with the declaration's own `default` so a
-/// `required` one can just be confirmed with Enter — its non-secret
-/// answer saved back to the cache so a later run of *any* block
-/// referencing the same variable doesn't ask again. Exits with an error
-/// instead of prompting when stdin isn't a terminal, same as `configure`.
-fn resolve_block_env_or_prompt(
-    block: &meshfox_core::CodeBlock,
+/// Resolves `refs` (declared-variable references in `crate::fence::EnvRef`
+/// shape) — prompting for whatever's still missing — and returns the
+/// resolved values keyed by each ref's own `local_name`. Shared by
+/// `resolve_block_env_or_prompt` (`refs` is a block's real `env=` list) and
+/// `resolve_block_interpreter_or_prompt` (`refs` is a synthetic one built
+/// from that block's own `interpreter=` references — see
+/// `meshfox_core::interpreter_var_refs` — where `local_name == var_name`
+/// always, there being no renaming concept for those). Tries `overrides`
+/// (`--set`)/the process environment/the on-disk cache/each declaration's
+/// own `default` first (`resolve_block_env` — a `required` declaration
+/// skips that last step, so it shows up here even when it has a `default`);
+/// whatever that leaves missing gets a terminal prompt — pre-filled with
+/// the declaration's own `default` so a `required` one can just be
+/// confirmed with Enter — its non-secret answer saved back to the cache so
+/// a later reference to the same variable, `env=` or `interpreter=`, in the
+/// same invocation doesn't ask again. Exits with an error instead of
+/// prompting when stdin isn't a terminal, same as `configure`.
+fn resolve_refs_or_prompt(
+    refs: &[meshfox_core::EnvRef],
     decls: &[VarDecl],
     overrides: &mut HashMap<String, String>,
     computed: &HashMap<String, String>,
     cache: &mut VarCache,
 ) -> HashMap<String, String> {
-    if block.env.is_empty() {
+    if refs.is_empty() {
         return HashMap::new();
     }
-    let mut resolution =
-        meshfox_core::resolve_block_env(&block.env, decls, overrides, cache, computed);
+    let mut resolution = meshfox_core::resolve_block_env(refs, decls, overrides, cache, computed);
     // A `from`-declared (computed) variable is never prompted for — if its
     // source block hasn't produced a value by the time this block needs
     // it, that's a hard failure (chain ordering should have run the source
@@ -1478,11 +1482,54 @@ fn resolve_block_env_or_prompt(
         overrides.insert(decl.name.clone(), value.clone());
         // A block could (unusually) reference the same declared variable
         // under more than one local name — fill in every one of them.
-        for er in block.env.iter().filter(|er| er.var_name == decl.name) {
+        for er in refs.iter().filter(|er| er.var_name == decl.name) {
             resolution.env.insert(er.local_name.clone(), value.clone());
         }
     }
     resolution.env
+}
+
+/// Resolves *only* the declared variables `block`'s own `env=` references
+/// (see SPEC.md's "Variables") — a block with no `env=` never resolves or
+/// prompts for anything, however many variables the document declares.
+fn resolve_block_env_or_prompt(
+    block: &meshfox_core::CodeBlock,
+    decls: &[VarDecl],
+    overrides: &mut HashMap<String, String>,
+    computed: &HashMap<String, String>,
+    cache: &mut VarCache,
+) -> HashMap<String, String> {
+    resolve_refs_or_prompt(&block.env, decls, overrides, computed, cache)
+}
+
+/// Resolves `block`'s own `interpreter=` (see SPEC.md's "Runnable code
+/// fences") into the literal command actually spawned — substituting every
+/// `$NAME` reference it contains (`meshfox_core::interpreter_var_refs`),
+/// prompting for whatever's still missing exactly like `env=` already
+/// does. `None` when `block` has no `interpreter=` at all; `Some` unchanged
+/// when it has one but references no variable (a plain literal spec, the
+/// common case).
+fn resolve_block_interpreter_or_prompt(
+    block: &meshfox_core::CodeBlock,
+    decls: &[VarDecl],
+    overrides: &mut HashMap<String, String>,
+    computed: &HashMap<String, String>,
+    cache: &mut VarCache,
+) -> Option<String> {
+    let spec = block.interpreter.as_deref()?;
+    let names = meshfox_core::interpreter_var_refs(spec);
+    if names.is_empty() {
+        return Some(spec.to_string());
+    }
+    let refs: Vec<meshfox_core::EnvRef> = names
+        .iter()
+        .map(|n| meshfox_core::EnvRef {
+            local_name: n.clone(),
+            var_name: n.clone(),
+        })
+        .collect();
+    let values = resolve_refs_or_prompt(&refs, decls, overrides, computed, cache);
+    Some(meshfox_core::resolve_interpreter(spec, &values))
 }
 
 /// Resolves — and prompts for whatever's still missing — every declared
@@ -1532,11 +1579,28 @@ fn preflight_chain_vars(
         else {
             continue;
         };
-        if block.env.is_empty() {
+        // `env=` plus a synthetic ref per `interpreter=`'s own `$NAME`
+        // reference (see `resolve_block_interpreter_or_prompt`) — the whole
+        // chain's preflight has to ask about both, not just `env=`, or a
+        // `$PYTHON`-only reference would still surface its own prompt late,
+        // defeating the point of this function.
+        let interpreter_refs: Vec<meshfox_core::EnvRef> = block
+            .interpreter
+            .as_deref()
+            .map(meshfox_core::interpreter_var_refs)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|n| meshfox_core::EnvRef {
+                local_name: n.clone(),
+                var_name: n,
+            })
+            .collect();
+        if block.env.is_empty() && interpreter_refs.is_empty() {
             continue;
         }
-        let resolution =
-            meshfox_core::resolve_block_env(&block.env, decls, overrides, cache, computed);
+        let refs: Vec<meshfox_core::EnvRef> =
+            block.env.iter().cloned().chain(interpreter_refs).collect();
+        let resolution = meshfox_core::resolve_block_env(&refs, decls, overrides, cache, computed);
         for decl in resolution.missing {
             if seen.insert(decl.name.clone()) {
                 missing.push(decl);
@@ -1897,6 +1961,13 @@ async fn run_async(
                 );
                 Some(path)
             };
+            let effective_interpreter = resolve_block_interpreter_or_prompt(
+                &block,
+                &decls,
+                &mut overrides,
+                &computed,
+                &mut var_cache,
+            );
             println!("==> {}", addr.block_name);
 
             let step_cwd = canvas_root_dir(located.origin.as_deref().unwrap_or(canvas_path));
@@ -1911,7 +1982,7 @@ async fn run_async(
                     had_failure = true;
                     break;
                 }
-                match run_tty_block(&block.code, block.interpreter.as_deref(), &block_env, step_cwd)
+                match run_tty_block(&block.code, effective_interpreter.as_deref(), &block_env, step_cwd)
                     .await
                 {
                     Ok(code) => code,
@@ -1922,8 +1993,17 @@ async fn run_async(
                     }
                 }
             } else {
+                // `spawn_block` reads `interpreter` off the `CodeBlock` it's
+                // given rather than taking it as a separate parameter (see
+                // its own doc comment) — a block-with-overridden-interpreter
+                // clone is how the fully-substituted (`$NAME` -> its
+                // resolved value) command actually reaches it, same trick
+                // `run_block`/`run_tty_chain` (`crates/server/src/lib.rs`)
+                // and the TUI's own `advance_run` use.
+                let mut resolved_block = block.clone();
+                resolved_block.interpreter = effective_interpreter.clone();
                 let mut proc = match meshfox_server::stream_exec::spawn_block(
-                    &block,
+                    &resolved_block,
                     &block_env,
                     Some(step_cwd),
                 ) {

@@ -115,10 +115,10 @@ pub enum VarsError {
     SelectMissingChoices(String),
     #[error("duplicate meshfox:var name {0:?}")]
     DuplicateName(String),
-    #[error("node {0:?} block {1:?} references undeclared variable {2:?} via env=")]
-    UndeclaredEnvVar(String, String, String),
-    #[error("node {0:?} block {1:?} references variable {2:?} via env=, but it's declared in node {3:?} — a node-scoped meshfox:var (see declared_vars) is only visible to its own subtree")]
-    VarOutOfScope(String, String, String, String),
+    #[error("node {0:?} block {1:?} references undeclared variable {2:?} via {3}=")]
+    UndeclaredEnvVar(String, String, String, &'static str),
+    #[error("node {0:?} block {1:?} references variable {2:?} via {4}=, but it's declared in node {3:?} — a node-scoped meshfox:var (see declared_vars) is only visible to its own subtree")]
+    VarOutOfScope(String, String, String, String, &'static str),
     #[error("meshfox:var {0:?} has an empty from= target")]
     EmptyFrom(String),
     #[error("meshfox:var {0:?} combines from= with {1}=, which isn't allowed for a computed variable")]
@@ -471,14 +471,21 @@ pub fn validate_var_scope(canvas: &Canvas) -> Result<(), VarsError> {
         .collect();
     for node in &canvas.nodes {
         for block in crate::fence::scan_runnable_blocks(&node.id, &node.text) {
-            for env_ref in &block.env {
-                if let Some(owner) = owners.get(env_ref.var_name.as_str()) {
+            let refs: Vec<(String, &'static str)> = block
+                .env
+                .iter()
+                .map(|e| (e.var_name.clone(), "env"))
+                .chain(interpreter_refs(&block).into_iter().map(|n| (n, "interpreter")))
+                .collect();
+            for (var_name, via) in refs {
+                if let Some(owner) = owners.get(var_name.as_str()) {
                     if !is_within_subtree(canvas, &node.id, owner) {
                         return Err(VarsError::VarOutOfScope(
                             node.id.clone(),
                             block.name.clone().unwrap_or_default(),
-                            env_ref.var_name.clone(),
+                            var_name,
                             (*owner).to_string(),
+                            via,
                         ));
                     }
                 }
@@ -488,24 +495,46 @@ pub fn validate_var_scope(canvas: &Canvas) -> Result<(), VarsError> {
     Ok(())
 }
 
+/// A runnable fence's own `interpreter=` variable references (see
+/// `crate::exec::interpreter_var_refs`), as owned `String`s — small
+/// convenience wrapper shared by `validate_var_scope`/`validate_env_refs`,
+/// which both need this alongside `block.env` for the same "every
+/// variable reference this fence has, regardless of which attribute it's
+/// written under" checks.
+fn interpreter_refs(block: &crate::fence::CodeBlock) -> Vec<String> {
+    block
+        .interpreter
+        .as_deref()
+        .map(crate::exec::interpreter_var_refs)
+        .unwrap_or_default()
+}
+
 /// Validates that every runnable fence's `env=` (see `crate::fence::EnvRef`)
-/// only ever references a variable this document actually declares —
-/// `meshfox validate`'s counterpart to `deps::validate` catching a `deps=`
-/// reference to a block that doesn't exist. A block's `env=` is what scopes
-/// variable resolution to just what it needs (see `resolve_block_env`), so
-/// a typo here would otherwise just silently resolve to nothing instead of
-/// failing loudly.
+/// and `interpreter=` (see `crate::exec::interpreter_var_refs`) only ever
+/// reference a variable this document actually declares — `meshfox
+/// validate`'s counterpart to `deps::validate` catching a `deps=` reference
+/// to a block that doesn't exist. A block's `env=`/`interpreter=` is what
+/// scopes variable resolution to just what it needs (see
+/// `resolve_block_env`), so a typo here would otherwise just silently
+/// resolve to nothing instead of failing loudly.
 pub fn validate_env_refs(canvas: &Canvas) -> Result<(), VarsError> {
     let decls = declared_vars(canvas)?;
     let declared: HashSet<&str> = decls.iter().map(|d| d.name.as_str()).collect();
     for node in &canvas.nodes {
         for block in crate::fence::scan_runnable_blocks(&node.id, &node.text) {
-            for env_ref in &block.env {
-                if !declared.contains(env_ref.var_name.as_str()) {
+            let refs: Vec<(String, &'static str)> = block
+                .env
+                .iter()
+                .map(|e| (e.var_name.clone(), "env"))
+                .chain(interpreter_refs(&block).into_iter().map(|n| (n, "interpreter")))
+                .collect();
+            for (var_name, via) in refs {
+                if !declared.contains(var_name.as_str()) {
                     return Err(VarsError::UndeclaredEnvVar(
                         node.id.clone(),
                         block.name.clone().unwrap_or_default(),
-                        env_ref.var_name.clone(),
+                        var_name,
+                        via,
                     ));
                 }
             }
@@ -1084,6 +1113,28 @@ mod tests {
                 "q".to_string(),
                 "MANUFACTURER_QUERY".to_string(),
                 "queries".to_string(),
+                "env",
+            )
+        );
+    }
+
+    #[test]
+    fn validate_var_scope_catches_a_reference_from_outside_the_owning_subtree_via_interpreter() {
+        let doc = concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Venv\n<!-- meshfox:node id=\"venv\" -->\n\n",
+            "<!-- meshfox:var name=\"PYTHON\" default=\"/usr/bin/python3\" -->\n\n",
+            "## Unrelated\n<!-- meshfox:node id=\"unrelated\" -->\n\n",
+            "```python name=\"q\" interpreter=\"$PYTHON -u\"\nprint(1)\n```\n",
+        );
+        assert_eq!(
+            validate_var_scope(&canvas(doc)).unwrap_err(),
+            VarsError::VarOutOfScope(
+                "unrelated".to_string(),
+                "q".to_string(),
+                "PYTHON".to_string(),
+                "venv".to_string(),
+                "interpreter",
             )
         );
     }
@@ -1339,7 +1390,26 @@ mod tests {
             VarsError::UndeclaredEnvVar(
                 "install".to_string(),
                 "install".to_string(),
-                "INSTALL_PATH".to_string()
+                "INSTALL_PATH".to_string(),
+                "env",
+            )
+        );
+    }
+
+    #[test]
+    fn validate_env_refs_catches_an_undeclared_reference_via_interpreter() {
+        let doc = concat!(
+            "# Root\n\n",
+            "## Install\n<!-- meshfox:node id=\"install\" -->\n\n",
+            "```python name=\"install\" interpreter=\"$PYTHON -u\"\nprint(1)\n```\n",
+        );
+        assert_eq!(
+            validate_env_refs(&canvas(doc)).unwrap_err(),
+            VarsError::UndeclaredEnvVar(
+                "install".to_string(),
+                "install".to_string(),
+                "PYTHON".to_string(),
+                "interpreter",
             )
         );
     }

@@ -16,7 +16,7 @@ use meshfox_core::deps::BlockAddr;
 use meshfox_core::fence::{self, scan_runnable_blocks};
 use meshfox_core::mdcanvas;
 use meshfox_core::output::{write_output, ExecOutput};
-use meshfox_core::vars::{declared_vars, resolve_block_env, VarDecl, VarType};
+use meshfox_core::vars::{declared_vars, resolve_block_env, BlockEnvResolution, VarDecl, VarType};
 use meshfox_core::{Canvas, FileDisplay, Node, NodeType, VarCache};
 use meshfox_server::stream_exec::SpawnedProcess;
 use ratatui::layout::Rect;
@@ -1299,6 +1299,51 @@ impl App {
         self.advance_run().await;
     }
 
+    /// Shared handling for a `resolve_block_env` result, used for both a
+    /// block's `env=` refs and (separately) any `$NAME` refs inside its
+    /// `interpreter=`: a hard failure on an unresolved `from=` source parks
+    /// the run as failed, a `missing` var opens the prompt form, and
+    /// otherwise the resolved values are returned so the caller can carry
+    /// on. Either parking path already did all the necessary `self.*`
+    /// mutation, so the caller just needs to `return` when this is `None`.
+    fn park_on_unresolved(
+        &mut self,
+        resolution: BlockEnvResolution,
+    ) -> Option<std::collections::HashMap<String, String>> {
+        if !resolution.unresolved_from.is_empty() {
+            let names: Vec<&str> = resolution
+                .unresolved_from
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect();
+            self.status = format!(
+                "computed variable(s) {} have no value — their from= source block either \
+                 didn't run, failed, or didn't produce them",
+                names.join(", ")
+            );
+            if let Some(run) = &mut self.run {
+                run.finished = true;
+                run.had_failure = true;
+            }
+            return None;
+        }
+        if !resolution.missing.is_empty() {
+            let inputs = resolution
+                .missing
+                .iter()
+                .map(|d| initial_field_input(d, &self.var_cache))
+                .collect();
+            self.var_form = Some(VarFormState {
+                decls: resolution.missing,
+                inputs,
+                selected: 0,
+                configuring: false,
+            });
+            return None;
+        }
+        Some(resolution.env)
+    }
+
     /// Drives the current run forward until it either starts a process
     /// (returns, so the event loop can start polling its output), pauses
     /// for a missing `meshfox:var` (returns, waiting on the prompt), or the
@@ -1408,49 +1453,52 @@ impl App {
             break (addr, located, node_text, block);
         };
 
-        let mut resolution = resolve_block_env(
+        let resolution = resolve_block_env(
             &block.env,
             &self.decls,
             &self.run_overrides,
             &self.var_cache,
             &self.run_computed,
         );
-        // A `from`-declared (computed) variable is never prompted for —
-        // chain resolution (`start_run`) already guarantees its source
-        // block runs first, so still having no value here is a hard
-        // failure (the source failed, or didn't produce it), not
-        // something a form can fix.
-        if !resolution.unresolved_from.is_empty() {
-            let names: Vec<&str> = resolution
-                .unresolved_from
-                .iter()
-                .map(|d| d.name.as_str())
-                .collect();
-            self.status = format!(
-                "computed variable(s) {} have no value — their from= source block either \
-                 didn't run, failed, or didn't produce them",
-                names.join(", ")
-            );
-            if let Some(run) = &mut self.run {
-                run.finished = true;
-                run.had_failure = true;
+        let Some(mut env) = self.park_on_unresolved(resolution) else {
+            return;
+        };
+
+        // A `$NAME` reference inside `interpreter=` (see
+        // `meshfox_core::interpreter_var_refs`) needs exactly the same
+        // resolution `env=` just got — a second, independent pass (rather
+        // than folding these names into `block.env` itself) so a
+        // referenced variable never silently ends up in the spawned
+        // process's own environment just because `interpreter=` happened
+        // to need it too; only a real `env=` entry ever does that.
+        let effective_interpreter = match &block.interpreter {
+            None => None,
+            Some(spec) => {
+                let names = meshfox_core::interpreter_var_refs(spec);
+                if names.is_empty() {
+                    Some(spec.clone())
+                } else {
+                    let refs: Vec<meshfox_core::EnvRef> = names
+                        .iter()
+                        .map(|n| meshfox_core::EnvRef {
+                            local_name: n.clone(),
+                            var_name: n.clone(),
+                        })
+                        .collect();
+                    let interp_resolution = resolve_block_env(
+                        &refs,
+                        &self.decls,
+                        &self.run_overrides,
+                        &self.var_cache,
+                        &self.run_computed,
+                    );
+                    let Some(values) = self.park_on_unresolved(interp_resolution) else {
+                        return;
+                    };
+                    Some(meshfox_core::resolve_interpreter(spec, &values))
+                }
             }
-            return;
-        }
-        if !resolution.missing.is_empty() {
-            let inputs = resolution
-                .missing
-                .iter()
-                .map(|d| initial_field_input(d, &self.var_cache))
-                .collect();
-            self.var_form = Some(VarFormState {
-                decls: resolution.missing,
-                inputs,
-                selected: 0,
-                configuring: false,
-            });
-            return;
-        }
+        };
 
         // If some declared variable is `from=`-sourced from *this* block,
         // give it a fresh output file to write `NAME=value` lines to —
@@ -1464,7 +1512,7 @@ impl App {
             None
         } else {
             let path = meshfox_core::allocate_vars_out_path();
-            resolution.env.insert(
+            env.insert(
                 meshfox_core::VARS_OUT_ENV.to_string(),
                 path.display().to_string(),
             );
@@ -1494,15 +1542,17 @@ impl App {
             self.pending_tty = Some(PendingTty {
                 block_name: addr.block_name.clone(),
                 code: block.code.clone(),
-                interpreter: block.interpreter.clone(),
-                env: resolution.env,
+                interpreter: effective_interpreter,
+                env,
                 cwd,
                 autoclose: block.autoclose,
             });
             return;
         }
 
-        match meshfox_server::stream_exec::spawn_block(&block, &resolution.env, Some(&cwd)) {
+        let mut resolved_block = block.clone();
+        resolved_block.interpreter = effective_interpreter;
+        match meshfox_server::stream_exec::spawn_block(&resolved_block, &env, Some(&cwd)) {
             Ok(proc) => {
                 let run = self.run.as_mut().unwrap();
                 run.proc = Some(proc);

@@ -32,8 +32,8 @@ pub use canvas::{ArrowEnd, Canvas, EdgeLineStyle, ExtraEdge, FileDisplay, Node, 
 pub use constraint::{evaluate as evaluate_constraints, ConstraintResult, ConstraintStatus};
 pub use deps::{BlockAddr, DepsError};
 pub use exec::{
-    executor_for, is_supported_lang, resolve_command, split_interpreter, Executor,
-    ResolvedCommand,
+    executor_for, interpreter_var_refs, is_supported_lang, resolve_command, resolve_interpreter,
+    split_interpreter, Executor, ResolvedCommand,
 };
 pub use fence::{fingerprint, scan_code_blocks, scan_runnable_blocks, BlockRef, CodeBlock, EnvRef};
 pub use file_read::{
@@ -248,6 +248,13 @@ pub fn env_var_names_for_chain(
             .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()))
         {
             needed.extend(block.env.iter().map(|er| er.var_name.clone()));
+            // A block's own `interpreter=` can reference a declared
+            // variable too (`$NAME` — see `exec::interpreter_var_refs`),
+            // and needs it resolved just as much as an `env=` reference
+            // does — it's what decides what actually gets spawned.
+            if let Some(spec) = &block.interpreter {
+                needed.extend(exec::interpreter_var_refs(spec));
+            }
         }
     }
     // Not just the names literally in each block's own env= -- a var

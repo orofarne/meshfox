@@ -89,6 +89,86 @@ pub fn split_interpreter(spec: &str) -> Option<(String, Vec<String>)> {
     Some((program, words))
 }
 
+/// True if `word` is a bare `$NAME` token in its entirety — a whole shell
+/// word, not a prefix/suffix of a longer one (`$PYTHON` matches,
+/// `/opt/$PYTHON/bin` and `$PYTHON-3.11` don't) — see
+/// `interpreter_var_refs`/`resolve_interpreter` for why only this shape is
+/// recognized.
+fn whole_token_var_name(word: &str) -> Option<&str> {
+    let name = word.strip_prefix('$')?;
+    let mut chars = name.chars();
+    let first_ok = chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+    if !first_ok || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some(name)
+}
+
+/// Every declared-variable name an `interpreter=` attribute's raw value
+/// references as a whole shell word (`interpreter="$PYTHON -u"` ->
+/// `["PYTHON"]`), in first-occurrence order, deduplicated — what a caller
+/// needs to have resolved (and, if a `from=`-computed one, already run the
+/// source block for — see `crate::deps::visit`) before calling
+/// `resolve_interpreter`.
+///
+/// Unlike `env=`'s entries (always a name reference, so a leading `$` is
+/// purely cosmetic there — see `crate::fence::strip_dollar`'s own doc
+/// comment), `interpreter=` mixes literal tokens (`python3`, `-u`) with
+/// possibly-a-reference ones, so the `$` can't be optional here: a bare
+/// `PYTHON` token is a literal program/argument, never treated as a
+/// variable reference. Only a *whole* `$NAME` word counts — a reference
+/// embedded partway through a token (`/opt/$NAME/bin`) is deliberately not
+/// recognized, so there's never any ambiguity about where a name starts
+/// and ends. Malformed shell-word syntax (unterminated quotes, same as
+/// `split_interpreter` itself would reject) yields no references at all —
+/// `resolve_command`'s own error handling is what surfaces that to a user,
+/// not this.
+pub fn interpreter_var_refs(spec: &str) -> Vec<String> {
+    let Some(words) = shlex::split(spec) else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut names = Vec::new();
+    for word in &words {
+        if let Some(name) = whole_token_var_name(word) {
+            if seen.insert(name.to_string()) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
+}
+
+/// Substitutes every whole-token `$NAME` reference in `spec` (see
+/// `interpreter_var_refs`) with its value from `resolved_vars`, leaving
+/// every other token exactly as written — the runtime counterpart callers
+/// use right before actually spawning anything, once every name
+/// `interpreter_var_refs` reported has a real value (from ordinary
+/// `meshfox:var` resolution — prompted, `--set`, cached, `from=`-computed,
+/// whatever the usual precedence supplies). Substitution happens at the
+/// shell-word level, not by splicing text into the raw string and
+/// re-parsing it — so a resolved value containing spaces (an unusual but
+/// legal interpreter path) becomes exactly one argument, never
+/// word-split. A name `interpreter_var_refs` would have reported but that's
+/// missing from `resolved_vars` is a caller bug (every such name is
+/// supposed to already be resolved by this point, same contract `env=`
+/// resolution already has) — degrades by leaving that one token literal
+/// (`$NAME`) rather than panicking, the same "don't crash on an
+/// unrecognized/unresolved case" fallback used throughout this format.
+pub fn resolve_interpreter(spec: &str, resolved_vars: &std::collections::HashMap<String, String>) -> String {
+    let Some(words) = shlex::split(spec) else {
+        return spec.to_string();
+    };
+    let substituted: Vec<String> = words
+        .into_iter()
+        .map(|word| match whole_token_var_name(&word) {
+            Some(name) => resolved_vars.get(name).cloned().unwrap_or(word),
+            None => word,
+        })
+        .collect();
+    shlex::try_join(substituted.iter().map(String::as_str)).unwrap_or(spec.to_string())
+}
+
 /// What to actually spawn for `code` given an optional `interpreter=`
 /// value — the shared decision behind every "run this block" path that
 /// builds its own `Command`/`CommandBuilder` rather than going through
@@ -281,6 +361,78 @@ mod tests {
         assert_eq!(split_interpreter(""), None);
         assert_eq!(split_interpreter("   "), None);
         assert_eq!(split_interpreter(r#"unterminated ""#), None);
+    }
+
+    #[test]
+    fn interpreter_var_refs_finds_a_whole_token_reference() {
+        assert_eq!(interpreter_var_refs("$PYTHON -u"), vec!["PYTHON".to_string()]);
+    }
+
+    #[test]
+    fn interpreter_var_refs_ignores_a_mid_token_reference() {
+        assert!(interpreter_var_refs("/opt/$PYTHON/bin").is_empty());
+        assert!(interpreter_var_refs("$PYTHON-3.11").is_empty());
+    }
+
+    #[test]
+    fn interpreter_var_refs_ignores_a_bare_word_with_no_dollar() {
+        assert!(interpreter_var_refs("python3 -u").is_empty());
+    }
+
+    #[test]
+    fn interpreter_var_refs_dedupes_and_preserves_first_occurrence_order() {
+        assert_eq!(
+            interpreter_var_refs("$PYTHON $FLAGS $PYTHON"),
+            vec!["PYTHON".to_string(), "FLAGS".to_string()]
+        );
+    }
+
+    #[test]
+    fn interpreter_var_refs_is_empty_for_malformed_shell_syntax() {
+        assert!(interpreter_var_refs(r#"unterminated ""#).is_empty());
+    }
+
+    #[test]
+    fn resolve_interpreter_substitutes_a_whole_token_reference() {
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("PYTHON".to_string(), ".venv/bin/python3".to_string());
+        assert_eq!(resolve_interpreter("$PYTHON -u", &vars), ".venv/bin/python3 -u");
+    }
+
+    #[test]
+    fn resolve_interpreter_leaves_literal_tokens_untouched() {
+        let vars = std::collections::HashMap::new();
+        assert_eq!(resolve_interpreter("python3 -u", &vars), "python3 -u");
+    }
+
+    #[test]
+    fn resolve_interpreter_keeps_a_value_containing_spaces_as_one_argument() {
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("PYTHON".to_string(), "/opt/my python/bin/python3".to_string());
+        let resolved = resolve_interpreter("$PYTHON -u", &vars);
+        assert_eq!(
+            split_interpreter(&resolved),
+            Some((
+                "/opt/my python/bin/python3".to_string(),
+                vec!["-u".to_string()]
+            ))
+        );
+    }
+
+    #[test]
+    fn resolve_interpreter_leaves_an_unresolved_reference_literal_rather_than_panicking() {
+        // Re-joining via `shlex` can legitimately re-quote an unresolved
+        // `$NAME` token (it contains a shell-special `$`) rather than
+        // returning it byte-for-byte unchanged — round-trip through
+        // `split_interpreter` instead of comparing raw strings, same as
+        // `resolve_interpreter_keeps_a_value_containing_spaces_as_one_argument`
+        // already does.
+        let vars = std::collections::HashMap::new();
+        let resolved = resolve_interpreter("$PYTHON -u", &vars);
+        assert_eq!(
+            split_interpreter(&resolved),
+            Some(("$PYTHON".to_string(), vec!["-u".to_string()]))
+        );
     }
 
     #[test]

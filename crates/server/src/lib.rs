@@ -2483,8 +2483,20 @@ async fn run_block(
                 );
                 Some(path)
             };
+            // `spawn_block` reads `interpreter` off the `CodeBlock` it's
+            // given rather than as a separate parameter — a
+            // block-with-substituted-interpreter clone is how a `$NAME`
+            // reference (`meshfox_core::interpreter_var_refs`) actually
+            // reaches it, already resolved against this chain's own
+            // `resolved_vars` (which `env_var_names_for_chain` already
+            // makes sure includes whatever `interpreter=` itself needs).
+            let mut resolved_block = block.clone();
+            if let Some(spec) = &block.interpreter {
+                resolved_block.interpreter = Some(meshfox_core::resolve_interpreter(spec, &resolved_vars));
+            }
+
             let step_started = std::time::Instant::now();
-            let mut proc = match stream_exec::spawn_block(&block, &block_env, Some(&cwd)) {
+            let mut proc = match stream_exec::spawn_block(&resolved_block, &block_env, Some(&cwd)) {
                 Ok(p) => p,
                 Err(e) => {
                     yield Ok(ndjson_line(&RunEvent::Error { message: e.to_string() }));
@@ -2974,6 +2986,13 @@ async fn run_tty_chain(
         let mut full_output = String::new();
         let step_started = std::time::Instant::now();
 
+        // Same block-with-substituted-interpreter clone `run_block` uses —
+        // see its own comment on the equivalent line.
+        let mut resolved_block = block.clone();
+        if let Some(spec) = &block.interpreter {
+            resolved_block.interpreter = Some(meshfox_core::resolve_interpreter(spec, &resolved_vars));
+        }
+
         let exit_code = if block.tty {
             if !send_event(
                 &mut socket,
@@ -2989,7 +3008,7 @@ async fn run_tty_chain(
             match relay_tty_step(
                 &mut socket,
                 &block.code,
-                block.interpreter.as_deref(),
+                resolved_block.interpreter.as_deref(),
                 &block_env,
                 Some(&cwd),
                 cols,
@@ -3007,7 +3026,7 @@ async fn run_tty_chain(
                 TtyStepOutcome::Disconnected => return,
             }
         } else {
-            let mut proc = match stream_exec::spawn_block(&block, &block_env, Some(&cwd)) {
+            let mut proc = match stream_exec::spawn_block(&resolved_block, &block_env, Some(&cwd)) {
                 Ok(p) => p,
                 Err(e) => {
                     send_event(

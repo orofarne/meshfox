@@ -286,6 +286,23 @@ Lives inside a node's Markdown text, as fence-info-string attributes:
   Works on a `tty` block too — the interactive session runs directly under
   `interpreter` (given a real pty/terminal) instead of `bash`, e.g.
   `interpreter="python3 -i"` for an interactive Python REPL.
+
+  A whole word starting with `$` (e.g. `$PYTHON` in `interpreter="$PYTHON
+  -u"`) is substituted with the value of a declared `meshfox:var` of that
+  name before word-splitting runs `interpreter target-tmpfile` — the same
+  resolution/prompting machinery `env=` uses, just scoped to `interpreter=`
+  instead of the block's process environment. Unlike `env=`, the `$` here
+  is mandatory, not cosmetic (`interpreter=` mixes literal words and
+  variable references, so dropping it would make `interpreter="PYTHON -u"`
+  ambiguous between "run the literal program `PYTHON`" and "run whatever
+  `PYTHON` resolves to"); only a whole token is substituted, not `$NAME`
+  embedded inside a larger word (`interpreter="/opt/$NAME/bin/python"`
+  stays literal). The natural use is a `from=`-computed var — e.g. a
+  `setup` block that creates/updates a venv and reports its interpreter
+  path via `MESHFOX_VARS_OUT` (see "Computed variables" below) — so
+  `interpreter="$PYTHON -u"` always runs under whatever interpreter that
+  block last resolved to, without hard-coding a path in every fence that
+  needs it.
 - `tty` — optional flag (`tty` or `tty=true`); this block wants a real
   interactive terminal instead of the usual captured/streamed output —
   e.g. `bash` on its own (a login-style shell), or anything else that reads
