@@ -145,6 +145,17 @@ struct SessionRun {
     /// from a `0`-exit run, same trust boundary `run_block`'s own live path
     /// already has for `from=` values.
     produced_vars: HashMap<String, String>,
+    /// Whatever this block printed (merged stdout/stderr) the last time it
+    /// actually ran — there's no fresh output to show from a skipped run
+    /// (it didn't run), so this is what `RunEvent::StepSkipped` sends
+    /// instead, letting the client still show it (typically collapsed by
+    /// default — see `web/src/MeshNode.tsx`'s `LiveRunOutput`). Empty for a
+    /// `tty` step, which never populates `full_output` to begin with (see
+    /// the `!block.tty` guard around `run_tty_chain`'s own `ExecOutput`).
+    output: String,
+    /// That same earlier run's own wall-clock duration, in milliseconds —
+    /// mirrors `RunEvent::StepEnd`'s `duration_ms`.
+    duration_ms: u64,
 }
 
 /// How long `TabGuard` waits, after the last `/api/watch` connection drops,
@@ -661,12 +672,19 @@ enum RunEvent {
     /// pulled-in dependency (never the block actually requested — see
     /// `AppState::session_runs`'s own doc comment) that already ran
     /// successfully earlier in this same `meshfox view` session and hasn't
-    /// changed since. Not emitted at all for `/api/run/tty`'s WebSocket —
-    /// `run_tty_chain` doesn't consult `session_runs`, only the plain
-    /// NDJSON `/api/run` path does.
+    /// changed since. Emitted the same way over both the plain NDJSON
+    /// `/api/run` path and `/api/run/tty`'s WebSocket — `run_tty_chain`
+    /// consults the same `session_runs` map `run_block` does.
     StepSkipped {
         node_id: String,
         block: String,
+        /// Whatever this step printed the last time it actually ran (see
+        /// `SessionRun::output`) — the client shows this in place of fresh
+        /// output, typically collapsed by default.
+        output: String,
+        /// That same earlier run's own duration, in milliseconds — mirrors
+        /// `StepEnd::duration_ms`.
+        duration_ms: u64,
     },
     /// One line of merged stdout/stderr, as it's produced.
     Output {
@@ -2458,6 +2476,8 @@ async fn run_block(
                     yield Ok(ndjson_line(&RunEvent::StepSkipped {
                         node_id: addr.node_id.clone(),
                         block: addr.block_name.clone(),
+                        output: session_run.output,
+                        duration_ms: session_run.duration_ms,
                     }));
                     continue;
                 }
@@ -2596,7 +2616,7 @@ async fn run_block(
             }
 
             if persist && block.cache {
-                let result = ExecOutput { exit_code, output: full_output, duration_ms };
+                let result = ExecOutput { exit_code, output: full_output.clone(), duration_ms };
                 if let Some(updated) = meshfox_core::write_output(&node_text, &addr.block_name, &result) {
                     if let Some(patched) = mdcanvas::set_node_body(&located.raw, &located.local_id, &updated) {
                         file_raws.insert(located.origin.clone(), patched);
@@ -2611,7 +2631,7 @@ async fn run_block(
                     .collect();
                 state.session_runs.lock().unwrap().insert(
                     (addr.node_id.clone(), addr.block_name.clone()),
-                    SessionRun { fingerprint: live_fingerprint, produced_vars },
+                    SessionRun { fingerprint: live_fingerprint, produced_vars, output: full_output, duration_ms },
                 );
             }
 
@@ -2957,6 +2977,8 @@ async fn run_tty_chain(
                     &RunEvent::StepSkipped {
                         node_id: addr.node_id.clone(),
                         block: addr.block_name.clone(),
+                        output: session_run.output,
+                        duration_ms: session_run.duration_ms,
                     },
                 )
                 .await
@@ -3164,7 +3186,7 @@ async fn run_tty_chain(
         if persist && block.cache && !block.tty {
             let result = ExecOutput {
                 exit_code,
-                output: full_output,
+                output: full_output.clone(),
                 duration_ms,
             };
             if let Some(updated) = meshfox_core::write_output(&node_text, &addr.block_name, &result)
@@ -3182,7 +3204,7 @@ async fn run_tty_chain(
                 .collect();
             state.session_runs.lock().unwrap().insert(
                 (addr.node_id.clone(), addr.block_name.clone()),
-                SessionRun { fingerprint: live_fingerprint, produced_vars },
+                SessionRun { fingerprint: live_fingerprint, produced_vars, output: full_output, duration_ms },
             );
         }
 
@@ -5459,6 +5481,31 @@ mod session_skip_tests {
         assert!(
             really_ran(&second, "target"),
             "the requested block itself must never be skipped, even when unchanged: {second:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_skipped_dependency_still_reports_its_last_real_output() {
+        // `step-skipped` carries whatever `dep` printed the last time it
+        // *actually* ran (see `SessionRun::output`) — there's no fresh
+        // output from the skipped run itself, so the client needs this to
+        // show anything at all instead of a bare status line (see
+        // `web/src/MeshNode.tsx`'s `SkippedRunOutput`).
+        let path = write_dep_chain_canvas("echo dep-ran");
+        let addr = spawn_test_server(path.clone()).await;
+
+        let _first = run_target(addr).await;
+        let second = run_target(addr).await;
+        let skip_event = second
+            .iter()
+            .find(|e| e["type"] == "step-skipped" && e["block"] == "dep")
+            .expect("dep should be skipped the second time");
+        assert_eq!(skip_event["output"], "dep-ran\n");
+        assert!(
+            skip_event["durationMs"].as_u64().is_some(),
+            "expected a numeric durationMs: {skip_event:?}"
         );
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

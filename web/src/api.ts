@@ -402,8 +402,11 @@ export type RunEvent =
    * already ran successfully earlier in the same `meshfox view` session and
    * hasn't changed since, so it wasn't actually re-run. Never emitted for
    * the block actually requested, only a pulled-in `deps=`/`from=`
-   * dependency. See SPEC.md's "Runnable code fences". */
-  | { type: "step-skipped"; nodeId: string; block: string }
+   * dependency. See SPEC.md's "Runnable code fences". `output`/`durationMs`
+   * are whatever that earlier real run produced — there's no fresh output
+   * from *this* run to show, so the client shows that instead (see
+   * `MeshNode.tsx`'s `LiveRunOutput`, typically collapsed by default). */
+  | { type: "step-skipped"; nodeId: string; block: string; output: string; durationMs: number }
   | { type: "output"; nodeId: string; block: string; text: string }
   | { type: "step-end"; nodeId: string; block: string; exitCode: number; durationMs: number }
   | { type: "killed"; nodeId: string; block: string }

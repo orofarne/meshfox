@@ -19,8 +19,13 @@ type TtyRunEvent =
   | { type: "step-start"; nodeId: string; block: string }
   /** A pulled-in dependency (never the block actually requested) that
    * already ran successfully earlier in this session and hasn't changed
-   * since — see `./api.ts`'s own `RunEvent` doc comment. */
-  | { type: "step-skipped"; nodeId: string; block: string }
+   * since — see `./api.ts`'s own `RunEvent` doc comment. `output`/
+   * `durationMs` are whatever that earlier real run produced — written
+   * straight into the terminal (dimmed) below, since this is already a
+   * plain scrollback the user can scroll through, unlike the plain web
+   * UI's own collapsed-by-default section (`MeshNode.tsx`'s
+   * `SkippedRunOutput`) — no separate fold needed here. */
+  | { type: "step-skipped"; nodeId: string; block: string; output: string; durationMs: number }
   | { type: "output"; nodeId: string; block: string; text: string }
   | { type: "tty-start"; nodeId: string; block: string }
   | { type: "step-end"; nodeId: string; block: string; exitCode: number }
@@ -169,6 +174,9 @@ export function TtyPanel({ path, blockName, withDeps, persist, vars, autoclose, 
             break;
           case "step-skipped":
             term.write(`\x1b[2m(skipped ${event.block} — already ran this session, unchanged)\x1b[0m\r\n`);
+            if (event.output) {
+              term.write(`\x1b[2m${event.output.replace(/\n/g, "\r\n")}\x1b[0m\r\n`);
+            }
             break;
           case "tty-start":
             ttyActiveRef.current = true;

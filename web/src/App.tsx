@@ -669,11 +669,11 @@ export default function App() {
             case "step-skipped":
               patchLiveBlock(event.nodeId, event.block, {
                 status: "skipped",
-                text: "",
+                text: event.output,
                 exitCode: undefined,
                 runId: undefined,
                 startedAt: undefined,
-                durationMs: undefined,
+                durationMs: event.durationMs,
               });
               break;
             case "output":
@@ -755,11 +755,11 @@ export default function App() {
             case "step-skipped":
               patchLiveBlock(event.nodeId, event.block, {
                 status: "skipped",
-                text: "",
+                text: event.output,
                 exitCode: undefined,
                 runId: undefined,
                 startedAt: undefined,
-                durationMs: undefined,
+                durationMs: event.durationMs,
               });
               break;
             case "output":

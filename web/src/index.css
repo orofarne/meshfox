@@ -1323,6 +1323,18 @@ a {
   font-style: italic;
 }
 
+/* The skipped step's own collapsible "what it printed last time" toggle
+ * (`FoldToggle`, reused — see MeshNode.tsx's `SkippedRunOutput`) blends into
+ * the muted status line instead of standing out as its own button, same
+ * override `.mesh-code-block-head .mesh-node-fold-toggle` gets for its own
+ * head. */
+.mesh-code-output[data-exit="skipped"] .mesh-node-fold-toggle {
+  padding: 0 0.3rem 0 0;
+  margin-right: 0.2rem;
+  border-color: transparent;
+  color: inherit;
+}
+
 /* Still streaming — no exit code yet, so neither the "ok" nor "fail"
  * treatment applies. A pulsing dot rather than a color says "in
  * progress" without implying success or failure either way. */

@@ -282,6 +282,14 @@ pub struct SessionRun {
     /// re-running it when this run is skipped, so a later step that
     /// declared `from=` this block still gets a value.
     pub produced_vars: HashMap<String, String>,
+    /// Whatever this block printed the last time it actually ran — there's
+    /// no fresh output from a skipped step (it didn't run), so this is
+    /// printed into the transcript instead, right after the skip line (see
+    /// `advance_run`). Empty for a `tty` step, which never populates
+    /// `RunState::full_output` to begin with.
+    pub output: String,
+    /// That same earlier run's own duration, in milliseconds.
+    pub duration_ms: u64,
 }
 
 /// A background link-preview fetch's result, reported back through
@@ -1441,9 +1449,16 @@ impl App {
                     self.run_computed.extend(session_run.produced_vars.clone());
                     if let Some(run) = &mut self.run {
                         run.lines.push(format!(
-                            "==> {} (skipped — already ran this session, unchanged)",
-                            addr.block_name
+                            "==> {} (skipped — already ran this session, unchanged · {})",
+                            addr.block_name,
+                            meshfox_core::format_duration_ms(session_run.duration_ms)
                         ));
+                        // No per-line fold in this transcript (unlike the
+                        // web UI's collapsible section — see
+                        // `web/src/MeshNode.tsx`'s `LiveRunOutput`), so the
+                        // last real run's output is just printed straight
+                        // through, same as if it had run again.
+                        run.lines.extend(session_run.output.lines().map(str::to_string));
                         run.idx += 1;
                     }
                     continue;
@@ -1771,7 +1786,7 @@ impl App {
                     if block.cache {
                         let result = ExecOutput {
                             exit_code,
-                            output: full_output,
+                            output: full_output.clone(),
                             duration_ms,
                         };
                         // Re-located (rather than stashed from `advance_run`)
@@ -1832,6 +1847,8 @@ impl App {
                             SessionRun {
                                 fingerprint: meshfox_core::fingerprint(&block),
                                 produced_vars,
+                                output: full_output,
+                                duration_ms,
                             },
                         );
                     }

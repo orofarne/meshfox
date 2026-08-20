@@ -782,6 +782,40 @@ function LiveElapsed({ startedAt }: { startedAt: number }) {
   return <>{formatDurationMs(Math.max(0, now - startedAt))}</>;
 }
 
+/** The `"skipped"` branch of `LiveRunOutput` — never the block actually
+ * requested (only a pulled-in dependency — see SPEC.md's "Runnable code
+ * fences"), so there's no fresh output from *this* run: the server sends
+ * whatever it printed last time it *actually* ran instead (`step-skipped`'s
+ * own `output`/`durationMs`, see `./api.ts`'s `RunEvent`), shown here
+ * collapsed by default — it's stale-by-definition (the whole point of the
+ * skip is "nothing changed since"), so worth having a click away without
+ * cluttering a chain of several skipped steps in a row by default. */
+function SkippedRunOutput({ live }: { live: LiveBlockState }) {
+  const [expanded, setExpanded] = useState(false);
+  const duration =
+    live.durationMs !== undefined ? ` · ${formatDurationMs(live.durationMs)}` : undefined;
+  return (
+    <div className="mesh-code-output" data-exit="skipped">
+      <div className="mesh-code-output-head">
+        {live.text && (
+          <FoldToggle
+            folded={!expanded}
+            onToggle={() => setExpanded((e) => !e)}
+            foldedTitle="Show its output from that earlier run"
+            unfoldedTitle="Hide its output from that earlier run"
+          />
+        )}
+        skipped · already ran this session, unchanged{duration}
+      </div>
+      {expanded && live.text && (
+        <pre>
+          <code><AnsiText text={live.text} /></code>
+        </pre>
+      )}
+    </div>
+  );
+}
+
 /** Live output (queued/running/done/killed, from the current run) — shared
  * by `RunOutput` (a fenced block's own output, falling back to its cached
  * copy when nothing's live — see below) and a runnable `file` node's own
@@ -791,16 +825,7 @@ function LiveElapsed({ startedAt }: { startedAt: number }) {
  * this replaces always had). */
 function LiveRunOutput({ live }: { live: LiveBlockState }) {
   if (live.status === "skipped") {
-    // Never the block actually requested (only a pulled-in dependency —
-    // see SPEC.md's "Runnable code fences"), so there's no fresh output to
-    // show here at all: whatever it printed last time it *actually* ran is
-    // still sitting in its own cached-output region (if `cache`d) below,
-    // untouched by this skip.
-    return (
-      <div className="mesh-code-output" data-exit="skipped">
-        <div className="mesh-code-output-head">skipped · already ran this session, unchanged</div>
-      </div>
-    );
+    return <SkippedRunOutput live={live} />;
   }
   const duration =
     live.durationMs !== undefined ? ` · ${formatDurationMs(live.durationMs)}` : undefined;
