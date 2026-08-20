@@ -33,6 +33,13 @@ pub fn ask(decl: &VarDecl, current: Option<&str>) -> io::Result<String> {
         if input.is_empty() {
             match current {
                 Some(c) => return Ok(c.to_string()),
+                // A `String` declaration accepts an empty value same as any
+                // other (`validate_value` puts no constraint on it at all) —
+                // an empty answer here is a deliberate "leave it blank", not
+                // "didn't type anything yet". Every other type still needs a
+                // real answer (`Int`/`Bool` can't parse "", `Select` has no
+                // empty choice).
+                None if decl.var_type == VarType::String => return Ok(String::new()),
                 None => {
                     println!("A value is required.");
                     continue;

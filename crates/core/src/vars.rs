@@ -115,10 +115,10 @@ pub enum VarsError {
     SelectMissingChoices(String),
     #[error("duplicate meshfox:var name {0:?}")]
     DuplicateName(String),
-    #[error("meshfox:var {0:?} is declared in node {1:?} — variables may only be declared in the root node")]
-    NotInRoot(String, String),
     #[error("node {0:?} block {1:?} references undeclared variable {2:?} via env=")]
     UndeclaredEnvVar(String, String, String),
+    #[error("node {0:?} block {1:?} references variable {2:?} via env=, but it's declared in node {3:?} — a node-scoped meshfox:var (see declared_vars) is only visible to its own subtree")]
+    VarOutOfScope(String, String, String, String),
     #[error("meshfox:var {0:?} has an empty from= target")]
     EmptyFrom(String),
     #[error("meshfox:var {0:?} combines from= with {1}=, which isn't allowed for a computed variable")]
@@ -325,6 +325,9 @@ pub fn scan_var_decls(markdown: &str) -> Result<Vec<VarDecl>, VarsError> {
         if fi < fence_ranges.len() && fence_ranges[fi].start <= start {
             continue;
         }
+        if crate::attrs::is_indented_as_code(line) {
+            continue;
+        }
         if let Some(attrs) = parse_var_comment(line) {
             decls.push(build_var_decl(attrs)?);
         }
@@ -351,6 +354,9 @@ pub fn unknown_var_attr(markdown: &str) -> Option<crate::attrs::UnknownAttrError
         if fi < fence_ranges.len() && fence_ranges[fi].start <= start {
             continue;
         }
+        if crate::attrs::is_indented_as_code(line) {
+            continue;
+        }
         if let Some(attrs) = parse_var_comment(line) {
             if let Some(attr) = crate::attrs::first_unknown(&attrs, VAR_ATTRS) {
                 let name = attrs.get("name").cloned().unwrap_or_else(|| "<unnamed>".to_string());
@@ -364,47 +370,122 @@ pub fn unknown_var_attr(markdown: &str) -> Option<crate::attrs::UnknownAttrError
     None
 }
 
-/// Every variable `canvas` declares, in document order — always from the
-/// root node only (see `VarsError::NotInRoot`: a `meshfox:var` found in any
-/// other node is a `meshfox validate` error, not silently ignored, so a
-/// misplaced declaration doesn't quietly do nothing). Also rejects a
-/// repeated `name` across the document.
-pub fn declared_vars(canvas: &Canvas) -> Result<Vec<VarDecl>, VarsError> {
-    let mut root_decls = Vec::new();
-    let mut root_id = None;
-    for node in &canvas.nodes {
-        let decls = scan_var_decls(&node.text)?;
-        if node.parent.is_none() {
-            root_id = Some(node.id.clone());
-            root_decls = decls;
-        } else if let Some(first) = decls.into_iter().next() {
-            return Err(VarsError::NotInRoot(first.name, node.id.clone()));
-        }
-    }
+/// One `meshfox:var` declaration together with the node it was actually
+/// written in — the "owner" that `declared_vars`'s implicit-`session`
+/// forcing and `validate_var_scope`'s subtree check both key off of. Kept
+/// as a private pairing rather than a new field on `VarDecl` itself: no
+/// existing caller/test needs to know a var's owner, only the two things in
+/// this module that key off it.
+struct ScannedVar {
+    owner_node: String,
+    decl: VarDecl,
+}
 
-    // A bare `from="block-name"` (no `node-id/`) means a block in the root
-    // node — same convention `deps=`'s bare form uses for "same node as the
-    // one declaring it", except a variable is always declared in root, so
-    // there's no other node it could mean. Normalizing here means every
-    // other consumer of a `VarDecl` (deps chain resolution, the runners)
-    // can treat `from`'s `node_id` as always populated.
-    if let Some(root_id) = &root_id {
-        for decl in &mut root_decls {
+/// Scans every node in `canvas` (not just root — see `declared_vars`'s own
+/// doc comment) for `meshfox:var` declarations, in document order.
+fn scan_all_var_decls(canvas: &Canvas) -> Result<Vec<ScannedVar>, VarsError> {
+    let mut out = Vec::new();
+    for node in &canvas.nodes {
+        let is_root = node.parent.is_none();
+        for mut decl in scan_var_decls(&node.text)? {
+            // A var declared outside the root is implicitly `session` —
+            // never cached to disk, and (since `configure`/`GET
+            // /api/vars/configure` both already skip `session` declarations)
+            // never shown in the document-wide "configure everything" list
+            // either. No new field/filter needed for either of those; this
+            // is the one place that makes both true at once.
+            if !is_root {
+                decl.session = true;
+            }
+            // A bare `from="block-name"` (no `node-id/`) means a block in
+            // the *same node this var is declared in* — same convention
+            // `deps=`'s bare form already uses. Root-declared vars keep
+            // exactly their old behavior (root's own id); this only changes
+            // what a non-root declaration's bare `from=` resolves to.
             if let Some(from) = &mut decl.from {
                 if from.node_id.is_none() {
-                    from.node_id = Some(root_id.clone());
+                    from.node_id = Some(node.id.clone());
+                }
+            }
+            out.push(ScannedVar {
+                owner_node: node.id.clone(),
+                decl,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Every variable `canvas` declares, in document order. A `meshfox:var` may
+/// be declared in any node, not just root — one declared outside root is
+/// scoped to that node's own subtree (see `validate_var_scope`) and
+/// implicitly `session` (see `scan_all_var_decls`), the shape a
+/// node-specific, never-cached, never-in-general-`configure` value like a
+/// one-block query parameter wants. Also rejects a repeated `name` anywhere
+/// in the document — variable names stay a single flat namespace regardless
+/// of which node declares them, since resolution (`resolve`) keys purely by
+/// name.
+pub fn declared_vars(canvas: &Canvas) -> Result<Vec<VarDecl>, VarsError> {
+    let scanned = scan_all_var_decls(canvas)?;
+    let mut seen = HashSet::new();
+    for s in &scanned {
+        if !seen.insert(s.decl.name.clone()) {
+            return Err(VarsError::DuplicateName(s.decl.name.clone()));
+        }
+    }
+    Ok(scanned.into_iter().map(|s| s.decl).collect())
+}
+
+/// True if `node_id` is `ancestor_id` itself or a (transitive) descendant of
+/// it, by document nesting (`Node::parent`) — same walk-up-the-parent-chain
+/// shape `Canvas::resolve_absolute_position` already uses for group offsets,
+/// just testing membership instead of accumulating a position.
+fn is_within_subtree(canvas: &Canvas, node_id: &str, ancestor_id: &str) -> bool {
+    if node_id == ancestor_id {
+        return true;
+    }
+    let mut current = canvas.node(node_id).and_then(|n| n.parent.as_deref());
+    while let Some(id) = current {
+        if id == ancestor_id {
+            return true;
+        }
+        current = canvas.node(id).and_then(|n| n.parent.as_deref());
+    }
+    false
+}
+
+/// Validates that no block's `env=` reaches outside a node-scoped
+/// `meshfox:var`'s own subtree (a root-declared var has no such
+/// restriction — its subtree is the whole document). `meshfox validate`-only
+/// (see `validate_env_refs`'s own doc comment for why this stays out of
+/// `resolve`/`resolve_block_env` themselves): a document written for an
+/// older meshfox that didn't have node-scoped vars at all has nothing to
+/// violate here, and a scope mistake degrading to "resolves anyway" rather
+/// than breaking `run`/`view` outright matches every other lenient-at-
+/// runtime, strict-at-`validate` check in this codebase.
+pub fn validate_var_scope(canvas: &Canvas) -> Result<(), VarsError> {
+    let scanned = scan_all_var_decls(canvas)?;
+    let owners: HashMap<&str, &str> = scanned
+        .iter()
+        .map(|s| (s.decl.name.as_str(), s.owner_node.as_str()))
+        .collect();
+    for node in &canvas.nodes {
+        for block in crate::fence::scan_runnable_blocks(&node.id, &node.text) {
+            for env_ref in &block.env {
+                if let Some(owner) = owners.get(env_ref.var_name.as_str()) {
+                    if !is_within_subtree(canvas, &node.id, owner) {
+                        return Err(VarsError::VarOutOfScope(
+                            node.id.clone(),
+                            block.name.clone().unwrap_or_default(),
+                            env_ref.var_name.clone(),
+                            (*owner).to_string(),
+                        ));
+                    }
                 }
             }
         }
     }
-
-    let mut seen = HashSet::new();
-    for decl in &root_decls {
-        if !seen.insert(decl.name.clone()) {
-            return Err(VarsError::DuplicateName(decl.name.clone()));
-        }
-    }
-    Ok(root_decls)
+    Ok(())
 }
 
 /// Validates that every runnable fence's `env=` (see `crate::fence::EnvRef`)
@@ -849,6 +930,38 @@ mod tests {
         assert!(scan_var_decls(md).unwrap().is_empty());
     }
 
+    // Regression: SPEC.md documents `meshfox:var` with a worked example
+    // written as an indented (4+ space) code block, the same "escape hatch"
+    // convention `fence.rs`'s own tests already cover for fences — meant to
+    // read as inert documentation, not a real declaration. Before
+    // node-scoped vars existed, SPEC.md's own non-root nodes were never
+    // scanned at all (`declared_vars` was root-only), so this was invisible
+    // even though `scan_var_decls` itself never actually checked
+    // indentation. Once `declared_vars` started scanning every node (see
+    // "a_non_root_declaration_is_implicitly_session" and friends below),
+    // this surfaced for real: `README.md` (which `include`s `SPEC.md`) and
+    // `SPEC.md`'s own indented `INSTALL_PATH` example collided as a
+    // `DuplicateName` — this is the fix for that regression.
+    #[test]
+    fn ignores_a_var_comment_written_as_an_indented_code_block() {
+        let md = "    <!-- meshfox:var name=\"NOT_REAL\" -->\n";
+        assert!(scan_var_decls(md).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_node_scoped_declaration_does_not_collide_with_an_indented_documentation_example_elsewhere() {
+        let doc = concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "<!-- meshfox:var name=\"INSTALL_PATH\" default=\"/usr/local/bin\" -->\n\n",
+            "## Docs\n<!-- meshfox:node id=\"docs\" -->\n\n",
+            "Worked example:\n\n",
+            "    <!-- meshfox:var name=\"INSTALL_PATH\" prompt=\"Install prefix?\" -->\n",
+        );
+        let decls = declared_vars(&canvas(doc)).unwrap();
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].name, "INSTALL_PATH");
+    }
+
     #[test]
     fn missing_name_is_an_error() {
         let md = "<!-- meshfox:var type=\"string\" -->\n";
@@ -888,17 +1001,102 @@ mod tests {
     }
 
     #[test]
-    fn declared_vars_rejects_a_declaration_outside_the_root() {
+    fn declared_vars_allows_a_declaration_outside_the_root() {
         let doc = concat!(
             "# Root\n\n",
             "## Install\n<!-- meshfox:node id=\"install\" -->\n\n",
-            "<!-- meshfox:var name=\"INSTALL_PATH\" -->\n",
+            "<!-- meshfox:var name=\"INSTALL_PATH\" default=\"/usr/local/bin\" -->\n",
         );
         let c = canvas(doc);
-        assert_eq!(
-            declared_vars(&c).unwrap_err(),
-            VarsError::NotInRoot("INSTALL_PATH".to_string(), "install".to_string())
+        let decls = declared_vars(&c).unwrap();
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].name, "INSTALL_PATH");
+    }
+
+    #[test]
+    fn a_non_root_declaration_is_implicitly_session() {
+        let doc = concat!(
+            "# Root\n\n",
+            "## Install\n<!-- meshfox:node id=\"install\" -->\n\n",
+            "<!-- meshfox:var name=\"INSTALL_PATH\" default=\"/usr/local/bin\" -->\n",
         );
+        let decls = declared_vars(&canvas(doc)).unwrap();
+        assert!(decls[0].session);
+    }
+
+    #[test]
+    fn a_root_declaration_stays_non_session_by_default() {
+        let doc = "# Root\n\n<!-- meshfox:var name=\"X\" default=\"1\" -->\n";
+        let decls = declared_vars(&canvas(doc)).unwrap();
+        assert!(!decls[0].session);
+    }
+
+    #[test]
+    fn declared_vars_still_rejects_a_duplicate_name_across_root_and_a_child_node() {
+        let doc = concat!(
+            "# Root\n\n",
+            "<!-- meshfox:var name=\"X\" default=\"1\" -->\n\n",
+            "## Install\n<!-- meshfox:node id=\"install\" -->\n\n",
+            "<!-- meshfox:var name=\"X\" default=\"2\" -->\n",
+        );
+        assert_eq!(
+            declared_vars(&canvas(doc)).unwrap_err(),
+            VarsError::DuplicateName("X".to_string())
+        );
+    }
+
+    #[test]
+    fn a_bare_from_on_a_non_root_var_resolves_to_its_own_node_not_root() {
+        let doc = concat!(
+            "# Root\n\n",
+            "## Install\n<!-- meshfox:node id=\"install\" -->\n\n",
+            "<!-- meshfox:var name=\"X\" from=\"create\" -->\n",
+        );
+        let decls = declared_vars(&canvas(doc)).unwrap();
+        assert_eq!(decls[0].from.as_ref().unwrap().node_id.as_deref(), Some("install"));
+    }
+
+    #[test]
+    fn validate_var_scope_ok_when_a_node_scoped_var_is_only_used_within_its_own_subtree() {
+        let doc = concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Queries\n<!-- meshfox:node id=\"queries\" -->\n\n",
+            "<!-- meshfox:var name=\"MANUFACTURER_QUERY\" default=\"Sanofi\" -->\n\n",
+            "### By manufacturer\n<!-- meshfox:node id=\"by-manufacturer\" parent=\"queries\" -->\n\n",
+            "```bash name=\"q\" env=\"$MANUFACTURER_QUERY\"\necho hi\n```\n",
+        );
+        assert!(validate_var_scope(&canvas(doc)).is_ok());
+    }
+
+    #[test]
+    fn validate_var_scope_catches_a_reference_from_outside_the_owning_subtree() {
+        let doc = concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Queries\n<!-- meshfox:node id=\"queries\" -->\n\n",
+            "<!-- meshfox:var name=\"MANUFACTURER_QUERY\" default=\"Sanofi\" -->\n\n",
+            "## Unrelated\n<!-- meshfox:node id=\"unrelated\" -->\n\n",
+            "```bash name=\"q\" env=\"$MANUFACTURER_QUERY\"\necho hi\n```\n",
+        );
+        assert_eq!(
+            validate_var_scope(&canvas(doc)).unwrap_err(),
+            VarsError::VarOutOfScope(
+                "unrelated".to_string(),
+                "q".to_string(),
+                "MANUFACTURER_QUERY".to_string(),
+                "queries".to_string(),
+            )
+        );
+    }
+
+    #[test]
+    fn validate_var_scope_never_restricts_a_root_declared_var() {
+        let doc = concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "<!-- meshfox:var name=\"X\" default=\"1\" -->\n\n",
+            "## Anywhere\n<!-- meshfox:node id=\"anywhere\" -->\n\n",
+            "```bash name=\"q\" env=\"$X\"\necho hi\n```\n",
+        );
+        assert!(validate_var_scope(&canvas(doc)).is_ok());
     }
 
     #[test]

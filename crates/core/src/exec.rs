@@ -26,6 +26,7 @@ pub struct BashExecutor;
 
 impl Executor for BashExecutor {
     fn run(&self, code: &str, cwd: Option<&Path>) -> io::Result<ExecOutput> {
+        let started = std::time::Instant::now();
         let mut command = Command::new("bash");
         command.arg("-e").arg("-c").arg(code);
         if let Some(cwd) = cwd {
@@ -54,6 +55,7 @@ impl Executor for BashExecutor {
         Ok(ExecOutput {
             exit_code: status.code().unwrap_or(-1),
             output,
+            duration_ms: started.elapsed().as_millis() as u64,
         })
     }
 }
@@ -147,6 +149,7 @@ pub struct InterpreterExecutor {
 
 impl Executor for InterpreterExecutor {
     fn run(&self, code: &str, cwd: Option<&Path>) -> io::Result<ExecOutput> {
+        let started = std::time::Instant::now();
         let path = std::env::temp_dir().join(format!("meshfox-{}.tmp", uuid_like_suffix()));
         std::fs::write(&path, code)?;
         let result = (|| {
@@ -174,6 +177,7 @@ impl Executor for InterpreterExecutor {
             Ok(ExecOutput {
                 exit_code: status.code().unwrap_or(-1),
                 output,
+                duration_ms: started.elapsed().as_millis() as u64,
             })
         })();
         let _ = std::fs::remove_file(&path);

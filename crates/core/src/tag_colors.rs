@@ -53,6 +53,9 @@ pub fn scan_tag_color_decls(markdown: &str) -> Result<Vec<(String, String)>, Tag
         if fi < fence_ranges.len() && fence_ranges[fi].start <= start {
             continue;
         }
+        if crate::attrs::is_indented_as_code(line) {
+            continue;
+        }
         if let Some(attrs) = parse_tag_color_comment(line) {
             let tag = attrs.get("tag").cloned().ok_or(TagColorError::MissingTag)?;
             let color = attrs
@@ -121,6 +124,9 @@ pub fn unknown_tag_color_attr(markdown: &str) -> Option<crate::attrs::UnknownAtt
         if fi < fence_ranges.len() && fence_ranges[fi].start <= start {
             continue;
         }
+        if crate::attrs::is_indented_as_code(line) {
+            continue;
+        }
         if let Some(attrs) = parse_tag_color_comment(line) {
             if let Some(attr) = crate::attrs::first_unknown(&attrs, TAG_COLOR_ATTRS) {
                 let tag = attrs.get("tag").cloned().unwrap_or_else(|| "<untagged>".to_string());
@@ -182,6 +188,18 @@ mod tests {
         let decls =
             scan_tag_color_decls("```\n<!-- meshfox:tag-color tag=\"bug\" color=\"1\" -->\n```\n")
                 .unwrap();
+        assert!(decls.is_empty());
+    }
+
+    // Same escape hatch fence.rs's own fence-open check uses — SPEC.md
+    // documents `meshfox:tag-color` with a worked example written as an
+    // indented (4+ space) code block. See vars.rs's own regression test for
+    // why this matters once a scanner's target can be spliced in from
+    // elsewhere via `include`.
+    #[test]
+    fn ignores_a_declaration_written_as_an_indented_code_block() {
+        let decls =
+            scan_tag_color_decls("    <!-- meshfox:tag-color tag=\"bug\" color=\"1\" -->\n").unwrap();
         assert!(decls.is_empty());
     }
 

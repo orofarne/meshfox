@@ -16,6 +16,7 @@ pub mod fence;
 pub mod file_read;
 pub mod image_attrs;
 pub mod include;
+pub mod locate;
 pub mod mdcanvas;
 pub mod options;
 pub mod output;
@@ -34,14 +35,15 @@ pub use exec::{
     executor_for, is_supported_lang, resolve_command, split_interpreter, Executor,
     ResolvedCommand,
 };
-pub use fence::{scan_code_blocks, scan_runnable_blocks, BlockRef, CodeBlock, EnvRef};
+pub use fence::{fingerprint, scan_code_blocks, scan_runnable_blocks, BlockRef, CodeBlock, EnvRef};
 pub use file_read::{
     confine, preview, ConfineError, FilePreview, PreviewError, FILE_PREVIEW_MAX_BYTES,
 };
 pub use include::IncludeError;
+pub use locate::{locate_node, LocateError, LocatedNode};
 pub use mdcanvas::{parse_fold_override, NodeMeta, ParseError};
 pub use options::{declared_options, OptionsError};
-pub use output::{write_output, ExecOutput};
+pub use output::{cached_output_hash, format_duration_ms, write_output, ExecOutput};
 pub use staticgen::{Asset, EdgeView, NodeView, Position, SiteData};
 pub use tag_colors::{
     annotate_effective_colors, declared_tag_colors, effective_color, TagColorError,
@@ -54,8 +56,8 @@ pub use varout::{
 };
 pub use vars::{
     close_over_var_refs, declared_vars, map_block_env, resolve as resolve_vars,
-    resolve_block_env, validate_env_refs, validate_value, validate_var_refs, BlockEnvResolution,
-    ResolvedVars, VarDecl, VarType, VarsError,
+    resolve_block_env, validate_env_refs, validate_value, validate_var_refs, validate_var_scope,
+    BlockEnvResolution, ResolvedVars, VarDecl, VarType, VarsError,
 };
 
 pub use attrs::UnknownAttrError;
@@ -372,7 +374,12 @@ mod tests {
         let canvas = Canvas::from_markdown(DOC).unwrap();
         let by_path = run_block(&canvas, &["tests"], "smoke", Path::new(".")).unwrap();
         let by_id = run_block_by_id(&canvas, "tests", "smoke", Path::new(".")).unwrap();
-        assert_eq!(by_path.result, by_id.result);
+        // Not a full `ExecOutput` equality check — these are two genuinely
+        // separate subprocess runs, so `duration_ms` naturally differs
+        // between them even though everything that actually matters here
+        // (which block ran, what it printed, its exit code) is identical.
+        assert_eq!(by_path.result.exit_code, by_id.result.exit_code);
+        assert_eq!(by_path.result.output, by_id.result.output);
     }
 
     #[test]

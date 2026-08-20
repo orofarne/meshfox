@@ -53,6 +53,8 @@ pub enum DepsError {
     MultipleDefaults(String, Vec<String>),
     #[error("node {0:?} block {1:?}: `tty` and `cache` are mutually exclusive — an interactive session isn't the kind of deterministic exit-code-plus-text `cache` can save/replay")]
     CacheTtyConflict(String, String),
+    #[error("node {0:?} block {1:?}: `autoclose` only means anything on a `tty` block")]
+    AutocloseWithoutTty(String, String),
     #[error(transparent)]
     Vars(#[from] crate::vars::VarsError),
 }
@@ -185,6 +187,9 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
             let Some(name) = &block.name else { continue };
             if block.tty && block.cache {
                 return Err(DepsError::CacheTtyConflict(node.id.clone(), name.clone()));
+            }
+            if block.autoclose && !block.tty {
+                return Err(DepsError::AutocloseWithoutTty(node.id.clone(), name.clone()));
             }
             resolve_chain(canvas, BlockAddr::new(node.id.clone(), name.clone()))?;
         }
@@ -335,6 +340,27 @@ mod tests {
             validate(&c).unwrap_err(),
             DepsError::CacheTtyConflict("root".to_string(), "shell".to_string())
         );
+    }
+
+    #[test]
+    fn validate_catches_autoclose_on_a_non_tty_block() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```bash name=\"build\" autoclose\necho hi\n```\n",
+        ));
+        assert_eq!(
+            validate(&c).unwrap_err(),
+            DepsError::AutocloseWithoutTty("root".to_string(), "build".to_string())
+        );
+    }
+
+    #[test]
+    fn validate_allows_autoclose_on_a_tty_block() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```bash name=\"shell\" tty autoclose\nbash\n```\n",
+        ));
+        assert!(validate(&c).is_ok());
     }
 
     #[test]

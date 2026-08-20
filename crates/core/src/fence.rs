@@ -23,6 +23,13 @@ pub struct CodeBlock {
     /// and only allowed as a `deps=` target of another `tty` block — both
     /// enforced by `crate::deps::validate`, not here.
     pub tty: bool,
+    /// Explicit `autoclose` flag (`autoclose` or `autoclose="true"`) —
+    /// only meaningful on a `tty` block (`crate::deps::validate` rejects it
+    /// otherwise): once the interactive process exits, hand control back to
+    /// the canvas immediately, rather than the default of leaving its exit
+    /// code (and whatever it last printed) on screen until a deliberate
+    /// keypress. See SPEC.md's "Interactive (`tty`) blocks".
+    pub autoclose: bool,
     /// Other blocks this one depends on (`deps="a,b"`) — run before this
     /// one, automatically, whenever this block runs. See `crate::deps`.
     pub deps: Vec<BlockRef>,
@@ -372,7 +379,16 @@ fn is_cached_output_fence(markdown: &str, fence_start: usize) -> bool {
 /// `FENCE_VALUE_ATTRS`/`FENCE_FLAG_ATTRS` (split there only because the
 /// popup needs to know which shape to insert — irrelevant here, where
 /// every key is just a key).
-const FENCE_ATTRS: &[&str] = &["name", "deps", "env", "cache", "tty", "default", "interpreter"];
+const FENCE_ATTRS: &[&str] = &[
+    "name",
+    "deps",
+    "env",
+    "cache",
+    "tty",
+    "autoclose",
+    "default",
+    "interpreter",
+];
 
 /// `meshfox validate`-only: the first runnable fence anywhere in
 /// `markdown` with an attribute not in `FENCE_ATTRS` — checked over every
@@ -401,6 +417,7 @@ fn build_code_block(
     let cache = attrs.get("cache").map(|v| v != "false").unwrap_or(false);
     let default = attrs.get("default").map(|v| v != "false").unwrap_or(false);
     let tty = attrs.get("tty").map(|v| v != "false").unwrap_or(false);
+    let autoclose = attrs.get("autoclose").map(|v| v != "false").unwrap_or(false);
     let deps = parse_deps(&attrs);
     let env = parse_env(&attrs);
     let interpreter = attrs.get("interpreter").cloned();
@@ -410,6 +427,7 @@ fn build_code_block(
         cache,
         default,
         tty,
+        autoclose,
         deps,
         env,
         interpreter,
@@ -501,6 +519,58 @@ fn lines_with_offsets(s: &str) -> Vec<(usize, &str)> {
         offset += line.len() + 1;
     }
     result
+}
+
+const FNV1A_OFFSET: u32 = 0x811c_9dc5;
+const FNV1A_PRIME: u32 = 0x0100_0193;
+
+fn fnv1a(bytes: &[u8]) -> u32 {
+    let mut hash = FNV1A_OFFSET;
+    for &b in bytes {
+        hash ^= b as u32;
+        hash = hash.wrapping_mul(FNV1A_PRIME);
+    }
+    hash
+}
+
+/// A short, non-cryptographic fingerprint of everything about a runnable
+/// fence that actually changes what running it does — its own code, lang,
+/// interpreter, and its `env=`/`deps=` *references* (by name, not a
+/// resolved value: a variable's value isn't known at parse time, and it
+/// changing elsewhere shouldn't by itself mark this fence stale). Two
+/// scans of the same fence (unchanged since) always agree; two different
+/// fences *usually* don't (a 32-bit hash isn't collision-free, but a
+/// collision here only ever costs an unnecessary rerun, never a wrongly
+/// skipped one — nothing safety-critical depends on this being unique).
+///
+/// FNV-1a over UTF-8 bytes specifically because it's small enough to
+/// hand-port byte-for-byte into the web UI's own TypeScript mirror
+/// (`web/src/fence.ts`'s `fingerprint`) without either side pulling in a
+/// hashing crate/package just for this — see `crate::output` (where this
+/// is embedded in a cached-output marker to detect "the fence changed
+/// since this ran") and `crate::deps` (where a session keeps its own
+/// already-ran-this-fingerprint bookkeeping to skip an unchanged
+/// dependency). Keep `web/src/fence.ts`'s `fingerprint` byte-for-byte in
+/// sync by hand if this ever changes — there's no way to share the
+/// implementation across the Rust/TS boundary, same tradeoff every other
+/// two-sided grammar mirror in this codebase already accepts (see SPEC.md's
+/// "Formal grammar" intro).
+pub fn fingerprint(block: &CodeBlock) -> String {
+    let mut parts: Vec<String> = vec![
+        block.lang.clone(),
+        block.code.clone(),
+        block.interpreter.clone().unwrap_or_default(),
+    ];
+    for env in &block.env {
+        parts.push(format!("{}\u{0}{}", env.local_name, env.var_name));
+    }
+    for dep in &block.deps {
+        parts.push(match &dep.node_id {
+            Some(node_id) => format!("{node_id}/{}", dep.block_name),
+            None => dep.block_name.clone(),
+        });
+    }
+    format!("{:08x}", fnv1a(parts.join("\u{0}").as_bytes()))
 }
 
 fn parse_info_string(info: &str) -> (String, HashMap<String, String>) {
@@ -806,6 +876,20 @@ mod tests {
     }
 
     #[test]
+    fn autoclose_flag_defaults_to_false() {
+        let md = "```bash name=\"x\" tty\necho hi\n```\n";
+        assert!(!scan_code_blocks(md)[0].autoclose);
+    }
+
+    #[test]
+    fn autoclose_flag_parses_bare_and_explicit_false() {
+        let md = "```bash name=\"x\" tty autoclose\necho hi\n```\n\n```bash name=\"y\" tty autoclose=false\necho hi\n```\n";
+        let blocks = scan_code_blocks(md);
+        assert!(blocks[0].autoclose);
+        assert!(!blocks[1].autoclose);
+    }
+
+    #[test]
     fn is_default_true_for_explicit_flag_or_name_matching_node_id() {
         let md = "```bash name=\"build\" default\necho hi\n```\n";
         let flagged = &scan_code_blocks(md)[0];
@@ -985,6 +1069,51 @@ mod tests {
         let md = "```bash cach\ncargo build\n```\n";
         let err = unknown_fence_attr(md).expect("cach is not a known attribute");
         assert_eq!(err.attr, "cach");
+    }
+
+    #[test]
+    fn fingerprint_is_deterministic_for_the_same_block() {
+        let md = "```bash name=\"x\" env=\"$A\" deps=\"y\"\necho hi\n```\n";
+        let block = &scan_code_blocks(md)[0];
+        assert_eq!(fingerprint(block), fingerprint(block));
+    }
+
+    #[test]
+    fn fingerprint_changes_when_the_code_changes() {
+        let a = &scan_code_blocks("```bash name=\"x\"\necho a\n```\n")[0];
+        let b = &scan_code_blocks("```bash name=\"x\"\necho b\n```\n")[0];
+        assert_ne!(fingerprint(a), fingerprint(b));
+    }
+
+    #[test]
+    fn fingerprint_changes_when_env_changes() {
+        let a = &scan_code_blocks("```bash name=\"x\" env=\"$A\"\necho hi\n```\n")[0];
+        let b = &scan_code_blocks("```bash name=\"x\" env=\"$B\"\necho hi\n```\n")[0];
+        assert_ne!(fingerprint(a), fingerprint(b));
+    }
+
+    #[test]
+    fn fingerprint_changes_when_deps_changes() {
+        let a = &scan_code_blocks("```bash name=\"x\" deps=\"a\"\necho hi\n```\n")[0];
+        let b = &scan_code_blocks("```bash name=\"x\" deps=\"b\"\necho hi\n```\n")[0];
+        assert_ne!(fingerprint(a), fingerprint(b));
+    }
+
+    #[test]
+    fn fingerprint_changes_when_interpreter_changes() {
+        let a = &scan_code_blocks("```python name=\"x\" interpreter=\"python3\"\npass\n```\n")[0];
+        let b = &scan_code_blocks("```python name=\"x\" interpreter=\"python3.11\"\npass\n```\n")[0];
+        assert_ne!(fingerprint(a), fingerprint(b));
+    }
+
+    #[test]
+    fn fingerprint_ignores_attributes_that_do_not_affect_execution() {
+        // `cache`/`tty`/`default`/`name` itself don't change what running
+        // the block actually does — only its code/lang/interpreter/env=/
+        // deps= do.
+        let a = &scan_code_blocks("```bash name=\"x\" cache\necho hi\n```\n")[0];
+        let b = &scan_code_blocks("```bash name=\"y\"\necho hi\n```\n")[0];
+        assert_eq!(fingerprint(a), fingerprint(b));
     }
 
     #[test]

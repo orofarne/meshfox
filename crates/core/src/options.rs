@@ -58,6 +58,9 @@ pub fn scan_option_decls(markdown: &str) -> Result<Vec<String>, OptionsError> {
         if fi < fence_ranges.len() && fence_ranges[fi].start <= start {
             continue;
         }
+        if crate::attrs::is_indented_as_code(line) {
+            continue;
+        }
         if let Some(attrs) = parse_option_comment(line) {
             names.push(
                 attrs
@@ -86,6 +89,9 @@ pub fn unknown_option_attr(markdown: &str) -> Option<crate::attrs::UnknownAttrEr
             fi += 1;
         }
         if fi < fence_ranges.len() && fence_ranges[fi].start <= start {
+            continue;
+        }
+        if crate::attrs::is_indented_as_code(line) {
             continue;
         }
         if let Some(attrs) = parse_option_comment(line) {
@@ -145,6 +151,17 @@ mod tests {
     fn ignores_an_option_comment_inside_a_fence() {
         let names =
             scan_option_decls("```\n<!-- meshfox:option name=\"unfold\" -->\n```\n").unwrap();
+        assert!(names.is_empty());
+    }
+
+    // Same escape hatch fence.rs's own fence-open check uses — SPEC.md
+    // documents `meshfox:option` with a worked example written as an
+    // indented (4+ space) code block, meant to read as inert documentation.
+    // See vars.rs's own regression test for why this matters once a
+    // scanner's target can be spliced in from elsewhere via `include`.
+    #[test]
+    fn ignores_an_option_comment_written_as_an_indented_code_block() {
+        let names = scan_option_decls("    <!-- meshfox:option name=\"unfold\" -->\n").unwrap();
         assert!(names.is_empty());
     }
 

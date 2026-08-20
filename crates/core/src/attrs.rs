@@ -4,6 +4,32 @@
 
 use std::collections::HashMap;
 
+/// True if `line` is indented 4+ *spaces* (a tab doesn't count) —
+/// CommonMark's own threshold for "this is an indented code block, not
+/// real document structure", the same escape hatch `crate::fence::
+/// fence_open` already uses for a fence's own opening line so SPEC.md's
+/// worked examples of the fence syntax read as inert documentation rather
+/// than being picked up as real runnable/constraint blocks. Every
+/// `meshfox:*` HTML-comment scanner that isn't already anchored to
+/// something *else* CommonMark would protect the same way (a fenced code
+/// block, or — for `meshfox:node`/`meshfox:edge` — the heading their own
+/// marker line always immediately follows, and an indented `#` heading
+/// isn't a heading at all) needs this same check on the comment line
+/// itself: `crate::vars::scan_var_decls`/`unknown_var_attr`,
+/// `crate::options::scan_option_decls`/`unknown_option_attr`,
+/// `crate::tag_colors::scan_tag_color_decls`/`unknown_tag_color_attr` — a
+/// bare `line.trim()` before matching `<!--` would otherwise erase the
+/// indentation signal entirely and treat SPEC.md's own indented example
+/// (`    <!-- meshfox:var name="INSTALL_PATH" ... -->`) as a real
+/// declaration once it's spliced into another document via `include` and
+/// actually scanned (see the regression this was written to fix: a
+/// node-scoped `meshfox:var` made non-root nodes newly reachable to
+/// `declared_vars`, which is what first exposed this — SPEC.md's own
+/// indented `INSTALL_PATH` example collided with README.md's real one).
+pub(crate) fn is_indented_as_code(line: &str) -> bool {
+    line.len() - line.trim_start_matches(' ').len() >= 4
+}
+
 pub fn tokenize(s: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut cur = String::new();

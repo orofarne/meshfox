@@ -299,7 +299,8 @@ Lives inside a node's Markdown text, as fence-info-string attributes:
   chained `tty` blocks already hand it over twice, back to back (each
   still running its own `deps=` first, same as any other block). See
   "Interactive (`tty`) blocks" below for how the CLI and web UI actually
-  run one.
+  run one, and that section's own `autoclose` for returning to the canvas
+  automatically once it exits.
 
 Supported languages without an `interpreter=` attribute: `bash` (`sh` is an
 alias for it). A fence in any other language never counts as runnable at
@@ -327,6 +328,20 @@ either.
     ```
 
 Running `test` here always runs `build` first.
+
+In the web UI and the TUI (long-lived processes — `meshfox view`/`meshfox
+tui`, as opposed to a one-shot `meshfox run` invocation), running a chain
+this way skips re-running a pulled-in dependency (never the block actually
+requested — that one always runs for real) that already ran successfully
+earlier in the *same* session and hasn't changed since — same
+`meshfox_core::fence::fingerprint` (code/lang/`interpreter=`/`env=`/`deps=`)
+comparison `crate::output`'s cached-output staleness uses, so editing a
+dependency's code (or its `env=`/`deps=`) makes it eligible to run again
+immediately, no explicit cache-busting needed. A skipped step still folds
+forward whatever it last wrote via `from=` (see "Computed variables"
+below), so a later step in the same chain that depends on that value isn't
+affected by the skip. Restarting the process starts fresh — this is
+session-scoped, never written to disk.
 
 ## Constraint fences
 
@@ -477,6 +492,24 @@ terminal to hand over.
   in the node's own inline output area the way a normal run does.
 - Either way, output from a `tty` block is never written back into the
   file — that's what the `cache` conflict (above) rules out.
+
+By default, once a `tty` block's process exits, its exit code (and
+whatever it last printed) stays visible until a deliberate action returns
+to the canvas — a keypress in `meshfox tui`, closing the panel by hand in
+`meshfox view` — same as leaving a real terminal window open after a
+command finishes. `autoclose` (a flag, `autoclose` or `autoclose="true"`;
+only meaningful on a `tty` block — `meshfox validate` rejects it on
+anything else) skips that and returns to the canvas the instant the
+process exits instead:
+
+    ```bash name="shell" tty autoclose
+    bash
+    ```
+
+This only affects `meshfox tui`/`meshfox view` (both long-lived, with a
+canvas to actually return *to*) — plain `meshfox run` has no such
+distinction to make, a `tty` step there always just hands the terminal
+back the moment its process exits, `autoclose` or not.
 - A real terminal (CLI's own, or the web UI's pseudo-terminal) is a
   genuine tty, so the "commands run without a pseudo-terminal" note under
   "Cached output" below doesn't apply to `tty` blocks — a tool that
@@ -489,14 +522,41 @@ Document-scoped configuration values a canvas wants from whoever runs
 it — an install prefix, a log level, an API token — asked for once and
 then remembered, the same idea as CMake's cached variables or a
 `./configure` step. Declared as `<!-- meshfox:var ... -->` comments,
-**only inside the root node's own body** — a `meshfox:var` found in any
-other node is a `meshfox validate` error, not silently ignored, since a
-variable is always document-wide, never per-node:
+most naturally inside the root node's own body, where a declaration is
+document-wide and shows up in `./configure`/the web UI's "Configure
+variables":
 
     <!-- meshfox:var name="INSTALL_PATH" prompt="Install prefix?" default="/usr/local/bin" -->
     <!-- meshfox:var name="LOG_LEVEL" type="select" choices="debug,info,warn,error" default="info" -->
     <!-- meshfox:var name="API_TOKEN" secret -->
     <!-- meshfox:var name="REGION" default="us-east-1" required -->
+
+A `meshfox:var` may also be declared inside any other node — a
+**node-scoped** variable, for a value only one block (or a small cluster
+of related ones) genuinely needs, e.g. a search term only one ad hoc query
+block uses. It's visible only to `env=` on a runnable fence *inside that
+node's own subtree* (`meshfox validate` catches a reference from outside
+it — see `meshfox_core::validate_var_scope` — though `run`/`view` stay
+lenient about it, same as every other `validate`-only check); it's
+implicitly `session` (see below) whether or not `session` is written on it
+explicitly, so it's never written to the on-disk cache and never shows up
+in the document-wide `configure` list — asking about it up front, or
+remembering an answer past the current session, wouldn't make sense for a
+value this narrowly scoped. `session` only ever changes *whether an answer
+is remembered*, though, never *whether one gets asked for* — a variable
+with a `default` and no `required` still resolves silently from it, every
+time, the same as any other non-`required` declaration; being `session`
+just means there's nothing left afterward to fall back on before that
+default kicks in. For a value meant to be typed fresh each run despite
+having a sensible default (a search term like this one, not a fixed path),
+pair it with `required` too — the combination this section's own `session`
+bullet already calls out as guaranteeing "a real prompt on *every* run":
+
+    <!-- meshfox:var name="MANUFACTURER_QUERY" prompt="Manufacturer name" default="Sanofi" required -->
+
+Variable names still share one flat namespace across the whole document
+regardless of where they're declared — a duplicate `name=`, root or not,
+is a `meshfox validate`/`declared_vars` error either way.
 
 Attributes:
 
@@ -556,7 +616,9 @@ Attributes:
 - `session` — flag (`session` or `session=true`). Never read from or
   written to the on-disk cache — unlike `secret`, input isn't masked; this
   is about *lifetime* (never remembered past the current `meshfox run`
-  invocation), not confidentiality. Combined with `required`, this
+  invocation), not confidentiality. Always true for a node-scoped
+  declaration (one outside the root node) whether or not it's written
+  explicitly — see above. Combined with `required`, this
   guarantees a real prompt on *every* run rather than silently falling
   back to a cached/default answer — e.g. picking which of several
   configurations to deploy, every time. A plain `session` without
@@ -570,8 +632,10 @@ Attributes:
   "Consumption" below). Mutually exclusive with `from=` (a computed value
   is already never cached, so `session` on it would be a no-op).
 - `from` — `from="node-id/block-name"` (or a bare `from="block-name"`,
-  meaning a block in the root node — the same shorthand `deps=`'s
-  same-node form uses). Makes this a **computed** variable: instead of
+  meaning a block in the *same node this variable is itself declared in* —
+  the same shorthand `deps=`'s same-node form uses; for a root-declared
+  variable that's the root node, same as before node-scoped variables
+  existed). Makes this a **computed** variable: instead of
   being prompted/defaulted/cached, its value comes from actually running
   the named block and reading back what it wrote to its own
   `MESHFOX_VARS_OUT` file — see "Computed variables (`from=`)" below.
@@ -741,29 +805,39 @@ suggested default) end up actually coming from running a script:
   silently do nothing or apply bare defaults) if stdin isn't one. Secret
   variables are never shown here — asking for one that's never cached
   and immediately discarded again wouldn't do anything useful.
-- `meshfox run` resolves each executed block's own `env=` *lazily*: only
-  a variable that block actually references, and that's still
-  unresolved after the above precedence, gets an interactive prompt,
-  right before that block runs — no separate configure step required,
-  and no prompt at all for a block whose `env=` is empty or already
-  fully resolved. `--set NAME=value` (repeatable) supplies overrides on
-  the command line, the non-interactive equivalent of answering a
-  prompt — the same flag CI would use in place of a TTY, which `run`
-  otherwise requires whenever some referenced variable is still missing
-  after `--set`/env/cache/default. A `--set` value is saved to the cache
-  regardless of whether anything in the current invocation actually
-  references it, same as `cmake -D` always updating `CMakeCache.txt`.
+- `meshfox run` only ever resolves/prompts for a variable that some block
+  in the requested chain actually references (no separate configure step
+  required, and no prompt at all for a block whose `env=` is empty or
+  already fully resolved) — but it does so for the *whole* resolved chain
+  up front, before running any of it, not block by block as each one's
+  turn comes up. Without this, a variable only a block near the tail of a
+  long chain references (e.g. a database password only the final `load`
+  step needs) would only be asked for after everything ahead of it had
+  already run — the same "resolve the whole chain's variables before
+  starting" the web UI's own pre-run form (`GET /api/vars`) already does.
+  A `from=`-computed variable is the one exception: nothing has run yet at
+  preflight time, so it can't be resolved that early — it's still checked
+  right before the block that needs it runs, once its source block has
+  actually had the chance to produce it. `--set NAME=value` (repeatable)
+  supplies overrides on the command line, the non-interactive equivalent
+  of answering a prompt — the same flag CI would use in place of a TTY,
+  which `run` otherwise requires whenever some referenced variable is
+  still missing after `--set`/env/cache/default. A `--set` value is saved
+  to the cache regardless of whether anything in the current invocation
+  actually references it, same as `cmake -D` always updating
+  `CMakeCache.txt`.
 
 ## Options
 
 Document-wide settings that flip a default behavior for the whole canvas —
 distinct from `meshfox:var` (a value asked for from whoever runs the
-document) in that an option has no prompt and no value: it's either
-declared or it isn't. Declared as `<!-- meshfox:option name="..." -->`
-comments, **only inside the root node's own body** — same restriction as
-`meshfox:var`, and for the same reason: an option is always document-wide,
-never per-node. A `meshfox:option` found in any other node, one missing
-`name`, or the same `name` declared twice, is a `meshfox validate` error.
+document, and — unlike an option — declarable per-node too, see above) in
+that an option has no prompt and no value: it's either declared or it
+isn't. Declared as `<!-- meshfox:option name="..." -->` comments, **only
+inside the root node's own body** — an option is always document-wide,
+never per-node, so unlike `meshfox:var` it has no node-scoped form at all.
+A `meshfox:option` found in any other node, one missing `name`, or the
+same `name` declared twice, is a `meshfox validate` error.
 
     <!-- meshfox:option name="unfold" -->
 
@@ -793,9 +867,10 @@ A node's `color=` (a JSON-Canvas preset `"1"`-`"6"` or a literal
 `#rrggbb` hex string) is normally set per node. `meshfox:tag-color`
 declares a document-wide default instead: any node carrying a given tag,
 with no `color=` of its own, picks up that tag's color automatically.
-Same placement restriction as `meshfox:var`/`meshfox:option` — **only
-inside the root node's own body** — and the same reasoning: the default
-applies to the whole document, not one node.
+Same placement restriction as `meshfox:option` (root-only, unlike
+`meshfox:var`, which also allows a node-scoped form — see "Variables"
+above) — and the same reasoning: the default applies to the whole
+document, not one node.
 
     <!-- meshfox:tag-color tag="bug" color="1" -->
     <!-- meshfox:tag-color tag="feature" color="4" -->
@@ -826,12 +901,31 @@ source, wrapped in markers so re-runs replace just that region:
     ```bash name="build" cache
     cargo build --workspace
     ```
-    <!-- meshfox:output name="build" -->
+    <!-- meshfox:output name="build" hash="a1b2c3d4" -->
     ```text
-    exit code: 0
+    exit code: 0 · 4.2s
     ...
     ```
     <!-- /meshfox:output -->
+
+The header line inside the `text` fence carries the exit code alongside how
+long the block's own process actually ran (`meshfox_core::format_duration_ms`
+— `"842ms"`/`"2.3s"`/`"1m 05s"`), so a re-opened canvas still shows the last
+run's duration, not just whether it succeeded. The web UI shows the same
+figure live, ticking up in real time while a block is still running (like a
+Livebook cell) rather than only once it's done.
+
+The marker's own `hash=` is a short fingerprint
+(`meshfox_core::fence::fingerprint`) of everything about the fence that
+actually changes what running it does — its code, `lang`, `interpreter=`, and
+its `env=`/`deps=` *references* (by name, not a resolved value) — not a
+security hash, just a cheap way to tell "this output is still current" from
+"the fence changed since this ran": every reader (the web UI, the TUI)
+recomputes the fence's own live fingerprint and compares it against this
+stored one, showing the cached output as **stale** (still there, never
+silently discarded) whenever they differ, until the block is actually
+re-run. A marker written before this field existed has no `hash=` at all —
+treated the same as stale, since there's nothing to compare against.
 
 Output (live or cached) that contains ANSI SGR color/style escape codes
 renders in color in the web UI, both while a block is still streaming and
@@ -975,7 +1069,7 @@ leading token instead of a `key=value` pair (`crates/core/src/fence.rs`):
     lang            ::= bare-value
 
     runnable-attr   ::= 'name' | 'cache' | 'default' | 'deps' | 'env' | 'tty'
-                     | 'interpreter'
+                     | 'autoclose' | 'interpreter'
     constraint-attr ::= 'constraint' | 'name'
 
 A runnable fence additionally requires `lang` to be `bash` or `sh`, *or* its

@@ -405,22 +405,41 @@ fn render_document(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_output(f: &mut Frame, area: Rect, app: &App) {
-    let title = match &app.run {
-        Some(run) if run.proc.is_some() => " Output (running — K to kill) ".to_string(),
-        Some(run) if run.killed => " Output (killed) ".to_string(),
-        Some(run) if run.had_failure => " Output (failed) ".to_string(),
-        Some(_) => " Output (done) ".to_string(),
-        None => " Output ".to_string(),
+    let title = if let Some(run) = &app.run {
+        if run.proc.is_some() {
+            " Output (running — K to kill) ".to_string()
+        } else if run.killed {
+            " Output (killed) ".to_string()
+        } else if run.had_failure {
+            " Output (failed) ".to_string()
+        } else {
+            " Output (done) ".to_string()
+        }
+    } else if let Some(run) = &app.file_run {
+        if run.proc.is_some() {
+            " Output (running — K to kill) ".to_string()
+        } else if run.had_failure {
+            " Output (failed) ".to_string()
+        } else {
+            " Output (done) ".to_string()
+        }
+    } else {
+        " Output ".to_string()
     };
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let text: Text = if let Some(run) = &app.run {
+    let lines: Option<&[String]> = if let Some(run) = &app.run {
+        Some(&run.lines)
+    } else {
+        app.file_run.as_ref().map(|run| run.lines.as_slice())
+    };
+    let text: Text = if let Some(lines) = lines {
         let take = inner.height as usize;
-        let start = run.lines.len().saturating_sub(take);
+        let start = lines.len().saturating_sub(take);
         Text::from(
-            run.lines[start..]
+            lines[start..]
                 .iter()
                 .map(|l| Line::from(l.as_str()))
                 .collect::<Vec<_>>(),

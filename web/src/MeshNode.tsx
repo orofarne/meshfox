@@ -88,7 +88,12 @@ export interface LiveBlockState {
    * shown the instant a run is requested, before the server has actually
    * confirmed this block is even part of the chain — reconciled against
    * real `step-start`/`step-end` events once those arrive. */
-  status: "queued" | "running" | "done" | "killed";
+  /** `"skipped"` — a `"step-skipped"` event: this dependency already ran
+   * successfully earlier in the session and hasn't changed since, so the
+   * server didn't actually re-run it (see SPEC.md's "Runnable code
+   * fences"). Never the status of the block actually requested, only a
+   * pulled-in dependency. */
+  status: "queued" | "running" | "done" | "killed" | "skipped";
   /** Set (only for the block whose button was actually clicked) when that
    * click was "⛓ run chain" rather than plain "run" — lets the two buttons'
    * labels change independently: whichever one was clicked shows
@@ -106,6 +111,20 @@ export interface LiveBlockState {
    * identify *this* run to the server. Cleared once the block is no
    * longer the actively-streaming step. */
   runId?: string;
+  /** `Date.now()` when this step's own `"step-start"` event arrived —
+   * client-side wall-clock, used only to tick a live elapsed-time counter
+   * while `status === "running"` (see `LiveElapsed`). Not meant to be
+   * precise to the millisecond (network latency between the server
+   * actually starting the process and this event arriving isn't
+   * accounted for) — the authoritative figure is `durationMs`, set once
+   * `"step-end"` actually reports it. */
+  startedAt?: number;
+  /** The server's own authoritative wall-clock duration for this step's
+   * process, in milliseconds — from `"step-end"`'s `durationMs` (mirrors
+   * `core::output::ExecOutput::duration_ms`, the same figure a `cache`d
+   * block's persisted output header carries after a reload). Set once
+   * `status` becomes `"done"`/`"killed"`. */
+  durationMs?: number;
 }
 
 export interface MeshNodeData {
@@ -231,8 +250,11 @@ export interface MeshNodeData {
   onKill: (blockName: string) => void;
   /** `tty` blocks only — opens a `TtyPanel` (a real interactive terminal)
    * instead of streaming captured output the way `onRun` does. Same
-   * `withDeps` meaning: plain "run" (false) vs "⛓ run chain" (true). */
-  onRunTty: (blockName: string, withDeps: boolean) => void;
+   * `withDeps` meaning: plain "run" (false) vs "⛓ run chain" (true).
+   * `autoclose` mirrors the block's own `CodeSegment.autoclose` — whether
+   * `TtyPanel` should close itself the instant the process exits, rather
+   * than the default of staying open until closed by hand. */
+  onRunTty: (blockName: string, withDeps: boolean, autoclose: boolean) => void;
   /** A constraint fence's Starlark isn't a `run`nable fence (only bash/sh
    * are), so each one gets this instead of a Run button: re-fetches the
    * whole canvas, which re-evaluates every constraint server-side (see
@@ -547,6 +569,55 @@ export function resolveNodeColor(color: string | undefined): string | undefined 
  * to it — long enough to catch the eye, short enough not to linger. */
 const JUMP_HIGHLIGHT_MS = 1200;
 
+/** Read-only, syntax-highlighted view of one fenced block's own source —
+ * the same CodeMirror-based highlighting `FileCodePreview` already uses for
+ * an included file's preview (`pickLanguage`), just fed a fence's
+ * already-in-hand `code` string directly instead of fetching one from the
+ * server. Previously `RunnableCodeBlock` rendered this as a bare
+ * `<pre><code>{seg.code}</code></pre>` with no highlighting wired up at
+ * all — unlike `FileCodePreview`, which is exactly why an included file's
+ * preview highlighted correctly while a node's own runnable blocks never
+ * did (TODO.canvas.md: "Подсветка синтаксиса в блоках кода в webui не
+ * работает"). Falls back to plain unhighlighted text while the grammar is
+ * still loading, or when `lang` doesn't match anything CodeMirror knows.
+ */
+function HighlightedCode({ code, lang }: { code: string; lang: string }) {
+  const dark = usePrefersDark();
+  const [extensions, setExtensions] = useState<Extension[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const desc = pickLanguage(lang, undefined);
+    if (!desc) {
+      setExtensions([]);
+      return;
+    }
+    desc
+      .load()
+      .then((support) => {
+        if (!cancelled) setExtensions(support ? [support] : []);
+      })
+      .catch(() => {
+        if (!cancelled) setExtensions([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [lang]);
+
+  return (
+    <div className="mesh-code-block-source nodrag nopan">
+      <CodeMirror
+        value={code}
+        theme={dark ? "dark" : "light"}
+        extensions={extensions}
+        editable={false}
+        basicSetup={{ highlightActiveLine: false, foldGutter: false, lineNumbers: false }}
+      />
+    </div>
+  );
+}
+
 function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData; nodeId: string }) {
   // Expanded by default (unlike a constraint fence — see
   // `ConstraintFenceBlock`): a runnable block's own code and output are
@@ -604,8 +675,12 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
   // captured output into this node's body — a separate handler, since
   // it's not the same "queued/running/killed in liveBlocks" state machine
   // at all (see App.tsx's `onRunTty` vs `onRun`).
-  const runHandler = seg.tty ? () => data.onRunTty(seg.name, false) : () => data.onRun(seg.name, false);
-  const chainHandler = seg.tty ? () => data.onRunTty(seg.name, true) : () => data.onRun(seg.name, true);
+  const runHandler = seg.tty
+    ? () => data.onRunTty(seg.name, false, seg.autoclose)
+    : () => data.onRun(seg.name, false);
+  const chainHandler = seg.tty
+    ? () => data.onRunTty(seg.name, true, seg.autoclose)
+    : () => data.onRun(seg.name, true);
 
   return (
     <div className="mesh-code-block" id={blockDomId({ nodeId, blockName: seg.name })}>
@@ -673,14 +748,38 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
               ))}
             </div>
           )}
-          <pre>
-            <code>{seg.code}</code>
-          </pre>
+          <HighlightedCode code={seg.code} lang={seg.lang} />
           {!seg.tty && <RunOutput seg={seg} live={live} />}
         </>
       )}
     </div>
   );
+}
+
+/** Mirrors `core::output::format_duration_ms` — kept in sync by hand (same
+ * split this codebase already uses for every other Rust/TS syntax pair, see
+ * SPEC.md's "Formal grammar" intro): `"842ms"` under a second, `"2.3s"`
+ * under a minute, `"1m 05s"` beyond that. */
+function formatDurationMs(ms: number): string {
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  const totalSeconds = Math.round(ms / 1000);
+  if (totalSeconds < 60) return `${(ms / 1000).toFixed(1)}s`;
+  return `${Math.floor(totalSeconds / 60)}m ${String(totalSeconds % 60).padStart(2, "0")}s`;
+}
+
+/** A ticking elapsed-time counter for a still-`"running"` step — like
+ * Livebook's own live cell timer. Purely client-side wall-clock
+ * (`Date.now() - startedAt`, re-rendered every 200ms via its own interval)
+ * — an approximation good enough to watch tick up, not meant to match the
+ * server's own authoritative `durationMs` (see `LiveBlockState.startedAt`'s
+ * own doc comment) to the millisecond. */
+function LiveElapsed({ startedAt }: { startedAt: number }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), 200);
+    return () => window.clearInterval(id);
+  }, []);
+  return <>{formatDurationMs(Math.max(0, now - startedAt))}</>;
 }
 
 /** Live output (queued/running/done/killed, from the current run) — shared
@@ -691,8 +790,31 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
  * lifetime (a page reload loses it, same as the transient-output behavior
  * this replaces always had). */
 function LiveRunOutput({ live }: { live: LiveBlockState }) {
+  if (live.status === "skipped") {
+    // Never the block actually requested (only a pulled-in dependency —
+    // see SPEC.md's "Runnable code fences"), so there's no fresh output to
+    // show here at all: whatever it printed last time it *actually* ran is
+    // still sitting in its own cached-output region (if `cache`d) below,
+    // untouched by this skip.
+    return (
+      <div className="mesh-code-output" data-exit="skipped">
+        <div className="mesh-code-output-head">skipped · already ran this session, unchanged</div>
+      </div>
+    );
+  }
+  const duration =
+    live.durationMs !== undefined ? ` · ${formatDurationMs(live.durationMs)}` : undefined;
   const label =
-    live.status === "killed" ? "killed" : live.status === "running" ? "running…" : `output · exit ${live.exitCode}`;
+    live.status === "killed" ? (
+      <>killed{duration}</>
+    ) : live.status === "running" ? (
+      <>running… {live.startedAt !== undefined && <LiveElapsed startedAt={live.startedAt} />}</>
+    ) : (
+      <>
+        output · exit {live.exitCode}
+        {duration}
+      </>
+    );
   const exitState =
     live.status === "killed" ? "killed" : live.status === "running" ? "running" : live.exitCode === 0 ? "ok" : "fail";
   return (
@@ -720,8 +842,17 @@ function RunOutput({ seg, live }: { seg: CodeSegment; live?: LiveBlockState }) {
   }
   if (!live && seg.output) {
     return (
-      <div className="mesh-code-output" data-exit={seg.output.exitCode === 0 ? "ok" : "fail"}>
-        <div className="mesh-code-output-head">output · exit {seg.output.exitCode}</div>
+      <div className="mesh-code-output" data-exit={seg.output.exitCode === 0 ? "ok" : "fail"} data-stale={seg.output.stale || undefined}>
+        <div className="mesh-code-output-head">
+          output · exit {seg.output.exitCode}
+          {seg.output.durationText && ` · ${seg.output.durationText}`}
+          {seg.output.stale && (
+            <span className="mesh-code-output-stale" title="The code changed since this output was captured — re-run to refresh it.">
+              {" "}
+              · stale
+            </span>
+          )}
+        </div>
         {seg.output.text && (
           <pre>
             <code><AnsiText text={seg.output.text} /></code>
@@ -900,6 +1031,7 @@ export function NodeBodyPreview({ text }: { text: string }) {
             </ReactMarkdown>
           );
         }
+        const highlightLang = seg.type === "constraint" ? "starlark" : seg.lang;
         const lang = seg.type === "constraint" ? `starlark${seg.name ? ` · ${seg.name}` : ""}` : seg.lang;
         return (
           <div className="mesh-code-block" key={`${seg.type === "constraint" ? "constraint" : seg.name}-${i}`}>
@@ -911,9 +1043,7 @@ export function NodeBodyPreview({ text }: { text: string }) {
                 )}
               </span>
             </div>
-            <pre>
-              <code>{seg.code}</code>
-            </pre>
+            <HighlightedCode code={seg.code} lang={highlightLang} />
           </div>
         );
       })}
@@ -970,9 +1100,7 @@ function ConstraintFenceBlock({
       </div>
       {expanded && (
         <>
-          <pre>
-            <code>{seg.code}</code>
-          </pre>
+          <HighlightedCode code={seg.code} lang="starlark" />
           {status && !status.ok && (
             <div className="mesh-code-output" data-exit="fail">
               <div className="mesh-code-output-head">{status.messages.length} failing</div>
@@ -1103,6 +1231,7 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
   // had drifted out of sync with (it always called `onRun`, unconditionally,
   // until this).
   const quickRunIsTty = quickRunBlock?.tty ?? false;
+  const quickRunAutoclose = quickRunBlock?.autoclose ?? false;
   const quickRunLive = quickRunBlockName ? data.liveBlocks[quickRunBlockName] : undefined;
   const quickRunBusy = quickRunLive?.status === "queued" || quickRunLive?.status === "running";
   const canOpenFile = data.nodeType === "file" && !!data.target;
@@ -1262,7 +1391,9 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
               className="mesh-node-icon-button mesh-node-quick-run-icon nodrag"
               disabled={quickRunBusy}
               onClick={() =>
-                quickRunIsTty ? data.onRunTty(quickRunBlockName, false) : data.onRun(quickRunBlockName, false)
+                quickRunIsTty
+                  ? data.onRunTty(quickRunBlockName, false, quickRunAutoclose)
+                  : data.onRun(quickRunBlockName, false)
               }
               title={
                 quickRunBusy

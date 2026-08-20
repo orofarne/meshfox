@@ -17,7 +17,7 @@ use meshfox_core::fence::{self, scan_runnable_blocks};
 use meshfox_core::mdcanvas;
 use meshfox_core::output::{write_output, ExecOutput};
 use meshfox_core::vars::{declared_vars, resolve_block_env, VarDecl, VarType};
-use meshfox_core::{Canvas, FileDisplay, NodeType, VarCache};
+use meshfox_core::{Canvas, FileDisplay, Node, NodeType, VarCache};
 use meshfox_server::stream_exec::SpawnedProcess;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -83,6 +83,15 @@ pub struct PendingTty {
     pub code: String,
     pub interpreter: Option<String>,
     pub env: HashMap<String, String>,
+    /// This step's own real `PWD` (see `advance_run`) — the primary
+    /// document's own directory, unless the step's node was spliced in
+    /// from an `include` elsewhere on disk, in which case that target's
+    /// own directory instead.
+    pub cwd: PathBuf,
+    /// Mirrors `CodeBlock::autoclose` — `mod.rs::run_tty_handoff` skips its
+    /// own "press any key to return" pause when this is set, going
+    /// straight back to the canvas the instant the process exits.
+    pub autoclose: bool,
 }
 
 pub struct RunState {
@@ -91,6 +100,12 @@ pub struct RunState {
     pub proc: Option<SpawnedProcess>,
     pub lines: Vec<String>,
     pub full_output: String,
+    /// Reset to `Instant::now()` right before each step is actually
+    /// spawned (`advance_run`) — read back once its exit code is known
+    /// (`on_output_line`) to time it into `ExecOutput::duration_ms`, the
+    /// same figure the web UI/CLI already compute around their own spawn
+    /// points.
+    pub step_started: std::time::Instant,
     pub current_node_text: String,
     pub had_failure: bool,
     pub killed: bool,
@@ -107,6 +122,22 @@ pub struct RunState {
     /// step's exit code is known, by `on_output_line`/`resume_after_tty` —
     /// see `meshfox_core::varout`.
     pub pending_vars_out: Option<(PathBuf, Vec<VarDecl>)>,
+}
+
+/// A runnable `file` node's own single execution — no `deps=` chain, no
+/// `cache`, no `meshfox:var`, unlike a fenced block's `RunState`, since a
+/// `file` node has none of those; see `App::start_file_run`. Kept as its
+/// own separate state (rather than shoehorned into `RunState`, which is
+/// built entirely around a `BlockAddr` chain) for the same reason the web
+/// UI's `run_file_node` is its own endpoint, distinct from `run_block`.
+pub struct FileRunState {
+    pub proc: Option<SpawnedProcess>,
+    pub lines: Vec<String>,
+    pub had_failure: bool,
+    /// Set once the process has exited — `run` stays around afterward
+    /// purely so its transcript keeps showing until the *next* run
+    /// starts, same convention `RunState::finished` uses.
+    pub finished: bool,
 }
 
 pub struct App {
@@ -149,6 +180,7 @@ pub struct App {
     pub highlighter: Highlighter,
     pub picker: Picker,
     pub run: Option<RunState>,
+    pub file_run: Option<FileRunState>,
     pub pending_tty: Option<PendingTty>,
     pub block_picker: Option<BlockPickerState>,
     pub var_form: Option<VarFormState>,
@@ -223,6 +255,33 @@ pub struct App {
     /// render path (`ui.rs`) can show it with no changes of its own —
     /// `Protocol` is cheap to clone (see `ratatui_image::protocol`).
     pub link_preview_image: HashMap<String, Protocol>,
+    /// Every block that has completed successfully at least once during
+    /// this TUI process's own lifetime, keyed by its address — consulted
+    /// (and updated) by `advance_run` so a chain run can skip re-running a
+    /// dependency that's already run this session *and* hasn't changed
+    /// since (see `SessionRun`; mirrors the web server's own
+    /// `AppState::session_runs`). Never persisted anywhere; restarting the
+    /// TUI starts fresh.
+    pub session_runs: HashMap<(String, String), SessionRun>,
+}
+
+/// One block's most recent successful run this session — see
+/// `App::session_runs`.
+#[derive(Clone)]
+pub struct SessionRun {
+    /// `meshfox_core::fingerprint` of the block *as it stood* on that
+    /// successful run — a later `advance_run` only treats this as
+    /// "already fresh" (skippable) if the block's own *current*
+    /// fingerprint still matches; any edit to its code/lang/interpreter/
+    /// env=/deps= changes the fingerprint and makes it stale again, the
+    /// same mechanism `crate::output`'s cached-output staleness uses.
+    pub fingerprint: String,
+    /// Whatever this block wrote to its own vars-out file last time it
+    /// actually ran (only ever non-empty for a block that's a `from=`
+    /// source for something) — folded into `run_computed` in place of
+    /// re-running it when this run is skipped, so a later step that
+    /// declared `from=` this block still gets a value.
+    pub produced_vars: HashMap<String, String>,
 }
 
 /// A background link-preview fetch's result, reported back through
@@ -319,6 +378,7 @@ impl App {
             highlighter: Highlighter::new(),
             picker,
             run: None,
+            file_run: None,
             pending_tty: None,
             block_picker: None,
             var_form: None,
@@ -335,6 +395,7 @@ impl App {
             link_preview_meta: HashMap::new(),
             link_preview_image_requested: HashSet::new(),
             link_preview_image: HashMap::new(),
+            session_runs: HashMap::new(),
         };
         app.render_current_document();
         Ok(app)
@@ -1107,16 +1168,46 @@ impl App {
             self.status = "a run is already in progress — press K to kill it first".into();
             return;
         }
+        if self.file_run.as_ref().is_some_and(|r| !r.finished) {
+            self.status = "a run is already in progress — press K to kill it first".into();
+            return;
+        }
         let Some(row) = self.rows.get(self.selected) else {
             return;
         };
         let node_id = row.node_id.clone();
-        let Some(node) = self.canvas.node(&node_id) else {
-            self.status =
-                "this comes from an `include` — open its own file to run its blocks".into();
+
+        // A runnable `file` node (`type="file" interpreter="..."`) has no
+        // fenced blocks at all — it's its own single, uncached, unchained
+        // action, same as the web UI's own "▷ run" on its title bar.
+        // Checked against `self.display_canvas` (already include-resolved,
+        // the same tree `row`/`node_id` came from) since a `file` node's
+        // own runnability has nothing to do with `deps=`/chain machinery.
+        if let Some(node) = self.display_canvas.node(&node_id) {
+            if node.is_runnable_file() {
+                self.start_file_run(node_id, node.clone()).await;
+                return;
+            }
+        }
+
+        // Finds which real file `node_id` actually lives in — itself or
+        // an `include` target elsewhere on disk (see `advance_run`'s own
+        // doc comment) — a fenced block spliced in from an `include` used
+        // to be entirely unreachable from here.
+        let located = match meshfox_core::locate_node(&self.raw, &self.canvas_path, &node_id) {
+            Ok(l) => l,
+            Err(e) => {
+                self.status = e.to_string();
+                return;
+            }
+        };
+        let Some(node_text) = Canvas::from_markdown(&located.raw)
+            .ok()
+            .and_then(|c| c.node(&located.local_id).map(|n| n.text.clone()))
+        else {
+            self.status = format!("node {node_id:?} not found");
             return;
         };
-        let node_text = node.text.clone();
         let blocks = scan_runnable_blocks(&node_id, &node_text);
         if blocks.is_empty() {
             self.status = "nothing runnable in this node".into();
@@ -1161,15 +1252,25 @@ impl App {
 
     async fn start_run(&mut self, node_id: String, block_name: String, with_deps: bool) {
         let target = BlockAddr::new(node_id, block_name);
+        // Include-resolved (not just `self.canvas`) so `target` can name a
+        // node spliced in from an `include` — same namespaced id
+        // `self.display_canvas`/the tree the caller picked `node_id` from
+        // already uses — and so a `deps=`/`from=` chain can cross from one
+        // file into another. `advance_run` (below) is what actually finds
+        // each step's *own* file to run/cache in via `locate_node`; this
+        // resolved canvas only has to be complete enough to trace the
+        // dependency graph, not track which file owns which node.
+        let resolved = meshfox_core::include::resolve(&self.canvas, &self.canvas_path)
+            .unwrap_or_else(|_| self.canvas.clone());
         // Even with `with_deps` false (the plain "run", skipping `deps=`),
         // the target's own `from=` sources still have to run first — a
         // computed variable has no value at all otherwise, unlike a
         // `deps=` dependency that might already have fresh cached output.
         // See `meshfox_core::resolve_run_chain`'s own doc comment.
         let chain_result = if with_deps {
-            meshfox_core::deps::resolve_chain(&self.canvas, target)
+            meshfox_core::deps::resolve_chain(&resolved, target)
         } else {
-            meshfox_core::deps::resolve_from_chain(&self.canvas, target)
+            meshfox_core::deps::resolve_from_chain(&resolved, target)
         };
         let chain = match chain_result {
             Ok(c) => c,
@@ -1185,6 +1286,7 @@ impl App {
             proc: None,
             lines: Vec::new(),
             full_output: String::new(),
+            step_started: std::time::Instant::now(),
             current_node_text: String::new(),
             had_failure: false,
             killed: false,
@@ -1202,51 +1304,107 @@ impl App {
     /// for a missing `meshfox:var` (returns, waiting on the prompt), or the
     /// chain runs out (marks `self.run` finished — see `RunState::finished`).
     async fn advance_run(&mut self) {
-        let Some((idx, len)) = self.run.as_ref().map(|r| (r.idx, r.chain.len())) else {
-            return;
-        };
-        if idx >= len {
-            let (killed, had_failure) = self
-                .run
-                .as_ref()
-                .map(|r| (r.killed, r.had_failure))
-                .unwrap_or_default();
-            self.status = if killed {
-                "run killed".into()
-            } else if had_failure {
-                "run finished with a failure".into()
-            } else {
-                "run finished".into()
+        // Loops rather than a single lookup: a step found to be "already
+        // fresh this session" (see `session_runs`) is skipped in place —
+        // folding whatever it produced last time straight into
+        // `run_computed` and moving on to the next `idx` — without ever
+        // reaching the spawn logic below. The loop only ever exits via an
+        // early `return` (chain exhausted, an error, or a step that
+        // genuinely needs to run) or falls through to spawn a step once
+        // one is found that isn't skippable.
+        let (addr, located, node_text, block) = loop {
+            let Some((idx, len)) = self.run.as_ref().map(|r| (r.idx, r.chain.len())) else {
+                return;
             };
-            if let Some(run) = &mut self.run {
-                run.finished = true;
+            if idx >= len {
+                let (killed, had_failure) = self
+                    .run
+                    .as_ref()
+                    .map(|r| (r.killed, r.had_failure))
+                    .unwrap_or_default();
+                self.status = if killed {
+                    "run killed".into()
+                } else if had_failure {
+                    "run finished with a failure".into()
+                } else {
+                    "run finished".into()
+                };
+                if let Some(run) = &mut self.run {
+                    run.finished = true;
+                }
+                return;
             }
-            return;
-        }
 
-        let addr = self.run.as_ref().unwrap().chain[idx].clone();
-        let Some(node) = self.canvas.node(&addr.node_id) else {
-            self.status = format!("node {:?} not found", addr.node_id);
-            if let Some(run) = &mut self.run {
-                run.finished = true;
-                run.had_failure = true;
+            let addr = self.run.as_ref().unwrap().chain[idx].clone();
+            // Finds which real file `addr.node_id` actually lives in —
+            // itself (the primary document) or an `include` target
+            // elsewhere on disk, however deeply nested — so a block
+            // spliced in from an `include` is addressable here at all, and
+            // its own `cache`/`PWD` land in the right file (see
+            // `Node::cwd`'s own reasoning; mirrors the web UI's
+            // `run_block`/`run_tty_chain`).
+            let located =
+                match meshfox_core::locate_node(&self.raw, &self.canvas_path, &addr.node_id) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        self.status = e.to_string();
+                        if let Some(run) = &mut self.run {
+                            run.finished = true;
+                            run.had_failure = true;
+                        }
+                        return;
+                    }
+                };
+            let Some(node_text) = Canvas::from_markdown(&located.raw)
+                .ok()
+                .and_then(|c| c.node(&located.local_id).map(|n| n.text.clone()))
+            else {
+                self.status = format!("node {:?} not found", addr.node_id);
+                if let Some(run) = &mut self.run {
+                    run.finished = true;
+                    run.had_failure = true;
+                }
+                return;
+            };
+            let Some(block) = scan_runnable_blocks(&addr.node_id, &node_text)
+                .into_iter()
+                .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()))
+            else {
+                self.status = format!(
+                    "block {:?} not found in {:?}",
+                    addr.block_name, addr.node_id
+                );
+                if let Some(run) = &mut self.run {
+                    run.finished = true;
+                    run.had_failure = true;
+                }
+                return;
+            };
+
+            // The block actually requested (always the chain's own last
+            // entry) always runs for real; only a pulled-in dependency is
+            // ever eligible to be skipped as "already fresh this session"
+            // — see `App::session_runs`.
+            let is_requested_target = idx + 1 == len;
+            let live_fingerprint = meshfox_core::fingerprint(&block);
+            if !is_requested_target {
+                let key = (addr.node_id.clone(), addr.block_name.clone());
+                if let Some(session_run) =
+                    self.session_runs.get(&key).filter(|r| r.fingerprint == live_fingerprint)
+                {
+                    self.run_computed.extend(session_run.produced_vars.clone());
+                    if let Some(run) = &mut self.run {
+                        run.lines.push(format!(
+                            "==> {} (skipped — already ran this session, unchanged)",
+                            addr.block_name
+                        ));
+                        run.idx += 1;
+                    }
+                    continue;
+                }
             }
-            return;
-        };
-        let node_text = node.text.clone();
-        let Some(block) = scan_runnable_blocks(&addr.node_id, &node_text)
-            .into_iter()
-            .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()))
-        else {
-            self.status = format!(
-                "block {:?} not found in {:?}",
-                addr.block_name, addr.node_id
-            );
-            if let Some(run) = &mut self.run {
-                run.finished = true;
-                run.had_failure = true;
-            }
-            return;
+
+            break (addr, located, node_text, block);
         };
 
         let mut resolution = resolve_block_env(
@@ -1322,6 +1480,9 @@ impl App {
         // it just parks the request and returns; `mod.rs`'s loop picks
         // `pending_tty` up before its next `select!` and calls
         // `resume_after_tty` once the child exits.
+        let cwd = crate::canvas_root_dir(located.origin.as_deref().unwrap_or(&self.canvas_path))
+            .to_path_buf();
+
         if block.tty {
             if let Some(run) = &mut self.run {
                 run.lines.push(format!(
@@ -1334,17 +1495,19 @@ impl App {
                 code: block.code.clone(),
                 interpreter: block.interpreter.clone(),
                 env: resolution.env,
+                cwd,
+                autoclose: block.autoclose,
             });
             return;
         }
 
-        let cwd = crate::canvas_root_dir(&self.canvas_path);
-        match meshfox_server::stream_exec::spawn_block(&block, &resolution.env, Some(cwd)) {
+        match meshfox_server::stream_exec::spawn_block(&block, &resolution.env, Some(&cwd)) {
             Ok(proc) => {
                 let run = self.run.as_mut().unwrap();
                 run.proc = Some(proc);
                 run.current_node_text = node_text;
                 run.full_output.clear();
+                run.step_started = std::time::Instant::now();
                 run.lines.push(format!("==> {}", addr.block_name));
                 return;
             }
@@ -1417,6 +1580,83 @@ impl App {
         had_error
     }
 
+    /// Runs a runnable `file` node (`type="file"` with both `target` and
+    /// `interpreter` set) as `interpreter target`, streaming output live —
+    /// the TUI counterpart to the web UI's own "▷ run" button on a `file`
+    /// node's title bar (`run_file_node` in `crates/server/src/lib.rs`),
+    /// previously the only way to run one at all. `node`'s own
+    /// `origin_path`, when set (spliced in from an `include`), names the
+    /// *real* file `target`/`PWD` resolve relative to, confined to it —
+    /// same boundary the web UI's `resolve_confined_target` enforces.
+    async fn start_file_run(&mut self, node_id: String, node: Node) {
+        let interpreter = node
+            .interpreter
+            .as_deref()
+            .expect("checked by is_runnable_file");
+        let (program, args) = match meshfox_core::split_interpreter(interpreter) {
+            Some(pair) => pair,
+            None => {
+                self.status =
+                    format!("interpreter={interpreter:?} isn't a valid shell-word command");
+                return;
+            }
+        };
+        let target = node.target.as_deref().expect("checked by is_runnable_file");
+        let origin_path = node
+            .origin_path
+            .as_deref()
+            .map(Path::new)
+            .unwrap_or(&self.canvas_path);
+        let origin_dir = crate::canvas_root_dir(origin_path);
+        let resolved_target = match meshfox_core::confine(origin_dir, target) {
+            Ok(p) => p,
+            Err(e) => {
+                self.status = e.to_string();
+                return;
+            }
+        };
+
+        match meshfox_server::stream_exec::spawn_process(
+            &program,
+            args.iter()
+                .map(std::ffi::OsStr::new)
+                .chain([resolved_target.as_os_str()]),
+            Some(origin_dir),
+        ) {
+            Ok(proc) => {
+                self.status.clear();
+                self.file_run = Some(FileRunState {
+                    proc: Some(proc),
+                    lines: vec![format!("==> {node_id}")],
+                    had_failure: false,
+                    finished: false,
+                });
+            }
+            Err(e) => {
+                self.status = format!("failed to run {node_id:?}: {e}");
+            }
+        }
+    }
+
+    /// Called by `mod.rs` once `file_run`'s own output channel closes —
+    /// mirrors `on_output_line`, minus everything that only applies to a
+    /// fenced block (no `cache`, no `meshfox:var`, no chain to advance).
+    pub async fn on_file_output_line(&mut self, line: Option<String>) {
+        let Some(run) = &mut self.file_run else { return };
+        match line {
+            Some(text) => run.lines.push(text),
+            None => {
+                let mut proc = run.proc.take().expect("output channel closed without a process");
+                let status = proc.child.wait().await;
+                let exit_code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
+                let run = self.file_run.as_mut().unwrap();
+                run.lines.push(format!("(exit {exit_code})"));
+                run.had_failure = exit_code != 0;
+                run.finished = true;
+            }
+        }
+    }
+
     /// Called by `mod.rs` once a `tty` handoff's child has exited —
     /// `tty`/`cache` are mutually exclusive (a `meshfox validate` error),
     /// so there's never cached output to write back for this step, unlike
@@ -1457,19 +1697,19 @@ impl App {
                 let status = proc.child.wait().await;
                 let exit_code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
 
-                let (addr, node_text, full_output) = {
+                let (addr, node_text, full_output, duration_ms) = {
                     let run = self.run.as_ref().unwrap();
                     (
                         run.chain[run.idx].clone(),
                         run.current_node_text.clone(),
                         run.full_output.clone(),
+                        run.step_started.elapsed().as_millis() as u64,
                     )
                 };
-                self.run
-                    .as_mut()
-                    .unwrap()
-                    .lines
-                    .push(format!("(exit {exit_code})"));
+                self.run.as_mut().unwrap().lines.push(format!(
+                    "(exit {exit_code} · {})",
+                    meshfox_core::format_duration_ms(duration_ms)
+                ));
 
                 let from_value_error = self.apply_pending_vars_out(exit_code);
 
@@ -1481,22 +1721,68 @@ impl App {
                         let result = ExecOutput {
                             exit_code,
                             output: full_output,
+                            duration_ms,
                         };
-                        if let Some(updated) = write_output(&node_text, &addr.block_name, &result) {
-                            if let Some(patched) =
-                                mdcanvas::set_node_body(&self.raw, &addr.node_id, &updated)
+                        // Re-located (rather than stashed from `advance_run`)
+                        // since it's cheap and this is the only place that
+                        // needs it again — an earlier step in this same
+                        // chain may have already patched this exact file
+                        // (primary or `include` target), so re-reading it
+                        // fresh here (via `locate_node`) picks that up
+                        // rather than risking a stale in-memory copy.
+                        if let Ok(located) = meshfox_core::locate_node(
+                            &self.raw,
+                            &self.canvas_path,
+                            &addr.node_id,
+                        ) {
+                            if let Some(updated) =
+                                write_output(&node_text, &addr.block_name, &result)
                             {
-                                self.raw = patched;
-                                let _ = std::fs::write(&self.canvas_path, &self.raw);
-                                *self.known_raw.lock().unwrap() = self.raw.clone();
-                                if let Ok(reparsed) = Canvas::from_markdown(&self.raw) {
-                                    self.canvas = reparsed;
+                                if let Some(patched) = mdcanvas::set_node_body(
+                                    &located.raw,
+                                    &located.local_id,
+                                    &updated,
+                                ) {
+                                    match &located.origin {
+                                        None => {
+                                            self.raw = patched;
+                                            let _ =
+                                                std::fs::write(&self.canvas_path, &self.raw);
+                                            *self.known_raw.lock().unwrap() = self.raw.clone();
+                                            if let Ok(reparsed) = Canvas::from_markdown(&self.raw)
+                                            {
+                                                self.canvas = reparsed;
+                                            }
+                                        }
+                                        Some(path) => {
+                                            let _ = std::fs::write(path, &patched);
+                                        }
+                                    }
                                     self.rebuild_display_canvas();
                                     self.rebuild_rows();
                                     self.render_current_document();
                                 }
                             }
                         }
+                    }
+
+                    if exit_code == 0 && !from_value_error {
+                        let produced_vars: HashMap<String, String> =
+                            meshfox_core::from_targets(&self.decls, &addr)
+                                .into_iter()
+                                .filter_map(|decl| {
+                                    self.run_computed
+                                        .get(&decl.name)
+                                        .map(|v| (decl.name.clone(), v.clone()))
+                                })
+                                .collect();
+                        self.session_runs.insert(
+                            (addr.node_id.clone(), addr.block_name.clone()),
+                            SessionRun {
+                                fingerprint: meshfox_core::fingerprint(&block),
+                                produced_vars,
+                            },
+                        );
                     }
                 }
 
@@ -1518,6 +1804,12 @@ impl App {
                 let _ = proc.kill();
             }
             run.killed = true;
+            self.status = "killing...".into();
+        }
+        if let Some(run) = &mut self.file_run {
+            if let Some(proc) = &run.proc {
+                let _ = proc.kill();
+            }
             self.status = "killing...".into();
         }
     }
@@ -1812,5 +2104,196 @@ mod tests {
         assert!(tiny.width >= 1 && tiny.height >= 1);
         let huge = image_size_budget(Some(10_000), Some(10_000));
         assert!(huge.width <= 500 && huge.height <= 500);
+    }
+
+    /// End-to-end: `start_run`/`advance_run`/`on_output_line` finding,
+    /// running, and caching a block that lives inside an `include` target
+    /// — same limitation `crates/server/src/lib.rs`'s own
+    /// `run_block_include_tests` and `crates/cli/tests/run_cmd.rs` used to
+    /// have (a block only reachable through an `include` was simply
+    /// unaddressable — `self.canvas` is deliberately never
+    /// `include`-resolved, see its own doc comment) before
+    /// `meshfox_core::locate_node` was wired into `start_run`/
+    /// `advance_run`/`on_output_line`.
+    #[tokio::test]
+    async fn runs_finds_and_caches_a_block_inside_an_included_canvas() {
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-tui-run-include-test-{}",
+            uuid_like()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("child.canvas.md"),
+            concat!(
+                "<!-- meshfox:canvas -->\n# Child\n<!-- meshfox:node id=\"root\" -->\n\n",
+                "## Leaf\n<!-- meshfox:node id=\"leaf\" -->\n\n",
+                "```bash name=\"report\" cache\npwd -P\n```\n",
+            ),
+        )
+        .unwrap();
+        let base_path = dir.join("base.canvas.md");
+        std::fs::write(
+            &base_path,
+            concat!(
+                "<!-- meshfox:canvas -->\n# Base\n<!-- meshfox:node id=\"base\" -->\n\n",
+                "## Child\n<!-- meshfox:node id=\"child\" type=\"include\" -->\n\n[child](./child.canvas.md)\n",
+            ),
+        )
+        .unwrap();
+        let child_path = dir.join("child.canvas.md");
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(base_path.clone(), tx).unwrap();
+
+        app.start_run("child/leaf".to_string(), "report".to_string(), true)
+            .await;
+
+        // Mirrors `mod.rs`'s own main loop: drain the spawned process's
+        // output, then signal EOF (`None`) so `on_output_line` reaps it,
+        // writes the cache, and advances the chain.
+        loop {
+            let has_proc = app.run.as_ref().is_some_and(|r| r.proc.is_some());
+            if !has_proc {
+                break;
+            }
+            let line = app
+                .run
+                .as_mut()
+                .unwrap()
+                .proc
+                .as_mut()
+                .unwrap()
+                .output_rx
+                .recv()
+                .await;
+            app.on_output_line(line).await;
+        }
+
+        let run = app.run.as_ref().expect("a run was started");
+        assert!(!run.had_failure, "lines: {:?}", run.lines);
+
+        let want_cwd = dir.canonicalize().unwrap().to_string_lossy().into_owned();
+        assert!(
+            run.lines.iter().any(|l| l == &want_cwd),
+            "expected {want_cwd:?} among the run's own output lines, got: {:?}",
+            run.lines
+        );
+
+        let base_after = std::fs::read_to_string(&base_path).unwrap();
+        assert!(!base_after.contains("meshfox:output"));
+        let child_after = std::fs::read_to_string(&child_path).unwrap();
+        assert!(child_after.contains("meshfox:output name=\"report\""));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `trigger_run` (the actual `r`/`R` keybinding handler) used to guard
+    /// on `self.canvas.node(&node_id)` directly — which, unlike
+    /// `self.display_canvas`, is deliberately never `include`-resolved —
+    /// so selecting a row spliced in from an `include` and pressing `r`
+    /// always bailed with "this comes from an `include`...", regardless of
+    /// what `start_run`/`advance_run` themselves could already handle.
+    /// Covers both a fenced block and a runnable `file` node, since they
+    /// take different branches inside `trigger_run`.
+    #[tokio::test]
+    async fn trigger_run_reaches_both_a_block_and_a_file_node_inside_an_included_canvas() {
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-tui-trigger-run-include-test-{}",
+            uuid_like()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("seed.sh"), "#!/bin/sh\necho hi from seed\n").unwrap();
+        std::fs::write(
+            dir.join("child.canvas.md"),
+            concat!(
+                "<!-- meshfox:canvas -->\n# Child\n<!-- meshfox:node id=\"root\" -->\n\n",
+                "## Leaf\n<!-- meshfox:node id=\"leaf\" -->\n\n",
+                "```bash name=\"report\" cache\necho hi from leaf\n```\n\n",
+                "## Seed\n<!-- meshfox:node id=\"seed\" type=\"file\" interpreter=\"bash\" -->\n\n",
+                "[seed](./seed.sh)\n",
+            ),
+        )
+        .unwrap();
+        let base_path = dir.join("base.canvas.md");
+        std::fs::write(
+            &base_path,
+            concat!(
+                "<!-- meshfox:canvas -->\n# Base\n<!-- meshfox:node id=\"base\" -->\n\n",
+                "## Child\n<!-- meshfox:node id=\"child\" type=\"include\" -->\n\n[child](./child.canvas.md)\n",
+            ),
+        )
+        .unwrap();
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(base_path.clone(), tx).unwrap();
+        // Expand ancestors so the rows under test are actually visible —
+        // `tree::flatten` only ever auto-expands depth 0 (the root).
+        app.expanded.insert("child".to_string());
+        app.expanded.insert("child/root".to_string());
+        app.rebuild_rows();
+
+        let leaf_idx = app
+            .rows
+            .iter()
+            .position(|r| r.node_id == "child/leaf")
+            .expect("child/leaf row visible");
+        app.selected = leaf_idx;
+        app.trigger_run(true).await;
+        assert!(
+            app.status.is_empty(),
+            "expected trigger_run to actually start a run, got status: {:?}",
+            app.status
+        );
+        loop {
+            if !app.run.as_ref().is_some_and(|r| r.proc.is_some()) {
+                break;
+            }
+            let line = app.run.as_mut().unwrap().proc.as_mut().unwrap().output_rx.recv().await;
+            app.on_output_line(line).await;
+        }
+        let run = app.run.as_ref().expect("a run was started");
+        assert!(!run.had_failure, "lines: {:?}", run.lines);
+        let child_after = std::fs::read_to_string(dir.join("child.canvas.md")).unwrap();
+        assert!(child_after.contains("meshfox:output name=\"report\""));
+
+        app.run = None;
+        let seed_idx = app
+            .rows
+            .iter()
+            .position(|r| r.node_id == "child/seed")
+            .expect("child/seed row visible");
+        app.selected = seed_idx;
+        app.trigger_run(true).await;
+        loop {
+            if !app.file_run.as_ref().is_some_and(|r| r.proc.is_some()) {
+                break;
+            }
+            let line = app
+                .file_run
+                .as_mut()
+                .unwrap()
+                .proc
+                .as_mut()
+                .unwrap()
+                .output_rx
+                .recv()
+                .await;
+            app.on_file_output_line(line).await;
+        }
+        let file_run = app.file_run.as_ref().expect("a file run was started");
+        assert!(!file_run.had_failure, "lines: {:?}", file_run.lines);
+        assert!(file_run.lines.iter().any(|l| l.contains("hi from seed")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn uuid_like() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
     }
 }

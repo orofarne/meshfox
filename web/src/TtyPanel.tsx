@@ -38,6 +38,13 @@ interface TtyPanelProps {
    * plays for `/api/run`. */
   persist: boolean;
   vars?: Record<string, string>;
+  /** Mirrors the block's own `CodeSegment.autoclose` — once the process
+   * exits (`status` becomes `"exited"`), this panel calls `onClose()`
+   * itself instead of the default of staying open until closed by hand.
+   * Never fires for `"killed"`/`"error"`/`"closed"` — those are already a
+   * deliberate or abnormal end, not "the process finished on its own",
+   * which is the one case `autoclose` is about. */
+  autoclose: boolean;
   onClose: () => void;
 }
 
@@ -78,7 +85,7 @@ function statusLabel(status: Status, exitCode: number | undefined, errorMsg: str
  * server reads as "client gone" and kills whatever's still running (see
  * `pty_exec::PtyProcess::kill`), same as closing a real terminal window.
  */
-export function TtyPanel({ path, blockName, withDeps, persist, vars, onClose }: TtyPanelProps) {
+export function TtyPanel({ path, blockName, withDeps, persist, vars, autoclose, onClose }: TtyPanelProps) {
   const dark = usePrefersDark();
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -258,6 +265,17 @@ export function TtyPanel({ path, blockName, withDeps, persist, vars, onClose }: 
     wsRef.current?.close();
     onClose();
   };
+  // `autoclose` — return to the canvas the instant the process exits on
+  // its own, instead of the default of leaving the panel open showing its
+  // exit code. Deliberately keyed only to `"exited"`, not `"killed"`/
+  // `"error"`/`"closed"` — those already end the session one way or
+  // another; `autoclose` is specifically about the process finishing.
+  useEffect(() => {
+    if (autoclose && status === "exited") {
+      handleClose();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoclose, status]);
   // The × button's own click handler — `canKill` (true from `started`
   // until the run's own step-end/killed/error, see the WebSocket handler
   // above) is exactly "is there a live process this would kill", so

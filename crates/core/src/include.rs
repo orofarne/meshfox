@@ -2,10 +2,12 @@
 //!
 //! This never touches disk beyond *reading* include targets: `resolve`
 //! takes a parsed `Canvas` and returns a new one with every `include` node
-//! expanded in memory. `run`/`check` never call this — they work on
-//! a single file's raw text directly, and see a bare `[label](target)`
-//! link, same as `file`/`link`. Only a consumer that wants the fully
-//! composed view (the server, before serving `GET /api/canvas`) calls it.
+//! expanded in memory. `check` never calls this — it works on a single
+//! file's raw text directly, and sees a bare `[label](target)` link, same
+//! as `file`/`link`. Consumers that want the fully composed view — the
+//! server (before serving `GET /api/canvas`), `run`/the TUI (via
+//! `crate::locate::locate_node`, to address and run a block living inside
+//! an `include` target) — call it directly or through that.
 //!
 //! Two kinds of target, told apart the same way `meshfox`'s own
 //! auto-discovery does (filename ends in `.canvas.md`, or a plain `.md`

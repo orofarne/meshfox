@@ -394,6 +394,9 @@ export default function App() {
     /** Set for a `tty` block's run — `handleVarsSubmit` opens `TtyPanel`
      * (via `ttySession`) with the answers instead of calling `executeRun`. */
     tty?: boolean;
+    /** Carried through to `ttySession`/`TtyPanel` once the vars gate is
+     * answered — see `handleRunTty`'s own `autoclose` param. */
+    autoclose?: boolean;
   } | null>(null);
   // Whether the toolbar's "configure" button should even appear — set from
   // `load()`'s own `fetchConfigureVars` call, so it's known without a
@@ -422,6 +425,7 @@ export default function App() {
     blockName: string;
     withDeps: boolean;
     vars?: Record<string, string>;
+    autoclose: boolean;
   } | null>(null);
   // Which node's settings modal (title/type/color/target/edges) is open,
   // if any — see NodeSettings.tsx. Set right after a successful "add
@@ -653,7 +657,24 @@ export default function App() {
               runId = event.runId;
               break;
             case "step-start":
-              patchLiveBlock(event.nodeId, event.block, { status: "running", text: "", exitCode: undefined, runId });
+              patchLiveBlock(event.nodeId, event.block, {
+                status: "running",
+                text: "",
+                exitCode: undefined,
+                runId,
+                startedAt: Date.now(),
+                durationMs: undefined,
+              });
+              break;
+            case "step-skipped":
+              patchLiveBlock(event.nodeId, event.block, {
+                status: "skipped",
+                text: "",
+                exitCode: undefined,
+                runId: undefined,
+                startedAt: undefined,
+                durationMs: undefined,
+              });
               break;
             case "output":
               setNodes((nds) =>
@@ -669,7 +690,12 @@ export default function App() {
               );
               break;
             case "step-end":
-              patchLiveBlock(event.nodeId, event.block, { status: "done", exitCode: event.exitCode, runId: undefined });
+              patchLiveBlock(event.nodeId, event.block, {
+                status: "done",
+                exitCode: event.exitCode,
+                runId: undefined,
+                durationMs: event.durationMs,
+              });
               break;
             case "killed":
               patchLiveBlock(event.nodeId, event.block, { status: "killed", runId: undefined });
@@ -717,7 +743,24 @@ export default function App() {
               runId = event.runId;
               break;
             case "step-start":
-              patchLiveBlock(event.nodeId, event.block, { status: "running", text: "", exitCode: undefined, runId });
+              patchLiveBlock(event.nodeId, event.block, {
+                status: "running",
+                text: "",
+                exitCode: undefined,
+                runId,
+                startedAt: Date.now(),
+                durationMs: undefined,
+              });
+              break;
+            case "step-skipped":
+              patchLiveBlock(event.nodeId, event.block, {
+                status: "skipped",
+                text: "",
+                exitCode: undefined,
+                runId: undefined,
+                startedAt: undefined,
+                durationMs: undefined,
+              });
               break;
             case "output":
               setNodes((nds) =>
@@ -733,7 +776,12 @@ export default function App() {
               );
               break;
             case "step-end":
-              patchLiveBlock(event.nodeId, event.block, { status: "done", exitCode: event.exitCode, runId: undefined });
+              patchLiveBlock(event.nodeId, event.block, {
+                status: "done",
+                exitCode: event.exitCode,
+                runId: undefined,
+                durationMs: event.durationMs,
+              });
               break;
             case "killed":
               patchLiveBlock(event.nodeId, event.block, { status: "killed", runId: undefined });
@@ -793,7 +841,7 @@ export default function App() {
   // `varsModal.tty` is how `handleVarsSubmit` (below) tells the two apart
   // once the modal comes back.
   const handleRunTty = useCallback(
-    async (nodeId: string, blockName: string, withDeps: boolean) => {
+    async (nodeId: string, blockName: string, withDeps: boolean, autoclose: boolean) => {
       if (!canvas) return;
       const path = pathTo(canvas, nodeId);
       let statuses: VarStatus[];
@@ -805,10 +853,10 @@ export default function App() {
       }
       const missing = statuses.filter((v) => !v.resolved);
       if (missing.length > 0) {
-        setVarsModal({ nodeId, blockName, withDeps, missing, tty: true });
+        setVarsModal({ nodeId, blockName, withDeps, missing, tty: true, autoclose });
         return;
       }
-      setTtySession({ path, blockName, withDeps });
+      setTtySession({ path, blockName, withDeps, autoclose });
     },
     [canvas],
   );
@@ -816,11 +864,11 @@ export default function App() {
   const handleVarsSubmit = useCallback(
     async (answers: Record<string, string>) => {
       if (!varsModal) return;
-      const { nodeId, blockName, withDeps, tty } = varsModal;
+      const { nodeId, blockName, withDeps, tty, autoclose } = varsModal;
       setVarsModal(null);
       if (tty) {
         if (!canvas) return;
-        setTtySession({ path: pathTo(canvas, nodeId), blockName, withDeps, vars: answers });
+        setTtySession({ path: pathTo(canvas, nodeId), blockName, withDeps, vars: answers, autoclose: autoclose ?? false });
         return;
       }
       await executeRun(nodeId, blockName, withDeps, answers);
@@ -1279,7 +1327,8 @@ export default function App() {
             plainMarkdownInclude: n.plainMarkdownInclude,
             onRun: (blockName: string, withDeps: boolean) => handleRun(n.id, blockName, withDeps),
             onKill: (blockName: string) => handleKill(n.id, blockName),
-            onRunTty: (blockName: string, withDeps: boolean) => handleRunTty(n.id, blockName, withDeps),
+            onRunTty: (blockName: string, withDeps: boolean, autoclose: boolean) =>
+              handleRunTty(n.id, blockName, withDeps, autoclose),
             onRecheckConstraint: () => load(),
             onOpenFile: () => handleOpenFile(n.id),
             onAddChild: () => handleAddChild(n.id),
@@ -1680,7 +1729,8 @@ export default function App() {
           editMode,
           onRun: (blockName: string, withDeps: boolean) => handleRun(n.id, blockName, withDeps),
           onKill: (blockName: string) => handleKill(n.id, blockName),
-          onRunTty: (blockName: string, withDeps: boolean) => handleRunTty(n.id, blockName, withDeps),
+          onRunTty: (blockName: string, withDeps: boolean, autoclose: boolean) =>
+            handleRunTty(n.id, blockName, withDeps, autoclose),
           onToggleFold: () => toggleFold(n.id),
         },
       })),
@@ -2253,6 +2303,7 @@ export default function App() {
           withDeps={ttySession.withDeps}
           persist={editMode}
           vars={ttySession.vars}
+          autoclose={ttySession.autoclose}
           onClose={() => setTtySession(null)}
         />
       )}

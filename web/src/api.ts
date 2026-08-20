@@ -398,8 +398,14 @@ export async function clearNodeId(id: string): Promise<{ id: string; doc: Canvas
 export type RunEvent =
   | { type: "started"; runId: string }
   | { type: "step-start"; nodeId: string; block: string }
+  /** Terminal for this one step (the chain keeps going) — this dependency
+   * already ran successfully earlier in the same `meshfox view` session and
+   * hasn't changed since, so it wasn't actually re-run. Never emitted for
+   * the block actually requested, only a pulled-in `deps=`/`from=`
+   * dependency. See SPEC.md's "Runnable code fences". */
+  | { type: "step-skipped"; nodeId: string; block: string }
   | { type: "output"; nodeId: string; block: string; text: string }
-  | { type: "step-end"; nodeId: string; block: string; exitCode: number }
+  | { type: "step-end"; nodeId: string; block: string; exitCode: number; durationMs: number }
   | { type: "killed"; nodeId: string; block: string }
   | { type: "error"; message: string }
   | { type: "done"; exitCode: number };

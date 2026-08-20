@@ -119,7 +119,12 @@ export function VarsForm({
                 value={values[v.name]}
                 onChange={(e) => set(v.name, e.target.value)}
                 autoFocus={i === 0}
-                required
+                // Only `int` genuinely can't be empty (it has to parse as a
+                // whole number — see `isValidValue`/`INT_PATTERN`). A
+                // `string` field is allowed to be blank on purpose (e.g. "no
+                // fixed value" style defaults) — `meshfox_core::vars::
+                // validate_value` already accepts "" for it.
+                required={v.type === "int"}
               />
             )}
           </label>

@@ -49,6 +49,73 @@ function attrsFromTokens(tokens: string[]): Record<string, string> {
 export interface CachedOutput {
   exitCode: number;
   text: string;
+  /** The human-readable duration `core::output::format_duration_ms` already
+   * rendered into the header (`"2.3s"`, `"1m 05s"`, ...) — kept as the same
+   * string rather than re-parsed back into milliseconds, since nothing here
+   * needs to do arithmetic on it, only display it. `undefined` for cached
+   * output written before this field existed (no `· <duration>` in the
+   * header at all). */
+  durationText?: string;
+  /** True when the fence's own live fingerprint (see `fingerprint` below)
+   * no longer matches the `hash=` its cached-output marker was written
+   * with — the code/lang/interpreter/env=/deps= changed since this output
+   * was captured. Also true for a marker with no `hash=` at all (cached
+   * before this field existed — nothing to compare against, so treated the
+   * same as stale). Never hides/discards the cached text itself, only
+   * flags it — see SPEC.md's "Cached output". */
+  stale: boolean;
+}
+
+/** FNV-1a over UTF-8 bytes, returned as 8 lowercase hex digits — must stay
+ * byte-for-byte in sync with `core::fence::fingerprint`'s own Rust
+ * implementation (see that function's own doc comment for why this is
+ * hand-ported rather than shared): same offset/prime constants, same
+ * unsigned-32-bit wraparound. `Math.imul` is what gives the 32-bit wrapping
+ * multiply JS numbers don't have natively. */
+function fnv1aHex(bytes: Uint8Array): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < bytes.length; i++) {
+    hash ^= bytes[i];
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+const NUL = "\u0000";
+
+function stripDollar(s: string): string {
+  return s.startsWith("$") ? s.slice(1) : s;
+}
+
+/** Mirrors `core::fence::fingerprint(block)` field-for-field: `lang`, `code`,
+ * `interpreter` (empty string when unset, same as Rust's
+ * `unwrap_or_default()`), then each `env=` entry as its own `local\0var`
+ * pair (same `local_name`/`var_name` split+dollar-strip
+ * `core::fence::parse_env_ref` does), then each raw `deps=` token as-is
+ * (already in the exact `node-id/block-name`-or-bare-name shape Rust
+ * reconstructs its own parsed `BlockRef`s back into). Joined with NUL,
+ * hashed as UTF-8 bytes — see `fnv1aHex`. */
+export function fingerprint(
+  lang: string,
+  code: string,
+  interpreter: string | undefined,
+  envAttr: string | undefined,
+  depsAttr: string | undefined,
+): string {
+  const parts = [lang, code, interpreter ?? ""];
+  for (const raw of (envAttr ?? "").split(",").map((s) => s.trim()).filter((s) => s.length > 0)) {
+    const eq = raw.indexOf("=");
+    if (eq >= 0) {
+      parts.push(`${raw.slice(0, eq).trim()}${NUL}${stripDollar(raw.slice(eq + 1).trim())}`);
+    } else {
+      const varName = stripDollar(raw);
+      parts.push(`${varName}${NUL}${varName}`);
+    }
+  }
+  for (const raw of (depsAttr ?? "").split(",").map((s) => s.trim()).filter((s) => s.length > 0)) {
+    parts.push(raw);
+  }
+  return fnv1aHex(new TextEncoder().encode(parts.join(NUL)));
 }
 
 export interface MarkdownSegment {
@@ -66,6 +133,11 @@ export interface CodeSegment {
    * see SPEC.md's "Interactive (`tty`) blocks". Mutually exclusive with
    * `cache` (a `meshfox validate` error), so a segment is never both. */
   tty: boolean;
+  /** Mirrors `core::fence::CodeBlock.autoclose` — only meaningful when
+   * `tty` is also set (`meshfox validate` rejects it otherwise): once the
+   * interactive process exits, return to the canvas immediately instead of
+   * leaving the panel open showing its exit code until closed by hand. */
+  autoclose: boolean;
   /** Raw `deps="a,b"` entries, in document order — a bare name is a block
    * in this same node, `node-id/block-name` is a block elsewhere. See
    * `./deps.ts` for resolving these into concrete addresses. */
@@ -197,16 +269,33 @@ function countUnnamedCandidateFences(markdown: string): number {
   return count;
 }
 
-function parseCachedOutputBlock(inner: string): CachedOutput {
-  // Always exactly `​```text\nexit code: N\n\n<output>\n```​` — see
-  // core::output::render_output_block.
+function parseCachedOutputBlock(inner: string): Omit<CachedOutput, "stale"> {
+  // Always exactly `​```text\nexit code: N · <duration>\n\n<output>\n```​` —
+  // see core::output::render_output_block. The `· <duration>` half is
+  // absent from output cached before that field existed, hence optional.
   const match = /```text\n([\s\S]*?)\n?```/.exec(inner);
   const body = match ? match[1] : inner;
-  const exitMatch = /^exit code: (-?\d+)\n?/.exec(body);
+  const exitMatch = /^exit code: (-?\d+)(?: · (.+?))?\n?/.exec(body);
   return {
     exitCode: exitMatch ? Number(exitMatch[1]) : 0,
+    durationText: exitMatch ? exitMatch[2] : undefined,
     text: exitMatch ? body.slice(exitMatch[0].length).replace(/^\n/, "") : body,
   };
+}
+
+/** Parses a `<!-- meshfox:output name="..." hash="..." -->` marker line's
+ * own attributes — `null` if `line` isn't that marker for `name` at all
+ * (matched on the `name=` prefix, not a full literal string, since `hash=`
+ * varies run to run — same reasoning `core::output::start_marker_prefix`
+ * has on the Rust side). */
+function parseOutputMarkerAttrs(line: string, name: string): Record<string, string> | null {
+  const trimmed = line.trim();
+  const prefix = `<!-- meshfox:output name="${name}"`;
+  if (!trimmed.startsWith(prefix) || !trimmed.endsWith("-->")) return null;
+  const inner = trimmed.slice("<!--".length, -"-->".length).trim();
+  const [construct, ...rest] = tokenize(inner);
+  if (construct !== "meshfox:output") return null;
+  return attrsFromTokens(rest);
 }
 
 /**
@@ -290,6 +379,7 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
     const name = attrs.name ?? nodeId;
     const cache = attrs.cache !== undefined && attrs.cache !== "false";
     const tty = attrs.tty !== undefined && attrs.tty !== "false";
+    const autoclose = attrs.autoclose !== undefined && attrs.autoclose !== "false";
     const isDefault = attrs.default !== undefined && attrs.default !== "false";
     const interpreter = attrs.interpreter;
     const deps = (attrs.deps ?? "")
@@ -300,9 +390,9 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
     // Look for this block's cached-output marker immediately after the
     // fence (see core::output — no blank line is inserted between them).
     let cursor = j + 1;
-    const startMarker = `<!-- meshfox:output name="${name}" -->`;
+    const markerAttrs = lines[cursor] !== undefined ? parseOutputMarkerAttrs(lines[cursor], name) : null;
     let output: CachedOutput | undefined;
-    if (lines[cursor]?.trim() === startMarker) {
+    if (markerAttrs) {
       const inner: string[] = [];
       let k = cursor + 1;
       let foundEnd = false;
@@ -315,12 +405,19 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
         k++;
       }
       if (foundEnd) {
-        output = parseCachedOutputBlock(inner.join("\n"));
+        const code = codeLines.join("\n");
+        // No `hash=` at all (output cached before this field existed) is
+        // treated the same as a mismatch — nothing to compare against, so
+        // "can't vouch this is still current" defaults to stale.
+        const stale =
+          markerAttrs.hash === undefined ||
+          markerAttrs.hash !== fingerprint(lang, code, interpreter, attrs.env, attrs.deps);
+        output = { ...parseCachedOutputBlock(inner.join("\n")), stale };
         cursor = k + 1;
       }
     }
 
-    segments.push({ type: "code", lang, name, cache, tty, deps, default: isDefault, interpreter, code: codeLines.join("\n"), output });
+    segments.push({ type: "code", lang, name, cache, tty, autoclose, deps, default: isDefault, interpreter, code: codeLines.join("\n"), output });
     i = cursor;
   }
   flushMarkdown();

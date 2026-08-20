@@ -1138,6 +1138,16 @@ a {
   margin-top: 0;
 }
 
+/* A runnable fence's own source, via CodeMirror (read-only) — same
+ * highlighting `.mesh-file-code-preview .cm-editor` already gets for an
+ * included file's preview, just without that panel's own scroll/height
+ * rules (a code block's height is however tall its source is, not clamped
+ * to fill the node). */
+.mesh-code-block-source .cm-editor {
+  font-family: "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+}
+
 .mesh-code-block-head {
   display: flex;
   align-items: center;
@@ -1304,6 +1314,15 @@ a {
   opacity: 1;
 }
 
+/* A pulled-in dependency the server didn't actually re-run this time
+ * (already fresh from earlier this session — see SPEC.md's "Runnable code
+ * fences") — neither success nor failure, so neither color applies; just
+ * a plain muted note, same idle weight as the ordinary (non-streaming)
+ * head text below. */
+.mesh-code-output[data-exit="skipped"] .mesh-code-output-head {
+  font-style: italic;
+}
+
 /* Still streaming — no exit code yet, so neither the "ok" nor "fail"
  * treatment applies. A pulsing dot rather than a color says "in
  * progress" without implying success or failure either way. */
@@ -1336,6 +1355,19 @@ a {
 
 .mesh-code-output-transient {
   font-style: italic;
+}
+
+.mesh-code-output-stale {
+  color: var(--alert-warning);
+  font-weight: 600;
+}
+
+/* Stale cached output (the fence's own code/lang/interpreter/env=/deps=
+ * changed since this ran — see SPEC.md's "Cached output") stays fully
+ * readable, just visually receded, so it reads as "still here, not
+ * current" rather than being hidden or looking like a fresh result. */
+.mesh-code-output[data-stale] pre {
+  opacity: 0.6;
 }
 
 .mesh-code-output pre {

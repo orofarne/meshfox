@@ -109,12 +109,42 @@ struct AppState {
     /// `link` node social-preview cache (see `link_preview`) — one entry
     /// per URL, alive for exactly this process's lifetime.
     link_preview_cache: link_preview::PreviewCache,
+    /// Every block that has completed successfully at least once during
+    /// this `meshfox view` process's own lifetime, keyed by its address —
+    /// consulted (and updated) by `run_block` so a "⛓ run chain" request
+    /// can skip re-running a dependency that's already run this session
+    /// *and* hasn't changed since (see `SessionRun`, `TODO.canvas.md`:
+    /// "Не перезапускать уже выполненные в этой сессии зависимости").
+    /// Never persisted anywhere and never touched by anything but this
+    /// process's own runs — restarting `meshfox view` starts fresh.
+    session_runs: Mutex<HashMap<(String, String), SessionRun>>,
 }
 
 impl AppState {
     fn save(&self, raw: &str) -> std::io::Result<()> {
         std::fs::write(&self.canvas_path, raw)
     }
+}
+
+/// One block's most recent successful run this session — see
+/// `AppState::session_runs`.
+#[derive(Clone)]
+struct SessionRun {
+    /// `meshfox_core::fingerprint` of the block *as it stood* on that
+    /// successful run — a later run_block call only treats this as
+    /// "already fresh" (skippable) if the block's own *current* fingerprint
+    /// still matches; any edit to its code/lang/interpreter/env=/deps=
+    /// changes the fingerprint and makes it stale again, the same
+    /// mechanism `crate::output`'s cached-output staleness uses.
+    fingerprint: String,
+    /// Whatever this block wrote to its own vars-out file last time it
+    /// actually ran (only ever non-empty for a block that's a `from=`
+    /// source for something) — folded into `resolved_vars` in place of
+    /// re-running it when this run is skipped, so a later step that
+    /// declared `from=` this block still gets a value. Only ever recorded
+    /// from a `0`-exit run, same trust boundary `run_block`'s own live path
+    /// already has for `from=` values.
+    produced_vars: HashMap<String, String>,
 }
 
 /// How long `TabGuard` waits, after the last `/api/watch` connection drops,
@@ -626,6 +656,18 @@ enum RunEvent {
         node_id: String,
         block: String,
     },
+    /// Terminal for *this step only* (the chain keeps going) — emitted
+    /// instead of `StepStart`/`Output`/`StepEnd` when this step is a
+    /// pulled-in dependency (never the block actually requested — see
+    /// `AppState::session_runs`'s own doc comment) that already ran
+    /// successfully earlier in this same `meshfox view` session and hasn't
+    /// changed since. Not emitted at all for `/api/run/tty`'s WebSocket —
+    /// `run_tty_chain` doesn't consult `session_runs`, only the plain
+    /// NDJSON `/api/run` path does.
+    StepSkipped {
+        node_id: String,
+        block: String,
+    },
     /// One line of merged stdout/stderr, as it's produced.
     Output {
         node_id: String,
@@ -649,6 +691,14 @@ enum RunEvent {
         node_id: String,
         block: String,
         exit_code: i32,
+        /// Wall-clock time this step's own process ran, in milliseconds —
+        /// timed from right before it was spawned to right after its exit
+        /// code was known, the same figure (for a `cache`d, persisted step)
+        /// written into `ExecOutput::duration_ms`/the cached-output header,
+        /// so what the client shows live and what a reload later shows from
+        /// disk agree. Lets the web UI show a real duration the instant a
+        /// step finishes rather than only a client-measured approximation.
+        duration_ms: u64,
     },
     /// Terminal for this run — no `Done` follows. Emitted for whichever
     /// step was actively running when `/api/kill` fired; later chain steps
@@ -804,58 +854,43 @@ async fn get_canvas(State(state): State<Arc<AppState>>) -> Result<Json<Canvas>, 
 /// mutating endpoint below routes through this first instead of assuming
 /// `id` lives in `state`'s own raw text — that assumption is what made
 /// editing an included subtree fail with a spurious "no node" before.
-struct LocatedNode {
-    /// `None` for `state`'s own document (already cached as
-    /// `state.canvas_path`/`state.raw`); `Some(path)` for an include
-    /// target — `raw` below is read fresh from disk each time rather than
-    /// cached in `AppState`, since it isn't the file this server session
-    /// "owns".
-    origin: Option<PathBuf>,
-    raw: String,
-    /// `id`, translated to whatever it's actually called in `raw`.
-    local_id: String,
-}
+/// `None` for `state`'s own document (already cached as
+/// `state.canvas_path`/`state.raw`); `Some(path)` for an include target —
+/// `raw` in that case is read fresh from disk each time rather than
+/// cached in `AppState`, since it isn't the file this server session
+/// "owns". Same struct `meshfox_core::locate_node`/`meshfox run`/the TUI
+/// use — kept as a type alias here rather than a fresh definition so
+/// every existing `located.origin`/`.raw`/`.local_id` reference below
+/// stays untouched.
+type LocatedNode = meshfox_core::LocatedNode;
 
+/// Thin `ApiError`-flavored wrapper around `meshfox_core::locate_node` —
+/// same lookup CLI/TUI now share, just with this server's own established
+/// HTTP status codes and wording for each failure mode (unchanged from
+/// before this was factored out into core).
 fn locate_node(state: &AppState, primary_raw: &str, id: &str) -> Result<LocatedNode, ApiError> {
-    let primary = parse_or_error(primary_raw)?;
-    if primary.node(id).is_some() {
-        return Ok(LocatedNode {
-            origin: None,
-            raw: primary_raw.to_string(),
-            local_id: id.to_string(),
-        });
-    }
-    // Not in `state`'s own raw text — maybe it's spliced in from an
-    // include. Resolve fully (splices every include, however deeply
-    // nested) and look it up there instead.
-    let resolved = resolved_canvas(primary_raw, &state.canvas_path)?;
-    let node = resolved
-        .node(id)
-        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}")))?;
-    let origin_path = node.origin_path.clone().ok_or_else(|| {
-        ApiError(
+    meshfox_core::locate_node(primary_raw, &state.canvas_path, id).map_err(|e| match e {
+        meshfox_core::LocateError::Parse(e) => {
+            ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
+        }
+        meshfox_core::LocateError::Include(e) => {
+            ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
+        }
+        meshfox_core::LocateError::NotFound(id) => {
+            ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}"))
+        }
+        meshfox_core::LocateError::NoOwnIdentity(id) => ApiError(
             StatusCode::UNPROCESSABLE_ENTITY,
             format!(
                 "node {id:?} lives inside an included canvas that can't be edited from here yet \
                  (it was included as plain Markdown rather than a .canvas.md, so it has no node \
                  identity of its own to write back to — open its own file directly to edit it)"
             ),
-        )
-    })?;
-    let local_id = node
-        .origin_id
-        .clone()
-        .expect("origin_path is always set together with origin_id");
-    let raw = std::fs::read_to_string(&origin_path).map_err(|e| {
-        ApiError(
+        ),
+        meshfox_core::LocateError::Io(path, e) => ApiError(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to read include target {origin_path}: {e}"),
-        )
-    })?;
-    Ok(LocatedNode {
-        origin: Some(PathBuf::from(origin_path)),
-        raw,
-        local_id,
+            format!("failed to read include target {path}: {e}"),
+        ),
     })
 }
 
@@ -1789,6 +1824,7 @@ async fn run_file_node(
         let _guard = RunGuard { state: Arc::clone(&state), run_id: run_id.clone() };
         yield Ok::<_, io::Error>(ndjson_line(&RunEvent::Started { run_id: run_id.clone() }));
         yield Ok(ndjson_line(&RunEvent::StepStart { node_id: id.clone(), block: id.clone() }));
+        let step_started = std::time::Instant::now();
 
         let mut proc = match stream_exec::spawn_process(
             &interpreter_program,
@@ -1828,7 +1864,8 @@ async fn run_file_node(
             }
         };
 
-        yield Ok(ndjson_line(&RunEvent::StepEnd { node_id: id.clone(), block: id.clone(), exit_code }));
+        let duration_ms = step_started.elapsed().as_millis() as u64;
+        yield Ok(ndjson_line(&RunEvent::StepEnd { node_id: id.clone(), block: id.clone(), exit_code, duration_ms }));
         yield Ok(ndjson_line(&RunEvent::Done { exit_code }));
     };
 
@@ -2392,6 +2429,36 @@ async fn run_block(
                 break;
             }
 
+            // The block actually requested (always the chain's own last
+            // entry — see `resolve_run_chain`'s doc comment) always runs
+            // for real; only a pulled-in dependency is ever eligible to be
+            // skipped as "already fresh this session" — see
+            // `AppState::session_runs`.
+            let is_requested_target = Some(addr) == chain.last();
+            let live_fingerprint = meshfox_core::fingerprint(&block);
+            if !is_requested_target {
+                let already_fresh = state
+                    .session_runs
+                    .lock()
+                    .unwrap()
+                    .get(&(addr.node_id.clone(), addr.block_name.clone()))
+                    .filter(|run| run.fingerprint == live_fingerprint)
+                    .cloned();
+                if let Some(session_run) = already_fresh {
+                    // Whatever this block wrote to its own vars-out file the
+                    // last time it *actually* ran still applies unchanged
+                    // (the block itself hasn't) — folded in exactly as if it
+                    // had just run again, so a later step that declared
+                    // `from=` this one still resolves.
+                    resolved_vars.extend(session_run.produced_vars);
+                    yield Ok(ndjson_line(&RunEvent::StepSkipped {
+                        node_id: addr.node_id.clone(),
+                        block: addr.block_name.clone(),
+                    }));
+                    continue;
+                }
+            }
+
             // Only this block's own `env=` list, relabeled to its local
             // names — not the whole chain's resolved variables — same
             // "opt-in per block" scoping the CLI applies.
@@ -2412,6 +2479,7 @@ async fn run_block(
                 );
                 Some(path)
             };
+            let step_started = std::time::Instant::now();
             let mut proc = match stream_exec::spawn_block(&block, &block_env, Some(&cwd)) {
                 Ok(p) => p,
                 Err(e) => {
@@ -2456,10 +2524,12 @@ async fn run_block(
                 break;
             }
 
+            let duration_ms = step_started.elapsed().as_millis() as u64;
             yield Ok(ndjson_line(&RunEvent::StepEnd {
                 node_id: addr.node_id.clone(),
                 block: addr.block_name.clone(),
                 exit_code,
+                duration_ms,
             }));
             final_exit_code = exit_code;
 
@@ -2510,12 +2580,23 @@ async fn run_block(
             }
 
             if persist && block.cache {
-                let result = ExecOutput { exit_code, output: full_output };
+                let result = ExecOutput { exit_code, output: full_output, duration_ms };
                 if let Some(updated) = meshfox_core::write_output(&node_text, &addr.block_name, &result) {
                     if let Some(patched) = mdcanvas::set_node_body(&located.raw, &located.local_id, &updated) {
                         file_raws.insert(located.origin.clone(), patched);
                     }
                 }
+            }
+
+            if exit_code == 0 && !from_value_error {
+                let produced_vars = from_decls
+                    .iter()
+                    .filter_map(|decl| resolved_vars.get(&decl.name).map(|v| (decl.name.clone(), v.clone())))
+                    .collect();
+                state.session_runs.lock().unwrap().insert(
+                    (addr.node_id.clone(), addr.block_name.clone()),
+                    SessionRun { fingerprint: live_fingerprint, produced_vars },
+                );
             }
 
             if exit_code != 0 || from_value_error {
@@ -2855,6 +2936,7 @@ async fn run_tty_chain(
             Some(path)
         };
         let mut full_output = String::new();
+        let step_started = std::time::Instant::now();
 
         let exit_code = if block.tty {
             if !send_event(
@@ -2946,12 +3028,14 @@ async fn run_tty_chain(
             break;
         }
 
+        let duration_ms = step_started.elapsed().as_millis() as u64;
         if !send_event(
             &mut socket,
             &RunEvent::StepEnd {
                 node_id: addr.node_id.clone(),
                 block: addr.block_name.clone(),
                 exit_code,
+                duration_ms,
             },
         )
         .await
@@ -3026,6 +3110,7 @@ async fn run_tty_chain(
             let result = ExecOutput {
                 exit_code,
                 output: full_output,
+                duration_ms,
             };
             if let Some(updated) = meshfox_core::write_output(&node_text, &addr.block_name, &result)
             {
@@ -3395,6 +3480,7 @@ async fn build_state(canvas_path: PathBuf, auto_exit: bool) -> std::io::Result<A
         change_tx,
         auto_exit,
         link_preview_cache: link_preview::PreviewCache::new(),
+        session_runs: Mutex::new(HashMap::new()),
     }))
 }
 
@@ -5133,6 +5219,150 @@ mod run_block_include_tests {
         assert!(child_after.contains("meshfox:output name=\"report\""));
 
         let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod session_skip_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    // Same request/dechunk/ndjson-parsing shape as `run_block_include_tests`
+    // above (kept local rather than shared — that module is itself
+    // `#[cfg(test)]`-private, nothing to import from).
+    async fn request(addr: SocketAddr, method: &str, path: &str, content_type: &str, body: &str) -> (u16, String) {
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.expect("read");
+        let mut parts = response.splitn(2, "\r\n\r\n");
+        let head = parts.next().unwrap_or_default();
+        let raw_body = parts.next().unwrap_or_default();
+        let status = head
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let body = if head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+            let mut out = String::new();
+            let mut rest = raw_body;
+            loop {
+                let Some(nl) = rest.find("\r\n") else { break };
+                let Ok(size) = usize::from_str_radix(rest[..nl].trim(), 16) else { break };
+                rest = &rest[nl + 2..];
+                if size == 0 || size > rest.len() {
+                    break;
+                }
+                out.push_str(&rest[..size]);
+                rest = rest[size..].strip_prefix("\r\n").unwrap_or(rest);
+            }
+            out
+        } else {
+            raw_body.to_string()
+        };
+        (status, body)
+    }
+
+    fn ndjson_events(body: &str) -> Vec<serde_json::Value> {
+        body.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("valid RunEvent JSON"))
+            .collect()
+    }
+
+    // `step-start` is emitted unconditionally, even for a step that turns
+    // out to be skipped a moment later (see `run_block`'s own doc comment
+    // on `RunEvent::StepSkipped`) -- "actually ran" means it reached a real
+    // `step-end`, not just a `step-start`.
+    fn really_ran(events: &[serde_json::Value], block: &str) -> bool {
+        events.iter().any(|e| e["type"] == "step-end" && e["block"] == block)
+    }
+
+    fn skipped_for(events: &[serde_json::Value], block: &str) -> bool {
+        events.iter().any(|e| e["type"] == "step-skipped" && e["block"] == block)
+    }
+
+    fn write_dep_chain_canvas(dep_code: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("meshfox-session-skip-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.md");
+        std::fs::write(
+            &path,
+            format!(
+                "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+                 ```bash name=\"dep\" cache\n{dep_code}\n```\n\n\
+                 ```bash name=\"target\" deps=\"dep\"\necho target-ran\n```\n",
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    async fn run_target(addr: SocketAddr) -> Vec<serde_json::Value> {
+        let (status, body) = request(
+            addr,
+            "POST",
+            "/api/run",
+            "application/json",
+            r#"{"path":[],"block":"target","persist":true}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "unexpected body: {body}");
+        ndjson_events(&body)
+    }
+
+    #[tokio::test]
+    async fn a_second_chain_run_skips_an_unchanged_dependency() {
+        let path = write_dep_chain_canvas("echo dep-ran");
+        let addr = spawn_test_server(path.clone()).await;
+
+        let first = run_target(addr).await;
+        assert!(really_ran(&first, "dep"), "expected dep to actually run the first time: {first:?}");
+        assert!(!skipped_for(&first, "dep"), "dep shouldn't be skipped before it's ever run: {first:?}");
+        // The target itself always runs for real, first time and every time.
+        assert!(really_ran(&first, "target"));
+
+        let second = run_target(addr).await;
+        assert!(skipped_for(&second, "dep"), "expected dep to be skipped the second time: {second:?}");
+        assert!(!really_ran(&second, "dep"), "a skipped dep must not also get a real step-start: {second:?}");
+        assert!(
+            really_ran(&second, "target"),
+            "the requested block itself must never be skipped, even when unchanged: {second:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn editing_the_dependencys_code_makes_it_rerun_instead_of_skipping() {
+        let path = write_dep_chain_canvas("echo dep-ran");
+        let addr = spawn_test_server(path.clone()).await;
+
+        let first = run_target(addr).await;
+        assert!(really_ran(&first, "dep"));
+
+        // Edit `dep`'s own code in place, same file shape `write_dep_chain_canvas`
+        // wrote, so its fence's fingerprint (see `meshfox_core::fingerprint`)
+        // changes — the same mechanism `crate::output`'s cached-output
+        // staleness uses, here driving "already ran this session" instead.
+        let edited = std::fs::read_to_string(&path).unwrap().replacen("echo dep-ran", "echo dep-ran-again", 1);
+        let (put_status, put_body) = request(addr, "PUT", "/api/canvas/raw", "text/plain", &edited).await;
+        assert_eq!(put_status, 204, "unexpected body: {put_body}");
+
+        let second = run_target(addr).await;
+        assert!(
+            really_ran(&second, "dep"),
+            "an edited dependency must actually rerun, not be skipped as fresh: {second:?}"
+        );
+        assert!(!skipped_for(&second, "dep"));
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
 

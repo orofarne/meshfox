@@ -173,11 +173,13 @@ async fn main_loop(
             let exit_code = run_tty_handoff(
                 terminal,
                 input_paused,
+                input_rx,
                 &pending.block_name,
                 &pending.code,
                 pending.interpreter.as_deref(),
                 &pending.env,
-                crate::canvas_root_dir(&app.canvas_path),
+                &pending.cwd,
+                pending.autoclose,
             )
             .await?;
             app.resume_after_tty(exit_code).await;
@@ -185,6 +187,7 @@ async fn main_loop(
         }
 
         let has_proc = app.run.as_ref().is_some_and(|r| r.proc.is_some());
+        let has_file_proc = app.file_run.as_ref().is_some_and(|r| r.proc.is_some());
         tokio::select! {
             maybe_ev = input_rx.recv() => {
                 match maybe_ev {
@@ -198,6 +201,11 @@ async fn main_loop(
                 app.run.as_mut().unwrap().proc.as_mut().unwrap().output_rx.recv().await
             }, if has_proc => {
                 app.on_output_line(line).await;
+            }
+            line = async {
+                app.file_run.as_mut().unwrap().proc.as_mut().unwrap().output_rx.recv().await
+            }, if has_file_proc => {
+                app.on_file_output_line(line).await;
             }
             Some(content) = reload_rx.recv() => {
                 app.on_external_change(content);
@@ -219,11 +227,13 @@ async fn main_loop(
 async fn run_tty_handoff(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     input_paused: &Arc<AtomicBool>,
+    input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
     block_name: &str,
     code: &str,
     interpreter: Option<&str>,
     env: &HashMap<String, String>,
     cwd: &std::path::Path,
+    autoclose: bool,
 ) -> io::Result<i32> {
     input_paused.store(true, Ordering::Release);
     // Comfortably longer than the reader thread's own 50ms poll timeout,
@@ -240,6 +250,22 @@ async fn run_tty_handoff(
     println!("==> {block_name}");
 
     let exit_code = run_tty_block(code, interpreter, env, cwd).await;
+
+    // Without `autoclose`, the canvas doesn't come back on its own — the
+    // exit code (and whatever the process last printed, still on screen
+    // right above this) stays visible until a deliberate keypress, same
+    // as leaving a real shell open after a command finishes. `autoclose`
+    // skips straight to restoring the canvas, the only behavior this block
+    // had before the flag existed.
+    if !autoclose {
+        println!("\r\n(exited {exit_code} — press any key to return to the canvas)");
+        // Briefly un-paused so the background reader thread (paused above,
+        // for the child's own exclusive use of the terminal) forwards the
+        // next keypress here instead of it being silently dropped.
+        input_paused.store(false, Ordering::Release);
+        let _ = input_rx.recv().await;
+        input_paused.store(true, Ordering::Release);
+    }
 
     enable_raw_mode()?;
     execute!(
