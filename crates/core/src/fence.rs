@@ -513,8 +513,7 @@ pub fn strip_fence_attrs(markdown: &str) -> String {
     for fence in &fences {
         out.push_str(&markdown[cursor..fence.span.start]);
         let (lang, _attrs) = parse_info_string(&fence.info);
-        let delim: String = std::iter::repeat(fence.delim_char)
-            .take(fence.delim_len)
+        let delim: String = std::iter::repeat_n(fence.delim_char, fence.delim_len)
             .collect();
         out.push_str(&delim);
         out.push_str(&lang);

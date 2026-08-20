@@ -246,14 +246,10 @@ where
 {
     tokio::spawn(async move {
         let mut lines = BufReader::new(reader).lines();
-        loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => {
-                    if tx.send(line).is_err() {
-                        break; // receiver gone — nobody left to read this
-                    }
-                }
-                _ => break, // EOF or a read error either way ends this stream
+        // EOF or a read error either way ends this stream.
+        while let Ok(Some(line)) = lines.next_line().await {
+            if tx.send(line).is_err() {
+                break; // receiver gone — nobody left to read this
             }
         }
     });

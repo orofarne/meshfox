@@ -327,7 +327,7 @@ mod tests {
     fn includes_plain_markdown_as_shifted_body_text() {
         let tmp = std::env::temp_dir().join(format!("meshfox-include-test-{}", std::process::id()));
         fs::create_dir_all(&tmp).unwrap();
-        let target = write(
+        let _target = write(
             &tmp,
             "spec.md",
             "# Spec Title\n\nSome body.\n\n## Sub\nmore\n",

@@ -536,6 +536,15 @@ For interactive debugging instead of a one-shot run, use `npm run test:e2e:ui` (
 
 `playwright.config.ts`'s `webServer` starts `meshfox view` itself (via `cargo run`, rebuilding only if the Rust side changed) — no server needs to be already running, and no separate `npm run build` step either, since `test:e2e` runs it as a `pretest:e2e` hook. Debug builds of `meshfox-server` read `web/dist` fresh off disk on every request (`rust-embed`'s `debug-embed` feature, which would force compile-time embedding even in a debug build, isn't enabled — see its `Cargo.toml`), so a frontend-only change just needs `npm run build` again, not a Rust rebuild, between test runs.
 
+### Linting
+<!-- meshfox:node id="linting" -->
+
+`web/`'s TypeScript type-checking (`tsc --noEmit`) — no ESLint yet, see TODO.canvas.md (not tracked in this repo) for why. `name=`d so it's runnable like any other block here, deliberately without `cache`, same reasoning as "Unit tests":
+
+```sh name="typecheck" default
+cd web && npm run typecheck
+```
+
 ### Release build
 <!-- meshfox:node id="release-build" -->
 
@@ -550,9 +559,9 @@ echo "binary: target/release/meshfox"
 ### Full check
 <!-- meshfox:node id="full-check" -->
 
-Run unit and e2e tests:
+Run unit tests, typecheck, and e2e tests:
 
-```bash deps="unit-tests/run,e2e-tests/run,release-build/release-build"
+```bash deps="unit-tests/run,linting/typecheck,e2e-tests/run,release-build/release-build"
 echo "done"
 ```
 

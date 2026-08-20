@@ -6,6 +6,14 @@ import { meshfoxMarkdown } from "./meshfoxSyntax";
 import { imagePaste } from "./imagePaste";
 import { THEME_CHANGE_EVENT } from "./theme";
 
+/** Both extensions are stable module-level values — a fresh array literal
+ * passed as `extensions=` every render would make `@uiw/react-codemirror`
+ * treat it as changed and re-dispatch a `StateEffect.reconfigure` on every
+ * keystroke (see its own `useCodeMirror` effect deps) for no reason.
+ * Shared with `CanvasSourceEditor.tsx`, the other CodeMirror instance that
+ * needs the exact same pair. */
+export const EDITOR_EXTENSIONS = [meshfoxMarkdown, imagePaste];
+
 /** How long to wait after the last keystroke before auto-saving — see
  * NodeSettings.tsx's identical constant/rationale. */
 const AUTOSAVE_DELAY_MS = 700;
@@ -110,7 +118,7 @@ export function NodeTextEditor({ initialText, onChange, onClose }: NodeTextEdito
               value={text}
               height="100%"
               theme={dark ? "dark" : "light"}
-              extensions={[meshfoxMarkdown, imagePaste]}
+              extensions={EDITOR_EXTENSIONS}
               onChange={setText}
               autoFocus
             />

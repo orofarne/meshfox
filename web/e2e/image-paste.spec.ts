@@ -19,6 +19,23 @@ import { test, expect, type Locator, type Page } from "@playwright/test";
 const ONE_PIXEL_PNG_BASE64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
 
+// Every test in this file is Firefox-skipped (see each test's own
+// `test.skip`) — confirmed directly (a standalone script dispatching a
+// synthetic `paste` `ClipboardEvent` built exactly like `pasteImage` below,
+// against a bare page, both browsers): Chromium's listener sees
+// `event.clipboardData.items` populated with the file just added via
+// `dt.items.add(file)`; Firefox's sees an empty `items` list every time,
+// even though the `DataTransfer` itself has the file right up until the
+// event is dispatched (`dt.files.length === 1` beforehand). Gecko drops a
+// synthetic (`isTrusted: false`) `ClipboardEvent`'s file data rather than
+// exposing it to script — a security restriction, not a bug in this app:
+// `imagePaste.ts`'s handler correctly finds no image item and bails out
+// (`return false`) before ever touching the editor, so nothing here is
+// otherwise reachable through Firefox's automation surface. A real,
+// OS-triggered (trusted) paste in actual Firefox isn't affected by this at
+// all — only the synthetic construction this suite relies on for
+// automation is.
+
 /** Builds a `File`/`DataTransfer` for `base64` (assumed `image/png`) in
  * the page's own context and dispatches a real `paste` `ClipboardEvent` at
  * `locator` — `page.evaluate` rather than Playwright's own clipboard
@@ -26,7 +43,8 @@ const ONE_PIXEL_PNG_BASE64 =
  * `navigator.clipboard`), since the async Clipboard API needs an actual
  * OS-level clipboard write first; constructing the event directly is both
  * simpler and exactly what a real "paste an image" keystroke ultimately
- * dispatches at the DOM either way. */
+ * dispatches at the DOM either way. Only actually exercises the app's
+ * handler on Chromium — see this file's own top comment. */
 async function pasteImage(locator: Locator, base64: string) {
   await locator.click();
   await locator.evaluate((el, base64) => {
@@ -51,7 +69,12 @@ test.beforeEach(async ({ page }) => {
   await page.getByRole("button", { name: "Edit" }).click();
 });
 
-test("pasting an image into a node's body editor embeds it as base64 and renders it live", async ({ page }) => {
+test("pasting an image into a node's body editor embeds it as base64 and renders it live", async ({
+  page,
+  browserName,
+}) => {
+  test.skip(browserName === "firefox", "Gecko drops synthetic paste-event file data — see this file's own top comment.");
+
   const root = page.locator('.react-flow__node[data-id="root"]');
   await root.locator(".mesh-node-title").hover();
   await root.locator('button[title="Edit this node\'s Markdown text"]').click();
@@ -72,7 +95,12 @@ test("pasting an image into a node's body editor embeds it as base64 and renders
   await expect.poll(() => fetchRaw(page)).toContain(`data:image/png;base64,${ONE_PIXEL_PNG_BASE64}`);
 });
 
-test("pasting an image into the whole-document source editor embeds it as base64", async ({ page }) => {
+test("pasting an image into the whole-document source editor embeds it as base64", async ({
+  page,
+  browserName,
+}) => {
+  test.skip(browserName === "firefox", "Gecko drops synthetic paste-event file data — see this file's own top comment.");
+
   await page.getByRole("button", { name: "Source" }).click();
   const source = page.locator(".mesh-source-editor-body .cm-content");
   await expect(source).toBeVisible();
@@ -84,7 +112,12 @@ test("pasting an image into the whole-document source editor embeds it as base64
   await expect.poll(() => fetchRaw(page)).toContain(`data:image/png;base64,${ONE_PIXEL_PNG_BASE64}`);
 });
 
-test("a large paste asks for confirmation first, and declining inserts nothing", async ({ page }) => {
+test("a large paste asks for confirmation first, and declining inserts nothing", async ({
+  page,
+  browserName,
+}) => {
+  test.skip(browserName === "firefox", "Gecko drops synthetic paste-event file data — see this file's own top comment.");
+
   // Doesn't need to be a real decodable image — the paste handler only
   // ever measures the resulting base64 *string* length before deciding to
   // ask, never decodes it (that's the renderer's job, and it's on-demand

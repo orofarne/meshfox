@@ -229,7 +229,7 @@ test("the Tags field suggests tags already used elsewhere in the document", asyn
   // "alpha" is already added — no longer offered, even though it still
   // matches; "beta" (not yet added, and also contains "a") still is.
   await tagInput.fill("a");
-  await expect(page.locator(".tag-editor-suggestions button", { hasText: "alpha", exact: true })).toHaveCount(0);
+  await expect(page.locator(".tag-editor-suggestions button", { hasText: /^alpha$/ })).toHaveCount(0);
   await expect(page.locator(".tag-editor-suggestions button", { hasText: "beta" })).toBeVisible();
 
   await page.locator(".vars-modal-actions button", { hasText: "cancel" }).click();

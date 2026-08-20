@@ -326,7 +326,10 @@ async fn get_vars(
     Query(query): Query<VarsQuery>,
 ) -> Result<Json<Vec<VarStatus>>, ApiError> {
     let raw = state.raw.lock().unwrap().clone();
-    let canvas = parse_or_error(&raw)?;
+    // Include-resolved (not just `parse_or_error`) so `path`/`block` below
+    // can address a node spliced in from an `include`, same as `run_block`
+    // — see `resolved_canvas`'s own doc comment.
+    let canvas = resolved_canvas(&raw, &state.canvas_path)?;
     let path: Vec<&str> = if query.path.is_empty() {
         Vec::new()
     } else {
@@ -538,7 +541,9 @@ async fn get_configure_vars(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<VarStatus>>, ApiError> {
     let raw = state.raw.lock().unwrap().clone();
-    let canvas = parse_or_error(&raw)?;
+    // Include-resolved so a `meshfox:var` declared inside an `include` is
+    // offered here too, same reasoning as `get_vars`.
+    let canvas = resolved_canvas(&raw, &state.canvas_path)?;
     let decls = meshfox_core::declared_vars(&canvas)
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
     // Same reasoning as `get_vars`: a `from`-declared variable is computed,
@@ -605,7 +610,9 @@ async fn post_configure_vars(
     Json(req): Json<ConfigureVarsRequest>,
 ) -> Result<Json<ConfigureVarsResponse>, ApiError> {
     let raw = state.raw.lock().unwrap().clone();
-    let canvas = parse_or_error(&raw)?;
+    // Include-resolved so a `meshfox:var` declared inside an `include` can
+    // be saved here too, same reasoning as `get_vars`.
+    let canvas = resolved_canvas(&raw, &state.canvas_path)?;
     let decls = meshfox_core::declared_vars(&canvas)
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
     let configurable: Vec<_> = decls
@@ -3368,15 +3375,10 @@ async fn watch_changes(State(state): State<Arc<AppState>>) -> Response {
         // see `TabGuard`'s own doc comment.
         let _guard = TabGuard { state: Arc::clone(&state) };
         yield Ok::<_, io::Error>(Bytes::from_static(b"{\"type\":\"connected\"}\n"));
-        loop {
-            match rx.recv().await {
-                Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
-                    yield Ok(Bytes::from_static(b"{\"type\":\"changed\"}\n"));
-                }
-                // Never actually fires: `change_tx`'s sender lives in
-                // `AppState`, which outlives every connection.
-                Err(broadcast::error::RecvError::Closed) => break,
-            }
+        // The `Closed` arm never actually fires: `change_tx`'s sender lives
+        // in `AppState`, which outlives every connection.
+        while let Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) = rx.recv().await {
+            yield Ok(Bytes::from_static(b"{\"type\":\"changed\"}\n"));
         }
     };
 
@@ -3424,7 +3426,7 @@ async fn get_include_asset(
         .nodes
         .iter()
         .filter_map(|n| n.asset_base.as_deref())
-        .any(|base| PathBuf::from(base) == requested_dir);
+        .any(|base| *base == requested_dir);
     if !known {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -5055,8 +5057,7 @@ mod run_file_tests {
     fn dechunk(raw: &str) -> String {
         let mut out = String::new();
         let mut rest = raw;
-        loop {
-            let Some(nl) = rest.find("\r\n") else { break };
+        while let Some(nl) = rest.find("\r\n") {
             let Ok(size) = usize::from_str_radix(rest[..nl].trim(), 16) else {
                 break;
             };
@@ -5065,7 +5066,7 @@ mod run_file_tests {
                 break;
             }
             out.push_str(&rest[..size]);
-            rest = &rest[size..].strip_prefix("\r\n").unwrap_or(rest);
+            rest = rest[size..].strip_prefix("\r\n").unwrap_or(rest);
         }
         out
     }
@@ -5264,8 +5265,7 @@ mod run_block_include_tests {
     fn dechunk(raw: &str) -> String {
         let mut out = String::new();
         let mut rest = raw;
-        loop {
-            let Some(nl) = rest.find("\r\n") else { break };
+        while let Some(nl) = rest.find("\r\n") {
             let Ok(size) = usize::from_str_radix(rest[..nl].trim(), 16) else {
                 break;
             };
@@ -5399,8 +5399,7 @@ mod session_skip_tests {
         let body = if head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
             let mut out = String::new();
             let mut rest = raw_body;
-            loop {
-                let Some(nl) = rest.find("\r\n") else { break };
+            while let Some(nl) = rest.find("\r\n") {
                 let Ok(size) = usize::from_str_radix(rest[..nl].trim(), 16) else { break };
                 rest = &rest[nl + 2..];
                 if size == 0 || size > rest.len() {
@@ -5983,6 +5982,53 @@ mod vars_endpoint_tests {
 
         let _ = std::fs::remove_file(&canvas_path);
         let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));
+    }
+
+    /// Regression test: `get_vars` used to parse only the primary document
+    /// (`parse_or_error`, no include splicing), so a `path` addressing a
+    /// node spliced in from an `include` could never be found there —
+    /// `resolve_target` fails with `RunError::Tree`, which `get_vars`
+    /// surfaced as a 404. `run_block` already resolved includes correctly
+    /// (see its own `resolved_canvas` call) — this only ever broke the
+    /// pre-run "what's still missing" check, not the run itself.
+    #[tokio::test]
+    async fn get_vars_resolves_a_block_that_lives_inside_an_included_canvas() {
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-vars-include-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("env.canvas.md"),
+            concat!(
+                "<!-- meshfox:canvas -->\n# Env\n<!-- meshfox:node id=\"root\" -->\n\n",
+                "<!-- meshfox:var name=\"API_KEY\" default=\"dev-key\" -->\n\n",
+                "## Setup\n<!-- meshfox:node id=\"setup\" -->\n\n",
+                "```bash name=\"prepare\"\necho prepare\n```\n\n",
+                "```bash name=\"resolve\" env=\"$API_KEY\"\necho $API_KEY\n```\n",
+            ),
+        )
+        .unwrap();
+        let base_path = dir.join("base.canvas.md");
+        std::fs::write(
+            &base_path,
+            concat!(
+                "<!-- meshfox:canvas -->\n# Base\n<!-- meshfox:node id=\"base\" -->\n\n",
+                "## Env\n<!-- meshfox:node id=\"env\" type=\"include\" -->\n\n[env](./env.canvas.md)\n",
+            ),
+        )
+        .unwrap();
+
+        let addr = spawn_test_server(base_path.clone()).await;
+        let (status, body) = get(addr, "/api/vars?path=env,env/root,env/setup&block=resolve").await;
+        assert_eq!(status, 200, "unexpected body: {body}");
+        let statuses: Vec<serde_json::Value> =
+            serde_json::from_str(&body).expect("valid VarStatus JSON");
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0]["name"], "API_KEY");
+        assert_eq!(statuses[0]["value"], "dev-key");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

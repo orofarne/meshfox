@@ -247,7 +247,7 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
     let parents = resolve_parent_ids(&segments, &ids)?;
 
     let mut nodes = Vec::with_capacity(segments.len());
-    for ((seg, id), parent) in segments.iter().zip(ids.iter()).zip(parents.into_iter()) {
+    for ((seg, id), parent) in segments.iter().zip(ids.iter()).zip(parents) {
         let node_type = match seg.node_attrs.get("type").map(String::as_str) {
             None | Some("text") => NodeType::Text,
             Some("file") => NodeType::File,

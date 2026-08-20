@@ -2,7 +2,7 @@
 //! rendering, and running blocks (deps chain + live streamed output + kill
 //! + cache write-back) — the same execution model `meshfox run`/`meshfox
 //! view` use, adapted to drive a redraw loop instead of printing to stdout
-//! or a browser.
+//!   or a browser.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -1575,7 +1575,6 @@ impl App {
                 run.full_output.clear();
                 run.step_started = std::time::Instant::now();
                 run.lines.push(format!("==> {}", addr.block_name));
-                return;
             }
             Err(e) => {
                 self.status = format!("failed to run {:?}: {e}", addr.block_name);
@@ -1583,7 +1582,6 @@ impl App {
                     run.finished = true;
                     run.had_failure = true;
                 }
-                return;
             }
         }
     }

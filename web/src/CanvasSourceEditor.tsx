@@ -1,9 +1,7 @@
 import { useEffect, useState } from "react";
 import CodeMirror from "@uiw/react-codemirror";
 import { fetchCanvasSource, fetchIncludes, saveCanvasSource, type IncludeManifestEntry } from "./api";
-import { usePrefersDark } from "./NodeTextEditor";
-import { meshfoxMarkdown } from "./meshfoxSyntax";
-import { imagePaste } from "./imagePaste";
+import { EDITOR_EXTENSIONS, usePrefersDark } from "./NodeTextEditor";
 
 interface CanvasSourceEditorProps {
   /** Seeds the file picker's initial selection — an include's own
@@ -150,7 +148,7 @@ export function CanvasSourceEditor({ initialInclude, onSaved, onClose, onDirtyCh
             value={text}
             height="100%"
             theme={dark ? "dark" : "light"}
-            extensions={[meshfoxMarkdown, imagePaste]}
+            extensions={EDITOR_EXTENSIONS}
             onChange={setText}
             autoFocus
           />
