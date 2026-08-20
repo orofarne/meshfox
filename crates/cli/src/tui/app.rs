@@ -81,6 +81,7 @@ pub struct BlockPickerState {
 pub struct PendingTty {
     pub block_name: String,
     pub code: String,
+    pub interpreter: Option<String>,
     pub env: HashMap<String, String>,
 }
 
@@ -1331,12 +1332,14 @@ impl App {
             self.pending_tty = Some(PendingTty {
                 block_name: addr.block_name.clone(),
                 code: block.code.clone(),
+                interpreter: block.interpreter.clone(),
                 env: resolution.env,
             });
             return;
         }
 
-        match meshfox_server::stream_exec::spawn_bash(&block.code, &resolution.env) {
+        let cwd = crate::canvas_root_dir(&self.canvas_path);
+        match meshfox_server::stream_exec::spawn_block(&block, &resolution.env, Some(cwd)) {
             Ok(proc) => {
                 let run = self.run.as_mut().unwrap();
                 run.proc = Some(proc);

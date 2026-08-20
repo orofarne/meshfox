@@ -96,14 +96,17 @@ of JSON, for readable diffs and hand-editability.
   - `lang="..."` — syntax-highlighting language hint for `display="code"`
     (e.g. `lang="rust"`). Optional; when omitted, the language is guessed
     from the target's file extension. Ignored when `display` isn't `code`.
-  - `interpreter="..."` — an executable (e.g. `interpreter="python"`) to run
-    against `target`, making the node runnable: `interpreter target` (the
-    target's path resolved relative to the canvas's own directory,
-    confined to it — same boundary `display="code"`/`include` targets are
-    resolved within). Optional; omitted means the node isn't runnable this
-    way. The web UI's "▷ run" button (next to "expand", in a runnable
-    node's title bar) invokes this the same way it does a `text` node's
-    default code block.
+  - `interpreter="..."` — a shebang-style command, e.g. `interpreter="python3
+    -u"` (word-split the same way a `#!/usr/bin/env -S ...` shebang line's
+    own arguments would be — quoting is honored), to run against `target`,
+    making the node runnable: `interpreter target` (the target's path
+    resolved relative to the canvas's own directory, confined to it — same
+    boundary `display="code"`/`include` targets are resolved within).
+    Optional; omitted means the node isn't runnable this way. The web UI's
+    "▷ run" button (next to "expand", in a runnable node's title bar)
+    invokes this the same way it does a `text` node's default code block.
+    A runnable code *fence* (see "Runnable code fences" below) can carry
+    the same `interpreter=` attribute — this is that mechanism's origin.
 
     ```
     <!-- meshfox:node type="file" display="code" lang="rust" -->
@@ -269,6 +272,20 @@ Lives inside a node's Markdown text, as fence-info-string attributes:
   block need to ask about anything" to the block itself, not the whole
   canvas. An `env=` entry naming a variable nothing declares is a
   `meshfox validate` error.
+- `interpreter="..."` — a shebang-style command, e.g. `interpreter="python3
+  -u"`, to run this fence's code under instead of the implicit `bash`/`sh`
+  executor: the fence's own body is written to a fresh temp file and run
+  as `interpreter target-tmpfile` (word-split the same way a
+  `#!/usr/bin/env -S ...` shebang line's own arguments would be — quoting
+  is honored, so `interpreter="env \"my python\" -u"` runs `env` with `my
+  python` as a single argument). Optional; when set, `lang` no longer has
+  to be `bash`/`sh` for the fence to count as runnable at all — `lang`
+  becomes purely a syntax-highlighting hint, same role it already plays on
+  a `file` node's own `interpreter=` (see "Node types" above, which this
+  attribute is the fenced-block counterpart of — both parse the same way).
+  Works on a `tty` block too — the interactive session runs directly under
+  `interpreter` (given a real pty/terminal) instead of `bash`, e.g.
+  `interpreter="python3 -i"` for an interactive Python REPL.
 - `tty` — optional flag (`tty` or `tty=true`); this block wants a real
   interactive terminal instead of the usual captured/streamed output —
   e.g. `bash` on its own (a login-style shell), or anything else that reads
@@ -284,14 +301,22 @@ Lives inside a node's Markdown text, as fence-info-string attributes:
   "Interactive (`tty`) blocks" below for how the CLI and web UI actually
   run one.
 
-Supported languages: `bash` (`sh` is an alias for it). A fence in any other
-language never counts as runnable at all — not with an explicit `name=`,
-and not as a node's sole unnamed fence — so an ordinary Markdown
-document's own example fences (a `yaml` config sample, a `json` snippet,
-...) never get mistaken for something to run just because meshfox was
-pointed at the file directly (the `meshfox:canvas` marker/`.canvas.md`
-suffix is only required for *auto-discovery* — see "CLI" below — an
-explicitly-given path still parses whatever heading structure it finds).
+Supported languages without an `interpreter=` attribute: `bash` (`sh` is an
+alias for it). A fence in any other language never counts as runnable at
+all — not with an explicit `name=`, and not as a node's sole unnamed fence
+— *unless* it carries its own `interpreter=` (see above), which makes it
+runnable under that command regardless of `lang`. This is what keeps an
+ordinary Markdown document's own example fences (a `yaml` config sample, a
+`json` snippet, ...) from being mistaken for something to run just because
+meshfox was pointed at the file directly (the `meshfox:canvas`
+marker/`.canvas.md` suffix is only required for *auto-discovery* — see
+"CLI" below — an explicitly-given path still parses whatever heading
+structure it finds) — a plain documentation fence has no `interpreter=`
+either.
+
+    ```python name="seed" interpreter="python3 -u" cache
+    print("seeding...")
+    ```
 
     ```bash name="build" cache
     cargo build --workspace
@@ -950,10 +975,12 @@ leading token instead of a `key=value` pair (`crates/core/src/fence.rs`):
     lang            ::= bare-value
 
     runnable-attr   ::= 'name' | 'cache' | 'default' | 'deps' | 'env' | 'tty'
+                     | 'interpreter'
     constraint-attr ::= 'constraint' | 'name'
 
-A runnable fence additionally requires `lang` to be `bash` or `sh` (see
-"Runnable code fences"); a constraint fence requires `lang = 'starlark'`
+A runnable fence additionally requires `lang` to be `bash` or `sh`, *or* its
+own `interpreter=` attribute set (see "Runnable code fences"); a constraint
+fence requires `lang = 'starlark'`
 *and* the bare `constraint` flag (see "Constraint fences") — again,
 cross-cutting rules enforced by the fence scanner/`meshfox validate`, not
 expressible in `fence-info` alone.

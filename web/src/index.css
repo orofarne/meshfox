@@ -1156,6 +1156,16 @@ a {
   font-family: "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
+/* A runnable fence's own `interpreter=` value, shown as `#!interpreter`
+ * right after the (uppercase) language label — e.g. `PYTHON #!python -u`.
+ * `text-transform: none` opts back out of `.mesh-code-lang`'s own
+ * `uppercase` (inherited otherwise): unlike the language label, this is a
+ * literal command someone would actually type, so it's shown exactly as
+ * written in the attribute, case and all. */
+.mesh-code-interpreter {
+  text-transform: none;
+}
+
 /* `seg.tty` marker next to the language label — small and understated,
  * same spirit as `.mesh-code-lang` next to it, not a loud warning. */
 .mesh-tty-badge {

@@ -76,6 +76,11 @@ export interface CodeSegment {
    * `defaultBlockName`), whether or not this flag is set — same "explicit
    * flag OR self-named" rule `core::fence::is_default` uses. */
   default: boolean;
+  /** Mirrors `core::fence::CodeBlock.interpreter` — a shebang-style
+   * command+flags string (`interpreter="python3 -u"`) this block runs
+   * under instead of the implicit `bash`/`sh` executor. When set, `lang`
+   * is purely a syntax-highlighting hint; see `isSupportedLang` below. */
+  interpreter?: string;
   code: string;
   output?: CachedOutput;
 }
@@ -132,12 +137,22 @@ function fenceIndentOk(line: string): boolean {
 
 /** Languages `crate::exec` actually knows how to run — mirrors
  * `core::exec::is_supported_lang`. A fence in any other language (`yaml`,
- * `starlark`, ...) is never runnable here, named or not: without this
- * check, a `name=`'d or sole-unnamed fence in an unsupported language would
- * still get a Run button that just errors when clicked, since the server's
- * own `candidate_fences` never considered it a candidate to begin with. */
+ * `starlark`, ...) is never runnable here, named or not, *unless* it
+ * carries its own `interpreter=` attribute (see `isRunnableCandidate`) —
+ * without this check, a `name=`'d or sole-unnamed fence in an unsupported
+ * language with no `interpreter=` either would still get a Run button
+ * that just errors when clicked, since the server's own
+ * `candidate_fences` never considered it a candidate to begin with. */
 function isSupportedLang(lang: string): boolean {
   return lang === "bash" || lang === "sh";
+}
+
+/** A fence is a runnable candidate if its `lang` is one `isSupportedLang`
+ * already knows, or it carries its own `interpreter=` attribute naming
+ * one explicitly — mirrors `core::fence::candidate_fences`'s own
+ * `is_supported_lang(lang) || attrs.contains_key("interpreter")` gate. */
+function isRunnableCandidate(lang: string, attrs: Record<string, string>): boolean {
+  return isSupportedLang(lang) || attrs.interpreter !== undefined;
 }
 
 /**
@@ -173,7 +188,8 @@ function countUnnamedCandidateFences(markdown: string): number {
       const precededByOutputMarker = (lines[i - 1] ?? "").trim().startsWith("<!-- meshfox:output");
       if (!precededByOutputMarker) {
         const [lang, ...rest] = tokenize(info);
-        if (isSupportedLang(lang) && attrsFromTokens(rest).name === undefined) count++;
+        const attrs = attrsFromTokens(rest);
+        if (isRunnableCandidate(lang, attrs) && attrs.name === undefined) count++;
       }
     }
     i = j + 1;
@@ -260,11 +276,11 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
       continue;
     }
 
-    if (!isSupportedLang(lang) || (!attrs.name && !soloUnnamed)) {
-      // Either an unsupported language (never runnable, regardless of
-      // naming — see `isSupportedLang`), or not a runnable block and not
-      // this node's (one and only) implicitly-named fence either — leave
-      // it as plain Markdown, fence and all.
+    if (!isRunnableCandidate(lang, attrs) || (!attrs.name && !soloUnnamed)) {
+      // Either not a runnable candidate at all (unsupported language and
+      // no `interpreter=` either — see `isRunnableCandidate`), or not a
+      // runnable block and not this node's (one and only) implicitly-named
+      // fence either — leave it as plain Markdown, fence and all.
       mdBuffer.push(...lines.slice(i, j + 1));
       i = j + 1;
       continue;
@@ -275,6 +291,7 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
     const cache = attrs.cache !== undefined && attrs.cache !== "false";
     const tty = attrs.tty !== undefined && attrs.tty !== "false";
     const isDefault = attrs.default !== undefined && attrs.default !== "false";
+    const interpreter = attrs.interpreter;
     const deps = (attrs.deps ?? "")
       .split(",")
       .map((s) => s.trim())
@@ -303,7 +320,7 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
       }
     }
 
-    segments.push({ type: "code", lang, name, cache, tty, deps, default: isDefault, code: codeLines.join("\n"), output });
+    segments.push({ type: "code", lang, name, cache, tty, deps, default: isDefault, interpreter, code: codeLines.join("\n"), output });
     i = cursor;
   }
   flushMarkdown();

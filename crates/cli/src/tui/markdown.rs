@@ -253,6 +253,10 @@ struct Renderer<'a> {
     quote_depth: usize,
     code_lang: Option<String>,
     code_name: Option<String>,
+    /// This fence's own `interpreter=` attribute, if any — mirrors the web
+    /// UI's `#!interpreter` suffix on the code-block head (see
+    /// `web/src/MeshNode.tsx`'s `mesh-code-interpreter`).
+    code_interpreter: Option<String>,
     code_buf: String,
     table: Option<TableState>,
     pending_heading_style: Option<Style>,
@@ -291,6 +295,7 @@ impl<'a> Renderer<'a> {
             quote_depth: 0,
             code_lang: None,
             code_name: None,
+            code_interpreter: None,
             code_buf: String::new(),
             table: None,
             pending_heading_style: None,
@@ -522,21 +527,25 @@ impl<'a> Renderer<'a> {
             }
             Tag::CodeBlock(kind) => {
                 self.flush_paragraph();
-                let (lang, name) = match kind {
+                let (lang, name, interpreter) = match kind {
                     // The info string carries meshfox's own attributes past
                     // the language token (`name="..."`, `cache`, ...) — see
                     // `meshfox_core::fence`, which this mirrors just enough
-                    // to pull out `name` for the block header below.
+                    // to pull out `name`/`interpreter` for the block header
+                    // below.
                     CodeBlockKind::Fenced(info) => {
                         let mut tokens = meshfox_core::attrs::tokenize(&info).into_iter();
                         let lang = tokens.next().unwrap_or_else(|| "text".to_string());
-                        let name = meshfox_core::attrs::attrs_from_tokens(tokens).remove("name");
-                        (lang, name)
+                        let mut attrs = meshfox_core::attrs::attrs_from_tokens(tokens);
+                        let name = attrs.remove("name");
+                        let interpreter = attrs.remove("interpreter");
+                        (lang, name, interpreter)
                     }
-                    CodeBlockKind::Indented => ("text".to_string(), None),
+                    CodeBlockKind::Indented => ("text".to_string(), None, None),
                 };
                 self.code_lang = Some(lang);
                 self.code_name = name;
+                self.code_interpreter = interpreter;
                 self.code_buf.clear();
             }
             Tag::List(start) => {
@@ -635,6 +644,7 @@ impl<'a> Renderer<'a> {
             TagEnd::CodeBlock => {
                 let lang = self.code_lang.take().unwrap_or_default();
                 let name = self.code_name.take();
+                let interpreter = self.code_interpreter.take();
                 let code = std::mem::take(&mut self.code_buf);
                 let highlighted = self.hl.highlight(&lang, &code);
                 let border = Style::default().fg(Color::DarkGray);
@@ -642,11 +652,18 @@ impl<'a> Renderer<'a> {
                 // it's clear at a glance what `r` would actually run, and
                 // doubles as a visual break between back-to-back fences —
                 // see `push_segment` for the blank-line half of that.
-                let label = match &name {
-                    Some(n) if n != &lang => format!(" {lang} · {n} "),
-                    Some(n) => format!(" {n} "),
-                    None => format!(" {lang} "),
+                let mut label = match &name {
+                    Some(n) if n != &lang => format!(" {lang} · {n}"),
+                    Some(n) => format!(" {n}"),
+                    None => format!(" {lang}"),
                 };
+                // `#!interpreter`, exactly as written in the attribute (no
+                // case-folding) — mirrors the web UI's own
+                // `mesh-code-interpreter` suffix right after the lang/name.
+                if let Some(interpreter) = &interpreter {
+                    label.push_str(&format!(" #!{interpreter}"));
+                }
+                label.push(' ');
                 // `┌` matches the box-drawing set ratatui's own pane
                 // borders already use (see `Borders::ALL` in ui.rs), so the
                 // corner reads as the same kind of line, not a stray glyph.
@@ -945,5 +962,25 @@ mod tests {
         let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
         let text = segment_text(&segments);
         assert!(text.contains("See[query]."), "{text}");
+    }
+
+    #[test]
+    fn a_fences_own_interpreter_attr_shows_up_as_a_shebang_suffix_on_its_header() {
+        let hl = Highlighter::new();
+        let md = "```python name=\"seed\" interpreter=\"python3 -u\"\nprint(1)\n```\n";
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        let text = segment_text(&segments);
+        // Exactly as written in the attribute — no case-folding — mirrors
+        // the web UI's own `mesh-code-interpreter` suffix.
+        assert!(text.contains("python · seed #!python3 -u"), "{text}");
+    }
+
+    #[test]
+    fn a_fence_with_no_interpreter_attr_has_no_shebang_suffix() {
+        let hl = Highlighter::new();
+        let md = "```bash name=\"build\" cache\necho hi\n```\n";
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        let text = segment_text(&segments);
+        assert!(!text.contains("#!"), "{text}");
     }
 }

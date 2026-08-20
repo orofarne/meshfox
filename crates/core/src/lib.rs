@@ -30,7 +30,10 @@ pub mod vars;
 pub use canvas::{ArrowEnd, Canvas, EdgeLineStyle, ExtraEdge, FileDisplay, Node, NodeType};
 pub use constraint::{evaluate as evaluate_constraints, ConstraintResult, ConstraintStatus};
 pub use deps::{BlockAddr, DepsError};
-pub use exec::{executor_for, is_supported_lang, Executor};
+pub use exec::{
+    executor_for, is_supported_lang, resolve_command, split_interpreter, Executor,
+    ResolvedCommand,
+};
 pub use fence::{scan_code_blocks, scan_runnable_blocks, BlockRef, CodeBlock, EnvRef};
 pub use file_read::{
     confine, preview, ConfineError, FilePreview, PreviewError, FILE_PREVIEW_MAX_BYTES,
@@ -94,6 +97,8 @@ pub enum RunError {
     BlockNotFound(String, String),
     #[error("no executor registered for language {0:?}")]
     NoExecutor(String),
+    #[error("block {0:?}'s interpreter={1:?} isn't a valid shell-word command")]
+    InvalidInterpreter(String, String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -121,9 +126,20 @@ pub struct RunOutcome {
 /// id (implicitly, or via an explicit `name=` that just happens to match),
 /// passing that same trailing segment as `block_name` here resolves it —
 /// see `resolve_target` and SPEC.md's "Runnable code fences".
-pub fn run_block(canvas: &Canvas, path: &[&str], block_name: &str) -> Result<RunOutcome, RunError> {
+///
+/// `canvas_dir` is the *primary* canvas file's own directory — the block
+/// actually runs in `node.cwd(canvas_dir)` (see `Node::cwd`), which is
+/// `canvas_dir` itself unless the node was spliced in from an `include`
+/// target elsewhere on disk, in which case it's that target's own
+/// directory instead.
+pub fn run_block(
+    canvas: &Canvas,
+    path: &[&str],
+    block_name: &str,
+    canvas_dir: &std::path::Path,
+) -> Result<RunOutcome, RunError> {
     let target = resolve_target(canvas, path, block_name)?;
-    run_block_by_id(canvas, &target.node_id, &target.block_name)
+    run_block_by_id(canvas, &target.node_id, &target.block_name, canvas_dir)
 }
 
 /// Same as `run_block`, but addresses the node directly by `id` instead of
@@ -134,16 +150,22 @@ pub fn run_block_by_id(
     canvas: &Canvas,
     node_id: &str,
     block_name: &str,
+    canvas_dir: &std::path::Path,
 ) -> Result<RunOutcome, RunError> {
     let node = canvas
         .node(node_id)
         .ok_or_else(|| TreeError::NodeNotFound(node_id.to_string()))?;
-    run_block_in(node, block_name)
+    run_block_in(node, block_name, canvas_dir)
 }
 
-fn run_block_in(node: &Node, block_name: &str) -> Result<RunOutcome, RunError> {
+fn run_block_in(
+    node: &Node,
+    block_name: &str,
+    canvas_dir: &std::path::Path,
+) -> Result<RunOutcome, RunError> {
     let node_id = node.id.clone();
     let text = node.text.clone();
+    let cwd = node.cwd(canvas_dir);
 
     let blocks = scan_runnable_blocks(&node_id, &text);
     let block = blocks
@@ -151,9 +173,15 @@ fn run_block_in(node: &Node, block_name: &str) -> Result<RunOutcome, RunError> {
         .find(|b| b.name.as_deref() == Some(block_name))
         .ok_or_else(|| RunError::BlockNotFound(block_name.to_string(), node_id.clone()))?;
 
-    let executor =
-        executor_for(&block.lang).ok_or_else(|| RunError::NoExecutor(block.lang.clone()))?;
-    let result = executor.run(&block.code)?;
+    let executor: Box<dyn Executor> = if let Some(interpreter) = &block.interpreter {
+        let (program, args) = exec::split_interpreter(interpreter).ok_or_else(|| {
+            RunError::InvalidInterpreter(block_name.to_string(), interpreter.clone())
+        })?;
+        Box::new(exec::InterpreterExecutor { program, args })
+    } else {
+        executor_for(&block.lang).ok_or_else(|| RunError::NoExecutor(block.lang.clone()))?
+    };
+    let result = executor.run(&block.code, Some(&cwd))?;
 
     let updated_node_text = if block.cache {
         write_output(&text, block_name, &result).map(|updated| (node_id, updated))
@@ -290,6 +318,7 @@ fn default_block_name(canvas: &Canvas, node_id: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     const DOC: &str =
         "# Project\n\n## Tests\n<!-- meshfox:node -->\n\n```bash name=\"smoke\" cache\necho ok\n```\n";
@@ -297,7 +326,7 @@ mod tests {
     #[test]
     fn run_block_executes_and_reports_cached_update() {
         let canvas = Canvas::from_markdown(DOC).unwrap();
-        let outcome = run_block(&canvas, &["tests"], "smoke").unwrap();
+        let outcome = run_block(&canvas, &["tests"], "smoke", Path::new(".")).unwrap();
         assert_eq!(outcome.result.exit_code, 0);
         assert_eq!(outcome.result.output.trim(), "ok");
 
@@ -307,19 +336,42 @@ mod tests {
     }
 
     #[test]
+    fn run_block_runs_in_the_given_canvas_dir() {
+        let doc = "# Project\n\n## Tests\n<!-- meshfox:node -->\n\n```bash name=\"where\"\npwd -P\n```\n";
+        let canvas = Canvas::from_markdown(doc).unwrap();
+        let dir = std::env::temp_dir();
+        let outcome = run_block(&canvas, &["tests"], "where", &dir).unwrap();
+        assert_eq!(
+            Path::new(outcome.result.output.trim()),
+            dir.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn run_block_prefers_a_nodes_own_asset_base_over_the_canvas_dir() {
+        let doc = "# Project\n\n## Tests\n<!-- meshfox:node -->\n\n```bash name=\"where\"\npwd -P\n```\n";
+        let mut canvas = Canvas::from_markdown(doc).unwrap();
+        let included_dir = std::env::temp_dir().canonicalize().unwrap();
+        canvas.node_mut("tests").unwrap().asset_base =
+            Some(included_dir.to_string_lossy().into_owned());
+        let outcome = run_block(&canvas, &["tests"], "where", Path::new("/nonexistent")).unwrap();
+        assert_eq!(Path::new(outcome.result.output.trim()), included_dir);
+    }
+
+    #[test]
     fn run_block_without_cache_reports_no_update() {
         let doc =
             "# Project\n\n## Tests\n<!-- meshfox:node -->\n\n```bash name=\"smoke\"\necho ok\n```\n";
         let canvas = Canvas::from_markdown(doc).unwrap();
-        let outcome = run_block(&canvas, &["tests"], "smoke").unwrap();
+        let outcome = run_block(&canvas, &["tests"], "smoke", Path::new(".")).unwrap();
         assert!(outcome.updated_node_text.is_none());
     }
 
     #[test]
     fn run_block_by_id_matches_run_block_by_path() {
         let canvas = Canvas::from_markdown(DOC).unwrap();
-        let by_path = run_block(&canvas, &["tests"], "smoke").unwrap();
-        let by_id = run_block_by_id(&canvas, "tests", "smoke").unwrap();
+        let by_path = run_block(&canvas, &["tests"], "smoke", Path::new(".")).unwrap();
+        let by_id = run_block_by_id(&canvas, "tests", "smoke", Path::new(".")).unwrap();
         assert_eq!(by_path.result, by_id.result);
     }
 
@@ -335,7 +387,7 @@ mod tests {
         // "smoke"'s sole fence has no name= — implicitly named "smoke".
         // `meshfox run tests smoke` (no separate trailing block name)
         // should still resolve it via the path alone.
-        let outcome = run_block(&canvas, &["tests"], "smoke").unwrap();
+        let outcome = run_block(&canvas, &["tests"], "smoke", Path::new(".")).unwrap();
         assert_eq!(outcome.result.output.trim(), "hi");
     }
 
@@ -352,7 +404,7 @@ mod tests {
         // "e2e"'s runnable block is named "run", not "e2e" — only the
         // explicit `default` flag makes `meshfox run tests e2e` resolve to
         // it without a trailing block-name argument.
-        let outcome = run_block(&canvas, &["tests"], "e2e").unwrap();
+        let outcome = run_block(&canvas, &["tests"], "e2e", Path::new(".")).unwrap();
         assert_eq!(outcome.result.output.trim(), "ran");
     }
 
@@ -368,9 +420,9 @@ mod tests {
         let canvas = Canvas::from_markdown(doc).unwrap();
         // Neither block is default (no flag, no name matching "e2e") — the
         // trailing block name is still required.
-        assert!(run_block(&canvas, &["tests"], "e2e").is_err());
+        assert!(run_block(&canvas, &["tests"], "e2e", Path::new(".")).is_err());
         assert_eq!(
-            run_block(&canvas, &["tests", "e2e"], "run")
+            run_block(&canvas, &["tests", "e2e"], "run", Path::new("."))
                 .unwrap()
                 .result
                 .output
@@ -390,10 +442,10 @@ mod tests {
         let canvas = Canvas::from_markdown(doc).unwrap();
         // The sole block is explicitly named "check", not "smoke" — this
         // isn't the "name matches its own node" case, so no shortcut.
-        assert!(run_block(&canvas, &["tests"], "smoke").is_err());
+        assert!(run_block(&canvas, &["tests"], "smoke", Path::new(".")).is_err());
         // The real address still works, same as always.
         assert_eq!(
-            run_block(&canvas, &["tests", "smoke"], "check")
+            run_block(&canvas, &["tests", "smoke"], "check", Path::new("."))
                 .unwrap()
                 .result
                 .output

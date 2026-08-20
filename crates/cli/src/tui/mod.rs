@@ -175,7 +175,9 @@ async fn main_loop(
                 input_paused,
                 &pending.block_name,
                 &pending.code,
+                pending.interpreter.as_deref(),
                 &pending.env,
+                crate::canvas_root_dir(&app.canvas_path),
             )
             .await?;
             app.resume_after_tty(exit_code).await;
@@ -213,12 +215,15 @@ async fn main_loop(
 /// `crates/cli/src/main.rs`), and comes back once it exits. `input_paused`
 /// is set for the duration so the background input-reader thread (see
 /// `run` above) isn't calling `read()` on the same fd the child now owns.
+#[allow(clippy::too_many_arguments)]
 async fn run_tty_handoff(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     input_paused: &Arc<AtomicBool>,
     block_name: &str,
     code: &str,
+    interpreter: Option<&str>,
     env: &HashMap<String, String>,
+    cwd: &std::path::Path,
 ) -> io::Result<i32> {
     input_paused.store(true, Ordering::Release);
     // Comfortably longer than the reader thread's own 50ms poll timeout,
@@ -234,7 +239,7 @@ async fn run_tty_handoff(
     )?;
     println!("==> {block_name}");
 
-    let exit_code = run_tty_block(code, env).await;
+    let exit_code = run_tty_block(code, interpreter, env, cwd).await;
 
     enable_raw_mode()?;
     execute!(
@@ -255,11 +260,19 @@ async fn run_tty_handoff(
 /// Mirrors `crates/cli/src/main.rs`'s own `run_tty_block`: `Ctrl+C` is
 /// swallowed and just keeps waiting — the child, as its own independent
 /// foreground process, decides for itself whether that signal ends it.
-async fn run_tty_block(code: &str, envs: &HashMap<String, String>) -> i32 {
-    let spawned = tokio::process::Command::new("bash")
-        .arg("-c")
-        .arg(code)
+async fn run_tty_block(
+    code: &str,
+    interpreter: Option<&str>,
+    envs: &HashMap<String, String>,
+    cwd: &std::path::Path,
+) -> i32 {
+    let Ok(resolved) = meshfox_core::resolve_command(code, interpreter) else {
+        return -1;
+    };
+    let spawned = tokio::process::Command::new(&resolved.program)
+        .args(&resolved.args)
         .envs(envs)
+        .current_dir(cwd)
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
@@ -267,13 +280,22 @@ async fn run_tty_block(code: &str, envs: &HashMap<String, String>) -> i32 {
 
     let mut child = match spawned {
         Ok(child) => child,
-        Err(_) => return -1,
+        Err(_) => {
+            if let Some(path) = &resolved.cleanup {
+                let _ = std::fs::remove_file(path);
+            }
+            return -1;
+        }
     };
 
-    loop {
+    let exit_code = loop {
         tokio::select! {
-            status = child.wait() => return status.ok().and_then(|s| s.code()).unwrap_or(-1),
+            status = child.wait() => break status.ok().and_then(|s| s.code()).unwrap_or(-1),
             _ = tokio::signal::ctrl_c() => continue,
         }
+    };
+    if let Some(path) = &resolved.cleanup {
+        let _ = std::fs::remove_file(path);
     }
+    exit_code
 }

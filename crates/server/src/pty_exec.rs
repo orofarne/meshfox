@@ -15,6 +15,7 @@
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use tokio::sync::{mpsc, oneshot};
 
 pub struct PtyProcess {
@@ -26,6 +27,12 @@ pub struct PtyProcess {
     /// Resolves once the child has actually exited. `take()`n by `wait`,
     /// so it's only meaningful to await once.
     exit_rx: Option<oneshot::Receiver<i32>>,
+    /// An `interpreter=` spawn's own temp file (see `spawn`) — removed by
+    /// the exit-watching thread once the child is confirmed gone, not by
+    /// this struct itself; kept here only so tests can observe that it
+    /// actually happened.
+    #[cfg_attr(not(test), allow(dead_code))]
+    cleanup: Option<PathBuf>,
 }
 
 impl PtyProcess {
@@ -71,15 +78,29 @@ impl PtyProcess {
     }
 }
 
-/// Spawns `code` under `bash -c` inside a fresh pty of size `cols`x`rows`.
+/// Spawns `code` inside a fresh pty of size `cols`x`rows` — under `bash -c`
+/// by default, or under an explicit `interpreter=` command (see
+/// `meshfox_core::exec::resolve_command`) when the `tty` block carries one.
 /// `envs` is added on top of the inherited environment, same convention
-/// `stream_exec::spawn_bash` uses.
-pub fn spawn_bash<I, K, V>(code: &str, envs: I, cols: u16, rows: u16) -> io::Result<PtyProcess>
+/// `stream_exec::spawn_bash` uses. `cwd`, when given, is the directory the
+/// child starts in — a node's own canvas file's directory (see
+/// `meshfox_core::canvas::Node::cwd`); `None` inherits the server's own
+/// cwd unchanged.
+pub fn spawn<I, K, V>(
+    code: &str,
+    interpreter: Option<&str>,
+    envs: I,
+    cwd: Option<&Path>,
+    cols: u16,
+    rows: u16,
+) -> io::Result<PtyProcess>
 where
     I: IntoIterator<Item = (K, V)>,
     K: AsRef<str>,
     V: AsRef<str>,
 {
+    let resolved = meshfox_core::resolve_command(code, interpreter)?;
+
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -90,14 +111,26 @@ where
         })
         .map_err(to_io_error)?;
 
-    let mut cmd = CommandBuilder::new("bash");
-    cmd.arg("-c");
-    cmd.arg(code);
+    let mut cmd = CommandBuilder::new(&resolved.program);
+    for arg in &resolved.args {
+        cmd.arg(arg);
+    }
     for (k, v) in envs {
         cmd.env(k.as_ref(), v.as_ref());
     }
+    if let Some(cwd) = cwd {
+        cmd.cwd(cwd);
+    }
 
-    let mut child = pair.slave.spawn_command(cmd).map_err(to_io_error)?;
+    let mut child = match pair.slave.spawn_command(cmd).map_err(to_io_error) {
+        Ok(child) => child,
+        Err(e) => {
+            if let Some(path) = &resolved.cleanup {
+                let _ = std::fs::remove_file(path);
+            }
+            return Err(e);
+        }
+    };
     // Only needed to spawn the child (which inherits it as its controlling
     // terminal) — dropping our own copy is what lets the master's reader
     // see EOF once the child (the only other holder) actually exits.
@@ -148,11 +181,19 @@ where
     });
 
     let (exit_tx, exit_rx) = oneshot::channel();
+    let cleanup = resolved.cleanup.clone();
     std::thread::spawn(move || {
         let code = child
             .wait()
             .map(|status| status.exit_code() as i32)
             .unwrap_or(-1);
+        // Removed here, once the child is actually confirmed gone, rather
+        // than relying on the caller to `.wait()` on the returned
+        // `PtyProcess` — `relay_tty_step`'s own `Disconnected` case
+        // returns without ever awaiting it.
+        if let Some(path) = cleanup {
+            let _ = std::fs::remove_file(path);
+        }
         let _ = exit_tx.send(code);
     });
 
@@ -162,6 +203,7 @@ where
         resize_tx,
         pid,
         exit_rx: Some(exit_rx),
+        cleanup: resolved.cleanup,
     })
 }
 
@@ -179,7 +221,7 @@ mod tests {
 
     #[tokio::test]
     async fn runs_bash_and_captures_output() {
-        let mut proc = spawn_bash("echo hello", no_envs(), 80, 24).unwrap();
+        let mut proc = spawn("echo hello", None, no_envs(), None, 80, 24).unwrap();
         let mut collected = Vec::new();
         while let Some(chunk) = proc.output_rx.recv().await {
             collected.extend_from_slice(&chunk);
@@ -193,14 +235,14 @@ mod tests {
 
     #[tokio::test]
     async fn reports_nonzero_exit_code() {
-        let mut proc = spawn_bash("exit 7", no_envs(), 80, 24).unwrap();
+        let mut proc = spawn("exit 7", None, no_envs(), None, 80, 24).unwrap();
         while proc.output_rx.recv().await.is_some() {}
         assert_eq!(proc.wait().await, 7);
     }
 
     #[tokio::test]
     async fn stdin_is_writable() {
-        let mut proc = spawn_bash("read line; echo \"got: $line\"", no_envs(), 80, 24).unwrap();
+        let mut proc = spawn("read line; echo \"got: $line\"", None, no_envs(), None, 80, 24).unwrap();
         proc.write(b"hi there\n".to_vec());
         let mut collected = Vec::new();
         while let Some(chunk) = proc.output_rx.recv().await {
@@ -214,9 +256,11 @@ mod tests {
 
     #[tokio::test]
     async fn injects_extra_env_vars_on_top_of_the_inherited_ones() {
-        let mut proc = spawn_bash(
+        let mut proc = spawn(
             "echo \"$INSTALL_PATH\"",
+            None,
             [("INSTALL_PATH", "/opt/meshfox")],
+            None,
             80,
             24,
         )
@@ -233,12 +277,58 @@ mod tests {
 
     #[tokio::test]
     async fn kill_terminates_a_long_running_process() {
-        let proc = spawn_bash("sleep 30", no_envs(), 80, 24).unwrap();
+        let proc = spawn("sleep 30", None, no_envs(), None, 80, 24).unwrap();
         proc.kill().unwrap();
         // Draining output_rx (dropped instead here, deliberately) isn't
         // needed to confirm the kill worked — `wait` below is enough.
         let mut proc = proc;
         let code = proc.wait().await;
         assert_ne!(code, 0);
+    }
+
+    #[tokio::test]
+    async fn runs_under_an_explicit_interpreter() {
+        // `cat` as a stand-in "interpreter" — no assumption about python
+        // being installed, just proves a `tty` block's own `interpreter=`
+        // actually reaches the pty instead of always running under `bash`.
+        let mut proc = spawn("hello from a tty interpreter", Some("cat"), no_envs(), None, 80, 24)
+            .unwrap();
+        let mut collected = Vec::new();
+        while let Some(chunk) = proc.output_rx.recv().await {
+            collected.extend_from_slice(&chunk);
+            if String::from_utf8_lossy(&collected).contains("hello from a tty interpreter") {
+                break;
+            }
+        }
+        assert!(String::from_utf8_lossy(&collected).contains("hello from a tty interpreter"));
+    }
+
+    #[tokio::test]
+    async fn interpreter_temp_file_is_removed_once_the_child_exits() {
+        let mut proc = spawn("temp contents", Some("cat"), no_envs(), None, 80, 24).unwrap();
+        let path = proc.cleanup.clone().expect("interpreter spawn sets cleanup");
+        assert!(path.exists());
+        while let Some(chunk) = proc.output_rx.recv().await {
+            if String::from_utf8_lossy(&chunk).contains("temp contents") {
+                break;
+            }
+        }
+        proc.wait().await;
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn runs_in_the_given_cwd() {
+        let dir = std::env::temp_dir();
+        let mut proc = spawn("pwd -P", None, no_envs(), Some(&dir), 80, 24).unwrap();
+        let want = dir.canonicalize().unwrap().to_string_lossy().into_owned();
+        let mut collected = Vec::new();
+        while let Some(chunk) = proc.output_rx.recv().await {
+            collected.extend_from_slice(&chunk);
+            if String::from_utf8_lossy(&collected).contains(&want) {
+                break;
+            }
+        }
+        assert!(String::from_utf8_lossy(&collected).contains(&want));
     }
 }

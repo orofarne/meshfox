@@ -56,14 +56,17 @@ const commentMatcher = new MatchDecorator({
 
 // ```bash name="build" cache deps="build" env="X"``` — a runnable fence's
 // info-string attributes (SPEC.md's "Runnable code fences"); `sh` is the
-// same language's alias. Only the attributes are decorated here — the
-// language word and fence markers already get the markdown language's own
-// styling.
+// same language's alias, and any other `lang` with its own `interpreter=`
+// attribute counts too (mirrors `fence.ts`'s `isRunnableCandidate`). Only
+// the attributes are decorated here — the language word and fence markers
+// already get the markdown language's own styling.
 const fenceMatcher = new MatchDecorator({
-  regexp: /```(?:bash|sh)\b((?:\s+[\w-]+(?:=(?:"[^"]*"|'[^']*'|[^\s`]*))?)*)/g,
+  regexp: /```([\w-]*)((?:\s+[\w-]+(?:=(?:"[^"]*"|'[^']*'|[^\s`]*))?)*)/g,
   decorate(add, from, to, match) {
-    const attrs = match[1];
+    const lang = match[1];
+    const attrs = match[2];
     if (!attrs) return;
+    if (lang !== "bash" && lang !== "sh" && !/\binterpreter=/.test(attrs)) return;
     addAttrMarks(add, attrs, from + match[0].length - attrs.length);
   },
 });

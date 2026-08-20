@@ -616,7 +616,10 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
           foldedTitle="Show the code"
           unfoldedTitle="Hide the code"
         />
-        <span className="mesh-code-lang">{seg.lang}</span>
+        <span className="mesh-code-lang">
+          {seg.lang}
+          {seg.interpreter && <span className="mesh-code-interpreter"> #!{seg.interpreter}</span>}
+        </span>
         {seg.tty && (
           <span className="mesh-tty-badge" title="Runs in a real interactive terminal, not captured/streamed output">
             tty
@@ -901,7 +904,12 @@ export function NodeBodyPreview({ text }: { text: string }) {
         return (
           <div className="mesh-code-block" key={`${seg.type === "constraint" ? "constraint" : seg.name}-${i}`}>
             <div className="mesh-code-block-head">
-              <span className="mesh-code-lang">{lang}</span>
+              <span className="mesh-code-lang">
+                {lang}
+                {seg.type === "code" && seg.interpreter && (
+                  <span className="mesh-code-interpreter"> #!{seg.interpreter}</span>
+                )}
+              </span>
             </div>
             <pre>
               <code>{seg.code}</code>

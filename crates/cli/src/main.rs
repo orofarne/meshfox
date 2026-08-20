@@ -982,6 +982,19 @@ fn parse_key_val(s: &str) -> Result<(String, String), String> {
     }
 }
 
+/// A canvas file's own directory — `.` when `canvas_path` is a bare
+/// filename with no directory component (`Path::parent()` on one of those
+/// returns `Some("")`, not `None`). A block runs with this as its `PWD`
+/// unless its own node was spliced in from an `include` elsewhere on disk
+/// (see `meshfox_core::canvas::Node::cwd`) — `meshfox run` doesn't resolve
+/// includes for execution yet, so this is every block's `PWD` here for now.
+pub(crate) fn canvas_root_dir(canvas_path: &Path) -> &Path {
+    canvas_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
 /// Every `meshfox:var` the canvas declares, in document order — same
 /// error-and-exit convention as every other parse step here.
 fn declared_vars_or_exit(canvas_path: &Path, raw: &str) -> Vec<VarDecl> {
@@ -1174,9 +1187,7 @@ fn check(canvas_path: &PathBuf) {
         std::process::exit(1);
     });
 
-    let canvas_dir = canvas_path.parent().filter(|p| !p.as_os_str().is_empty());
-    let canvas_dir = Some(canvas_dir.unwrap_or(std::path::Path::new(".")));
-    let results = meshfox_core::evaluate_constraints(&canvas, canvas_dir);
+    let results = meshfox_core::evaluate_constraints(&canvas, Some(canvas_root_dir(canvas_path)));
     if results.is_empty() {
         println!(
             "meshfox check: {} ok (no constraints)",
@@ -1492,22 +1503,41 @@ fn resolve_block_env_or_prompt(
 /// just absorbs every `SIGINT` while waiting and keeps waiting — the
 /// child, as its own independent process, decides for itself whether that
 /// signal ends it or not.
-async fn run_tty_block(code: &str, envs: &HashMap<String, String>) -> std::io::Result<i32> {
-    let mut child = tokio::process::Command::new("bash")
-        .arg("-c")
-        .arg(code)
+async fn run_tty_block(
+    code: &str,
+    interpreter: Option<&str>,
+    envs: &HashMap<String, String>,
+    cwd: &Path,
+) -> std::io::Result<i32> {
+    let resolved = meshfox_core::resolve_command(code, interpreter)?;
+    let spawned = tokio::process::Command::new(&resolved.program)
+        .args(&resolved.args)
         .envs(envs)
+        .current_dir(cwd)
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
-        .spawn()?;
+        .spawn();
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(e) => {
+            if let Some(path) = &resolved.cleanup {
+                let _ = std::fs::remove_file(path);
+            }
+            return Err(e);
+        }
+    };
 
-    loop {
+    let result = loop {
         tokio::select! {
-            status = child.wait() => return Ok(status?.code().unwrap_or(-1)),
+            status = child.wait() => break Ok(status?.code().unwrap_or(-1)),
             _ = tokio::signal::ctrl_c() => continue,
         }
+    };
+    if let Some(path) = &resolved.cleanup {
+        let _ = std::fs::remove_file(path);
     }
+    result
 }
 
 /// Same chain-resolution/dedup/stop-on-failure logic `run` always had, but
@@ -1608,7 +1638,7 @@ async fn run_async(
                 had_failure = true;
                 break;
             };
-            if !meshfox_server::stream_exec::supports(&block.lang) {
+            if !meshfox_server::stream_exec::supports(&block) {
                 eprintln!(
                     "error running {:?}: no executor registered for language {:?}",
                     addr.block_name, block.lang
@@ -1646,7 +1676,14 @@ async fn run_async(
                     had_failure = true;
                     break;
                 }
-                match run_tty_block(&block.code, &block_env).await {
+                match run_tty_block(
+                    &block.code,
+                    block.interpreter.as_deref(),
+                    &block_env,
+                    canvas_root_dir(canvas_path),
+                )
+                .await
+                {
                     Ok(code) => code,
                     Err(e) => {
                         eprintln!("error running {:?}: {e}", addr.block_name);
@@ -1655,15 +1692,18 @@ async fn run_async(
                     }
                 }
             } else {
-                let mut proc =
-                    match meshfox_server::stream_exec::spawn_bash(&block.code, &block_env) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            eprintln!("error running {:?}: {e}", addr.block_name);
-                            had_failure = true;
-                            break;
-                        }
-                    };
+                let mut proc = match meshfox_server::stream_exec::spawn_block(
+                    &block,
+                    &block_env,
+                    Some(canvas_root_dir(canvas_path)),
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("error running {:?}: {e}", addr.block_name);
+                        had_failure = true;
+                        break;
+                    }
+                };
 
                 loop {
                     tokio::select! {

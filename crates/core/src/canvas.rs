@@ -348,6 +348,22 @@ impl Node {
                 .as_deref()
                 .is_some_and(|i| !i.trim().is_empty())
     }
+
+    /// The directory this node's own runnable block(s) should execute
+    /// in: `asset_base` (the directory of the `include` target this node
+    /// was actually spliced in from) when set, otherwise `canvas_dir` —
+    /// the *primary* canvas file's own directory. This is what gives each
+    /// canvas its own `PWD` regardless of nesting: a node spliced in from
+    /// `sub/other.canvas.md` runs with `sub/` as `PWD`, even though the
+    /// document being viewed is the top-level canvas elsewhere on disk —
+    /// same "which file does this node really belong to" resolution
+    /// `asset_base` already drives for relative asset references.
+    pub fn cwd(&self, canvas_dir: &std::path::Path) -> std::path::PathBuf {
+        self.asset_base
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| canvas_dir.to_path_buf())
+    }
 }
 
 impl Canvas {
@@ -428,6 +444,22 @@ impl Canvas {
 #[cfg(test)]
 mod tests {
     use crate::mdcanvas::parse;
+    use std::path::Path;
+
+    #[test]
+    fn node_cwd_falls_back_to_the_canvas_dir_without_an_asset_base() {
+        let doc = "# Root\n\n## Section\n<!-- meshfox:node -->\n\nbody\n";
+        let node = parse(doc).unwrap().node("section").unwrap().clone();
+        assert_eq!(node.cwd(Path::new("/canvas/dir")), Path::new("/canvas/dir"));
+    }
+
+    #[test]
+    fn node_cwd_prefers_its_own_asset_base_when_set() {
+        let doc = "# Root\n\n## Section\n<!-- meshfox:node -->\n\nbody\n";
+        let mut node = parse(doc).unwrap().node("section").unwrap().clone();
+        node.asset_base = Some("/included/dir".to_string());
+        assert_eq!(node.cwd(Path::new("/canvas/dir")), Path::new("/included/dir"));
+    }
 
     #[test]
     fn resolve_absolute_position_adds_the_groups_own_anchor() {

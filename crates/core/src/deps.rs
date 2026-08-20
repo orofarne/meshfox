@@ -338,6 +338,15 @@ mod tests {
     }
 
     #[test]
+    fn validate_allows_interpreter_on_a_tty_block() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```python name=\"shell\" tty interpreter=\"python3\"\npass\n```\n",
+        ));
+        assert!(validate(&c).is_ok());
+    }
+
+    #[test]
     fn a_non_tty_block_may_depend_on_a_tty_block() {
         // Each runner already hands the terminal/pty over at exactly this
         // point in the chain and continues once it exits -- there's

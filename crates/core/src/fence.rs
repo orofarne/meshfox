@@ -33,6 +33,13 @@ pub struct CodeBlock {
     /// process environment normally, same as any child process); only
     /// variables named here are ever resolved/prompted for on its behalf.
     pub env: Vec<EnvRef>,
+    /// `interpreter="..."` — a shebang-style command+flags string
+    /// (`interpreter="python3 -u"`) to run this fence's code under instead
+    /// of the implicit `bash`/`sh` executor. When set, `lang` no longer
+    /// has to be `bash`/`sh` for the fence to count as runnable at all —
+    /// see `candidate_fences`. See `crate::exec::split_interpreter` for how
+    /// this string is parsed into a program + argument list.
+    pub interpreter: Option<String>,
     pub attrs: HashMap<String, String>,
     pub code: String,
     /// Byte range of the whole fence (opening ` ``` ` line through the
@@ -309,17 +316,18 @@ pub fn scan_runnable_blocks(node_id: &str, markdown: &str) -> Vec<CodeBlock> {
         .collect()
 }
 
-/// Backtick fences with a non-empty info string naming a language
-/// `crate::exec` actually knows how to run — the universe of fences that
-/// *could* be runnable, named or not — parsed once so both scan functions
-/// above share the work. Excluding an unsupported language here (not just
-/// downstream at execution time) means a fence in some other language
-/// never counts as runnable at all, named or not — including for the
-/// "sole unnamed fence" implicit-naming rule in `scan_runnable_blocks`,
-/// which is what keeps an ordinary Markdown document's own example fences
-/// (a `yaml` config sample, a `json` snippet, ...) from being mistaken for
-/// "the" runnable block in a node that has no real meshfox structure of
-/// its own. A cached-output block's own fence (always unnamed — see
+/// Backtick fences with a non-empty info string, and either a language
+/// `crate::exec` already knows how to run (`bash`/`sh`) or its own
+/// `interpreter=` attribute naming one explicitly — the universe of fences
+/// that *could* be runnable, named or not — parsed once so both scan
+/// functions above share the work. Excluding a fence that's neither here
+/// (not just downstream at execution time) means it never counts as
+/// runnable at all, named or not — including for the "sole unnamed fence"
+/// implicit-naming rule in `scan_runnable_blocks`, which is what keeps an
+/// ordinary Markdown document's own example fences (a `yaml` config
+/// sample, a `json` snippet, ...) from being mistaken for "the" runnable
+/// block in a node that has no real meshfox structure of its own. A
+/// cached-output block's own fence (always unnamed — see
 /// `crate::output::render_output_block`, a plain ` ```text `) is excluded
 /// here too, on top of `text` already not being a supported language —
 /// belt and suspenders against ever growing a spurious implicit block out
@@ -336,7 +344,9 @@ fn candidate_fences(markdown: &str) -> Vec<(RawFence, String, HashMap<String, St
             let (lang, attrs) = parse_info_string(&f.info);
             (f, lang, attrs)
         })
-        .filter(|(_, lang, _)| crate::exec::is_supported_lang(lang))
+        .filter(|(_, lang, attrs)| {
+            crate::exec::is_supported_lang(lang) || attrs.contains_key("interpreter")
+        })
         .collect()
 }
 
@@ -362,7 +372,7 @@ fn is_cached_output_fence(markdown: &str, fence_start: usize) -> bool {
 /// `FENCE_VALUE_ATTRS`/`FENCE_FLAG_ATTRS` (split there only because the
 /// popup needs to know which shape to insert — irrelevant here, where
 /// every key is just a key).
-const FENCE_ATTRS: &[&str] = &["name", "deps", "env", "cache", "tty", "default"];
+const FENCE_ATTRS: &[&str] = &["name", "deps", "env", "cache", "tty", "default", "interpreter"];
 
 /// `meshfox validate`-only: the first runnable fence anywhere in
 /// `markdown` with an attribute not in `FENCE_ATTRS` — checked over every
@@ -393,6 +403,7 @@ fn build_code_block(
     let tty = attrs.get("tty").map(|v| v != "false").unwrap_or(false);
     let deps = parse_deps(&attrs);
     let env = parse_env(&attrs);
+    let interpreter = attrs.get("interpreter").cloned();
     CodeBlock {
         lang,
         name: Some(name),
@@ -401,6 +412,7 @@ fn build_code_block(
         tty,
         deps,
         env,
+        interpreter,
         attrs,
         code: f.code,
         span: f.span,
@@ -542,6 +554,30 @@ mod tests {
         let blocks = scan_code_blocks(md);
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].code, "  echo hi");
+    }
+
+    #[test]
+    fn interpreter_defaults_to_none() {
+        let md = "```bash name=\"x\"\necho hi\n```\n";
+        assert_eq!(scan_code_blocks(md)[0].interpreter, None);
+    }
+
+    #[test]
+    fn interpreter_attr_makes_a_non_bash_lang_runnable() {
+        // `python` isn't `is_supported_lang`, but an explicit `interpreter=`
+        // makes the fence a runnable candidate anyway.
+        let md = "```python name=\"seed\" interpreter=\"python3 -u\"\nprint('hi')\n```\n";
+        let blocks = scan_code_blocks(md);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].interpreter.as_deref(), Some("python3 -u"));
+    }
+
+    #[test]
+    fn scan_runnable_blocks_names_a_lone_unnamed_interpreter_fence_after_the_node() {
+        let md = "```python interpreter=\"python3\"\nprint('hi')\n```\n";
+        let blocks = scan_runnable_blocks("my-node", md);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].name.as_deref(), Some("my-node"));
     }
 
     #[test]
