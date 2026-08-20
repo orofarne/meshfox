@@ -30,6 +30,20 @@ pub struct CodeBlock {
     /// code (and whatever it last printed) on screen until a deliberate
     /// keypress. See SPEC.md's "Interactive (`tty`) blocks".
     pub autoclose: bool,
+    /// Explicit `always` flag (`always` or `always="true"`) — opts this
+    /// block out of the webui/TUI session-freshness skip entirely (see
+    /// `AppState::session_runs`/`App::session_runs`): even when it's
+    /// unchanged and already ran successfully earlier in the same
+    /// long-lived session, a "⛓ run chain" that pulls it in as a
+    /// dependency still runs it for real every time, same as the block
+    /// actually requested always does. For a step whose side effect isn't
+    /// captured by "looks unchanged" — a migration that always drops and
+    /// recreates a table, say, where re-running is the whole point even
+    /// though the migration script itself never changes. Meaningless (but
+    /// harmless) on a block nothing ever reaches as a *pulled-in*
+    /// dependency — the block actually requested already always runs for
+    /// real regardless. See SPEC.md's "Runnable code fences".
+    pub always: bool,
     /// Other blocks this one depends on (`deps="a,b"`) — run before this
     /// one, automatically, whenever this block runs. See `crate::deps`.
     pub deps: Vec<BlockRef>,
@@ -386,6 +400,7 @@ const FENCE_ATTRS: &[&str] = &[
     "cache",
     "tty",
     "autoclose",
+    "always",
     "default",
     "interpreter",
 ];
@@ -418,6 +433,7 @@ fn build_code_block(
     let default = attrs.get("default").map(|v| v != "false").unwrap_or(false);
     let tty = attrs.get("tty").map(|v| v != "false").unwrap_or(false);
     let autoclose = attrs.get("autoclose").map(|v| v != "false").unwrap_or(false);
+    let always = attrs.get("always").map(|v| v != "false").unwrap_or(false);
     let deps = parse_deps(&attrs);
     let env = parse_env(&attrs);
     let interpreter = attrs.get("interpreter").cloned();
@@ -428,6 +444,7 @@ fn build_code_block(
         default,
         tty,
         autoclose,
+        always,
         deps,
         env,
         interpreter,
@@ -887,6 +904,21 @@ mod tests {
         let blocks = scan_code_blocks(md);
         assert!(blocks[0].autoclose);
         assert!(!blocks[1].autoclose);
+    }
+
+    #[test]
+    fn always_flag_defaults_to_false() {
+        let md = "```bash name=\"x\"\necho hi\n```\n";
+        assert!(!scan_code_blocks(md)[0].always);
+    }
+
+    #[test]
+    fn always_flag_parses_bare_and_explicit_false() {
+        let md =
+            "```bash name=\"x\" always\necho hi\n```\n\n```bash name=\"y\" always=false\necho hi\n```\n";
+        let blocks = scan_code_blocks(md);
+        assert!(blocks[0].always);
+        assert!(!blocks[1].always);
     }
 
     #[test]

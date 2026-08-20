@@ -341,7 +341,21 @@ immediately, no explicit cache-busting needed. A skipped step still folds
 forward whatever it last wrote via `from=` (see "Computed variables"
 below), so a later step in the same chain that depends on that value isn't
 affected by the skip. Restarting the process starts fresh — this is
-session-scoped, never written to disk.
+session-scoped, never written to disk. Applies the same way whether the
+chain ends in a `tty` step or not — the web UI's `/api/run/tty` WebSocket
+consults the same per-session record `/api/run` does, not a separate one.
+
+`always` — optional flag (`always` or `always="true"`), opts a block out of
+this skip entirely: even unchanged and already run successfully this
+session, a `⛓ run chain` that pulls it in as a dependency still runs it for
+real every time. For a step whose side effect isn't captured by "looks
+unchanged" — a migration that always drops and recreates a table before
+loading fresh data, say, where re-running is the whole point even though
+the migration script itself never changes between runs:
+
+    ```python name="migrate" env="PGHOST,PGPORT,PGDATABASE,PGUSER,PGPASSWORD" always
+    ...
+    ```
 
 ## Constraint fences
 
@@ -1069,7 +1083,7 @@ leading token instead of a `key=value` pair (`crates/core/src/fence.rs`):
     lang            ::= bare-value
 
     runnable-attr   ::= 'name' | 'cache' | 'default' | 'deps' | 'env' | 'tty'
-                     | 'autoclose' | 'interpreter'
+                     | 'autoclose' | 'always' | 'interpreter'
     constraint-attr ::= 'constraint' | 'name'
 
 A runnable fence additionally requires `lang` to be `bash` or `sh`, *or* its

@@ -427,6 +427,7 @@ mod tests {
             default: false,
             tty: false,
             autoclose: false,
+            always: false,
             deps: Vec::new(),
             env: Vec::new(),
             interpreter: None,

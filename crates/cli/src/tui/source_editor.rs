@@ -25,7 +25,7 @@ use ratatui::style::{Color, Modifier, Style};
 /// — value-taking (`name="..."`) vs. bare presence flags (`cache`, no
 /// `=value` at all) need different insertion shapes, see `AttrCandidate`.
 const FENCE_VALUE_ATTRS: &[&str] = &["name", "deps", "env", "interpreter"];
-const FENCE_FLAG_ATTRS: &[&str] = &["cache", "tty", "autoclose", "default"];
+const FENCE_FLAG_ATTRS: &[&str] = &["cache", "tty", "autoclose", "always", "default"];
 
 /// What the caller (`App::on_key`) should do after handing a keypress to
 /// the editor.

@@ -2433,10 +2433,14 @@ async fn run_block(
             // entry — see `resolve_run_chain`'s doc comment) always runs
             // for real; only a pulled-in dependency is ever eligible to be
             // skipped as "already fresh this session" — see
-            // `AppState::session_runs`.
+            // `AppState::session_runs`. A block's own `always` flag opts it
+            // out of the skip entirely, even as a pulled-in dependency —
+            // for a step whose side effect isn't captured by "looks
+            // unchanged" (a migration that always drops and recreates a
+            // table, say).
             let is_requested_target = Some(addr) == chain.last();
             let live_fingerprint = meshfox_core::fingerprint(&block);
-            if !is_requested_target {
+            if !is_requested_target && !block.always {
                 let already_fresh = state
                     .session_runs
                     .lock()
@@ -2919,6 +2923,38 @@ async fn run_tty_chain(
             break;
         };
 
+        // Same session-freshness skip `run_block` already has (see its own
+        // doc comment) — previously missing here entirely, so a `⛓ run
+        // chain` through this WebSocket path always re-ran every pulled-in
+        // dependency regardless of whether it had already run successfully
+        // this session, unlike the plain (non-`tty`) `/api/run` path.
+        let is_requested_target = Some(addr) == chain.last();
+        let live_fingerprint = meshfox_core::fingerprint(&block);
+        if !is_requested_target && !block.always {
+            let already_fresh = state
+                .session_runs
+                .lock()
+                .unwrap()
+                .get(&(addr.node_id.clone(), addr.block_name.clone()))
+                .filter(|run| run.fingerprint == live_fingerprint)
+                .cloned();
+            if let Some(session_run) = already_fresh {
+                resolved_vars.extend(session_run.produced_vars);
+                if !send_event(
+                    &mut socket,
+                    &RunEvent::StepSkipped {
+                        node_id: addr.node_id.clone(),
+                        block: addr.block_name.clone(),
+                    },
+                )
+                .await
+                {
+                    return;
+                }
+                continue;
+            }
+        }
+
         let mut block_env = meshfox_core::map_block_env(&block.env, &resolved_vars);
         // If some declared variable is `from=`-sourced from *this* block
         // (tty or not), give it a fresh output file to write `NAME=value`
@@ -3118,6 +3154,17 @@ async fn run_tty_chain(
                     file_raws.insert(located.origin.clone(), patched);
                 }
             }
+        }
+
+        if exit_code == 0 && !from_value_error {
+            let produced_vars = from_decls
+                .iter()
+                .filter_map(|decl| resolved_vars.get(&decl.name).map(|v| (decl.name.clone(), v.clone())))
+                .collect();
+            state.session_runs.lock().unwrap().insert(
+                (addr.node_id.clone(), addr.block_name.clone()),
+                SessionRun { fingerprint: live_fingerprint, produced_vars },
+            );
         }
 
         if exit_code != 0 || from_value_error {
@@ -4702,6 +4749,65 @@ mod ws_tests {
     }
 
     #[tokio::test]
+    async fn tty_websocket_skips_an_unchanged_dependency_already_run_this_session() {
+        // A non-`tty` `dep` pulled in as a dependency of a `tty` target —
+        // regression coverage for the gap the plain (non-`tty`) `/api/run`
+        // path already had `session_runs` skip-checking for, but this
+        // WebSocket path didn't: previously a `tty` chain always re-ran
+        // every dependency regardless of whether it had already succeeded
+        // this session.
+        let canvas_path = write_test_canvas(concat!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```bash name=\"dep\" cache\necho dep-ran\n```\n\n",
+            "```bash name=\"target\" tty deps=\"dep\"\necho ready; read line\n```\n",
+        ));
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let url = format!("ws://{addr}/api/run/tty?path=&block=target&cols=80&rows=24");
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.expect("connect");
+        next_event(&mut ws).await; // started
+        let step_start = next_event(&mut ws).await;
+        assert_eq!(step_start["type"], "step-start");
+        assert_eq!(step_start["block"], "dep");
+        let output = next_event(&mut ws).await;
+        assert_eq!(output["type"], "output");
+        assert_eq!(output["text"], "dep-ran");
+        let step_end = next_event(&mut ws).await;
+        assert_eq!(step_end["type"], "step-end");
+        assert_eq!(step_end["block"], "dep");
+        next_event(&mut ws).await; // step-start for target
+        next_event(&mut ws).await; // tty-start
+        read_until(&mut ws, "ready").await;
+        ws.send(WsMessage::Binary(b"\n".to_vec().into())).await.expect("send input");
+        next_event(&mut ws).await; // step-end for target
+        drop(ws);
+
+        let (mut ws2, _) = tokio_tungstenite::connect_async(&url).await.expect("connect");
+        next_event(&mut ws2).await; // started
+        // `step-start` is sent unconditionally for every chain step, even
+        // one about to be skipped a moment later (same "brief flash" the
+        // plain `/api/run` path already has — see `RunEvent::StepSkipped`'s
+        // own doc comment) — the real signal is the `step-skipped` right
+        // after it, not the absence of `step-start`.
+        let dep_step_start = next_event(&mut ws2).await;
+        assert_eq!(dep_step_start["type"], "step-start");
+        assert_eq!(dep_step_start["block"], "dep");
+        let second_step = next_event(&mut ws2).await;
+        assert_eq!(
+            second_step["type"], "step-skipped",
+            "dep should be skipped the second time: {second_step:?}"
+        );
+        assert_eq!(second_step["block"], "dep");
+        next_event(&mut ws2).await; // step-start for target
+        next_event(&mut ws2).await; // tty-start
+        read_until(&mut ws2, "ready").await;
+        ws2.send(WsMessage::Binary(b"\n".to_vec().into())).await.expect("send input");
+        next_event(&mut ws2).await; // step-end for target
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
     async fn tty_websocket_runs_a_tty_blocks_own_interpreter_not_bash() {
         // Skipped, not failed, where python3 isn't installed — same
         // graceful-skip convention `meshfox_core::exec`'s own
@@ -5363,6 +5469,40 @@ mod session_skip_tests {
         assert!(!skipped_for(&second, "dep"));
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_always_flagged_dependency_never_gets_skipped() {
+        // Same shape as `write_dep_chain_canvas`, but `dep` carries `always`
+        // — a migration-style step whose side effect (here: writing a
+        // marker file) needs to happen on every chain run regardless of
+        // whether its own code looks unchanged.
+        let dir = std::env::temp_dir().join(format!("meshfox-session-skip-always-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.md");
+        std::fs::write(
+            &path,
+            concat!(
+                "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+                "```bash name=\"dep\" cache always\necho dep-ran\n```\n\n",
+                "```bash name=\"target\" deps=\"dep\"\necho target-ran\n```\n",
+            ),
+        )
+        .unwrap();
+        let addr = spawn_test_server(path.clone()).await;
+
+        let first = run_target(addr).await;
+        assert!(really_ran(&first, "dep"));
+
+        let second = run_target(addr).await;
+        assert!(
+            really_ran(&second, "dep"),
+            "an `always` dependency must rerun even though it's unchanged and already \
+             succeeded this session: {second:?}"
+        );
+        assert!(!skipped_for(&second, "dep"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

@@ -1384,10 +1384,11 @@ impl App {
             // The block actually requested (always the chain's own last
             // entry) always runs for real; only a pulled-in dependency is
             // ever eligible to be skipped as "already fresh this session"
-            // — see `App::session_runs`.
+            // — see `App::session_runs`. A block's own `always` flag opts
+            // it out of the skip entirely, even as a pulled-in dependency.
             let is_requested_target = idx + 1 == len;
             let live_fingerprint = meshfox_core::fingerprint(&block);
-            if !is_requested_target {
+            if !is_requested_target && !block.always {
                 let key = (addr.node_id.clone(), addr.block_name.clone());
                 if let Some(session_run) =
                     self.session_runs.get(&key).filter(|r| r.fingerprint == live_fingerprint)
