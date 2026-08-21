@@ -31,11 +31,14 @@ This document is itself a valid meshfox canvas — every `##` section here is a 
 - A project is one **canvas**: a tree of nodes starting from a single **root** node.
 - From the root, large **section** nodes branch off (e.g. one section per feature).
 - From sections, further **block** nodes branch off. Blocks hold Markdown.
+- A canvas is stored as a single, plain `.md` file — node metadata (ids, positions, edges) lives in HTML comments, so the file still renders sensibly in GitHub or any plain Markdown viewer, and diffs cleanly in git.
 - Markdown inside a block can contain fenced code. A fence can be marked *runnable*; running it executes the code and (optionally) writes the result back into the same node, right under the code, so nobody has to re-run it just to see what happened last time.
+- A runnable fence can declare `deps=` on other blocks — running it runs its whole dependency chain first, `make`-style, with nothing run twice. Blocks can also share document-scoped config values (declared once as `meshfox:var`), each block opting in individually via its own `env=` attribute — so running one block never prompts for a variable only some *other* block needs.
 - Three ways to interact with the same files:
   - a browser UI (canvas view + block runner) backed by a small Rust server — opens read-only, so pulling up a canvas to look around never one-click-modifies it: running a block is always allowed (you're still explicitly clicking "run", and it's the whole point of a canvas), but a `cache`d block's output isn't written back to the file until an explicit "Edit" button is clicked, which also unlocks dragging, resizing, and saving layout. Output streams into the browser live as the block runs (not just once it's finished), and a running block gets a Kill button, for when one hangs.
   - a CLI that runs blocks non-interactively, `make`-style, for use in scripts/CI — `meshfox list` prints every runnable block as a tree, so there's no need to go spelunking through the file to find out what's runnable. `meshfox run` streams output live too (the same async, killable executor as the browser UI); Ctrl+C kills whichever step is currently running, whole process group and all, and stops there — whatever earlier steps in the chain already completed stays cached.
   - a terminal UI (`meshfox tui`, experimental) — the browser's tree-and-block-runner experience without leaving the terminal: browse the node tree, read a node's rendered body (syntax-highlighted code, images), and run blocks with the same live streaming/kill/cache behavior as the other two. See "Terminal viewer" under Usage below.
+- Beyond editing and running: a built-in Starlark constraint system (`meshfox check`) lets a canvas validate its own consistency, and a canvas can be exported to a static HTML site or a PDF (both experimental — see Usage below).
 
 ## File format
 <!-- meshfox:node id="file-format" type="include" -->
