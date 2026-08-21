@@ -17,7 +17,9 @@ curl -fsSL https://raw.githubusercontent.com/orofarne/meshfox/main/scripts/insta
 
 <!-- meshfox:var name="INSTALL_PATH" prompt="Install prefix?" default="/usr/local/bin" -->
 
-An interactive canvas: a hierarchical, node-based document where nodes hold Markdown, and code blocks inside that Markdown can be run — with their output optionally cached right next to the code.
+An interactive canvas: a hierarchical, node-based document where nodes hold Markdown, and code blocks inside that Markdown can be run.
+
+Meshfox pulls together several documentation patterns that are usually spread across separate tools into one file format: the mindmap-style canvas of Miro and Obsidian, Livebook’s lightweight markdown-compatible storage, code-in-document execution from Jupyter Notebook and Livebook, and Make’s dependency graph for running scripts. A built-in Starlark constraint system (meshfox check) lets a canvas enforce its own consistency rules, and a canvas can be exported to a static HTML site or a PDF (both experimental — see Usage below).
 
 Status: **early bootstrap**.
 
