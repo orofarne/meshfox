@@ -765,9 +765,7 @@ impl From<RunError> for ApiError {
     fn from(err: RunError) -> Self {
         let status = match &err {
             RunError::Tree(_) | RunError::BlockNotFound(_, _) => StatusCode::NOT_FOUND,
-            RunError::NoExecutor(_) | RunError::Deps(_) | RunError::InvalidInterpreter(_, _) => {
-                StatusCode::UNPROCESSABLE_ENTITY
-            }
+            RunError::Deps(_) => StatusCode::UNPROCESSABLE_ENTITY,
             RunError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         ApiError(status, err.to_string())
@@ -4853,8 +4851,8 @@ mod ws_tests {
     #[tokio::test]
     async fn tty_websocket_runs_a_tty_blocks_own_interpreter_not_bash() {
         // Skipped, not failed, where python3 isn't installed — same
-        // graceful-skip convention `meshfox_core::exec`'s own
-        // `InterpreterExecutor` test uses.
+        // graceful-skip convention `stream_exec`'s own interpreter tests
+        // use.
         if std::process::Command::new("python3")
             .arg("--version")
             .output()

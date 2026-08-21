@@ -32,16 +32,19 @@ pub use canvas::{ArrowEnd, Canvas, EdgeLineStyle, ExtraEdge, FileDisplay, Node, 
 pub use constraint::{evaluate as evaluate_constraints, ConstraintResult, ConstraintStatus};
 pub use deps::{BlockAddr, DepsError};
 pub use exec::{
-    executor_for, interpreter_var_refs, is_supported_lang, resolve_command, resolve_interpreter,
-    split_interpreter, Executor, ResolvedCommand,
+    interpreter_var_refs, is_supported_lang, resolve_command, resolve_interpreter,
+    split_interpreter, ResolvedCommand,
 };
-pub use fence::{fingerprint, scan_code_blocks, scan_runnable_blocks, BlockRef, CodeBlock, EnvRef};
+pub use fence::{
+    fingerprint, parse_deps_list, parse_env_list, scan_code_blocks, scan_runnable_blocks,
+    BlockRef, CodeBlock, EnvRef,
+};
 pub use file_read::{
     confine, preview, ConfineError, FilePreview, PreviewError, FILE_PREVIEW_MAX_BYTES,
 };
 pub use include::IncludeError;
 pub use locate::{locate_node, LocateError, LocatedNode};
-pub use mdcanvas::{parse_fold_override, NodeMeta, ParseError};
+pub use mdcanvas::{parse_fold_override, parse_tags, FenceAttrsPatch, NodeMeta, ParseError};
 pub use options::{declared_options, OptionsError};
 pub use output::{cached_output_hash, format_duration_ms, write_output, ExecOutput};
 pub use staticgen::{Asset, EdgeView, NodeView, Position, SiteData};
@@ -97,104 +100,10 @@ pub enum RunError {
     Tree(#[from] TreeError),
     #[error("no runnable code block named {0:?} in node {1:?}")]
     BlockNotFound(String, String),
-    #[error("no executor registered for language {0:?}")]
-    NoExecutor(String),
-    #[error("block {0:?}'s interpreter={1:?} isn't a valid shell-word command")]
-    InvalidInterpreter(String, String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Deps(#[from] DepsError),
-}
-
-/// Result of running one code block.
-pub struct RunOutcome {
-    pub result: ExecOutput,
-    /// If the block opted into `cache`, the node's new full body text with
-    /// the output region inserted/updated — patch this into the source
-    /// file with `mdcanvas::set_node_body` (don't re-serialize the whole
-    /// document, which would reformat unrelated content).
-    pub updated_node_text: Option<(String, String)>,
-}
-
-/// Resolve `path` (node ids from the root's children down) to a node, and
-/// run the code block named `block_name` inside it. Does not mutate
-/// `canvas` or touch disk — the caller applies `updated_node_text` to the
-/// actual source file, see `RunOutcome`. Only runs `block_name` itself —
-/// use `resolve_run_chain` first if its `deps=` should run too.
-///
-/// `block_name` can be omitted from the *last* path segment instead: if
-/// `path` names a node whose only runnable block shares that node's own
-/// id (implicitly, or via an explicit `name=` that just happens to match),
-/// passing that same trailing segment as `block_name` here resolves it —
-/// see `resolve_target` and SPEC.md's "Runnable code fences".
-///
-/// `canvas_dir` is the *primary* canvas file's own directory — the block
-/// actually runs in `node.cwd(canvas_dir)` (see `Node::cwd`), which is
-/// `canvas_dir` itself unless the node was spliced in from an `include`
-/// target elsewhere on disk, in which case it's that target's own
-/// directory instead.
-pub fn run_block(
-    canvas: &Canvas,
-    path: &[&str],
-    block_name: &str,
-    canvas_dir: &std::path::Path,
-) -> Result<RunOutcome, RunError> {
-    let target = resolve_target(canvas, path, block_name)?;
-    run_block_by_id(canvas, &target.node_id, &target.block_name, canvas_dir)
-}
-
-/// Same as `run_block`, but addresses the node directly by `id` instead of
-/// walking a root-relative path — what `resolve_run_chain`'s output is
-/// meant to be fed into, since a dependency chain is a list of `BlockAddr`
-/// (node id + block name), not root-relative paths.
-pub fn run_block_by_id(
-    canvas: &Canvas,
-    node_id: &str,
-    block_name: &str,
-    canvas_dir: &std::path::Path,
-) -> Result<RunOutcome, RunError> {
-    let node = canvas
-        .node(node_id)
-        .ok_or_else(|| TreeError::NodeNotFound(node_id.to_string()))?;
-    run_block_in(node, block_name, canvas_dir)
-}
-
-fn run_block_in(
-    node: &Node,
-    block_name: &str,
-    canvas_dir: &std::path::Path,
-) -> Result<RunOutcome, RunError> {
-    let node_id = node.id.clone();
-    let text = node.text.clone();
-    let cwd = node.cwd(canvas_dir);
-
-    let blocks = scan_runnable_blocks(&node_id, &text);
-    let block = blocks
-        .iter()
-        .find(|b| b.name.as_deref() == Some(block_name))
-        .ok_or_else(|| RunError::BlockNotFound(block_name.to_string(), node_id.clone()))?;
-
-    let executor: Box<dyn Executor> = if let Some(interpreter) = &block.interpreter {
-        let (program, args) = exec::split_interpreter(interpreter).ok_or_else(|| {
-            RunError::InvalidInterpreter(block_name.to_string(), interpreter.clone())
-        })?;
-        Box::new(exec::InterpreterExecutor { program, args })
-    } else {
-        executor_for(&block.lang).ok_or_else(|| RunError::NoExecutor(block.lang.clone()))?
-    };
-    let result = executor.run(&block.code, Some(&cwd))?;
-
-    let updated_node_text = if block.cache {
-        write_output(&text, block_name, &result).map(|updated| (node_id, updated))
-    } else {
-        None
-    };
-
-    Ok(RunOutcome {
-        result,
-        updated_node_text,
-    })
 }
 
 /// Resolve `path` + `block_name` to a `BlockAddr`, then, if `with_deps` is
@@ -208,10 +117,10 @@ fn run_block_in(
 /// dependency, which might already have fresh cached output, a
 /// `from=`-declared variable has no value at all until its source block
 /// runs, so skipping that edge is never something `--no-deps` can mean.
-/// Feed the result to `run_block_by_id`, one at a time, re-parsing the
-/// canvas between steps if any step's cached output is applied back to the
-/// source first (mirrors how the CLI already runs a list of
-/// independently-requested blocks).
+/// Feed the result to a real spawner (`meshfox_server::stream_exec`), one
+/// step at a time, re-parsing the canvas between steps if any step's cached
+/// output is applied back to the source first (mirrors how the CLI already
+/// runs a list of independently-requested blocks).
 pub fn resolve_run_chain(
     canvas: &Canvas,
     path: &[&str],
@@ -327,70 +236,12 @@ fn default_block_name(canvas: &Canvas, node_id: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     const DOC: &str =
         "# Project\n\n## Tests\n<!-- meshfox:node -->\n\n```bash name=\"smoke\" cache\necho ok\n```\n";
 
     #[test]
-    fn run_block_executes_and_reports_cached_update() {
-        let canvas = Canvas::from_markdown(DOC).unwrap();
-        let outcome = run_block(&canvas, &["tests"], "smoke", Path::new(".")).unwrap();
-        assert_eq!(outcome.result.exit_code, 0);
-        assert_eq!(outcome.result.output.trim(), "ok");
-
-        let (node_id, updated_text) = outcome.updated_node_text.expect("cache was requested");
-        assert_eq!(node_id, "tests");
-        assert!(updated_text.contains("meshfox:output name=\"smoke\""));
-    }
-
-    #[test]
-    fn run_block_runs_in_the_given_canvas_dir() {
-        let doc = "# Project\n\n## Tests\n<!-- meshfox:node -->\n\n```bash name=\"where\"\npwd -P\n```\n";
-        let canvas = Canvas::from_markdown(doc).unwrap();
-        let dir = std::env::temp_dir();
-        let outcome = run_block(&canvas, &["tests"], "where", &dir).unwrap();
-        assert_eq!(
-            Path::new(outcome.result.output.trim()),
-            dir.canonicalize().unwrap()
-        );
-    }
-
-    #[test]
-    fn run_block_prefers_a_nodes_own_asset_base_over_the_canvas_dir() {
-        let doc = "# Project\n\n## Tests\n<!-- meshfox:node -->\n\n```bash name=\"where\"\npwd -P\n```\n";
-        let mut canvas = Canvas::from_markdown(doc).unwrap();
-        let included_dir = std::env::temp_dir().canonicalize().unwrap();
-        canvas.node_mut("tests").unwrap().asset_base =
-            Some(included_dir.to_string_lossy().into_owned());
-        let outcome = run_block(&canvas, &["tests"], "where", Path::new("/nonexistent")).unwrap();
-        assert_eq!(Path::new(outcome.result.output.trim()), included_dir);
-    }
-
-    #[test]
-    fn run_block_without_cache_reports_no_update() {
-        let doc =
-            "# Project\n\n## Tests\n<!-- meshfox:node -->\n\n```bash name=\"smoke\"\necho ok\n```\n";
-        let canvas = Canvas::from_markdown(doc).unwrap();
-        let outcome = run_block(&canvas, &["tests"], "smoke", Path::new(".")).unwrap();
-        assert!(outcome.updated_node_text.is_none());
-    }
-
-    #[test]
-    fn run_block_by_id_matches_run_block_by_path() {
-        let canvas = Canvas::from_markdown(DOC).unwrap();
-        let by_path = run_block(&canvas, &["tests"], "smoke", Path::new(".")).unwrap();
-        let by_id = run_block_by_id(&canvas, "tests", "smoke", Path::new(".")).unwrap();
-        // Not a full `ExecOutput` equality check — these are two genuinely
-        // separate subprocess runs, so `duration_ms` naturally differs
-        // between them even though everything that actually matters here
-        // (which block ran, what it printed, its exit code) is identical.
-        assert_eq!(by_path.result.exit_code, by_id.result.exit_code);
-        assert_eq!(by_path.result.output, by_id.result.output);
-    }
-
-    #[test]
-    fn run_block_omits_the_trailing_name_when_it_would_just_repeat_the_node() {
+    fn resolve_target_omits_the_trailing_name_when_it_would_just_repeat_the_node() {
         let doc = concat!(
             "# Project\n\n",
             "## Tests\n<!-- meshfox:node id=\"tests\" -->\n\n",
@@ -401,12 +252,13 @@ mod tests {
         // "smoke"'s sole fence has no name= — implicitly named "smoke".
         // `meshfox run tests smoke` (no separate trailing block name)
         // should still resolve it via the path alone.
-        let outcome = run_block(&canvas, &["tests"], "smoke", Path::new(".")).unwrap();
-        assert_eq!(outcome.result.output.trim(), "hi");
+        let addr = resolve_target(&canvas, &["tests"], "smoke").unwrap();
+        assert_eq!(addr.node_id, "smoke");
+        assert_eq!(addr.block_name, "smoke");
     }
 
     #[test]
-    fn run_block_omits_the_trailing_name_for_an_explicit_default_flag() {
+    fn resolve_target_omits_the_trailing_name_for_an_explicit_default_flag() {
         let doc = concat!(
             "# Project\n\n",
             "## Tests\n<!-- meshfox:node id=\"tests\" -->\n\n",
@@ -418,12 +270,13 @@ mod tests {
         // "e2e"'s runnable block is named "run", not "e2e" — only the
         // explicit `default` flag makes `meshfox run tests e2e` resolve to
         // it without a trailing block-name argument.
-        let outcome = run_block(&canvas, &["tests"], "e2e", Path::new(".")).unwrap();
-        assert_eq!(outcome.result.output.trim(), "ran");
+        let addr = resolve_target(&canvas, &["tests"], "e2e").unwrap();
+        assert_eq!(addr.node_id, "e2e");
+        assert_eq!(addr.block_name, "run");
     }
 
     #[test]
-    fn run_block_fallback_does_not_kick_in_when_the_node_has_no_default() {
+    fn resolve_target_fallback_does_not_kick_in_when_the_node_has_no_default() {
         let doc = concat!(
             "# Project\n\n",
             "## Tests\n<!-- meshfox:node id=\"tests\" -->\n\n",
@@ -434,19 +287,14 @@ mod tests {
         let canvas = Canvas::from_markdown(doc).unwrap();
         // Neither block is default (no flag, no name matching "e2e") — the
         // trailing block name is still required.
-        assert!(run_block(&canvas, &["tests"], "e2e", Path::new(".")).is_err());
-        assert_eq!(
-            run_block(&canvas, &["tests", "e2e"], "run", Path::new("."))
-                .unwrap()
-                .result
-                .output
-                .trim(),
-            "ran"
-        );
+        assert!(resolve_target(&canvas, &["tests"], "e2e").is_err());
+        let addr = resolve_target(&canvas, &["tests", "e2e"], "run").unwrap();
+        assert_eq!(addr.node_id, "e2e");
+        assert_eq!(addr.block_name, "run");
     }
 
     #[test]
-    fn run_block_fallback_does_not_kick_in_for_an_unrelated_name() {
+    fn resolve_target_fallback_does_not_kick_in_for_an_unrelated_name() {
         let doc = concat!(
             "# Project\n\n",
             "## Tests\n<!-- meshfox:node id=\"tests\" -->\n\n",
@@ -456,16 +304,11 @@ mod tests {
         let canvas = Canvas::from_markdown(doc).unwrap();
         // The sole block is explicitly named "check", not "smoke" — this
         // isn't the "name matches its own node" case, so no shortcut.
-        assert!(run_block(&canvas, &["tests"], "smoke", Path::new(".")).is_err());
+        assert!(resolve_target(&canvas, &["tests"], "smoke").is_err());
         // The real address still works, same as always.
-        assert_eq!(
-            run_block(&canvas, &["tests", "smoke"], "check", Path::new("."))
-                .unwrap()
-                .result
-                .output
-                .trim(),
-            "hi"
-        );
+        let addr = resolve_target(&canvas, &["tests", "smoke"], "check").unwrap();
+        assert_eq!(addr.node_id, "smoke");
+        assert_eq!(addr.block_name, "check");
     }
 
     #[test]

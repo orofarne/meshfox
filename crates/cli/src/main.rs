@@ -13,7 +13,8 @@
 
 use clap::{Args, Parser, Subcommand};
 use meshfox_core::{
-    mdcanvas, Canvas, ExtraEdge, FileDisplay, Node, NodeMeta, NodeType, VarCache, VarDecl,
+    mdcanvas, Canvas, ExtraEdge, FenceAttrsPatch, FileDisplay, Node, NodeMeta, NodeType, TreeError,
+    VarCache, VarDecl,
 };
 use std::collections::HashMap;
 use std::io::IsTerminal;
@@ -325,7 +326,7 @@ enum Command {
     /// writing it back, same as every other mutating command here.
     Node {
         #[command(subcommand)]
-        command: NodeCommand,
+        command: Box<NodeCommand>,
     },
     /// Print the full .canvas.md format specification (SPEC.md, embedded in
     /// this binary at compile time) — the canonical reference for the
@@ -351,15 +352,87 @@ enum Command {
     Completions { shell: clap_complete::Shell },
 }
 
+/// Position/size/style fields settable via `node meta`, and (since they're
+/// exactly the same fields, just applied at creation time instead of as a
+/// separate follow-up call) via `node add` too — flattened into both
+/// variants below rather than repeated, so the two can never quietly drift
+/// apart. `node meta`'s own `--clear-position` isn't here: it's meaningless
+/// on a node that doesn't have a position yet.
+#[derive(Args, Default)]
+struct NodeMetaFields {
+    #[arg(long, allow_negative_numbers = true)]
+    x: Option<f64>,
+    #[arg(long, allow_negative_numbers = true)]
+    y: Option<f64>,
+    #[arg(long = "w")]
+    width: Option<f64>,
+    #[arg(long = "h")]
+    height: Option<f64>,
+    #[arg(long)]
+    color: Option<String>,
+    /// `text` (the default), `file`, `link`, `group`, or `include`.
+    #[arg(long = "type")]
+    node_type: Option<String>,
+    /// `file`-node display mode: `link` (the default) or `code`.
+    #[arg(long)]
+    display: Option<String>,
+    /// `file`-node syntax-highlighting language hint.
+    #[arg(long)]
+    lang: Option<String>,
+    /// `file`-node interpreter (e.g. `python`) — makes the node runnable
+    /// as `interpreter target`.
+    #[arg(long)]
+    interpreter: Option<String>,
+    /// `link`-node social preview toggle: `true` shows an OpenGraph
+    /// preview card below the link, `false` (the default) doesn't.
+    #[arg(long)]
+    preview: Option<bool>,
+    /// Per-node fold-state override (see SPEC.md's "Options" section):
+    /// `true`/`false` sets an explicit override, `default` clears it back
+    /// to following the document's own default. Omit this flag entirely
+    /// to leave whatever's already there untouched (or, on `node add`, to
+    /// leave the new node with no override at all).
+    #[arg(long)]
+    fold: Option<String>,
+    /// Comma-separated tags (`meshfox:node`'s own `tags=` spelling — see
+    /// `meshfox_core::parse_tags`), replacing the whole list. Omit this
+    /// flag entirely to leave the current tags untouched (or, on `node
+    /// add`, to leave the new node with none); pass `--tags ""` to clear
+    /// them.
+    #[arg(long)]
+    tags: Option<String>,
+}
+
+impl NodeMetaFields {
+    /// True if any field was actually given — `node add` only bothers
+    /// calling into `apply_node_meta` at all when this is true, so a plain
+    /// `node add <parent> <title>` with none of these flags produces
+    /// exactly the same output it always has.
+    fn is_set(&self) -> bool {
+        self.x.is_some()
+            || self.y.is_some()
+            || self.width.is_some()
+            || self.height.is_some()
+            || self.color.is_some()
+            || self.node_type.is_some()
+            || self.display.is_some()
+            || self.lang.is_some()
+            || self.interpreter.is_some()
+            || self.preview.is_some()
+            || self.fold.is_some()
+            || self.tags.is_some()
+    }
+}
+
 #[derive(Subcommand)]
 enum NodeCommand {
-    /// Add a new, empty-bodied child node under `parent-id`, as the last
-    /// item in its existing subtree (`mdcanvas::insert_child_node`) — same
-    /// as the web UI's "add child" button. No position is set, so it stays
-    /// unpositioned (auto-placed by the web UI's own client-side layout)
-    /// until something gives it a real one — dragging it in the browser, or
-    /// `node meta`. Prints the new node's id: a slug of `title`,
-    /// de-duplicated against every id already in the file.
+    /// Add a new child node under `parent-id`, as the last item in its
+    /// existing subtree (`mdcanvas::insert_child_node`) — same as the web
+    /// UI's "add child" button. Empty-bodied and unpositioned by default,
+    /// same as before `--body-file`/the position/style flags below existed
+    /// — either can still be set later with `node body`/`node meta`
+    /// instead, if not given here. Prints the new node's id: a slug of
+    /// `title`, de-duplicated against every id already in the file.
     Add {
         /// Path to the .canvas.md file. If omitted: auto-discover the
         /// single candidate in the current directory.
@@ -367,6 +440,14 @@ enum NodeCommand {
         canvas: Option<PathBuf>,
         parent_id: String,
         title: String,
+        /// Sets the new node's body in the same call, from this file — or
+        /// from stdin if the value is `-`, same convention `git`/`tar`
+        /// use. Omitted entirely (the default): the node stays
+        /// empty-bodied, same as before this flag existed.
+        #[arg(long)]
+        body_file: Option<PathBuf>,
+        #[command(flatten)]
+        fields: NodeMetaFields,
     },
     /// Delete a node. By default the whole subtree goes with it
     /// (`mdcanvas::delete_node`), and any `meshfox:edge from="..."`
@@ -448,9 +529,88 @@ enum NodeCommand {
         #[arg(long)]
         file: Option<PathBuf>,
     },
+    /// Rewrites just one runnable fence's own info-string attributes (and,
+    /// optionally, its code — `--code-file`/`--code -`) inside a node
+    /// (`mdcanvas::set_fence_attrs`) — every other fence in the node, the
+    /// rest of its body, and the rest of the document are left byte-for-
+    /// byte untouched. Unlike `node body`, never needs the whole node body
+    /// reconstructed just to flip one flag on one block. `block-name` is
+    /// resolved the same way `meshfox run`/`meshfox list` already do
+    /// (explicit `name=`, the sole unnamed fence, or an explicit `default`
+    /// flag) — see SPEC.md's "Runnable code fences". Any field left
+    /// entirely unset keeps its current value; a paired `--no-`/`--clear-`
+    /// flag explicitly removes it instead. `--deps` is validated
+    /// (existing targets, no cycle) against the whole document right away,
+    /// not deferred to a separate `meshfox validate`.
+    Block {
+        /// Path to the .canvas.md file. If omitted: auto-discover the
+        /// single candidate in the current directory.
+        #[arg(long)]
+        canvas: Option<PathBuf>,
+        node_id: String,
+        block_name: String,
+        /// New `name=` for the block — a fence's own runnable identity
+        /// isn't addressable any other way, so this *is* the rename.
+        #[arg(long)]
+        rename: Option<String>,
+        /// The bare language word right after the opening delimiter
+        /// (`bash` in `` ```bash ``).
+        #[arg(long)]
+        lang: Option<String>,
+        #[arg(long)]
+        cache: bool,
+        #[arg(long = "no-cache")]
+        no_cache: bool,
+        #[arg(long)]
+        always: bool,
+        #[arg(long = "no-always")]
+        no_always: bool,
+        #[arg(long)]
+        default: bool,
+        #[arg(long = "no-default")]
+        no_default: bool,
+        #[arg(long)]
+        tty: bool,
+        #[arg(long = "no-tty")]
+        no_tty: bool,
+        #[arg(long)]
+        autoclose: bool,
+        #[arg(long = "no-autoclose")]
+        no_autoclose: bool,
+        /// Comma-separated `deps=` targets (`node-id/block-name`, or a bare
+        /// `block-name` for one in this same node), replacing the whole
+        /// list outright — same spelling as the file's own `deps=`.
+        #[arg(long)]
+        deps: Option<String>,
+        /// Removes `deps=` entirely instead of replacing it. Mutually
+        /// exclusive with `--deps` in the same call.
+        #[arg(long)]
+        clear_deps: bool,
+        /// Comma-separated `env=` entries (`$VAR` or `LOCAL=$VAR`),
+        /// replacing the whole list outright — same spelling as the
+        /// file's own `env=`.
+        #[arg(long)]
+        env: Option<String>,
+        /// Removes `env=` entirely instead of replacing it. Mutually
+        /// exclusive with `--env` in the same call.
+        #[arg(long)]
+        clear_env: bool,
+        /// New `interpreter=` command (e.g. `"python3 -u"`).
+        #[arg(long)]
+        interpreter: Option<String>,
+        /// Removes `interpreter=` entirely instead of setting it. Mutually
+        /// exclusive with `--interpreter` in the same call.
+        #[arg(long)]
+        clear_interpreter: bool,
+        /// Replaces the block's code, from this file — or from stdin if
+        /// the value is `-`, same convention `node add --body-file` uses.
+        /// Omitted entirely (the default): the code stays as it is.
+        #[arg(long)]
+        code_file: Option<PathBuf>,
+    },
     /// Set a node's position/size/style fields (`mdcanvas::set_node_meta`)
     /// — `--x`/`--y`/`--w`/`--h` for a manual position/size override,
-    /// `--color`/`--type`/`--display`/`--lang`/`--interpreter` for
+    /// `--color`/`--type`/`--display`/`--lang`/`--interpreter`/`--tags` for
     /// style/type. Any field left unset keeps its current value. `group`
     /// nodes never store a *size* (its box is always derived from its
     /// children instead), so `--w`/`--h` are rejected for one — but a
@@ -463,14 +623,8 @@ enum NodeCommand {
         #[arg(long)]
         canvas: Option<PathBuf>,
         node_id: String,
-        #[arg(long, allow_negative_numbers = true)]
-        x: Option<f64>,
-        #[arg(long, allow_negative_numbers = true)]
-        y: Option<f64>,
-        #[arg(long = "w")]
-        width: Option<f64>,
-        #[arg(long = "h")]
-        height: Option<f64>,
+        #[command(flatten)]
+        fields: NodeMetaFields,
         /// Drops any authored `x`/`y`/`w`/`h`, reverting the node to
         /// auto-placement (the web UI's own client-side layout picks a
         /// position/size for it again, same as a node that never had one)
@@ -478,31 +632,6 @@ enum NodeCommand {
         /// call.
         #[arg(long)]
         clear_position: bool,
-        #[arg(long)]
-        color: Option<String>,
-        /// `text` (the default), `file`, `link`, `group`, or `include`.
-        #[arg(long = "type")]
-        node_type: Option<String>,
-        /// `file`-node display mode: `link` (the default) or `code`.
-        #[arg(long)]
-        display: Option<String>,
-        /// `file`-node syntax-highlighting language hint.
-        #[arg(long)]
-        lang: Option<String>,
-        /// `file`-node interpreter (e.g. `python`) — makes the node
-        /// runnable as `interpreter target`.
-        #[arg(long)]
-        interpreter: Option<String>,
-        /// `link`-node social preview toggle: `true` shows an OpenGraph
-        /// preview card below the link, `false` (the default) doesn't.
-        #[arg(long)]
-        preview: Option<bool>,
-        /// Per-node fold-state override (see SPEC.md's "Options" section):
-        /// `true`/`false` sets an explicit override, `default` clears it
-        /// back to following the document's own default. Omit this flag
-        /// entirely to leave whatever's already there untouched.
-        #[arg(long)]
-        fold: Option<String>,
     },
     /// Replace a node's whole set of extra incoming edges (`meshfox:edge
     /// from="..."` lines, `mdcanvas::set_node_edges`) — the
@@ -566,6 +695,27 @@ enum NodeCommand {
         #[arg(long)]
         canvas: Option<PathBuf>,
         node_id: String,
+    },
+    /// Finds every node matching a CSS selector — for answering "which
+    /// nodes have tag X" / "children of node Y" without grepping the raw
+    /// file. The tree maps onto CSS almost directly: a node is an element,
+    /// each tag is a class (`.bag`), `id`/`type`/`color` are ordinary
+    /// attributes (`[type="file"]`), and structural nesting is DOM nesting
+    /// — `#todo > .bag` for direct children, `#todo .bag` for descendants
+    /// at any depth. Matching runs against a synthetic HTML document built
+    /// from the canvas tree (never against real rendered content) via
+    /// `scraper` — the same CSS engine a browser uses, not a bespoke
+    /// query language to learn.
+    Find {
+        /// Path to the .canvas.md file. If omitted: auto-discover the
+        /// single candidate in the current directory.
+        #[arg(long)]
+        canvas: Option<PathBuf>,
+        selector: String,
+        /// Print each match's full `node show` report instead of just its
+        /// id.
+        #[arg(long)]
+        show: bool,
     },
 }
 
@@ -755,7 +905,22 @@ fn main() {
             no_deps,
             set,
         } => {
-            let canvas_path = canvas.unwrap_or_else(find_canvas);
+            let canvas_path = canvas.unwrap_or_else(|| {
+                // No `--canvas` given — about to fall back to
+                // auto-discovery. If one of `run`'s own positional args
+                // looks like it was actually meant as the canvas path
+                // (`meshfox run foo.md ...` instead of `meshfox foo.md run
+                // ...`), warn before find_canvas() has its own say — auto-
+                // discovery may still succeed (a single real candidate in
+                // the directory), in which case the mistake surfaces again,
+                // more concretely, once `args` fails to resolve as a
+                // node-id path below.
+                let arg_strs: Vec<&str> = args.iter().map(String::as_str).collect();
+                if let Some(hint) = run_hint_for_misplaced_canvas(&arg_strs) {
+                    eprintln!("meshfox run: warning:{hint}");
+                }
+                find_canvas()
+            });
             run(&canvas_path, args, no_deps, set)
         }
         Command::Configure { canvas } => {
@@ -832,12 +997,20 @@ fn main() {
             let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
             pdf_cmd(&canvas_path, out.as_deref(), force, mode)
         }
-        Command::Node { command } => match command {
+        Command::Node { command } => match *command {
             NodeCommand::Add {
                 canvas,
                 parent_id,
                 title,
-            } => node_add(&canvas.unwrap_or_else(find_canvas), &parent_id, &title),
+                body_file,
+                fields,
+            } => node_add(
+                &canvas.unwrap_or_else(find_canvas),
+                &parent_id,
+                &title,
+                body_file,
+                fields,
+            ),
             NodeCommand::Rm {
                 canvas,
                 node_id,
@@ -867,36 +1040,76 @@ fn main() {
                 node_id,
                 file,
             } => node_body(&canvas.unwrap_or_else(find_canvas), &node_id, file),
+            NodeCommand::Block {
+                canvas,
+                node_id,
+                block_name,
+                rename,
+                lang,
+                cache,
+                no_cache,
+                always,
+                no_always,
+                default,
+                no_default,
+                tty,
+                no_tty,
+                autoclose,
+                no_autoclose,
+                deps,
+                clear_deps,
+                env,
+                clear_env,
+                interpreter,
+                clear_interpreter,
+                code_file,
+            } => node_block(
+                &canvas.unwrap_or_else(find_canvas),
+                &node_id,
+                &block_name,
+                BlockArgs {
+                    rename,
+                    lang,
+                    cache,
+                    no_cache,
+                    always,
+                    no_always,
+                    default,
+                    no_default,
+                    tty,
+                    no_tty,
+                    autoclose,
+                    no_autoclose,
+                    deps,
+                    clear_deps,
+                    env,
+                    clear_env,
+                    interpreter,
+                    clear_interpreter,
+                    code_file,
+                },
+            ),
             NodeCommand::Meta {
                 canvas,
                 node_id,
-                x,
-                y,
-                width,
-                height,
+                fields,
                 clear_position,
-                color,
-                node_type,
-                display,
-                lang,
-                interpreter,
-                preview,
-                fold,
             } => node_meta(
                 &canvas.unwrap_or_else(find_canvas),
                 &node_id,
-                x,
-                y,
-                width,
-                height,
+                fields.x,
+                fields.y,
+                fields.width,
+                fields.height,
                 clear_position,
-                color,
-                node_type,
-                display,
-                lang,
-                interpreter,
-                preview,
-                fold,
+                fields.color,
+                fields.node_type,
+                fields.display,
+                fields.lang,
+                fields.interpreter,
+                fields.preview,
+                fields.fold,
+                fields.tags,
             ),
             NodeCommand::Edges {
                 canvas,
@@ -919,6 +1132,11 @@ fn main() {
             NodeCommand::Show { canvas, node_id } => {
                 node_show(&canvas.unwrap_or_else(find_canvas), &node_id)
             }
+            NodeCommand::Find {
+                canvas,
+                selector,
+                show,
+            } => node_find(&canvas.unwrap_or_else(find_canvas), &selector, show),
         },
         Command::Spec => print!("{}", include_str!("../../../SPEC.md")),
         Command::CheckUpdates { yes } => check_updates(yes),
@@ -1325,6 +1543,7 @@ fn find_canvas() -> PathBuf {
             }
         }
     }
+    candidates.sort();
     match candidates.as_slice() {
         [one] => one.clone(),
         [] => {
@@ -1333,13 +1552,104 @@ fn find_canvas() -> PathBuf {
             );
             std::process::exit(1);
         }
-        _ => {
+        many => {
+            let names: Vec<String> = many
+                .iter()
+                .map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned())
+                .collect();
             eprintln!(
-                "multiple canvas files found in the current directory; pass the path explicitly"
+                "multiple canvas files found: {} — pass one explicitly",
+                names.join(", ")
             );
             std::process::exit(1);
         }
     }
+}
+
+/// True for a positional argument that looks like it was meant as a canvas
+/// path — same ".md" heuristic `splice_leading_canvas` uses to recognize
+/// one *before* the subcommand. `run`'s own positional args are a
+/// free-form node-id-path/block-name list with no such convention of their
+/// own, so a canvas path typed *after* the subcommand (`meshfox run
+/// foo.md ...` instead of `meshfox foo.md run ...`) is silently swallowed
+/// as if it were a node id instead — see `run_hint_for_misplaced_canvas`'s
+/// callers for where this gets flagged back to the user.
+fn looks_like_a_canvas_path(s: &str) -> bool {
+    s.to_ascii_lowercase().ends_with(".md")
+}
+
+/// A one-line hint appended to an error already caused by `run` (or a
+/// `node <op>`, someday) misresolving its own node-id-path args, *iff* one
+/// of those args looks like it was actually meant as the canvas path (see
+/// `looks_like_a_canvas_path`) — `None` when nothing here looks suspicious,
+/// so callers can just unwrap-or-default it onto the end of their own
+/// error message without an extra branch.
+fn run_hint_for_misplaced_canvas(args: &[&str]) -> Option<String> {
+    let culprit = args.iter().find(|a| looks_like_a_canvas_path(a))?;
+    Some(format!(
+        " (note: {culprit:?} looks like a canvas path — for `run`, pass it *before* the \
+         subcommand, e.g. `meshfox {culprit} run ...`, or via `--canvas`, not as one of `run`'s \
+         own node-id-path/block-name arguments)"
+    ))
+}
+
+/// Plain Levenshtein edit distance, `char`-wise — just for
+/// `closest_node_path`'s "did you mean" suggestion below, so pulling in a
+/// crate (`strsim`, already resolved transitively via `clap`, just not a
+/// direct dependency here) isn't worth it for one small use.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
+/// Node-id path from just below the root down to `node_id` — the same
+/// space-joined spelling `run`'s own positional arguments (and `meshfox
+/// list`'s printed example commands) already use.
+fn node_path_string(canvas: &Canvas, node_id: &str) -> String {
+    let mut segments = Vec::new();
+    let mut current = canvas.node(node_id);
+    while let Some(node) = current {
+        let Some(parent_id) = &node.parent else {
+            break; // the root itself is never part of the addressable path
+        };
+        segments.push(node.id.clone());
+        current = canvas.node(parent_id);
+    }
+    segments.reverse();
+    segments.join(" ")
+}
+
+/// "did you mean ...?" suggestion for a node-id path segment `run` (via
+/// `resolve_run_chain`/`Canvas::resolve_path`) couldn't find
+/// (`TreeError::NodeNotFound`). An exact id match *anywhere else* in the
+/// tree wins outright regardless of distance — by far the most common real
+/// mistake is the right node id addressed with the wrong (missing/extra)
+/// ancestor chain, not a typo in the id itself. Falls back to the closest
+/// id by edit distance, only offered when close enough to plausibly be a
+/// typo rather than a coincidence — `None` means nothing found worth
+/// suggesting.
+fn closest_node_path(canvas: &Canvas, missing: &str) -> Option<String> {
+    let addressable = || canvas.nodes.iter().filter(|n| n.parent.is_some());
+    if let Some(exact) = addressable().find(|n| n.id == missing) {
+        return Some(node_path_string(canvas, &exact.id));
+    }
+    let threshold = (missing.chars().count() / 3).max(1);
+    addressable()
+        .map(|n| (levenshtein(missing, &n.id), n))
+        .filter(|(dist, _)| *dist <= threshold)
+        .min_by_key(|(dist, _)| *dist)
+        .map(|(_, n)| node_path_string(canvas, &n.id))
 }
 
 fn run(canvas_path: &PathBuf, args: Vec<String>, no_deps: bool, set: Vec<(String, String)>) {
@@ -1869,7 +2179,19 @@ async fn run_async(
                         }
                     }
                     _ => {
-                        eprintln!("error resolving dependencies for {name:?}: {e}");
+                        let misplaced_canvas_hint =
+                            run_hint_for_misplaced_canvas(&full_path).unwrap_or_default();
+                        let did_you_mean = match &e {
+                            meshfox_core::RunError::Tree(TreeError::NodeNotFound(missing)) => {
+                                closest_node_path(&canvas, missing)
+                                    .map(|p| format!(" (did you mean `{p} {name}`?)"))
+                                    .unwrap_or_default()
+                            }
+                            _ => String::new(),
+                        };
+                        eprintln!(
+                            "error resolving dependencies for {name:?}: {e}{did_you_mean}{misplaced_canvas_hint}"
+                        );
                         had_failure = true;
                     }
                 }
@@ -2363,9 +2685,16 @@ fn write_raw_or_exit(canvas_path: &Path, content: &str) {
     });
 }
 
-fn node_add(canvas_path: &Path, parent_id: &str, title: &str) {
+fn node_add(
+    canvas_path: &Path,
+    parent_id: &str,
+    title: &str,
+    body_file: Option<PathBuf>,
+    fields: NodeMetaFields,
+) {
     let raw = read_raw_or_exit(canvas_path);
-    match apply_node_add(&raw, parent_id, title) {
+    let body = body_file.as_deref().map(read_body_source_or_exit);
+    match apply_node_add_with_extras(&raw, parent_id, title, body.as_deref(), fields) {
         Ok((updated, new_id)) => {
             write_raw_or_exit(canvas_path, &updated);
             println!(
@@ -2380,6 +2709,29 @@ fn node_add(canvas_path: &Path, parent_id: &str, title: &str) {
     }
 }
 
+/// Reads `--body-file`'s value: `path` itself, unless it's the literal `-`
+/// (the same "read stdin instead" sentinel `git`/`tar` use), in which case
+/// stdin. Distinct from `node body`'s own `--file`, which already treats
+/// *omitting* the flag entirely as "read stdin" — `node add`'s
+/// `--body-file` can't reuse that trick, since omitting it here has to
+/// mean "no body at all" instead.
+fn read_body_source_or_exit(path: &Path) -> String {
+    if path == Path::new("-") {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf).unwrap_or_else(|e| {
+            eprintln!("failed to read stdin: {e}");
+            std::process::exit(1);
+        });
+        buf
+    } else {
+        std::fs::read_to_string(path).unwrap_or_else(|e| {
+            eprintln!("failed to read {}: {e}", path.display());
+            std::process::exit(1);
+        })
+    }
+}
+
 /// Pure logic behind `node add`: insert the child, then make sure the
 /// result still parses before handing it back to the caller to write.
 /// Returns `(updated document, new node's id)`.
@@ -2387,6 +2739,47 @@ fn apply_node_add(raw: &str, parent_id: &str, title: &str) -> Result<(String, St
     let (updated, new_id) = mdcanvas::insert_child_node(raw, parent_id, title)
         .ok_or_else(|| format!("no node {parent_id:?}"))?;
     validate_patch(&updated)?;
+    Ok((updated, new_id))
+}
+
+/// `apply_node_add`, then optionally `apply_node_body`/`apply_node_meta`
+/// on the freshly created node in the same pass — `node add
+/// --body-file`/the position/style flags, so a node with real starting
+/// content doesn't need a separate `node body`/`node meta` follow-up call
+/// just to carry its own id across. `fields` is only ever applied when at
+/// least one of them was actually given (`NodeMetaFields::is_set`) — a
+/// plain `node add` with none of these flags behaves exactly as it always
+/// has, byte for byte.
+fn apply_node_add_with_extras(
+    raw: &str,
+    parent_id: &str,
+    title: &str,
+    body: Option<&str>,
+    fields: NodeMetaFields,
+) -> Result<(String, String), String> {
+    let (mut updated, new_id) = apply_node_add(raw, parent_id, title)?;
+    if let Some(body) = body {
+        updated = apply_node_body(&updated, &new_id, body)?;
+    }
+    if fields.is_set() {
+        updated = apply_node_meta(
+            &updated,
+            &new_id,
+            fields.x,
+            fields.y,
+            fields.width,
+            fields.height,
+            false, // clear-position never applies to a brand-new node
+            fields.color,
+            fields.node_type,
+            fields.display,
+            fields.lang,
+            fields.interpreter,
+            fields.preview,
+            fields.fold,
+            fields.tags,
+        )?;
+    }
     Ok((updated, new_id))
 }
 
@@ -2614,6 +3007,158 @@ fn apply_node_body(raw: &str, node_id: &str, new_body: &str) -> Result<String, S
     Ok(updated)
 }
 
+/// Every `node block` flag except `canvas`/`node_id`/`block_name`
+/// themselves — bundled into one struct since there are too many to pass
+/// as bare positional arguments legibly. `--x`/`--no-x` pairs stay as two
+/// raw `bool`s here; `apply_node_block` is what resolves each pair (and
+/// rejects both being given at once) into the `Option<bool>`
+/// `FenceAttrsPatch` actually wants.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Default)]
+struct BlockArgs {
+    rename: Option<String>,
+    lang: Option<String>,
+    cache: bool,
+    no_cache: bool,
+    always: bool,
+    no_always: bool,
+    default: bool,
+    no_default: bool,
+    tty: bool,
+    no_tty: bool,
+    autoclose: bool,
+    no_autoclose: bool,
+    deps: Option<String>,
+    clear_deps: bool,
+    env: Option<String>,
+    clear_env: bool,
+    interpreter: Option<String>,
+    clear_interpreter: bool,
+    code_file: Option<PathBuf>,
+}
+
+fn node_block(canvas_path: &Path, node_id: &str, block_name: &str, args: BlockArgs) {
+    let code = args.code_file.as_deref().map(read_body_source_or_exit);
+    let raw = read_raw_or_exit(canvas_path);
+    match apply_node_block(&raw, node_id, block_name, &args, code.as_deref()) {
+        Ok(updated) => {
+            write_raw_or_exit(canvas_path, &updated);
+            println!(
+                "meshfox node block: updated {block_name:?} in {node_id:?} in {}",
+                canvas_path.display()
+            );
+        }
+        Err(e) => {
+            eprintln!("meshfox node block: {e} ({})", canvas_path.display());
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Resolves one `--x`/`--no-x` pair to `Some(true)`/`Some(false)`/`None`
+/// ("not touched") — rejects both being set in the same call, the one
+/// shape that would otherwise silently pick a winner.
+fn resolve_bool_pair(on: bool, off: bool, on_flag: &str, off_flag: &str) -> Result<Option<bool>, String> {
+    match (on, off) {
+        (true, true) => Err(format!("{on_flag} is mutually exclusive with {off_flag}")),
+        (true, false) => Ok(Some(true)),
+        (false, true) => Ok(Some(false)),
+        (false, false) => Ok(None),
+    }
+}
+
+/// Pure logic behind `node block`: resolve every flag pair, look up the
+/// target block (for error messages precise enough to say *which* of
+/// node-id/block-name didn't resolve), build the patch, apply it, and — if
+/// `--deps`/`--clear-deps` actually touched the dependency list this call —
+/// validate the whole resulting document's `deps=` graph right away
+/// (`deps::validate`: dangling targets, cycles) rather than leaving that
+/// for a separate `meshfox validate`.
+fn apply_node_block(
+    raw: &str,
+    node_id: &str,
+    block_name: &str,
+    args: &BlockArgs,
+    code: Option<&str>,
+) -> Result<String, String> {
+    let canvas = Canvas::from_markdown(raw).map_err(|e| e.to_string())?;
+    let node = canvas
+        .node(node_id)
+        .ok_or_else(|| format!("no node {node_id:?}"))?;
+    if !meshfox_core::scan_runnable_blocks(node_id, &node.text)
+        .iter()
+        .any(|b| b.name.as_deref() == Some(block_name))
+    {
+        return Err(format!(
+            "no runnable code block named {block_name:?} in node {node_id:?}"
+        ));
+    }
+
+    let cache = resolve_bool_pair(args.cache, args.no_cache, "--cache", "--no-cache")?;
+    let always = resolve_bool_pair(args.always, args.no_always, "--always", "--no-always")?;
+    let default = resolve_bool_pair(args.default, args.no_default, "--default", "--no-default")?;
+    let tty = resolve_bool_pair(args.tty, args.no_tty, "--tty", "--no-tty")?;
+    let autoclose = resolve_bool_pair(
+        args.autoclose,
+        args.no_autoclose,
+        "--autoclose",
+        "--no-autoclose",
+    )?;
+
+    if args.deps.is_some() && args.clear_deps {
+        return Err("--deps is mutually exclusive with --clear-deps".to_string());
+    }
+    let deps_touched = args.deps.is_some() || args.clear_deps;
+    let deps = if args.clear_deps {
+        Some(Vec::new())
+    } else {
+        args.deps.as_deref().map(meshfox_core::parse_deps_list)
+    };
+
+    if args.env.is_some() && args.clear_env {
+        return Err("--env is mutually exclusive with --clear-env".to_string());
+    }
+    let env = if args.clear_env {
+        Some(Vec::new())
+    } else {
+        args.env.as_deref().map(meshfox_core::parse_env_list)
+    };
+
+    if args.interpreter.is_some() && args.clear_interpreter {
+        return Err("--interpreter is mutually exclusive with --clear-interpreter".to_string());
+    }
+    let interpreter = if args.clear_interpreter {
+        Some(None)
+    } else {
+        args.interpreter.clone().map(Some)
+    };
+
+    let patch = FenceAttrsPatch {
+        name: args.rename.clone(),
+        lang: args.lang.clone(),
+        cache,
+        always,
+        default,
+        tty,
+        autoclose,
+        deps,
+        env,
+        interpreter,
+        code: code.map(str::to_string),
+    };
+    let updated = mdcanvas::set_fence_attrs(raw, node_id, block_name, &patch).ok_or_else(|| {
+        format!("no runnable code block named {block_name:?} in node {node_id:?}")
+    })?;
+    validate_patch(&updated)?;
+
+    if deps_touched {
+        let updated_canvas = Canvas::from_markdown(&updated).map_err(|e| e.to_string())?;
+        meshfox_core::deps::validate(&updated_canvas).map_err(|e| e.to_string())?;
+    }
+
+    Ok(updated)
+}
+
 fn parse_node_type(s: &str) -> Result<NodeType, String> {
     match s {
         "text" => Ok(NodeType::Text),
@@ -2651,6 +3196,7 @@ fn node_meta(
     interpreter: Option<String>,
     preview: Option<bool>,
     fold: Option<String>,
+    tags: Option<String>,
 ) {
     let raw = read_raw_or_exit(canvas_path);
     match apply_node_meta(
@@ -2668,6 +3214,7 @@ fn node_meta(
         interpreter,
         preview,
         fold,
+        tags,
     ) {
         Ok(updated) => {
             write_raw_or_exit(canvas_path, &updated);
@@ -2699,6 +3246,7 @@ fn apply_node_meta(
     interpreter: Option<String>,
     preview: Option<bool>,
     fold: Option<String>,
+    tags: Option<String>,
 ) -> Result<String, String> {
     let canvas = Canvas::from_markdown(raw).map_err(|e| e.to_string())?;
     let node = canvas
@@ -2723,6 +3271,14 @@ fn apply_node_meta(
     let parsed_fold = match fold.as_deref() {
         None => node.fold,
         Some(s) => meshfox_core::parse_fold_override(s)?,
+    };
+    // Same "omitted keeps current, given replaces outright" contract as
+    // `--from` on `node edges` — `--tags ""` parses to an empty list (see
+    // `meshfox_core::parse_tags`), clearing every tag rather than being a
+    // no-op.
+    let parsed_tags = match &tags {
+        None => node.tags.clone(),
+        Some(s) => meshfox_core::parse_tags(Some(s)),
     };
 
     // A group's *size* is always derived from its children, never stored —
@@ -2768,7 +3324,7 @@ fn apply_node_meta(
         preview: Some(preview.unwrap_or(node.preview)),
         edge_label: node.edge_label.clone(),
         fold: parsed_fold,
-        tags: node.tags.clone(),
+        tags: parsed_tags,
     };
     let updated = mdcanvas::set_node_meta(raw, node_id, &meta)
         .ok_or_else(|| format!("no node {node_id:?}"))?;
@@ -2946,6 +3502,9 @@ fn format_node_show(raw: &str, node_id: &str) -> Result<String, String> {
     if let Some(c) = &node.color {
         out.push_str(&format!("color: {c}\n"));
     }
+    if !node.tags.is_empty() {
+        out.push_str(&format!("tags: {}\n", node.tags.join(", ")));
+    }
     if let Some(t) = &node.target {
         out.push_str(&format!("target: {t}\n"));
     }
@@ -2963,6 +3522,101 @@ fn format_node_show(raw: &str, node_id: &str) -> Result<String, String> {
 
 fn fmt_opt_num(v: Option<f64>) -> String {
     v.map(|n| n.to_string()).unwrap_or_else(|| "?".to_string())
+}
+
+fn node_find(canvas_path: &Path, selector: &str, show: bool) {
+    let raw = read_raw_or_exit(canvas_path);
+    let canvas = Canvas::from_markdown(&raw).unwrap_or_else(|e| {
+        eprintln!("failed to parse {}: {e}", canvas_path.display());
+        std::process::exit(1);
+    });
+    let ids = find_node_ids(&canvas, selector).unwrap_or_else(|e| {
+        eprintln!("meshfox node find: {e}");
+        std::process::exit(1);
+    });
+    if ids.is_empty() {
+        println!("meshfox node find: no matches for {selector:?}");
+        return;
+    }
+    for id in &ids {
+        if show {
+            match format_node_show(&raw, id) {
+                Ok(text) => {
+                    println!("=== {id} ===");
+                    print!("{text}");
+                }
+                Err(e) => eprintln!("meshfox node find: {e}"),
+            }
+        } else {
+            println!("{id}");
+        }
+    }
+}
+
+/// Pure logic behind `node find`: build a synthetic HTML skeleton of the
+/// canvas tree (id/class/attrs only, never real node content — see
+/// `canvas_node_html`) and match `selector` against it with `scraper`'s
+/// CSS engine, the same one a browser uses — see `NodeCommand::Find`'s own
+/// doc comment for the id/tag/type/color/nesting mapping this relies on.
+/// Matches come back in document order (`scraper::Html::select`'s own
+/// order, which walks the synthetic tree depth-first — the same order
+/// `Canvas::children` built it in).
+fn find_node_ids(canvas: &Canvas, selector: &str) -> Result<Vec<String>, String> {
+    let Some(root) = canvas.nodes.iter().find(|n| n.parent.is_none()) else {
+        return Ok(Vec::new());
+    };
+    let html = format!(
+        "<html><body>{}</body></html>",
+        canvas_node_html(canvas, root)
+    );
+    let document = scraper::Html::parse_document(&html);
+    let parsed = scraper::Selector::parse(selector)
+        .map_err(|_| format!("invalid CSS selector {selector:?}"))?;
+    Ok(document
+        .select(&parsed)
+        .filter_map(|el| el.value().attr("id").map(str::to_string))
+        .collect())
+}
+
+/// One node, and (recursively) its structural children — `Canvas::children`,
+/// the same nesting `run`/`node show` already address by — rendered as a
+/// `<div>`: `id` is the node's own id, `class` is its tags (space-joined,
+/// CSS's own native multi-value-attribute shape — a direct fit for
+/// `tags="a,b,c"`), plus `type`/`color` as ordinary attributes. Never the
+/// node's title or body text — this is a structural skeleton for matching
+/// against, not a rendering.
+fn canvas_node_html(canvas: &Canvas, node: &Node) -> String {
+    let mut attrs = format!(" id=\"{}\"", html_escape_attr(&node.id));
+    if !node.tags.is_empty() {
+        attrs.push_str(&format!(
+            " class=\"{}\"",
+            html_escape_attr(&node.tags.join(" "))
+        ));
+    }
+    attrs.push_str(&format!(
+        " type=\"{}\"",
+        html_escape_attr(node.node_type.as_str())
+    ));
+    if let Some(c) = &node.color {
+        attrs.push_str(&format!(" color=\"{}\"", html_escape_attr(c)));
+    }
+    let children: String = canvas
+        .children(&node.id)
+        .into_iter()
+        .map(|child| canvas_node_html(canvas, child))
+        .collect();
+    format!("<div{attrs}>{children}</div>")
+}
+
+/// Just enough escaping for a value dropped into a double-quoted HTML
+/// attribute — a node id/tag/color containing `&`/`"`/`<`/`>` (unusual,
+/// but not disallowed) would otherwise corrupt the synthetic markup
+/// `find_node_ids` builds around it.
+fn html_escape_attr(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Basename of a template's own optional config file (`--template`'s own
@@ -3351,6 +4005,41 @@ Shared body.
     }
 
     #[test]
+    fn add_with_extras_sets_body_and_meta_in_one_call() {
+        let (updated, new_id) = apply_node_add_with_extras(
+            TEST_DOC,
+            "tests",
+            "New Check",
+            Some("Its own body."),
+            NodeMetaFields {
+                x: Some(10.0),
+                y: Some(20.0),
+                color: Some("2".to_string()),
+                tags: Some("bag".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let canvas = Canvas::from_markdown(&updated).unwrap();
+        let node = canvas.node(&new_id).unwrap();
+        assert_eq!(node.text, "Its own body.");
+        assert_eq!(node.x, Some(10.0));
+        assert_eq!(node.y, Some(20.0));
+        assert_eq!(node.color.as_deref(), Some("2"));
+        assert_eq!(node.tags, vec!["bag".to_string()]);
+    }
+
+    #[test]
+    fn add_with_extras_matches_plain_add_when_nothing_extra_is_given() {
+        let (with_extras, id_a) =
+            apply_node_add_with_extras(TEST_DOC, "tests", "New Check", None, NodeMetaFields::default())
+                .unwrap();
+        let (plain, id_b) = apply_node_add(TEST_DOC, "tests", "New Check").unwrap();
+        assert_eq!(id_a, id_b);
+        assert_eq!(with_extras, plain);
+    }
+
+    #[test]
     fn rm_deletes_the_whole_subtree_by_default() {
         let updated = apply_node_rm(TEST_DOC, "tests", false).unwrap();
         let canvas = Canvas::from_markdown(&updated).unwrap();
@@ -3472,6 +4161,7 @@ Shared body.
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let canvas = Canvas::from_markdown(&updated).unwrap();
@@ -3484,6 +4174,83 @@ Shared body.
     }
 
     #[test]
+    fn meta_sets_and_clears_tags() {
+        // Omitted (`None`) leaves the node's tags untouched, same contract
+        // as every other field here.
+        let updated = apply_node_meta(
+            TEST_DOC,
+            "smoke-test",
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(Canvas::from_markdown(&updated).unwrap().node("smoke-test").unwrap().tags.is_empty());
+
+        // Given, replaces the whole list outright — trimmed/split the same
+        // way the file's own `tags="a, b"` attribute is.
+        let updated = apply_node_meta(
+            TEST_DOC,
+            "smoke-test",
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("bag, fixed".to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            Canvas::from_markdown(&updated).unwrap().node("smoke-test").unwrap().tags,
+            vec!["bag".to_string(), "fixed".to_string()],
+        );
+        // Untouched fields (here, color) still keep their prior value.
+        assert_eq!(
+            Canvas::from_markdown(&updated).unwrap().node("smoke-test").unwrap().color.as_deref(),
+            Some("1")
+        );
+
+        // `--tags ""` explicitly clears rather than being a no-op.
+        let cleared = apply_node_meta(
+            &updated,
+            "smoke-test",
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(String::new()),
+        )
+        .unwrap();
+        assert!(Canvas::from_markdown(&cleared).unwrap().node("smoke-test").unwrap().tags.is_empty());
+        assert!(!cleared.contains("tags="));
+    }
+
+    #[test]
     fn meta_rejects_a_size_on_a_group() {
         let err = apply_node_meta(
             TEST_DOC,
@@ -3493,6 +4260,7 @@ Shared body.
             Some(300.0),
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -3519,6 +4287,7 @@ Shared body.
             None,
             None,
             None,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("group"), "unexpected error: {err}");
@@ -3534,6 +4303,7 @@ Shared body.
             None,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -3570,6 +4340,7 @@ Shared body.
             None,
             None,
             Some("true".to_string()),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -3596,6 +4367,7 @@ Shared body.
             None,
             None,
             Some("default".to_string()),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -3625,6 +4397,7 @@ Shared body.
             None,
             None,
             Some("bogus".to_string()),
+            None,
         )
         .unwrap_err();
         assert!(err.contains("fold"), "unexpected error: {err}");
@@ -3640,6 +4413,7 @@ Shared body.
             None,
             None,
             true,
+            None,
             None,
             None,
             None,
@@ -3676,6 +4450,7 @@ Shared body.
             None,
             None,
             None,
+            None,
         )
         .unwrap_err();
         assert!(
@@ -3696,6 +4471,7 @@ Shared body.
             false,
             None,
             Some("bogus".to_string()),
+            None,
             None,
             None,
             None,
@@ -3796,6 +4572,19 @@ Shared body.
     }
 
     #[test]
+    fn show_reports_tags_when_set_and_omits_the_line_when_not() {
+        const DOC: &str = concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Tagged\n<!-- meshfox:node id=\"tagged\" tags=\"bag,fixed\" -->\n\nbody\n\n",
+            "## Untagged\n<!-- meshfox:node id=\"untagged\" -->\n\nbody\n",
+        );
+        let tagged = format_node_show(DOC, "tagged").unwrap();
+        assert!(tagged.contains("tags: bag, fixed"), "{tagged}");
+        let untagged = format_node_show(DOC, "untagged").unwrap();
+        assert!(!untagged.contains("tags:"), "{untagged}");
+    }
+
+    #[test]
     fn show_reports_a_group_members_resolved_absolute_position() {
         const DOC: &str = concat!(
             "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
@@ -3827,6 +4616,232 @@ Shared body.
         assert!(err.contains("no node"), "unexpected error: {err}");
     }
 
+    const BLOCK_DOC: &str = concat!(
+        "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "```bash name=\"build\" cache\necho hi\n```\n\n",
+        "```bash name=\"other\"\necho untouched\n```\n",
+    );
+
+    #[test]
+    fn block_renames_and_toggles_flags() {
+        let updated = apply_node_block(
+            BLOCK_DOC,
+            "root",
+            "build",
+            &BlockArgs {
+                rename: Some("built".to_string()),
+                always: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        let node = Canvas::from_markdown(&updated).unwrap();
+        let blocks = meshfox_core::scan_runnable_blocks("root", &node.node("root").unwrap().text);
+        let block = blocks
+            .iter()
+            .find(|b| b.name.as_deref() == Some("built"))
+            .unwrap();
+        assert!(block.always);
+        assert!(block.cache, "untouched cache flag should survive");
+        assert!(updated.contains("echo untouched"), "sibling block untouched");
+    }
+
+    #[test]
+    fn block_rejects_both_halves_of_a_flag_pair_at_once() {
+        let err = apply_node_block(
+            BLOCK_DOC,
+            "root",
+            "build",
+            &BlockArgs {
+                cache: true,
+                no_cache: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("mutually exclusive"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn block_replaces_deps_and_rejects_a_dangling_target() {
+        let updated = apply_node_block(
+            BLOCK_DOC,
+            "root",
+            "build",
+            &BlockArgs {
+                deps: Some("other".to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert!(updated.contains("deps=\"other\""));
+
+        let err = apply_node_block(
+            BLOCK_DOC,
+            "root",
+            "build",
+            &BlockArgs {
+                deps: Some("nonexistent".to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("nonexistent"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn block_clears_deps_and_env_explicitly() {
+        let with_deps = apply_node_block(
+            BLOCK_DOC,
+            "root",
+            "build",
+            &BlockArgs {
+                deps: Some("other".to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        let cleared = apply_node_block(
+            &with_deps,
+            "root",
+            "build",
+            &BlockArgs {
+                clear_deps: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert!(!cleared.contains("deps="));
+    }
+
+    #[test]
+    fn block_sets_and_clears_interpreter() {
+        let set = apply_node_block(
+            BLOCK_DOC,
+            "root",
+            "build",
+            &BlockArgs {
+                interpreter: Some("python3 -u".to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert!(set.contains("interpreter=\"python3 -u\""));
+
+        let cleared = apply_node_block(
+            &set,
+            "root",
+            "build",
+            &BlockArgs {
+                clear_interpreter: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert!(!cleared.contains("interpreter="));
+    }
+
+    #[test]
+    fn block_replaces_the_code() {
+        let updated =
+            apply_node_block(BLOCK_DOC, "root", "build", &BlockArgs::default(), Some("echo new"))
+                .unwrap();
+        assert!(updated.contains("echo new"));
+        assert!(!updated.contains("echo hi"));
+    }
+
+    #[test]
+    fn block_rejects_an_unknown_node_or_block() {
+        let err =
+            apply_node_block(BLOCK_DOC, "nope", "build", &BlockArgs::default(), None).unwrap_err();
+        assert!(err.contains("no node"), "unexpected error: {err}");
+
+        let err =
+            apply_node_block(BLOCK_DOC, "root", "nope", &BlockArgs::default(), None).unwrap_err();
+        assert!(err.contains("no runnable"), "unexpected error: {err}");
+    }
+
+    const FIND_DOC: &str = concat!(
+        "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "## Todo\n<!-- meshfox:node id=\"todo\" tags=\"bag\" -->\n\n",
+        "### Fixed Bug\n<!-- meshfox:node id=\"fixed-bug\" tags=\"bag,fixed\" -->\n\n",
+        "#### Nested\n<!-- meshfox:node id=\"nested\" tags=\"bag\" -->\n\n",
+        "### Other\n<!-- meshfox:node id=\"other\" type=\"group\" color=\"4\" -->\n",
+    );
+
+    #[test]
+    fn find_matches_a_tag_class_selector_in_document_order() {
+        let canvas = Canvas::from_markdown(FIND_DOC).unwrap();
+        let ids = find_node_ids(&canvas, ".bag").unwrap();
+        assert_eq!(ids, vec!["todo", "fixed-bug", "nested"]);
+    }
+
+    #[test]
+    fn find_direct_child_combinator_excludes_deeper_descendants() {
+        let canvas = Canvas::from_markdown(FIND_DOC).unwrap();
+        assert_eq!(find_node_ids(&canvas, "#todo > .bag").unwrap(), vec!["fixed-bug"]);
+        // Plain descendant combinator (space) reaches any depth.
+        assert_eq!(
+            find_node_ids(&canvas, "#todo .bag").unwrap(),
+            vec!["fixed-bug", "nested"]
+        );
+    }
+
+    #[test]
+    fn find_matches_type_and_color_attributes() {
+        let canvas = Canvas::from_markdown(FIND_DOC).unwrap();
+        assert_eq!(find_node_ids(&canvas, "[type=\"group\"]").unwrap(), vec!["other"]);
+        assert_eq!(find_node_ids(&canvas, "[color=\"4\"]").unwrap(), vec!["other"]);
+    }
+
+    #[test]
+    fn find_combines_multiple_tags_and_id_selectors() {
+        let canvas = Canvas::from_markdown(FIND_DOC).unwrap();
+        assert_eq!(find_node_ids(&canvas, ".bag.fixed").unwrap(), vec!["fixed-bug"]);
+        assert_eq!(find_node_ids(&canvas, "#fixed-bug").unwrap(), vec!["fixed-bug"]);
+    }
+
+    #[test]
+    fn find_returns_empty_not_an_error_for_no_matches() {
+        let canvas = Canvas::from_markdown(FIND_DOC).unwrap();
+        assert_eq!(find_node_ids(&canvas, ".nonexistent").unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn find_rejects_an_invalid_selector() {
+        let canvas = Canvas::from_markdown(FIND_DOC).unwrap();
+        let err = find_node_ids(&canvas, "###bad").unwrap_err();
+        assert!(err.contains("invalid CSS selector"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn find_escapes_html_special_characters_without_corrupting_the_document() {
+        // `&`/`<` are legitimate, parseable characters in a real tags="..."
+        // value (only `"` itself isn't — it's the attribute's own
+        // delimiter, so it can't appear in a real parsed document any more
+        // than it could in the synthetic HTML this builds). Left
+        // unescaped, `<` in particular would open a bogus element and
+        // corrupt parsing for the rest of the document, not just this
+        // node — a sibling node still resolving correctly afterward is
+        // what actually proves the escaping worked.
+        let doc = concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Odd\n<!-- meshfox:node id=\"odd\" tags=\"a&b,c<d\" -->\n\n",
+            "## Safe\n<!-- meshfox:node id=\"safe-node\" tags=\"plain\" -->\n",
+        );
+        let canvas = Canvas::from_markdown(doc).unwrap();
+        assert_eq!(find_node_ids(&canvas, ".plain").unwrap(), vec!["safe-node"]);
+        assert_eq!(find_node_ids(&canvas, "#odd").unwrap(), vec!["odd"]);
+    }
+
     #[test]
     fn parse_node_type_accepts_every_variant_and_rejects_garbage() {
         assert_eq!(parse_node_type("text").unwrap(), NodeType::Text);
@@ -3842,6 +4857,59 @@ Shared body.
         assert_eq!(parse_display("link").unwrap(), FileDisplay::Link);
         assert_eq!(parse_display("code").unwrap(), FileDisplay::Code);
         assert!(parse_display("bogus").is_err());
+    }
+}
+
+#[cfg(test)]
+mod run_hint_tests {
+    use super::*;
+
+    #[test]
+    fn looks_like_a_canvas_path_matches_dot_md_case_insensitively() {
+        assert!(looks_like_a_canvas_path("README.md"));
+        assert!(looks_like_a_canvas_path("weird.MD"));
+        assert!(!looks_like_a_canvas_path("linting"));
+        assert!(!looks_like_a_canvas_path("typecheck"));
+    }
+
+    #[test]
+    fn misplaced_canvas_hint_fires_only_when_an_arg_looks_like_a_path() {
+        assert!(run_hint_for_misplaced_canvas(&["README.md", "linting"]).is_some());
+        assert!(run_hint_for_misplaced_canvas(&["linting", "typecheck"]).is_none());
+    }
+
+    #[test]
+    fn levenshtein_matches_known_distances() {
+        assert_eq!(levenshtein("linting", "linting"), 0);
+        assert_eq!(levenshtein("kitten", "sitting"), 3);
+        assert_eq!(levenshtein("", "abc"), 3);
+    }
+
+    const TREE_DOC: &str = concat!(
+        "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "## Development\n<!-- meshfox:node id=\"development\" -->\n\n",
+        "### Linting\n<!-- meshfox:node id=\"linting\" -->\n\nbody\n",
+    );
+
+    #[test]
+    fn closest_node_path_finds_an_exact_id_at_the_right_depth() {
+        let canvas = Canvas::from_markdown(TREE_DOC).unwrap();
+        // "linting" itself isn't a direct child of root — it's two levels
+        // down, under "development" — the exact mistake this is for.
+        assert_eq!(
+            closest_node_path(&canvas, "linting"),
+            Some("development linting".to_string())
+        );
+    }
+
+    #[test]
+    fn closest_node_path_suggests_a_close_typo_but_not_a_wild_guess() {
+        let canvas = Canvas::from_markdown(TREE_DOC).unwrap();
+        assert_eq!(
+            closest_node_path(&canvas, "lintin"),
+            Some("development linting".to_string())
+        );
+        assert_eq!(closest_node_path(&canvas, "completely-unrelated-id"), None);
     }
 }
 

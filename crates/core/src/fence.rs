@@ -186,6 +186,28 @@ fn parse_env(attrs: &HashMap<String, String>) -> Vec<EnvRef> {
         .unwrap_or_default()
 }
 
+/// Same splitting/trimming `parse_deps` does, but straight from a raw
+/// `deps=`-shaped string rather than a whole fence's parsed attrs map —
+/// what a caller building one from scratch (`node block --deps`) needs,
+/// since it has no fence to have parsed one out of yet.
+pub fn parse_deps_list(s: &str) -> Vec<BlockRef> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(parse_block_ref)
+        .collect()
+}
+
+/// Same splitting/trimming `parse_env` does, but straight from a raw
+/// `env=`-shaped string — see `parse_deps_list`'s own doc comment.
+pub fn parse_env_list(s: &str) -> Vec<EnvRef> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(parse_env_ref)
+        .collect()
+}
+
 /// A top-level fenced block, found the way CommonMark actually specifies:
 /// an opening run of 3+ identical `` ` `` or `~` characters, closed only by
 /// a line consisting of a run of the *same* character that is *at least as

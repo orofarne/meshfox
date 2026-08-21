@@ -19,7 +19,11 @@ landing as a corrupt file.
 
 Map your intent to a subcommand instead:
 
-- Add a child node → `meshfox node add <parent-id> <title>`
+- Add a child node → `meshfox node add <parent-id> <title>`. Prints the new
+  node's id (a slug of `title`) — pass `--body-file <path>` (or `--body-file
+  -` for stdin) and/or any `node meta` flag below in that same call to give
+  it real starting content/position/style too, instead of a separate
+  `node body`/`node meta` follow-up that needs that id again.
 - Delete a node (and its subtree) → `meshfox node rm <id>`; keep its
   children by reparenting them instead → `meshfox node rm <id>
   --keep-children`
@@ -29,20 +33,24 @@ Map your intent to a subcommand instead:
   from=`, best-effort `deps=`) → `meshfox node set-id <id> <new-id>`
 - Replace a node's body → `meshfox node body <id> --file <path>` (or pipe to
   stdin)
-- Set position/size/style (`x`/`y`/`w`/`h`/`color`/`type`/`display`/`lang`)
-  → `meshfox node meta <id> [flags...]`. `color` is either a literal hex
+- Set position/size/style/tags (`x`/`y`/`w`/`h`/`color`/`type`/`display`/
+  `lang`/`interpreter`/`tags`) → `meshfox node meta <id> [flags...]` — same
+  flags `node add` above also accepts. `color` is either a literal hex
   string or one of six numbered presets — the same ones the web UI's swatch
   picker uses — so `--color 4` is shorthand for green:
   - `1` red, `2` orange, `3` yellow, `4` green, `5` blue, `6` purple
   - e.g. `meshfox node meta <id> --color 4` for green, or `--color ""` to
     clear it back to no color
+  - `--tags "bag,fixed"` replaces the whole tag list outright (comma-
+    separated, same spelling as the file's own `tags=`); `--tags ""` clears
+    it. Omitting `--tags` entirely leaves existing tags untouched.
 - Replace a node's extra incoming edges → `meshfox node edges <id> --from
   <id>... ` (or `--clear`)
 - Resync on-disk heading order to match on-canvas layout after moving things
   by position → `meshfox node reorder`
 - Inspect a node before changing it (parent, children, extra parents, type,
-  position/style) → `meshfox node show <id>`, instead of reading the raw
-  file and guessing
+  position/style, tags/color when set) → `meshfox node show <id>`, instead
+  of reading the raw file and guessing
 
 Hand-editing is fine for prose *inside* an existing node's body that doesn't
 touch structure or bookkeeping comments. Either way, validate afterward:
@@ -95,4 +103,10 @@ path/`--canvas` overrides if both are given. Omitting it entirely
 auto-discovers the single `.canvas.md` candidate in the current directory — fine for a one-off in a
 directory known to have exactly one, but pass it explicitly whenever that's
 not certain, so behavior doesn't depend on what else happens to be in the
-directory.
+directory. `run foo.md tests smoke` (path *after* the subcommand instead of
+before) is a common slip — `foo.md` there just gets swallowed as if it were
+a node-id path segment instead, since `run`'s own positionals have no such
+convention of their own; both this and a "did you mean" typo/missing-
+ancestor suggestion are surfaced back in the error when it happens, so it's
+recoverable, but getting the ordering right the first time avoids the
+detour.

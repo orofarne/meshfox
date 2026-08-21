@@ -39,6 +39,10 @@ open = "5"
 self_update = { version = "0.44.0", default-features = false, features = ["ureq", "rustls", "archive-tar", "compression-flate2"] }
 headless_chrome = { version = "1.0.22", features = ["fetch"] }
 lopdf = "0.44.0"
-
-[dev-dependencies]
+# `node find`'s CSS-selector matching (see its own doc comment) — already a
+# real dependency of `meshfox-server` (OpenGraph preview HTML parsing) and
+# reachable from this binary either way (`meshfox-server` is a real
+# dependency of this crate), so this promotion from the dev-only copy below
+# adds no new transitive weight, just a second real use of what's already
+# compiled in.
 scraper = "0.20"

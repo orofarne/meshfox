@@ -34,6 +34,7 @@ use crate::attrs::parse_attrs;
 use crate::canvas::{
     slugify, ArrowEnd, Canvas, EdgeLineStyle, ExtraEdge, FileDisplay, Node, NodeType,
 };
+use crate::fence::{scan_runnable_blocks, BlockRef, EnvRef};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use thiserror::Error;
@@ -361,8 +362,10 @@ fn extra_edge_from_attrs(attrs: &HashMap<String, String>, from_id: &str) -> Extr
 
 /// Splits a `tags="a, b, c"` attribute value into its individual tags,
 /// trimming whitespace and dropping empty entries — shared by node and
-/// edge parsing. `None` (attribute absent) is just an empty list.
-fn parse_tags(v: Option<&String>) -> Vec<String> {
+/// edge parsing, and by the CLI's `node meta --tags` (same comma-separated
+/// spelling on the command line as in the file itself). `None` (attribute
+/// absent) is just an empty list.
+pub fn parse_tags(v: Option<&String>) -> Vec<String> {
     v.map(|s| {
         s.split(',')
             .map(str::trim)
@@ -598,6 +601,170 @@ pub fn set_node_meta(markdown: &str, node_id: &str, meta: &NodeMeta) -> Option<S
             out.push_str(&markdown[seg.heading_span.end..]);
         }
     }
+    Some(out)
+}
+
+/// Fence attributes settable via `set_fence_attrs` — same "`None` leaves it
+/// untouched" contract as `NodeMeta`, field by field. `deps`/`env` follow
+/// `NodeMeta::tags`'s own convention too: `Some(vec![])` (from
+/// `--clear-deps`/`--clear-env`) clears the list outright, distinct from
+/// `None` (not touched at all). `interpreter` is tri-state for the same
+/// reason: `None` leaves it alone, `Some(None)` clears it
+/// (`--clear-interpreter`), `Some(Some(spec))` sets it — a plain
+/// `Option<String>` can't tell "clear" apart from "not given" on its own.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FenceAttrsPatch {
+    /// New `name=` — a fence's own runnable identity isn't addressable any
+    /// other way (unlike a node's `id`), so this *is* the rename, not a
+    /// separate operation.
+    pub name: Option<String>,
+    /// The bare language word right after the opening delimiter (`bash` in
+    /// `` ```bash ``).
+    pub lang: Option<String>,
+    pub cache: Option<bool>,
+    pub always: Option<bool>,
+    pub default: Option<bool>,
+    pub tty: Option<bool>,
+    pub autoclose: Option<bool>,
+    pub deps: Option<Vec<BlockRef>>,
+    pub env: Option<Vec<EnvRef>>,
+    pub interpreter: Option<Option<String>>,
+    /// New code, replacing everything between the opening and closing
+    /// delimiter lines outright — `None` leaves the code untouched.
+    pub code: Option<String>,
+}
+
+/// Rewrites just one runnable fence's own info-string attributes (and,
+/// optionally, its code — see `FenceAttrsPatch::code`) inside node
+/// `node_id` — every other fence in the node, the rest of its body, and
+/// the rest of the document are left byte-for-byte untouched. Unlike
+/// `set_node_body`, a caller never has to reconstruct surrounding prose or
+/// sibling blocks just to flip one flag on one of them.
+///
+/// `block_name` is resolved via `scan_runnable_blocks` — the same name/
+/// `default`-flag/implicit-self-naming address `meshfox run` and `meshfox
+/// list` already understand, see SPEC.md's "Runnable code fences".
+///
+/// The original delimiter (`` ``` `` vs `~~~`, and its exact run length,
+/// e.g. four backticks so a fence can safely contain a literal ` ``` `)
+/// and any leading indentation are read straight off the source and
+/// carried over verbatim — this only ever rewrites what `patch` actually
+/// asks it to. `None` (not `Some` with an empty string) when `node_id` or
+/// `block_name` doesn't resolve to a real fence.
+pub fn set_fence_attrs(
+    markdown: &str,
+    node_id: &str,
+    block_name: &str,
+    patch: &FenceAttrsPatch,
+) -> Option<String> {
+    let segments = scan(markdown);
+    let ids = assign_ids(&segments).ok()?;
+    let idx = ids.iter().position(|id| id == node_id)?;
+    let seg = &segments[idx];
+    let body = &markdown[seg.body_span.clone()];
+
+    let blocks = scan_runnable_blocks(node_id, body);
+    let block = blocks.iter().find(|b| b.name.as_deref() == Some(block_name))?;
+
+    let abs_start = seg.body_span.start + block.span.start;
+    let abs_end = seg.body_span.start + block.span.end;
+    let fence_text = &markdown[abs_start..abs_end];
+
+    // A fence found by `scan_runnable_blocks` always has both a real
+    // opening and closing line, even when empty-bodied (`` ```bash\n``` ``)
+    // — that's exactly what makes it a fence rather than an unclosed run.
+    let mut lines: Vec<&str> = fence_text.lines().collect();
+    let closing_line = lines.pop()?;
+    let opening_line = lines.remove(0);
+    let existing_code_lines = lines;
+
+    let indent_len = opening_line.len() - opening_line.trim_start().len();
+    let indent = &opening_line[..indent_len];
+    let delim: String = opening_line[indent_len..]
+        .chars()
+        .take_while(|&c| c == '`' || c == '~')
+        .collect();
+
+    let lang = patch.lang.clone().unwrap_or_else(|| block.lang.clone());
+
+    let mut parts = Vec::new();
+    if let Some(n) = patch.name.clone().or_else(|| block.name.clone()) {
+        parts.push(format!("name=\"{n}\""));
+    }
+    let deps = patch.deps.clone().unwrap_or_else(|| block.deps.clone());
+    if !deps.is_empty() {
+        let rendered = deps
+            .iter()
+            .map(|d| match &d.node_id {
+                Some(n) => format!("{n}/{}", d.block_name),
+                None => d.block_name.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        parts.push(format!("deps=\"{rendered}\""));
+    }
+    let env = patch.env.clone().unwrap_or_else(|| block.env.clone());
+    if !env.is_empty() {
+        let rendered = env
+            .iter()
+            .map(|e| {
+                if e.local_name == e.var_name {
+                    format!("${}", e.var_name)
+                } else {
+                    format!("{}=${}", e.local_name, e.var_name)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        parts.push(format!("env=\"{rendered}\""));
+    }
+    if patch.cache.unwrap_or(block.cache) {
+        parts.push("cache".to_string());
+    }
+    if patch.tty.unwrap_or(block.tty) {
+        parts.push("tty".to_string());
+    }
+    if patch.autoclose.unwrap_or(block.autoclose) {
+        parts.push("autoclose".to_string());
+    }
+    if patch.always.unwrap_or(block.always) {
+        parts.push("always".to_string());
+    }
+    if patch.default.unwrap_or(block.default) {
+        parts.push("default".to_string());
+    }
+    let interpreter = match &patch.interpreter {
+        Some(new) => new.clone(),
+        None => block.interpreter.clone(),
+    };
+    if let Some(i) = &interpreter {
+        parts.push(format!("interpreter=\"{i}\""));
+    }
+
+    let attrs_suffix = if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", parts.join(" "))
+    };
+    let new_opening = format!("{indent}{delim}{lang}{attrs_suffix}");
+
+    let new_code_lines: Vec<&str> = match &patch.code {
+        Some(code) => code.lines().collect(),
+        None => existing_code_lines,
+    };
+
+    let mut new_fence = new_opening;
+    new_fence.push('\n');
+    for line in &new_code_lines {
+        new_fence.push_str(line);
+        new_fence.push('\n');
+    }
+    new_fence.push_str(closing_line);
+
+    let mut out = String::with_capacity(markdown.len() + new_fence.len());
+    out.push_str(&markdown[..abs_start]);
+    out.push_str(&new_fence);
+    out.push_str(&markdown[abs_end..]);
     Some(out)
 }
 
@@ -2064,6 +2231,193 @@ Reused from Tests as well.
             .unwrap()
             .tags
             .is_empty());
+    }
+
+    #[test]
+    fn set_fence_attrs_renames_a_block_leaving_everything_else_untouched() {
+        let doc = concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "Some prose above.\n\n",
+            "```bash name=\"build\" cache\necho hi\n```\n\n",
+            "```bash name=\"other\"\necho untouched\n```\n\n",
+            "Some prose below.\n",
+        );
+        let patch = FenceAttrsPatch {
+            name: Some("built".to_string()),
+            ..Default::default()
+        };
+        let updated = set_fence_attrs(doc, "root", "build", &patch).unwrap();
+        let canvas = parse(&updated).unwrap();
+        let node = canvas.node("root").unwrap();
+        let blocks = scan_runnable_blocks("root", &node.text);
+        assert!(blocks.iter().any(|b| b.name.as_deref() == Some("built")));
+        assert!(!blocks.iter().any(|b| b.name.as_deref() == Some("build")));
+        // Every other line — prose, the untouched sibling block, its code —
+        // survives byte-for-byte.
+        assert!(updated.contains("Some prose above."));
+        assert!(updated.contains("Some prose below."));
+        assert!(updated.contains("```bash name=\"other\"\necho untouched\n```"));
+        assert!(updated.contains("echo hi"));
+    }
+
+    #[test]
+    fn set_fence_attrs_toggles_boolean_flags_on_and_off() {
+        let doc = "# Root\n<!-- meshfox:node id=\"root\" -->\n\n```bash name=\"b\"\necho hi\n```\n";
+        let set = set_fence_attrs(
+            doc,
+            "root",
+            "b",
+            &FenceAttrsPatch {
+                cache: Some(true),
+                always: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let block = scan_runnable_blocks("root", &parse(&set).unwrap().node("root").unwrap().text)
+            .into_iter()
+            .find(|b| b.name.as_deref() == Some("b"))
+            .unwrap();
+        assert!(block.cache);
+        assert!(block.always);
+
+        // Flipping back off drops the flags entirely, same as a fresh doc.
+        let unset = set_fence_attrs(
+            &set,
+            "root",
+            "b",
+            &FenceAttrsPatch {
+                cache: Some(false),
+                always: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!unset.contains("cache"));
+        assert!(!unset.contains("always"));
+    }
+
+    #[test]
+    fn set_fence_attrs_replaces_deps_and_clears_them() {
+        let doc = concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```bash name=\"b\" deps=\"a\"\necho hi\n```\n",
+        );
+        let replaced = set_fence_attrs(
+            doc,
+            "root",
+            "b",
+            &FenceAttrsPatch {
+                deps: Some(crate::fence::parse_deps_list("x,y/z")),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let block =
+            scan_runnable_blocks("root", &parse(&replaced).unwrap().node("root").unwrap().text)
+                .into_iter()
+                .find(|b| b.name.as_deref() == Some("b"))
+                .unwrap();
+        assert_eq!(block.deps.len(), 2);
+        assert_eq!(block.deps[0].block_name, "x");
+        assert_eq!(block.deps[1].node_id.as_deref(), Some("y"));
+        assert_eq!(block.deps[1].block_name, "z");
+
+        // Not touching `deps` at all leaves it as-is.
+        let untouched = set_fence_attrs(doc, "root", "b", &FenceAttrsPatch::default()).unwrap();
+        assert!(untouched.contains("deps=\"a\""));
+
+        // An empty (but Some) list clears it outright.
+        let cleared = set_fence_attrs(
+            doc,
+            "root",
+            "b",
+            &FenceAttrsPatch {
+                deps: Some(Vec::new()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!cleared.contains("deps="));
+    }
+
+    #[test]
+    fn set_fence_attrs_sets_and_clears_interpreter() {
+        let doc = "# Root\n<!-- meshfox:node id=\"root\" -->\n\n```bash name=\"b\"\nprint(1)\n```\n";
+        let set = set_fence_attrs(
+            doc,
+            "root",
+            "b",
+            &FenceAttrsPatch {
+                interpreter: Some(Some("python3 -u".to_string())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(set.contains("interpreter=\"python3 -u\""));
+
+        let cleared = set_fence_attrs(
+            &set,
+            "root",
+            "b",
+            &FenceAttrsPatch {
+                interpreter: Some(None),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!cleared.contains("interpreter="));
+    }
+
+    #[test]
+    fn set_fence_attrs_replaces_the_code_and_can_combine_with_attrs_in_one_call() {
+        let doc = "# Root\n<!-- meshfox:node id=\"root\" -->\n\n```bash name=\"b\"\necho old\n```\n";
+        let updated = set_fence_attrs(
+            doc,
+            "root",
+            "b",
+            &FenceAttrsPatch {
+                always: Some(true),
+                code: Some("echo new\necho more".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let node = parse(&updated).unwrap();
+        let block = scan_runnable_blocks("root", &node.node("root").unwrap().text)
+            .into_iter()
+            .find(|b| b.name.as_deref() == Some("b"))
+            .unwrap();
+        assert!(block.always);
+        assert_eq!(block.code, "echo new\necho more");
+        assert!(!updated.contains("echo old"));
+    }
+
+    #[test]
+    fn set_fence_attrs_preserves_a_longer_delimiter() {
+        // Four backticks — needed here because the code itself contains a
+        // literal fenced block written as plain text (a common reason to
+        // need one at all: quoting example Markdown inside a real fence).
+        let doc = "# Root\n<!-- meshfox:node id=\"root\" -->\n\n````bash name=\"b\"\necho '```'\n````\n";
+        let updated = set_fence_attrs(
+            doc,
+            "root",
+            "b",
+            &FenceAttrsPatch {
+                cache: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(updated.starts_with("# Root"));
+        assert!(updated.contains("````bash name=\"b\" cache\necho '```'\n````"));
+    }
+
+    #[test]
+    fn set_fence_attrs_is_none_for_an_unknown_node_or_block() {
+        let doc = "# Root\n<!-- meshfox:node id=\"root\" -->\n\n```bash name=\"b\"\necho hi\n```\n";
+        assert!(set_fence_attrs(doc, "nope", "b", &FenceAttrsPatch::default()).is_none());
+        assert!(set_fence_attrs(doc, "root", "nope", &FenceAttrsPatch::default()).is_none());
     }
 
     #[test]

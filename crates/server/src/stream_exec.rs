@@ -1,15 +1,11 @@
-//! Async, cancellable counterpart to `meshfox_core::exec` — used only by
-//! the server, for `meshfox view`'s live-output streaming and Kill button.
-//!
-//! The CLI keeps using `core::exec::BashExecutor` (`std::process`,
-//! blocking `wait()`) unchanged — it never needs to show output before a
-//! block finishes, or cancel a block mid-flight, so there's no reason to
-//! pull `tokio` into `meshfox-core` (a deliberately light,
-//! runtime-agnostic crate) just for this. This duplicates
-//! `BashExecutor`'s small "spawn bash, merge stdout+stderr" body in
-//! `tokio::process` form — justified by a genuinely different execution
-//! model (cancellable/async vs blocking/sync), not accidental drift; keep
-//! the two in sync by hand if the merging strategy ever changes.
+//! The one actual runner behind every block a person can watch run live
+//! and kill: `meshfox view`'s streaming/Kill button, `meshfox run`'s own
+//! live terminal output (`crates/cli/src/main.rs`'s `run_async`), and the
+//! TUI (`crates/cli/src/tui/app.rs`). `meshfox_core::exec` handles the
+//! `interpreter=` parsing/resolution these spawns build their commands
+//! around, but doesn't spawn anything itself — `tokio` stays out of that
+//! crate (deliberately light, runtime-agnostic) by keeping the actual
+//! async, cancellable spawning here in the server crate instead.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -98,7 +94,11 @@ where
     V: AsRef<std::ffi::OsStr>,
 {
     let mut command = Command::new("bash");
-    command.arg("-c").arg(code).envs(envs);
+    // `-e`: a script that doesn't check its own exit codes (a bare
+    // `cp`/`mkdir`/`mv` failing partway through) would otherwise silently
+    // continue past the failure and report whatever its last line's exit
+    // code happens to be — usually success — instead of the real one.
+    command.arg("-e").arg("-c").arg(code).envs(envs);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -155,9 +155,9 @@ where
 }
 
 /// Spawns `code` under an explicit `interpreter=` command (see
-/// `meshfox_core::exec::split_interpreter`) — the streaming counterpart to
-/// `meshfox_core::exec::InterpreterExecutor`: `code` is written to a fresh
-/// temp file first (shebang-style, same reasoning as the sync version),
+/// `meshfox_core::exec::split_interpreter`): `code` is written to a fresh
+/// temp file first (shebang-style — works for interpreters that care about
+/// `__file__`/script-relative paths, and sidesteps shell quoting entirely),
 /// then run as `program args... tmpfile`, as the leader of a fresh process
 /// group like every other spawn function here. The temp file is removed
 /// once the returned `SpawnedProcess` is dropped (see its `Drop` impl).
@@ -276,11 +276,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interleaves_stdout_and_stderr_in_emission_order() {
+        let mut proc = spawn_bash(
+            "echo out1; sleep 0.05; echo err1 >&2; sleep 0.05; echo out2; sleep 0.05; echo err2 >&2",
+            no_envs(),
+            None,
+        )
+        .unwrap();
+        let mut lines = Vec::new();
+        while let Some(line) = proc.output_rx.recv().await {
+            lines.push(line);
+        }
+        let _ = proc.child.wait().await.unwrap();
+        assert_eq!(lines, vec!["out1", "err1", "out2", "err2"]);
+    }
+
+    #[tokio::test]
+    async fn captures_output_with_no_trailing_newline() {
+        let mut proc = spawn_bash("printf 'no newline'", no_envs(), None).unwrap();
+        let mut lines = Vec::new();
+        while let Some(line) = proc.output_rx.recv().await {
+            lines.push(line);
+        }
+        let _ = proc.child.wait().await.unwrap();
+        assert_eq!(lines, vec!["no newline"]);
+    }
+
+    #[tokio::test]
     async fn reports_nonzero_exit_code() {
         let mut proc = spawn_bash("exit 7", no_envs(), None).unwrap();
         while proc.output_rx.recv().await.is_some() {}
         let status = proc.child.wait().await.unwrap();
         assert_eq!(status.code(), Some(7));
+    }
+
+    /// Regression test: `spawn_bash` used to run without `-e`, so a script
+    /// with an early failing command that never checks its own exit code
+    /// (a bare `cp`/`mkdir`/`mv` to a path it can't write) silently kept
+    /// going — the final reported exit code came from whatever its *last*
+    /// line happened to be, not the real failure. Multi-line scripts (like
+    /// README.md's own "Install" block) rely on `-e` to stop and report the
+    /// actual failure instead.
+    #[tokio::test]
+    async fn a_failing_command_stops_the_script_instead_of_being_silently_ignored() {
+        let mut proc = spawn_bash(
+            "echo before; false; echo after-should-not-print",
+            no_envs(),
+            None,
+        )
+        .unwrap();
+        let mut lines = Vec::new();
+        while let Some(line) = proc.output_rx.recv().await {
+            lines.push(line);
+        }
+        let status = proc.child.wait().await.unwrap();
+        assert_eq!(lines, vec!["before"], "unexpected output: {lines:?}");
+        assert_ne!(status.code(), Some(0));
     }
 
     #[tokio::test]
