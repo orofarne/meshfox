@@ -92,6 +92,26 @@ command line, if that's what's intended instead of the full chain.
 - `meshfox spec` — the full `.canvas.md` format reference, if a hand-edit is
   actually warranted.
 
+## MCP, if available
+
+`meshfox mcp <path>` is a stdio MCP server bound to one canvas file —
+experimental, and not something this binary itself starts (a host launches
+it: `{"command": "meshfox", "args": ["mcp", "/path/to.canvas.md"]}`). If
+this session already has that configured, its tools are usually a better
+fit than shelling out through this same CLI for two specific cases:
+
+- **A multi-step debug session** (`debug_start`/`debug_send`/`debug_stop`):
+  a persistent shell in a node/block's own resolved cwd/env, so state
+  (exported vars, files a snippet wrote) survives between calls — a
+  one-shot `meshfox run` re-resolves everything from scratch every time.
+- **Structured reads/single edits** (`node_show`/`node_add`/`node_meta`/
+  `node_body`/`node_block`/`node_rm`/`node_mv`) — `node_show` returns JSON,
+  not text to re-parse.
+
+Everything else (validate/check/list/static/pdf, batch edits, anything
+`--no-deps`-shaped) still only exists via the CLI below — the MCP tools are
+a narrower, additive surface, not a replacement for it.
+
 ## Canvas path
 
 Most commands take the canvas path as an optional trailing argument or

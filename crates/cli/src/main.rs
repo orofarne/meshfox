@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
+mod mcp;
 mod pdf;
 mod prompt;
 mod tui;
@@ -198,6 +199,26 @@ enum Command {
     /// no *structural* editing beyond that (use `meshfox
     /// node ...` or the browser UI's Edit mode for that).
     Tui {
+        #[command(flatten)]
+        canvas: CanvasOpt,
+    },
+    /// Experimental: an MCP stdio server, bound to one canvas file, giving
+    /// an AI agent two tool groups without shelling out to this same
+    /// binary: a stateful debug session (`debug_start`/`debug_send`/
+    /// `debug_stop` — a persistent `bash` kept alive in a node/block's own
+    /// resolved cwd/env, so a multi-step snippet's state — exported vars,
+    /// files it wrote — survives between calls, unlike a one-shot `meshfox
+    /// run`) and thin wrappers around the existing single-node edit
+    /// operations (`node show` as structured JSON, `add`/`meta`/`body`/
+    /// `block`/`rm`/`mv`). Deliberately does *not* attempt batch/
+    /// transactional multi-edit or optimistic-concurrency write conflicts
+    /// (see TODO.canvas.md's own "MCP-редактирование файла"/"Оптимистичная
+    /// конкурентность" — still open design questions, not implemented
+    /// here) — every write here is the same immediate read-modify-write
+    /// `node <op>` already does. A host launches this the same way as any
+    /// other stdio MCP server: `{"command": "meshfox", "args": ["mcp",
+    /// "/path/to.canvas.md"]}`.
+    Mcp {
         #[command(flatten)]
         canvas: CanvasOpt,
     },
@@ -967,6 +988,10 @@ fn main() {
             let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
             tui(canvas_path)
         }
+        Command::Mcp { canvas } => {
+            let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
+            mcp_cmd(canvas_path)
+        }
         Command::Validate { canvas } => {
             let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
             validate(&canvas_path)
@@ -1518,6 +1543,17 @@ fn tui(canvas_path: PathBuf) {
     });
     if let Err(e) = runtime.block_on(tui::run(canvas_path)) {
         eprintln!("meshfox tui: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn mcp_cmd(canvas_path: PathBuf) {
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+        eprintln!("failed to start async runtime: {e}");
+        std::process::exit(1);
+    });
+    if let Err(e) = runtime.block_on(mcp::run(canvas_path)) {
+        eprintln!("meshfox mcp: {e}");
         std::process::exit(1);
     }
 }
