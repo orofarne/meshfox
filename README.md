@@ -92,9 +92,9 @@ an example of the format it's describing.
 ```bash name="usage-help" cache
 meshfox -h
 ```
-<!-- meshfox:output name="usage-help" -->
+<!-- meshfox:output name="usage-help" hash="d456ec0a" -->
 ````text
-exit code: 0
+exit code: 0 · 20ms
 
 
  /\_/\
@@ -111,7 +111,8 @@ Commands:
   configure      Interactively resolve every declared `meshfox:var` (see SPEC.md's "Variables") and save the answers to the on-disk cache (`.meshfox/<filename>.env`, next to the canvas file) so `run` doesn't have to ask again. Shows each variable's currently-resolved value as the prompt's own default — press Enter to keep it. Secret variables are never cached, so there's nothing for this to save for them; they're skipped here and asked for fresh at run time instead. Requires an interactive terminal
   create         Create a new, empty canvas file: just the `meshfox:canvas` marker followed by a lone root heading (`#`) named after the file itself (its name with a trailing `.canvas.md`/`.md` stripped). Fails if the file already exists — this never overwrites
   view           Start the local web UI: canvas view, run buttons. Opens read-only — running a block is always allowed, but click "Edit" in the browser to unlock dragging, resizing, saving layout, and persisting a `cache`d block's output back into the file
-  tui            Experimental: an ncurses-style terminal viewer — browse the node tree, read a node's rendered Markdown body (syntax-highlighted code, local images shown inline where the terminal supports it), and run blocks with live streamed output, right in the terminal. Same deps-chain/cache/`meshfox:var` handling as `meshfox run`/`meshfox view`. A `tty` block hands the real terminal over to it, same as `meshfox run`'s own `tty` handling. Mouse support covers clicking a tree row to select it (or its ▾/▸ marker to expand/collapse) and scrolling the tree/document panes. `e` opens a fullscreen raw-source editor (vim-style input, syntax highlighting, `Ctrl-f` to switch between the document and any `include`d file) on the selected node's own file — the terminal counterpart to the browser UI's Source mode. Still no *structural* editing beyond that (use `meshfox node ...` or the browser UI's Edit mode for that)
+  tui            Experimental: an ncurses-style terminal viewer — browse the node tree, read a node's rendered Markdown body (syntax-highlighted code, local images shown inline where the terminal supports it), and run blocks with live streamed output, right in the terminal. Same deps-chain/cache/`meshfox:var` handling as `meshfox run`/`meshfox view`. A `tty` block hands the real terminal over to it, same as `meshfox run`'s own `tty` handling. The tree/document panes' own mouse support covers clicking a tree row to select it (or its ▾/▸ marker to expand/collapse) and scrolling either pane; each row's title is also colored to match the node's own `color=`. `e` opens a fullscreen raw-source editor (vim-style modal input via `edtui`, meshfox-specific syntax highlighting, full mouse support — click to position the cursor, drag to select, scroll to move the viewport) on the selected node's own file — the terminal counterpart to the browser UI's Source mode. `Ctrl-f` switches between the document and any `include`d file; `Ctrl-n` turns the heading under the cursor into a node in one keystroke; `Ctrl-p` suggests attributes for the current `meshfox:node`/`meshfox:edge` comment or runnable-fence line, or, with the cursor inside a `tags=` value, tags already used elsewhere in the document. Still no *structural* editing beyond that (use `meshfox node ...` or the browser UI's Edit mode for that)
+  mcp            Experimental: an MCP stdio server giving an AI agent tool-call access to every canvas file under the current directory, without shelling out to this same binary. Takes no arguments — a host launches it the same way as any other stdio MCP server: `{"command": "meshfox", "args": ["mcp"]}`, and whichever directory it's started in becomes its root. Multi-canvas by design, but keeps "one file, one process" isolation underneath: `canvas_open`/`canvas_close`/`canvas_list` manage a registry of canvases, each backed by its own spawned, isolated child process (a crash or hung debug session on one canvas can't affect another) — resolved only under that root directory, never above it. Every other tool requires that `canvas_id` as its first argument, mirroring its single-canvas equivalent exactly: a stateful debug session (`debug_start`/`debug_send`/`debug_stop` — a persistent `bash` kept alive in a node/block's own resolved cwd/env, so a multi-step snippet's state — exported vars, files it wrote — survives between calls, unlike a one-shot `meshfox run`) and thin wrappers around the whole `node <op>` surface — every subcommand, not just a subset: `show`/`find` (find as structured JSON, CSS-selector matching, same as `node find`) and the mutating `add`/`meta`/`body`/`block`/`rm`/`mv`/`rename`/`set_id`/`edges`/ `move`/`reorder`. Deliberately does *not* attempt batch/ transactional multi-edit or optimistic-concurrency write conflicts (see TODO.canvas.md's own "MCP-редактирование файла"/"Оптимистичная конкурентность" — still open design questions, not implemented here) — every write here is the same immediate read-modify-write `node <op>` already does
   validate       Validate that a file parses as a meshfox canvas — same checks `run`/`view` already do before touching anything (single root, no duplicate ids, no dangling `meshfox:edge` targets, `group`/ `file`/`link` body rules) — without executing anything or writing the file back. Exits non-zero on a parse error, so it's usable as a pre-commit/CI check
   check          Run every embedded ` ```starlark constraint ` fence's Starlark contract against the document (see `crate::constraint`/SPEC.md's "Constraint nodes") and report which passed. Distinct from `validate`: `validate` checks that the file *parses* as a well-formed canvas; `check` asks whether the document as a whole satisfies whatever rules its own constraint fences declare (e.g. "every node tagged `table` has exactly one `file` child") — implies `validate` first, since an unparseable file has no constraints to run. Resolves includes first (same as `validate`/`view`/`static`), so a constraint sees the fully composed document — including one that lives inside an included canvas, evaluated against its namespaced `{include_id}/{original_id}` — same tree the web UI checks, not just this file in isolation. Exits non-zero if the file (or any include target) fails to parse, an include is broken, or any constraint fails, so it's usable as a pre-commit/CI check alongside (or instead of) `validate`
   list           Print every runnable code block in the canvas as an indented tree, each with a ready-to-paste `meshfox run <path...> <name>` — so you don't have to go spelunking through the file to find out what's runnable. Same raw-file-only scope as `run`/`validate` (no include resolution)
@@ -351,16 +352,18 @@ Every `<!-- meshfox:... -->` marker comment is also highlighted on top of the bu
 ### MCP server (experimental)
 <!-- meshfox:node id="mcp-server-experimental" -->
 
-`meshfox mcp` starts an MCP ([Model Context Protocol](https://modelcontextprotocol.io)) stdio server bound to one canvas file — a fourth front door onto the same files as `run`/`view`/`tui`, this one for an AI agent talking to `meshfox` through structured tool calls instead of shelling out to the binary or hand-editing the file. A host launches it the same way as any other stdio MCP server:
+`meshfox mcp` starts an MCP ([Model Context Protocol](https://modelcontextprotocol.io)) stdio server — a fourth front door onto the same files as `run`/`view`/`tui`, this one for an AI agent talking to `meshfox` through structured tool calls instead of shelling out to the binary or hand-editing the file. Takes no arguments; a host launches it the same way as any other stdio MCP server, and whichever directory it's started in becomes its root:
 
 ```json
-{"command": "meshfox", "args": ["mcp", "/path/to.canvas.md"]}
+{"command": "meshfox", "args": ["mcp"]}
 ```
 
-Two tool groups:
+Multi-canvas by design, but keeping "one file, one process" isolation underneath it: `canvas_open`/`canvas_close`/`canvas_list` manage a registry of open canvases, each backed by its own spawned, isolated child process — a crash or a hung `debug_send` on one canvas can't touch another, even though a host still sees exactly one MCP server. `canvas_open` only resolves paths under that **root directory** — it refuses anything above that (`..`, an absolute path elsewhere, a symlink pointing out). A canvas id is that file's path relative to the root; opening an already-open file just returns its existing id rather than spawning a second process. **Every other tool takes that `canvas_id` as its first argument** — there's no implicit "current" canvas.
+
+Two tool groups, each mirroring its single-canvas equivalent exactly:
 
 - **Debug session** — `debug_start`/`debug_send`/`debug_stop`: a persistent `bash` kept alive in a node/block's own resolved cwd/env, so a multi-step snippet's state (exported vars, files it wrote) survives between calls, unlike a one-shot `run`. `debug_start` resolves `env=` the same way `run` does, taking `vars` as an explicit override for anything `meshfox:var` would otherwise need to prompt for — there's no interactive terminal on the other end of a tool call to prompt.
-- **Node operations** — `node_show`/`node_find` (structured JSON, `find` matching a CSS selector against the canvas tree the same way `node find` does) plus every mutating `node <op>` subcommand: `node_add`/`node_meta`/`node_body`/`node_block`/`node_rm`/`node_mv`/`node_rename`/`node_set_id`/`node_edges`/`node_move`/`node_reorder`. Each is a thin wrapper around the exact same validated read-modify-write `node <op>` already does — no batch/transactional multi-edit, no optimistic-concurrency write-conflict detection against a concurrent editor.
+- **Node operations** — `node_show`/`node_find` (structured JSON, `find` matching a CSS selector against the canvas tree the same way `node find` does, both with an optional `include_body` to also get a node's own Markdown text) plus every mutating `node <op>` subcommand: `node_add`/`node_meta`/`node_body`/`node_block`/`node_rm`/`node_mv`/`node_rename`/`node_set_id`/`node_edges`/`node_move`/`node_reorder`. Each is a thin wrapper around the exact same validated read-modify-write `node <op>` already does — no batch/transactional multi-edit, no optimistic-concurrency write-conflict detection against a concurrent editor.
 
 See [`AGENT_HELP.md`](./AGENT_HELP.md) (also `meshfox --agent-help`) for the same "prefer structured operations over hand-editing" guidance this tool surface exists to make available as tool calls rather than shell commands.
 
@@ -369,20 +372,31 @@ meshfox mcp -h
 ```
 <!-- meshfox:output name="mcp-help" hash="21dec42a" -->
 ```text
-exit code: 0 · 18ms
+exit code: 0 · 27ms
 
-Experimental: an MCP stdio server, bound to one canvas file, giving an AI agent two tool groups without shelling out to this same binary: a stateful debug session (`debug_start`/`debug_send`/ `debug_stop` — a persistent `bash` kept alive in a node/block's own resolved cwd/env, so a multi-step snippet's state — exported vars, files it wrote — survives between calls, unlike a one-shot `meshfox run`) and thin wrappers around the whole `node <op>` surface — every subcommand, not just a subset: `show`/`find` (find as structured JSON, CSS-selector matching, same as `node find`) and the mutating `add`/`meta`/`body`/`block`/`rm`/`mv`/`rename`/`set_id`/`edges`/ `move`/`reorder`. Deliberately does *not* attempt batch/ transactional multi-edit or optimistic-concurrency write conflicts (see TODO.canvas.md's own "MCP-редактирование файла"/"Оптимистичная конкурентность" — still open design questions, not implemented here) — every write here is the same immediate read-modify-write `node <op>` already does. A host launches this the same way as any other stdio MCP server: `{"command": "meshfox", "args": ["mcp", "/path/to.canvas.md"]}`
+Experimental: an MCP stdio server giving an AI agent tool-call access to every canvas file under the current directory, without shelling out to this same binary. Takes no arguments — a host launches it the same way as any other stdio MCP server: `{"command": "meshfox", "args": ["mcp"]}`, and whichever directory it's started in becomes its root. Multi-canvas by design, but keeps "one file, one process" isolation underneath: `canvas_open`/`canvas_close`/`canvas_list` manage a registry of canvases, each backed by its own spawned, isolated child process (a crash or hung debug session on one canvas can't affect another) — resolved only under that root directory, never above it. Every other tool requires that `canvas_id` as its first argument, mirroring its single-canvas equivalent exactly: a stateful debug session (`debug_start`/`debug_send`/`debug_stop` — a persistent `bash` kept alive in a node/block's own resolved cwd/env, so a multi-step snippet's state — exported vars, files it wrote — survives between calls, unlike a one-shot `meshfox run`) and thin wrappers around the whole `node <op>` surface — every subcommand, not just a subset: `show`/`find` (find as structured JSON, CSS-selector matching, same as `node find`) and the mutating `add`/`meta`/`body`/`block`/`rm`/`mv`/`rename`/`set_id`/`edges`/ `move`/`reorder`. Deliberately does *not* attempt batch/ transactional multi-edit or optimistic-concurrency write conflicts (see TODO.canvas.md's own "MCP-редактирование файла"/"Оптимистичная конкурентность" — still open design questions, not implemented here) — every write here is the same immediate read-modify-write `node <op>` already does
 
-Usage: meshfox mcp [OPTIONS] [CANVAS]
-
-Arguments:
-  [CANVAS]  Path to the .canvas.md file. If omitted: auto-discover the single candidate in the current directory
+Usage: meshfox mcp
 
 Options:
-      --canvas <CANVAS>  Same as the positional argument above, spelled as a flag — for parity with `run`/`node <op>`, which only accept this form
-  -h, --help             Print help
+  -h, --help  Print help
 ```
 <!-- /meshfox:output -->
+
+#### MCP Inspector
+<!-- meshfox:node id="mcp-inspector" -->
+
+[`@modelcontextprotocol/inspector`](https://github.com/modelcontextprotocol/inspector) is the reference Node.js tool for poking at any MCP server directly — lists every tool with its full JSON schema and logs every request/response live, handy for checking a tool call actually reaches a host the way `meshfox mcp` sends it, without going through a real client. Installed globally so its own `mcp-inspector` binary lands on `PATH`:
+
+```sh name="mcp-inspector-install"
+npm install -g @modelcontextprotocol/inspector
+```
+
+`mcp-inspector` ships three modes — `--web` (the default), `--cli`, `--tui` — but only `--cli`/`--tui` accept a bare stdio command as trailing arguments; hand `--web` the same `meshfox mcp ...` command and it silently fails to connect, since that mode only knows how to read a server from a catalog/config file. `--tui` is the one that actually drops into the terminal instead of a browser, so it's the one this fence uses — flagged `tty` (see "Interactive (`tty`) blocks" above) rather than `cache`, since it's a live, interactive UI with nothing to freeze into an output block; `autoclose` folds this block back up the moment the inspector process itself exits (`q`/Ctrl-C), instead of leaving a stale terminal panel open:
+
+```sh name="mcp-inspector-launch" tty autoclose
+mcp-inspector meshfox mcp
+```
 
 ### Static export (experimental)
 <!-- meshfox:node id="usage-static" -->
@@ -615,6 +629,15 @@ Copies the release binary to `$INSTALL_PATH` — see "Variables" above, where it
 mkdir -p "$INSTALL_PATH"
 cp target/release/meshfox "$INSTALL_PATH/meshfox"
 echo "installed to $INSTALL_PATH/meshfox"
+```
+
+### Fix macOS Gatekeeper kill
+<!-- meshfox:node id="fix-macos-gatekeeper-kill" -->
+
+macOS only, and not fully deterministic: a locally built/installed binary can get silently `SIGKILL`ed on launch (exit code 137, no error message) — an AMFI/Gatekeeper code-signature check a plain `cargo build`'s own output doesn't satisfy, and one that's been seen resurfacing even on a binary that already ran fine earlier in the same session, not only right after a fresh build. Re-signing ad hoc (no real identity, just enough to satisfy the check) clears it. Deliberately without `cache`, same reasoning as "Install" above — nothing here worth freezing, and re-running this is exactly the point whenever the kill resurfaces:
+
+```sh name="fix-macos-kill" env="$INSTALL_PATH"
+codesign --force -s - "$INSTALL_PATH/meshfox"
 ```
 
 ## License

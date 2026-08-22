@@ -49,8 +49,13 @@ scraper = "0.20"
 # `meshfox mcp` — an MCP stdio server exposing debug-session and
 # canvas-editing tools to AI agents (see TODO.canvas.md's "MCP-сессия"/
 # "MCP-редактирование файла" nodes). The official Rust SDK; `server` +
-# `transport-io` cover a stdio-based tool server, nothing more.
-rmcp = { version = "3", features = ["server", "transport-io"] }
+# `transport-io` cover the stdio tool server surface a host talks to.
+# `client` + `transport-child-process` are for the *other* side of the same
+# binary: `canvas_open` spawns `meshfox mcp <file>` per opened canvas and
+# talks to it as an MCP client over its own stdio, keeping "one file, one
+# process" isolation while still presenting one server to the host (see
+# TODO.canvas.md's "Несколько канвасов в одном MCP-сервере?").
+rmcp = { version = "3", features = ["server", "transport-io", "client", "transport-child-process"] }
 schemars = "1"
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }

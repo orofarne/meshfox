@@ -1,32 +1,43 @@
-//! `meshfox mcp <path>` — an MCP stdio server bound to one canvas file (see
-//! `Command::Mcp`'s own doc comment). Two tool groups:
+//! `meshfox mcp` — an MCP stdio server for AI agents (see TODO.canvas.md's
+//! "MCP-сессия"/"Несколько канвасов в одном MCP-сервере?" nodes). Takes no
+//! arguments: whatever directory it's started in becomes its root. Two
+//! layers, same binary, distinguished only by [`LEAF_ENV_VAR`]:
 //!
-//! - **Debug session** (`debug_start`/`debug_send`/`debug_stop`): a
-//!   persistent `bash` kept alive in a node/block's own resolved cwd/env,
-//!   so state between calls (exported vars, files a snippet wrote) survives
-//!   the way a one-shot `meshfox run` never could. Always plain `bash`,
-//!   never a block's own `interpreter=` — a session is inherently about
-//!   running many different ad-hoc snippets over time, not repeatedly
-//!   driving one fixed non-shell REPL.
-//! - **Editing**: `node_show`/`node_find` as structured JSON, plus thin
-//!   wrappers around the same pure `apply_node_*` functions `node <op>`
-//!   already uses — the full `node <op>` surface (`add`/`rm`/`mv`/
-//!   `rename`/`set_id`/`body`/`block`/`meta`/`edges`/`move`/`reorder`/
-//!   `show`/`find`) is mirrored here one tool per subcommand, so an agent
-//!   never has to fall back to hand-editing or shelling out to the CLI for
-//!   something the MCP surface is missing. Each call is its own immediate
-//!   read-modify-write, same as the CLI. Deliberately no batch/transactional
-//!   multi-edit and no optimistic-concurrency write conflict detection (see
-//!   TODO.canvas.md's own still-open design notes on both) — not attempted
-//!   here.
+//! - **Root** (default — what a host actually launches): [`MeshfoxMcpRoot`].
+//!   Doesn't touch any canvas file itself. `canvas_open`/`canvas_close`/
+//!   `canvas_list` manage a registry of canvases, each backed by its own
+//!   spawned `meshfox mcp` **child process** (via
+//!   `rmcp::transport::TokioChildProcess`, the same client transport an MCP
+//!   host itself uses to launch a stdio server — this is the exact same
+//!   mechanism, just one level up). Every other tool takes a required
+//!   `canvas_id` and is a pure proxy: forward the identically-named,
+//!   identically-shaped call to that canvas's own child process, return
+//!   whatever it says. One file, one process — a crash or a hung
+//!   `debug_send` on one canvas can't touch another — while a host still
+//!   sees exactly one MCP server.
+//! - **Leaf** (`MESHFOX_MCP_LEAF=1` in the environment, canvas path in
+//!   [`LEAF_PATH_ENV_VAR`] — only `canvas_open` sets either, never a human):
+//!   [`MeshfoxMcp`], the original single-file server, unchanged.
+//!   `node_show`/`add`/`meta`/`body`/`block`/`rm`/`mv`/`rename`/`set_id`/
+//!   `edges`/`move`/`reorder`/`find` are thin wrappers around the same pure
+//!   `apply_node_*`/`find_node_ids` functions `node <op>` already uses;
+//!   `debug_start`/`debug_send`/`debug_stop` run a persistent `bash` kept
+//!   alive in a node/block's own resolved cwd/env, so state between calls
+//!   (exported vars, files a snippet wrote) survives the way a one-shot
+//!   `meshfox run` never could. Each call is its own immediate
+//!   read-modify-write of the file on disk — no batching, no
+//!   optimistic-concurrency conflict detection against a concurrent editor
+//!   (see TODO.canvas.md's own still-open "MCP-редактирование файла" node).
 //!
-//! Concurrency: each debug session serializes its own `debug_send` calls
-//! (a `Mutex` per session) but different sessions run independently. An
-//! idle session (no `debug_send` for `IDLE_TIMEOUT`) is killed and dropped
-//! by a periodic sweep, in case an agent forgets to call `debug_stop`.
+//! `canvas_open` only ever resolves paths under the **root directory** — the
+//! canonicalized directory `meshfox mcp` was started in — rejecting anything
+//! that escapes it (`..`, an absolute path elsewhere, a symlink pointing
+//! out). A canvas id is that file's path relative to the root; opening an
+//! already-open file just returns the same id rather than spawning a second
+//! process for it.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -34,10 +45,15 @@ use std::time::{Duration, Instant};
 use meshfox_core::Canvas;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ServerCapabilities, ServerInfo};
-use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler, ServiceExt};
+use rmcp::model::{CallToolRequestParams, CallToolResult, ServerCapabilities, ServerInfo};
+use rmcp::service::RunningService;
+use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
+use rmcp::{
+    tool, tool_handler, tool_router, ErrorData, RoleClient, ServerHandler, ServiceError,
+    ServiceExt,
+};
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
@@ -46,8 +62,32 @@ use tokio::sync::{mpsc, Mutex};
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const SWEEP_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_SEND_TIMEOUT_MS: u64 = 60_000;
+const CANVAS_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub async fn run(canvas_path: PathBuf) -> Result<(), String> {
+/// Set (to any value) only in the environment of a process `canvas_open`
+/// itself spawns — never meant for a human to set. Its presence is the only
+/// thing that distinguishes a leaf `meshfox mcp` process from the root one a
+/// host actually launches; see this module's own doc comment.
+const LEAF_ENV_VAR: &str = "MESHFOX_MCP_LEAF";
+
+/// The canvas path a leaf process serves, passed as an environment variable
+/// rather than a CLI argument so `meshfox mcp` itself stays argument-free
+/// for a human/host to launch — only `canvas_open` ever sets this, right
+/// alongside [`LEAF_ENV_VAR`].
+const LEAF_PATH_ENV_VAR: &str = "MESHFOX_MCP_LEAF_PATH";
+
+pub async fn run() -> Result<(), String> {
+    if std::env::var_os(LEAF_ENV_VAR).is_some() {
+        let canvas_path = std::env::var_os(LEAF_PATH_ENV_VAR)
+            .map(PathBuf::from)
+            .ok_or_else(|| format!("{LEAF_PATH_ENV_VAR} not set in a leaf process"))?;
+        run_leaf(canvas_path).await
+    } else {
+        run_root().await
+    }
+}
+
+async fn run_leaf(canvas_path: PathBuf) -> Result<(), String> {
     let server = MeshfoxMcp::new(canvas_path);
     server.spawn_idle_sweep();
     let service = server
@@ -60,6 +100,33 @@ pub async fn run(canvas_path: PathBuf) -> Result<(), String> {
         .map_err(|e| format!("MCP server ended unexpectedly: {e}"))?;
     Ok(())
 }
+
+async fn run_root() -> Result<(), String> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| format!("failed to resolve the current directory: {e}"))?;
+    let root = cwd
+        .canonicalize()
+        .map_err(|e| format!("failed to resolve {} as a root directory: {e}", cwd.display()))?;
+    let server = MeshfoxMcpRoot::new(root);
+    server.spawn_idle_sweep();
+    let service = server
+        .serve(rmcp::transport::stdio())
+        .await
+        .map_err(|e| format!("failed to start MCP server: {e}"))?;
+    service
+        .waiting()
+        .await
+        .map_err(|e| format!("MCP server ended unexpectedly: {e}"))?;
+    Ok(())
+}
+
+fn invalid_params(msg: impl Into<String>) -> ErrorData {
+    ErrorData::invalid_params(msg.into(), None)
+}
+
+// =======================================================================
+// Leaf: one process, one canvas file — the original implementation.
+// =======================================================================
 
 #[derive(Clone)]
 struct MeshfoxMcp {
@@ -119,10 +186,6 @@ impl MeshfoxMcp {
             )
         })
     }
-}
-
-fn invalid_params(msg: impl Into<String>) -> ErrorData {
-    ErrorData::invalid_params(msg.into(), None)
 }
 
 // ---------------------------------------------------------------------
@@ -316,10 +379,10 @@ fn strip_marker(line: &str, marker: &str) -> Option<i32> {
 }
 
 // ---------------------------------------------------------------------
-// Tool parameter types
+// Leaf tool parameter types
 // ---------------------------------------------------------------------
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, Serialize, JsonSchema)]
 struct DebugStartParams {
     /// The node whose own cwd/env this session runs in.
     node_id: String,
@@ -339,7 +402,7 @@ struct DebugStartParams {
     vars: HashMap<String, String>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, Serialize, JsonSchema)]
 struct DebugSendParams {
     session_id: String,
     /// Shell code to run in this session's own shell — the same process,
@@ -353,17 +416,22 @@ struct DebugSendParams {
     timeout_ms: Option<u64>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, Serialize, JsonSchema)]
 struct DebugStopParams {
     session_id: String,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, Serialize, JsonSchema)]
 struct NodeIdParams {
     node_id: String,
+    /// Include the node's own Markdown body (its `text`, between this
+    /// heading and the next) in the result. Omitted by default since most
+    /// callers only want the structural metadata.
+    #[serde(default)]
+    include_body: bool,
 }
 
-#[derive(Deserialize, JsonSchema, Default)]
+#[derive(Deserialize, Serialize, JsonSchema, Default)]
 struct McpNodeFields {
     #[serde(default)]
     x: Option<f64>,
@@ -415,7 +483,7 @@ impl McpNodeFields {
     }
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, Serialize, JsonSchema)]
 struct NodeAddParams {
     parent_id: String,
     title: String,
@@ -427,7 +495,7 @@ struct NodeAddParams {
     fields: McpNodeFields,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, Serialize, JsonSchema)]
 struct NodeMetaParams {
     node_id: String,
     /// Clears x/y/width/height back to unset. Mutually exclusive with
@@ -438,13 +506,13 @@ struct NodeMetaParams {
     fields: McpNodeFields,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, Serialize, JsonSchema)]
 struct NodeBodyParams {
     node_id: String,
     body: String,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, Serialize, JsonSchema)]
 struct NodeRmParams {
     node_id: String,
     /// Promote direct children to this node's own parent instead of
@@ -453,13 +521,13 @@ struct NodeRmParams {
     keep_children: bool,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, Serialize, JsonSchema)]
 struct NodeMvParams {
     node_id: String,
     new_parent_id: String,
 }
 
-#[derive(Deserialize, JsonSchema, Default)]
+#[derive(Deserialize, Serialize, JsonSchema, Default)]
 struct NodeBlockParams {
     node_id: String,
     block_name: String,
@@ -498,7 +566,7 @@ struct NodeBlockParams {
     code: Option<String>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, Serialize, JsonSchema)]
 struct NodeRenameParams {
     node_id: String,
     /// New heading text. The node's id, heading level, and body are left
@@ -507,7 +575,7 @@ struct NodeRenameParams {
     title: String,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, Serialize, JsonSchema)]
 struct NodeSetIdParams {
     node_id: String,
     /// The new stable id. Every `parent=`/`meshfox:edge from=` reference to
@@ -516,7 +584,7 @@ struct NodeSetIdParams {
     new_id: String,
 }
 
-#[derive(Deserialize, JsonSchema, Default)]
+#[derive(Deserialize, Serialize, JsonSchema, Default)]
 struct NodeEdgesParams {
     node_id: String,
     /// Full replacement list of extra-parent ids (`meshfox:edge from="..."`
@@ -526,7 +594,7 @@ struct NodeEdgesParams {
     from: Vec<String>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, Serialize, JsonSchema)]
 struct NodeMoveParams {
     node_id: String,
     /// Move `node_id` to sit immediately before this sibling. Exactly one
@@ -539,10 +607,10 @@ struct NodeMoveParams {
     after: Option<String>,
 }
 
-#[derive(Deserialize, JsonSchema, Default)]
+#[derive(Deserialize, Serialize, JsonSchema, Default)]
 struct NodeReorderParams {}
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, Serialize, JsonSchema)]
 struct NodeFindParams {
     /// A CSS selector matched against the canvas tree: a node is an
     /// element, each tag is a class (`.bag`), `id`/`type`/`color` are
@@ -554,6 +622,10 @@ struct NodeFindParams {
     /// just its id.
     #[serde(default)]
     show: bool,
+    /// With `show`, also include each match's own Markdown body. No effect
+    /// without `show`, since a bare id list has no metadata to attach it to.
+    #[serde(default)]
+    include_body: bool,
 }
 
 fn bool_pair(v: Option<bool>) -> (bool, bool) {
@@ -565,7 +637,7 @@ fn bool_pair(v: Option<bool>) -> (bool, bool) {
 }
 
 // ---------------------------------------------------------------------
-// Tools
+// Leaf tools
 // ---------------------------------------------------------------------
 
 #[tool_router]
@@ -719,7 +791,7 @@ impl MeshfoxMcp {
     }
 
     #[tool(
-        description = "Reads one node's structured metadata — id, title, type, parent, children, position, color, tags, and, for a file/link node, target/display."
+        description = "Reads one node's structured metadata — id, title, type, parent, children, position, color, tags, and, for a file/link node, target/display. Pass include_body to also get its Markdown body."
     )]
     async fn node_show(
         &self,
@@ -730,7 +802,11 @@ impl MeshfoxMcp {
         let node = canvas
             .node(&params.node_id)
             .ok_or_else(|| invalid_params(format!("no node {:?}", params.node_id)))?;
-        Ok(CallToolResult::structured(node_json(&canvas, node)))
+        Ok(CallToolResult::structured(node_json(
+            &canvas,
+            node,
+            params.include_body,
+        )))
     }
 
     #[tool(
@@ -978,7 +1054,7 @@ impl MeshfoxMcp {
             let nodes: Vec<serde_json::Value> = ids
                 .iter()
                 .filter_map(|id| canvas.node(id))
-                .map(|n| node_json(&canvas, n))
+                .map(|n| node_json(&canvas, n, params.include_body))
                 .collect();
             result["nodes"] = json!(nodes);
         }
@@ -986,7 +1062,7 @@ impl MeshfoxMcp {
     }
 }
 
-fn node_json(canvas: &Canvas, node: &meshfox_core::Node) -> serde_json::Value {
+fn node_json(canvas: &Canvas, node: &meshfox_core::Node, include_body: bool) -> serde_json::Value {
     let children: Vec<&str> = canvas
         .children(&node.id)
         .iter()
@@ -997,7 +1073,7 @@ fn node_json(canvas: &Canvas, node: &meshfox_core::Node) -> serde_json::Value {
         .iter()
         .map(|e| e.from.as_str())
         .collect();
-    json!({
+    let mut result = json!({
         "id": node.id,
         "title": node.title,
         "type": node.node_type.as_str(),
@@ -1014,7 +1090,11 @@ fn node_json(canvas: &Canvas, node: &meshfox_core::Node) -> serde_json::Value {
         "display": node.display.map(|d| d.as_str()),
         "preview": node.preview,
         "lang": node.lang,
-    })
+    });
+    if include_body {
+        result["body"] = json!(node.text);
+    }
+    result
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -1027,5 +1107,569 @@ impl ServerHandler for MeshfoxMcp {
              set_id/edges/move/reorder). Each edit call is its own immediate read-modify-write of the \
              file on disk — no batching, no conflict detection against a concurrent editor.",
         )
+    }
+}
+
+// =======================================================================
+// Root: what a host actually launches. Owns no canvas file itself — every
+// canvas-scoped tool is a proxy to that canvas's own leaf child process.
+// =======================================================================
+
+struct CanvasHandle {
+    client: RunningService<RoleClient, ()>,
+    path: PathBuf,
+    last_used: Instant,
+}
+
+#[derive(Clone)]
+struct MeshfoxMcpRoot {
+    root: PathBuf,
+    canvases: Arc<Mutex<HashMap<String, Arc<Mutex<CanvasHandle>>>>>,
+    tool_router: ToolRouter<Self>,
+}
+
+impl MeshfoxMcpRoot {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            canvases: Arc::new(Mutex::new(HashMap::new())),
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    fn spawn_idle_sweep(&self) {
+        let canvases = Arc::clone(&self.canvases);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(SWEEP_INTERVAL).await;
+                let idle_ids: Vec<String> = {
+                    let map = canvases.lock().await;
+                    let mut idle = Vec::new();
+                    for (id, handle) in map.iter() {
+                        if handle.lock().await.last_used.elapsed() > IDLE_TIMEOUT {
+                            idle.push(id.clone());
+                        }
+                    }
+                    idle
+                };
+                for id in idle_ids {
+                    let removed = canvases.lock().await.remove(&id);
+                    if let Some(handle) = removed {
+                        let mut guard = handle.lock().await;
+                        let _ = guard.client.close_with_timeout(CANVAS_CLOSE_TIMEOUT).await;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Resolves `requested` (relative to this server's own root, or
+    /// absolute) to a canonical path that must live under that root —
+    /// rejects `..`/absolute/symlink escapes — and derives its canvas id
+    /// (the resolved path relative to the root, forward-slash separated).
+    fn resolve_under_root(&self, requested: &str) -> Result<(PathBuf, String), ErrorData> {
+        let requested_path = Path::new(requested);
+        let joined = if requested_path.is_absolute() {
+            requested_path.to_path_buf()
+        } else {
+            self.root.join(requested_path)
+        };
+        let canonical = joined.canonicalize().map_err(|e| {
+            invalid_params(format!(
+                "cannot resolve {requested:?} under {}: {e}",
+                self.root.display()
+            ))
+        })?;
+        if !canonical.starts_with(&self.root) {
+            return Err(invalid_params(format!(
+                "{requested:?} resolves outside this server's root directory ({}) — \
+                 canvas_open is limited to files under it",
+                self.root.display()
+            )));
+        }
+        let rel = canonical
+            .strip_prefix(&self.root)
+            .expect("just checked starts_with the same root");
+        let canvas_id = rel.to_string_lossy().replace('\\', "/");
+        Ok((canonical, canvas_id))
+    }
+
+    async fn lookup(&self, canvas_id: &str) -> Result<Arc<Mutex<CanvasHandle>>, ErrorData> {
+        self.canvases
+            .lock()
+            .await
+            .get(canvas_id)
+            .cloned()
+            .ok_or_else(|| {
+                invalid_params(format!(
+                    "no open canvas {canvas_id:?} — call canvas_open first"
+                ))
+            })
+    }
+
+    /// Forwards `inner` to `tool_name` on `canvas_id`'s own child process,
+    /// one-to-one — same tool name, same argument shape, minus the
+    /// `canvas_id` wrapper this level adds. The child's own success/failure
+    /// comes back exactly as it sent it.
+    async fn forward(
+        &self,
+        canvas_id: &str,
+        tool_name: &'static str,
+        inner: impl Serialize,
+    ) -> Result<CallToolResult, ErrorData> {
+        let arguments = match serde_json::to_value(inner) {
+            Ok(serde_json::Value::Object(map)) => Some(map),
+            Ok(serde_json::Value::Null) => None,
+            Ok(_) => {
+                return Err(ErrorData::internal_error(
+                    "internal: forwarded tool arguments must serialize to a JSON object",
+                    None,
+                ))
+            }
+            Err(e) => {
+                return Err(ErrorData::internal_error(
+                    format!("failed to serialize arguments for {tool_name}: {e}"),
+                    None,
+                ))
+            }
+        };
+
+        let handle = self.lookup(canvas_id).await?;
+        let mut guard = handle.lock().await;
+        guard.last_used = Instant::now();
+        let mut request = CallToolRequestParams::new(tool_name);
+        if let Some(arguments) = arguments {
+            request = request.with_arguments(arguments);
+        }
+        match guard.client.call_tool(request).await {
+            Ok(result) => Ok(result),
+            // The child's own tool returned `Err(ErrorData)` — propagate
+            // its exact code/message rather than wrapping it, so calling a
+            // proxied tool reads no differently than calling it directly
+            // on a single-canvas leaf server would.
+            Err(ServiceError::McpError(e)) => Err(e),
+            Err(e) => Err(ErrorData::internal_error(
+                format!("canvas {canvas_id:?} ({tool_name}): {e}"),
+                None,
+            )),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Root tool parameter types
+// ---------------------------------------------------------------------
+
+/// Wraps any leaf tool's own parameter type with the `canvas_id` every
+/// proxied tool now requires — one generic wrapper instead of a bespoke
+/// `canvas_id`-plus-everything-else struct per tool.
+#[derive(Deserialize, JsonSchema)]
+struct WithCanvas<T> {
+    /// Which open canvas to operate on — from `canvas_open`.
+    canvas_id: String,
+    #[serde(flatten)]
+    inner: T,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct CanvasOpenParams {
+    /// Path to the canvas file, relative to this server's own root
+    /// directory (absolute is fine too, as long as it still resolves under
+    /// that same root). Escaping above the root — `..`, an absolute path
+    /// elsewhere, a symlink pointing out — is rejected.
+    path: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct CanvasIdOnlyParams {
+    canvas_id: String,
+}
+
+#[derive(Deserialize, JsonSchema, Default)]
+struct EmptyParams {}
+
+// ---------------------------------------------------------------------
+// Root tools
+// ---------------------------------------------------------------------
+
+#[tool_router]
+impl MeshfoxMcpRoot {
+    #[tool(
+        description = "Opens a canvas file for editing/debugging, spawning its own isolated process if it isn't already open (a crash or hang on one canvas can't affect another). `path` must resolve under this server's own root directory. Returns a canvas_id — required by every other tool. Opening an already-open file just returns its existing id."
+    )]
+    async fn canvas_open(
+        &self,
+        Parameters(params): Parameters<CanvasOpenParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let (resolved, canvas_id) = self.resolve_under_root(&params.path)?;
+
+        if let Some(handle) = self.canvases.lock().await.get(&canvas_id).cloned() {
+            handle.lock().await.last_used = Instant::now();
+            return Ok(CallToolResult::structured(
+                json!({ "canvas_id": canvas_id, "path": canvas_id }),
+            ));
+        }
+
+        let exe = std::env::current_exe().map_err(|e| {
+            ErrorData::internal_error(format!("failed to locate own executable: {e}"), None)
+        })?;
+        let command = Command::new(exe).configure(|cmd| {
+            cmd.arg("mcp")
+                .env(LEAF_ENV_VAR, "1")
+                .env(LEAF_PATH_ENV_VAR, &resolved)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped());
+        });
+        let transport = TokioChildProcess::new(command).map_err(|e| {
+            ErrorData::internal_error(
+                format!("failed to spawn a process for canvas {canvas_id:?}: {e}"),
+                None,
+            )
+        })?;
+        let client = ().serve(transport).await.map_err(|e| {
+            ErrorData::internal_error(
+                format!("failed to start MCP session for canvas {canvas_id:?}: {e}"),
+                None,
+            )
+        })?;
+
+        let mut canvases = self.canvases.lock().await;
+        if let Some(handle) = canvases.get(&canvas_id).cloned() {
+            // Lost a race with a concurrent canvas_open for the same file
+            // — drop this call's own just-spawned duplicate, keep the
+            // winner already in the registry.
+            drop(canvases);
+            let _ = client.cancel().await;
+            handle.lock().await.last_used = Instant::now();
+            return Ok(CallToolResult::structured(
+                json!({ "canvas_id": canvas_id, "path": canvas_id }),
+            ));
+        }
+        canvases.insert(
+            canvas_id.clone(),
+            Arc::new(Mutex::new(CanvasHandle {
+                client,
+                path: resolved,
+                last_used: Instant::now(),
+            })),
+        );
+        Ok(CallToolResult::structured(
+            json!({ "canvas_id": canvas_id, "path": canvas_id }),
+        ))
+    }
+
+    #[tool(
+        description = "Closes an open canvas, gracefully shutting down its process (any live debug sessions on it end too)."
+    )]
+    async fn canvas_close(
+        &self,
+        Parameters(params): Parameters<CanvasIdOnlyParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let handle = self
+            .canvases
+            .lock()
+            .await
+            .remove(&params.canvas_id)
+            .ok_or_else(|| invalid_params(format!("no open canvas {:?}", params.canvas_id)))?;
+        let mut guard = handle.lock().await;
+        let _ = guard.client.close_with_timeout(CANVAS_CLOSE_TIMEOUT).await;
+        Ok(CallToolResult::structured(
+            json!({ "closed": params.canvas_id }),
+        ))
+    }
+
+    #[tool(description = "Lists every currently open canvas and its id.")]
+    async fn canvas_list(
+        &self,
+        Parameters(_params): Parameters<EmptyParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let canvases = self.canvases.lock().await;
+        let mut items = Vec::new();
+        for (id, handle) in canvases.iter() {
+            let guard = handle.lock().await;
+            items.push(json!({
+                "canvas_id": id,
+                "path": id,
+                "resolved_path": guard.path.display().to_string(),
+            }));
+        }
+        Ok(CallToolResult::structured(json!({ "canvases": items })))
+    }
+
+    #[tool(
+        description = "Same as debug_start, scoped to canvas_id (see canvas_open) — starts a persistent debug shell in that canvas."
+    )]
+    async fn debug_start(
+        &self,
+        Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<DebugStartParams>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.forward(&canvas_id, "debug_start", inner).await
+    }
+
+    #[tool(
+        description = "Same as debug_send, scoped to canvas_id (see canvas_open) — runs code in that canvas's debug session."
+    )]
+    async fn debug_send(
+        &self,
+        Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<DebugSendParams>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.forward(&canvas_id, "debug_send", inner).await
+    }
+
+    #[tool(
+        description = "Same as debug_stop, scoped to canvas_id (see canvas_open) — stops a debug session in that canvas."
+    )]
+    async fn debug_stop(
+        &self,
+        Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<DebugStopParams>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.forward(&canvas_id, "debug_stop", inner).await
+    }
+
+    #[tool(
+        description = "Same as node_show, scoped to canvas_id (see canvas_open) — reads one node's structured metadata in that canvas."
+    )]
+    async fn node_show(
+        &self,
+        Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<NodeIdParams>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.forward(&canvas_id, "node_show", inner).await
+    }
+
+    #[tool(
+        description = "Same as node_add, scoped to canvas_id (see canvas_open) — adds a new child node in that canvas."
+    )]
+    async fn node_add(
+        &self,
+        Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<NodeAddParams>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.forward(&canvas_id, "node_add", inner).await
+    }
+
+    #[tool(
+        description = "Same as node_meta, scoped to canvas_id (see canvas_open) — updates a node's position/style/type fields in that canvas."
+    )]
+    async fn node_meta(
+        &self,
+        Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<NodeMetaParams>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.forward(&canvas_id, "node_meta", inner).await
+    }
+
+    #[tool(
+        description = "Same as node_body, scoped to canvas_id (see canvas_open) — replaces a node's whole Markdown body in that canvas."
+    )]
+    async fn node_body(
+        &self,
+        Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<NodeBodyParams>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.forward(&canvas_id, "node_body", inner).await
+    }
+
+    #[tool(
+        description = "Same as node_block, scoped to canvas_id (see canvas_open) — rewrites one runnable fence's attributes/code in that canvas."
+    )]
+    async fn node_block(
+        &self,
+        Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<NodeBlockParams>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.forward(&canvas_id, "node_block", inner).await
+    }
+
+    #[tool(
+        description = "Same as node_rm, scoped to canvas_id (see canvas_open) — deletes a node in that canvas."
+    )]
+    async fn node_rm(
+        &self,
+        Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<NodeRmParams>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.forward(&canvas_id, "node_rm", inner).await
+    }
+
+    #[tool(
+        description = "Same as node_mv, scoped to canvas_id (see canvas_open) — moves a node to a new structural parent in that canvas."
+    )]
+    async fn node_mv(
+        &self,
+        Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<NodeMvParams>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.forward(&canvas_id, "node_mv", inner).await
+    }
+
+    #[tool(
+        description = "Same as node_rename, scoped to canvas_id (see canvas_open) — renames a node's heading text in that canvas."
+    )]
+    async fn node_rename(
+        &self,
+        Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<NodeRenameParams>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.forward(&canvas_id, "node_rename", inner).await
+    }
+
+    #[tool(
+        description = "Same as node_set_id, scoped to canvas_id (see canvas_open) — changes a node's id in that canvas."
+    )]
+    async fn node_set_id(
+        &self,
+        Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<NodeSetIdParams>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.forward(&canvas_id, "node_set_id", inner).await
+    }
+
+    #[tool(
+        description = "Same as node_edges, scoped to canvas_id (see canvas_open) — replaces a node's extra incoming edges in that canvas."
+    )]
+    async fn node_edges(
+        &self,
+        Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<NodeEdgesParams>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.forward(&canvas_id, "node_edges", inner).await
+    }
+
+    #[tool(
+        description = "Same as node_move, scoped to canvas_id (see canvas_open) — reorders a node among its siblings in that canvas."
+    )]
+    async fn node_move(
+        &self,
+        Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<NodeMoveParams>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.forward(&canvas_id, "node_move", inner).await
+    }
+
+    #[tool(
+        description = "Same as node_reorder, scoped to canvas_id (see canvas_open) — resyncs sibling order to canvas layout in that canvas."
+    )]
+    async fn node_reorder(
+        &self,
+        Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<NodeReorderParams>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.forward(&canvas_id, "node_reorder", inner).await
+    }
+
+    #[tool(
+        description = "Same as node_find, scoped to canvas_id (see canvas_open) — finds nodes matching a CSS selector in that canvas."
+    )]
+    async fn node_find(
+        &self,
+        Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<NodeFindParams>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.forward(&canvas_id, "node_find", inner).await
+    }
+}
+
+#[tool_handler(router = self.tool_router)]
+impl ServerHandler for MeshfoxMcpRoot {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+            "Multi-canvas meshfox MCP server. Every canvas-scoped tool requires a canvas_id from \
+             canvas_open first — there is no implicit 'current' canvas. canvas_open/canvas_close/ \
+             canvas_list manage a registry of canvases, each backed by its own spawned, isolated \
+             process (one file, one process — a crash or a hung debug session on one canvas can't \
+             affect another). canvas_open only resolves paths under this server's own root directory \
+             (the directory of the canvas path meshfox mcp was launched with) — it refuses to open \
+             anything above that. Every other tool mirrors its single-canvas equivalent exactly, just \
+             with canvas_id added as the first argument.",
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{node_json, MeshfoxMcpRoot};
+    use meshfox_core::Canvas;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn node_json_omits_body_by_default_and_includes_it_when_asked() {
+        let markdown = "<!-- meshfox:canvas -->\n# Root\n\n## Child\n<!-- meshfox:node id=\"child\" -->\n\nsome node text\n";
+        let canvas = Canvas::from_markdown(markdown).unwrap();
+        let node = canvas.node("child").unwrap();
+
+        let without_body = node_json(&canvas, node, false);
+        assert!(without_body.get("body").is_none());
+
+        let with_body = node_json(&canvas, node, true);
+        assert_eq!(with_body["body"], "some node text");
+    }
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// A fresh `<root>/a.canvas.md`, `<root>/sub/b.canvas.md`, and a sibling
+    /// `<root>/../outside.canvas.md` — enough to exercise every
+    /// `resolve_under_root` outcome without spawning any real MCP process.
+    fn fixture() -> (std::path::PathBuf, std::path::PathBuf) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!("meshfox-mcp-root-test-{nanos}-{n}"));
+        let root = base.join("root");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("a.canvas.md"), "").unwrap();
+        std::fs::write(root.join("sub/b.canvas.md"), "").unwrap();
+        std::fs::write(base.join("outside.canvas.md"), "").unwrap();
+        (base, root.canonicalize().unwrap())
+    }
+
+    #[test]
+    fn resolve_under_root_accepts_a_file_directly_in_the_root() {
+        let (_base, root) = fixture();
+        let server = MeshfoxMcpRoot::new(root.clone());
+        let (resolved, id) = server.resolve_under_root("a.canvas.md").unwrap();
+        assert_eq!(resolved, root.join("a.canvas.md"));
+        assert_eq!(id, "a.canvas.md");
+    }
+
+    #[test]
+    fn resolve_under_root_accepts_a_nested_file_and_normalizes_the_id() {
+        let (_base, root) = fixture();
+        let server = MeshfoxMcpRoot::new(root.clone());
+        let (resolved, id) = server.resolve_under_root("sub/b.canvas.md").unwrap();
+        assert_eq!(resolved, root.join("sub").join("b.canvas.md"));
+        assert_eq!(id, "sub/b.canvas.md");
+    }
+
+    #[test]
+    fn resolve_under_root_rejects_a_dot_dot_escape() {
+        let (_base, root) = fixture();
+        let server = MeshfoxMcpRoot::new(root);
+        let err = server
+            .resolve_under_root("../outside.canvas.md")
+            .unwrap_err();
+        assert!(
+            err.message.contains("outside this server's root directory"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_under_root_rejects_an_absolute_path_outside_the_root() {
+        let (base, root) = fixture();
+        let server = MeshfoxMcpRoot::new(root);
+        let outside = base.join("outside.canvas.md");
+        let err = server
+            .resolve_under_root(outside.to_str().unwrap())
+            .unwrap_err();
+        assert!(
+            err.message.contains("outside this server's root directory"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_under_root_rejects_a_nonexistent_path() {
+        let (_base, root) = fixture();
+        let server = MeshfoxMcpRoot::new(root);
+        assert!(server.resolve_under_root("no-such-file.canvas.md").is_err());
+    }
+
+    #[test]
+    fn resolve_under_root_same_path_yields_the_same_id_every_time() {
+        let (_base, root) = fixture();
+        let server = MeshfoxMcpRoot::new(root);
+        let (_, id1) = server.resolve_under_root("sub/b.canvas.md").unwrap();
+        let (_, id2) = server.resolve_under_root("sub/b.canvas.md").unwrap();
+        assert_eq!(id1, id2);
     }
 }

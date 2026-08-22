@@ -202,13 +202,23 @@ enum Command {
         #[command(flatten)]
         canvas: CanvasOpt,
     },
-    /// Experimental: an MCP stdio server, bound to one canvas file, giving
-    /// an AI agent two tool groups without shelling out to this same
-    /// binary: a stateful debug session (`debug_start`/`debug_send`/
-    /// `debug_stop` — a persistent `bash` kept alive in a node/block's own
-    /// resolved cwd/env, so a multi-step snippet's state — exported vars,
-    /// files it wrote — survives between calls, unlike a one-shot `meshfox
-    /// run`) and thin wrappers around the whole `node <op>` surface — every
+    /// Experimental: an MCP stdio server giving an AI agent tool-call access
+    /// to every canvas file under the current directory, without shelling
+    /// out to this same binary. Takes no arguments — a host launches it the
+    /// same way as any other stdio MCP server: `{"command": "meshfox",
+    /// "args": ["mcp"]}`, and whichever directory it's started in becomes
+    /// its root. Multi-canvas by design, but keeps "one file, one process"
+    /// isolation underneath: `canvas_open`/`canvas_close`/`canvas_list`
+    /// manage a registry of canvases, each backed by its own spawned,
+    /// isolated child process (a crash or hung debug session on one canvas
+    /// can't affect another) — resolved only under that root directory,
+    /// never above it. Every other tool requires that `canvas_id` as its
+    /// first argument, mirroring its single-canvas equivalent exactly:
+    /// a stateful debug session (`debug_start`/`debug_send`/`debug_stop` —
+    /// a persistent `bash` kept alive in a node/block's own resolved
+    /// cwd/env, so a multi-step snippet's state — exported vars, files it
+    /// wrote — survives between calls, unlike a one-shot `meshfox run`) and
+    /// thin wrappers around the whole `node <op>` surface — every
     /// subcommand, not just a subset: `show`/`find` (find as structured
     /// JSON, CSS-selector matching, same as `node find`) and the mutating
     /// `add`/`meta`/`body`/`block`/`rm`/`mv`/`rename`/`set_id`/`edges`/
@@ -217,13 +227,8 @@ enum Command {
     /// (see TODO.canvas.md's own "MCP-редактирование файла"/"Оптимистичная
     /// конкурентность" — still open design questions, not implemented
     /// here) — every write here is the same immediate read-modify-write
-    /// `node <op>` already does. A host launches this the same way as any
-    /// other stdio MCP server: `{"command": "meshfox", "args": ["mcp",
-    /// "/path/to.canvas.md"]}`.
-    Mcp {
-        #[command(flatten)]
-        canvas: CanvasOpt,
-    },
+    /// `node <op>` already does.
+    Mcp,
     /// Validate that a file parses as a meshfox canvas — same checks
     /// `run`/`view` already do before touching anything (single root,
     /// no duplicate ids, no dangling `meshfox:edge` targets, `group`/
@@ -990,10 +995,7 @@ fn main() {
             let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
             tui(canvas_path)
         }
-        Command::Mcp { canvas } => {
-            let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
-            mcp_cmd(canvas_path)
-        }
+        Command::Mcp => mcp_cmd(),
         Command::Validate { canvas } => {
             let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
             validate(&canvas_path)
@@ -1549,12 +1551,12 @@ fn tui(canvas_path: PathBuf) {
     }
 }
 
-fn mcp_cmd(canvas_path: PathBuf) {
+fn mcp_cmd() {
     let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
         eprintln!("failed to start async runtime: {e}");
         std::process::exit(1);
     });
-    if let Err(e) = runtime.block_on(mcp::run(canvas_path)) {
+    if let Err(e) = runtime.block_on(mcp::run()) {
         eprintln!("meshfox mcp: {e}");
         std::process::exit(1);
     }
