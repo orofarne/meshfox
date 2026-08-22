@@ -348,6 +348,42 @@ Keybindings on top of vim's own:
 
 Every `<!-- meshfox:... -->` marker comment is also highlighted on top of the buffer's own Markdown syntax highlighting — the marker itself in one color, each of its attribute names in another — so a node's own bookkeeping reads at a glance alongside the surrounding prose.
 
+### MCP server (experimental)
+<!-- meshfox:node id="mcp-server-experimental" -->
+
+`meshfox mcp` starts an MCP ([Model Context Protocol](https://modelcontextprotocol.io)) stdio server bound to one canvas file — a fourth front door onto the same files as `run`/`view`/`tui`, this one for an AI agent talking to `meshfox` through structured tool calls instead of shelling out to the binary or hand-editing the file. A host launches it the same way as any other stdio MCP server:
+
+```json
+{"command": "meshfox", "args": ["mcp", "/path/to.canvas.md"]}
+```
+
+Two tool groups:
+
+- **Debug session** — `debug_start`/`debug_send`/`debug_stop`: a persistent `bash` kept alive in a node/block's own resolved cwd/env, so a multi-step snippet's state (exported vars, files it wrote) survives between calls, unlike a one-shot `run`. `debug_start` resolves `env=` the same way `run` does, taking `vars` as an explicit override for anything `meshfox:var` would otherwise need to prompt for — there's no interactive terminal on the other end of a tool call to prompt.
+- **Node operations** — `node_show`/`node_find` (structured JSON, `find` matching a CSS selector against the canvas tree the same way `node find` does) plus every mutating `node <op>` subcommand: `node_add`/`node_meta`/`node_body`/`node_block`/`node_rm`/`node_mv`/`node_rename`/`node_set_id`/`node_edges`/`node_move`/`node_reorder`. Each is a thin wrapper around the exact same validated read-modify-write `node <op>` already does — no batch/transactional multi-edit, no optimistic-concurrency write-conflict detection against a concurrent editor.
+
+See [`AGENT_HELP.md`](./AGENT_HELP.md) (also `meshfox --agent-help`) for the same "prefer structured operations over hand-editing" guidance this tool surface exists to make available as tool calls rather than shell commands.
+
+```bash name="mcp-help" cache
+meshfox mcp -h
+```
+<!-- meshfox:output name="mcp-help" hash="21dec42a" -->
+```text
+exit code: 0 · 18ms
+
+Experimental: an MCP stdio server, bound to one canvas file, giving an AI agent two tool groups without shelling out to this same binary: a stateful debug session (`debug_start`/`debug_send`/ `debug_stop` — a persistent `bash` kept alive in a node/block's own resolved cwd/env, so a multi-step snippet's state — exported vars, files it wrote — survives between calls, unlike a one-shot `meshfox run`) and thin wrappers around the whole `node <op>` surface — every subcommand, not just a subset: `show`/`find` (find as structured JSON, CSS-selector matching, same as `node find`) and the mutating `add`/`meta`/`body`/`block`/`rm`/`mv`/`rename`/`set_id`/`edges`/ `move`/`reorder`. Deliberately does *not* attempt batch/ transactional multi-edit or optimistic-concurrency write conflicts (see TODO.canvas.md's own "MCP-редактирование файла"/"Оптимистичная конкурентность" — still open design questions, not implemented here) — every write here is the same immediate read-modify-write `node <op>` already does. A host launches this the same way as any other stdio MCP server: `{"command": "meshfox", "args": ["mcp", "/path/to.canvas.md"]}`
+
+Usage: meshfox mcp [OPTIONS] [CANVAS]
+
+Arguments:
+  [CANVAS]  Path to the .canvas.md file. If omitted: auto-discover the single candidate in the current directory
+
+Options:
+      --canvas <CANVAS>  Same as the positional argument above, spelled as a flag — for parity with `run`/`node <op>`, which only accept this form
+  -h, --help             Print help
+```
+<!-- /meshfox:output -->
+
 ### Static export (experimental)
 <!-- meshfox:node id="usage-static" -->
 

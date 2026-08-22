@@ -208,9 +208,11 @@ enum Command {
     /// `debug_stop` — a persistent `bash` kept alive in a node/block's own
     /// resolved cwd/env, so a multi-step snippet's state — exported vars,
     /// files it wrote — survives between calls, unlike a one-shot `meshfox
-    /// run`) and thin wrappers around the existing single-node edit
-    /// operations (`node show` as structured JSON, `add`/`meta`/`body`/
-    /// `block`/`rm`/`mv`). Deliberately does *not* attempt batch/
+    /// run`) and thin wrappers around the whole `node <op>` surface — every
+    /// subcommand, not just a subset: `show`/`find` (find as structured
+    /// JSON, CSS-selector matching, same as `node find`) and the mutating
+    /// `add`/`meta`/`body`/`block`/`rm`/`mv`/`rename`/`set_id`/`edges`/
+    /// `move`/`reorder`. Deliberately does *not* attempt batch/
     /// transactional multi-edit or optimistic-concurrency write conflicts
     /// (see TODO.canvas.md's own "MCP-редактирование файла"/"Оптимистичная
     /// конкурентность" — still open design questions, not implemented
