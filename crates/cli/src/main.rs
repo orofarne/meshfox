@@ -1494,17 +1494,21 @@ fn create(canvas_path: &Path) {
 /// doesn't already know this is a meshfox document from looking at it.
 const NEW_CANVAS_NOTE: &str = "<!-- meshfox:comment -->\n> This is a [meshfox](https://meshfox.orofarne.net/) document — open it with `meshfox view` (or `meshfox tui`) for the interactive canvas. This note is only visible here, in a plain Markdown viewer.\n<!-- /meshfox:comment -->";
 
-/// The empty-canvas template shared by `create` and `view --create`: the
-/// `meshfox:canvas` marker, a lone root heading named after the file
-/// itself (so the new file is immediately valid and auto-discoverable),
-/// and `NEW_CANVAS_NOTE` as the root's own body.
-fn write_canvas_template(canvas_path: &Path) {
+/// The empty-canvas template shared by `create`, `view --create`, and MCP's
+/// `canvas_open`'s own `create` flag: the `meshfox:canvas` marker, a lone
+/// root heading named after the file itself (so the new file is
+/// immediately valid and auto-discoverable), and `NEW_CANVAS_NOTE` as the
+/// root's own body.
+pub(crate) fn canvas_template_content(canvas_path: &Path) -> String {
     let title = canvas_title(canvas_path);
-    let content = format!(
+    format!(
         "{}\n# {title}\n\n{NEW_CANVAS_NOTE}\n",
         mdcanvas::CANVAS_MARKER
-    );
-    std::fs::write(canvas_path, content).unwrap_or_else(|e| {
+    )
+}
+
+fn write_canvas_template(canvas_path: &Path) {
+    std::fs::write(canvas_path, canvas_template_content(canvas_path)).unwrap_or_else(|e| {
         eprintln!("failed to write {}: {e}", canvas_path.display());
         std::process::exit(1);
     });

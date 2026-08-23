@@ -1194,6 +1194,44 @@ impl MeshfoxMcpRoot {
         Ok((canonical, canvas_id))
     }
 
+    /// Same boundary check as `resolve_under_root`, but for a path that
+    /// doesn't have to exist yet (`canvas_open`'s own `create` flag) — the
+    /// file itself can't be canonicalized before it's written, so this
+    /// canonicalizes its *parent* directory instead (which does have to
+    /// already exist) and rejects a missing/escaping parent the same way
+    /// `resolve_under_root` rejects a missing/escaping file.
+    fn resolve_under_root_for_create(&self, requested: &str) -> Result<(PathBuf, String), ErrorData> {
+        let requested_path = Path::new(requested);
+        let joined = if requested_path.is_absolute() {
+            requested_path.to_path_buf()
+        } else {
+            self.root.join(requested_path)
+        };
+        let file_name = joined
+            .file_name()
+            .ok_or_else(|| invalid_params(format!("{requested:?} has no file name")))?;
+        let parent = joined.parent().unwrap_or(Path::new("."));
+        let canonical_parent = parent.canonicalize().map_err(|e| {
+            invalid_params(format!(
+                "cannot resolve the directory for {requested:?} under {}: {e}",
+                self.root.display()
+            ))
+        })?;
+        if !canonical_parent.starts_with(&self.root) {
+            return Err(invalid_params(format!(
+                "{requested:?} resolves outside this server's root directory ({}) — \
+                 canvas_open is limited to files under it",
+                self.root.display()
+            )));
+        }
+        let canonical = canonical_parent.join(file_name);
+        let rel = canonical
+            .strip_prefix(&self.root)
+            .expect("just checked starts_with the same root");
+        let canvas_id = rel.to_string_lossy().replace('\\', "/");
+        Ok((canonical, canvas_id))
+    }
+
     async fn lookup(&self, canvas_id: &str) -> Result<Arc<Mutex<CanvasHandle>>, ErrorData> {
         self.canvases
             .lock()
@@ -1278,6 +1316,11 @@ struct CanvasOpenParams {
     /// that same root). Escaping above the root — `..`, an absolute path
     /// elsewhere, a symlink pointing out — is rejected.
     path: String,
+    /// If the file doesn't exist yet, create it first (same empty
+    /// `meshfox:canvas` template `meshfox create`/`meshfox view --create`
+    /// use) rather than failing. A no-op if the file already exists.
+    #[serde(default)]
+    create: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1295,13 +1338,27 @@ struct EmptyParams {}
 #[tool_router]
 impl MeshfoxMcpRoot {
     #[tool(
-        description = "Opens a canvas file for editing/debugging, spawning its own isolated process if it isn't already open (a crash or hang on one canvas can't affect another). `path` must resolve under this server's own root directory. Returns a canvas_id — required by every other tool. Opening an already-open file just returns its existing id."
+        description = "Opens a canvas file for editing/debugging, spawning its own isolated process if it isn't already open (a crash or hang on one canvas can't affect another). `path` must resolve under this server's own root directory. Returns a canvas_id — required by every other tool. Opening an already-open file just returns its existing id. Pass `create: true` to create the file first (an empty canvas) if it doesn't exist yet — a no-op if it already does."
     )]
     async fn canvas_open(
         &self,
         Parameters(params): Parameters<CanvasOpenParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (resolved, canvas_id) = self.resolve_under_root(&params.path)?;
+        let (resolved, canvas_id) = if params.create {
+            let (resolved, canvas_id) = self.resolve_under_root_for_create(&params.path)?;
+            if !resolved.exists() {
+                let content = crate::canvas_template_content(&resolved);
+                std::fs::write(&resolved, content).map_err(|e| {
+                    ErrorData::internal_error(
+                        format!("failed to create {}: {e}", resolved.display()),
+                        None,
+                    )
+                })?;
+            }
+            (resolved, canvas_id)
+        } else {
+            self.resolve_under_root(&params.path)?
+        };
 
         if let Some(handle) = self.canvases.lock().await.get(&canvas_id).cloned() {
             handle.lock().await.last_used = Instant::now();
@@ -1671,5 +1728,39 @@ mod tests {
         let (_, id1) = server.resolve_under_root("sub/b.canvas.md").unwrap();
         let (_, id2) = server.resolve_under_root("sub/b.canvas.md").unwrap();
         assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn resolve_under_root_for_create_accepts_a_new_file_in_an_existing_subdir() {
+        let (_base, root) = fixture();
+        let server = MeshfoxMcpRoot::new(root.clone());
+        let (resolved, id) = server
+            .resolve_under_root_for_create("sub/new.canvas.md")
+            .unwrap();
+        assert_eq!(resolved, root.join("sub").join("new.canvas.md"));
+        assert_eq!(id, "sub/new.canvas.md");
+        assert!(!resolved.exists());
+    }
+
+    #[test]
+    fn resolve_under_root_for_create_rejects_a_dot_dot_escape() {
+        let (_base, root) = fixture();
+        let server = MeshfoxMcpRoot::new(root);
+        let err = server
+            .resolve_under_root_for_create("../new.canvas.md")
+            .unwrap_err();
+        assert!(
+            err.message.contains("outside this server's root directory"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_under_root_for_create_rejects_a_missing_parent_directory() {
+        let (_base, root) = fixture();
+        let server = MeshfoxMcpRoot::new(root);
+        assert!(server
+            .resolve_under_root_for_create("no-such-dir/new.canvas.md")
+            .is_err());
     }
 }
