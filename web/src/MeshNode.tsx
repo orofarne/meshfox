@@ -324,6 +324,17 @@ export interface MeshNodeData {
   /** Persists a full replacement of this node's raw Markdown body — the
    * inline text editor's auto-save. */
   onSaveText: (text: string) => void;
+  /** True for exactly one render, right after "add child" + NodeSettings'
+   * "ok" on a text-type node (see App.tsx's `autoOpenTextEditorNodeId`) —
+   * opens this node's inline body editor immediately instead of making the
+   * user click the ✏ button themselves, since typing the body is almost
+   * always the very next thing after naming a freshly-created node.
+   * `undefined`/`false` the rest of the time. Paired with
+   * `onAutoOpenTextEditorConsumed`, which this component calls the moment
+   * it's acted on `true` — App.tsx clears its own tracking state in
+   * response, so this never re-fires for the same creation. */
+  autoOpenTextEditor?: boolean;
+  onAutoOpenTextEditorConsumed?: () => void;
   /** `plainMarkdownInclude` nodes only — opens Source mode scoped to this
    * node's own id (the include's `nodeId`) instead of the inline text
    * editor, since that's the only place this content can actually be
@@ -1245,6 +1256,19 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
   const [editingText, setEditingText] = useState(false);
   const isTextNode = data.nodeType === "text";
   const isGroup = data.nodeType === "group";
+  // See `MeshNodeData.autoOpenTextEditor`'s own doc comment — App.tsx
+  // already only ever sets this for a text-type node, but guards it here
+  // too rather than trusting that invariant blindly (`plainMarkdownInclude`
+  // in particular has no inline editor to open at all, see the ✏ button's
+  // own branch below).
+  useEffect(() => {
+    if (!data.autoOpenTextEditor) return;
+    if (isTextNode && !data.plainMarkdownInclude) {
+      setEditingText(true);
+    }
+    data.onAutoOpenTextEditorConsumed?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data.autoOpenTextEditor]);
   const nodeColor = resolveNodeColor(data.effectiveColor ?? data.color);
   // A heading-only node (no body Markdown at all) has nothing to show in
   // its body area — while read-only, that's just dead space under a

@@ -47,6 +47,10 @@ interface TtyPanelProps {
    * plays for `/api/run`. */
   persist: boolean;
   vars?: Record<string, string>;
+  /** Names of `secret`-declared variables (a subset of `vars`' own keys) to
+   * persist to the on-disk var cache anyway, in plaintext — see
+   * `VarsForm`'s own "save (plaintext)" checkbox. */
+  saveSecrets?: string[];
   /** Mirrors the block's own `CodeSegment.autoclose` — once the process
    * exits (`status` becomes `"exited"`), this panel calls `onClose()`
    * itself instead of the default of staying open until closed by hand.
@@ -94,7 +98,7 @@ function statusLabel(status: Status, exitCode: number | undefined, errorMsg: str
  * server reads as "client gone" and kills whatever's still running (see
  * `pty_exec::PtyProcess::kill`), same as closing a real terminal window.
  */
-export function TtyPanel({ path, blockName, withDeps, persist, vars, autoclose, onClose }: TtyPanelProps) {
+export function TtyPanel({ path, blockName, withDeps, persist, vars, saveSecrets, autoclose, onClose }: TtyPanelProps) {
   const dark = usePrefersDark();
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -151,6 +155,7 @@ export function TtyPanel({ path, blockName, withDeps, persist, vars, autoclose, 
       noDeps: String(!withDeps),
       persist: String(persist),
       vars: JSON.stringify(vars ?? {}),
+      saveSecrets: JSON.stringify(saveSecrets ?? []),
       cols: String(term.cols),
       rows: String(term.rows),
     });
@@ -250,10 +255,11 @@ export function TtyPanel({ path, blockName, withDeps, persist, vars, autoclose, 
       ws.close();
       term.dispose();
     };
-    // Mount-once: `path`/`blockName`/`withDeps`/`persist`/`vars` address
-    // exactly the one run this panel was opened for — a real change to any
-    // of them means a different run, which means a fresh `TtyPanel` (a new
-    // `key` from the caller), not a live-reconnect of this one.
+    // Mount-once: `path`/`blockName`/`withDeps`/`persist`/`vars`/
+    // `saveSecrets` address exactly the one run this panel was opened for
+    // — a real change to any of them means a different run, which means a
+    // fresh `TtyPanel` (a new `key` from the caller), not a live-reconnect
+    // of this one.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

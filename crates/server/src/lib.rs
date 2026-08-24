@@ -130,12 +130,14 @@ impl AppState {
 /// `AppState::session_runs`.
 #[derive(Clone)]
 struct SessionRun {
-    /// `meshfox_core::fingerprint` of the block *as it stood* on that
-    /// successful run — a later run_block call only treats this as
-    /// "already fresh" (skippable) if the block's own *current* fingerprint
-    /// still matches; any edit to its code/lang/interpreter/env=/deps=
-    /// changes the fingerprint and makes it stale again, the same
-    /// mechanism `crate::output`'s cached-output staleness uses.
+    /// `meshfox_core::session_fingerprint` of the block *as it stood* (code/
+    /// lang/interpreter/env=/deps=, same as `crate::output`'s cached-output
+    /// staleness mechanism) *and* the resolved values of whatever variables
+    /// it referenced, on that successful run — a later run_block call only
+    /// treats this as "already fresh" (skippable) if both still match. A
+    /// re-answered `meshfox:var`/changed `--set` override/different
+    /// upstream `from=` value makes it stale again just as much as an edit
+    /// to the block itself would.
     fingerprint: String,
     /// Whatever this block wrote to its own vars-out file last time it
     /// actually ran (only ever non-empty for a block that's a `from=`
@@ -273,6 +275,16 @@ struct RunRequest {
     /// starts, so the next run doesn't ask again.
     #[serde(default)]
     vars: HashMap<String, String>,
+    /// Names (a subset of `vars`' own keys) of `secret`-declared variables
+    /// the user explicitly opted into persisting anyway, via `VarsForm`'s
+    /// own "save (plaintext)" checkbox — TODO.canvas.md: "Галочка
+    /// 'сохранить' у secret". A name here only actually overrides anything
+    /// for a declaration that's both `secret` *and* named here; harmless
+    /// (ignored) for a non-secret name, since those already persist
+    /// unconditionally. Never overrides `session` — see this override's own
+    /// use below.
+    #[serde(default)]
+    save_secrets: std::collections::HashSet<String>,
 }
 
 /// One declared `meshfox:var`'s current status — what `GET /api/vars`
@@ -2410,7 +2422,10 @@ async fn run_block(
     // fail before starting, same as an unresolvable chain above. Every
     // non-secret answer the request actually supplied is persisted right
     // away, so the next run (CLI or UI, even for a different block that
-    // happens to reference the same variable) doesn't ask again.
+    // happens to reference the same variable) doesn't ask again — as is a
+    // `secret` one explicitly named in `req.save_secrets` (see that field's
+    // own doc comment), still in plaintext (no encryption yet — see
+    // TODO.canvas.md's own follow-up item on that).
     let needed = meshfox_core::env_var_names_for_chain(&canvas, &chain);
     let decls = meshfox_core::declared_vars(&canvas)
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
@@ -2438,7 +2453,7 @@ async fn run_block(
         for (name, value) in &req.vars {
             if relevant_decls
                 .iter()
-                .any(|d| &d.name == name && !d.secret && !d.session)
+                .any(|d| &d.name == name && (!d.secret || req.save_secrets.contains(name)) && !d.session)
             {
                 let _ = cache.set(name, value);
             }
@@ -2543,7 +2558,7 @@ async fn run_block(
             // unchanged" (a migration that always drops and recreates a
             // table, say).
             let is_requested_target = Some(addr) == chain.last();
-            let live_fingerprint = meshfox_core::fingerprint(&block);
+            let live_fingerprint = meshfox_core::session_fingerprint(&block, &resolved_vars);
             if !is_requested_target && !block.always {
                 let already_fresh = state
                     .session_runs
@@ -2804,6 +2819,12 @@ struct TtyRunQuery {
     persist: bool,
     #[serde(default)]
     vars: String,
+    /// JSON-encoded array of secret variable names to persist anyway — same
+    /// meaning as `RunRequest::save_secrets`, just query-string-encoded
+    /// (like `vars` itself) since this is a `GET` for the WebSocket
+    /// upgrade, not a JSON body.
+    #[serde(default)]
+    save_secrets: String,
     #[serde(default = "default_pty_cols")]
     cols: u16,
     #[serde(default = "default_pty_rows")]
@@ -2860,6 +2881,12 @@ async fn run_block_tty(
         serde_json::from_str(&query.vars)
             .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("invalid `vars`: {e}")))?
     };
+    let save_secrets: std::collections::HashSet<String> = if query.save_secrets.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        serde_json::from_str(&query.save_secrets)
+            .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("invalid `saveSecrets`: {e}")))?
+    };
 
     // Same resolution this chain's `env=` needs as `run_block` does — see
     // its own doc comment for why only the chain's actually-referenced
@@ -2894,7 +2921,7 @@ async fn run_block_tty(
         for (name, value) in &requested_vars {
             if relevant_decls
                 .iter()
-                .any(|d| &d.name == name && !d.secret && !d.session)
+                .any(|d| &d.name == name && (!d.secret || save_secrets.contains(name)) && !d.session)
             {
                 let _ = cache.set(name, value);
             }
@@ -3047,7 +3074,7 @@ async fn run_tty_chain(
         // dependency regardless of whether it had already run successfully
         // this session, unlike the plain (non-`tty`) `/api/run` path.
         let is_requested_target = Some(addr) == chain.last();
-        let live_fingerprint = meshfox_core::fingerprint(&block);
+        let live_fingerprint = meshfox_core::session_fingerprint(&block, &resolved_vars);
         if !is_requested_target && !block.always {
             let already_fresh = state
                 .session_runs
@@ -3435,6 +3462,19 @@ async fn kill_run(State(state): State<Arc<AppState>>, Json(req): Json<KillReques
     }
 }
 
+/// Forgets every block's session-freshness record (`AppState::session_runs`)
+/// — the next "⛓ run chain" re-runs every pulled-in dependency for real
+/// instead of skipping whichever ones still look unchanged since their last
+/// run this session. Purely in-memory bookkeeping, so this never touches
+/// the canvas file itself or any persisted `<!-- meshfox:output ... -->`
+/// cache (`crate::output`/a block's own `cache` flag) — those are a
+/// separate, deliberately-persisted mechanism, not what "session" refers
+/// to here. See TODO.canvas.md: "Сброс сессии".
+async fn reset_session(State(state): State<Arc<AppState>>) -> StatusCode {
+    state.session_runs.lock().unwrap().clear();
+    StatusCode::NO_CONTENT
+}
+
 /// Streams NDJSON `{"type": "..."}` lines for as long as the client stays
 /// connected — one long-lived connection per open browser tab. Serves two
 /// purposes at once: forwards every `changed` event the file-watcher thread
@@ -3679,6 +3719,7 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/run", post(run_block))
         .route("/api/run/tty", get(run_block_tty))
         .route("/api/kill", post(kill_run))
+        .route("/api/session/reset", post(reset_session))
         .route("/api/watch", get(watch_changes))
         .route("/api/include-asset", get(get_include_asset))
         .route("/api/syntax", get(get_syntax_list))
@@ -5650,6 +5691,34 @@ mod session_skip_tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[tokio::test]
+    async fn reset_session_makes_a_previously_skippable_dependency_rerun() {
+        let path = write_dep_chain_canvas("echo dep-ran");
+        let addr = spawn_test_server(path.clone()).await;
+
+        let first = run_target(addr).await;
+        assert!(really_ran(&first, "dep"));
+
+        let second = run_target(addr).await;
+        assert!(
+            skipped_for(&second, "dep"),
+            "expected dep to be skipped before any reset: {second:?}"
+        );
+
+        let (status, body) = request(addr, "POST", "/api/session/reset", "application/json", "").await;
+        assert_eq!(status, 204, "unexpected body: {body}");
+
+        let third = run_target(addr).await;
+        assert!(
+            really_ran(&third, "dep"),
+            "a dependency must rerun for real right after a session reset, even though \
+             it's unchanged and had already run this session before the reset: {third:?}"
+        );
+        assert!(!skipped_for(&third, "dep"));
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
 }
 
 #[cfg(test)]
@@ -5988,6 +6057,59 @@ mod vars_endpoint_tests {
         assert_eq!(cache.get("GREETING"), Some("Hi"));
         assert_eq!(cache.get("INSTALL_PATH"), Some("/opt/app"));
         assert_eq!(cache.get("API_TOKEN"), None);
+
+        let _ = std::fs::remove_file(&canvas_path);
+        let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));
+    }
+
+    const SECRET_ENV_CANVAS: &str = concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "<!-- meshfox:var name=\"API_TOKEN\" secret -->\n\n",
+        "```bash name=\"use-token\" env=\"$API_TOKEN\"\necho \"$API_TOKEN\"\n```\n",
+    );
+
+    // TODO.canvas.md: "Галочка \"сохранить\" у secret" — a `secret`
+    // declaration is never persisted to the on-disk cache by default, same
+    // as before `save_secrets` existed.
+    #[tokio::test]
+    async fn run_block_does_not_persist_a_secret_answer_by_default() {
+        let canvas_path = write_test_canvas(SECRET_ENV_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, body) = post_json(
+            addr,
+            "/api/run",
+            r#"{"path":[],"block":"use-token","vars":{"API_TOKEN":"sk-secret"}}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "unexpected body: {body}");
+
+        let cache = VarCache::load(&canvas_path).expect("load cache");
+        assert_eq!(cache.get("API_TOKEN"), None);
+
+        let _ = std::fs::remove_file(&canvas_path);
+        let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));
+    }
+
+    #[tokio::test]
+    async fn run_block_persists_a_secret_answer_when_save_secrets_names_it() {
+        let canvas_path = write_test_canvas(SECRET_ENV_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, body) = post_json(
+            addr,
+            "/api/run",
+            r#"{"path":[],"block":"use-token","vars":{"API_TOKEN":"sk-secret"},"saveSecrets":["API_TOKEN"]}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "unexpected body: {body}");
+
+        let cache = VarCache::load(&canvas_path).expect("load cache");
+        assert_eq!(
+            cache.get("API_TOKEN"),
+            Some("sk-secret"),
+            "naming API_TOKEN in saveSecrets should have persisted it, in plaintext, anyway"
+        );
 
         let _ = std::fs::remove_file(&canvas_path);
         let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));

@@ -8,7 +8,13 @@ interface VarsFormProps {
    * "configure" flow (`handleConfigure`), every declared non-secret
    * variable in the document, resolved or not — see `fetchConfigureVars`. */
   vars: VarStatus[];
-  onSubmit: (answers: Record<string, string>) => void;
+  /** `saveSecrets` is the names of whichever `secret` fields the user
+   * checked "save (plaintext)" on (see the per-field checkbox below) — the
+   * caller only ever needs to look at it for the pre-run form, since the
+   * "configure" flow never shows a `secret` field at all (`GET
+   * /api/vars/configure` excludes them entirely) to have one checked in the
+   * first place. */
+  onSubmit: (answers: Record<string, string>, saveSecrets: string[]) => void;
   onCancel: () => void;
   /** Defaults to the pre-run gate's own copy — `handleConfigure` overrides
    * these three for the "configure every declared variable" flow, the
@@ -49,7 +55,11 @@ function initialValue(v: VarStatus): string {
  * counterpart to `meshfox run`/`configure`'s terminal prompt. Answers are
  * submitted alongside the run request; the server persists whatever isn't
  * `secret` to the on-disk cache, so this only has to ask once per variable
- * (until the cache is cleared or a different value is needed).
+ * (until the cache is cleared or a different value is needed) — a `secret`
+ * field gets its own "save (plaintext)" checkbox instead (TODO.canvas.md:
+ * "Галочка \"сохранить\" у secret"), off by default, for opting a specific
+ * secret into that same on-disk persistence anyway; there's no encryption
+ * yet, so checking it really does write the value out in plain text.
  */
 export function VarsForm({
   vars,
@@ -62,6 +72,12 @@ export function VarsForm({
   const [values, setValues] = useState<Record<string, string>>(() =>
     Object.fromEntries(vars.map((v) => [v.name, initialValue(v)])),
   );
+  // Which `secret` fields' "save (plaintext)" checkbox is checked — see
+  // `VarsFormProps.onSubmit`'s own doc comment. Absent from `values`
+  // itself: it isn't a variable's *value*, and initializing it there would
+  // mean threading a `secret`-only branch through every place `values` is
+  // built/read.
+  const [saveSecret, setSaveSecret] = useState<Record<string, boolean>>({});
   // Set by `handleSubmit` when an `int` field fails `isValidValue` — the
   // server would reject it too (`meshfox_core::validate_value`, wired
   // into `POST /api/vars/configure`/`/api/run`), but catching it here
@@ -79,11 +95,16 @@ export function VarsForm({
       return;
     }
     setError(null);
-    onSubmit(values);
+    onSubmit(
+      values,
+      Object.keys(saveSecret).filter((name) => saveSecret[name]),
+    );
   };
 
   const defaultHint = `This canvas needs a few values before it can run — answered once, then remembered${
-    vars.some((v) => v.secret) ? " (secret ones aren't saved, and are asked for again next time)" : ""
+    vars.some((v) => v.secret)
+      ? " (secret ones aren't saved and are asked for again next time, unless you check \"save\")"
+      : ""
   }.`;
 
   return (
@@ -92,7 +113,8 @@ export function VarsForm({
         <h3>{title}</h3>
         {error ? <p className="vars-modal-error">{error}</p> : <p className="vars-modal-hint">{hint ?? defaultHint}</p>}
         {vars.map((v, i) => (
-          <label key={v.name} className="vars-modal-field">
+          <div key={v.name} className="vars-modal-field-group">
+          <label className="vars-modal-field">
             <span>{v.prompt}</span>
             {v.type === "bool" ? (
               <input
@@ -128,6 +150,19 @@ export function VarsForm({
               />
             )}
           </label>
+          {v.secret && (
+            <label className="vars-modal-secret-save">
+              <input
+                type="checkbox"
+                checked={saveSecret[v.name] ?? false}
+                onChange={(e) => setSaveSecret((prev) => ({ ...prev, [v.name]: e.target.checked }))}
+              />
+              <span title="Not encrypted yet — written to the on-disk var cache in plain text.">
+                save (plaintext)
+              </span>
+            </label>
+          )}
+          </div>
         ))}
         <div className="vars-modal-actions">
           <button type="button" onClick={onCancel}>

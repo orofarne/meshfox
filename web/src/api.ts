@@ -464,11 +464,22 @@ export async function runBlockStream(
   withDeps: boolean,
   onEvent: (event: RunEvent) => void,
   vars?: Record<string, string>,
+  /** Names of `secret`-declared variables (a subset of `vars`' own keys) to
+   * persist to the on-disk var cache anyway, in plaintext — see
+   * `VarsForm`'s own "save (plaintext)" checkbox. */
+  saveSecrets?: string[],
 ): Promise<void> {
   const res = await fetch("/api/run", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ path, block, persist, noDeps: !withDeps, vars: vars ?? {} }),
+    body: JSON.stringify({
+      path,
+      block,
+      persist,
+      noDeps: !withDeps,
+      vars: vars ?? {},
+      saveSecrets: saveSecrets ?? [],
+    }),
   });
   if (!res.ok) {
     const text = await res.text();
@@ -560,6 +571,21 @@ export async function killRun(runId: string): Promise<void> {
   });
   if (!res.ok && res.status !== 404) {
     throw new Error(`POST /api/kill: ${res.status}`);
+  }
+}
+
+/**
+ * Forgets every block's session-freshness record on the server — the next
+ * "⛓ run chain" re-runs every pulled-in dependency for real instead of
+ * skipping whichever ones still look unchanged since their last run this
+ * session (see `RunEvent`'s `"step-skipped"` variant). Purely in-memory on
+ * the server side, so this never touches the canvas file itself or any
+ * persisted `<!-- meshfox:output ... -->` cache — those are unaffected.
+ */
+export async function resetSession(): Promise<void> {
+  const res = await fetch("/api/session/reset", { method: "POST" });
+  if (!res.ok) {
+    throw new Error(`POST /api/session/reset: ${res.status}`);
   }
 }
 

@@ -611,6 +611,40 @@ pub fn fingerprint(block: &CodeBlock) -> String {
     format!("{:08x}", fnv1a(parts.join("\u{0}").as_bytes()))
 }
 
+/// `fingerprint` plus the *resolved values* of the variables this block
+/// actually references — only its own `env=` list and any `$NAME` its
+/// `interpreter=` refers to (`crate::exec::interpreter_var_refs`), same
+/// scoping `resolve_block_env` already applies. Session-freshness
+/// bookkeeping (`AppState::session_runs`/TUI's `App::session_runs`, see
+/// TODO.canvas.md: "Переменные как часть состояния блока") uses this
+/// instead of plain `fingerprint` so a variable's *value* changing (not
+/// just which variables the block declares) invalidates the skip too — a
+/// re-answered `meshfox:var` prompt, a changed `--set`/env override, or an
+/// upstream `from=` block now producing something different.
+///
+/// Deliberately not part of `fingerprint` itself: that one also backs the
+/// on-disk `<!-- meshfox:output ... hash="..." -->` cache
+/// (`crate::output`), which has no notion of a "currently resolved"
+/// variable value to fold in — a value is a purely session-scoped concept.
+pub fn session_fingerprint(block: &CodeBlock, resolved_vars: &HashMap<String, String>) -> String {
+    let mut names: Vec<String> = block.env.iter().map(|e| e.var_name.clone()).collect();
+    if let Some(spec) = &block.interpreter {
+        names.extend(crate::exec::interpreter_var_refs(spec));
+    }
+    names.sort();
+    names.dedup();
+    let base = fingerprint(block);
+    if names.is_empty() {
+        return base;
+    }
+    let mut parts = vec![base];
+    for name in names {
+        let value = resolved_vars.get(&name).map(String::as_str).unwrap_or("");
+        parts.push(format!("{name}\u{0}{value}"));
+    }
+    format!("{:08x}", fnv1a(parts.join("\u{0}").as_bytes()))
+}
+
 fn parse_info_string(info: &str) -> (String, HashMap<String, String>) {
     let mut tokens = crate::attrs::tokenize(info).into_iter();
     let lang = tokens.next().unwrap_or_default();
@@ -1157,6 +1191,45 @@ mod tests {
         let a = &scan_code_blocks("```python name=\"x\" interpreter=\"python3\"\npass\n```\n")[0];
         let b = &scan_code_blocks("```python name=\"x\" interpreter=\"python3.11\"\npass\n```\n")[0];
         assert_ne!(fingerprint(a), fingerprint(b));
+    }
+
+    #[test]
+    fn session_fingerprint_changes_when_a_referenced_var_value_changes() {
+        let block = &scan_code_blocks("```bash name=\"x\" env=\"$A\"\necho hi\n```\n")[0];
+        let mut a = HashMap::new();
+        a.insert("A".to_string(), "1".to_string());
+        let mut b = HashMap::new();
+        b.insert("A".to_string(), "2".to_string());
+        assert_ne!(session_fingerprint(block, &a), session_fingerprint(block, &b));
+    }
+
+    #[test]
+    fn session_fingerprint_ignores_an_unrelated_var_value_changing() {
+        let block = &scan_code_blocks("```bash name=\"x\" env=\"$A\"\necho hi\n```\n")[0];
+        let mut a = HashMap::new();
+        a.insert("A".to_string(), "1".to_string());
+        a.insert("UNRELATED".to_string(), "1".to_string());
+        let mut b = HashMap::new();
+        b.insert("A".to_string(), "1".to_string());
+        b.insert("UNRELATED".to_string(), "2".to_string());
+        assert_eq!(session_fingerprint(block, &a), session_fingerprint(block, &b));
+    }
+
+    #[test]
+    fn session_fingerprint_changes_when_an_interpreter_referenced_var_value_changes() {
+        let block =
+            &scan_code_blocks("```python name=\"x\" interpreter=\"$PYTHON -u\"\npass\n```\n")[0];
+        let mut a = HashMap::new();
+        a.insert("PYTHON".to_string(), "python3".to_string());
+        let mut b = HashMap::new();
+        b.insert("PYTHON".to_string(), "python3.11".to_string());
+        assert_ne!(session_fingerprint(block, &a), session_fingerprint(block, &b));
+    }
+
+    #[test]
+    fn session_fingerprint_matches_plain_fingerprint_for_a_block_with_no_vars() {
+        let block = &scan_code_blocks("```bash name=\"x\"\necho hi\n```\n")[0];
+        assert_eq!(session_fingerprint(block, &HashMap::new()), fingerprint(block));
     }
 
     #[test]

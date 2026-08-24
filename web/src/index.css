@@ -272,6 +272,54 @@ a {
   min-height: 0;
 }
 
+/* TODO.canvas.md: "Поиск" — a React Flow `<Panel>` (same overlay mechanism
+ * `<Controls>`/`<MiniMap>` already use), so no custom absolute positioning
+ * of its own is needed. */
+.search-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.5rem;
+  background: var(--bg);
+  border: 1px solid var(--node-border);
+  border-radius: 6px;
+  box-shadow: 0 2px 8px rgb(0 0 0 / 0.15);
+}
+
+.search-bar input {
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--node-border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--fg);
+  width: 22rem;
+  max-width: 40vw;
+}
+
+.search-bar-count {
+  font-size: 0.75rem;
+  opacity: 0.7;
+  min-width: 3rem;
+  text-align: center;
+}
+
+.search-bar button {
+  font-size: 0.85rem;
+  padding: 0.2rem 0.5rem;
+  border-radius: 4px;
+  border: 1px solid var(--node-border);
+  background: transparent;
+  color: var(--fg);
+  cursor: pointer;
+}
+
+.search-bar button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
 /* Toolbar's "Source" mode (CanvasSourceEditor) — fills the same
  * `.canvas-area` slot the graph view normally occupies, not a modal, since
  * there's nothing underneath worth seeing at the same time. */
@@ -1547,6 +1595,25 @@ a {
   align-self: flex-start;
   width: 1rem;
   height: 1rem;
+}
+
+.vars-modal-field-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.vars-modal-secret-save {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.75rem;
+  opacity: 0.75;
+}
+
+.vars-modal-secret-save input[type="checkbox"] {
+  width: 0.9rem;
+  height: 0.9rem;
 }
 
 .vars-modal-actions {

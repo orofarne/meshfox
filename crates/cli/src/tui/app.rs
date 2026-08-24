@@ -269,12 +269,12 @@ pub struct App {
 /// `App::session_runs`.
 #[derive(Clone)]
 pub struct SessionRun {
-    /// `meshfox_core::fingerprint` of the block *as it stood* on that
-    /// successful run — a later `advance_run` only treats this as
-    /// "already fresh" (skippable) if the block's own *current*
-    /// fingerprint still matches; any edit to its code/lang/interpreter/
-    /// env=/deps= changes the fingerprint and makes it stale again, the
-    /// same mechanism `crate::output`'s cached-output staleness uses.
+    /// `meshfox_core::session_fingerprint` of the block *as it stood*
+    /// (code/lang/interpreter/env=/deps=, same as `crate::output`'s
+    /// cached-output staleness mechanism) *and* the resolved values of
+    /// whatever variables it referenced, on that successful run — a later
+    /// `advance_run` only treats this as "already fresh" (skippable) if
+    /// both still match.
     pub fingerprint: String,
     /// Whatever this block wrote to its own vars-out file last time it
     /// actually ran (only ever non-empty for a block that's a `from=`
@@ -469,6 +469,7 @@ impl App {
             KeyCode::Char('r') => self.trigger_run(true).await,
             KeyCode::Char('R') => self.trigger_run(false).await,
             KeyCode::Char('K') => self.kill_running(),
+            KeyCode::Char('S') => self.reset_session(),
             KeyCode::Char('o') => self.trigger_open_file(),
             KeyCode::Char('c') => self.trigger_configure(),
             KeyCode::Char('e') => self.open_source_editor(),
@@ -1368,7 +1369,7 @@ impl App {
         // early `return` (chain exhausted, an error, or a step that
         // genuinely needs to run) or falls through to spawn a step once
         // one is found that isn't skippable.
-        let (addr, located, node_text, block) = loop {
+        let (addr, located, node_text, block, env_resolution, interp_resolution) = loop {
             let Some((idx, len)) = self.run.as_ref().map(|r| (r.idx, r.chain.len())) else {
                 return;
             };
@@ -1437,13 +1438,67 @@ impl App {
                 return;
             };
 
+            // Resolved *without* parking on anything still missing — a
+            // best-effort lookup against whatever's already available
+            // (overrides/cache/default/computed), purely to know the
+            // values feeding `session_fingerprint` below. A block that
+            // ends up skippable never needs to actually park (which could
+            // otherwise force an interactive prompt just to decide whether
+            // to skip); a block that isn't skippable reuses this exact
+            // same resolution afterward instead of resolving twice.
+            let env_resolution = resolve_block_env(
+                &block.env,
+                &self.decls,
+                &self.run_overrides,
+                &self.var_cache,
+                &self.run_computed,
+            );
+            // Same reasoning as `env_resolution`, for any `$NAME` ref
+            // inside `interpreter=` (see `meshfox_core::interpreter_var_refs`)
+            // — `None` means `block.interpreter` has no such reference at
+            // all, not merely that resolution hasn't happened yet.
+            let interp_refs: Vec<meshfox_core::EnvRef> = block
+                .interpreter
+                .as_deref()
+                .map(meshfox_core::interpreter_var_refs)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|n| meshfox_core::EnvRef { local_name: n.clone(), var_name: n })
+                .collect();
+            let interp_resolution = if interp_refs.is_empty() {
+                None
+            } else {
+                Some(resolve_block_env(
+                    &interp_refs,
+                    &self.decls,
+                    &self.run_overrides,
+                    &self.var_cache,
+                    &self.run_computed,
+                ))
+            };
+
+            // `session_fingerprint` wants var-name-keyed values;
+            // `BlockEnvResolution::env` is local-name-keyed (relabeled per
+            // `env=`), so project back through `block.env`'s own pairs —
+            // for `interp_resolution`, local name == var name already (see
+            // `interp_refs` above), so its `env` needs no projection.
+            let mut fingerprint_vars: HashMap<String, String> = HashMap::new();
+            for env_ref in &block.env {
+                if let Some(v) = env_resolution.env.get(&env_ref.local_name) {
+                    fingerprint_vars.insert(env_ref.var_name.clone(), v.clone());
+                }
+            }
+            if let Some(ir) = &interp_resolution {
+                fingerprint_vars.extend(ir.env.clone());
+            }
+
             // The block actually requested (always the chain's own last
             // entry) always runs for real; only a pulled-in dependency is
             // ever eligible to be skipped as "already fresh this session"
             // — see `App::session_runs`. A block's own `always` flag opts
             // it out of the skip entirely, even as a pulled-in dependency.
             let is_requested_target = idx + 1 == len;
-            let live_fingerprint = meshfox_core::fingerprint(&block);
+            let live_fingerprint = meshfox_core::session_fingerprint(&block, &fingerprint_vars);
             if !is_requested_target && !block.always {
                 let key = (addr.node_id.clone(), addr.block_name.clone());
                 if let Some(session_run) =
@@ -1468,22 +1523,14 @@ impl App {
                 }
             }
 
-            break (addr, located, node_text, block);
+            break (addr, located, node_text, block, env_resolution, interp_resolution);
         };
 
-        let resolution = resolve_block_env(
-            &block.env,
-            &self.decls,
-            &self.run_overrides,
-            &self.var_cache,
-            &self.run_computed,
-        );
-        let Some(mut env) = self.park_on_unresolved(resolution) else {
+        let Some(mut env) = self.park_on_unresolved(env_resolution) else {
             return;
         };
 
-        // A `$NAME` reference inside `interpreter=` (see
-        // `meshfox_core::interpreter_var_refs`) needs exactly the same
+        // A `$NAME` reference inside `interpreter=` needs exactly the same
         // resolution `env=` just got — a second, independent pass (rather
         // than folding these names into `block.env` itself) so a
         // referenced variable never silently ends up in the spawned
@@ -1491,31 +1538,15 @@ impl App {
         // to need it too; only a real `env=` entry ever does that.
         let effective_interpreter = match &block.interpreter {
             None => None,
-            Some(spec) => {
-                let names = meshfox_core::interpreter_var_refs(spec);
-                if names.is_empty() {
-                    Some(spec.clone())
-                } else {
-                    let refs: Vec<meshfox_core::EnvRef> = names
-                        .iter()
-                        .map(|n| meshfox_core::EnvRef {
-                            local_name: n.clone(),
-                            var_name: n.clone(),
-                        })
-                        .collect();
-                    let interp_resolution = resolve_block_env(
-                        &refs,
-                        &self.decls,
-                        &self.run_overrides,
-                        &self.var_cache,
-                        &self.run_computed,
-                    );
+            Some(spec) => match interp_resolution {
+                None => Some(spec.clone()),
+                Some(interp_resolution) => {
                     let Some(values) = self.park_on_unresolved(interp_resolution) else {
                         return;
                     };
                     Some(meshfox_core::resolve_interpreter(spec, &values))
                 }
-            }
+            },
         };
 
         // If some declared variable is `from=`-sourced from *this* block,
@@ -1881,6 +1912,18 @@ impl App {
             }
             self.status = "killing...".into();
         }
+    }
+
+    /// Forgets every block's session-freshness record (`session_runs`) —
+    /// the next chain run re-runs every pulled-in dependency for real
+    /// instead of skipping whichever ones still look unchanged since their
+    /// last run this session. Mirrors the web server's own `POST
+    /// /api/session/reset`. Purely in-memory, so this never touches the
+    /// canvas file itself or any persisted `<!-- meshfox:output ... -->`
+    /// cache. See TODO.canvas.md: "Сброс сессии".
+    fn reset_session(&mut self) {
+        self.session_runs.clear();
+        self.status = "session reset".into();
     }
 
     /// Saves every field in `var_form` at once — whatever's currently
@@ -2352,6 +2395,38 @@ mod tests {
         let file_run = app.file_run.as_ref().expect("a file run was started");
         assert!(!file_run.had_failure, "lines: {:?}", file_run.lines);
         assert!(file_run.lines.iter().any(|l| l.contains("hi from seed")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn reset_session_clears_every_recorded_session_run() {
+        let dir = std::env::temp_dir().join(format!("meshfox-tui-reset-session-test-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.md");
+        std::fs::write(
+            &path,
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
+        )
+        .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(path, tx).unwrap();
+
+        app.session_runs.insert(
+            ("root".to_string(), "dep".to_string()),
+            SessionRun {
+                fingerprint: "deadbeef".to_string(),
+                produced_vars: HashMap::new(),
+                output: "dep-ran\n".to_string(),
+                duration_ms: 1,
+            },
+        );
+        assert!(!app.session_runs.is_empty());
+
+        app.reset_session();
+
+        assert!(app.session_runs.is_empty());
+        assert_eq!(app.status, "session reset");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

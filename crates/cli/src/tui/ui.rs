@@ -671,6 +671,8 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         "R               run this node's block only (skip deps)",
         "  (a node with more than one block opens a picker first)",
         "K               kill the running block",
+        "S               reset session — forget which blocks already ran,",
+        "                so the next chain run re-runs every dependency",
         "e               edit this node's own file, full-screen (Ctrl-s save,",
         "                Ctrl-f switch file, Ctrl-n heading->node, Ctrl-p",
         "                suggest attributes/tags, mouse click/drag/scroll, esc close)",

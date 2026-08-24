@@ -38,7 +38,7 @@ pub use exec::{
 };
 pub use fence::{
     fingerprint, parse_deps_list, parse_env_list, scan_code_blocks, scan_runnable_blocks,
-    BlockRef, CodeBlock, EnvRef,
+    session_fingerprint, BlockRef, CodeBlock, EnvRef,
 };
 pub use file_read::{
     confine, preview, ConfineError, FilePreview, PreviewError, FILE_PREVIEW_MAX_BYTES,

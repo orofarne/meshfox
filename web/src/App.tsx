@@ -4,6 +4,7 @@ import {
   Background,
   Controls,
   MiniMap,
+  Panel,
   MarkerType,
   useNodesState,
   useEdgesState,
@@ -34,10 +35,11 @@ import {
   clearNodeLayout,
   watchChanges,
   clearLayout,
+  resetSession,
   type RunEvent,
   type NodePatch,
 } from "./api";
-import type { CanvasDoc, CanvasNode, ExtraEdgeDto, VarStatus } from "./types";
+import type { CanvasDoc, CanvasNode, ExtraEdgeDto, NodeType, VarStatus } from "./types";
 import { pathTo, deriveEdges, findRoot, visibleNodeIds, subtreeIds } from "./tree";
 import { computeAutoLayout, FOLDED_HEIGHT, type LayoutBox } from "./autolayout";
 import { buildBlockGraph, resolveChain, type BlockAddr } from "./deps";
@@ -218,6 +220,13 @@ function positionFor(
 export default function App() {
   const [canvas, setCanvas] = useState<CanvasDoc | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Briefly `true` right after a successful "reset session" click — purely
+  // informational feedback (same `.saving-indicator` styling the layout
+  // autosave uses), since the button itself has no other visible effect
+  // until the *next* chain run behaves differently. Cleared by the
+  // `setTimeout` in `handleResetSession` below, not by anything reacting to
+  // a run.
+  const [sessionResetJustNow, setSessionResetJustNow] = useState(false);
   // A node's subtree folded to a compact title-only row — a view
   // preference (never written to the file, see `handleSaveLayout`), one
   // React state shared by the fold-toggle UI, keyboard nav's visible
@@ -297,6 +306,14 @@ export default function App() {
       setThemePreference(next);
       return next;
     });
+  }, []);
+  const handleResetSession = useCallback(() => {
+    resetSession()
+      .then(() => {
+        setSessionResetJustNow(true);
+        setTimeout(() => setSessionResetJustNow(false), 1500);
+      })
+      .catch((e) => setError(String(e)));
   }, []);
   const [nodes, setNodes, onNodesChange] = useNodesState<Node<MeshNodeData>>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
@@ -425,12 +442,31 @@ export default function App() {
     blockName: string;
     withDeps: boolean;
     vars?: Record<string, string>;
+    saveSecrets?: string[];
     autoclose: boolean;
   } | null>(null);
   // Which node's settings modal (title/type/color/target/edges) is open,
   // if any — see NodeSettings.tsx. Set right after a successful "add
   // child" too, so the new node's title is immediately editable.
   const [settingsNodeId, setSettingsNodeId] = useState<string | null>(null);
+  // Set right after `handleAddChild` creates a node, so `handleSettingsOk`
+  // can tell "ok was just clicked on the node this dialog opened *for*
+  // right after creating it" apart from "ok was clicked on some node's
+  // settings some other time" — only the former should auto-open the body
+  // editor below. Cleared the moment the settings modal closes, whichever
+  // way (see `onClose` at this component's own `<NodeSettings>` render
+  // site), so it's a one-shot signal, never a standing "this node was ever
+  // created" flag.
+  const justCreatedNodeIdRef = useRef<string | null>(null);
+  // Which node's inline body editor (`NodeTextEditor`, rendered inside
+  // `MeshNode` itself, not here) should open itself right away — set by
+  // `handleSettingsOk` (TODO.canvas.md: "Редактирование после Node
+  // settings"), consumed (and cleared back to `null`) by that one
+  // `MeshNode` instance via `onAutoOpenTextEditorConsumed` the moment it's
+  // acted on it, same one-shot shape as `justCreatedNodeIdRef` — see
+  // `focusedRenderNodes` below for where this actually reaches that node's
+  // own `data`.
+  const [autoOpenTextEditorNodeId, setAutoOpenTextEditorNodeId] = useState<string | null>(null);
   // Which node's body is expanded into a floating window (see
   // NodeExpandPanel) — available read-only, unlike `settingsNodeId`. Looked
   // up from `nodes` (the live React Flow state, not `canvas.nodes`) so the
@@ -597,7 +633,13 @@ export default function App() {
   // vars-modal's "run" button can call straight back into this once
   // answered, without re-checking `fetchVars` a second time.
   const executeRun = useCallback(
-    async (nodeId: string, blockName: string, withDeps: boolean, vars?: Record<string, string>) => {
+    async (
+      nodeId: string,
+      blockName: string,
+      withDeps: boolean,
+      vars?: Record<string, string>,
+      saveSecrets?: string[],
+    ) => {
       if (!canvas) return;
       const path = pathTo(canvas, nodeId);
 
@@ -706,7 +748,7 @@ export default function App() {
             case "done":
               break;
           }
-        }, vars);
+        }, vars, saveSecrets);
         // Reloading clears every node's `liveBlocks` (see the canvas-load
         // effect below) — worth it when it picks up a `cache`d block's
         // freshly-persisted output, but pure loss for a chain that has no
@@ -862,16 +904,23 @@ export default function App() {
   );
 
   const handleVarsSubmit = useCallback(
-    async (answers: Record<string, string>) => {
+    async (answers: Record<string, string>, saveSecrets: string[]) => {
       if (!varsModal) return;
       const { nodeId, blockName, withDeps, tty, autoclose } = varsModal;
       setVarsModal(null);
       if (tty) {
         if (!canvas) return;
-        setTtySession({ path: pathTo(canvas, nodeId), blockName, withDeps, vars: answers, autoclose: autoclose ?? false });
+        setTtySession({
+          path: pathTo(canvas, nodeId),
+          blockName,
+          withDeps,
+          vars: answers,
+          saveSecrets,
+          autoclose: autoclose ?? false,
+        });
         return;
       }
-      await executeRun(nodeId, blockName, withDeps, answers);
+      await executeRun(nodeId, blockName, withDeps, answers, saveSecrets);
     },
     [varsModal, executeRun, canvas],
   );
@@ -967,7 +1016,10 @@ export default function App() {
         const updated = await createNode(parentId, "New Node");
         setCanvas(updated);
         const added = updated.nodes.find((n) => !previousIds.has(n.id));
-        if (added) setSettingsNodeId(added.id);
+        if (added) {
+          setSettingsNodeId(added.id);
+          justCreatedNodeIdRef.current = added.id;
+        }
       } catch (e) {
         setError(String(e));
       }
@@ -989,6 +1041,23 @@ export default function App() {
       setCanvas(updated);
     } catch (e) {
       setError(String(e));
+    }
+  }, []);
+
+  // NodeSettings' "ok" — fires on every commit, even a no-op one (unlike
+  // `handleNodeSettingsChange` above), which is what makes it the right
+  // hook for "the user just clicked ok right after creating this node" (see
+  // `justCreatedNodeIdRef`'s own doc comment): the common case is creating
+  // a node and immediately clicking ok without touching a single field,
+  // meaning to type its body next, which would never fire `onChange` at
+  // all. Only a text-type node has an inline body editor to open — a
+  // freshly-created node defaults to "text", but the same settings dialog
+  // that's closing could have just switched it to file/link/group/include,
+  // so this checks the *final* type, not an assumption baked in at creation
+  // time.
+  const handleSettingsOk = useCallback((id: string, type: NodeType) => {
+    if (justCreatedNodeIdRef.current === id && type === "text") {
+      setAutoOpenTextEditorNodeId(id);
     }
   }, []);
 
@@ -1787,6 +1856,93 @@ export default function App() {
     },
     [flowInstance],
   );
+
+  // TODO.canvas.md: "Поиск" — search across every node's title/body text,
+  // with a small floating bar (a React Flow `<Panel>`, same overlay
+  // mechanism `<Controls>`/`<MiniMap>` already use) to type a query and
+  // step through matches. Deliberately plain substring/case-insensitive,
+  // not fuzzy or regex — this is "find the node about X", not a query
+  // language.
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchMatchIndex, setSearchMatchIndex] = useState(0);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const searchMatches = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    if (!canvas || !q) return [];
+    return canvas.nodes.filter((n) => n.title.toLowerCase().includes(q) || n.text.toLowerCase().includes(q)).map((n) => n.id);
+  }, [canvas, searchQuery]);
+  // A query edit can shrink `searchMatches` out from under whatever index
+  // was current — clamped here (once, as a render-time derivation) rather
+  // than in every place that reads `searchMatchIndex`, same "one place
+  // reconciles it" reasoning `focusedRenderNodes` already applies to
+  // `focused`/`autoOpenTextEditor`.
+  const clampedSearchMatchIndex =
+    searchMatches.length === 0 ? 0 : Math.min(searchMatchIndex, searchMatches.length - 1);
+  // Un-hides `id` first if it's inside a folded subtree (walking every
+  // ancestor, not just its direct parent — a deeply nested match could sit
+  // under several folded groups at once), then focuses/centers it.
+  //
+  // The centering half deliberately doesn't just unfold and then call
+  // `focusNode` — `flowInstance.getNode(id)` (what `focusNode` reads)
+  // wouldn't have a real position for `id` yet: unfolding only updates
+  // `foldedNodeIds`, and the newly-revealed node's actual `x`/`y` is a
+  // render-or-two-later `setNodes` away (the reflow effect reacting to
+  // this same `foldedNodeIds` change) — same gap `toggleFold`'s own
+  // camera-shift has to route around, and the same fix: compute the
+  // *resulting* box directly via `computeAutoLayout` against the target
+  // folded set, rather than wait on `nodes`/React Flow's own store to
+  // catch up.
+  const revealAndFocus = useCallback(
+    (id: string) => {
+      if (!canvas) return;
+      setFocusedNodeId(id);
+      const ancestors = pathTo(canvas, id).slice(0, -1);
+      const foldedAncestors = ancestors.filter((a) => foldedNodeIds.has(a));
+      if (foldedAncestors.length === 0) {
+        focusNode(id);
+        return;
+      }
+      const nextFolded = new Set(foldedNodeIds);
+      for (const a of foldedAncestors) nextFolded.delete(a);
+      setFoldedNodeIds(nextFolded);
+      if (!flowInstance) return;
+      const boxes = computeAutoLayout({
+        canvas,
+        viewportWidth: viewportWidthRef.current,
+        measuredHeight: (nodeId) => measuredHeightsRef.current.get(nodeId),
+        foldedNodeIds: nextFolded,
+      });
+      const box = boxes.get(id);
+      if (!box) return;
+      flowInstance.setCenter(box.x + box.width / 2, box.y + box.height / 2, {
+        zoom: flowInstance.getZoom(),
+        duration: 400,
+      });
+    },
+    [canvas, foldedNodeIds, flowInstance, focusNode],
+  );
+  const gotoSearchMatch = useCallback(
+    (delta: number) => {
+      if (searchMatches.length === 0) return;
+      const next = (clampedSearchMatchIndex + delta + searchMatches.length) % searchMatches.length;
+      setSearchMatchIndex(next);
+      revealAndFocus(searchMatches[next]);
+    },
+    [searchMatches, clampedSearchMatchIndex, revealAndFocus],
+  );
+  const openSearch = useCallback(() => {
+    setSearchOpen(true);
+    // Runs after this render commits the now-mounted `<input>` (the
+    // `Panel` only renders it once `searchOpen` is true) — a plain
+    // synchronous `.focus()` call right here would still be targeting
+    // last render's DOM (or nothing, on the very first open).
+    requestAnimationFrame(() => searchInputRef.current?.focus());
+  }, []);
+  const closeSearch = useCallback(() => {
+    setSearchOpen(false);
+  }, []);
+
   useEffect(() => {
     function isEditableTarget(el: Element | null): boolean {
       if (!(el instanceof HTMLElement)) return false;
@@ -1807,8 +1963,17 @@ export default function App() {
         deleteConfirmNodeId ||
         reparentPromptNodeId ||
         expandedNodeId ||
-        autoLayoutConfirmOpen
+        autoLayoutConfirmOpen ||
+        searchOpen
       ) {
+        return;
+      }
+      // Same convention Slack/GitHub use for "focus the search box" — `/`
+      // is otherwise unbound in this canvas-nav scheme (j/k/h/l/arrows/
+      // Enter/Tab), so it never collides with anything above.
+      if (e.key === "/") {
+        e.preventDefault();
+        openSearch();
         return;
       }
       if (visibleOrder.length === 0) return;
@@ -1897,13 +2062,24 @@ export default function App() {
     reparentPromptNodeId,
     expandedNodeId,
     autoLayoutConfirmOpen,
+    searchOpen,
+    openSearch,
   ]);
+  const handleAutoOpenTextEditorConsumed = useCallback(() => setAutoOpenTextEditorNodeId(null), []);
   const focusedRenderNodes = useMemo(
     () =>
-      visibleNodes.map((n) =>
-        (n.data.focused ?? false) === (n.id === focusedNodeId) ? n : { ...n, data: { ...n.data, focused: n.id === focusedNodeId } },
-      ),
-    [visibleNodes, focusedNodeId],
+      visibleNodes.map((n) => {
+        const focused = n.id === focusedNodeId;
+        const autoOpenTextEditor = n.id === autoOpenTextEditorNodeId;
+        if ((n.data.focused ?? false) === focused && (n.data.autoOpenTextEditor ?? false) === autoOpenTextEditor) {
+          return n;
+        }
+        return {
+          ...n,
+          data: { ...n.data, focused, autoOpenTextEditor, onAutoOpenTextEditorConsumed: handleAutoOpenTextEditorConsumed },
+        };
+      }),
+    [visibleNodes, focusedNodeId, autoOpenTextEditorNodeId, handleAutoOpenTextEditorConsumed],
   );
 
   const settingsNode = useMemo(
@@ -2176,6 +2352,26 @@ export default function App() {
             ⚙ configure
           </button>
         )}
+        <button
+          className={searchOpen ? "deps-toggle deps-toggle-active" : "deps-toggle"}
+          onClick={() => (searchOpen ? closeSearch() : openSearch())}
+          disabled={sourceMode}
+          title={
+            sourceMode
+              ? "Source mode has its own search (the editor's own Ctrl/Cmd-F)"
+              : "Search every node's title/body (or press /)"
+          }
+        >
+          🔍 search
+        </button>
+        <button
+          className="deps-toggle"
+          onClick={handleResetSession}
+          title="Forget which blocks already ran successfully this session, so the next ⛓ run chain re-runs every dependency instead of skipping unchanged ones"
+        >
+          ↺ reset session
+        </button>
+        {sessionResetJustNow && <span className="saving-indicator">session reset</span>}
         {error && <span className="error">{error}</span>}
         <button
           className="deps-toggle theme-toggle"
@@ -2197,6 +2393,11 @@ export default function App() {
       handleConfigure,
       themePreference,
       cycleTheme,
+      handleResetSession,
+      sessionResetJustNow,
+      searchOpen,
+      openSearch,
+      closeSearch,
     ],
   );
 
@@ -2272,6 +2473,51 @@ export default function App() {
             <Background />
             <Controls />
             <MiniMap />
+            {searchOpen && (
+              <Panel position="top-center" className="search-bar">
+                <input
+                  ref={searchInputRef}
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => {
+                    setSearchQuery(e.target.value);
+                    setSearchMatchIndex(0);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") {
+                      e.preventDefault();
+                      closeSearch();
+                    } else if (e.key === "Enter") {
+                      e.preventDefault();
+                      gotoSearchMatch(e.shiftKey ? -1 : 1);
+                    }
+                  }}
+                  placeholder="Search title/body… (Enter: next, Shift+Enter: prev, Esc: close)"
+                />
+                <span className="search-bar-count">
+                  {searchQuery.trim() === "" ? "" : searchMatches.length === 0 ? "0/0" : `${clampedSearchMatchIndex + 1}/${searchMatches.length}`}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => gotoSearchMatch(-1)}
+                  disabled={searchMatches.length === 0}
+                  title="Previous match (Shift+Enter)"
+                >
+                  ↑
+                </button>
+                <button
+                  type="button"
+                  onClick={() => gotoSearchMatch(1)}
+                  disabled={searchMatches.length === 0}
+                  title="Next match (Enter)"
+                >
+                  ↓
+                </button>
+                <button type="button" onClick={closeSearch} title="Close (Esc)">
+                  ×
+                </button>
+              </Panel>
+            )}
           </ReactFlow>
         )}
       </div>
@@ -2303,6 +2549,7 @@ export default function App() {
           withDeps={ttySession.withDeps}
           persist={editMode}
           vars={ttySession.vars}
+          saveSecrets={ttySession.saveSecrets}
           autoclose={ttySession.autoclose}
           onClose={() => setTtySession(null)}
         />
@@ -2333,7 +2580,11 @@ export default function App() {
           onChange={handleNodeSettingsChange}
           onRenameId={handleNodeIdChange}
           onClearId={handleNodeIdClear}
-          onClose={() => setSettingsNodeId(null)}
+          onOk={handleSettingsOk}
+          onClose={() => {
+            setSettingsNodeId(null);
+            justCreatedNodeIdRef.current = null;
+          }}
         />
       )}
       {deleteConfirmNode && (
