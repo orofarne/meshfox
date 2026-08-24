@@ -54,9 +54,16 @@ pub struct VarDecl {
     /// Only non-empty for `Select`; `declared_vars`/`scan_var_decls` reject
     /// a `select` with none.
     pub choices: Vec<String>,
-    /// Never persisted to the on-disk cache and never pre-filled from it —
-    /// only `--set`/the process environment can supply one without an
-    /// interactive prompt. See `crate::varcache`.
+    /// Never *automatically* persisted to the on-disk cache the way a
+    /// plain declaration's answer is — normally only `--set`/the process
+    /// environment can supply one without an interactive prompt. A caller
+    /// can still explicitly opt a specific answer into being cached anyway
+    /// (in plaintext — no encryption yet), e.g. the web UI's "save
+    /// (plaintext)" checkbox (`RunRequest::save_secrets`/`TtyRunQuery::
+    /// save_secrets` in `meshfox-server`); once that's happened, `resolve`
+    /// *does* read it back from the cache like any other declaration —
+    /// otherwise persisting it in the first place would be pointless. See
+    /// `crate::varcache`.
     pub secret: bool,
     /// Forces an interactive confirmation the first time this variable is
     /// needed, even when `default` would otherwise resolve it silently —
@@ -660,15 +667,17 @@ pub struct ResolvedVars {
 
 /// Resolves `decls` against, in priority order: `overrides` (explicit
 /// `--set`/a submitted web form), the current process environment, the
-/// on-disk cache (skipped entirely for a `secret` declaration — it's never
-/// read from or written to `cache`, see `crate::varcache`), and finally
-/// each declaration's own `default` — except for a `required` declaration,
-/// which skips that last step: with nothing else supplying a value, it
-/// lands in `missing` (still carrying `default`, for the caller to offer
-/// as the prompt's pre-filled suggestion) rather than silently taking the
-/// default. This is only a one-time confirmation, not a standing "always
-/// ask" — once answered, a non-secret answer is written to `cache` same as
-/// any other resolution, so the very next lookup finds it there and
+/// on-disk cache (this function only ever reads `cache`, never writes it —
+/// see the `secret`/`session` handling inline below for what's actually
+/// eligible to be read from it), and finally each declaration's own
+/// `default` — except for a `required` declaration, which skips that last
+/// step: with nothing else supplying a value, it lands in `missing` (still
+/// carrying `default`, for the caller to offer as the prompt's pre-filled
+/// suggestion) rather than silently taking the default. This is only a
+/// one-time confirmation, not a standing "always ask" — once answered, a
+/// caller typically writes a non-secret answer to `cache` (a `secret`
+/// answer only if the caller explicitly opts it in, e.g. the web UI's
+/// "save (plaintext)" checkbox), so the very next lookup finds it there and
 /// resolves without prompting again. Whatever isn't resolved ends up in
 /// `missing`, for the caller to prompt for and resolve again — a
 /// variable's own type/`choices` are informational for that prompt only;
@@ -738,11 +747,21 @@ pub fn resolve(
             .cloned()
             .or_else(|| std::env::var(&decl.name).ok())
             .or_else(|| {
-                // `session` skips the cache the same way `secret` does --
-                // never remembered past this one resolution pass. See
-                // `VarDecl::session`'s own doc comment for how a caller
-                // avoids re-prompting on every block within one run.
-                if decl.secret || decl.session {
+                // `session` skips the cache entirely -- never remembered
+                // past this one resolution pass, see `VarDecl::session`'s
+                // own doc comment for how a caller avoids re-prompting on
+                // every block within one run. `secret` does *not* skip the
+                // cache here: nothing in this module ever *writes* one
+                // there (`resolve` only reads `cache`, never mutates it),
+                // but a `secret` value can still legitimately be sitting in
+                // it -- a caller explicitly opted a specific answer into
+                // being persisted anyway (the web UI's "save (plaintext)"
+                // checkbox, `RunRequest::save_secrets`/`TtyRunQuery::
+                // save_secrets` in `meshfox-server`), or the cache file was
+                // hand-edited (it's a small, hand-editable dotenv file, see
+                // `crate::varcache`'s own doc comment). Refusing to read it
+                // back here would make that persistence a silent no-op.
+                if decl.session {
                     None
                 } else {
                     cache.get(&decl.name).map(str::to_string)
@@ -1312,12 +1331,47 @@ mod tests {
     }
 
     #[test]
-    fn resolve_never_reads_a_secret_from_cache() {
+    fn resolve_reads_a_secret_from_cache_if_present() {
+        // A `secret` value only ever ends up in the cache via an explicit
+        // opt-in (the web UI's "save (plaintext)" checkbox) or a hand
+        // edit — but once it's there, `resolve` has to actually read it
+        // back, or that persistence is a silent no-op and the caller is
+        // asked again on every single run despite having "saved" it.
         let decls = vec![decl("TOKEN", None, true)];
         let mut cache = VarCache::in_memory();
         cache
             .values_mut_for_test()
-            .insert("TOKEN".to_string(), "leaked".to_string());
+            .insert("TOKEN".to_string(), "saved-secret".to_string());
+        let resolved = resolve(&decls, &HashMap::new(), &cache, &HashMap::new());
+        assert_eq!(resolved.values.get("TOKEN").map(String::as_str), Some("saved-secret"));
+        assert!(resolved.missing.is_empty());
+    }
+
+    #[test]
+    fn resolve_still_prompts_for_a_secret_with_nothing_in_the_cache() {
+        // The common case, unchanged: a `secret` that was never opted into
+        // the cache (the vast majority of them) still prompts every run,
+        // same as before `resolve` started reading a *present* secret back.
+        let decls = vec![decl("TOKEN", None, true)];
+        let cache = VarCache::in_memory();
+        let resolved = resolve(&decls, &HashMap::new(), &cache, &HashMap::new());
+        assert!(resolved.values.is_empty());
+        assert_eq!(resolved.missing.len(), 1);
+    }
+
+    #[test]
+    fn resolve_a_session_secret_still_never_reads_the_cache() {
+        // `session` wins over a cached value regardless of `secret` — a
+        // `session` declaration is never meant to be remembered past one
+        // run, even if something (a stale hand-edit, an old opt-in save
+        // before `session` was added to the declaration) left a value
+        // sitting in the cache file.
+        let mut decls = vec![required_decl("TOKEN", None, true, false)];
+        decls[0].session = true;
+        let mut cache = VarCache::in_memory();
+        cache
+            .values_mut_for_test()
+            .insert("TOKEN".to_string(), "stale".to_string());
         let resolved = resolve(&decls, &HashMap::new(), &cache, &HashMap::new());
         assert!(resolved.values.is_empty());
         assert_eq!(resolved.missing.len(), 1);

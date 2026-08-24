@@ -6115,6 +6115,55 @@ mod vars_endpoint_tests {
         let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));
     }
 
+    // Regression: saving a secret via `saveSecrets` used to write it to the
+    // on-disk cache but never actually read it back (`vars::resolve` still
+    // unconditionally skipped the cache for any `secret` declaration,
+    // regardless of what was in it) — so a *second* run still reported the
+    // variable as unresolved and asked again, even though the value was
+    // sitting right there in the `.env` file the whole time. Covers the
+    // real end-to-end path a browser tab actually takes (`GET /api/vars`
+    // between two `/api/run` calls, not just `crate::vars::resolve` in
+    // isolation), since that's the shape of the report that caught this.
+    #[tokio::test]
+    async fn a_saved_secret_is_reported_resolved_and_reused_on_a_later_run() {
+        let canvas_path = write_test_canvas(SECRET_ENV_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, body) = post_json(
+            addr,
+            "/api/run",
+            r#"{"path":[],"block":"use-token","vars":{"API_TOKEN":"sk-secret"},"saveSecrets":["API_TOKEN"]}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "unexpected body: {body}");
+
+        // `GET /api/vars` (what the pre-run form checks before ever
+        // opening) now sees it as resolved — so the browser wouldn't even
+        // ask again — and still never puts the actual value on the wire.
+        let (status, body) = get(addr, "/api/vars?block=use-token").await;
+        assert_eq!(status, 200);
+        let statuses: Vec<serde_json::Value> = serde_json::from_str(&body).expect("valid VarStatus JSON");
+        assert_eq!(statuses[0]["name"], "API_TOKEN");
+        assert_eq!(
+            statuses[0]["resolved"], true,
+            "a saved secret should show up as already resolved: {body}"
+        );
+        assert!(
+            statuses[0]["value"].is_null(),
+            "a secret's actual value must never be sent to the browser, saved or not: {body}"
+        );
+
+        // A later run supplying *no* `vars` at all (the client never re-asks
+        // for something already resolved) must still succeed by reading the
+        // saved value back from the cache, not fail with "missing required
+        // variable(s)".
+        let (status, body) = post_json(addr, "/api/run", r#"{"path":[],"block":"use-token","vars":{}}"#).await;
+        assert_eq!(status, 200, "unexpected body: {body}");
+
+        let _ = std::fs::remove_file(&canvas_path);
+        let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));
+    }
+
     const TYPED_CANVAS: &str = concat!(
         "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
         "<!-- meshfox:var name=\"COUNT\" type=\"int\" -->\n",

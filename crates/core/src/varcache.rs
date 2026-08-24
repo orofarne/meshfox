@@ -2,8 +2,10 @@
 //! hand-editable, `.gitignore`-able file that remembers what a document's
 //! variables were last resolved to, so a canvas only has to ask once
 //! (analogous to CMake's `CMakeCache.txt`). See `crate::vars` for
-//! declaration/resolution; a `secret` variable is never read from or
-//! written to this cache — see `vars::resolve`.
+//! declaration/resolution; a `secret` variable is never *automatically*
+//! written here (only an explicit opt-in does, e.g. the web UI's "save
+//! (plaintext)" checkbox), but is read back from here like any other
+//! declaration once it's actually present — see `vars::resolve`.
 
 use std::collections::HashMap;
 use std::io;
