@@ -18,3 +18,4 @@ web/blob-report/
 # state, analogous to CMake's CMakeCache.txt, never something to commit.
 .meshfox/
 TODO.canvas.md
+/CLAUDE.md

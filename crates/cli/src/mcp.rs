@@ -1625,7 +1625,12 @@ impl ServerHandler for MeshfoxMcpRoot {
              affect another). canvas_open only resolves paths under this server's own root directory \
              (the directory of the canvas path meshfox mcp was launched with) — it refuses to open \
              anything above that. Every other tool mirrors its single-canvas equivalent exactly, just \
-             with canvas_id added as the first argument.",
+             with canvas_id added as the first argument. Prefer these node_* tools over hand-editing \
+             a .canvas.md file's text directly for structural changes — ids, parent=, meshfox:edge \
+             targets, heading depth, sibling order. mdcanvas validates the whole resulting document \
+             on every write, so a bad hand-edit can land as a corrupt file instead of failing loudly. \
+             Editing prose inside an existing node's body by hand is fine; node_body does the same \
+             thing through this surface.",
         )
     }
 }
