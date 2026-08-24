@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
-import CodeMirror from "@uiw/react-codemirror";
+import { useEffect, useRef, useState } from "react";
+import Editor, { type OnMount } from "@monaco-editor/react";
 import { fetchCanvasSource, fetchIncludes, saveCanvasSource, type IncludeManifestEntry } from "./api";
-import { EDITOR_EXTENSIONS, usePrefersDark } from "./NodeTextEditor";
+import { MONACO_OPTIONS, attachMeshfoxEditorExtensions, useMonacoReady, usePrefersDark } from "./NodeTextEditor";
+import { THEMES } from "./shiki";
 
 interface CanvasSourceEditorProps {
   /** Seeds the file picker's initial selection — an include's own
@@ -57,6 +58,13 @@ export function CanvasSourceEditor({ initialInclude, onSaved, onClose, onDirtyCh
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const dark = usePrefersDark();
+  const monacoReady = useMonacoReady();
+  const detachRef = useRef<(() => void) | null>(null);
+  useEffect(() => () => detachRef.current?.(), []);
+  const handleMount: OnMount = (editor, monaco) => {
+    detachRef.current = attachMeshfoxEditorExtensions(editor, monaco);
+    editor.focus();
+  };
 
   useEffect(() => {
     fetchIncludes()
@@ -140,17 +148,18 @@ export function CanvasSourceEditor({ initialInclude, onSaved, onClose, onDirtyCh
         </div>
       </div>
       <div className="mesh-source-editor-body">
-        {text === null ? (
+        {text === null || !monacoReady ? (
           <div className="mesh-source-editor-loading">Loading…</div>
         ) : (
-          <CodeMirror
+          <Editor
             key={selected}
-            value={text}
             height="100%"
-            theme={dark ? "dark" : "light"}
-            extensions={EDITOR_EXTENSIONS}
-            onChange={setText}
-            autoFocus
+            language="markdown"
+            theme={dark ? THEMES.dark : THEMES.light}
+            value={text}
+            onChange={(v) => setText(v ?? "")}
+            onMount={handleMount}
+            options={MONACO_OPTIONS}
           />
         )}
       </div>

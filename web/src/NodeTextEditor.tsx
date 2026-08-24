@@ -1,22 +1,84 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import CodeMirror from "@uiw/react-codemirror";
+import Editor, { type OnMount } from "@monaco-editor/react";
+import type * as MonacoNS from "monaco-editor";
 import { NodeBodyPreview } from "./MeshNode";
-import { meshfoxMarkdown } from "./meshfoxSyntax";
-import { imagePaste } from "./imagePaste";
+import { attachMeshfoxMarkers } from "./meshfoxMarkers";
+import { attachImagePaste } from "./imagePaste";
+import { ensureMonacoConfigured } from "./monacoSetup";
+import { THEMES } from "./shiki";
 import { THEME_CHANGE_EVENT } from "./theme";
 
-/** Both extensions are stable module-level values — a fresh array literal
- * passed as `extensions=` every render would make `@uiw/react-codemirror`
- * treat it as changed and re-dispatch a `StateEffect.reconfigure` on every
- * keystroke (see its own `useCodeMirror` effect deps) for no reason.
- * Shared with `CanvasSourceEditor.tsx`, the other CodeMirror instance that
- * needs the exact same pair. */
-export const EDITOR_EXTENSIONS = [meshfoxMarkdown, imagePaste];
+/** Resolves once Monaco is self-hosted and ready to mount (see
+ * `monacoSetup.ts`'s own doc comment for why this is lazy rather than
+ * loaded at app startup). Both editors gate their own `<Editor>` render on
+ * this — mounting one before `loader.config` has actually run risks a
+ * race against `@monaco-editor/react`'s default CDN loader kicking in
+ * first. */
+export function useMonacoReady(): boolean {
+  const [ready, setReady] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    ensureMonacoConfigured().then(() => {
+      if (!cancelled) setReady(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  return ready;
+}
 
 /** How long to wait after the last keystroke before auto-saving — see
  * NodeSettings.tsx's identical constant/rationale. */
 const AUTOSAVE_DELAY_MS = 700;
+
+/** Shared Monaco `options` for every editor in the app (NodeTextEditor,
+ * CanvasSourceEditor) — kept as one stable module-level object rather than
+ * a fresh literal per render, same reasoning the old CodeMirror
+ * `EDITOR_EXTENSIONS` constant documented (avoids Monaco treating it as a
+ * changed prop on every keystroke). */
+export const MONACO_OPTIONS: MonacoNS.editor.IStandaloneEditorConstructionOptions = {
+  fontFamily: "'Fira Code', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+  fontSize: 13,
+  minimap: { enabled: false },
+  wordWrap: "on",
+  scrollBeyondLastLine: false,
+  // Monaco's own "confusable Unicode character" detection (meant to flag
+  // homoglyph attacks in *code* — a Cyrillic а disguised as a Latin a in an
+  // identifier) draws a box around every Cyrillic letter it considers
+  // visually ambiguous next to Latin text. A node's body is ordinary,
+  // legitimately multilingual prose (this app's own docs are half
+  // Russian), not untrusted source code — the boxes are just noise here,
+  // not a real signal, so this is off rather than tuned.
+  unicodeHighlight: { ambiguousCharacters: false, invisibleCharacters: false },
+  // Highlights every other occurrence of whatever word the cursor is
+  // currently on — meant for jumping between uses of a variable/symbol in
+  // real code (where "same word" usually means "same identifier"). In
+  // prose it just means "same word" in the mundane sense (an article, a
+  // common verb), which lights up half the paragraph for no useful reason.
+  occurrencesHighlight: "off",
+};
+
+/**
+ * Wires up meshfox's own extensions on a freshly-mounted Monaco editor —
+ * marker-comment/fence-attribute highlighting (`meshfoxMarkers.ts`) and
+ * image-paste-as-base64 (`imagePaste.ts`) — the Monaco counterparts of the
+ * old CodeMirror `EDITOR_EXTENSIONS`. Shared between `NodeTextEditor` and
+ * `CanvasSourceEditor`, both the same setup, rather than each wiring it in
+ * separately. Returns a cleanup function.
+ */
+export function attachMeshfoxEditorExtensions(
+  editor: MonacoNS.editor.IStandaloneCodeEditor,
+  monaco: typeof MonacoNS,
+): () => void {
+  const detachMarkers = attachMeshfoxMarkers(editor, monaco);
+  const detachPaste = attachImagePaste(editor);
+  return () => {
+    detachMarkers();
+    detachPaste();
+  };
+}
 
 /** The effective theme right now: the toolbar's manual override (see
  * theme.ts's `data-theme` attribute) if one is set, else the OS
@@ -28,10 +90,11 @@ function resolveDark(): boolean {
   return window.matchMedia("(prefers-color-scheme: dark)").matches;
 }
 
-/** Tracks the effective light/dark theme so CodeMirror's built-in theme
- * follows the same signal `index.css`'s `@media (prefers-color-scheme)` +
- * `data-theme` override already does for the rest of the app, rather than
- * picking its own. */
+/** Tracks the effective light/dark theme so Monaco's theme (`THEMES.dark`/
+ * `THEMES.light`, `shiki.ts` — registered into Monaco by `monacoSetup.ts`,
+ * not one of Monaco's own built-in `vs`/`vs-dark`) follows the same signal
+ * `index.css`'s `@media (prefers-color-scheme)` + `data-theme` override
+ * already does for the rest of the app, rather than picking its own. */
 export function usePrefersDark(): boolean {
   const [dark, setDark] = useState(resolveDark);
   useEffect(() => {
@@ -57,8 +120,8 @@ interface NodeTextEditorProps {
 }
 
 /**
- * Split-pane editor for a node's raw Markdown body: a CodeMirror source
- * editor (syntax highlighting, undo, bracket matching) on the left, a live
+ * Split-pane editor for a node's raw Markdown body: a Monaco source editor
+ * (syntax highlighting, undo, bracket matching) on the left, a live
  * preview using the exact same rendering the canvas itself uses
  * (`NodeBodyPreview`) on the right. Deliberately a *source* editor, not a
  * WYSIWYG one — the body can contain meshfox-specific syntax (fence
@@ -82,6 +145,8 @@ interface NodeTextEditorProps {
 export function NodeTextEditor({ initialText, onChange, onClose }: NodeTextEditorProps) {
   const [text, setText] = useState(initialText);
   const dark = usePrefersDark();
+  const monacoReady = useMonacoReady();
+  const detachRef = useRef<(() => void) | null>(null);
 
   const isFirstRender = useRef(true);
   const pendingSave = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -100,6 +165,13 @@ export function NodeTextEditor({ initialText, onChange, onClose }: NodeTextEdito
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [text]);
 
+  useEffect(() => () => detachRef.current?.(), []);
+
+  const handleMount: OnMount = (editor, monaco) => {
+    detachRef.current = attachMeshfoxEditorExtensions(editor, monaco);
+    editor.focus();
+  };
+
   const handleClose = () => {
     if (pendingSave.current) {
       clearTimeout(pendingSave.current);
@@ -114,14 +186,19 @@ export function NodeTextEditor({ initialText, onChange, onClose }: NodeTextEdito
       <div className="mesh-text-editor" onClick={(e) => e.stopPropagation()}>
         <div className="mesh-text-editor-panes">
           <div className="mesh-text-editor-source">
-            <CodeMirror
-              value={text}
-              height="100%"
-              theme={dark ? "dark" : "light"}
-              extensions={EDITOR_EXTENSIONS}
-              onChange={setText}
-              autoFocus
-            />
+            {monacoReady ? (
+              <Editor
+                height="100%"
+                language="markdown"
+                theme={dark ? THEMES.dark : THEMES.light}
+                value={text}
+                onChange={(v) => setText(v ?? "")}
+                onMount={handleMount}
+                options={MONACO_OPTIONS}
+              />
+            ) : (
+              <p className="mesh-node-hint">loading editor…</p>
+            )}
           </div>
           <div className="mesh-text-editor-preview">
             <NodeBodyPreview text={text} />

@@ -365,6 +365,9 @@ impl App {
         // color, so they render everywhere, tmux included.
         let picker = Picker::halfblocks();
         let known_raw = Arc::new(Mutex::new(raw.clone()));
+        // Computed before `canvas_path` is moved into the struct literal
+        // below (its `canvas_path,` shorthand field).
+        let syntax_root = crate::canvas_root_dir(&canvas_path).to_path_buf();
 
         let mut app = App {
             canvas_path,
@@ -383,7 +386,7 @@ impl App {
             doc_segments: Vec::new(),
             doc_images: HashMap::new(),
             doc_scroll: 0,
-            highlighter: Highlighter::new(),
+            highlighter: Highlighter::with_extra_syntaxes(&syntax_root),
             picker,
             run: None,
             file_run: None,

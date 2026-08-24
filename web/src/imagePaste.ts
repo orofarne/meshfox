@@ -1,5 +1,4 @@
-import { EditorView } from "@codemirror/view";
-import type { Extension } from "@codemirror/state";
+import type * as MonacoNS from "monaco-editor";
 
 /** Same threshold `crates/core/src/file_read.rs`'s `FILE_PREVIEW_MAX_BYTES`
  * already uses for "big enough to ask first" — not a hard cap, just where
@@ -7,12 +6,11 @@ import type { Extension } from "@codemirror/state";
  * ~33% on top of this). */
 const SOFT_WARN_BYTES = 1_000_000;
 
-function insertAtCursor(view: EditorView, text: string) {
-  const { from, to } = view.state.selection.main;
-  view.dispatch({
-    changes: { from, to, insert: text },
-    selection: { anchor: from + text.length },
-  });
+function insertAtCursor(editor: MonacoNS.editor.IStandaloneCodeEditor, text: string) {
+  const selection = editor.getSelection();
+  if (!selection) return;
+  editor.executeEdits("image-paste", [{ range: selection, text, forceMoveMarkers: true }]);
+  editor.focus();
 }
 
 /**
@@ -20,12 +18,12 @@ function insertAtCursor(view: EditorView, text: string) {
  * tool, or copied from a file manager/browser) embeds it directly as
  * `![](data:image/...;base64,...)` at the cursor, rather than the browser's
  * own default paste (which has nothing to insert for an image into a plain
- * text buffer — CodeMirror's content is just text, so nothing would happen
+ * text buffer — Monaco's content is just text, so nothing would happen
  * either way, but intercepting it explicitly means we choose what does).
  * Shared between `NodeTextEditor.tsx` (a node's own body) and
- * `CanvasSourceEditor.tsx` (the whole document) — both are the same
- * CodeMirror setup, so one extension covers both rather than wiring the
- * same paste handler into each separately.
+ * `CanvasSourceEditor.tsx` (the whole document) — both are the same Monaco
+ * setup, so one attach function covers both rather than wiring the same
+ * paste handler into each separately.
  *
  * Deliberately narrow: only the *first* image item in the clipboard is
  * used, and only when there is one — a normal text paste (the overwhelming
@@ -35,18 +33,40 @@ function insertAtCursor(view: EditorView, text: string) {
  * Empty alt text (`![]`, not a placeholder like "pasted image") — nothing
  * useful to say by default that the pasting person wouldn't rather write
  * themselves.
+ *
+ * Listens in the *capture* phase on `document` itself, not the editor's own
+ * DOM node — ahead of Monaco's own internal paste handling, the same
+ * "intercept before Monaco/CodeMirror gets it" shape the old CodeMirror
+ * `domEventHandlers` version relied on. Has to be `document` specifically:
+ * Monaco 0.53's EditContext-API input model (`.native-edit-context`, a
+ * `div[role=textbox]`, not a real textarea) does its own paste interception
+ * somewhere at or above `@monaco-editor/react`'s own `<section>` wrapper —
+ * confirmed empirically (a listener planted at each ancestor level, capture
+ * phase, showed propagation reaching the wrapper `<section>` but never any
+ * node inside it, meaning something there calls `stopPropagation()` before
+ * a listener on `editor.getDomNode()` itself would ever run). `document` is
+ * the one node guaranteed to sit above that boundary, so a capture listener
+ * there always runs first regardless of registration order. Filtered by
+ * `node.contains(event.target)` so a paste elsewhere on the page (or into a
+ * different, unrelated Monaco instance) is left alone. Returns a cleanup
+ * function.
  */
-export const imagePaste: Extension = EditorView.domEventHandlers({
-  paste(event, view) {
+export function attachImagePaste(editor: MonacoNS.editor.IStandaloneCodeEditor): () => void {
+  const node = editor.getDomNode();
+  if (!node) return () => {};
+
+  const handler = (event: ClipboardEvent) => {
+    if (!(event.target instanceof Node) || !node.contains(event.target)) return;
     const items = event.clipboardData?.items;
-    if (!items) return false;
+    if (!items) return;
     const imageItem = Array.from(items).find((item) => item.type.startsWith("image/"));
     const file = imageItem?.getAsFile();
-    if (!file) return false;
-    // Nothing meaningful a plain-text CodeMirror buffer could do with the
+    if (!file) return;
+    // Nothing meaningful a plain-text Monaco buffer could do with the
     // browser's own default image paste — always ours to handle once an
     // image item is actually present.
     event.preventDefault();
+    event.stopPropagation();
 
     const reader = new FileReader();
     reader.onload = () => {
@@ -60,9 +80,11 @@ export const imagePaste: Extension = EditorView.domEventHandlers({
         );
         if (!proceed) return;
       }
-      insertAtCursor(view, `![](${dataUrl})`);
+      insertAtCursor(editor, `![](${dataUrl})`);
     };
     reader.readAsDataURL(file);
-    return true;
-  },
-});
+  };
+
+  document.addEventListener("paste", handler, true);
+  return () => document.removeEventListener("paste", handler, true);
+}

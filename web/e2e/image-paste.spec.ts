@@ -1,7 +1,7 @@
 import { test, expect, type Locator, type Page } from "@playwright/test";
 
 // Drives web/e2e/fixtures/image-paste.canvas.md (TODO.canvas.md: "Base64
-// image") — pasting an image into either of the two CodeMirror editors
+// image") — pasting an image into either of the two Monaco editors
 // that share `imagePaste.ts` (the node body editor, NodeTextEditor, and
 // the whole-document source editor, CanvasSourceEditor) embeds it as
 // `![](data:image/...;base64,...)` at the cursor. Also covers the flip
@@ -38,16 +38,29 @@ const ONE_PIXEL_PNG_BASE64 =
 
 /** Builds a `File`/`DataTransfer` for `base64` (assumed `image/png`) in
  * the page's own context and dispatches a real `paste` `ClipboardEvent` at
- * `locator` — `page.evaluate` rather than Playwright's own clipboard
- * permissions API (`context.grantPermissions(["clipboard-read"])` +
- * `navigator.clipboard`), since the async Clipboard API needs an actual
- * OS-level clipboard write first; constructing the event directly is both
- * simpler and exactly what a real "paste an image" keystroke ultimately
- * dispatches at the DOM either way. Only actually exercises the app's
- * handler on Chromium — see this file's own top comment. */
-async function pasteImage(locator: Locator, base64: string) {
-  await locator.click();
-  await locator.evaluate((el, base64) => {
+ * `editor`'s (the `.monaco-editor` container's) input target —
+ * `page.evaluate` rather than Playwright's own clipboard permissions API
+ * (`context.grantPermissions(["clipboard-read"])` + `navigator.clipboard`),
+ * since the async Clipboard API needs an actual OS-level clipboard write
+ * first; constructing the event directly is both simpler and exactly what a
+ * real "paste an image" keystroke ultimately dispatches at the DOM either
+ * way. Only actually exercises the app's handler on Chromium — see this
+ * file's own top comment.
+ *
+ * Two different elements, deliberately: Monaco 0.53's real input/focus
+ * target is `.native-edit-context` (a `div[role=textbox]`, the modern
+ * EditContext-API replacement for a plain `<textarea>`), but it isn't the
+ * clickable surface — the rendered text layer (`.view-lines`) sits visually
+ * on top of it and intercepts a direct click there (Playwright's
+ * actionability check correctly refuses it: "subtree intercepts pointer
+ * events"). A real user click lands on `.view-lines`, which Monaco's own
+ * mouse handling turns into a cursor move + focus of the edit-context
+ * element programmatically — so this does the same: click the visible text
+ * to focus/position the cursor, then dispatch the synthetic paste directly
+ * on the edit-context element itself. */
+async function pasteImage(editor: Locator, base64: string) {
+  await editor.locator(".view-lines").click();
+  await editor.locator(".native-edit-context").evaluate((el, base64) => {
     const byteChars = atob(base64);
     const bytes = new Uint8Array(byteChars.length);
     for (let i = 0; i < byteChars.length; i++) bytes[i] = byteChars.charCodeAt(i);
@@ -79,7 +92,7 @@ test("pasting an image into a node's body editor embeds it as base64 and renders
   await root.locator(".mesh-node-title").hover();
   await root.locator('button[title="Edit this node\'s Markdown text"]').click();
 
-  const source = page.locator(".mesh-text-editor-source .cm-content");
+  const source = page.locator(".mesh-text-editor-source .monaco-editor");
   await expect(source).toBeVisible();
   await pasteImage(source, ONE_PIXEL_PNG_BASE64);
 
@@ -102,7 +115,7 @@ test("pasting an image into the whole-document source editor embeds it as base64
   test.skip(browserName === "firefox", "Gecko drops synthetic paste-event file data — see this file's own top comment.");
 
   await page.getByRole("button", { name: "Source" }).click();
-  const source = page.locator(".mesh-source-editor-body .cm-content");
+  const source = page.locator(".mesh-source-editor-body .monaco-editor");
   await expect(source).toBeVisible();
   await pasteImage(source, ONE_PIXEL_PNG_BASE64);
 
@@ -132,7 +145,7 @@ test("a large paste asks for confirmation first, and declining inserts nothing",
   const root = page.locator('.react-flow__node[data-id="root"]');
   await root.locator(".mesh-node-title").hover();
   await root.locator('button[title="Edit this node\'s Markdown text"]').click();
-  const source = page.locator(".mesh-text-editor-source .cm-content");
+  const source = page.locator(".mesh-text-editor-source .monaco-editor");
   await expect(source).toBeVisible();
   // Compared against the buffer's own content before, not asserted to be
   // literally absent — the two tests above may have already run against

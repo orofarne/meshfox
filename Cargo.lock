@@ -3112,6 +3112,7 @@ dependencies = [
  "serde",
  "serde_json",
  "syntect",
+ "syntect-tmlanguage",
  "tera",
  "tokio",
  "toml",
@@ -5561,6 +5562,19 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.19",
  "walkdir",
+ "yaml-rust",
+]
+
+[[package]]
+name = "syntect-tmlanguage"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "943a194958107a0664cee03f03886eae5bb214b22d33cd28bfe47b79031ba200"
+dependencies = [
+ "serde",
+ "serde_json",
+ "syntect",
+ "thiserror 2.0.19",
  "yaml-rust",
 ]
 

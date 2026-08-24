@@ -1,0 +1,31 @@
+{
+  "name": "meshfox-markdown",
+  "scopeName": "text.html.markdown.meshfox",
+  "patterns": [
+    { "include": "#meshfox-comment" },
+    { "include": "text.html.markdown" }
+  ],
+  "repository": {
+    "meshfox-comment": {
+      "begin": "(<!--)\\s*(/)?(meshfox:[\\w-]+)",
+      "beginCaptures": {
+        "1": { "name": "punctuation.definition.comment.meshfox" },
+        "2": { "name": "punctuation.definition.tag.end.meshfox" },
+        "3": { "name": "keyword.other.meshfox" }
+      },
+      "end": "(-->)",
+      "endCaptures": {
+        "1": { "name": "punctuation.definition.comment.meshfox" }
+      },
+      "name": "comment.block.meshfox",
+      "patterns": [{ "include": "#meshfox-attr" }]
+    },
+    "meshfox-attr": {
+      "match": "([\\w-]+)(=(?:\"[^\"]*\"|'[^']*'|[^\\s`>]*))?",
+      "captures": {
+        "1": { "name": "entity.other.attribute-name.meshfox" },
+        "2": { "name": "string.unquoted.meshfox" }
+      }
+    }
+  }
+}

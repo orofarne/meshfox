@@ -262,6 +262,34 @@ export async function fetchNodeFileContent(id: string): Promise<NodeFileContent>
   return res.json();
 }
 
+export interface SyntaxGrammarEntry {
+  /** Filename — also what `fetchSyntaxGrammar` expects. */
+  name: string;
+  /** `"local"` (`.meshfox/syntax/` next to the canvas) or `"global"`
+   * (`~/.meshfox/syntax/`). */
+  source: "local" | "global";
+}
+
+/**
+ * Custom syntax-highlighting grammars available to this canvas — the same
+ * `.meshfox/syntax/`/`~/.meshfox/syntax/` repository the TUI's own
+ * `syntect::parsing::SyntaxSet` loads from (see `meshfox_core::syntax_dirs`
+ * and `crate::syntax_registry` on the Rust side). Used by `shiki.ts` to
+ * register anything Shiki's own bundled language set doesn't already cover.
+ */
+export async function fetchSyntaxList(): Promise<SyntaxGrammarEntry[]> {
+  const res = await fetch("/api/syntax");
+  if (!res.ok) throw new Error(`GET /api/syntax: ${res.status}`);
+  return res.json();
+}
+
+/** Raw content (JSON or YAML text) of one entry from `fetchSyntaxList`. */
+export async function fetchSyntaxGrammar(name: string): Promise<string> {
+  const res = await fetch(`/api/syntax/${encodeURIComponent(name)}`);
+  if (!res.ok) throw new Error(`GET /api/syntax/${name}: ${res.status}`);
+  return res.text();
+}
+
 export interface LinkPreview {
   title?: string;
   description?: string;

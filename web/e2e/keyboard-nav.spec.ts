@@ -115,7 +115,7 @@ test("moving focus pans the camera to keep the focused node in view", async ({ p
 test("keys are ignored while the source editor is open", async ({ page }) => {
   await page.locator("button", { hasText: "Edit" }).click();
   await page.locator("button", { hasText: "Source" }).click();
-  await expect(page.locator(".cm-editor")).toBeVisible();
+  await expect(page.locator(".monaco-editor")).toBeVisible();
 
   await page.keyboard.press("j");
 

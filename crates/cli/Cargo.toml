@@ -28,6 +28,13 @@ ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
 crossterm = "0.29.0"
 pulldown-cmark = "0.13.4"
 syntect = { version = "5.3.0", default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "regex-fancy"] }
+# Loads real TextMate `.tmLanguage.json` grammars into `syntect`'s own
+# `SyntaxDefinition` — see `crate::syntax_registry`. Depends on `syntect`
+# with its `regex-onig` feature; Cargo unifies that into this binary's one
+# `syntect` instance alongside the `regex-fancy` feature above (`onig` is
+# already pulled in transitively via `edtui`, so this adds no new
+# C-toolchain requirement).
+syntect-tmlanguage = "0.1"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
 # Already resolved transitively (headless_chrome's own dep chain) — pinned

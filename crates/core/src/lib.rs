@@ -22,6 +22,7 @@ pub mod options;
 pub mod output;
 pub mod staticgen;
 pub mod subsup;
+pub mod syntax_dirs;
 pub mod tag_colors;
 pub mod tree;
 pub mod varcache;

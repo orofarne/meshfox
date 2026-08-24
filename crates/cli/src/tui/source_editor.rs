@@ -16,10 +16,9 @@ use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use edtui::actions::{AppendNewline, InsertChar};
-use edtui::{EditorEventHandler, EditorMode, EditorState, Highlight, Index2, Lines};
+use edtui::{EditorEventHandler, EditorMode, EditorState, Index2, Lines};
 use meshfox_core::include::IncludeInfo;
 use meshfox_core::mdcanvas::{EDGE_ATTRS, NODE_ATTRS};
-use ratatui::style::{Color, Modifier, Style};
 
 /// A runnable fence's own attribute vocabulary (`crates/core/src/fence.rs`)
 /// — value-taking (`name="..."`) vs. bare presence flags (`cache`, no
@@ -148,7 +147,6 @@ impl SourceEditorState {
         let raw = std::fs::read_to_string(&path)?;
         let mut editor = EditorState::new(Lines::from(raw.as_str()));
         editor.cursor = cursor;
-        editor.highlights = meshfox_highlights(&raw);
         prime_viewport(&mut editor);
         Ok(SourceEditorState {
             primary_path,
@@ -248,7 +246,6 @@ impl SourceEditorState {
         self.pending_discard = false;
         self.error = None;
         self.events.on_key_event(key, &mut self.editor);
-        self.refresh_meshfox_highlights();
         SourceEditorOutcome::Stay
     }
 
@@ -315,20 +312,10 @@ impl SourceEditorState {
             }
         };
         self.editor = EditorState::new(Lines::from(raw.as_str()));
-        self.editor.highlights = meshfox_highlights(&raw);
         self.original = raw;
         self.path = path;
         self.is_canvas = is_canvas;
         self.error = None;
-    }
-
-    /// Recomputes `self.editor.highlights` from the buffer's current text
-    /// — called after anything that could have changed it (a real
-    /// keystroke, an attribute/node-comment insertion below), so the
-    /// meshfox-specific coloring (see `meshfox_highlights`) never goes
-    /// stale relative to what's actually on screen.
-    fn refresh_meshfox_highlights(&mut self) {
-        self.editor.highlights = meshfox_highlights(&self.editor.lines.to_string());
     }
 
     /// TODO.canvas.md: "Саджесты и подсветка синтаксиса в TUI", item 3 —
@@ -358,7 +345,6 @@ impl SourceEditorState {
         // needed first.
         self.editor.execute(AppendNewline(1));
         type_str(&mut self.editor, "<!-- meshfox:node -->");
-        self.refresh_meshfox_highlights();
         Ok(())
     }
 
@@ -480,7 +466,6 @@ impl SourceEditorState {
             format!("{tag},")
         };
         type_str(&mut self.editor, &insertion);
-        self.refresh_meshfox_highlights();
     }
 
     /// Which vocabulary the currently-open popup is suggesting from — for
@@ -539,7 +524,6 @@ impl SourceEditorState {
             type_str(&mut self.editor, &format!(" {}=\"\"", candidate.name));
             self.editor.cursor.col -= 1; // land between the quotes
         }
-        self.refresh_meshfox_highlights();
     }
 }
 
@@ -596,8 +580,7 @@ fn detect_attr_context(line: &str) -> Option<AttrKind> {
 /// a value attribute counts as present if `"name="` appears anywhere in
 /// the line (covers both `id="..."` and the bare-numeric `x=0` form); a
 /// flag attribute counts as present if it appears as its own whitespace-
-/// delimited word. Best-effort, same spirit as `meshfox_highlights` below
-/// — a suggestion list, not the real parser.
+/// delimited word. Best-effort — a suggestion list, not the real parser.
 fn attr_candidates(kind: AttrKind, line: &str) -> Vec<AttrCandidate> {
     let (value_attrs, flag_attrs): (&[&str], &[&str]) = match kind {
         AttrKind::Node => (NODE_ATTRS, &[]),
@@ -628,89 +611,6 @@ fn type_str(editor: &mut EditorState, s: &str) {
     for c in s.chars() {
         editor.execute(InsertChar(c));
     }
-}
-
-/// TODO.canvas.md: "Саджесты и подсветка синтаксиса в TUI", item 1 —
-/// highlights every `<!-- meshfox:... -->`/`<!-- /meshfox:... -->` marker
-/// comment (the whole thing, one bold accent color) plus each `key=`
-/// attribute name inside one (a second color), on top of whatever the
-/// buffer's ordinary Markdown syntax highlighting already does (custom
-/// `EditorState::highlights` are applied after the syntax highlighter's
-/// own base styling — see `edtui`'s own render pipeline — so these always
-/// win). Recomputed from scratch on every call rather than incrementally
-/// — cheap enough (a handful of linear string scans) that there's no
-/// reason to track what changed.
-///
-/// Scoped to `meshfox:` comment lines only, not a runnable fence's own
-/// `name="..."`/`cache` attribute line — code-fence content already reads
-/// visually distinct (its own syntax highlighting, different indentation
-/// context), and parsing an attribute line's exact boundaries safely
-/// alongside arbitrary fence-language syntax highlighting underneath adds
-/// real risk for comparatively little extra clarity; the `Ctrl-p`
-/// suggestion popup still covers fence attributes even though this
-/// doesn't highlight them.
-fn meshfox_highlights(text: &str) -> Vec<Highlight> {
-    let marker_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
-    let key_style = Style::default().fg(Color::LightCyan);
-
-    let mut highlights = Vec::new();
-    let mut line_start = 0usize;
-    for line in text.split_inclusive('\n') {
-        let content = line.strip_suffix('\n').unwrap_or(line);
-        if let (Some(open), Some(close)) = (content.find("<!--"), content.rfind("-->")) {
-            let comment_end = close + "-->".len();
-            if open < close && content[open..comment_end].contains("meshfox:") {
-                highlights.push(Highlight::new(
-                    byte_offset_to_cursor(text, line_start + open),
-                    byte_offset_to_cursor(text, line_start + comment_end - 1),
-                    marker_style,
-                ));
-
-                let inner_start = open + "<!--".len();
-                let inner = &content[inner_start..close];
-                for (rel, token) in whitespace_tokens_with_offsets(inner) {
-                    let Some(eq) = token.find('=') else { continue };
-                    let key = &token[..eq];
-                    if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphabetic()) {
-                        continue;
-                    }
-                    let key_start = line_start + inner_start + rel;
-                    let key_end = key_start + key.len();
-                    highlights.push(Highlight::new(
-                        byte_offset_to_cursor(text, key_start),
-                        byte_offset_to_cursor(text, key_end - 1),
-                        key_style,
-                    ));
-                }
-            }
-        }
-        line_start += line.len();
-    }
-    highlights
-}
-
-/// Whitespace-delimited tokens in `s`, each paired with its own byte
-/// offset from the start of `s` — `str::split_whitespace` alone doesn't
-/// give offsets, and re-`find`ing each token back in `s` (the obvious
-/// alternative) breaks the moment the same token appears twice. Safe to
-/// slice with (never lands mid-character): every boundary here comes from
-/// `char_indices`, which only ever yields real char-boundary offsets.
-fn whitespace_tokens_with_offsets(s: &str) -> Vec<(usize, &str)> {
-    let mut out = Vec::new();
-    let mut start: Option<usize> = None;
-    for (i, c) in s.char_indices() {
-        if c.is_whitespace() {
-            if let Some(st) = start.take() {
-                out.push((st, &s[st..i]));
-            }
-        } else if start.is_none() {
-            start = Some(i);
-        }
-    }
-    if let Some(st) = start {
-        out.push((st, &s[st..]));
-    }
-    out
 }
 
 /// Works around an `edtui` quirk that otherwise left the source editor
@@ -899,46 +799,6 @@ mod tests {
 
         assert_eq!(se.editor.cursor, Index2::new(0, 0));
         let _ = std::fs::remove_file(&se.path);
-    }
-
-    // TODO.canvas.md: "Саджесты и подсветка синтаксиса в TUI", item 1.
-    #[test]
-    fn meshfox_highlights_covers_the_whole_marker_comment() {
-        let text = "# Root\n<!-- meshfox:node id=\"root\" -->\n\nbody\n";
-        let highlights = meshfox_highlights(text);
-        let marker = highlights
-            .iter()
-            .find(|h| h.start == Index2::new(1, 0))
-            .expect("a highlight starting at the comment's own line");
-        // "<!-- meshfox:node id=\"root\" -->" is 31 chars long; `end` is
-        // inclusive, so the last char (the closing `>`) is at col 30.
-        assert_eq!(marker.end, Index2::new(1, 30));
-    }
-
-    #[test]
-    fn meshfox_highlights_covers_each_attribute_key() {
-        let text = "<!-- meshfox:node id=\"root\" color=\"1\" -->\n";
-        let highlights = meshfox_highlights(text);
-        // "id" starts right after "<!-- meshfox:node " (18 chars in).
-        let id_key = highlights
-            .iter()
-            .find(|h| h.start == Index2::new(0, 18))
-            .expect("a highlight for the `id` key");
-        assert_eq!(id_key.end, Index2::new(0, 19)); // "id" is 2 chars, inclusive end
-    }
-
-    #[test]
-    fn meshfox_highlights_ignores_a_plain_prose_line() {
-        let text = "# Root\n\njust some text, no markers here\n";
-        assert!(meshfox_highlights(text).is_empty());
-    }
-
-    #[test]
-    fn meshfox_highlights_covers_a_bare_closing_marker_with_no_attributes() {
-        let text = "<!-- /meshfox:output -->\n";
-        let highlights = meshfox_highlights(text);
-        assert_eq!(highlights.len(), 1, "just the marker span, no attribute keys");
-        assert_eq!(highlights[0].start, Index2::new(0, 0));
     }
 
     // TODO.canvas.md: "Саджесты и подсветка синтаксиса в TUI", item 3.

@@ -5,14 +5,11 @@ import remarkGfm from "remark-gfm";
 import remarkImageAttrs from "./remarkImageAttrs";
 import remarkSubSup from "./remarkSubSup";
 import remarkGfmAlerts from "./remarkGfmAlerts";
-import CodeMirror from "@uiw/react-codemirror";
-import { LanguageDescription } from "@codemirror/language";
-import { languages } from "@codemirror/language-data";
-import type { Extension } from "@codemirror/state";
+import { highlightToHtml } from "./shiki";
 import { defaultBlock, parseBody, type BodySegment, type CodeSegment, type ConstraintSegment } from "./fence";
 import { parseBlockRef, blockDomId } from "./deps";
 import { AnsiText } from "./AnsiText";
-import { NodeTextEditor, usePrefersDark } from "./NodeTextEditor";
+import { NodeTextEditor } from "./NodeTextEditor";
 import { fetchNodeFileContent, fetchLinkPreview, type LinkPreview } from "./api";
 import type { ConstraintStatusDto, NodeType } from "./types";
 
@@ -53,6 +50,28 @@ const allowDataImageUrls: UrlTransform = (url, key, node) => {
 };
 
 /**
+ * A fenced code block embedded in plain prose (not a runnable/constraint
+ * fence — those are split out of the "markdown" segment entirely by
+ * `fence.ts::parseBody` and highlighted separately, see `RunnableCodeBlock`/
+ * `ConstraintFenceBlock` below) — react-markdown's own default rendering
+ * for these is a bare, unhighlighted `<pre><code>`, the exact bug
+ * TODO.canvas.md's "Подсветка синтаксиса в блоках кода в webui не
+ * работает" was about, just for the one case that fix never actually
+ * covered (a plain example snippet in the middle of a node's write-up,
+ * with no `name=`/`cache=`/`constraint` marking it a *runnable* fence).
+ * Routes it through the same `HighlightedCode`/Shiki path as every other
+ * read-only code block instead. `className` is react-markdown's own
+ * `language-xxx` (from the fence's info string) on a block-level `code`;
+ * absent entirely for inline code (`` `foo` ``), which is left as the
+ * plain default — nothing to highlight, and it was never part of this bug.
+ */
+function MarkdownCodeBlock({ className, children }: { className?: string; children?: React.ReactNode }) {
+  const lang = /language-(\S+)/.exec(className ?? "")?.[1];
+  if (!lang) return <code className={className}>{children}</code>;
+  return <HighlightedCode code={String(children).replace(/\n$/, "")} lang={lang} />;
+}
+
+/**
  * Builds this file's `<ReactMarkdown>` `components` — same shape
  * everywhere (a link in a node's rendered body opens in a new tab rather
  * than navigating the canvas itself away from the app; `rel=` is the
@@ -61,6 +80,12 @@ const allowDataImageUrls: UrlTransform = (url, key, node) => {
  * targets resolved against `assetBase` first (see `resolveAssetHref`).
  * `node` is react-markdown's own mdast node for the element, not a real
  * DOM attribute — destructured out so it never reaches the native tag.
+ *
+ * `pre` is a plain passthrough: in CommonMark/GFM output `<pre>` only ever
+ * wraps a fenced `code` block, and `MarkdownCodeBlock`/`HighlightedCode`
+ * already supplies its own wrapper — keeping the default `<pre>` around it
+ * too would double up (and, for the plain-`<pre><code>` loading-state
+ * fallback, nest one `<pre>` inside another).
  */
 function makeMarkdownComponents(assetBase: string | undefined): Components {
   return {
@@ -68,6 +93,10 @@ function makeMarkdownComponents(assetBase: string | undefined): Components {
       <a {...props} href={resolveAssetHref(href, assetBase)} target="_blank" rel="noopener noreferrer" />
     ),
     img: ({ node: _node, src, ...props }) => <img {...props} src={resolveAssetHref(src, assetBase)} />,
+    pre: ({ children }) => <>{children}</>,
+    code: ({ node: _node, className, children }) => (
+      <MarkdownCodeBlock className={className}>{children}</MarkdownCodeBlock>
+    ),
   };
 }
 
@@ -570,51 +599,43 @@ export function resolveNodeColor(color: string | undefined): string | undefined 
 const JUMP_HIGHLIGHT_MS = 1200;
 
 /** Read-only, syntax-highlighted view of one fenced block's own source —
- * the same CodeMirror-based highlighting `FileCodePreview` already uses for
- * an included file's preview (`pickLanguage`), just fed a fence's
- * already-in-hand `code` string directly instead of fetching one from the
- * server. Previously `RunnableCodeBlock` rendered this as a bare
- * `<pre><code>{seg.code}</code></pre>` with no highlighting wired up at
- * all — unlike `FileCodePreview`, which is exactly why an included file's
- * preview highlighted correctly while a node's own runnable blocks never
- * did (TODO.canvas.md: "Подсветка синтаксиса в блоках кода в webui не
- * работает"). Falls back to plain unhighlighted text while the grammar is
- * still loading, or when `lang` doesn't match anything CodeMirror knows.
+ * Shiki (see `./shiki.ts`), fed a fence's already-in-hand `code` string
+ * directly instead of fetching one from the server. Previously
+ * `RunnableCodeBlock` rendered this as a bare `<pre><code>{seg.code}</code>
+ * </pre>` with no highlighting wired up at all (TODO.canvas.md: "Подсветка
+ * синтаксиса в блоках кода в webui не работает") — falls back to that same
+ * plain rendering while the grammar is still loading, or when `lang`
+ * doesn't match anything Shiki (bundled or a local/global custom grammar)
+ * knows.
  */
 function HighlightedCode({ code, lang }: { code: string; lang: string }) {
-  const dark = usePrefersDark();
-  const [extensions, setExtensions] = useState<Extension[]>([]);
+  const [html, setHtml] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    const desc = pickLanguage(lang, undefined);
-    if (!desc) {
-      setExtensions([]);
-      return;
-    }
-    desc
-      .load()
-      .then((support) => {
-        if (!cancelled) setExtensions(support ? [support] : []);
-      })
-      .catch(() => {
-        if (!cancelled) setExtensions([]);
-      });
+    highlightToHtml(code, lang).then((h) => {
+      if (!cancelled) setHtml(h);
+    });
     return () => {
       cancelled = true;
     };
-  }, [lang]);
+  }, [code, lang]);
 
+  if (html === null) {
+    return (
+      <div className="mesh-code-block-source nodrag nopan">
+        <pre>
+          <code>{code}</code>
+        </pre>
+      </div>
+    );
+  }
   return (
-    <div className="mesh-code-block-source nodrag nopan">
-      <CodeMirror
-        value={code}
-        theme={dark ? "dark" : "light"}
-        extensions={extensions}
-        editable={false}
-        basicSetup={{ highlightActiveLine: false, foldGutter: false, lineNumbers: false }}
-      />
-    </div>
+    <div
+      className="mesh-code-block-source mesh-shiki nodrag nopan"
+      // eslint-disable-next-line react/no-danger -- Shiki's own trusted HTML output, not user input
+      dangerouslySetInnerHTML={{ __html: html }}
+    />
   );
 }
 
@@ -889,35 +910,40 @@ function RunOutput({ seg, live }: { seg: CodeSegment; live?: LiveBlockState }) {
   return null;
 }
 
-/** `lang` (if it names a known language) wins; otherwise falls back to
- * guessing from `target`'s file extension. Returns `null` when neither
- * resolves to anything CodeMirror knows how to highlight — the caller then
- * just renders plain, unhighlighted text rather than erroring. */
-function pickLanguage(lang: string | undefined, target: string | undefined): LanguageDescription | null {
-  const byName = lang ? LanguageDescription.matchLanguageName(languages, lang, true) : null;
-  if (byName) return byName;
-  return target ? LanguageDescription.matchFilename(languages, target) : null;
+/** `target`'s own extension (lowercase, no dot) as a best-effort Shiki
+ * language id — used only when a `file` node has no explicit `lang=` of
+ * its own. Not a real filename→language mapping table (Shiki has no
+ * public equivalent of CodeMirror's `LanguageDescription.matchFilename`);
+ * relies on the extension itself already being a Shiki bundled-language
+ * alias (true for most common ones — `rs`, `py`, `ts`, ...) or a matching
+ * local/global custom-grammar filename stem (see `shiki.ts`'s
+ * `grammarNameMatches`). Anything else just renders unhighlighted, same
+ * "still show *something*" fallback the rest of this component already
+ * relies on.
+ */
+function extensionOf(target: string | undefined): string | undefined {
+  const dot = target?.lastIndexOf(".");
+  return dot && dot >= 0 ? target?.slice(dot + 1).toLowerCase() : undefined;
 }
 
 /**
  * A `file` node's `display: "code"` body (see SPEC.md): fetches the
  * target's own content fresh from the server on every mount
  * (`fetchNodeFileContent`, confined server-side to the canvas's own
- * directory) and renders it as a read-only, syntax-highlighted CodeMirror
- * view — never runnable, unlike a node's own fenced code blocks. `lang`
- * picks the highlighting grammar when set; otherwise it's guessed from the
- * target's file extension. Falls back to the plain link view on any error
- * (missing file, binary content, a target outside the canvas directory) —
- * a node whose file preview can't load should still show *something*
- * useful, not go blank.
+ * directory) and renders it as a read-only, syntax-highlighted (Shiki, see
+ * `./shiki.ts`) view — never runnable, unlike a node's own fenced code
+ * blocks. `lang` picks the highlighting grammar when set; otherwise it's
+ * guessed from the target's file extension. Falls back to the plain link
+ * view on any error (missing file, binary content, a target outside the
+ * canvas directory) — a node whose file preview can't load should still
+ * show *something* useful, not go blank.
  */
 function FileCodePreview({ nodeId, target, lang }: { nodeId: string; target?: string; lang?: string }) {
-  const dark = usePrefersDark();
   const wheelRef = useStopWheelIfScrollable<HTMLDivElement>();
   const [state, setState] = useState<
     | { status: "loading" }
     | { status: "error"; message: string }
-    | { status: "ready"; content: string; truncated: boolean; extensions: Extension[] }
+    | { status: "ready"; content: string; truncated: boolean; html: string }
   >({ status: "loading" });
 
   useEffect(() => {
@@ -925,10 +951,9 @@ function FileCodePreview({ nodeId, target, lang }: { nodeId: string; target?: st
     setState({ status: "loading" });
     fetchNodeFileContent(nodeId)
       .then(async ({ content, truncated }) => {
-        const desc = pickLanguage(lang, target);
-        const support = desc ? await desc.load().catch(() => null) : null;
+        const html = await highlightToHtml(content, lang ?? extensionOf(target) ?? "text");
         if (cancelled) return;
-        setState({ status: "ready", content, truncated, extensions: support ? [support] : [] });
+        setState({ status: "ready", content, truncated, html });
       })
       .catch((err: unknown) => {
         if (!cancelled) {
@@ -958,14 +983,9 @@ function FileCodePreview({ nodeId, target, lang }: { nodeId: string; target?: st
     return <p className="mesh-node-hint">loading preview…</p>;
   }
   return (
-    <div className="mesh-file-code-preview nodrag nopan" ref={wheelRef}>
-      <CodeMirror
-        value={state.content}
-        theme={dark ? "dark" : "light"}
-        extensions={state.extensions}
-        editable={false}
-        basicSetup={{ highlightActiveLine: false, foldGutter: false }}
-      />
+    <div className="mesh-file-code-preview mesh-shiki nodrag nopan" ref={wheelRef}>
+      {/* eslint-disable-next-line react/no-danger -- Shiki's own trusted HTML output, not user input */}
+      <div dangerouslySetInnerHTML={{ __html: state.html }} />
       {state.truncated && <p className="mesh-node-hint">preview truncated to the first part of the file</p>}
     </div>
   );

@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 mod mcp;
 mod pdf;
 mod prompt;
+mod syntax_registry;
 mod tui;
 
 /// `commit <hash> (<date>)`, or `<tag> (<date>)` for a build made from a

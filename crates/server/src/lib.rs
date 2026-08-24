@@ -1792,6 +1792,87 @@ async fn get_node_file_content(
     }))
 }
 
+/// One entry in `GET /api/syntax`'s listing — enough for the browser to
+/// know what's available and fetch each one's raw grammar via
+/// `GET /api/syntax/:name`. See `meshfox_core::syntax_dirs` for where these
+/// come from (shared with the TUI's own `crate::syntax_registry` on the
+/// `meshfox-cli` side, so both front ends see the same custom grammars).
+#[derive(Serialize)]
+struct SyntaxGrammarEntry {
+    /// Filename — also the path segment `GET /api/syntax/:name` expects.
+    name: String,
+    /// `"local"` (`.meshfox/syntax/` next to the canvas) or `"global"`
+    /// (`~/.meshfox/syntax/`) — whichever one this entry was actually
+    /// resolved from once local/global name clashes are settled.
+    source: &'static str,
+}
+
+/// `.tmLanguage.json`/`.sublime-syntax` filenames directly in `dir` (no
+/// recursion) — empty, not an error, if `dir` doesn't exist.
+fn list_grammar_files(dir: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            (name.ends_with(".tmLanguage.json") || name.ends_with(".sublime-syntax")).then_some(name)
+        })
+        .collect()
+}
+
+/// Lists custom syntax-highlighting grammars available to this canvas —
+/// the "shared grammar repository" the browser reads from so Shiki/Monaco
+/// can register the same local/global grammars the TUI already loads into
+/// its own `syntect::parsing::SyntaxSet`. Local wins over global on a name
+/// clash (same precedence `syntax_registry::build_syntax_set` uses on the
+/// TUI side).
+async fn get_syntax_list(State(state): State<Arc<AppState>>) -> Json<Vec<SyntaxGrammarEntry>> {
+    let canvas_dir = canvas_root_dir(&state.canvas_path);
+    let mut by_name: HashMap<String, &'static str> = HashMap::new();
+    if let Some(dir) = meshfox_core::syntax_dirs::global_syntax_dir() {
+        for name in list_grammar_files(&dir) {
+            by_name.insert(name, "global");
+        }
+    }
+    for name in list_grammar_files(&meshfox_core::syntax_dirs::local_syntax_dir(canvas_dir)) {
+        by_name.insert(name, "local"); // overwrites a same-named global entry
+    }
+    let mut entries: Vec<SyntaxGrammarEntry> = by_name
+        .into_iter()
+        .map(|(name, source)| SyntaxGrammarEntry { name, source })
+        .collect();
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    Json(entries)
+}
+
+/// Raw content of one custom grammar named by `GET /api/syntax`'s own
+/// listing. `name` is never joined onto a filesystem path unchecked — it's
+/// only ever used to look up an entry this handler already enumerated
+/// itself via `list_grammar_files`, so there's no directory-traversal
+/// surface here regardless of what a caller passes.
+async fn get_syntax_file(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<String, ApiError> {
+    let canvas_dir = canvas_root_dir(&state.canvas_path);
+    let local_dir = meshfox_core::syntax_dirs::local_syntax_dir(canvas_dir);
+    for dir in [Some(local_dir), meshfox_core::syntax_dirs::global_syntax_dir()]
+        .into_iter()
+        .flatten()
+    {
+        if list_grammar_files(&dir).contains(&name) {
+            return std::fs::read_to_string(dir.join(&name))
+                .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+        }
+    }
+    Err(ApiError(
+        StatusCode::NOT_FOUND,
+        format!("no custom grammar {name:?}"),
+    ))
+}
+
 /// Runs a runnable `file` node's `interpreter target` (see
 /// `meshfox_core::Node::is_runnable_file`) — the counterpart to `run_block`
 /// for a node that has no fenced code of its own to run, just a target file
@@ -3600,6 +3681,8 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/kill", post(kill_run))
         .route("/api/watch", get(watch_changes))
         .route("/api/include-asset", get(get_include_asset))
+        .route("/api/syntax", get(get_syntax_list))
+        .route("/api/syntax/:name", get(get_syntax_file))
         .fallback(serve_embedded)
         .with_state(state)
         .layer(CorsLayer::permissive())
@@ -6208,5 +6291,101 @@ mod link_preview_endpoint_tests {
         assert_eq!(body, r#"{"preview":null}"#);
 
         let _ = std::fs::remove_file(&canvas_path);
+    }
+}
+
+#[cfg(test)]
+mod syntax_endpoint_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    /// A fresh scratch *directory* per call (not just a bare filename in
+    /// the shared system temp dir) — `.meshfox/syntax/` lives next to the
+    /// canvas file, so two tests sharing one parent directory would
+    /// otherwise race on (and pollute each other's view of) the same
+    /// `.meshfox/syntax/` folder under parallel test execution.
+    fn write_test_canvas(contents: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("meshfox-syntax-endpoint-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("root.canvas.md");
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    async fn get(addr: SocketAddr, path: &str) -> (u16, String) {
+        let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.expect("read");
+        let mut parts = response.splitn(2, "\r\n\r\n");
+        let head = parts.next().unwrap_or_default();
+        let body = parts.next().unwrap_or_default();
+        let status = head
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        (status, body.to_string())
+    }
+
+    const CANVAS: &str = "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n";
+    const TINY_TMLANGUAGE: &str = r#"{"scopeName": "source.meshfox-endpoint-test", "name": "Meshfox Endpoint Test"}"#;
+
+    /// Only exercises the *local* `.meshfox/syntax/` directory — the
+    /// global `~/.meshfox/syntax/` one shares the exact same
+    /// `list_grammar_files`/lookup code path (see `meshfox_core::syntax_dirs`),
+    /// so it isn't separately covered here to avoid depending on/mutating
+    /// whatever's actually in the real test-runner's `$HOME`.
+    #[tokio::test]
+    async fn lists_and_serves_a_local_custom_grammar() {
+        let canvas_path = write_test_canvas(CANVAS);
+        let canvas_dir = canvas_path.parent().unwrap().to_path_buf();
+        let syntax_dir = canvas_dir.join(".meshfox").join("syntax");
+        std::fs::create_dir_all(&syntax_dir).unwrap();
+        std::fs::write(syntax_dir.join("test.tmLanguage.json"), TINY_TMLANGUAGE).unwrap();
+
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, body) = get(addr, "/api/syntax").await;
+        assert_eq!(status, 200);
+        let entries: Vec<serde_json::Value> = serde_json::from_str(&body).expect("valid JSON");
+        assert!(
+            entries
+                .iter()
+                .any(|e| e["name"] == "test.tmLanguage.json" && e["source"] == "local"),
+            "expected a local test.tmLanguage.json entry, got {body}"
+        );
+
+        let (status, body) = get(addr, "/api/syntax/test.tmLanguage.json").await;
+        assert_eq!(status, 200);
+        assert_eq!(body, TINY_TMLANGUAGE);
+
+        std::fs::remove_dir_all(&canvas_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn unknown_grammar_name_is_a_404_not_a_path_traversal_attempt() {
+        let canvas_path = write_test_canvas(CANVAS);
+        let canvas_dir = canvas_path.parent().unwrap().to_path_buf();
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        // `:name` is one path segment, so a literal `/` in the request path
+        // (unencoded) doesn't even reach `get_syntax_file` — it just fails
+        // to match this route at all, same as any other unmatched path.
+        // The real thing to check is what happens once traversal-looking
+        // *content* does reach the handler as a `name` value — a `%2F`-
+        // encoded slash decodes to one within a single segment. Either way,
+        // `get_syntax_file` only ever serves a name it already found via
+        // its own `read_dir` listing (see its own doc comment), so this
+        // should 404 exactly like any other name that isn't a real file.
+        let (status, _) = get(addr, "/api/syntax/..%2F..%2F..%2F..%2Fetc%2Fpasswd").await;
+        assert_eq!(status, 404);
+        let (status, _) = get(addr, "/api/syntax/does-not-exist.tmLanguage.json").await;
+        assert_eq!(status, 404);
+
+        std::fs::remove_dir_all(&canvas_dir).ok();
     }
 }

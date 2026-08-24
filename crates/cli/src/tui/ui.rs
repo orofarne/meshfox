@@ -7,6 +7,8 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 use ratatui_image::Image;
+use std::sync::Arc;
+use syntect::parsing::SyntaxSet;
 
 use edtui::{EditorView, LineNumbers, SyntaxHighlighter};
 
@@ -118,6 +120,11 @@ fn wrap_word_indices(word_widths: &[usize], first_width: usize, cont_width: usiz
 /// is. "dracula" is the theme edtui's own docs/examples default to; not
 /// otherwise meaningful here.
 const SOURCE_EDITOR_THEME: &str = "dracula";
+/// Falls back to plain `"md"` (`find_syntax_by_token`, extension-based) only
+/// if `crate::syntax_registry::MESHFOX_MARKDOWN_SYNTAX_NAME` somehow isn't
+/// registered — never actually expected (it's bundled into the binary, see
+/// `syntax_registry::build_syntax_set`), but resolving a language is one
+/// `Option` chain either way, so there's no cost to not panicking on it.
 const SOURCE_EDITOR_LANG: &str = "md";
 
 const OUTPUT_HEIGHT: u16 = 9;
@@ -163,7 +170,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // overlay on top of the usual 3-pane layout — see `source_editor.rs`'s
     // own module docs.
     if let Some(se) = &mut app.source_editor {
-        render_source_editor(f, area, se);
+        let syntax_set = Arc::clone(app.highlighter.syntax_set());
+        render_source_editor(f, area, se, &syntax_set);
         return;
     }
 
@@ -705,7 +713,7 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
 /// the `edtui` buffer itself, and a footer (error, or the keybinding
 /// hint) — plus the file-switcher (`Ctrl-f`) as a `render_block_picker`-
 /// style overlay on top when open.
-fn render_source_editor(f: &mut Frame, area: Rect, se: &mut SourceEditorState) {
+fn render_source_editor(f: &mut Frame, area: Rect, se: &mut SourceEditorState, syntax_set: &Arc<SyntaxSet>) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -733,7 +741,25 @@ fn render_source_editor(f: &mut Frame, area: Rect, se: &mut SourceEditorState) {
     ]);
     f.render_widget(Paragraph::new(header), chunks[0]);
 
-    let syntax_highlighter = SyntaxHighlighter::new(SOURCE_EDITOR_THEME, SOURCE_EDITOR_LANG).ok();
+    // `with_sets` (not `new`, which would load its own separate, defaults-
+    // only SyntaxSet) so this editor sees the exact same custom grammars as
+    // the read-only preview pane — see `crate::syntax_registry`.
+    let syntax_highlighter = syntax_set
+        .find_syntax_by_name(crate::syntax_registry::MESHFOX_MARKDOWN_SYNTAX_NAME)
+        .or_else(|| syntax_set.find_syntax_by_token(SOURCE_EDITOR_LANG))
+        .cloned()
+        .map(|syntax_ref| {
+            let theme_set = syntect::highlighting::ThemeSet::load_defaults();
+            let theme = theme_set.themes.get(SOURCE_EDITOR_THEME).cloned();
+            let theme = theme.or_else(|| theme_set.themes.values().next().cloned());
+            let theme = theme.expect("syntect ships at least one theme");
+            // Bundled `syntect` themes have no rules at all for meshfox's
+            // own scope names — without this, a `<!-- meshfox:... -->`
+            // marker's keyword/attribute-name/attribute-value would all
+            // render in one plain color, same as any other comment text.
+            let theme = crate::syntax_registry::with_meshfox_scope_colors(theme);
+            SyntaxHighlighter::with_sets(theme, Arc::new(theme_set), syntax_ref, Arc::clone(syntax_set))
+        });
     let view = EditorView::new(&mut se.editor)
         .line_numbers(LineNumbers::Absolute)
         .wrap(true);

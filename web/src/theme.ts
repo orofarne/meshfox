@@ -1,7 +1,7 @@
 /**
  * Light/dark theme preference — a manual override on top of the OS-level
  * `prefers-color-scheme` this app already followed everywhere (index.css's
- * `@media` block, `<ReactFlow colorMode>`, `usePrefersDark`'s CodeMirror/
+ * `@media` block, `<ReactFlow colorMode>`, `usePrefersDark`'s Monaco/
  * `TtyPanel` consumers). `"system"` (the default) keeps following the OS;
  * `"light"`/`"dark"` pins it regardless of what the OS says.
  */

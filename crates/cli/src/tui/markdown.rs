@@ -8,6 +8,7 @@
 //! `Segment` below for the split.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use pulldown_cmark::{
     Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
@@ -41,15 +42,34 @@ pub enum Segment {
 
 /// Loads syntect's bundled (compiled-in, no on-disk assets) syntax/theme
 /// sets once and reuses them for every code fence — these sets are a few
-/// MB to build and meant to be shared, not rebuilt per fence.
+/// MB to build and meant to be shared, not rebuilt per fence. `syntax_set`
+/// is `Arc`-wrapped so it can be shared with `edtui`'s own full-screen
+/// editor too (`edtui::SyntaxHighlighter::with_sets`, see `tui::ui`) — both
+/// TUI surfaces then know about the same custom grammars, not two
+/// independently-loaded sets.
 pub struct Highlighter {
-    syntax_set: SyntaxSet,
+    syntax_set: Arc<SyntaxSet>,
     theme: Theme,
 }
 
 impl Highlighter {
+    /// Defaults-only — only the real app's own `with_extra_syntaxes` runs
+    /// outside tests, so this is `cfg(test)` rather than plain `pub`.
+    #[cfg(test)]
     pub fn new() -> Self {
-        let syntax_set = SyntaxSet::load_defaults_newlines();
+        Self::with_syntax_set(SyntaxSet::load_defaults_newlines())
+    }
+
+    /// Same as `new`, but the `SyntaxSet` also includes whatever custom
+    /// grammars `crate::syntax_registry::build_syntax_set` found under
+    /// `canvas_root` (locally, `.meshfox/syntax/`) or `~/.meshfox/syntax/`
+    /// (globally) — the constructor the real app uses; `new` stays
+    /// defaults-only for tests that don't care about local grammars.
+    pub fn with_extra_syntaxes(canvas_root: &Path) -> Self {
+        Self::with_syntax_set(crate::syntax_registry::build_syntax_set(canvas_root))
+    }
+
+    fn with_syntax_set(syntax_set: SyntaxSet) -> Self {
         let theme_set = ThemeSet::load_defaults();
         let theme = theme_set
             .themes
@@ -63,7 +83,18 @@ impl Highlighter {
                     .cloned()
                     .expect("syntect ships at least one theme")
             });
-        Highlighter { syntax_set, theme }
+        Highlighter {
+            syntax_set: Arc::new(syntax_set),
+            theme,
+        }
+    }
+
+    /// The underlying `SyntaxSet`, `Arc`-shared so a caller (the TUI's
+    /// `edtui`-based full-screen editor) can hand the exact same grammar
+    /// set to `edtui::SyntaxHighlighter::with_sets` instead of loading its
+    /// own separate one.
+    pub fn syntax_set(&self) -> &Arc<SyntaxSet> {
+        &self.syntax_set
     }
 
     fn highlight(&self, lang: &str, code: &str) -> Vec<Line<'static>> {

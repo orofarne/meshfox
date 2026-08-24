@@ -23,7 +23,7 @@
   --dep: #a05dd1;
   --dep-flash: rgba(160, 93, 209, 0.28);
   /* meshfox's own Markdown syntax extensions, as highlighted in the
-   * CodeMirror source editors (see meshfoxSyntax.ts) — `meshfox:node`/
+   * Monaco source editors (see meshfoxMarkers.ts) — `meshfox:node`/
    * `meshfox:edge`/etc. comments and runnable-fence attributes
    * (`name=`/`cache`/`deps=`/...), kept visually distinct from --accent/
    * --dep so they don't read as "a run/deps UI element" instead of "a bit
@@ -164,13 +164,6 @@ body {
 
 a {
   color: var(--accent);
-}
-
-/* Every CodeMirror source editor in the app (NodeTextEditor,
- * CanvasSourceEditor) shares this one rule rather than each editor's own
- * wrapper class repeating it. */
-.cm-editor {
-  font-family: "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
 .app {
@@ -343,45 +336,46 @@ a {
   overflow: auto;
 }
 
-.mesh-source-editor-body .cm-editor {
-  height: 100%;
-}
-
 .mesh-source-editor-loading {
   padding: 1rem;
   opacity: 0.7;
 }
 
 /* meshfox's own syntax extensions on top of plain Markdown/HTML — see
- * meshfoxSyntax.ts's decorations, shared by every CodeMirror source editor
- * in the app (NodeTextEditor, CanvasSourceEditor). Each of our marks nests
- * *outside* the base Markdown language's own syntax-highlighting span for
- * the same text (an HTML comment's content, a fence's info string) — that
+ * meshfoxMarkers.ts's decorations, shared by every Monaco source editor in
+ * the app (NodeTextEditor, CanvasSourceEditor). The read-only preview gets
+ * `<!-- meshfox:... -->` marker-comment coloring from a real grammar
+ * instead (`meshfoxGrammar.ts`) — Monaco doesn't (a confirmed
+ * `@shikijs/monaco` limitation with injection grammars, see
+ * `monacoSetup.ts`'s own doc comment), so these rules stay in charge of
+ * both the comments and the fence attributes here. Each of our marks nests
+ * *outside* Monaco's own base-Markdown syntax-highlighting span for the
+ * same text (an HTML comment's content, a fence's info string) — that
  * inner span always carries its own explicit `color`, which wins for its
  * own text over anything an ancestor declares, no matter the ancestor's
  * specificity. The `*` + `!important` pair is what actually reaches
- * through it: `!important` beats CodeMirror's own (non-important)
- * injected color rule once both apply to the very same descendant
- * element, which plain specificity here cannot. */
-.cm-meshfoxComment,
-.cm-meshfoxComment * {
+ * through it: `!important` beats Monaco's own (non-important) injected
+ * color rule once both apply to the very same descendant element, which
+ * plain specificity here cannot. */
+.mesh-marker-comment,
+.mesh-marker-comment * {
   background: var(--syntax-tint);
   border-radius: 3px;
 }
 
-.cm-meshfoxKeyword,
-.cm-meshfoxKeyword * {
+.mesh-marker-keyword,
+.mesh-marker-keyword * {
   color: var(--accent) !important;
   font-weight: 600 !important;
 }
 
-.cm-meshfoxAttrName,
-.cm-meshfoxAttrName * {
+.mesh-marker-attr-name,
+.mesh-marker-attr-name * {
   color: var(--syntax-attr) !important;
 }
 
-.cm-meshfoxAttrValue,
-.cm-meshfoxAttrValue * {
+.mesh-marker-attr-value,
+.mesh-marker-attr-value * {
   color: var(--syntax-value) !important;
 }
 
@@ -703,13 +697,25 @@ a {
  * same as `.mesh-node-body`. */
 .mesh-file-code-preview {
   flex: 1;
+  /* See `.mesh-node-body`'s identical rule/comment just above — same flex
+   * item + `overflow: auto` trap, same fix. */
+  min-height: 0;
   overflow: auto;
   user-select: text;
 }
 
-.mesh-file-code-preview .cm-editor {
-  height: 100%;
+.mesh-file-code-preview .shiki {
+  /* Not `height: 100%` — that pins the block to the container's own
+   * height instead of letting it grow with content, which silently
+   * defeats the parent's `overflow: auto` (nothing ever overflows a box
+   * exactly as tall as itself). `min-height: 100%` still fills a short
+   * file's box, without capping a long one. */
+  min-height: 100%;
+  margin: 0;
+  padding: 0.6rem 0.75rem;
+  font-family: "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 0.78rem;
+  line-height: 1.45;
 }
 
 /* A `link` node's `preview: true` OpenGraph card — see `LinkPreviewCard` in
@@ -794,10 +800,6 @@ a {
   min-width: 0;
   overflow: auto;
   border-right: 1px solid var(--node-border);
-}
-
-.mesh-text-editor-source .cm-editor {
-  height: 100%;
 }
 
 .mesh-text-editor-preview {
@@ -1138,14 +1140,51 @@ a {
   margin-top: 0;
 }
 
-/* A runnable fence's own source, via CodeMirror (read-only) — same
- * highlighting `.mesh-file-code-preview .cm-editor` already gets for an
+/* A runnable fence's own source, via Shiki (read-only, see `./shiki.ts`) —
+ * same highlighting `.mesh-file-code-preview .shiki` already gets for an
  * included file's preview, just without that panel's own scroll/height
  * rules (a code block's height is however tall its source is, not clamped
  * to fill the node). */
-.mesh-code-block-source .cm-editor {
+.mesh-code-block-source .shiki {
+  margin: 0;
+  padding: 0.6rem 0.75rem;
+  overflow-x: auto;
   font-family: "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+/* Shiki's own dual-theme CSS variables (`--shiki-light`/`--shiki-dark`,
+ * `defaultColor: false` in `highlightToHtml` — see `./shiki.ts`) — light
+ * is the plain default, dark mode (OS `prefers-color-scheme`, or the
+ * toolbar's manual `data-theme` override) swaps to the other set. Same
+ * selector precedence every other themed color in this file already uses. */
+.mesh-shiki .shiki {
+  background-color: var(--shiki-light-bg);
+}
+
+.mesh-shiki .shiki,
+.mesh-shiki .shiki span {
+  color: var(--shiki-light);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .mesh-shiki .shiki {
+    background-color: var(--shiki-dark-bg);
+  }
+  :root:not([data-theme="light"]) .mesh-shiki .shiki,
+  :root:not([data-theme="light"]) .mesh-shiki .shiki span {
+    color: var(--shiki-dark);
+  }
+}
+
+:root[data-theme="dark"] .mesh-shiki .shiki {
+  background-color: var(--shiki-dark-bg);
+}
+
+:root[data-theme="dark"] .mesh-shiki .shiki,
+:root[data-theme="dark"] .mesh-shiki .shiki span {
+  color: var(--shiki-dark);
 }
 
 .mesh-code-block-head {
