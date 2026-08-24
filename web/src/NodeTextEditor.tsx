@@ -1,11 +1,11 @@
-import { useEffect, useRef, useState } from "react";
+import { Suspense, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import Editor, { type OnMount } from "@monaco-editor/react";
+import type { OnMount } from "@monaco-editor/react";
 import type * as MonacoNS from "monaco-editor";
 import { NodeBodyPreview } from "./MeshNode";
 import { attachMeshfoxMarkers } from "./meshfoxMarkers";
 import { attachImagePaste } from "./imagePaste";
-import { ensureMonacoConfigured } from "./monacoSetup";
+import { ensureMonacoConfigured, LazyEditor } from "./monacoSetup";
 import { THEMES } from "./shiki";
 import { THEME_CHANGE_EVENT } from "./theme";
 
@@ -187,15 +187,17 @@ export function NodeTextEditor({ initialText, onChange, onClose }: NodeTextEdito
         <div className="mesh-text-editor-panes">
           <div className="mesh-text-editor-source">
             {monacoReady ? (
-              <Editor
-                height="100%"
-                language="markdown"
-                theme={dark ? THEMES.dark : THEMES.light}
-                value={text}
-                onChange={(v) => setText(v ?? "")}
-                onMount={handleMount}
-                options={MONACO_OPTIONS}
-              />
+              <Suspense fallback={<p className="mesh-node-hint">loading editor…</p>}>
+                <LazyEditor
+                  height="100%"
+                  language="markdown"
+                  theme={dark ? THEMES.dark : THEMES.light}
+                  value={text}
+                  onChange={(v) => setText(v ?? "")}
+                  onMount={handleMount}
+                  options={MONACO_OPTIONS}
+                />
+              </Suspense>
             ) : (
               <p className="mesh-node-hint">loading editor…</p>
             )}

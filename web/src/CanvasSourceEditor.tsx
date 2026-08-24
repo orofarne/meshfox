@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from "react";
-import Editor, { type OnMount } from "@monaco-editor/react";
+import { Suspense, useEffect, useRef, useState } from "react";
+import type { OnMount } from "@monaco-editor/react";
 import { fetchCanvasSource, fetchIncludes, saveCanvasSource, type IncludeManifestEntry } from "./api";
+import { LazyEditor } from "./monacoSetup";
 import { MONACO_OPTIONS, attachMeshfoxEditorExtensions, useMonacoReady, usePrefersDark } from "./NodeTextEditor";
 import { THEMES } from "./shiki";
 
@@ -151,16 +152,18 @@ export function CanvasSourceEditor({ initialInclude, onSaved, onClose, onDirtyCh
         {text === null || !monacoReady ? (
           <div className="mesh-source-editor-loading">Loading…</div>
         ) : (
-          <Editor
-            key={selected}
-            height="100%"
-            language="markdown"
-            theme={dark ? THEMES.dark : THEMES.light}
-            value={text}
-            onChange={(v) => setText(v ?? "")}
-            onMount={handleMount}
-            options={MONACO_OPTIONS}
-          />
+          <Suspense fallback={<div className="mesh-source-editor-loading">Loading…</div>}>
+            <LazyEditor
+              key={selected}
+              height="100%"
+              language="markdown"
+              theme={dark ? THEMES.dark : THEMES.light}
+              value={text}
+              onChange={(v) => setText(v ?? "")}
+              onMount={handleMount}
+              options={MONACO_OPTIONS}
+            />
+          </Suspense>
         )}
       </div>
     </div>

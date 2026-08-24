@@ -3,7 +3,24 @@ import EditorWorker from "monaco-editor/esm/vs/editor/editor.worker.js?worker";
 // into this module's own (eagerly-loaded) chunk the way a value import
 // would.
 import type * as Monaco from "monaco-editor";
+import { lazy } from "react";
 import { getHighlighter } from "./shiki";
+
+/**
+ * `@monaco-editor/react`'s `Editor` component, loaded lazily — mirrors
+ * `ensureMonacoConfigured` below's own `import("@monaco-editor/react")`.
+ * Both `NodeTextEditor.tsx` and `CanvasSourceEditor.tsx` used to `import
+ * Editor from "@monaco-editor/react"` directly; a *static* import there
+ * defeats this file's own dynamic one (Vite's `INEFFECTIVE_DYNAMIC_IMPORT`
+ * warning) and bundles the module into the main chunk regardless, which is
+ * exactly what the laziness above is trying to avoid. Both editors already
+ * gate mounting on `useMonacoReady()`, so by the time `<LazyEditor>` itself
+ * renders, `ensureMonacoConfigured()` has already resolved this same
+ * dynamic import — the `<Suspense>` boundary each caller wraps it in only
+ * ever needs to cover a single already-cached microtask, never a real
+ * loading state.
+ */
+export const LazyEditor = lazy(() => import("@monaco-editor/react"));
 
 /**
  * Self-hosts Monaco — without this, `@monaco-editor/react`'s default
