@@ -564,6 +564,27 @@ a {
   color: var(--node-bg);
 }
 
+/* A node's own busy indicator (see MeshNode.tsx's `RunningSpinner`) — shown
+ * in the title bar whenever any of the node's own blocks is `"running"`, so
+ * a folded or off-screen node still reads as busy without needing its body
+ * (and that block's own pulsing-dot output marker, see
+ * `.mesh-code-output[data-exit="running"]` below) visible. */
+.mesh-node-running-spinner {
+  flex-shrink: 0;
+  width: 0.85em;
+  height: 0.85em;
+  border-radius: 50%;
+  border: 2px solid var(--node-border);
+  border-top-color: var(--accent);
+  animation: mesh-node-spin 0.7s linear infinite;
+}
+
+@keyframes mesh-node-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 /* Icon buttons (edit text, open settings) — edit mode only, sit together
  * in the title bar next to the (possibly truncated) title text rather than
  * floating over the node body. */

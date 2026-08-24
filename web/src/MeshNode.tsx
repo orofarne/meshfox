@@ -462,6 +462,17 @@ function ConstraintBadge({ status }: { status: ConstraintStatusDto | undefined }
   );
 }
 
+/** Shown in a node's title bar whenever any of its own blocks (fenced code
+ * blocks by name, or a runnable `file` node's own run, keyed under its own
+ * id — see `MeshNodeData.liveBlocks`'s doc comment) has `status ===
+ * "running"`, so a busy node stays visible as busy even folded or scrolled
+ * out of view of its actual output. Not shown for `"queued"` — that's
+ * "about to run", not "running", and each runnable block's own button
+ * already surfaces that via its "queued…" label. */
+function RunningSpinner() {
+  return <span className="mesh-node-running-spinner" title="A block in this node is running" />;
+}
+
 /** A pixel of slack for the "already at the scroll boundary" checks below —
  * `scrollTop`/`scrollLeft` can be fractional (subpixel layout, non-integer
  * zoom) while `scrollHeight`/`clientHeight` round differently, so a strict
@@ -1305,6 +1316,11 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
   const quickRunBusy = quickRunLive?.status === "queued" || quickRunLive?.status === "running";
   const canOpenFile = data.nodeType === "file" && !!data.target;
   const constraintStatus = aggregateConstraintStatus(data.constraintResults);
+  // `data.liveBlocks` is already scoped to this node's own blocks (App.tsx
+  // keys each node's map by that node alone), so this covers both a `text`
+  // node's fenced blocks (keyed by block name) and a runnable `file` node's
+  // own run (keyed under its own id) without needing to special-case either.
+  const nodeRunning = Object.values(data.liveBlocks).some((lb) => lb.status === "running");
   // Clicking the title text toggles fold both ways in read-only mode
   // (alongside `FoldToggle` itself), but the title text is also meant to
   // stay selectable (e.g. to copy it) — a plain `onClick` alone can't
@@ -1440,6 +1456,7 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
             {data.title}
           </span>
           {nodeTags}
+          {nodeRunning && <RunningSpinner />}
         </div>
       ) : (
         <div className="mesh-node-title" data-level={data.level}>
@@ -1453,6 +1470,7 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
             {data.title}
           </span>
           {nodeTags}
+          {nodeRunning && <RunningSpinner />}
           <ConstraintBadge status={constraintStatus} />
           {quickRunBlockName && (
             <button

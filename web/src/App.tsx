@@ -52,6 +52,7 @@ import { NodeExpandPanel } from "./NodeExpandPanel";
 import { NodeSettings } from "./NodeSettings";
 import { DeleteNodeDialog } from "./DeleteNodeDialog";
 import { AutoLayoutConfirmDialog } from "./AutoLayoutConfirmDialog";
+import { ResetSessionConfirmDialog } from "./ResetSessionConfirmDialog";
 import { ReparentChoiceDialog } from "./ReparentChoiceDialog";
 import { DeletableEdge } from "./DeletableEdge";
 import { CanvasSourceEditor } from "./CanvasSourceEditor";
@@ -488,6 +489,10 @@ export default function App() {
   // stored position/size in the file), so this is the one gate before
   // `handleAutoLayout` actually runs.
   const [autoLayoutConfirmOpen, setAutoLayoutConfirmOpen] = useState(false);
+  // Whether the toolbar's "reset session" confirm dialog (see
+  // ResetSessionConfirmDialog) is open — see that component's own doc
+  // comment for why a purely in-memory reset still gets a confirm gate.
+  const [resetSessionConfirmOpen, setResetSessionConfirmOpen] = useState(false);
 
   // Best-effort client-side mirror of crates/core/src/deps.rs — used only
   // to preview a run's dependency chain (so "running" indicators can light
@@ -1964,6 +1969,7 @@ export default function App() {
         reparentPromptNodeId ||
         expandedNodeId ||
         autoLayoutConfirmOpen ||
+        resetSessionConfirmOpen ||
         searchOpen
       ) {
         return;
@@ -2062,6 +2068,7 @@ export default function App() {
     reparentPromptNodeId,
     expandedNodeId,
     autoLayoutConfirmOpen,
+    resetSessionConfirmOpen,
     searchOpen,
     openSearch,
   ]);
@@ -2366,7 +2373,7 @@ export default function App() {
         </button>
         <button
           className="deps-toggle"
-          onClick={handleResetSession}
+          onClick={() => setResetSessionConfirmOpen(true)}
           title="Forget which blocks already ran successfully this session, so the next ⛓ run chain re-runs every dependency instead of skipping unchanged ones"
         >
           ↺ reset session
@@ -2606,6 +2613,15 @@ export default function App() {
             handleAutoLayout();
           }}
           onCancel={() => setAutoLayoutConfirmOpen(false)}
+        />
+      )}
+      {resetSessionConfirmOpen && (
+        <ResetSessionConfirmDialog
+          onConfirm={() => {
+            setResetSessionConfirmOpen(false);
+            handleResetSession();
+          }}
+          onCancel={() => setResetSessionConfirmOpen(false)}
         />
       )}
       {reparentPromptNode && (

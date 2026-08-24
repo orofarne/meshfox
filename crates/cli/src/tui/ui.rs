@@ -186,6 +186,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
         render_block_picker(f, area, bp);
     } else if let Some(vf) = &app.var_form {
         render_var_form(f, area, vf);
+    } else if app.reset_session_confirm {
+        render_reset_session_confirm(f, area);
     } else if app.show_help {
         render_help(f, area, &*app);
     }
@@ -658,6 +660,40 @@ fn render_block_picker(f: &mut Frame, area: Rect, bp: &super::app::BlockPickerSt
     state.select(Some(bp.selected));
     let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     f.render_stateful_widget(list, inner, &mut state);
+}
+
+/// The `S` (reset session) confirm prompt — see `App::reset_session_confirm`
+/// and `App::on_reset_session_confirm_key`. Fixed size rather than
+/// `render_block_picker`/`render_var_form`'s content-driven height (`bp
+/// .blocks.len()`/`vf.decls.len()`) since this has no list to size around,
+/// just the one static message.
+fn render_reset_session_confirm(f: &mut Frame, area: Rect) {
+    let rect = centered_rect(60, 8, area);
+    f.render_widget(Clear, rect);
+    let block = Block::default().borders(Borders::ALL).title(" reset session? ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let message = Paragraph::new(
+        "Forgets which blocks already ran successfully this session, so the next chain run \
+         re-runs every dependency instead of skipping unchanged ones. Doesn't touch the canvas \
+         file or any saved output.",
+    )
+    .wrap(Wrap { trim: true });
+    f.render_widget(message, rows[0]);
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "y/enter confirm · n/esc cancel",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        rows[1],
+    );
 }
 
 fn render_help(f: &mut Frame, area: Rect, app: &App) {

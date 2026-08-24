@@ -269,6 +269,12 @@ pub struct App {
     /// `AppState::session_runs`). Never persisted anywhere; restarting the
     /// TUI starts fresh.
     pub session_runs: HashMap<(String, String), SessionRun>,
+    /// Whether the `S` (reset session) confirm prompt is up — see `on_key`'s
+    /// early dispatch to `on_reset_session_confirm_key` and
+    /// `reset_session`'s own doc comment for why this asks at all despite
+    /// being purely in-memory. Same "one thing at a time" precedence as
+    /// `var_form`/`block_picker`/`source_editor`.
+    pub reset_session_confirm: bool,
 }
 
 /// One block's most recent successful run this session — see
@@ -413,6 +419,7 @@ impl App {
             link_preview_image_requested: HashSet::new(),
             link_preview_image: HashMap::new(),
             session_runs: HashMap::new(),
+            reset_session_confirm: false,
         };
         app.render_current_document();
         Ok(app)
@@ -438,6 +445,10 @@ impl App {
         }
         if self.block_picker.is_some() {
             self.on_block_picker_key(key).await;
+            return;
+        }
+        if self.reset_session_confirm {
+            self.on_reset_session_confirm_key(key);
             return;
         }
 
@@ -475,7 +486,7 @@ impl App {
             KeyCode::Char('r') => self.trigger_run(true).await,
             KeyCode::Char('R') => self.trigger_run(false).await,
             KeyCode::Char('K') => self.kill_running(),
-            KeyCode::Char('S') => self.reset_session(),
+            KeyCode::Char('S') => self.reset_session_confirm = true,
             KeyCode::Char('o') => self.trigger_open_file(),
             KeyCode::Char('c') => self.trigger_configure(),
             KeyCode::Char('e') => self.open_source_editor(),
@@ -2012,6 +2023,27 @@ impl App {
         self.status = "session reset".into();
     }
 
+    /// While `reset_session_confirm` is up (see `on_key`'s early dispatch) —
+    /// `y`/Enter confirms, `n`/Esc backs out untouched. Same
+    /// confirm-before-acting gate the web UI's own `ResetSessionConfirmDialog`
+    /// puts in front of its "↺ reset session" button, for the same reason
+    /// (see that component's doc comment): the reset is harmless to the
+    /// file/cache but still easy to trigger by accident and mildly costly to
+    /// shrug off, so `S` alone shouldn't fire it immediately.
+    fn on_reset_session_confirm_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                self.reset_session_confirm = false;
+                self.reset_session();
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                self.reset_session_confirm = false;
+                self.status = "session reset cancelled".into();
+            }
+            _ => {}
+        }
+    }
+
     /// Saves every field in `var_form` at once — whatever's currently
     /// typed in each, not just the focused one — same "submit the whole
     /// form" semantics as the web UI's `VarsForm`. A `secret` field is
@@ -2511,6 +2543,52 @@ mod tests {
 
         app.reset_session();
 
+        assert!(app.session_runs.is_empty());
+        assert_eq!(app.status, "session reset");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[tokio::test]
+    async fn s_key_only_resets_the_session_after_confirming() {
+        let dir = std::env::temp_dir().join(format!("meshfox-tui-reset-session-confirm-test-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.md");
+        std::fs::write(
+            &path,
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
+        )
+        .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(path, tx).unwrap();
+        app.session_runs.insert(
+            ("root".to_string(), "dep".to_string()),
+            SessionRun {
+                fingerprint: "deadbeef".to_string(),
+                produced_vars: HashMap::new(),
+                output: "dep-ran\n".to_string(),
+                duration_ms: 1,
+            },
+        );
+
+        // `S` alone opens the prompt — doesn't clear anything yet.
+        app.on_key(key(KeyCode::Char('S'))).await;
+        assert!(app.reset_session_confirm);
+        assert!(!app.session_runs.is_empty());
+
+        // `n` backs out untouched.
+        app.on_key(key(KeyCode::Char('n'))).await;
+        assert!(!app.reset_session_confirm);
+        assert!(!app.session_runs.is_empty());
+
+        // `S` then `y` actually resets.
+        app.on_key(key(KeyCode::Char('S'))).await;
+        app.on_key(key(KeyCode::Char('y'))).await;
+        assert!(!app.reset_session_confirm);
         assert!(app.session_runs.is_empty());
         assert_eq!(app.status, "session reset");
 
