@@ -104,22 +104,43 @@ pub fn default_block<'a>(
 /// One entry of a fence's `deps=` list: either a bare block name (a block
 /// in the same node as the one declaring the dependency) or
 /// `node-id/block-name` (a block in another node, addressed the same way
-/// `meshfox:edge from=` addresses nodes).
+/// `meshfox:edge from=` addresses nodes). A trailing `!` (e.g.
+/// `deps="build,schema/migrate!"`) sets `sync` — see its own doc comment.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BlockRef {
     pub node_id: Option<String>,
     pub block_name: String,
+    /// Trailing `!` on this `deps=` entry: ties this dependency's own
+    /// session-freshness decision to the block declaring the edge, instead
+    /// of its own fingerprint. See `crate::deps::compute_forced_reruns`
+    /// for the full semantics/rationale — in short, whenever the
+    /// declaring block actually runs for real this pass (not skipped as
+    /// "already fresh"), this dependency is forced to run for real too,
+    /// regardless of its own fingerprint or `always` flag; when the
+    /// declaring block is itself skipped, this dependency is left to its
+    /// own normal freshness decision. For a setup step whose side effect
+    /// (unlike `always`) should only recur alongside one specific
+    /// consumer's own rerun — e.g. a migration that must drop/recreate a
+    /// schema exactly when (and only when) the load step that repopulates
+    /// it is about to run for real, not on every pulled-in reference.
+    pub sync: bool,
 }
 
 pub(crate) fn parse_block_ref(s: &str) -> BlockRef {
+    let (s, sync) = match s.strip_suffix('!') {
+        Some(rest) => (rest, true),
+        None => (s, false),
+    };
     match s.split_once('/') {
         Some((node_id, block_name)) => BlockRef {
             node_id: Some(node_id.to_string()),
             block_name: block_name.to_string(),
+            sync,
         },
         None => BlockRef {
             node_id: None,
             block_name: s.to_string(),
+            sync,
         },
     }
 }
@@ -603,10 +624,14 @@ pub fn fingerprint(block: &CodeBlock) -> String {
         parts.push(format!("{}\u{0}{}", env.local_name, env.var_name));
     }
     for dep in &block.deps {
-        parts.push(match &dep.node_id {
+        let mut part = match &dep.node_id {
             Some(node_id) => format!("{node_id}/{}", dep.block_name),
             None => dep.block_name.clone(),
-        });
+        };
+        if dep.sync {
+            part.push('!');
+        }
+        parts.push(part);
     }
     format!("{:08x}", fnv1a(parts.join("\u{0}").as_bytes()))
 }
@@ -827,14 +852,45 @@ mod tests {
             &vec![
                 BlockRef {
                     node_id: None,
-                    block_name: "build".to_string()
+                    block_name: "build".to_string(),
+                    sync: false,
                 },
                 BlockRef {
                     node_id: Some("other-node".to_string()),
-                    block_name: "test".to_string()
+                    block_name: "test".to_string(),
+                    sync: false,
                 },
             ]
         );
+    }
+
+    #[test]
+    fn deps_parses_trailing_bang_as_sync_on_bare_and_qualified_names() {
+        let md =
+            "```bash name=\"deploy\" deps=\"build!,other-node/test!\"\necho hi\n```\n";
+        let deps = &scan_code_blocks(md)[0].deps;
+        assert_eq!(
+            deps,
+            &vec![
+                BlockRef {
+                    node_id: None,
+                    block_name: "build".to_string(),
+                    sync: true,
+                },
+                BlockRef {
+                    node_id: Some("other-node".to_string()),
+                    block_name: "test".to_string(),
+                    sync: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn fingerprint_changes_when_a_deps_entry_gains_the_sync_suffix() {
+        let a = &scan_code_blocks("```bash name=\"x\" deps=\"y\"\necho hi\n```\n")[0];
+        let b = &scan_code_blocks("```bash name=\"x\" deps=\"y!\"\necho hi\n```\n")[0];
+        assert_ne!(fingerprint(a), fingerprint(b));
     }
 
     #[test]

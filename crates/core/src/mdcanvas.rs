@@ -695,9 +695,15 @@ pub fn set_fence_attrs(
     if !deps.is_empty() {
         let rendered = deps
             .iter()
-            .map(|d| match &d.node_id {
-                Some(n) => format!("{n}/{}", d.block_name),
-                None => d.block_name.clone(),
+            .map(|d| {
+                let mut part = match &d.node_id {
+                    Some(n) => format!("{n}/{}", d.block_name),
+                    None => d.block_name.clone(),
+                };
+                if d.sync {
+                    part.push('!');
+                }
+                part
             })
             .collect::<Vec<_>>()
             .join(",");
@@ -2505,7 +2511,8 @@ Reused from Tests as well.
             blocks[0].deps,
             vec![crate::fence::BlockRef {
                 node_id: Some("build step".to_string()),
-                block_name: "build".to_string()
+                block_name: "build".to_string(),
+                sync: false,
             }]
         );
     }
@@ -3860,11 +3867,13 @@ Reused from Tests as well.
             vec![
                 crate::fence::BlockRef {
                     node_id: Some("build".to_string()),
-                    block_name: "build".to_string()
+                    block_name: "build".to_string(),
+                    sync: false,
                 },
                 crate::fence::BlockRef {
                     node_id: None,
-                    block_name: "other".to_string()
+                    block_name: "other".to_string(),
+                    sync: false,
                 },
             ]
         );

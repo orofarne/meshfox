@@ -122,6 +122,12 @@ pub struct RunState {
     /// step's exit code is known, by `on_output_line`/`resume_after_tty` —
     /// see `meshfox_core::varout`.
     pub pending_vars_out: Option<(PathBuf, Vec<VarDecl>)>,
+    /// Which of `chain`'s entries must run for real regardless of
+    /// `session_runs` — computed once, up front, by
+    /// `meshfox_core::compute_forced_reruns` in `start_run` (see its own
+    /// doc comment) and consulted by `advance_run`'s skip check alongside
+    /// `is_requested_target`/`block.always`.
+    pub forced_reruns: HashSet<BlockAddr>,
 }
 
 /// A runnable `file` node's own single execution — no `deps=` chain, no
@@ -1292,6 +1298,29 @@ impl App {
             }
         };
 
+        // Dry-run pass over the whole chain, up front — mirrors the web
+        // server's own `run_block`/`run_tty_chain` (see their shared doc
+        // comment on the equivalent call) — so a `!` (sync) `deps=` edge
+        // can force its dependency to run for real when the block that
+        // declared the edge is about to, even though that block comes
+        // *later* in `chain`'s dependency order than its dependency does.
+        let forced_reruns = match meshfox_core::compute_forced_reruns(
+            &resolved,
+            &chain,
+            |block, computed| self.fingerprint_vars_for(block, computed),
+            |addr| {
+                self.session_runs
+                    .get(&(addr.node_id.clone(), addr.block_name.clone()))
+                    .map(|r| (r.fingerprint.clone(), r.produced_vars.clone()))
+            },
+        ) {
+            Ok(f) => f,
+            Err(e) => {
+                self.status = format!("dependency error: {e}");
+                return;
+            }
+        };
+
         self.run = Some(RunState {
             chain,
             idx: 0,
@@ -1304,6 +1333,7 @@ impl App {
             killed: false,
             finished: false,
             pending_vars_out: None,
+            forced_reruns,
         });
         self.run_overrides.clear();
         self.run_computed.clear();
@@ -1354,6 +1384,80 @@ impl App {
             return None;
         }
         Some(resolution.env)
+    }
+
+    /// `interpreter=`'s own `$NAME` refs, as `EnvRef`s (local name == var
+    /// name — an interpreter substitution has no `local=name` renaming of
+    /// its own, unlike `env=`) — `None` when `block.interpreter` has no
+    /// such reference at all, not merely that resolution hasn't happened
+    /// yet. Shared by `advance_run` and `fingerprint_vars_for`.
+    fn interp_env_refs(block: &meshfox_core::CodeBlock) -> Vec<meshfox_core::EnvRef> {
+        block
+            .interpreter
+            .as_deref()
+            .map(meshfox_core::interpreter_var_refs)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|n| meshfox_core::EnvRef { local_name: n.clone(), var_name: n })
+            .collect()
+    }
+
+    /// `session_fingerprint` wants var-name-keyed values; `env_resolution`/
+    /// `interp_resolution` (`BlockEnvResolution::env`) are local-name-keyed
+    /// (relabeled per `env=`), so project back through `block.env`'s own
+    /// pairs — for `interp_resolution`, local name == var name already (see
+    /// `interp_env_refs`), so its `env` needs no projection. Shared by
+    /// `advance_run` (which already has both resolutions in hand) and
+    /// `fingerprint_vars_for` (which computes its own, purely to feed this).
+    fn project_fingerprint_vars(
+        block: &meshfox_core::CodeBlock,
+        env_resolution: &BlockEnvResolution,
+        interp_resolution: Option<&BlockEnvResolution>,
+    ) -> HashMap<String, String> {
+        let mut fingerprint_vars: HashMap<String, String> = HashMap::new();
+        for env_ref in &block.env {
+            if let Some(v) = env_resolution.env.get(&env_ref.local_name) {
+                fingerprint_vars.insert(env_ref.var_name.clone(), v.clone());
+            }
+        }
+        if let Some(ir) = interp_resolution {
+            fingerprint_vars.extend(ir.env.clone());
+        }
+        fingerprint_vars
+    }
+
+    /// The var-name-keyed value map `meshfox_core::session_fingerprint`
+    /// needs for `block`, resolved against `self.run_overrides`/
+    /// `self.var_cache`/`default` the same way `advance_run` resolves them
+    /// before actually running a step, with `computed` standing in for
+    /// `self.run_computed` — a caller simulating a chain that hasn't
+    /// actually run yet (`start_run`'s own `compute_forced_reruns` call)
+    /// passes its own simulated copy instead. Never parks on anything
+    /// missing: a best-effort lookup purely to know what a fingerprint
+    /// comparison would see, same as `advance_run`'s own equivalent
+    /// resolve-then-project pair — kept separate from it (rather than
+    /// having `advance_run` call this too) so a step that isn't skippable
+    /// doesn't resolve `env=`/`interpreter=` twice.
+    fn fingerprint_vars_for(
+        &self,
+        block: &meshfox_core::CodeBlock,
+        computed: &HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        let env_resolution =
+            resolve_block_env(&block.env, &self.decls, &self.run_overrides, &self.var_cache, computed);
+        let interp_refs = Self::interp_env_refs(block);
+        let interp_resolution = if interp_refs.is_empty() {
+            None
+        } else {
+            Some(resolve_block_env(
+                &interp_refs,
+                &self.decls,
+                &self.run_overrides,
+                &self.var_cache,
+                computed,
+            ))
+        };
+        Self::project_fingerprint_vars(block, &env_resolution, interp_resolution.as_ref())
     }
 
     /// Drives the current run forward until it either starts a process
@@ -1453,18 +1557,7 @@ impl App {
                 &self.var_cache,
                 &self.run_computed,
             );
-            // Same reasoning as `env_resolution`, for any `$NAME` ref
-            // inside `interpreter=` (see `meshfox_core::interpreter_var_refs`)
-            // — `None` means `block.interpreter` has no such reference at
-            // all, not merely that resolution hasn't happened yet.
-            let interp_refs: Vec<meshfox_core::EnvRef> = block
-                .interpreter
-                .as_deref()
-                .map(meshfox_core::interpreter_var_refs)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|n| meshfox_core::EnvRef { local_name: n.clone(), var_name: n })
-                .collect();
+            let interp_refs = Self::interp_env_refs(&block);
             let interp_resolution = if interp_refs.is_empty() {
                 None
             } else {
@@ -1476,30 +1569,23 @@ impl App {
                     &self.run_computed,
                 ))
             };
-
-            // `session_fingerprint` wants var-name-keyed values;
-            // `BlockEnvResolution::env` is local-name-keyed (relabeled per
-            // `env=`), so project back through `block.env`'s own pairs —
-            // for `interp_resolution`, local name == var name already (see
-            // `interp_refs` above), so its `env` needs no projection.
-            let mut fingerprint_vars: HashMap<String, String> = HashMap::new();
-            for env_ref in &block.env {
-                if let Some(v) = env_resolution.env.get(&env_ref.local_name) {
-                    fingerprint_vars.insert(env_ref.var_name.clone(), v.clone());
-                }
-            }
-            if let Some(ir) = &interp_resolution {
-                fingerprint_vars.extend(ir.env.clone());
-            }
+            let fingerprint_vars =
+                Self::project_fingerprint_vars(&block, &env_resolution, interp_resolution.as_ref());
 
             // The block actually requested (always the chain's own last
             // entry) always runs for real; only a pulled-in dependency is
             // ever eligible to be skipped as "already fresh this session"
             // — see `App::session_runs`. A block's own `always` flag opts
-            // it out of the skip entirely, even as a pulled-in dependency.
+            // it out of the skip entirely, even as a pulled-in dependency;
+            // so does `RunState::forced_reruns` (a `!` `deps=` edge whose
+            // declaring block is itself running for real this pass — see
+            // `meshfox_core::compute_forced_reruns`), computed once up
+            // front in `start_run` since it needs to look *ahead* in the
+            // chain, past this block's own position.
             let is_requested_target = idx + 1 == len;
             let live_fingerprint = meshfox_core::session_fingerprint(&block, &fingerprint_vars);
-            if !is_requested_target && !block.always {
+            let forced = self.run.as_ref().is_some_and(|r| r.forced_reruns.contains(&addr));
+            if !is_requested_target && !block.always && !forced {
                 let key = (addr.node_id.clone(), addr.block_name.clone());
                 if let Some(session_run) =
                     self.session_runs.get(&key).filter(|r| r.fingerprint == live_fingerprint)

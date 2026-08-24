@@ -1239,6 +1239,7 @@ mod tests {
         crate::fence::BlockRef {
             node_id: Some(node_id.to_string()),
             block_name: block_name.to_string(),
+            sync: false,
         }
     }
 
@@ -1549,6 +1550,7 @@ mod tests {
             Some(crate::fence::BlockRef {
                 node_id: Some("provision".to_string()),
                 block_name: "create".to_string(),
+                sync: false,
             })
         );
     }
@@ -1565,6 +1567,7 @@ mod tests {
             Some(crate::fence::BlockRef {
                 node_id: None,
                 block_name: "create".to_string(),
+                sync: false,
             })
         );
     }
@@ -1606,6 +1609,7 @@ mod tests {
             Some(crate::fence::BlockRef {
                 node_id: Some("my-root".to_string()),
                 block_name: "create".to_string(),
+                sync: false,
             })
         );
     }

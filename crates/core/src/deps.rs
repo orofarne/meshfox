@@ -20,6 +20,7 @@
 use crate::canvas::Canvas;
 use crate::fence::{scan_runnable_blocks, BlockRef};
 use crate::vars::VarDecl;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 /// Fully resolved address of a runnable block: which node it lives in, and
@@ -111,6 +112,60 @@ fn find_block(canvas: &Canvas, addr: &BlockAddr) -> Result<crate::fence::CodeBlo
         .ok_or_else(|| DepsError::BlockNotFound(addr.node_id.clone(), addr.block_name.clone()))
 }
 
+/// Implicit `from=` dependency addresses `block` (living in node `node_id`)
+/// picks up through its own `env=`/`interpreter=` — not just the names
+/// literally in `block.env`: a var referenced only indirectly, through
+/// another (directly-referenced) var's own `default_var`/`choices_var`,
+/// still needs its `from=` source to have run first, or that other var's
+/// dynamic default/choices could never be materialized (see
+/// `vars::close_over_var_refs`). A block's own `interpreter=` can reference
+/// a declared variable too (`$NAME` — see `crate::exec::interpreter_var_refs`)
+/// and needs exactly the same treatment: running the block at all requires
+/// knowing what to spawn, so a `from=`-computed interpreter path is just as
+/// much an implicit dependency as one referenced via `env=`. Shared by
+/// `visit` (which also walks `deps=`, gated by its own `follow_deps`) and
+/// `direct_deps` (which always wants both).
+fn implicit_from_deps(
+    node_id: &str,
+    block: &crate::fence::CodeBlock,
+    decls: &[VarDecl],
+) -> Vec<BlockAddr> {
+    let interpreter_names = block
+        .interpreter
+        .as_deref()
+        .map(crate::exec::interpreter_var_refs)
+        .unwrap_or_default();
+    let env_names = block
+        .env
+        .iter()
+        .map(|e| e.var_name.as_str())
+        .chain(interpreter_names.iter().map(String::as_str));
+    crate::vars::close_over_var_refs(decls, env_names)
+        .into_iter()
+        .filter_map(|name| {
+            decls
+                .iter()
+                .find(|d| d.name == name)
+                .and_then(|d| d.from.as_ref())
+                .map(|from| resolve_ref(node_id, from))
+        })
+        .collect()
+}
+
+/// Every direct dependency address `block` (living in node `node_id`) has —
+/// its own `deps=` entries plus `implicit_from_deps` — regardless of
+/// whether a `deps=` entry carries the `!` (`BlockRef::sync`) marker. Used
+/// by `compute_forced_reruns`'s forward (dependency-forces-consumer)
+/// cascade, which doesn't care how the edge got there, only that one
+/// exists — unlike `visit`'s own `follow_deps`, which exists to let a
+/// caller opt out of `deps=` entirely (`resolve_from_chain`), not to
+/// distinguish a plain `deps=` entry from a `!` one.
+fn direct_deps(node_id: &str, block: &crate::fence::CodeBlock, decls: &[VarDecl]) -> Vec<BlockAddr> {
+    let mut dep_addrs: Vec<BlockAddr> = block.deps.iter().map(|d| resolve_ref(node_id, d)).collect();
+    dep_addrs.extend(implicit_from_deps(node_id, block, decls));
+    dep_addrs
+}
+
 /// `follow_deps` gates whether `block.deps` (`deps=`) edges are walked;
 /// implicit `from=` edges (any declared variable `block.env` references
 /// whose `VarDecl::from` is set) are always walked regardless — see
@@ -147,35 +202,7 @@ fn visit(
     } else {
         Vec::new()
     };
-    // Not just the names literally in `block.env` — a var referenced only
-    // indirectly, through another (directly-referenced) var's own
-    // `default_var`/`choices_var`, still needs its `from=` source to have
-    // run first, or that other var's dynamic default/choices could never
-    // be materialized. See `vars::close_over_var_refs`. A block's own
-    // `interpreter=` can reference a declared variable too (`$NAME` — see
-    // `crate::exec::interpreter_var_refs`) and needs exactly the same
-    // treatment: running the block at all requires knowing what to spawn,
-    // so a `from=`-computed interpreter path is just as much an implicit
-    // dependency as one referenced via `env=`.
-    let interpreter_names = block
-        .interpreter
-        .as_deref()
-        .map(crate::exec::interpreter_var_refs)
-        .unwrap_or_default();
-    let env_names = block
-        .env
-        .iter()
-        .map(|e| e.var_name.as_str())
-        .chain(interpreter_names.iter().map(String::as_str));
-    for name in crate::vars::close_over_var_refs(decls, env_names) {
-        if let Some(from) = decls
-            .iter()
-            .find(|d| d.name == name)
-            .and_then(|d| d.from.as_ref())
-        {
-            dep_addrs.push(resolve_ref(&addr.node_id, from));
-        }
-    }
+    dep_addrs.extend(implicit_from_deps(&addr.node_id, &block, decls));
 
     for dep_addr in dep_addrs {
         visit(canvas, dep_addr, decls, follow_deps, order, visited, stack)?;
@@ -185,6 +212,114 @@ fn visit(
     visited.insert(key);
     order.push(addr);
     Ok(())
+}
+
+/// Which of `chain`'s entries a session-freshness-aware runner (the TUI,
+/// the web UI) must actually run for real, bypassing the usual "already ran
+/// successfully this session and hasn't changed" skip — the last entry
+/// (the block actually requested) and every `always` block are always in
+/// this set, same as today. Two propagation passes ride on top of that
+/// baseline:
+///
+/// - *Forward* (dependency forces consumer, every `deps=`/implicit `from=`
+///   edge, unconditionally): if a block ends up in this set for *any*
+///   reason — it's the target, `always`, its own fingerprint no longer
+///   matches, or it was itself forced by this same rule — everything that
+///   depends on it (directly) is forced too, transitively, the same way a
+///   `make`/Bazel-style build propagates a rebuild to everything downstream
+///   of a changed input. This is what keeps a plain, non-`always` step from
+///   silently reusing a cached result that was only valid against whatever
+///   its own dependency looked like *before* that dependency's forced
+///   rerun — in particular, a consumer of an `always` block is no longer
+///   the declaring block's problem to force by hand.
+/// - *Backward* (consumer forces dependency, `deps=` entries marked `!` —
+///   `BlockRef::sync` — only): whenever the block that declared a `!` edge
+///   ends up in this set, its `!` dependency is added too, even if nothing
+///   about the dependency itself (fingerprint, forward cascade) would have
+///   forced it. This is the narrower, opt-in complement to the forward
+///   rule: forward propagation alone can only make a dependency's forced
+///   rerun spread to *more* things running more often, never make an
+///   otherwise-independent, plain-fingerprint dependency (no `always`, own
+///   fingerprint unchanged) rerun *less often than always* just because one
+///   particular consumer needs it fresh — see `BlockRef::sync`'s own doc
+///   comment for the motivating case (a migration that should reset state
+///   exactly when, and only when, the load step that repopulates it is
+///   about to rerun, not on every session-`always` tick).
+///
+/// This is a *dry run*: no block is actually executed. `fingerprint_vars`
+/// computes the same var-name-keyed map `crate::fence::session_fingerprint`
+/// needs for one block, given whatever `from=`-produced values this dry run
+/// has simulated so far (see below) — a caller that resolves its whole
+/// chain's variables up front into one flat map (the web server) can ignore
+/// that second argument and return `overrides/cache/default ∪ computed`;
+/// one that resolves each block's own `env=` independently (the TUI, via
+/// `crate::vars::resolve_block_env`) plugs it straight in as that call's own
+/// `computed` argument, mirroring the real run exactly. `cached_run` looks
+/// up a block's session-freshness record (its `fingerprint` and
+/// `produced_vars`, same fields `SessionRun` in `crates/server`/`crates/cli`
+/// carries) — `None` if it hasn't completed successfully yet this session.
+/// For any entry this dry run decides would be *skipped*, `cached_run`'s
+/// `produced_vars` are folded into the simulated `computed` set feeding
+/// later blocks' `fingerprint_vars` calls, mirroring exactly what the real
+/// run does in that case; for an entry decided to run for real, its
+/// *actual* output values aren't known yet (nothing has run) — only
+/// relevant if some other block's `env=` needs a `from=` value out of a
+/// block that only ends up forced to run via a `!` edge (rather than its own
+/// fingerprint already having flagged it stale), a narrow enough case to
+/// leave as a known gap rather than complicate this further.
+pub fn compute_forced_reruns(
+    canvas: &Canvas,
+    chain: &[BlockAddr],
+    mut fingerprint_vars: impl FnMut(&crate::fence::CodeBlock, &HashMap<String, String>) -> HashMap<String, String>,
+    cached_run: impl Fn(&BlockAddr) -> Option<(String, HashMap<String, String>)>,
+) -> Result<HashSet<BlockAddr>, DepsError> {
+    let decls = crate::vars::declared_vars(canvas)?;
+    let target = chain.last();
+    let mut forced: HashSet<BlockAddr> = HashSet::new();
+    let mut sim_computed: HashMap<String, String> = HashMap::new();
+
+    for addr in chain {
+        let block = find_block(canvas, addr)?;
+        // Forward cascade: `chain` is topologically sorted (dependencies
+        // before dependents), so every direct dependency has already been
+        // decided by the time we reach `addr` — if any of them is forced,
+        // `addr` is too, regardless of its own fingerprint.
+        let cascaded = direct_deps(&addr.node_id, &block, &decls)
+            .iter()
+            .any(|dep| forced.contains(dep));
+        let live_fingerprint =
+            crate::fence::session_fingerprint(&block, &fingerprint_vars(&block, &sim_computed));
+        let cached = cached_run(addr);
+        let run_for_real = Some(addr) == target
+            || block.always
+            || cascaded
+            || !cached
+                .as_ref()
+                .is_some_and(|(fp, _)| *fp == live_fingerprint);
+        if run_for_real {
+            forced.insert(addr.clone());
+        } else if let Some((_, produced)) = cached {
+            sim_computed.extend(produced);
+        }
+    }
+
+    // Reverse (dependent-before-dependency) pass so a `!` edge sees its
+    // declaring block's *final* decision, including anything that block
+    // itself only picked up via a `!` edge from an even later consumer —
+    // chained sync edges propagate transitively in one pass this way.
+    for addr in chain.iter().rev() {
+        if !forced.contains(addr) {
+            continue;
+        }
+        let block = find_block(canvas, addr)?;
+        for dep in &block.deps {
+            if dep.sync {
+                forced.insert(resolve_ref(&addr.node_id, dep));
+            }
+        }
+    }
+
+    Ok(forced)
 }
 
 /// Validates every `deps=` reference in the whole canvas resolves to a real
@@ -576,5 +711,186 @@ mod tests {
         ));
         let chain = resolve_from_chain(&c, BlockAddr::new("root", "deploy")).unwrap();
         assert_eq!(chain, vec![BlockAddr::new("root", "deploy")]);
+    }
+
+    /// `migrate` <-`!`- `load` <- `validate`, all fully "fresh" (every
+    /// cached fingerprint matches what a dry run would compute) — nothing
+    /// but the requested target (`validate`) should be forced, in
+    /// particular *not* `migrate`: its declaring block (`load`) isn't
+    /// itself running for real, so the `!` edge has nothing to propagate.
+    #[test]
+    fn compute_forced_reruns_does_not_force_a_sync_dep_when_its_declaring_block_is_skipped() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```bash name=\"migrate\"\necho migrate\n```\n\n",
+            "```bash name=\"load\" deps=\"migrate!\"\necho load\n```\n\n",
+            "```bash name=\"validate\" deps=\"load\"\necho validate\n```\n",
+        ));
+        let chain = resolve_chain(&c, BlockAddr::new("root", "validate")).unwrap();
+        let vars = HashMap::new();
+        let mut cached: HashMap<BlockAddr, (String, HashMap<String, String>)> = HashMap::new();
+        for addr in &chain {
+            let block = find_block(&c, addr).unwrap();
+            let fp = crate::fence::session_fingerprint(&block, &vars);
+            cached.insert(addr.clone(), (fp, HashMap::new()));
+        }
+        let forced = compute_forced_reruns(
+            &c,
+            &chain,
+            |_block, _computed| vars.clone(),
+            |addr| cached.get(addr).cloned(),
+        )
+        .unwrap();
+        assert_eq!(forced, HashSet::from([BlockAddr::new("root", "validate")]));
+    }
+
+    /// Same chain, but `load` itself has no session-freshness record yet
+    /// (so it must run for real) — its `!` edge now forces `migrate` too,
+    /// even though `migrate`'s own cached fingerprint still matches.
+    #[test]
+    fn compute_forced_reruns_forces_a_sync_dep_when_its_declaring_block_runs_for_real() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```bash name=\"migrate\"\necho migrate\n```\n\n",
+            "```bash name=\"load\" deps=\"migrate!\"\necho load\n```\n\n",
+            "```bash name=\"validate\" deps=\"load\"\necho validate\n```\n",
+        ));
+        let chain = resolve_chain(&c, BlockAddr::new("root", "validate")).unwrap();
+        let vars = HashMap::new();
+        let migrate_addr = BlockAddr::new("root", "migrate");
+        let migrate_block = find_block(&c, &migrate_addr).unwrap();
+        let migrate_fp = crate::fence::session_fingerprint(&migrate_block, &vars);
+        let mut cached: HashMap<BlockAddr, (String, HashMap<String, String>)> = HashMap::new();
+        cached.insert(migrate_addr.clone(), (migrate_fp, HashMap::new()));
+        // No entry for `load` at all — never run this session yet.
+
+        let forced = compute_forced_reruns(
+            &c,
+            &chain,
+            |_block, _computed| vars.clone(),
+            |addr| cached.get(addr).cloned(),
+        )
+        .unwrap();
+        assert_eq!(
+            forced,
+            HashSet::from([
+                migrate_addr,
+                BlockAddr::new("root", "load"),
+                BlockAddr::new("root", "validate"),
+            ])
+        );
+    }
+
+    /// No `!` anywhere — `migrate` is plain `always`, `load` has a plain
+    /// (unmarked) `deps="migrate"`. Every block's own fingerprint matches
+    /// its cache, so without the forward cascade `load` would be wrongly
+    /// skipped even though `migrate` just reran for real underneath it —
+    /// this is the general "cascading dirtiness" case (`TODO.canvas.md`),
+    /// as opposed to the two tests above, which are the narrower `!` case.
+    #[test]
+    fn compute_forced_reruns_cascades_forward_from_an_always_dependency_to_a_plain_consumer() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```bash name=\"migrate\" always\necho migrate\n```\n\n",
+            "```bash name=\"load\" deps=\"migrate\"\necho load\n```\n\n",
+            "```bash name=\"validate\" deps=\"load\"\necho validate\n```\n",
+        ));
+        let chain = resolve_chain(&c, BlockAddr::new("root", "validate")).unwrap();
+        let vars = HashMap::new();
+        let mut cached: HashMap<BlockAddr, (String, HashMap<String, String>)> = HashMap::new();
+        for addr in &chain {
+            let block = find_block(&c, addr).unwrap();
+            let fp = crate::fence::session_fingerprint(&block, &vars);
+            cached.insert(addr.clone(), (fp, HashMap::new()));
+        }
+        let forced = compute_forced_reruns(
+            &c,
+            &chain,
+            |_block, _computed| vars.clone(),
+            |addr| cached.get(addr).cloned(),
+        )
+        .unwrap();
+        assert_eq!(
+            forced,
+            HashSet::from([
+                BlockAddr::new("root", "migrate"),
+                BlockAddr::new("root", "load"),
+                BlockAddr::new("root", "validate"),
+            ])
+        );
+    }
+
+    /// The forward cascade only follows real edges — a sibling dependency
+    /// of the same consumer that doesn't itself depend on the `always`
+    /// block must stay skippable.
+    #[test]
+    fn compute_forced_reruns_does_not_cascade_to_an_unrelated_sibling_dependency() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```bash name=\"migrate\" always\necho migrate\n```\n\n",
+            "```bash name=\"other\"\necho other\n```\n\n",
+            "```bash name=\"validate\" deps=\"migrate,other\"\necho validate\n```\n",
+        ));
+        let chain = resolve_chain(&c, BlockAddr::new("root", "validate")).unwrap();
+        let vars = HashMap::new();
+        let mut cached: HashMap<BlockAddr, (String, HashMap<String, String>)> = HashMap::new();
+        for addr in &chain {
+            let block = find_block(&c, addr).unwrap();
+            let fp = crate::fence::session_fingerprint(&block, &vars);
+            cached.insert(addr.clone(), (fp, HashMap::new()));
+        }
+        let forced = compute_forced_reruns(
+            &c,
+            &chain,
+            |_block, _computed| vars.clone(),
+            |addr| cached.get(addr).cloned(),
+        )
+        .unwrap();
+        assert_eq!(
+            forced,
+            HashSet::from([
+                BlockAddr::new("root", "migrate"),
+                BlockAddr::new("root", "validate"),
+            ])
+        );
+    }
+
+    /// The forward cascade also follows an *implicit* `from=` edge, not
+    /// just an explicit `deps=` one — `deploy` never names `provision` in
+    /// its own `deps=`, only reaches it through `env="$X"` plus `X`'s own
+    /// `from="provision"` declaration.
+    #[test]
+    fn compute_forced_reruns_cascades_forward_through_an_implicit_from_edge() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "<!-- meshfox:var name=\"X\" from=\"provision\" -->\n\n",
+            "```bash name=\"provision\" always\necho id=abc\n```\n\n",
+            "```bash name=\"deploy\" env=\"$X\"\necho deploy\n```\n\n",
+            "```bash name=\"validate\" deps=\"deploy\"\necho validate\n```\n",
+        ));
+        let chain = resolve_chain(&c, BlockAddr::new("root", "validate")).unwrap();
+        let mut vars = HashMap::new();
+        vars.insert("X".to_string(), "abc".to_string());
+        let mut cached: HashMap<BlockAddr, (String, HashMap<String, String>)> = HashMap::new();
+        for addr in &chain {
+            let block = find_block(&c, addr).unwrap();
+            let fp = crate::fence::session_fingerprint(&block, &vars);
+            cached.insert(addr.clone(), (fp, HashMap::new()));
+        }
+        let forced = compute_forced_reruns(
+            &c,
+            &chain,
+            |_block, _computed| vars.clone(),
+            |addr| cached.get(addr).cloned(),
+        )
+        .unwrap();
+        assert_eq!(
+            forced,
+            HashSet::from([
+                BlockAddr::new("root", "provision"),
+                BlockAddr::new("root", "deploy"),
+                BlockAddr::new("root", "validate"),
+            ])
+        );
     }
 }

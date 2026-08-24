@@ -2461,6 +2461,36 @@ async fn run_block(
         resolved.values
     };
 
+    // Dry-run pass over the whole chain, up front, so a `!` (sync) `deps=`
+    // edge (see `meshfox_core::fence::BlockRef::sync`) can force its
+    // dependency to run for real when the block that declared the edge is
+    // about to — that block comes *later* in `chain`'s dependency order, so
+    // this can't be decided incrementally inside the loop below the way the
+    // rest of the skip logic is. See `compute_forced_reruns`'s own doc
+    // comment for what "dry run" means here and its one known gap.
+    let forced_reruns = {
+        let session_runs = state.session_runs.lock().unwrap();
+        // The real loop below fingerprints against the *whole* accumulated
+        // `resolved_vars` map, not a per-block-filtered subset (see its own
+        // `session_fingerprint` call) — mirror that here: this dry run's
+        // own seed plus whatever a skipped step's `produced_vars` folds in.
+        meshfox_core::compute_forced_reruns(
+            &canvas,
+            &chain,
+            |_block, sim_computed| {
+                let mut vars = resolved_vars.clone();
+                vars.extend(sim_computed.clone());
+                vars
+            },
+            |addr| {
+                session_runs
+                    .get(&(addr.node_id.clone(), addr.block_name.clone()))
+                    .map(|run| (run.fingerprint.clone(), run.produced_vars.clone()))
+            },
+        )
+        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?
+    };
+
     let run_id = uuid::Uuid::new_v4().to_string();
     let (kill_tx, mut kill_rx) = oneshot::channel::<()>();
     state.runs.lock().unwrap().insert(run_id.clone(), kill_tx);
@@ -2556,10 +2586,12 @@ async fn run_block(
             // out of the skip entirely, even as a pulled-in dependency —
             // for a step whose side effect isn't captured by "looks
             // unchanged" (a migration that always drops and recreates a
-            // table, say).
+            // table, say). `forced_reruns` (computed once, up front — see
+            // above) adds a third way in: a `!` `deps=` edge whose
+            // declaring block is itself running for real this pass.
             let is_requested_target = Some(addr) == chain.last();
             let live_fingerprint = meshfox_core::session_fingerprint(&block, &resolved_vars);
-            if !is_requested_target && !block.always {
+            if !is_requested_target && !block.always && !forced_reruns.contains(addr) {
                 let already_fresh = state
                     .session_runs
                     .lock()
@@ -2929,6 +2961,31 @@ async fn run_block_tty(
         resolved.values
     };
 
+    // Same up-front dry-run pass `run_block` does — see its own doc
+    // comment on the equivalent line.
+    let forced_reruns = {
+        let session_runs = state.session_runs.lock().unwrap();
+        // The real loop below fingerprints against the *whole* accumulated
+        // `resolved_vars` map, not a per-block-filtered subset (see its own
+        // `session_fingerprint` call) — mirror that here: this dry run's
+        // own seed plus whatever a skipped step's `produced_vars` folds in.
+        meshfox_core::compute_forced_reruns(
+            &canvas,
+            &chain,
+            |_block, sim_computed| {
+                let mut vars = resolved_vars.clone();
+                vars.extend(sim_computed.clone());
+                vars
+            },
+            |addr| {
+                session_runs
+                    .get(&(addr.node_id.clone(), addr.block_name.clone()))
+                    .map(|run| (run.fingerprint.clone(), run.produced_vars.clone()))
+            },
+        )
+        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?
+    };
+
     let run_id = uuid::Uuid::new_v4().to_string();
     let (kill_tx, kill_rx) = oneshot::channel::<()>();
     state.runs.lock().unwrap().insert(run_id.clone(), kill_tx);
@@ -2941,6 +2998,7 @@ async fn run_block_tty(
             chain,
             decls,
             resolved_vars,
+            forced_reruns,
             persist,
             cols,
             rows,
@@ -2976,6 +3034,7 @@ async fn run_tty_chain(
     chain: Vec<meshfox_core::BlockAddr>,
     decls: Vec<meshfox_core::VarDecl>,
     mut resolved_vars: HashMap<String, String>,
+    forced_reruns: std::collections::HashSet<meshfox_core::BlockAddr>,
     persist: bool,
     cols: u16,
     rows: u16,
@@ -3075,7 +3134,7 @@ async fn run_tty_chain(
         // this session, unlike the plain (non-`tty`) `/api/run` path.
         let is_requested_target = Some(addr) == chain.last();
         let live_fingerprint = meshfox_core::session_fingerprint(&block, &resolved_vars);
-        if !is_requested_target && !block.always {
+        if !is_requested_target && !block.always && !forced_reruns.contains(addr) {
             let already_fresh = state
                 .session_runs
                 .lock()

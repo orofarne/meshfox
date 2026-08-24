@@ -259,7 +259,15 @@ Lives inside a node's Markdown text, as fence-info-string attributes:
   each dependency's own `deps` are resolved transitively, in order, with
   no block run twice even if several blocks in the chain depend on it.
   A cycle, or a `deps` entry naming a block that doesn't exist, is a
-  `meshfox validate` error.
+  `meshfox validate` error. A trailing `!` on an entry (`deps="build,
+  schema/migrate!"`) ties that dependency's own web UI/TUI
+  session-freshness decision to *this* block's: whenever this block ends
+  up running for real this pass (not skipped as "already fresh"), the
+  `!` dependency is forced to run for real too, regardless of its own
+  fingerprint or `always`; when this block is itself skipped, the `!`
+  dependency is left to its own normal freshness decision instead — see
+  `always` below for the plain (unconditional) alternative, and why a `!`
+  edge exists as a separate mechanism from it.
 - `env` — optional, comma-separated list of declared `meshfox:var`s (see
   "Variables" below) this block wants in its own process environment.
   Each entry is a bare name (pass the declared variable through under the
@@ -362,17 +370,45 @@ session-scoped, never written to disk. Applies the same way whether the
 chain ends in a `tty` step or not — the web UI's `/api/run/tty` WebSocket
 consults the same per-session record `/api/run` does, not a separate one.
 
+This skip cascades: if a block ends up running for real this pass for *any*
+reason (below), everything that transitively depends on it — via `deps=`
+or an implicit `from=` reference — is forced to run for real too, even if
+its own fingerprint alone would have called it unchanged. Otherwise a step
+downstream of one that just did something different (dropped a table,
+regenerated a file `from=` feeds elsewhere, ...) could reuse a cached
+result that was only ever valid against what that dependency looked like
+*before* this run, the same way a `make`/Bazel-style build propagates a
+rebuild to everything downstream of a changed input — see
+`meshfox_core::deps::compute_forced_reruns`.
+
 `always` — optional flag (`always` or `always="true"`), opts a block out of
-this skip entirely: even unchanged and already run successfully this
-session, a `⛓ run chain` that pulls it in as a dependency still runs it for
-real every time. For a step whose side effect isn't captured by "looks
-unchanged" — a migration that always drops and recreates a table before
-loading fresh data, say, where re-running is the whole point even though
-the migration script itself never changes between runs:
+the fingerprint-based part of this skip entirely: even unchanged and
+already run successfully this session, a `⛓ run chain` that pulls it in as
+a dependency still runs it for real every time, *whichever* block pulls it
+in — and, per the cascade above, so does *everything* that depends on it,
+transitively, on every single run. For a step whose side effect isn't
+captured by "looks unchanged" — a migration that always drops and
+recreates a table before loading fresh data, say, where re-running is the
+whole point even though the migration script itself never changes between
+runs:
 
     ```python name="migrate" env="PGHOST,PGPORT,PGDATABASE,PGUSER,PGPASSWORD" always
     ...
     ```
+
+That blanket "every consumer, every time" reach is exactly what makes
+`always` the wrong tool when only *one particular* consumer actually needs
+this block fresh, and that consumer is otherwise expensive enough to be
+worth still skipping when nothing changed (a bulk data load, say) — an
+`always` migration ahead of it would now force that load to rerun on every
+single chain run too, session-freshness skip defeated for it entirely. For
+that narrower "run exactly when this one consumer runs, and only then"
+shape, mark the *consumer's* own `deps=` entry for it with a trailing `!`
+instead (see `deps` above) — `deps="paths/resolve,schema/migrate!"` on the
+loading step, with plain (no `always`) `migrate`, ties `migrate`'s
+freshness to the loading step's own decision, rather than forcing it (and
+cascading from it) on every run regardless of what anything downstream
+actually needs.
 
 ## Constraint fences
 
@@ -1120,7 +1156,7 @@ itself:
     tag          ::= <one or more characters, none of them ',' or '"'>
 
     deps-list    ::= deps-entry { ',' deps-entry }
-    deps-entry   ::= [ node-id '/' ] block-name
+    deps-entry   ::= [ node-id '/' ] block-name [ '!' ]
 
     env-list     ::= env-entry { ',' env-entry }
     env-entry    ::= [ '$' ] var-name [ '=' [ '$' ] var-name ]

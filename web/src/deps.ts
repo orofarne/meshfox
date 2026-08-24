@@ -19,14 +19,19 @@ export function addrKey(a: BlockAddr): string {
   return `${a.nodeId}::${a.blockName}`;
 }
 
-/** Resolves one raw `deps=` entry (a bare block name, or `node-id/block-name`)
- * against the node that declared it. Exported for MeshNode's clickable
- * "after: …" links, which need the same resolution just to jump to a block
- * rather than to build the whole graph. */
+/** Resolves one raw `deps=` entry (a bare block name, or `node-id/block-name`,
+ * either optionally suffixed with `!` — see `core::fence::BlockRef::sync`)
+ * against the node that declared it. The trailing `!` only matters to the
+ * server's own session-freshness bookkeeping (`meshfox_core::deps::
+ * compute_forced_reruns`) — nothing here reads it back, it's just stripped
+ * before resolving so the block name itself still matches. Exported for
+ * MeshNode's clickable "after: …" links, which need the same resolution
+ * just to jump to a block rather than to build the whole graph. */
 export function parseBlockRef(raw: string, ownerNodeId: string): BlockAddr {
-  const slash = raw.indexOf("/");
-  if (slash === -1) return { nodeId: ownerNodeId, blockName: raw };
-  return { nodeId: raw.slice(0, slash), blockName: raw.slice(slash + 1) };
+  const ref = raw.endsWith("!") ? raw.slice(0, -1) : raw;
+  const slash = ref.indexOf("/");
+  if (slash === -1) return { nodeId: ownerNodeId, blockName: ref };
+  return { nodeId: ref.slice(0, slash), blockName: ref.slice(slash + 1) };
 }
 
 /** Stable DOM id for a runnable code block, used to scroll/highlight it

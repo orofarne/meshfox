@@ -31,7 +31,7 @@ pub mod vars;
 
 pub use canvas::{ArrowEnd, Canvas, EdgeLineStyle, ExtraEdge, FileDisplay, Node, NodeType};
 pub use constraint::{evaluate as evaluate_constraints, ConstraintResult, ConstraintStatus};
-pub use deps::{BlockAddr, DepsError};
+pub use deps::{compute_forced_reruns, BlockAddr, DepsError};
 pub use exec::{
     interpreter_var_refs, is_supported_lang, resolve_command, resolve_interpreter,
     split_interpreter, ResolvedCommand,
