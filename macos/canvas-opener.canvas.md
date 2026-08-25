@@ -86,7 +86,13 @@ start out marked "untrusted" and lose out to a "trusted" one during type
 resolution — this is exactly what caused the compound-extension approach
 (see this canvas's own intro) to look plausible right up until it was
 actually tested — and only flips to "trusted" once the app has been
-launched at least once (also verified directly, not assumed).
+launched at least once (also verified directly, not assumed). That launch
+is what `launcher.applescript`'s `on run` handler fires for — normally a
+plain double-click on the app icon shows a `meshfox --version` dialog
+(handy as a quick "is it actually working" check), but this particular
+launch passes `MESHFOX_CANVAS_OPENER_WARMUP=1` via `open --env` so the
+handler recognizes it and stays silent instead of popping a dialog on
+every single `build` run.
 
 This only installs the app — it does **not** make it the default handler
 for anything yet (that's a separate, not-yet-done step; see the intro).
@@ -94,7 +100,7 @@ Until then, the only way to actually use it is Finder's own "Open With"
 submenu, one file at a time. See `package` below to hand a copy to
 someone else instead of just using it locally.
 
-```bash
+```bash always
 set -euo pipefail
 
 APP="$HOME/Applications/MeshfoxCanvas.app"
@@ -150,9 +156,9 @@ LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchSe
 "$LSREGISTER" -f "$APP"
 
 # Warm up LaunchServices' trust for this app's own type claims (see prose
-# above) — no document, so the script's own `run` handler fires and does
-# nothing.
-open -g -a "$APP" >/dev/null 2>&1 || true
+# above) — no document, so `on run` fires; the env var tells it to skip
+# the `meshfox --version` dialog this one time.
+open -g -a "$APP" --env MESHFOX_CANVAS_OPENER_WARMUP=1 >/dev/null 2>&1 || true
 sleep 1
 
 echo "Installed $APP"
@@ -183,7 +189,7 @@ either, the app's own runtime check (`launcher.applescript`'s
 `resolveMeshfox`) opens Terminal with the install command for them the
 first time they try to use it, instead of just failing silently.
 
-```bash deps="build/build"
+```bash deps="build/build" always
 set -euo pipefail
 
 APP="$HOME/Applications/MeshfoxCanvas.app"

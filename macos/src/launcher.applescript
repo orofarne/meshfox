@@ -12,12 +12,8 @@
 -- built is still found.
 
 on open theFiles
-	set meshfoxBin to my resolveMeshfox()
+	set meshfoxBin to my resolveOrInstallMeshfox()
 	if meshfoxBin is missing value then
-		tell application "Terminal"
-			activate
-			do script "curl -fsSL https://raw.githubusercontent.com/orofarne/meshfox/main/scripts/install.sh | sh"
-		end tell
 		return
 	end if
 	repeat with f in theFiles
@@ -28,10 +24,39 @@ on open theFiles
 end open
 
 on run
-	-- Launched with no documents — e.g. a plain double-click on the app
-	-- itself, or the `build` block's own "warm up LaunchServices trust"
-	-- step. Nothing to do.
+	-- Launched with no documents — a plain double-click on the app icon
+	-- itself, most likely. Except when it's actually the `build` block's
+	-- own silent "warm up LaunchServices trust" launch instead (see that
+	-- block) — it sets this env var via `open --env` for exactly this
+	-- reason, so that launch stays silent rather than popping a dialog
+	-- every time someone runs `build`.
+	if (system attribute "MESHFOX_CANVAS_OPENER_WARMUP") is not "" then return
+
+	set meshfoxBin to my resolveOrInstallMeshfox()
+	if meshfoxBin is missing value then
+		return
+	end if
+	try
+		set versionText to do shell script quoted form of meshfoxBin & " --version"
+	on error errText
+		set versionText to "meshfox --version failed:" & return & errText
+	end try
+	display dialog versionText buttons {"OK"} default button "OK" with title "Meshfox Canvas"
 end run
+
+on resolveOrInstallMeshfox()
+	set meshfoxBin to my resolveMeshfox()
+	
+	if meshfoxBin is missing value then
+		tell application "Terminal"
+			activate
+			do script "curl -fsSL https://raw.githubusercontent.com/orofarne/meshfox/main/scripts/install.sh | sh"
+		end tell
+		return missing value
+	end if
+
+	return meshfoxBin
+end resolveOrInstallMeshfox
 
 on resolveMeshfox()
 	-- meshfox's own install script (see the `on open` handler above)

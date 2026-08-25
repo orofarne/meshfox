@@ -142,7 +142,9 @@ prompt_install_dir() {
 
     printf 'meshfox-install: install directory? [%s] ' "$INSTALL_DIR"
     read -r reply </dev/tty || reply=""
-    [ -n "$reply" ] && INSTALL_DIR="$reply"
+    if [ -n "$reply" ]; then
+        INSTALL_DIR="$reply"
+    fi
 }
 
 find_existing() {
