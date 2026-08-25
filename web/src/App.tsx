@@ -692,6 +692,34 @@ export default function App() {
       // whole chain (the server only ever runs one step of it at a time).
       let runId: string | undefined;
 
+      // The server stops running a chain the moment one step fails (a
+      // non-zero exit) or the run is killed (see crates/server/src/lib.rs's
+      // `run_block` loop: `if exit_code != 0 { break; }`) — no further
+      // `step-start`/`step-skipped` event ever arrives for whatever was
+      // still `queuedByNode`'s `"queued"` at that point, which used to leave
+      // those blocks stuck reading "queued…" forever (nothing left to move
+      // them out of it). Called once the stream ends, success or not
+      // (including the network-failure `catch` below), to flip any of them
+      // still `"queued"` to `"blocked"` — skipped, not run, because
+      // something earlier in its own chain didn't finish cleanly.
+      const blockStuckQueued = () => {
+        setNodes((nds) =>
+          nds.map((n) => {
+            const names = queuedByNode.get(n.id);
+            if (!names) return n;
+            let changed = false;
+            const liveBlocks = { ...n.data.liveBlocks };
+            for (const name of names) {
+              if (liveBlocks[name]?.status === "queued") {
+                liveBlocks[name] = { ...liveBlocks[name], status: "blocked" };
+                changed = true;
+              }
+            }
+            return changed ? { ...n, data: { ...n.data, liveBlocks } } : n;
+          }),
+        );
+      };
+
       try {
         // Running is always allowed; only Edit mode persists a cache'd
         // block's output to the file. When `withDeps`, the server
@@ -754,6 +782,7 @@ export default function App() {
               break;
           }
         }, vars, saveSecrets);
+        blockStuckQueued();
         // Reloading clears every node's `liveBlocks` (see the canvas-load
         // effect below) — worth it when it picks up a `cache`d block's
         // freshly-persisted output, but pure loss for a chain that has no
@@ -765,6 +794,7 @@ export default function App() {
           await load();
         }
       } catch (e) {
+        blockStuckQueued();
         setError(String(e));
       }
     },

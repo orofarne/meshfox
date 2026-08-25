@@ -585,6 +585,29 @@ a {
   }
 }
 
+/* A node's own failure indicator (see MeshNode.tsx's `FailedBadge`) — same
+ * spot and same "visible even folded/off-screen" rationale as
+ * `.mesh-node-running-spinner` above, shown instead of it once the node's
+ * last-run block is no longer running but ended killed or non-zero. */
+.mesh-node-failed-badge {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 0.85em;
+  height: 0.85em;
+  border-radius: 50%;
+  background: var(--fail);
+  color: var(--node-bg);
+  font-size: 0.6em;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.mesh-node-failed-badge::before {
+  content: "✗";
+}
+
 /* Icon buttons (edit text, open settings) — edit mode only, sit together
  * in the title bar next to the (possibly truncated) title text rather than
  * floating over the node body. */
@@ -1428,6 +1451,17 @@ a {
  * a plain muted note, same idle weight as the ordinary (non-streaming)
  * head text below. */
 .mesh-code-output[data-exit="skipped"] .mesh-code-output-head {
+  font-style: italic;
+}
+
+/* Never actually run — a dependency earlier in its own chain failed or was
+ * killed before the server ever reached this step (see MeshNode.tsx's
+ * `BlockedRunOutput`). Tinted with --fail (this block's own chain did end
+ * in failure) but muted/italic like `skipped` above rather than the full
+ * `fail`/`killed` treatment — the failure isn't this block's own. */
+.mesh-code-output[data-exit="blocked"] .mesh-code-output-head {
+  color: var(--fail);
+  opacity: 0.75;
   font-style: italic;
 }
 

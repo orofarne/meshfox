@@ -8,7 +8,8 @@ deterministic — no `date`/timestamps — and separate from
 documentation example's own content. Covers: a plain block, a same-node
 `deps` chain, a cross-node `deps` chain, an uncached block inside a chain,
 a block with multiple `deps`, a slow block for exercising live streaming
-and Kill, and an implicitly-named (no `name=`) lone block.
+and Kill, a block that always fails (for exercising a chain's downstream
+`blocked` state), and an implicitly-named (no `name=`) lone block.
 
 Every block that's ever a pulled-in *dependency* (not the directly-clicked
 target — that one always runs for real, see `run_block`'s own doc comment)
@@ -69,6 +70,24 @@ echo "finished"
 
 ```bash name="after-slow" deps="slow"
 echo "after-slow ran"
+```
+
+## Failing Node
+<!-- meshfox:node id="failing-node" -->
+
+`fail` always exits non-zero; `after-fail` depends on it, so a test can
+confirm the server stops the chain right there and the client shows
+`after-fail` as `blocked` (a dependency failed) instead of stuck `queued`
+forever — see `LiveBlockState.status`'s `"blocked"` doc comment in
+MeshNode.tsx.
+
+```bash name="fail" always
+echo "about to fail"
+exit 1
+```
+
+```bash name="after-fail" deps="fail"
+echo "after-fail ran"
 ```
 
 ## Implicit Node

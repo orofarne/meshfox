@@ -131,8 +131,10 @@ test("Kill stops a running block, and the rest of its chain never starts", async
   await expect(slow.locator('[data-exit="killed"]')).toBeVisible({ timeout: 5_000 });
   await expect(slow.locator(".mesh-kill-button")).toHaveCount(0);
   // Killing stops the whole chain — after-slow (queued behind `slow`)
-  // should never have gotten a chance to run at all.
-  await expect(afterSlow.locator(".mesh-code-output")).toHaveCount(0);
+  // never gets a chance to run at all, so it settles into `blocked` rather
+  // than sitting stuck on "queued…" forever (see MeshNode.tsx's
+  // `LiveBlockState.status` doc comment).
+  await expect(afterSlow.locator('[data-exit="blocked"]')).toBeVisible({ timeout: 5_000 });
 
   // The process is really gone, not just abandoned client-side — running
   // `slow` again should behave like a completely fresh run, not one still
@@ -140,4 +142,22 @@ test("Kill stops a running block, and the rest of its chain never starts", async
   await slow.locator("button", { hasText: "run" }).click();
   await expect(slow.locator(".mesh-code-output")).toContainText("tick 1", { timeout: 3_000 });
   await expect(slow.locator(".mesh-code-output")).toContainText("finished", { timeout: 8_000 });
+});
+
+test("a failing step in a chain marks what comes after it blocked, not stuck queued", async ({ page }) => {
+  const fail = block(page, "failing-node", "fail");
+  const afterFail = block(page, "failing-node", "after-fail");
+
+  await afterFail.locator("button.mesh-run-chain").click();
+
+  await expect(fail.locator('[data-exit="fail"]')).toBeVisible({ timeout: 5_000 });
+  // The server stops the chain the moment `fail` exits non-zero — `after-fail`
+  // never gets a `step-start`/`step-skipped` at all, so it must settle into
+  // `blocked` on its own once the stream ends rather than sitting on
+  // "queued…" forever (see App.tsx's `executeRun`/`blockStuckQueued`).
+  await expect(afterFail.locator('[data-exit="blocked"]')).toBeVisible({ timeout: 5_000 });
+  await expect(afterFail.locator(".mesh-code-output")).toContainText("a dependency in its chain failed");
+
+  // Not stuck disabled either — retrying is just clicking run again.
+  await expect(afterFail.locator("button", { hasText: "run" })).toBeEnabled();
 });

@@ -121,8 +121,16 @@ export interface LiveBlockState {
    * successfully earlier in the session and hasn't changed since, so the
    * server didn't actually re-run it (see SPEC.md's "Runnable code
    * fences"). Never the status of the block actually requested, only a
-   * pulled-in dependency. */
-  status: "queued" | "running" | "done" | "killed" | "skipped";
+   * pulled-in dependency.
+   *
+   * `"blocked"` — never actually run at all: still `"queued"` when the rest
+   * of its chain's run ended (a `step-end` with a non-zero exit, a `killed`,
+   * or a network failure — see App.tsx's `executeRun`/`blockStuckQueued`),
+   * so the server never got around to a `step-start`/`step-skipped` for it.
+   * Purely a client-side inference — the server itself has no such status,
+   * it just stops sending events for a chain it gave up on partway
+   * through. */
+  status: "queued" | "running" | "done" | "killed" | "skipped" | "blocked";
   /** Set (only for the block whose button was actually clicked) when that
    * click was "⛓ run chain" rather than plain "run" — lets the two buttons'
    * labels change independently: whichever one was clicked shows
@@ -471,6 +479,16 @@ function ConstraintBadge({ status }: { status: ConstraintStatusDto | undefined }
  * already surfaces that via its "queued…" label. */
 function RunningSpinner() {
   return <span className="mesh-node-running-spinner" title="A block in this node is running" />;
+}
+
+/** Shown in a node's title bar whenever any of its own blocks' most recent
+ * run (see `RunningSpinner`'s doc comment for the same `liveBlocks` lookup)
+ * ended badly — killed, or `"done"` with a non-zero exit code — so a failure
+ * stays visible even for a folded or scrolled-out-of-view node, the same way
+ * `RunningSpinner` keeps a busy one visible. Cleared the same way the live
+ * state itself is: a fresh run of that block, or the next canvas reload. */
+function FailedBadge() {
+  return <span className="mesh-node-failed-badge" title="A block in this node failed" />;
 }
 
 /** A pixel of slack for the "already at the scroll boundary" checks below —
@@ -859,6 +877,22 @@ function SkippedRunOutput({ live }: { live: LiveBlockState }) {
   );
 }
 
+/** The `"blocked"` branch of `LiveRunOutput` — this block never actually
+ * ran (see `LiveBlockState.status`'s doc comment): something earlier in its
+ * own chain failed or was killed, so the server gave up on the rest of the
+ * chain before ever reaching it. No output/duration to show (there's
+ * nothing to expand, unlike `SkippedRunOutput`), just why it's not the
+ * "queued…" it was stuck reading before this status existed — the run/chain
+ * buttons above this are already re-enabled (this status is neither `busy`
+ * in `RunnableCodeBlock`), so retrying is just clicking them again. */
+function BlockedRunOutput() {
+  return (
+    <div className="mesh-code-output" data-exit="blocked">
+      <div className="mesh-code-output-head">blocked · a dependency in its chain failed</div>
+    </div>
+  );
+}
+
 /** Live output (queued/running/done/killed, from the current run) — shared
  * by `RunOutput` (a fenced block's own output, falling back to its cached
  * copy when nothing's live — see below) and a runnable `file` node's own
@@ -869,6 +903,9 @@ function SkippedRunOutput({ live }: { live: LiveBlockState }) {
 function LiveRunOutput({ live }: { live: LiveBlockState }) {
   if (live.status === "skipped") {
     return <SkippedRunOutput live={live} />;
+  }
+  if (live.status === "blocked") {
+    return <BlockedRunOutput />;
   }
   const duration =
     live.durationMs !== undefined ? ` · ${formatDurationMs(live.durationMs)}` : undefined;
@@ -1321,6 +1358,9 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
   // node's fenced blocks (keyed by block name) and a runnable `file` node's
   // own run (keyed under its own id) without needing to special-case either.
   const nodeRunning = Object.values(data.liveBlocks).some((lb) => lb.status === "running");
+  const nodeFailed = Object.values(data.liveBlocks).some(
+    (lb) => lb.status === "killed" || (lb.status === "done" && lb.exitCode !== 0),
+  );
   // Clicking the title text toggles fold both ways in read-only mode
   // (alongside `FoldToggle` itself), but the title text is also meant to
   // stay selectable (e.g. to copy it) — a plain `onClick` alone can't
@@ -1457,6 +1497,7 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
           </span>
           {nodeTags}
           {nodeRunning && <RunningSpinner />}
+          {!nodeRunning && nodeFailed && <FailedBadge />}
         </div>
       ) : (
         <div className="mesh-node-title" data-level={data.level}>
@@ -1471,6 +1512,7 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
           </span>
           {nodeTags}
           {nodeRunning && <RunningSpinner />}
+          {!nodeRunning && nodeFailed && <FailedBadge />}
           <ConstraintBadge status={constraintStatus} />
           {quickRunBlockName && (
             <button
