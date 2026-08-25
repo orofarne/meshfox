@@ -189,7 +189,7 @@ either, the app's own runtime check (`launcher.applescript`'s
 `resolveMeshfox`) opens Terminal with the install command for them the
 first time they try to use it, instead of just failing silently.
 
-```bash deps="build/build" always
+```bash deps="build/build" always default
 set -euo pipefail
 
 APP="$HOME/Applications/MeshfoxCanvas.app"
@@ -201,6 +201,12 @@ ditto -c -k --sequesterRsrc --keepParent "$APP" "$OUT"
 echo "Wrote $OUT"
 echo "Whoever you send it to: right-click -> Open the first time (it's"
 echo "ad-hoc signed, not notarized, so Gatekeeper will otherwise refuse it)."
+```
+
+If none of that works, quarantine can be lifted directly instead:
+
+```bash tty name="xattr-quarantine"
+sudo xattr -rd com.apple.quarantine /Applications/MeshfoxCanvas.app
 ```
 
 ## Uninstall
