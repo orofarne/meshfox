@@ -64,7 +64,8 @@ use std::cell::RefCell;
 use std::fmt::Write as _;
 
 /// Result of running one embedded constraint fence's script.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ConstraintResult {
     /// Id of the node whose body the fence lives in.
     pub node_id: String,
@@ -285,7 +286,7 @@ fn build_prelude(canvas: &Canvas, base_dir: Option<&Path>) -> String {
          def _nodes_with_tag(tag):\n\
          \x20   return [n for n in _nodes if tag in n.tags]\n\
          \n\
-         def _make_node(id, title, type, parent, tags, text, _content, _json, _yaml, _toml, _csv):\n\
+         def _make_node(id, title, type, parent, tags, text, created_at, updated_at, created_at_ts, updated_at_ts, _content, _json, _yaml, _toml, _csv):\n\
          \x20   return struct(\n\
          \x20       id = id,\n\
          \x20       title = title,\n\
@@ -293,6 +294,10 @@ fn build_prelude(canvas: &Canvas, base_dir: Option<&Path>) -> String {
          \x20       parent = parent,\n\
          \x20       tags = tags,\n\
          \x20       text = text,\n\
+         \x20       created_at = created_at,\n\
+         \x20       updated_at = updated_at,\n\
+         \x20       created_at_ts = created_at_ts,\n\
+         \x20       updated_at_ts = updated_at_ts,\n\
          \x20       children = lambda: _children_of(id),\n\
          \x20       descendants = lambda: _descendants_of(id),\n\
          \x20       node = _node_by_id,\n\
@@ -318,10 +323,27 @@ fn build_prelude(canvas: &Canvas, base_dir: Option<&Path>) -> String {
             Some(p) => star_str(p),
             None => "None".to_string(),
         };
+        let created_at = match &n.created_at {
+            Some(v) => star_str(v),
+            None => "None".to_string(),
+        };
+        let updated_at = match &n.updated_at {
+            Some(v) => star_str(v),
+            None => "None".to_string(),
+        };
+        let created_at_ts = match n.created_at.as_deref().and_then(crate::timestamp::unix_timestamp) {
+            Some(ts) => ts.to_string(),
+            None => "None".to_string(),
+        };
+        let updated_at_ts = match n.updated_at.as_deref().and_then(crate::timestamp::unix_timestamp) {
+            Some(ts) => ts.to_string(),
+            None => "None".to_string(),
+        };
         let file_data = file_data_literals(n, base_dir);
         let _ = writeln!(
             out,
             "    _make_node(id={}, title={}, type={}, parent={}, tags=[{}], text={}, \
+             created_at={}, updated_at={}, created_at_ts={}, updated_at_ts={}, \
              _content={}, _json={}, _yaml={}, _toml={}, _csv={}),",
             star_str(&n.id),
             star_str(&n.title),
@@ -329,6 +351,10 @@ fn build_prelude(canvas: &Canvas, base_dir: Option<&Path>) -> String {
             parent,
             tags,
             star_str(&n.text),
+            created_at,
+            updated_at,
+            created_at_ts,
+            updated_at_ts,
             file_data.content,
             file_data.json,
             file_data.yaml,

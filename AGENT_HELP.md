@@ -33,6 +33,8 @@ Map your intent to a subcommand instead:
   from=`, best-effort `deps=`) → `meshfox node set-id <id> <new-id>`
 - Replace a node's body → `meshfox node body <id> --file <path>` (or pipe to
   stdin)
+- Append to a node's existing body, without reading it back first → `meshfox
+  node append <id> --file <path>` (or pipe to stdin)
 - Set position/size/style/tags (`x`/`y`/`w`/`h`/`color`/`type`/`display`/
   `lang`/`interpreter`/`tags`) → `meshfox node meta <id> [flags...]` — same
   flags `node add` above also accepts. `color` is either a literal hex
@@ -91,6 +93,17 @@ command line, if that's what's intended instead of the full chain.
   run` invocation, instead of reading the file to find block names.
 - `meshfox spec` — the full `.canvas.md` format reference, if a hand-edit is
   actually warranted.
+- `meshfox node find` — the general lookup tool: a CSS selector
+  (`.tag`, `[type="file"]`, `#parent > .child`) for structure, `--text
+  <substring>` for a case-insensitive full-text search over title/body
+  (each match comes back with a short excerpt, so a separate `node show`
+  usually isn't needed just to see why it matched), and
+  `--created-after`/`--created-before`/`--updated-after`/`--updated-before`/
+  `--since` (RFC3339 or a relative duration like `7d`) for filtering by
+  when a node was made or last changed. All of these AND together; any can
+  be omitted, and the selector itself defaults to `*` (every node) when
+  dropped — e.g. `meshfox node find --since 7d` for "what changed
+  recently," instead of rereading the whole tree every session.
 
 ## MCP, if available
 
@@ -112,14 +125,21 @@ specific cases:
   (exported vars, files a snippet wrote) survives between calls — a
   one-shot `meshfox run` re-resolves everything from scratch every time.
 - **Structured reads/single edits** — the whole `node <op>` surface, not
-  just a subset: `node_show`/`node_find`/`node_add`/`node_meta`/`node_body`/
-  `node_block`/`node_rm`/`node_mv`/`node_rename`/`node_set_id`/`node_edges`/
-  `node_move`/`node_reorder` — `node_show` returns JSON, not text to
-  re-parse.
+  just a subset: `node_show`/`node_find`/`node_add`/`node_body`/
+  `node_append`/`node_meta`/`node_block`/`node_rm`/`node_mv`/`node_rename`/
+  `node_set_id`/`node_edges`/`node_move`/`node_reorder` — `node_show`
+  returns JSON, not text to re-parse.
+- **`validate`/`check`** — same checks `meshfox validate`/`meshfox check`
+  run, as structured JSON instead of text to re-parse: `validate` returns a
+  tool error naming the specific problem on failure (same convention
+  `node_add` etc. use for a bad write), not just a non-zero exit code;
+  `check` returns `{ok, results}` with one entry per constraint fence
+  (`ok`/`messages`) — a single constraint failing isn't itself a tool
+  error, so a caller can inspect what's wrong without try/catch.
 
-Everything else (validate/check/list/static/pdf, batch edits, anything
-`--no-deps`-shaped) still only exists via the CLI below — the MCP tools are
-a narrower, additive surface, not a replacement for it.
+Everything else (list/static/pdf, batch edits, anything `--no-deps`-shaped)
+still only exists via the CLI below — the MCP tools are a narrower,
+additive surface, not a replacement for it.
 
 ## Canvas path
 

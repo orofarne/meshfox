@@ -15,7 +15,7 @@ function optionsButton(page: Page) {
 }
 
 function unfoldCheckbox(page: Page) {
-  return page.locator(".vars-modal").getByRole("checkbox");
+  return page.getByLabel("Expand everything by default");
 }
 
 test.beforeEach(async ({ page }) => {

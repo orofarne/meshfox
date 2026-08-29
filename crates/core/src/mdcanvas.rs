@@ -80,6 +80,11 @@ pub enum ParseError {
     InvalidLinkBody(String, &'static str),
     #[error("id {0:?} contains a forbidden character (a `\"`, a `,`, or a control character)")]
     InvalidId(String),
+    #[error(
+        "node {0:?} has an invalid {1}={2:?} — expected RFC3339, e.g. \"2026-08-29T10:15:00Z\" \
+         or with an explicit offset like \"2026-08-29T13:15:00+03:00\""
+    )]
+    InvalidTimestamp(String, &'static str, String),
 }
 
 /// Characters an id can never contain, whether typed by hand in an explicit
@@ -144,6 +149,14 @@ pub struct NodeMeta {
     /// Free-form tags. Empty means "omitted" — same "caller passes through
     /// the existing value to keep it" contract as every other field here.
     pub tags: Vec<String>,
+    /// `createdAt=` override (see `Node::created_at`) — `node meta
+    /// --created-at` is the only writer; validated as RFC3339 before it
+    /// ever reaches this struct (`crate::timestamp::is_valid_rfc3339`).
+    /// Same "omitted unless set" contract as `display`/`lang`/`interpreter`.
+    /// `updatedAt=` has no equivalent field here — it's never
+    /// caller-settable, only auto-touched by `set_node_body` (see its own
+    /// doc comment) via a dedicated raw-attribute rewrite, not this struct.
+    pub created_at: Option<String>,
     /// Per-node fold-state override (see `Node::fold`). Same "omitted
     /// unless set" contract as `display`/`lang`/`interpreter` — `None`
     /// omits `fold=` entirely (no override; follows the document
@@ -193,6 +206,8 @@ pub const NODE_ATTRS: &[&str] = &[
     "preview",
     "fold",
     "edgeLabel",
+    "createdAt",
+    "updatedAt",
 ];
 /// `meshfox:edge`'s own attribute vocabulary — `from` is required, the
 /// rest optional styling (`canvas.rs`'s `ExtraEdge`/style enums).
@@ -278,6 +293,29 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
             NodeType::Text => None,
         };
 
+        let created_at = match seg.node_attrs.get("createdAt") {
+            Some(v) if crate::timestamp::is_valid_rfc3339(v) => Some(v.clone()),
+            Some(v) => {
+                return Err(ParseError::InvalidTimestamp(
+                    id.clone(),
+                    "createdAt",
+                    v.clone(),
+                ))
+            }
+            None => None,
+        };
+        let updated_at = match seg.node_attrs.get("updatedAt") {
+            Some(v) if crate::timestamp::is_valid_rfc3339(v) => Some(v.clone()),
+            Some(v) => {
+                return Err(ParseError::InvalidTimestamp(
+                    id.clone(),
+                    "updatedAt",
+                    v.clone(),
+                ))
+            }
+            None => None,
+        };
+
         nodes.push(Node {
             id: id.clone(),
             title: seg.title.clone(),
@@ -310,6 +348,8 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
             preview: seg.node_attrs.get("preview").map(|v| v == "true").unwrap_or(false),
             edge_label: seg.node_attrs.get("edgeLabel").cloned(),
             text: body,
+            created_at,
+            updated_at,
             constraint_results: Vec::new(),
             effective_color: None,
             asset_base: None,
@@ -465,6 +505,12 @@ fn render_node_line(canvas: &Canvas, node: &Node) -> String {
     if let Some(l) = &node.edge_label {
         parts.push(format!("edgeLabel=\"{l}\""));
     }
+    if let Some(c) = &node.created_at {
+        parts.push(format!("createdAt=\"{c}\""));
+    }
+    if let Some(u) = &node.updated_at {
+        parts.push(format!("updatedAt=\"{u}\""));
+    }
     if !node.tags.is_empty() {
         parts.push(format!("tags=\"{}\"", node.tags.join(",")));
     }
@@ -496,14 +542,25 @@ pub fn node_body_offset(markdown: &str, node_id: &str) -> Option<usize> {
 /// Replace just the body of node `node_id` with `new_body`, leaving the
 /// rest of the document untouched. Used to write cached block output back
 /// into the source file without reformatting anything else.
+///
+/// When the new body actually differs from what was there before, and the
+/// document has declared the `auto-timestamps` option (see SPEC.md's
+/// "Options" — off by default, meshfox is first and foremost a
+/// documentation format), this also bumps the node's own `updatedAt=` to
+/// now — see `Node::updated_at`. A body that comes out byte-identical
+/// (re-running a `cache`d block whose output didn't change, say) never
+/// touches `updatedAt`, so re-running an unchanged block doesn't
+/// manufacture a git diff on its own.
 pub fn set_node_body(markdown: &str, node_id: &str, new_body: &str) -> Option<String> {
     let segments = scan(markdown);
     let ids = assign_ids(&segments).ok()?;
     let idx = ids.iter().position(|id| id == node_id)?;
     let seg = &segments[idx];
 
-    let mut replacement = String::new();
     let trimmed = new_body.trim();
+    let body_changed = markdown[seg.body_span.clone()].trim() != trimmed;
+
+    let mut replacement = String::new();
     if !trimmed.is_empty() {
         replacement.push('\n');
         replacement.push_str(trimmed);
@@ -515,7 +572,124 @@ pub fn set_node_body(markdown: &str, node_id: &str, new_body: &str) -> Option<St
     out.push_str(&markdown[..seg.body_span.start]);
     out.push_str(&replacement);
     out.push_str(&markdown[seg.body_span.end..]);
-    Some(out)
+
+    if !body_changed || !timestamps_enabled(markdown, &segments) {
+        return Some(out);
+    }
+    let Some(line_span) = &seg.node_line_span else {
+        // Only the root can lack a `meshfox:node` comment line at all —
+        // nowhere to stamp `updatedAt` onto without inventing one, which
+        // `node meta` (not a body write) is the deliberate way to do.
+        return Some(out);
+    };
+    let mut attrs = seg.node_attrs.clone();
+    attrs.insert(
+        "updatedAt".to_string(),
+        crate::timestamp::now_utc_rfc3339(),
+    );
+    let new_line = rebuild_node_line_from_raw_attrs(node_id, &attrs);
+    // `line_span` was measured against the original `markdown`, but nothing
+    // between it and `seg.body_span.start` (where the edit above starts)
+    // moved, so the same byte offsets still apply to `out`.
+    let mut restamped = String::with_capacity(out.len() + new_line.len());
+    restamped.push_str(&out[..line_span.start]);
+    restamped.push_str(&new_line);
+    restamped.push_str(&out[line_span.end..]);
+    Some(restamped)
+}
+
+/// Appends `addition` to the end of node `node_id`'s existing prose body —
+/// after whatever's already there, still before its first child's own
+/// heading (a node's `body_span` already ends there, same boundary
+/// `set_node_body` itself patches in place) — without the caller having to
+/// read the current body first just to hand it back unchanged. A plain
+/// wrapper over `set_node_body` (so it gets the same `updatedAt`/
+/// `auto-timestamps` handling for free): reads the current raw body,
+/// concatenates, replaces.
+pub fn append_node_body(markdown: &str, node_id: &str, addition: &str) -> Option<String> {
+    let segments = scan(markdown);
+    let ids = assign_ids(&segments).ok()?;
+    let idx = ids.iter().position(|id| id == node_id)?;
+    let seg = &segments[idx];
+
+    let existing = markdown[seg.body_span.clone()].trim();
+    let addition = addition.trim();
+    let combined = match (existing.is_empty(), addition.is_empty()) {
+        (true, _) => addition.to_string(),
+        (false, true) => existing.to_string(),
+        (false, false) => format!("{existing}\n\n{addition}"),
+    };
+    set_node_body(markdown, node_id, &combined)
+}
+
+/// Whether `markdown`'s root node declares `<!-- meshfox:option
+/// name="auto-timestamps" -->` (see SPEC.md's "Options") — checked by
+/// `insert_child_node`/`set_node_body` before ever stamping `createdAt`/
+/// `updatedAt` automatically. Timestamps are off unless this is declared —
+/// meshfox is first and foremost a documentation format, and most
+/// documents don't want bookkeeping churn on every regeneration. Fails
+/// closed (assumes timestamps are *not* enabled, the same as the
+/// undeclared case) on anything that doesn't scan cleanly — this is a soft
+/// internal check, not `meshfox validate`'s job (which already separately
+/// rejects a misplaced or malformed `meshfox:option` declaration), and the
+/// safe outcome when uncertain is simply not to have a side effect.
+fn timestamps_enabled(markdown: &str, segments: &[Segment]) -> bool {
+    let Some(root) = segments.iter().find(|s| s.level == 1) else {
+        return false;
+    };
+    crate::options::scan_option_decls(&markdown[root.body_span.clone()])
+        .unwrap_or_default()
+        .iter()
+        .any(|name| name == "auto-timestamps")
+}
+
+/// Every `meshfox:node` attribute key that isn't `id`, in the same
+/// canonical order `render_node_line`/`set_node_meta` already write them
+/// in, alongside whether its value is quoted (every attribute except the
+/// bare-numeric `x`/`y`/`w`/`h`). Shared only by
+/// `rebuild_node_line_from_raw_attrs` below — unlike `set_node_meta`
+/// (which rebuilds a line from typed, individually-validated fields), that
+/// function rewrites a line from whatever raw strings were already there,
+/// for a caller (`set_node_body`'s own `updatedAt` auto-touch) that only
+/// wants to touch *one* attribute and pass every other one through
+/// untouched, without re-parsing each of them into a typed value first.
+const NODE_LINE_RAW_ORDER: &[(&str, bool)] = &[
+    ("type", true),
+    ("parent", true),
+    ("x", false),
+    ("y", false),
+    ("w", false),
+    ("h", false),
+    ("color", true),
+    ("display", true),
+    ("lang", true),
+    ("interpreter", true),
+    ("preview", true),
+    ("edgeLabel", true),
+    ("fold", true),
+    ("createdAt", true),
+    ("updatedAt", true),
+    ("tags", true),
+];
+
+/// Rebuilds a `<!-- meshfox:node ... -->` line from `attrs` (raw strings,
+/// as already parsed off the existing line) in canonical order — see
+/// `NODE_LINE_RAW_ORDER`. Only `set_node_body`'s `updatedAt` auto-touch
+/// uses this; every other mutator that rewrites this line
+/// (`set_node_meta`) goes through typed fields instead, since it may also
+/// need to validate or transform a value, not just pass it through.
+fn rebuild_node_line_from_raw_attrs(id: &str, attrs: &HashMap<String, String>) -> String {
+    let mut parts = vec![format!("id=\"{id}\"")];
+    for (key, quoted) in NODE_LINE_RAW_ORDER {
+        if let Some(v) = attrs.get(*key) {
+            if *quoted {
+                parts.push(format!("{key}=\"{v}\""));
+            } else {
+                parts.push(format!("{key}={v}"));
+            }
+        }
+    }
+    format!("<!-- meshfox:node {} -->", parts.join(" "))
 }
 
 /// Insert or update just node `node_id`'s `meshfox:node` comment line with
@@ -580,6 +754,16 @@ pub fn set_node_meta(markdown: &str, node_id: &str, meta: &NodeMeta) -> Option<S
     }
     if let Some(f) = meta.fold {
         parts.push(format!("fold=\"{f}\""));
+    }
+    if let Some(c) = &meta.created_at {
+        parts.push(format!("createdAt=\"{c}\""));
+    }
+    // `updatedAt=` isn't part of `NodeMeta` at all (see its own doc
+    // comment) — unlike every other field here, there's no caller-supplied
+    // value that could carry it forward, so (same as `parent=` above) it's
+    // always read straight off the existing line instead.
+    if let Some(u) = seg.node_attrs.get("updatedAt") {
+        parts.push(format!("updatedAt=\"{u}\""));
     }
     if !meta.tags.is_empty() {
         parts.push(format!("tags=\"{}\"", meta.tags.join(",")));
@@ -1234,18 +1418,22 @@ pub fn insert_child_node(markdown: &str, parent_id: &str, title: &str) -> Option
     let used: HashSet<String> = ids.iter().cloned().collect();
     let new_id = unique_slug(title, &used);
 
+    let mut node_parts = vec![format!("id=\"{new_id}\"")];
+    if needs_explicit_parent {
+        node_parts.push(format!("parent=\"{parent_id}\""));
+    }
+    if timestamps_enabled(markdown, &segments) {
+        let now = crate::timestamp::now_utc_rfc3339();
+        node_parts.push(format!("createdAt=\"{now}\""));
+        node_parts.push(format!("updatedAt=\"{now}\""));
+    }
+
     let mut block = String::new();
     block.push_str(&"#".repeat(child_level as usize));
     block.push(' ');
     block.push_str(title);
     block.push('\n');
-    if needs_explicit_parent {
-        block.push_str(&format!(
-            "<!-- meshfox:node id=\"{new_id}\" parent=\"{parent_id}\" -->\n"
-        ));
-    } else {
-        block.push_str(&format!("<!-- meshfox:node id=\"{new_id}\" -->\n"));
-    }
+    block.push_str(&format!("<!-- meshfox:node {} -->\n", node_parts.join(" ")));
     block.push('\n');
 
     let mut out = String::with_capacity(markdown.len() + block.len() + 1);
@@ -2709,6 +2897,7 @@ Reused from Tests as well.
             edge_label: None,
             fold: None,
             tags: Vec::new(),
+            created_at: None,
         };
         let updated = set_node_meta(DOC, "tests", &meta).unwrap();
         let c = parse(&updated).unwrap();
@@ -3211,6 +3400,51 @@ Reused from Tests as well.
         let examples_pos = updated.find("## Examples").unwrap();
         assert!(smoke_pos < new_pos);
         assert!(new_pos < examples_pos);
+    }
+
+    #[test]
+    fn insert_child_node_does_not_stamp_timestamps_by_default() {
+        // `DOC` declares no `meshfox:option` — timestamps are off by
+        // default (meshfox is first and foremost a documentation format).
+        let (updated, new_id) = insert_child_node(DOC, "tests", "New Check").unwrap();
+        let c = parse(&updated).unwrap();
+        let n = c.node(&new_id).unwrap();
+        assert_eq!(n.created_at, None);
+        assert_eq!(n.updated_at, None);
+    }
+
+    #[test]
+    fn insert_child_node_stamps_timestamps_when_auto_timestamps_declared() {
+        let doc = "# Root\n<!-- meshfox:node id=\"root\" -->\n<!-- meshfox:option name=\"auto-timestamps\" -->\n\nprose\n";
+        let (updated, new_id) = insert_child_node(doc, "root", "New Check").unwrap();
+        let c = parse(&updated).unwrap();
+        let n = c.node(&new_id).unwrap();
+        assert!(n.created_at.as_deref().is_some_and(crate::timestamp::is_valid_rfc3339));
+        assert_eq!(n.created_at, n.updated_at);
+    }
+
+    #[test]
+    fn set_node_body_does_not_stamp_updated_at_by_default() {
+        let updated = set_node_body(DOC, "smoke-test", "New body text.").unwrap();
+        let c = parse(&updated).unwrap();
+        assert_eq!(c.node("smoke-test").unwrap().updated_at, None);
+    }
+
+    #[test]
+    fn set_node_body_stamps_updated_at_when_auto_timestamps_declared() {
+        let doc = "# Root\n<!-- meshfox:node id=\"root\" -->\n<!-- meshfox:option name=\"auto-timestamps\" -->\n\n## Child\n<!-- meshfox:node id=\"child\" -->\n\nold body\n";
+        let updated = set_node_body(doc, "child", "new body").unwrap();
+        let c = parse(&updated).unwrap();
+        let n = c.node("child").unwrap();
+        assert!(n.updated_at.as_deref().is_some_and(crate::timestamp::is_valid_rfc3339));
+
+        // re-applying the *same* body still doesn't touch updatedAt again —
+        // the byte-unchanged skip applies independently of the option.
+        let updated2 = set_node_body(&updated, "child", "new body").unwrap();
+        assert_eq!(
+            parse(&updated2).unwrap().node("child").unwrap().updated_at,
+            n.updated_at
+        );
     }
 
     #[test]

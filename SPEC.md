@@ -21,7 +21,7 @@ of JSON, for readable diffs and hand-editability.
 - **`<!-- meshfox:node ... -->`** — right after a heading line. Turns the
   heading into a node and holds its bookkeeping as `key="value"` attributes:
   `id`, `type`, `x`, `y`, `w`, `h`, `color`, `tags`, `parent`, `fold`,
-  `edgeLabel`. All optional; a
+  `edgeLabel`, `createdAt`, `updatedAt` (see "Timestamps" below). All optional; a
   bare `<!-- meshfox:node -->` is enough. `id` defaults to a slug of the
   heading text; only write it explicitly for a stable handle that survives
   renames (e.g. because an edge references it). First write-back (running a
@@ -74,6 +74,49 @@ of JSON, for readable diffs and hand-editability.
   plain `*.md` file as a canvas even though it isn't named `*.canvas.md`
   (used so this doubles as auto-discovery hint; not required for parsing —
   any correctly-structured file parses as a canvas regardless of name).
+
+## Timestamps
+
+`createdAt`/`updatedAt` on `meshfox:node` are optional RFC3339 timestamps
+(any valid offset, e.g. `2026-08-29T10:15:00Z` or
+`2026-08-29T13:15:00+03:00`) — a malformed value is a `meshfox validate`
+error, same as an unknown `type=`. Both are absent by default, on every
+document: meshfox is first and foremost a documentation format, and
+automatic timestamp bookkeeping isn't something most documents want.
+Automatic stamping is opt-in per document, via the `auto-timestamps`
+option (see "Options" below).
+
+- `createdAt` — stamped automatically by `meshfox node add` (and the web
+  UI's "add child") at creation time, for a document that declares
+  `auto-timestamps`. Never rewritten afterward except by an explicit `node
+  meta --created-at` (for backfilling/importing existing data with a real
+  historical date — works on any document, `auto-timestamps` or not).
+- `updatedAt` — stamped automatically whenever a node's own body text
+  actually changes: `node body`, `node append`, a `cache`d block's output
+  being written back, the web UI's in-node editor. A body write that comes
+  out byte-identical to what was already there (re-running an unchanged
+  `cache`d block, say) never touches it — so re-running a chain with no
+  real output changes doesn't manufacture a diff on its own. Never touched
+  by a pure position/style/tag change (`node meta`) — only body writes bump
+  it, so it stays a signal of "when did this node's own content last
+  change", not "when was this node last touched on the canvas at all".
+  There's no way to set it directly (no `--updated-at` flag anywhere) — it
+  wouldn't mean much once it stopped being trustworthy.
+
+meshfox's own automatic stamps are always UTC (`Z`) — a hand-typed
+`--created-at` may use any offset, but two auto-stamped values are always
+directly, correctly string-comparable against each other regardless.
+Mixing offsets (an auto-stamp and a hand-typed one with a different
+offset) doesn't compare correctly as plain strings — see "Constraint
+fences" below for a way around that (`.created_at_ts`/`.updated_at_ts`,
+offset-independent by construction).
+
+A document has to declare the `auto-timestamps` option (see "Options"
+below) to get either stamp from either automatic path at all —
+`insert_child_node` writes no `createdAt`, and `set_node_body` writes no
+`updatedAt`, unless it's declared. An explicit `node meta --created-at`
+works regardless of the option either way; it's a separate, deliberate
+manual path, not gated by it.
 
 ## Node types
 
@@ -468,6 +511,20 @@ The script sees:
     **`.parent`** (a string, or `None` for the root), **`.tags`** (a list
     of strings), **`.text`** (its own raw Markdown body, unrendered) —
     plain read-only fields.
+  - **`.created_at`**, **`.updated_at`** — the node's own `createdAt`/
+    `updatedAt` (see "Timestamps" above), as the literal RFC3339 string, or
+    `None` if unset. **`.created_at_ts`**, **`.updated_at_ts`** — the same
+    two values as a Unix timestamp (`int`), or `None` — Starlark has no
+    datetime type, so this is what makes real arithmetic possible (e.g.
+    `self.updated_at_ts - other.created_at_ts > 86400`) and, being
+    offset-independent by construction, compares correctly across nodes
+    even when their own `created_at`/`updated_at` strings carry different
+    literal offsets (plain string comparison doesn't). There's no `now()`
+    builtin — a constraint comparing against "how old is too old" needs a
+    literal cutoff (timestamp or int), not a relative one: exposing the
+    evaluator's own wall-clock time would make the same script pass or fail
+    depending on *when* `meshfox check` happens to run, breaking the
+    same-input-same-output property every other constraint here has.
   - **`.children()`** — its direct structural children (same tree
     `Canvas::children` walks — not extra `meshfox:edge` parents).
   - **`.descendants()`** — everything in its subtree (children, their
@@ -917,6 +974,16 @@ Currently defined options:
   whichever default applies to it with its own `fold=` attribute (see
   "File structure" above) — the option only sets what an *unset* node
   falls back to.
+- `auto-timestamps` — opts the whole document in to `insert_child_node`/
+  `set_node_body`'s automatic `createdAt`/`updatedAt` stamping (see
+  "Timestamps" above). Off by default — meshfox is first and foremost a
+  documentation format, and most documents don't want bookkeeping churn on
+  every regeneration (a `cache`d block's output changing on every doc
+  build, say, the way this project's own README.md's does). Worth turning
+  on for a document that's genuinely a living record instead — a personal
+  task tracker, a running log — where knowing when something was created
+  or last touched is itself useful. Doesn't affect an explicit `node meta
+  --created-at` — that works regardless, on any document.
 
 An unrecognized `name` is not an error — options are meant to grow over
 time, and an older meshfox binary should still open a canvas written for a

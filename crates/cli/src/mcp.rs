@@ -462,6 +462,15 @@ struct McpNodeFields {
     /// Comma-separated, replacing the whole list. Pass `""` to clear.
     #[serde(default)]
     tags: Option<String>,
+    /// Override `createdAt=` (RFC3339, e.g. `2026-08-29T10:15:00Z` or with
+    /// an explicit offset). Meant for backfilling/importing existing data —
+    /// meshfox only stamps a fresh one automatically at creation time when
+    /// the document declares the `auto-timestamps` option (off by default,
+    /// see SPEC.md's "Timestamps"), so this is the only way to get a
+    /// `createdAt` on a document that doesn't. Omit to leave whatever's
+    /// already there untouched.
+    #[serde(default, rename = "createdAt")]
+    created_at: Option<String>,
 }
 
 impl McpNodeFields {
@@ -479,6 +488,7 @@ impl McpNodeFields {
             preview: self.preview,
             fold: self.fold,
             tags: self.tags,
+            created_at: self.created_at,
         }
     }
 }
@@ -510,6 +520,13 @@ struct NodeMetaParams {
 struct NodeBodyParams {
     node_id: String,
     body: String,
+}
+
+#[derive(Deserialize, Serialize, JsonSchema)]
+struct NodeAppendParams {
+    node_id: String,
+    /// Text to append after whatever's already in the node's body.
+    addition: String,
 }
 
 #[derive(Deserialize, Serialize, JsonSchema)]
@@ -611,12 +628,23 @@ struct NodeMoveParams {
 struct NodeReorderParams {}
 
 #[derive(Deserialize, Serialize, JsonSchema)]
+struct ValidateParams {}
+
+#[derive(Deserialize, Serialize, JsonSchema)]
+struct CheckParams {}
+
+#[derive(Deserialize, Serialize, JsonSchema)]
 struct NodeFindParams {
     /// A CSS selector matched against the canvas tree: a node is an
     /// element, each tag is a class (`.bag`), `id`/`type`/`color` are
     /// ordinary attributes (`[type="file"]`), structural nesting is DOM
     /// nesting (`#todo > .bag` for direct children, `#todo .bag` for
-    /// descendants at any depth).
+    /// descendants at any depth). Omit (or pass `"*"`) to match every
+    /// node — useful when filtering purely by `text`/the date fields
+    /// below, which AND together with this as independent predicates,
+    /// not a CSS extension (CSS selectors have no substring-search or
+    /// numeric-range primitives to begin with).
+    #[serde(default = "default_selector")]
     selector: String,
     /// Include each match's full `node_show`-equivalent metadata instead of
     /// just its id.
@@ -626,6 +654,40 @@ struct NodeFindParams {
     /// without `show`, since a bare id list has no metadata to attach it to.
     #[serde(default)]
     include_body: bool,
+    /// Case-insensitive substring match against each node's title or body
+    /// text. A match's own result carries a short `excerpt` of the
+    /// matching line, so a caller doesn't need a separate `node_show` just
+    /// to see why it matched.
+    #[serde(default)]
+    text: Option<String>,
+    /// Keep only nodes `createdAt`'d at or after this instant — RFC3339
+    /// (`2026-08-29T10:00:00Z`), or a relative duration ago (`7d`, `2w`,
+    /// `1h`, `30m`, `45s`). A node with no `createdAt` at all never
+    /// matches any of these five date fields — "unset" isn't "in range".
+    #[serde(default, rename = "createdAfter")]
+    created_after: Option<String>,
+    /// Keep only nodes `createdAt`'d strictly before this instant. Same
+    /// RFC3339-or-relative parsing as `createdAfter`.
+    #[serde(default, rename = "createdBefore")]
+    created_before: Option<String>,
+    /// Keep only nodes `updatedAt`'d at or after this instant. Same
+    /// RFC3339-or-relative parsing as `createdAfter`.
+    #[serde(default, rename = "updatedAfter")]
+    updated_after: Option<String>,
+    /// Keep only nodes `updatedAt`'d strictly before this instant. Same
+    /// RFC3339-or-relative parsing as `createdAfter`.
+    #[serde(default, rename = "updatedBefore")]
+    updated_before: Option<String>,
+    /// Keep only nodes touched (created OR updated) at or after this
+    /// instant — shorthand for "what changed recently", equivalent to
+    /// `createdAfter`/`updatedAfter` together. Same RFC3339-or-relative
+    /// parsing.
+    #[serde(default)]
+    since: Option<String>,
+}
+
+fn default_selector() -> String {
+    "*".to_string()
 }
 
 fn bool_pair(v: Option<bool>) -> (bool, bool) {
@@ -854,6 +916,7 @@ impl MeshfoxMcp {
             f.preview,
             f.fold,
             f.tags,
+            f.created_at,
         )
         .map_err(invalid_params)?;
         self.write_raw(&updated)?;
@@ -867,6 +930,20 @@ impl MeshfoxMcp {
     ) -> Result<CallToolResult, ErrorData> {
         let raw = self.read_raw()?;
         let updated = crate::apply_node_body(&raw, &params.node_id, &params.body)
+            .map_err(invalid_params)?;
+        self.write_raw(&updated)?;
+        Ok(CallToolResult::structured(json!({ "updated": params.node_id })))
+    }
+
+    #[tool(
+        description = "Appends text to the end of a node's existing Markdown body — after whatever's already there, still before its first child's own heading — without having to read the current body back first just to resend it unchanged."
+    )]
+    async fn node_append(
+        &self,
+        Parameters(params): Parameters<NodeAppendParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let raw = self.read_raw()?;
+        let updated = crate::apply_node_append(&raw, &params.node_id, &params.addition)
             .map_err(invalid_params)?;
         self.write_raw(&updated)?;
         Ok(CallToolResult::structured(json!({ "updated": params.node_id })))
@@ -1040,6 +1117,34 @@ impl MeshfoxMcp {
     }
 
     #[tool(
+        description = "Validates that the canvas parses as well-formed meshfox — no duplicate ids, no dangling include/deps=/env=/var references, valid meshfox:option declarations, no unrecognized attribute names. Doesn't execute anything or write the file back. Returns the node count on success; a validation failure comes back as a tool error naming the specific problem, same as node_add etc. already do for a bad write."
+    )]
+    async fn validate(
+        &self,
+        Parameters(_params): Parameters<ValidateParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let raw = self.read_raw()?;
+        let node_count = crate::validate_canvas(&raw, &self.canvas_path).map_err(invalid_params)?;
+        Ok(CallToolResult::structured(json!({
+            "ok": true,
+            "node_count": node_count,
+        })))
+    }
+
+    #[tool(
+        description = "Runs every embedded `starlark constraint` fence's Starlark contract against the document (implies validate first, over the fully include-resolved tree) and reports pass/fail per fence. Unlike validate, one constraint failing isn't a tool error — it comes back as structured data (ok: false, with that fence's own fail() messages) so a caller can inspect what's wrong without try/catch. A parse/include failure (the document doesn't even reach a checkable state) is still a tool error, same as validate's."
+    )]
+    async fn check(&self, Parameters(_params): Parameters<CheckParams>) -> Result<CallToolResult, ErrorData> {
+        let raw = self.read_raw()?;
+        let results = crate::check_canvas(&raw, &self.canvas_path).map_err(invalid_params)?;
+        let ok = results.iter().all(|r| r.ok);
+        Ok(CallToolResult::structured(json!({
+            "ok": ok,
+            "results": results,
+        })))
+    }
+
+    #[tool(
         description = "Finds every node matching a CSS selector — answers \"which nodes have tag X\" / \"children of node Y\" without grepping the raw file or walking node_show one node at a time. Matching runs against a synthetic document built from the canvas tree, via the same CSS engine a browser uses."
     )]
     async fn node_find(
@@ -1049,7 +1154,29 @@ impl MeshfoxMcp {
         let raw = self.read_raw()?;
         let canvas = Canvas::from_markdown(&raw).map_err(|e| invalid_params(e.to_string()))?;
         let ids = crate::find_node_ids(&canvas, &params.selector).map_err(invalid_params)?;
+        let ids = crate::filter_by_text(&canvas, ids, params.text.as_deref());
+        let ids = crate::filter_by_dates(
+            &canvas,
+            ids,
+            params.created_after.as_deref(),
+            params.created_before.as_deref(),
+            params.updated_after.as_deref(),
+            params.updated_before.as_deref(),
+            params.since.as_deref(),
+        )
+        .map_err(invalid_params)?;
         let mut result = json!({ "ids": ids });
+        if let Some(needle) = params.text.as_deref() {
+            let excerpts: serde_json::Map<String, serde_json::Value> = ids
+                .iter()
+                .filter_map(|id| {
+                    let n = canvas.node(id)?;
+                    let e = crate::excerpt_for(n, needle)?;
+                    Some((id.clone(), json!(e)))
+                })
+                .collect();
+            result["excerpts"] = json!(excerpts);
+        }
         if params.show {
             let nodes: Vec<serde_json::Value> = ids
                 .iter()
@@ -1090,6 +1217,8 @@ fn node_json(canvas: &Canvas, node: &meshfox_core::Node, include_body: bool) -> 
         "display": node.display.map(|d| d.as_str()),
         "preview": node.preview,
         "lang": node.lang,
+        "createdAt": node.created_at,
+        "updatedAt": node.updated_at,
     });
     if include_body {
         result["body"] = json!(node.text);
@@ -1524,6 +1653,16 @@ impl MeshfoxMcpRoot {
     }
 
     #[tool(
+        description = "Same as node_append, scoped to canvas_id (see canvas_open) — appends to a node's Markdown body in that canvas."
+    )]
+    async fn node_append(
+        &self,
+        Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<NodeAppendParams>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.forward(&canvas_id, "node_append", inner).await
+    }
+
+    #[tool(
         description = "Same as node_block, scoped to canvas_id (see canvas_open) — rewrites one runnable fence's attributes/code in that canvas."
     )]
     async fn node_block(
@@ -1601,6 +1740,26 @@ impl MeshfoxMcpRoot {
         Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<NodeReorderParams>>,
     ) -> Result<CallToolResult, ErrorData> {
         self.forward(&canvas_id, "node_reorder", inner).await
+    }
+
+    #[tool(
+        description = "Same as validate, scoped to canvas_id (see canvas_open) — checks that canvas parses as well-formed meshfox."
+    )]
+    async fn validate(
+        &self,
+        Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<ValidateParams>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.forward(&canvas_id, "validate", inner).await
+    }
+
+    #[tool(
+        description = "Same as check, scoped to canvas_id (see canvas_open) — runs that canvas's own constraint fences and reports pass/fail per fence."
+    )]
+    async fn check(
+        &self,
+        Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<CheckParams>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.forward(&canvas_id, "check", inner).await
     }
 
     #[tool(

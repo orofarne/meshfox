@@ -112,6 +112,8 @@ mod tests {
             preview: false,
             edge_label: None,
             text: text.to_string(),
+            created_at: None,
+            updated_at: None,
             constraint_results: Vec::new(),
             effective_color: None,
             asset_base: None,

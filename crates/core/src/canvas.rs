@@ -269,6 +269,23 @@ pub struct Node {
     /// the next heading. For `group`, always empty. For `file`/`link`,
     /// always exactly the one Markdown link `target` was parsed from.
     pub text: String,
+    /// `createdAt="..."` — an RFC3339 timestamp (see `crate::timestamp`),
+    /// stamped automatically by `mdcanvas::insert_child_node` at creation
+    /// time when the document declares the `auto-timestamps` option (off
+    /// by default — see SPEC.md's "Options"). `None` for a node created
+    /// while the option wasn't declared, or that predates this feature.
+    /// Never rewritten after creation except by an explicit `node meta
+    /// --created-at` (for backfilling/importing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    /// `updatedAt="..."` — same format as `created_at`, bumped
+    /// automatically by `mdcanvas::set_node_body` (same `auto-timestamps`
+    /// gating) whenever this node's own body text actually changes
+    /// (cached-block output included) — never on a pure position/style/tag
+    /// change (`set_node_meta`). `None` for the same reasons as
+    /// `created_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
     /// Most recently evaluated result of every ` ```starlark constraint `
     /// fence embedded in this node's body (see
     /// `crate::constraint::annotate_status`), one entry per fence, in

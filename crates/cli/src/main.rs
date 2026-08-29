@@ -430,6 +430,16 @@ struct NodeMetaFields {
     /// them.
     #[arg(long)]
     tags: Option<String>,
+    /// Override `createdAt=` (see SPEC.md's "Timestamps") — RFC3339, e.g.
+    /// `2026-08-29T10:15:00Z` or with an explicit offset like
+    /// `2026-08-29T13:15:00+03:00`. Meant for backfilling/importing
+    /// existing data with a real historical date; meshfox only stamps a
+    /// fresh one automatically at creation time when the document declares
+    /// the `auto-timestamps` option (off by default), so this is the only
+    /// way to get a `createdAt` on a document that doesn't. Omit this flag
+    /// entirely to leave whatever's already there untouched.
+    #[arg(long = "created-at")]
+    created_at: Option<String>,
 }
 
 impl NodeMetaFields {
@@ -450,6 +460,7 @@ impl NodeMetaFields {
             || self.preview.is_some()
             || self.fold.is_some()
             || self.tags.is_some()
+            || self.created_at.is_some()
     }
 }
 
@@ -555,6 +566,24 @@ enum NodeCommand {
         canvas: Option<PathBuf>,
         node_id: String,
         /// Read the new body from this file instead of stdin.
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    /// Appends to the end of a node's existing Markdown body
+    /// (`mdcanvas::append_node_body`) — after whatever's already there,
+    /// still before its first child's own heading — without having to
+    /// first read the current body back just to hand it to `node body`
+    /// unchanged. Reads the text to append from `--file`, or from stdin if
+    /// omitted, same convention as `node body`. Bumps `updatedAt=` the same
+    /// way `node body` does (see SPEC.md's "Timestamps"), since it's
+    /// implemented on top of the same `set_node_body`.
+    Append {
+        /// Path to the .canvas.md file. If omitted: auto-discover the
+        /// single candidate in the current directory.
+        #[arg(long)]
+        canvas: Option<PathBuf>,
+        node_id: String,
+        /// Read the text to append from this file instead of stdin.
         #[arg(long)]
         file: Option<PathBuf>,
     },
@@ -725,14 +754,21 @@ enum NodeCommand {
         canvas: Option<PathBuf>,
         node_id: String,
     },
-    /// Finds every node matching a CSS selector — for answering "which
-    /// nodes have tag X" / "children of node Y" without grepping the raw
-    /// file. The tree maps onto CSS almost directly: a node is an element,
-    /// each tag is a class (`.bag`), `id`/`type`/`color` are ordinary
-    /// attributes (`[type="file"]`), and structural nesting is DOM nesting
-    /// — `#todo > .bag` for direct children, `#todo .bag` for descendants
-    /// at any depth. Matching runs against a synthetic HTML document built
-    /// from the canvas tree (never against real rendered content) via
+    /// Finds every node matching a CSS selector, a text substring, and/or
+    /// a created/updated date range — the three axes AND together; any
+    /// may be omitted. `selector` alone (its original form, still the
+    /// default when nothing else is given) behaves byte-for-byte as
+    /// before: the CSS engine stays the right tool for structure (`#todo
+    /// > .bag`, tag/type/color matching, arbitrary-depth nesting) —
+    /// `--text`/the date flags are independent predicates layered next to
+    /// it, not a CSS extension, since CSS selectors have no
+    /// substring-search or numeric-range primitives to begin with. The
+    /// tree maps onto CSS almost directly: a node is an element, each tag
+    /// is a class (`.bag`), `id`/`type`/`color` are ordinary attributes
+    /// (`[type="file"]`), and structural nesting is DOM nesting — `#todo
+    /// > .bag` for direct children, `#todo .bag` for descendants at any
+    /// depth. Matching runs against a synthetic HTML document built from
+    /// the canvas tree (never against real rendered content) via
     /// `scraper` — the same CSS engine a browser uses, not a bespoke
     /// query language to learn.
     Find {
@@ -740,11 +776,44 @@ enum NodeCommand {
         /// single candidate in the current directory.
         #[arg(long)]
         canvas: Option<PathBuf>,
-        selector: String,
+        /// Omit entirely (or pass "*") to match every node — useful when
+        /// filtering purely by `--text`/the date flags below.
+        selector: Option<String>,
         /// Print each match's full `node show` report instead of just its
         /// id.
         #[arg(long)]
         show: bool,
+        /// Case-insensitive substring match against each node's title or
+        /// body text. A match is followed by a short excerpt of the
+        /// matching line, so a caller doesn't need a separate `node show`
+        /// just to see why it matched.
+        #[arg(long)]
+        text: Option<String>,
+        /// Keep only nodes `createdAt`'d at or after this instant —
+        /// RFC3339 (`2026-08-29T10:00:00Z`), or a relative duration ago
+        /// (`7d`, `2w`, `1h`, `30m`, `45s`). A node with no `createdAt` at
+        /// all never matches any `--created-*`/`--updated-*`/`--since`
+        /// filter (see SPEC.md's "Timestamps") — "unset" isn't "in range".
+        #[arg(long = "created-after")]
+        created_after: Option<String>,
+        /// Keep only nodes `createdAt`'d strictly before this instant.
+        /// Same RFC3339-or-relative parsing as `--created-after`.
+        #[arg(long = "created-before")]
+        created_before: Option<String>,
+        /// Keep only nodes `updatedAt`'d at or after this instant. Same
+        /// RFC3339-or-relative parsing as `--created-after`.
+        #[arg(long = "updated-after")]
+        updated_after: Option<String>,
+        /// Keep only nodes `updatedAt`'d strictly before this instant.
+        /// Same RFC3339-or-relative parsing as `--created-after`.
+        #[arg(long = "updated-before")]
+        updated_before: Option<String>,
+        /// Keep only nodes touched (created OR updated) at or after this
+        /// instant — shorthand for "what changed recently", equivalent to
+        /// `--created-after`/`--updated-after` together. Same
+        /// RFC3339-or-relative parsing.
+        #[arg(long)]
+        since: Option<String>,
     },
 }
 
@@ -1070,6 +1139,11 @@ fn main() {
                 node_id,
                 file,
             } => node_body(&canvas.unwrap_or_else(find_canvas), &node_id, file),
+            NodeCommand::Append {
+                canvas,
+                node_id,
+                file,
+            } => node_append(&canvas.unwrap_or_else(find_canvas), &node_id, file),
             NodeCommand::Block {
                 canvas,
                 node_id,
@@ -1140,6 +1214,7 @@ fn main() {
                 fields.preview,
                 fields.fold,
                 fields.tags,
+                fields.created_at,
             ),
             NodeCommand::Edges {
                 canvas,
@@ -1166,7 +1241,23 @@ fn main() {
                 canvas,
                 selector,
                 show,
-            } => node_find(&canvas.unwrap_or_else(find_canvas), &selector, show),
+                text,
+                created_after,
+                created_before,
+                updated_after,
+                updated_before,
+                since,
+            } => node_find(
+                &canvas.unwrap_or_else(find_canvas),
+                selector.as_deref().unwrap_or("*"),
+                show,
+                text.as_deref(),
+                created_after.as_deref(),
+                created_before.as_deref(),
+                updated_after.as_deref(),
+                updated_before.as_deref(),
+                since.as_deref(),
+            ),
         },
         Command::Spec => print!("{}", include_str!("../../../SPEC.md")),
         Command::CheckUpdates { yes } => check_updates(yes),
@@ -1335,77 +1426,63 @@ fn configure(canvas_path: &PathBuf) {
     );
 }
 
+/// Pure logic behind `meshfox validate` — the full validity pipeline
+/// (parse, includes, `deps=`, var refs/scope, options, known attrs) —
+/// returning the node count on success or the first failure's message.
+/// Shared by the CLI's own `validate` (below, wraps this in
+/// `println!`/`exit(1)`) and the MCP `validate` tool (wraps it in a
+/// structured tool result/error) so the two front doors can't drift on
+/// what "valid" means.
+fn validate_canvas(raw: &str, canvas_path: &Path) -> Result<usize, String> {
+    let canvas = Canvas::from_markdown(raw).map_err(|e| e.to_string())?;
+    // Resolving includes here is the only way to catch a broken link, a
+    // cycle, or a target that doesn't itself parse before `meshfox view`
+    // does — this file's own structure is already known good at this
+    // point regardless of the outcome below.
+    meshfox_core::include::resolve(&canvas, canvas_path).map_err(|e| e.to_string())?;
+    // Same idea for runnable-fence `deps=`: a dangling reference or a
+    // cycle should fail CI/pre-commit here, not surface only when someone
+    // actually tries to run the block.
+    meshfox_core::deps::validate(&canvas).map_err(|e| e.to_string())?;
+    // Validates every `meshfox:var` declaration itself (unique name,
+    // declared in the root, `select` has `choices=`, ...) and every
+    // runnable fence's `env=` reference against them — a typo'd variable
+    // name would otherwise just silently resolve to nothing instead of
+    // failing loudly (see `vars::resolve_block_env`).
+    meshfox_core::validate_env_refs(&canvas).map_err(|e| e.to_string())?;
+    // Same idea again for `default_var=`/`choices_var=`: every reference
+    // must name a real declared variable, and the reference graph must be
+    // acyclic.
+    meshfox_core::validate_var_refs(&canvas).map_err(|e| e.to_string())?;
+    // A node-scoped `meshfox:var` (declared outside root) is only visible
+    // to `env=` inside its own subtree — same lenient-at-runtime,
+    // strict-at-`validate` split as every check above.
+    meshfox_core::validate_var_scope(&canvas).map_err(|e| e.to_string())?;
+    // Same idea for `meshfox:option` (unique name, declared in the root)
+    // — a misplaced or duplicated option should fail loudly here rather
+    // than just being silently ignored by whatever consumer reads
+    // `Canvas::options`.
+    meshfox_core::declared_options(&canvas).map_err(|e| e.to_string())?;
+    // `validate`-only, unlike every check above: an attribute name a
+    // construct doesn't recognize (a typo, most likely) — every other
+    // reader keeps silently accepting one it doesn't know, for
+    // forward/backward compatibility between format versions (see
+    // `validate_known_attrs`'s own doc comment).
+    meshfox_core::validate_known_attrs(raw).map_err(|e| e.to_string())?;
+    Ok(canvas.nodes.len())
+}
+
 fn validate(canvas_path: &PathBuf) {
     let raw = std::fs::read_to_string(canvas_path).unwrap_or_else(|e| {
         eprintln!("failed to read {}: {e}", canvas_path.display());
         std::process::exit(1);
     });
-    match Canvas::from_markdown(&raw) {
-        Ok(canvas) => {
-            // Resolving includes here is the only way to catch a broken
-            // link, a cycle, or a target that doesn't itself parse before
-            // `meshfox view` does — this file's own structure is already
-            // known good at this point regardless of the outcome below.
-            if let Err(e) = meshfox_core::include::resolve(&canvas, canvas_path) {
-                eprintln!("meshfox validate: {}: {e}", canvas_path.display());
-                std::process::exit(1);
-            }
-            // Same idea for runnable-fence `deps=`: a dangling reference or
-            // a cycle should fail CI/pre-commit here, not surface only when
-            // someone actually tries to run the block.
-            if let Err(e) = meshfox_core::deps::validate(&canvas) {
-                eprintln!("meshfox validate: {}: {e}", canvas_path.display());
-                std::process::exit(1);
-            }
-            // Validates every `meshfox:var` declaration itself (unique
-            // name, declared in the root, `select` has `choices=`, ...)
-            // and every runnable fence's `env=` reference against them —
-            // a typo'd variable name would otherwise just silently
-            // resolve to nothing instead of failing loudly (see
-            // `vars::resolve_block_env`).
-            if let Err(e) = meshfox_core::validate_env_refs(&canvas) {
-                eprintln!("meshfox validate: {}: {e}", canvas_path.display());
-                std::process::exit(1);
-            }
-            // Same idea again for `default_var=`/`choices_var=`: every
-            // reference must name a real declared variable, and the
-            // reference graph must be acyclic.
-            if let Err(e) = meshfox_core::validate_var_refs(&canvas) {
-                eprintln!("meshfox validate: {}: {e}", canvas_path.display());
-                std::process::exit(1);
-            }
-            // A node-scoped `meshfox:var` (declared outside root) is only
-            // visible to `env=` inside its own subtree — same lenient-at-
-            // runtime, strict-at-`validate` split as every check above.
-            if let Err(e) = meshfox_core::validate_var_scope(&canvas) {
-                eprintln!("meshfox validate: {}: {e}", canvas_path.display());
-                std::process::exit(1);
-            }
-            // Same idea for `meshfox:option` (unique name, declared in the
-            // root) — a misplaced or duplicated option should fail loudly
-            // here rather than just being silently ignored by whatever
-            // consumer reads `Canvas::options`.
-            if let Err(e) = meshfox_core::declared_options(&canvas) {
-                eprintln!("meshfox validate: {}: {e}", canvas_path.display());
-                std::process::exit(1);
-            }
-            // `validate`-only, unlike every check above: an attribute
-            // name a construct doesn't recognize (a typo, most likely)
-            // — every other reader keeps silently accepting one it
-            // doesn't know, for forward/backward compatibility between
-            // format versions (see `validate_known_attrs`'s own doc
-            // comment).
-            if let Err(e) = meshfox_core::validate_known_attrs(&raw) {
-                eprintln!("meshfox validate: {}: {e}", canvas_path.display());
-                std::process::exit(1);
-            }
-            let n = canvas.nodes.len();
-            println!(
-                "meshfox validate: {} ok ({n} node{})",
-                canvas_path.display(),
-                if n == 1 { "" } else { "s" }
-            );
-        }
+    match validate_canvas(&raw, canvas_path) {
+        Ok(n) => println!(
+            "meshfox validate: {} ok ({n} node{})",
+            canvas_path.display(),
+            if n == 1 { "" } else { "s" }
+        ),
         Err(e) => {
             eprintln!("meshfox validate: {}: {e}", canvas_path.display());
             std::process::exit(1);
@@ -1428,21 +1505,31 @@ fn validate(canvas_path: &PathBuf) {
 /// `base_dir`, so a constraint's `.content()`/`.json()`/`.yaml()`/
 /// `.toml()`/`.csv()` on a `file`-type node can actually resolve that
 /// node's target (see `meshfox_core::constraint`).
+/// Pure logic behind `meshfox check`: resolves includes, then evaluates
+/// every constraint fence. `Err` only for a parse/include failure (same
+/// class `validate_canvas` fails on) — an empty or partially-failing
+/// result list is not an error, same as `find_node_ids` returning an
+/// empty match list rather than erroring: the caller (CLI `check` below,
+/// or the MCP `check` tool) decides what to do with per-constraint
+/// failures.
+fn check_canvas(raw: &str, canvas_path: &Path) -> Result<Vec<meshfox_core::ConstraintResult>, String> {
+    let canvas = Canvas::from_markdown(raw).map_err(|e| e.to_string())?;
+    let canvas = meshfox_core::include::resolve(&canvas, canvas_path).map_err(|e| e.to_string())?;
+    Ok(meshfox_core::evaluate_constraints(
+        &canvas,
+        Some(canvas_root_dir(canvas_path)),
+    ))
+}
+
 fn check(canvas_path: &PathBuf) {
     let raw = std::fs::read_to_string(canvas_path).unwrap_or_else(|e| {
         eprintln!("failed to read {}: {e}", canvas_path.display());
         std::process::exit(1);
     });
-    let canvas = Canvas::from_markdown(&raw).unwrap_or_else(|e| {
+    let results = check_canvas(&raw, canvas_path).unwrap_or_else(|e| {
         eprintln!("meshfox check: {}: {e}", canvas_path.display());
         std::process::exit(1);
     });
-    let canvas = meshfox_core::include::resolve(&canvas, canvas_path).unwrap_or_else(|e| {
-        eprintln!("meshfox check: {}: {e}", canvas_path.display());
-        std::process::exit(1);
-    });
-
-    let results = meshfox_core::evaluate_constraints(&canvas, Some(canvas_root_dir(canvas_path)));
     if results.is_empty() {
         println!(
             "meshfox check: {} ok (no constraints)",
@@ -2823,6 +2910,7 @@ fn apply_node_add_with_extras(
             fields.preview,
             fields.fold,
             fields.tags,
+            fields.created_at,
         )?;
     }
     Ok((updated, new_id))
@@ -2945,6 +3033,7 @@ fn apply_node_mv(raw: &str, node_id: &str, new_parent_id: &str) -> Result<String
                         edge_label: new_node.edge_label.clone(),
                         fold: new_node.fold,
                         tags: new_node.tags.clone(),
+                        created_at: new_node.created_at.clone(),
                     };
                     if let Some(patched) = mdcanvas::set_node_meta(&updated, node_id, &meta) {
                         updated = patched;
@@ -3047,6 +3136,47 @@ fn node_body(canvas_path: &Path, node_id: &str, file: Option<PathBuf>) {
 
 fn apply_node_body(raw: &str, node_id: &str, new_body: &str) -> Result<String, String> {
     let updated = mdcanvas::set_node_body(raw, node_id, new_body)
+        .ok_or_else(|| format!("no node {node_id:?}"))?;
+    validate_patch(&updated)?;
+    Ok(updated)
+}
+
+fn node_append(canvas_path: &Path, node_id: &str, file: Option<PathBuf>) {
+    let raw = read_raw_or_exit(canvas_path);
+    let addition = match file {
+        Some(path) => std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            eprintln!("failed to read {}: {e}", path.display());
+            std::process::exit(1);
+        }),
+        None => {
+            use std::io::Read;
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .unwrap_or_else(|e| {
+                    eprintln!("failed to read stdin: {e}");
+                    std::process::exit(1);
+                });
+            buf
+        }
+    };
+    match apply_node_append(&raw, node_id, &addition) {
+        Ok(updated) => {
+            write_raw_or_exit(canvas_path, &updated);
+            println!(
+                "meshfox node append: updated {node_id:?} in {}",
+                canvas_path.display()
+            );
+        }
+        Err(e) => {
+            eprintln!("meshfox node append: {e} ({})", canvas_path.display());
+            std::process::exit(1);
+        }
+    }
+}
+
+fn apply_node_append(raw: &str, node_id: &str, addition: &str) -> Result<String, String> {
+    let updated = mdcanvas::append_node_body(raw, node_id, addition)
         .ok_or_else(|| format!("no node {node_id:?}"))?;
     validate_patch(&updated)?;
     Ok(updated)
@@ -3226,6 +3356,7 @@ fn parse_display(s: &str) -> Result<FileDisplay, String> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn node_meta(
     canvas_path: &Path,
     node_id: &str,
@@ -3242,6 +3373,7 @@ fn node_meta(
     preview: Option<bool>,
     fold: Option<String>,
     tags: Option<String>,
+    created_at: Option<String>,
 ) {
     let raw = read_raw_or_exit(canvas_path);
     match apply_node_meta(
@@ -3260,6 +3392,7 @@ fn node_meta(
         preview,
         fold,
         tags,
+        created_at,
     ) {
         Ok(updated) => {
             write_raw_or_exit(canvas_path, &updated);
@@ -3292,11 +3425,19 @@ fn apply_node_meta(
     preview: Option<bool>,
     fold: Option<String>,
     tags: Option<String>,
+    created_at: Option<String>,
 ) -> Result<String, String> {
     let canvas = Canvas::from_markdown(raw).map_err(|e| e.to_string())?;
     let node = canvas
         .node(node_id)
         .ok_or_else(|| format!("no node {node_id:?}"))?;
+    if let Some(v) = &created_at {
+        if !meshfox_core::timestamp::is_valid_rfc3339(v) {
+            return Err(format!(
+                "invalid --created-at {v:?} — expected RFC3339, e.g. \"2026-08-29T10:15:00Z\""
+            ));
+        }
+    }
 
     if clear_position && (x.is_some() || y.is_some() || width.is_some() || height.is_some()) {
         return Err(
@@ -3370,6 +3511,7 @@ fn apply_node_meta(
         edge_label: node.edge_label.clone(),
         fold: parsed_fold,
         tags: parsed_tags,
+        created_at: created_at.or_else(|| node.created_at.clone()),
     };
     let updated = mdcanvas::set_node_meta(raw, node_id, &meta)
         .ok_or_else(|| format!("no node {node_id:?}"))?;
@@ -3544,6 +3686,12 @@ fn format_node_show(raw: &str, node_id: &str) -> Result<String, String> {
             ));
         }
     }
+    if let Some(c) = &node.created_at {
+        out.push_str(&format!("created: {c}\n"));
+    }
+    if let Some(u) = &node.updated_at {
+        out.push_str(&format!("updated: {u}\n"));
+    }
     if let Some(c) = &node.color {
         out.push_str(&format!("color: {c}\n"));
     }
@@ -3569,7 +3717,18 @@ fn fmt_opt_num(v: Option<f64>) -> String {
     v.map(|n| n.to_string()).unwrap_or_else(|| "?".to_string())
 }
 
-fn node_find(canvas_path: &Path, selector: &str, show: bool) {
+#[allow(clippy::too_many_arguments)]
+fn node_find(
+    canvas_path: &Path,
+    selector: &str,
+    show: bool,
+    text: Option<&str>,
+    created_after: Option<&str>,
+    created_before: Option<&str>,
+    updated_after: Option<&str>,
+    updated_before: Option<&str>,
+    since: Option<&str>,
+) {
     let raw = read_raw_or_exit(canvas_path);
     let canvas = Canvas::from_markdown(&raw).unwrap_or_else(|e| {
         eprintln!("failed to parse {}: {e}", canvas_path.display());
@@ -3579,22 +3738,180 @@ fn node_find(canvas_path: &Path, selector: &str, show: bool) {
         eprintln!("meshfox node find: {e}");
         std::process::exit(1);
     });
+    let ids = filter_by_text(&canvas, ids, text);
+    let ids = filter_by_dates(
+        &canvas,
+        ids,
+        created_after,
+        created_before,
+        updated_after,
+        updated_before,
+        since,
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("meshfox node find: {e}");
+        std::process::exit(1);
+    });
     if ids.is_empty() {
         println!("meshfox node find: no matches for {selector:?}");
         return;
     }
     for id in &ids {
+        let excerpt = text.and_then(|needle| canvas.node(id).and_then(|n| excerpt_for(n, needle)));
         if show {
             match format_node_show(&raw, id) {
-                Ok(text) => {
+                Ok(report) => {
                     println!("=== {id} ===");
-                    print!("{text}");
+                    print!("{report}");
+                    if let Some(e) = &excerpt {
+                        println!("matched: {e}");
+                    }
                 }
                 Err(e) => eprintln!("meshfox node find: {e}"),
             }
+        } else if let Some(e) = &excerpt {
+            println!("{id}: {e}");
         } else {
             println!("{id}");
         }
+    }
+}
+
+/// Case-insensitive substring filter over `ids` against each node's own
+/// `title`/`text` — the second, independent axis `node find` layers next
+/// to the CSS selector (see `NodeCommand::Find`'s doc comment for why this
+/// isn't a CSS extension). `None` (no `--text` given) is a no-op.
+fn filter_by_text(canvas: &Canvas, ids: Vec<String>, text: Option<&str>) -> Vec<String> {
+    let Some(needle) = text else {
+        return ids;
+    };
+    let needle_lower = needle.to_lowercase();
+    ids.into_iter()
+        .filter(|id| {
+            canvas.node(id).is_some_and(|n| {
+                n.title.to_lowercase().contains(&needle_lower)
+                    || n.text.to_lowercase().contains(&needle_lower)
+            })
+        })
+        .collect()
+}
+
+/// The third axis: keeps only nodes whose `created_at`/`updated_at` fall
+/// in the requested range(s) — every given bound is resolved via
+/// `meshfox_core::timestamp::parse_since` (RFC3339 or a relative duration
+/// like `7d`) and ANDed together with whatever `filter_by_text` already
+/// narrowed down. `after` is inclusive (`ts >= x`), `before` is exclusive
+/// (`ts < x`), so `--updated-after A --updated-before B` never double-
+/// counts the boundary. A node missing the timestamp a given bound checks
+/// never satisfies that bound — "unset" isn't "in range" (see
+/// `NodeCommand::Find`'s doc comment).
+#[allow(clippy::too_many_arguments)]
+fn filter_by_dates(
+    canvas: &Canvas,
+    ids: Vec<String>,
+    created_after: Option<&str>,
+    created_before: Option<&str>,
+    updated_after: Option<&str>,
+    updated_before: Option<&str>,
+    since: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let parse = |s: Option<&str>, flag: &str| -> Result<Option<i64>, String> {
+        s.map(|s| {
+            meshfox_core::timestamp::parse_since(s).ok_or_else(|| {
+                format!(
+                    "invalid {flag} {s:?} — expected RFC3339 or a relative duration \
+                     like \"7d\"/\"2w\"/\"1h\""
+                )
+            })
+        })
+        .transpose()
+    };
+    let created_after = parse(created_after, "--created-after")?;
+    let created_before = parse(created_before, "--created-before")?;
+    let updated_after = parse(updated_after, "--updated-after")?;
+    let updated_before = parse(updated_before, "--updated-before")?;
+    let since = parse(since, "--since")?;
+
+    if created_after.is_none()
+        && created_before.is_none()
+        && updated_after.is_none()
+        && updated_before.is_none()
+        && since.is_none()
+    {
+        return Ok(ids);
+    }
+
+    Ok(ids
+        .into_iter()
+        .filter(|id| {
+            let Some(node) = canvas.node(id) else {
+                return false;
+            };
+            let c_ts = node
+                .created_at
+                .as_deref()
+                .and_then(meshfox_core::timestamp::unix_timestamp);
+            let u_ts = node
+                .updated_at
+                .as_deref()
+                .and_then(meshfox_core::timestamp::unix_timestamp);
+
+            if let Some(x) = created_after {
+                if !c_ts.is_some_and(|t| t >= x) {
+                    return false;
+                }
+            }
+            if let Some(x) = created_before {
+                if !c_ts.is_some_and(|t| t < x) {
+                    return false;
+                }
+            }
+            if let Some(x) = updated_after {
+                if !u_ts.is_some_and(|t| t >= x) {
+                    return false;
+                }
+            }
+            if let Some(x) = updated_before {
+                if !u_ts.is_some_and(|t| t < x) {
+                    return false;
+                }
+            }
+            if let Some(x) = since {
+                let touched =
+                    c_ts.is_some_and(|t| t >= x) || u_ts.is_some_and(|t| t >= x);
+                if !touched {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect())
+}
+
+/// A short, single-line preview of why `node` matched a `--text` query —
+/// the first line (checking its title, then its body) that contains
+/// `needle` case-insensitively, truncated to a sane length. `None` only
+/// if `needle` doesn't actually appear in either — shouldn't happen for a
+/// node that already passed `filter_by_text`, but this is reused
+/// defensively rather than assumed.
+fn excerpt_for(node: &Node, needle: &str) -> Option<String> {
+    let needle_lower = needle.to_lowercase();
+    let candidate = if node.title.to_lowercase().contains(&needle_lower) {
+        node.title.as_str()
+    } else {
+        node.text
+            .lines()
+            .find(|line| line.to_lowercase().contains(&needle_lower))?
+    };
+    const MAX_CHARS: usize = 100;
+    let trimmed = candidate.trim();
+    if trimmed.chars().count() > MAX_CHARS {
+        Some(format!(
+            "{}…",
+            trimmed.chars().take(MAX_CHARS).collect::<String>()
+        ))
+    } else {
+        Some(trimmed.to_string())
     }
 }
 
@@ -4081,7 +4398,19 @@ Shared body.
                 .unwrap();
         let (plain, id_b) = apply_node_add(TEST_DOC, "tests", "New Check").unwrap();
         assert_eq!(id_a, id_b);
-        assert_eq!(with_extras, plain);
+        // Byte-for-byte equality no longer holds now that every `node add`
+        // auto-stamps `createdAt`/`updatedAt` (see `insert_child_node`) —
+        // the two calls happen at genuinely different instants, so those
+        // two values may legitimately differ even though nothing else
+        // does. Compare structurally instead, blanking out just those two
+        // dynamic fields on every node.
+        let mut canvas_a = Canvas::from_markdown(&with_extras).unwrap();
+        let mut canvas_b = Canvas::from_markdown(&plain).unwrap();
+        for n in canvas_a.nodes.iter_mut().chain(canvas_b.nodes.iter_mut()) {
+            n.created_at = None;
+            n.updated_at = None;
+        }
+        assert_eq!(canvas_a, canvas_b);
     }
 
     #[test]
@@ -4207,6 +4536,7 @@ Shared body.
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let canvas = Canvas::from_markdown(&updated).unwrap();
@@ -4238,6 +4568,7 @@ Shared body.
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert!(Canvas::from_markdown(&updated).unwrap().node("smoke-test").unwrap().tags.is_empty());
@@ -4260,6 +4591,7 @@ Shared body.
             None,
             None,
             Some("bag, fixed".to_string()),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -4289,6 +4621,7 @@ Shared body.
             None,
             None,
             Some(String::new()),
+            None,
         )
         .unwrap();
         assert!(Canvas::from_markdown(&cleared).unwrap().node("smoke-test").unwrap().tags.is_empty());
@@ -4305,6 +4638,7 @@ Shared body.
             Some(300.0),
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -4333,6 +4667,7 @@ Shared body.
             None,
             None,
             None,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("group"), "unexpected error: {err}");
@@ -4348,6 +4683,7 @@ Shared body.
             None,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -4386,6 +4722,7 @@ Shared body.
             None,
             Some("true".to_string()),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -4412,6 +4749,7 @@ Shared body.
             None,
             None,
             Some("default".to_string()),
+            None,
             None,
         )
         .unwrap();
@@ -4443,6 +4781,7 @@ Shared body.
             None,
             Some("bogus".to_string()),
             None,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("fold"), "unexpected error: {err}");
@@ -4458,6 +4797,7 @@ Shared body.
             None,
             None,
             true,
+            None,
             None,
             None,
             None,
@@ -4496,6 +4836,7 @@ Shared body.
             None,
             None,
             None,
+            None,
         )
         .unwrap_err();
         assert!(
@@ -4516,6 +4857,7 @@ Shared body.
             false,
             None,
             Some("bogus".to_string()),
+            None,
             None,
             None,
             None,

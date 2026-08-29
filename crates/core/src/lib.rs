@@ -24,6 +24,7 @@ pub mod staticgen;
 pub mod subsup;
 pub mod syntax_dirs;
 pub mod tag_colors;
+pub mod timestamp;
 pub mod tree;
 pub mod varcache;
 pub mod varout;

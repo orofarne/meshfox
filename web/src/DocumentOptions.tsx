@@ -6,7 +6,7 @@ interface KnownOption {
   hint: string;
 }
 
-// The only option meshfox itself currently understands — see SPEC.md's
+// Every option meshfox itself currently understands — see SPEC.md's
 // "Options". Deliberately a plain array, not derived from anything the
 // server sends: an unrecognized `meshfox:option` name is valid (future
 // meshfox versions, or a hand-written one this UI doesn't know about yet)
@@ -17,6 +17,11 @@ const KNOWN_OPTIONS: KnownOption[] = [
     name: "unfold",
     label: "Expand everything by default",
     hint: "Without this, every subtree (except root) opens folded to a compact title-only row, and you unfold what you need as you go. A node's own \"fold\" setting (in its own settings modal) still overrides this either way.",
+  },
+  {
+    name: "auto-timestamps",
+    label: "Auto-stamp createdAt/updatedAt",
+    hint: "Off by default — meshfox is first and foremost a documentation format, and most documents don't want bookkeeping churn on every regeneration. With this enabled, meshfox stamps createdAt automatically when a node is created and bumps updatedAt whenever its body text actually changes (see SPEC.md's \"Timestamps\"). An explicit `node meta --created-at` still works either way.",
   },
 ];
 

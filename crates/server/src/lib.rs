@@ -1147,6 +1147,7 @@ async fn put_canvas(
             edge_label: node.edge_label.clone(),
             fold: node.fold,
             tags: node.tags.clone(),
+            created_at: node.created_at.clone(),
         };
         match &located.origin {
             None => {
@@ -1235,6 +1236,7 @@ async fn clear_layout(State(state): State<Arc<AppState>>) -> Result<Json<Canvas>
             edge_label: node.edge_label.clone(),
             fold: node.fold,
             tags: node.tags.clone(),
+            created_at: node.created_at.clone(),
         };
         if let Some(patched) = mdcanvas::set_node_meta(&raw, &node.id, &meta) {
             raw = patched;
@@ -1278,6 +1280,7 @@ async fn clear_node_layout(
         edge_label: node.edge_label.clone(),
         fold: node.fold,
         tags: node.tags.clone(),
+        created_at: node.created_at.clone(),
     };
     let updated = mdcanvas::set_node_meta(&located.raw, &located.local_id, &meta)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}")))?;
@@ -1582,6 +1585,7 @@ async fn update_node(
         existing_tags,
         existing_fold,
         existing_edge_label,
+        existing_created_at,
     ) = (
         initial_node.x,
         initial_node.y,
@@ -1595,6 +1599,7 @@ async fn update_node(
         initial_node.tags.clone(),
         initial_node.fold,
         initial_node.edge_label.clone(),
+        initial_node.created_at.clone(),
     );
     // `display`/`lang`/`interpreter` only mean anything on a `file` node —
     // clear them (rather than leave a stale attribute behind) whenever this
@@ -1663,6 +1668,7 @@ async fn update_node(
             edge_label,
             fold: resolve_fold_override(req.fold.as_deref(), existing_fold)?,
             tags: req.tags.clone().unwrap_or(existing_tags),
+            created_at: existing_created_at,
         };
         raw = mdcanvas::set_node_meta(&raw, &local_id, &meta).ok_or_else(not_found)?;
     }
@@ -2203,6 +2209,7 @@ async fn reparent_node(
                         edge_label: new_node.edge_label.clone(),
                         fold: new_node.fold,
                         tags: new_node.tags.clone(),
+                        created_at: new_node.created_at.clone(),
                     };
                     if let Some(patched) = mdcanvas::set_node_meta(&updated, local_id, &meta) {
                         updated = patched;
