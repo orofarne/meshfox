@@ -14,6 +14,9 @@ web/test-results/
 web/playwright-report/
 web/blob-report/
 .DS_Store
+# Project-local Python virtualenvs created by a canvas's own `venv-setup`
+# block (see examples/python-venv.canvas.md) — local machine state.
+.venv/
 # Resolved meshfox:var answers (see SPEC.md's "Variables") — local machine
 # state, analogous to CMake's CMakeCache.txt, never something to commit.
 .meshfox/

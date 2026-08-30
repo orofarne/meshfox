@@ -76,6 +76,76 @@ A ` ```starlark constraint ` fence is a sandboxed Starlark contract living right
 
 [examples/constraints.canvas.md](./examples/constraints.canvas.md)
 
+## How-to
+<!-- meshfox:node id="how-to" -->
+
+A few common recipes, each pointing at a real, running example elsewhere in
+this repo rather than repeating it.
+
+### Structured docs instead of a Makefile
+<!-- meshfox:node id="structured-docs-instead-of-a-makefile" -->
+
+This very README is the worked example: every `##` section is a node (see
+"Concept" above), and its runnable fences — "Usage" below runs real CLI
+invocations, "Development" runs the real build/test/lint commands — replace
+what would otherwise be a Makefile's targets. `meshfox validate`/`meshfox
+check` double as the pre-commit/CI gate ("Full check" under "Development"),
+and `meshfox list` prints every runnable block as a tree instead of grepping
+the file for what's runnable.
+
+### A canvas's own Python environment
+<!-- meshfox:node id="a-canvas-s-own-python-environment" -->
+
+[examples/python-venv.canvas.md](./examples/python-venv.canvas.md) — a
+project-local `.venv/`, created once and reported as a computed
+`meshfox:var` (`PYTHON`) every other Python fence references via
+`interpreter="$PYTHON -u"`, so nothing hardcodes a path or depends on
+whatever Python happens to be on `$PATH`. Its "Requirements" node also
+demonstrates a smaller trick: a plain requirements list, installed directly
+via `interpreter="$PYTHON -m pip install -r"` — no separate
+`requirements.txt` to keep in sync, since `interpreter=` hands pip a real
+temp file built from the fence's own body.
+
+### Running a block under a different language/tool
+<!-- meshfox:node id="running-a-block-under-a-different-language-tool" -->
+
+[examples/interpreters.canvas.md](./examples/interpreters.canvas.md) — every
+shape of `interpreter=` side by side: a bare command (`python3`), one with
+its own flags (`python3 -u`), any other tool on `$PATH` (`node`), an
+interactive `tty` block handing over a real REPL, and the same mechanism on
+a `file`-type node instead of a fence.
+
+### Checking that documentation stays consistent
+<!-- meshfox:node id="checking-that-documentation-stays-consistent" -->
+
+[LICENSE.canvas.md](./LICENSE.canvas.md) below is the real, load-bearing
+example: its `every-direct-dep-is-documented` constraint fails `meshfox
+check` whenever a `Cargo.toml`/`package.json` dependency has crept in with no
+matching row in that file's license tables — the same mechanism
+"Constraints" above walks through in isolation
+([examples/constraints.canvas.md](./examples/constraints.canvas.md)'s
+"Dependency audit" node).
+
+### Publishing a canvas as a static site
+<!-- meshfox:node id="publishing-a-canvas-as-a-static-site" -->
+
+See "Usage" below → "Static export" for the real `meshfox static`
+invocation against [examples/hello.canvas.md](./examples/hello.canvas.md)
+and [site-template/](./site-template/). This README's own repo builds and
+publishes itself that way (`scripts/build-site.sh`, see `.gitignore`'s
+`/site-dist` entry) — the live result is
+[meshfox.orofarne.net](https://meshfox.orofarne.net/).
+
+### A second brain for an LLM agent
+<!-- meshfox:node id="a-second-brain-for-an-llm-agent" -->
+
+[examples/second-brain.canvas.md](./examples/second-brain.canvas.md) — one
+memory per node, tagged by type (`user`/`feedback`/`project`/`reference`),
+with a constraint fence enforcing that a `feedback`/`project` memory always
+carries a `**Why:**` line so a later session can judge an edge case instead
+of blindly following the rule. The same schema this repo's own coding-agent
+sessions use for their persistent memory, outside the chat window itself.
+
 ## Usage
 <!-- meshfox:node id="usage" -->
 
@@ -679,3 +749,4 @@ meshfox is MIT-licensed.
 <!-- meshfox:node id="license-deps" type="include" -->
 
 [LICENSE.canvas.md](./LICENSE.canvas.md)
+
