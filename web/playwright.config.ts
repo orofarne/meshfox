@@ -82,6 +82,18 @@ const IMAGE_PASTE_PORT = 4605;
 // this suite never writes to its canvas, but every other one still gets
 // its own server, so this one does too.
 const MARKDOWN_EXTENSIONS_PORT = 4606;
+// Eighteenth server + port for search.spec.ts — same reasoning again, its
+// own fixture (search.canvas.md, two independently-foldable branches each
+// with one matching leaf) and port, so its own fold/unfold-via-search
+// writes never collide with any other suite's server/canvas.
+const SEARCH_PORT = 4607;
+// Nineteenth server + port for search-pan.spec.ts — split out from
+// search.spec.ts (own fixture, search-pan.canvas.md) rather than sharing
+// its port: its one node is deliberately taller than the browser viewport,
+// which wrecks `clickFitViewAndWait`'s fit-to-everything zoom for every
+// other node on a shared canvas (confirmed directly) — see the fixture's
+// own doc comment.
+const SEARCH_PAN_PORT = 4608;
 
 // Taller than Playwright's 720px default — the app's own `minZoom` (0.5)
 // is a hard floor on how far "fit view" can zoom out, and deps.canvas.md's
@@ -205,6 +217,16 @@ export default defineConfig({
       testMatch: /(^|\/)markdown-extensions\.spec\.ts$/,
       use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${MARKDOWN_EXTENSIONS_PORT}` },
     },
+    {
+      name: `${browser}-search`,
+      testMatch: /(^|\/)search\.spec\.ts$/,
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${SEARCH_PORT}` },
+    },
+    {
+      name: `${browser}-search-pan`,
+      testMatch: /(^|\/)search-pan\.spec\.ts$/,
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${SEARCH_PAN_PORT}` },
+    },
   ]),
   webServer: [
     {
@@ -317,6 +339,18 @@ export default defineConfig({
     {
       command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view e2e/fixtures/markdown-extensions.canvas.md --port ${MARKDOWN_EXTENSIONS_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${MARKDOWN_EXTENSIONS_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view e2e/fixtures/search.canvas.md --port ${SEARCH_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${SEARCH_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view e2e/fixtures/search-pan.canvas.md --port ${SEARCH_PAN_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${SEARCH_PAN_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },

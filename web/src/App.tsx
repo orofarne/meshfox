@@ -218,6 +218,25 @@ function positionFor(
   return { x, y };
 }
 
+/** How many non-overlapping times `needle` occurs in `haystack` — both
+ * assumed already lowercased by the caller (search's own case-insensitive
+ * matching), so this is a plain count, not a search itself. Used by the
+ * search bar's `searchMatches` to enumerate individual *occurrences*
+ * rather than just matching nodes (see its own doc comment) — a query
+ * appearing three times in one node's body is three stops to step
+ * through, not one. */
+function countOccurrences(haystack: string, needle: string): number {
+  if (!needle) return 0;
+  let count = 0;
+  let from = 0;
+  let idx: number;
+  while ((idx = haystack.indexOf(needle, from)) !== -1) {
+    count++;
+    from = idx + needle.length;
+  }
+  return count;
+}
+
 export default function App() {
   const [canvas, setCanvas] = useState<CanvasDoc | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -1902,10 +1921,35 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchMatchIndex, setSearchMatchIndex] = useState(0);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
+  // Which node ids were folded *before* this search session touched
+  // anything — captured once in `openSearch`, not updated as matches are
+  // stepped through. `revealAndFocus` diffs against this to know which of
+  // its own auto-unfolds are safe to fold back once they're no longer
+  // needed for the current candidate (see its own comment). Closing search
+  // deliberately never reads this to restore anything — the whole point is
+  // that whatever's left open when the user stops stays open (see
+  // `closeSearch`) — it's only reset to `null` there so the next `/`
+  // session starts its own fresh baseline instead of reusing a stale one.
+  const searchFoldSnapshotRef = useRef<Set<string> | null>(null);
+  // One entry per *occurrence* of the query, not per matching node — a
+  // node with the query three times in its body is three stops here, not
+  // one, same as a browser's own Ctrl+F. `occurrence` is 0-based, counted
+  // within this node's own `title` then `text`, in that order — the same
+  // order `useSearchHighlight`'s DOM walk finds them in (title always
+  // renders before body), which is what lets that node line this index up
+  // with the right `Range` to scroll/pan to (see its own `occurrence`
+  // read of `MeshNodeData.searchCurrentOccurrence`).
   const searchMatches = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     if (!canvas || !q) return [];
-    return canvas.nodes.filter((n) => n.title.toLowerCase().includes(q) || n.text.toLowerCase().includes(q)).map((n) => n.id);
+    const matches: { nodeId: string; occurrence: number }[] = [];
+    for (const n of canvas.nodes) {
+      const count = countOccurrences(n.title.toLowerCase(), q) + countOccurrences(n.text.toLowerCase(), q);
+      for (let occurrence = 0; occurrence < count; occurrence++) {
+        matches.push({ nodeId: n.id, occurrence });
+      }
+    }
+    return matches;
   }, [canvas, searchQuery]);
   // A query edit can shrink `searchMatches` out from under whatever index
   // was current — clamped here (once, as a render-time derivation) rather
@@ -1917,6 +1961,25 @@ export default function App() {
   // Un-hides `id` first if it's inside a folded subtree (walking every
   // ancestor, not just its direct parent — a deeply nested match could sit
   // under several folded groups at once), then focuses/centers it.
+  //
+  // Also folds back any ancestor (or the previous candidate itself)
+  // `searchFoldSnapshotRef` says was folded *before this search session
+  // started* that isn't needed to keep `id` itself visible — so stepping
+  // match-to-match doesn't leave a trail of every previously-visited
+  // candidate's ancestors pinned open, only the current one's. A node the
+  // user unfolded by hand (never in the snapshot) or that was already open
+  // before search began is left alone either way; this only ever folds
+  // back what search itself opened.
+  //
+  // `id` itself is unfolded right alongside its ancestors, not just them —
+  // a node's own `folded` state hides its *own* body (see `canFold`'s own
+  // comment: any non-title-only node folds by default, children or not),
+  // independently of whether some ancestor is also hiding the node
+  // wholesale. Without this, a match on a leaf that starts pre-folded
+  // (the common case — `resolveDefaultFold` folds everything but the root
+  // by default) got its ancestors opened and got focused/centered, but
+  // stayed collapsed to a title-only row — centering on an empty box, no
+  // body in sight.
   //
   // The centering half deliberately doesn't just unfold and then call
   // `focusNode` — `flowInstance.getNode(id)` (what `focusNode` reads)
@@ -1933,48 +1996,71 @@ export default function App() {
       if (!canvas) return;
       setFocusedNodeId(id);
       const ancestors = pathTo(canvas, id).slice(0, -1);
-      const foldedAncestors = ancestors.filter((a) => foldedNodeIds.has(a));
-      if (foldedAncestors.length === 0) {
-        focusNode(id);
-        return;
-      }
+      const toReveal = [...ancestors, id];
+      const revealSet = new Set(toReveal);
+      const snapshot = searchFoldSnapshotRef.current;
       const nextFolded = new Set(foldedNodeIds);
-      for (const a of foldedAncestors) nextFolded.delete(a);
-      setFoldedNodeIds(nextFolded);
-      if (!flowInstance) return;
-      const boxes = computeAutoLayout({
-        canvas,
-        viewportWidth: viewportWidthRef.current,
-        measuredHeight: (nodeId) => measuredHeightsRef.current.get(nodeId),
-        foldedNodeIds: nextFolded,
-      });
-      const box = boxes.get(id);
-      if (!box) return;
-      flowInstance.setCenter(box.x + box.width / 2, box.y + box.height / 2, {
-        zoom: flowInstance.getZoom(),
-        duration: 400,
-      });
+      let changed = false;
+      if (snapshot) {
+        for (const nodeId of snapshot) {
+          if (!nextFolded.has(nodeId) && !revealSet.has(nodeId)) {
+            nextFolded.add(nodeId);
+            changed = true;
+          }
+        }
+      }
+      for (const a of toReveal) {
+        if (nextFolded.delete(a)) changed = true;
+      }
+      if (changed) setFoldedNodeIds(nextFolded);
+      // Deliberately no camera pan here (this used to `computeAutoLayout`
+      // + `flowInstance.setCenter` on `id`'s own box) — MeshNode.tsx's
+      // `useSearchHighlight`/`ensureRangeVisible` already does that, once
+      // this node's own render commits, aimed at the *specific occurrence*
+      // rather than the node's whole box. Two independent `setCenter`
+      // calls racing (this one synchronous/right away, that one from a
+      // `useEffect` a render later) used to fight each other — this one
+      // reading `computeAutoLayout`'s stale internal position bookkeeping
+      // while the other read the real, live DOM mid-animation — and could
+      // land the camera on empty canvas roughly half the time. One camera
+      // mover, not two.
     },
-    [canvas, foldedNodeIds, flowInstance, focusNode],
+    [canvas, foldedNodeIds],
   );
   const gotoSearchMatch = useCallback(
     (delta: number) => {
       if (searchMatches.length === 0) return;
       const next = (clampedSearchMatchIndex + delta + searchMatches.length) % searchMatches.length;
       setSearchMatchIndex(next);
-      revealAndFocus(searchMatches[next]);
+      // Stepping between two occurrences *within the same node* (a query
+      // that appears more than once in one body) calls this with the same
+      // `nodeId` as last time — `revealAndFocus` itself has nothing left
+      // to do then (already unfolded/focused/centered), but the
+      // `data.searchCurrentOccurrence` derivation below still changes,
+      // which is what actually moves `useSearchHighlight`'s scroll/pan
+      // target on to the next occurrence.
+      revealAndFocus(searchMatches[next].nodeId);
     },
     [searchMatches, clampedSearchMatchIndex, revealAndFocus],
   );
   const openSearch = useCallback(() => {
+    // Baseline for `revealAndFocus`'s fold-back logic — must be captured
+    // here, before anything about this search session has had a chance to
+    // unfold a single node.
+    searchFoldSnapshotRef.current = new Set(foldedNodeIds);
     setSearchOpen(true);
     // Runs after this render commits the now-mounted `<input>` (the
     // `Panel` only renders it once `searchOpen` is true) — a plain
     // synchronous `.focus()` call right here would still be targeting
     // last render's DOM (or nothing, on the very first open).
     requestAnimationFrame(() => searchInputRef.current?.focus());
-  }, []);
+  }, [foldedNodeIds]);
   const closeSearch = useCallback(() => {
+    // Deliberately doesn't restore `searchFoldSnapshotRef` here — whatever
+    // fold state search leaves behind when the user stops stays as-is
+    // (see the ref's own comment). Just clears the snapshot so the next
+    // `/` starts its own fresh baseline instead of reusing this one.
+    searchFoldSnapshotRef.current = null;
     setSearchOpen(false);
   }, []);
 
@@ -2103,20 +2189,57 @@ export default function App() {
     openSearch,
   ]);
   const handleAutoOpenTextEditorConsumed = useCallback(() => setAutoOpenTextEditorNodeId(null), []);
+  // Trimmed once here, not read fresh off `searchQuery` state inside the
+  // map below — `useMemo`'s own dependency array needs a primitive it can
+  // actually compare across renders, and every node's `data.searchQuery`
+  // should carry the exact same already-trimmed string a keystroke-by-
+  // keystroke `.trim()` inside the callback would otherwise recompute
+  // identically N times over, once per visible node.
+  const trimmedSearchQuery = searchOpen ? searchQuery.trim() : "";
+  // Which occurrence *within its own node* the current search match is —
+  // read by that node's own `useSearchHighlight` to scroll/pan to the
+  // right one, not just always the first (see MeshNodeData.searchCurrentOccurrence's
+  // own doc comment). `undefined` outside active search navigation, and
+  // also right after a plain (non-search) focus change lands on some
+  // other node than the current match — `focusedNodeId` drives both, and
+  // this only means something when they agree.
+  const currentSearchOccurrence =
+    searchOpen && searchMatches.length > 0 && searchMatches[clampedSearchMatchIndex].nodeId === focusedNodeId
+      ? searchMatches[clampedSearchMatchIndex].occurrence
+      : undefined;
   const focusedRenderNodes = useMemo(
     () =>
       visibleNodes.map((n) => {
         const focused = n.id === focusedNodeId;
         const autoOpenTextEditor = n.id === autoOpenTextEditorNodeId;
-        if ((n.data.focused ?? false) === focused && (n.data.autoOpenTextEditor ?? false) === autoOpenTextEditor) {
+        if (
+          (n.data.focused ?? false) === focused &&
+          (n.data.autoOpenTextEditor ?? false) === autoOpenTextEditor &&
+          (n.data.searchQuery ?? "") === trimmedSearchQuery &&
+          (n.data.searchCurrentOccurrence ?? undefined) === currentSearchOccurrence
+        ) {
           return n;
         }
         return {
           ...n,
-          data: { ...n.data, focused, autoOpenTextEditor, onAutoOpenTextEditorConsumed: handleAutoOpenTextEditorConsumed },
+          data: {
+            ...n.data,
+            focused,
+            autoOpenTextEditor,
+            onAutoOpenTextEditorConsumed: handleAutoOpenTextEditorConsumed,
+            searchQuery: trimmedSearchQuery,
+            searchCurrentOccurrence: currentSearchOccurrence,
+          },
         };
       }),
-    [visibleNodes, focusedNodeId, autoOpenTextEditorNodeId, handleAutoOpenTextEditorConsumed],
+    [
+      visibleNodes,
+      focusedNodeId,
+      autoOpenTextEditorNodeId,
+      handleAutoOpenTextEditorConsumed,
+      trimmedSearchQuery,
+      currentSearchOccurrence,
+    ],
   );
 
   const settingsNode = useMemo(
@@ -2390,6 +2513,13 @@ export default function App() {
           </button>
         )}
         <button
+          className="deps-toggle"
+          onClick={() => setResetSessionConfirmOpen(true)}
+          title="Forget which blocks already ran successfully this session, so the next ⛓ run chain re-runs every dependency instead of skipping unchanged ones"
+        >
+          ↺ reset session
+        </button>
+        <button
           className={searchOpen ? "deps-toggle deps-toggle-active" : "deps-toggle"}
           onClick={() => (searchOpen ? closeSearch() : openSearch())}
           disabled={sourceMode}
@@ -2400,13 +2530,6 @@ export default function App() {
           }
         >
           🔍 search
-        </button>
-        <button
-          className="deps-toggle"
-          onClick={() => setResetSessionConfirmOpen(true)}
-          title="Forget which blocks already ran successfully this session, so the next ⛓ run chain re-runs every dependency instead of skipping unchanged ones"
-        >
-          ↺ reset session
         </button>
         {sessionResetJustNow && <span className="saving-indicator">session reset</span>}
         {error && <span className="error">{error}</span>}

@@ -39,6 +39,15 @@
   --alert-important: #8250df;
   --alert-warning: #9a6700;
   --alert-caution: #cf222e;
+  /* The search bar's own substring highlight (see MeshNode.tsx's
+   * `useSearchHighlight`) — a plain warm yellow, the universal "this is
+   * what you searched for" convention (browser find-in-page, most editors),
+   * deliberately not --accent: that's this app's own brand color, already
+   * doing double duty as the keyboard-nav/current-candidate focus ring
+   * (index.css's `[data-focused="true"]`) — reusing it here would make a
+   * highlighted match read as "focused" too. */
+  --search-match-bg: #ffe066;
+  --search-match-fg: #3a2c00;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -62,6 +71,8 @@
     --alert-important: #a371f7;
     --alert-warning: #d29922;
     --alert-caution: #f85149;
+    --search-match-bg: #7a5c12;
+    --search-match-fg: #fff3cf;
   }
 }
 
@@ -91,6 +102,8 @@
   --alert-important: #a371f7;
   --alert-warning: #d29922;
   --alert-caution: #f85149;
+  --search-match-bg: #7a5c12;
+  --search-match-fg: #fff3cf;
 }
 
 :root[data-theme="light"] {
@@ -113,6 +126,8 @@
   --alert-important: #8250df;
   --alert-warning: #9a6700;
   --alert-caution: #cf222e;
+  --search-match-bg: #ffe066;
+  --search-match-fg: #3a2c00;
 }
 
 /* React Flow's own default edge color/width (used by every edge with no
@@ -757,6 +772,32 @@ a {
 .mesh-node[data-focused="true"] {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
+}
+
+/* The search bar's own substring matches (see MeshNode.tsx's
+ * `useSearchHighlight`/`SEARCH_HIGHLIGHT_NAME`) — a CSS Custom Highlight
+ * API overlay, not real `<mark>` elements, so this paints purely from the
+ * `Range`s registered under that name; nothing here needs (or has) a DOM
+ * selector to match against. Unsupported in a browser without the API
+ * (`useSearchHighlight` already no-ops there) — this rule just never
+ * has anything registered to paint in that case. */
+::highlight(mesh-search-match) {
+  background-color: var(--search-match-bg);
+  color: var(--search-match-fg);
+}
+
+/* The search bar's *current* occurrence (MeshNode.tsx's
+ * `searchCurrentHighlight`/`SEARCH_CURRENT_HIGHLIGHT_NAME`) — painted on
+ * top of the plain match rule above via that highlight's own higher
+ * `.priority`, not via selector specificity (`::highlight()` doesn't
+ * layer that way). `var(--accent)` rather than a dedicated variable pair:
+ * it's this app's own "this is the thing that's active/focused" color
+ * everywhere else already (the node focus ring just above, toolbar
+ * buttons, ...), and reusing it here reads as "the current match" for
+ * the same reason a matching-colored ring around the whole node does. */
+::highlight(mesh-search-match-current) {
+  background-color: var(--accent);
+  color: #fff;
 }
 
 .mesh-node-hint {

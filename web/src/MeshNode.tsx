@@ -231,6 +231,24 @@ export interface MeshNodeData {
    * silently changes what's selected for resize/multi-op purposes.
    * Undefined/false for every other node. */
   focused?: boolean;
+  /** App.tsx's search bar's current query, trimmed — only set while the
+   * bar is open and non-empty. Drives this node's own substring
+   * highlighting (see `useSearchHighlight`); this component doesn't care
+   * whether *this* node is actually among the matches, it just highlights
+   * whatever occurrences of the string happen to be in its own rendered
+   * text. Empty/undefined the rest of the time, which clears any
+   * highlight this node was carrying. */
+  searchQuery?: string;
+  /** Which occurrence of `searchQuery`, 0-based, *within this node's own*
+   * title+text (title occurrences first — App.tsx's `searchMatches` counts
+   * them in that same order), is the one the search bar is currently
+   * stopped on. Only meaningful — and only ever set — for the one node
+   * that's also `focused`: it's what `useSearchHighlight` scrolls/pans to,
+   * rather than always the first occurrence it finds, since a query that
+   * appears more than once in one node is that many separate stops, not
+   * one (see App.tsx's own `searchMatches` doc comment). `undefined`
+   * outside active search navigation. */
+  searchCurrentOccurrence?: number;
   target?: string;
   /** Results of every embedded ` ```starlark constraint ` fence in this
    * node's own body, in document order (see `ConstraintStatusDto`) — matched
@@ -614,6 +632,301 @@ function useStopWheelIfScrollable<T extends HTMLElement>(): (node: T | null) => 
     node.addEventListener("wheel", stopWheelIfScrollable, { passive: true });
     return () => node.removeEventListener("wheel", stopWheelIfScrollable);
   }, []);
+}
+
+const SEARCH_HIGHLIGHT_NAME = "mesh-search-match";
+const SEARCH_CURRENT_HIGHLIGHT_NAME = "mesh-search-match-current";
+
+/** Two `Highlight`s (the CSS Custom Highlight API's own type — a `Set`-like
+ * bag of `Range`s that `::highlight(name)` in index.css paints without
+ * touching the DOM), each shared by every `MeshNode` instance, registered
+ * once at module load. Shared rather than one per node because a
+ * `::highlight()` name has to be a literal identifier already written
+ * into the stylesheet — there's no way to mint one per node id at runtime
+ * and still have anything style it. Each node just owns its own slice of
+ * Ranges within these shared bags (added/removed independently in
+ * `useSearchHighlight` below), so nothing about sharing them risks one
+ * node's matches bleeding into another's.
+ *
+ * Split in two, not one, so the search bar's *current* occurrence reads
+ * as visually distinct from every other match, not just another same-
+ * colored highlight indistinguishable from the rest: `searchHighlight`
+ * covers every occurrence search matched, `searchCurrentHighlight` covers
+ * only the one `useSearchHighlight` is actively centering/panning to (at
+ * most one `Range`, ever, across the whole app — see its own doc
+ * comment), painted on top via a higher `.priority` (index.css's
+ * `::highlight(mesh-search-match-current)` alone would otherwise have to
+ * out-specificity the plain one some other, arbitrary way).
+ *
+ * `null` on a browser without the API at all (e.g. an older Firefox) —
+ * every call site below checks this and just no-ops instead, so the rest
+ * of search (reveal/focus/pan/fold-unfold, see App.tsx's
+ * `revealAndFocus`) still works regardless of highlight support. */
+const searchHighlight: Highlight | null =
+  typeof CSS !== "undefined" && "highlights" in CSS && typeof Highlight !== "undefined" ? new Highlight() : null;
+const searchCurrentHighlight: Highlight | null = searchHighlight ? new Highlight() : null;
+if (searchHighlight && searchCurrentHighlight) {
+  searchCurrentHighlight.priority = 1;
+  CSS.highlights.set(SEARCH_HIGHLIGHT_NAME, searchHighlight);
+  CSS.highlights.set(SEARCH_CURRENT_HIGHLIGHT_NAME, searchCurrentHighlight);
+}
+
+/**
+ * Every scrollable ancestor of `range` up to (and including) `root` gets a
+ * chance to bring it into its own view first, in both axes — same idea as
+ * `Element.scrollIntoView()`, just walked by hand since a `Range` (not
+ * necessarily backed by a single element) can't call that itself. Vertical
+ * is the common case (`.mesh-node-body`'s own `overflow: auto`, a long
+ * body capped by autolayout.ts's depth-≥2 `max-height`); horizontal
+ * matters for a cached/live run output block's own `<pre>` (also
+ * `overflow: auto`), whose `white-space: pre` content never wraps a long
+ * line the way prose does. Written generally rather than hardcoded to
+ * either one specific class, since any nested scroll container between
+ * the match and `root` should count, on whichever axis it actually
+ * overflows.
+ *
+ * That alone isn't always enough: a node with no such cap (root/depth-1 —
+ * see autolayout.ts) just grows to fit its content, so a long enough one
+ * has nothing to scroll *inside* at all — internally it's already
+ * "fully shown", but the match can still be well outside the browser's
+ * own visible viewport if the node itself is taller (or wider) than the
+ * screen. Once every internal scroll above has done what it can, this
+ * checks the range's final on-screen position against the window itself
+ * and, if it's still out of view, pans the canvas via React Flow's own
+ * `setCenter` — converting the range's *current* screen position to flow
+ * coordinates first (`screenToFlowPosition`), then centering on that
+ * point, the same mechanism App.tsx's `revealAndFocus` already uses for
+ * centering a whole node's box, just aimed at this one occurrence's own
+ * position within it instead. */
+function ensureRangeVisible(
+  range: Range,
+  root: HTMLElement,
+  rf: { setCenter: (x: number, y: number, opts?: { zoom?: number; duration?: number }) => void; getZoom: () => number; screenToFlowPosition: (pos: { x: number; y: number }) => { x: number; y: number } },
+) {
+  // `getBoundingClientRect()` (what `rangeRect`/`ancestorRect` below are
+  // built from) reports *screen*-space pixels — already scaled by
+  // whatever the canvas's current zoom is (a `transform: scale()` on
+  // `.react-flow__viewport`, an ancestor of every node here). `scrollTop`/
+  // `scrollLeft`/`clientHeight`/`clientWidth` are the opposite: always in
+  // the *element's own* unscaled CSS pixels, same regardless of zoom.
+  // Centering purely with screen-space deltas — this used to compute
+  // `clientHeight / 2` directly (an unscaled value) against `rangeRect`/
+  // `ancestorRect` (scaled ones) — silently mixed the two, correct only
+  // by coincidence right at zoom 1. Dividing the final screen-space delta
+  // by `zoom` before adding it to `scrollTop`/`scrollLeft` is what
+  // actually converts it into the unscaled units scrolling expects;
+  // using `ancestorRect.height`/`.width` (already screen-space, matching
+  // `rangeRect`) instead of `clientHeight`/`clientWidth` keeps every term
+  // in that same delta in one consistent space. Confirmed directly this
+  // was wrong: a zoomed-out-enough canvas (more content than
+  // `clickFitViewAndWait` alone ever exercised) landed a "centered" match
+  // hundreds of screen pixels off — including, at an extreme enough zoom,
+  // entirely outside the very ancestor it was supposedly centered within.
+  const zoom = rf.getZoom();
+  let ancestor = range.startContainer.parentElement;
+  while (ancestor && root.contains(ancestor)) {
+    if (ancestor.scrollHeight > ancestor.clientHeight) {
+      const rangeRect = range.getBoundingClientRect();
+      const ancestorRect = ancestor.getBoundingClientRect();
+      if (rangeRect.top < ancestorRect.top || rangeRect.bottom > ancestorRect.bottom) {
+        ancestor.scrollTop +=
+          (rangeRect.top - ancestorRect.top - ancestorRect.height / 2 + rangeRect.height / 2) / zoom;
+      }
+    }
+    // A cached/live run output block (`<pre>`, `overflow: auto`) never
+    // wraps its content (`white-space: pre`, same as any real terminal
+    // output) — a long enough line needs horizontal scrolling to bring a
+    // match on it into view, same idea as the vertical case just above.
+    // `getBoundingClientRect()` reports a range's geometric position
+    // regardless of whatever clips it (clipping is a paint-time thing,
+    // not a layout one) — so skipping this half doesn't just leave a
+    // horizontally-scrolled-off match unscrolled, it also *poisons* the
+    // window-visibility check and canvas-pan target below with an x
+    // coordinate that was never actually the match's true on-screen
+    // position, wherever this element's own clipped box happens to sit
+    // (confirmed directly against README.md's own cached `meshfox -h`
+    // output — the "3rd match" in `mcp` landed the camera on empty
+    // canvas because the pan target's x came from this exact gap).
+    if (ancestor.scrollWidth > ancestor.clientWidth) {
+      const rangeRect = range.getBoundingClientRect();
+      const ancestorRect = ancestor.getBoundingClientRect();
+      if (rangeRect.left < ancestorRect.left || rangeRect.right > ancestorRect.right) {
+        ancestor.scrollLeft +=
+          (rangeRect.left - ancestorRect.left - ancestorRect.width / 2 + rangeRect.width / 2) / zoom;
+      }
+    }
+    ancestor = ancestor.parentElement;
+  }
+
+  const rect = range.getBoundingClientRect();
+  const inViewport =
+    rect.top >= 0 && rect.left >= 0 && rect.bottom <= window.innerHeight && rect.right <= window.innerWidth;
+  if (inViewport) return;
+  const flowPoint = rf.screenToFlowPosition({ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 });
+  rf.setCenter(flowPoint.x, flowPoint.y, { zoom: rf.getZoom(), duration: 400 });
+}
+
+// How many consecutive, identically-positioned frames `waitForStableRect`
+// needs before it trusts a range's on-screen position — see that
+// function's own doc comment.
+const STABLE_RECT_FRAMES_REQUIRED = 3;
+// Hard cap on how long `waitForStableRect` will keep waiting for a
+// position that never settles (e.g. some unrelated animation genuinely
+// never stops) — `onSettled` still fires with whatever the position is by
+// then, rather than never firing at all.
+const STABLE_RECT_MAX_FRAMES = 30;
+
+/**
+ * Calls `onSettled` once `range`'s own `getBoundingClientRect()` stops
+ * changing between animation frames (`STABLE_RECT_FRAMES_REQUIRED` in a
+ * row, within `RECT_EPSILON`px — floating-point paint jitter, not a real
+ * change), or once `STABLE_RECT_MAX_FRAMES` have passed either way.
+ *
+ * Exists because a single fixed delay (this used to be two nested
+ * `requestAnimationFrame`s) isn't enough for a real, deep canvas: a newly-
+ * unfolded node first mounts with an *estimated* height, and
+ * autolayout.ts's real measurement — a `ResizeObserver`-driven reflow in
+ * App.tsx (`measuredSignature`) — can take several of its own render
+ * passes to settle, not just one, when unfolding reveals a whole subtree
+ * rather than a single node (confirmed directly against README.md's own
+ * "MCP server" section, several levels deep: two fixed frames settled a
+ * small two-level test fixture fine but still occasionally landed the
+ * camera on a position the real page hadn't actually reached yet). Rather
+ * than guess a bigger fixed number and still be wrong for an even deeper
+ * cascade, this just watches the actual quantity that matters — this
+ * range's own screen position — and waits until *it* stops moving.
+ *
+ * Returns a cancel function (used from the calling effect's own cleanup,
+ * same as a plain `requestAnimationFrame` id would need).
+ */
+function waitForStableRect(range: Range, onSettled: () => void): () => void {
+  const RECT_EPSILON = 0.5;
+  let cancelled = false;
+  let frameId: number | undefined;
+  let prev: DOMRect | null = null;
+  let stableStreak = 0;
+  let frameCount = 0;
+  function closeEnough(a: DOMRect, b: DOMRect): boolean {
+    return (
+      Math.abs(a.top - b.top) < RECT_EPSILON &&
+      Math.abs(a.left - b.left) < RECT_EPSILON &&
+      Math.abs(a.bottom - b.bottom) < RECT_EPSILON &&
+      Math.abs(a.right - b.right) < RECT_EPSILON
+    );
+  }
+  function tick() {
+    if (cancelled) return;
+    const rect = range.getBoundingClientRect();
+    stableStreak = prev && closeEnough(prev, rect) ? stableStreak + 1 : 0;
+    prev = rect;
+    frameCount++;
+    if (stableStreak >= STABLE_RECT_FRAMES_REQUIRED || frameCount >= STABLE_RECT_MAX_FRAMES) {
+      onSettled();
+      return;
+    }
+    frameId = requestAnimationFrame(tick);
+  }
+  frameId = requestAnimationFrame(tick);
+  return () => {
+    cancelled = true;
+    if (frameId !== undefined) cancelAnimationFrame(frameId);
+  };
+}
+
+/**
+ * Highlights every occurrence of `data.searchQuery` inside `rootRef`'s own
+ * rendered text (title, tags, and — unless folded/still being edited —
+ * body: prose, code, cached/live run output, ANSI output, all of it,
+ * since this walks the actual live DOM rather than any one content type's
+ * own source) via `searchHighlight` above, and — only for the current
+ * search candidate (`data.focused`, set by App.tsx's `revealAndFocus`
+ * alongside the unfold it already does) — brings this node's *current*
+ * occurrence (`data.searchCurrentOccurrence`, App.tsx's own 0-based index
+ * within this node's title+text, in the same order this function's own
+ * DOM walk finds them: title before body) into view via
+ * `ensureRangeVisible` above, not just whichever occurrence happened to be
+ * first — a query appearing more than once in one node is that many
+ * separate stops (see App.tsx's own `searchMatches` doc comment), each
+ * with its own scroll/pan target. That same current occurrence's `Range`
+ * also goes into `searchCurrentHighlight`, on top of (not instead of)
+ * `searchHighlight`, so it reads as visually distinct from every other
+ * match rather than just another same-colored highlight — the only cue
+ * beforehand was this node's own `data-focused` outline, useless for
+ * telling apart two occurrences *within* the one focused node.
+ *
+ * Deliberately a DOM `Range` overlay, not real `<mark>` elements spliced
+ * into the tree by hand — the body this scans is whatever
+ * `ReactMarkdown`/Shiki/`AnsiText` last rendered, still fully owned and
+ * reconciled by React; wrapping its text nodes here would fight React's
+ * own diffing the next time any of that content actually changes (a live
+ * run streaming more output, a re-fetch after `recheck`, ...).
+ *
+ * `skip` is `true` while this node's own inline text editor is open
+ * (`editingText` in `MeshNode`) — its content is a live edit buffer, not
+ * rendered prose, and not what search matched against to begin with.
+ */
+function useSearchHighlight(
+  rootRef: React.RefObject<HTMLElement | null>,
+  data: Pick<MeshNodeData, "searchQuery" | "searchCurrentOccurrence" | "focused" | "folded" | "text" | "title">,
+  skip: boolean,
+) {
+  // `useReactFlow()`'s own returned object/methods aren't guaranteed
+  // referentially stable across renders — read via a ref updated every
+  // render instead of putting them in the effect's own dependency array,
+  // so a change in *their* identity alone never re-triggers this (which
+  // would otherwise risk re-scrolling/re-panning on renders that have
+  // nothing to do with search at all).
+  const rf = useReactFlow();
+  const rfRef = useRef(rf);
+  rfRef.current = rf;
+
+  useEffect(() => {
+    if (!searchHighlight) return;
+    const root = rootRef.current;
+    const query = skip ? undefined : data.searchQuery?.trim();
+    if (!root || !query) return;
+    const lowerQuery = query.toLowerCase();
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const ranges: Range[] = [];
+    let textNode: Node | null;
+    while ((textNode = walker.nextNode())) {
+      const text = textNode.textContent ?? "";
+      const lowerText = text.toLowerCase();
+      let from = 0;
+      let idx: number;
+      while ((idx = lowerText.indexOf(lowerQuery, from)) !== -1) {
+        const range = new Range();
+        range.setStart(textNode, idx);
+        range.setEnd(textNode, idx + query.length);
+        ranges.push(range);
+        from = idx + query.length;
+      }
+    }
+    for (const r of ranges) searchHighlight.add(r);
+
+    let currentRange: Range | undefined;
+    // Waits for `target`'s own on-screen position to actually settle
+    // before measuring/panning to it — see `waitForStableRect`'s own doc
+    // comment for why a fixed frame delay isn't enough (a node that just
+    // got unfolded this same render mounts with an *estimated* height
+    // first; autolayout.ts's real measurement can take several of its own
+    // render passes to land, not just one or two, for a deep enough
+    // cascade).
+    let cancelSettle: (() => void) | undefined;
+    if (data.focused && ranges.length > 0) {
+      const occurrence = Math.min(Math.max(data.searchCurrentOccurrence ?? 0, 0), ranges.length - 1);
+      currentRange = ranges[occurrence];
+      searchCurrentHighlight?.add(currentRange);
+      const target = currentRange;
+      cancelSettle = waitForStableRect(target, () => ensureRangeVisible(target, root, rfRef.current));
+    }
+
+    return () => {
+      for (const r of ranges) searchHighlight.delete(r);
+      if (currentRange) searchCurrentHighlight?.delete(currentRange);
+      cancelSettle?.();
+    };
+  }, [rootRef, data.searchQuery, data.searchCurrentOccurrence, data.focused, data.folded, data.text, data.title, skip]);
 }
 
 /** JSON Canvas's six numbered color presets — same hex values as
@@ -1302,6 +1615,8 @@ export function NodeBodyContent({ data, nodeId }: { data: MeshNodeData; nodeId: 
 
 export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeData }) {
   const [editingText, setEditingText] = useState(false);
+  const nodeRootRef = useRef<HTMLDivElement | null>(null);
+  useSearchHighlight(nodeRootRef, data, editingText);
   const isTextNode = data.nodeType === "text";
   const isGroup = data.nodeType === "group";
   // See `MeshNodeData.autoOpenTextEditor`'s own doc comment — App.tsx
@@ -1420,6 +1735,7 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
 
   return (
     <div
+      ref={nodeRootRef}
       className="mesh-node"
       data-type={data.nodeType}
       data-suggested={data.suggested}
