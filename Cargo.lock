@@ -3106,6 +3106,7 @@ dependencies = [
  "ratatui-image",
  "rmcp",
  "rpassword",
+ "rustls",
  "schemars",
  "scraper",
  "self_update",

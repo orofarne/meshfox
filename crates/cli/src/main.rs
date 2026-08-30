@@ -974,6 +974,16 @@ fn print_completions(shell: clap_complete::Shell) {
 }
 
 fn main() {
+    // reqwest (meshfox-server's link-preview fetch) is built with rustls's
+    // "rustls-no-provider" feature — see crates/server/Cargo.toml — so it
+    // needs a process-wide default crypto provider installed before any TLS
+    // connection happens. `ring` (not aws-lc-rs) so the binary only ever
+    // compiles the one crypto backend headless_chrome/self_update already
+    // need via ureq.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("no default rustls CryptoProvider installed yet");
+
     let args = splice_leading_canvas(std::env::args().collect());
 
     if args.len() == 2 && !args[1].starts_with('-') && args[1].to_ascii_lowercase().ends_with(".md")

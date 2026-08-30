@@ -19,7 +19,12 @@ uuid = { version = "1", features = ["v4"] }
 libc = "0.2"
 portable-pty = "0.9.0"
 anyhow = "1.0.104"
-reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+# "rustls-no-provider" (not "rustls") so reqwest doesn't force its default
+# crypto backend (aws-lc-rs, a slow C/asm build) — the binary already needs
+# rustls's "ring" backend for headless_chrome/self_update's ureq, and
+# installing that as the process-wide default (meshfox-cli's `main`) covers
+# reqwest too, without compiling two crypto libraries into one binary.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 scraper = "0.20"
 
 [dev-dependencies]
