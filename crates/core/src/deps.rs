@@ -56,6 +56,8 @@ pub enum DepsError {
     CacheTtyConflict(String, String),
     #[error("node {0:?} block {1:?}: `autoclose` only means anything on a `tty` block")]
     AutocloseWithoutTty(String, String),
+    #[error("node {0:?} block {1:?}: a `button` fence can't also carry `{2}` — it has no real code of its own to run under it")]
+    ButtonAttrConflict(String, String, &'static str),
     #[error(transparent)]
     Vars(#[from] crate::vars::VarsError),
 }
@@ -340,6 +342,26 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
             if block.autoclose && !block.tty {
                 return Err(DepsError::AutocloseWithoutTty(node.id.clone(), name.clone()));
             }
+            if crate::exec::is_button(&block.lang) {
+                let conflict = if block.interpreter.is_some() {
+                    Some("interpreter")
+                } else if block.cache {
+                    Some("cache")
+                } else if !block.env.is_empty() {
+                    Some("env")
+                } else if block.tty {
+                    Some("tty")
+                } else {
+                    None
+                };
+                if let Some(attr) = conflict {
+                    return Err(DepsError::ButtonAttrConflict(
+                        node.id.clone(),
+                        name.clone(),
+                        attr,
+                    ));
+                }
+            }
             resolve_chain(canvas, BlockAddr::new(node.id.clone(), name.clone()))?;
         }
     }
@@ -488,6 +510,65 @@ mod tests {
         assert_eq!(
             validate(&c).unwrap_err(),
             DepsError::CacheTtyConflict("root".to_string(), "shell".to_string())
+        );
+    }
+
+    #[test]
+    fn validate_ok_for_a_plain_button_fence() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```bash name=\"build\" cache\necho build\n```\n\n",
+            "```button name=\"full-import\" default deps=\"build\"\nRun everything\n```\n",
+        ));
+        assert!(validate(&c).is_ok());
+    }
+
+    #[test]
+    fn validate_catches_button_with_interpreter() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```button name=\"go\" interpreter=\"python3\"\n```\n",
+        ));
+        assert_eq!(
+            validate(&c).unwrap_err(),
+            DepsError::ButtonAttrConflict("root".to_string(), "go".to_string(), "interpreter")
+        );
+    }
+
+    #[test]
+    fn validate_catches_button_with_cache() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```button name=\"go\" cache\n```\n",
+        ));
+        assert_eq!(
+            validate(&c).unwrap_err(),
+            DepsError::ButtonAttrConflict("root".to_string(), "go".to_string(), "cache")
+        );
+    }
+
+    #[test]
+    fn validate_catches_button_with_env() {
+        let c = canvas(concat!(
+            "<!-- meshfox:var name=\"X\" default=\"1\" -->\n",
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```button name=\"go\" env=\"X\"\n```\n",
+        ));
+        assert_eq!(
+            validate(&c).unwrap_err(),
+            DepsError::ButtonAttrConflict("root".to_string(), "go".to_string(), "env")
+        );
+    }
+
+    #[test]
+    fn validate_catches_button_with_tty() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```button name=\"go\" tty\n```\n",
+        ));
+        assert_eq!(
+            validate(&c).unwrap_err(),
+            DepsError::ButtonAttrConflict("root".to_string(), "go".to_string(), "tty")
         );
     }
 

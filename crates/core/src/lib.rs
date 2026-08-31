@@ -34,8 +34,8 @@ pub use canvas::{ArrowEnd, Canvas, EdgeLineStyle, ExtraEdge, FileDisplay, Node, 
 pub use constraint::{evaluate as evaluate_constraints, ConstraintResult, ConstraintStatus};
 pub use deps::{compute_forced_reruns, BlockAddr, DepsError};
 pub use exec::{
-    interpreter_var_refs, is_supported_lang, resolve_command, resolve_interpreter,
-    split_interpreter, ResolvedCommand,
+    interpreter_var_refs, is_button, is_supported_lang, resolve_command, resolve_interpreter,
+    split_interpreter, ResolvedCommand, BUTTON_LANG,
 };
 pub use fence::{
     fingerprint, parse_deps_list, parse_env_list, scan_code_blocks, scan_runnable_blocks,

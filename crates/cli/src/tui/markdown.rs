@@ -677,6 +677,34 @@ impl<'a> Renderer<'a> {
                 let name = self.code_name.take();
                 let interpreter = self.code_interpreter.take();
                 let code = std::mem::take(&mut self.code_buf);
+                if lang == meshfox_core::BUTTON_LANG {
+                    // No frame, no fill — a bold accent marker instead.
+                    // The caption *is* the fence's own body (falling back
+                    // to `name` when blank), same as the web UI's
+                    // frameless button; no real code to syntax-highlight
+                    // here, so the ordinary framed-code rendering below
+                    // doesn't apply at all. This pane's own mouse support
+                    // is scroll-only (see README.md's "Terminal viewer")
+                    // — running a block is always `r`/`R` on the tree's
+                    // selected node — hence the `(r to run)` hint spelling
+                    // out which key actually fires it, the same role the
+                    // framed rendering's own `lang · name` head already
+                    // plays.
+                    let caption = code.trim();
+                    let caption = if caption.is_empty() {
+                        name.clone().unwrap_or_default()
+                    } else {
+                        caption.to_string()
+                    };
+                    let marker = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+                    let hint = Style::default().fg(Color::DarkGray);
+                    self.push_segment(Segment::Text(vec![Line::from(vec![
+                        Span::styled("▶ ", marker),
+                        Span::styled(caption, marker),
+                        Span::styled("  (r to run)", hint),
+                    ])]));
+                    return;
+                }
                 let highlighted = self.hl.highlight(&lang, &code);
                 let border = Style::default().fg(Color::DarkGray);
                 // Mirrors the web UI's code-block head (lang + run name) so
@@ -1013,5 +1041,52 @@ mod tests {
         let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
         let text = segment_text(&segments);
         assert!(!text.contains("#!"), "{text}");
+    }
+
+    #[test]
+    fn a_button_fence_renders_its_body_as_the_caption_with_a_run_hint() {
+        let hl = Highlighter::new();
+        let md = "```button name=\"full-import\" deps=\"build\"\n🚀 Run everything\n```\n";
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        let text = segment_text(&segments);
+        assert!(text.contains("🚀 Run everything"), "{text}");
+        assert!(text.contains("(r to run)"), "{text}");
+        // No framed-code rendering (no `┌─`/`│ `/`└─` border) — a button
+        // fence has no real code to put in a frame.
+        assert!(!text.contains('┌'), "{text}");
+    }
+
+    #[test]
+    fn a_button_fence_falls_back_to_its_name_when_the_body_is_blank() {
+        let hl = Highlighter::new();
+        let md = "```button name=\"full-import\" deps=\"build\"\n```\n";
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        let text = segment_text(&segments);
+        assert!(text.contains("full-import"), "{text}");
+    }
+
+    #[test]
+    fn a_button_fences_caption_is_rendered_as_a_bold_accent_marker() {
+        let hl = Highlighter::new();
+        let md = "```button name=\"full-import\" deps=\"build\"\nRun everything\n```\n";
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        let Segment::Text(lines) = &segments[0] else {
+            panic!("expected a text segment");
+        };
+        let caption_span = lines[0]
+            .spans
+            .iter()
+            .find(|s| s.content.contains("Run everything"))
+            .expect("caption span");
+        assert_eq!(caption_span.style.bg, None, "no fill — see design choice above");
+        assert_eq!(caption_span.style.fg, Some(Color::Yellow));
+        assert!(caption_span.style.add_modifier.contains(Modifier::BOLD));
+
+        let marker_span = lines[0]
+            .spans
+            .iter()
+            .find(|s| s.content.contains('▶'))
+            .expect("▶ marker span");
+        assert_eq!(marker_span.style.fg, Some(Color::Yellow));
     }
 }

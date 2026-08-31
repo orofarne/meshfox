@@ -234,6 +234,17 @@ where
     K: AsRef<std::ffi::OsStr>,
     V: AsRef<std::ffi::OsStr>,
 {
+    if meshfox_core::is_button(&block.lang) {
+        // A `button` fence has no real code of its own — its whole point is
+        // its `deps=` chain, already run before this by the same caller
+        // that runs any other block's dependencies. Spawn a genuine (if
+        // trivial, instant, silent) process rather than fabricating a
+        // `SpawnedProcess` by hand, so kill/output-streaming/exit-code
+        // handling stay exactly the same as for any other block.
+        // `crate::deps::validate` already rejects `interpreter=` alongside
+        // `button`, so this never needs to consider one.
+        return spawn_bash(":", envs, cwd);
+    }
     match &block.interpreter {
         Some(interpreter) => spawn_interpreter(interpreter, &block.code, envs, cwd),
         None => spawn_bash(&block.code, envs, cwd),
@@ -367,6 +378,23 @@ mod tests {
         proc.child.wait().await.unwrap();
         drop(proc);
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn spawn_block_runs_a_button_fence_as_a_silent_no_op() {
+        // A `button` fence's own "code" is just a description, never
+        // executed — `spawn_block` should ignore it entirely and still
+        // succeed with no output, same as any other block's caller expects
+        // (only its already-run `deps=` chain is the real payload).
+        let block = test_block("button", None, "this is prose, not code — never run");
+        let mut proc = spawn_block(&block, no_envs(), None).unwrap();
+        let mut lines = Vec::new();
+        while let Some(line) = proc.output_rx.recv().await {
+            lines.push(line);
+        }
+        assert!(lines.is_empty());
+        let status = proc.child.wait().await.unwrap();
+        assert!(status.success());
     }
 
     #[tokio::test]

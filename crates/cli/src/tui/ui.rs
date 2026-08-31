@@ -638,6 +638,9 @@ fn render_block_picker(f: &mut Frame, area: Rect, bp: &super::app::BlockPickerSt
             if b.is_default {
                 flags.push("default");
             }
+            if b.is_button {
+                flags.push("button");
+            }
             if b.cache {
                 flags.push("cache");
             }

@@ -453,6 +453,44 @@ freshness to the loading step's own decision, rather than forcing it (and
 cascading from it) on every run regardless of what anything downstream
 actually needs.
 
+## Button fences
+
+A `` ```button `` fence is an ordinary runnable fence — `name=`/`default=`/
+`deps=`/`always` all mean exactly what they already mean above, with no new
+rules — whose own body is never executed as code. Its whole point is its
+`deps=` chain: a prominent shortcut to run some other block's chain from
+wherever in the document is most convenient to put a button, rather than
+wherever that block itself happens to live.
+
+    ```button name="full-import" default deps="parsers/step-5"
+    🚀 Запустить полный импорт
+    ```
+
+- There's no separate `label=`/`title=` attribute — the fence's own body
+  *is* its caption, rendered directly on the button (a web UI/TUI's usual
+  small run icon, but as one prominent, human-readable button instead).
+  Falls back to the block's own `name` when the body is blank.
+- The body is never executed — running this block never treats it as
+  code. `meshfox validate` rejects `interpreter=`, `cache`, `env=`, or
+  `tty` alongside `lang="button"`: all four presuppose a real process of
+  the block's own, which a button fence never has.
+- `name=`/`default=` are what give a button its "alias": a button fence
+  living directly on the root node with `name="full-import"` is reachable
+  as `meshfox run full-import` for free — the root's own blocks need no
+  path segments — the same addressing every other runnable fence already
+  has, nothing new. `deps=` can name another `button` fence just as
+  freely as any other block; the usual cycle detection covers it the same
+  way.
+- `always` is deliberately *not* implied by `lang="button"` — see its own
+  entry above ("the block actually requested... always runs for real"):
+  the button itself never benefits from `always`, and forcing it onto the
+  button's `deps=` chain would conflict with `always`'s existing
+  "every consumer, every time" semantics. A pipeline step that genuinely
+  needs to never be session-skipped still opts in with its own `always`,
+  same as it would with no button involved.
+- Scope: `deps=` never crosses an `include` boundary (see "What crosses
+  the include boundary" above) — neither does a button's own addressing.
+
 ## Constraint fences
 
 A ` ```starlark constraint ` fence, living in any node's ordinary
@@ -1284,7 +1322,7 @@ then the block name).
   whatever earlier steps in the chain already completed stays cached on
   disk.
 - `meshfox list` — print every runnable block as an indented tree, each
-  with its `[cache]`/`[default]`/`[tty]`/`[deps: ...]`/`[env: ...]` flags and a
+  with its `[button]`/`[cache]`/`[default]`/`[tty]`/`[deps: ...]`/`[env: ...]` flags and a
   ready-to-paste `meshfox run <path...> <name>` — so you don't have to go spelunking
   through the file to find out what's runnable. A node whose only block
   is its default gets a single merged tree line instead of a separate one

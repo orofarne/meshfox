@@ -2743,7 +2743,7 @@ fn has_default(node_id: &str, blocks: &[&meshfox_core::RunnableBlock]) -> bool {
         .is_some()
 }
 
-/// `[cache]`/`[tty]`/`[default]`/`[deps: ...]`/`[env: ...]` suffix for one block's
+/// `[button]`/`[cache]`/`[tty]`/`[default]`/`[deps: ...]`/`[env: ...]` suffix for one block's
 /// tree line. `default` is only shown for the explicit flag — a block
 /// that's default purely by its name matching the node's own id doesn't
 /// need the annotation, since that's already visible from the node/block
@@ -2754,6 +2754,9 @@ fn has_default(node_id: &str, blocks: &[&meshfox_core::RunnableBlock]) -> bool {
 /// never will (see SPEC.md's "Variables").
 fn annotate(block: &meshfox_core::CodeBlock) -> String {
     let mut annotations = Vec::new();
+    if meshfox_core::is_button(&block.lang) {
+        annotations.push("button".to_string());
+    }
     if block.cache {
         annotations.push("cache".to_string());
     }

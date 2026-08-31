@@ -64,6 +64,7 @@ pub struct BlockChoice {
     pub cache: bool,
     pub tty: bool,
     pub is_default: bool,
+    pub is_button: bool,
 }
 
 pub struct BlockPickerState {
@@ -1268,6 +1269,7 @@ impl App {
                     name,
                     cache: b.cache,
                     tty: b.tty,
+                    is_button: meshfox_core::is_button(&b.lang),
                 }
             })
             .collect();

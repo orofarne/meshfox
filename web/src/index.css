@@ -1465,6 +1465,53 @@ a {
   filter: brightness(1.1);
 }
 
+/* A `` ```button `` fence (see SPEC.md's "Button fences") — one filled,
+ * unmissable call-to-action in place of the usual small outlined run pill —
+ * deliberately no card/border/background of its own (unlike
+ * `.mesh-code-block`), just the button sitting directly in the node's
+ * body, since its whole point is to be the obvious "run this" spot in the
+ * document rather than read as another framed block. */
+.mesh-button-block {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.6rem 0;
+}
+
+.mesh-button-block:first-child {
+  margin-top: 0;
+}
+
+.mesh-button-block button.mesh-run-button {
+  font-size: 0.95rem;
+  font-weight: 600;
+  padding: 0.5rem 1rem;
+  border-radius: 6px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+}
+
+.mesh-button-block button.mesh-run-button:hover {
+  filter: brightness(1.08);
+}
+
+.mesh-button-block button.mesh-run-button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.mesh-button-block button.mesh-kill-button {
+  border-color: var(--fail);
+  background: var(--fail);
+  color: #fff;
+  border-radius: 4px;
+  padding: 0.15rem 0.5rem;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+
 .mesh-code-block pre {
   border: none;
   border-radius: 0;

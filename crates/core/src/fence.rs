@@ -740,6 +740,27 @@ mod tests {
     }
 
     #[test]
+    fn button_body_is_kept_as_its_own_caption() {
+        // A `button` fence has no `label=` attribute at all — its body
+        // *is* the caption a UI renders on the button (see
+        // `crate::exec::BUTTON_LANG`), same as any other fence's `code`.
+        let md = "```button name=\"full-import\" deps=\"parsers/step-5\"\n🚀 Run everything\n```\n";
+        let blocks = scan_code_blocks(md);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].code, "🚀 Run everything");
+    }
+
+    #[test]
+    fn button_lang_is_runnable_with_no_interpreter() {
+        // `button` is `is_supported_lang`, unlike `python` above — no
+        // `interpreter=` needed for it to count as a runnable candidate.
+        let md = "```button name=\"full-import\" deps=\"parsers/step-5\"\n```\n";
+        let blocks = scan_code_blocks(md);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].lang, "button");
+    }
+
+    #[test]
     fn scan_runnable_blocks_names_a_lone_unnamed_interpreter_fence_after_the_node() {
         let md = "```python interpreter=\"python3\"\nprint('hi')\n```\n";
         let blocks = scan_runnable_blocks("my-node", md);

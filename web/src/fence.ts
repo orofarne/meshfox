@@ -216,8 +216,13 @@ function fenceIndentOk(line: string): boolean {
  * that just errors when clicked, since the server's own
  * `candidate_fences` never considered it a candidate to begin with. */
 function isSupportedLang(lang: string): boolean {
-  return lang === "bash" || lang === "sh";
+  return lang === "bash" || lang === "sh" || lang === BUTTON_LANG;
 }
+
+/** Mirrors `core::exec::BUTTON_LANG` — the fence "language" for a `button`
+ * shortcut fence: always runnable, but its own body is never executed (see
+ * `CodeSegment.label`/SPEC.md's "Button fences"). */
+export const BUTTON_LANG = "button";
 
 /** A fence is a runnable candidate if its `lang` is one `isSupportedLang`
  * already knows, or it carries its own `interpreter=` attribute naming

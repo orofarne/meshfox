@@ -6,7 +6,7 @@ import remarkImageAttrs from "./remarkImageAttrs";
 import remarkSubSup from "./remarkSubSup";
 import remarkGfmAlerts from "./remarkGfmAlerts";
 import { highlightToHtml } from "./shiki";
-import { defaultBlock, parseBody, type BodySegment, type CodeSegment, type ConstraintSegment } from "./fence";
+import { BUTTON_LANG, defaultBlock, parseBody, type BodySegment, type CodeSegment, type ConstraintSegment } from "./fence";
 import { parseBlockRef, blockDomId } from "./deps";
 import { AnsiText } from "./AnsiText";
 import { NodeTextEditor } from "./NodeTextEditor";
@@ -993,6 +993,13 @@ function HighlightedCode({ code, lang }: { code: string; lang: string }) {
 }
 
 function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData; nodeId: string }) {
+  // A `button` fence has no real code of its own to show/edit — its whole
+  // point is a prominent shortcut to its `deps=` chain (see SPEC.md's
+  // "Button fences") — so it gets an entirely different, much smaller
+  // rendering instead of the ordinary code-editor block below.
+  if (seg.lang === BUTTON_LANG) {
+    return <ButtonBlock seg={seg} data={data} nodeId={nodeId} />;
+  }
   // Expanded by default (unlike a constraint fence — see
   // `ConstraintFenceBlock`): a runnable block's own code and output are
   // usually the point of reading a node at all. The run/chain/kill buttons
@@ -1125,6 +1132,47 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
           <HighlightedCode code={seg.code} lang={seg.lang} />
           {!seg.tty && <RunOutput seg={seg} live={live} />}
         </>
+      )}
+    </div>
+  );
+}
+
+/** Renders a `` ```button `` fence (see SPEC.md's "Button fences") as a
+ * single prominent button, with no card/border around it — just the
+ * button itself (plus a kill button alongside it while running), in place
+ * of the ordinary bordered code-editor block. There's no separate
+ * `label=` attribute: the fence's own body *is* its caption (falling back
+ * to its `name` when blank), never executed as code — clicking it only
+ * ever runs its `deps=` chain (the equivalent of "⛓ run chain" — there's
+ * no "just this block" to run, since it has no real code of its own). */
+function ButtonBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData; nodeId: string }) {
+  const live = data.liveBlocks[seg.name];
+  const queued = live?.status === "queued";
+  const running = live?.status === "running";
+  const busy = queued || running;
+  const caption = seg.code.trim() || seg.name;
+  const buttonLabel = !busy ? caption : queued ? "queued…" : "running…";
+
+  return (
+    <div className="mesh-button-block" id={blockDomId({ nodeId, blockName: seg.name })}>
+      <button
+        type="button"
+        className="mesh-run-button"
+        disabled={busy}
+        onClick={() => data.onRun(seg.name, true)}
+        title={seg.deps.length > 0 ? `runs its dependency chain: ${seg.deps.join(", ")} → ${seg.name}` : caption}
+      >
+        {buttonLabel}
+      </button>
+      {running && (
+        <button
+          type="button"
+          className="mesh-kill-button"
+          onClick={() => data.onKill(seg.name)}
+          title="Kill this run — terminates the process (and anything it spawned), and stops the rest of its dependency chain, in case it's hung"
+        >
+          ⏹ kill
+        </button>
       )}
     </div>
   );
@@ -1446,6 +1494,19 @@ export function NodeBodyPreview({ text }: { text: string }) {
             >
               {seg.content}
             </ReactMarkdown>
+          );
+        }
+        if (seg.type === "code" && seg.lang === BUTTON_LANG) {
+          // Same static, disabled-look rendering `ButtonBlock` would give
+          // this fence in the real canvas — no run/kill state to show here
+          // (this is an unsaved draft, see this component's own doc
+          // comment), just what it would look like.
+          return (
+            <div className="mesh-button-block" key={`${seg.name}-${i}`}>
+              <button type="button" className="mesh-run-button" disabled>
+                {seg.code.trim() || seg.name}
+              </button>
+            </div>
           );
         }
         const highlightLang = seg.type === "constraint" ? "starlark" : seg.lang;

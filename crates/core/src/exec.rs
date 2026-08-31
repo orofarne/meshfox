@@ -168,7 +168,23 @@ fn uuid_like_suffix() -> String {
 /// sample, a `json` snippet, ...) from being mistaken for "the" runnable
 /// block in a node that has no real meshfox structure of its own.
 pub fn is_supported_lang(lang: &str) -> bool {
-    matches!(lang, "bash" | "sh")
+    matches!(lang, "bash" | "sh" | BUTTON_LANG)
+}
+
+/// The fence "language" for a `button` shortcut fence (see SPEC.md's
+/// "Button fences") — a runnable fence with no real code of its own. Its
+/// whole point is its `deps=` chain (already run before it, like any other
+/// block's dependencies) plus a prominent UI button in place of the usual
+/// small run icon; the fence's own body is just an optional description for
+/// a person reading the document, never executed. Always runnable, same as
+/// `bash`/`sh` — see `is_supported_lang` — but `crate::deps::validate`
+/// rejects `interpreter=`/`cache`/`env=`/`tty` alongside it, since none of
+/// those mean anything without a real process of the block's own.
+pub const BUTTON_LANG: &str = "button";
+
+/// True if `lang` is the `button` pseudo-language — see `BUTTON_LANG`.
+pub fn is_button(lang: &str) -> bool {
+    lang == BUTTON_LANG
 }
 
 #[cfg(test)]
@@ -179,8 +195,15 @@ mod tests {
     fn is_supported_lang_matches_known_languages() {
         assert!(is_supported_lang("bash"));
         assert!(is_supported_lang("sh"));
+        assert!(is_supported_lang("button"));
         assert!(!is_supported_lang("yaml"));
         assert!(!is_supported_lang("ruby"));
+    }
+
+    #[test]
+    fn is_button_matches_only_the_button_lang() {
+        assert!(is_button("button"));
+        assert!(!is_button("bash"));
     }
 
     #[test]
