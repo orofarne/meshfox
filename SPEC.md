@@ -369,6 +369,15 @@ Lives inside a node's Markdown text, as fence-info-string attributes:
   "Interactive (`tty`) blocks" below for how the CLI and web UI actually
   run one, and that section's own `autoclose` for returning to the canvas
   automatically once it exits.
+- `output="markdown"` — optional; changes how a `cache`d run's captured
+  stdout is written back (see "Cached output" below). By default it's
+  wrapped in a passive ` ```text ` fence, shown verbatim. With
+  `output="markdown"`, it's spliced in as real Markdown instead — useful
+  for a command that already prints Markdown worth rendering, e.g. a
+  `pandas` `DataFrame` via `df.to_markdown()` (needs the `tabulate`
+  package), which then renders as an actual table rather than
+  preformatted text. Any other value (or omitting the attribute) keeps the
+  default text rendering.
 
 Supported languages without an `interpreter=` attribute: `bash` (`sh` is an
 alias for it). A fence in any other language never counts as runnable at
@@ -1086,6 +1095,38 @@ long the block's own process actually ran (`meshfox_core::format_duration_ms`
 run's duration, not just whether it succeeded. The web UI shows the same
 figure live, ticking up in real time while a block is still running (like a
 Livebook cell) rather than only once it's done.
+
+With `output="markdown"` on the fence (see "Runnable code fences" above),
+the same region instead carries the captured stdout spliced in as real
+Markdown, with no wrapping fence and no `exit code`/duration header on a
+successful run:
+
+    ```python name="df" cache output="markdown" interpreter="python3 -u"
+    print(df.to_markdown())
+    ```
+    <!-- meshfox:output name="df" hash="a1b2c3d4" -->
+
+    | id | name |
+    |---:|:-----|
+    |  1 | ann  |
+
+    <!-- /meshfox:output -->
+
+— which renders as an actual table instead of preformatted text. A failed
+run (`exit_code != 0`) still gets a leading bold `**⚠ exit code: N ·
+duration**` line, since the rendered content alone might not make that
+obvious. Because this content is genuinely re-parsed as Markdown/HTML by
+every downstream reader (unlike the fenced default, which is always inert),
+`meshfox_core::output::write_output` escapes any literal `<!--` in it
+first (`&lt;!--`) so a command's own output can never forge a
+`meshfox:node`/`meshfox:edge`/`meshfox:output` (or any other `meshfox:*`)
+comment — and a fence *inside* the region (a forged ` ```bash name="..."
+cache ` block, say) is never picked up as a real runnable or
+` ```starlark constraint ` block either, the same way heading/`meshfox:node`
+detection (`crate::mdcanvas::scan`) treats the whole marker-to-marker
+region as opaque. `output="markdown"` is therefore meant for output you
+trust to *look at*, not output from an untrusted source — same trust level
+as any other Markdown already committed to the file.
 
 The marker's own `hash=` is a short fingerprint
 (`meshfox_core::fence::fingerprint`) of everything about the fence that

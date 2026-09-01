@@ -142,6 +142,15 @@ export interface CodeSegment {
    * in this same node, `node-id/block-name` is a block elsewhere. See
    * `./deps.ts` for resolving these into concrete addresses. */
   deps: string[];
+  /** Mirrors the fence's own `output="markdown"` attribute (SPEC.md's
+   * "Runnable code fences"/"Cached output" —
+   * `core::output::render_output_block_markdown`): a `cache`d run's
+   * captured stdout is spliced into the file as real Markdown instead of
+   * the default passive `text` fence. Read by `parseCachedOutputBlock`
+   * (a different marker-body shape to parse) and by `MeshNode.tsx`'s
+   * `RunOutput`/`LiveRunOutput` (render the result through `ReactMarkdown`
+   * instead of a `<pre>`/`AnsiText` block). */
+  outputMarkdown: boolean;
   /** Mirrors `core::fence::CodeBlock.default` — the explicit `default`
    * flag (`` ```bash name="run" default ``). A block also counts as this
    * node's default when `name` equals the node's own id (see `MeshNode.tsx`'s
@@ -288,6 +297,24 @@ function parseCachedOutputBlock(inner: string): Omit<CachedOutput, "stale"> {
   };
 }
 
+/** `output="markdown"` counterpart of `parseCachedOutputBlock` — mirrors
+ * `core::output::render_output_block_markdown`'s shape: no wrapping fence
+ * at all (`inner`, trimmed, *is* the Markdown to render), and no `exit
+ * code`/duration line on a successful run — only a leading bold `**⚠ exit
+ * code: N · duration**` line on a failure, which is stripped back out
+ * here the same way the plain-text header is above (`MeshNode.tsx` already
+ * shows exit code/duration in this block's own head bar; leaving the bold
+ * line in the rendered body too would just double it up). */
+function parseCachedOutputBlockMarkdown(inner: string): Omit<CachedOutput, "stale"> {
+  const body = inner.replace(/^\n+/, "").replace(/\n+$/, "");
+  const exitMatch = /^\*\*⚠ exit code: (-?\d+)(?: · (.+?))?\*\*\n\n?/.exec(body);
+  return {
+    exitCode: exitMatch ? Number(exitMatch[1]) : 0,
+    durationText: exitMatch?.[2],
+    text: exitMatch ? body.slice(exitMatch[0].length) : body,
+  };
+}
+
 /** Parses a `<!-- meshfox:output name="..." hash="..." -->` marker line's
  * own attributes — `null` if `line` isn't that marker for `name` at all
  * (matched on the `name=` prefix, not a full literal string, since `hash=`
@@ -386,6 +413,7 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
     const tty = attrs.tty !== undefined && attrs.tty !== "false";
     const autoclose = attrs.autoclose !== undefined && attrs.autoclose !== "false";
     const isDefault = attrs.default !== undefined && attrs.default !== "false";
+    const outputMarkdown = attrs.output === "markdown";
     const interpreter = attrs.interpreter;
     const deps = (attrs.deps ?? "")
       .split(",")
@@ -417,12 +445,15 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
         const stale =
           markerAttrs.hash === undefined ||
           markerAttrs.hash !== fingerprint(lang, code, interpreter, attrs.env, attrs.deps);
-        output = { ...parseCachedOutputBlock(inner.join("\n")), stale };
+        const parsed = outputMarkdown
+          ? parseCachedOutputBlockMarkdown(inner.join("\n"))
+          : parseCachedOutputBlock(inner.join("\n"));
+        output = { ...parsed, stale };
         cursor = k + 1;
       }
     }
 
-    segments.push({ type: "code", lang, name, cache, tty, autoclose, deps, default: isDefault, interpreter, code: codeLines.join("\n"), output });
+    segments.push({ type: "code", lang, name, cache, tty, autoclose, deps, default: isDefault, outputMarkdown, interpreter, code: codeLines.join("\n"), output });
     i = cursor;
   }
   flushMarkdown();

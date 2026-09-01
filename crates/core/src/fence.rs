@@ -397,12 +397,11 @@ pub fn scan_runnable_blocks(node_id: &str, markdown: &str) -> Vec<CodeBlock> {
 /// belt and suspenders against ever growing a spurious implicit block out
 /// of a node's own cached output.
 fn candidate_fences(markdown: &str) -> Vec<(RawFence, String, HashMap<String, String>)> {
+    let output_ranges = crate::output::output_byte_ranges(markdown);
     scan_raw_fences(markdown)
         .into_iter()
         .filter(|f| {
-            f.delim_char == '`'
-                && !f.info.is_empty()
-                && !is_cached_output_fence(markdown, f.span.start)
+            f.delim_char == '`' && !f.info.is_empty() && !in_output_region(&output_ranges, f.span.start)
         })
         .map(|f| {
             let (lang, attrs) = parse_info_string(&f.info);
@@ -414,18 +413,20 @@ fn candidate_fences(markdown: &str) -> Vec<(RawFence, String, HashMap<String, St
         .collect()
 }
 
-/// True if the line immediately before `fence_start` is a `<!--
-/// meshfox:output ... -->` marker — matches exactly how
-/// `output::render_output_block` places a cached-output fence right after
-/// that marker line, no blank line in between.
-fn is_cached_output_fence(markdown: &str, fence_start: usize) -> bool {
-    markdown[..fence_start]
-        .trim_end_matches('\n')
-        .rsplit('\n')
-        .next()
-        .unwrap_or("")
-        .trim_start()
-        .starts_with("<!-- meshfox:output")
+/// True if `pos` falls inside one of `ranges` (each from
+/// `crate::output::output_byte_ranges`) — i.e. inside a `<!--
+/// meshfox:output ... --> ... <!-- /meshfox:output -->` region. A fence in
+/// there is always cached output, never real source: the default
+/// text-mode rendering wraps it in exactly one such fence right after the
+/// marker line (`output::render_output_block`), and `output="markdown"`
+/// mode can additionally splice a command's own raw stdout into the same
+/// region, which could otherwise contain what *looks* like a real
+/// `name=`/`cache` runnable fence (or a `starlark constraint` one, see
+/// `scan_constraint_blocks`) forged by whatever the command printed —
+/// belt and suspenders against ever growing a spurious/adversarial block
+/// out of a node's own cached output.
+fn in_output_region(ranges: &[Range<usize>], pos: usize) -> bool {
+    ranges.iter().any(|r| r.start <= pos && pos < r.end)
 }
 
 /// Every attribute name `build_code_block` actually reads off a runnable
@@ -446,6 +447,7 @@ const FENCE_ATTRS: &[&str] = &[
     "always",
     "default",
     "interpreter",
+    "output",
 ];
 
 /// `meshfox validate`-only: the first runnable fence anywhere in
@@ -516,9 +518,13 @@ pub struct ConstraintBlock {
 /// way an unnamed `bash` fence is left alone by `scan_code_blocks` unless
 /// it opts in with `name=`.
 pub fn scan_constraint_blocks(markdown: &str) -> Vec<ConstraintBlock> {
+    let output_ranges = crate::output::output_byte_ranges(markdown);
     scan_raw_fences(markdown)
         .into_iter()
         .filter_map(|f| {
+            if in_output_region(&output_ranges, f.span.start) {
+                return None;
+            }
             let (lang, attrs) = parse_info_string(&f.info);
             if lang != "starlark" {
                 return None;

@@ -1130,7 +1130,7 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
             </div>
           )}
           <HighlightedCode code={seg.code} lang={seg.lang} />
-          {!seg.tty && <RunOutput seg={seg} live={live} />}
+          {!seg.tty && <RunOutput seg={seg} live={live} assetBase={data.assetBase} />}
         </>
       )}
     </div>
@@ -1254,14 +1254,49 @@ function BlockedRunOutput() {
   );
 }
 
+/** Renders a `output="markdown"` block's captured stdout as real Markdown
+ * (SPEC.md's "Cached output") instead of the `<pre><AnsiText/></pre>` every
+ * other block's output gets — same `ReactMarkdown` setup (plugins,
+ * `assetBase`-aware link/image resolution) `MeshNodeBody`'s own prose
+ * segments use, via `makeMarkdownComponents`, so an `output="markdown"`
+ * block's rendered table/etc. looks and behaves exactly like any other
+ * Markdown in the node. */
+function MarkdownOutput({ text, assetBase }: { text: string; assetBase?: string }) {
+  const components = useMemo(() => makeMarkdownComponents(assetBase), [assetBase]);
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm, remarkImageAttrs, remarkSubSup, remarkGfmAlerts]}
+      components={components}
+      urlTransform={allowDataImageUrls}
+    >
+      {text}
+    </ReactMarkdown>
+  );
+}
+
 /** Live output (queued/running/done/killed, from the current run) — shared
  * by `RunOutput` (a fenced block's own output, falling back to its cached
  * copy when nothing's live — see below) and a runnable `file` node's own
  * body (`NodeBodyContent`), which has no cached copy to fall back to at
  * all. Never shown at all for a read-only run beyond this component's own
  * lifetime (a page reload loses it, same as the transient-output behavior
- * this replaces always had). */
-function LiveRunOutput({ live }: { live: LiveBlockState }) {
+ * this replaces always had).
+ *
+ * `outputMarkdown` (default `false`, since a `file` node's own live output
+ * has no `output=` attribute to read it from) only switches the *finished*
+ * (`"done"`) rendering to Markdown — a still-`"running"` stream is shown
+ * raw regardless, the same way a Jupyter cell doesn't try to incrementally
+ * render partial rich output either; it only ever renders once a
+ * `display_data` payload is complete. */
+function LiveRunOutput({
+  live,
+  outputMarkdown = false,
+  assetBase,
+}: {
+  live: LiveBlockState;
+  outputMarkdown?: boolean;
+  assetBase?: string;
+}) {
   if (live.status === "skipped") {
     return <SkippedRunOutput live={live} />;
   }
@@ -1283,13 +1318,15 @@ function LiveRunOutput({ live }: { live: LiveBlockState }) {
     );
   const exitState =
     live.status === "killed" ? "killed" : live.status === "running" ? "running" : live.exitCode === 0 ? "ok" : "fail";
+  const renderMarkdown = outputMarkdown && live.status === "done";
   return (
     <div className="mesh-code-output" data-exit={exitState}>
       <div className="mesh-code-output-head">
         {label}
         <span className="mesh-code-output-transient"> · not saved</span>
       </div>
-      {live.text && (
+      {live.text && renderMarkdown && <MarkdownOutput text={live.text} assetBase={assetBase} />}
+      {live.text && !renderMarkdown && (
         <pre>
           <code><AnsiText text={live.text} /></code>
         </pre>
@@ -1302,9 +1339,9 @@ function LiveRunOutput({ live }: { live: LiveBlockState }) {
  * the current run) takes over from the cached copy in the file whenever
  * one's in progress or just finished — cleared back to the cached view once
  * `App.tsx` reloads the canvas after a persisted run. */
-function RunOutput({ seg, live }: { seg: CodeSegment; live?: LiveBlockState }) {
+function RunOutput({ seg, live, assetBase }: { seg: CodeSegment; live?: LiveBlockState; assetBase?: string }) {
   if (live && live.status !== "queued") {
-    return <LiveRunOutput live={live} />;
+    return <LiveRunOutput live={live} outputMarkdown={seg.outputMarkdown} assetBase={assetBase} />;
   }
   if (!live && seg.output) {
     return (
@@ -1319,7 +1356,8 @@ function RunOutput({ seg, live }: { seg: CodeSegment; live?: LiveBlockState }) {
             </span>
           )}
         </div>
-        {seg.output.text && (
+        {seg.output.text && seg.outputMarkdown && <MarkdownOutput text={seg.output.text} assetBase={assetBase} />}
+        {seg.output.text && !seg.outputMarkdown && (
           <pre>
             <code><AnsiText text={seg.output.text} /></code>
           </pre>

@@ -23,7 +23,7 @@ use meshfox_core::mdcanvas::{EDGE_ATTRS, NODE_ATTRS};
 /// A runnable fence's own attribute vocabulary (`crates/core/src/fence.rs`)
 /// — value-taking (`name="..."`) vs. bare presence flags (`cache`, no
 /// `=value` at all) need different insertion shapes, see `AttrCandidate`.
-const FENCE_VALUE_ATTRS: &[&str] = &["name", "deps", "env", "interpreter"];
+const FENCE_VALUE_ATTRS: &[&str] = &["name", "deps", "env", "interpreter", "output"];
 const FENCE_FLAG_ATTRS: &[&str] = &["cache", "tty", "autoclose", "always", "default"];
 
 /// What the caller (`App::on_key`) should do after handing a keypress to

@@ -2266,14 +2266,30 @@ fn scan(markdown: &str) -> Vec<Segment> {
     // fence, or arbitrary cached command output that happens to contain a
     // ``` run, as closing the fence early and expose its content (which
     // might itself contain `#` lines) as if it were real document structure.
+    //
+    // Same treatment for a `<!-- meshfox:output ... --> ...
+    // <!-- /meshfox:output -->` region (`crate::output::output_byte_ranges`)
+    // — needed on top of the fence check above because `output="markdown"`
+    // mode (see `crate::output::render_output_block_markdown`) splices a
+    // command's own stdout in as real Markdown rather than inside a fence,
+    // so without this a forged `# Heading` + `<!-- meshfox:node ... -->`
+    // pair printed by the command could otherwise become a real,
+    // adversarial canvas node on the next parse.
     let fence_ranges = crate::fence::fenced_byte_ranges(markdown);
+    let output_ranges = crate::output::output_byte_ranges(markdown);
     let mut fi = 0;
+    let mut oi = 0;
     let mut all_headings = Vec::new();
     for (i, &(start_off, line)) in lines.iter().enumerate() {
         while fi < fence_ranges.len() && fence_ranges[fi].end <= start_off {
             fi += 1;
         }
-        if fi < fence_ranges.len() && fence_ranges[fi].start <= start_off {
+        while oi < output_ranges.len() && output_ranges[oi].end <= start_off {
+            oi += 1;
+        }
+        let in_fence = fi < fence_ranges.len() && fence_ranges[fi].start <= start_off;
+        let in_output = oi < output_ranges.len() && output_ranges[oi].start <= start_off;
+        if in_fence || in_output {
             continue;
         }
         let content = line.trim_end_matches('\n');
@@ -2803,6 +2819,24 @@ Reused from Tests as well.
         // long enough (meshfox_core::output picks one longer than any run
         // in the body), none of it should be treated as real structure.
         let doc = "# Root\n<!-- meshfox:node id=\"root\" -->\n\n```bash name=\"evil\" cache\necho evil\n```\n<!-- meshfox:output name=\"evil\" -->\n``````text\nexit code: 0\n\n# Fake Root\n<!-- meshfox:node id=\"fake\" -->\n## Fake Section\n```\n````\n`````\n``````\n<!-- /meshfox:output -->\n";
+        let c = parse(doc).unwrap();
+        assert_eq!(c.nodes.len(), 1);
+        assert!(c.node("fake").is_none());
+    }
+
+    #[test]
+    fn heading_and_fake_node_comment_inside_unfenced_markdown_output_is_not_a_node() {
+        // `output="markdown"` mode (crate::output::render_output_block_markdown)
+        // splices a command's stdout in as real Markdown, with no wrapping
+        // fence at all -- so this is a second, independent guard on top of
+        // `heading_and_fake_node_comment_inside_arbitrary_cached_output_is_not_a_node`
+        // above: the region between the `meshfox:output`/`/meshfox:output`
+        // markers is opaque to heading detection regardless of whether it's
+        // fenced. (`crate::output::write_output` itself additionally
+        // escapes any literal `<!--` before ever writing content like this
+        // -- this test exercises the range-based guard directly, as if
+        // that first layer weren't there.)
+        let doc = "# Root\n<!-- meshfox:node id=\"root\" -->\n\n```python name=\"evil\" cache output=\"markdown\"\nprint(payload)\n```\n<!-- meshfox:output name=\"evil\" hash=\"x\" -->\n\n# Fake Root\n<!-- meshfox:node id=\"fake\" -->\n\n<!-- /meshfox:output -->\n";
         let c = parse(doc).unwrap();
         assert_eq!(c.nodes.len(), 1);
         assert!(c.node("fake").is_none());

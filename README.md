@@ -117,6 +117,23 @@ temp file built from the fence's own body.
 
 [examples/python-venv.canvas.md](./examples/python-venv.canvas.md)
 
+### Rendering rich output (a pandas DataFrame preview)
+<!-- meshfox:node id="rendering-rich-output-a-pandas-dataframe-preview" -->
+
+[examples/pandas-dataframe.canvas.md](./examples/pandas-dataframe.canvas.md)
+— the `output="markdown"` fence attribute (SPEC.md's "Runnable code
+fences"/"Cached output") splices a `cache`d block's captured stdout into the
+canvas as real Markdown instead of the default passive `text` fence, so a
+command that already prints Markdown worth rendering — here, a `pandas`
+`DataFrame` via `df.to_markdown()` — shows up as an actual table rather than
+a wall of pipe characters. Builds on the same venv pattern as "A canvas's own
+Python environment" above.
+
+#### Example
+<!-- meshfox:node id="example-7" type="file" -->
+
+[examples/pandas-dataframe.canvas.md](./examples/pandas-dataframe.canvas.md)
+
 ### Running a block under a different language/tool
 <!-- meshfox:node id="running-a-block-under-a-different-language-tool" -->
 
