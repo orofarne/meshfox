@@ -1260,17 +1260,27 @@ function BlockedRunOutput() {
  * `assetBase`-aware link/image resolution) `MeshNodeBody`'s own prose
  * segments use, via `makeMarkdownComponents`, so an `output="markdown"`
  * block's rendered table/etc. looks and behaves exactly like any other
- * Markdown in the node. */
+ * Markdown in the node.
+ *
+ * The `.mesh-code-output-markdown` wrapper gives this its own inset
+ * padding and dashed top separator (`index.css`), mirroring
+ * `.mesh-code-output pre`'s own treatment — `.mesh-code-output` itself has
+ * no padding of its own (every other kind of content it holds, `pre`
+ * included, supplies its own), and a bare `<table>`'s per-cell borders
+ * would otherwise land flush against the box's own border with nothing
+ * else here to create that gap. */
 function MarkdownOutput({ text, assetBase }: { text: string; assetBase?: string }) {
   const components = useMemo(() => makeMarkdownComponents(assetBase), [assetBase]);
   return (
-    <ReactMarkdown
-      remarkPlugins={[remarkGfm, remarkImageAttrs, remarkSubSup, remarkGfmAlerts]}
-      components={components}
-      urlTransform={allowDataImageUrls}
-    >
-      {text}
-    </ReactMarkdown>
+    <div className="mesh-code-output-markdown">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm, remarkImageAttrs, remarkSubSup, remarkGfmAlerts]}
+        components={components}
+        urlTransform={allowDataImageUrls}
+      >
+        {text}
+      </ReactMarkdown>
+    </div>
   );
 }
 

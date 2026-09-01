@@ -1260,6 +1260,40 @@ a {
   content: "🛑 Caution";
 }
 
+/* GFM tables (`remark-gfm`) — a bare, unstyled table reads as an unaligned
+ * wall of text, especially sitting right next to bordered code
+ * blocks/alerts. A visible grid plus a shaded header row (--code-head-bg,
+ * same tone `.mesh-code-block-head` already uses) makes it read as one
+ * more framed thing, same family as the code/alert boxes above rather
+ * than plain prose. `display: block` + `overflow-x: auto` (same idea as
+ * `.mesh-node-body pre`'s own horizontal scroll) keeps a wide table from
+ * blowing out the node's own width instead of shrinking its columns
+ * illegibly. */
+.mesh-node-body table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  margin: 0.6rem 0;
+  font-size: 0.85rem;
+}
+
+.mesh-node-body th,
+.mesh-node-body td {
+  border: 1px solid var(--node-border);
+  padding: 0.35rem 0.75rem;
+  text-align: left;
+}
+
+.mesh-node-body th {
+  background: var(--code-head-bg);
+  font-weight: 600;
+}
+
+.mesh-node-body tbody tr:nth-child(even) {
+  background: var(--code-bg);
+}
+
 /* One runnable fence: language label + run button, right above its own
  * code — not a button bar detached at the bottom of the node. */
 .mesh-code-block {
@@ -1608,7 +1642,8 @@ a {
  * changed since this ran — see SPEC.md's "Cached output") stays fully
  * readable, just visually receded, so it reads as "still here, not
  * current" rather than being hidden or looking like a fresh result. */
-.mesh-code-output[data-stale] pre {
+.mesh-code-output[data-stale] pre,
+.mesh-code-output[data-stale] .mesh-code-output-markdown {
   opacity: 0.6;
 }
 
@@ -1616,6 +1651,26 @@ a {
   border: none;
   border-radius: 0;
   border-top: 1px dashed var(--node-border);
+}
+
+/* `output="markdown"` (see MarkdownOutput in MeshNode.tsx) — the same
+ * head-separator/inset `.mesh-code-output pre` gets above, since
+ * `.mesh-code-output` itself supplies no padding of its own and a bare
+ * `<table>`'s per-cell borders would otherwise sit flush against this
+ * box's own border. `:first-child`/`:last-child` drop the rendered
+ * Markdown's own top/bottom margin so this wrapper's padding is the only
+ * thing controlling the inset — not double-spaced on top of it. */
+.mesh-code-output-markdown {
+  padding: 0.6rem 0.75rem;
+  border-top: 1px dashed var(--node-border);
+}
+
+.mesh-code-output-markdown > :first-child {
+  margin-top: 0;
+}
+
+.mesh-code-output-markdown > :last-child {
+  margin-bottom: 0;
 }
 
 /* An edge's own `label` (extra or structural — either kind can have one,
