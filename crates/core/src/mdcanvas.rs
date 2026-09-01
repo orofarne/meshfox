@@ -52,6 +52,39 @@ pub fn has_marker(markdown: &str) -> bool {
     parse_comment(first_line, "meshfox:canvas").is_some()
 }
 
+/// Whether `path`'s own name marks it as a canvas without having to read
+/// it — the cheap half of the "is this a canvas" check, split out so a
+/// caller that only has a `*.canvas.md` candidate (or wants to avoid a read
+/// for a file it's about to reject anyway) doesn't have to read the file
+/// just to find out. A plain `*.md` file still needs [`has_marker`] on its
+/// actual contents — see [`is_canvas`].
+pub fn is_canvas_path(path: &std::path::Path) -> bool {
+    path.to_string_lossy().ends_with(".canvas.md")
+}
+
+/// Whether `path` (whose `contents` the caller already has in hand) counts
+/// as a canvas: either its name ends in `.canvas.md`, or it's a plain `.md`
+/// file that opens with the `meshfox:canvas` marker (see [`has_marker`]) —
+/// this is how e.g. README.md itself can be treated as a canvas without
+/// being renamed. The one rule used, up to now, independently by
+/// `include::resolve`/`include::list_includes` and the CLI's own
+/// `find_canvas()`.
+pub fn is_canvas(path: &std::path::Path, contents: &str) -> bool {
+    is_canvas_path(path) || has_marker(contents)
+}
+
+/// Splits a `file`/`link` node's `target` on its first `#` into the path
+/// portion and an optional fragment — e.g. `other.canvas.md#some-node` deep
+/// links to node `some-node` in that canvas. The fragment must be stripped
+/// before the path portion is resolved against the filesystem (`confine`/
+/// `resolve_confined_target`), since neither knows about node ids.
+pub fn split_target_fragment(target: &str) -> (&str, Option<&str>) {
+    match target.split_once('#') {
+        Some((path, fragment)) => (path, Some(fragment)),
+        None => (target, None),
+    }
+}
+
 #[derive(Debug, Error, PartialEq)]
 pub enum ParseError {
     #[error("document has no top-level (#) heading to serve as the root node")]

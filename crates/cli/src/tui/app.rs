@@ -95,6 +95,22 @@ pub struct PendingTty {
     pub autoclose: bool,
 }
 
+/// A canvas-target `file`-node "open" waiting for `mod.rs`'s event loop to
+/// hand the terminal to a nested child TUI — the terminal counterpart to
+/// `PendingTty` above, and to the web UI's cross-canvas navigation (see
+/// `crates/server/src/lib.rs`'s `open_node_file`), but without that one's
+/// registry/daemon: a nested TUI runs synchronously in the foreground, so
+/// there's nothing to keep alive once it exits and nothing to look up by
+/// port. See `App::trigger_open_file`.
+pub struct PendingChildCanvas {
+    pub path: PathBuf,
+    /// The `#fragment` off the original link target, if any — becomes the
+    /// child's own `--node` (see `Command::Tui`), so a
+    /// `[label](other.canvas.md#some-node)` deep link lands the nested TUI
+    /// on `some-node` instead of its root.
+    pub node: Option<String>,
+}
+
 pub struct RunState {
     pub chain: Vec<BlockAddr>,
     pub idx: usize,
@@ -189,6 +205,7 @@ pub struct App {
     pub run: Option<RunState>,
     pub file_run: Option<FileRunState>,
     pub pending_tty: Option<PendingTty>,
+    pub pending_child_canvas: Option<PendingChildCanvas>,
     pub block_picker: Option<BlockPickerState>,
     pub var_form: Option<VarFormState>,
     pub status: String,
@@ -362,13 +379,26 @@ impl App {
     pub fn new(
         canvas_path: PathBuf,
         link_preview_tx: tokio::sync::mpsc::UnboundedSender<LinkPreviewMsg>,
+        initial_node: Option<&str>,
     ) -> io::Result<App> {
         let raw = std::fs::read_to_string(&canvas_path)?;
         let canvas = Canvas::from_markdown(&raw).map_err(|e| io::Error::other(e.to_string()))?;
         let decls = declared_vars(&canvas).unwrap_or_default();
         let var_cache = VarCache::load(&canvas_path).unwrap_or_else(|_| VarCache::in_memory());
-        let expanded = HashSet::new();
         let display_canvas = resolve_includes(&canvas, &canvas_path);
+        // Deep-link start (`meshfox tui <path> --node <id>` — see
+        // `Command::Tui`): expand every ancestor of `initial_node` so its
+        // row actually exists in `flatten`'s output below, same as the web
+        // UI's own `deepLinkNodeId` handling has to unfold ancestors before
+        // `flowInstance.getNode` can find anything.
+        let mut expanded = HashSet::new();
+        if let Some(target) = initial_node {
+            let mut current = display_canvas.node(target).and_then(|n| n.parent.clone());
+            while let Some(id) = current {
+                current = display_canvas.node(&id).and_then(|n| n.parent.clone());
+                expanded.insert(id);
+            }
+        }
         let constraint_stats = constraint_stats(&display_canvas);
         let rows = tree::flatten(&display_canvas, &expanded);
         // `Picker::from_query_stdio()` (protocol auto-detection) turned out
@@ -404,6 +434,7 @@ impl App {
             run: None,
             file_run: None,
             pending_tty: None,
+            pending_child_canvas: None,
             block_picker: None,
             var_form: None,
             status: String::new(),
@@ -422,6 +453,11 @@ impl App {
             session_runs: HashMap::new(),
             reset_session_confirm: false,
         };
+        if let Some(target) = initial_node {
+            if let Some(idx) = app.rows.iter().position(|r| r.node_id == target) {
+                app.selected = idx;
+            }
+        }
         app.render_current_document();
         Ok(app)
     }
@@ -841,20 +877,26 @@ impl App {
             .is_some_and(|node| node.node_type == NodeType::File && node.target.is_some())
     }
 
-    /// `o` — opens the selected `file` node's `target` in the OS's own
-    /// default application for it (`open` on macOS, `xdg-open` on Linux,
-    /// `start` on Windows, via the `open` crate), the terminal
+    /// `o` — opens the selected `file` node's `target`, the terminal
     /// counterpart to the web UI's "↗ open" button
     /// (`crates/server/src/lib.rs`'s `open_node_file` handler does the
-    /// same thing over HTTP, for the browser case). Resolved relative to
-    /// the canvas file's own directory, same `base_dir` join
-    /// `render_current_document`'s `display="code"` preview already
-    /// uses — no separate "must stay inside the canvas directory"
-    /// confinement check like the server's own `resolve_confined_target`,
-    /// since there's no network boundary to defend here: this is the
-    /// user's own local process, opening a file they can already reach
-    /// directly. Best-effort — spawns the opener and returns as soon as
-    /// it has, without waiting for it to exit.
+    /// same thing over HTTP, for the browser case). A plain file goes to
+    /// the OS's own default application for it (`open` on macOS,
+    /// `xdg-open` on Linux, `start` on Windows, via the `open` crate) —
+    /// best-effort, spawns the opener and returns as soon as it has,
+    /// without waiting for it to exit. A `.canvas.md` (or marker-carrying
+    /// `.md`) target has no such OS association to hand off to instead
+    /// arms `pending_child_canvas` for `mod.rs`'s event loop to hand the
+    /// terminal to a nested `meshfox tui` — no registry/daemon needed
+    /// here, unlike the web case: a nested TUI is a plain synchronous
+    /// foreground child, same shape as a `tty` block's own handoff. Target
+    /// resolved relative to the canvas file's own directory, same
+    /// `base_dir` join `render_current_document`'s `display="code"`
+    /// preview already uses — no separate "must stay inside the canvas
+    /// directory" confinement check like the server's own
+    /// `resolve_confined_target`, since there's no network boundary to
+    /// defend here: this is the user's own local process, opening a file
+    /// they can already reach directly.
     fn trigger_open_file(&mut self) {
         let Some(row) = self.rows.get(self.selected) else {
             return;
@@ -870,12 +912,26 @@ impl App {
             self.status = "file node has no target".into();
             return;
         };
+        let (target_path, fragment) = meshfox_core::mdcanvas::split_target_fragment(target);
         let base_dir = self
             .canvas_path
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
-        let path = base_dir.join(target);
+        let path = base_dir.join(target_path);
+
+        let is_canvas = meshfox_core::mdcanvas::is_canvas_path(&path)
+            || (path.extension().is_some_and(|ext| ext == "md")
+                && std::fs::read_to_string(&path)
+                    .is_ok_and(|contents| meshfox_core::mdcanvas::has_marker(&contents)));
+        if is_canvas {
+            self.pending_child_canvas = Some(PendingChildCanvas {
+                path,
+                node: fragment.map(str::to_string),
+            });
+            return;
+        }
+
         match open::that(&path) {
             Ok(()) => self.status = format!("opened {}", path.display()),
             Err(e) => self.status = format!("failed to open {}: {e}", path.display()),
@@ -2375,7 +2431,7 @@ mod tests {
         let child_path = dir.join("child.canvas.md");
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(base_path.clone(), tx).unwrap();
+        let mut app = App::new(base_path.clone(), tx, None).unwrap();
 
         app.start_run("child/leaf".to_string(), "report".to_string(), true)
             .await;
@@ -2457,7 +2513,7 @@ mod tests {
         .unwrap();
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(base_path.clone(), tx).unwrap();
+        let mut app = App::new(base_path.clone(), tx, None).unwrap();
         // Expand ancestors so the rows under test are actually visible —
         // `tree::flatten` only ever auto-expands depth 0 (the root).
         app.expanded.insert("child".to_string());
@@ -2530,7 +2586,7 @@ mod tests {
         )
         .unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(path, tx).unwrap();
+        let mut app = App::new(path, tx, None).unwrap();
 
         app.session_runs.insert(
             ("root".to_string(), "dep".to_string()),
@@ -2566,7 +2622,7 @@ mod tests {
         )
         .unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(path, tx).unwrap();
+        let mut app = App::new(path, tx, None).unwrap();
         app.session_runs.insert(
             ("root".to_string(), "dep".to_string()),
             SessionRun {

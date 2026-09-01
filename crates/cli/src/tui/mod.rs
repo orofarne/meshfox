@@ -32,7 +32,7 @@ use ratatui::Terminal;
 
 use app::{App, LinkPreviewMsg};
 
-pub async fn run(canvas_path: PathBuf) -> io::Result<()> {
+pub async fn run(canvas_path: PathBuf, initial_node: Option<String>) -> io::Result<()> {
     // Raw mode + the alternate screen go up *before* `App::new` — it calls
     // `Picker::from_query_stdio()` (see `app::App::new`), which queries the
     // terminal for its graphics-protocol support by writing an escape
@@ -52,7 +52,7 @@ pub async fn run(canvas_path: PathBuf) -> io::Result<()> {
     let (link_preview_tx, mut link_preview_rx) =
         tokio::sync::mpsc::unbounded_channel::<LinkPreviewMsg>();
 
-    let result = match App::new(canvas_path, link_preview_tx) {
+    let result = match App::new(canvas_path, link_preview_tx, initial_node.as_deref()) {
         Ok(mut app) => {
             // `crossterm::event::read()` is blocking, so reading happens on
             // its own OS thread — the main loop stays async and can
@@ -186,6 +186,18 @@ async fn main_loop(
             continue;
         }
 
+        if let Some(pending) = app.pending_child_canvas.take() {
+            run_child_canvas_handoff(
+                terminal,
+                input_paused,
+                input_rx,
+                &pending.path,
+                pending.node.as_deref(),
+            )
+            .await?;
+            continue;
+        }
+
         let has_proc = app.run.as_ref().is_some_and(|r| r.proc.is_some());
         let has_file_proc = app.file_run.as_ref().is_some_and(|r| r.proc.is_some());
         tokio::select! {
@@ -215,6 +227,71 @@ async fn main_loop(
             }
         }
     }
+}
+
+/// Leaves the TUI's screen entirely, runs a synchronous child `meshfox tui
+/// <path>` (`--node <id>` too, for a deep link — see `Command::Tui`'s own
+/// `node` field) with its stdin/stdout/stderr inherited from the real
+/// terminal, and comes back once it exits — the terminal counterpart to
+/// the web UI's "↗ open" button navigating to another canvas (see
+/// `crates/server/src/lib.rs`'s `open_node_file`), but without that one's
+/// registry/daemon machinery: a nested TUI is a plain foreground child,
+/// same as a `tty` block, so there's no port to hand back and nothing to
+/// keep alive after it exits. Same leave/restore-screen shape as
+/// `run_tty_handoff` right below, for the same reason (`input_paused`
+/// keeps the background reader thread off the fd the child now owns).
+async fn run_child_canvas_handoff(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    input_paused: &Arc<AtomicBool>,
+    input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    path: &std::path::Path,
+    node: Option<&str>,
+) -> io::Result<()> {
+    input_paused.store(true, Ordering::Release);
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+
+    let outcome = async {
+        let exe = std::env::current_exe()?;
+        let mut cmd = tokio::process::Command::new(&exe);
+        cmd.arg("tui").arg(path);
+        if let Some(node) = node {
+            cmd.arg("--node").arg(node);
+        }
+        cmd.stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status()
+            .await
+    }
+    .await;
+
+    if let Err(e) = outcome {
+        println!(
+            "\r\nfailed to open {}: {e}\r\n(press any key to return to the canvas)",
+            path.display()
+        );
+        input_paused.store(false, Ordering::Release);
+        let _ = input_rx.recv().await;
+        input_paused.store(true, Ordering::Release);
+    }
+
+    enable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    )?;
+    terminal.clear()?;
+
+    input_paused.store(false, Ordering::Release);
+    Ok(())
 }
 
 /// Leaves the TUI's screen entirely, runs `code` with its stdin/stdout/

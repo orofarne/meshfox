@@ -111,8 +111,7 @@ pub fn resolve(canvas: &Canvas, base_path: &Path) -> Result<Canvas, IncludeError
         // `/api/include-asset` handler that resolves against it).
         let asset_base = canon.parent().map(|p| p.to_string_lossy().into_owned());
 
-        let is_canvas = target_path.to_string_lossy().ends_with(".canvas.md")
-            || mdcanvas::has_marker(&contents);
+        let is_canvas = mdcanvas::is_canvas(&target_path, &contents);
 
         if is_canvas {
             let included = mdcanvas::parse(&contents)
@@ -273,7 +272,7 @@ pub fn list_includes(canvas: &Canvas, base_path: &Path) -> Vec<IncludeInfo> {
             continue;
         }
         let contents = std::fs::read_to_string(&canon).ok();
-        let is_canvas = target_path.to_string_lossy().ends_with(".canvas.md")
+        let is_canvas = mdcanvas::is_canvas_path(&target_path)
             || contents.as_deref().is_some_and(mdcanvas::has_marker);
 
         if is_canvas {

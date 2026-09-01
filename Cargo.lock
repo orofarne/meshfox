@@ -3126,6 +3126,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "csv",
+ "libc",
  "pulldown-cmark 0.12.2",
  "serde",
  "serde_json",

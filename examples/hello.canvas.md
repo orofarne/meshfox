@@ -146,3 +146,9 @@ linting...
 <!-- meshfox:node id="architecture-diagram" type="file" x=20 y=120 w=250 h=60 -->
 
 [architecture](./architecture.png)
+
+### Related Canvas
+<!-- meshfox:node id="related-canvas" type="file" x=20 y=220 w=250 h=60 -->
+
+[vars.canvas.md](./vars.canvas.md)
+

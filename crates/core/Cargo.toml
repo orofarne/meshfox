@@ -16,3 +16,6 @@ serde_norway = "0.9.42"
 toml = "0.8"
 shlex = "1"
 time = { version = "0.3", features = ["formatting", "parsing"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

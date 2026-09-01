@@ -176,7 +176,30 @@ enum Command {
         /// wouldn't have).
         #[arg(long)]
         no_auto_exit: bool,
+        /// Write the actual bound port to this file right after startup
+        /// (as plain decimal text, no newline) — how `meshfox
+        /// view-registry-serve` learns a worker's port back after spawning
+        /// it with `--port 0`, without parsing log output. Not meant to be
+        /// passed by hand.
+        #[arg(long, hide = true)]
+        port_file: Option<PathBuf>,
     },
+    /// Hidden: the "open a canvas from another canvas" navigation daemon
+    /// (see TODO.canvas.md's "Ссылки и навигация между канвасами"). Not
+    /// meant to be run by hand — `meshfox view`'s own server spawns this
+    /// itself (self-re-exec via `current_exe()`, same pattern
+    /// `crates/cli/src/mcp.rs`'s `canvas_open` already uses to spawn a
+    /// per-canvas MCP child) the first time a "↗ Open" click on a
+    /// `.canvas.md` target needs somewhere to route to, and detaches itself
+    /// (`libc::daemon`) so it outlives whichever `view` triggered it.
+    /// Holds a flat registry of `path -> spawned worker` (each a plain
+    /// `meshfox view <path> --port 0 --no-open --port-file <tmp>`),
+    /// get-or-spawn only, over a Unix socket at
+    /// `meshfox_core::view_registry::socket_path()`. Exits on its own once
+    /// idle (no live workers) for 30 minutes — see
+    /// `meshfox_core::view_registry::IDLE_TIMEOUT`.
+    #[command(hide = true)]
+    ViewRegistryServe,
     /// Experimental: an ncurses-style terminal viewer — browse the node
     /// tree, read a node's rendered Markdown body (syntax-highlighted code,
     /// local images shown inline where the terminal supports it), and run
@@ -202,6 +225,14 @@ enum Command {
     Tui {
         #[command(flatten)]
         canvas: CanvasOpt,
+        /// Start with this node id already selected (and its ancestors
+        /// expanded so its row is actually visible) — how a "↗ open" on a
+        /// `[label](other.canvas.md#node-id)` deep link lands the child
+        /// TUI it spawns on the right node instead of the root. Not meant
+        /// to be typed by hand day to day, but not hidden either — same
+        /// spirit as jumping straight to a line number.
+        #[arg(long)]
+        node: Option<String>,
     },
     /// Experimental: an MCP stdio server giving an AI agent tool-call access
     /// to every canvas file under the current directory, without shelling
@@ -990,7 +1021,7 @@ fn main() {
     {
         // A bare `meshfox test.md`, no subcommand: open it, same as
         // clicking the file — `meshfox view`'s own defaults otherwise.
-        return view(PathBuf::from(&args[1]), 0, true, true);
+        return view(PathBuf::from(&args[1]), 0, true, true, None);
     }
 
     let cli = Cli::parse_from(args);
@@ -1051,6 +1082,7 @@ fn main() {
             no_open,
             create: create_if_missing,
             no_auto_exit,
+            port_file,
         } => {
             let canvas_path = match canvas.resolve() {
                 Some(p) => p,
@@ -1069,11 +1101,17 @@ fn main() {
                 write_canvas_template(&canvas_path);
                 println!("meshfox view: created {}", canvas_path.display());
             }
-            view(canvas_path, port, !no_open, !no_auto_exit)
+            view(canvas_path, port, !no_open, !no_auto_exit, port_file)
         }
-        Command::Tui { canvas } => {
+        Command::ViewRegistryServe => {
+            if let Err(e) = meshfox_core::view_registry::serve() {
+                eprintln!("meshfox view-registry-serve: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Tui { canvas, node } => {
             let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
-            tui(canvas_path)
+            tui(canvas_path, node)
         }
         Command::Mcp => mcp_cmd(),
         Command::Validate { canvas } => {
@@ -1626,7 +1664,13 @@ fn canvas_title(path: &Path) -> String {
         .to_string()
 }
 
-fn view(canvas_path: PathBuf, port: u16, open_browser: bool, auto_exit: bool) {
+fn view(
+    canvas_path: PathBuf,
+    port: u16,
+    open_browser: bool,
+    auto_exit: bool,
+    port_file: Option<PathBuf>,
+) {
     let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
         eprintln!("failed to start async runtime: {e}");
         std::process::exit(1);
@@ -1636,18 +1680,19 @@ fn view(canvas_path: PathBuf, port: u16, open_browser: bool, auto_exit: bool) {
         port,
         open_browser,
         auto_exit,
+        port_file,
     )) {
         eprintln!("meshfox view: {e}");
         std::process::exit(1);
     }
 }
 
-fn tui(canvas_path: PathBuf) {
+fn tui(canvas_path: PathBuf, initial_node: Option<String>) {
     let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
         eprintln!("failed to start async runtime: {e}");
         std::process::exit(1);
     });
-    if let Err(e) = runtime.block_on(tui::run(canvas_path)) {
+    if let Err(e) = runtime.block_on(tui::run(canvas_path, initial_node)) {
         eprintln!("meshfox tui: {e}");
         std::process::exit(1);
     }
@@ -1675,7 +1720,7 @@ fn find_canvas() -> PathBuf {
     {
         let path = entry.path();
         let name = path.to_string_lossy();
-        if name.ends_with(".canvas.md") {
+        if mdcanvas::is_canvas_path(&path) {
             candidates.push(path);
         } else if name.ends_with(".md") {
             if let Ok(contents) = std::fs::read_to_string(&path) {

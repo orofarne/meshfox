@@ -112,6 +112,11 @@ via `interpreter="$PYTHON -m pip install -r"` — no separate
 `requirements.txt` to keep in sync, since `interpreter=` hands pip a real
 temp file built from the fence's own body.
 
+#### Example
+<!-- meshfox:node id="example" type="file" -->
+
+[examples/python-venv.canvas.md](./examples/python-venv.canvas.md)
+
 ### Running a block under a different language/tool
 <!-- meshfox:node id="running-a-block-under-a-different-language-tool" -->
 
@@ -120,6 +125,11 @@ shape of `interpreter=` side by side: a bare command (`python3`), one with
 its own flags (`python3 -u`), any other tool on `$PATH` (`node`), an
 interactive `tty` block handing over a real REPL, and the same mechanism on
 a `file`-type node instead of a fence.
+
+#### Example
+<!-- meshfox:node id="example-2" type="file" -->
+
+[examples/interpreters.canvas.md](./examples/interpreters.canvas.md)
 
 ### Checking that documentation stays consistent
 <!-- meshfox:node id="checking-that-documentation-stays-consistent" -->
@@ -132,6 +142,11 @@ matching row in that file's license tables — the same mechanism
 ([examples/constraints.canvas.md](./examples/constraints.canvas.md)'s
 "Dependency audit" node).
 
+#### Example
+<!-- meshfox:node id="example-3" type="file" -->
+
+[LICENSE.canvas.md](./LICENSE.canvas.md)
+
 ### Publishing a canvas as a static site
 <!-- meshfox:node id="publishing-a-canvas-as-a-static-site" -->
 
@@ -142,6 +157,11 @@ publishes itself that way (`scripts/build-site.sh`, see `.gitignore`'s
 `/site-dist` entry) — the live result is
 [meshfox.orofarne.net](https://meshfox.orofarne.net/).
 
+#### Example
+<!-- meshfox:node id="example-4" type="file" -->
+
+[examples/hello.canvas.md](./examples/hello.canvas.md)
+
 ### A second brain for an LLM agent
 <!-- meshfox:node id="a-second-brain-for-an-llm-agent" -->
 
@@ -151,6 +171,28 @@ with a constraint fence enforcing that a `feedback`/`project` memory always
 carries a `**Why:**` line so a later session can judge an edge case instead
 of blindly following the rule. The same schema this repo's own coding-agent
 sessions use for their persistent memory, outside the chat window itself.
+
+#### Example
+<!-- meshfox:node id="example-5" type="file" -->
+
+[examples/second-brain.canvas.md](./examples/second-brain.canvas.md)
+
+### Navigating between canvases
+<!-- meshfox:node id="navigating-between-canvases" -->
+
+A `file` node whose target is itself a `.canvas.md` (or a plain `.md`
+carrying the `meshfox:canvas` marker) gets special "↗ open" handling
+instead of being handed to the OS's default app: the web UI spawns (or
+reuses) a `meshfox view` worker for it and opens a new browser tab; the
+TUI's `o` spawns a nested `meshfox tui` in the same terminal instead.
+[examples/hello.canvas.md](./examples/hello.canvas.md)'s "Links" node has a
+live example ("Related Canvas") — opening it takes you to
+[examples/vars.canvas.md](./examples/vars.canvas.md).
+
+#### Example
+<!-- meshfox:node id="example-6" type="file" -->
+
+[examples/hello.canvas.md#related-canvas](./examples/hello.canvas.md#related-canvas)
 
 ## Usage
 <!-- meshfox:node id="usage" -->

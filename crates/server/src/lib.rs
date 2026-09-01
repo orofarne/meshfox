@@ -1998,17 +1998,59 @@ async fn run_file_node(
         .unwrap())
 }
 
-/// Opens a `file` node's target in the OS's default application for it
-/// (`open` on macOS, `xdg-open` on Linux, `start` on Windows — via the
-/// `open` crate, same one `meshfox view`'s own `--open` browser-launch
-/// already uses) — the web UI's "↗ open" button. Best-effort: spawns the
-/// opener and returns as soon as it has (not once whatever it opened has
-/// itself finished loading/exited), same as the browser-launch case.
-/// `spawn_blocking` because `open::that` shells out synchronously.
+/// Whether `path` (already resolved/confined on disk) counts as a canvas —
+/// `meshfox_core::mdcanvas::is_canvas_path`'s cheap suffix check first, and
+/// only falling back to actually reading the file (for a plain `.md` that
+/// might carry the `meshfox:canvas` marker) when that's inconclusive, so a
+/// `.png`/`.pdf`/etc. target never gets read just to be rejected.
+fn is_canvas_file(path: &std::path::Path) -> bool {
+    meshfox_core::mdcanvas::is_canvas_path(path)
+        || (path.extension().is_some_and(|ext| ext == "md")
+            && std::fs::read_to_string(path)
+                .is_ok_and(|contents| meshfox_core::mdcanvas::has_marker(&contents)))
+}
+
+/// `POST /api/nodes/:id/open`'s response body for a canvas target — see
+/// `OpenOutcome`.
+#[derive(Debug, Serialize)]
+struct OpenNavigateResponse {
+    url: String,
+}
+
+/// `open_node_file`'s two outcomes: the pre-existing "handed off to the
+/// OS's own opener" (`204`, nothing more for the caller to do) and the new
+/// canvas case, where there's no OS association to hand off to — the
+/// browser is already looking at a canvas, so the response instead carries
+/// the URL of the (possibly just-spawned) worker serving the target canvas,
+/// for `web/src/App.tsx`'s `handleOpenFile` to `window.open` into a new tab.
+enum OpenOutcome {
+    Opened,
+    Navigate(OpenNavigateResponse),
+}
+
+impl IntoResponse for OpenOutcome {
+    fn into_response(self) -> Response {
+        match self {
+            OpenOutcome::Opened => StatusCode::NO_CONTENT.into_response(),
+            OpenOutcome::Navigate(body) => (StatusCode::OK, Json(body)).into_response(),
+        }
+    }
+}
+
+/// Opens a `file` node's target — the web UI's "↗ open" button. A plain
+/// file goes to the OS's default application for it (`open` on macOS,
+/// `xdg-open` on Linux, `start` on Windows — via the `open` crate, same one
+/// `meshfox view`'s own `--open` browser-launch already uses), best-effort:
+/// spawns the opener and returns as soon as it has, not once whatever it
+/// opened has itself finished loading/exited, same as the browser-launch
+/// case. A `.canvas.md` (or marker-carrying `.md`) target instead routes
+/// through `meshfox_core::view_registry` — see `OpenOutcome`.
+/// `spawn_blocking` throughout because both `open::that` and the registry
+/// client shell out/block on socket I/O synchronously.
 async fn open_node_file(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<OpenOutcome, ApiError> {
     let primary_raw = state.raw.lock().unwrap().clone();
     let located = locate_node(&state, &primary_raw, &id)?;
     let canvas = parse_or_error(&located.raw)?;
@@ -2027,8 +2069,28 @@ async fn open_node_file(
             format!("node {id:?} has no target"),
         )
     })?;
+    let (target_path, fragment) = meshfox_core::mdcanvas::split_target_fragment(target);
     let canvas_path = located.origin.as_deref().unwrap_or(&state.canvas_path);
-    let resolved = resolve_confined_target(canvas_path, target)?;
+    let resolved = resolve_confined_target(canvas_path, target_path)?;
+
+    if is_canvas_file(&resolved) {
+        let fragment = fragment.map(str::to_string);
+        let port = tokio::task::spawn_blocking(move || meshfox_core::view_registry::get_or_spawn(&resolved))
+            .await
+            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .map_err(|e| {
+                ApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("couldn't open the canvas: {e}"),
+                )
+            })?;
+        let mut url = format!("http://127.0.0.1:{port}/");
+        if let Some(fragment) = fragment {
+            url.push('#');
+            url.push_str(&fragment);
+        }
+        return Ok(OpenOutcome::Navigate(OpenNavigateResponse { url }));
+    }
 
     tokio::task::spawn_blocking(move || open::that(&resolved))
         .await
@@ -2040,7 +2102,7 @@ async fn open_node_file(
             )
         })?;
 
-    Ok(StatusCode::NO_CONTENT)
+    Ok(OpenOutcome::Opened)
 }
 
 #[derive(Debug, Deserialize)]
@@ -3805,6 +3867,7 @@ pub async fn run(
     port: u16,
     open_browser: bool,
     auto_exit: bool,
+    port_file: Option<PathBuf>,
 ) -> std::io::Result<()> {
     let state = build_state(canvas_path.clone(), auto_exit).await?;
     spawn_file_watcher(Arc::clone(&state));
@@ -3816,6 +3879,13 @@ pub async fn run(
         "meshfox: serving {} on http://{addr}",
         canvas_path.display()
     );
+
+    // Written right after the bind succeeds, before anything else can fail
+    // — `meshfox_core::view_registry`'s daemon polls for this file to learn
+    // a just-spawned worker's port back without parsing the log line above.
+    if let Some(path) = &port_file {
+        std::fs::write(path, addr.port().to_string())?;
+    }
 
     if open_browser {
         // Best-effort: no browser, no display, or an unsupported platform

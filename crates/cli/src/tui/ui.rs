@@ -1026,7 +1026,7 @@ mod tests {
         .unwrap();
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let app = App::new(path, tx).expect("valid test canvas");
+        let app = App::new(path, tx, None).expect("valid test canvas");
 
         let backend = TestBackend::new(20, 20);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1079,7 +1079,7 @@ mod tests {
         .unwrap();
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(path, tx).expect("valid test canvas");
+        let mut app = App::new(path, tx, None).expect("valid test canvas");
 
         let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1138,7 +1138,7 @@ mod tests {
         .unwrap();
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(path, tx).expect("valid test canvas");
+        let mut app = App::new(path, tx, None).expect("valid test canvas");
 
         // Narrow enough that "ALFA BRAVO CHARLIE DELTA ECHO  #bag #improvement  [run,cache]"
         // (73+ chars) cannot possibly fit on one row.

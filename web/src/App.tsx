@@ -349,6 +349,15 @@ export default function App() {
   // which would otherwise yank the viewport out from under whatever the
   // user is currently looking at.
   const hasSetInitialView = useRef(false);
+  // A deep link into this specific node, e.g. a cross-canvas "↗ open" on a
+  // `[label](other.canvas.md#node-id)` link (see `crates/server/src/lib.rs`'s
+  // `open_node_file`, which appends `#node-id` to the worker URL it hands
+  // back for `api.ts`'s `openNodeFile` to open). Read once, at mount —
+  // there's nothing to react to afterward, since navigating around the
+  // canvas by hand never rewrites the URL.
+  const [deepLinkNodeId] = useState<string | null>(() =>
+    window.location.hash ? decodeURIComponent(window.location.hash.slice(1)) : null,
+  );
   // Snapshot, not live-tracked: the 60%/40% viewport-relative widths
   // `autolayout.ts` computes are read once per app load, not recomputed on
   // window resize (deliberate — see autolayout.ts's module doc comment).
@@ -1045,13 +1054,17 @@ export default function App() {
     [setNodes],
   );
 
-  // Opens a `file` node's target in the OS's default application (the
-  // title bar's "↗ open" button) — fire-and-forget from the UI's point of
-  // view, just surfaced to the same error banner every other action here
-  // uses if the server couldn't spawn the opener.
+  // Opens a `file` node's target (the title bar's "↗ open" button) —
+  // fire-and-forget from the UI's point of view for a plain file, just
+  // surfaced to the same error banner every other action here uses if the
+  // server couldn't spawn the opener. A canvas target instead comes back
+  // with a `url` (the worker `meshfox view` spawned/reused for it — see
+  // `api.ts`'s `openNodeFile`), which this opens as a new tab itself,
+  // since there's no OS-level opener for "view this canvas".
   const handleOpenFile = useCallback(async (nodeId: string) => {
     try {
-      await openNodeFile(nodeId);
+      const result = await openNodeFile(nodeId);
+      if (result?.url) window.open(result.url, "_blank");
     } catch (e) {
       setError(String(e));
     }
@@ -1806,9 +1819,11 @@ export default function App() {
   // the left half of the screen as empty canvas). Waits for both the flow
   // instance (`onInit`, below) and the root's own measured node (built
   // from `canvas` above) — whichever arrives second triggers this, so it
-  // doesn't matter which one that is.
+  // doesn't matter which one that is. Skipped entirely when this load is a
+  // deep link (see `deepLinkNodeId`) — the effect further down centers on
+  // the linked node instead, once `focusNode` exists to call.
   useEffect(() => {
-    if (hasSetInitialView.current || !flowInstance || !canvas) return;
+    if (hasSetInitialView.current || !flowInstance || !canvas || deepLinkNodeId) return;
     const root = canvas.nodes.find((n) => !n.parent);
     const rootNode = root && nodes.find((n) => n.id === root.id);
     if (!rootNode) return;
@@ -1821,7 +1836,7 @@ export default function App() {
       },
       { duration: 0 },
     );
-  }, [flowInstance, canvas, nodes]);
+  }, [flowInstance, canvas, nodes, deepLinkNodeId]);
 
   // Toggling Edit mode shouldn't rebuild the whole graph (that would reset
   // any in-progress drag/selection) — just patch the flags every node
@@ -1910,6 +1925,37 @@ export default function App() {
     },
     [flowInstance],
   );
+
+  // One-time deep-link focus (see `deepLinkNodeId`): unfolds whatever
+  // ancestors are hiding the target, then waits for its real position to
+  // land in `nodes` before centering — same gap `revealAndFocus`'s own
+  // comment describes (unfolding only flips `foldedNodeIds`; the node's
+  // actual `x`/`y` is a render-or-two-later reflow away), worked around
+  // here by just re-running this effect on every `nodes`/`foldedNodeIds`
+  // change instead of computing the resulting layout up front — there's no
+  // race to avoid, unlike `revealAndFocus`'s search-highlight case, since
+  // nothing else is trying to move the camera at the same time.
+  const hasFocusedDeepLink = useRef(false);
+  useEffect(() => {
+    if (hasFocusedDeepLink.current || !deepLinkNodeId || !canvas || !flowInstance) return;
+    if (!canvas.nodes.some((n) => n.id === deepLinkNodeId)) {
+      hasFocusedDeepLink.current = true; // no such node — bad/stale link, give up quietly
+      return;
+    }
+    const ancestors = pathTo(canvas, deepLinkNodeId).slice(0, -1);
+    if (ancestors.some((id) => foldedNodeIds.has(id))) {
+      setFoldedNodeIds((prev) => {
+        const next = new Set(prev);
+        for (const a of ancestors) next.delete(a);
+        return next;
+      });
+      return; // wait for the reflow this triggers, then retry below
+    }
+    const rfNode = flowInstance.getNode(deepLinkNodeId);
+    if (!rfNode) return; // not measured/positioned yet — retry on the next `nodes` update
+    hasFocusedDeepLink.current = true;
+    focusNode(deepLinkNodeId);
+  }, [deepLinkNodeId, canvas, flowInstance, nodes, foldedNodeIds, focusNode]);
 
   // TODO.canvas.md: "Поиск" — search across every node's title/body text,
   // with a small floating bar (a React Flow `<Panel>`, same overlay
