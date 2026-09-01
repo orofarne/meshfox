@@ -64,6 +64,13 @@ export interface CachedOutput {
    * same as stale). Never hides/discards the cached text itself, only
    * flags it — see SPEC.md's "Cached output". */
   stale: boolean;
+  /** `output="markdown"` mode only (`core::output::render_output_block_markdown`):
+   * stderr, captured and rendered separately from `text` (stdout — the
+   * half actually meant to be parsed as Markdown) as its own plain-text
+   * block, shown *before* it regardless of the two streams' real emission
+   * order relative to each other. `undefined` for text-mode output (which
+   * never splits the two) or a markdown-mode block with no stderr at all. */
+  stderrText?: string;
 }
 
 /** FNV-1a over UTF-8 bytes, returned as 8 lowercase hex digits — must stay
@@ -298,20 +305,30 @@ function parseCachedOutputBlock(inner: string): Omit<CachedOutput, "stale"> {
 }
 
 /** `output="markdown"` counterpart of `parseCachedOutputBlock` — mirrors
- * `core::output::render_output_block_markdown`'s shape: no wrapping fence
- * at all (`inner`, trimmed, *is* the Markdown to render), and no `exit
- * code`/duration line on a successful run — only a leading bold `**⚠ exit
- * code: N · duration**` line on a failure, which is stripped back out
- * here the same way the plain-text header is above (`MeshNode.tsx` already
- * shows exit code/duration in this block's own head bar; leaving the bold
- * line in the rendered body too would just double it up). */
+ * `core::output::render_output_block_markdown`'s shape: an optional
+ * leading stderr `​```text​` block (same shape `parseCachedOutputBlock`
+ * itself parses, extracted into `stderrText` rather than left in `text`),
+ * then no wrapping fence at all for the rest — `text` (stdout), trimmed,
+ * *is* the Markdown to render — and no `exit code`/duration line on a
+ * successful run — only a leading bold `**⚠ exit code: N · duration**`
+ * line on a failure, which is stripped back out here the same way the
+ * plain-text header is above (`MeshNode.tsx` already shows exit
+ * code/duration in this block's own head bar; leaving the bold line in
+ * the rendered body too would just double it up). */
 function parseCachedOutputBlockMarkdown(inner: string): Omit<CachedOutput, "stale"> {
-  const body = inner.replace(/^\n+/, "").replace(/\n+$/, "");
+  let body = inner.replace(/^\n+/, "").replace(/\n+$/, "");
+  let stderrText: string | undefined;
+  const stderrMatch = /^```text\n([\s\S]*?)\n?```\n*/.exec(body);
+  if (stderrMatch) {
+    stderrText = stderrMatch[1];
+    body = body.slice(stderrMatch[0].length);
+  }
   const exitMatch = /^\*\*⚠ exit code: (-?\d+)(?: · (.+?))?\*\*\n\n?/.exec(body);
   return {
     exitCode: exitMatch ? Number(exitMatch[1]) : 0,
     durationText: exitMatch?.[2],
     text: exitMatch ? body.slice(exitMatch[0].length) : body,
+    stderrText,
   };
 }
 

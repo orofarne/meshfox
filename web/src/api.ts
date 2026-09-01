@@ -435,7 +435,14 @@ export type RunEvent =
    * from *this* run to show, so the client shows that instead (see
    * `MeshNode.tsx`'s `LiveRunOutput`, typically collapsed by default). */
   | { type: "step-skipped"; nodeId: string; block: string; output: string; durationMs: number }
-  | { type: "output"; nodeId: string; block: string; text: string }
+  /** `stream` says which pipe this line actually came from — the two
+   * remain interleaved on this one event stream in roughly their real
+   * emission order (`stream_exec::OutputStream`'s own doc comment: two
+   * separate pipes, no ordering guarantee between them), same as before
+   * this field existed; `App.tsx`'s `"output"` handling uses it only to
+   * *additionally* accumulate `stdoutText`/`stderrText` on `LiveBlockState`
+   * (`MeshNode.tsx`), for `output="markdown"` mode's live view. */
+  | { type: "output"; nodeId: string; block: string; stream: "stdout" | "stderr"; text: string }
   | { type: "step-end"; nodeId: string; block: string; exitCode: number; durationMs: number }
   | { type: "killed"; nodeId: string; block: string }
   | { type: "error"; message: string }

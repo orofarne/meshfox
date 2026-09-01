@@ -26,7 +26,7 @@ type TtyRunEvent =
    * UI's own collapsed-by-default section (`MeshNode.tsx`'s
    * `SkippedRunOutput`) — no separate fold needed here. */
   | { type: "step-skipped"; nodeId: string; block: string; output: string; durationMs: number }
-  | { type: "output"; nodeId: string; block: string; text: string }
+  | { type: "output"; nodeId: string; block: string; stream: "stdout" | "stderr"; text: string }
   | { type: "tty-start"; nodeId: string; block: string }
   | { type: "step-end"; nodeId: string; block: string; exitCode: number }
   | { type: "killed"; nodeId: string; block: string }

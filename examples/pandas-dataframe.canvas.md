@@ -61,8 +61,19 @@ pipe-table into an actually-rendered table in the canvas on the next run,
 instead of a passive `text` block — the only difference from an ordinary
 `cache`d fence.
 
+The script also logs a line to stderr (`sys.stderr`) — with `output="markdown"`,
+stderr is captured separately from stdout and shown as its own plain-text
+block, *before* the rendered table, regardless of where in the script it was
+actually printed (`core::output::render_output_block_markdown`): stdout is
+the only half meant to be parsed as Markdown, so stray warnings/log lines
+never end up mixed into the table.
+
 ```python name="demo" interpreter="$PYTHON -u" cache deps="requirements/install-requirements" output="markdown"
+import sys
+
 import pandas as pd
+
+print("note: this is a demo warning, printed to stderr", file=sys.stderr)
 
 df = pd.DataFrame(
     {
@@ -73,7 +84,11 @@ df = pd.DataFrame(
 )
 print(df.to_markdown(index=False))
 ```
-<!-- meshfox:output name="demo" hash="64b91ace" -->
+<!-- meshfox:output name="demo" hash="416781c3" -->
+
+```text
+note: this is a demo warning, printed to stderr
+```
 
 | package   | kind      | role             |
 |:----------|:----------|:-----------------|

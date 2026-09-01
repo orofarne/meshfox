@@ -1112,10 +1112,18 @@ successful run:
 
     <!-- /meshfox:output -->
 
-— which renders as an actual table instead of preformatted text. A failed
-run (`exit_code != 0`) still gets a leading bold `**⚠ exit code: N ·
-duration**` line, since the rendered content alone might not make that
-obvious. Because this content is genuinely re-parsed as Markdown/HTML by
+— which renders as an actual table instead of preformatted text. Any stderr
+the block produced comes first, as its own ordinary `​```text​` block —
+same shape the default (non-markdown) rendering always uses — regardless of
+where in the script's own execution order those lines actually landed
+relative to stdout: `output="markdown"` is about treating *stdout* as
+structured content worth parsing, and stderr (warnings, progress bars,
+tracebacks) was never meant to be part of that, so it's kept separate
+rather than interleaved into what gets rendered as Markdown. A failed run
+(`exit_code != 0`) still gets a leading bold `**⚠ exit code: N ·
+duration**` line right before the stdout half, since the rendered content
+alone might not make that obvious. Because this content is genuinely
+re-parsed as Markdown/HTML by
 every downstream reader (unlike the fenced default, which is always inert),
 `meshfox_core::output::write_output` escapes any literal `<!--` in it
 first (`&lt;!--`) so a command's own output can never forge a

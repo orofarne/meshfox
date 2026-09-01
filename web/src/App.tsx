@@ -225,6 +225,23 @@ function positionFor(
  * rather than just matching nodes (see its own doc comment) — a query
  * appearing three times in one node's body is three stops to step
  * through, not one. */
+/** Appends one `"output"` event's line onto `prev`'s accumulated live
+ * state — `text` (merged stdout+stderr, unchanged from before `stream`
+ * existed on the wire) plus whichever of `stdoutText`/`stderrText` this
+ * line's own `stream` says it belongs to (the other one carries over
+ * untouched). Shared by `executeRun`/`executeFileRun`'s own `"output"`
+ * handling below — see `LiveBlockState.stdoutText`'s own doc comment for
+ * why the split exists at all (`output="markdown"` mode's live view). */
+function appendOutputLine(prev: LiveBlockState, event: { stream: "stdout" | "stderr"; text: string }): LiveBlockState {
+  const append = (s: string | undefined) => (s ? `${s}\n${event.text}` : event.text);
+  return {
+    ...prev,
+    text: append(prev.text),
+    stdoutText: event.stream === "stdout" ? append(prev.stdoutText) : prev.stdoutText,
+    stderrText: event.stream === "stderr" ? append(prev.stderrText) : prev.stderrText,
+  };
+}
+
 function countOccurrences(haystack: string, needle: string): number {
   if (!needle) return 0;
   let count = 0;
@@ -763,6 +780,8 @@ export default function App() {
               patchLiveBlock(event.nodeId, event.block, {
                 status: "running",
                 text: "",
+                stdoutText: undefined,
+                stderrText: undefined,
                 exitCode: undefined,
                 runId,
                 startedAt: Date.now(),
@@ -770,9 +789,22 @@ export default function App() {
               });
               break;
             case "step-skipped":
+              // `event.output` is `SessionRun::output` (merged stdout+stderr
+              // only — the session-skip cache doesn't keep them split, see
+              // `crates/server/src/lib.rs`'s own `SessionRun`), and
+              // `MeshNode.tsx`'s `SkippedRunOutput` always renders `text`
+              // as plain text regardless, never Markdown — so there's
+              // nothing for `stdoutText`/`stderrText` to do here even for
+              // an `output="markdown"` block. Explicitly cleared anyway
+              // (not left whatever an earlier run on this same block
+              // happened to leave behind) so a *previous* run's split text
+              // can't leak
+              // into this skipped display.
               patchLiveBlock(event.nodeId, event.block, {
                 status: "skipped",
                 text: event.output,
+                stdoutText: undefined,
+                stderrText: undefined,
                 exitCode: undefined,
                 runId: undefined,
                 startedAt: undefined,
@@ -784,10 +816,12 @@ export default function App() {
                 nds.map((n) => {
                   if (n.id !== event.nodeId) return n;
                   const prev = n.data.liveBlocks[event.block] ?? { status: "running", text: "" };
-                  const text = prev.text ? `${prev.text}\n${event.text}` : event.text;
                   return {
                     ...n,
-                    data: { ...n.data, liveBlocks: { ...n.data.liveBlocks, [event.block]: { ...prev, text } } },
+                    data: {
+                      ...n.data,
+                      liveBlocks: { ...n.data.liveBlocks, [event.block]: appendOutputLine(prev, event) },
+                    },
                   };
                 }),
               );
@@ -851,6 +885,8 @@ export default function App() {
               patchLiveBlock(event.nodeId, event.block, {
                 status: "running",
                 text: "",
+                stdoutText: undefined,
+                stderrText: undefined,
                 exitCode: undefined,
                 runId,
                 startedAt: Date.now(),
@@ -858,9 +894,22 @@ export default function App() {
               });
               break;
             case "step-skipped":
+              // `event.output` is `SessionRun::output` (merged stdout+stderr
+              // only — the session-skip cache doesn't keep them split, see
+              // `crates/server/src/lib.rs`'s own `SessionRun`), and
+              // `MeshNode.tsx`'s `SkippedRunOutput` always renders `text`
+              // as plain text regardless, never Markdown — so there's
+              // nothing for `stdoutText`/`stderrText` to do here even for
+              // an `output="markdown"` block. Explicitly cleared anyway
+              // (not left whatever an earlier run on this same block
+              // happened to leave behind) so a *previous* run's split text
+              // can't leak
+              // into this skipped display.
               patchLiveBlock(event.nodeId, event.block, {
                 status: "skipped",
                 text: event.output,
+                stdoutText: undefined,
+                stderrText: undefined,
                 exitCode: undefined,
                 runId: undefined,
                 startedAt: undefined,
@@ -872,10 +921,12 @@ export default function App() {
                 nds.map((n) => {
                   if (n.id !== event.nodeId) return n;
                   const prev = n.data.liveBlocks[event.block] ?? { status: "running", text: "" };
-                  const text = prev.text ? `${prev.text}\n${event.text}` : event.text;
                   return {
                     ...n,
-                    data: { ...n.data, liveBlocks: { ...n.data.liveBlocks, [event.block]: { ...prev, text } } },
+                    data: {
+                      ...n.data,
+                      liveBlocks: { ...n.data.liveBlocks, [event.block]: appendOutputLine(prev, event) },
+                    },
                   };
                 }),
               );

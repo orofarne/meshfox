@@ -1641,8 +1641,13 @@ a {
 /* Stale cached output (the fence's own code/lang/interpreter/env=/deps=
  * changed since this ran — see SPEC.md's "Cached output") stays fully
  * readable, just visually receded, so it reads as "still here, not
- * current" rather than being hidden or looking like a fresh result. */
-.mesh-code-output[data-stale] pre,
+ * current" rather than being hidden or looking like a fresh result.
+ * `> pre` (direct child only, not `.mesh-code-output-markdown`'s own
+ * nested stderr `pre` below) — that one's already inside a
+ * `.mesh-code-output-markdown` this rule's second selector dims as a
+ * whole; matching it here too would double the dimming (opacities
+ * multiply on nested elements) instead of just applying it once. */
+.mesh-code-output[data-stale] > pre,
 .mesh-code-output[data-stale] .mesh-code-output-markdown {
   opacity: 0.6;
 }
@@ -1671,6 +1676,21 @@ a {
 
 .mesh-code-output-markdown > :last-child {
   margin-bottom: 0;
+}
+
+/* A leading stderr block (`MarkdownOutput`'s own `stderrText`, see its
+ * doc comment) sits *inside* `.mesh-code-output-markdown`, one level
+ * deeper than the plain-text case's own `pre` above — this overrides
+ * that rule's dashed-top/no-radius treatment (meant for a `pre` sitting
+ * directly under `.mesh-code-output`'s own head bar) back to an ordinary
+ * bordered code box, same as any other `pre` in a node's prose, with its
+ * own bottom margin separating it from the Markdown/table that follows.
+ * Same specificity as `.mesh-code-output pre` above (one class + `pre`)
+ * — wins by simply coming later in the file. */
+.mesh-code-output-markdown pre {
+  border: 1px solid var(--node-border);
+  border-radius: 6px;
+  margin: 0 0 0.6rem;
 }
 
 /* An edge's own `label` (extra or structural — either kind can have one,

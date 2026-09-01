@@ -14,15 +14,39 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
+/// Which pipe a `SpawnedProcess::output_rx` line came from — see
+/// `SpawnedProcess`'s own doc comment for why a caller needs this at all
+/// given the two are still delivered on one interleaved channel.
+/// `Serialize`s to `"stdout"`/`"stderr"` — the same tag `RunEvent::Output`
+/// (`crate::RunEvent`) sends over the wire, so the web UI's live view can
+/// split the two apart too, not just a `cache`d run's persisted result
+/// (`core::output::ExecOutput::stdout`/`.stderr`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
 /// A running process plus its merged stdout+stderr, line by line, in
 /// roughly the order they were actually emitted (same caveat as
 /// `core::exec`'s sync reader threads: two separate pipes have no
-/// ordering guarantee between them). The channel closes (yields `None`)
-/// once the process has closed both streams — not necessarily the same
-/// moment `child` is waitable, so callers still need `child.wait()`.
+/// ordering guarantee between them) — each line tagged with which pipe it
+/// came from (`OutputStream`), so a caller that wants the live/text-mode
+/// interleaved view can still just read every line off in order (SPEC.md's
+/// "Cached output"), while one that wants `output="markdown"` mode's split
+/// rendering (`core::output::render_output_block_markdown` — stderr shown
+/// as its own plain-text block, *before* the markdown one, since a script
+/// can freely mix `print()`/`print(..., file=sys.stderr)` calls in any
+/// order and stdout is the only half meant to be parsed as Markdown) can
+/// accumulate the two separately from the very same stream, with no
+/// after-the-fact "which lines were whose" guessing. The channel closes
+/// (yields `None`) once the process has closed both streams — not
+/// necessarily the same moment `child` is waitable, so callers still need
+/// `child.wait()`.
 pub struct SpawnedProcess {
     pub child: Child,
-    pub output_rx: mpsc::UnboundedReceiver<String>,
+    pub output_rx: mpsc::UnboundedReceiver<(OutputStream, String)>,
     /// A temp file (`spawn_interpreter`'s materialized fence body) to
     /// remove once this process is done with it — removed on drop so it's
     /// cleaned up regardless of which path the caller takes to get there
@@ -110,8 +134,8 @@ where
         .spawn()?;
 
     let (tx, output_rx) = mpsc::unbounded_channel();
-    spawn_line_reader(child.stdout.take().expect("piped stdout"), tx.clone());
-    spawn_line_reader(child.stderr.take().expect("piped stderr"), tx);
+    spawn_line_reader(child.stdout.take().expect("piped stdout"), OutputStream::Stdout, tx.clone());
+    spawn_line_reader(child.stderr.take().expect("piped stderr"), OutputStream::Stderr, tx);
 
     Ok(SpawnedProcess {
         child,
@@ -144,8 +168,8 @@ where
         .spawn()?;
 
     let (tx, output_rx) = mpsc::unbounded_channel();
-    spawn_line_reader(child.stdout.take().expect("piped stdout"), tx.clone());
-    spawn_line_reader(child.stderr.take().expect("piped stderr"), tx);
+    spawn_line_reader(child.stdout.take().expect("piped stdout"), OutputStream::Stdout, tx.clone());
+    spawn_line_reader(child.stderr.take().expect("piped stderr"), OutputStream::Stderr, tx);
 
     Ok(SpawnedProcess {
         child,
@@ -207,8 +231,8 @@ where
     };
 
     let (tx, output_rx) = mpsc::unbounded_channel();
-    spawn_line_reader(child.stdout.take().expect("piped stdout"), tx.clone());
-    spawn_line_reader(child.stderr.take().expect("piped stderr"), tx);
+    spawn_line_reader(child.stdout.take().expect("piped stdout"), OutputStream::Stdout, tx.clone());
+    spawn_line_reader(child.stderr.take().expect("piped stderr"), OutputStream::Stderr, tx);
 
     Ok(SpawnedProcess {
         child,
@@ -251,7 +275,7 @@ where
     }
 }
 
-fn spawn_line_reader<R>(reader: R, tx: mpsc::UnboundedSender<String>)
+fn spawn_line_reader<R>(reader: R, stream: OutputStream, tx: mpsc::UnboundedSender<(OutputStream, String)>)
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -259,7 +283,7 @@ where
         let mut lines = BufReader::new(reader).lines();
         // EOF or a read error either way ends this stream.
         while let Ok(Some(line)) = lines.next_line().await {
-            if tx.send(line).is_err() {
+            if tx.send((stream, line)).is_err() {
                 break; // receiver gone — nobody left to read this
             }
         }
@@ -278,7 +302,7 @@ mod tests {
     async fn merges_stdout_and_lets_the_child_be_waited_on() {
         let mut proc = spawn_bash("echo one; echo two", no_envs(), None).unwrap();
         let mut lines = Vec::new();
-        while let Some(line) = proc.output_rx.recv().await {
+        while let Some((_, line)) = proc.output_rx.recv().await {
             lines.push(line);
         }
         let status = proc.child.wait().await.unwrap();
@@ -295,7 +319,7 @@ mod tests {
         )
         .unwrap();
         let mut lines = Vec::new();
-        while let Some(line) = proc.output_rx.recv().await {
+        while let Some((_, line)) = proc.output_rx.recv().await {
             lines.push(line);
         }
         let _ = proc.child.wait().await.unwrap();
@@ -303,10 +327,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn each_line_is_tagged_with_the_pipe_it_came_from() {
+        // Same `sleep`-between-lines trick `interleaves_stdout_and_stderr_
+        // in_emission_order` above uses — stdout/stderr are two separate
+        // pipes with no ordering guarantee between them, so without an
+        // artificial gap the three `echo`s can (and did, flakily) land in
+        // any relative order.
+        let mut proc = spawn_bash(
+            "echo out1; sleep 0.05; echo err1 >&2; sleep 0.05; echo out2",
+            no_envs(),
+            None,
+        )
+        .unwrap();
+        let mut tagged = Vec::new();
+        while let Some(pair) = proc.output_rx.recv().await {
+            tagged.push(pair);
+        }
+        let _ = proc.child.wait().await.unwrap();
+        assert_eq!(
+            tagged,
+            vec![
+                (OutputStream::Stdout, "out1".to_string()),
+                (OutputStream::Stderr, "err1".to_string()),
+                (OutputStream::Stdout, "out2".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn captures_output_with_no_trailing_newline() {
         let mut proc = spawn_bash("printf 'no newline'", no_envs(), None).unwrap();
         let mut lines = Vec::new();
-        while let Some(line) = proc.output_rx.recv().await {
+        while let Some((_, line)) = proc.output_rx.recv().await {
             lines.push(line);
         }
         let _ = proc.child.wait().await.unwrap();
@@ -337,7 +389,7 @@ mod tests {
         )
         .unwrap();
         let mut lines = Vec::new();
-        while let Some(line) = proc.output_rx.recv().await {
+        while let Some((_, line)) = proc.output_rx.recv().await {
             lines.push(line);
         }
         let status = proc.child.wait().await.unwrap();
@@ -351,7 +403,7 @@ mod tests {
         // being installed, just proves the temp-file-plus-args plumbing.
         let mut proc = spawn_interpreter("cat", "hello from a temp file", no_envs(), None).unwrap();
         let mut lines = Vec::new();
-        while let Some(line) = proc.output_rx.recv().await {
+        while let Some((_, line)) = proc.output_rx.recv().await {
             lines.push(line);
         }
         let status = proc.child.wait().await.unwrap();
@@ -389,7 +441,7 @@ mod tests {
         let block = test_block("button", None, "this is prose, not code — never run");
         let mut proc = spawn_block(&block, no_envs(), None).unwrap();
         let mut lines = Vec::new();
-        while let Some(line) = proc.output_rx.recv().await {
+        while let Some((_, line)) = proc.output_rx.recv().await {
             lines.push(line);
         }
         assert!(lines.is_empty());
@@ -402,7 +454,7 @@ mod tests {
         let block = test_block("cat", Some("cat"), "via interpreter");
         let mut proc = spawn_block(&block, no_envs(), None).unwrap();
         let mut lines = Vec::new();
-        while let Some(line) = proc.output_rx.recv().await {
+        while let Some((_, line)) = proc.output_rx.recv().await {
             lines.push(line);
         }
         assert_eq!(lines, vec!["via interpreter"]);
@@ -413,7 +465,7 @@ mod tests {
         let block = test_block("bash", None, "echo via bash");
         let mut proc = spawn_block(&block, no_envs(), None).unwrap();
         let mut lines = Vec::new();
-        while let Some(line) = proc.output_rx.recv().await {
+        while let Some((_, line)) = proc.output_rx.recv().await {
             lines.push(line);
         }
         assert_eq!(lines, vec!["via bash"]);
@@ -438,7 +490,7 @@ mod tests {
         let mut proc =
             spawn_bash("echo \"$INSTALL_PATH\"", [("INSTALL_PATH", "/opt/meshfox")], None).unwrap();
         let mut lines = Vec::new();
-        while let Some(line) = proc.output_rx.recv().await {
+        while let Some((_, line)) = proc.output_rx.recv().await {
             lines.push(line);
         }
         assert_eq!(lines, vec!["/opt/meshfox"]);
@@ -461,7 +513,7 @@ mod tests {
         // leaving `sleep` running as an orphan — this is the bug `kill`
         // exists to avoid.
         let mut proc = spawn_bash("echo starting; sleep 30", no_envs(), None).unwrap();
-        while let Some(line) = proc.output_rx.recv().await {
+        while let Some((_, line)) = proc.output_rx.recv().await {
             if line == "starting" {
                 break;
             }
@@ -516,7 +568,7 @@ mod tests {
     async fn spawn_process_runs_a_program_directly_with_args() {
         let mut proc = spawn_process("echo", ["one", "two"], None).unwrap();
         let mut lines = Vec::new();
-        while let Some(line) = proc.output_rx.recv().await {
+        while let Some((_, line)) = proc.output_rx.recv().await {
             lines.push(line);
         }
         let status = proc.child.wait().await.unwrap();
@@ -537,7 +589,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let mut proc = spawn_bash("pwd -P", no_envs(), Some(&dir)).unwrap();
         let mut lines = Vec::new();
-        while let Some(line) = proc.output_rx.recv().await {
+        while let Some((_, line)) = proc.output_rx.recv().await {
             lines.push(line);
         }
         assert_eq!(lines, vec![dir.canonicalize().unwrap().to_string_lossy()]);
@@ -551,7 +603,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let mut proc = spawn_interpreter("bash", "pwd -P", no_envs(), Some(&dir)).unwrap();
         let mut lines = Vec::new();
-        while let Some(line) = proc.output_rx.recv().await {
+        while let Some((_, line)) = proc.output_rx.recv().await {
             lines.push(line);
         }
         assert_eq!(lines, vec![dir.canonicalize().unwrap().to_string_lossy()]);
@@ -562,7 +614,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let mut proc = spawn_process("pwd", ["-P"], Some(&dir)).unwrap();
         let mut lines = Vec::new();
-        while let Some(line) = proc.output_rx.recv().await {
+        while let Some((_, line)) = proc.output_rx.recv().await {
             lines.push(line);
         }
         assert_eq!(lines, vec![dir.canonicalize().unwrap().to_string_lossy()]);

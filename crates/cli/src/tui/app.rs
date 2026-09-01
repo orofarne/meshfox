@@ -18,7 +18,7 @@ use meshfox_core::mdcanvas;
 use meshfox_core::output::{write_output, ExecOutput};
 use meshfox_core::vars::{declared_vars, resolve_block_env, BlockEnvResolution, VarDecl, VarType};
 use meshfox_core::{Canvas, FileDisplay, Node, NodeType, VarCache};
-use meshfox_server::stream_exec::SpawnedProcess;
+use meshfox_server::stream_exec::{OutputStream, SpawnedProcess};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -117,6 +117,12 @@ pub struct RunState {
     pub proc: Option<SpawnedProcess>,
     pub lines: Vec<String>,
     pub full_output: String,
+    /// Just this step's stdout lines, reset alongside `full_output` at the
+    /// start of each step — see `stderr_only`/`ExecOutput::stdout` for why
+    /// `full_output` alone isn't enough for `output="markdown"` mode.
+    pub stdout_only: String,
+    /// Just this step's stderr lines — see `stdout_only` above.
+    pub stderr_only: String,
     /// Reset to `Instant::now()` right before each step is actually
     /// spawned (`advance_run`) — read back once its exit code is known
     /// (`on_output_line`) to time it into `ExecOutput::duration_ms`, the
@@ -1396,6 +1402,8 @@ impl App {
             proc: None,
             lines: Vec::new(),
             full_output: String::new(),
+            stdout_only: String::new(),
+            stderr_only: String::new(),
             step_started: std::time::Instant::now(),
             current_node_text: String::new(),
             had_failure: false,
@@ -1762,6 +1770,8 @@ impl App {
                 run.proc = Some(proc);
                 run.current_node_text = node_text;
                 run.full_output.clear();
+                run.stdout_only.clear();
+                run.stderr_only.clear();
                 run.step_started = std::time::Instant::now();
                 run.lines.push(format!("==> {}", addr.block_name));
             }
@@ -1894,10 +1904,10 @@ impl App {
     /// Called by `mod.rs` once `file_run`'s own output channel closes —
     /// mirrors `on_output_line`, minus everything that only applies to a
     /// fenced block (no `cache`, no `meshfox:var`, no chain to advance).
-    pub async fn on_file_output_line(&mut self, line: Option<String>) {
+    pub async fn on_file_output_line(&mut self, line: Option<(OutputStream, String)>) {
         let Some(run) = &mut self.file_run else { return };
         match line {
-            Some(text) => run.lines.push(text),
+            Some((_, text)) => run.lines.push(text),
             None => {
                 let mut proc = run.proc.take().expect("output channel closed without a process");
                 let status = proc.child.wait().await;
@@ -1928,16 +1938,26 @@ impl App {
         self.advance_run().await;
     }
 
-    pub async fn on_output_line(&mut self, line: Option<String>) {
+    pub async fn on_output_line(&mut self, line: Option<(OutputStream, String)>) {
         if self.run.is_none() {
             return;
         }
         match line {
-            Some(text) => {
+            Some((stream, text)) => {
                 let run = self.run.as_mut().unwrap();
                 run.lines.push(text.clone());
                 run.full_output.push_str(&text);
                 run.full_output.push('\n');
+                match stream {
+                    OutputStream::Stdout => {
+                        run.stdout_only.push_str(&text);
+                        run.stdout_only.push('\n');
+                    }
+                    OutputStream::Stderr => {
+                        run.stderr_only.push_str(&text);
+                        run.stderr_only.push('\n');
+                    }
+                }
             }
             None => {
                 let mut proc = self
@@ -1950,12 +1970,14 @@ impl App {
                 let status = proc.child.wait().await;
                 let exit_code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
 
-                let (addr, node_text, full_output, duration_ms) = {
+                let (addr, node_text, full_output, stdout_only, stderr_only, duration_ms) = {
                     let run = self.run.as_ref().unwrap();
                     (
                         run.chain[run.idx].clone(),
                         run.current_node_text.clone(),
                         run.full_output.clone(),
+                        run.stdout_only.clone(),
+                        run.stderr_only.clone(),
                         run.step_started.elapsed().as_millis() as u64,
                     )
                 };
@@ -1975,6 +1997,8 @@ impl App {
                             exit_code,
                             output: full_output.clone(),
                             duration_ms,
+                            stdout: stdout_only,
+                            stderr: stderr_only,
                         };
                         // Re-located (rather than stashed from `advance_run`)
                         // since it's cheap and this is the only place that

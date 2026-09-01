@@ -2233,7 +2233,7 @@ async fn run_file_node_cli(canvas_path: &Path, node: &Node) -> Result<(), String
         tokio::select! {
             line = proc.output_rx.recv() => {
                 match line {
-                    Some(text) => println!("{text}"),
+                    Some((_, text)) => println!("{text}"),
                     None => {
                         let status = proc.child.wait().await;
                         let exit_code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
@@ -2481,6 +2481,8 @@ async fn run_async(
 
             let step_cwd = canvas_root_dir(located.origin.as_deref().unwrap_or(canvas_path));
             let mut full_output = String::new();
+            let mut stdout_only = String::new();
+            let mut stderr_only = String::new();
             let step_started = std::time::Instant::now();
             let exit_code = if block.tty {
                 if !prompt::stdin_is_tty() || !std::io::stdout().is_terminal() {
@@ -2528,10 +2530,20 @@ async fn run_async(
                     tokio::select! {
                         line = proc.output_rx.recv() => {
                             match line {
-                                Some(text) => {
+                                Some((stream, text)) => {
                                     println!("{text}");
                                     full_output.push_str(&text);
                                     full_output.push('\n');
+                                    match stream {
+                                        meshfox_server::stream_exec::OutputStream::Stdout => {
+                                            stdout_only.push_str(&text);
+                                            stdout_only.push('\n');
+                                        }
+                                        meshfox_server::stream_exec::OutputStream::Stderr => {
+                                            stderr_only.push_str(&text);
+                                            stderr_only.push('\n');
+                                        }
+                                    }
                                 }
                                 None => {
                                     let status = proc.child.wait().await;
@@ -2614,6 +2626,8 @@ async fn run_async(
                     exit_code,
                     output: full_output,
                     duration_ms: step_duration_ms,
+                    stdout: stdout_only,
+                    stderr: stderr_only,
                 };
                 if let Some(updated) =
                     meshfox_core::write_output(&node_text, &addr.block_name, &result)

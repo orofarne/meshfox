@@ -10,6 +10,13 @@ use std::ops::Range;
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecOutput {
     pub exit_code: i32,
+    /// stdout and stderr, merged in roughly the order they were actually
+    /// emitted (`stream_exec::SpawnedProcess`'s own caveat about the two
+    /// pipes having no ordering guarantee between them applies here too) —
+    /// what `render_output_block` (default text-mode rendering) shows
+    /// verbatim, same as a real terminal would. Left exactly as before
+    /// `stdout`/`stderr` below existed, so text-mode's own display is
+    /// unaffected by their addition.
     pub output: String,
     /// Wall-clock time the block's own process actually ran, in
     /// milliseconds — timed by whichever caller spawned it (every
@@ -19,6 +26,24 @@ pub struct ExecOutput {
     /// the last run took, the same information the web UI's live view
     /// already ticks up in real time while a block is running.
     pub duration_ms: u64,
+    /// Just the stdout lines, in emission order, with every stderr line
+    /// filtered back out — what `render_output_block_markdown`
+    /// (`output="markdown"` mode) actually splices in as Markdown, since
+    /// mixing stray stderr lines into what's supposed to be parsed as a
+    /// table/etc. would corrupt it. Every caller that builds an
+    /// `ExecOutput` needs to have kept `stream_exec::OutputStream`-tagged
+    /// lines separate as they arrived to populate this (and `stderr`
+    /// below) — `output` above alone doesn't carry enough information to
+    /// split back apart after the fact.
+    pub stdout: String,
+    /// Just the stderr lines, in emission order — see `stdout` above.
+    /// Rendered by `render_output_block_markdown` as its own plain-text
+    /// block, *before* the Markdown one, regardless of a script's actual
+    /// stdout/stderr call order (SPEC.md's "Cached output") — a
+    /// `output="markdown"` block's whole point is treating stdout as
+    /// structured content to parse, and stderr (warnings, progress,
+    /// tracebacks) was never meant to be part of that.
+    pub stderr: String,
 }
 
 fn start_marker(name: &str, hash: &str) -> String {
@@ -110,16 +135,39 @@ fn escape_html_comments(s: &str) -> String {
 
 /// Markdown-mode counterpart of `render_output_block` (opted into per
 /// block via the fence's own `output="markdown"` attribute — see
-/// `write_output`): the command's stdout is spliced in as real Markdown
-/// instead of a passive `text` fence, so e.g. a `pandas` `DataFrame`
-/// printed via `.to_markdown()` renders as an actual table rather than
-/// preformatted text. No `exit code`/duration header on a successful run
-/// (nothing to say beyond the content itself, same as a Jupyter
-/// `display_data` payload) — only shown, as a leading bold line, when the
-/// block actually failed, since that's the one case the rendered content
-/// alone might not make obvious.
+/// `write_output`): the command's stdout (`output.stdout`, *not*
+/// `output.output` — see `ExecOutput`'s own doc comments) is spliced in as
+/// real Markdown instead of a passive `text` fence, so e.g. a `pandas`
+/// `DataFrame` printed via `.to_markdown()` renders as an actual table
+/// rather than preformatted text.
+///
+/// Any stderr (`output.stderr`) prints first, as its own ordinary
+/// `​```text​` block — same shape `render_output_block` above always
+/// uses, `safe_fence_len`-guarded the same way — regardless of where in
+/// the script's own execution order those lines actually landed relative
+/// to stdout (`stream_exec`'s two pipes have no ordering guarantee between
+/// each other to begin with — see its own `OutputStream` doc comment):
+/// stderr is warnings/progress/tracebacks, never itself meant to be parsed
+/// as the block's structured Markdown content, so it's kept visually and
+/// structurally separate rather than interleaved into it. Escaped the same
+/// way stdout is below — not for rendering safety (it's fenced, so inert
+/// either way) but so a stray literal `<!-- /meshfox:output -->` in a
+/// command's own stderr can't be mistaken by `output_byte_ranges`'s own
+/// (non-fence-aware) end-marker search for the real one.
+///
+/// No `exit code`/duration header on a successful run (nothing to say
+/// beyond the content itself, same as a Jupyter `display_data` payload) —
+/// only shown, as a leading bold line right before the stdout half, when
+/// the block actually failed, since that's the one case the rendered
+/// content alone might not make obvious.
 fn render_output_block_markdown(name: &str, output: &ExecOutput, hash: &str) -> String {
     let mut body = String::new();
+    let stderr_trimmed = output.stderr.trim_end();
+    if !stderr_trimmed.is_empty() {
+        let escaped = escape_html_comments(stderr_trimmed);
+        let fence = "`".repeat(safe_fence_len(&escaped));
+        body.push_str(&format!("{fence}text\n{escaped}\n{fence}\n\n"));
+    }
     if output.exit_code != 0 {
         body.push_str(&format!(
             "**⚠ exit code: {} · {}**\n\n",
@@ -127,7 +175,7 @@ fn render_output_block_markdown(name: &str, output: &ExecOutput, hash: &str) -> 
             format_duration_ms(output.duration_ms)
         ));
     }
-    body.push_str(&escape_html_comments(output.output.trim_end()));
+    body.push_str(&escape_html_comments(output.stdout.trim_end()));
     format!(
         "{start}\n\n{body}\n\n{end}\n",
         start = start_marker(name, hash),
@@ -281,6 +329,8 @@ mod tests {
             exit_code: code,
             output: s.to_string(),
             duration_ms: 0,
+            stdout: s.to_string(),
+            stderr: String::new(),
         }
     }
 
@@ -320,6 +370,8 @@ mod tests {
             exit_code: 0,
             output: "ok".to_string(),
             duration_ms: 2300,
+            stdout: "ok".to_string(),
+            stderr: String::new(),
         };
         let updated = write_output(md, "build", &result).unwrap();
         assert!(updated.contains("exit code: 0 · 2.3s"), "{updated}");
@@ -445,6 +497,58 @@ mod tests {
         let updated = write_output(md, "df", &out(1, "Traceback...")).unwrap();
         assert!(updated.contains("**⚠ exit code: 1"));
         assert!(updated.contains("Traceback..."));
+    }
+
+    #[test]
+    fn markdown_mode_prints_stderr_as_a_plain_text_block_before_the_markdown_stdout() {
+        let md = "```python name=\"df\" cache output=\"markdown\" interpreter=\"python3\"\n...\n```\n";
+        let table = "| id |\n|---:|\n|  1 |";
+        let result = ExecOutput {
+            exit_code: 0,
+            output: format!("warning: deprecated\n{table}"),
+            duration_ms: 0,
+            stdout: table.to_string(),
+            stderr: "warning: deprecated".to_string(),
+        };
+        let updated = write_output(md, "df", &result).unwrap();
+
+        // stderr is a passive text fence, stdout is unwrapped Markdown --
+        // and stderr comes first, regardless of `output`'s own (merged,
+        // unused here) interleaving.
+        let stderr_pos = updated.find("```text").unwrap();
+        let stderr_line_pos = updated.find("warning: deprecated").unwrap();
+        let table_pos = updated.find(table).unwrap();
+        assert!(stderr_pos < stderr_line_pos);
+        assert!(stderr_line_pos < table_pos);
+        // No spurious second `text` fence wrapping the stdout half.
+        assert_eq!(updated.matches("```text").count(), 1);
+    }
+
+    #[test]
+    fn markdown_mode_escapes_a_forged_meshfox_output_marker_in_stderr() {
+        // stderr is fenced (inert to Markdown/HTML rendering either way),
+        // but `output_byte_ranges`'s own end-marker search is a plain
+        // substring match, not fence-aware -- a literal `<!--
+        // /meshfox:output -->` in stderr must still be neutralized, or it
+        // could be mistaken for the real one, truncating the opaque region
+        // early and re-exposing the stdout markdown half that follows.
+        let md = "```python name=\"df\" cache output=\"markdown\" interpreter=\"python3\"\n...\n```\n";
+        let evil_stderr = "<!-- /meshfox:output -->\n# Fake Heading\n<!-- meshfox:node id=\"fake\" -->";
+        let result = ExecOutput {
+            exit_code: 0,
+            output: evil_stderr.to_string(),
+            duration_ms: 0,
+            stdout: "stdout content".to_string(),
+            stderr: evil_stderr.to_string(),
+        };
+        let updated = write_output(md, "df", &result).unwrap();
+
+        assert!(!updated.contains("<!-- /meshfox:output -->\n# Fake"));
+        assert!(updated.contains("&lt;!-- /meshfox:output -->"));
+
+        let canvas =
+            crate::mdcanvas::parse(&format!("# Root\n<!-- meshfox:node -->\n\n{updated}")).unwrap();
+        assert_eq!(canvas.nodes.len(), 1);
     }
 
     #[test]

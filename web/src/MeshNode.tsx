@@ -144,6 +144,19 @@ export interface LiveBlockState {
    * to the file unless `cache` + Edit mode, in which case the eventual
    * canvas reload picks up the real cached copy instead. */
   text: string;
+  /** Just this run's stdout lines so far, kept separately from `text`
+   * (merged stdout+stderr) as each `"output"` event's own `stream` tag
+   * says which one it was — mirrors `core::output::ExecOutput::stdout`/
+   * `.stderr`, needed for the same reason: `output="markdown"` mode
+   * (`RunOutput`'s `MarkdownOutput`) renders stdout as Markdown and stderr
+   * as its own plain-text block, and merged `text` alone can't be split
+   * back apart once interleaved. `undefined` until the first `"output"`
+   * event of a run arrives (cleared to `undefined`, not `""`, at
+   * `"step-start"` — see App.tsx — so a block with no stdout at all this
+   * run reads as "nothing yet", not "empty markdown"). */
+  stdoutText?: string;
+  /** Just this run's stderr lines so far — see `stdoutText` above. */
+  stderrText?: string;
   /** Set once `status` becomes `"running"` — what `onKill` needs to
    * identify *this* run to the server. Cleared once the block is no
    * longer the actively-streaming step. */
@@ -1262,17 +1275,38 @@ function BlockedRunOutput() {
  * block's rendered table/etc. looks and behaves exactly like any other
  * Markdown in the node.
  *
- * The `.mesh-code-output-markdown` wrapper gives this its own inset
- * padding and dashed top separator (`index.css`), mirroring
- * `.mesh-code-output pre`'s own treatment — `.mesh-code-output` itself has
- * no padding of its own (every other kind of content it holds, `pre`
- * included, supplies its own), and a bare `<table>`'s per-cell borders
- * would otherwise land flush against the box's own border with nothing
- * else here to create that gap. */
-function MarkdownOutput({ text, assetBase }: { text: string; assetBase?: string }) {
+ * `stderrText`, if present (`core::output::render_output_block_markdown`
+ * captures stderr separately from stdout — see `CachedOutput.stderrText`'s
+ * own doc comment), renders first as an ordinary `<pre><AnsiText/></pre>`
+ * block, same treatment `RunOutput`'s default text-mode rendering already
+ * gives a whole block's output — stderr was never meant to be parsed as
+ * this block's Markdown content, so it stays visually distinct from it
+ * rather than folded into the same `ReactMarkdown` call.
+ *
+ * The `.mesh-code-output-markdown` wrapper gives this (both halves
+ * together) its own inset padding and dashed top separator (`index.css`),
+ * mirroring `.mesh-code-output pre`'s own treatment — `.mesh-code-output`
+ * itself has no padding of its own (every other kind of content it holds,
+ * `pre` included, supplies its own), and a bare `<table>`'s per-cell
+ * borders would otherwise land flush against the box's own border with
+ * nothing else here to create that gap. */
+function MarkdownOutput({
+  text,
+  stderrText,
+  assetBase,
+}: {
+  text: string;
+  stderrText?: string;
+  assetBase?: string;
+}) {
   const components = useMemo(() => makeMarkdownComponents(assetBase), [assetBase]);
   return (
     <div className="mesh-code-output-markdown">
+      {stderrText && (
+        <pre>
+          <code><AnsiText text={stderrText} /></code>
+        </pre>
+      )}
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkImageAttrs, remarkSubSup, remarkGfmAlerts]}
         components={components}
@@ -1328,14 +1362,24 @@ function LiveRunOutput({
     );
   const exitState =
     live.status === "killed" ? "killed" : live.status === "running" ? "running" : live.exitCode === 0 ? "ok" : "fail";
-  const renderMarkdown = outputMarkdown && live.status === "done";
+  // `RunEvent::Output`'s own `stream` tag (see `App.tsx`'s `appendOutputLine`)
+  // is what makes this possible at all: `live.stdoutText`/`.stderrText`
+  // accumulate separately from `live.text` (the merged view, still used
+  // for every non-markdown block) as each line arrives, the same split
+  // `ExecOutput.stdout`/`.stderr` gives a `cache`d run's persisted result —
+  // so the live "done" view renders correctly split even before `App.tsx`
+  // reloads the canvas and swaps in the cached copy.
+  const renderMarkdown =
+    outputMarkdown && live.status === "done" && (live.stdoutText !== undefined || live.stderrText !== undefined);
   return (
     <div className="mesh-code-output" data-exit={exitState}>
       <div className="mesh-code-output-head">
         {label}
         <span className="mesh-code-output-transient"> · not saved</span>
       </div>
-      {live.text && renderMarkdown && <MarkdownOutput text={live.text} assetBase={assetBase} />}
+      {renderMarkdown && (
+        <MarkdownOutput text={live.stdoutText ?? ""} stderrText={live.stderrText} assetBase={assetBase} />
+      )}
       {live.text && !renderMarkdown && (
         <pre>
           <code><AnsiText text={live.text} /></code>
@@ -1366,7 +1410,9 @@ function RunOutput({ seg, live, assetBase }: { seg: CodeSegment; live?: LiveBloc
             </span>
           )}
         </div>
-        {seg.output.text && seg.outputMarkdown && <MarkdownOutput text={seg.output.text} assetBase={assetBase} />}
+        {seg.output.text && seg.outputMarkdown && (
+          <MarkdownOutput text={seg.output.text} stderrText={seg.output.stderrText} assetBase={assetBase} />
+        )}
         {seg.output.text && !seg.outputMarkdown && (
           <pre>
             <code><AnsiText text={seg.output.text} /></code>

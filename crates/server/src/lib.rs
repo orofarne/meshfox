@@ -705,10 +705,20 @@ enum RunEvent {
         /// `StepEnd::duration_ms`.
         duration_ms: u64,
     },
-    /// One line of merged stdout/stderr, as it's produced.
+    /// One line of stdout/stderr, as it's produced — the two remain
+    /// interleaved on this one event stream in roughly their real
+    /// emission order (same caveat `stream_exec::OutputStream`'s own doc
+    /// comment has: two separate pipes, no ordering guarantee between
+    /// them), but `stream` says which pipe each line actually came from,
+    /// so a client rendering `output="markdown"` mode's live view can
+    /// split stdout (parsed as Markdown) from stderr (its own plain-text
+    /// block) the same way a `cache`d run's persisted result already does
+    /// (`core::output::ExecOutput::stdout`/`.stderr`) — see
+    /// `MeshNode.tsx`'s `LiveRunOutput`.
     Output {
         node_id: String,
         block: String,
+        stream: stream_exec::OutputStream,
         text: String,
     },
     /// `/api/run/tty`'s WebSocket only: emitted right after `StepStart` for
@@ -1964,10 +1974,11 @@ async fn run_file_node(
             tokio::select! {
                 line = proc.output_rx.recv() => {
                     match line {
-                        Some(text) => {
+                        Some((stream, text)) => {
                             yield Ok(ndjson_line(&RunEvent::Output {
                                 node_id: id.clone(),
                                 block: id.clone(),
+                                stream,
                                 text,
                             }));
                         }
@@ -2727,16 +2738,29 @@ async fn run_block(
             };
 
             let mut full_output = String::new();
+            let mut stdout_only = String::new();
+            let mut stderr_only = String::new();
             let exit_code = loop {
                 tokio::select! {
                     line = proc.output_rx.recv() => {
                         match line {
-                            Some(text) => {
+                            Some((stream, text)) => {
                                 full_output.push_str(&text);
                                 full_output.push('\n');
+                                match stream {
+                                    stream_exec::OutputStream::Stdout => {
+                                        stdout_only.push_str(&text);
+                                        stdout_only.push('\n');
+                                    }
+                                    stream_exec::OutputStream::Stderr => {
+                                        stderr_only.push_str(&text);
+                                        stderr_only.push('\n');
+                                    }
+                                }
                                 yield Ok(ndjson_line(&RunEvent::Output {
                                     node_id: addr.node_id.clone(),
                                     block: addr.block_name.clone(),
+                                    stream,
                                     text,
                                 }));
                             }
@@ -2818,7 +2842,13 @@ async fn run_block(
             }
 
             if persist && block.cache {
-                let result = ExecOutput { exit_code, output: full_output.clone(), duration_ms };
+                let result = ExecOutput {
+                    exit_code,
+                    output: full_output.clone(),
+                    duration_ms,
+                    stdout: stdout_only,
+                    stderr: stderr_only,
+                };
                 if let Some(updated) = meshfox_core::write_output(&node_text, &addr.block_name, &result) {
                     if let Some(patched) = mdcanvas::set_node_body(&located.raw, &located.local_id, &updated) {
                         file_raws.insert(located.origin.clone(), patched);
@@ -3247,6 +3277,8 @@ async fn run_tty_chain(
             Some(path)
         };
         let mut full_output = String::new();
+        let mut stdout_only = String::new();
+        let mut stderr_only = String::new();
         let step_started = std::time::Instant::now();
 
         // Same block-with-substituted-interpreter clone `run_block` uses —
@@ -3306,12 +3338,23 @@ async fn run_tty_chain(
                 tokio::select! {
                     line = proc.output_rx.recv() => {
                         match line {
-                            Some(text) => {
+                            Some((stream, text)) => {
                                 full_output.push_str(&text);
                                 full_output.push('\n');
+                                match stream {
+                                    stream_exec::OutputStream::Stdout => {
+                                        stdout_only.push_str(&text);
+                                        stdout_only.push('\n');
+                                    }
+                                    stream_exec::OutputStream::Stderr => {
+                                        stderr_only.push_str(&text);
+                                        stderr_only.push('\n');
+                                    }
+                                }
                                 if !send_event(&mut socket, &RunEvent::Output {
                                     node_id: addr.node_id.clone(),
                                     block: addr.block_name.clone(),
+                                    stream,
                                     text,
                                 }).await {
                                     let _ = proc.kill();
@@ -3429,6 +3472,8 @@ async fn run_tty_chain(
                 exit_code,
                 output: full_output.clone(),
                 duration_ms,
+                stdout: stdout_only,
+                stderr: stderr_only,
             };
             if let Some(updated) = meshfox_core::write_output(&node_text, &addr.block_name, &result)
             {
@@ -5364,8 +5409,8 @@ mod run_file_tests {
         assert!(
             events
                 .iter()
-                .any(|e| e["type"] == "output" && e["text"] == "hi from seed"),
-            "expected an output event with the script's own stdout, got: {events:?}"
+                .any(|e| e["type"] == "output" && e["text"] == "hi from seed" && e["stream"] == "stdout"),
+            "expected a stdout-tagged output event with the script's own stdout, got: {events:?}"
         );
         let step_end = events
             .iter()
@@ -5624,6 +5669,48 @@ mod run_block_include_tests {
         assert!(child_after.contains("meshfox:output name=\"report\""));
 
         let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
+    }
+
+    /// Not include-specific — just reuses this module's own `post_json`/
+    /// `ndjson_events` helpers. Each `"output"` `RunEvent` over `/api/run`'s
+    /// NDJSON stream now carries a `stream` field (`stream_exec::OutputStream`,
+    /// see its own doc comment) alongside `text`, so the web UI's live view
+    /// can tell stdout from stderr apart the same way a `cache`d run's
+    /// persisted `ExecOutput.stdout`/`.stderr` already lets it once reloaded
+    /// (`MeshNode.tsx`'s `LiveRunOutput`/`App.tsx`'s `appendOutputLine`).
+    #[tokio::test]
+    async fn output_events_over_ndjson_are_tagged_with_their_own_stream() {
+        let canvas_path = std::env::temp_dir().join(format!(
+            "meshfox-run-stream-tag-test-{}.canvas.md",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &canvas_path,
+            concat!(
+                "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+                "```bash name=\"root\" cache\necho out1; sleep 0.05; echo err1 >&2\n```\n",
+            ),
+        )
+        .unwrap();
+
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let (status, body) =
+            post_json(addr, "/api/run", r#"{"path":[],"block":"root","persist":false}"#).await;
+        assert_eq!(status, 200, "unexpected body: {body}");
+
+        let events = ndjson_events(&body);
+        let output_events: Vec<(Option<&str>, Option<&str>)> = events
+            .iter()
+            .filter(|e| e["type"] == "output")
+            .map(|e| (e["stream"].as_str(), e["text"].as_str()))
+            .collect();
+        assert_eq!(
+            output_events,
+            vec![(Some("stdout"), Some("out1")), (Some("stderr"), Some("err1"))],
+            "events: {events:?}"
+        );
+
+        let _ = std::fs::remove_file(&canvas_path);
     }
 }
 
