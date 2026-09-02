@@ -435,6 +435,34 @@ Options:
 ```
 <!-- /meshfox:output -->
 
+### macOS menu-bar app (`open`, experimental)
+<!-- meshfox:node id="macos-menu-bar-app-open-experimental" -->
+
+`Meshfox.app` is a menu-bar-only daemon (no Dock icon) that also handles Finder's double-click/drag-onto-icon/"Open With" on a `.canvas.md` — see [macos/app.canvas.md](./macos/app.canvas.md) for the build/install steps (`swift build`, ad-hoc signing, installs to `~/Applications/Meshfox.app`). Installed separately from the `meshfox` binary itself; not built by default.
+
+`meshfox open <target>` (optionally `target#node-id` for a deep link, same syntax a `file`-node target already supports) hands a canvas off to this daemon instead of starting a private `meshfox view` session of your own. Deliberately never a fallback for `view` or vice versa — the two are different guarantees: `view` blocks in your terminal and everything it spawned dies when you kill it; `open` hands off and returns immediately, to whatever keeps running (and stays reachable) independent of this process. If the daemon isn't already running, `open` starts it (if installed) and waits for it to come up — it does *not* silently fall back to `view`'s own behavior on failure.
+
+macOS only for now — the daemon itself doesn't exist anywhere else yet.
+
+```bash name="open-help" cache
+meshfox open -h
+```
+<!-- meshfox:output name="open-help" hash="0c0f4120" -->
+```text
+exit code: 0 · 20ms
+
+Hand a `.canvas.md` off to the persistent macOS menu-bar daemon (`macos/MeshfoxDaemon`, "core-only" MVP — see TODO.canvas.md's "Ссылки и навигация между канвасами") instead of starting a private `meshfox view` session of your own. Deliberately never a fallback for `view` or vice versa — the two are different guarantees: `view` blocks in your terminal and everything it spawned dies when you kill it; `open` hands off and returns immediately, to whatever keeps running (and stays reachable) independent of this process. Requires the daemon: if it's not already running, this starts it (if installed) and waits for it to come up — it does *not* silently fall back to `view`'s own private-watcher behavior on failure; see the error message for what to do instead. macOS only for now — the daemon itself doesn't exist anywhere else yet
+
+Usage: meshfox open <TARGET>
+
+Arguments:
+  <TARGET>  Path to the `.canvas.md` file, optionally with `#node-id` for a deep link straight to that node (same syntax a `file`-node target already supports — `meshfox_core::mdcanvas::split_target_fragment`)
+
+Options:
+  -h, --help  Print help
+```
+<!-- /meshfox:output -->
+
 ### Terminal viewer (experimental)
 <!-- meshfox:node id="usage-tui" -->
 
@@ -546,6 +574,15 @@ npm install -g @modelcontextprotocol/inspector
 ```sh name="mcp-inspector-launch" tty autoclose
 mcp-inspector meshfox mcp
 ```
+
+### VS Code extension (experimental)
+<!-- meshfox:node id="vs-code-extension-experimental" -->
+
+[`editors/vscode/`](./editors/vscode/) — opens `.canvas.md` files (and any other `.md` whose first line is the `<!-- meshfox:canvas -->` marker — this document included) as the same interactive node canvas the browser UI shows, embedded directly in an editor tab instead of a browser one. The extension acts as its own private coordinator (mirroring `crates/cli/src/watcher.rs`'s own role, reimplemented in TypeScript over the same wire protocol `meshfox open` above also speaks): it spawns a `meshfox view --watcher-socket` worker per open canvas and points that tab's webview at its local port. Read-only from VS Code's own perspective, same as the browser UI itself — click "Edit" inside the canvas to unlock dragging/resizing/saving layout.
+
+Also ships a small TextMate injection grammar that highlights meshfox's own bookkeeping comments (`meshfox:node`/`meshfox:edge`/`meshfox:var`/...) wherever the raw file is shown as plain text instead of through the canvas editor — git diffs/blame, "Open With... → Text Editor".
+
+No Marketplace listing yet — see [editors/vscode/README.md](./editors/vscode/README.md) for building/installing the `.vsix` locally and the extension's own limitations (macOS/Linux only for now, same watcher-socket protocol as `meshfox open` above).
 
 ### Static export (experimental)
 <!-- meshfox:node id="usage-static" -->
