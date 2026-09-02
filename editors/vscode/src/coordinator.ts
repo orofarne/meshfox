@@ -5,7 +5,8 @@ import * as os from "os";
 import * as path from "path";
 import { ChildProcess, spawn } from "child_process";
 import { parseWorkerMessage } from "./protocol";
-import { VIEW_TYPE } from "./constants";
+import { VIEW_TYPE, resolveExecutablePath } from "./constants";
+import { showInstallInstructions } from "./updates";
 
 const READY_TIMEOUT_MS = 15000;
 
@@ -133,15 +134,18 @@ export class Coordinator implements vscode.Disposable {
       return entry.port;
     }
     if (!entry) {
-      const exe = vscode.workspace.getConfiguration("meshfox").get<string>("executablePath", "meshfox");
+      const exe = resolveExecutablePath();
       const proc = spawn(exe, ["view", fsPath, "--port", "0", "--watcher-socket", this.socketPath], {
         stdio: ["ignore", "pipe", "pipe"],
       });
       entry = { proc, waiters: [] };
       this.workers.set(key, entry);
       proc.stderr?.on("data", (chunk) => this.output.append(chunk.toString("utf8")));
-      proc.on("error", (err) => {
+      proc.on("error", (err: NodeJS.ErrnoException) => {
         this.output.appendLine(`meshfox: failed to launch "${exe} view": ${err.message}`);
+        if (err.code === "ENOENT") {
+          void showInstallInstructions(exe);
+        }
         const waiters = entry!.waiters.splice(0);
         waiters.forEach((w) => w.reject(err));
         this.workers.delete(key);

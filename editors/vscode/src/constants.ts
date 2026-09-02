@@ -1,3 +1,5 @@
+import * as vscode from "vscode";
+
 // Must match the `viewType`s a `resolveCustomEditor`/`openCustomDocument`
 // provider is registered under in package.json's `contributes.customEditors`.
 // `VIEW_TYPE` is the *default* editor for `*.canvas.md` — auto-opens on
@@ -9,3 +11,7 @@
 // there's no content-sniffing default-then-bail-out here instead.
 export const VIEW_TYPE = "meshfox.canvasEditor";
 export const VIEW_TYPE_ANY = "meshfox.canvasEditorAny";
+
+export function resolveExecutablePath(): string {
+  return vscode.workspace.getConfiguration("meshfox").get<string>("executablePath", "meshfox");
+}

@@ -64,6 +64,24 @@ the custom-editor bail-out that broke tab state — same lesson: TextMate/VS
 Code API interactions that look right on paper still need an actual F5
 check before trusting them).
 
+## Keeping `meshfox` itself up to date
+
+Once a day (throttled via `globalState`, not on every window), the
+extension checks GitHub's Releases API for a newer `meshfox` than the one
+`meshfox.executablePath` resolves to and — only for a release build (a
+`v1.2.3`-style version; a local/dev build has nothing to compare against,
+same as `meshfox check-updates`'s own no-op case) — shows a toast with an
+**Update** button if one exists. Nothing is downloaded or installed by
+that check itself; clicking **Update** (or running the **"meshfox: Check
+for Updates"** command directly) asks for confirmation once more, then
+runs `meshfox check-updates -y` — the existing CLI command
+(`self_update`-based, downloads from the same GitHub releases) that
+actually replaces the binary, reused rather than reimplemented here.
+
+If the configured executable can't be found at all (spawning it fails
+with `ENOENT`), an error notification offers to copy the same install
+one-liner the root README documents — never runs it for you.
+
 ## How it works
 
 The extension acts as its own private coordinator (see `src/coordinator.ts`)

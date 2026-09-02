@@ -1,7 +1,13 @@
 import * as vscode from "vscode";
 import { Coordinator } from "./coordinator";
 import { CanvasEditorProvider } from "./canvasEditorProvider";
-import { VIEW_TYPE, VIEW_TYPE_ANY } from "./constants";
+import { VIEW_TYPE, VIEW_TYPE_ANY, resolveExecutablePath } from "./constants";
+import {
+  isExecutableAvailable,
+  maybeCheckForUpdatesOnStartup,
+  runInteractiveUpdate,
+  showInstallInstructions,
+} from "./updates";
 
 let coordinator: Coordinator | undefined;
 
@@ -34,8 +40,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         return;
       }
       await vscode.commands.executeCommand("vscode.openWith", target, VIEW_TYPE);
+    }),
+    vscode.commands.registerCommand("meshfox.checkForUpdates", async () => {
+      const exe = resolveExecutablePath();
+      if (!(await isExecutableAvailable(exe))) {
+        await showInstallInstructions(exe);
+        return;
+      }
+      await runInteractiveUpdate(exe, output);
     })
   );
+
+  // Fire-and-forget: throttled to once a day (see updates.ts), purely
+  // informational, never installs without an explicit click on the toast
+  // it shows. Must never block or fail activation.
+  void maybeCheckForUpdatesOnStartup(context, resolveExecutablePath(), output);
 }
 
 export function deactivate(): void {

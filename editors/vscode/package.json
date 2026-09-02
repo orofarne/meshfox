@@ -50,6 +50,11 @@
         "command": "meshfox.openAsCanvas",
         "title": "Open as meshfox canvas",
         "category": "meshfox"
+      },
+      {
+        "command": "meshfox.checkForUpdates",
+        "title": "Check for Updates",
+        "category": "meshfox"
       }
     ],
     "menus": {
