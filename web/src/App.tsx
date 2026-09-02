@@ -1106,16 +1106,15 @@ export default function App() {
   );
 
   // Opens a `file` node's target (the title bar's "↗ open" button) —
-  // fire-and-forget from the UI's point of view for a plain file, just
-  // surfaced to the same error banner every other action here uses if the
-  // server couldn't spawn the opener. A canvas target instead comes back
-  // with a `url` (the worker `meshfox view` spawned/reused for it — see
-  // `api.ts`'s `openNodeFile`), which this opens as a new tab itself,
-  // since there's no OS-level opener for "view this canvas".
+  // fire-and-forget from the UI's point of view either way: a plain file
+  // goes to the OS's default opener, a canvas target to this worker's own
+  // watcher (which opens the browser tab itself — see `api.ts`'s
+  // `openNodeFile`). Nothing for this component to do afterward but
+  // surface a failure to the same error banner every other action here
+  // uses.
   const handleOpenFile = useCallback(async (nodeId: string) => {
     try {
-      const result = await openNodeFile(nodeId);
-      if (result?.url) window.open(result.url, "_blank");
+      await openNodeFile(nodeId);
     } catch (e) {
       setError(String(e));
     }

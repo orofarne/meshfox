@@ -549,24 +549,24 @@ export async function runFileStream(nodeId: string, onEvent: (event: RunEvent) =
 }
 
 /**
- * Opens a `file` node's target — the web UI's "↗ open" button. A plain
- * file goes to the OS's default application for it, best-effort: resolves
- * once the opener has been spawned, not once whatever it opened has itself
- * finished loading (a `204`, nothing returned). A `.canvas.md` target has
- * no such OS association to hand off to — the server instead spawns (or
- * reuses) a `meshfox view` worker for it and returns that worker's own URL
- * (`200`), for the caller to `window.open` into a new tab. Rejects (thrown
- * error) for a non-file node, a node with no target, or a target outside
- * the canvas directory.
+ * Opens a `file` node's target — the web UI's "↗ open" button. Always
+ * fire-and-forget (`204`, nothing returned): a plain file goes to the OS's
+ * default application for it, best-effort, resolving once the opener has
+ * been spawned, not once whatever it opened has itself finished loading. A
+ * `.canvas.md` target has no such OS association to hand off to — the
+ * server instead asks this worker's own watcher (see
+ * `meshfox_server::watcher_protocol`) to get-or-spawn-and-show it, opening
+ * the browser tab itself; there's no URL for this call to hand back and
+ * `window.open` into a tab any more. Rejects (thrown error) for a non-file
+ * node, a node with no target, a target outside the canvas directory, or
+ * (canvas targets only) no watcher to ask at all.
  */
-export async function openNodeFile(nodeId: string): Promise<{ url: string } | void> {
+export async function openNodeFile(nodeId: string): Promise<void> {
   const res = await fetch(`/api/nodes/${encodeURIComponent(nodeId)}/open`, { method: "POST" });
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `POST /api/nodes/${nodeId}/open: ${res.status}`);
   }
-  if (res.status === 204) return;
-  return res.json();
 }
 
 /**

@@ -42,6 +42,10 @@ mod pty_exec;
 /// `pub` so `meshfox-cli` can reuse the same async spawn/kill primitives
 /// for `meshfox run`'s real-time output — see its `main.rs`.
 pub mod stream_exec;
+/// `pub` so `meshfox-cli`'s watcher (the coordinator this crate's own
+/// workers talk to — see `open_node_file`/`run`) can speak the exact same
+/// wire types without duplicating them.
+pub mod watcher_protocol;
 
 #[derive(RustEmbed)]
 #[folder = "../../web/dist"]
@@ -118,6 +122,15 @@ struct AppState {
     /// Never persisted anywhere and never touched by anything but this
     /// process's own runs — restarting `meshfox view` starts fresh.
     session_runs: Mutex<HashMap<(String, String), SessionRun>>,
+    /// Where this worker's own coordinating watcher (or, eventually, a
+    /// persistent GUI daemon) is listening — `None` only for a worker
+    /// started without one (the `#[cfg(test)]` server, or a hand-run
+    /// `meshfox-server` embedder that doesn't need cross-canvas
+    /// navigation). `open_node_file` forwards a `.canvas.md` target's
+    /// "↗ open" here (`watcher_protocol::request_open`) instead of
+    /// spawning/tracking anything itself — see that module's own doc
+    /// comment for why.
+    watcher_socket: Option<PathBuf>,
 }
 
 impl AppState {
@@ -2021,47 +2034,25 @@ fn is_canvas_file(path: &std::path::Path) -> bool {
                 .is_ok_and(|contents| meshfox_core::mdcanvas::has_marker(&contents)))
 }
 
-/// `POST /api/nodes/:id/open`'s response body for a canvas target — see
-/// `OpenOutcome`.
-#[derive(Debug, Serialize)]
-struct OpenNavigateResponse {
-    url: String,
-}
-
-/// `open_node_file`'s two outcomes: the pre-existing "handed off to the
-/// OS's own opener" (`204`, nothing more for the caller to do) and the new
-/// canvas case, where there's no OS association to hand off to — the
-/// browser is already looking at a canvas, so the response instead carries
-/// the URL of the (possibly just-spawned) worker serving the target canvas,
-/// for `web/src/App.tsx`'s `handleOpenFile` to `window.open` into a new tab.
-enum OpenOutcome {
-    Opened,
-    Navigate(OpenNavigateResponse),
-}
-
-impl IntoResponse for OpenOutcome {
-    fn into_response(self) -> Response {
-        match self {
-            OpenOutcome::Opened => StatusCode::NO_CONTENT.into_response(),
-            OpenOutcome::Navigate(body) => (StatusCode::OK, Json(body)).into_response(),
-        }
-    }
-}
-
-/// Opens a `file` node's target — the web UI's "↗ open" button. A plain
-/// file goes to the OS's default application for it (`open` on macOS,
-/// `xdg-open` on Linux, `start` on Windows — via the `open` crate, same one
-/// `meshfox view`'s own `--open` browser-launch already uses), best-effort:
-/// spawns the opener and returns as soon as it has, not once whatever it
-/// opened has itself finished loading/exited, same as the browser-launch
-/// case. A `.canvas.md` (or marker-carrying `.md`) target instead routes
-/// through `meshfox_core::view_registry` — see `OpenOutcome`.
-/// `spawn_blocking` throughout because both `open::that` and the registry
-/// client shell out/block on socket I/O synchronously.
+/// Opens a `file` node's target — the web UI's "↗ open" button. Always
+/// `204`, fire-and-forget from the caller's own point of view (the client
+/// never gets a URL back to act on itself any more — see
+/// `crate::watcher_protocol`'s own doc comment for why): a plain file goes
+/// to the OS's default application for it (`open` on macOS, `xdg-open` on
+/// Linux, `start` on Windows — via the `open` crate), best-effort, spawning
+/// the opener and returning as soon as it has, not once whatever it opened
+/// has itself finished loading/exited. A `.canvas.md` (or marker-carrying
+/// `.md`) target instead asks this worker's own coordinator to
+/// get-or-spawn-and-show it (`watcher_protocol::request_open`) — *that*
+/// failing (no coordinator reachable) is the one case this endpoint
+/// reports as a real error, since it's the one thing cross-canvas
+/// navigation actually depends on. `spawn_blocking` for the plain-file
+/// case only, since `open::that` blocks on shelling out; the coordinator
+/// request is already async.
 async fn open_node_file(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<OpenOutcome, ApiError> {
+) -> Result<StatusCode, ApiError> {
     let primary_raw = state.raw.lock().unwrap().clone();
     let located = locate_node(&state, &primary_raw, &id)?;
     let canvas = parse_or_error(&located.raw)?;
@@ -2085,22 +2076,23 @@ async fn open_node_file(
     let resolved = resolve_confined_target(canvas_path, target_path)?;
 
     if is_canvas_file(&resolved) {
-        let fragment = fragment.map(str::to_string);
-        let port = tokio::task::spawn_blocking(move || meshfox_core::view_registry::get_or_spawn(&resolved))
+        let socket = state.watcher_socket.as_deref().ok_or_else(|| {
+            ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no watcher to ask — this worker wasn't started with one, so cross-canvas \
+                 navigation isn't available"
+                    .to_string(),
+            )
+        })?;
+        watcher_protocol::request_open(socket, &resolved, fragment.map(str::to_string))
             .await
-            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             .map_err(|e| {
                 ApiError(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("couldn't open the canvas: {e}"),
+                    format!("couldn't reach the watcher to open the canvas: {e}"),
                 )
             })?;
-        let mut url = format!("http://127.0.0.1:{port}/");
-        if let Some(fragment) = fragment {
-            url.push('#');
-            url.push_str(&fragment);
-        }
-        return Ok(OpenOutcome::Navigate(OpenNavigateResponse { url }));
+        return Ok(StatusCode::NO_CONTENT);
     }
 
     tokio::task::spawn_blocking(move || open::that(&resolved))
@@ -2113,7 +2105,7 @@ async fn open_node_file(
             )
         })?;
 
-    Ok(OpenOutcome::Opened)
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Debug, Deserialize)]
@@ -3840,7 +3832,11 @@ async fn get_link_preview(
 /// closed — see `TabGuard`). `port` of `0` asks the OS to assign a free
 /// port instead — the actual bound port is read back from the listener
 /// below.
-async fn build_state(canvas_path: PathBuf, auto_exit: bool) -> std::io::Result<Arc<AppState>> {
+async fn build_state(
+    canvas_path: PathBuf,
+    auto_exit: bool,
+    watcher_socket: Option<PathBuf>,
+) -> std::io::Result<Arc<AppState>> {
     let raw = std::fs::read_to_string(&canvas_path)?;
     if let Err(e) = Canvas::from_markdown(&raw) {
         return Err(std::io::Error::new(
@@ -3863,6 +3859,7 @@ async fn build_state(canvas_path: PathBuf, auto_exit: bool) -> std::io::Result<A
         auto_exit,
         link_preview_cache: link_preview::PreviewCache::new(),
         session_runs: Mutex::new(HashMap::new()),
+        watcher_socket,
     }))
 }
 
@@ -3907,14 +3904,21 @@ fn build_app(state: Arc<AppState>) -> Router {
 /// closed — see `TabGuard`). `port` of `0` asks the OS to assign a free
 /// port instead — the actual bound port is read back from the listener
 /// below.
+///
+/// `watcher_socket`, when given, names the coordinator this worker reports
+/// its own bound port to (`watcher_protocol::notify_ready`) and forwards a
+/// `.canvas.md` "↗ open" to (`open_node_file`) — see that module's own doc
+/// comment. This worker never opens a browser tab itself, for itself or
+/// anything else — that's the coordinator's job, always, uniformly,
+/// whether this is the very first canvas a `meshfox view <path>` invocation
+/// asked for or one navigated to afterward.
 pub async fn run(
     canvas_path: PathBuf,
     port: u16,
-    open_browser: bool,
     auto_exit: bool,
-    port_file: Option<PathBuf>,
+    watcher_socket: Option<PathBuf>,
 ) -> std::io::Result<()> {
-    let state = build_state(canvas_path.clone(), auto_exit).await?;
+    let state = build_state(canvas_path.clone(), auto_exit, watcher_socket.clone()).await?;
     spawn_file_watcher(Arc::clone(&state));
     let app = build_app(state);
 
@@ -3925,18 +3929,15 @@ pub async fn run(
         canvas_path.display()
     );
 
-    // Written right after the bind succeeds, before anything else can fail
-    // — `meshfox_core::view_registry`'s daemon polls for this file to learn
-    // a just-spawned worker's port back without parsing the log line above.
-    if let Some(path) = &port_file {
-        std::fs::write(path, addr.port().to_string())?;
-    }
-
-    if open_browser {
-        // Best-effort: no browser, no display, or an unsupported platform
-        // shouldn't stop the server from running headless.
-        if let Err(e) = open::that(format!("http://{addr}")) {
-            eprintln!("meshfox: couldn't open a browser automatically ({e}) — open http://{addr} yourself");
+    // Best-effort, same reasoning `open_browser` used to have for
+    // `open::that` failing: a watcher that's gone, or was never given at
+    // all, shouldn't stop this worker from serving its own canvas — it
+    // just means nobody opens a browser tab for it, and this worker's own
+    // future cross-canvas navigation attempts will fail too (that failure
+    // *does* surface, in `open_node_file`).
+    if let Some(socket) = &watcher_socket {
+        if let Err(e) = watcher_protocol::notify_ready(socket, &canvas_path, addr.port()).await {
+            eprintln!("meshfox: couldn't reach the watcher to report this worker's port ({e})");
         }
     }
 
@@ -3950,7 +3951,7 @@ pub async fn run(
 /// (`println!`, browser-opening, auto-exit).
 #[cfg(test)]
 async fn spawn_test_server(canvas_path: PathBuf) -> SocketAddr {
-    let state = build_state(canvas_path, false)
+    let state = build_state(canvas_path, false, None)
         .await
         .expect("valid test canvas");
     let app = build_app(state);
@@ -3998,7 +3999,7 @@ mod clear_layout_tests {
         let canvas_path = write_test_canvas(
             &CANVAS.replace("./other/README.md", &target_path.display().to_string()),
         );
-        let state = build_state(canvas_path.clone(), false)
+        let state = build_state(canvas_path.clone(), false, None)
             .await
             .expect("valid test canvas");
 
@@ -4032,7 +4033,7 @@ mod clear_layout_tests {
     #[tokio::test]
     async fn clear_node_layout_clears_only_the_target_nodes_position() {
         let canvas_path = write_test_canvas(TWO_POSITIONED);
-        let state = build_state(canvas_path.clone(), false)
+        let state = build_state(canvas_path.clone(), false, None)
             .await
             .expect("valid test canvas");
 
@@ -4060,7 +4061,7 @@ mod clear_layout_tests {
     #[tokio::test]
     async fn clear_node_layout_on_an_unknown_id_404s() {
         let canvas_path = write_test_canvas(TWO_POSITIONED);
-        let state = build_state(canvas_path.clone(), false)
+        let state = build_state(canvas_path.clone(), false, None)
             .await
             .expect("valid test canvas");
 
@@ -4115,7 +4116,7 @@ mod reparent_position_tests {
             "<!-- meshfox:edge from=\"frame\" -->\n\nbody\n",
         );
         let canvas_path = write_test_canvas(CANVAS);
-        let state = build_state(canvas_path.clone(), false)
+        let state = build_state(canvas_path.clone(), false, None)
             .await
             .expect("valid test canvas");
 
@@ -4152,7 +4153,7 @@ mod reparent_position_tests {
             "## Elsewhere\n<!-- meshfox:node id=\"elsewhere\" -->\n\nbody\n",
         );
         let canvas_path = write_test_canvas(CANVAS);
-        let state = build_state(canvas_path.clone(), false)
+        let state = build_state(canvas_path.clone(), false, None)
             .await
             .expect("valid test canvas");
 
@@ -4189,7 +4190,7 @@ mod reparent_position_tests {
             "<!-- meshfox:edge from=\"frame\" -->\n\nbody\n",
         );
         let canvas_path = write_test_canvas(CANVAS);
-        let state = build_state(canvas_path.clone(), false)
+        let state = build_state(canvas_path.clone(), false, None)
             .await
             .expect("valid test canvas");
 
@@ -4226,7 +4227,7 @@ mod reparent_position_tests {
     #[tokio::test]
     async fn move_sibling_moves_a_node_before_a_target() {
         let canvas_path = write_test_canvas(ABC_CANVAS);
-        let state = build_state(canvas_path.clone(), false)
+        let state = build_state(canvas_path.clone(), false, None)
             .await
             .expect("valid test canvas");
 
@@ -4249,7 +4250,7 @@ mod reparent_position_tests {
     #[tokio::test]
     async fn move_sibling_moves_a_node_after_a_target() {
         let canvas_path = write_test_canvas(ABC_CANVAS);
-        let state = build_state(canvas_path.clone(), false)
+        let state = build_state(canvas_path.clone(), false, None)
             .await
             .expect("valid test canvas");
 
@@ -4278,7 +4279,7 @@ mod reparent_position_tests {
             "## B\n<!-- meshfox:node id=\"b\" -->\n\nbody b\n",
         );
         let canvas_path = write_test_canvas(canvas);
-        let state = build_state(canvas_path.clone(), false)
+        let state = build_state(canvas_path.clone(), false, None)
             .await
             .expect("valid test canvas");
 
@@ -4303,7 +4304,7 @@ mod reparent_position_tests {
     #[tokio::test]
     async fn move_sibling_rejects_a_request_naming_neither_or_both_of_before_after() {
         let canvas_path = write_test_canvas(ABC_CANVAS);
-        let state = build_state(canvas_path.clone(), false)
+        let state = build_state(canvas_path.clone(), false, None)
             .await
             .expect("valid test canvas");
 
@@ -4343,7 +4344,7 @@ mod reparent_position_tests {
     #[tokio::test]
     async fn move_sibling_on_an_unknown_id_404s() {
         let canvas_path = write_test_canvas(ABC_CANVAS);
-        let state = build_state(canvas_path.clone(), false)
+        let state = build_state(canvas_path.clone(), false, None)
             .await
             .expect("valid test canvas");
 
@@ -4436,7 +4437,7 @@ mod include_edit_tests {
         let base_path = write_base_and_child_canvas();
         let child_path = base_path.parent().unwrap().join("child.canvas.md");
         let base_before = std::fs::read_to_string(&base_path).unwrap();
-        let state = build_state(base_path.clone(), false)
+        let state = build_state(base_path.clone(), false, None)
             .await
             .expect("valid test canvas");
 
@@ -4463,7 +4464,7 @@ mod include_edit_tests {
     async fn create_node_under_an_included_parent_writes_into_the_included_file() {
         let base_path = write_base_and_child_canvas();
         let child_path = base_path.parent().unwrap().join("child.canvas.md");
-        let state = build_state(base_path.clone(), false)
+        let state = build_state(base_path.clone(), false, None)
             .await
             .expect("valid test canvas");
 
@@ -4496,7 +4497,7 @@ mod include_edit_tests {
         let base_path = write_base_and_child_canvas();
         let child_path = base_path.parent().unwrap().join("child.canvas.md");
         let base_before = std::fs::read_to_string(&base_path).unwrap();
-        let state = build_state(base_path.clone(), false)
+        let state = build_state(base_path.clone(), false, None)
             .await
             .expect("valid test canvas");
 
@@ -4521,7 +4522,7 @@ mod include_edit_tests {
     #[tokio::test]
     async fn rename_node_id_renames_within_the_included_file() {
         let base_path = write_base_and_child_canvas();
-        let state = build_state(base_path.clone(), false)
+        let state = build_state(base_path.clone(), false, None)
             .await
             .expect("valid test canvas");
 
@@ -4552,7 +4553,7 @@ mod include_edit_tests {
         // Give it a second one first via the ordinary create-node path.
         let base_path = write_base_and_child_canvas();
         let child_path = base_path.parent().unwrap().join("child.canvas.md");
-        let state = build_state(base_path.clone(), false)
+        let state = build_state(base_path.clone(), false, None)
             .await
             .expect("valid test canvas");
 
@@ -4624,7 +4625,7 @@ mod include_edit_tests {
         )
         .unwrap();
         let base_before = std::fs::read_to_string(&base_path).unwrap();
-        let state = build_state(base_path.clone(), false)
+        let state = build_state(base_path.clone(), false, None)
             .await
             .expect("valid test canvas");
 
@@ -4654,7 +4655,7 @@ mod include_edit_tests {
     #[tokio::test]
     async fn clear_node_id_drops_the_attribute_on_the_primary_document() {
         let base_path = write_base_and_child_canvas();
-        let state = build_state(base_path.clone(), false)
+        let state = build_state(base_path.clone(), false, None)
             .await
             .expect("valid test canvas");
 
@@ -4673,7 +4674,7 @@ mod include_edit_tests {
     async fn clear_node_id_resolves_within_the_included_file_and_reports_the_namespaced_id() {
         let base_path = write_base_and_child_canvas();
         let child_path = base_path.parent().unwrap().join("child.canvas.md");
-        let state = build_state(base_path.clone(), false)
+        let state = build_state(base_path.clone(), false, None)
             .await
             .expect("valid test canvas");
 
@@ -4696,7 +4697,7 @@ mod include_edit_tests {
     #[tokio::test]
     async fn clear_node_id_rederives_from_the_title_when_the_id_had_diverged() {
         let base_path = write_base_and_child_canvas();
-        let state = build_state(base_path.clone(), false)
+        let state = build_state(base_path.clone(), false, None)
             .await
             .expect("valid test canvas");
 
@@ -4724,7 +4725,7 @@ mod include_edit_tests {
     #[tokio::test]
     async fn clear_node_id_on_an_unknown_id_404s() {
         let base_path = write_base_and_child_canvas();
-        let state = build_state(base_path.clone(), false)
+        let state = build_state(base_path.clone(), false, None)
             .await
             .expect("valid test canvas");
 
@@ -4745,7 +4746,7 @@ mod include_edit_tests {
         // `encodeURIComponent` on every id-bearing request handles the
         // transport side (see `web/src/api.ts`).
         let base_path = write_base_and_child_canvas();
-        let state = build_state(base_path.clone(), false)
+        let state = build_state(base_path.clone(), false, None)
             .await
             .expect("valid test canvas");
 
@@ -4789,7 +4790,7 @@ mod include_edit_tests {
         )
         .unwrap();
         let base_before = std::fs::read_to_string(&base_path).unwrap();
-        let state = build_state(base_path.clone(), false)
+        let state = build_state(base_path.clone(), false, None)
             .await
             .expect("valid test canvas");
 
@@ -4811,7 +4812,7 @@ mod include_edit_tests {
     #[tokio::test]
     async fn update_node_on_an_unknown_id_still_404s() {
         let base_path = write_base_and_child_canvas();
-        let state = build_state(base_path.clone(), false)
+        let state = build_state(base_path.clone(), false, None)
             .await
             .expect("valid test canvas");
 
@@ -4833,7 +4834,7 @@ mod include_edit_tests {
         let base_path = write_base_and_child_canvas();
         let child_path = base_path.parent().unwrap().join("child.canvas.md");
         let base_before = std::fs::read_to_string(&base_path).unwrap();
-        let state = build_state(base_path.clone(), false)
+        let state = build_state(base_path.clone(), false, None)
             .await
             .expect("valid test canvas");
 
@@ -4863,7 +4864,7 @@ mod include_edit_tests {
     #[tokio::test]
     async fn get_includes_lists_the_child_canvas_include() {
         let base_path = write_base_and_child_canvas();
-        let state = build_state(base_path.clone(), false)
+        let state = build_state(base_path.clone(), false, None)
             .await
             .expect("valid test canvas");
 
@@ -4886,7 +4887,7 @@ mod include_edit_tests {
         let base_path = write_base_and_child_canvas();
         let child_path = base_path.parent().unwrap().join("child.canvas.md");
         let base_before = std::fs::read_to_string(&base_path).unwrap();
-        let state = build_state(base_path.clone(), false)
+        let state = build_state(base_path.clone(), false, None)
             .await
             .expect("valid test canvas");
 
@@ -4923,7 +4924,7 @@ mod include_edit_tests {
     #[tokio::test]
     async fn source_mode_rejects_an_unknown_include_id() {
         let base_path = write_base_and_child_canvas();
-        let state = build_state(base_path.clone(), false)
+        let state = build_state(base_path.clone(), false, None)
             .await
             .expect("valid test canvas");
 
@@ -4960,7 +4961,7 @@ mod include_edit_tests {
             ),
         )
         .unwrap();
-        let state = build_state(base_path.clone(), false)
+        let state = build_state(base_path.clone(), false, None)
             .await
             .expect("valid test canvas");
 

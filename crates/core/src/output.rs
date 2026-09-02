@@ -184,11 +184,22 @@ fn render_output_block_markdown(name: &str, output: &ExecOutput, hash: &str) -> 
 }
 
 /// Byte ranges of every `<!-- meshfox:output name="..." ... --> ...
-/// <!-- /meshfox:output -->` region anywhere in `markdown`, fence-aware —
-/// a marker shown literally inside a real code fence (e.g. documentation
-/// demonstrating this exact syntax) isn't treated as a real region, same
-/// as `meshfox:comment`/heading/node-comment scanning elsewhere
-/// (`crate::comment`, `crate::mdcanvas::scan`'s own `fence_ranges`).
+/// <!-- /meshfox:output -->` region anywhere in `markdown`. A candidate
+/// start match only counts as a real region if it's structurally where
+/// `write_output` actually places one: immediately after some real
+/// fence's own closing line, at exactly `fence.span.end + 1` (one `\n`,
+/// nothing else — see `write_output`'s own insertion, which drops
+/// whatever originally followed the fence and writes exactly that byte
+/// layout). This is deliberately much stricter than "not inside a fence" —
+/// a document can and does mention this exact marker syntax in ordinary
+/// prose (this very doc comment, for one) with nothing structurally
+/// fenced about it at all; matching on fence-adjacency instead of mere
+/// fence-avoidance is what keeps a stray mention from being mistaken for
+/// a real region and swallowing everything up to the next accidental
+/// `<!-- /meshfox:output -->`-shaped text later in the document — a real,
+/// previously-shipped bug this comment is deliberately part of the
+/// regression test for (see `output_byte_ranges_ignores_a_bare_mention_
+/// in_prose_even_far_from_any_fence` below).
 ///
 /// Two independent callers treat these ranges as opaque: `mdcanvas::scan`
 /// (a heading, and any `meshfox:node`/`meshfox:edge` comment, inside one of
@@ -208,13 +219,13 @@ fn render_output_block_markdown(name: &str, output: &ExecOutput, hash: &str) -> 
 pub(crate) fn output_byte_ranges(markdown: &str) -> Vec<Range<usize>> {
     const START_PREFIX: &str = "<!-- meshfox:output ";
     let fence_ranges = crate::fence::fenced_byte_ranges(markdown);
-    let in_fence = |pos: usize| fence_ranges.iter().any(|r| r.start <= pos && pos < r.end);
+    let follows_a_real_fence = |pos: usize| fence_ranges.iter().any(|r| r.end + 1 == pos);
 
     let mut ranges = Vec::new();
     let mut search_from = 0;
     while let Some(rel) = markdown[search_from..].find(START_PREFIX) {
         let start = search_from + rel;
-        if in_fence(start) {
+        if !follows_a_real_fence(start) {
             search_from = start + START_PREFIX.len();
             continue;
         }
@@ -606,5 +617,33 @@ mod tests {
     fn output_byte_ranges_ignores_a_marker_shown_literally_inside_a_fence() {
         let md = "```text\n<!-- meshfox:output name=\"fake\" hash=\"x\" -->\nhi\n<!-- /meshfox:output -->\n```\n";
         assert!(output_byte_ranges(md).is_empty());
+    }
+
+    /// Regression test for a real bug: `output_byte_ranges` used to accept
+    /// *any* `<!-- meshfox:output ` text not literally inside a fence as a
+    /// region start, not just one that actually follows a real fence the
+    /// way `write_output` places one. A document that simply *mentions*
+    /// the marker syntax in ordinary prose (this crate's own doc comments,
+    /// or — the real-world case that surfaced this — a personal notes file
+    /// discussing this exact feature) would trip that: the bare mention
+    /// got treated as a start, and everything up to the next
+    /// coincidentally-`<!-- /meshfox:output -->`-shaped text far later in
+    /// the document silently became invisible to `mdcanvas::scan`'s
+    /// heading detection — headings in between stopped being real nodes at
+    /// all, with no error, just missing structure.
+    #[test]
+    fn output_byte_ranges_ignores_a_bare_mention_in_prose_even_far_from_any_fence() {
+        let md = "# Root\n\n\
+                  Some text mentioning `<!-- meshfox:output name=\"x\" hash=\"y\" -->` inline, \
+                  not after any real fence.\n\n\
+                  ## Real Section\n\
+                  <!-- meshfox:node id=\"real-section\" -->\n\n\
+                  More text, and later on, a totally unrelated mention of \
+                  `<!-- /meshfox:output -->` too.\n";
+        assert!(output_byte_ranges(md).is_empty());
+
+        let canvas = crate::mdcanvas::parse(md).unwrap();
+        assert_eq!(canvas.nodes.len(), 2);
+        assert!(canvas.node("real-section").is_some());
     }
 }

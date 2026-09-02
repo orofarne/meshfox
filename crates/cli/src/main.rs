@@ -25,6 +25,7 @@ mod pdf;
 mod prompt;
 mod syntax_registry;
 mod tui;
+mod watcher;
 
 /// `commit <hash> (<date>)`, or `<tag> (<date>)` for a build made from a
 /// release tag, captured at build time by `build.rs` from the repo `meshfox`
@@ -176,30 +177,35 @@ enum Command {
         /// wouldn't have).
         #[arg(long)]
         no_auto_exit: bool,
-        /// Write the actual bound port to this file right after startup
-        /// (as plain decimal text, no newline) — how `meshfox
-        /// view-registry-serve` learns a worker's port back after spawning
-        /// it with `--port 0`, without parsing log output. Not meant to be
-        /// passed by hand.
+        /// Hidden: this run *is* a worker, spawned by a watcher (see
+        /// `crate::watcher`) — connect to this socket to report our own
+        /// bound port, and forward any cross-canvas "↗ open" click there
+        /// instead of failing outright. Presence of this flag is what
+        /// distinguishes a worker from a top-level invocation (which has
+        /// none, and instead *becomes* the watcher — see the dispatch
+        /// arm below). Not meant to be passed by hand.
         #[arg(long, hide = true)]
-        port_file: Option<PathBuf>,
+        watcher_socket: Option<PathBuf>,
     },
-    /// Hidden: the "open a canvas from another canvas" navigation daemon
-    /// (see TODO.canvas.md's "Ссылки и навигация между канвасами"). Not
-    /// meant to be run by hand — `meshfox view`'s own server spawns this
-    /// itself (self-re-exec via `current_exe()`, same pattern
-    /// `crates/cli/src/mcp.rs`'s `canvas_open` already uses to spawn a
-    /// per-canvas MCP child) the first time a "↗ Open" click on a
-    /// `.canvas.md` target needs somewhere to route to, and detaches itself
-    /// (`libc::daemon`) so it outlives whichever `view` triggered it.
-    /// Holds a flat registry of `path -> spawned worker` (each a plain
-    /// `meshfox view <path> --port 0 --no-open --port-file <tmp>`),
-    /// get-or-spawn only, over a Unix socket at
-    /// `meshfox_core::view_registry::socket_path()`. Exits on its own once
-    /// idle (no live workers) for 30 minutes — see
-    /// `meshfox_core::view_registry::IDLE_TIMEOUT`.
-    #[command(hide = true)]
-    ViewRegistryServe,
+    /// Hand a `.canvas.md` off to the persistent macOS menu-bar daemon
+    /// (`macos/MeshfoxDaemon`, "core-only" MVP — see TODO.canvas.md's
+    /// "Ссылки и навигация между канвасами") instead of starting a private
+    /// `meshfox view` session of your own. Deliberately never a fallback
+    /// for `view` or vice versa — the two are different guarantees: `view`
+    /// blocks in your terminal and everything it spawned dies when you
+    /// kill it; `open` hands off and returns immediately, to whatever
+    /// keeps running (and stays reachable) independent of this process.
+    /// Requires the daemon: if it's not already running, this starts it
+    /// (if installed) and waits for it to come up — it does *not* silently
+    /// fall back to `view`'s own private-watcher behavior on failure; see
+    /// the error message for what to do instead. macOS only for now — the
+    /// daemon itself doesn't exist anywhere else yet.
+    Open {
+        /// Path to the `.canvas.md` file, optionally with `#node-id` for a
+        /// deep link straight to that node (same syntax a `file`-node
+        /// target already supports — `meshfox_core::mdcanvas::split_target_fragment`).
+        target: String,
+    },
     /// Experimental: an ncurses-style terminal viewer — browse the node
     /// tree, read a node's rendered Markdown body (syntax-highlighted code,
     /// local images shown inline where the terminal supports it), and run
@@ -1021,7 +1027,7 @@ fn main() {
     {
         // A bare `meshfox test.md`, no subcommand: open it, same as
         // clicking the file — `meshfox view`'s own defaults otherwise.
-        return view(PathBuf::from(&args[1]), 0, true, true, None);
+        return view_watcher(PathBuf::from(&args[1]), 0, true, true);
     }
 
     let cli = Cli::parse_from(args);
@@ -1082,7 +1088,7 @@ fn main() {
             no_open,
             create: create_if_missing,
             no_auto_exit,
-            port_file,
+            watcher_socket,
         } => {
             let canvas_path = match canvas.resolve() {
                 Some(p) => p,
@@ -1097,18 +1103,29 @@ fn main() {
                     find_canvas()
                 }
             };
-            if create_if_missing && !canvas_path.exists() {
-                write_canvas_template(&canvas_path);
-                println!("meshfox view: created {}", canvas_path.display());
+            match watcher_socket {
+                // Spawned by a watcher — just run the server; see
+                // `meshfox_server::run`'s own doc comment for why it
+                // never opens a browser tab itself any more.
+                Some(socket) => view_worker(canvas_path, port, !no_auto_exit, socket),
+                // A top-level invocation — this process itself becomes
+                // the watcher (see `crate::watcher`'s own module doc
+                // comment for why that's a plain process tree rather than
+                // a detached daemon), spawning a worker for `canvas_path`
+                // as its own child. `--create` only makes sense here:
+                // the file has to exist before any worker (spawned by
+                // either this or a later `Open` request) tries to read
+                // it.
+                None => {
+                    if create_if_missing && !canvas_path.exists() {
+                        write_canvas_template(&canvas_path);
+                        println!("meshfox view: created {}", canvas_path.display());
+                    }
+                    view_watcher(canvas_path, port, !no_open, !no_auto_exit)
+                }
             }
-            view(canvas_path, port, !no_open, !no_auto_exit, port_file)
         }
-        Command::ViewRegistryServe => {
-            if let Err(e) = meshfox_core::view_registry::serve() {
-                eprintln!("meshfox view-registry-serve: {e}");
-                std::process::exit(1);
-            }
-        }
+        Command::Open { target } => open_via_daemon(&target),
         Command::Tui { canvas, node } => {
             let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
             tui(canvas_path, node)
@@ -1664,27 +1681,143 @@ fn canvas_title(path: &Path) -> String {
         .to_string()
 }
 
-fn view(
-    canvas_path: PathBuf,
-    port: u16,
-    open_browser: bool,
-    auto_exit: bool,
-    port_file: Option<PathBuf>,
-) {
+/// A worker's own run — spawned by a watcher (`watcher_socket` names where
+/// to report our own port and forward cross-canvas navigation). Never
+/// opens a browser tab itself; see `meshfox_server::run`'s own doc
+/// comment.
+fn view_worker(canvas_path: PathBuf, port: u16, auto_exit: bool, watcher_socket: PathBuf) {
     let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
         eprintln!("failed to start async runtime: {e}");
         std::process::exit(1);
     });
-    if let Err(e) = runtime.block_on(meshfox_server::run(
-        canvas_path,
-        port,
-        open_browser,
-        auto_exit,
-        port_file,
-    )) {
+    if let Err(e) = runtime.block_on(meshfox_server::run(canvas_path, port, auto_exit, Some(watcher_socket))) {
         eprintln!("meshfox view: {e}");
         std::process::exit(1);
     }
+}
+
+/// A top-level `meshfox view <path>` invocation — this process itself
+/// becomes the watcher for the whole session (see `crate::watcher`'s own
+/// module doc comment), spawning `canvas_path`'s own worker as its first
+/// child.
+fn view_watcher(canvas_path: PathBuf, port: u16, open_browser: bool, auto_exit: bool) {
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+        eprintln!("failed to start async runtime: {e}");
+        std::process::exit(1);
+    });
+    let exe = std::env::current_exe().unwrap_or_else(|e| {
+        eprintln!("meshfox view: couldn't resolve this binary's own path: {e}");
+        std::process::exit(1);
+    });
+    if let Err(e) = runtime.block_on(watcher::run(exe, canvas_path, port, open_browser, auto_exit)) {
+        eprintln!("meshfox view: {e}");
+        std::process::exit(1);
+    }
+}
+
+/// `~/Library/Application Support/meshfox/daemon.sock` — must match
+/// `macos/MeshfoxDaemon/Sources/MeshfoxDaemon/main.swift`'s own
+/// `defaultSocketPath()` exactly; nothing shares this string between the
+/// two languages beyond both being documented to use it.
+#[cfg(target_os = "macos")]
+fn daemon_socket_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(Path::new(&home).join("Library/Application Support/meshfox/daemon.sock"))
+}
+
+/// Where the daemon app itself lives, if it's installed at all —
+/// `$MESHFOX_DAEMON_BIN` first (not for normal use, just for developing/
+/// testing this against a `swift build` output instead of the real
+/// installed app), then the real conventional install location
+/// `macos/app.canvas.md`'s own `build` installs to: `~/Applications/Meshfox.app`
+/// (ad-hoc signed, no App Store — same `~/Applications` convention the
+/// project's now-retired `MeshfoxCanvas.app` already established).
+#[cfg(target_os = "macos")]
+fn resolve_daemon_app() -> Option<PathBuf> {
+    if let Some(over) = std::env::var_os("MESHFOX_DAEMON_BIN") {
+        let p = PathBuf::from(over);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let home = std::env::var_os("HOME")?;
+    let conventional = Path::new(&home).join("Applications/Meshfox.app/Contents/MacOS/Meshfox");
+    conventional.is_file().then_some(conventional)
+}
+
+/// `meshfox open <target>` — see `Command::Open`'s own doc comment for
+/// the contract this follows (never a silent fallback to `view`'s private
+/// watcher). Three outcomes, checked in order: the daemon's socket is
+/// already live (just send `Open` and return); the socket's dead but the
+/// app is installed (start it, wait for the socket to come up, then send);
+/// neither (a real, actionable error — not a silent fallback).
+#[cfg(target_os = "macos")]
+fn open_via_daemon(target: &str) {
+    let (path_str, fragment) = meshfox_core::mdcanvas::split_target_fragment(target);
+    let canonical = match Path::new(path_str).canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("meshfox open: {path_str}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let fragment = fragment.map(str::to_string);
+
+    let Some(socket) = daemon_socket_path() else {
+        eprintln!("meshfox open: HOME isn't set — can't locate the daemon's own socket path");
+        std::process::exit(1);
+    };
+
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+        eprintln!("failed to start async runtime: {e}");
+        std::process::exit(1);
+    });
+
+    runtime.block_on(async {
+        if meshfox_server::watcher_protocol::request_open(&socket, &canonical, fragment.clone())
+            .await
+            .is_ok()
+        {
+            return; // already running — handed off, nothing more to do
+        }
+
+        let Some(app) = resolve_daemon_app() else {
+            eprintln!(
+                "meshfox open: no meshfox daemon is running, and none is installed \
+                 (checked $MESHFOX_DAEMON_BIN and ~/Applications/Meshfox.app) — \
+                 install the daemon, or use `meshfox view` instead"
+            );
+            std::process::exit(1);
+        };
+        if let Err(e) = std::process::Command::new(&app).spawn() {
+            eprintln!("meshfox open: couldn't start the daemon ({}): {e}", app.display());
+            std::process::exit(1);
+        }
+
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+        loop {
+            if meshfox_server::watcher_protocol::request_open(&socket, &canonical, fragment.clone())
+                .await
+                .is_ok()
+            {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                eprintln!("meshfox open: started the daemon, but it never came up");
+                std::process::exit(1);
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_via_daemon(_target: &str) {
+    eprintln!(
+        "meshfox open: not supported on this platform yet — the persistent daemon only \
+         exists for macOS so far (see TODO.canvas.md). Use `meshfox view` instead."
+    );
+    std::process::exit(1);
 }
 
 fn tui(canvas_path: PathBuf, initial_node: Option<String>) {

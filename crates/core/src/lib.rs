@@ -29,7 +29,6 @@ pub mod tree;
 pub mod varcache;
 pub mod varout;
 pub mod vars;
-pub mod view_registry;
 
 pub use canvas::{ArrowEnd, Canvas, EdgeLineStyle, ExtraEdge, FileDisplay, Node, NodeType};
 pub use constraint::{evaluate as evaluate_constraints, ConstraintResult, ConstraintStatus};

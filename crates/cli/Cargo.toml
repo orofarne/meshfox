@@ -13,7 +13,7 @@ meshfox-core = { path = "../core" }
 meshfox-server = { path = "../server" }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "process", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "process", "io-util", "net", "time"] }
 rpassword = "7"
 tera = "1"
 serde = { version = "1", features = ["derive"] }
