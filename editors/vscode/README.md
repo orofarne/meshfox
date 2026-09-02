@@ -6,6 +6,11 @@ instead. Requires the `meshfox` binary (see the repo root README for
 install instructions); set `meshfox.executablePath` in settings if it's
 not on `PATH`.
 
+On the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=Orofarne.meshfox-vscode)
+as `Orofarne.meshfox-vscode` — install from there (Extensions view, search
+"meshfox", or `ext install Orofarne.meshfox-vscode`) rather than building
+it yourself; the rest of this file is for developing the extension itself.
+
 `*.canvas.md` opens as a canvas automatically (it's the default editor for
 that pattern). A plain `.md` file that's a canvas without the suffix — a
 marker-carrying file like this project's own README.md — doesn't
@@ -138,7 +143,9 @@ via the `npm: compile` pre-launch task. `npm run watch` recompiles on save
 if you'd rather keep a dev host open across edits (reload it with
 `Cmd/Ctrl+R` after each change instead of relaunching).
 
-## Packaging (no Marketplace publish needed)
+## Building a local `.vsix`
+
+For testing a dev build without waiting on a Marketplace release:
 
 ```sh
 npx @vscode/vsce package
@@ -151,4 +158,5 @@ code --install-extension meshfox-vscode-<version>.vsix
 ```
 
 or via the Extensions view → "..." → "Install from VSIX". `vsce package`
-needs no publisher account/token — only `vsce publish` does.
+needs no publisher account/token — that's only for actually publishing a
+new version to the Marketplace.

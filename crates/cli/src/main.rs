@@ -206,7 +206,7 @@ enum Command {
         /// target already supports — `meshfox_core::mdcanvas::split_target_fragment`).
         target: String,
     },
-    /// Experimental: an ncurses-style terminal viewer — browse the node
+    /// An ncurses-style terminal viewer — browse the node
     /// tree, read a node's rendered Markdown body (syntax-highlighted code,
     /// local images shown inline where the terminal supports it), and run
     /// blocks with live streamed output, right in the terminal. Same
@@ -240,7 +240,7 @@ enum Command {
         #[arg(long)]
         node: Option<String>,
     },
-    /// Experimental: an MCP stdio server giving an AI agent tool-call access
+    /// An MCP stdio server giving an AI agent tool-call access
     /// to every canvas file under the current directory, without shelling
     /// out to this same binary. Takes no arguments — a host launches it the
     /// same way as any other stdio MCP server: `{"command": "meshfox",
