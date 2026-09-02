@@ -87,11 +87,43 @@ one-liner the root README documents — never runs it for you.
 The extension acts as its own private coordinator (see `src/coordinator.ts`)
 — it binds a Unix socket, and for each file opened through either
 `viewType` spawns `meshfox view <path> --port 0 --watcher-socket <that
-socket>`. Once the
-worker reports its bound port over the socket, the editor tab's webview
-points an `<iframe>` at `http://127.0.0.1:<port>`. Closing the tab kills
-that worker; a "↗ open" link to another canvas inside the UI opens (or
-focuses) another VS Code tab the same way.
+socket>`. Once the worker reports its bound port over the socket, the
+editor tab's webview fetches that worker's own `index.html` and becomes it
+directly (`src/canvasEditorProvider.ts`/`canvasHtml.ts`) — not an
+`<iframe>` pointed at it. A `<base href="http://127.0.0.1:<port>/">`
+injected into the fetched page's `<head>` makes every one of its
+root-absolute asset/`fetch()` references resolve against that server
+instead of the webview's own origin, so the app runs exactly as it does in
+a real browser tab, just hosted directly in the tab's own webview document.
+Closing the tab kills that worker; a "↗ open" link to another canvas
+inside the UI opens (or focuses) another VS Code tab the same way.
+
+Being the webview's own top-level document means it's also subject to two
+things a real browser tab never has to deal with, both worked around in
+`canvasAppHtml` (`canvasHtml.ts`): the injected CSP needs `'wasm-unsafe-
+eval'` on `script-src` (Shiki's default syntax-highlighting engine is
+WASM — without it, every code block quietly renders unhighlighted rather
+than erroring), and a small `<style>` reset undoes VS Code's own default
+webview stylesheet, which paints a `background-color` onto every bare
+`<code>` element (meant for a short inline `` `snippet` `` in a
+markdown-preview-style webview) — Shiki's `<pre class="shiki"><code>`
+wrapping means that paints over/behind a highlighted block's own intended
+background and washes out its colors otherwise.
+
+This wasn't the original design — an earlier version *did* use an
+`<iframe>`, and copy/paste plus the right-click context menu silently
+didn't work inside it. That turned out to be a long-standing, still-open
+upstream VS Code limitation specific to a *nested cross-origin iframe*
+inside a webview, not to a webview's own top-level content (see
+[microsoft/vscode#180234](https://github.com/microsoft/vscode/issues/180234),
+[#68799](https://github.com/microsoft/vscode/issues/68799),
+[#121580](https://github.com/microsoft/vscode/issues/121580)) — switching
+to loading the app as the webview's own document sidesteps the whole bug
+class rather than working around its symptoms. If anything still feels off
+compared to a real browser tab, the **"meshfox: Open in Browser"** command
+(also a button in the editor tab's own title bar) opens the exact same
+already-running worker in a real browser tab instead, which is never
+subject to any webview limitation at all.
 
 ## Developing
 

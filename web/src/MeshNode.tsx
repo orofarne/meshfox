@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { Handle, NodeResizer, NodeToolbar, Position, useReactFlow, type NodeProps } from "@xyflow/react";
 import ReactMarkdown, { defaultUrlTransform, type Components, type UrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -50,6 +50,22 @@ const allowDataImageUrls: UrlTransform = (url, key, node) => {
 };
 
 /**
+ * react-markdown v9+ dropped the `inline` prop its `code` component used to
+ * get (a breaking change — see its own migration notes), so there's no
+ * longer a direct signal telling `MarkdownCodeBlock` whether it's rendering
+ * a block-level fence or an inline `` `snippet` ``; `className` alone only
+ * distinguishes "has a language" from "doesn't", not "block" from
+ * "inline" — a language-less *block* fence and inline code both hit
+ * `code` with no `className` at all. The underlying hast tree still makes
+ * the distinction structurally, the same way real HTML does: a block
+ * fence's `code` is nested inside a `pre`, inline code never is. `pre`'s
+ * own component (below) provides this context around its children so
+ * `MarkdownCodeBlock` can read the one bit of structural info it actually
+ * needs, without needing `node`/parent access react-markdown doesn't give it.
+ */
+const InsideMarkdownPre = createContext(false);
+
+/**
  * A fenced code block embedded in plain prose (not a runnable/constraint
  * fence — those are split out of the "markdown" segment entirely by
  * `fence.ts::parseBody` and highlighted separately, see `RunnableCodeBlock`/
@@ -62,13 +78,27 @@ const allowDataImageUrls: UrlTransform = (url, key, node) => {
  * Routes it through the same `HighlightedCode`/Shiki path as every other
  * read-only code block instead. `className` is react-markdown's own
  * `language-xxx` (from the fence's info string) on a block-level `code`;
- * absent entirely for inline code (`` `foo` ``), which is left as the
- * plain default — nothing to highlight, and it was never part of this bug.
+ * absent entirely for inline code (`` `foo` ``) *and* for a block fence
+ * with no language of its own — `InsideMarkdownPre` (above) is what tells
+ * these two apart. A language-less block fence still needs its own
+ * `<pre>` (dropped entirely otherwise, since `pre`'s own component below
+ * is a passthrough) so it renders as a preformatted block — monospace,
+ * whitespace/line breaks preserved — even with nothing to highlight;
+ * genuine inline code is left as the plain unwrapped default, same as
+ * before.
  */
 function MarkdownCodeBlock({ className, children }: { className?: string; children?: React.ReactNode }) {
+  const insidePre = useContext(InsideMarkdownPre);
   const lang = /language-(\S+)/.exec(className ?? "")?.[1];
-  if (!lang) return <code className={className}>{children}</code>;
-  return <HighlightedCode code={String(children).replace(/\n$/, "")} lang={lang} />;
+  if (lang) return <HighlightedCode code={String(children).replace(/\n$/, "")} lang={lang} />;
+  if (!insidePre) return <code className={className}>{children}</code>;
+  return (
+    <div className="mesh-code-block-source nodrag nopan">
+      <pre>
+        <code className={className}>{children}</code>
+      </pre>
+    </div>
+  );
 }
 
 /**
@@ -81,11 +111,16 @@ function MarkdownCodeBlock({ className, children }: { className?: string; childr
  * `node` is react-markdown's own mdast node for the element, not a real
  * DOM attribute — destructured out so it never reaches the native tag.
  *
- * `pre` is a plain passthrough: in CommonMark/GFM output `<pre>` only ever
- * wraps a fenced `code` block, and `MarkdownCodeBlock`/`HighlightedCode`
- * already supplies its own wrapper — keeping the default `<pre>` around it
- * too would double up (and, for the plain-`<pre><code>` loading-state
- * fallback, nest one `<pre>` inside another).
+ * `pre` never renders its own `<pre>` tag — in CommonMark/GFM output it
+ * only ever wraps a fenced `code` block, and `MarkdownCodeBlock`/
+ * `HighlightedCode` already supplies whichever wrapper that block actually
+ * needs (Shiki's own for a highlighted one, a plain `<pre>` for a
+ * language-less fence, none at all if it turns out to be inline instead —
+ * see `MarkdownCodeBlock`'s own doc comment) — keeping this one around too
+ * would double one of those up. It still runs the code node through the
+ * `InsideMarkdownPre` context flag first, though: that's the one piece of
+ * structural information (block-level fence vs. inline code) this level
+ * has that `MarkdownCodeBlock` itself can't recover otherwise.
  */
 function makeMarkdownComponents(assetBase: string | undefined): Components {
   return {
@@ -93,7 +128,7 @@ function makeMarkdownComponents(assetBase: string | undefined): Components {
       <a {...props} href={resolveAssetHref(href, assetBase)} target="_blank" rel="noopener noreferrer" />
     ),
     img: ({ node: _node, src, ...props }) => <img {...props} src={resolveAssetHref(src, assetBase)} />,
-    pre: ({ children }) => <>{children}</>,
+    pre: ({ children }) => <InsideMarkdownPre.Provider value={true}>{children}</InsideMarkdownPre.Provider>,
     code: ({ node: _node, className, children }) => (
       <MarkdownCodeBlock className={className}>{children}</MarkdownCodeBlock>
     ),

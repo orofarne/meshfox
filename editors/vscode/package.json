@@ -55,6 +55,12 @@
         "command": "meshfox.checkForUpdates",
         "title": "Check for Updates",
         "category": "meshfox"
+      },
+      {
+        "command": "meshfox.openInBrowser",
+        "title": "Open in Browser",
+        "category": "meshfox",
+        "icon": "$(link-external)"
       }
     ],
     "menus": {
@@ -62,6 +68,13 @@
         {
           "command": "meshfox.openAsCanvas",
           "when": "resourceExtname == .md",
+          "group": "navigation"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "meshfox.openInBrowser",
+          "when": "activeCustomEditorId == meshfox.canvasEditor || activeCustomEditorId == meshfox.canvasEditorAny",
           "group": "navigation"
         }
       ]

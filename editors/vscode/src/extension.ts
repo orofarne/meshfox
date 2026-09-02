@@ -48,6 +48,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         return;
       }
       await runInteractiveUpdate(exe, output);
+    }),
+    vscode.commands.registerCommand("meshfox.openInBrowser", async (uri?: vscode.Uri) => {
+      const target = uri ?? activeCanvasUri();
+      if (!target) {
+        vscode.window.showErrorMessage(
+          "meshfox: no canvas to open in the browser — no argument and no active meshfox canvas tab."
+        );
+        return;
+      }
+      let port: number;
+      try {
+        port = await coordinator!.getOrSpawnWorker(target.fsPath);
+      } catch (err) {
+        vscode.window.showErrorMessage(`meshfox: ${err instanceof Error ? err.message : String(err)}`);
+        return;
+      }
+      const external = await vscode.env.asExternalUri(vscode.Uri.parse(`http://127.0.0.1:${port}/`));
+      await vscode.env.openExternal(external);
     })
   );
 
@@ -55,6 +73,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // informational, never installs without an explicit click on the toast
   // it shows. Must never block or fail activation.
   void maybeCheckForUpdatesOnStartup(context, resolveExecutablePath(), output);
+}
+
+/** The document URI of the active tab, if it's one of ours — for
+ * `meshfox.openInBrowser` invoked from the Command Palette (no `uri` arg)
+ * rather than a menu contribution VS Code passes the resource to. */
+function activeCanvasUri(): vscode.Uri | undefined {
+  const tab = vscode.window.tabGroups.activeTabGroup.activeTab;
+  const input = tab?.input;
+  if (
+    input instanceof vscode.TabInputCustom &&
+    (input.viewType === VIEW_TYPE || input.viewType === VIEW_TYPE_ANY)
+  ) {
+    return input.uri;
+  }
+  return undefined;
 }
 
 export function deactivate(): void {
