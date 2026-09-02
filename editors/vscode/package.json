@@ -1,0 +1,93 @@
+{
+  "name": "meshfox-vscode",
+  "displayName": "meshfox",
+  "description": "View and run meshfox .canvas.md files as an interactive node canvas, right inside VS Code.",
+  "version": "0.0.1",
+  "private": true,
+  "publisher": "meshfox",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/orofarne/meshfox",
+    "directory": "editors/vscode"
+  },
+  "icon": "icon.png",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Notebooks",
+    "Visualization",
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "customEditors": [
+      {
+        "viewType": "meshfox.canvasEditor",
+        "displayName": "meshfox canvas",
+        "selector": [
+          {
+            "filenamePattern": "*.canvas.md"
+          }
+        ],
+        "priority": "default"
+      },
+      {
+        "viewType": "meshfox.canvasEditorAny",
+        "displayName": "meshfox canvas",
+        "selector": [
+          {
+            "filenamePattern": "*.md"
+          }
+        ],
+        "priority": "option"
+      }
+    ],
+    "commands": [
+      {
+        "command": "meshfox.openAsCanvas",
+        "title": "Open as meshfox canvas",
+        "category": "meshfox"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "meshfox.openAsCanvas",
+          "when": "resourceExtname == .md",
+          "group": "navigation"
+        }
+      ]
+    },
+    "grammars": [
+      {
+        "scopeName": "meshfox.marker.injection",
+        "path": "./syntaxes/meshfox-marker.injection.json",
+        "injectTo": ["text.html.markdown"]
+      }
+    ],
+    "configuration": {
+      "title": "meshfox",
+      "properties": {
+        "meshfox.executablePath": {
+          "type": "string",
+          "default": "meshfox",
+          "description": "Path to the meshfox binary. Left as \"meshfox\", it's resolved from PATH — set an absolute path here if it isn't installed there."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -w -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^2.24.0",
+    "typescript": "^5.4.0"
+  }
+}

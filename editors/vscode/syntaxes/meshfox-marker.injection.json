@@ -1,0 +1,43 @@
+{
+  "scopeName": "meshfox.marker.injection",
+  "injectionSelector": "L:text.html.markdown",
+  "patterns": [
+    { "include": "#meshfox-marker" }
+  ],
+  "repository": {
+    "meshfox-marker": {
+      "begin": "(<!--)\\s*(/?meshfox:[\\w-]+)",
+      "beginCaptures": {
+        "1": { "name": "punctuation.definition.comment.meshfox" },
+        "2": { "name": "keyword.control.meshfox" }
+      },
+      "end": "(-->)",
+      "endCaptures": {
+        "1": { "name": "punctuation.definition.comment.meshfox" }
+      },
+      "name": "comment.block.html meta.tag.meshfox",
+      "patterns": [
+        {
+          "match": "([^\\s=\"]+)(=)(\"[^\"]*\")",
+          "captures": {
+            "1": { "name": "entity.other.attribute-name.meshfox" },
+            "2": { "name": "punctuation.separator.key-value.meshfox" },
+            "3": { "name": "string.quoted.double.meshfox" }
+          }
+        },
+        {
+          "match": "([^\\s=\"]+)(=)(\\S+)",
+          "captures": {
+            "1": { "name": "entity.other.attribute-name.meshfox" },
+            "2": { "name": "punctuation.separator.key-value.meshfox" },
+            "3": { "name": "string.unquoted.meshfox" }
+          }
+        },
+        {
+          "match": "[^\\s=\"]+",
+          "name": "entity.other.attribute-name.meshfox"
+        }
+      ]
+    }
+  }
+}
