@@ -1,6 +1,6 @@
 <!-- meshfox:canvas -->
 # Hello Project
-<!-- meshfox:node id="root" x=0 y=0 w=250 h=60 -->
+<!-- meshfox:node id="root" -->
 
 This is the project root. Everything else branches from here.
 
@@ -8,7 +8,7 @@ This is the project root. Everything else branches from here.
 <!-- meshfox:node id="tests" type="group" -->
 
 ### Smoke Test
-<!-- meshfox:node id="smoke-test" x=20 y=20 w=420 h=240 -->
+<!-- meshfox:node id="smoke-test" -->
 
 A trivial runnable check, with its output cached below the fence.
 
@@ -58,7 +58,7 @@ testing...
 <!-- meshfox:node id="examples" type="group" -->
 
 ### Shared Smoke Check
-<!-- meshfox:node id="shared-smoke" x=20 y=20 w=420 h=200 -->
+<!-- meshfox:node id="shared-smoke" -->
 <!-- meshfox:edge from="tests" -->
 
 Reused from Tests as well — this node has two parents: Examples (its
@@ -138,17 +138,17 @@ linting...
 <!-- meshfox:node id="links" type="group" -->
 
 ### Project Homepage
-<!-- meshfox:node id="homepage" type="link" x=20 y=20 w=250 h=60 -->
+<!-- meshfox:node id="homepage" type="link" -->
 
 [meshfox on GitHub](https://github.com/example/meshfox)
 
 ### Architecture Diagram
-<!-- meshfox:node id="architecture-diagram" type="file" x=20 y=120 w=250 h=60 -->
+<!-- meshfox:node id="architecture-diagram" type="file" -->
 
 [architecture](./architecture.png)
 
 ### Related Canvas
-<!-- meshfox:node id="related-canvas" type="file" x=20 y=220 w=250 h=60 -->
+<!-- meshfox:node id="related-canvas" type="file" -->
 
 [vars.canvas.md](./vars.canvas.md)
 

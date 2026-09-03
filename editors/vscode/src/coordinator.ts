@@ -99,6 +99,14 @@ export class Coordinator implements vscode.Disposable {
       this.output.appendLine(`meshfox: coordinator got an unparseable message: ${line}`);
       return;
     }
+    if (msg.op === "open_file") {
+      // A plain (non-canvas) file node's "↗ open" — this coordinator's own
+      // answer is a fresh editor tab, unlike `crate::watcher`'s (the OS's
+      // default application for it): there's no "outside VS Code" for this
+      // extension's own context to hand off to.
+      vscode.commands.executeCommand("vscode.open", vscode.Uri.file(msg.path));
+      return;
+    }
     const key = canonical(msg.canvas_path);
     if (msg.op === "ready") {
       const entry = this.workers.get(key);
@@ -134,7 +142,7 @@ export class Coordinator implements vscode.Disposable {
       return entry.port;
     }
     if (!entry) {
-      const exe = resolveExecutablePath();
+      const exe = await resolveExecutablePath();
       const proc = spawn(exe, ["view", fsPath, "--port", "0", "--watcher-socket", this.socketPath], {
         stdio: ["ignore", "pipe", "pipe"],
       });

@@ -19,7 +19,15 @@ export interface OpenMessage {
   fragment?: string | null;
 }
 
-export type WorkerMessage = ReadyMessage | OpenMessage;
+/** A "↗ open" on a plain (non-canvas) file node's target — see
+ * `watcher_protocol::Message::OpenFile`'s own doc comment for why this is
+ * a separate variant from `OpenMessage` rather than a reused field on it. */
+export interface OpenFileMessage {
+  op: "open_file";
+  path: string;
+}
+
+export type WorkerMessage = ReadyMessage | OpenMessage | OpenFileMessage;
 
 export function parseWorkerMessage(line: string): WorkerMessage | undefined {
   let parsed: unknown;
@@ -28,23 +36,22 @@ export function parseWorkerMessage(line: string): WorkerMessage | undefined {
   } catch {
     return undefined;
   }
+  if (typeof parsed !== "object" || parsed === null || !("op" in parsed)) {
+    return undefined;
+  }
+  const msg = parsed as { op: unknown };
   if (
-    typeof parsed !== "object" ||
-    parsed === null ||
-    !("op" in parsed) ||
-    !("canvas_path" in parsed)
+    msg.op === "ready" &&
+    typeof (parsed as ReadyMessage).canvas_path === "string" &&
+    typeof (parsed as ReadyMessage).port === "number"
   ) {
-    return undefined;
-  }
-  const msg = parsed as { op: unknown; canvas_path: unknown };
-  if (typeof msg.canvas_path !== "string") {
-    return undefined;
-  }
-  if (msg.op === "ready" && typeof (parsed as ReadyMessage).port === "number") {
     return parsed as ReadyMessage;
   }
-  if (msg.op === "open") {
+  if (msg.op === "open" && typeof (parsed as OpenMessage).canvas_path === "string") {
     return parsed as OpenMessage;
+  }
+  if (msg.op === "open_file" && typeof (parsed as OpenFileMessage).path === "string") {
+    return parsed as OpenFileMessage;
   }
   return undefined;
 }

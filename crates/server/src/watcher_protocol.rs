@@ -10,9 +10,9 @@
 //! a worker never needs to know or care whether the process on the other
 //! end is this crate's own watcher or something else entirely.
 //!
-//! Two messages, both one-way — no response payload a caller needs to act
-//! on, since opening a browser tab is the *coordinator's* job now, not
-//! something a caller waits for a port back to do itself (see
+//! Three messages, all one-way — no response payload a caller needs to act
+//! on, since opening a browser tab (or a plain file) is the *coordinator's*
+//! job now, not something a caller waits for a port back to do itself (see
 //! `crate::open_node_file`):
 //! - [`Message::Ready`] — sent once by a freshly-spawned worker, right
 //!   after it binds its listener. Replaces the old `--port-file` polling
@@ -21,6 +21,16 @@
 //!   handler needs to show the user some *other* canvas (a "↗ open" click
 //!   on a `.canvas.md` target) — get-or-spawn-and-show is entirely the
 //!   coordinator's problem from here.
+//! - [`Message::OpenFile`] — sent by that same handler for a "↗ open" on a
+//!   plain (non-canvas) file node's target. Deliberately a separate variant
+//!   from `Open` rather than an optional/reused field on it: a plain file
+//!   has no fragment, no port, no spawn-and-wait lifecycle — just "hand
+//!   this path to whatever this coordinator does with a file", which is
+//!   exactly the hook that lets each coordinator implementation give it
+//!   different behavior (the OS's default application for `crate::view`'s
+//!   own watcher and the macOS menu-bar daemon, a fresh editor tab for the
+//!   VS Code extension's coordinator) without the worker itself knowing or
+//!   caring which one it's talking to.
 //!
 //! A connection failure (the coordinator's socket doesn't exist, or
 //! nothing answers) is surfaced as a plain `io::Error` to the caller — see
@@ -51,6 +61,12 @@ pub enum Message {
         canvas_path: PathBuf,
         fragment: Option<String>,
     },
+    /// "Open `path` — a plain file, not a canvas — however this
+    /// coordinator opens plain files." Sent by `open_node_file` for a
+    /// file-node target that isn't a `.canvas.md` (or marker-carrying
+    /// `.md`). No fragment, no port to wait for: fire-and-forget, same as
+    /// `Open` once a worker's already running.
+    OpenFile { path: PathBuf },
 }
 
 /// Sends `msg` to the coordinator listening at `socket_path` as one
@@ -100,6 +116,21 @@ pub async fn request_open(
         &Message::Open {
             canvas_path: canvas_path.to_path_buf(),
             fragment,
+        },
+    )
+    .await
+}
+
+/// [`Message::OpenFile`] — called by `open_node_file` for a plain-file
+/// target. Same failure contract as `request_open`: no coordinator
+/// reachable is a real error the caller surfaces, since without one there's
+/// nobody left to open the file at all (see `open_node_file`'s own
+/// handling of that case for both message kinds).
+pub async fn request_open_file(socket_path: &Path, path: &Path) -> io::Result<()> {
+    send(
+        socket_path,
+        &Message::OpenFile {
+            path: path.to_path_buf(),
         },
     )
     .await
@@ -175,6 +206,32 @@ mod tests {
                 assert_eq!(fragment.as_deref(), Some("some-node"));
             }
             other => panic!("expected Open, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn request_open_file_sends_a_single_parseable_open_file_line() {
+        let socket_path = temp_socket_path("open-file");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let path = PathBuf::from("/tmp/some.txt");
+        let send_task = tokio::spawn({
+            let socket_path = socket_path.clone();
+            let path = path.clone();
+            async move { request_open_file(&socket_path, &path).await }
+        });
+
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = String::new();
+        stream.read_to_string(&mut buf).await.unwrap();
+        send_task.await.unwrap().unwrap();
+
+        let msg: Message = serde_json::from_str(buf.trim()).unwrap();
+        match msg {
+            Message::OpenFile { path: p } => assert_eq!(p, path),
+            other => panic!("expected OpenFile, got {other:?}"),
         }
 
         let _ = std::fs::remove_file(&socket_path);

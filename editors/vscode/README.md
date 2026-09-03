@@ -3,8 +3,12 @@
 Opens `.canvas.md` files as an interactive node canvas — the same web UI
 `meshfox view` serves in a browser tab, embedded directly in an editor tab
 instead. Requires the `meshfox` binary (see the repo root README for
-install instructions); set `meshfox.executablePath` in settings if it's
-not on `PATH`.
+install instructions). Resolved from PATH first, then `scripts/install.sh`'s
+own default install location (`~/.local/bin`) and a couple of other common
+ones (`/opt/homebrew/bin`, `/usr/local/bin`) if that fails — GUI apps
+launched from Finder/Dock/Spotlight don't always inherit a login shell's
+PATH, so this covers the common case of a real install that VS Code just
+can't see. Set `meshfox.executablePath` in settings to override both.
 
 On the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=Orofarne.meshfox-vscode)
 as `Orofarne.meshfox-vscode` — install from there (Extensions view, search
@@ -84,8 +88,10 @@ runs `meshfox check-updates -y` — the existing CLI command
 actually replaces the binary, reused rather than reimplemented here.
 
 If the configured executable can't be found at all (spawning it fails
-with `ENOENT`), an error notification offers to copy the same install
-one-liner the root README documents — never runs it for you.
+with `ENOENT`), an error notification offers **Install** — same as running
+the **"meshfox: Install"** command directly — which types the same install
+one-liner the root README documents into an integrated terminal, Enter
+left to you: never runs it on your behalf.
 
 ## How it works
 

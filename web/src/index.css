@@ -643,12 +643,28 @@ a {
   color: var(--fg);
   cursor: pointer;
   opacity: 0.7;
+  transition: transform 0.1s ease-out;
 }
 
 .mesh-node-icon-button:hover {
   opacity: 1;
   border-color: var(--accent);
   color: var(--accent);
+}
+
+/* Every icon button here (run, open, settings, delete, fold, ...) fires
+ * instantly on click with nothing further for the UI to wait on — no
+ * spinner, no round trip to show progress for — so `:hover`'s color/border
+ * change alone left a click feeling like it hadn't registered at all.
+ * `:active` (the moment the mouse is actually down) fills that in with an
+ * immediate, purely visual press — a quick scale-down plus the accent
+ * color filled in solid, gone the instant the button is released. */
+.mesh-node-icon-button:active {
+  transform: scale(0.88);
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--bg);
+  opacity: 1;
 }
 
 /* The ▸/▾ subtree fold marker (see MeshNode.tsx's `FoldToggle`) — sits
@@ -666,6 +682,16 @@ a {
 .mesh-node-delete-icon:hover {
   border-color: var(--fail);
   color: var(--fail);
+}
+
+/* Same press feedback as `.mesh-node-icon-button:active`, just in
+ * destructive red instead of the shared accent — otherwise this button's
+ * own `:hover` (same specificity, later in the cascade) would win out and
+ * leave a press looking orange-filled but red-bordered. */
+.mesh-node-delete-icon:active {
+  background: var(--fail);
+  border-color: var(--fail);
+  color: var(--bg);
 }
 
 /* The title bar's quick-run button (a node's own default block, or a

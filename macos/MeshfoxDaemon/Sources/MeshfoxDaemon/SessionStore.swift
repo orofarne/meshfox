@@ -79,6 +79,8 @@ final class SessionStore {
             markReady(canvasPath: canvasPath, port: port)
         case .open(let canvasPath, let fragment):
             openCanvas(path: canvasPath, fragment: fragment)
+        case .openFile(let path):
+            openFile(path: path)
         }
     }
 
@@ -126,6 +128,18 @@ final class SessionStore {
         lock.unlock()
 
         spawnWorker(canonicalPath: canonical, pendingOpen: .wanted(fragment: fragment))
+    }
+
+    /// A "↗ open" on a plain (non-canvas) file node's target — this
+    /// daemon's own answer is the OS's default application for it, same as
+    /// `crate::watcher::open_plain_file` on the CLI's own private watcher
+    /// (unlike the VS Code extension's coordinator, there's no in-app tab
+    /// concept to prefer here). No session bookkeeping: unlike a canvas,
+    /// there's no port to wait for and nothing worth tracking afterwards.
+    func openFile(path: String) {
+        DispatchQueue.main.async {
+            NSWorkspace.shared.open(URL(fileURLWithPath: path))
+        }
     }
 
     private static func canonicalize(_ path: String) -> String {

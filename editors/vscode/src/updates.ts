@@ -4,6 +4,7 @@ import { spawn } from "child_process";
 const LAST_CHECK_KEY = "meshfox.lastUpdateCheckAt";
 const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const REPO = "orofarne/meshfox";
+const INSTALL_COMMAND = "curl -fsSL https://raw.githubusercontent.com/orofarne/meshfox/main/scripts/install.sh | sh";
 
 /** Mirrors `check_updates`'s own `is_release_tag` check in
  * crates/cli/src/main.rs — a `v<digit>...` label means this build was cut
@@ -141,20 +142,40 @@ export async function runInteractiveUpdate(exe: string, output: vscode.OutputCha
   vscode.window.showInformationMessage(summary || "meshfox: update check finished.");
 }
 
+/** Reused across calls the same way VS Code's own built-in terminal-backed
+ * tasks do — a second "meshfox: Install" while the first one's terminal
+ * tab is still open just refocuses and re-sends into it, rather than
+ * piling up a fresh terminal per click. `exitStatus` is `undefined` for as
+ * long as the terminal itself is still open (whether or not a command is
+ * running inside it), so that alone is enough to tell "reuse" from "the
+ * user already closed that tab, make a new one" apart. */
+let installTerminal: vscode.Terminal | undefined;
+
+/** The install one-liner the root README documents, typed into a fresh (or
+ * reused) integrated terminal but *not* submitted — `sendText`'s own
+ * `addNewLine: false` leaves the actual Enter to the user. Same trust
+ * boundary the old clipboard-only version drew, just one clipboard-paste
+ * step shorter: this extension still never pipes a downloaded script into
+ * a shell on someone's behalf without them explicitly choosing to run it
+ * themselves. Backs both the standalone "meshfox: Install" command and
+ * `showInstallInstructions`'s own prompt. */
+export function openInstallTerminal(): void {
+  if (!installTerminal || installTerminal.exitStatus !== undefined) {
+    installTerminal = vscode.window.createTerminal("meshfox install");
+  }
+  installTerminal.show();
+  installTerminal.sendText(INSTALL_COMMAND, false);
+}
+
 /** Shown wherever spawning the configured `meshfox` executable fails with
- * ENOENT — offers the same install one-liner the root README documents,
- * copied to the clipboard rather than run for the user: this extension
- * doesn't pipe a downloaded script into a shell on someone's behalf
- * without them explicitly choosing to run it themselves. */
+ * ENOENT. */
 export async function showInstallInstructions(exe: string): Promise<void> {
-  const installCommand = "curl -fsSL https://raw.githubusercontent.com/orofarne/meshfox/main/scripts/install.sh | sh";
   const choice = await vscode.window.showErrorMessage(
     `meshfox: couldn't find "${exe}" — install it, or set "meshfox.executablePath" if it's installed somewhere ` +
       "not on PATH.",
-    "Copy Install Command"
+    "Install"
   );
-  if (choice === "Copy Install Command") {
-    await vscode.env.clipboard.writeText(installCommand);
-    vscode.window.showInformationMessage("Copied — paste it into a terminal.");
+  if (choice === "Install") {
+    openInstallTerminal();
   }
 }

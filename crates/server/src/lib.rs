@@ -2036,19 +2036,17 @@ fn is_canvas_file(path: &std::path::Path) -> bool {
 
 /// Opens a `file` node's target — the web UI's "↗ open" button. Always
 /// `204`, fire-and-forget from the caller's own point of view (the client
-/// never gets a URL back to act on itself any more — see
-/// `crate::watcher_protocol`'s own doc comment for why): a plain file goes
-/// to the OS's default application for it (`open` on macOS, `xdg-open` on
-/// Linux, `start` on Windows — via the `open` crate), best-effort, spawning
-/// the opener and returning as soon as it has, not once whatever it opened
-/// has itself finished loading/exited. A `.canvas.md` (or marker-carrying
-/// `.md`) target instead asks this worker's own coordinator to
-/// get-or-spawn-and-show it (`watcher_protocol::request_open`) — *that*
-/// failing (no coordinator reachable) is the one case this endpoint
-/// reports as a real error, since it's the one thing cross-canvas
-/// navigation actually depends on. `spawn_blocking` for the plain-file
-/// case only, since `open::that` blocks on shelling out; the coordinator
-/// request is already async.
+/// never gets a URL — or a success/failure of the open itself — back to
+/// act on any more, see `crate::watcher_protocol`'s own doc comment for
+/// why): both a plain file and a `.canvas.md` (or marker-carrying `.md`)
+/// target are handed to this worker's own coordinator
+/// (`watcher_protocol::request_open`/`request_open_file`) — get-or-spawn-
+/// and-show for a canvas, "open however this coordinator opens plain
+/// files" for anything else, entirely that coordinator's decision either
+/// way (the OS's default application for `crate::cli`'s own watcher and the
+/// macOS daemon, a fresh editor tab for the VS Code extension's). No
+/// coordinator reachable *is* the one thing this endpoint reports as a real
+/// error, since without one there's nobody left to open anything at all.
 async fn open_node_file(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -2075,15 +2073,16 @@ async fn open_node_file(
     let canvas_path = located.origin.as_deref().unwrap_or(&state.canvas_path);
     let resolved = resolve_confined_target(canvas_path, target_path)?;
 
+    let socket = state.watcher_socket.as_deref().ok_or_else(|| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no watcher to ask — this worker wasn't started with one, so opening files isn't \
+             available"
+                .to_string(),
+        )
+    })?;
+
     if is_canvas_file(&resolved) {
-        let socket = state.watcher_socket.as_deref().ok_or_else(|| {
-            ApiError(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "no watcher to ask — this worker wasn't started with one, so cross-canvas \
-                 navigation isn't available"
-                    .to_string(),
-            )
-        })?;
         watcher_protocol::request_open(socket, &resolved, fragment.map(str::to_string))
             .await
             .map_err(|e| {
@@ -2092,18 +2091,16 @@ async fn open_node_file(
                     format!("couldn't reach the watcher to open the canvas: {e}"),
                 )
             })?;
-        return Ok(StatusCode::NO_CONTENT);
+    } else {
+        watcher_protocol::request_open_file(socket, &resolved)
+            .await
+            .map_err(|e| {
+                ApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("couldn't reach the watcher to open the file: {e}"),
+                )
+            })?;
     }
-
-    tokio::task::spawn_blocking(move || open::that(&resolved))
-        .await
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .map_err(|e| {
-            ApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("couldn't open the file: {e}"),
-            )
-        })?;
 
     Ok(StatusCode::NO_CONTENT)
 }

@@ -2,7 +2,7 @@
   "name": "meshfox-vscode",
   "displayName": "meshfox",
   "description": "View and run meshfox .canvas.md files as an interactive node canvas, right inside VS Code.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "Orofarne",
   "license": "MIT",
   "repository": {
@@ -51,6 +51,11 @@
         "category": "meshfox"
       },
       {
+        "command": "meshfox.install",
+        "title": "Install",
+        "category": "meshfox"
+      },
+      {
         "command": "meshfox.checkForUpdates",
         "title": "Check for Updates",
         "category": "meshfox"
@@ -91,7 +96,7 @@
         "meshfox.executablePath": {
           "type": "string",
           "default": "meshfox",
-          "description": "Path to the meshfox binary. Left as \"meshfox\", it's resolved from PATH — set an absolute path here if it isn't installed there."
+          "description": "Path to the meshfox binary. Left as \"meshfox\" (the default), it's resolved from PATH first, then a couple of common install locations (~/.local/bin, /opt/homebrew/bin, /usr/local/bin) if that fails. Set an absolute path here to override both and use that exact binary."
         }
       }
     }
@@ -99,6 +104,7 @@
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -w -p ./",
+    "vscode:prepublish": "npm run compile",
     "package": "vsce package"
   },
   "devDependencies": {

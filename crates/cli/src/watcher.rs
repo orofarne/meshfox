@@ -4,11 +4,12 @@
 //! *becomes* a watcher: it binds a private, per-invocation Unix socket,
 //! spawns exactly one worker (a plain `meshfox view <path> --watcher-socket
 //! <socket>`) for the file the user actually asked for, and from then on
-//! is the single place that handles both "a worker just bound a port,
-//! maybe open a browser tab for it" and "a worker wants another canvas
-//! opened" — see `meshfox_server::watcher_protocol`'s own doc comment for
-//! why this lives behind a stable, language-agnostic wire protocol rather
-//! than in-process state a worker could reach directly.
+//! is the single place that handles "a worker just bound a port, maybe open
+//! a browser tab for it", "a worker wants another canvas opened", and "a
+//! worker wants a plain file opened" — see
+//! `meshfox_server::watcher_protocol`'s own doc comment for why this lives
+//! behind a stable, language-agnostic wire protocol rather than in-process
+//! state a worker could reach directly.
 //!
 //! Deliberately a plain parent-owns-children process tree, not a detached
 //! system-wide daemon (contrast the earlier, now-removed
@@ -97,24 +98,20 @@ impl Registry {
         let _ = self.shutdown.send(());
     }
 
-    /// A worker's own `Ready` arrived — record its port, and open a
-    /// browser tab now (with whichever fragment the pending request
-    /// asked for) if anyone's waiting on it. `path` is trusted as already
-    /// the same canonical form this registry spawned/keys by (it's echoed
-    /// straight back from what the watcher itself passed the worker as an
-    /// argument).
-    fn mark_ready(&self, path: &Path, port: u16) {
-        let pending = {
-            let mut entries = self.entries.lock().unwrap();
-            let Some(entry) = entries.get_mut(path) else {
-                return; // a Ready for something we're no longer tracking (already killed?) — ignore
-            };
-            entry.port = Some(port);
-            entry.pending_open.take()
-        };
-        if let Some(fragment) = pending {
-            open_browser_tab(port, fragment.as_deref());
-        }
+    /// A worker's own `Ready` arrived — record its port, and return
+    /// whichever fragment a pending request wants a browser tab opened
+    /// with (`Some(None)` for "no fragment, just the root"), if anyone's
+    /// waiting on it. `path` is trusted as already the same canonical form
+    /// this registry spawned/keys by (it's echoed straight back from what
+    /// the watcher itself passed the worker as an argument). Deliberately a
+    /// pure state transition rather than calling `open_browser_tab` itself
+    /// — leaving that to the caller means this can't shell out to actually
+    /// open the user's browser just from being called in a test.
+    fn mark_ready(&self, path: &Path, port: u16) -> Option<Option<String>> {
+        let mut entries = self.entries.lock().unwrap();
+        let entry = entries.get_mut(path)?; // a Ready for something we're no longer tracking (already killed?) — ignore
+        entry.port = Some(port);
+        entry.pending_open.take()
     }
 
     /// Removes `path`'s entry (its worker task is the sole caller, once
@@ -146,6 +143,23 @@ fn open_browser_tab(port: u16, fragment: Option<&str>) {
     tokio::task::spawn_blocking(move || {
         if let Err(e) = open::that(&url) {
             eprintln!("meshfox: couldn't open a browser automatically ({e}) — open {url} yourself");
+        }
+    });
+}
+
+/// A plain file, opened however this platform's default association says
+/// to (`open` on macOS, `xdg-open` on Linux, `start` on Windows) —
+/// this watcher's own answer to `Message::OpenFile`, the same "hand it to
+/// the OS" behavior `open_node_file` used to do itself before that moved
+/// up here. Best-effort, same reasoning as `open_browser_tab`; runs on a
+/// blocking thread for the same reason.
+fn open_plain_file(path: PathBuf) {
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = open::that(&path) {
+            eprintln!(
+                "meshfox: couldn't open {} automatically ({e})",
+                path.display()
+            );
         }
     });
 }
@@ -239,7 +253,9 @@ async fn handle_connection(stream: UnixStream, registry: Arc<Registry>, exe: Pat
     };
     match msg {
         Message::Ready { canvas_path, port } => {
-            registry.mark_ready(&canvas_path, port);
+            if let Some(fragment) = registry.mark_ready(&canvas_path, port) {
+                open_browser_tab(port, fragment.as_deref());
+            }
         }
         Message::Open { canvas_path, fragment } => {
             let canonical = canvas_path.canonicalize().unwrap_or(canvas_path);
@@ -285,6 +301,7 @@ async fn handle_connection(stream: UnixStream, registry: Arc<Registry>, exe: Pat
                 }
             }
         }
+        Message::OpenFile { path } => open_plain_file(path),
     }
 }
 
@@ -398,14 +415,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mark_ready_opens_a_pending_entry_and_clears_it() {
+    async fn mark_ready_returns_the_pending_fragment_and_clears_it() {
         let registry = Registry::new();
         registry.entries.lock().unwrap().insert(
             PathBuf::from("/tmp/a.canvas.md"),
             Entry { port: None, pending_open: Some(Some("some-node".to_string())) },
         );
 
-        registry.mark_ready(Path::new("/tmp/a.canvas.md"), 4242);
+        let pending = registry.mark_ready(Path::new("/tmp/a.canvas.md"), 4242);
+        assert_eq!(pending, Some(Some("some-node".to_string())));
 
         let entries = registry.entries.lock().unwrap();
         let entry = entries.get(Path::new("/tmp/a.canvas.md")).unwrap();
@@ -416,7 +434,8 @@ mod tests {
     #[tokio::test]
     async fn mark_ready_for_an_untracked_path_is_a_harmless_no_op() {
         let registry = Registry::new();
-        registry.mark_ready(Path::new("/tmp/nope.canvas.md"), 4242);
+        let pending = registry.mark_ready(Path::new("/tmp/nope.canvas.md"), 4242);
+        assert_eq!(pending, None);
         assert!(registry.is_empty());
     }
 

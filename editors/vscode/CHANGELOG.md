@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.0
+
+- New **"meshfox: Install"** command — types the same install one-liner
+  the root README documents into an integrated terminal (Enter is still
+  yours to press) instead of only offering it as a copy-to-clipboard
+  string from an error prompt.
+- A "↗ open" on a plain (non-canvas) file node now opens a regular VS Code
+  editor tab instead of shelling out to the OS's default application for
+  it — the coordinator decides how a plain file gets opened, and this
+  extension's own answer is "inside the editor".
+- The `meshfox` binary is now found even when it isn't on VS Code's own
+  PATH (a GUI app launched from Finder/Dock/Spotlight doesn't always
+  inherit a login shell's) — falls back to checking `scripts/install.sh`'s
+  own default install location (`~/.local/bin`) and a couple of other
+  common ones (`/opt/homebrew/bin`, `/usr/local/bin`) before giving up.
+  An explicit `meshfox.executablePath` override is unaffected — always
+  used as-is.
+
 ## 0.1.0
 
 Initial public release.

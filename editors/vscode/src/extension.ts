@@ -5,6 +5,7 @@ import { VIEW_TYPE, VIEW_TYPE_ANY, resolveExecutablePath } from "./constants";
 import {
   isExecutableAvailable,
   maybeCheckForUpdatesOnStartup,
+  openInstallTerminal,
   runInteractiveUpdate,
   showInstallInstructions,
 } from "./updates";
@@ -41,8 +42,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
       await vscode.commands.executeCommand("vscode.openWith", target, VIEW_TYPE);
     }),
+    vscode.commands.registerCommand("meshfox.install", () => {
+      openInstallTerminal();
+    }),
     vscode.commands.registerCommand("meshfox.checkForUpdates", async () => {
-      const exe = resolveExecutablePath();
+      const exe = await resolveExecutablePath();
       if (!(await isExecutableAvailable(exe))) {
         await showInstallInstructions(exe);
         return;
@@ -72,7 +76,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // Fire-and-forget: throttled to once a day (see updates.ts), purely
   // informational, never installs without an explicit click on the toast
   // it shows. Must never block or fail activation.
-  void maybeCheckForUpdatesOnStartup(context, resolveExecutablePath(), output);
+  void (async () => {
+    const exe = await resolveExecutablePath();
+    await maybeCheckForUpdatesOnStartup(context, exe, output);
+  })();
 }
 
 /** The document URI of the active tab, if it's one of ours — for
