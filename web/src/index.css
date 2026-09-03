@@ -181,6 +181,21 @@ a {
   color: var(--accent);
 }
 
+/* A `file` node body's own target — a `<button>`, not a real `<a href>`
+ * (see MeshNode.tsx's `NodeBodyContent` for why), styled to still read as
+ * the plain link it visually replaces. */
+.mesh-node-open-link {
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  color: var(--accent);
+  text-decoration: underline;
+  cursor: pointer;
+  text-align: left;
+}
+
 .app {
   display: flex;
   flex-direction: column;
@@ -516,6 +531,42 @@ a {
   stroke-width: 1.6;
   stroke-linecap: round;
   stroke-linejoin: round;
+}
+
+/* A `file`/`link` node body's own target link, plus (file nodes only) the
+ * download/show-folder icon buttons right after it — see MeshNode.tsx's
+ * `NodeBodyContent`. Row layout so a long link and the fixed-size icon
+ * buttons sit inline rather than the icons wrapping under the text. */
+.mesh-node-target-row {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+}
+
+/* `DownloadIcon`/`FolderIcon` in MeshNode.tsx — same hand-drawn-SVG-over-
+ * emoji rationale as `.mesh-node-type-icon` above, just sized to fill a
+ * `.mesh-node-icon-button` instead of sitting inline with title text. */
+.mesh-node-button-icon {
+  width: 1em;
+  height: 1em;
+  vertical-align: -0.15em;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* The download icon is an `<a download>`, not a `<button>` — reset it back
+ * to `.mesh-node-icon-button`'s own look, since a plain anchor doesn't
+ * inherit a button's default styling the way `.mesh-node-inline-icon`'s
+ * sibling `<button>` (the folder icon) does for free. */
+.mesh-node-inline-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
 }
 
 .mesh-node-title[data-level="1"] {

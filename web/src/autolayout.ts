@@ -228,8 +228,37 @@ function placeRightward(
     return size.height;
   }
 
-  const childX = nx + size.width + H_GAP;
-  let cursor = ny;
+  // A `group`'s own rendered box is later overridden by `layoutGroups`
+  // (below) to a frame bounding its members, padded by `GROUP_PADDING` on
+  // every side plus `GROUP_TITLE_SPACE` above that for its own title row —
+  // space this pass has to reserve *before* stacking its children, not
+  // after: sibling spacing (both here, for a nested group's own children,
+  // and in `computeAutoLayout`'s root-children loop) is decided from this
+  // function's return value alone, before `layoutGroups` ever runs, so a
+  // *preceding* sibling's slot would otherwise get silently encroached on
+  // once that override actually padded the frame out above/below where
+  // this function had placed the group's children (confirmed directly: an
+  // unfolded group's frame overlapped the sibling row directly above it by
+  // exactly `GROUP_PADDING + GROUP_TITLE_SPACE`px — invisible before the
+  // group's frame extended left far enough to actually reach that sibling's
+  // own column, but always there).
+  const isGroup = node.type === "group";
+  const topReserve = isGroup ? GROUP_PADDING + GROUP_TITLE_SPACE : 0;
+  const bottomReserve = isGroup ? GROUP_PADDING : 0;
+
+  // A group's own frame directly wraps its members (`layoutGroups` below,
+  // now anchored at this node's own `x` too — see its own comment) — its
+  // children indent only `GROUP_PADDING` from that same left edge, not the
+  // normal `size.width + H_GAP` column-jump every other parent/child pair
+  // gets (each rendered as its own separate box, side by side, one tier
+  // deeper). Using the normal jump here still positioned every member
+  // correctly (`layoutGroups`' own bounding box just follows wherever they
+  // landed) — it just left a wide dead gap between the frame's own
+  // (correctly self-aligned) left edge and the far-off column its members
+  // actually rendered in, since nothing here was previously reserving the
+  // *frame*'s edge as the actual left edge to indent from.
+  const childX = isGroup ? nx + GROUP_PADDING : nx + size.width + H_GAP;
+  let cursor = ny + topReserve;
   let span = 0;
   children.forEach((child, i) => {
     if (i > 0) {
@@ -241,10 +270,25 @@ function placeRightward(
     cursor += childH;
     span += childH;
   });
-  const consumed = Math.max(span, size.height);
+  // A group's own `size.height` is deliberately left out of its `consumed`
+  // — that figure is `measuredHeight(node.id)`, last render's real DOM
+  // height of whatever `layoutGroups` (below) set this same box to on the
+  // *previous* pass, so feeding it back into this pass's own layout math
+  // never converges (confirmed directly: an unfolded group's height blew
+  // up to several thousand px within a couple of reflow passes before this
+  // was excluded). `topReserve`/`bottomReserve` stand in for it here
+  // instead, covering the frame's own overhang on both ends of the stack.
+  const consumed = isGroup ? topReserve + span + bottomReserve : Math.max(span, size.height);
   // Only recenter a synthetic y against the children's stacked span — a
-  // real y is the user's own, never shifted to "look centered".
-  const nodeY = node.y !== undefined ? ny : ny + (consumed - size.height) / 2;
+  // real y is the user's own, never shifted to "look centered". Skipped
+  // for a group entirely (`nodeY = ny`, no centering): whenever this
+  // branch runs at all, the group has ≥1 visible child, which means
+  // `layoutGroups` is about to override this box wholesale from its
+  // members' own boxes anyway (see that function) — nothing stored here
+  // survives, so centering against a stale `size.height` would just be
+  // reintroducing that same feedback risk for a value nothing downstream
+  // even reads.
+  const nodeY = node.y !== undefined || isGroup ? ny : ny + (consumed - size.height) / 2;
   boxes.set(node.id, { x: nx, y: nodeY, ...size });
   return consumed;
 }
@@ -272,6 +316,21 @@ function layoutGroups(
       .map((id) => boxes.get(id))
       .filter((b): b is LayoutBox => b !== undefined);
     if (memberBoxes.length === 0) continue;
+    // Deliberately just the members here, not the group's own box too —
+    // `placeRightward` now indents a group's own children by exactly
+    // `GROUP_PADDING` from its own left edge (`childX`, above), rather
+    // than the normal full-column jump every other parent/child pair
+    // gets, specifically so this bounding box, once padded back out by
+    // that same `GROUP_PADDING` below, lands exactly on the group's own
+    // column again — `minX - GROUP_PADDING` here already equals the
+    // group's own `x` by construction, with no need to fold that `x` into
+    // the `Math.min` a second time. Doing that anyway (an earlier version
+    // of this fix did) double-subtracted the padding — `min(ownX, ownX +
+    // GROUP_PADDING) - GROUP_PADDING = ownX - GROUP_PADDING` — and landed
+    // the frame `GROUP_PADDING`px left of every sibling instead (confirmed
+    // directly against this same `Links` node: its frame's left edge sat
+    // 40px left of `Tests`/`Examples`'s own, once `childX` alone was
+    // already enough to align them exactly).
     const minX = Math.min(...memberBoxes.map((b) => b.x));
     const minY = Math.min(...memberBoxes.map((b) => b.y));
     const maxX = Math.max(...memberBoxes.map((b) => b.x + b.width));

@@ -20,6 +20,7 @@ import {
   runBlockStream,
   runFileStream,
   openNodeFile,
+  openNodeFileFolder,
   killRun,
   fetchVars,
   fetchConfigureVars,
@@ -1120,6 +1121,16 @@ export default function App() {
     }
   }, []);
 
+  // Opens the directory containing a `file` node's target (the body's
+  // "show folder" icon) — same fire-and-forget shape as `handleOpenFile`.
+  const handleOpenFileFolder = useCallback(async (nodeId: string) => {
+    try {
+      await openNodeFileFolder(nodeId);
+    } catch (e) {
+      setError(String(e));
+    }
+  }, []);
+
   // Creates a new child node under `parentId` (empty body, no position —
   // the server's layout suggestion places it to the parent's right, see
   // `mdcanvas::insert_child_node`'s doc comment) and immediately opens its
@@ -1517,6 +1528,7 @@ export default function App() {
               handleRunTty(n.id, blockName, withDeps, autoclose),
             onRecheckConstraint: () => load(),
             onOpenFile: () => handleOpenFile(n.id),
+            onOpenFileFolder: () => handleOpenFileFolder(n.id),
             onAddChild: () => handleAddChild(n.id),
             onMoveUp:
               suggested && prevSibling

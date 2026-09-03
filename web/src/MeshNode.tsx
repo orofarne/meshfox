@@ -388,8 +388,13 @@ export interface MeshNodeData {
   /** Opens this node's settings modal (title/type/color/target/edges). */
   onOpenSettings: () => void;
   /** file-node only — opens `target` in the OS's default application for
-   * it (the title bar's "↗ open" button). */
+   * it (the title bar's "↗ open" button, and clicking the body's own link,
+   * which now behaves the same way rather than fetching the raw file). */
   onOpenFile: () => void;
+  /** file-node only — opens `target`'s containing directory in the OS's
+   * default file manager (the body's "show folder" icon, right after the
+   * download icon). */
+  onOpenFileFolder: () => void;
   /** Opens this node's body in a floating window (`NodeExpandPanel`) — same
    * live content (run/kill buttons, streaming output) as the inline box,
    * just bigger and not at the mercy of the canvas's current pan/zoom.
@@ -497,6 +502,31 @@ function TypeIcon({ type }: { type: NodeType }) {
     );
   }
   return null;
+}
+
+/** A `file` node body's "download" icon, right after its target link — same
+ * hand-drawn-SVG rationale as `TypeIcon` above (a 📥/⬇️ glyph is color-emoji
+ * presentation on most platforms, which pixelates at low zoom; this scales
+ * cleanly via `currentColor`/`em` at any zoom instead). */
+function DownloadIcon() {
+  return (
+    <svg className="mesh-node-button-icon" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M12 4v10.5" />
+      <path d="M7.5 10.5L12 15l4.5-4.5" />
+      <path d="M5 18.5h14" />
+    </svg>
+  );
+}
+
+/** A `file` node body's "show folder" icon, right after the download icon —
+ * same rationale as `DownloadIcon` above (a 📁 glyph is color-emoji
+ * presentation). */
+function FolderIcon() {
+  return (
+    <svg className="mesh-node-button-icon" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M4.5 7a1.5 1.5 0 0 1 1.5-1.5h3.5l1.8 1.8H18a1.5 1.5 0 0 1 1.5 1.5v8a1.5 1.5 0 0 1-1.5 1.5H6A1.5 1.5 0 0 1 4.5 17V7Z" />
+    </svg>
+  );
 }
 
 /** Rolls up every embedded constraint fence's result in a node into one
@@ -1784,12 +1814,65 @@ export function NodeBodyContent({ data, nodeId }: { data: MeshNodeData; nodeId: 
     );
   }
   if (data.nodeType === "file" || data.nodeType === "link") {
+    const isFile = data.nodeType === "file";
     return (
       <div className="mesh-node-body nopan">
         {data.target ? (
-          <a href={data.target} target="_blank" rel="noreferrer">
-            {data.target}
-          </a>
+          <div className="mesh-node-target-row">
+            {/* A `file` node's own link now behaves exactly like the title
+             * bar's "↗ open" button (opens `target` in the OS's default
+             * application) instead of fetching the raw file — the download
+             * and folder icons right after it are what took over that old
+             * "click the link to get the file" behavior (and a new one,
+             * respectively), so the two are no longer conflated on the one
+             * link. A `link` node's own target is unaffected — it still
+             * just opens the URL, same as before.
+             *
+             * Deliberately a hrefless `<button>` for the `file` case, not
+             * an `<a href>` with a click handler that calls
+             * `preventDefault()` — the VS Code extension embeds this app
+             * in a webview, and VS Code's webview host intercepts *every*
+             * anchor click by inspecting its `href` directly (to hand
+             * `http(s)` targets off to the OS's real browser), completely
+             * independent of whatever this page's own JS does with the
+             * event; `preventDefault()` here never reaches it. With a real
+             * `href` still on the tag, that interception fired *in
+             * addition to* this handler's own `onOpenFile()` — one click
+             * opening two tabs (confirmed directly: VS Code's own native
+             * image-preview tab from `onOpenFile()`, plus a second raw
+             * browser tab straight at the file's server URL from VS
+             * Code's own interception). A `<button>` has no `href` at all
+             * for that interception to ever find. */}
+            {isFile ? (
+              <button type="button" className="mesh-node-open-link nodrag" onClick={data.onOpenFile}>
+                {data.target}
+              </button>
+            ) : (
+              <a href={data.target} target="_blank" rel="noreferrer" className="nodrag">
+                {data.target}
+              </a>
+            )}
+            {isFile && (
+              <>
+                <a
+                  href={data.target}
+                  download
+                  className="mesh-node-icon-button mesh-node-inline-icon nodrag"
+                  title="Download this file"
+                >
+                  <DownloadIcon />
+                </a>
+                <button
+                  type="button"
+                  className="mesh-node-icon-button mesh-node-inline-icon nodrag"
+                  onClick={data.onOpenFileFolder}
+                  title="Show this file's containing folder"
+                >
+                  <FolderIcon />
+                </button>
+              </>
+            )}
+          </div>
         ) : (
           <em>no target</em>
         )}
@@ -1857,6 +1940,24 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
   const quickRunLive = quickRunBlockName ? data.liveBlocks[quickRunBlockName] : undefined;
   const quickRunBusy = quickRunLive?.status === "queued" || quickRunLive?.status === "running";
   const canOpenFile = data.nodeType === "file" && !!data.target;
+  // A `link` node's own title-bar "↗ open" button — same spot/icon as a
+  // `file` node's (`canOpenFile` above), just opening the URL directly in a
+  // new tab (no OS-level app to hand it off to, unlike a file) rather than
+  // via `onOpenFile`. Purely for behavioral consistency between the two
+  // node types — the body's own link already does the exact same thing on
+  // click, this is just a second, title-bar-level way to trigger it.
+  //
+  // Deliberately rendered as a real `<a target="_blank">` below (see its
+  // own render site), not a `<button onClick={() => window.open(...)}>`:
+  // the VS Code extension embeds this whole app in a webview, whose CSP
+  // blocks a *scripted* `window.open` outright (silently — it just does
+  // nothing, no thrown error to notice), while a real anchor click is
+  // still a user-driven navigation, which VS Code's webview host already
+  // intercepts and hands off to the OS's real browser (the same reason the
+  // body's own `<a>` link already worked there before this button
+  // existed). Confirmed directly: the button did nothing at all under the
+  // VS Code extension until switched to a real anchor.
+  const canOpenLink = data.nodeType === "link" && !!data.target;
   const constraintStatus = aggregateConstraintStatus(data.constraintResults);
   // `data.liveBlocks` is already scoped to this node's own blocks (App.tsx
   // keys each node's map by that node alone), so this covers both a `text`
@@ -1874,13 +1975,20 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
   // this tracks the `mousedown` position (`titleMouseDownRef`) and only
   // toggles if `mouseup` landed within `TITLE_CLICK_MOVE_THRESHOLD`px of
   // it *and* there's no active text selection left behind — a genuine
-  // click, not a selection drag. No `data.hasChildren` gate here, same
-  // as before this toggled both ways: a childless `isTitleOnly` node's
-  // own row looks identical folded or not (no `FoldToggle` shown for it
-  // either — see that render condition below), but this stays its only
-  // way back to unfolded for the rare case a document explicitly authors
-  // `fold="true"` on one anyway (`App.tsx`'s `resolveDefaultFold` honors
-  // that override regardless of `canFold`).
+  // click, not a selection drag.
+  //
+  // A childless `isTitleOnly` node gets no `FoldToggle` at all (see that
+  // render condition below) — its own row looks identical folded or not,
+  // so there's nothing a toggle could do — and this mirrors that gate
+  // rather than toggling anyway: `data.hasChildren` has to hold too for a
+  // title-only node specifically, otherwise a plain click on its title
+  // silently flips `folded` in state for a node that has no user-visible
+  // way to *see* that flip (and, since that state is what the toggle
+  // button itself would show once such a node acquires a child later,
+  // that stale flip isn't even harmless). A normal (non-title-only) node
+  // always keeps a real `FoldToggle` regardless of children (a leaf's own
+  // body can be just as unwieldy as a whole subtree), so its title click
+  // stays ungated.
   //
   // In Edit mode this is disabled outright — `FoldToggle`'s own button
   // is the only way to fold there. The title in Edit mode is also the
@@ -1895,6 +2003,7 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
   };
   const handleTitleClick = (e: React.MouseEvent) => {
     if (data.editMode) return;
+    if (isTitleOnly && !data.hasChildren) return;
     const start = titleMouseDownRef.current;
     const moved = start ? Math.hypot(e.clientX - start.x, e.clientY - start.y) : 0;
     if (moved > TITLE_CLICK_MOVE_THRESHOLD) return;
@@ -2050,6 +2159,17 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
             >
               ↗
             </button>
+          )}
+          {canOpenLink && (
+            <a
+              href={data.target}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="mesh-node-icon-button mesh-node-inline-icon nodrag"
+              title="Open this link in a new tab"
+            >
+              ↗
+            </a>
           )}
           {data.editMode && (
             <span className="mesh-node-title-actions">

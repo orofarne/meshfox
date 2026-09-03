@@ -2105,6 +2105,66 @@ async fn open_node_file(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Opens the directory containing a `file` node's target — the web UI's
+/// "show folder" icon next to a file link. Same resolution/confinement as
+/// `open_node_file` above, just handed the resolved target's parent
+/// directory instead of the target itself, and always via
+/// `watcher_protocol::request_open_file` (a containing folder is never a
+/// canvas to get-or-spawn-and-show, even when the file inside it happens to
+/// be one).
+async fn open_node_file_folder(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let primary_raw = state.raw.lock().unwrap().clone();
+    let located = locate_node(&state, &primary_raw, &id)?;
+    let canvas = parse_or_error(&located.raw)?;
+    let node = canvas
+        .node(&located.local_id)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}")))?;
+    if node.node_type != NodeType::File {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("node {id:?} is not a file node"),
+        ));
+    }
+    let target = node.target.as_deref().ok_or_else(|| {
+        ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("node {id:?} has no target"),
+        )
+    })?;
+    let (target_path, _fragment) = meshfox_core::mdcanvas::split_target_fragment(target);
+    let canvas_path = located.origin.as_deref().unwrap_or(&state.canvas_path);
+    let resolved = resolve_confined_target(canvas_path, target_path)?;
+    let folder = resolved.parent().ok_or_else(|| {
+        ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("{}: has no containing directory", resolved.display()),
+        )
+    })?;
+
+    let socket = state.watcher_socket.as_deref().ok_or_else(|| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no watcher to ask — this worker wasn't started with one, so opening files isn't \
+             available"
+                .to_string(),
+        )
+    })?;
+
+    watcher_protocol::request_open_file(socket, folder)
+        .await
+        .map_err(|e| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("couldn't reach the watcher to open the folder: {e}"),
+            )
+        })?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DeleteNodeQuery {
@@ -3876,6 +3936,7 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/nodes/:id/file-content", get(get_node_file_content))
         .route("/api/nodes/:id/run", post(run_file_node))
         .route("/api/nodes/:id/open", post(open_node_file))
+        .route("/api/nodes/:id/open-folder", post(open_node_file_folder))
         .route("/api/options", put(put_options))
         .route("/api/vars", get(get_vars))
         .route(

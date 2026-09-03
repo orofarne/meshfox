@@ -138,9 +138,9 @@ linting...
 <!-- meshfox:node id="links" type="group" -->
 
 ### Project Homepage
-<!-- meshfox:node id="homepage" type="link" -->
+<!-- meshfox:node id="homepage" type="link" preview="true" -->
 
-[meshfox on GitHub](https://github.com/example/meshfox)
+[Project Homepage](https://github.com/orofarne/meshfox)
 
 ### Architecture Diagram
 <!-- meshfox:node id="architecture-diagram" type="file" -->

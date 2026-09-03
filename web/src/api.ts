@@ -570,6 +570,20 @@ export async function openNodeFile(nodeId: string): Promise<void> {
 }
 
 /**
+ * Opens the directory containing a `file` node's target — the web UI's
+ * "show folder" icon. Same fire-and-forget shape as `openNodeFile` above,
+ * just always handed off to the OS's default file manager for the
+ * containing folder rather than the target itself.
+ */
+export async function openNodeFileFolder(nodeId: string): Promise<void> {
+  const res = await fetch(`/api/nodes/${encodeURIComponent(nodeId)}/open-folder`, { method: "POST" });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `POST /api/nodes/${nodeId}/open-folder: ${res.status}`);
+  }
+}
+
+/**
  * Cancels an in-flight run started by `runBlockStream` (`runId` comes from
  * that stream's first `"started"` event) — kills whichever block is
  * currently executing and stops the rest of its dependency chain. A 404
