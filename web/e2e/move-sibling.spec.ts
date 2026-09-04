@@ -1,5 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
-import { clickFitViewAndWait } from "./helpers";
+import { clickFitViewAndWait, selectNode } from "./helpers";
 
 // Drives web/e2e/fixtures/move-sibling.canvas.md — the web UI's `↑`/`↓`
 // sibling-reorder buttons, an auto-placed node's only lever for changing
@@ -10,6 +10,19 @@ import { clickFitViewAndWait } from "./helpers";
 
 function node(page: Page, id: string) {
   return page.locator(`.react-flow__node[data-id="${id}"]`);
+}
+
+// The `↑`/`↓` buttons now live in the floating `NodeToolbar` above a
+// *selected* node (see helpers.ts's `selectNode`), not inline in its
+// title bar — global, not scoped under a specific node's own locator,
+// for the same reason `toolbarButton` there isn't either: `NodeToolbar`
+// portals its content out of the node's own DOM subtree, and only ever
+// renders one at a time (whichever node is currently selected).
+function moveUpButton(page: Page) {
+  return page.locator(".mesh-node-toolbar .mesh-node-move-up");
+}
+function moveDownButton(page: Page) {
+  return page.locator(".mesh-node-toolbar .mesh-node-move-down");
 }
 
 function fetchRaw(page: Page): Promise<string> {
@@ -24,27 +37,27 @@ test.beforeEach(async ({ page }) => {
 });
 
 test("a positioned node never shows the ↑/↓ buttons, even hovered in edit mode", async ({ page }) => {
-  await node(page, "positioned").locator(".mesh-node-title").hover();
-  await expect(node(page, "positioned").locator(".mesh-node-move-up")).toHaveCount(0);
-  await expect(node(page, "positioned").locator(".mesh-node-move-down")).toHaveCount(0);
+  await selectNode(node(page, "positioned"));
+  await expect(moveUpButton(page)).toHaveCount(0);
+  await expect(moveDownButton(page)).toHaveCount(0);
 });
 
 test("the topmost auto-placed sibling has no ↑ button, the bottommost has no ↓ button", async ({ page }) => {
-  await node(page, "alpha").locator(".mesh-node-title").hover();
-  await expect(node(page, "alpha").locator(".mesh-node-move-up")).toHaveCount(0);
-  await expect(node(page, "alpha").locator(".mesh-node-move-down")).toHaveCount(1);
+  await selectNode(node(page, "alpha"));
+  await expect(moveUpButton(page)).toHaveCount(0);
+  await expect(moveDownButton(page)).toHaveCount(1);
 
-  await node(page, "gamma").locator(".mesh-node-title").hover();
-  await expect(node(page, "gamma").locator(".mesh-node-move-down")).toHaveCount(0);
-  await expect(node(page, "gamma").locator(".mesh-node-move-up")).toHaveCount(1);
+  await selectNode(node(page, "gamma"));
+  await expect(moveDownButton(page)).toHaveCount(0);
+  await expect(moveUpButton(page)).toHaveCount(1);
 });
 
 test("clicking ↓ moves a node after its next sibling, even a positioned one", async ({ page }) => {
   const before = await fetchRaw(page);
   expect(before.indexOf('id="alpha"')).toBeLessThan(before.indexOf('id="positioned"'));
 
-  await node(page, "alpha").locator(".mesh-node-title").hover();
-  await node(page, "alpha").locator(".mesh-node-move-down").click();
+  await selectNode(node(page, "alpha"));
+  await moveDownButton(page).click();
 
   await expect.poll(() => fetchRaw(page).then((r) => r.indexOf('id="alpha"') > r.indexOf('id="positioned"'))).toBe(
     true,
@@ -61,8 +74,8 @@ test("clicking ↑ moves a node before its previous sibling", async ({ page }) =
   const before = await fetchRaw(page);
   expect(before.indexOf('id="beta"')).toBeLessThan(before.indexOf('id="gamma"'));
 
-  await node(page, "gamma").locator(".mesh-node-title").hover();
-  await node(page, "gamma").locator(".mesh-node-move-up").click();
+  await selectNode(node(page, "gamma"));
+  await moveUpButton(page).click();
 
   await expect
     .poll(() => fetchRaw(page).then((r) => r.indexOf('id="gamma"') < r.indexOf('id="beta"')))

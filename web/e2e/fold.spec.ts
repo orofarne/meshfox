@@ -198,6 +198,12 @@ test("a folded auto-placed node restores its real height after an unrelated canv
   await page.locator(".mesh-node-add-child").first().click();
   await page.locator(".vars-modal-actions button", { hasText: "ok" }).click();
   await expect(page.locator(".node-settings-modal")).toHaveCount(0);
+  // "ok" right after creating a node auto-opens its own body editor
+  // (TODO.canvas.md: "Редактирование после Node settings") — a real user
+  // wanting to interact with the rest of the canvas right away would close
+  // this first (its own full-screen backdrop otherwise just intercepts the
+  // fold-toggle click below); do the same here rather than fighting it.
+  await page.locator(".mesh-text-editor-actions button", { hasText: "done" }).click();
 
   await node(page, "sibling-node").locator(".mesh-node-fold-toggle").click();
 

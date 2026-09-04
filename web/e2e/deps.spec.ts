@@ -158,6 +158,9 @@ test("a failing step in a chain marks what comes after it blocked, not stuck que
   await expect(afterFail.locator('[data-exit="blocked"]')).toBeVisible({ timeout: 5_000 });
   await expect(afterFail.locator(".mesh-code-output")).toContainText("a dependency in its chain failed");
 
-  // Not stuck disabled either — retrying is just clicking run again.
-  await expect(afterFail.locator("button", { hasText: "run" })).toBeEnabled();
+  // Not stuck disabled either — retrying is just clicking run again. Scoped
+  // to the plain run button specifically (`hasText: "run"` alone also
+  // matches the block's own "⛓ run chain: after-fail" button, still present
+  // and enabled here too — see the top of this file's own `block` helper).
+  await expect(afterFail.locator("button:not(.mesh-run-chain)", { hasText: "run" })).toBeEnabled();
 });

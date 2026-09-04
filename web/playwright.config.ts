@@ -119,6 +119,12 @@ export default defineConfig({
   fullyParallel: false,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 1 : 0,
+  // Playwright's own default (half the CPU cores) still lets enough browser
+  // instances run at once, across this file's many per-suite projects, to
+  // starve timing-sensitive tests (e.g. select.spec.ts's drag-selection
+  // tests) of real CPU under a full-suite run — capped lower here so a full
+  // run trades some wall-clock time for not flaking under self-contention.
+  workers: process.env.CI ? 1 : 2,
   reporter: [["list"]],
   use: {
     baseURL: `http://127.0.0.1:${PORT}`,

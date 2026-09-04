@@ -1,4 +1,5 @@
 import { test, expect, type Locator, type Page } from "@playwright/test";
+import { selectNode, toolbarButton } from "./helpers";
 
 // Drives web/e2e/fixtures/image-paste.canvas.md (TODO.canvas.md: "Base64
 // image") — pasting an image into either of the two Monaco editors
@@ -89,8 +90,8 @@ test("pasting an image into a node's body editor embeds it as base64 and renders
   test.skip(browserName === "firefox", "Gecko drops synthetic paste-event file data — see this file's own top comment.");
 
   const root = page.locator('.react-flow__node[data-id="root"]');
-  await root.locator(".mesh-node-title").hover();
-  await root.locator('button[title="Edit this node\'s Markdown text"]').click();
+  await selectNode(root);
+  await toolbarButton(page, "Edit this node's Markdown text").click();
 
   const source = page.locator(".mesh-text-editor-source .monaco-editor");
   await expect(source).toBeVisible();
@@ -143,8 +144,8 @@ test("a large paste asks for confirmation first, and declining inserts nothing",
   });
 
   const root = page.locator('.react-flow__node[data-id="root"]');
-  await root.locator(".mesh-node-title").hover();
-  await root.locator('button[title="Edit this node\'s Markdown text"]').click();
+  await selectNode(root);
+  await toolbarButton(page, "Edit this node's Markdown text").click();
   const source = page.locator(".mesh-text-editor-source .monaco-editor");
   await expect(source).toBeVisible();
   // Compared against the buffer's own content before, not asserted to be

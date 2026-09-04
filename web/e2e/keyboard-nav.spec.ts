@@ -1,5 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
-import { clickFitViewAndWait, viewportTransform } from "./helpers";
+import { clickFitViewAndWait, selectNode, toolbarButton, viewportTransform } from "./helpers";
 
 // Drives web/e2e/fixtures/keyboard-nav.canvas.md, in the default read-only
 // mode except for the one guard test that needs Edit mode — j/k/h/l/Enter
@@ -131,8 +131,8 @@ test("keys are ignored while the source editor is open", async ({ page }) => {
 test("keys are ignored while a node's own body editor is open, and still reach the editor", async ({ page }) => {
   await page.locator("button", { hasText: "Edit" }).click();
   const root = page.locator('.react-flow__node[data-id="root"]');
-  await root.locator(".mesh-node-title").hover();
-  await root.locator('button[title="Edit this node\'s Markdown text"]').click();
+  await selectNode(root);
+  await toolbarButton(page, "Edit this node's Markdown text").click();
 
   const source = page.locator(".mesh-text-editor-source .monaco-editor");
   await expect(source).toBeVisible();

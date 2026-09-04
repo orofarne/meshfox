@@ -1,4 +1,4 @@
-import { expect, type Page } from "@playwright/test";
+import { expect, type Locator, type Page } from "@playwright/test";
 
 // Shared across the e2e suite's spec files.
 
@@ -38,4 +38,35 @@ export async function clickFitViewAndWait(page: Page) {
  * (a flat fixture has nothing the default would ever fold). */
 export async function disableDefaultFold(page: Page, rootId: string) {
   await page.addInitScript((key) => localStorage.setItem(key, "[]"), `meshfox-folded:${rootId}`);
+}
+
+/** Selects `node` (a `.react-flow__node[data-id="..."]` locator) by
+ * clicking its own title text — needed before reaching any of that
+ * node's own action buttons (edit/settings/delete/move/reset-layout):
+ * they now live in a floating `NodeToolbar` above the node (`.mesh-node-
+ * toolbar`, MeshNode.tsx) instead of inline in its title bar, shown only
+ * once the node is actually *selected*, not merely hovered, the way the
+ * old inline buttons worked. A plain click on the title text is a
+ * documented no-op in Edit mode as far as fold-toggling goes (see
+ * MeshNode.tsx's `handleTitleClick`'s own `if (data.editMode) return`)
+ * but still bubbles up to React Flow's own default click-to-select
+ * handling — unlike clicking the fold toggle button itself, or any other
+ * icon, both of which handle the click themselves. Works the same way
+ * whether `node` has a real body (`.mesh-node-title-text`) or is a
+ * header-only, centered-layout node (`.mesh-node-title-centered-text`);
+ * exactly one of the two ever exists for a given node, never both. */
+export async function selectNode(node: Locator) {
+  await node.locator(".mesh-node-title-text, .mesh-node-title-centered-text").first().click();
+}
+
+/** The floating `NodeToolbar` button whose `title` contains `titleSubstring`
+ * (case-insensitive) — global, not scoped under a specific node's own
+ * locator, since `NodeToolbar` portals its content out of the node's own
+ * DOM subtree entirely (into React Flow's shared top-level rendering
+ * layer — see MeshNode.tsx's own comment on why) and only ever renders
+ * for whichever single node is currently selected, so at most one `.mesh-
+ * node-toolbar` exists in the DOM at any one time regardless of how many
+ * nodes the canvas has. Call `selectNode` on the target node first. */
+export function toolbarButton(page: Page, titleSubstring: string): Locator {
+  return page.locator(`.mesh-node-toolbar button[title*="${titleSubstring}" i]`);
 }

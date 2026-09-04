@@ -1,5 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
-import { clickFitViewAndWait, disableDefaultFold } from "./helpers";
+import { clickFitViewAndWait, disableDefaultFold, selectNode, toolbarButton } from "./helpers";
 
 // Drives web/e2e/fixtures/settings.canvas.md: one node per NodeSettings-
 // relevant type/field combination (see the fixture's own root body for the
@@ -23,12 +23,12 @@ import { clickFitViewAndWait, disableDefaultFold } from "./helpers";
 
 async function openSettings(page: Page, nodeId: string) {
   const node = page.locator(`.react-flow__node[data-id="${nodeId}"]`);
-  // A `group` node's own box spans its children, so hovering the node's
-  // full bounding box (rather than just its title bar) can land on a
-  // child's DOM instead and never reveal this node's own actions — see
-  // `.mesh-node-title`/`.mesh-node-title-actions` in MeshNode.tsx.
-  await node.locator(".mesh-node-title").hover();
-  await node.locator('button[title*="settings" i]').click();
+  // The settings gear now lives in a floating `NodeToolbar` above the
+  // node, shown once it's selected — not inline in its title bar, hover-
+  // revealed, the way it used to be (see `selectNode`/`toolbarButton`'s
+  // own doc comments in helpers.ts).
+  await selectNode(node);
+  await toolbarButton(page, "settings").click();
   await expect(page.locator(".node-settings-modal")).toBeVisible();
 }
 
@@ -192,6 +192,12 @@ test("the id-suggestion hint still appears for an auto-generated id that picked 
   await expect(page.locator(".node-settings-modal")).toBeVisible();
   await page.locator(".vars-modal-actions button", { hasText: "ok" }).click();
   await expect(page.locator(".node-settings-modal")).toHaveCount(0);
+  // "ok" right after creating a node auto-opens its own body editor
+  // (TODO.canvas.md: "Редактирование после Node settings") — a real user
+  // creating a second node right away would close this first (its own
+  // full-screen backdrop otherwise just intercepts the next click below);
+  // do the same here rather than fighting the backdrop.
+  await page.locator(".mesh-text-editor-actions button", { hasText: "done" }).click();
 
   await page.locator(".mesh-node-add-child").first().click();
   await expect(page.locator(".node-settings-modal")).toBeVisible();
