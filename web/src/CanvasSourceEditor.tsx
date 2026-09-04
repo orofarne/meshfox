@@ -118,7 +118,7 @@ export function CanvasSourceEditor({ initialInclude, onSaved, onClose, onDirtyCh
   };
 
   return (
-    <div className="mesh-source-editor">
+    <div className="mesh-source-editor nokey">
       <div className="mesh-source-editor-toolbar">
         <span className="mesh-source-editor-label">Editing raw Markdown source</span>
         {includes.length > 0 && (

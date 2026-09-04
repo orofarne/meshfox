@@ -21,6 +21,7 @@ web/blob-report/
 # state, analogous to CMake's CMakeCache.txt, never something to commit.
 .meshfox/
 TODO.canvas.md
+ARTICLES.canvas.md
 /CLAUDE.md
 .mcp.json
 memory-pilot.canvas.md

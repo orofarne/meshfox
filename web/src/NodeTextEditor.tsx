@@ -181,8 +181,19 @@ export function NodeTextEditor({ initialText, onChange, onClose }: NodeTextEdito
     onClose();
   };
 
+  // `nokey`: React Flow's own global Space-to-pan shortcut (`panActivationKeyCode`,
+  // default-on, never opted into by this app) decides whether to ignore a
+  // keydown via `isInputDOMNode` — an input/textarea/select tag or a
+  // `contenteditable` attribute. Monaco 0.53's real typing surface, when the
+  // browser supports the EditContext API (Chromium-based — VS Code's webview
+  // among them), is `.native-edit-context`, a plain `<div>` with neither of
+  // those, so React Flow doesn't recognize it as text input and swallows
+  // Space (`preventDefault()`s it) meant for typing a space character in the
+  // editor. `nokey` is `isInputDOMNode`'s own documented escape hatch
+  // (`target.closest('.nokey')`) for exactly this case — same fix applied to
+  // CanvasSourceEditor's wrapper for its Monaco instance.
   return createPortal(
-    <div className="mesh-text-editor-backdrop" onClick={handleClose}>
+    <div className="mesh-text-editor-backdrop nokey" onClick={handleClose}>
       <div className="mesh-text-editor" onClick={(e) => e.stopPropagation()}>
         <div className="mesh-text-editor-panes">
           <div className="mesh-text-editor-source">

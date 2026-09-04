@@ -134,8 +134,24 @@ struct AppState {
 }
 
 impl AppState {
+    /// Writes `raw` to disk *and* updates the server's own in-memory view
+    /// to match, in one step — every call site used to do the two
+    /// separately, which meant a successful save never told any other tab
+    /// connected to this same worker (VS Code's own "Open in Browser"
+    /// reopens the exact same worker, and so does opening the same canvas
+    /// twice) that anything had changed: `spawn_file_watcher`'s polling
+    /// thread is the only thing that ever sends a `changed` event over
+    /// `/api/watch`, and it deliberately skips exactly this case — by the
+    /// time it polls, `state.raw` already matches the file it just wrote,
+    /// so nothing looks different to *it* even though a sibling tab never
+    /// saw this write at all. Broadcasting here, right where the write
+    /// that every other tab needs to hear about actually happens, covers
+    /// that gap without touching the watcher's own external-change logic.
     fn save(&self, raw: &str) -> std::io::Result<()> {
-        std::fs::write(&self.canvas_path, raw)
+        std::fs::write(&self.canvas_path, raw)?;
+        *self.raw.lock().unwrap() = raw.to_string();
+        let _ = self.change_tx.send(());
+        Ok(())
     }
 }
 
@@ -966,7 +982,6 @@ fn commit_located(state: &AppState, located: &LocatedNode, raw: &str) -> Result<
             state
                 .save(raw)
                 .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            *state.raw.lock().unwrap() = raw.to_string();
         }
         Some(path) => {
             std::fs::write(path, raw)
@@ -1099,7 +1114,6 @@ async fn put_canvas_raw(
             state
                 .save(&body)
                 .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            *state.raw.lock().unwrap() = body;
         }
         SourceFile::Include { path, .. } => {
             std::fs::write(&path, &body)
@@ -1208,7 +1222,6 @@ async fn put_canvas(
     state
         .save(&primary_out)
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    *state.raw.lock().unwrap() = primary_out;
     for (path, raw) in &included_out {
         std::fs::write(path, raw)
             .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -1268,7 +1281,6 @@ async fn clear_layout(State(state): State<Arc<AppState>>) -> Result<Json<Canvas>
     state
         .save(&raw)
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    *state.raw.lock().unwrap() = raw.clone();
     canvas_response(&raw, &state.canvas_path)
 }
 
@@ -1385,7 +1397,6 @@ async fn put_options(
     state
         .save(&updated)
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    *state.raw.lock().unwrap() = updated.clone();
     canvas_response(&updated, &state.canvas_path)
 }
 
@@ -2931,7 +2942,7 @@ async fn run_block(
         if persist {
             for (origin, content) in file_raws {
                 let result = match &origin {
-                    None => state.save(&content).map(|()| *state.raw.lock().unwrap() = content),
+                    None => state.save(&content),
                     Some(path) => std::fs::write(path, &content),
                 };
                 if let Err(e) = result {
@@ -3551,7 +3562,7 @@ async fn run_tty_chain(
     if persist {
         for (origin, content) in file_raws {
             let result = match &origin {
-                None => state.save(&content).map(|()| *state.raw.lock().unwrap() = content),
+                None => state.save(&content),
                 Some(path) => std::fs::write(path, &content),
             };
             if let Err(e) = result {
@@ -4112,6 +4123,40 @@ mod clear_layout_tests {
         let b = updated.node("b").expect("b still present");
         assert_eq!(b.x, Some(200.0));
         assert_eq!(b.y, Some(300.0));
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    // Regression test for TODO.canvas.md: "VSCode: не подтягиваются
+    // изменения файла, сделанные через другой коннект" — every mutation
+    // used to update `state.raw` in memory but never tell any *other*
+    // already-connected `/api/watch` tab about it (only
+    // `spawn_file_watcher`'s polling thread ever broadcast a `changed`
+    // event, and it deliberately skips this exact case — see `AppState::
+    // save`'s own doc comment). A second tab on the same worker (VS Code's
+    // "Open in Browser" reopens the very same worker, and so does opening
+    // the same canvas twice) never found out about a sibling tab's edit
+    // until manually reloaded.
+    #[tokio::test]
+    async fn save_broadcasts_a_changed_event_to_other_tabs() {
+        let canvas_path = write_test_canvas(TWO_POSITIONED);
+        let state = build_state(canvas_path.clone(), false, None)
+            .await
+            .expect("valid test canvas");
+        // Subscribed *before* the mutation, exactly like a real `/api/watch`
+        // connection that was already open when a sibling tab saved.
+        let mut change_rx = state.change_tx.subscribe();
+
+        if let Err(e) = clear_node_layout(State(state), Path("a".to_string())).await {
+            panic!("clear-layout failed: {}", e.1);
+        }
+
+        assert!(
+            change_rx.try_recv().is_ok(),
+            "a save from one client should broadcast `changed` so every other \
+             /api/watch-connected tab reloads too, not just the file-watcher's \
+             own external-change poll"
+        );
 
         let _ = std::fs::remove_file(&canvas_path);
     }

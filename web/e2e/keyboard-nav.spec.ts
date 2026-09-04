@@ -121,3 +121,25 @@ test("keys are ignored while the source editor is open", async ({ page }) => {
 
   await expect(page.locator('.mesh-node[data-focused="true"]')).toHaveCount(0);
 });
+
+// Regression test: unlike Source mode above (guarded by its own
+// `sourceMode` flag), a node's own body editor (NodeTextEditor) has no
+// equivalent App.tsx state — `isEditableTarget` is the *only* thing
+// standing between typing here and j/k/h/l firing as canvas navigation,
+// and it used to miss Monaco's EditContext-API input surface entirely
+// (see App.tsx's own comment on `isEditableTarget`).
+test("keys are ignored while a node's own body editor is open, and still reach the editor", async ({ page }) => {
+  await page.locator("button", { hasText: "Edit" }).click();
+  const root = page.locator('.react-flow__node[data-id="root"]');
+  await root.locator(".mesh-node-title").hover();
+  await root.locator('button[title="Edit this node\'s Markdown text"]').click();
+
+  const source = page.locator(".mesh-text-editor-source .monaco-editor");
+  await expect(source).toBeVisible();
+  await source.locator(".view-lines").click();
+
+  await page.keyboard.type("jkhl");
+
+  await expect(page.locator('.mesh-node[data-focused="true"]')).toHaveCount(0);
+  await expect(source).toContainText("jkhl");
+});

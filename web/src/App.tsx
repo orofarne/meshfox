@@ -2175,7 +2175,19 @@ export default function App() {
   useEffect(() => {
     function isEditableTarget(el: Element | null): boolean {
       if (!(el instanceof HTMLElement)) return false;
-      return el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable;
+      if (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable) return true;
+      // Monaco 0.53's real typing surface, when the browser supports the
+      // EditContext API (Chromium-based — VS Code's webview among them),
+      // is `.native-edit-context`, a plain `<div>` with neither of the
+      // checks above (see NodeTextEditor.tsx's own `nokey` comment for the
+      // same gap in React Flow's built-in key handling) — so j/k/h/l
+      // leaked through as canvas navigation while typing in either Monaco
+      // instance (the per-node body editor or the whole-document source
+      // editor) instead of being ignored like any other text input.
+      // `.monaco-editor` is Monaco's own stable root class regardless of
+      // which internal input strategy it picked, so this covers the
+      // EditContext div and its older textarea-based fallback alike.
+      return el.closest(".monaco-editor") !== null;
     }
     function onKeyDown(e: KeyboardEvent) {
       if (isEditableTarget(document.activeElement)) return;
