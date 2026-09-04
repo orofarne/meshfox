@@ -37,7 +37,7 @@ import type { CanvasDoc, CanvasNode } from "./types";
 import { findRoot, subtreeIds, visibleNodeIds } from "./tree";
 
 const H_GAP = 80;
-const V_GAP = 60;
+const V_GAP = 30; // 16;
 const GROUP_PADDING = 40;
 const GROUP_TITLE_SPACE = 40;
 /** A folded node's own box height, regardless of its real/measured content

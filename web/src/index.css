@@ -468,6 +468,7 @@ a {
 }
 
 .mesh-node {
+  position: relative;
   width: 100%;
   height: 100%;
   display: flex;
@@ -889,9 +890,25 @@ a {
   pointer-events: auto;
 }
 
-.mesh-node[data-suggested="true"]:not([data-type="group"]) {
-  border-style: dashed;
-  opacity: 0.9;
+/* A small filled top-left corner marks a node whose position/size come from
+ * real x/y saved in the file, rather than this session's own auto-layout
+ * guess (see App.tsx's `suggested`). Deliberately subtle and on the
+ * opposite state from the old dashed-border treatment this replaced: once a
+ * canvas is arranged, *most* nodes are authored, so flagging every
+ * unauthored one (dashed, on the common case) read as "something's wrong
+ * here" — a quiet corner on the less-common authored ones reads as a
+ * confirmation instead. */
+.mesh-node[data-suggested="false"]:not([data-type="group"])::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 0;
+  height: 0;
+  border-top: 10px solid var(--accent);
+  border-right: 10px solid transparent;
+  opacity: 0.55;
+  pointer-events: none;
 }
 
 /* Keyboard-nav focus (see App.tsx's `focusedNodeId`/MeshNode.tsx's
