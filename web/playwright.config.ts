@@ -38,6 +38,17 @@ const GROUP_DRAG_PORT = 4596;
 // Eighth server + port for group-enter.spec.ts — same reasoning again, its
 // own fixture (group-enter.canvas.md) and port.
 const GROUP_ENTER_PORT = 4597;
+// group-drag.spec.ts and group-enter.spec.ts each genuinely rewrite their
+// fixture on disk (unlike every read-only suite above, where the
+// chrome/firefox projects harmlessly share one server) — giving the
+// `firefox-group-drag`/`firefox-group-enter` projects their own port *and*
+// their own fixture copy (`group-drag-firefox.canvas.md`,
+// `group-enter-firefox.canvas.md` — see each one's own doc comment) keeps a
+// drag-and-persist write from one browser's run from racing a concurrent
+// read/write from the other's when both run in the same `playwright test`
+// invocation, exactly as every port above already does between suites.
+const GROUP_DRAG_FIREFOX_PORT = 4610;
+const GROUP_ENTER_FIREFOX_PORT = 4611;
 // Ninth server + port for document-options.spec.ts — same reasoning
 // again, its own fixture (document-options.canvas.md) and port, so its
 // own `PUT /api/options` writes never collide with any other suite's
@@ -176,12 +187,20 @@ export default defineConfig({
     {
       name: `${browser}-group-drag`,
       testMatch: /(^|\/)group-drag\.spec\.ts$/,
-      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${GROUP_DRAG_PORT}` },
+      use: {
+        ...device,
+        viewport: VIEWPORT,
+        baseURL: `http://127.0.0.1:${browser === "firefox" ? GROUP_DRAG_FIREFOX_PORT : GROUP_DRAG_PORT}`,
+      },
     },
     {
       name: `${browser}-group-enter`,
       testMatch: /(^|\/)group-enter\.spec\.ts$/,
-      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${GROUP_ENTER_PORT}` },
+      use: {
+        ...device,
+        viewport: VIEWPORT,
+        baseURL: `http://127.0.0.1:${browser === "firefox" ? GROUP_ENTER_FIREFOX_PORT : GROUP_ENTER_PORT}`,
+      },
     },
     {
       name: `${browser}-document-options`,
@@ -301,6 +320,18 @@ export default defineConfig({
     {
       command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view e2e/fixtures/group-enter.canvas.md --port ${GROUP_ENTER_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${GROUP_ENTER_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view e2e/fixtures/group-drag-firefox.canvas.md --port ${GROUP_DRAG_FIREFOX_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${GROUP_DRAG_FIREFOX_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view e2e/fixtures/group-enter-firefox.canvas.md --port ${GROUP_ENTER_FIREFOX_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${GROUP_ENTER_FIREFOX_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },

@@ -1,4 +1,5 @@
 import { test, expect, type Page, type Locator } from "@playwright/test";
+import { selectNode, toolbarButton } from "./helpers";
 
 // Drives web/e2e/fixtures/group-enter.canvas.md — a group's expand button
 // (see MeshNode.tsx) opens a mini sub-canvas of its own direct members
@@ -58,14 +59,13 @@ test("closing the panel via the backdrop hides it again", async ({ page }) => {
 test("dragging a member inside the mini canvas persists the same way as on the main canvas", async ({ page }) => {
   await page.getByRole("button", { name: "Edit" }).click();
   const frame = page.locator('.react-flow__node[data-id="frame"]');
-  // Edit mode's extra per-node action buttons (resize handles included)
-  // push member-one's own title bar close enough to frame's own that a
-  // coordinate-based click (even `force: true`, which only skips
-  // Playwright's own actionability checks, not the browser's native
-  // hit-testing at that screen position) can land on the member instead —
-  // invoke the DOM `click()` method directly on the right element, no
-  // screen coordinates involved.
-  await frame.locator(".mesh-node-expand-icon").evaluate((el: HTMLElement) => el.click());
+  // The expand icon now lives in a floating `NodeToolbar`, shown only once
+  // `frame` is selected and portaled out of its own DOM subtree entirely
+  // (see helpers.ts's own doc comments on `selectNode`/`toolbarButton`) —
+  // select it first, then reach the toolbar globally rather than scoped
+  // under `frame`.
+  await selectNode(frame);
+  await toolbarButton(page, "Open this group's members").click();
 
   const panel = page.locator(".mesh-expand-panel-group");
   const memberOne = panel.locator('.react-flow__node[data-id="member-one"]');

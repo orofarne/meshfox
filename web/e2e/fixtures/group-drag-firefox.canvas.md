@@ -15,6 +15,14 @@ CI (a fresh checkout every time), but running it locally leaves this
 fixture modified on disk; `git checkout` it back afterward if that
 matters to you.
 
+An exact duplicate of `group-drag.canvas.md`, on its own server/port
+(`playwright.config.ts`'s `GROUP_DRAG_FIREFOX_PORT`) for the `firefox-
+group-drag` project specifically — this suite genuinely rewrites its
+fixture on disk, and the `chrome-group-drag`/`firefox-group-drag`
+projects otherwise shared one server/file, so a real drag-and-persist
+write from one browser's run could race a concurrent read/write from the
+other's when both ran in the same `playwright test` invocation.
+
 ## Frame
 <!-- meshfox:node id="frame" type="group" x=2080 y=1144 -->
 
