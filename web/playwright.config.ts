@@ -94,6 +94,11 @@ const SEARCH_PORT = 4607;
 // other node on a shared canvas (confirmed directly) — see the fixture's
 // own doc comment.
 const SEARCH_PAN_PORT = 4608;
+// Twentieth server + port for autofit-title.spec.ts — same reasoning
+// again, its own fixture (autofit-title.canvas.md, header-only nodes with
+// an authored `width`/`height` — see `MeshNode.tsx`'s `useAutoFitTitleFontSize`)
+// and port.
+const AUTOFIT_TITLE_PORT = 4609;
 
 // Taller than Playwright's 720px default — the app's own `minZoom` (0.5)
 // is a hard floor on how far "fit view" can zoom out, and deps.canvas.md's
@@ -227,6 +232,11 @@ export default defineConfig({
       testMatch: /(^|\/)search-pan\.spec\.ts$/,
       use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${SEARCH_PAN_PORT}` },
     },
+    {
+      name: `${browser}-autofit-title`,
+      testMatch: /(^|\/)autofit-title\.spec\.ts$/,
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${AUTOFIT_TITLE_PORT}` },
+    },
   ]),
   webServer: [
     {
@@ -351,6 +361,12 @@ export default defineConfig({
     {
       command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view e2e/fixtures/search-pan.canvas.md --port ${SEARCH_PAN_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${SEARCH_PAN_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view e2e/fixtures/autofit-title.canvas.md --port ${AUTOFIT_TITLE_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${AUTOFIT_TITLE_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },

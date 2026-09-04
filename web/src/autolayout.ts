@@ -47,14 +47,6 @@ const GROUP_TITLE_SPACE = 40;
  * hidden subtree used to occupy, instead of leaving a gap the size of its
  * un-folded content. */
 export const FOLDED_HEIGHT = 44;
-/** Vertical gap either side of a folded node (see `gapBetween`) — much
- * tighter than `V_GAP`: a folded node's whole point is reading as one
- * compact row among others, and `V_GAP`'s spacing (sized for a stack of
- * full, expanded boxes) reads as an oversized, mostly-empty gap around
- * something this small. Two *expanded* siblings still get the full
- * `V_GAP` either way — only a gap actually touching a folded node
- * shrinks. */
-const FOLDED_V_GAP = 16;
 /** Direct children of root get only a small nudge right of it, reading
  * top-to-bottom like a document's title followed by its headings — mirrors
  * `layout.rs`'s `ROOT_CHILD_INDENT`. */
@@ -120,13 +112,6 @@ function widthForDepth(depth: number, viewportWidth: number): number {
   return depth <= 1 ? viewportWidth * WIDTH_RATIO_SHALLOW : viewportWidth * WIDTH_RATIO_DEEP;
 }
 
-/** The vertical gap to leave between two vertically-stacked siblings (or,
- * at the top level, between root and its first child) — `FOLDED_V_GAP`
- * if either one is folded, `V_GAP` only when both are fully expanded. */
-function gapBetween(prevId: string, nextId: string, folded: ReadonlySet<string>): number {
-  return folded.has(prevId) || folded.has(nextId) ? FOLDED_V_GAP : V_GAP;
-}
-
 /** A fresh layout for every currently-visible node in `canvas` (excluding
  * any folded node's descendants), keyed by node id — see the module doc
  * comment for the shape. */
@@ -167,13 +152,11 @@ export function computeAutoLayout({
   boxes.set(root.id, { x: 0, y: 0, ...rootSize });
 
   let yCursor = rootSize.height;
-  let prevSiblingId = root.id;
   for (const section of directChildren(view, root.id)) {
-    yCursor += gapBetween(prevSiblingId, section.id, folded);
+    yCursor += V_GAP;
     // `null`: root's own direct children are never inside a group (root
     // has no parent, so nothing above it could be one either).
     yCursor += placeRightward(view, section, ROOT_CHILD_INDENT, yCursor, 1, null, sizeFor, boxes, folded);
-    prevSiblingId = section.id;
   }
 
   layoutGroups(view, boxes, sizeFor);
@@ -262,9 +245,8 @@ function placeRightward(
   let span = 0;
   children.forEach((child, i) => {
     if (i > 0) {
-      const gap = gapBetween(children[i - 1].id, child.id, folded);
-      cursor += gap;
-      span += gap;
+      cursor += V_GAP;
+      span += V_GAP;
     }
     const childH = placeRightward(canvas, child, childX, cursor, depth + 1, childGroupOrigin, sizeFor, boxes, folded);
     cursor += childH;

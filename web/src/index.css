@@ -595,12 +595,55 @@ a {
  * properties from here rather than repeating them. */
 .mesh-node-title-centered {
   flex: 1;
+  /* A flex item's default `min-height: auto` refuses to shrink below its
+   * own content's min-content size — harmless for an auto-sized node
+   * (there's nothing above it fighting for the same space), but for a
+   * `fixedSize` one it means this element's own `clientHeight` isn't
+   * actually clamped to its fixed share of the box at all: it grows right
+   * along with however tall the title currently renders, the same
+   * fixed-height escape hatch `.mesh-node-body`/`.mesh-file-code-preview`
+   * already both need for their own `overflow: auto` to mean anything
+   * (see their own `min-height: 0` — same reasoning, same fix). Confirmed
+   * directly: without this, `useAutoFitTitleFontSize`'s own overflow
+   * check (`scrollHeight` vs `clientHeight`) never settles — `clientHeight`
+   * itself was tracking the very content the check was trying to measure
+   * against a fixed ceiling. */
+  min-height: 0;
   border-bottom: none;
   justify-content: center;
   text-align: center;
   white-space: normal;
   font-size: 1rem;
   user-select: text;
+}
+
+/* Only a `fixedSize` node (MeshNode.tsx's `data-autofit`, driven by
+ * `useAutoFitTitleFontSize`) gets a scrollbar here — a node autolayout is
+ * still sizing itself just grows to fit its title instead, so `overflow:
+ * hidden` (the plain `.mesh-node` rule) staying the only word there is
+ * fine; this only ever matters once the title has already been shrunk to
+ * `MIN_AUTOFIT_TITLE_PX` and still doesn't fit — the same "scroll rather
+ * than clip" fallback a node with real body content already gets from
+ * `.mesh-node-body { overflow: auto }`. */
+.mesh-node-title-centered[data-autofit] {
+  overflow-y: auto;
+}
+
+/* Set only once shrinking has already hit `MIN_AUTOFIT_TITLE_PX` and the
+ * title *still* doesn't fit (MeshNode.tsx's `data-overflowing`) — `align-
+ * items: center` (inherited from the plain `.mesh-node-title` rule both
+ * classes share) is exactly what makes the centered layout read as
+ * Miro/Obsidian-style when a title *does* fit, but centering something
+ * *taller than its own scroll container* pushes half the overflow above
+ * the container's own top edge — into negative scroll territory no wheel
+ * gesture can ever reach (there's no such thing as `scrollTop: -12`), so
+ * the top of a too-long title was both visibly clipped *and*
+ * permanently unreachable, wheel scroll included (confirmed directly).
+ * `flex-start` here means the overflow is ordinary, always-reachable
+ * *bottom* overflow instead — the same direction `overflow-y: auto`
+ * already handles correctly everywhere else in this app. */
+.mesh-node-title-centered[data-overflowing] {
+  align-items: flex-start;
 }
 
 /* A node's own aggregate constraint pass/fail pill (see MeshNode.tsx's
@@ -674,13 +717,23 @@ a {
   content: "✗";
 }
 
-/* Icon buttons (edit text, open settings) — edit mode only, sit together
- * in the title bar next to the (possibly truncated) title text rather than
- * floating over the node body. */
-.mesh-node-title-actions {
-  flex-shrink: 0;
+/* Every action button, edit mode only, floating in its own small panel
+ * above the node instead of crowding its title bar — see MeshNode.tsx's
+ * `NodeToolbar` usage. `nodrag`/`nopan` (also on the wrapping `<div>` in
+ * MeshNode.tsx) keep a click/drag here from panning the canvas or being
+ * misread as a node drag, same reason every button inside it already
+ * carries `nodrag` individually — `NodeToolbar` portals this out of the
+ * node's own DOM subtree, so it isn't automatically covered by whatever
+ * opt-outs the node itself has. */
+.mesh-node-toolbar {
   display: flex;
+  align-items: center;
   gap: 0.3rem;
+  padding: 0.3rem;
+  border-radius: 8px;
+  border: 1px solid var(--node-border);
+  background: var(--node-bg);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
 }
 
 .mesh-node-icon-button {

@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Handle, NodeResizer, NodeToolbar, Position, useReactFlow, type NodeProps } from "@xyflow/react";
 import ReactMarkdown, { defaultUrlTransform, type Components, type UrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -238,6 +238,38 @@ export interface MeshNodeData {
    * shrink against. Undefined for anything that isn't a capped auto node
    * (root/depth-1, or any node with a real, authored height). */
   maxHeight?: number;
+  /** Both `width` and `height` are real, authored values (`n.width !==
+   * undefined && n.height !== undefined` in App.tsx — never true for a
+   * `group`, whose box is always derived) — a box the user picked on
+   * purpose, as opposed to autolayout's own tier-based/measured guess.
+   * Drives the header-only title's own auto-shrink-to-fit (see
+   * `useAutoFitTitleFontSize`, TODO.canvas.md's "Автоскейл текста, если у
+   * ноды есть фиксированный размер") — a node autolayout is still sizing
+   * itself keeps growing to fit its content instead, so there's nothing
+   * for auto-fit to do there. */
+  fixedSize: boolean;
+  /** `n.height` itself, but only when `fixedSize` is true (`undefined`
+   * otherwise) — applied directly as this component's own root `style`
+   * (see its render site) rather than relying on React Flow's own
+   * `height` node prop to keep the box that size: `@xyflow/system`'s
+   * `getNodeDimensions` resolves a node's dimensions as `node.measured ??
+   * node.height ?? ...` — *measured* wins once `ResizeObserver` has ever
+   * fired (which is almost immediately, for every node), so a `height`
+   * only ever actually constrains the very first frame, before its own
+   * real content has had a chance to grow the box past it. Confirmed
+   * directly (a plain body-text node with `h=160` authored, content
+   * clearly taller than that): rendered at 225px, the wrapper's own
+   * inline `style` never getting a `height` at all, only `width` — width
+   * doesn't suffer the same fate since nothing here ever measures wider
+   * than a definite given width to begin with (text reflows to fit,
+   * rather than pushing the box wider), so only height needed this.
+   * Setting it here, directly, sidesteps React Flow's own measurement
+   * bookkeeping entirely for the one thing that actually paints the box:
+   * content taller than this now scrolls (`.mesh-node-body`'s own
+   * `overflow: auto`, or `.mesh-node-title-centered`'s `overflow-y: auto`
+   * for a title-only node — see `useAutoFitTitleFontSize`) instead of
+   * silently growing past the size the file actually authored. */
+  fixedHeight?: number;
   /** Read-only by default — dragging, resizing, and saving layout are
    * gated on this until the user clicks "Edit". Running blocks is always
    * allowed; this only controls whether a run persists its output. */
@@ -457,6 +489,207 @@ export interface MeshNodeData {
 // node's title text and still count as a click-to-toggle-fold rather than
 // the start of a text-selection drag (see `MeshNode`'s `handleTitleClick`).
 const TITLE_CLICK_MOVE_THRESHOLD = 5;
+
+/** Never shrinks a header-only title past this, no matter how little of it
+ * would otherwise fit (see `useAutoFitTitleFontSize`) — past this point
+ * `.mesh-node-title-centered`'s own `overflow-y: auto` (index.css) takes
+ * over instead, same fallback a node with real body content already gets
+ * for its own overflow, rather than shrinking text down to unreadable. */
+const MIN_AUTOFIT_TITLE_PX = 10;
+/** Binary-search iterations for `useAutoFitTitleFontSize` — each halves
+ * the remaining search range, so this many reliably lands within a
+ * fraction of a px of the largest size that still fits, for a handful of
+ * reflows total rather than one per whole-px step from the CSS default
+ * down to `MIN_AUTOFIT_TITLE_PX`. */
+const AUTOFIT_BINARY_SEARCH_STEPS = 6;
+
+/** A single offscreen clone, shared and reused across every node's own
+ * `useAutoFitTitleFontSize` call (created lazily, on first use) — binary-
+ * searching against a scratch element nobody else ever looks at, rather
+ * than the real, rendered, *observed* one, is what makes this immune to
+ * the self-triggering feedback loop an earlier, live-DOM-mutating version
+ * of this hook had: that version mutated `ref.current.style.fontSize`
+ * directly to probe each candidate size, on the very element a
+ * `ResizeObserver` (needed to catch a live resize/autolayout width
+ * change) was watching — every probe (and even this function's own final
+ * "reset to computed" step) looked like a fresh resize to react to,
+ * retriggering the search before React ever got to actually commit the
+ * previous call's result. Confirmed directly, repeatedly, across several
+ * attempted fixes to that version (clearing state before re-reading the
+ * CSS default, observing the parent instead of the element itself): the
+ * title still intermittently stuck at the unshrunk default despite
+ * genuinely overflowing. Probing a scratch element nothing observes
+ * can't retrigger anything, no matter how many candidate sizes it's
+ * mutated through. */
+let autofitMeasureEl: HTMLDivElement | null = null;
+function getAutofitMeasureEl(): HTMLDivElement {
+  if (!autofitMeasureEl) {
+    autofitMeasureEl = document.createElement("div");
+    // Shares the real title's own class so its *un-overridden* font-size
+    // resolves through the exact same CSS rule (`1rem`) — the only
+    // reliable way to read back "the true default" later (see its use
+    // in `recompute` below): this element's `style.fontSize` is cleared
+    // and re-read fresh every single call, so unlike `el`'s own computed
+    // style (which can already hold a *previous* shrink result by then),
+    // it can never end up reading its own last answer back as if it
+    // were the default.
+    autofitMeasureEl.className = "mesh-node-title-centered";
+    const s = autofitMeasureEl.style;
+    s.position = "fixed";
+    s.top = "-9999px";
+    s.left = "-9999px";
+    s.visibility = "hidden";
+    s.pointerEvents = "none";
+    s.boxSizing = "border-box";
+    s.whiteSpace = "normal";
+    document.body.appendChild(autofitMeasureEl);
+  }
+  return autofitMeasureEl;
+}
+
+/**
+ * Shrinks a header-only node's own title just enough to fit inside its
+ * box without overflowing vertically — Miro/Obsidian-style, and only ever
+ * called with `enabled` true for a node with an explicit, authored
+ * `width`/`height` (see `MeshNodeData.fixedSize`); every other node keeps
+ * the CSS default (`.mesh-node-title-centered`'s `1rem`) and just wraps
+ * normally, since autolayout is still free to grow its box to fit
+ * whatever the title needs.
+ *
+ * `ref` should point at `.mesh-node-title-centered` itself — its
+ * `clientHeight` (a real, authored `height` resolves this to a definite
+ * pixel value — this is the only child in a title-only node's layout) is
+ * read *once* per pass as the target to fit within; the actual search
+ * happens against `getAutofitMeasureEl()`'s own `scrollHeight` instead of
+ * this element's (see that function's own comment for why), cloning just
+ * the handful of properties that affect wrapping/height (font, padding,
+ * width) rather than the element itself.
+ *
+ * Binary search (a handful of reflows on the scratch element to converge,
+ * rather than one per whole-px step down from the default) rather than a
+ * linear decrement. The final chosen size is handed back as state so it
+ * flows through React's own render (a plain `style` prop) like anything
+ * else.
+ *
+ * Re-runs on `text` changing (a different title can need a different
+ * size) and, via `ResizeObserver` on `ref.current` itself — safe here
+ * precisely because this hook no longer mutates that element while
+ * searching — whenever the box's own real rendered size changes (a
+ * resize, or autolayout recomputing width): neither is a prop this hook
+ * could otherwise depend on to know to re-measure, since the box's actual
+ * pixel size is React Flow's own layout output, not state this component
+ * owns.
+ */
+interface AutoFitTitleResult {
+  fontSize: number | undefined;
+  /** True only once shrinking all the way to `MIN_AUTOFIT_TITLE_PX` still
+   * doesn't fit — see the render site's own `data-overflowing`: a title
+   * this long needs `align-items: flex-start` instead of the usual
+   * centered layout, or the overflowing lines end up unreachable (see
+   * that CSS rule's own comment for why). */
+  overflowing: boolean;
+}
+
+function useAutoFitTitleFontSize(
+  ref: React.RefObject<HTMLElement | null>,
+  enabled: boolean,
+  text: string,
+): AutoFitTitleResult {
+  const [fontSize, setFontSize] = useState<number | undefined>(undefined);
+  const [overflowing, setOverflowing] = useState(false);
+
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!enabled || !el) {
+      setFontSize(undefined);
+      setOverflowing(false);
+      return;
+    }
+
+    const recompute = () => {
+      const targetHeight = el.clientHeight;
+      const cs = getComputedStyle(el);
+      const measure = getAutofitMeasureEl();
+      measure.style.width = `${el.clientWidth}px`;
+      measure.style.padding = cs.padding;
+      measure.style.fontFamily = cs.fontFamily;
+      measure.style.fontWeight = cs.fontWeight;
+      measure.style.fontStyle = cs.fontStyle;
+      measure.style.letterSpacing = cs.letterSpacing;
+      measure.style.lineHeight = cs.lineHeight;
+      measure.textContent = text;
+      // The "default" (un-shrunk) size has to come from `measure`'s own
+      // computed style (via its shared `mesh-node-title-centered` class —
+      // see `getAutofitMeasureEl`), cleared first, *not* from `el`'s: `el`
+      // is the real, rendered title, and its actual inline `font-size` is
+      // this very hook's own `fontSize` state once any render has ever
+      // applied a shrink — reading `el`'s computed style for "the
+      // default" on a *later* pass silently read back its own last
+      // result instead, and if that shrunk size happened to fit (which of
+      // course it did — it was the answer), concluded "the default
+      // fits" and dropped the override entirely, snapping back to the
+      // real CSS default, which is exactly the size that doesn't fit,
+      // undoing the shrink outright (confirmed directly via the
+      // sequence of measurements this raced against: default misread as
+      // 13.09px — the previous shrink result — right after it had
+      // already been correctly identified as not fitting at the real
+      // 16px default one pass earlier). `measure`'s own font-size is
+      // never touched by anything but this hook, and always cleared
+      // before being read, so it can't suffer the same corruption.
+      measure.style.fontSize = "";
+      const defaultPx = parseFloat(getComputedStyle(measure).fontSize);
+      const fits = (px: number) => {
+        measure.style.fontSize = `${px}px`;
+        return measure.scrollHeight <= targetHeight + 0.5;
+      };
+      if (fits(defaultPx)) {
+        setFontSize(undefined);
+        setOverflowing(false);
+        return;
+      }
+      if (!fits(MIN_AUTOFIT_TITLE_PX)) {
+        setFontSize(MIN_AUTOFIT_TITLE_PX);
+        setOverflowing(true);
+        return;
+      }
+      let lo = MIN_AUTOFIT_TITLE_PX;
+      let hi = defaultPx;
+      for (let i = 0; i < AUTOFIT_BINARY_SEARCH_STEPS; i++) {
+        const mid = (lo + hi) / 2;
+        if (fits(mid)) lo = mid;
+        else hi = mid;
+      }
+      setFontSize(lo);
+      setOverflowing(false);
+    };
+
+    recompute();
+    const observer = new ResizeObserver(recompute);
+    observer.observe(el);
+    // A web font (e.g. Fira Code — see index.css) can still be loading at
+    // the moment `recompute()` above first runs, so that very first
+    // measurement can land against a fallback font's own metrics instead
+    // — often narrower/shorter, so a title that "fit" against the
+    // fallback silently doesn't once the real font swaps in, and nothing
+    // about that swap resizes `el` either, so the `ResizeObserver` above
+    // never catches it on its own. One more pass once every font this
+    // document uses is actually loaded and rendered closes that gap;
+    // `cancelled` guards against a stale recompute landing after this
+    // effect's own deps already moved on (a fast-changing title, or the
+    // node's own `fixedSize` flag flipping) and fighting whatever the
+    // newer instance already decided.
+    let cancelled = false;
+    document.fonts.ready.then(() => {
+      if (!cancelled) recompute();
+    });
+    return () => {
+      cancelled = true;
+      observer.disconnect();
+    };
+  }, [ref, enabled, text]);
+
+  return { fontSize, overflowing };
+}
 
 function FoldToggle({
   folded,
@@ -1907,13 +2140,42 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
   }, [data.autoOpenTextEditor]);
   const nodeColor = resolveNodeColor(data.effectiveColor ?? data.color);
   // A heading-only node (no body Markdown at all) has nothing to show in
-  // its body area — while read-only, that's just dead space under a
-  // left-aligned title, so it gets a distinct, centered-title layout
-  // instead. Edit mode keeps the normal title bar regardless (still needs
-  // its own row for the edit/settings/delete buttons, and staying put
-  // avoids the layout jumping under the cursor mid-edit the moment the
-  // first character is typed).
-  const isTitleOnly = !data.editMode && isTextNode && data.text.trim() === "";
+  // its body area — that's just dead space under a left-aligned title, so
+  // it gets a distinct, centered-title layout instead, in edit mode too:
+  // now that every edit action lives in the floating `NodeToolbar` above
+  // (see its own comment) rather than inline in the title bar, there's no
+  // longer a reason for edit mode to need the extra row this layout
+  // doesn't have — matching view mode exactly means what you see while
+  // editing is what you'll actually get once you leave edit mode, not a
+  // different, wider box that shrinks the moment you're done.
+  const isTitleOnly = isTextNode && data.text.trim() === "";
+  const titleOnlyRef = useRef<HTMLDivElement | null>(null);
+  const { fontSize: autoFitTitlePx, overflowing: autoFitOverflowing } = useAutoFitTitleFontSize(
+    titleOnlyRef,
+    isTitleOnly && data.fixedSize,
+    data.title,
+  );
+  // Same `stopWheelIfScrollable` opt-out `.mesh-node-body`/`FileCodePreview`
+  // already need (see that hook's own doc comment) — without it, a wheel
+  // over an overflowing (`data-overflowing`) title fell through to React
+  // Flow's own zoom-on-scroll instead of scrolling the title itself, since
+  // `overflow-y: auto` alone doesn't opt out of the canvas's pane-level
+  // native listener. Combined with `titleOnlyRef` (a plain object ref, for
+  // this component's own `scrollHeight`/`clientHeight` reads above) via one
+  // callback ref, since a DOM element only has one `ref` prop to give.
+  const titleWheelRef = useStopWheelIfScrollable<HTMLDivElement>();
+  const setTitleOnlyRef = useCallback(
+    (node: HTMLDivElement | null) => {
+      titleOnlyRef.current = node;
+      // `titleWheelRef` (React 19's callback-ref cleanup convention —
+      // see `useStopWheelIfScrollable`'s own doc comment) returns a
+      // function that removes the listener it just added; propagated
+      // here as *this* combined ref's own cleanup, or React would have
+      // no way to know to call it and the listener would just leak.
+      return titleWheelRef(node);
+    },
+    [titleWheelRef],
+  );
 
   // The title bar's "▷ run" quick-run button: for a `text` node, its one
   // unambiguous default block (explicit `default` flag or self-named, same
@@ -2043,12 +2305,13 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
       style={{
         ...(nodeColor ? { borderColor: nodeColor, boxShadow: `inset 4px 0 0 ${nodeColor}` } : undefined),
         ...(data.maxHeight !== undefined ? { maxHeight: data.maxHeight } : undefined),
+        ...(data.fixedHeight !== undefined ? { height: data.fixedHeight } : undefined),
       }}
     >
       {data.nodeType !== "group" && (
         <NodeResizer
-          minWidth={220}
-          minHeight={120}
+          minWidth={100}
+          minHeight={100}
           color="var(--accent)"
           isVisible={data.editMode && selected}
         />
@@ -2083,7 +2346,14 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
       <Handle type="source" id="source-top" position={Position.Top} className="mesh-handle-routing" />
       <Handle type="source" id="source-bottom" position={Position.Bottom} className="mesh-handle-routing" />
       {isTitleOnly ? (
-        <div className="mesh-node-title mesh-node-title-centered nopan" data-level={data.level}>
+        <div
+          ref={setTitleOnlyRef}
+          className="mesh-node-title mesh-node-title-centered nopan"
+          data-level={data.level}
+          data-autofit={data.fixedSize || undefined}
+          data-overflowing={autoFitOverflowing || undefined}
+          style={autoFitTitlePx !== undefined ? { fontSize: `${autoFitTitlePx}px` } : undefined}
+        >
           {/* `FoldToggle` only if there's a subtree to fold: an
            * empty-bodied text node's own row is this exact compact
            * single-line layout whether folded or not (its body was never
@@ -2129,6 +2399,90 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
           {nodeRunning && <RunningSpinner />}
           {!nodeRunning && nodeFailed && <FailedBadge />}
           <ConstraintBadge status={constraintStatus} />
+          {/* Read-only: these stay right in the title bar, same as always
+           * — nothing here competes with `NodeResizer`'s own handles (only
+           * shown in edit mode), so there's no small-node crowding to
+           * solve outside edit mode. In edit mode, every one of these
+           * (this group and the action buttons below) moves into the
+           * `NodeToolbar` further down instead — see its own comment for
+           * why. */}
+          {!data.editMode && quickRunBlockName && (
+            <button
+              type="button"
+              className="mesh-node-icon-button mesh-node-quick-run-icon nodrag"
+              disabled={quickRunBusy}
+              onClick={() =>
+                quickRunIsTty
+                  ? data.onRunTty(quickRunBlockName, true, quickRunAutoclose)
+                  : data.onRun(quickRunBlockName, true)
+              }
+              title={
+                quickRunBusy
+                  ? "running…"
+                  : quickRunIsTty
+                    ? `runs its dependency chain first, then opens an interactive terminal for ${quickRunBlockName}`
+                    : `⛓ runs its dependency chain first, then ${quickRunBlockName}`
+              }
+            >
+              ▷
+            </button>
+          )}
+          {!data.editMode && canOpenFile && (
+            <button
+              type="button"
+              className="mesh-node-icon-button nodrag"
+              onClick={data.onOpenFile}
+              title="Open this file in the default application"
+            >
+              ↗
+            </button>
+          )}
+          {!data.editMode && canOpenLink && (
+            <a
+              href={data.target}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="mesh-node-icon-button mesh-node-inline-icon nodrag"
+              title="Open this link in a new tab"
+            >
+              ↗
+            </a>
+          )}
+          {/* Always the rightmost icon, read-only mode only (see above) —
+           * for a group, this opens a mini sub-canvas of its own members
+           * instead of a body panel (a group's own body is always empty) —
+           * see NodeExpandPanel.tsx. */}
+          {!data.editMode && (
+            <button
+              type="button"
+              className="mesh-node-icon-button mesh-node-expand-icon nodrag"
+              onClick={data.onExpand}
+              title={
+                isGroup ? "Open this group's members in their own view" : "Expand this node into a floating window"
+              }
+            >
+              ⛶
+            </button>
+          )}
+        </div>
+      )}
+      {/* Every action button, edit mode only, in one floating toolbar
+       * above the node instead of crammed into its own title bar (see
+       * TODO.canvas.md's own note on this) — a small `fixedSize` node
+       * (see MeshNodeData.fixedSize) especially couldn't fit them all
+       * without the row itself either wrapping past its own fixed height
+       * or overlapping `NodeResizer`'s corner/edge handles just below it,
+       * and either way the title text underneath them was the first thing
+       * to get squeezed out or hidden entirely. `isVisible={selected}`
+       * (not React Flow's own default — "visible whenever this is the
+       * only selected node" — which would already match, but doing it
+       * explicitly keeps this in sync with the `editMode` condition this
+       * whole block is already gated on) — appearing only once a node is
+       * actually clicked keeps a canvas full of nodes from filling up with
+       * floating toolbars the instant Edit mode turns on. */}
+      {data.editMode && (
+        <NodeToolbar nodeId={id} isVisible={selected} position={Position.Top} align="center" offset={8}>
+          <div className="mesh-node-toolbar nodrag nopan">
           {quickRunBlockName && (
             <button
               type="button"
@@ -2171,96 +2525,84 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
               ↗
             </a>
           )}
-          {data.editMode && (
-            <span className="mesh-node-title-actions">
-              {isTextNode &&
-                (data.plainMarkdownInclude ? (
-                  <button
-                    type="button"
-                    className="mesh-node-icon-button nodrag"
-                    onClick={() => data.onOpenSourceMode(id)}
-                    title="This content comes from an included file — edit it in Source mode"
-                  >
-                    ⇥
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    className="mesh-node-icon-button nodrag"
-                    onClick={() => setEditingText(true)}
-                    title="Edit this node's Markdown text"
-                  >
-                    ✏
-                  </button>
-                ))}
-              {isGroup && (
-                <button
-                  type="button"
-                  className="mesh-node-icon-button nodrag"
-                  onClick={data.onAddChild}
-                  title="Add a child node to this group"
-                >
-                  +
-                </button>
-              )}
-              {data.onMoveUp && (
-                <button
-                  type="button"
-                  className="mesh-node-icon-button mesh-node-move-up nodrag"
-                  onClick={data.onMoveUp}
-                  title="Move this node before its previous sibling"
-                >
-                  ↑
-                </button>
-              )}
-              {data.onMoveDown && (
-                <button
-                  type="button"
-                  className="mesh-node-icon-button mesh-node-move-down nodrag"
-                  onClick={data.onMoveDown}
-                  title="Move this node after its next sibling"
-                >
-                  ↓
-                </button>
-              )}
-              {data.onClearLayout && (
-                <button
-                  type="button"
-                  className="mesh-node-icon-button mesh-node-clear-layout nodrag"
-                  onClick={data.onClearLayout}
-                  title="Reset to auto-layout (clears this node's saved position/size)"
-                >
-                  ↺
-                </button>
-              )}
+          {isTextNode &&
+            (data.plainMarkdownInclude ? (
               <button
                 type="button"
                 className="mesh-node-icon-button nodrag"
-                onClick={data.onOpenSettings}
-                title="Edit node settings (title, type, color, tags, target, edges)"
+                onClick={() => data.onOpenSourceMode(id)}
+                title="This content comes from an included file — edit it in Source mode"
               >
-                ⚙
+                ⇥
               </button>
-              {data.canDelete && (
-                <button
-                  type="button"
-                  className="mesh-node-icon-button mesh-node-delete-icon nodrag"
-                  onClick={data.onRequestDelete}
-                  title="Delete this node"
-                >
-                  🗑
-                </button>
-              )}
-            </span>
+            ) : (
+              <button
+                type="button"
+                className="mesh-node-icon-button nodrag"
+                onClick={() => setEditingText(true)}
+                title="Edit this node's Markdown text"
+              >
+                ✏
+              </button>
+            ))}
+          {isGroup && (
+            <button
+              type="button"
+              className="mesh-node-icon-button nodrag"
+              onClick={data.onAddChild}
+              title="Add a child node to this group"
+            >
+              +
+            </button>
           )}
-          {/* Always the rightmost icon, editMode's own action group
-           * included — a node's icon set varies (run/open only show up
-           * for some node types, editMode adds a whole extra group), and
-           * keeping expand pinned last means its position doesn't shift
-           * depending on which of the others happen to be present. For a
-           * group, this opens a mini sub-canvas of its own members instead
-           * of a body panel (a group's own body is always empty) — see
-           * NodeExpandPanel.tsx. */}
+          {data.onMoveUp && (
+            <button
+              type="button"
+              className="mesh-node-icon-button mesh-node-move-up nodrag"
+              onClick={data.onMoveUp}
+              title="Move this node before its previous sibling"
+            >
+              ↑
+            </button>
+          )}
+          {data.onMoveDown && (
+            <button
+              type="button"
+              className="mesh-node-icon-button mesh-node-move-down nodrag"
+              onClick={data.onMoveDown}
+              title="Move this node after its next sibling"
+            >
+              ↓
+            </button>
+          )}
+          {data.onClearLayout && (
+            <button
+              type="button"
+              className="mesh-node-icon-button mesh-node-clear-layout nodrag"
+              onClick={data.onClearLayout}
+              title="Reset to auto-layout (clears this node's saved position/size)"
+            >
+              ↺
+            </button>
+          )}
+          <button
+            type="button"
+            className="mesh-node-icon-button nodrag"
+            onClick={data.onOpenSettings}
+            title="Edit node settings (title, type, color, tags, target, edges)"
+          >
+            ⚙
+          </button>
+          {data.canDelete && (
+            <button
+              type="button"
+              className="mesh-node-icon-button mesh-node-delete-icon nodrag"
+              onClick={data.onRequestDelete}
+              title="Delete this node"
+            >
+              🗑
+            </button>
+          )}
           <button
             type="button"
             className="mesh-node-icon-button mesh-node-expand-icon nodrag"
@@ -2269,7 +2611,8 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
           >
             ⛶
           </button>
-        </div>
+          </div>
+        </NodeToolbar>
       )}
       {/* A node's counterpart to the settings gear, but kept as a floating
        * circle just outside the node's own right edge (rather than inline

@@ -1460,6 +1460,15 @@ export default function App() {
         // `maxHeight` doc comment on `MeshNodeData` in MeshNode.tsx).
         const height = isGroup ? box?.height : isFolded ? FOLDED_HEIGHT : n.height;
         const maxHeight = !isGroup && !isFolded && n.height === undefined ? box?.maxHeight : undefined;
+        // Both dimensions authored on purpose — a group's box is always
+        // derived from its members, and a folded node's own compact box
+        // is `FOLDED_HEIGHT` regardless of what it's authored (see
+        // `height` above) — excluded here for the same reason, so a
+        // folded node with a real `h=` doesn't fight its own fold state
+        // once unfolded/refolded. See `MeshNodeData.fixedSize`'s own doc
+        // comment.
+        const fixedSize = !isGroup && !isFolded && n.width !== undefined && n.height !== undefined;
+        const fixedHeight = fixedSize ? n.height : undefined;
         const style: CSSProperties | undefined = isGroup ? { pointerEvents: "none" } : undefined;
         return {
           id: n.id,
@@ -1505,6 +1514,8 @@ export default function App() {
             nodeType: n.type ?? "text",
             suggested,
             maxHeight,
+            fixedSize,
+            fixedHeight,
             editMode,
             liveBlocks: {},
             folded: isFolded,
@@ -1804,7 +1815,25 @@ export default function App() {
     setNodes((prev) =>
       prev.map((n) => {
         const isFolded = foldedNodeIds.has(n.id);
-        if (n.data.suggested) {
+        // `touchedNodeIds` (set the instant a drag/resize gesture starts —
+        // see `onNodesChangeAndMark`) excluded here for the same reason
+        // `handleSaveLayout`'s own node filter already does (further
+        // down): this effect's own trigger, `measuredSignature`, reacts to
+        // ANY `n.measured.height` change — including the ones React Flow's
+        // own `NodeResizer` fires continuously *while the user is actively
+        // dragging its handle*, well before the drag ends and
+        // `handleSaveLayout` gets a chance to persist real `x`/`y`/`width`/
+        // `height` into `canvas.nodes` (only that write flips
+        // `data.suggested` false, so it alone still reads `true` for the
+        // drag's entire duration). Without this, resizing a brand-new,
+        // still-`suggested` node fought this effect on every single frame:
+        // it kept snapping the box back to autolayout's own computed
+        // size/position mid-drag, undoing whatever the user had just
+        // dragged to — confirmed directly (a fresh node's first-ever
+        // resize visibly jittered/fought the cursor; a *second* resize,
+        // once a real width/height had actually persisted from the first,
+        // was smooth, since `data.suggested` was `false` for it by then).
+        if (n.data.suggested && !touchedNodeIds.current.has(n.id)) {
           const box = boxes.get(n.id);
           const canvasNode = byId.get(n.id);
           if (!box || !canvasNode) return n;
