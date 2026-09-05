@@ -508,6 +508,19 @@ a {
   border-bottom: 1px solid var(--node-border);
 }
 
+/* A folded node (MeshNode.tsx: `{isTitleOnly || data.folded ? null : ...}`)
+ * renders no body/children row below this title at all — this title's own
+ * `border-bottom` above then has nothing left to separate from and sits
+ * flush against `.mesh-node`'s own outer border instead, reading as a
+ * doubled line along the bottom edge. `.mesh-node-title-centered` (the
+ * empty-body case) already strips its own border-bottom for the same
+ * reason; this covers the other case that reaches the same empty-clip
+ * state — a node WITH real body/children content that's just currently
+ * folded shut. */
+.mesh-node[data-folded="true"] .mesh-node-title {
+  border-bottom: none;
+}
+
 .mesh-node-title-text {
   min-width: 0;
   flex: 1;
@@ -889,12 +902,24 @@ a {
 .mesh-node-add-child {
   width: 20px;
   height: 20px;
-  line-height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   padding: 0;
   border-radius: 50%;
   border: 1px solid var(--accent);
   background: var(--node-bg);
   color: var(--accent);
+  /* Buttons don't inherit the page's own font by default (the browser's
+   * UI font wins instead — every other button in this file opts back out
+   * of that with its own `font: inherit`/`font-family: inherit`, see e.g.
+   * `.mesh-node-open-link`). Missing here, the "+" glyph rendered in the
+   * platform UI font instead of the app's own — that font's metrics don't
+   * center the same way `line-height`-based centering assumed, so the
+   * glyph sat visibly off-center. Flex-centering here instead of relying
+   * on `line-height` is the more robust fix regardless of which font ends
+   * up applying. */
+  font: inherit;
   font-size: 0.9rem;
   font-weight: 600;
   cursor: pointer;
