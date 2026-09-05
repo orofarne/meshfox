@@ -1332,12 +1332,20 @@ struct CreateNodeRequest {
 }
 
 /// Adds a new, empty-bodied child heading node under `parentId`, as the
-/// last item in its existing subtree (see `mdcanvas::insert_child_node`).
-/// Deliberately doesn't set a position — the web client's own auto-layout
-/// places it using the same tree-aware default any other position-less
-/// node gets, which for a fresh child means "to the right of its parent",
-/// exactly what the UI's "add child" button wants without any extra
-/// placement logic here.
+/// last item in its existing subtree (see
+/// `mdcanvas::insert_child_node_random_id`). Deliberately doesn't set a
+/// position — the web client's own auto-layout places it using the same
+/// tree-aware default any other position-less node gets, which for a fresh
+/// child means "to the right of its parent", exactly what the UI's "add
+/// child" button wants without any extra placement logic here.
+///
+/// Uses `insert_child_node_random_id`, not the plain title-slug
+/// `insert_child_node` CLI/MCP `node add` uses — the web UI's "add child"
+/// button no longer opens a settings dialog first (TODO.canvas.md:
+/// "Позволить редактировать заголовок прямо на канвасе"), so `req.title`
+/// here is only ever the placeholder the client is about to let the user
+/// overwrite inline, never a real title worth deriving an id from (see
+/// TODO.canvas.md: "Id-хэши вместо new-node-X по умолчанию").
 async fn create_node(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateNodeRequest>,
@@ -1348,15 +1356,17 @@ async fn create_node(
     // it first so the new node is actually written into the file the
     // parent lives in, same as editing an existing node there already is.
     let located = locate_node(&state, &primary_raw, &req.parent_id)?;
-    let (updated, _new_id) =
-        mdcanvas::insert_child_node(&located.raw, &located.local_id, &req.title).ok_or_else(
-            || {
-                ApiError(
-                    StatusCode::NOT_FOUND,
-                    format!("no node {:?}", req.parent_id),
-                )
-            },
-        )?;
+    let (updated, _new_id) = mdcanvas::insert_child_node_random_id(
+        &located.raw,
+        &located.local_id,
+        &req.title,
+    )
+    .ok_or_else(|| {
+        ApiError(
+            StatusCode::NOT_FOUND,
+            format!("no node {:?}", req.parent_id),
+        )
+    })?;
     // Insertion can't actually break parsing, but validate anyway — same
     // validate-before-commit shape every other mutating endpoint here uses.
     parse_or_error(&updated)?;
@@ -4660,7 +4670,7 @@ mod include_edit_tests {
             .await
             .expect("valid test canvas");
 
-        expect_ok(
+        let created = expect_ok(
             create_node(
                 State(state.clone()),
                 Json(CreateNodeRequest {
@@ -4670,11 +4680,21 @@ mod include_edit_tests {
             )
             .await,
         );
+        // `create_node` assigns a random id, not a slug of the title (see
+        // `insert_child_node_random_id`) — look it up by title instead of
+        // assuming "child/second-leaf".
+        let second_leaf_id = created
+            .nodes
+            .iter()
+            .find(|n| n.title == "Second Leaf")
+            .expect("new node present in the response")
+            .id
+            .clone();
 
         let updated = expect_ok(
             move_sibling(
                 State(state),
-                Path("child/second-leaf".to_string()),
+                Path(second_leaf_id.clone()),
                 Json(MoveSiblingRequest {
                     before: Some("child/leaf".to_string()),
                     after: None,
@@ -4690,14 +4710,17 @@ mod include_edit_tests {
             .filter(|n| n.parent.as_deref() == Some(&root.id))
             .map(|n| n.id.as_str())
             .collect();
-        assert_eq!(order, vec!["child/second-leaf", "child/leaf"]);
+        assert_eq!(order, vec![second_leaf_id.as_str(), "child/leaf"]);
         // The move landed in the include target's own file, not the
         // primary document — same "writes into the include target, not
         // base.canvas.md" contract every other mutating endpoint here
         // already has — with the reordering visible in its raw heading
         // order too, not just the resolved response.
+        let local_id = second_leaf_id.strip_prefix("child/").unwrap();
         let child_raw = std::fs::read_to_string(&child_path).unwrap();
-        assert!(child_raw.find("id=\"second-leaf\"").unwrap() < child_raw.find("id=\"leaf\"").unwrap());
+        assert!(
+            child_raw.find(&format!("id=\"{local_id}\"")).unwrap() < child_raw.find("id=\"leaf\"").unwrap()
+        );
 
         let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
     }

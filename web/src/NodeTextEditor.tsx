@@ -111,11 +111,26 @@ export function usePrefersDark(): boolean {
 }
 
 interface NodeTextEditorProps {
+  /** Current title, shown (and editable) in the header — see
+   * `onSaveTitle`. */
+  title: string;
   initialText: string;
   /** Auto-save callback — fired (debounced) as the text changes, and once
    * more on close to flush anything still pending. Doesn't close the
    * editor itself; only `onClose` does. */
   onChange: (text: string) => void;
+  /** Commits the header's title field — fired on blur/Enter, same
+   * "wherever the title is being edited" shape as MeshNode's own inline
+   * canvas title edit (TODO.canvas.md: "Редактирование заголовка и вызов
+   * node settings внутри редактора"), not debounced like `onChange` above:
+   * a title is one short field, not worth a partial-typing round trip. */
+  onSaveTitle: (title: string) => void;
+  /** The header's gear button — opens NodeSettings without leaving this
+   * editor open underneath it (TODO.canvas.md: same node as `onSaveTitle`
+   * above — "убрать отдельное меню node settings" turned out to mean "stop
+   * requiring it for a rename", not remove it: it's still where type,
+   * color, tags, target, and edges live). */
+  onOpenSettings: () => void;
   onClose: () => void;
 }
 
@@ -142,8 +157,16 @@ interface NodeTextEditorProps {
  * Save/Cancel step, just a "done" button to close once whatever's pending
  * has flushed.
  */
-export function NodeTextEditor({ initialText, onChange, onClose }: NodeTextEditorProps) {
+export function NodeTextEditor({ title, initialText, onChange, onSaveTitle, onOpenSettings, onClose }: NodeTextEditorProps) {
   const [text, setText] = useState(initialText);
+  const [titleDraft, setTitleDraft] = useState(title);
+  // Keeps the header's title field in sync with a rename made elsewhere
+  // while this editor stayed open — most commonly via the gear button
+  // right next to it (NodeSettings can change the title too). Harmless
+  // while the user is actively typing here instead: `title` only changes
+  // once *this* field's own `onSaveTitle` round-trips back through a fresh
+  // canvas, at which point it matches `titleDraft` already.
+  useEffect(() => setTitleDraft(title), [title]);
   const dark = usePrefersDark();
   const monacoReady = useMonacoReady();
   const detachRef = useRef<(() => void) | null>(null);
@@ -181,6 +204,21 @@ export function NodeTextEditor({ initialText, onChange, onClose }: NodeTextEdito
     onClose();
   };
 
+  // Not debounced like the body's own autosave above — a title is one
+  // short field, committed whole on blur/Enter, same as MeshNode's inline
+  // canvas title edit.
+  const handleTitleBlur = () => onSaveTitle(titleDraft);
+  const handleTitleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      e.currentTarget.blur();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      setTitleDraft(title);
+      e.currentTarget.blur();
+    }
+  };
+
   // `nokey`: React Flow's own global Space-to-pan shortcut (`panActivationKeyCode`,
   // default-on, never opted into by this app) decides whether to ignore a
   // keydown via `isInputDOMNode` — an input/textarea/select tag or a
@@ -195,6 +233,23 @@ export function NodeTextEditor({ initialText, onChange, onClose }: NodeTextEdito
   return createPortal(
     <div className="mesh-text-editor-backdrop nokey" onClick={handleClose}>
       <div className="mesh-text-editor" onClick={(e) => e.stopPropagation()}>
+        <div className="mesh-text-editor-header">
+          <input
+            className="mesh-text-editor-title-input"
+            value={titleDraft}
+            onChange={(e) => setTitleDraft(e.target.value)}
+            onBlur={handleTitleBlur}
+            onKeyDown={handleTitleKeyDown}
+          />
+          <button
+            type="button"
+            className="mesh-node-icon-button"
+            onClick={onOpenSettings}
+            title="Edit node settings (type, color, tags, target, edges)"
+          >
+            ⚙
+          </button>
+        </div>
         <div className="mesh-text-editor-panes">
           <div className="mesh-text-editor-source">
             {monacoReady ? (

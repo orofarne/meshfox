@@ -476,8 +476,26 @@ a {
   background: var(--node-bg);
   border: 1px solid var(--node-border);
   border-radius: 6px;
-  overflow: hidden;
   font-size: 0.85rem;
+}
+
+/* Wraps everything visible (title, body) — see MeshNode.tsx's own comment
+ * at this element's render site for why `overflow: hidden` lives here
+ * rather than directly on `.mesh-node`: that used to clip `NodeResizer`'s
+ * own corner/edge handles, which sit half outside the node's border by
+ * design. `border-radius: inherit` keeps this wrapper's own clipping
+ * shape matching `.mesh-node`'s rounded corners exactly; `min-height: 0`
+ * is the same flex-item-won't-shrink-below-content fix every other nested
+ * flex/overflow context here already needs (see `.mesh-node-title-centered`'s
+ * own comment). */
+.mesh-node-clip {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  border-radius: inherit;
+  overflow: hidden;
 }
 
 .mesh-node-title {
@@ -582,6 +600,22 @@ a {
 .mesh-node-title-text,
 .mesh-node-title-centered-text {
   cursor: pointer;
+}
+
+/* Inline title rename (MeshNode.tsx's `editingTitle`, TODO.canvas.md:
+ * "Позволить редактировать заголовок прямо на канвасе") — replaces
+ * `.mesh-node-title-text`/`.mesh-node-title-centered-text` in place, so it
+ * inherits their row's font size/weight rather than picking its own; only
+ * a thin accent border marks it as editable instead of static text. */
+.mesh-node-title-edit-input {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  color: inherit;
+  background: var(--node-bg);
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  padding: 0 0.3rem;
 }
 
 /* A heading-only node (empty body), read-only — see MeshNode.tsx's
@@ -897,8 +931,12 @@ a {
  * canvas is arranged, *most* nodes are authored, so flagging every
  * unauthored one (dashed, on the common case) read as "something's wrong
  * here" — a quiet corner on the less-common authored ones reads as a
- * confirmation instead. */
-.mesh-node[data-suggested="false"]:not([data-type="group"])::before {
+ * confirmation instead. On `.mesh-node-clip`, not `.mesh-node` itself
+ * (still gated on the outer element's own `data-suggested`/`data-type`) —
+ * this sharp-cornered triangle needs `.mesh-node-clip`'s own `overflow:
+ * hidden` to actually clip to the shared rounded corner; on the outer,
+ * now-unclipped `.mesh-node` it would poke past the curve instead. */
+.mesh-node[data-suggested="false"]:not([data-type="group"]) .mesh-node-clip::before {
   content: "";
   position: absolute;
   top: 0;
@@ -1066,6 +1104,37 @@ a {
   border-radius: 8px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
   overflow: hidden;
+}
+
+/* This node's title, editable in place, plus a gear button straight into
+ * NodeSettings for everything else (type/color/tags/target/edges) —
+ * TODO.canvas.md: "Редактирование заголовка и вызов node settings внутри
+ * редактора". Not debounced like the body pane below it: see
+ * NodeTextEditor.tsx's `handleTitleBlur`. */
+.mesh-text-editor-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--node-border);
+}
+
+.mesh-text-editor-title-input {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-weight: 600;
+  color: var(--fg);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  padding: 0.2rem 0.4rem;
+}
+
+.mesh-text-editor-title-input:hover,
+.mesh-text-editor-title-input:focus {
+  border-color: var(--node-border);
+  background: var(--node-bg);
 }
 
 .mesh-text-editor-panes {

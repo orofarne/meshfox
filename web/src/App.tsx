@@ -40,7 +40,7 @@ import {
   type RunEvent,
   type NodePatch,
 } from "./api";
-import type { CanvasDoc, CanvasNode, ExtraEdgeDto, NodeType, VarStatus } from "./types";
+import type { CanvasDoc, CanvasNode, ExtraEdgeDto, VarStatus } from "./types";
 import { pathTo, deriveEdges, findRoot, visibleNodeIds, subtreeIds } from "./tree";
 import { computeAutoLayout, FOLDED_HEIGHT, type LayoutBox } from "./autolayout";
 import { buildBlockGraph, resolveChain, type BlockAddr } from "./deps";
@@ -493,27 +493,23 @@ export default function App() {
     autoclose: boolean;
   } | null>(null);
   // Which node's settings modal (title/type/color/target/edges) is open,
-  // if any — see NodeSettings.tsx. Set right after a successful "add
-  // child" too, so the new node's title is immediately editable.
+  // if any — see NodeSettings.tsx. Opened only via a node's own gear
+  // button (or the text editor's, see NodeTextEditor's own header) — no
+  // longer right after "add child" (TODO.canvas.md: "Позволить
+  // редактировать заголовок прямо на канвасе" — that flow uses
+  // `autoStartTitleEditNodeId` below instead of this modal now).
   const [settingsNodeId, setSettingsNodeId] = useState<string | null>(null);
-  // Set right after `handleAddChild` creates a node, so `handleSettingsOk`
-  // can tell "ok was just clicked on the node this dialog opened *for*
-  // right after creating it" apart from "ok was clicked on some node's
-  // settings some other time" — only the former should auto-open the body
-  // editor below. Cleared the moment the settings modal closes, whichever
-  // way (see `onClose` at this component's own `<NodeSettings>` render
-  // site), so it's a one-shot signal, never a standing "this node was ever
-  // created" flag.
-  const justCreatedNodeIdRef = useRef<string | null>(null);
-  // Which node's inline body editor (`NodeTextEditor`, rendered inside
-  // `MeshNode` itself, not here) should open itself right away — set by
-  // `handleSettingsOk` (TODO.canvas.md: "Редактирование после Node
-  // settings"), consumed (and cleared back to `null`) by that one
-  // `MeshNode` instance via `onAutoOpenTextEditorConsumed` the moment it's
-  // acted on it, same one-shot shape as `justCreatedNodeIdRef` — see
-  // `focusedRenderNodes` below for where this actually reaches that node's
-  // own `data`.
-  const [autoOpenTextEditorNodeId, setAutoOpenTextEditorNodeId] = useState<string | null>(null);
+  // Which node's title should open straight into inline canvas editing —
+  // set right after `handleAddChild` creates a node (TODO.canvas.md:
+  // "Позволить редактировать заголовок прямо на канвасе"), consumed by
+  // that one `MeshNode` instance via `onAutoStartTitleEditConsumed`, same
+  // one-shot shape as `autoOpenTextEditorNodeId` used to have (and, once
+  // consumed, `MeshNode`'s own local editing state carries on independent
+  // of this — see its own doc comment). Committing or cancelling that
+  // inline edit no longer auto-opens the body editor afterward — that
+  // behavior (TODO.canvas.md: "Редактирование после Node settings") was
+  // removed once creation stopped going through NodeSettings at all.
+  const [autoStartTitleEditNodeId, setAutoStartTitleEditNodeId] = useState<string | null>(null);
   // Which node's body is expanded into a floating window (see
   // NodeExpandPanel) — available read-only, unlike `settingsNodeId`. Looked
   // up from `nodes` (the live React Flow state, not `canvas.nodes`) so the
@@ -1133,9 +1129,15 @@ export default function App() {
 
   // Creates a new child node under `parentId` (empty body, no position —
   // the server's layout suggestion places it to the parent's right, see
-  // `mdcanvas::insert_child_node`'s doc comment) and immediately opens its
-  // settings modal, pre-focused on the title field, so the freshly-created
-  // "New Node" placeholder title gets renamed right away.
+  // `mdcanvas::insert_child_node_random_id`'s doc comment) and immediately
+  // starts inline-editing its title on the canvas — no settings modal
+  // (TODO.canvas.md: "Позволить редактировать заголовок прямо на
+  // канвасе"), and always type "text" (nothing here ever sets a `type=`,
+  // so it's whatever the server defaults to): the id `createNode` gets
+  // back is a random hash (TODO.canvas.md: "Id-хэши вместо new-node-X по
+  // умолчанию"), not a slug of the "New Node" placeholder below — that
+  // placeholder is only real text because a heading can't be empty, not a
+  // real title the user chose.
   const handleAddChild = useCallback(
     async (parentId: string) => {
       if (!canvas) return;
@@ -1144,10 +1146,7 @@ export default function App() {
         const updated = await createNode(parentId, "New Node");
         setCanvas(updated);
         const added = updated.nodes.find((n) => !previousIds.has(n.id));
-        if (added) {
-          setSettingsNodeId(added.id);
-          justCreatedNodeIdRef.current = added.id;
-        }
+        if (added) setAutoStartTitleEditNodeId(added.id);
       } catch (e) {
         setError(String(e));
       }
@@ -1172,22 +1171,29 @@ export default function App() {
     }
   }, []);
 
-  // NodeSettings' "ok" — fires on every commit, even a no-op one (unlike
-  // `handleNodeSettingsChange` above), which is what makes it the right
-  // hook for "the user just clicked ok right after creating this node" (see
-  // `justCreatedNodeIdRef`'s own doc comment): the common case is creating
-  // a node and immediately clicking ok without touching a single field,
-  // meaning to type its body next, which would never fire `onChange` at
-  // all. Only a text-type node has an inline body editor to open — a
-  // freshly-created node defaults to "text", but the same settings dialog
-  // that's closing could have just switched it to file/link/group/include,
-  // so this checks the *final* type, not an assumption baked in at creation
-  // time.
-  const handleSettingsOk = useCallback((id: string, type: NodeType) => {
-    if (justCreatedNodeIdRef.current === id && type === "text") {
-      setAutoOpenTextEditorNodeId(id);
-    }
-  }, []);
+  // MeshNode's inline title edit (canvas double-click, or the body
+  // editor's own title field — TODO.canvas.md: "Позволить редактировать
+  // заголовок прямо на канвасе" / "Редактирование заголовка и вызов node
+  // settings внутри редактора") committing — fires on blur/Enter. A blank
+  // commit (the field left empty) falls back to the node's existing title
+  // instead of writing one — the file format has no way to represent a
+  // heading with no text — same as `NodeSettings`' own empty-title guard.
+  const handleCommitTitleEdit = useCallback(
+    async (id: string, title: string) => {
+      const trimmed = title.trim();
+      const current = canvas?.nodes.find((n) => n.id === id);
+      if (trimmed === "" || !current || trimmed === current.title) return;
+      try {
+        const updated = await updateNode(id, { title: trimmed });
+        setCanvas(updated);
+      } catch (e) {
+        setError(String(e));
+      }
+    },
+    [canvas],
+  );
+
+  const handleAutoStartTitleEditConsumed = useCallback(() => setAutoStartTitleEditNodeId(null), []);
 
   // MeshNode's ↑/↓ sibling-reorder buttons (auto-placed nodes only — see
   // `MeshNodeData.onMoveUp`/`onMoveDown`) — same fire-and-surface-globally
@@ -1551,6 +1557,7 @@ export default function App() {
                 : undefined,
             onClearLayout: suggested ? undefined : () => handleClearNodeLayout(n.id),
             onOpenSettings: () => setSettingsNodeId(n.id),
+            onCommitTitle: (title: string) => handleCommitTitleEdit(n.id, title),
             onExpand: () => setExpandedNodeId(n.id),
             onSaveText: (text: string) => handleSaveText(n.id, text),
             onOpenSourceMode: handleOpenSourceMode,
@@ -2092,7 +2099,7 @@ export default function App() {
   // was current — clamped here (once, as a render-time derivation) rather
   // than in every place that reads `searchMatchIndex`, same "one place
   // reconciles it" reasoning `focusedRenderNodes` already applies to
-  // `focused`/`autoOpenTextEditor`.
+  // `focused`/`autoStartTitleEdit`.
   const clampedSearchMatchIndex =
     searchMatches.length === 0 ? 0 : Math.min(searchMatchIndex, searchMatches.length - 1);
   // Un-hides `id` first if it's inside a folded subtree (walking every
@@ -2337,7 +2344,6 @@ export default function App() {
     searchOpen,
     openSearch,
   ]);
-  const handleAutoOpenTextEditorConsumed = useCallback(() => setAutoOpenTextEditorNodeId(null), []);
   // Trimmed once here, not read fresh off `searchQuery` state inside the
   // map below — `useMemo`'s own dependency array needs a primitive it can
   // actually compare across renders, and every node's `data.searchQuery`
@@ -2360,10 +2366,10 @@ export default function App() {
     () =>
       visibleNodes.map((n) => {
         const focused = n.id === focusedNodeId;
-        const autoOpenTextEditor = n.id === autoOpenTextEditorNodeId;
+        const autoStartTitleEdit = n.id === autoStartTitleEditNodeId;
         if (
           (n.data.focused ?? false) === focused &&
-          (n.data.autoOpenTextEditor ?? false) === autoOpenTextEditor &&
+          (n.data.autoStartTitleEdit ?? false) === autoStartTitleEdit &&
           (n.data.searchQuery ?? "") === trimmedSearchQuery &&
           (n.data.searchCurrentOccurrence ?? undefined) === currentSearchOccurrence
         ) {
@@ -2374,8 +2380,8 @@ export default function App() {
           data: {
             ...n.data,
             focused,
-            autoOpenTextEditor,
-            onAutoOpenTextEditorConsumed: handleAutoOpenTextEditorConsumed,
+            autoStartTitleEdit,
+            onAutoStartTitleEditConsumed: handleAutoStartTitleEditConsumed,
             searchQuery: trimmedSearchQuery,
             searchCurrentOccurrence: currentSearchOccurrence,
           },
@@ -2384,8 +2390,8 @@ export default function App() {
     [
       visibleNodes,
       focusedNodeId,
-      autoOpenTextEditorNodeId,
-      handleAutoOpenTextEditorConsumed,
+      autoStartTitleEditNodeId,
+      handleAutoStartTitleEditConsumed,
       trimmedSearchQuery,
       currentSearchOccurrence,
     ],
@@ -2889,11 +2895,7 @@ export default function App() {
           onChange={handleNodeSettingsChange}
           onRenameId={handleNodeIdChange}
           onClearId={handleNodeIdClear}
-          onOk={handleSettingsOk}
-          onClose={() => {
-            setSettingsNodeId(null);
-            justCreatedNodeIdRef.current = null;
-          }}
+          onClose={() => setSettingsNodeId(null)}
         />
       )}
       {deleteConfirmNode && (

@@ -1436,6 +1436,36 @@ pub fn set_document_options(markdown: &str, desired: &[String]) -> Option<String
 /// rules, and the new node would silently attach one level too high (to
 /// `parent_id`'s own parent) instead.
 pub fn insert_child_node(markdown: &str, parent_id: &str, title: &str) -> Option<(String, String)> {
+    insert_child_node_impl(markdown, parent_id, title, |used| unique_slug(title, used))
+}
+
+/// Same as [`insert_child_node`], except the new node's id is always a
+/// random base36-encoded 64-bit number (see `random_base36_id`), never a
+/// slug of `title` — the web UI's "add child" button uses this, not
+/// `insert_child_node` itself. That button no longer opens a settings
+/// dialog before creating the node (TODO.canvas.md: "Позволить
+/// редактировать заголовок прямо на канвасе"), so `title` here is just a
+/// placeholder the user is about to overwrite inline, not a real title —
+/// slugging it would only reproduce the confusing "new-node"/"new-node-2"
+/// ids this exists to replace (TODO.canvas.md: "Id-хэши вместо new-node-X
+/// по умолчанию"). `insert_child_node` itself (CLI/MCP `node add`, where
+/// the caller's title is the real, final one) is untouched — its
+/// human-readable, title-derived id is exactly the point there.
+pub fn insert_child_node_random_id(markdown: &str, parent_id: &str, title: &str) -> Option<(String, String)> {
+    insert_child_node_impl(markdown, parent_id, title, |used| loop {
+        let candidate = random_base36_id();
+        if !used.contains(&candidate) {
+            return candidate;
+        }
+    })
+}
+
+fn insert_child_node_impl(
+    markdown: &str,
+    parent_id: &str,
+    title: &str,
+    gen_id: impl FnOnce(&HashSet<String>) -> String,
+) -> Option<(String, String)> {
     let segments = scan(markdown);
     let ids = assign_ids(&segments).ok()?;
     let parents = resolve_parent_ids(&segments, &ids).ok()?;
@@ -1449,7 +1479,7 @@ pub fn insert_child_node(markdown: &str, parent_id: &str, title: &str) -> Option
         .unwrap_or(markdown.len());
 
     let used: HashSet<String> = ids.iter().cloned().collect();
-    let new_id = unique_slug(title, &used);
+    let new_id = gen_id(&used);
 
     let mut node_parts = vec![format!("id=\"{new_id}\"")];
     if needs_explicit_parent {
@@ -2153,6 +2183,28 @@ fn unique_slug(title: &str, used: &HashSet<String>) -> String {
         }
         n += 1;
     }
+}
+
+/// A random 64-bit number, base36-encoded (`0-9a-z`, lowercase, no
+/// padding) — see `insert_child_node_random_id`. Uses `RandomState`'s own
+/// OS-seeded key rather than pulling in a `rand` dependency just for this;
+/// not cryptographic, only needs to not collide, which the caller's `used`
+/// check already guards regardless.
+fn random_base36_id() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let mut n = RandomState::new().build_hasher().finish();
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if n == 0 {
+        return "0".to_string();
+    }
+    let mut buf = Vec::with_capacity(13);
+    while n > 0 {
+        buf.push(DIGITS[(n % 36) as usize]);
+        n /= 36;
+    }
+    buf.reverse();
+    String::from_utf8(buf).expect("base36 digits are ASCII")
 }
 
 /// (start_offset, line_including_its_own_trailing_newline_if_any)
@@ -3524,6 +3576,19 @@ Reused from Tests as well.
     }
 
     #[test]
+    fn insert_child_node_random_id_ignores_the_title_slug() {
+        let (updated, first_id) = insert_child_node_random_id(DOC, "root", "New Node").unwrap();
+        assert_ne!(first_id, "new-node");
+        assert!(first_id.chars().all(|c| c.is_ascii_digit() || c.is_ascii_lowercase()));
+        let (updated, second_id) = insert_child_node_random_id(&updated, "root", "New Node").unwrap();
+        assert_ne!(second_id, "new-node-2");
+        assert_ne!(first_id, second_id);
+        let c = parse(&updated).unwrap();
+        assert_eq!(c.node(&first_id).unwrap().title, "New Node");
+        assert_eq!(c.node(&second_id).unwrap().title, "New Node");
+    }
+
+    #[test]
     fn insert_child_node_under_leaf_with_no_children_appends_at_end() {
         let doc = "# Root\n\n## Leaf\n<!-- meshfox:node -->\n\nbody\n";
         let (updated, new_id) = insert_child_node(doc, "leaf", "Child").unwrap();
@@ -4293,3 +4358,4 @@ Reused from Tests as well.
         assert_eq!(unknown_node_edge_attr(doc), None);
     }
 }
+

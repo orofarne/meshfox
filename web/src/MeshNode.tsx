@@ -419,6 +419,27 @@ export interface MeshNodeData {
   onClearLayout?: () => void;
   /** Opens this node's settings modal (title/type/color/target/edges). */
   onOpenSettings: () => void;
+  /** Renames this node inline — the canvas-native counterpart to
+   * NodeSettings' own Title field (TODO.canvas.md: "Позволить редактировать
+   * заголовок прямо на канвасе" / "Редактирование заголовка и вызов node
+   * settings внутри редактора"). Fired on blur/Enter from wherever the
+   * title is being edited (a double-click on the canvas title, or the
+   * inline body editor's own title field) with whatever text is currently
+   * in that field — may be unchanged, or blank (App.tsx falls back to the
+   * node's existing title rather than writing an empty one; the file
+   * format has no way to represent a heading with no text at all). */
+  onCommitTitle: (title: string) => void;
+  /** True for exactly one render, right after "add child" (App.tsx's
+   * `autoStartTitleEditNodeId`) — a freshly-created node opens straight
+   * into an editable title on the canvas rather than NodeSettings' modal,
+   * since typing a real name is the first thing to do with a new node
+   * (TODO.canvas.md: "Позволить редактировать заголовок прямо на
+   * канвасе"). `undefined`/`false` the rest of the time. Paired with
+   * `onAutoStartTitleEditConsumed`, which this component calls the moment
+   * it's acted on `true` — App.tsx clears its own tracking state in
+   * response, so this never re-fires for the same creation. */
+  autoStartTitleEdit?: boolean;
+  onAutoStartTitleEditConsumed?: () => void;
   /** file-node only — opens `target` in the OS's default application for
    * it (the title bar's "↗ open" button, and clicking the body's own link,
    * which now behaves the same way rather than fetching the raw file). */
@@ -435,17 +456,6 @@ export interface MeshNodeData {
   /** Persists a full replacement of this node's raw Markdown body — the
    * inline text editor's auto-save. */
   onSaveText: (text: string) => void;
-  /** True for exactly one render, right after "add child" + NodeSettings'
-   * "ok" on a text-type node (see App.tsx's `autoOpenTextEditorNodeId`) —
-   * opens this node's inline body editor immediately instead of making the
-   * user click the ✏ button themselves, since typing the body is almost
-   * always the very next thing after naming a freshly-created node.
-   * `undefined`/`false` the rest of the time. Paired with
-   * `onAutoOpenTextEditorConsumed`, which this component calls the moment
-   * it's acted on `true` — App.tsx clears its own tracking state in
-   * response, so this never re-fires for the same creation. */
-  autoOpenTextEditor?: boolean;
-  onAutoOpenTextEditorConsumed?: () => void;
   /** `plainMarkdownInclude` nodes only — opens Source mode scoped to this
    * node's own id (the include's `nodeId`) instead of the inline text
    * editor, since that's the only place this content can actually be
@@ -2125,19 +2135,119 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
   useSearchHighlight(nodeRootRef, data, editingText);
   const isTextNode = data.nodeType === "text";
   const isGroup = data.nodeType === "group";
-  // See `MeshNodeData.autoOpenTextEditor`'s own doc comment — App.tsx
-  // already only ever sets this for a text-type node, but guards it here
-  // too rather than trusting that invariant blindly (`plainMarkdownInclude`
-  // in particular has no inline editor to open at all, see the ✏ button's
-  // own branch below).
+  // Inline title editing (TODO.canvas.md: "Позволить редактировать
+  // заголовок прямо на канвасе") — a local edit buffer (`titleDraft`), same
+  // "own state until it's explicitly committed" shape as `editingText`'s
+  // `NodeTextEditor` above, just for the title span instead of the body.
+  // Started either by a double-click on the title (`handleTitleDoubleClick`
+  // below) or by `data.autoStartTitleEdit` right after this node was
+  // created — the trigger flag is consumed immediately (via
+  // `onAutoStartTitleEditConsumed`), `editingTitle` itself then stays true
+  // independent of it until commit/cancel. Unlike `editingText`'s own body
+  // editor, committing or cancelling this doesn't auto-open anything else
+  // afterward — that used to chain into `editingText` here, removed once
+  // it turned out not to be wanted.
+  const [editingTitle, setEditingTitle] = useState(false);
+  const [titleDraft, setTitleDraft] = useState(data.title);
+  const titleInputRef = useRef<HTMLInputElement | null>(null);
+  // Set right before a deliberate Escape-cancel, so the `blur` it triggers
+  // (moving focus off the about-to-unmount input) doesn't *also* fire a
+  // commit — `onBlur`/`onKeyDown`'s Escape branch would otherwise race.
+  const titleEditCancelledRef = useRef(false);
   useEffect(() => {
-    if (!data.autoOpenTextEditor) return;
-    if (isTextNode && !data.plainMarkdownInclude) {
+    if (!data.autoStartTitleEdit) return;
+    setTitleDraft(data.title);
+    titleEditCancelledRef.current = false;
+    setEditingTitle(true);
+    data.onAutoStartTitleEditConsumed?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data.autoStartTitleEdit]);
+  // A brand-new node (just created, right before `data.autoStartTitleEdit`
+  // fires) hasn't been measured by React Flow yet — `.focus()` called on
+  // its still-unmeasured title input is silently a no-op in Chromium (same
+  // element, same visible/enabled computed style, but not yet focusable —
+  // reproduced directly, not just theorized), and there's no single event
+  // to await instead. Retries every animation frame (a real user's
+  // double-click never hits this window at all — the node it's clicking
+  // is already fully measured) until it actually lands, capped so a node
+  // that somehow never becomes focusable doesn't retry forever.
+  useEffect(() => {
+    if (!editingTitle) return;
+    let cancelled = false;
+    let frame = 0;
+    let attempts = 0;
+    const tryFocus = () => {
+      if (cancelled) return;
+      const el = titleInputRef.current;
+      if (!el) return;
+      el.focus();
+      el.select();
+      attempts += 1;
+      if (document.activeElement !== el && attempts < 60) {
+        frame = requestAnimationFrame(tryFocus);
+      }
+    };
+    frame = requestAnimationFrame(tryFocus);
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(frame);
+    };
+  }, [editingTitle]);
+  const handleTitleDoubleClick = (e: React.MouseEvent) => {
+    if (!data.editMode) return;
+    e.stopPropagation();
+    setTitleDraft(data.title);
+    titleEditCancelledRef.current = false;
+    setEditingTitle(true);
+  };
+  // Double-clicking a node's rendered body in Edit mode opens the same
+  // editor its own ✏ button does — the body's counterpart to
+  // `handleTitleDoubleClick` above (TODO.canvas.md: "Позволить
+  // редактировать заголовок прямо на канвасе" extended to the body, same
+  // "double-click the read-only rendered thing to edit it" gesture).
+  // `plainMarkdownInclude` has no inline editor of its own (see that
+  // field's doc comment) — its ✏ slot is a different button entirely
+  // (`onOpenSourceMode`), so this mirrors that instead. A `file`/`link`/
+  // `group` node has no body editor at all; double-clicking those is a
+  // no-op, same as clicking a ✏ button that was never rendered for them.
+  const handleBodyDoubleClick = () => {
+    if (!data.editMode || !isTextNode) return;
+    if (data.plainMarkdownInclude) {
+      data.onOpenSourceMode(id);
+    } else {
       setEditingText(true);
     }
-    data.onAutoOpenTextEditorConsumed?.();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [data.autoOpenTextEditor]);
+  };
+  const commitTitleEdit = () => {
+    if (titleEditCancelledRef.current) {
+      titleEditCancelledRef.current = false;
+      return;
+    }
+    setEditingTitle(false);
+    data.onCommitTitle(titleDraft);
+  };
+  const cancelTitleEdit = () => {
+    titleEditCancelledRef.current = true;
+    setEditingTitle(false);
+  };
+  const titleEditInputProps = {
+    ref: titleInputRef,
+    className: "mesh-node-title-edit-input nodrag nopan",
+    value: titleDraft,
+    onChange: (e: React.ChangeEvent<HTMLInputElement>) => setTitleDraft(e.target.value),
+    onMouseDown: (e: React.MouseEvent) => e.stopPropagation(),
+    onKeyDown: (e: React.KeyboardEvent) => {
+      e.stopPropagation();
+      if (e.key === "Enter") {
+        e.preventDefault();
+        (e.target as HTMLInputElement).blur();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        cancelTitleEdit();
+      }
+    },
+    onBlur: commitTitleEdit,
+  };
   const nodeColor = resolveNodeColor(data.effectiveColor ?? data.color);
   // A heading-only node (no body Markdown at all) has nothing to show in
   // its body area — that's just dead space under a left-aligned title, so
@@ -2345,6 +2455,21 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
       <Handle type="target" id="target-bottom" position={Position.Bottom} className="mesh-handle-routing" />
       <Handle type="source" id="source-top" position={Position.Top} className="mesh-handle-routing" />
       <Handle type="source" id="source-bottom" position={Position.Bottom} className="mesh-handle-routing" />
+      {/* Everything visible (title, body) lives inside this wrapper, which
+       * carries the `overflow: hidden` `.mesh-node` itself used to have
+       * (clipping the title bar's/body's own rectangular backgrounds to
+       * the shared rounded corners) — moved here, rather than removed,
+       * specifically so it stops clipping `NodeResizer`'s corner/edge
+       * handles above and the connection `Handle`s around them: those are
+       * positioned half outside the node's own border by design (the
+       * standard resize/connect affordance), and sat directly inside
+       * `.mesh-node`'s old `overflow: hidden` before this, visibly cut off
+       * at every corner. Both toolbars and `NodeTextEditor` below are
+       * portals (`NodeToolbar`, `createPortal`) — nesting them inside this
+       * clipped wrapper has no visual effect either way, since a portal's
+       * real DOM ancestor is wherever it portals to, never this JSX
+       * position. */}
+      <div className="mesh-node-clip">
       {isTitleOnly ? (
         <div
           ref={setTitleOnlyRef}
@@ -2372,14 +2497,19 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
            * as a distinct class since this one must stay `white-space:
            * normal` (wrap, no ellipsis) for this layout's own "long title
            * wraps across a centered block" behavior. */}
-          <span
-            className="mesh-node-title-centered-text"
-            onMouseDown={handleTitleMouseDown}
-            onClick={handleTitleClick}
-          >
-            <TypeIcon type={data.nodeType} />
-            {data.title}
-          </span>
+          {editingTitle ? (
+            <input {...titleEditInputProps} />
+          ) : (
+            <span
+              className="mesh-node-title-centered-text"
+              onMouseDown={handleTitleMouseDown}
+              onClick={handleTitleClick}
+              onDoubleClick={handleTitleDoubleClick}
+            >
+              <TypeIcon type={data.nodeType} />
+              {data.title}
+            </span>
+          )}
           {nodeTags}
           {nodeRunning && <RunningSpinner />}
           {!nodeRunning && nodeFailed && <FailedBadge />}
@@ -2387,14 +2517,19 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
       ) : (
         <div className="mesh-node-title" data-level={data.level}>
           <FoldToggle folded={data.folded} onToggle={data.onToggleFold} />
-          <span
-            className="mesh-node-title-text nopan"
-            onMouseDown={handleTitleMouseDown}
-            onClick={handleTitleClick}
-          >
-            <TypeIcon type={data.nodeType} />
-            {data.title}
-          </span>
+          {editingTitle ? (
+            <input {...titleEditInputProps} />
+          ) : (
+            <span
+              className="mesh-node-title-text nopan"
+              onMouseDown={handleTitleMouseDown}
+              onClick={handleTitleClick}
+              onDoubleClick={handleTitleDoubleClick}
+            >
+              <TypeIcon type={data.nodeType} />
+              {data.title}
+            </span>
+          )}
           {nodeTags}
           {nodeRunning && <RunningSpinner />}
           {!nodeRunning && nodeFailed && <FailedBadge />}
@@ -2644,11 +2779,24 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
           </button>
         </NodeToolbar>
       )}
-      {isTitleOnly || data.folded ? null : <NodeBodyContent data={data} nodeId={id} />}
+      {isTitleOnly || data.folded ? null : (
+        // `display: contents` — purely an event-bubbling boundary for
+        // `handleBodyDoubleClick`, not a layout box: `NodeBodyContent`'s
+        // own root (`.mesh-node-body` or similar) still needs to be a
+        // direct flex child of `.mesh-node-clip` for its `flex: 1`/
+        // `overflow` rules to mean anything.
+        <div onDoubleClick={handleBodyDoubleClick} style={{ display: "contents" }}>
+          <NodeBodyContent data={data} nodeId={id} />
+        </div>
+      )}
+      </div>
       {editingText && (
         <NodeTextEditor
+          title={data.title}
           initialText={data.text}
           onChange={(text) => data.onSaveText(text)}
+          onSaveTitle={(title) => data.onCommitTitle(title)}
+          onOpenSettings={data.onOpenSettings}
           onClose={() => setEditingText(false)}
         />
       )}

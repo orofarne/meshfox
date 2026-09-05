@@ -119,10 +119,29 @@ test("renaming the id and changing another field in the same 'ok' click both lan
   // nesting. Which parent gets the new child doesn't matter for this test.
   await page.locator(".mesh-node-add-child").first().click();
 
+  // Creating a node now starts inline title editing directly on the
+  // canvas instead of opening NodeSettings (TODO.canvas.md: "Позволить
+  // редактировать заголовок прямо на канвасе") — Escape leaves the node's
+  // placeholder title untouched (nothing saved), then the gear button
+  // opens NodeSettings same as for any other node, to reach the id+title
+  // rename-together path this test is actually about.
+  const titleEditInput = page.locator(".mesh-node-title-edit-input");
+  await expect(titleEditInput).toBeFocused();
+  await page.keyboard.press("Escape");
+
+  const newNode = page.locator(".react-flow__node", { hasText: "New Node" });
+  await selectNode(newNode);
+  await toolbarButton(page, "settings").click();
   await expect(page.locator(".node-settings-modal")).toBeVisible();
+
   const titleInput = page.locator(".vars-modal-field", { hasText: "Title" }).locator("input");
   const idInput = page.locator(".vars-modal-field", { hasText: "ID" }).locator("input");
-  await expect(idInput).toHaveValue("new-node");
+  // A freshly-created node's id is a random base36 hash now, not a slug of
+  // its placeholder title (TODO.canvas.md: "Id-хэши вместо new-node-X по
+  // умолчанию") — just confirm it's non-empty rather than asserting an
+  // exact value.
+  const initialId = await idInput.inputValue();
+  expect(initialId).not.toBe("");
 
   await titleInput.fill("My title");
   await idInput.fill("my-title");
@@ -133,6 +152,7 @@ test("renaming the id and changing another field in the same 'ok' click both lan
   const raw = await fetchRaw(page);
   expect(raw).toContain('id="my-title"');
   expect(raw).toContain("My title");
+  expect(raw).not.toContain(`id="${initialId}"`);
 
   // `DELETE` alone doesn't guarantee coming back byte-for-byte (it's not
   // meant to — `insert_child_node`/`delete_node` aren't exact inverses down
@@ -177,36 +197,32 @@ test("leaving the ID field empty on 'ok' clears the explicit id back to the titl
   expect(await fetchRaw(page)).toBe(before);
 });
 
-// TODO.canvas.md: same item — the id-suggestion hint used to stop appearing
-// forever on any node whose auto-generated id picked up a `-2`/`-3`... dedup
-// suffix (`insert_child_node`'s own collision handling), since the gate only
-// ever compared against the bare, unsuffixed slug. Two default-titled "New
-// Node" children in a row reproduces the suffix; editing the second one's
-// title should still offer to update its id.
-test("the id-suggestion hint still appears for an auto-generated id that picked up a dedup suffix", async ({
-  page,
-}) => {
+// TODO.canvas.md: "Id-хэши вместо new-node-X по умолчанию" — a freshly
+// created node's id is a random base36 hash now, not a slug of its
+// placeholder title, so two default-titled "New Node" children in a row no
+// longer produce a "new-node"/"new-node-2" dedup pair at all (there's
+// nothing left to dedupe against — see `insert_child_node_random_id` in
+// crates/core/src/mdcanvas.rs). This replaces an older test for that now-
+// impossible dedup-suffix id, which also assumed "add child" opened
+// NodeSettings immediately (it now starts inline title editing on the
+// canvas instead — TODO.canvas.md: "Позволить редактировать заголовок
+// прямо на канвасе").
+test("a freshly created node gets a random base36 id, not a slug of its placeholder title", async ({ page }) => {
   const before = await fetchRaw(page);
 
   await page.locator(".mesh-node-add-child").first().click();
-  await expect(page.locator(".node-settings-modal")).toBeVisible();
-  await page.locator(".vars-modal-actions button", { hasText: "ok" }).click();
-  await expect(page.locator(".node-settings-modal")).toHaveCount(0);
-  // "ok" right after creating a node auto-opens its own body editor
-  // (TODO.canvas.md: "Редактирование после Node settings") — a real user
-  // creating a second node right away would close this first (its own
-  // full-screen backdrop otherwise just intercepts the next click below);
-  // do the same here rather than fighting the backdrop.
-  await page.locator(".mesh-text-editor-actions button", { hasText: "done" }).click();
+  const titleEditInput = page.locator(".mesh-node-title-edit-input");
+  await expect(titleEditInput).toBeFocused();
+  await page.keyboard.press("Escape");
 
-  await page.locator(".mesh-node-add-child").first().click();
+  const newNode = page.locator(".react-flow__node", { hasText: "New Node" });
+  await selectNode(newNode);
+  await toolbarButton(page, "settings").click();
   await expect(page.locator(".node-settings-modal")).toBeVisible();
   const idInput = page.locator(".vars-modal-field", { hasText: "ID" }).locator("input");
-  await expect(idInput).toHaveValue("new-node-2");
-
-  const titleInput = page.locator(".vars-modal-field", { hasText: "Title" }).locator("input");
-  await titleInput.fill("Another Node");
-  await expect(page.locator(".node-settings-id-hint")).toContainText("another-node");
+  const id = await idInput.inputValue();
+  expect(id).not.toBe("new-node");
+  expect(id).toMatch(/^[0-9a-z]+$/);
 
   await page.locator(".vars-modal-actions button", { hasText: "cancel" }).click();
   await expect(page.locator(".node-settings-modal")).toHaveCount(0);
@@ -240,4 +256,107 @@ test("the Tags field suggests tags already used elsewhere in the document", asyn
 
   await page.locator(".vars-modal-actions button", { hasText: "cancel" }).click();
   await expect(page.locator(".node-settings-modal")).toHaveCount(0);
+});
+
+// TODO.canvas.md: "Позволить редактировать заголовок прямо на канвасе" —
+// double-clicking a node's title in Edit mode renames it in place, no
+// NodeSettings modal involved at all.
+test("double-clicking a node's title renames it inline on the canvas", async ({ page }) => {
+  const before = await fetchRaw(page);
+
+  const node = page.locator('.react-flow__node[data-id="text-plain"]');
+  await node.locator(".mesh-node-title-text, .mesh-node-title-centered-text").first().dblclick();
+  const input = node.locator(".mesh-node-title-edit-input");
+  await expect(input).toBeFocused();
+  await expect(input).toHaveValue("Plain Text");
+  await input.fill("Renamed Plain Text");
+  await input.press("Enter");
+
+  await expect(node.locator(".mesh-node-title-text, .mesh-node-title-centered-text")).toContainText(
+    "Renamed Plain Text",
+  );
+  const raw = await fetchRaw(page);
+  expect(raw).toContain("Renamed Plain Text");
+  expect(raw).not.toContain("## Plain Text\n");
+
+  await page.evaluate(
+    (raw) => fetch("/api/canvas/raw", { method: "PUT", headers: { "content-type": "text/plain" }, body: raw }),
+    before,
+  );
+  expect(await fetchRaw(page)).toBe(before);
+});
+
+test("Escape cancels an inline title edit without saving", async ({ page }) => {
+  const before = await fetchRaw(page);
+
+  const node = page.locator('.react-flow__node[data-id="text-plain"]');
+  await node.locator(".mesh-node-title-text, .mesh-node-title-centered-text").first().dblclick();
+  const input = node.locator(".mesh-node-title-edit-input");
+  await expect(input).toBeFocused();
+  await input.fill("Should not be saved");
+  await input.press("Escape");
+
+  await expect(node.locator(".mesh-node-title-text, .mesh-node-title-centered-text")).toContainText("Plain Text");
+  expect(await fetchRaw(page)).toBe(before);
+});
+
+// TODO.canvas.md: "Редактирование заголовка и вызов node settings внутри
+// редактора" — Node settings isn't removed, it's just no longer the only
+// way to rename: the inline body editor gets its own title field, plus a
+// gear button straight into NodeSettings for everything else.
+test("the body editor's header can rename the node and open NodeSettings", async ({ page }) => {
+  const before = await fetchRaw(page);
+
+  const node = page.locator('.react-flow__node[data-id="text-plain"]');
+  await selectNode(node);
+  await toolbarButton(page, "Edit this node's Markdown text").click();
+  await expect(page.locator(".mesh-text-editor")).toBeVisible();
+
+  const titleInput = page.locator(".mesh-text-editor-title-input");
+  await expect(titleInput).toHaveValue("Plain Text");
+  await titleInput.fill("Renamed From Editor");
+  await titleInput.press("Enter");
+  await expect(node.locator(".mesh-node-title-text, .mesh-node-title-centered-text")).toContainText(
+    "Renamed From Editor",
+  );
+
+  await page.locator(".mesh-text-editor-header button", { hasText: "⚙" }).click();
+  await expect(page.locator(".node-settings-modal")).toBeVisible();
+  const settingsTitleInput = page.locator(".vars-modal-field", { hasText: "Title" }).locator("input");
+  await expect(settingsTitleInput).toHaveValue("Renamed From Editor");
+  await page.locator(".vars-modal-actions button", { hasText: "cancel" }).click();
+  await expect(page.locator(".node-settings-modal")).toHaveCount(0);
+
+  await page.locator(".mesh-text-editor-actions button", { hasText: "done" }).click();
+
+  await page.evaluate(
+    (raw) => fetch("/api/canvas/raw", { method: "PUT", headers: { "content-type": "text/plain" }, body: raw }),
+    before,
+  );
+  expect(await fetchRaw(page)).toBe(before);
+});
+
+// TODO.canvas.md: "Позволить редактировать заголовок прямо на канвасе"
+// extended to the body — double-clicking a text node's rendered body in
+// Edit mode opens the same inline editor its own ✏ button does, without
+// needing to select the node or hunt down the toolbar button first.
+test("double-clicking a node's body opens its inline text editor", async ({ page }) => {
+  const node = page.locator('.react-flow__node[data-id="text-plain"]');
+  await node.locator(".mesh-node-body").dblclick();
+  await expect(page.locator(".mesh-text-editor")).toBeVisible();
+  await expect(page.locator(".mesh-text-editor-title-input")).toHaveValue("Plain Text");
+
+  await page.locator(".mesh-text-editor-actions button", { hasText: "done" }).click();
+  await expect(page.locator(".mesh-text-editor")).toHaveCount(0);
+});
+
+// Same gesture, but back in read-only mode — must stay a no-op, same as
+// the ✏ button itself, which isn't even rendered outside Edit mode.
+// `beforeEach` above always starts a test in Edit mode, so this leaves it
+// via the toolbar's own "done" button first.
+test("double-clicking a node's body does nothing outside Edit mode", async ({ page }) => {
+  await page.getByRole("button", { name: "done" }).click();
+  const node = page.locator('.react-flow__node[data-id="text-plain"]');
+  await node.locator(".mesh-node-body").dblclick();
+  await expect(page.locator(".mesh-text-editor")).toHaveCount(0);
 });

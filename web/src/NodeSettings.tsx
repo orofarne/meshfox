@@ -49,17 +49,6 @@ interface NodeSettingsProps {
    * fresh derivation), so `handleOk` doesn't need an error path for it. */
   onClearId: (id: string) => Promise<string>;
   onClose: () => void;
-  /** Fired only on a real "ok" commit (never on cancel/backdrop-click),
-   * right before `onClose` — unlike `onChange`, which is skipped entirely
-   * when nothing actually changed (see `handleOk`), this always fires on
-   * "ok", so a caller that needs to know "the user committed this modal"
-   * (e.g. App.tsx opening the body editor right after an "add child" +
-   * "ok", regardless of whether any field actually changed) has something
-   * to hook. Takes the post-rename id (same reasoning as `onChange`'s own
-   * `id` parameter) and the node's final type, so a caller that only cares
-   * about e.g. a freshly-created *text* node doesn't have to wait for the
-   * `onChange` patch to round-trip back through a fresh `canvas` first. */
-  onOk?: (id: string, type: NodeType) => void;
 }
 
 /** JSON Canvas colors are either a hex string or a preset `"1"`–`"6"` — the
@@ -88,7 +77,7 @@ const COLOR_SWATCHES = ["", "1", "2", "3", "4", "5", "6"];
  * here, since it needs to ask what happens to the node's children, which
  * doesn't fit this modal's single ok/cancel shape.
  */
-export function NodeSettings({ node, allNodes, onChange, onRenameId, onClearId, onClose, onOk }: NodeSettingsProps) {
+export function NodeSettings({ node, allNodes, onChange, onRenameId, onClearId, onClose }: NodeSettingsProps) {
   const [title, setTitle] = useState(node.title);
   const [id, setId] = useState(node.id);
   const [idError, setIdError] = useState<string | null>(null);
@@ -235,7 +224,6 @@ export function NodeSettings({ node, allNodes, onChange, onRenameId, onClearId, 
     }
     const patch = buildPatch();
     if (Object.keys(patch).length > 0) onChange(currentId, patch);
-    onOk?.(currentId, nodeType);
     onClose();
   };
 
