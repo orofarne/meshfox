@@ -2422,7 +2422,24 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
         <NodeResizer
           minWidth={100}
           minHeight={100}
-          color="var(--accent)"
+          // Colors the corner handles only — not the plain `color` prop,
+          // which `ResizeControl`'s own implementation applies to *both*
+          // variants (`{ [isHandleControl ? 'backgroundColor' : 'borderColor']: color }`,
+          // spread in after `style`, so it always wins over a `lineStyle`
+          // override below regardless of what that sets). The edge "line"
+          // controls (a whole-edge hit target for an edge-drag resize) are
+          // meant to be invisible — `.mesh-node`'s own border already marks
+          // the edge — so they need `color` to just never reach them.
+          handleStyle={{ backgroundColor: "var(--accent)" }}
+          // Explicitly transparent, not merely "unset": the line controls'
+          // own default (`.react-flow__resize-control.line`'s CSS,
+          // `border-color: var(--xy-resize-background-color-default)`)
+          // isn't transparent either. These used to render fully clipped
+          // away by `.mesh-node`'s old `overflow: hidden` (see
+          // `.mesh-node-clip`'s own comment for why that moved) — left at
+          // their default now, the bottom one in particular reads as a
+          // second border directly under the real one.
+          lineStyle={{ borderColor: "transparent" }}
           isVisible={data.editMode && selected}
         />
       )}
