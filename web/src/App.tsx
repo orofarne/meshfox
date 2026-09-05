@@ -1528,6 +1528,7 @@ export default function App() {
             hasChildren: parentIdSet.has(n.id),
             onToggleFold: () => toggleFold(n.id),
             target: n.target,
+            caption: n.caption,
             constraintResults: n.constraintResults,
             display: n.display,
             lang: n.lang,

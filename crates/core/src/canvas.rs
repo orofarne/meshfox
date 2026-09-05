@@ -231,6 +231,18 @@ pub struct Node {
     /// one Markdown link. `None` for `text`/`group`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    /// `file`/`link`/`include` only: optional plain-prose explanatory text
+    /// after the required link (SPEC.md: body is exactly one Markdown
+    /// link, optionally followed by a caption) — e.g. a short note on why
+    /// this link is here. `None` for `text`/`group`, and for a
+    /// `file`/`link`/`include` node with no caption written. Never
+    /// contains block-level Markdown (headings, lists, images, code
+    /// fences, tables, block quotes, thematic breaks, raw HTML) —
+    /// `mdcanvas::parse` rejects that as `ParseError::InvalidLinkBody`,
+    /// same as a malformed link itself; inline formatting (bold/italic/
+    /// code/links) is fine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
     /// `file`-node only: how the target is shown on the canvas — a plain
     /// clickable link (default), or a read-only syntax-highlighted preview
     /// of the target file's own content. `None` for every other node type.

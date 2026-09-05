@@ -108,7 +108,9 @@ pub enum ParseError {
     #[error("group node {0:?} must have an empty body (groups are purely organizational)")]
     GroupHasBody(String),
     #[error(
-        "{1} node {0:?} must have a body that is exactly one Markdown link, e.g. [label](target)"
+        "{1} node {0:?} must have a body starting with exactly one Markdown link, e.g. \
+         [label](target), optionally followed by a plain-text caption (no headings, lists, \
+         images, code fences, tables, block quotes, or raw HTML)"
     )]
     InvalidLinkBody(String, &'static str),
     #[error("id {0:?} contains a forbidden character (a `\"`, a `,`, or a control character)")]
@@ -312,18 +314,18 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
         let body = crate::comment::strip(&markdown[seg.body_span.clone()])
             .trim()
             .to_string();
-        let target = match node_type {
+        let (target, caption) = match node_type {
             NodeType::Group => {
                 if !body.is_empty() {
                     return Err(ParseError::GroupHasBody(id.clone()));
                 }
-                None
+                (None, None)
             }
-            NodeType::File | NodeType::Link | NodeType::Include => match parse_single_link(&body) {
-                Some((_, target)) => Some(target),
+            NodeType::File | NodeType::Link | NodeType::Include => match parse_link_body(&body) {
+                Some((_, target, caption)) => (Some(target), caption),
                 None => return Err(ParseError::InvalidLinkBody(id.clone(), node_type.as_str())),
             },
-            NodeType::Text => None,
+            NodeType::Text => (None, None),
         };
 
         let created_at = match seg.node_attrs.get("createdAt") {
@@ -368,6 +370,7 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
             }),
             tags: parse_tags(seg.node_attrs.get("tags")),
             target,
+            caption,
             display: seg
                 .node_attrs
                 .get("display")
@@ -2294,19 +2297,68 @@ fn parse_comment(line: &str, tag: &str) -> Option<String> {
     inner.strip_prefix(tag).map(|rest| rest.trim().to_string())
 }
 
-/// Parses a body that is *exactly* one Markdown link — `[label](target)`
-/// and nothing else — as required for `file`/`link` nodes. Returns
-/// `(label, target)`.
-fn parse_single_link(body: &str) -> Option<(String, String)> {
-    let rest = body.trim().strip_prefix('[')?;
-    let close_bracket = rest.find(']')?;
-    let label = &rest[..close_bracket];
-    let rest = rest[close_bracket + 1..].strip_prefix('(')?;
-    let target = rest.strip_suffix(')')?;
+/// Parses a `file`/`link`/`include` body: the first line must be *exactly*
+/// one Markdown link, `[label](target)` and nothing else on that line;
+/// anything after it (separated from the link by at least a blank line —
+/// same-line trailing text after the closing `)` is still rejected, same
+/// as before this had a caption at all) is an optional plain-prose caption,
+/// validated by `caption_is_plain_prose` (SPEC.md: "optionally followed by
+/// a caption"). Returns `(label, target, caption)`.
+fn parse_link_body(body: &str) -> Option<(String, String, Option<String>)> {
+    let body = body.trim();
+    let (first_line, rest) = match body.split_once('\n') {
+        Some((first, rest)) => (first, rest.trim()),
+        None => (body, ""),
+    };
+    let after_bracket = first_line.trim().strip_prefix('[')?;
+    let close_bracket = after_bracket.find(']')?;
+    let label = &after_bracket[..close_bracket];
+    let after_label = after_bracket[close_bracket + 1..].strip_prefix('(')?;
+    let target = after_label.strip_suffix(')')?;
     if target.is_empty() {
         return None;
     }
-    Some((label.to_string(), target.to_string()))
+    let caption = if rest.is_empty() {
+        None
+    } else if caption_is_plain_prose(rest) {
+        Some(rest.to_string())
+    } else {
+        return None;
+    };
+    Some((label.to_string(), target.to_string(), caption))
+}
+
+/// True if `text` contains only inline-level Markdown — paragraphs of
+/// plain text, line breaks, and inline emphasis/strong/code/links — no
+/// block-level structure at all (headings — including the setext
+/// `===`/`---`-underline form, lists, block quotes, code fences, tables,
+/// images, thematic breaks, raw HTML). This is the allowed shape for a
+/// `file`/`link`/`include` body's caption (see `parse_link_body`): a short
+/// explanatory note, not real document structure smuggled into a node type
+/// that's supposed to be just a link. Deliberately the plain CommonMark
+/// parser with no extensions enabled (no GFM tables/strikethrough/etc.) —
+/// this is a strict allowlist of event kinds, not a blocklist, so enabling
+/// more syntax would just make more of it parse as `Event::Text` (still
+/// fine) rather than ever needing to widen the match below.
+fn caption_is_plain_prose(text: &str) -> bool {
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+    Parser::new(text).all(|event| {
+        matches!(
+            event,
+            Event::Start(Tag::Paragraph)
+                | Event::End(TagEnd::Paragraph)
+                | Event::Start(Tag::Emphasis)
+                | Event::End(TagEnd::Emphasis)
+                | Event::Start(Tag::Strong)
+                | Event::End(TagEnd::Strong)
+                | Event::Start(Tag::Link { .. })
+                | Event::End(TagEnd::Link)
+                | Event::Text(_)
+                | Event::Code(_)
+                | Event::SoftBreak
+                | Event::HardBreak
+        )
+    })
 }
 
 fn scan(markdown: &str) -> Vec<Segment> {
@@ -3072,6 +3124,78 @@ Reused from Tests as well.
         assert_eq!(n.node_type, NodeType::File);
         assert_eq!(n.target.as_deref(), Some("./architecture.png"));
         assert_eq!(n.text, "[architecture](./architecture.png)");
+    }
+
+    #[test]
+    fn file_node_with_no_caption_leaves_it_none() {
+        let doc = "# Root\n\n## Diagram\n<!-- meshfox:node type=\"file\" -->\n\n[architecture](./architecture.png)\n";
+        let c = parse(doc).unwrap();
+        assert_eq!(c.node("diagram").unwrap().caption, None);
+    }
+
+    #[test]
+    fn link_node_parses_a_plain_text_caption_after_the_link() {
+        let doc = "# Root\n\n## LinkedIn\n<!-- meshfox:node type=\"link\" -->\n\n[post](https://lnkd.in/p/dXe_v6GH)\n\n\
+                    Опубликовано: см. дату в самом посте.\n";
+        let c = parse(doc).unwrap();
+        let n = c.node("linkedin").unwrap();
+        assert_eq!(n.target.as_deref(), Some("https://lnkd.in/p/dXe_v6GH"));
+        assert_eq!(n.caption.as_deref(), Some("Опубликовано: см. дату в самом посте."));
+    }
+
+    #[test]
+    fn link_node_caption_allows_inline_formatting() {
+        let doc = "# Root\n\n## LinkedIn\n<!-- meshfox:node type=\"link\" -->\n\n[post](https://example.com)\n\n\
+                    A **bold** note with `code` and a [nested link](https://other.example).\n";
+        let c = parse(doc).unwrap();
+        assert_eq!(
+            c.node("linkedin").unwrap().caption.as_deref(),
+            Some("A **bold** note with `code` and a [nested link](https://other.example).")
+        );
+    }
+
+    #[test]
+    fn link_node_caption_rejects_a_heading() {
+        let doc =
+            "# Root\n\n## LinkedIn\n<!-- meshfox:node type=\"link\" -->\n\n[post](https://example.com)\n\n### Not allowed\n";
+        assert_eq!(parse(doc), Err(ParseError::InvalidLinkBody("linkedin".to_string(), "link")));
+    }
+
+    #[test]
+    fn link_node_caption_rejects_a_list() {
+        let doc = "# Root\n\n## LinkedIn\n<!-- meshfox:node type=\"link\" -->\n\n[post](https://example.com)\n\n- one\n- two\n";
+        assert_eq!(parse(doc), Err(ParseError::InvalidLinkBody("linkedin".to_string(), "link")));
+    }
+
+    #[test]
+    fn file_node_caption_rejects_an_image() {
+        let doc = "# Root\n\n## Diagram\n<!-- meshfox:node type=\"file\" -->\n\n[architecture](./architecture.png)\n\n\
+                    ![alt](./other.png)\n";
+        assert_eq!(parse(doc), Err(ParseError::InvalidLinkBody("diagram".to_string(), "file")));
+    }
+
+    #[test]
+    fn file_node_caption_rejects_a_code_fence() {
+        let doc = "# Root\n\n## Diagram\n<!-- meshfox:node type=\"file\" -->\n\n[architecture](./architecture.png)\n\n\
+                    ```\ncode\n```\n";
+        assert_eq!(parse(doc), Err(ParseError::InvalidLinkBody("diagram".to_string(), "file")));
+    }
+
+    #[test]
+    fn link_node_rejects_trailing_text_glued_onto_the_links_own_line() {
+        // The caption must follow on its own line — same-line trailing
+        // text right after the closing `)` stays rejected, exactly as any
+        // trailing text did before captions existed at all.
+        let doc = "# Root\n\n## LinkedIn\n<!-- meshfox:node type=\"link\" -->\n\n[post](https://example.com) extra\n";
+        assert_eq!(parse(doc), Err(ParseError::InvalidLinkBody("linkedin".to_string(), "link")));
+    }
+
+    #[test]
+    fn render_roundtrips_a_link_node_with_a_caption() {
+        let doc = "# Root\n\n## LinkedIn\n<!-- meshfox:node type=\"link\" -->\n\n[post](https://example.com)\n\nA short note.\n";
+        let c = parse(doc).unwrap();
+        let rendered = render(&c);
+        assert_eq!(parse(&rendered).unwrap(), c);
     }
 
     #[test]

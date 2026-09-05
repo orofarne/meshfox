@@ -360,3 +360,101 @@ test("double-clicking a node's body does nothing outside Edit mode", async ({ pa
   await node.locator(".mesh-node-body").dblclick();
   await expect(page.locator(".mesh-text-editor")).toHaveCount(0);
 });
+
+// TODO.canvas.md: "Текст в нодах типа link/file" — a `file`/`link`/
+// `include` body may carry a plain-prose caption after the required link
+// (`mdcanvas::parse_link_body`/`caption_is_plain_prose`). Hand-writes the
+// caption via Source mode's own raw endpoint (there's no UI to author one
+// yet — see this feature's own "Сделано" note) and checks it renders.
+test("a link node's caption renders below the plain link, with inline formatting", async ({ page }) => {
+  const before = await fetchRaw(page);
+  const withCaption = before.replace(
+    "[example](https://example.com)\n",
+    "[example](https://example.com)\n\nA **bold** note with `code` and a [nested link](https://other.example).\n",
+  );
+  await page.evaluate(
+    (raw) => fetch("/api/canvas/raw", { method: "PUT", headers: { "content-type": "text/plain" }, body: raw }),
+    withCaption,
+  );
+  await page.reload();
+  await page.waitForSelector(".mesh-node");
+
+  const node = page.locator('.react-flow__node[data-id="link-node"]');
+  const body = node.locator(".mesh-node-body");
+  await expect(body).toContainText("A bold note with code and a nested link.");
+  await expect(body.locator("strong", { hasText: "bold" })).toBeVisible();
+  await expect(body.locator("code", { hasText: "code" })).toBeVisible();
+  await expect(body.locator("a", { hasText: "nested link" })).toHaveAttribute(
+    "href",
+    "https://other.example",
+  );
+
+  await page.evaluate(
+    (raw) => fetch("/api/canvas/raw", { method: "PUT", headers: { "content-type": "text/plain" }, body: raw }),
+    before,
+  );
+  expect(await fetchRaw(page)).toBe(before);
+});
+
+test("a file node's display=code caption renders after the file preview", async ({ page }) => {
+  const before = await fetchRaw(page);
+  const withCaption = before.replace(
+    '<!-- meshfox:node id="file-code" type="file" display="code" lang="text" interpreter="cat" -->\n\n[settings-file-target.txt](./settings-file-target.txt)\n',
+    '<!-- meshfox:node id="file-code" type="file" display="code" lang="text" interpreter="cat" -->\n\n[settings-file-target.txt](./settings-file-target.txt)\n\nCaption for the preview.\n',
+  );
+  expect(withCaption).not.toBe(before);
+  await page.evaluate(
+    (raw) => fetch("/api/canvas/raw", { method: "PUT", headers: { "content-type": "text/plain" }, body: raw }),
+    withCaption,
+  );
+  await page.reload();
+  await page.waitForSelector(".mesh-node");
+
+  const node = page.locator('.react-flow__node[data-id="file-code"]');
+  await expect(node).toContainText("Caption for the preview.");
+
+  await page.evaluate(
+    (raw) => fetch("/api/canvas/raw", { method: "PUT", headers: { "content-type": "text/plain" }, body: raw }),
+    before,
+  );
+  expect(await fetchRaw(page)).toBe(before);
+});
+
+// TODO.canvas.md: same item — NodeSettings' "URL" field used to rewrite a
+// link/file node's whole body as just `[title](target)`, silently dropping
+// any caption. `crates/server/src/lib.rs`'s `update_node` now preserves it.
+test("changing a link node's URL via NodeSettings preserves its existing caption", async ({ page }) => {
+  const before = await fetchRaw(page);
+  const withCaption = before.replace(
+    "[example](https://example.com)\n",
+    "[example](https://example.com)\n\nAn existing caption.\n",
+  );
+  await page.evaluate(
+    (raw) => fetch("/api/canvas/raw", { method: "PUT", headers: { "content-type": "text/plain" }, body: raw }),
+    withCaption,
+  );
+  // A reload resets Edit mode and the viewport — both needed again for
+  // `openSettings` below (the settings gear only shows in Edit mode, and
+  // `selectNode`'s click needs the node actually on-screen).
+  await page.reload();
+  await page.waitForSelector(".mesh-node");
+  await clickFitViewAndWait(page);
+  await page.getByRole("button", { name: "Edit" }).click();
+
+  await openSettings(page, "link-node");
+  const urlInput = page.locator(".vars-modal-field", { hasText: "URL" }).locator("input");
+  await urlInput.fill("https://changed.example");
+  await clickOk(page);
+
+  const node = page.locator('.react-flow__node[data-id="link-node"]');
+  await expect(node).toContainText("An existing caption.");
+  const raw = await fetchRaw(page);
+  expect(raw).toContain("https://changed.example");
+  expect(raw).toContain("An existing caption.");
+
+  await page.evaluate(
+    (raw) => fetch("/api/canvas/raw", { method: "PUT", headers: { "content-type": "text/plain" }, body: raw }),
+    before,
+  );
+  expect(await fetchRaw(page)).toBe(before);
+});

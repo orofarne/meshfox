@@ -106,6 +106,7 @@ mod tests {
             fold: None,
             tags: Vec::new(),
             target: None,
+            caption: None,
             display: None,
             lang: None,
             interpreter: None,

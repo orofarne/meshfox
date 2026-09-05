@@ -330,6 +330,11 @@ export interface MeshNodeData {
    * outside active search navigation. */
   searchCurrentOccurrence?: number;
   target?: string;
+  /** file/link/include only: optional plain-prose caption after the
+   * required link (see `CanvasNode.caption`'s own doc comment) — rendered
+   * below the target row, same markdown renderer a `text` node's body
+   * uses. `undefined` means no caption. */
+  caption?: string;
   /** Results of every embedded ` ```starlark constraint ` fence in this
    * node's own body, in document order (see `ConstraintStatusDto`) — matched
    * to its rendered `ConstraintSegment` purely by position, both being built
@@ -2040,6 +2045,24 @@ function MeshNodeBody({ data, nodeId }: { data: MeshNodeData; nodeId: string }) 
  * deps rail) at a larger size, instead of a separate read-only copy that
  * could drift from what the node itself shows.
  */
+/** Renders a `file`/`link`/`include` node's optional caption (see
+ * `MeshNodeData.caption`) — plain-prose Markdown, same renderer/plugins as
+ * a `text` node's body, just without `parseBody`'s fence/constraint
+ * segmentation: a caption can't contain either (`mdcanvas::parse` rejects
+ * any block-level Markdown in one at all — see SPEC.md), so there's
+ * nothing for that segmentation to ever find. */
+function FileLinkCaption({ caption }: { caption: string }) {
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm, remarkImageAttrs, remarkSubSup, remarkGfmAlerts]}
+      components={markdownComponents}
+      urlTransform={allowDataImageUrls}
+    >
+      {caption}
+    </ReactMarkdown>
+  );
+}
+
 export function NodeBodyContent({ data, nodeId }: { data: MeshNodeData; nodeId: string }) {
   if (data.nodeType === "group") return null;
   // A runnable file node's live run state is keyed under its own id in
@@ -2051,6 +2074,11 @@ export function NodeBodyContent({ data, nodeId }: { data: MeshNodeData; nodeId: 
   if (data.nodeType === "file" && data.display === "code") {
     return (
       <>
+        {/* Above the preview, not below — a caption here reads as a
+         * heading/intro for the file content that follows, not a footnote
+         * on it (unlike the plain-link display mode, where the caption
+         * naturally reads as elaborating on the link above it). */}
+        {data.caption && <div className="mesh-node-body nopan"><FileLinkCaption caption={data.caption} /></div>}
         <FileCodePreview nodeId={nodeId} target={data.target} lang={data.lang} />
         {fileRunLive && <LiveRunOutput live={fileRunLive} />}
       </>
@@ -2122,6 +2150,7 @@ export function NodeBodyContent({ data, nodeId }: { data: MeshNodeData; nodeId: 
         {data.nodeType === "link" && data.preview && data.target && (
           <LinkPreviewCard target={data.target} />
         )}
+        {data.caption && <FileLinkCaption caption={data.caption} />}
         {fileRunLive && <LiveRunOutput live={fileRunLive} />}
       </div>
     );

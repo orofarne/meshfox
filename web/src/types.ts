@@ -74,6 +74,12 @@ export interface CanvasNode {
   tags?: string[];
   /** For file/link nodes: the path or URL parsed out of the body's one link. */
   target?: string;
+  /** file/link/include only: optional plain-prose explanatory text after
+   * the required link (SPEC.md: body is exactly one Markdown link,
+   * optionally followed by a caption) — absent means no caption. Inline
+   * formatting only (bold/italic/code/links); rendered the same way a
+   * `text` node's body is. */
+  caption?: string;
   /** file-node only: how the target is shown — a plain link (default,
    * absent here) or a read-only code preview of the target file's content. */
   display?: "link" | "code";

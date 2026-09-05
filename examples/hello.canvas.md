@@ -152,3 +152,17 @@ linting...
 
 [vars.canvas.md](./vars.canvas.md)
 
+### Bug Tracker
+<!-- meshfox:node id="bug-tracker" type="link" -->
+
+[Bug Tracker](https://github.com/orofarne/meshfox/issues)
+
+Found something broken? Search here first, then open a new issue if it's not already tracked.
+
+### Seed Script
+<!-- meshfox:node id="seed-script" type="file" display="code" -->
+
+[seed.py](./interpreters-data/seed.py)
+
+A tiny runnable script — see `interpreters.canvas.md` for how meshfox executes it directly from the canvas.
+

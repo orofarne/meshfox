@@ -266,7 +266,19 @@ fn build_node_view(
     let (html_body, target) = if node.node_type == NodeType::Group {
         (String::new(), None)
     } else if node.node_type == NodeType::File && node.display == Some(FileDisplay::Code) {
-        (render_file_code(node, ctx.canvas_dir), node.target.clone())
+        // `render_file_code` replaces the node's own body with the
+        // target's file content — but an optional caption (see
+        // `Node::caption`) is still part of that body, and still worth
+        // showing. Above the preview, not below (unlike the plain-link
+        // display mode, which gets its caption for free below the link by
+        // rendering `node.text` — link line + caption — whole) — it reads
+        // as a heading/intro for the file content, not a footnote on it.
+        let mut html = String::new();
+        if let Some(caption) = &node.caption {
+            html.push_str(&render_markdown(caption, ctx, assets));
+        }
+        html.push_str(&render_file_code(node, ctx.canvas_dir));
+        (html, node.target.clone())
     } else {
         let html_body = render_markdown(&node.text, ctx, assets);
         let target = node.target.as_deref().map(|t| resolve_link_url(t, ctx));
@@ -1321,6 +1333,54 @@ mod tests {
         assert!(assets.is_empty());
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn display_code_file_node_puts_its_caption_above_the_preview() {
+        let dir = temp_dir("code-preview-caption");
+        write(&dir, "hello.rs", b"fn main() {}\n");
+        let c = canvas(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+             ## Src\n<!-- meshfox:node id=\"src\" type=\"file\" display=\"code\" -->\n\n\
+             [hello.rs](hello.rs)\n\nA short **caption**.\n",
+        );
+
+        let (site, _assets) = build(&c, &dir, None);
+        let src = site.find("src").unwrap();
+        assert!(src.html_body.contains("language-rust"), "{}", src.html_body);
+        let caption_at = src
+            .html_body
+            .find("<strong>caption</strong>")
+            .unwrap_or_else(|| panic!("caption missing: {}", src.html_body));
+        let preview_at = src
+            .html_body
+            .find("language-rust")
+            .unwrap_or_else(|| panic!("preview missing: {}", src.html_body));
+        assert!(
+            caption_at < preview_at,
+            "caption should render above the file preview: {}",
+            src.html_body
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn link_node_renders_its_caption_below_the_plain_link() {
+        // No dedicated branch for this in `build_node_view` — a `link`
+        // node's `html_body` is just `render_markdown(&node.text, ...)`
+        // whole, so the caption (already part of `node.text`) comes along
+        // for free; this is the regression test for that staying true.
+        let c = canvas(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+             ## Post\n<!-- meshfox:node id=\"post\" type=\"link\" -->\n\n\
+             [example](https://example.com)\n\nA short note.\n",
+        );
+
+        let site = build_site(&c);
+        let post = site.find("post").unwrap();
+        assert!(post.html_body.contains("example.com"), "{}", post.html_body);
+        assert!(post.html_body.contains("A short note."), "{}", post.html_body);
     }
 
     #[test]

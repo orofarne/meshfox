@@ -1718,7 +1718,13 @@ async fn update_node(
     }
 
     if let Some(target) = &req.target {
-        let body = format!("[{title}]({target})");
+        // Preserves an existing caption (see `Node::caption`) rather than
+        // silently dropping it — this patch only ever means "change the
+        // link", never "clear whatever explanatory text was under it".
+        let body = match &initial_node.caption {
+            Some(caption) => format!("[{title}]({target})\n\n{caption}"),
+            None => format!("[{title}]({target})"),
+        };
         raw = mdcanvas::set_node_body(&raw, &local_id, &body).ok_or_else(not_found)?;
     }
 
@@ -4896,6 +4902,42 @@ mod include_edit_tests {
         );
 
         let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn update_node_patching_target_preserves_an_existing_caption() {
+        // `NodeSettings`' "URL/File path" field only ever means "change the
+        // link" — this used to silently drop whatever caption (see
+        // `Node::caption`) was already there, since the old code rebuilt
+        // the whole body as just `[title](target)`.
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-caption-preserve-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base_path = dir.join("base.canvas.md");
+        std::fs::write(
+            &base_path,
+            concat!(
+                "<!-- meshfox:canvas -->\n# Base\n<!-- meshfox:node id=\"base\" -->\n\n",
+                "## LinkedIn\n<!-- meshfox:node id=\"linkedin\" type=\"link\" -->\n\n",
+                "[post](https://old.example)\n\nA short note.\n",
+            ),
+        )
+        .unwrap();
+        let state = build_state(base_path.clone(), false, None)
+            .await
+            .expect("valid test canvas");
+
+        let mut req = blank_update_request();
+        req.target = Some("https://new.example".to_string());
+        let updated =
+            expect_ok(update_node(State(state), Path("linkedin".to_string()), Json(req)).await);
+        let node = updated.node("linkedin").unwrap();
+        assert_eq!(node.target.as_deref(), Some("https://new.example"));
+        assert_eq!(node.caption.as_deref(), Some("A short note."));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

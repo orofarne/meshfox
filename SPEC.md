@@ -128,9 +128,15 @@ manual path, not gated by it.
   whatever nests under it structurally (no separate containment mechanism);
   a direct child's own `x`/`y` is relative to the group's, not absolute —
   see `x`/`y` above.
-- **`file`** / **`link`** — body must be *exactly* one Markdown link and
-  nothing else: `[label](target)`. A `file` node also accepts two optional
-  display attributes on its `meshfox:node` line:
+- **`file`** / **`link`** — body must start with exactly one Markdown link
+  on its own line, `[label](target)`, optionally followed (after a blank
+  line) by a plain-prose caption — inline formatting (bold/italic/inline
+  code/links) is fine, but no block-level Markdown: no headings (including
+  the setext `===`/`---`-underline form), lists, block quotes, code fences,
+  tables, images, thematic breaks, or raw HTML. Same-line trailing text
+  right after the link's closing `)` is still rejected — a caption has to
+  be its own paragraph. A `file` node also accepts two optional display
+  attributes on its `meshfox:node` line:
   - `display="link"` (default) or `display="code"` — `code` shows the
     target's own file content as a read-only, non-runnable syntax-highlighted
     preview instead of a plain clickable link. The file is read fresh from
@@ -188,15 +194,16 @@ manual path, not gated by it.
 
     [meshfox](https://github.com/orofarne/meshfox)
     ```
-- **`include`** — same one-link body as `file`/`link`, but the target
-  (another `.md` or `.canvas.md` file) is spliced in *dynamically* by
-  whatever consumer resolves includes — never written back to disk.
-  `run`/`validate` see the bare link, same as `file`/`link`. See
-  "Includes" below.
+- **`include`** — same link-plus-optional-caption body as `file`/`link`,
+  but the target (another `.md` or `.canvas.md` file) is spliced in
+  *dynamically* by whatever consumer resolves includes — never written
+  back to disk. `run`/`validate` see the bare link (and caption, if any),
+  same as `file`/`link`. See "Includes" below.
 
 Any other `type=` value, a non-empty `group` body, or a `file`/`link`/
-`include` body that isn't a single link is a parse error (`meshfox
-validate` catches these, plus a missing/cyclic/unparseable include target).
+`include` body that doesn't start with a single link (or whose caption
+carries block-level Markdown) is a parse error (`meshfox validate` catches
+these, plus a missing/cyclic/unparseable include target).
 
 There's no node type for a constraint contract — a Starlark check is an
 embedded fence living in any node's ordinary body, alongside its prose and
@@ -1186,9 +1193,9 @@ that as the new file's root body:
     > This note is only visible here, in a plain Markdown viewer.
     <!-- /meshfox:comment -->
 
-A `file`/`link`/`include` node's body rule ("exactly one Markdown link") is
-checked *after* stripping — a comment-wrapped blurb alongside the link
-doesn't count against it. Fence-aware, same as heading/node-comment
+A `file`/`link`/`include` node's body rule ("starts with exactly one
+Markdown link") is checked *after* stripping — a comment-wrapped blurb
+alongside the link doesn't count against it. Fence-aware, same as heading/node-comment
 scanning elsewhere in this spec: a marker written literally inside a code
 fence (e.g. showing someone this exact syntax) is left alone rather than
 treated as a real region.

@@ -1087,7 +1087,7 @@ impl App {
         if node.node_type == NodeType::File && node.display == Some(FileDisplay::Code) {
             if let Some(target) = &node.target {
                 let path = base_dir.join(target);
-                self.doc_segments = match std::fs::read_to_string(&path) {
+                let preview = match std::fs::read_to_string(&path) {
                     Ok(content) => {
                         vec![Segment::Text(self.highlighter.highlight_file(
                             node.lang.as_deref(),
@@ -1100,6 +1100,22 @@ impl App {
                         Style::default().fg(Color::Red),
                     ))])],
                 };
+                // The file-content preview replaces `node.text` entirely
+                // (it's the target's own content, not the node's body) —
+                // but an optional caption (see `Node::caption`) is still
+                // part of that body and still worth showing. Above the
+                // preview, not below (unlike the plain-link display mode,
+                // which gets its caption for free below the link by
+                // rendering `node.text` whole) — it reads as a heading/
+                // intro for the file content, not a footnote on it.
+                self.doc_segments = Vec::new();
+                if let Some(caption) = &node.caption {
+                    self.doc_segments
+                        .extend(markdown::render(caption, &base_dir, &self.highlighter));
+                    self.doc_segments
+                        .push(Segment::Text(vec![Line::from("")]));
+                }
+                self.doc_segments.extend(preview);
                 return;
             }
         }
