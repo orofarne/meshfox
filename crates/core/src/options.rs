@@ -43,9 +43,13 @@ pub(crate) fn parse_option_comment(
 /// Scans `markdown` (a node's own body text) for `meshfox:option` comments,
 /// fence-aware — a line inside a code fence (e.g. a worked example showing
 /// off the syntax itself) is never mistaken for a real declaration, same
-/// convention `vars::scan_var_decls`/`mdcanvas::scan` already use.
+/// convention `vars::scan_var_decls`/`mdcanvas::scan` already use — and
+/// output-region-aware (`fence::in_output_region`), so a marker only
+/// present because a command's own `output="markdown"` stdout got spliced
+/// in isn't mistaken for one the document's author actually wrote either.
 pub fn scan_option_decls(markdown: &str) -> Result<Vec<String>, OptionsError> {
     let fence_ranges = crate::fence::fenced_byte_ranges(markdown);
+    let output_ranges = crate::output::output_byte_ranges(markdown);
     let mut fi = 0;
     let mut names = Vec::new();
     let mut offset = 0;
@@ -56,6 +60,9 @@ pub fn scan_option_decls(markdown: &str) -> Result<Vec<String>, OptionsError> {
             fi += 1;
         }
         if fi < fence_ranges.len() && fence_ranges[fi].start <= start {
+            continue;
+        }
+        if crate::fence::in_output_region(&output_ranges, start) {
             continue;
         }
         if crate::attrs::is_indented_as_code(line) {
@@ -74,12 +81,13 @@ pub fn scan_option_decls(markdown: &str) -> Result<Vec<String>, OptionsError> {
 }
 
 /// `meshfox validate`-only: the first `meshfox:option` comment attribute
-/// anywhere in `markdown` that isn't `name` — same fence-aware line scan
-/// as `scan_option_decls`, kept separate for the same reason
+/// anywhere in `markdown` that isn't `name` — same fence-and-output-aware
+/// line scan as `scan_option_decls`, kept separate for the same reason
 /// `vars::unknown_var_attr` is (see `attrs::UnknownAttrError`'s own doc
 /// comment).
 pub fn unknown_option_attr(markdown: &str) -> Option<crate::attrs::UnknownAttrError> {
     let fence_ranges = crate::fence::fenced_byte_ranges(markdown);
+    let output_ranges = crate::output::output_byte_ranges(markdown);
     let mut fi = 0;
     let mut offset = 0;
     for line in markdown.split('\n') {
@@ -89,6 +97,9 @@ pub fn unknown_option_attr(markdown: &str) -> Option<crate::attrs::UnknownAttrEr
             fi += 1;
         }
         if fi < fence_ranges.len() && fence_ranges[fi].start <= start {
+            continue;
+        }
+        if crate::fence::in_output_region(&output_ranges, start) {
             continue;
         }
         if crate::attrs::is_indented_as_code(line) {
@@ -162,6 +173,23 @@ mod tests {
     #[test]
     fn ignores_an_option_comment_written_as_an_indented_code_block() {
         let names = scan_option_decls("    <!-- meshfox:option name=\"unfold\" -->\n").unwrap();
+        assert!(names.is_empty());
+    }
+
+    // TODO.canvas.md: "Другие fence-aware сканеры не знают про
+    // meshfox:output-регионы" — an `output="markdown"` region splices a
+    // command's raw stdout in unfenced (see
+    // `output::render_output_block_markdown`), so a forged declaration
+    // landing there isn't caught by the plain fence check alone.
+    #[test]
+    fn ignores_an_option_comment_forged_inside_an_unfenced_markdown_output_region() {
+        let md = concat!(
+            "```bash name=\"smoke\" cache output=\"markdown\"\necho hi\n```\n",
+            "<!-- meshfox:output name=\"smoke\" hash=\"x\" -->\n\n",
+            "<!-- meshfox:option name=\"unfold\" -->\n\n",
+            "<!-- /meshfox:output -->\n",
+        );
+        let names = scan_option_decls(md).unwrap();
         assert!(names.is_empty());
     }
 

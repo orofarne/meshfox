@@ -38,9 +38,12 @@ fn parse_tag_color_comment(line: &str) -> Option<HashMap<String, String>> {
 
 /// Scans `markdown` (a node's own body text) for `meshfox:tag-color`
 /// comments, fence-aware — same convention `vars::scan_var_decls`/
-/// `options::scan_option_decls` already use.
+/// `options::scan_option_decls` already use — and output-region-aware
+/// (`fence::in_output_region`), same reasoning as `options::scan_option_decls`'s
+/// own doc comment.
 pub fn scan_tag_color_decls(markdown: &str) -> Result<Vec<(String, String)>, TagColorError> {
     let fence_ranges = crate::fence::fenced_byte_ranges(markdown);
+    let output_ranges = crate::output::output_byte_ranges(markdown);
     let mut fi = 0;
     let mut decls = Vec::new();
     let mut offset = 0;
@@ -51,6 +54,9 @@ pub fn scan_tag_color_decls(markdown: &str) -> Result<Vec<(String, String)>, Tag
             fi += 1;
         }
         if fi < fence_ranges.len() && fence_ranges[fi].start <= start {
+            continue;
+        }
+        if crate::fence::in_output_region(&output_ranges, start) {
             continue;
         }
         if crate::attrs::is_indented_as_code(line) {
@@ -113,6 +119,7 @@ pub fn effective_color<'a>(node: &'a Node, tag_colors: &'a HashMap<String, Strin
 pub fn unknown_tag_color_attr(markdown: &str) -> Option<crate::attrs::UnknownAttrError> {
     const TAG_COLOR_ATTRS: &[&str] = &["tag", "color"];
     let fence_ranges = crate::fence::fenced_byte_ranges(markdown);
+    let output_ranges = crate::output::output_byte_ranges(markdown);
     let mut fi = 0;
     let mut offset = 0;
     for line in markdown.split('\n') {
@@ -122,6 +129,9 @@ pub fn unknown_tag_color_attr(markdown: &str) -> Option<crate::attrs::UnknownAtt
             fi += 1;
         }
         if fi < fence_ranges.len() && fence_ranges[fi].start <= start {
+            continue;
+        }
+        if crate::fence::in_output_region(&output_ranges, start) {
             continue;
         }
         if crate::attrs::is_indented_as_code(line) {
@@ -200,6 +210,22 @@ mod tests {
     fn ignores_a_declaration_written_as_an_indented_code_block() {
         let decls =
             scan_tag_color_decls("    <!-- meshfox:tag-color tag=\"bug\" color=\"1\" -->\n").unwrap();
+        assert!(decls.is_empty());
+    }
+
+    // TODO.canvas.md: "Другие fence-aware сканеры не знают про
+    // meshfox:output-регионы" — see options.rs's own regression test for
+    // why an unfenced `output="markdown"` region needs its own check
+    // beyond the plain fence one.
+    #[test]
+    fn ignores_a_declaration_forged_inside_an_unfenced_markdown_output_region() {
+        let md = concat!(
+            "```bash name=\"smoke\" cache output=\"markdown\"\necho hi\n```\n",
+            "<!-- meshfox:output name=\"smoke\" hash=\"x\" -->\n\n",
+            "<!-- meshfox:tag-color tag=\"bug\" color=\"1\" -->\n\n",
+            "<!-- /meshfox:output -->\n",
+        );
+        let decls = scan_tag_color_decls(md).unwrap();
         assert!(decls.is_empty());
     }
 

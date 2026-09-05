@@ -317,9 +317,12 @@ pub fn validate_value(decl: &VarDecl, value: &str) -> Result<(), String> {
 /// Scans `markdown` (a node's own body text) for `meshfox:var` comments,
 /// fence-aware — a line inside a code fence (e.g. a worked example showing
 /// off the syntax itself) is never mistaken for a real declaration, same
-/// convention `mdcanvas::scan`/`fence::candidate_fences` already use.
+/// convention `mdcanvas::scan`/`fence::candidate_fences` already use — and
+/// output-region-aware (`fence::in_output_region`), same reasoning as
+/// `options::scan_option_decls`'s own doc comment.
 pub fn scan_var_decls(markdown: &str) -> Result<Vec<VarDecl>, VarsError> {
     let fence_ranges = crate::fence::fenced_byte_ranges(markdown);
+    let output_ranges = crate::output::output_byte_ranges(markdown);
     let mut fi = 0;
     let mut decls = Vec::new();
     let mut offset = 0;
@@ -330,6 +333,9 @@ pub fn scan_var_decls(markdown: &str) -> Result<Vec<VarDecl>, VarsError> {
             fi += 1;
         }
         if fi < fence_ranges.len() && fence_ranges[fi].start <= start {
+            continue;
+        }
+        if crate::fence::in_output_region(&output_ranges, start) {
             continue;
         }
         if crate::attrs::is_indented_as_code(line) {
@@ -343,13 +349,14 @@ pub fn scan_var_decls(markdown: &str) -> Result<Vec<VarDecl>, VarsError> {
 }
 
 /// `meshfox validate`-only: the first `meshfox:var` comment attribute
-/// anywhere in `markdown` that isn't in `VAR_ATTRS`. Same fence-aware
-/// line scan as `scan_var_decls`, kept separate rather than folded into
-/// it (or `build_var_decl`'s own `VarsError`) since every other reader
+/// anywhere in `markdown` that isn't in `VAR_ATTRS`. Same fence-and-output-
+/// aware line scan as `scan_var_decls`, kept separate rather than folded
+/// into it (or `build_var_decl`'s own `VarsError`) since every other reader
 /// needs to keep silently accepting an attribute it doesn't recognize —
 /// see `attrs::UnknownAttrError`'s own doc comment.
 pub fn unknown_var_attr(markdown: &str) -> Option<crate::attrs::UnknownAttrError> {
     let fence_ranges = crate::fence::fenced_byte_ranges(markdown);
+    let output_ranges = crate::output::output_byte_ranges(markdown);
     let mut fi = 0;
     let mut offset = 0;
     for line in markdown.split('\n') {
@@ -359,6 +366,9 @@ pub fn unknown_var_attr(markdown: &str) -> Option<crate::attrs::UnknownAttrError
             fi += 1;
         }
         if fi < fence_ranges.len() && fence_ranges[fi].start <= start {
+            continue;
+        }
+        if crate::fence::in_output_region(&output_ranges, start) {
             continue;
         }
         if crate::attrs::is_indented_as_code(line) {
@@ -975,6 +985,22 @@ mod tests {
     #[test]
     fn ignores_var_comments_inside_a_fence() {
         let md = "```text\n<!-- meshfox:var name=\"NOT_REAL\" -->\n```\n";
+        assert!(scan_var_decls(md).unwrap().is_empty());
+    }
+
+    // TODO.canvas.md: "Другие fence-aware сканеры не знают про
+    // meshfox:output-регионы" — an `output="markdown"` region splices a
+    // command's raw stdout in unfenced (see
+    // `output::render_output_block_markdown`), so a forged declaration
+    // landing there isn't caught by the plain fence check above at all.
+    #[test]
+    fn ignores_a_var_comment_forged_inside_an_unfenced_markdown_output_region() {
+        let md = concat!(
+            "```bash name=\"smoke\" cache output=\"markdown\"\necho hi\n```\n",
+            "<!-- meshfox:output name=\"smoke\" hash=\"x\" -->\n\n",
+            "<!-- meshfox:var name=\"NOT_REAL\" -->\n\n",
+            "<!-- /meshfox:output -->\n",
+        );
         assert!(scan_var_decls(md).unwrap().is_empty());
     }
 

@@ -27,24 +27,30 @@ const END_MARKER: &str = "<!-- /meshfox:comment -->";
 /// Removes every top-level (fence-aware — a marker written literally
 /// inside a code fence, e.g. as a usage example, is left alone, same
 /// spirit as `mdcanvas::scan`'s own fence-awareness for headings/node
-/// comments) `meshfox:comment` region from `markdown`, markers and
-/// enclosed text alike. Pairs each start marker with the next end marker
-/// after it, left to right; a start marker with no end marker anywhere
-/// after it is left untouched (malformed input — same "don't guess, leave
-/// it alone" every other marker-pair parser in this crate uses).
+/// comments — and output-region-aware, same reasoning as
+/// `fence::in_output_region`'s own doc comment: a marker only present
+/// because a command's own `output="markdown"` stdout got spliced in must
+/// never be mistaken for one the document's author actually wrote)
+/// `meshfox:comment` region from `markdown`, markers and enclosed text
+/// alike. Pairs each start marker with the next end marker after it, left
+/// to right; a start marker with no end marker anywhere after it is left
+/// untouched (malformed input — same "don't guess, leave it alone" every
+/// other marker-pair parser in this crate uses).
 pub(crate) fn strip(markdown: &str) -> String {
     let fenced = fenced_byte_ranges(markdown);
+    let output = crate::output::output_byte_ranges(markdown);
     let in_fence = |pos: usize| fenced.iter().any(|r| r.start <= pos && pos < r.end);
+    let hidden = |pos: usize| in_fence(pos) || crate::fence::in_output_region(&output, pos);
 
     let starts: Vec<usize> = markdown
         .match_indices(START_MARKER)
         .map(|(i, _)| i)
-        .filter(|&i| !in_fence(i))
+        .filter(|&i| !hidden(i))
         .collect();
     let ends: Vec<usize> = markdown
         .match_indices(END_MARKER)
         .map(|(i, _)| i)
-        .filter(|&i| !in_fence(i))
+        .filter(|&i| !hidden(i))
         .collect();
 
     let mut regions: Vec<Range<usize>> = Vec::new();
@@ -112,5 +118,24 @@ mod tests {
     fn a_region_can_span_a_fence_that_sits_entirely_inside_it() {
         let md = "<!-- meshfox:comment -->before\n```\ncode\n```\nafter<!-- /meshfox:comment -->kept";
         assert_eq!(strip(md), "kept");
+    }
+
+    // TODO.canvas.md: "Другие fence-aware сканеры не знают про
+    // meshfox:output-регионы" — an `output="markdown"` region splices a
+    // command's raw stdout in unfenced (see
+    // `output::render_output_block_markdown`), so a marker pair landing
+    // there isn't caught by the plain fence check above at all; must be
+    // recognized as opaque via `output::output_byte_ranges` instead.
+    #[test]
+    fn a_marker_pair_forged_inside_an_unfenced_markdown_output_region_is_left_alone() {
+        let md = concat!(
+            "keep before\n\n",
+            "```bash name=\"smoke\" cache output=\"markdown\"\necho hi\n```\n",
+            "<!-- meshfox:output name=\"smoke\" hash=\"x\" -->\n\n",
+            "<!-- meshfox:comment -->forged<!-- /meshfox:comment -->\n\n",
+            "<!-- /meshfox:output -->\n",
+            "keep after\n",
+        );
+        assert_eq!(strip(md), md);
     }
 }

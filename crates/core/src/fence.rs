@@ -424,8 +424,14 @@ fn candidate_fences(markdown: &str) -> Vec<(RawFence, String, HashMap<String, St
 /// `name=`/`cache` runnable fence (or a `starlark constraint` one, see
 /// `scan_constraint_blocks`) forged by whatever the command printed —
 /// belt and suspenders against ever growing a spurious/adversarial block
-/// out of a node's own cached output.
-fn in_output_region(ranges: &[Range<usize>], pos: usize) -> bool {
+/// out of a node's own cached output. Also used, `pub(crate)`, by every
+/// other root-only comment scanner (`comment::strip`,
+/// `options::scan_option_decls`/`unknown_option_attr`,
+/// `tag_colors::scan_tag_color_decls`/`unknown_tag_color_attr`,
+/// `vars::scan_var_decls`/`unknown_var_attr`) for the same reason — see
+/// TODO.canvas.md: "Другие fence-aware сканеры не знают про
+/// meshfox:output-регионы".
+pub(crate) fn in_output_region(ranges: &[Range<usize>], pos: usize) -> bool {
     ranges.iter().any(|r| r.start <= pos && pos < r.end)
 }
 
