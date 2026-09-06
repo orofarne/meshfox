@@ -2,7 +2,7 @@
   "name": "meshfox-vscode",
   "displayName": "meshfox",
   "description": "View and run meshfox .canvas.md files as an interactive node canvas, right inside VS Code.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publisher": "Orofarne",
   "license": "MIT",
   "repository": {

@@ -76,6 +76,15 @@ const GROUP_ENTER_PORT = 4597;
 // invocation, exactly as every port above already does between suites.
 const GROUP_DRAG_FIREFOX_PORT = 4610;
 const GROUP_ENTER_FIREFOX_PORT = 4611;
+// Twenty-second/third server + port for copy-paste.spec.ts — same
+// GROUP_DRAG_FIREFOX_PORT-style split as above, its own fixture pair
+// (copy-paste.canvas.md/copy-paste-firefox.canvas.md) and two ports: this
+// suite's round-trip test genuinely rewrites its fixture's root body on
+// both browsers (unlike image-paste.spec.ts, which skips Firefox
+// entirely), so a real write from one browser's run could otherwise race
+// a concurrent read/write from the other's.
+const COPY_PASTE_PORT = 4612;
+const COPY_PASTE_FIREFOX_PORT = 4613;
 // Ninth server + port for document-options.spec.ts — same reasoning
 // again, its own fixture (document-options.canvas.md) and port, so its
 // own `PUT /api/options` writes never collide with any other suite's
@@ -289,6 +298,15 @@ export default defineConfig({
       testMatch: /(^|\/)autofit-title\.spec\.ts$/,
       use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${AUTOFIT_TITLE_PORT}` },
     },
+    {
+      name: `${browser}-copy-paste`,
+      testMatch: /(^|\/)copy-paste\.spec\.ts$/,
+      use: {
+        ...device,
+        viewport: VIEWPORT,
+        baseURL: `http://127.0.0.1:${browser === "firefox" ? COPY_PASTE_FIREFOX_PORT : COPY_PASTE_PORT}`,
+      },
+    },
   ]),
   webServer: [
     {
@@ -431,6 +449,18 @@ export default defineConfig({
     {
       command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/autofit-title.canvas.md --port ${AUTOFIT_TITLE_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${AUTOFIT_TITLE_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/copy-paste.canvas.md --port ${COPY_PASTE_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${COPY_PASTE_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/copy-paste-firefox.canvas.md --port ${COPY_PASTE_FIREFOX_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${COPY_PASTE_FIREFOX_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },

@@ -148,7 +148,7 @@ export function CanvasSourceEditor({ initialInclude, onSaved, onClose, onDirtyCh
           </button>
         </div>
       </div>
-      <div className="mesh-source-editor-body">
+      <div className="mesh-source-editor-body" data-vscode-context="{}">
         {text === null || !monacoReady ? (
           <div className="mesh-source-editor-loading">Loading…</div>
         ) : (

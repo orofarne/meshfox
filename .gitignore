@@ -13,6 +13,10 @@ web/dist/*
 web/test-results/
 web/playwright-report/
 web/blob-report/
+# Same, for the real-VS-Code e2e suite (editors/vscode/e2e/playwright.config.ts).
+editors/vscode/e2e/test-results/
+editors/vscode/e2e/playwright-report/
+editors/vscode/e2e/blob-report/
 .DS_Store
 # Project-local Python virtualenvs created by a canvas's own `venv-setup`
 # block (see examples/python-venv.canvas.md) — local machine state.

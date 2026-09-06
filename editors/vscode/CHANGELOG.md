@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.1
+
+- Fixed: pasting text into a node's body editor (or the whole-document
+  Source editor) via Ctrl/Cmd+V did nothing inside a real VS Code window,
+  despite working fine in a plain browser tab — a real Ctrl/Cmd+V there
+  never delivered a native `paste` event to Monaco's input surface at all
+  (a VS Code/Electron limitation around its own nested webview iframe, not
+  a bug in this extension); it's now detected and worked around by reading
+  the clipboard directly when that happens.
+- The same editors' right-click menu (Cut/Copy/Paste) is now this
+  extension's own instead of the OS's native one — that native menu's own
+  Paste suffered the identical gap, and there was no way to keep only it
+  disabled while leaving Cut/Copy native.
+
 ## 0.2.0
 
 - New **"meshfox: Install"** command — types the same install one-liner

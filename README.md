@@ -793,6 +793,25 @@ For interactive debugging instead of a one-shot run, use `npm run test:e2e:ui` (
 
 `playwright.config.ts`'s `webServer` starts `meshfox view` itself (via `cargo run`, rebuilding only if the Rust side changed) — no server needs to be already running, and no separate `npm run build` step either, since `test:e2e` runs it as a `pretest:e2e` hook. Debug builds of `meshfox-server` read `web/dist` fresh off disk on every request (`rust-embed`'s `debug-embed` feature, which would force compile-time embedding even in a debug build, isn't enabled — see its `Cargo.toml`), so a frontend-only change just needs `npm run build` again, not a Rust rebuild, between test runs.
 
+### VS Code end-to-end tests
+<!-- meshfox:node id="vs-code-end-to-end-tests" -->
+
+`editors/vscode/e2e/` is a separate, deliberately opt-in [Playwright](https://playwright.dev) suite from the one above — it drives a real, already-installed VS Code via Playwright's Electron support (`_electron.launch()`), not headless Chromium, because the bug it exists to catch (TODO.canvas.md: "VSCode: вставка текста (Cmd+V и контекстное меню) в редактор ноды не работает") only reproduces inside a real VS Code window: a genuinely trusted Cmd+V against `web/src/NodeTextEditor.tsx`'s Monaco editor fires a normal `paste` DOM event in any real browser tab (confirmed directly, and covered by `web/e2e/copy-paste.spec.ts`'s own round-trip test) but never does inside VS Code's own webview — a long-standing, still-open class of upstream VS Code/Electron limitation (nested-iframe focus resolution for a native accelerator-driven paste command; see [microsoft/vscode#129178](https://github.com/microsoft/vscode/issues/129178)), not a bug in this app. `web/src/textPasteFallback.ts` works around it (falls back to `navigator.clipboard.readText()` when a real `paste` event doesn't show up within 250ms of a Ctrl/Cmd+V keydown) — this suite is what actually proves that fallback works, end to end, in the one environment that matters for it. Confirmed the same investigation's way: the node body editor's own title field and NodeSettings' ID field (both plain `<input>`s, no `EditContext` involved) already paste correctly via real Cmd+V in VS Code with no fallback needed at all — the gap is specific to Monaco's `EditContext` input surface, not general to every input in the app.
+
+Heavier and more fragile than the browser suite above on purpose (see `playwright.config.ts`'s own doc comment): a real VS Code + extension-host + meshfox-worker launch costs ~15-20s per file, needs a real VS Code install on the machine running it (`VSCODE_ELECTRON_PATH` env var overrides the default macOS/Linux install-path guesses in `helpers.ts`), and isn't part of `e2e-tests` above or any CI gate — run it by hand when touching real-VS-Code-specific behavior (`editors/vscode/`, or anything paste/clipboard-related in the Monaco editors).
+
+```sh name="vscode-e2e-prep"
+cd editors/vscode/e2e
+npm install
+```
+
+```sh name="vscode-e2e-run" deps="vscode-e2e-prep"
+cargo build -p meshfox-cli
+cd web && npm run build && cd ..
+cd editors/vscode && npm run compile && cd e2e
+npm test
+```
+
 ### Linting
 <!-- meshfox:node id="linting" -->
 

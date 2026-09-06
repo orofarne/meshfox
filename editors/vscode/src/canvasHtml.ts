@@ -120,6 +120,17 @@ export function canvasAppHtml(indexHtml: string, baseUrl: string, fragment: stri
   const inject =
     `<meta http-equiv="Content-Security-Policy" content="${escapeHtml(csp)}">\n` +
     `<base href="${escapeHtml(baseUrl)}">\n` +
+    // A plain `<meta>` tag, not a script — needs no CSP allowance (unlike
+    // `fragmentScript` below, which needs the shared nonce) and is simpler
+    // than a query param on `baseUrl` (which every root-absolute asset/
+    // `fetch()` reference would otherwise inherit). The app's own
+    // `web/src/vscodeHost.ts` reads this once at startup to tell a real VS
+    // Code webview apart from a plain browser tab (e.g. "meshfox: Open in
+    // Browser", or the real browser this same `index.html` also serves) —
+    // see that file's own doc comment for what it's actually used for
+    // (working around real-VS-Code-only paste/context-menu limitations,
+    // TODO.canvas.md: "VSCode: вставка текста... не работает").
+    `<meta name="meshfox-host" content="vscode">\n` +
     fragmentScript +
     CODE_BLOCK_BACKGROUND_RESET +
     "\n";

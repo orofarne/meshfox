@@ -5,6 +5,8 @@ import type * as MonacoNS from "monaco-editor";
 import { NodeBodyPreview } from "./MeshNode";
 import { attachMeshfoxMarkers } from "./meshfoxMarkers";
 import { attachImagePaste } from "./imagePaste";
+import { attachTextPasteFallback } from "./textPasteFallback";
+import { attachVSCodeContextMenu } from "./vsCodeContextMenu";
 import { ensureMonacoConfigured, LazyEditor } from "./monacoSetup";
 import { THEMES } from "./shiki";
 import { THEME_CHANGE_EVENT } from "./theme";
@@ -58,15 +60,39 @@ export const MONACO_OPTIONS: MonacoNS.editor.IStandaloneEditorConstructionOption
   // prose it just means "same word" in the mundane sense (an article, a
   // common verb), which lights up half the paragraph for no useful reason.
   occurrencesHighlight: "off",
+  // Monaco's own custom right-click menu's "Paste" item is broken
+  // everywhere, not just on Chromium: it calls `document.execCommand
+  // ("paste")`, confirmed (TODO.canvas.md: "VSCode: вставка текста... не
+  // работает") to silently no-op against Monaco 0.53's Chromium-only
+  // `EditContext`-API input surface (`.native-edit-context`) — an earlier
+  // version of this fix left it enabled on Firefox specifically, since the
+  // exact same `execCommand("paste")` call does insert real clipboard
+  // content there when invoked directly via `execCommand`. But a real
+  // right-click → Paste through Firefox's own rendered menu item doesn't
+  // (confirmed directly, by hand, after that first fix shipped) — whatever
+  // Monaco's own Paste *action* actually does differs from a bare
+  // `execCommand` call in a way that breaks it there too. `false`
+  // unconditionally, everywhere: no custom Monaco menu entries
+  // (`editor.addAction`) exist anywhere in this app to lose, and every
+  // browser's own native context menu pastes as a trusted OS-level action
+  // instead of a scripted one — confirmed a real (CDP-trusted) Cmd+V
+  // already works fine against the same `.native-edit-context` element, so
+  // the native menu's Paste, going through that same non-scripted path,
+  // does too.
+  contextmenu: false,
 };
 
 /**
  * Wires up meshfox's own extensions on a freshly-mounted Monaco editor —
- * marker-comment/fence-attribute highlighting (`meshfoxMarkers.ts`) and
- * image-paste-as-base64 (`imagePaste.ts`) — the Monaco counterparts of the
- * old CodeMirror `EDITOR_EXTENSIONS`. Shared between `NodeTextEditor` and
- * `CanvasSourceEditor`, both the same setup, rather than each wiring it in
- * separately. Returns a cleanup function.
+ * marker-comment/fence-attribute highlighting (`meshfoxMarkers.ts`),
+ * image-paste-as-base64 (`imagePaste.ts`), a scripted-clipboard fallback
+ * for when a real Ctrl/Cmd+V never produces a native `paste` event at all
+ * (`textPasteFallback.ts` — real VS Code, confirmed), and a full Cut/Copy/
+ * Paste right-click menu of its own to replace the native one that same
+ * gap breaks there (`vsCodeContextMenu.ts` — both real-VS-Code-only) — the
+ * Monaco counterparts of the old CodeMirror `EDITOR_EXTENSIONS`. Shared
+ * between `NodeTextEditor` and `CanvasSourceEditor`, both the same setup,
+ * rather than each wiring it in separately. Returns a cleanup function.
  */
 export function attachMeshfoxEditorExtensions(
   editor: MonacoNS.editor.IStandaloneCodeEditor,
@@ -74,9 +100,13 @@ export function attachMeshfoxEditorExtensions(
 ): () => void {
   const detachMarkers = attachMeshfoxMarkers(editor, monaco);
   const detachPaste = attachImagePaste(editor);
+  const detachTextPasteFallback = attachTextPasteFallback(editor);
+  const detachContextMenu = attachVSCodeContextMenu(editor);
   return () => {
     detachMarkers();
     detachPaste();
+    detachTextPasteFallback();
+    detachContextMenu();
   };
 }
 
@@ -251,7 +281,7 @@ export function NodeTextEditor({ title, initialText, onChange, onSaveTitle, onOp
           </button>
         </div>
         <div className="mesh-text-editor-panes">
-          <div className="mesh-text-editor-source">
+          <div className="mesh-text-editor-source" data-vscode-context="{}">
             {monacoReady ? (
               <Suspense fallback={<p className="mesh-node-hint">loading editor…</p>}>
                 <LazyEditor

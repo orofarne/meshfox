@@ -1,5 +1,6 @@
 .vscode/**
 src/**
+e2e/**
 tsconfig.json
 **/*.map
 **/*.ts
