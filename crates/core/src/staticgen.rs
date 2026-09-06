@@ -456,7 +456,20 @@ fn render_markdown(text: &str, ctx: &RenderCtx, assets: &mut Vec<Asset>) -> Stri
         | Options::ENABLE_FOOTNOTES
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_GFM;
-    let raw: Vec<Event> = Parser::new_ext(&stripped, options).collect();
+    // Raw HTML (`Event::Html`/`Event::InlineHtml`) straight from a node's
+    // own Markdown text — `<script>` and friends — is dropped here, not
+    // sanitized: web UI's `ReactMarkdown` renders without `rehype-raw`,
+    // so `mdast-util-to-hast` already drops any raw-HTML node outright
+    // (no `rehype-sanitize`-style safe-subset passthrough either) rather
+    // than showing it as escaped text. Matching that means dropping, not
+    // allowlisting. This must run on `raw` (straight off the parser)
+    // *before* the transform loop below, which synthesizes its own
+    // legitimate `Event::Html` for spliced `<img>` attrs and `<sub>`/
+    // `<sup>` (`subsup_events`) — filtering the final `events` list
+    // instead would strip those too.
+    let raw: Vec<Event> = Parser::new_ext(&stripped, options)
+        .filter(|e| !matches!(e, Event::Html(_) | Event::InlineHtml(_)))
+        .collect();
     let mut events: Vec<Event> = Vec::with_capacity(raw.len());
     let mut in_code = false;
     let mut i = 0;
@@ -900,6 +913,46 @@ mod tests {
             "{body}"
         );
         assert!(assets.is_empty(), "a data: URL has no local file to copy");
+    }
+
+    // TODO.canvas.md: "Static export не санитайзит сырой HTML из тела нод"
+    // — a static site has no `ReactMarkdown` deciding what's safe to
+    // render at view time, unlike web UI, so raw HTML in a node's body
+    // (however it got there — hand-typed, or spliced in via a runnable
+    // fence's `output="markdown"`) must be dropped at render time here
+    // instead, the same way web UI's `ReactMarkdown` (no `rehype-raw`)
+    // already drops it rather than rendering or sanitizing it.
+    #[test]
+    fn raw_html_in_a_node_body_is_dropped_not_rendered() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "before <script>alert(1)</script> after\n\n",
+            "<div onclick=\"evil()\">block html</div>\n",
+        ));
+        let site = build_site(&c);
+        let body = &site.find("root").unwrap().html_body;
+        assert!(!body.contains("<script"), "{body}");
+        assert!(!body.contains("onclick"), "{body}");
+        assert!(!body.contains("<div"), "{body}");
+        assert!(body.contains("before"), "{body}");
+        assert!(body.contains("after"), "{body}");
+    }
+
+    // Raw-HTML filtering (above) must only touch what the parser itself
+    // read off the node's own Markdown text — not the `Event::Html` this
+    // renderer synthesizes for its own spliced `<img>` attrs, or dropping
+    // this would silently regress `image_size_attrs_become_html_width_height`.
+    #[test]
+    fn image_size_attrs_still_render_alongside_dropped_raw_html() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "<script>alert(1)</script>\n\n",
+            "![alt](pic.png){width=300}\n",
+        ));
+        let site = build_site(&c);
+        let body = &site.find("root").unwrap().html_body;
+        assert!(!body.contains("<script"), "{body}");
+        assert!(body.contains(r#"width="300""#), "{body}");
     }
 
     #[test]

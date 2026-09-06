@@ -967,6 +967,29 @@ pub fn set_fence_attrs(
         parts.push(format!("interpreter=\"{i}\""));
     }
 
+    // Any attribute this patch has no typed field for (e.g. `output=` —
+    // see SPEC.md's "Cached output") still lives in `block.attrs`
+    // (`fence::build_code_block` keeps the raw map alongside the typed
+    // fields) — carry it over verbatim instead of silently dropping it
+    // just because `FenceAttrsPatch` doesn't know its name yet.
+    const KNOWN_ATTRS: &[&str] = &[
+        "name", "deps", "env", "cache", "tty", "autoclose", "always", "default", "interpreter",
+    ];
+    let mut extra: Vec<(&str, &str)> = block
+        .attrs
+        .iter()
+        .filter(|(k, _)| !KNOWN_ATTRS.contains(&k.as_str()))
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    extra.sort_unstable_by_key(|(k, _)| *k);
+    for (k, v) in extra {
+        if v == "true" {
+            parts.push(k.to_string());
+        } else {
+            parts.push(format!("{k}=\"{v}\""));
+        }
+    }
+
     let attrs_suffix = if parts.is_empty() {
         String::new()
     } else {
@@ -2758,6 +2781,33 @@ Reused from Tests as well.
         .unwrap();
         assert!(updated.starts_with("# Root"));
         assert!(updated.contains("````bash name=\"b\" cache\necho '```'\n````"));
+    }
+
+    #[test]
+    fn set_fence_attrs_preserves_attributes_it_has_no_typed_field_for() {
+        // Repro from TODO.canvas.md: `output="markdown"` has no field on
+        // `FenceAttrsPatch`, so a rename/deps-clear/etc. must still leave
+        // it (and any other attribute the patch doesn't know about)
+        // exactly as it was, instead of dropping it silently.
+        let doc = concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```python name=\"demo\" interpreter=\"$PYTHON -u\" cache ",
+            "deps=\"a\" output=\"markdown\"\nprint(1)\n```\n",
+        );
+        let updated = set_fence_attrs(
+            doc,
+            "root",
+            "demo",
+            &FenceAttrsPatch {
+                deps: Some(Vec::new()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(updated.contains("output=\"markdown\""));
+        assert!(!updated.contains("deps="));
+        assert!(updated.contains("cache"));
+        assert!(updated.contains("interpreter=\"$PYTHON -u\""));
     }
 
     #[test]
