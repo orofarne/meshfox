@@ -306,6 +306,11 @@ struct Renderer<'a> {
     code_deps: Option<String>,
     code_env: Option<String>,
     code_buf: String,
+    /// Set between a `<!-- meshfox:output name="..." ... -->` marker and
+    /// its matching `<!-- /meshfox:output -->` (an `output="markdown"`
+    /// block's own cached, spliced-in result — see `crate::output`) — see
+    /// `OutputRegion`'s own doc comment for what happens inside one.
+    output_region: Option<OutputRegion>,
     table: Option<TableState>,
     pending_heading_style: Option<Style>,
     /// Parallel stack to `quote_depth` — which (if any) GFM alert kind
@@ -330,6 +335,31 @@ struct TableState {
     in_head: bool,
 }
 
+/// State inside a `<!-- meshfox:output name="..." ... --> ... <!--
+/// /meshfox:output -->` region — an `output="markdown"` block's own real
+/// result gets its own purple frame, same color identity as its source
+/// block's (`theme::DEP` — see `dep_line`), so it reads as visually
+/// grouped with it instead of blending into surrounding prose.
+/// `render_output_block_markdown` (`crates/core/src/output.rs`) always
+/// writes stderr, if any, first, as its own `` ```text `` fence, *before*
+/// the real spliced Markdown — that gets its own separate frame (handled
+/// directly in `TagEnd::CodeBlock`, never through `push_segment`'s own
+/// wrapping below), not nested inside the Markdown one, so the two read
+/// as two related-but-distinct panels rather than one frame accidentally
+/// doubled.
+struct OutputRegion {
+    name: String,
+    /// Cleared by whichever code path handles this region's very first
+    /// segment — the leading stderr fence special-case in
+    /// `TagEnd::CodeBlock`, or `push_segment`'s own generic path — so
+    /// exactly one of them claims it.
+    first_segment_pending: bool,
+    /// Whether this region's own "markdown" frame's header has already
+    /// been pushed — opened lazily, right before the first segment that
+    /// isn't the leading stderr fence (`push_segment`).
+    markdown_frame_open: bool,
+}
+
 impl<'a> Renderer<'a> {
     fn new(base_dir: &'a Path, hl: &'a Highlighter, node_id: &'a str, decls: &'a [meshfox_core::vars::VarDecl]) -> Self {
         Renderer {
@@ -349,6 +379,7 @@ impl<'a> Renderer<'a> {
             code_deps: None,
             code_env: None,
             code_buf: String::new(),
+            output_region: None,
             table: None,
             pending_heading_style: None,
             alert_stack: Vec::new(),
@@ -403,16 +434,123 @@ impl<'a> Renderer<'a> {
     /// back, ...) render with no gap and read as one merged block, since
     /// `render_document` just stacks each segment's lines directly on top
     /// of the next with no spacing of its own.
+    ///
+    /// Inside an `output_region` (see its own doc comment), this is also
+    /// where that region's own "markdown" frame gets opened, lazily,
+    /// right before whichever segment is the first one it actually claims
+    /// (`TagEnd::CodeBlock`'s leading-stderr special case claims one
+    /// itself instead, via `push_segment_plain`, before this ever runs).
+    /// The header is pushed (via `push_segment_plain`, so its own blank
+    /// separator reads as *outside* the frame) before
+    /// `markdown_frame_open` flips to `true` — only then does `seg`'s own
+    /// blank separator, computed fresh inside `push_segment_plain`, read
+    /// as *inside* it and get the same `│ ` border `seg` itself does.
     fn push_segment(&mut self, seg: Segment) {
+        let needs_frame = matches!(&self.output_region, Some(r) if !r.markdown_frame_open);
+        if needs_frame {
+            let name = self.output_region.as_ref().unwrap().name.clone();
+            self.push_segment_plain(Segment::Text(vec![Line::from(Span::styled(
+                format!("┌─ output: {name} · markdown ──"),
+                Style::default().fg(super::theme::DEP),
+            ))]));
+            if let Some(region) = &mut self.output_region {
+                region.first_segment_pending = false;
+                region.markdown_frame_open = true;
+            }
+        }
+        self.push_segment_plain(self.wrap_in_output_border(seg));
+    }
+
+    /// `push_segment`, minus the frame-*opening* decision above — still
+    /// applies the region's own border to its own blank separator (via
+    /// `wrap_in_output_border`, checked fresh against whatever
+    /// `output_region` state holds *right now*), just never opens/claims
+    /// the frame itself. Used for a segment that has already fully
+    /// decided its own framing: the leading-stderr special case in
+    /// `TagEnd::CodeBlock` (frame not open yet — its own separator comes
+    /// out unwrapped, correctly sitting outside/before the markdown
+    /// frame), the markdown frame's own header just above (same reason),
+    /// and its closing line in `handle_output_marker` (frame *is* still
+    /// open at that point — its own separator comes out wrapped, closing
+    /// the border cleanly down to the `└─` corner).
+    fn push_segment_plain(&mut self, seg: Segment) {
         if !self.segments.is_empty() {
-            self.segments.push(Segment::Text(vec![Line::from("")]));
+            let blank = self.wrap_in_output_border(Segment::Text(vec![Line::from("")]));
+            self.segments.push(blank);
         }
         self.segments.push(seg);
+    }
+
+    /// Prefixes every line of `seg` with a purple `│ ` — the "markdown"
+    /// frame's own left border, while it's actually open (not merely
+    /// while inside `output_region` at all — see `push_segment`'s own
+    /// doc comment for why the two aren't the same thing).
+    fn wrap_in_output_border(&self, seg: Segment) -> Segment {
+        let open = matches!(&self.output_region, Some(r) if r.markdown_frame_open);
+        if !open {
+            return seg;
+        }
+        match seg {
+            Segment::Text(lines) => Segment::Text(
+                lines
+                    .into_iter()
+                    .map(|l| {
+                        let mut spans =
+                            vec![Span::styled("│ ", Style::default().fg(super::theme::DEP))];
+                        spans.extend(l.spans);
+                        Line::from(spans)
+                    })
+                    .collect(),
+            ),
+            other => other, // Segment::Image — no border to draw around a widget.
+        }
     }
 
     fn finish(mut self) -> Vec<Segment> {
         self.flush_paragraph();
         self.segments
+    }
+
+    /// Recognizes a `<!-- meshfox:output name="..." ... -->`/
+    /// `<!-- /meshfox:output -->` pair (`crate::output`'s own markers —
+    /// mirrored here as plain string literals since both are private to
+    /// that module, nothing public to import) inside a raw-HTML `text`
+    /// event, opening/closing `output_region` around whatever's between
+    /// them. Every other HTML comment (`meshfox:node`, `meshfox:var`,
+    /// ...) is still just dropped, same as before this existed.
+    fn handle_output_marker(&mut self, text: &str) {
+        let trimmed = text.trim();
+        if let Some(rest) = trimmed.strip_prefix("<!-- meshfox:output ") {
+            let attrs_str = rest.strip_suffix("-->").unwrap_or(rest).trim();
+            let attrs =
+                meshfox_core::attrs::attrs_from_tokens(meshfox_core::attrs::tokenize(attrs_str));
+            let name = attrs.get("name").cloned().unwrap_or_default();
+            self.flush_paragraph();
+            // No frame pushed yet — deferred to the region's first real
+            // content, so an empty region (or one whose only content is
+            // the leading stderr fence, handled separately) never leaves
+            // a stray, contentless frame behind.
+            self.output_region = Some(OutputRegion {
+                name,
+                first_segment_pending: true,
+                markdown_frame_open: false,
+            });
+        } else if trimmed == "<!-- /meshfox:output -->" {
+            self.flush_paragraph();
+            // `output_region` is only cleared *after* the closer is
+            // pushed — `push_segment_plain`'s own blank separator (right
+            // above the `└─` corner) still needs to see the frame as open
+            // to get wrapped, closing the border cleanly instead of
+            // leaving a gap right before it.
+            let frame_open = matches!(&self.output_region, Some(r) if r.markdown_frame_open);
+            if frame_open {
+                self.push_segment_plain(Segment::Text(vec![Line::from(Span::styled(
+                    "└─",
+                    Style::default().fg(super::theme::DEP),
+                ))]));
+            }
+            self.output_region = None;
+        }
     }
 
     /// Applies a `{width=NN%}`/`{height=NN%}` marker (see
@@ -519,8 +657,11 @@ impl<'a> Renderer<'a> {
             // meshfox's own bookkeeping (`meshfox:node`/`meshfox:output`/...)
             // lives entirely in HTML comments — invisible in any normal
             // Markdown viewer per SPEC.md, so raw HTML is simply dropped
-            // here rather than shown.
-            Event::Html(_) | Event::InlineHtml(_) => {}
+            // here rather than shown — except a `meshfox:output`/
+            // `/meshfox:output` pair, which still isn't shown itself but
+            // now toggles `in_output_region` around whatever's between
+            // them (see `wrap_in_output_border`).
+            Event::Html(text) | Event::InlineHtml(text) => self.handle_output_marker(&text),
             _ => {}
         }
     }
@@ -835,6 +976,25 @@ impl<'a> Renderer<'a> {
                     Line::from(spans)
                 }));
                 framed.push(Line::from(Span::styled("└─", border)));
+
+                // Inside an output region, a leading `` ```text `` fence
+                // is `render_output_block_markdown`'s own stderr capture
+                // (see `OutputRegion`'s own doc comment) — it gets
+                // relabeled and pushed as its own frame, right here,
+                // rather than folded into the region's "markdown" one via
+                // the ordinary `push_segment` path below.
+                if let Some(region) = &mut self.output_region {
+                    if region.first_segment_pending && lang == "text" {
+                        region.first_segment_pending = false;
+                        let name = region.name.clone();
+                        framed[0] = Line::from(Span::styled(
+                            format!("┌─ output: {name} · text ──"),
+                            Style::default().fg(super::theme::DEP),
+                        ));
+                        self.push_segment_plain(Segment::Text(framed));
+                        return;
+                    }
+                }
                 self.push_segment(Segment::Text(framed));
             }
             TagEnd::List(_) => {

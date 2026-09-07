@@ -804,7 +804,7 @@ checksum = "4fe5f465a4f6fee88fad41b85d990f84c835335e85b5d9e6e63e0d06d28cba7c"
 dependencies = [
  "encode_unicode",
  "libc",
- "unicode-width 0.2.0",
+ "unicode-width 0.2.2",
  "windows-sys 0.61.2",
 ]
 
@@ -1583,7 +1583,7 @@ dependencies = [
  "ratatui-core",
  "ratatui-widgets",
  "syntect",
- "unicode-width 0.2.0",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]
@@ -2004,7 +2004,7 @@ version = "0.2.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfe4fbac503b8d1f88e6676011885f34b7174f46e59956bba534ba83abded4df"
 dependencies = [
- "unicode-width 0.2.0",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]
@@ -2570,7 +2570,7 @@ checksum = "9433806cd6b4ec1aba79c021c7e4c58fb4c3b9977c085062e611ac929998fb0c"
 dependencies = [
  "console",
  "portable-atomic",
- "unicode-width 0.2.0",
+ "unicode-width 0.2.2",
  "unit-prefix",
  "web-time",
 ]
@@ -3101,6 +3101,7 @@ dependencies = [
  "meshfox-core",
  "meshfox-server",
  "open",
+ "portable-pty",
  "pulldown-cmark 0.13.4",
  "ratatui",
  "ratatui-image",
@@ -3118,6 +3119,7 @@ dependencies = [
  "tokio",
  "toml",
  "uuid",
+ "vt100",
 ]
 
 [[package]]
@@ -4245,7 +4247,7 @@ dependencies = [
  "thiserror 2.0.19",
  "unicode-segmentation",
  "unicode-truncate",
- "unicode-width 0.2.0",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]
@@ -4325,7 +4327,7 @@ dependencies = [
  "strum",
  "time",
  "unicode-segmentation",
- "unicode-width 0.2.0",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]
@@ -6204,7 +6206,7 @@ checksum = "16b380a1238663e5f8a691f9039c73e1cdae598a30e9855f541d29b08b53e9a5"
 dependencies = [
  "itertools",
  "unicode-segmentation",
- "unicode-width 0.2.0",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]
@@ -6215,9 +6217,9 @@ checksum = "7dd6e30e90baa6f72411720665d41d89b9a3d039dc45b8faea1ddd07f617f6af"
 
 [[package]]
 name = "unicode-width"
-version = "0.2.0"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fc81956842c57dac11422a97c3b8195a1ff727f06e85c84ed2e8aa277c9a0fd"
+checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
 name = "unicode-xid"
@@ -6342,6 +6344,27 @@ name = "vsimd"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
+
+[[package]]
+name = "vt100"
+version = "0.16.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "054ff75fb8fa83e609e685106df4faeffdf3a735d3c74ebce97ec557d5d36fd9"
+dependencies = [
+ "itoa",
+ "unicode-width 0.2.2",
+ "vte",
+]
+
+[[package]]
+name = "vte"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5924018406ce0063cd67f8e008104968b74b563ee1b85dde3ed1f7cb87d3dbd"
+dependencies = [
+ "arrayvec",
+ "memchr",
+]
 
 [[package]]
 name = "vtparse"

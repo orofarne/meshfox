@@ -74,3 +74,7 @@ libc = "0.2"
 # self_update both pull it in through ureq), this just makes it the one
 # process-wide default so reqwest has a provider to use at all.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
+[dev-dependencies]
+portable-pty = "0.9"
+vt100 = "0.16.2"

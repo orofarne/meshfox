@@ -812,6 +812,17 @@ cd editors/vscode && npm run compile && cd e2e
 npm test
 ```
 
+### TUI end-to-end tests
+<!-- meshfox:node id="tui-end-to-end-tests" -->
+
+`crates/cli/tests/tui_e2e/` is a third, separate, deliberately opt-in suite alongside the two above — Rust's own counterpart to them, for the TUI (`crates/cli/src/tui/`). Every existing TUI test (`crates/cli/src/tui/{app,ui,markdown}.rs`) drives `App` directly (`app.on_key(...).await`) or renders one frame via `ratatui::backend::TestBackend` — none of them ever touch the real `crossterm::event::read()`/raw-mode/`EnableMouseCapture` event loop in `crates/cli/src/tui/mod.rs::run`, so a bug specific to that real path (real terminal setup, real mouse escape-sequence parsing, real terminal cleanup on exit) is structurally invisible to them. This suite spawns the real, compiled `meshfox` binary inside a real pty (`portable-pty` — already a real dependency, `crates/server/src/pty_exec.rs` uses it for `tty` blocks) and drives it with real keystrokes and real xterm SGR mouse escape sequences, asserting on the real rendered screen via `vt100`.
+
+Every test in it is `#[ignore]`d — Cargo has no other way to exclude one integration-test target from `cargo test --workspace`'s default run, so this is what keeps it out of that gate (confirmed: `cargo test --workspace` reports this target's tests as `ignored`, not run, adding ~0s). Most of the suite's tests (`mouse_*.rs`) are written against mouse-support checklist items in TODO.canvas.md's "Мышь в панелях TUI (tree/document/output)" that don't exist yet — they fail today, on purpose: implementing a checklist item and making its test pass happen together, the same red-then-green shape as TDD. `baseline.rs` is the one part expected to pass right now — a couple of tests on the keyboard-driven flows (start up and render, select a node and run its block, quit and actually exit) that already work, so a regression in the real event loop itself doesn't slip through unnoticed.
+
+```sh name="tui-e2e-run"
+cargo test --test tui_e2e -- --ignored
+```
+
 ### Linting
 <!-- meshfox:node id="linting" -->
 

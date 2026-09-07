@@ -36,7 +36,15 @@ use super::tree::{self, TreeRow};
 pub enum Focus {
     Tree,
     Document,
+    Output,
 }
+
+/// How close together two `MouseEventKind::Down`s at the same cell have to
+/// land to count as a double-click (`App::on_mouse`'s own `last_click`) —
+/// a real terminal never sends "double-click" as its own event. Roughly
+/// the same ballpark most desktop OSes default their own double-click
+/// interval to.
+const DOUBLE_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// A modal form for one or more declared variables at once — all of them
 /// visible and editable together (arrow keys move the focused field,
@@ -220,6 +228,27 @@ pub struct App {
     pub doc_segments: Vec<Segment>,
     pub doc_images: HashMap<PathBuf, Option<Protocol>>,
     pub doc_scroll: u16,
+    /// Lines scrolled back from the *bottom* of the Output pane — `0`
+    /// (the default) pins it to the live tail, same as before this
+    /// existed; scrolling up increases it, revealing earlier lines (see
+    /// `scroll_output`). Reset to `0` whenever a fresh run starts, so a
+    /// scrolled-up view doesn't silently miss new output.
+    pub output_scroll: u16,
+    /// Which pane (if any) is currently filling the whole screen — set by
+    /// pressing `f` (toggles whichever pane is `focus`ed), clicking a
+    /// pane's own `[+]`/`[-]` title-row icon, or double-clicking its
+    /// title row (`on_key`/`on_mouse`). Renders that one pane alone,
+    /// full-terminal (`ui::render`/`ui::compute_layout`), same "one thing
+    /// at a time" idea `source_editor` already has over the ordinary
+    /// 3-pane layout, just toggle-able (any of the three routes above,
+    /// again, on the now full-width pane) rather than a stack.
+    pub fullscreen: Option<Focus>,
+    /// `(row, col, Instant)` of the most recent left-click `on_mouse` saw
+    /// — compared against the next one to detect a double-click. A real
+    /// terminal never sends "double-click" as its own event; noticing two
+    /// `Down`s in the same place within `DOUBLE_CLICK_WINDOW` is on this
+    /// app.
+    last_click: Option<(u16, u16, std::time::Instant)>,
     pub highlighter: Highlighter,
     pub picker: Picker,
     pub run: Option<RunState>,
@@ -449,6 +478,9 @@ impl App {
             doc_segments: Vec::new(),
             doc_images: HashMap::new(),
             doc_scroll: 0,
+            output_scroll: 0,
+            fullscreen: None,
+            last_click: None,
             highlighter: Highlighter::with_extra_syntaxes(&syntax_root),
             picker,
             run: None,
@@ -514,6 +546,8 @@ impl App {
             KeyCode::Esc => {
                 if self.show_help {
                     self.show_help = false;
+                } else if self.fullscreen.is_some() {
+                    self.fullscreen = None;
                 } else {
                     self.should_quit = true;
                 }
@@ -522,16 +556,19 @@ impl App {
             KeyCode::Tab => {
                 self.focus = match self.focus {
                     Focus::Tree => Focus::Document,
-                    Focus::Document => Focus::Tree,
+                    Focus::Document => Focus::Output,
+                    Focus::Output => Focus::Tree,
                 };
             }
             KeyCode::Up | KeyCode::Char('k') => match self.focus {
                 Focus::Tree => self.move_selection(-1),
                 Focus::Document => self.scroll_document(-1),
+                Focus::Output => self.scroll_output(-1),
             },
             KeyCode::Down | KeyCode::Char('j') => match self.focus {
                 Focus::Tree => self.move_selection(1),
                 Focus::Document => self.scroll_document(1),
+                Focus::Output => self.scroll_output(1),
             },
             KeyCode::Enter if self.focus == Focus::Tree => self.toggle_expand(),
             KeyCode::Left | KeyCode::Char('h') if self.focus == Focus::Tree => {
@@ -547,14 +584,40 @@ impl App {
             KeyCode::Char('o') => self.trigger_open_file(),
             KeyCode::Char('c') => self.trigger_configure(),
             KeyCode::Char('e') => self.open_source_editor(),
-            KeyCode::PageDown => self.scroll_document(10),
-            KeyCode::PageUp => self.scroll_document(-10),
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.scroll_document(10)
+            // The keyboard counterpart to clicking a pane's own `[+]`/`[-]`
+            // title-row icon or double-clicking its title (`on_mouse`) —
+            // those are mouse-only and, on a TUI, have no visual
+            // affordance suggesting they're even possible (unlike a GUI
+            // title bar's own double-click-to-maximize convention), so
+            // this is the actually-discoverable way in (see the footer
+            // hint/`?` help). Toggles fullscreen for whichever pane is
+            // currently focused — leaves focus untouched either way, so
+            // toggling back out lands right where toggling in did.
+            KeyCode::Char('f') => {
+                self.fullscreen = if self.fullscreen == Some(self.focus) {
+                    None
+                } else {
+                    Some(self.focus)
+                };
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.scroll_document(-10)
-            }
+            KeyCode::PageDown => match self.focus {
+                Focus::Output => self.scroll_output(10),
+                _ => self.scroll_document(10),
+            },
+            KeyCode::PageUp => match self.focus {
+                Focus::Output => self.scroll_output(-10),
+                _ => self.scroll_document(-10),
+            },
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => match self.focus
+            {
+                Focus::Output => self.scroll_output(10),
+                _ => self.scroll_document(10),
+            },
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => match self.focus
+            {
+                Focus::Output => self.scroll_output(-10),
+                _ => self.scroll_document(-10),
+            },
             _ => {}
         }
     }
@@ -694,9 +757,16 @@ impl App {
     /// before — except a click that lands specifically on a row's own
     /// disclosure marker (`▾`/`▸`, see `ui::render_tree`) toggles it
     /// expanded/collapsed instead, same as clicking it with the keyboard
-    /// (`enter`) would. The scroll wheel over either the tree or the
-    /// document pane moves/scrolls it. Nothing else (run/kill buttons,
-    /// clicking inside a `tty` handoff) is wired up yet.
+    /// (`enter`) would, and a click anywhere on any of the three panes'
+    /// own title row focuses it and — on its `[+]`/`[-]` icon
+    /// specifically, or as a double-click anywhere else on that row (same
+    /// "two `Down`s close together" detection `last_click` exists for,
+    /// see its own doc comment) — toggles `fullscreen` for it (see
+    /// `toggle_fullscreen_on_title_click`). The scroll wheel over any of
+    /// the three panes moves/scrolls it. `layout` itself already reflects
+    /// `fullscreen` (`ui::compute_layout`), so a collapsed pane's own
+    /// `point_in` checks below simply never match. Nothing else (run/kill
+    /// buttons, clicking inside a `tty` handoff) is wired up yet.
     pub fn on_mouse(&mut self, mouse: MouseEvent) {
         if let Some(se) = &mut self.source_editor {
             se.on_mouse(mouse);
@@ -706,12 +776,19 @@ impl App {
             return; // modal is up — no pane underneath it to click through to
         }
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        let layout = ui::compute_layout(Rect::new(0, 0, cols, rows));
+        let layout = ui::compute_layout(Rect::new(0, 0, cols, rows), self.fullscreen);
 
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                let is_double_click = matches!(
+                    self.last_click,
+                    Some((r, c, t))
+                        if r == mouse.row && c == mouse.column && t.elapsed() < DOUBLE_CLICK_WINDOW
+                );
+                self.last_click = Some((mouse.row, mouse.column, std::time::Instant::now()));
+
                 if point_in(layout.tree, mouse.column, mouse.row) {
-                    self.focus = Focus::Tree;
+                    self.toggle_fullscreen_on_title_click(Focus::Tree, layout.tree, &mouse, is_double_click);
                     let inner_x = layout.tree.x + 1; // left border
                     let inner_y = layout.tree.y + 1; // top border
                     if mouse.row >= inner_y {
@@ -737,7 +814,9 @@ impl App {
                         }
                     }
                 } else if point_in(layout.document, mouse.column, mouse.row) {
-                    self.focus = Focus::Document;
+                    self.toggle_fullscreen_on_title_click(Focus::Document, layout.document, &mouse, is_double_click);
+                } else if point_in(layout.output, mouse.column, mouse.row) {
+                    self.toggle_fullscreen_on_title_click(Focus::Output, layout.output, &mouse, is_double_click);
                 }
             }
             MouseEventKind::ScrollDown => {
@@ -745,6 +824,8 @@ impl App {
                     self.move_selection(1);
                 } else if point_in(layout.document, mouse.column, mouse.row) {
                     self.scroll_document(3);
+                } else if point_in(layout.output, mouse.column, mouse.row) {
+                    self.scroll_output(3);
                 }
             }
             MouseEventKind::ScrollUp => {
@@ -752,6 +833,8 @@ impl App {
                     self.move_selection(-1);
                 } else if point_in(layout.document, mouse.column, mouse.row) {
                     self.scroll_document(-3);
+                } else if point_in(layout.output, mouse.column, mouse.row) {
+                    self.scroll_output(-3);
                 }
             }
             _ => {}
@@ -775,6 +858,37 @@ impl App {
 
     fn scroll_document(&mut self, delta: i32) {
         self.doc_scroll = (self.doc_scroll as i32 + delta).max(0) as u16;
+    }
+
+    /// `output_scroll` counts lines back from the *bottom* (the live
+    /// tail), the opposite sense from `doc_scroll` (which counts forward
+    /// from the top) — so a positive `delta` here (the same "down"/
+    /// "forward" direction `scroll_document`'s own callers already use)
+    /// *decreases* it, moving back toward the tail, while a negative one
+    /// increases it, revealing earlier lines.
+    fn scroll_output(&mut self, delta: i32) {
+        self.output_scroll = (self.output_scroll as i32 - delta).max(0) as u16;
+    }
+
+    /// Shared by `on_mouse`'s tree/document/output branches: a click
+    /// anywhere in `pane`'s own `rect` focuses it, and — if it landed on
+    /// `pane`'s own `[+]`/`[-]` icon (`ui::fullscreen_icon_title`, drawn
+    /// flush against `rect`'s own top-right corner via
+    /// `Line::right_aligned`) or was a double-click anywhere else on that
+    /// same title row — toggles `fullscreen` for it, same as pressing `f`
+    /// while it's focused would.
+    fn toggle_fullscreen_on_title_click(&mut self, pane: Focus, rect: Rect, mouse: &MouseEvent, is_double_click: bool) {
+        self.focus = pane;
+        let icon_start = rect
+            .x
+            .saturating_add(rect.width)
+            .saturating_sub(1 + ui::FULLSCREEN_ICON_WIDTH);
+        let on_icon = mouse.row == rect.y
+            && mouse.column >= icon_start
+            && mouse.column < icon_start + ui::FULLSCREEN_ICON_WIDTH;
+        if on_icon || (is_double_click && mouse.row == rect.y) {
+            self.fullscreen = if self.fullscreen == Some(pane) { None } else { Some(pane) };
+        }
     }
 
     fn toggle_expand(&mut self) {
@@ -1434,6 +1548,7 @@ impl App {
             }
         };
 
+        self.output_scroll = 0;
         self.run = Some(RunState {
             chain,
             idx: 0,
@@ -1926,6 +2041,7 @@ impl App {
         ) {
             Ok(proc) => {
                 self.status.clear();
+                self.output_scroll = 0;
                 self.file_run = Some(FileRunState {
                     proc: Some(proc),
                     lines: vec![format!("==> {node_id}")],

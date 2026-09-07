@@ -131,6 +131,31 @@ const SOURCE_EDITOR_LANG: &str = "md";
 const OUTPUT_HEIGHT: u16 = 9;
 const FOOTER_HEIGHT: u16 = 1;
 
+/// Any pane's own top-right corner toggle (`fullscreen_icon_title`) — same
+/// bracket-badge look `[cache]`/`[run,cache]` already use elsewhere in
+/// this TUI. Both exactly `FULLSCREEN_ICON_WIDTH` columns wide, so
+/// `App::on_mouse`'s own click hit-test (it only needs the width, not
+/// which glyph is currently showing) stays in step with wherever this
+/// actually renders (always flush against the border's own right corner,
+/// via `Line::right_aligned`).
+pub const FULLSCREEN_ICON_EXPAND: &str = "[+]";
+pub const FULLSCREEN_ICON_SHRINK: &str = "[-]";
+pub const FULLSCREEN_ICON_WIDTH: u16 = 3;
+
+/// The right-aligned title every pane's own `Block` carries (`render_tree`/
+/// `render_document`/`render_output`) — `[+]` normally, `[-]` when `pane`
+/// itself is the one currently filling the screen (`App::fullscreen`).
+/// Click it, double-click the title row, or press `f` while `pane` is
+/// focused (`App::on_key`/`on_mouse`) to toggle it.
+fn fullscreen_icon_title(app: &App, pane: Focus) -> Line<'static> {
+    let icon = if app.fullscreen == Some(pane) {
+        FULLSCREEN_ICON_SHRINK
+    } else {
+        FULLSCREEN_ICON_EXPAND
+    };
+    Line::from(Span::styled(icon, Style::default().fg(ACCENT))).right_aligned()
+}
+
 /// The three panes' rects for a given terminal size — computed once here
 /// and shared by both rendering (`render`) and mouse hit-testing
 /// (`app::App::on_mouse`), so the two can never drift apart.
@@ -141,7 +166,28 @@ pub struct PaneLayout {
     pub footer: Rect,
 }
 
-pub fn compute_layout(area: Rect) -> PaneLayout {
+/// `fullscreen` (see `App::fullscreen`), when set, collapses the other two
+/// panes to empty rects and gives whichever one it names the whole area
+/// above the footer — a click/scroll's own `point_in(layout.tree, ...)`/
+/// `point_in(layout.document, ...)`/`point_in(layout.output, ...)` checks
+/// in `App::on_mouse` then simply never match a collapsed pane, with no
+/// separate "are we fullscreen, and which pane" branch needed there.
+pub fn compute_layout(area: Rect, fullscreen: Option<Focus>) -> PaneLayout {
+    if let Some(pane) = fullscreen {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(FOOTER_HEIGHT)])
+            .split(area);
+        let full = chunks[0];
+        let empty = Rect::default();
+        return PaneLayout {
+            tree: if pane == Focus::Tree { full } else { empty },
+            document: if pane == Focus::Document { full } else { empty },
+            output: if pane == Focus::Output { full } else { empty },
+            footer: chunks[1],
+        };
+    }
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -176,11 +222,18 @@ pub fn render(f: &mut Frame, app: &mut App) {
         return;
     }
 
-    let layout = compute_layout(area);
+    let layout = compute_layout(area, app.fullscreen);
 
-    render_tree(f, layout.tree, app);
-    render_document(f, layout.document, &*app);
-    render_output(f, layout.output, &*app);
+    match app.fullscreen {
+        None => {
+            render_tree(f, layout.tree, app);
+            render_document(f, layout.document, &*app);
+            render_output(f, layout.output, &*app);
+        }
+        Some(Focus::Tree) => render_tree(f, layout.tree, app),
+        Some(Focus::Document) => render_document(f, layout.document, &*app),
+        Some(Focus::Output) => render_output(f, layout.output, &*app),
+    }
     render_footer(f, layout.footer, &*app);
 
     if let Some(bp) = &app.block_picker {
@@ -280,7 +333,8 @@ fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
                         .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or("canvas")
-                )),
+                ))
+                .title(fullscreen_icon_title(&*app, Focus::Tree)),
         )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
@@ -323,7 +377,8 @@ fn render_document(f: &mut Frame, area: Rect, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(pane_border(app.focus == Focus::Document))
-        .title(format!(" {title} "));
+        .title(format!(" {title} "))
+        .title(fullscreen_icon_title(app, Focus::Document));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -435,8 +490,9 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(BORDER))
-        .title(title);
+        .border_style(pane_border(app.focus == Focus::Output))
+        .title(title)
+        .title(fullscreen_icon_title(app, Focus::Output));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -446,10 +502,18 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
         app.file_run.as_ref().map(|run| run.lines.as_slice())
     };
     let text: Text = if let Some(lines) = lines {
+        // `output_scroll` counts lines back from the bottom (see its own
+        // doc comment) — clamped here (not in `App::scroll_output`, same
+        // "state is unclamped, rendering clamps" convention `doc_scroll`/
+        // `wrapped_text_layout` already use) so scrolling can't go past
+        // the very first line.
         let take = inner.height as usize;
-        let start = lines.len().saturating_sub(take);
+        let max_scroll = lines.len().saturating_sub(take);
+        let scroll = (app.output_scroll as usize).min(max_scroll);
+        let end = lines.len() - scroll;
+        let start = end.saturating_sub(take);
         Text::from(
-            lines[start..]
+            lines[start..end]
                 .iter()
                 .map(|l| Line::from(l.as_str()))
                 .collect::<Vec<_>>(),
@@ -470,7 +534,7 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
 
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     let mut hint = String::from(
-        "tab focus · j/k move/scroll · enter expand · h/l collapse/expand · r run · R run (no deps) · K kill · e edit",
+        "tab focus · f fullscreen focused pane · j/k move/scroll · enter expand · h/l collapse/expand · r run · R run (no deps) · K kill · e edit",
     );
     if app.selected_is_open_target() {
         hint.push_str(" · o open");
@@ -708,8 +772,8 @@ fn render_reset_session_confirm(f: &mut Frame, area: Rect) {
 
 fn render_help(f: &mut Frame, area: Rect, app: &App) {
     let mut items = vec![
-        "tab             switch focus: tree <-> document",
-        "j / k / ↑ / ↓   move selection (tree) or scroll (document)",
+        "tab             cycle focus: tree -> document -> output -> tree",
+        "j / k / ↑ / ↓   move selection (tree) or scroll (document/output)",
         "enter           expand/collapse node",
         "l / →           expand node",
         "h / ←           collapse node, or jump to parent",
@@ -717,6 +781,8 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         "R               run this node's block only (skip deps)",
         "  (a node with more than one block opens a picker first)",
         "K               kill the running block",
+        "f               expand the focused pane to fill the screen, or",
+        "                shrink it back (esc also shrinks it back)",
         "S               reset session — forget which blocks already ran,",
         "                so the next chain run re-runs every dependency",
         "e               edit this node's own file, full-screen (Ctrl-s save,",
@@ -732,14 +798,16 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         );
     }
     items.extend([
-        "PageUp/Down     scroll the document pane",
-        "Ctrl-u / Ctrl-d scroll the document pane",
+        "PageUp/Down     scroll the focused pane (document or output)",
+        "Ctrl-u / Ctrl-d scroll the focused pane (document or output)",
         "?               toggle this help",
         "q / esc         quit",
         "",
         "mouse: click a tree row to select it, or its ▾/▸ marker to",
-        "expand/collapse; scroll wheel over the tree moves selection,",
-        "over the document scrolls it",
+        "expand/collapse; click the document/output pane to focus it;",
+        "scroll wheel over any of the three panes scrolls/moves it;",
+        "click a pane's own [+]/[-] (top-right of its title), or",
+        "double-click its title, to expand/shrink it (same as f)",
         "",
         "running a `tty` block hands the real terminal over to it,",
         "same as `meshfox run` — this UI reappears once it exits",
