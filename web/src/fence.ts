@@ -5,7 +5,7 @@
 // present) its own parsed output, instead of one opaque blob of Markdown —
 // see README.md for the conventions themselves.
 
-function tokenize(s: string): string[] {
+export function tokenize(s: string): string[] {
   const tokens: string[] = [];
   let cur = "";
   let inQuotes = false;
@@ -33,7 +33,7 @@ function unquote(v: string): string {
   return v;
 }
 
-function attrsFromTokens(tokens: string[]): Record<string, string> {
+export function attrsFromTokens(tokens: string[]): Record<string, string> {
   const attrs: Record<string, string> = {};
   for (const tok of tokens) {
     const eq = tok.indexOf("=");
@@ -44,6 +44,37 @@ function attrsFromTokens(tokens: string[]): Record<string, string> {
     }
   }
   return attrs;
+}
+
+/** One entry of a fence's `env=` list — mirrors `core::fence::EnvRef`:
+ * which declared `meshfox:var` to pull a value from (`varName`), and what
+ * to call it in this block's own process environment (`localName`). */
+export interface EnvRef {
+  localName: string;
+  varName: string;
+}
+
+/** A leading `$` is purely cosmetic (`env="$VAR"` and `env="VAR"` mean the
+ * same thing) — direct port of `core::fence::parse_env_ref`. */
+function parseEnvRef(s: string): EnvRef {
+  const eq = s.indexOf("=");
+  if (eq === -1) {
+    const varName = s.trim().replace(/^\$/, "");
+    return { localName: varName, varName };
+  }
+  const local = s.slice(0, eq).trim();
+  const value = s.slice(eq + 1).trim().replace(/^\$/, "");
+  return { localName: local, varName: value };
+}
+
+/** Splits a fence's raw `env="a,LOCAL=$b"` attribute into its individual
+ * references — direct port of `core::fence::parse_env_list`. */
+export function parseEnvList(raw: string): EnvRef[] {
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0)
+    .map(parseEnvRef);
 }
 
 export interface CachedOutput {
@@ -149,6 +180,13 @@ export interface CodeSegment {
    * in this same node, `node-id/block-name` is a block elsewhere. See
    * `./deps.ts` for resolving these into concrete addresses. */
   deps: string[];
+  /** Mirrors `core::fence::CodeBlock.env` — which declared `meshfox:var`s
+   * this block's own process environment pulls in. Used by `./vars.ts` to
+   * compute this block's *implicit* dependencies (a referenced var that's
+   * itself `from=`-computed needs its source block to have run first) —
+   * see `MeshNode.tsx`'s implicit-deps hint next to the explicit `after:
+   * …` line. */
+  envRefs: EnvRef[];
   /** Mirrors the fence's own `output="markdown"` attribute (SPEC.md's
    * "Runnable code fences"/"Cached output" —
    * `core::output::render_output_block_markdown`): a `cache`d run's
@@ -432,6 +470,7 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
     const isDefault = attrs.default !== undefined && attrs.default !== "false";
     const outputMarkdown = attrs.output === "markdown";
     const interpreter = attrs.interpreter;
+    const envRefs = attrs.env !== undefined ? parseEnvList(attrs.env) : [];
     const deps = (attrs.deps ?? "")
       .split(",")
       .map((s) => s.trim())
@@ -470,7 +509,7 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
       }
     }
 
-    segments.push({ type: "code", lang, name, cache, tty, autoclose, deps, default: isDefault, outputMarkdown, interpreter, code: codeLines.join("\n"), output });
+    segments.push({ type: "code", lang, name, cache, tty, autoclose, deps, envRefs, default: isDefault, outputMarkdown, interpreter, code: codeLines.join("\n"), output });
     i = cursor;
   }
   flushMarkdown();

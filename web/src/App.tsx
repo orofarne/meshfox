@@ -44,6 +44,7 @@ import type { CanvasDoc, CanvasNode, ExtraEdgeDto, VarStatus } from "./types";
 import { pathTo, deriveEdges, findRoot, visibleNodeIds, subtreeIds } from "./tree";
 import { computeAutoLayout, FOLDED_HEIGHT, type LayoutBox } from "./autolayout";
 import { buildBlockGraph, resolveChain, type BlockAddr } from "./deps";
+import { parseVarDecls } from "./vars";
 import { parseBody, type CodeSegment } from "./fence";
 import { MeshNode, resolveNodeColor, type MeshNodeData, type LiveBlockState } from "./MeshNode";
 import { VarsForm } from "./VarsForm";
@@ -542,6 +543,13 @@ export default function App() {
   // remains the source of truth for actually resolving and executing the
   // chain.
   const blockGraph = useMemo(() => (canvas ? buildBlockGraph(canvas) : new Map()), [canvas]);
+
+  // Every declared `meshfox:var`, document-wide — best-effort client-side
+  // mirror of crates/core/src/vars.rs (see ./vars.ts), threaded into every
+  // node's own `data` below so `MeshNode`'s `RunnableCodeBlock` can compute
+  // each block's own *implicit* (variable-based) dependencies next to its
+  // explicit `after: …` line.
+  const varDecls = useMemo(() => (canvas ? parseVarDecls(canvas) : new Map()), [canvas]);
 
   // Every node id that's a structural parent of at least one other node —
   // shared by the fold-marker's `hasChildren` prop (a title-only node
@@ -1524,6 +1532,7 @@ export default function App() {
             fixedHeight,
             editMode,
             liveBlocks: {},
+            varDecls,
             folded: isFolded,
             hasChildren: parentIdSet.has(n.id),
             onToggleFold: () => toggleFold(n.id),
@@ -1908,7 +1917,7 @@ export default function App() {
       }),
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [canvas, measuredSignature, foldedNodeIds]);
+  }, [canvas, varDecls, measuredSignature, foldedNodeIds]);
 
   // Anchors the very first view on the root node's own top-left corner, a
   // fixed padding in from the canvas area's, at a fixed readable zoom (see

@@ -1668,6 +1668,46 @@ a {
   text-decoration-style: solid;
 }
 
+/* Implicit (variable-based) deps' own fold toggle, inline in the small
+ * `.mesh-code-deps` text row — opts out of `.mesh-node-icon-button`'s
+ * bordered-pill look the same way `.mesh-code-block-head
+ * .mesh-node-fold-toggle` already does for the block's own collapse
+ * toggle, just re-declared here since this is a different, more specific
+ * container. */
+.mesh-code-deps .mesh-node-fold-toggle {
+  padding: 0.15rem 0.2rem;
+  margin: 0 0.15rem;
+  border-color: transparent;
+  color: inherit;
+  font-size: inherit;
+  opacity: 0.6;
+}
+
+/* Implicit deps read as a quieter, secondary kind of dependency: same
+ * `--dep` color identity as the always-visible `after: …` text (still
+ * recognizable as "a dependency"), but faded and slightly smaller so it
+ * doesn't compete with it for attention — collapsed behind the fold
+ * toggle above by default. */
+.mesh-implicit-deps-count,
+.mesh-implicit-dep {
+  font-size: 0.9em;
+  opacity: 0.6;
+  font-style: italic;
+}
+
+/* The collapsed "N via var" hint is itself a button (not just its fold
+ * arrow) — opts out of default button chrome so it still reads as plain
+ * text, same trick `.mesh-dep-link` uses for the explicit deps' own
+ * jump-to-block buttons. */
+.mesh-implicit-deps-count {
+  border: none;
+  background: none;
+  padding: 0;
+  font-family: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
 /* Briefly highlights a code block after jumping to it via an "after: …"
  * link, so the eye can find it even after the canvas has panned. A
  * background wash rather than a box-shadow ring: `.mesh-code-block` has

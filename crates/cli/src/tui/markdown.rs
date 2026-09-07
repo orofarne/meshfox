@@ -241,8 +241,14 @@ fn heading_style(level: HeadingLevel) -> Style {
 /// against it; anything that parses as an absolute URL (`http(s)://...`) is
 /// shown as a plain link instead of fetched, matching this being a local
 /// document viewer, not a browser.
-pub fn render(md: &str, base_dir: &Path, hl: &Highlighter) -> Vec<Segment> {
-    let mut renderer = Renderer::new(base_dir, hl);
+pub fn render(
+    md: &str,
+    base_dir: &Path,
+    hl: &Highlighter,
+    node_id: &str,
+    decls: &[meshfox_core::vars::VarDecl],
+) -> Vec<Segment> {
+    let mut renderer = Renderer::new(base_dir, hl, node_id, decls);
     // `ENABLE_GFM` is what makes `pulldown-cmark` recognize `> [!NOTE]`/...
     // alert blockquotes (`Tag::BlockQuote(Some(kind))`, marker line
     // already stripped) — see `start`'s own `Tag::BlockQuote` arm below.
@@ -276,6 +282,12 @@ enum Inline {
 struct Renderer<'a> {
     base_dir: &'a Path,
     hl: &'a Highlighter,
+    /// The node this body belongs to — bare `deps=`/`env=` references
+    /// resolve against this (see `dep_line`), same convention
+    /// `deps::resolve_ref`/`vars::scan_all_var_decls` already use.
+    node_id: &'a str,
+    /// Every declared `meshfox:var` in the whole document — see `dep_line`.
+    decls: &'a [meshfox_core::vars::VarDecl],
     segments: Vec<Segment>,
     lines: Vec<Line<'static>>,
     current: Vec<Span<'static>>,
@@ -288,6 +300,10 @@ struct Renderer<'a> {
     /// UI's `#!interpreter` suffix on the code-block head (see
     /// `web/src/MeshNode.tsx`'s `mesh-code-interpreter`).
     code_interpreter: Option<String>,
+    /// This fence's own raw `deps=`/`env=` attributes, if any — parsed in
+    /// `TagEnd::CodeBlock` into `dep_line`'s explicit/implicit deps line.
+    code_deps: Option<String>,
+    code_env: Option<String>,
     code_buf: String,
     table: Option<TableState>,
     pending_heading_style: Option<Style>,
@@ -314,10 +330,12 @@ struct TableState {
 }
 
 impl<'a> Renderer<'a> {
-    fn new(base_dir: &'a Path, hl: &'a Highlighter) -> Self {
+    fn new(base_dir: &'a Path, hl: &'a Highlighter, node_id: &'a str, decls: &'a [meshfox_core::vars::VarDecl]) -> Self {
         Renderer {
             base_dir,
             hl,
+            node_id,
+            decls,
             segments: Vec::new(),
             lines: Vec::new(),
             current: Vec::new(),
@@ -327,6 +345,8 @@ impl<'a> Renderer<'a> {
             code_lang: None,
             code_name: None,
             code_interpreter: None,
+            code_deps: None,
+            code_env: None,
             code_buf: String::new(),
             table: None,
             pending_heading_style: None,
@@ -558,25 +578,29 @@ impl<'a> Renderer<'a> {
             }
             Tag::CodeBlock(kind) => {
                 self.flush_paragraph();
-                let (lang, name, interpreter) = match kind {
+                let (lang, name, interpreter, deps, env) = match kind {
                     // The info string carries meshfox's own attributes past
                     // the language token (`name="..."`, `cache`, ...) — see
                     // `meshfox_core::fence`, which this mirrors just enough
-                    // to pull out `name`/`interpreter` for the block header
-                    // below.
+                    // to pull out `name`/`interpreter`/`deps`/`env` for the
+                    // block header and its own deps line (`dep_line`) below.
                     CodeBlockKind::Fenced(info) => {
                         let mut tokens = meshfox_core::attrs::tokenize(&info).into_iter();
                         let lang = tokens.next().unwrap_or_else(|| "text".to_string());
                         let mut attrs = meshfox_core::attrs::attrs_from_tokens(tokens);
                         let name = attrs.remove("name");
                         let interpreter = attrs.remove("interpreter");
-                        (lang, name, interpreter)
+                        let deps = attrs.remove("deps");
+                        let env = attrs.remove("env");
+                        (lang, name, interpreter, deps, env)
                     }
-                    CodeBlockKind::Indented => ("text".to_string(), None, None),
+                    CodeBlockKind::Indented => ("text".to_string(), None, None, None, None),
                 };
                 self.code_lang = Some(lang);
                 self.code_name = name;
                 self.code_interpreter = interpreter;
+                self.code_deps = deps;
+                self.code_env = env;
                 self.code_buf.clear();
             }
             Tag::List(start) => {
@@ -654,6 +678,76 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    /// A fenced block's own dependency line, right under its header —
+    /// mirrors the web UI's `.mesh-code-deps` row (`web/src/MeshNode.tsx`):
+    /// explicit `deps=` first (`after: …`), then a `via VAR: …` hint for
+    /// every declared variable this block's `env=`/`interpreter=`
+    /// transitively needs (through `default_var=`/`choices_var=` chains —
+    /// see `vars::close_over_var_refs`) that's itself `from=`-computed —
+    /// the same implicit dependency `deps::implicit_from_deps` folds into
+    /// the run-chain graph. `None` when the block has neither kind.
+    fn dep_line(&self, deps_raw: Option<&str>, env_raw: Option<&str>, interpreter: Option<&str>) -> Option<Line<'static>> {
+        let explicit: Vec<String> = deps_raw
+            .map(meshfox_core::fence::parse_deps_list)
+            .unwrap_or_default()
+            .iter()
+            .map(|r| {
+                let addr = meshfox_core::deps::resolve_ref(self.node_id, r);
+                super::app::dep_label(self.node_id, &addr.node_id, &addr.block_name)
+            })
+            .collect();
+
+        let env_refs = env_raw.map(meshfox_core::fence::parse_env_list).unwrap_or_default();
+        let interp_refs: Vec<String> = interpreter
+            .map(meshfox_core::interpreter_var_refs)
+            .unwrap_or_default();
+        let seed = env_refs
+            .iter()
+            .map(|e| e.var_name.as_str())
+            .chain(interp_refs.iter().map(String::as_str));
+        // Sorted for a stable render — `close_over_var_refs` returns a
+        // `HashSet`, whose iteration order isn't something this pane
+        // should flicker between redraws over.
+        let mut var_names: Vec<String> = meshfox_core::vars::close_over_var_refs(self.decls, seed)
+            .into_iter()
+            .collect();
+        var_names.sort();
+        let implicit: Vec<String> = var_names
+            .into_iter()
+            .filter_map(|var_name| {
+                let decl = self.decls.iter().find(|d| d.name == var_name)?;
+                let from = decl.from.as_ref()?;
+                let addr = meshfox_core::deps::resolve_ref(self.node_id, from);
+                Some(format!(
+                    "via {var_name}: {}",
+                    super::app::dep_label(self.node_id, &addr.node_id, &addr.block_name)
+                ))
+            })
+            .collect();
+
+        if explicit.is_empty() && implicit.is_empty() {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if !explicit.is_empty() {
+            parts.push(format!("after: {}", explicit.join(", ")));
+        }
+        parts.extend(implicit);
+        // `├─` (not `│`, the code lines' own left border) — this line is
+        // metadata branching off the header, not code content, and reusing
+        // `│` made it read as the first line of the block's own body. `├─`
+        // is still drawn from the same box-drawing set as the frame's other
+        // corners/edges, so it reads as "part of the frame, not a stray
+        // glyph" the same way the header's own `┌─` already does — the
+        // trailing `─` matches the header's own corner-plus-dash shape
+        // (`┌─`), rather than a bare `├` whose own built-in horizontal arm
+        // is visibly shorter than a real `─` glyph beside it.
+        Some(Line::from(Span::styled(
+            format!("├─ {}", parts.join("  ")),
+            Style::default().fg(Color::DarkGray),
+        )))
+    }
+
     fn end(&mut self, tag: TagEnd) {
         match tag {
             TagEnd::Paragraph => self.flush_paragraph(),
@@ -676,6 +770,8 @@ impl<'a> Renderer<'a> {
                 let lang = self.code_lang.take().unwrap_or_default();
                 let name = self.code_name.take();
                 let interpreter = self.code_interpreter.take();
+                let deps_raw = self.code_deps.take();
+                let env_raw = self.code_env.take();
                 let code = std::mem::take(&mut self.code_buf);
                 if lang == meshfox_core::BUTTON_LANG {
                     // No frame, no fill — a bold accent marker instead.
@@ -728,6 +824,10 @@ impl<'a> Renderer<'a> {
                 // corner reads as the same kind of line, not a stray glyph.
                 let mut framed: Vec<Line<'static>> =
                     vec![Line::from(Span::styled(format!("┌─{label}──"), border))];
+                if let Some(dep_line) = self.dep_line(deps_raw.as_deref(), env_raw.as_deref(), interpreter.as_deref())
+                {
+                    framed.push(dep_line);
+                }
                 framed.extend(highlighted.into_iter().map(|l| {
                     let mut spans = vec![Span::styled("│ ", border)];
                     spans.extend(l.spans);
@@ -845,7 +945,7 @@ mod tests {
     fn a_data_url_image_becomes_a_segment_image_keyed_by_the_url_itself() {
         let hl = Highlighter::new();
         let md = "![a pixel](data:image/png;base64,iVBORw0KGgo=)\n";
-        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
         let Segment::Image { path, alt, .. } = segments
             .into_iter()
             .find(|s| matches!(s, Segment::Image { .. }))
@@ -861,7 +961,7 @@ mod tests {
     fn an_http_image_is_still_inert_text_not_a_segment_image() {
         let hl = Highlighter::new();
         let md = "![x](https://example.com/pic.png)\n";
-        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
         assert!(!segments.iter().any(|s| matches!(s, Segment::Image { .. })));
     }
 
@@ -889,7 +989,7 @@ mod tests {
     fn image_percent_attrs_become_a_sizing_hint() {
         let hl = Highlighter::new();
         let md = "![alt](pic.png){width=50% height=25%}\n";
-        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
         let Segment::Image {
             width_percent,
             height_percent,
@@ -909,7 +1009,7 @@ mod tests {
     fn image_absolute_attrs_are_parsed_but_have_no_tui_effect() {
         let hl = Highlighter::new();
         let md = "![alt](pic.png){width=300}\n";
-        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
         let Segment::Image { width_percent, .. } = segments
             .into_iter()
             .find(|s| matches!(s, Segment::Image { .. }))
@@ -924,7 +1024,7 @@ mod tests {
     fn text_right_after_an_image_with_no_attrs_marker_is_rendered_normally() {
         let hl = Highlighter::new();
         let md = "![alt](pic.png) just text\n";
-        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
         assert!(segment_text(&segments).contains("just text"));
     }
 
@@ -933,7 +1033,7 @@ mod tests {
     fn subscript_and_superscript_render_as_unicode_small_forms() {
         let hl = Highlighter::new();
         let md = "H~2~O and x^n^\n";
-        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
         assert_eq!(segment_text(&segments), "H₂O and xⁿ");
     }
 
@@ -941,7 +1041,7 @@ mod tests {
     fn subsup_falls_back_to_literal_when_not_fully_mapped_to_unicode() {
         let hl = Highlighter::new();
         let md = "x~query~\n";
-        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
         assert_eq!(segment_text(&segments), "x~query~");
     }
 
@@ -949,7 +1049,7 @@ mod tests {
     fn subsup_never_applies_inside_a_code_block() {
         let hl = Highlighter::new();
         let md = "```text\nx~2~\n```\n";
-        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
         assert!(segment_text(&segments).contains("x~2~"));
     }
 
@@ -959,7 +1059,7 @@ mod tests {
     fn a_gfm_alert_blockquote_gets_a_styled_title_line() {
         let hl = Highlighter::new();
         let md = "> [!WARNING]\n> be careful\n";
-        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
         let text = segment_text(&segments);
         assert!(text.contains("Warning"), "{text}");
         assert!(text.contains("be careful"), "{text}");
@@ -970,7 +1070,7 @@ mod tests {
     fn an_ordinary_blockquote_gets_no_title_line() {
         let hl = Highlighter::new();
         let md = "> just a quote\n";
-        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
         let text = segment_text(&segments);
         assert!(text.contains("just a quote"), "{text}");
         assert!(!text.contains("Note"), "{text}");
@@ -986,7 +1086,7 @@ mod tests {
     fn task_list_items_show_a_checkbox_after_their_bullet() {
         let hl = Highlighter::new();
         let md = "- [ ] todo\n- [x] done\n";
-        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
         let text = segment_text(&segments);
         assert!(text.contains("[ ] todo"), "{text}");
         assert!(text.contains("[x] done"), "{text}");
@@ -996,7 +1096,7 @@ mod tests {
     fn a_numeric_footnote_reference_renders_as_unicode_superscript() {
         let hl = Highlighter::new();
         let md = "See[^1].\n\n[^1]: A note.\n";
-        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
         let text = segment_text(&segments);
         assert!(text.contains("See¹."), "{text}");
         assert!(!text.contains("[^1]"), "{text}");
@@ -1006,7 +1106,7 @@ mod tests {
     fn a_footnote_definition_gets_a_bracketed_label_and_its_body() {
         let hl = Highlighter::new();
         let md = "See[^1].\n\n[^1]: A note.\n";
-        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
         let text = segment_text(&segments);
         assert!(text.contains("[1]"), "{text}");
         assert!(text.contains("A note."), "{text}");
@@ -1018,7 +1118,7 @@ mod tests {
         // 'q' has no superscript Unicode glyph, so "note" (which does map
         // fully) is deliberately not used here — want the fallback path.
         let md = "See[^query].\n\n[^query]: A note.\n";
-        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
         let text = segment_text(&segments);
         assert!(text.contains("See[query]."), "{text}");
     }
@@ -1027,7 +1127,7 @@ mod tests {
     fn a_fences_own_interpreter_attr_shows_up_as_a_shebang_suffix_on_its_header() {
         let hl = Highlighter::new();
         let md = "```python name=\"seed\" interpreter=\"python3 -u\"\nprint(1)\n```\n";
-        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
         let text = segment_text(&segments);
         // Exactly as written in the attribute — no case-folding — mirrors
         // the web UI's own `mesh-code-interpreter` suffix.
@@ -1038,7 +1138,7 @@ mod tests {
     fn a_fence_with_no_interpreter_attr_has_no_shebang_suffix() {
         let hl = Highlighter::new();
         let md = "```bash name=\"build\" cache\necho hi\n```\n";
-        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
         let text = segment_text(&segments);
         assert!(!text.contains("#!"), "{text}");
     }
@@ -1047,7 +1147,7 @@ mod tests {
     fn a_button_fence_renders_its_body_as_the_caption_with_a_run_hint() {
         let hl = Highlighter::new();
         let md = "```button name=\"full-import\" deps=\"build\"\n🚀 Run everything\n```\n";
-        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
         let text = segment_text(&segments);
         assert!(text.contains("🚀 Run everything"), "{text}");
         assert!(text.contains("(r to run)"), "{text}");
@@ -1060,7 +1160,7 @@ mod tests {
     fn a_button_fence_falls_back_to_its_name_when_the_body_is_blank() {
         let hl = Highlighter::new();
         let md = "```button name=\"full-import\" deps=\"build\"\n```\n";
-        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
         let text = segment_text(&segments);
         assert!(text.contains("full-import"), "{text}");
     }
@@ -1069,7 +1169,7 @@ mod tests {
     fn a_button_fences_caption_is_rendered_as_a_bold_accent_marker() {
         let hl = Highlighter::new();
         let md = "```button name=\"full-import\" deps=\"build\"\nRun everything\n```\n";
-        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl);
+        let segments = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
         let Segment::Text(lines) = &segments[0] else {
             panic!("expected a text segment");
         };

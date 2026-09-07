@@ -62,7 +62,7 @@ pub enum DepsError {
     Vars(#[from] crate::vars::VarsError),
 }
 
-fn resolve_ref(owner_node_id: &str, r: &BlockRef) -> BlockAddr {
+pub fn resolve_ref(owner_node_id: &str, r: &BlockRef) -> BlockAddr {
     BlockAddr {
         node_id: r
             .node_id

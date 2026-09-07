@@ -8,6 +8,7 @@ import remarkGfmAlerts from "./remarkGfmAlerts";
 import { highlightToHtml } from "./shiki";
 import { BUTTON_LANG, defaultBlock, parseBody, type BodySegment, type CodeSegment, type ConstraintSegment } from "./fence";
 import { parseBlockRef, blockDomId } from "./deps";
+import { implicitDepsForBlock, interpreterVarRefsNaive, type ClientVarDecl } from "./vars";
 import { AnsiText } from "./AnsiText";
 import { NodeTextEditor } from "./NodeTextEditor";
 import { fetchNodeFileContent, fetchLinkPreview, type LinkPreview } from "./api";
@@ -279,6 +280,11 @@ export interface MeshNodeData {
    * not-yet-reloaded-away run; absent means "show the cached `seg.output`
    * from the file, if any". */
   liveBlocks: Record<string, LiveBlockState>;
+  /** Every declared `meshfox:var` in the whole document (see `./vars.ts`),
+   * document-wide (not scoped to this node) — used by `RunnableCodeBlock`
+   * to compute each of this node's own blocks' *implicit* (variable-based)
+   * dependencies next to their explicit `after: …` line. */
+  varDecls: Map<string, ClientVarDecl>;
   /** This node itself is folded — for a node with real body content, that
    * means shrinking to a compact title-only row (no body, no run buttons);
    * for an already-title-only node (empty body — see `isTitleOnly` at its
@@ -1339,6 +1345,22 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
   const chainBusy = busy && live?.viaChain;
   const runBusy = busy && !live?.viaChain;
   const hasDeps = seg.deps.length > 0;
+  // Implicit (variable-based) deps — see ./vars.ts. Collapsed by default:
+  // unlike `deps=`, this is metadata explaining *why* a block still can't
+  // run standalone, not something that needs the same always-on
+  // prominence as the explicit `after: …` line right below it.
+  const implicit = useMemo(
+    () =>
+      implicitDepsForBlock(
+        nodeId,
+        seg.envRefs.map((e) => e.varName),
+        interpreterVarRefsNaive(seg.interpreter),
+        data.varDecls,
+      ),
+    [nodeId, seg.envRefs, seg.interpreter, data.varDecls],
+  );
+  const hasImplicitDeps = implicit.length > 0;
+  const [showImplicit, setShowImplicit] = useState(false);
   const { setCenter, getNode, getZoom } = useReactFlow();
 
   const cacheHint = !seg.cache
@@ -1437,22 +1459,66 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
       </div>
       {expanded && (
         <>
-          {hasDeps && (
+          {(hasDeps || hasImplicitDeps) && (
             <div className="mesh-code-deps">
-              after:{" "}
-              {seg.deps.map((raw, i) => (
-                <span key={raw}>
-                  {i > 0 && ", "}
-                  <button
-                    type="button"
-                    className="mesh-dep-link"
-                    onClick={() => jumpTo(raw)}
-                    title={`jump to ${raw}`}
-                  >
-                    {raw}
-                  </button>
+              {hasDeps && (
+                <>
+                  after:{" "}
+                  {seg.deps.map((raw, i) => (
+                    <span key={raw}>
+                      {i > 0 && ", "}
+                      <button
+                        type="button"
+                        className="mesh-dep-link"
+                        onClick={() => jumpTo(raw)}
+                        title={`jump to ${raw}`}
+                      >
+                        {raw}
+                      </button>
+                    </span>
+                  ))}
+                </>
+              )}
+              {hasImplicitDeps && (
+                <span className="mesh-implicit-deps">
+                  {hasDeps && "  "}
+                  <FoldToggle
+                    folded={!showImplicit}
+                    onToggle={() => setShowImplicit((s) => !s)}
+                    foldedTitle={`${implicit.length} implicit dependenc${implicit.length === 1 ? "y" : "ies"} via variables — a var referenced here that's itself computed by another block`}
+                    unfoldedTitle="Hide implicit dependencies"
+                  />
+                  {!showImplicit && (
+                    <button
+                      type="button"
+                      className="mesh-implicit-deps-count"
+                      onClick={() => setShowImplicit(true)}
+                      title={`${implicit.length} implicit dependenc${implicit.length === 1 ? "y" : "ies"} via variables — a var referenced here that's itself computed by another block`}
+                    >
+                      {implicit.length} via var
+                    </button>
+                  )}
+                  {showImplicit &&
+                    implicit.map(({ varName, source }, i) => {
+                      const raw =
+                        source.nodeId === nodeId ? source.blockName : `${source.nodeId}/${source.blockName}`;
+                      return (
+                        <span key={varName} className="mesh-implicit-dep">
+                          {i > 0 && ", "}
+                          via {varName}:{" "}
+                          <button
+                            type="button"
+                            className="mesh-dep-link"
+                            onClick={() => jumpTo(raw)}
+                            title={`jump to ${raw}`}
+                          >
+                            {raw}
+                          </button>
+                        </span>
+                      );
+                    })}
                 </span>
-              ))}
+              )}
             </div>
           )}
           <HighlightedCode code={seg.code} lang={seg.lang} />

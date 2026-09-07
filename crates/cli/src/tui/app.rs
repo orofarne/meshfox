@@ -59,6 +59,20 @@ pub struct VarFormState {
     pub configuring: bool,
 }
 
+/// Human-readable label for a dependency's own block — bare `block_name`
+/// when it lives in the same node as the block depending on it, otherwise
+/// `node_id/block_name` — mirrors the convention `core::fence::fingerprint`
+/// already uses for the same "which block, from here" question. `pub(super)`
+/// (not just local to this module) since `markdown::render` uses it too, to
+/// label a block's own deps line the same way.
+pub(super) fn dep_label(current_node_id: &str, node_id: &str, block_name: &str) -> String {
+    if node_id == current_node_id {
+        block_name.to_string()
+    } else {
+        format!("{node_id}/{block_name}")
+    }
+}
+
 pub struct BlockChoice {
     pub name: String,
     pub cache: bool,
@@ -1079,6 +1093,14 @@ impl App {
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
+        // Document-wide declared vars, purely so `markdown::render` can
+        // label each fenced block's own implicit `from=` deps (see its own
+        // doc comment) — `self.display_canvas` is already include-resolved
+        // (see its own field doc comment), so this sees a `meshfox:var`
+        // spliced in from an `include` too, same as `trigger_run`'s own
+        // `declared_vars` call. Best-effort: a `vars.rs` error (e.g. a
+        // duplicate declaration) just means no implicit deps are shown.
+        let decls = meshfox_core::declared_vars(&self.display_canvas).unwrap_or_default();
 
         // `file` nodes with `display="code"` (see SPEC.md) show the
         // target's own file content, read fresh off disk — same as the
@@ -1111,7 +1133,7 @@ impl App {
                 self.doc_segments = Vec::new();
                 if let Some(caption) = &node.caption {
                     self.doc_segments
-                        .extend(markdown::render(caption, &base_dir, &self.highlighter));
+                        .extend(markdown::render(caption, &base_dir, &self.highlighter, &node.id, &decls));
                     self.doc_segments
                         .push(Segment::Text(vec![Line::from("")]));
                 }
@@ -1120,7 +1142,7 @@ impl App {
             }
         }
 
-        self.doc_segments = markdown::render(&node.text, &base_dir, &self.highlighter);
+        self.doc_segments = markdown::render(&node.text, &base_dir, &self.highlighter, &node.id, &decls);
 
         let images: Vec<(PathBuf, Option<u32>, Option<u32>)> = self
             .doc_segments
