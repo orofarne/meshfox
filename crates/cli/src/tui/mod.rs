@@ -12,6 +12,7 @@
 mod app;
 mod markdown;
 mod source_editor;
+mod theme;
 mod tree;
 mod ui;
 

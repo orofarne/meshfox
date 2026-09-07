@@ -13,6 +13,7 @@ use syntect::parsing::SyntaxSet;
 use edtui::{EditorView, LineNumbers, SyntaxHighlighter};
 
 use super::app::{App, Focus};
+use super::theme::{ACCENT, BORDER, FAIL, OK};
 use super::markdown::Segment;
 use super::source_editor::SourceEditorState;
 use super::tree::TreeRow;
@@ -49,8 +50,8 @@ fn tree_row_words(row: &TreeRow, title_style: Style) -> Vec<(String, Style)> {
         .map(|w| (w.to_string(), title_style))
         .collect();
     match row.constraint_ok {
-        Some(true) => words.push(("✓".to_string(), Style::default().fg(Color::Green))),
-        Some(false) => words.push(("✗".to_string(), Style::default().fg(Color::Red))),
+        Some(true) => words.push(("✓".to_string(), Style::default().fg(OK))),
+        Some(false) => words.push(("✗".to_string(), Style::default().fg(FAIL))),
         None => {}
     }
     for tag in &row.tags {
@@ -69,7 +70,7 @@ fn tree_row_words(row: &TreeRow, title_style: Style) -> Vec<(String, Style)> {
     if !flags.is_empty() {
         words.push((
             format!("[{}]", flags.join(",")),
-            Style::default().fg(Color::Green),
+            Style::default().fg(OK),
         ));
     }
     words
@@ -194,11 +195,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
 }
 
 fn pane_border(focused: bool) -> Style {
-    if focused {
-        Style::default().fg(Color::Yellow)
-    } else {
-        Style::default()
-    }
+    Style::default().fg(if focused { ACCENT } else { BORDER })
 }
 
 fn type_marker(t: NodeType) -> &'static str {
@@ -403,7 +400,7 @@ fn render_document(f: &mut Frame, area: Rect, app: &App) {
                     Some(p) => f.render_widget(Image::new(p), rect),
                     None => f.render_widget(
                         Paragraph::new(format!("[image failed to load: {alt}]"))
-                            .style(Style::default().fg(Color::Red)),
+                            .style(Style::default().fg(FAIL)),
                         rect,
                     ),
                 }
@@ -436,7 +433,10 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
     } else {
         " Output ".to_string()
     };
-    let block = Block::default().borders(Borders::ALL).title(title);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(BORDER))
+        .title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -457,7 +457,7 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
     } else if !app.status.is_empty() {
         Text::from(Line::from(Span::styled(
             app.status.as_str(),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(ACCENT),
         )))
     } else {
         Text::from(Line::from(Span::styled(
@@ -483,14 +483,14 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     let mut spans = Vec::new();
     if let Some((total, failed)) = app.constraint_stats {
         let (text, color) = if failed > 0 {
-            (format!("{failed}/{total} constraints failing"), Color::Red)
+            (format!("{failed}/{total} constraints failing"), FAIL)
         } else {
             (
                 format!(
                     "all {total} constraint{} pass",
                     if total == 1 { "" } else { "s" }
                 ),
-                Color::Green,
+                OK,
             )
         };
         spans.push(Span::styled(text, Style::default().fg(color)));
@@ -552,7 +552,10 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
     } else {
         " variables needed "
     };
-    let block = Block::default().borders(Borders::ALL).title(title);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .title(title);
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
@@ -626,6 +629,7 @@ fn render_block_picker(f: &mut Frame, area: Rect, bp: &super::app::BlockPickerSt
     };
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
         .title(format!(" {} — which block? ", mode));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
@@ -654,7 +658,7 @@ fn render_block_picker(f: &mut Frame, area: Rect, bp: &super::app::BlockPickerSt
             };
             ListItem::new(Line::from(vec![
                 Span::raw(b.name.clone()),
-                Span::styled(badge, Style::default().fg(Color::Green)),
+                Span::styled(badge, Style::default().fg(OK)),
             ]))
         })
         .collect();
@@ -673,7 +677,10 @@ fn render_block_picker(f: &mut Frame, area: Rect, bp: &super::app::BlockPickerSt
 fn render_reset_session_confirm(f: &mut Frame, area: Rect) {
     let rect = centered_rect(60, 8, area);
     f.render_widget(Clear, rect);
-    let block = Block::default().borders(Borders::ALL).title(" reset session? ");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .title(" reset session? ");
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
@@ -742,6 +749,7 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
         .title(" keybindings ");
     let inner = block.inner(rect);
     f.render_widget(block, rect);
@@ -811,7 +819,7 @@ fn render_source_editor(f: &mut Frame, area: Rect, se: &mut SourceEditorState, s
     f.render_widget(view, chunks[1]);
 
     let footer = match &se.error {
-        Some(msg) => Line::from(Span::styled(msg.as_str(), Style::default().fg(Color::Red))),
+        Some(msg) => Line::from(Span::styled(msg.as_str(), Style::default().fg(FAIL))),
         None => Line::from(Span::styled(
             "Ctrl-s save · Ctrl-f switch file · Ctrl-n heading→node · Ctrl-p suggest params · \
              esc close (vim keys inside the buffer)",
@@ -843,6 +851,7 @@ fn render_attr_suggest_popup(f: &mut Frame, area: Rect, se: &SourceEditorState) 
     f.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
         .title(format!(" {} attribute ", se.attr_suggest_label()));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
@@ -871,7 +880,10 @@ fn render_tag_suggest_popup(f: &mut Frame, area: Rect, se: &SourceEditorState) {
     let height = (se.tag_suggest_candidates.len() as u16 + 2).min(area.height);
     let rect = centered_rect(36, height, area);
     f.render_widget(Clear, rect);
-    let block = Block::default().borders(Borders::ALL).title(" tag ");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .title(" tag ");
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
@@ -894,6 +906,7 @@ fn render_source_file_picker(f: &mut Frame, area: Rect, se: &SourceEditorState) 
     f.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
         .title(" switch file ");
     let inner = block.inner(rect);
     f.render_widget(block, rect);

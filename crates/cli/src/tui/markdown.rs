@@ -153,7 +153,11 @@ impl Highlighter {
 /// to hand-roll rather than pull in a bridging crate — an `a == 0` alpha
 /// (syntect's convention for "no color set, inherit the theme's default")
 /// maps to `None` so we don't paint over a span with a color the theme
-/// never actually chose.
+/// never actually chose. Deliberately never carries the theme's own
+/// per-token `background` across — the bundled `syntect` theme fills it in
+/// densely enough to read as a solid gray box behind every code line,
+/// which doesn't match the web UI's plain, borderless code text; only
+/// `foreground` (the actual syntax coloring) survives the translation.
 fn translate_style(style: syntect::highlighting::Style) -> Style {
     use syntect::highlighting::FontStyle;
 
@@ -167,9 +171,6 @@ fn translate_style(style: syntect::highlighting::Style) -> Style {
     let mut out = Style::default();
     if let Some(fg) = color(style.foreground) {
         out = out.fg(fg);
-    }
-    if let Some(bg) = color(style.background) {
-        out = out.bg(bg);
     }
     if style.font_style.contains(FontStyle::BOLD) {
         out = out.add_modifier(Modifier::BOLD);
@@ -744,7 +745,7 @@ impl<'a> Renderer<'a> {
         // is visibly shorter than a real `─` glyph beside it.
         Some(Line::from(Span::styled(
             format!("├─ {}", parts.join("  ")),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(super::theme::DEP),
         )))
     }
 
@@ -792,7 +793,7 @@ impl<'a> Renderer<'a> {
                     } else {
                         caption.to_string()
                     };
-                    let marker = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+                    let marker = Style::default().fg(super::theme::ACCENT).add_modifier(Modifier::BOLD);
                     let hint = Style::default().fg(Color::DarkGray);
                     self.push_segment(Segment::Text(vec![Line::from(vec![
                         Span::styled("▶ ", marker),
@@ -802,7 +803,7 @@ impl<'a> Renderer<'a> {
                     return;
                 }
                 let highlighted = self.hl.highlight(&lang, &code);
-                let border = Style::default().fg(Color::DarkGray);
+                let border = Style::default().fg(super::theme::DEP);
                 // Mirrors the web UI's code-block head (lang + run name) so
                 // it's clear at a glance what `r` would actually run, and
                 // doubles as a visual break between back-to-back fences —
@@ -1179,7 +1180,7 @@ mod tests {
             .find(|s| s.content.contains("Run everything"))
             .expect("caption span");
         assert_eq!(caption_span.style.bg, None, "no fill — see design choice above");
-        assert_eq!(caption_span.style.fg, Some(Color::Yellow));
+        assert_eq!(caption_span.style.fg, Some(crate::tui::theme::ACCENT));
         assert!(caption_span.style.add_modifier.contains(Modifier::BOLD));
 
         let marker_span = lines[0]
@@ -1187,6 +1188,6 @@ mod tests {
             .iter()
             .find(|s| s.content.contains('▶'))
             .expect("▶ marker span");
-        assert_eq!(marker_span.style.fg, Some(Color::Yellow));
+        assert_eq!(marker_span.style.fg, Some(crate::tui::theme::ACCENT));
     }
 }
