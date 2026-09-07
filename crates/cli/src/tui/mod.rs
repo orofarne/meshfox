@@ -206,7 +206,7 @@ async fn main_loop(
             maybe_ev = input_rx.recv() => {
                 match maybe_ev {
                     Some(Event::Key(key)) if key.kind == KeyEventKind::Press => app.on_key(key).await,
-                    Some(Event::Mouse(mouse)) => app.on_mouse(mouse),
+                    Some(Event::Mouse(mouse)) => app.on_mouse(mouse).await,
                     Some(_) => {}
                     None => return Ok(()),
                 }

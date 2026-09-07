@@ -16,12 +16,12 @@ A trivial runnable check, with its output cached below the fence.
 echo "hello from meshfox"
 date
 ```
-<!-- meshfox:output name="smoke" -->
+<!-- meshfox:output name="smoke" hash="2502e214" -->
 ```text
-exit code: 0
+exit code: 0 · 33ms
 
 hello from meshfox
-Wed Aug 12 11:00:52 +04 2026
+Mon Sep  7 23:35:17 +04 2026
 ```
 <!-- /meshfox:output -->
 

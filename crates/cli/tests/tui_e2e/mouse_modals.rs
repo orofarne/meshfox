@@ -1,9 +1,9 @@
-//! TODO.canvas.md: "Мышь в панелях TUI" — `App::on_mouse` is currently a
-//! no-op whenever a modal (`var_form`/`block_picker`) is open
-//! (`app.rs:705-707`), so today only `j`/`k`/arrows can move a modal
-//! list's own selection. This covers the block picker (opened by `r` on a
-//! node with more than one runnable block) — clicking a row should select
-//! it, same as `j`/`k` would.
+//! TODO.canvas.md: "Мышь в панелях TUI" — `App::on_mouse` used to be a
+//! no-op whenever a modal (`var_form`/`block_picker`) was open, so only
+//! `j`/`k`/arrows could move a modal list's own selection; `on_modal_mouse`
+//! now handles a click on either one's own list. This covers the block
+//! picker (opened by `r` on a node with more than one runnable block) —
+//! clicking a row selects it, same as `j`/`k` would.
 
 use std::time::Duration;
 
@@ -11,7 +11,7 @@ use crate::fixtures;
 use crate::harness::TuiSession;
 
 #[test]
-#[ignore = "not implemented — see TODO.canvas.md's modals bullet"]
+#[ignore = "pty-based e2e — run via `cargo test --test tui_e2e -- --ignored`"]
 fn clicking_a_row_in_the_block_picker_selects_it() {
     let (canvas_path, dir) = fixtures::write_fixture(fixtures::TWO_BLOCKS);
     let mut session = TuiSession::spawn(&canvas_path, dir, 30, 100);

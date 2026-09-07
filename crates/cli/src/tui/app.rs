@@ -28,7 +28,7 @@ use ratatui_image::protocol::Protocol;
 
 use super::ui;
 
-use super::markdown::{self, Highlighter, Segment};
+use super::markdown::{self, ClickRegion, ClickTarget, Highlighter, Segment};
 use super::source_editor::{self, SourceEditorOutcome, SourceEditorState};
 use super::tree::{self, TreeRow};
 
@@ -45,6 +45,32 @@ pub enum Focus {
 /// the same ballpark most desktop OSes default their own double-click
 /// interval to.
 const DOUBLE_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// Which border a `MouseEventKind::Down(Left)` landed on, if any — set on
+/// `App::resize_drag` for the rest of the gesture (every `Drag(Left)` until
+/// the matching `Up(Left)`), so `on_resize_drag` knows which of
+/// `tree_width_pct`/`output_height` to update as the cursor moves. See
+/// `App::resize_handle_at`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResizeDrag {
+    /// The seam between the tree and document panes — dragging it changes
+    /// `tree_width_pct`.
+    Vertical,
+    /// The seam between the tree/document row and the Output pane below it
+    /// — dragging it changes `output_height`.
+    Horizontal,
+}
+
+/// `App::tree_width_pct`'s own allowed range — narrow enough on either end
+/// that neither pane ever shrinks to something unreadable, wide enough that
+/// the split still feels adjustable rather than barely-there.
+const MIN_TREE_WIDTH_PCT: u16 = 15;
+const MAX_TREE_WIDTH_PCT: u16 = 85;
+/// `App::output_height`'s own lower bound — enough rows for its own border
+/// plus a couple of lines of real output; the upper bound instead comes
+/// from `ui::MIN_MAIN_HEIGHT` (leaving the tree/document row usable), since
+/// that one depends on the terminal's own current height.
+const MIN_OUTPUT_HEIGHT: u16 = 3;
 
 /// A modal form for one or more declared variables at once — all of them
 /// visible and editable together (arrow keys move the focused field,
@@ -233,6 +259,19 @@ pub struct App {
     pub list_state: ListState,
     pub focus: Focus,
     pub doc_segments: Vec<Segment>,
+    /// Every clickable span in `doc_segments`, in the same segment-local
+    /// coordinates `markdown::render` returned them in — recomputed
+    /// alongside `doc_segments` (`render_current_document`), consulted by
+    /// `ui::render_document` to populate `doc_click_targets` (actual
+    /// on-screen `Rect`s) every frame, the same two-step split
+    /// `ClickRegion`'s own doc comment describes.
+    pub doc_click_regions: Vec<ClickRegion>,
+    /// `doc_click_regions` translated to actual on-screen `Rect`s by the
+    /// most recent `ui::render_document` call — consulted by
+    /// `App::on_mouse`'s document-pane branch. Recomputed every frame (like
+    /// `ui::compute_layout`'s own pane rects), so a click always hit-tests
+    /// against exactly what's currently on screen, scroll/wrap included.
+    pub doc_click_targets: Vec<(Rect, ClickTarget)>,
     pub doc_images: HashMap<PathBuf, Option<Protocol>>,
     pub doc_scroll: u16,
     /// Lines scrolled back from the *bottom* of the Output pane — `0`
@@ -241,6 +280,12 @@ pub struct App {
     /// `scroll_output`). Reset to `0` whenever a fresh run starts, so a
     /// scrolled-up view doesn't silently miss new output.
     pub output_scroll: u16,
+    /// Columns scrolled right, for the Output pane's own lines — unlike
+    /// `output_scroll` there's no wrapping fallback for a line wider than
+    /// the pane (see `ui::render_output`), so this is the only way to see
+    /// a wide line's own tail. Reset to `0` whenever a fresh run starts,
+    /// same reasoning as `output_scroll`.
+    pub output_hscroll: u16,
     /// Which pane (if any) is currently filling the whole screen — set by
     /// pressing `f` (toggles whichever pane is `focus`ed), clicking a
     /// pane's own `[+]`/`[-]` title-row icon, or double-clicking its
@@ -256,6 +301,23 @@ pub struct App {
     /// `Down`s in the same place within `DOUBLE_CLICK_WINDOW` is on this
     /// app.
     last_click: Option<(u16, u16, std::time::Instant)>,
+    /// The tree pane's own share of the tree/document row, as a percentage
+    /// (the document pane gets the rest) — `ui::compute_layout`'s own
+    /// `Percentage` split. Adjustable by dragging the border between the
+    /// two panes (`resize_drag`/`on_resize_drag`); clamped to
+    /// `MIN_TREE_WIDTH_PCT..=MAX_TREE_WIDTH_PCT`.
+    pub tree_width_pct: u16,
+    /// The Output pane's own height, in rows — `ui::compute_layout`'s own
+    /// `Constraint::Length`. Adjustable the same way as `tree_width_pct`,
+    /// via the border between the tree/document row and Output; clamped to
+    /// `MIN_OUTPUT_HEIGHT..=` whatever still leaves `ui::MIN_MAIN_HEIGHT`
+    /// rows for the tree/document row above it.
+    pub output_height: u16,
+    /// Which border (if any) a `MouseEventKind::Down(Left)` most recently
+    /// landed on and is still being dragged — `None` outside an active
+    /// resize gesture. Set by `resize_handle_at`, consumed by
+    /// `on_resize_drag`, cleared on the matching `Up(Left)`.
+    resize_drag: Option<ResizeDrag>,
     pub highlighter: Highlighter,
     pub picker: Picker,
     pub run: Option<RunState>,
@@ -483,11 +545,17 @@ impl App {
             list_state: ListState::default(),
             focus: Focus::Tree,
             doc_segments: Vec::new(),
+            doc_click_regions: Vec::new(),
+            doc_click_targets: Vec::new(),
             doc_images: HashMap::new(),
             doc_scroll: 0,
             output_scroll: 0,
+            output_hscroll: 0,
             fullscreen: None,
             last_click: None,
+            tree_width_pct: ui::DEFAULT_TREE_WIDTH_PCT,
+            output_height: ui::DEFAULT_OUTPUT_HEIGHT,
+            resize_drag: None,
             highlighter: Highlighter::with_extra_syntaxes(&syntax_root),
             picker,
             run: None,
@@ -760,30 +828,42 @@ impl App {
     /// for it, so the tree/document hit-testing below never runs against
     /// coordinates that actually landed on the editor's own overlay.
     ///
+    /// A `var_form`/`block_picker` modal, when up, claims every click of
+    /// its own instead — its own list is the only clickable thing on
+    /// screen while it's open (see `on_modal_mouse`).
+    ///
     /// Otherwise: clicks select a tree row and focus that pane, same as
     /// before — except a click that lands specifically on a row's own
     /// disclosure marker (`▾`/`▸`, see `ui::render_tree`) toggles it
     /// expanded/collapsed instead, same as clicking it with the keyboard
-    /// (`enter`) would, and a click anywhere on any of the three panes'
-    /// own title row focuses it and — on its `[+]`/`[-]` icon
+    /// (`enter`) would; a double-click elsewhere on that same row runs its
+    /// node's own default block, mirroring a file manager's
+    /// double-click-to-open convention. A click anywhere on any of the
+    /// three panes' own title row focuses it and — on its `[+]`/`[-]` icon
     /// specifically, or as a double-click anywhere else on that row (same
     /// "two `Down`s close together" detection `last_click` exists for,
     /// see its own doc comment) — toggles `fullscreen` for it (see
-    /// `toggle_fullscreen_on_title_click`). The scroll wheel over any of
-    /// the three panes moves/scrolls it. `layout` itself already reflects
-    /// `fullscreen` (`ui::compute_layout`), so a collapsed pane's own
-    /// `point_in` checks below simply never match. Nothing else (run/kill
-    /// buttons, clicking inside a `tty` handoff) is wired up yet.
-    pub fn on_mouse(&mut self, mouse: MouseEvent) {
+    /// `toggle_fullscreen_on_title_click`). A click on the document pane
+    /// that lands on one of `doc_click_targets` (a button fence's own
+    /// marker, or a deps line's block name — see `ui::render_document`)
+    /// runs/jumps to it, same as `r` or a tree click would. The scroll
+    /// wheel over any of the three panes moves/scrolls it — including,
+    /// over the Output pane, sideways (`ScrollLeft`/`ScrollRight`), since
+    /// its own lines never wrap (see `ui::render_output`). `layout` itself
+    /// already reflects `fullscreen` (`ui::compute_layout`), so a collapsed
+    /// pane's own `point_in` checks below simply never match.
+    pub async fn on_mouse(&mut self, mouse: MouseEvent) {
         if let Some(se) = &mut self.source_editor {
             se.on_mouse(mouse);
             return;
         }
-        if self.var_form.is_some() || self.block_picker.is_some() {
-            return; // modal is up — no pane underneath it to click through to
-        }
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        let layout = ui::compute_layout(Rect::new(0, 0, cols, rows), self.fullscreen);
+        let area = Rect::new(0, 0, cols, rows);
+        if self.var_form.is_some() || self.block_picker.is_some() {
+            self.on_modal_mouse(mouse, area);
+            return;
+        }
+        let layout = ui::compute_layout(area, self.fullscreen, self.tree_width_pct, self.output_height);
 
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -793,6 +873,11 @@ impl App {
                         if r == mouse.row && c == mouse.column && t.elapsed() < DOUBLE_CLICK_WINDOW
                 );
                 self.last_click = Some((mouse.row, mouse.column, std::time::Instant::now()));
+
+                if let Some(drag) = self.resize_handle_at(&layout, mouse.column, mouse.row) {
+                    self.resize_drag = Some(drag);
+                    return; // starting a resize claims the click — no pane underneath it
+                }
 
                 if point_in(layout.tree, mouse.column, mouse.row) {
                     self.toggle_fullscreen_on_title_click(Focus::Tree, layout.tree, &mouse, is_double_click);
@@ -817,11 +902,21 @@ impl App {
                             }
                             if on_disclosure {
                                 self.toggle_expand();
+                            } else if is_double_click {
+                                self.trigger_run(true).await;
                             }
                         }
                     }
                 } else if point_in(layout.document, mouse.column, mouse.row) {
                     self.toggle_fullscreen_on_title_click(Focus::Document, layout.document, &mouse, is_double_click);
+                    let target = self
+                        .doc_click_targets
+                        .iter()
+                        .find(|(r, _)| point_in(*r, mouse.column, mouse.row))
+                        .map(|(_, t)| t.clone());
+                    if let Some(target) = target {
+                        self.activate_click_target(target).await;
+                    }
                 } else if point_in(layout.output, mouse.column, mouse.row) {
                     self.toggle_fullscreen_on_title_click(Focus::Output, layout.output, &mouse, is_double_click);
                 }
@@ -844,7 +939,134 @@ impl App {
                     self.scroll_output(-3);
                 }
             }
+            MouseEventKind::ScrollRight if point_in(layout.output, mouse.column, mouse.row) => {
+                self.scroll_output_h(5);
+            }
+            MouseEventKind::ScrollLeft if point_in(layout.output, mouse.column, mouse.row) => {
+                self.scroll_output_h(-5);
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.on_resize_drag(area, mouse.column, mouse.row);
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.resize_drag = None;
+            }
             _ => {}
+        }
+    }
+
+    /// A `ClickTarget` (see its own doc comment) actually being clicked —
+    /// split out of `on_mouse` so its own `match` doesn't have to live
+    /// inside that already-long function. Respects the same "one run at a
+    /// time" guard `trigger_run` applies to a keyboard `r`/`R`, since a
+    /// button-fence click reaches `start_run` directly rather than through
+    /// `trigger_run` itself (only `trigger_run` knows how to fall back to
+    /// the block picker, which a click never needs — it always names its
+    /// own exact block already).
+    async fn activate_click_target(&mut self, target: ClickTarget) {
+        match target {
+            ClickTarget::RunBlock { node_id, block_name } => {
+                if self.run.as_ref().is_some_and(|r| !r.finished)
+                    || self.file_run.as_ref().is_some_and(|r| !r.finished)
+                {
+                    self.status = "a run is already in progress — press K to kill it first".into();
+                    return;
+                }
+                self.start_run(node_id, block_name, true).await;
+            }
+            ClickTarget::JumpToNode { node_id } => self.jump_to_node(&node_id),
+        }
+    }
+
+    /// `on_mouse`'s own modal branch: while `var_form`/`block_picker` is up,
+    /// a left-click on one of its own list rows selects it, same as `j`/`k`
+    /// would — everything else (including a click that lands outside the
+    /// modal's own rect, on whatever pane is still visible behind it) is a
+    /// no-op, since there's no pane underneath a modal to click through to.
+    /// `list_rect` mirrors exactly what `render_var_form`/
+    /// `render_block_picker` themselves compute (`ui::var_form_list_rect`/
+    /// `ui::block_picker_list_rect`), so a row's hit-test can never drift
+    /// from where it actually renders.
+    fn on_modal_mouse(&mut self, mouse: MouseEvent, area: Rect) {
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+        if let Some(vf) = &mut self.var_form {
+            let list_rect = ui::var_form_list_rect(area, vf.decls.len());
+            if mouse.row >= list_rect.y && mouse.row < list_rect.y + list_rect.height {
+                let idx = (mouse.row - list_rect.y) as usize;
+                if idx < vf.decls.len() {
+                    vf.selected = idx;
+                }
+            }
+        } else if let Some(bp) = &mut self.block_picker {
+            let list_rect = ui::block_picker_list_rect(area, bp.blocks.len());
+            if mouse.row >= list_rect.y && mouse.row < list_rect.y + list_rect.height {
+                let idx = (mouse.row - list_rect.y) as usize;
+                if idx < bp.blocks.len() {
+                    bp.selected = idx;
+                }
+            }
+        }
+    }
+
+    /// Which border (if any) `(col, row)` lands on — the seam between the
+    /// tree and document panes, or between the tree/document row and
+    /// Output below it. `None` while a pane is fullscreen — there's nothing
+    /// to drag apart then (`ui::compute_layout` itself ignores
+    /// `tree_width_pct`/`output_height` in that case too).
+    ///
+    /// The vertical seam is genuinely two adjacent border columns (tree's
+    /// own right border, then document's own left border right next to
+    /// it) — either counts, since neither has any other click behavior of
+    /// its own to conflict with. The horizontal seam is deliberately
+    /// one-sided: only the tree/document row's own *bottom* border counts,
+    /// never Output's own *top* border right below it — that row is
+    /// Output's own title row, with its own click-to-focus/
+    /// double-click-to-fullscreen behavior
+    /// (`toggle_fullscreen_on_title_click`) that a resize-drag start must
+    /// not shadow.
+    fn resize_handle_at(&self, layout: &ui::PaneLayout, col: u16, row: u16) -> Option<ResizeDrag> {
+        if self.fullscreen.is_some() {
+            return None;
+        }
+        let in_tree_document_rows = row >= layout.tree.y && row < layout.tree.y + layout.tree.height;
+        if in_tree_document_rows && (col == layout.document.x || col + 1 == layout.document.x) {
+            return Some(ResizeDrag::Vertical);
+        }
+        if row + 1 == layout.tree.y + layout.tree.height {
+            return Some(ResizeDrag::Horizontal);
+        }
+        None
+    }
+
+    /// The other half of a resize gesture `resize_handle_at` started —
+    /// called on every `MouseEventKind::Drag(Left)` while `resize_drag` is
+    /// `Some`, translating the cursor's current position back into a new
+    /// `tree_width_pct`/`output_height`. `area` is the whole terminal, same
+    /// as what `ui::compute_layout` itself sizes the panes against, so a
+    /// drag to column/row `N` reproduces exactly the split that would put
+    /// the border there.
+    fn on_resize_drag(&mut self, area: Rect, col: u16, row: u16) {
+        match self.resize_drag {
+            None => {}
+            Some(ResizeDrag::Vertical) => {
+                if area.width == 0 {
+                    return;
+                }
+                let pct = (col.saturating_sub(area.x) as u32 * 100 / area.width as u32) as u16;
+                self.tree_width_pct = pct.clamp(MIN_TREE_WIDTH_PCT, MAX_TREE_WIDTH_PCT);
+            }
+            Some(ResizeDrag::Horizontal) => {
+                let content_height = area.height.saturating_sub(ui::FOOTER_HEIGHT);
+                let max_output_height = content_height.saturating_sub(ui::MIN_MAIN_HEIGHT);
+                if max_output_height < MIN_OUTPUT_HEIGHT {
+                    return; // terminal too short to leave any room to negotiate
+                }
+                let target_row = row.saturating_sub(area.y);
+                let new_height = content_height.saturating_sub(target_row);
+                self.output_height = new_height.clamp(MIN_OUTPUT_HEIGHT, max_output_height);
+            }
         }
     }
 
@@ -875,6 +1097,42 @@ impl App {
     /// increases it, revealing earlier lines.
     fn scroll_output(&mut self, delta: i32) {
         self.output_scroll = (self.output_scroll as i32 - delta).max(0) as u16;
+    }
+
+    /// `output_hscroll`'s own counterpart to `scroll_output` — see that
+    /// field's own doc comment. Unlike `output_scroll`, "forward"/"back"
+    /// only ever means "right"/"left" here, so a positive `delta` increases
+    /// it directly, no sign flip.
+    fn scroll_output_h(&mut self, delta: i32) {
+        self.output_hscroll = (self.output_hscroll as i32 + delta).max(0) as u16;
+    }
+
+    /// The TUI's counterpart to the web UI's `jumpTo` (`web/src/MeshNode.tsx`)
+    /// — moves the tree's own selection to `node_id`'s row, expanding every
+    /// collapsed ancestor first (mirrors `App::new`'s own deep-link
+    /// expansion) so that row actually exists in `self.rows` to jump to.
+    /// There's no canvas to pan/scroll to in the TUI the way there is on
+    /// the web, so "jump" here is purely a tree-selection change — see
+    /// `ClickTarget::JumpToNode`'s own doc comment.
+    fn jump_to_node(&mut self, node_id: &str) {
+        let mut expanded_any = false;
+        let mut current = self.display_canvas.node(node_id).and_then(|n| n.parent.clone());
+        while let Some(id) = current {
+            current = self.display_canvas.node(&id).and_then(|n| n.parent.clone());
+            if self.expanded.insert(id) {
+                expanded_any = true;
+            }
+        }
+        if expanded_any {
+            self.rebuild_rows();
+        }
+        if let Some(idx) = self.rows.iter().position(|r| r.node_id == node_id) {
+            if idx != self.selected {
+                self.selected = idx;
+                self.doc_scroll = 0;
+                self.render_current_document();
+            }
+        }
     }
 
     /// Shared by `on_mouse`'s tree/document/output branches: a click
@@ -1202,6 +1460,7 @@ impl App {
 
     fn render_current_document(&mut self) {
         self.doc_segments.clear();
+        self.doc_click_regions.clear();
         self.doc_images.clear();
         let Some(row) = self.rows.get(self.selected) else {
             return;
@@ -1253,8 +1512,19 @@ impl App {
                 // intro for the file content, not a footnote on it.
                 self.doc_segments = Vec::new();
                 if let Some(caption) = &node.caption {
-                    self.doc_segments
-                        .extend(markdown::render(caption, &base_dir, &self.highlighter, &node.id, &decls));
+                    let (segs, regions) =
+                        markdown::render(caption, &base_dir, &self.highlighter, &node.id, &decls);
+                    // `regions` came back indexed into `segs` alone —
+                    // offset by how many segments already precede it (none,
+                    // here, but kept explicit rather than assumed) so they
+                    // still point at the right entry once folded into the
+                    // shared `doc_segments`/`doc_click_regions`.
+                    let offset = self.doc_segments.len();
+                    self.doc_click_regions.extend(regions.into_iter().map(|mut r| {
+                        r.segment_index += offset;
+                        r
+                    }));
+                    self.doc_segments.extend(segs);
                     self.doc_segments
                         .push(Segment::Text(vec![Line::from("")]));
                 }
@@ -1263,7 +1533,9 @@ impl App {
             }
         }
 
-        self.doc_segments = markdown::render(&node.text, &base_dir, &self.highlighter, &node.id, &decls);
+        let (segs, regions) = markdown::render(&node.text, &base_dir, &self.highlighter, &node.id, &decls);
+        self.doc_segments = segs;
+        self.doc_click_regions = regions;
 
         let images: Vec<(PathBuf, Option<u32>, Option<u32>)> = self
             .doc_segments
@@ -1556,6 +1828,7 @@ impl App {
         };
 
         self.output_scroll = 0;
+        self.output_hscroll = 0;
         self.run = Some(RunState {
             chain,
             idx: 0,
@@ -2055,6 +2328,7 @@ impl App {
             Ok(proc) => {
                 self.status.clear();
                 self.output_scroll = 0;
+                self.output_hscroll = 0;
                 self.file_run = Some(FileRunState {
                     proc: Some(proc),
                     lines: vec![format!("==> {node_id}")],

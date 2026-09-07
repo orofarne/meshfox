@@ -13,10 +13,12 @@
 //! "TUI end-to-end tests" section for the full rationale.
 //!
 //! Every mouse-support test here mirrors one checklist item in
-//! TODO.canvas.md's "Мышь в панелях TUI (tree/document/output)" — it's
-//! written now, failing (red), against a feature that doesn't exist yet;
-//! implementing the feature and ticking its TODO box happen together with
-//! un-`#[ignore]`ing/greening its test.
+//! TODO.canvas.md's "Мышь в панелях TUI (tree/document/output)" — each was
+//! written first, failing (red), against a feature that didn't exist yet;
+//! implementing the feature and ticking its TODO box happened together
+//! with greening its test (its own `#[ignore]` reason then changes to the
+//! ordinary "pty-based e2e" one below — every test here stays `#[ignore]`d
+//! regardless, same as `mouse_output_pane`'s already were).
 
 mod baseline;
 mod fixtures;
@@ -26,4 +28,5 @@ mod mouse_drag_dblclick;
 mod mouse_horizontal_scroll;
 mod mouse_modals;
 mod mouse_output_pane;
+mod mouse_resize;
 mod mouse_run_buttons;

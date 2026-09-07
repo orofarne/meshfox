@@ -3,8 +3,9 @@
 //! *looks* clickable there is a `button` fence's `▶ caption (r to run)`
 //! marker (`markdown.rs`'s `BUTTON_LANG` branch) — every ordinary runnable
 //! block has no inline run control at all, only the tree's `r`/`R`. This
-//! test is written against clicking that marker running its own `deps=`
-//! chain, same as pressing `r` on it would.
+//! test covers clicking that marker running its own `deps=` chain, same as
+//! pressing `r` on it would (`markdown::ClickTarget::RunBlock`,
+//! `App::activate_click_target`).
 
 use std::time::Duration;
 
@@ -12,7 +13,7 @@ use crate::fixtures;
 use crate::harness::TuiSession;
 
 #[test]
-#[ignore = "not implemented — see TODO.canvas.md's run/chain-button bullet"]
+#[ignore = "pty-based e2e — run via `cargo test --test tui_e2e -- --ignored`"]
 fn clicking_a_button_fences_marker_runs_its_deps_chain() {
     let (canvas_path, dir) = fixtures::write_fixture(fixtures::BUTTON_FENCE);
     let mut session = TuiSession::spawn(&canvas_path, dir, 30, 100);

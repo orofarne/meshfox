@@ -128,8 +128,12 @@ const SOURCE_EDITOR_THEME: &str = "dracula";
 /// `Option` chain either way, so there's no cost to not panicking on it.
 const SOURCE_EDITOR_LANG: &str = "md";
 
-const OUTPUT_HEIGHT: u16 = 9;
-const FOOTER_HEIGHT: u16 = 1;
+/// Default `App::output_height` — see `App::resize_handle_at`/
+/// `on_resize_drag` for how a mouse drag on the border can change it.
+pub(super) const DEFAULT_OUTPUT_HEIGHT: u16 = 9;
+/// Default `App::tree_width_pct` — same reasoning as `DEFAULT_OUTPUT_HEIGHT`.
+pub(super) const DEFAULT_TREE_WIDTH_PCT: u16 = 30;
+pub(super) const FOOTER_HEIGHT: u16 = 1;
 
 /// Any pane's own top-right corner toggle (`fullscreen_icon_title`) — same
 /// bracket-badge look `[cache]`/`[run,cache]` already use elsewhere in
@@ -166,13 +170,25 @@ pub struct PaneLayout {
     pub footer: Rect,
 }
 
+/// The minimum height (rows) `compute_layout` ever leaves the tree/document
+/// row for — matches the `Constraint::Min(6)` below. `App::on_resize_drag`
+/// clamps `output_height` against this so a drag can never starve it past
+/// what `compute_layout` itself would already refuse to shrink further.
+pub(super) const MIN_MAIN_HEIGHT: u16 = 6;
+
 /// `fullscreen` (see `App::fullscreen`), when set, collapses the other two
 /// panes to empty rects and gives whichever one it names the whole area
 /// above the footer — a click/scroll's own `point_in(layout.tree, ...)`/
 /// `point_in(layout.document, ...)`/`point_in(layout.output, ...)` checks
 /// in `App::on_mouse` then simply never match a collapsed pane, with no
 /// separate "are we fullscreen, and which pane" branch needed there.
-pub fn compute_layout(area: Rect, fullscreen: Option<Focus>) -> PaneLayout {
+///
+/// `tree_width_pct`/`output_height` (`App`'s own fields, adjustable by
+/// dragging the border between panes — see `App::on_resize_drag`) size the
+/// tree/document horizontal split and the Output pane's own height; both
+/// are ignored while `fullscreen` is set, same as before either field
+/// existed.
+pub fn compute_layout(area: Rect, fullscreen: Option<Focus>, tree_width_pct: u16, output_height: u16) -> PaneLayout {
     if let Some(pane) = fullscreen {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -191,15 +207,18 @@ pub fn compute_layout(area: Rect, fullscreen: Option<Focus>) -> PaneLayout {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(6),
-            Constraint::Length(OUTPUT_HEIGHT),
+            Constraint::Min(MIN_MAIN_HEIGHT),
+            Constraint::Length(output_height),
             Constraint::Length(FOOTER_HEIGHT),
         ])
         .split(area);
 
     let main = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+        .constraints([
+            Constraint::Percentage(tree_width_pct),
+            Constraint::Percentage(100 - tree_width_pct),
+        ])
         .split(chunks[0]);
 
     PaneLayout {
@@ -222,16 +241,16 @@ pub fn render(f: &mut Frame, app: &mut App) {
         return;
     }
 
-    let layout = compute_layout(area, app.fullscreen);
+    let layout = compute_layout(area, app.fullscreen, app.tree_width_pct, app.output_height);
 
     match app.fullscreen {
         None => {
             render_tree(f, layout.tree, app);
-            render_document(f, layout.document, &*app);
+            render_document(f, layout.document, app);
             render_output(f, layout.output, &*app);
         }
         Some(Focus::Tree) => render_tree(f, layout.tree, app),
-        Some(Focus::Document) => render_document(f, layout.document, &*app),
+        Some(Focus::Document) => render_document(f, layout.document, app),
         Some(Focus::Output) => render_output(f, layout.output, &*app),
     }
     render_footer(f, layout.footer, &*app);
@@ -368,7 +387,7 @@ fn wrapped_text_layout(total: u16, skip: u16, available: u16) -> Option<TextLayo
     })
 }
 
-fn render_document(f: &mut Frame, area: Rect, app: &App) {
+fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
     let title = app
         .rows
         .get(app.selected)
@@ -382,6 +401,7 @@ fn render_document(f: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    app.doc_click_targets.clear();
     if inner.height == 0 || inner.width == 0 {
         return;
     }
@@ -390,12 +410,17 @@ fn render_document(f: &mut Frame, area: Rect, app: &App) {
     let bottom = inner.y + inner.height;
     let mut skip = app.doc_scroll;
 
-    for seg in &app.doc_segments {
+    for (seg_idx, seg) in app.doc_segments.iter().enumerate() {
         if y >= bottom {
             break;
         }
         match seg {
             Segment::Text(lines) => {
+                // How far into this segment's own wrapped rows `skip`
+                // reaches, *before* it gets zeroed out below — needed to
+                // translate a click region's (pre-scroll) row back to
+                // where it actually lands once scrolled.
+                let seg_skip = skip;
                 // A segment's own *rendered* (word-wrapped, `inner.width`)
                 // row count can be well past `lines.len()` — a single
                 // long logical `Line` (a wordy bullet point, say) wraps
@@ -433,6 +458,57 @@ fn render_document(f: &mut Frame, area: Rect, app: &App) {
                     height: layout.height,
                 };
                 f.render_widget(paragraph.scroll((layout.row_offset, 0)), rect);
+
+                // Any `ClickRegion`s targeting this segment, translated
+                // into real on-screen cells — `App::on_mouse` hit-tests
+                // against these, not `doc_click_regions` directly, so it
+                // never has to redo this segment's own wrap/scroll math
+                // itself.
+                if app.doc_click_regions.iter().any(|r| r.segment_index == seg_idx) {
+                    // Each line's own wrapped-row start within the
+                    // segment, found by wrapping it alone rather than
+                    // re-deriving an offset from `total` above — wrapping
+                    // is per-`Line` in `ratatui` (a `Paragraph` never
+                    // merges two logical lines' own wrapped rows
+                    // together), so summing each line's own row count in
+                    // isolation gives exactly the same row starts the
+                    // combined `paragraph` above just rendered with.
+                    let mut line_row_starts: Vec<u16> = Vec::with_capacity(lines.len());
+                    let mut acc = 0u16;
+                    for line in lines {
+                        line_row_starts.push(acc);
+                        let single =
+                            Paragraph::new(Text::from(vec![line.clone()])).wrap(Wrap { trim: false });
+                        acc += single.line_count(inner.width) as u16;
+                    }
+                    for region in app.doc_click_regions.iter().filter(|r| r.segment_index == seg_idx) {
+                        let Some(&line_start) = line_row_starts.get(region.line_index) else {
+                            continue;
+                        };
+                        if line_start < seg_skip {
+                            continue; // scrolled above the visible window
+                        }
+                        let row_in_view = line_start - seg_skip;
+                        if row_in_view >= layout.height {
+                            continue; // scrolled below the visible window
+                        }
+                        let col_start = region.col_start.min(inner.width);
+                        let col_end = region.col_end.min(inner.width);
+                        if col_end <= col_start {
+                            continue;
+                        }
+                        app.doc_click_targets.push((
+                            Rect {
+                                x: inner.x + col_start,
+                                y: y + row_in_view,
+                                width: col_end - col_start,
+                                height: 1,
+                            },
+                            region.target.clone(),
+                        ));
+                    }
+                }
+
                 y += layout.height;
             }
             Segment::Image { path, alt, .. } => {
@@ -529,7 +605,14 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(Color::DarkGray),
         )))
     };
-    f.render_widget(Paragraph::new(text), inner);
+    // `output_hscroll` counts columns scrolled right (see its own doc
+    // comment) — clamped here against the *currently visible* lines' own
+    // longest width, same "state is unclamped, rendering clamps"
+    // convention `output_scroll` above already uses, so scrolling right
+    // can't go past a line's own last column.
+    let max_hscroll = (text.width() as u16).saturating_sub(inner.width);
+    let hscroll = app.output_hscroll.min(max_hscroll);
+    f.render_widget(Paragraph::new(text).scroll((0, hscroll)), inner);
 }
 
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
@@ -607,9 +690,31 @@ fn tail_fit(s: &str, max: usize) -> String {
     format!("…{}", chars[start..].iter().collect::<String>())
 }
 
+/// The var form modal's own outer rect for `decl_count` fields in `area` —
+/// factored out of `render_var_form` so `var_form_list_rect` (below) can
+/// derive the same inner list rows rect from it without duplicating this
+/// sizing math.
+fn var_form_rect(area: Rect, decl_count: usize) -> Rect {
+    let height = (decl_count as u16 + 4).min(area.height);
+    centered_rect(64, height, area)
+}
+
+/// The var form's own list rows rect for `decl_count` fields in `area` —
+/// shared by `render_var_form` and `App::on_mouse`'s modal hit-testing, so
+/// the two can never drift apart (same idea as `PaneLayout`/
+/// `compute_layout`).
+pub(super) fn var_form_list_rect(area: Rect, decl_count: usize) -> Rect {
+    let rect = var_form_rect(area, decl_count);
+    let inner = Block::default().borders(Borders::ALL).inner(rect);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    rows[0]
+}
+
 fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
-    let height = (vf.decls.len() as u16 + 4).min(area.height);
-    let rect = centered_rect(64, height, area);
+    let rect = var_form_rect(area, vf.decls.len());
     f.render_widget(Clear, rect);
     let title = if vf.configuring {
         " configure variables "
@@ -682,9 +787,23 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
     );
 }
 
+/// The block picker modal's own outer rect for `block_count` blocks in
+/// `area` — see `var_form_rect`'s own doc comment for why this is factored
+/// out the same way.
+fn block_picker_rect(area: Rect, block_count: usize) -> Rect {
+    let height = (block_count as u16 + 4).min(area.height);
+    centered_rect(56, height, area)
+}
+
+/// The block picker's own list rect for `block_count` blocks in `area` —
+/// see `var_form_list_rect`'s own doc comment; same sharing reasoning.
+pub(super) fn block_picker_list_rect(area: Rect, block_count: usize) -> Rect {
+    let rect = block_picker_rect(area, block_count);
+    Block::default().borders(Borders::ALL).inner(rect)
+}
+
 fn render_block_picker(f: &mut Frame, area: Rect, bp: &super::app::BlockPickerState) {
-    let height = (bp.blocks.len() as u16 + 4).min(area.height);
-    let rect = centered_rect(56, height, area);
+    let rect = block_picker_rect(area, bp.blocks.len());
     f.render_widget(Clear, rect);
     let mode = if bp.with_deps {
         "run (with deps)"
@@ -804,10 +923,14 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         "q / esc         quit",
         "",
         "mouse: click a tree row to select it, or its ▾/▸ marker to",
-        "expand/collapse; click the document/output pane to focus it;",
-        "scroll wheel over any of the three panes scrolls/moves it;",
-        "click a pane's own [+]/[-] (top-right of its title), or",
-        "double-click its title, to expand/shrink it (same as f)",
+        "expand/collapse; double-click a row to run its default block;",
+        "click a button fence's own ▶ marker, or a block name in a",
+        "deps line, to run/jump to it; click a var-form/block-picker",
+        "row to select it; scroll wheel over any of the three panes",
+        "scrolls/moves it (also sideways, over Output); click a pane's",
+        "own [+]/[-] (top-right of its title), or double-click its",
+        "title, to expand/shrink it (same as f); drag the border between",
+        "the tree/document panes, or between them and Output, to resize",
         "",
         "running a `tty` block hands the real terminal over to it,",
         "same as `meshfox run` — this UI reappears once it exits",
@@ -1107,12 +1230,12 @@ mod tests {
         .unwrap();
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let app = App::new(path, tx, None).expect("valid test canvas");
+        let mut app = App::new(path, tx, None).expect("valid test canvas");
 
         let backend = TestBackend::new(20, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         let area = Rect::new(0, 0, 20, 20);
-        terminal.draw(|f| render_document(f, area, &app)).unwrap();
+        terminal.draw(|f| render_document(f, area, &mut app)).unwrap();
 
         let buf = terminal.backend().buffer();
         let mut screen = String::new();

@@ -104,6 +104,22 @@ impl TuiSession {
         self.send_mouse_click(row, col);
     }
 
+    /// A left-button press-drag-release gesture: press at `(from_row,
+    /// from_col)`, a single drag-motion event landing at `(to_row,
+    /// to_col)`, then release there — enough to exercise `App::on_mouse`'s
+    /// own resize-drag state machine (`Down` starts it, `Drag` updates it,
+    /// `Up` ends it) without simulating every intermediate cell a real
+    /// mouse would cross, since `on_resize_drag` only ever looks at the
+    /// drag event's own absolute position, never an accumulated delta.
+    pub fn send_mouse_drag(&mut self, from_row: u16, from_col: u16, to_row: u16, to_col: u16) {
+        self.send_keys(&format!("\x1b[<0;{};{}M", from_col + 1, from_row + 1));
+        // SGR button code `32` = left button (`0`) plus the motion/drag bit
+        // (`0x20`) — the standard xterm extension crossterm decodes as
+        // `MouseEventKind::Drag(MouseButton::Left)`.
+        self.send_keys(&format!("\x1b[<32;{};{}M", to_col + 1, to_row + 1));
+        self.send_keys(&format!("\x1b[<0;{};{}m", to_col + 1, to_row + 1));
+    }
+
     /// A wheel event at 0-indexed `(row, col)` — SGR button code `64` (up)
     /// or `65` (down), no matching release event (a real wheel doesn't
     /// send one either).

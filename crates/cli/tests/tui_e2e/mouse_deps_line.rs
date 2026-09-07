@@ -16,7 +16,7 @@ use crate::fixtures;
 use crate::harness::TuiSession;
 
 #[test]
-#[ignore = "not implemented — see TODO.canvas.md's deps-line bullet"]
+#[ignore = "pty-based e2e — run via `cargo test --test tui_e2e -- --ignored`"]
 fn clicking_the_block_name_in_a_deps_line_selects_its_owning_node() {
     let (canvas_path, dir) = fixtures::write_fixture(fixtures::DEPS_LINE_JUMP);
     let mut session = TuiSession::spawn(&canvas_path, dir, 30, 100);
