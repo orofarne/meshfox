@@ -119,16 +119,49 @@ pub struct ResolvedCommand {
     /// that: an owned process handle's own `Drop`, or inline right after
     /// its own blocking `wait()`).
     pub cleanup: Option<std::path::PathBuf>,
+    /// `MESHFOX_*` env vars an `@name` builtin (see
+    /// `crate::builtin_interpreter`) needs on top of whatever the caller
+    /// already builds for the block — empty for a plain, non-`@`
+    /// `interpreter=`. The caller merges these into its own env before
+    /// spawning `program`, same as `stream_exec::spawn_interpreter` does
+    /// for the non-`tty` path.
+    pub extra_envs: Vec<(String, String)>,
 }
 
-pub fn resolve_command(code: &str, interpreter: Option<&str>) -> io::Result<ResolvedCommand> {
+/// `cwd`/`canvas_path`/`env_names` are only consulted for an `@name`
+/// builtin spec (see `crate::builtin_interpreter::resolve_with_env`) —
+/// `cwd` as the local config root, `canvas_path` to key `@python_venv`'s
+/// own venv directory, `env_names` (the block's own `env=` locals) for
+/// `@agent`'s prompt interpolation. All three can be left empty/`None` for
+/// a plain `interpreter=`, which never touches any of them.
+pub fn resolve_command(
+    code: &str,
+    interpreter: Option<&str>,
+    cwd: Option<&std::path::Path>,
+    canvas_path: Option<&std::path::Path>,
+    env_names: &[String],
+) -> io::Result<ResolvedCommand> {
     match interpreter {
         None => Ok(ResolvedCommand {
             program: "bash".to_string(),
             args: vec!["-c".to_string(), code.to_string()],
             cleanup: None,
+            extra_envs: Vec::new(),
         }),
         Some(spec) => {
+            let resolved_spec;
+            let extra_envs;
+            let spec = match crate::builtin_interpreter::resolve_with_env(spec, cwd, canvas_path, env_names)? {
+                Some((path, envs)) => {
+                    resolved_spec = path;
+                    extra_envs = envs;
+                    resolved_spec.as_str()
+                }
+                None => {
+                    extra_envs = Vec::new();
+                    spec
+                }
+            };
             let (program, mut args) = split_interpreter(spec).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -142,6 +175,7 @@ pub fn resolve_command(code: &str, interpreter: Option<&str>) -> io::Result<Reso
                 program,
                 args,
                 cleanup: Some(path),
+                extra_envs,
             })
         }
     }
@@ -314,7 +348,7 @@ mod tests {
 
     #[test]
     fn resolve_command_with_no_interpreter_is_implicit_bash() {
-        let resolved = resolve_command("echo hi", None).unwrap();
+        let resolved = resolve_command("echo hi", None, None, None, &[]).unwrap();
         assert_eq!(resolved.program, "bash");
         assert_eq!(resolved.args, vec!["-c".to_string(), "echo hi".to_string()]);
         assert!(resolved.cleanup.is_none());
@@ -322,7 +356,7 @@ mod tests {
 
     #[test]
     fn resolve_command_with_interpreter_writes_a_temp_file_and_appends_its_path() {
-        let resolved = resolve_command("print('hi')", Some("python3 -u")).unwrap();
+        let resolved = resolve_command("print('hi')", Some("python3 -u"), None, None, &[]).unwrap();
         assert_eq!(resolved.program, "python3");
         let cleanup = resolved.cleanup.clone().expect("interpreter spawn sets cleanup");
         assert_eq!(
@@ -335,7 +369,26 @@ mod tests {
 
     #[test]
     fn resolve_command_rejects_a_malformed_interpreter() {
-        assert!(resolve_command("code", Some(r#"unterminated ""#)).is_err());
+        assert!(resolve_command("code", Some(r#"unterminated ""#), None, None, &[]).is_err());
+    }
+
+    #[test]
+    fn resolve_command_resolves_an_at_builtin_interpreter_to_its_materialized_script() {
+        let resolved = resolve_command("a prompt", Some("@agent"), None, None, &[]).unwrap();
+        assert!(resolved.program.ends_with(".sh"), "program: {}", resolved.program);
+        assert!(std::path::Path::new(&resolved.program).exists());
+        // No canvas_path given -> no MESHFOX_VENV_DIR, but @agent never
+        // sets that anyway (only @python_venv does) — this just confirms
+        // resolve_command's own config-env plumbing ran at all, same as
+        // stream_exec's spawn_interpreter test covers for the non-tty path.
+        let cleanup = resolved.cleanup.clone().expect("interpreter spawn sets cleanup");
+        assert_eq!(std::fs::read_to_string(&cleanup).unwrap(), "a prompt");
+        std::fs::remove_file(&cleanup).unwrap();
+    }
+
+    #[test]
+    fn resolve_command_rejects_an_unknown_at_builtin_name() {
+        assert!(resolve_command("code", Some("@nonexistent"), None, None, &[]).is_err());
     }
 
 }

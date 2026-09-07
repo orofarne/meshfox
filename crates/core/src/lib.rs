@@ -6,8 +6,10 @@
 //! README is itself a valid meshfox document).
 
 pub mod attrs;
+pub mod builtin_interpreter;
 pub mod canvas;
 pub mod comment;
+pub mod config;
 pub mod constraint;
 pub mod deps;
 mod dotenv;
@@ -30,6 +32,7 @@ pub mod varcache;
 pub mod varout;
 pub mod vars;
 
+pub use builtin_interpreter::{is_builtin, resolve_builtin_spec, resolve_with_env};
 pub use canvas::{ArrowEnd, Canvas, EdgeLineStyle, ExtraEdge, FileDisplay, Node, NodeType};
 pub use constraint::{evaluate as evaluate_constraints, ConstraintResult, ConstraintStatus};
 pub use deps::{compute_forced_reruns, BlockAddr, DepsError};

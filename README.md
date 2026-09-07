@@ -108,11 +108,10 @@ the file for what's runnable.
 project-local `.venv/`, created once and reported as a computed
 `meshfox:var` (`PYTHON`) every other Python fence references via
 `interpreter="$PYTHON -u"`, so nothing hardcodes a path or depends on
-whatever Python happens to be on `$PATH`. Its "Requirements" node also
-demonstrates a smaller trick: a plain requirements list, installed directly
-via `interpreter="$PYTHON -m pip install -r"` — no separate
-`requirements.txt` to keep in sync, since `interpreter=` hands pip a real
-temp file built from the fence's own body.
+whatever Python happens to be on `$PATH`. The venv/install step itself is
+meshfox's own built-in `interpreter="@python_venv"` — the fence's body is
+just a plain `requirements.txt`, no shell script of your own to write or
+keep in sync.
 
 #### Example
 <!-- meshfox:node id="example" type="file" -->
@@ -212,6 +211,37 @@ live example ("Related Canvas") — opening it takes you to
 <!-- meshfox:node id="example-6" type="file" -->
 
 [examples/hello.canvas.md#related-canvas](./examples/hello.canvas.md#related-canvas)
+
+### Calling an AI agent from a block
+<!-- meshfox:node id="calling-an-ai-agent-from-a-block" -->
+
+[examples/agent-prompt.canvas.md](./examples/agent-prompt.canvas.md) —
+`interpreter="@agent"` is one of a small, fixed set of built-in macro
+interpreters meshfox ships in its own binary (`crates/core/src/builtins/`,
+alongside `@python_venv` above) — the fence body becomes a one-shot prompt
+to `claude -p`/`codex exec` (restricted, no tool access), or, on a `tty`
+block, a genuine interactive session instead (`agent.sh`'s own `[ -t 1 ]`
+check tells the two apart, no separate meshfox mechanism needed).
+`env=`-declared variables interpolate right into the prompt as
+`$NAME`/`${NAME}` — whole-token only (`$TOPIC` matches, `$TOPICS` doesn't),
+and only names this fence's own `env=` actually declares; `$$NAME` escapes
+to a literal `$NAME` for anything that shouldn't be touched. No
+shell-quoting of your own to write for any of it.
+
+Which provider a `@name` macro actually calls (`claude` vs. `codex`, for
+`@agent`) comes from a small settings file meshfox itself reads —
+`interpreters.agent.provider` in `.meshfox/config.toml` next to the canvas,
+or `~/.meshfox/config.toml` globally (local wins, key by key) — a fact
+about the machine/what's installed, not something a `meshfox:var` should
+have to prompt for on every run. Every dotted key in there is exported to
+a macro's own process as `MESHFOX_CONFIG_<PATH>` (e.g.
+`MESHFOX_CONFIG_INTERPRETERS_AGENT_PROVIDER`), so a hand-written
+`interpreter=` script can read the same settings too.
+
+#### Example
+<!-- meshfox:node id="example-8" type="file" -->
+
+[examples/agent-prompt.canvas.md](./examples/agent-prompt.canvas.md)
 
 ## Usage
 <!-- meshfox:node id="usage" -->

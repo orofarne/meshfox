@@ -35,32 +35,20 @@ nothing implicit forces `generate-csv` to run first.
 Creates `.venv/` the first time anything below needs it and installs this
 demo's requirements into it — both idempotent, so re-running this block on
 every use (no `cache` here, unlike `demo` below) costs at most a quick "already
-satisfied" pip check, not a real reinstall. Reports the venv's own `python3`
-as the computed `PYTHON` variable via `$MESHFOX_VARS_OUT` (SPEC.md's
-"Computed variables"), so anything that needs the venv ready just references
-`$PYTHON` (see the root node's note above) rather than also declaring an
-explicit `deps=` on this block.
+satisfied" pip check, not a real reinstall. Uses meshfox's own built-in
+`interpreter="@python_venv"` (see `python-venv.canvas.md`'s "Environment
+setup" for the pattern in isolation): the fence's body is a plain
+`requirements.txt` — `pandas` for the `DataFrame` itself, `tabulate` for
+`DataFrame.to_markdown()` (pandas shells out to it rather than implementing
+Markdown rendering itself) — and the builtin reports the venv's own
+`python3` as the computed `PYTHON` variable via `$MESHFOX_VARS_OUT`
+(SPEC.md's "Computed variables"), so anything that needs the venv ready
+just references `$PYTHON` (see the root node's note above) rather than
+also declaring an explicit `deps=` on this block.
 
-`pandas` for the `DataFrame` itself, `tabulate` for `DataFrame.to_markdown()`
-(pandas shells out to it rather than implementing Markdown rendering
-itself). The requirements list itself is right there in the heredoc below,
-plain and readable — `pip install -r -` can't read it from stdin directly
-(pip only ever tries to open `-r`'s argument as a real file, stdin or not:
-`Could not open requirements file: [Errno 2] No such file or directory:
-'-'`), but bash `<(...)` process substitution hands it a real (if
-ephemeral) path instead, so this stays one file with nothing to keep in
-sync by hand.
-
-```bash name="venv-setup"
-set -euo pipefail
-[ -x .venv/bin/python3 ] || python3 -m venv .venv
-.venv/bin/python3 -m pip install --disable-pip-version-check -r <(cat <<'REQUIREMENTS'
+```text name="venv-setup" interpreter="@python_venv"
 pandas==2.2.3
 tabulate==0.9.0
-REQUIREMENTS
-)
-echo "PYTHON=$(pwd)/.venv/bin/python3" >> "$MESHFOX_VARS_OUT"
-echo "venv ready: .venv/bin/python3"
 ```
 
 A second, unrelated setup step: a fresh scratch directory for `generate-csv`
@@ -142,17 +130,17 @@ print(df.to_markdown(index=False))
 <!-- meshfox:output name="demo" hash="9082ac1e" -->
 
 ```text
-loaded 6 rows from /var/folders/y2/qq2wc6hd75b06jsjmcvpbmn80000gn/T/meshfox-demo-XXXXXX.Q9Fra105IT/data.csv
+loaded 6 rows from /var/folders/y2/qq2wc6hd75b06jsjmcvpbmn80000gn/T/meshfox-demo-XXXXXX.h1ayRrg445/data.csv
 ```
 
 | city       |   temp_c |   humidity_pct |
 |:-----------|---------:|---------------:|
-| Berlin     |       32 |             20 |
-| Tokyo      |        6 |             38 |
-| Lima       |       30 |             23 |
-| Nairobi    |       -1 |             77 |
-| Oslo       |       33 |             77 |
-| Wellington |       13 |             63 |
+| Berlin     |       17 |             21 |
+| Tokyo      |       10 |             27 |
+| Lima       |        3 |             54 |
+| Nairobi    |       -2 |             78 |
+| Oslo       |       33 |             31 |
+| Wellington |       23 |             32 |
 
 <!-- /meshfox:output -->
 

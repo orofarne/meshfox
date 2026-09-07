@@ -180,6 +180,7 @@ async fn main_loop(
                 pending.interpreter.as_deref(),
                 &pending.env,
                 &pending.cwd,
+                &pending.canvas_path,
                 pending.autoclose,
             )
             .await?;
@@ -311,6 +312,7 @@ async fn run_tty_handoff(
     interpreter: Option<&str>,
     env: &HashMap<String, String>,
     cwd: &std::path::Path,
+    canvas_path: &std::path::Path,
     autoclose: bool,
 ) -> io::Result<i32> {
     input_paused.store(true, Ordering::Release);
@@ -327,7 +329,7 @@ async fn run_tty_handoff(
     )?;
     println!("==> {block_name}");
 
-    let exit_code = run_tty_block(code, interpreter, env, cwd).await;
+    let exit_code = run_tty_block(code, interpreter, env, cwd, canvas_path).await;
 
     // Without `autoclose`, the canvas doesn't come back on its own — the
     // exit code (and whatever the process last printed, still on screen
@@ -369,13 +371,18 @@ async fn run_tty_block(
     interpreter: Option<&str>,
     envs: &HashMap<String, String>,
     cwd: &std::path::Path,
+    canvas_path: &std::path::Path,
 ) -> i32 {
-    let Ok(resolved) = meshfox_core::resolve_command(code, interpreter) else {
+    let env_names: Vec<String> = envs.keys().cloned().collect();
+    let Ok(resolved) =
+        meshfox_core::resolve_command(code, interpreter, Some(cwd), Some(canvas_path), &env_names)
+    else {
         return -1;
     };
     let spawned = tokio::process::Command::new(&resolved.program)
         .args(&resolved.args)
         .envs(envs)
+        .envs(resolved.extra_envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .current_dir(cwd)
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())

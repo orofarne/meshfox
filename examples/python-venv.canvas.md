@@ -24,42 +24,28 @@ and installed everything into it.
 ## Environment setup
 <!-- meshfox:node id="environment" -->
 
-Creates `.venv/` the first time anything below needs it (idempotent — a
-no-op once it already exists), installs this demo's requirements into it,
-and reports the venv's own `python3` as the computed `PYTHON` variable via
-`$MESHFOX_VARS_OUT` (SPEC.md's "Computed variables") — all in one block, so
-anything that needs the venv ready just references `$PYTHON` (see the root
-node's note above) rather than also declaring an explicit `deps=` on this
-block. Skipped on a later run in the same session once its own code hasn't
-changed (the usual session-freshness skip).
+`interpreter="@python_venv"` is meshfox's own built-in interpreter for
+exactly this — a small, fixed set of macro scripts meshfox carries with it.
+The fence's body below is a plain `requirements.txt`; the builtin creates
+`.venv/` (idempotent — a no-op once it already exists), installs it, and
+reports the venv's own `python3` as the computed `PYTHON` variable via
+`$MESHFOX_VARS_OUT`
+(SPEC.md's "Computed variables") — the same shell script this node used to
+spell out by hand, now shipped inside meshfox itself. Anything that needs
+the venv ready just references `$PYTHON` (see the root node's note above)
+rather than also declaring an explicit `deps=` on this block. Skipped on a
+later run in the same session once its own code hasn't changed (the usual
+session-freshness skip).
 
-The requirements list itself is right there in the heredoc below, plain and
-readable — `pip install -r -` can't read it from stdin directly (pip only
-ever tries to open `-r`'s argument as a real file, stdin or not: `Could not
-open requirements file: [Errno 2] No such file or directory: '-'`), but bash
-`<(...)` process substitution hands it a real (if ephemeral) path instead,
-so this stays one file with nothing to keep in sync by hand.
-
-```bash name="venv-setup" cache
-set -euo pipefail
-[ -x .venv/bin/python3 ] || python3 -m venv .venv
-.venv/bin/python3 -m pip install --disable-pip-version-check -r <(cat <<'REQUIREMENTS'
+```text name="venv-setup" interpreter="@python_venv" cache
 tabulate==0.9.0
-REQUIREMENTS
-)
-echo "PYTHON=$(pwd)/.venv/bin/python3" >> "$MESHFOX_VARS_OUT"
-echo "venv ready: .venv/bin/python3"
 ```
-<!-- meshfox:output name="venv-setup" hash="eaefb65e" -->
+<!-- meshfox:output name="venv-setup" hash="4f84ef89" -->
 ```text
-exit code: 0 · 2.4s
+exit code: 0 · 261ms
 
-Collecting tabulate==0.9.0 (from -r /dev/fd/63 (line 1))
-  Using cached tabulate-0.9.0-py3-none-any.whl.metadata (34 kB)
-Using cached tabulate-0.9.0-py3-none-any.whl (35 kB)
-Installing collected packages: tabulate
-Successfully installed tabulate-0.9.0
-venv ready: .venv/bin/python3
+Requirement already satisfied: tabulate==0.9.0 in ./.meshfox/python-venv.canvas.md.venv/lib/python3.14/site-packages (from -r /var/folders/y2/qq2wc6hd75b06jsjmcvpbmn80000gn/T/meshfox-54304-5a44f457-3d19-49f5-9a5d-90b21f8294c5.tmp (line 1)) (0.9.0)
+venv ready: /Users/orofarne/sources/meshfox/examples/.meshfox/python-venv.canvas.md.venv/bin/python3
 ```
 <!-- /meshfox:output -->
 
@@ -76,7 +62,7 @@ print(tabulate([["meshfox", "canvas"], ["venv", "demo"]], headers=["a", "b"]))
 ```
 <!-- meshfox:output name="demo" hash="b23e8b55" -->
 ```text
-exit code: 0 · 35ms
+exit code: 0 · 50ms
 
 a        b
 -------  ------

@@ -2294,11 +2294,14 @@ async fn run_tty_block(
     interpreter: Option<&str>,
     envs: &HashMap<String, String>,
     cwd: &Path,
+    canvas_path: &Path,
 ) -> std::io::Result<i32> {
-    let resolved = meshfox_core::resolve_command(code, interpreter)?;
+    let env_names: Vec<String> = envs.keys().cloned().collect();
+    let resolved = meshfox_core::resolve_command(code, interpreter, Some(cwd), Some(canvas_path), &env_names)?;
     let spawned = tokio::process::Command::new(&resolved.program)
         .args(&resolved.args)
         .envs(envs)
+        .envs(resolved.extra_envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .current_dir(cwd)
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
@@ -2626,8 +2629,14 @@ async fn run_async(
                     had_failure = true;
                     break;
                 }
-                match run_tty_block(&block.code, effective_interpreter.as_deref(), &block_env, step_cwd)
-                    .await
+                match run_tty_block(
+                    &block.code,
+                    effective_interpreter.as_deref(),
+                    &block_env,
+                    step_cwd,
+                    located.origin.as_deref().unwrap_or(canvas_path),
+                )
+                .await
                 {
                     Ok(code) => code,
                     Err(e) => {
@@ -2650,6 +2659,7 @@ async fn run_async(
                     &resolved_block,
                     &block_env,
                     Some(step_cwd),
+                    Some(located.origin.as_deref().unwrap_or(canvas_path)),
                 ) {
                     Ok(p) => p,
                     Err(e) => {

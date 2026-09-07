@@ -85,12 +85,15 @@ impl PtyProcess {
 /// `stream_exec::spawn_bash` uses. `cwd`, when given, is the directory the
 /// child starts in — a node's own canvas file's directory (see
 /// `meshfox_core::canvas::Node::cwd`); `None` inherits the server's own
-/// cwd unchanged.
+/// cwd unchanged. `canvas_path`, when given, is the canvas file this
+/// step's fence actually lives in — only consulted for an `@name` builtin
+/// `interpreter` (see `meshfox_core::resolve_command`'s own doc comment).
 pub fn spawn<I, K, V>(
     code: &str,
     interpreter: Option<&str>,
     envs: I,
     cwd: Option<&Path>,
+    canvas_path: Option<&Path>,
     cols: u16,
     rows: u16,
 ) -> io::Result<PtyProcess>
@@ -99,7 +102,12 @@ where
     K: AsRef<str>,
     V: AsRef<str>,
 {
-    let resolved = meshfox_core::resolve_command(code, interpreter)?;
+    let envs: Vec<(String, String)> = envs
+        .into_iter()
+        .map(|(k, v)| (k.as_ref().to_string(), v.as_ref().to_string()))
+        .collect();
+    let env_names: Vec<String> = envs.iter().map(|(k, _)| k.clone()).collect();
+    let resolved = meshfox_core::resolve_command(code, interpreter, cwd, canvas_path, &env_names)?;
 
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -115,8 +123,11 @@ where
     for arg in &resolved.args {
         cmd.arg(arg);
     }
-    for (k, v) in envs {
-        cmd.env(k.as_ref(), v.as_ref());
+    for (k, v) in &envs {
+        cmd.env(k, v);
+    }
+    for (k, v) in &resolved.extra_envs {
+        cmd.env(k, v);
     }
     if let Some(cwd) = cwd {
         cmd.cwd(cwd);
@@ -221,7 +232,7 @@ mod tests {
 
     #[tokio::test]
     async fn runs_bash_and_captures_output() {
-        let mut proc = spawn("echo hello", None, no_envs(), None, 80, 24).unwrap();
+        let mut proc = spawn("echo hello", None, no_envs(), None, None, 80, 24).unwrap();
         let mut collected = Vec::new();
         while let Some(chunk) = proc.output_rx.recv().await {
             collected.extend_from_slice(&chunk);
@@ -235,14 +246,14 @@ mod tests {
 
     #[tokio::test]
     async fn reports_nonzero_exit_code() {
-        let mut proc = spawn("exit 7", None, no_envs(), None, 80, 24).unwrap();
+        let mut proc = spawn("exit 7", None, no_envs(), None, None, 80, 24).unwrap();
         while proc.output_rx.recv().await.is_some() {}
         assert_eq!(proc.wait().await, 7);
     }
 
     #[tokio::test]
     async fn stdin_is_writable() {
-        let mut proc = spawn("read line; echo \"got: $line\"", None, no_envs(), None, 80, 24).unwrap();
+        let mut proc = spawn("read line; echo \"got: $line\"", None, no_envs(), None, None, 80, 24).unwrap();
         proc.write(b"hi there\n".to_vec());
         let mut collected = Vec::new();
         while let Some(chunk) = proc.output_rx.recv().await {
@@ -261,6 +272,7 @@ mod tests {
             None,
             [("INSTALL_PATH", "/opt/meshfox")],
             None,
+            None,
             80,
             24,
         )
@@ -277,7 +289,7 @@ mod tests {
 
     #[tokio::test]
     async fn kill_terminates_a_long_running_process() {
-        let proc = spawn("sleep 30", None, no_envs(), None, 80, 24).unwrap();
+        let proc = spawn("sleep 30", None, no_envs(), None, None, 80, 24).unwrap();
         proc.kill().unwrap();
         // Draining output_rx (dropped instead here, deliberately) isn't
         // needed to confirm the kill worked — `wait` below is enough.
@@ -291,7 +303,7 @@ mod tests {
         // `cat` as a stand-in "interpreter" — no assumption about python
         // being installed, just proves a `tty` block's own `interpreter=`
         // actually reaches the pty instead of always running under `bash`.
-        let mut proc = spawn("hello from a tty interpreter", Some("cat"), no_envs(), None, 80, 24)
+        let mut proc = spawn("hello from a tty interpreter", Some("cat"), no_envs(), None, None, 80, 24)
             .unwrap();
         let mut collected = Vec::new();
         while let Some(chunk) = proc.output_rx.recv().await {
@@ -305,7 +317,7 @@ mod tests {
 
     #[tokio::test]
     async fn interpreter_temp_file_is_removed_once_the_child_exits() {
-        let mut proc = spawn("temp contents", Some("cat"), no_envs(), None, 80, 24).unwrap();
+        let mut proc = spawn("temp contents", Some("cat"), no_envs(), None, None, 80, 24).unwrap();
         let path = proc.cleanup.clone().expect("interpreter spawn sets cleanup");
         assert!(path.exists());
         while let Some(chunk) = proc.output_rx.recv().await {
@@ -320,7 +332,7 @@ mod tests {
     #[tokio::test]
     async fn runs_in_the_given_cwd() {
         let dir = std::env::temp_dir();
-        let mut proc = spawn("pwd -P", None, no_envs(), Some(&dir), 80, 24).unwrap();
+        let mut proc = spawn("pwd -P", None, no_envs(), Some(&dir), None, 80, 24).unwrap();
         let want = dir.canonicalize().unwrap().to_string_lossy().into_owned();
         let mut collected = Vec::new();
         while let Some(chunk) = proc.output_rx.recv().await {

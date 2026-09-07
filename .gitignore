@@ -18,8 +18,12 @@ editors/vscode/e2e/test-results/
 editors/vscode/e2e/playwright-report/
 editors/vscode/e2e/blob-report/
 .DS_Store
-# Project-local Python virtualenvs created by a canvas's own `venv-setup`
-# block (see examples/python-venv.canvas.md) — local machine state.
+# Project-local Python virtualenvs a canvas's own `@python_venv` builtin
+# interpreter creates (see examples/python-venv.canvas.md) — local machine
+# state. Colocated per-canvas under `.meshfox/<canvas filename>.venv`
+# (already covered by the `.meshfox/` entry below); this plain `.venv/`
+# only remains as the fallback path when no canvas path was available to
+# key it by (see meshfox_core::builtin_interpreter::resolve_with_env).
 .venv/
 # Resolved meshfox:var answers (see SPEC.md's "Variables") — local machine
 # state, analogous to CMake's CMakeCache.txt, never something to commit.

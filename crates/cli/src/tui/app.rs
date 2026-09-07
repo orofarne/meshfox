@@ -111,6 +111,13 @@ pub struct PendingTty {
     /// from an `include` elsewhere on disk, in which case that target's
     /// own directory instead.
     pub cwd: PathBuf,
+    /// The canvas file this step's fence actually lives in (its own
+    /// `include` origin if spliced in, otherwise the primary document) —
+    /// not always derivable from `cwd` alone, since two unrelated canvases
+    /// can share one directory. Only consulted for an `@name` builtin
+    /// interpreter (`crate::exec::resolve_command`'s own `canvas_path`
+    /// param) — see `meshfox_core::builtin_interpreter::resolve_with_env`.
+    pub canvas_path: PathBuf,
     /// Mirrors `CodeBlock::autoclose` — `mod.rs::run_tty_handoff` skips its
     /// own "press any key to return" pause when this is set, going
     /// straight back to the canvas the instant the process exits.
@@ -1894,8 +1901,8 @@ impl App {
         // it just parks the request and returns; `mod.rs`'s loop picks
         // `pending_tty` up before its next `select!` and calls
         // `resume_after_tty` once the child exits.
-        let cwd = crate::canvas_root_dir(located.origin.as_deref().unwrap_or(&self.canvas_path))
-            .to_path_buf();
+        let step_canvas_path = located.origin.as_deref().unwrap_or(&self.canvas_path).to_path_buf();
+        let cwd = crate::canvas_root_dir(&step_canvas_path).to_path_buf();
 
         if block.tty {
             if let Some(run) = &mut self.run {
@@ -1910,6 +1917,7 @@ impl App {
                 interpreter: effective_interpreter,
                 env,
                 cwd,
+                canvas_path: step_canvas_path,
                 autoclose: block.autoclose,
             });
             return;
@@ -1917,7 +1925,12 @@ impl App {
 
         let mut resolved_block = block.clone();
         resolved_block.interpreter = effective_interpreter;
-        match meshfox_server::stream_exec::spawn_block(&resolved_block, &env, Some(&cwd)) {
+        match meshfox_server::stream_exec::spawn_block(
+            &resolved_block,
+            &env,
+            Some(&cwd),
+            Some(&step_canvas_path),
+        ) {
             Ok(proc) => {
                 let run = self.run.as_mut().unwrap();
                 run.proc = Some(proc);

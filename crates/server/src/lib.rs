@@ -516,7 +516,7 @@ async fn run_from_source_for_status(
         meshfox_core::VARS_OUT_ENV.to_string(),
         path.display().to_string(),
     );
-    let mut proc = stream_exec::spawn_block(&block, &env, Some(&cwd)).ok()?;
+    let mut proc = stream_exec::spawn_block(&block, &env, Some(&cwd), Some(canvas_path)).ok()?;
     while proc.output_rx.recv().await.is_some() {}
     let status = proc.child.wait().await.ok()?;
     if !status.success() {
@@ -2805,7 +2805,12 @@ async fn run_block(
             }
 
             let step_started = std::time::Instant::now();
-            let mut proc = match stream_exec::spawn_block(&resolved_block, &block_env, Some(&cwd)) {
+            let mut proc = match stream_exec::spawn_block(
+                &resolved_block,
+                &block_env,
+                Some(&cwd),
+                Some(canvas_path_for_step),
+            ) {
                 Ok(p) => p,
                 Err(e) => {
                     yield Ok(ndjson_line(&RunEvent::Error { message: e.to_string() }));
@@ -3382,6 +3387,7 @@ async fn run_tty_chain(
                 resolved_block.interpreter.as_deref(),
                 &block_env,
                 Some(&cwd),
+                Some(canvas_path_for_step),
                 cols,
                 rows,
                 &mut kill_rx,
@@ -3397,7 +3403,12 @@ async fn run_tty_chain(
                 TtyStepOutcome::Disconnected => return,
             }
         } else {
-            let mut proc = match stream_exec::spawn_block(&resolved_block, &block_env, Some(&cwd)) {
+            let mut proc = match stream_exec::spawn_block(
+                &resolved_block,
+                &block_env,
+                Some(&cwd),
+                Some(canvas_path_for_step),
+            ) {
                 Ok(p) => p,
                 Err(e) => {
                     send_event(
@@ -3628,11 +3639,12 @@ async fn relay_tty_step(
     interpreter: Option<&str>,
     envs: &HashMap<String, String>,
     cwd: Option<&std::path::Path>,
+    canvas_path: Option<&std::path::Path>,
     cols: u16,
     rows: u16,
     kill_rx: &mut oneshot::Receiver<()>,
 ) -> TtyStepOutcome {
-    let mut pty = match pty_exec::spawn(code, interpreter, envs, cwd, cols, rows) {
+    let mut pty = match pty_exec::spawn(code, interpreter, envs, cwd, canvas_path, cols, rows) {
         Ok(p) => p,
         Err(e) => {
             send_event(

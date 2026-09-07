@@ -185,17 +185,52 @@ where
 /// then run as `program args... tmpfile`, as the leader of a fresh process
 /// group like every other spawn function here. The temp file is removed
 /// once the returned `SpawnedProcess` is dropped (see its `Drop` impl).
+///
+/// `interpreter` is resolved through `meshfox_core::resolve_with_env`
+/// first — an `@name` builtin (see `meshfox_core::builtin_interpreter`)
+/// becomes its materialized script's real path before anything below ever
+/// sees it, with its `MESHFOX_*` env vars (config, and — for
+/// `@python_venv` specifically, when `canvas_path` is given —
+/// `MESHFOX_VENV_DIR`) merged into `envs`; a plain, non-`@` `interpreter=`
+/// never pays for any of that at all. `canvas_path`, when given, is the
+/// canvas file this block's fence actually lives in — not necessarily
+/// derivable from `cwd` alone, since two unrelated canvases can share one
+/// directory (see `meshfox_core::builtin_interpreter::resolve_with_env`'s
+/// own doc comment for why that distinction matters).
 pub fn spawn_interpreter<I, K, V>(
     interpreter: &str,
     code: &str,
     envs: I,
     cwd: Option<&Path>,
+    canvas_path: Option<&Path>,
 ) -> io::Result<SpawnedProcess>
 where
     I: IntoIterator<Item = (K, V)>,
     K: AsRef<std::ffi::OsStr>,
     V: AsRef<std::ffi::OsStr>,
 {
+    let mut envs: Vec<(std::ffi::OsString, std::ffi::OsString)> = envs
+        .into_iter()
+        .map(|(k, v)| (k.as_ref().to_os_string(), v.as_ref().to_os_string()))
+        .collect();
+    // Snapshotted *before* any builtin extras are added below — exactly
+    // the caller's own block-level `env=` locals, nothing else (no
+    // `$PATH`/`$MESHFOX_CONFIG_*` leaking into `MESHFOX_ENV_NAMES`).
+    let env_names: Vec<String> = envs
+        .iter()
+        .map(|(k, _)| k.to_string_lossy().into_owned())
+        .collect();
+
+    let resolved_interpreter;
+    let interpreter = match meshfox_core::resolve_with_env(interpreter, cwd, canvas_path, &env_names)? {
+        Some((path, extra_envs)) => {
+            envs.extend(extra_envs.into_iter().map(|(k, v)| (k.into(), v.into())));
+            resolved_interpreter = path;
+            resolved_interpreter.as_str()
+        }
+        None => interpreter,
+    };
+
     let (program, args) = meshfox_core::split_interpreter(interpreter).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -248,10 +283,14 @@ where
 /// `spawn_process` directly) should use, so a new interpreter-aware caller
 /// never has to duplicate this branch. See `supports` for the matching
 /// eligibility check.
+///
+/// `canvas_path`, when given, is threaded straight through to
+/// `spawn_interpreter` — see its own doc comment.
 pub fn spawn_block<I, K, V>(
     block: &meshfox_core::CodeBlock,
     envs: I,
     cwd: Option<&Path>,
+    canvas_path: Option<&Path>,
 ) -> io::Result<SpawnedProcess>
 where
     I: IntoIterator<Item = (K, V)>,
@@ -270,7 +309,7 @@ where
         return spawn_bash(":", envs, cwd);
     }
     match &block.interpreter {
-        Some(interpreter) => spawn_interpreter(interpreter, &block.code, envs, cwd),
+        Some(interpreter) => spawn_interpreter(interpreter, &block.code, envs, cwd, canvas_path),
         None => spawn_bash(&block.code, envs, cwd),
     }
 }
@@ -401,7 +440,7 @@ mod tests {
     async fn spawn_interpreter_runs_code_via_the_named_program() {
         // `cat` as a stand-in "interpreter" — no assumption about python
         // being installed, just proves the temp-file-plus-args plumbing.
-        let mut proc = spawn_interpreter("cat", "hello from a temp file", no_envs(), None).unwrap();
+        let mut proc = spawn_interpreter("cat", "hello from a temp file", no_envs(), None, None).unwrap();
         let mut lines = Vec::new();
         while let Some((_, line)) = proc.output_rx.recv().await {
             lines.push(line);
@@ -416,15 +455,57 @@ mod tests {
         // `SpawnedProcess` (the `Ok` side) doesn't implement `Debug` — it
         // owns a live child process/channel, nothing worth debug-printing
         // — so this matches instead of `.unwrap_err()`.
-        match spawn_interpreter(r#"unterminated ""#, "code", no_envs(), None) {
+        match spawn_interpreter(r#"unterminated ""#, "code", no_envs(), None, None) {
             Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidInput),
             Ok(_) => panic!("expected an error for a malformed interpreter command"),
         }
     }
 
+    /// End-to-end through the real `@agent` builtin (materialized script,
+    /// `spawn_interpreter`'s own `@`-detection, config-env merge) without
+    /// ever actually invoking a real `claude`/`codex` binary: an unknown
+    /// `MESHFOX_CONFIG_INTERPRETERS_AGENT_PROVIDER` value hits `agent.sh`'s
+    /// own `*)` branch and exits 1 before either provider's command is
+    /// ever reached. Assumes this machine has no real
+    /// `~/.meshfox/config.toml` setting `interpreters.agent.provider` — if
+    /// it did, that would override this test's own env-supplied value, per
+    /// `spawn_interpreter`'s doc comment on `envs`/config precedence.
+    #[tokio::test]
+    async fn spawn_interpreter_resolves_the_agent_builtin_and_merges_config_env() {
+        let mut proc = spawn_interpreter(
+            "@agent",
+            "an unused prompt",
+            [(
+                "MESHFOX_CONFIG_INTERPRETERS_AGENT_PROVIDER".to_string(),
+                "bogus-provider".to_string(),
+            )],
+            None,
+            None,
+        )
+        .unwrap();
+        let mut lines = Vec::new();
+        while let Some((_, line)) = proc.output_rx.recv().await {
+            lines.push(line);
+        }
+        let status = proc.child.wait().await.unwrap();
+        assert_ne!(status.code(), Some(0));
+        assert!(
+            lines.iter().any(|l| l.contains("bogus-provider")),
+            "expected agent.sh's own unknown-provider message, got: {lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_interpreter_rejects_an_unknown_builtin_name() {
+        match spawn_interpreter("@nonexistent", "code", no_envs(), None, None) {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidInput),
+            Ok(_) => panic!("expected an error for an unknown @builtin name"),
+        }
+    }
+
     #[tokio::test]
     async fn spawn_interpreter_cleans_up_its_temp_file_on_drop() {
-        let mut proc = spawn_interpreter("cat", "temp contents", no_envs(), None).unwrap();
+        let mut proc = spawn_interpreter("cat", "temp contents", no_envs(), None, None).unwrap();
         let path = proc.cleanup.clone().expect("interpreter spawn sets cleanup");
         while proc.output_rx.recv().await.is_some() {}
         proc.child.wait().await.unwrap();
@@ -439,7 +520,7 @@ mod tests {
         // succeed with no output, same as any other block's caller expects
         // (only its already-run `deps=` chain is the real payload).
         let block = test_block("button", None, "this is prose, not code — never run");
-        let mut proc = spawn_block(&block, no_envs(), None).unwrap();
+        let mut proc = spawn_block(&block, no_envs(), None, None).unwrap();
         let mut lines = Vec::new();
         while let Some((_, line)) = proc.output_rx.recv().await {
             lines.push(line);
@@ -452,7 +533,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_block_dispatches_to_interpreter_when_set() {
         let block = test_block("cat", Some("cat"), "via interpreter");
-        let mut proc = spawn_block(&block, no_envs(), None).unwrap();
+        let mut proc = spawn_block(&block, no_envs(), None, None).unwrap();
         let mut lines = Vec::new();
         while let Some((_, line)) = proc.output_rx.recv().await {
             lines.push(line);
@@ -463,7 +544,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_block_falls_back_to_bash_with_no_interpreter() {
         let block = test_block("bash", None, "echo via bash");
-        let mut proc = spawn_block(&block, no_envs(), None).unwrap();
+        let mut proc = spawn_block(&block, no_envs(), None, None).unwrap();
         let mut lines = Vec::new();
         while let Some((_, line)) = proc.output_rx.recv().await {
             lines.push(line);
@@ -601,7 +682,7 @@ mod tests {
         // `pwd -P` — proves `cwd` reaches the actual spawned child, not
         // just whatever `bash -c` would've inherited.
         let dir = std::env::temp_dir();
-        let mut proc = spawn_interpreter("bash", "pwd -P", no_envs(), Some(&dir)).unwrap();
+        let mut proc = spawn_interpreter("bash", "pwd -P", no_envs(), Some(&dir), None).unwrap();
         let mut lines = Vec::new();
         while let Some((_, line)) = proc.output_rx.recv().await {
             lines.push(line);
