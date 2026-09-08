@@ -3623,6 +3623,27 @@ fn node_meta(
     }
 }
 
+/// Rejects a `--tags`/`tags` value carrying characters that were never a
+/// legitimate tag — `parse_tags` only ever splits on commas, so a value
+/// that's accidentally JSON (`["foo","bar"]`, or an array whose elements
+/// got joined by a raw newline instead of `, `) doesn't fail: it just gets
+/// folded into one mangled tag with the stray brackets/quotes/newline baked
+/// in. Catching it here turns that silent corruption into an immediate,
+/// actionable error instead.
+fn validate_tags_input(s: &str) -> Result<(), String> {
+    if let Some(c) = s.chars().find(|c| c.is_control()) {
+        return Err(format!(
+            "--tags contains a control character ({c:?}) — expected plain comma-separated tags, e.g. \"foo,bar\", not a JSON-encoded list"
+        ));
+    }
+    if let Some(c) = s.chars().find(|c| matches!(c, '"' | '\'' | '[' | ']' | '{' | '}')) {
+        return Err(format!(
+            "--tags contains {c:?}, which looks like accidental JSON — expected plain comma-separated tags, e.g. \"foo,bar\""
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_node_meta(
     raw: &str,
@@ -3679,7 +3700,10 @@ fn apply_node_meta(
     // no-op.
     let parsed_tags = match &tags {
         None => node.tags.clone(),
-        Some(s) => meshfox_core::parse_tags(Some(s)),
+        Some(s) => {
+            validate_tags_input(s)?;
+            meshfox_core::parse_tags(Some(s))
+        }
     };
 
     // A group's *size* is always derived from its children, never stored —
@@ -4841,6 +4865,42 @@ Shared body.
         .unwrap();
         assert!(Canvas::from_markdown(&cleared).unwrap().node("smoke-test").unwrap().tags.is_empty());
         assert!(!cleared.contains("tags="));
+    }
+
+    #[test]
+    fn meta_rejects_tags_that_look_like_accidental_json() {
+        // A JSON-encoded list handed to `--tags` instead of plain
+        // comma-separated text — the exact shape an agent slips into when
+        // it forgets this field isn't an array — must be rejected instead
+        // of silently landing as one mangled tag full of stray syntax.
+        for bad in [
+            "[\"foo\",\"bar\"]",
+            "[\"foo\nbar\"]",
+            "foo,bar\n",
+            "{\"foo\":\"bar\"}",
+            "it's a tag",
+        ] {
+            let err = apply_node_meta(
+                TEST_DOC,
+                "smoke-test",
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(bad.to_string()),
+                None,
+            )
+            .unwrap_err();
+            assert!(err.contains("--tags"), "{bad:?} -> {err}");
+        }
     }
 
     #[test]
