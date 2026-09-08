@@ -466,23 +466,33 @@ mod tests {
     /// ever actually invoking a real `claude`/`codex` binary: an unknown
     /// `MESHFOX_CONFIG_INTERPRETERS_AGENT_PROVIDER` value hits `agent.sh`'s
     /// own `*)` branch and exits 1 before either provider's command is
-    /// ever reached. Assumes this machine has no real
-    /// `~/.meshfox/config.toml` setting `interpreters.agent.provider` — if
-    /// it did, that would override this test's own env-supplied value, per
-    /// `spawn_interpreter`'s doc comment on `envs`/config precedence.
+    /// ever reached.
+    ///
+    /// Forces that value via a *local* `.meshfox/config.toml` in a fresh
+    /// temp `cwd`, not a plain `envs` override — config-derived vars are
+    /// merged in *after* the caller's own `envs` (see `spawn_interpreter`'s
+    /// own doc comment on precedence), so an env override alone would lose
+    /// to whatever this machine's real `~/.meshfox/config.toml` happens to
+    /// say; a local override, per `meshfox_core::config`'s own "local wins"
+    /// precedence, reliably wins over that same global file instead,
+    /// keeping this deterministic regardless of the developer's own
+    /// machine (a real, unrelated `provider` setting there used to make
+    /// this test flaky/fail outright).
     #[tokio::test]
     async fn spawn_interpreter_resolves_the_agent_builtin_and_merges_config_env() {
-        let mut proc = spawn_interpreter(
-            "@agent",
-            "an unused prompt",
-            [(
-                "MESHFOX_CONFIG_INTERPRETERS_AGENT_PROVIDER".to_string(),
-                "bogus-provider".to_string(),
-            )],
-            None,
-            None,
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-agent-builtin-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(dir.join(".meshfox")).unwrap();
+        std::fs::write(
+            dir.join(".meshfox").join("config.toml"),
+            "[interpreters.agent]\nprovider = \"bogus-provider\"\n",
         )
         .unwrap();
+
+        let mut proc = spawn_interpreter("@agent", "an unused prompt", no_envs(), Some(&dir), None).unwrap();
         let mut lines = Vec::new();
         while let Some((_, line)) = proc.output_rx.recv().await {
             lines.push(line);
@@ -493,6 +503,8 @@ mod tests {
             lines.iter().any(|l| l.contains("bogus-provider")),
             "expected agent.sh's own unknown-provider message, got: {lines:?}"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
@@ -635,6 +647,7 @@ mod tests {
             default: false,
             tty: false,
             autoclose: false,
+            service: false,
             always: false,
             deps: Vec::new(),
             env: Vec::new(),

@@ -17,6 +17,14 @@ pub struct TreeRow {
     pub runnable_count: usize,
     pub has_cache: bool,
     pub has_tty: bool,
+    /// Whether any of this node's own blocks is a `service` (see
+    /// `meshfox_core::CodeBlock::service`, SPEC.md's "Service blocks
+    /// (experimental)") — same "declared in the source" flag `has_tty`
+    /// already is, not a live status (that's `App.services`, cross-
+    /// referenced by node id at render time in `ui::tree_row_words` since
+    /// it changes independently of the document — see that function's own
+    /// comment for why it isn't a field here).
+    pub has_service: bool,
     /// Aggregate pass/fail across every embedded constraint fence in this
     /// node's own body (`node.constraint_results`, populated by
     /// `App`'s `resolve_includes` before `flatten` ever runs) — `Some(true)`
@@ -72,6 +80,7 @@ fn visit(
         runnable_count: blocks.len(),
         has_cache: blocks.iter().any(|b| b.cache),
         has_tty: blocks.iter().any(|b| b.tty),
+        has_service: blocks.iter().any(|b| b.service),
         constraint_ok,
         color: node.effective_color.clone(),
         tags: node.tags.clone(),

@@ -177,6 +177,22 @@ pub fn with_meshfox_scope_colors(mut theme: syntect::highlighting::Theme) -> syn
     let accent = Color { r: 0xff, g: 0x6e, b: 0x15, a: 0xff };
     let attr = Color { r: 0xd8, g: 0xb6, b: 0x56, a: 0xff };
     let value = Color { r: 0x6f, g: 0xcf, b: 0x97, a: 0xff };
+    // `edtui`'s own `SyntaxHighlighter` colors *every* span from `syntect`'s
+    // per-line highlight, including plain text with no matching scope at
+    // all (`edtui::view::syntax_higlighting::highlight_line` — see its
+    // own `else` branch, only reached when highlighting fails outright,
+    // for the one case that instead uses `EditorTheme::base`) — so unlike
+    // a read-only preview pane, this editor's base/default foreground is
+    // entirely the *syntect theme's own* `settings.foreground`, not
+    // anything `theme.rs`/`EditorTheme` here controls. Every bundled
+    // `syntect` theme's own default there reads as washed-out/dim next to
+    // this file's own vivid accent/attr/value colors just below —
+    // confirmed directly (plain prose, generic YAML, attribute values all
+    // rendered noticeably dimmer than real syntax tokens in the same
+    // buffer) — so this pins a clearly legible off-white explicitly,
+    // regardless of which bundled theme (`ui::SOURCE_EDITOR_THEME`) is
+    // actually in use.
+    theme.settings.foreground = Some(Color { r: 0xf8, g: 0xf8, b: 0xf2, a: 0xff });
     theme.scopes.push(ThemeItem {
         scope: "keyword.other.meshfox".parse().unwrap(),
         style: StyleModifier { foreground: Some(accent), background: None, font_style: Some(FontStyle::BOLD) },
@@ -560,5 +576,52 @@ mod meshfox_grammar_tests {
         assert_ne!(attr_value_color, plain_default, "the \"root\" attribute value should not render as plain text");
         assert_ne!(keyword_color, attr_name_color, "keyword and attribute-name should be distinctly colored");
         assert_ne!(attr_name_color, attr_value_color, "attribute-name and attribute-value should be distinctly colored");
+    }
+
+    /// `edtui`'s own `SyntaxHighlighter` colors *every* span (plain text
+    /// included) from `syntect`'s per-line highlight — never falls back to
+    /// `EditorTheme::base` unless highlighting fails outright (see
+    /// `with_meshfox_scope_colors`'s own doc comment on why this lives
+    /// here) — so the fullscreen source editor's own base/default text
+    /// color is entirely `theme.settings.foreground`. Every theme
+    /// `syntect::highlighting::ThemeSet::load_defaults()` actually bundles
+    /// (`crate::tui::ui::SOURCE_EDITOR_THEME` picks one of these — this
+    /// test doesn't hardcode which, precisely because that constant used
+    /// to name `"dracula"`, a theme that isn't in this bundled set at all,
+    /// and the lookup silently fell through to an arbitrary one instead of
+    /// erroring) ships a noticeably dimmer default than this fix's own
+    /// pinned value — this test proves genuinely plain text (no matching
+    /// scope at all) renders in that legible color regardless of which
+    /// bundled theme it started from, not whatever that theme's own
+    /// default happens to be.
+    #[test]
+    fn plain_unscoped_text_uses_the_pinned_legible_foreground_not_a_dim_bundled_default() {
+        let root = std::env::temp_dir().join("meshfox-grammar-test-never-created");
+        let ss = build_syntax_set(&root);
+        let syntax = ss
+            .find_syntax_by_name(MESHFOX_MARKDOWN_SYNTAX_NAME)
+            .expect("the bundled meshfox-markdown grammar should always be present");
+
+        let ts = syntect::highlighting::ThemeSet::load_defaults();
+        let base_theme = ts
+            .themes
+            .get(crate::tui::ui::SOURCE_EDITOR_THEME)
+            .unwrap_or_else(|| panic!("{:?} should be a real bundled syntect theme", crate::tui::ui::SOURCE_EDITOR_THEME))
+            .clone();
+        let theme = with_meshfox_scope_colors(base_theme);
+
+        let mut hl = syntect::easy::HighlightLines::new(syntax, &theme);
+        let ranges = hl.highlight_line("just plain prose, no markup at all\n", &ss).unwrap();
+
+        let pinned_foreground = syntect::highlighting::Color { r: 0xf8, g: 0xf8, b: 0xf2, a: 0xff };
+        for (style, text) in &ranges {
+            if text.trim().is_empty() {
+                continue;
+            }
+            assert_eq!(
+                style.foreground, pinned_foreground,
+                "plain text {text:?} should use the pinned legible foreground, not a dim bundled default"
+            );
+        }
     }
 }

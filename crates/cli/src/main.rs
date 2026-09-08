@@ -18,6 +18,7 @@ use meshfox_core::{
 };
 use std::collections::HashMap;
 use std::io::IsTerminal;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 mod mcp;
@@ -672,6 +673,11 @@ enum NodeCommand {
         autoclose: bool,
         #[arg(long = "no-autoclose")]
         no_autoclose: bool,
+        /// **Experimental** — see SPEC.md's "Service blocks (experimental)".
+        #[arg(long)]
+        service: bool,
+        #[arg(long = "no-service")]
+        no_service: bool,
         /// Comma-separated `deps=` targets (`node-id/block-name`, or a bare
         /// `block-name` for one in this same node), replacing the whole
         /// list outright — same spelling as the file's own `deps=`.
@@ -1225,6 +1231,8 @@ fn main() {
                 no_tty,
                 autoclose,
                 no_autoclose,
+                service,
+                no_service,
                 deps,
                 clear_deps,
                 env,
@@ -1249,6 +1257,8 @@ fn main() {
                     no_tty,
                     autoclose,
                     no_autoclose,
+                    service,
+                    no_service,
                     deps,
                     clear_deps,
                     env,
@@ -2403,6 +2413,32 @@ async fn run_file_node_cli(canvas_path: &Path, node: &Node) -> Result<(), String
 /// `bash` itself, so a hung child (`sleep`, a server it started, ...)
 /// doesn't survive as an orphan — and stops there, persisting whatever
 /// earlier steps already completed.
+/// A bare `y`/`N` confirm prompt on the real terminal — used only for a
+/// `service` block's lock-conflict prompt (see SPEC.md's "Service blocks
+/// (experimental)"): unlike `prompt::ask` (a typed `meshfox:var` answer),
+/// this isn't tied to any declared variable, just plain yes/no. Empty
+/// input (bare Enter) counts as "no" — the safer default for "kill
+/// another process".
+/// Stops every service this invocation has spawned so far — called at
+/// every early-bailout point in `run_async` once `services` could be
+/// non-empty (see that variable's own doc comment for why this can't just
+/// be `kill_on_drop`).
+fn stop_all_services(services: &[meshfox_server::services::ServiceHandle]) {
+    for handle in services {
+        let _ = handle.stop();
+    }
+}
+
+fn confirm_yn(question: &str) -> bool {
+    print!("{question} [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
 async fn run_async(
     canvas_path: &PathBuf,
     mut args: Vec<String>,
@@ -2455,6 +2491,20 @@ async fn run_async(
     let mut had_failure = false;
     let mut already_ran: std::collections::HashSet<(String, String)> =
         std::collections::HashSet::new();
+    // Every `service` block this invocation has spawned — kept alive (not
+    // waited on) here, then either streamed-and-watched after the whole
+    // chain finishes (see the bottom of this function) or stopped on
+    // Ctrl-C (`stop_all_services`, called at every exit point below that
+    // can be reached once this is non-empty). **Experimental**, see
+    // SPEC.md's "Service blocks (experimental)": ownership is tied to
+    // *this* process's own lifetime — note that's *not* automatic via
+    // `SpawnedProcess`'s `.kill_on_drop(true)`, which only ever fires on a
+    // graceful in-process `Drop` (a normal `return`/scope exit); `std::
+    // process::exit` skips destructors entirely (documented Rust
+    // behavior), so every early-bailout path below has to call
+    // `stop_all_services` explicitly or a service spawned earlier in this
+    // same invocation would survive as an orphan.
+    let mut services: Vec<meshfox_server::services::ServiceHandle> = Vec::new();
     for name in block_names {
         // Re-resolve each iteration so a block run earlier in this loop
         // (which may have patched a file's own entry in `file_raws`) is
@@ -2468,15 +2518,22 @@ async fn run_async(
             .get(&None)
             .cloned()
             .unwrap_or_else(|| initial_raw.clone());
-        let primary_canvas = Canvas::from_markdown(&primary_raw_now).unwrap_or_else(|e| {
-            eprintln!("failed to parse {}: {e}", canvas_path.display());
-            std::process::exit(1);
-        });
-        let canvas =
-            meshfox_core::include::resolve(&primary_canvas, canvas_path).unwrap_or_else(|e| {
-                eprintln!("failed to resolve includes in {}: {e}", canvas_path.display());
+        let primary_canvas = match Canvas::from_markdown(&primary_raw_now) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("failed to parse {}: {e}", canvas_path.display());
+                stop_all_services(&services);
                 std::process::exit(1);
-            });
+            }
+        };
+        let canvas = match meshfox_core::include::resolve(&primary_canvas, canvas_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("failed to resolve includes in {}: {e}", canvas_path.display());
+                stop_all_services(&services);
+                std::process::exit(1);
+            }
+        };
 
         // Running a block automatically runs whatever it `deps=` on first,
         // in dependency order — same chain the web UI's "⛓ run chain"
@@ -2613,9 +2670,94 @@ async fn run_async(
                 &computed,
                 &mut var_cache,
             );
+            let step_cwd = canvas_root_dir(located.origin.as_deref().unwrap_or(canvas_path));
+
+            // `service` blocks branch out here, before the normal
+            // spawn-and-wait path below: "done" is "spawned", not
+            // "exited" — see SPEC.md's "Service blocks (experimental)".
+            // Ownership is tied to this process's own lifetime; it stays
+            // running in the background (`services`, above) until this
+            // invocation either finishes its whole chain and stays
+            // attached to stream/watch it (bottom of this function) or is
+            // interrupted.
+            if block.service {
+                let owner_path = located.origin.as_deref().unwrap_or(canvas_path);
+                let lock_path =
+                    meshfox_core::service_lock_path(owner_path, &addr.node_id, &addr.block_name);
+                match meshfox_core::service_lock::check(&lock_path) {
+                    Ok(meshfox_core::ServiceLockState::Free) => {}
+                    Ok(meshfox_core::ServiceLockState::Held { info, .. }) => {
+                        if !prompt::stdin_is_tty() || !std::io::stdout().is_terminal() {
+                            eprintln!(
+                                "error running {:?}: service already running (pid {}, started via {}) — refusing to guess without an interactive terminal to ask",
+                                addr.block_name, info.pid, info.owner
+                            );
+                            had_failure = true;
+                            break;
+                        }
+                        let proceed = confirm_yn(&format!(
+                            "Service {:?} is already running (pid {}, started via {}). Kill it and start fresh?",
+                            addr.block_name, info.pid, info.owner
+                        ));
+                        if !proceed {
+                            eprintln!(
+                                "meshfox run: cancelled — {:?} is already running elsewhere",
+                                addr.block_name
+                            );
+                            had_failure = true;
+                            break;
+                        }
+                        if info.pid != 0 {
+                            // SAFETY: same whole-process-group SIGKILL every
+                            // other kill path here uses (see
+                            // `meshfox_server::services`' private
+                            // `kill_process_group`) — inlined because this
+                            // pid comes from the lock file on disk, not a
+                            // live `ServiceHandle` this process already
+                            // holds.
+                            unsafe {
+                                libc::kill(-(info.pid as libc::pid_t), libc::SIGKILL);
+                            }
+                        }
+                        let _ = meshfox_core::service_lock::release(&lock_path);
+                    }
+                    Err(e) => {
+                        eprintln!("error running {:?}: {e}", addr.block_name);
+                        had_failure = true;
+                        break;
+                    }
+                }
+
+                let mut resolved_block = block.clone();
+                resolved_block.interpreter = effective_interpreter.clone();
+                match meshfox_server::services::spawn(
+                    addr.node_id.clone(),
+                    addr.block_name.clone(),
+                    resolved_block,
+                    block_env.clone(),
+                    step_cwd.to_path_buf(),
+                    owner_path.to_path_buf(),
+                    "cli",
+                ) {
+                    Ok(handle) => {
+                        println!("==> {} (service started, pid {})", addr.block_name, handle.pid);
+                        services.push(handle);
+                    }
+                    Err(e) => {
+                        // Doesn't stop already-running services from
+                        // earlier in this same invocation — a later
+                        // service failing to start is no reason to tear
+                        // those down too.
+                        eprintln!("error running {:?}: {e}", addr.block_name);
+                        had_failure = true;
+                        break;
+                    }
+                }
+                continue;
+            }
+
             println!("==> {}", addr.block_name);
 
-            let step_cwd = canvas_root_dir(located.origin.as_deref().unwrap_or(canvas_path));
             let mut full_output = String::new();
             let mut stdout_only = String::new();
             let mut stderr_only = String::new();
@@ -2703,6 +2845,10 @@ async fn run_async(
                             // already-cached output just because a *later*
                             // step got interrupted.
                             write_all_files(&file_raws);
+                            // Also stop any `service` block(s) already
+                            // started earlier in this same invocation — see
+                            // `services`' own doc comment.
+                            stop_all_services(&services);
                             std::process::exit(130); // 128 + SIGINT, the usual convention
                         }
                     }
@@ -2794,6 +2940,63 @@ async fn run_async(
     }
 
     write_all_files(&file_raws);
+
+    // Any `service` block(s) started above are still running — stay
+    // attached (unlike an ordinary chain, which just exits once every
+    // step is done) so `meshfox run` reads as "start this dev server and
+    // watch it" rather than silently detaching, streaming each one's log
+    // lines (docker-compose-style, prefixed by block name) until either
+    // every one of them stops on its own or the user hits Ctrl-C. See
+    // SPEC.md's "Service blocks (experimental)".
+    if !services.is_empty() {
+        println!(
+            "meshfox: {} service(s) running — streaming their output below; Ctrl-C stops them and exits",
+            services.len()
+        );
+        let mut printed = vec![0usize; services.len()];
+        let mut crash_reported = vec![false; services.len()];
+        let mut any_crashed = false;
+        'watch: loop {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
+                    let mut any_running = false;
+                    for (i, handle) in services.iter().enumerate() {
+                        let log = handle.log_snapshot();
+                        for (stream, text) in log.iter().skip(printed[i]) {
+                            let tag = match stream {
+                                meshfox_server::stream_exec::OutputStream::Stderr => " (stderr)",
+                                meshfox_server::stream_exec::OutputStream::Stdout => "",
+                            };
+                            println!("[{}]{tag} {text}", handle.block_name);
+                        }
+                        printed[i] = log.len();
+                        match handle.status() {
+                            meshfox_server::services::ServiceStatus::Running => any_running = true,
+                            meshfox_server::services::ServiceStatus::Crashed { exit_code } => {
+                                any_crashed = true;
+                                if !crash_reported[i] {
+                                    eprintln!("[{}] crashed (exit {exit_code})", handle.block_name);
+                                    crash_reported[i] = true;
+                                }
+                            }
+                            meshfox_server::services::ServiceStatus::Stopped => {}
+                        }
+                    }
+                    if !any_running {
+                        break 'watch;
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    println!("^C — stopping {} service(s)", services.len());
+                    stop_all_services(&services);
+                    std::process::exit(130); // 128 + SIGINT, the usual convention
+                }
+            }
+        }
+        if any_crashed {
+            had_failure = true;
+        }
+    }
 
     if had_failure {
         std::process::exit(1);
@@ -3418,6 +3621,8 @@ struct BlockArgs {
     no_tty: bool,
     autoclose: bool,
     no_autoclose: bool,
+    service: bool,
+    no_service: bool,
     deps: Option<String>,
     clear_deps: bool,
     env: Option<String>,
@@ -3494,6 +3699,7 @@ fn apply_node_block(
         "--autoclose",
         "--no-autoclose",
     )?;
+    let service = resolve_bool_pair(args.service, args.no_service, "--service", "--no-service")?;
 
     if args.deps.is_some() && args.clear_deps {
         return Err("--deps is mutually exclusive with --clear-deps".to_string());
@@ -3531,6 +3737,7 @@ fn apply_node_block(
         default,
         tty,
         autoclose,
+        service,
         deps,
         env,
         interpreter,

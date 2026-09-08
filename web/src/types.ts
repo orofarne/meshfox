@@ -143,6 +143,29 @@ export interface CanvasDoc {
 // variable, `value` can be present even when `resolved` is false: a
 // `required` declaration that's still unconfirmed still carries its own
 // `default` here, purely as VarsForm's pre-filled suggestion.
+/** One `service` block this server process has spawned and still knows
+ * about (running, crashed, or explicitly stopped) — mirrors
+ * `crates/server/src/lib.rs`'s `ServiceDto`. **Experimental**, see SPEC.md's
+ * "Service blocks (experimental)". Fetched via `GET /api/services`,
+ * independently of `CanvasDoc`/`fetchCanvas` — a service's lifetime spans
+ * many requests/page-loads, unlike anything else `CanvasNode` carries. */
+export interface ServiceStatusDto {
+  nodeId: string;
+  block: string;
+  status: "running" | "crashed" | "stopped";
+  /** Present only when `status === "crashed"`. */
+  exitCode?: number;
+  pid: number;
+  /** Milliseconds since this instance was spawned, as of the response —
+   * recompute-on-poll rather than a client-side ticking clock, since a
+   * page reload has no other way to know when it actually started. */
+  uptimeMs: number;
+  /** Absent if a resource sample couldn't be taken (process already gone,
+   * or a permissions boundary). */
+  cpuPercent?: number;
+  memBytes?: number;
+}
+
 export interface VarStatus {
   name: string;
   type: "string" | "int" | "bool" | "select";

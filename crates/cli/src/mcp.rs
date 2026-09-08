@@ -562,6 +562,9 @@ struct NodeBlockParams {
     tty: Option<bool>,
     #[serde(default)]
     autoclose: Option<bool>,
+    /// **Experimental** — see SPEC.md's "Service blocks (experimental)".
+    #[serde(default)]
+    service: Option<bool>,
     /// Comma-separated `deps=` list, replacing the whole thing (same
     /// syntax as the fence attribute itself — bare `name` or
     /// `node-id/name`). Mutually exclusive with `clear_deps`.
@@ -962,6 +965,7 @@ impl MeshfoxMcp {
         let (default, no_default) = bool_pair(params.default);
         let (tty, no_tty) = bool_pair(params.tty);
         let (autoclose, no_autoclose) = bool_pair(params.autoclose);
+        let (service, no_service) = bool_pair(params.service);
         let args = crate::BlockArgs {
             rename: params.rename,
             lang: params.lang,
@@ -975,6 +979,8 @@ impl MeshfoxMcp {
             no_tty,
             autoclose,
             no_autoclose,
+            service,
+            no_service,
             deps: params.deps,
             clear_deps: params.clear_deps,
             env: params.env,

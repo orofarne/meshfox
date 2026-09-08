@@ -1,4 +1,4 @@
-import type { CanvasDoc, ExtraEdgeDto, NodeType, VarStatus } from "./types";
+import type { CanvasDoc, ExtraEdgeDto, NodeType, ServiceStatusDto, VarStatus } from "./types";
 
 export async function fetchCanvas(): Promise<CanvasDoc> {
   const res = await fetch("/api/canvas");
@@ -446,7 +446,16 @@ export type RunEvent =
   | { type: "step-end"; nodeId: string; block: string; exitCode: number; durationMs: number }
   | { type: "killed"; nodeId: string; block: string }
   | { type: "error"; message: string }
-  | { type: "done"; exitCode: number };
+  | { type: "done"; exitCode: number }
+  /** Terminal for this one step (chain keeps going), a `service` block's
+   * equivalent of `step-end` — "done" for a service is "spawned", not
+   * "exited", so there's no `exitCode`/`durationMs` here. **Experimental**,
+   * see SPEC.md's "Service blocks (experimental)". */
+  | { type: "service-started"; nodeId: string; block: string; pid: number }
+  /** Terminal for the whole run (no `done` follows — same as `killed`) — the
+   * service's lock file is already held by another live-or-stale process.
+   * Show a confirm dialog; on confirm, call `forceStartService`. */
+  | { type: "service-lock-conflict"; nodeId: string; block: string; ownerPid: number; ownerDesc: string };
 
 /**
  * Running is always allowed. `persist` controls whether a `cache`d block's
@@ -599,6 +608,73 @@ export async function killRun(runId: string): Promise<void> {
   if (!res.ok && res.status !== 404) {
     throw new Error(`POST /api/kill: ${res.status}`);
   }
+}
+
+/**
+ * Every `service` block this server process has ever spawned and still
+ * knows about — what a freshly-loaded/refreshed tab polls to repopulate
+ * the service panel and every node's own badge from. **Experimental**, see
+ * SPEC.md's "Service blocks (experimental)".
+ */
+export async function fetchServices(): Promise<ServiceStatusDto[]> {
+  const res = await fetch("/api/services");
+  if (!res.ok) throw new Error(`GET /api/services: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchServiceLog(
+  nodeId: string,
+  block: string,
+): Promise<{ stream: "stdout" | "stderr"; text: string }[]> {
+  const params = new URLSearchParams({ nodeId, block });
+  const res = await fetch(`/api/services/log?${params}`);
+  if (!res.ok) throw new Error(`GET /api/services/log: ${res.status}`);
+  return res.json();
+}
+
+/** Kills the service's whole process group and releases its lock file —
+ * the registry entry itself stays (now `"stopped"`), not removed. */
+export async function stopService(nodeId: string, block: string): Promise<void> {
+  const res = await fetch("/api/services/stop", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ nodeId, block }),
+  });
+  if (!res.ok) throw new Error(`POST /api/services/stop: ${res.status}`);
+}
+
+/** Stops the running instance and spawns a fresh one with the exact
+ * parameters it was last started with — "local only", never touches
+ * anything that depends on this service. */
+export async function restartService(nodeId: string, block: string): Promise<{ pid: number }> {
+  const res = await fetch("/api/services/restart", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ nodeId, block }),
+  });
+  if (!res.ok) throw new Error(`POST /api/services/restart: ${res.status}`);
+  return res.json();
+}
+
+/** The confirm side of a `"service-lock-conflict"` event: kills whatever
+ * process the lock file currently names as owner, releases the lock, and
+ * starts the service fresh. `path`/`block`/`vars` mirror `runBlockStream`'s
+ * own arguments for the same block. */
+export async function forceStartService(
+  path: string[],
+  block: string,
+  vars?: Record<string, string>,
+): Promise<{ pid: number }> {
+  const res = await fetch("/api/services/force-start", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path, block, vars: vars ?? {} }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `POST /api/services/force-start: ${res.status}`);
+  }
+  return res.json();
 }
 
 /**

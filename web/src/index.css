@@ -265,6 +265,33 @@ a {
   font-weight: 600;
 }
 
+/* Toolbar's global services pill (App.tsx) — same pill shape/spot as
+ * `.constraint-stats` right next to it, but a real `<button>` (constraints
+ * has no global panel to open, this does — see `ServicePanel.tsx`), so it
+ * needs its own reset on top of the shared pill look. **Experimental**,
+ * see SPEC.md's "Service blocks (experimental)". */
+.service-stats {
+  font: inherit;
+  font-size: 0.75rem;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--node-border);
+  background: transparent;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.service-stats-ok {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.service-stats-fail {
+  border-color: var(--fail);
+  color: var(--fail);
+  font-weight: 600;
+}
+
 /* Layout (position/size from dragging/resizing) auto-saves, debounced —
  * this is purely informational, not a control (there's nothing to click;
  * see App.tsx's `layoutSaveTimer` effect). */
@@ -717,6 +744,37 @@ a {
 }
 
 .mesh-node-constraint-badge-fail {
+  background: var(--fail);
+  color: var(--node-bg);
+}
+
+/* A node's own `service` block(s) pill (see MeshNode.tsx's `ServiceBadge`)
+ * — **experimental**, see SPEC.md's "Service blocks (experimental)". Same
+ * spot/sizing as `.mesh-node-constraint-badge` (right after it in the title
+ * bar), but a rounded-square shape and distinct glyph (●/⚠, not ✓/✗) so the
+ * two are visually distinguishable when a node has both a failing
+ * constraint and a crashed service showing at once. Clickable — opens the
+ * global service panel. */
+.mesh-node-service-badge {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.1rem;
+  height: 1.1rem;
+  border-radius: 4px;
+  font-size: 0.65rem;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.mesh-node-service-badge-ok {
+  background: var(--accent);
+  color: var(--node-bg);
+}
+
+.mesh-node-service-badge-fail {
   background: var(--fail);
   color: var(--node-bg);
 }
@@ -1635,6 +1693,74 @@ a {
   color: var(--dep);
 }
 
+/* A `service` block's own tag, right in its head row next to the language
+ * (see MeshNode.tsx's `RunnableCodeBlock`) — deliberately filled, not just
+ * outlined like `.mesh-tty-badge`, so it reads as noticeably different at
+ * a glance, not just another small pill easy to miss among the run/chain
+ * buttons. Its own `::before` dot reflects this *specific* block's live
+ * status (`RunnableCodeBlock`'s own `serviceStatus` lookup) — white/idle
+ * when not running, a smoothly pulsing green while it is, red (static) if
+ * it crashed — the same live-or-not question `ServiceBadge`/the toolbar
+ * pill answer at the node/document level, just visible right on the block
+ * itself without having to open anything. **Experimental**, see SPEC.md's
+ * "Service blocks (experimental)". */
+.mesh-service-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.65rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0.1rem 0.4rem;
+  border-radius: 3px;
+  background: var(--accent);
+  color: #fff;
+}
+
+.mesh-service-tag::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #fff;
+}
+
+.mesh-service-tag-running::before {
+  background: var(--ok);
+  animation: mesh-service-dot-pulse 1.8s ease-in-out infinite;
+}
+
+.mesh-service-tag-crashed::before {
+  background: var(--fail);
+}
+
+@keyframes mesh-service-dot-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+/* Replaces `.mesh-kill-button` for a `service` block — opens the service
+ * panel instead of a run-scoped kill that's a no-op for it (see
+ * `RunnableCodeBlock`'s own comment on why). Same filled weight as
+ * `.mesh-run-chain`'s "more than one thing happens here" treatment, in the
+ * accent color rather than --fail: this isn't a destructive action. */
+.mesh-code-block-head button.mesh-service-manage-button {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #fff;
+}
+
+.mesh-code-block-head button.mesh-service-manage-button:hover {
+  filter: brightness(1.1);
+}
+
 /* Note that this block's run button will also trigger other blocks first —
  * its own row (not squeezed into the head next to lang/button), so it can
  * wrap and list any number of `deps=` entries without clipping or
@@ -1912,6 +2038,30 @@ a {
 
 .mesh-code-output-transient {
   font-style: italic;
+}
+
+/* A `service` block's own live status, fixed the instant it's spawned (see
+ * MeshNode.tsx's `LiveRunOutput` — `"started"` is this step's *terminal*
+ * live state, there's no eventual exit code to wait for) — deliberately a
+ * plain solid dot, not `[data-exit="running"]`'s pulsing one: nothing is
+ * "in progress" here that a blinking indicator should keep drawing the eye
+ * to, the process is just up and its own status/log now live in the
+ * service panel instead. **Experimental**, see SPEC.md's "Service blocks
+ * (experimental)". */
+.mesh-code-output[data-exit="started"] .mesh-code-output-head {
+  color: var(--accent);
+  opacity: 1;
+}
+
+.mesh-code-output[data-exit="started"] .mesh-code-output-head::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 0.4em;
+  border-radius: 50%;
+  background: var(--accent);
+  vertical-align: middle;
 }
 
 .mesh-code-output-stale {
@@ -2398,6 +2548,165 @@ a {
 .vars-modal-actions .autolayout-confirm-button:hover {
   background: var(--accent);
   color: #fff;
+}
+
+/* ServicePanel.tsx — the global `service`-block list opened from any node's
+ * title-bar `ServiceBadge`. **Experimental**, see SPEC.md's "Service blocks
+ * (experimental)". Reuses `.vars-modal-backdrop` for its own backdrop (same
+ * z-index/dim-and-center shape every other modal here already uses), but
+ * its own `.service-panel` card instead of `.vars-modal` — wider/taller,
+ * since it has to fit a list *and* a log, not just a couple of form
+ * fields. */
+.service-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  width: min(760px, 92vw);
+  height: min(560px, 85vh);
+  padding: 1.25rem;
+  background: var(--node-bg);
+  border: 1px solid var(--node-border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+}
+
+.service-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.service-panel-header h3 {
+  margin: 0;
+}
+
+.service-panel-header button {
+  font-size: 1.1rem;
+  line-height: 1;
+  padding: 0.2rem 0.5rem;
+}
+
+.service-panel-body {
+  display: flex;
+  gap: 0.75rem;
+  flex: 1;
+  min-height: 0;
+}
+
+.service-panel-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  width: 220px;
+  flex-shrink: 0;
+  overflow-y: auto;
+  border-right: 1px solid var(--node-border);
+  padding-right: 0.5rem;
+}
+
+.service-panel-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.4rem 0.5rem;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  font: inherit;
+  font-size: 0.8rem;
+  text-align: left;
+  cursor: pointer;
+  color: var(--fg);
+}
+
+.service-panel-row:hover {
+  background: var(--bg);
+}
+
+.service-panel-row-selected {
+  border-color: var(--accent);
+  background: var(--bg);
+}
+
+.service-panel-row-block {
+  font-weight: 600;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.service-panel-row-node {
+  opacity: 0.6;
+  font-size: 0.7rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.service-panel-status-dot {
+  flex-shrink: 0;
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 50%;
+}
+
+.service-panel-status-running {
+  background: var(--ok);
+}
+
+.service-panel-status-crashed {
+  background: var(--fail);
+}
+
+.service-panel-status-stopped {
+  background: var(--node-border);
+}
+
+.service-panel-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+.service-panel-detail-meta {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  font-size: 0.75rem;
+  opacity: 0.75;
+}
+
+.service-panel-exit-code {
+  color: var(--fail);
+  opacity: 1;
+}
+
+.service-panel-detail-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.service-panel-detail-actions button {
+  font-size: 0.85rem;
+  padding: 0.3rem 0.75rem;
+}
+
+.service-panel-log {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  margin: 0;
+  padding: 0.5rem;
+  background: var(--bg);
+  border: 1px solid var(--node-border);
+  border-radius: 4px;
+  font-size: 0.78rem;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 /* DeleteNodeDialog.tsx — reuses `.vars-modal`'s backdrop/card/hint/actions

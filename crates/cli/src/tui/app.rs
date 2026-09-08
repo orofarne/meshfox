@@ -18,6 +18,7 @@ use meshfox_core::mdcanvas;
 use meshfox_core::output::{write_output, ExecOutput};
 use meshfox_core::vars::{declared_vars, resolve_block_env, BlockEnvResolution, VarDecl, VarType};
 use meshfox_core::{Canvas, FileDisplay, Node, NodeType, VarCache};
+use meshfox_server::services::{ServiceHandle, ServiceStatus};
 use meshfox_server::stream_exec::{OutputStream, SpawnedProcess};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -224,6 +225,26 @@ pub struct FileRunState {
     pub finished: bool,
 }
 
+/// A `service` step's lock file (`.meshfox/services/...`) is already held
+/// by another live-or-stale process — parked here (mirrors
+/// `reset_session_confirm`'s "one thing at a time" precedence, see
+/// `on_key`) until the user answers via `on_service_conflict_key`.
+/// **Experimental**, see SPEC.md's "Service blocks (experimental)": per
+/// the product decision, this always prompts, live owner or stale.
+pub struct ServiceConflictState {
+    pub block_name: String,
+    pub owner_pid: u32,
+    pub owner_desc: String,
+    pub lock_path: PathBuf,
+}
+
+/// The `v` services list view — see `App::services_view`,
+/// `App::on_services_view_key`, `ui::render_services_view`.
+/// **Experimental**, see SPEC.md's "Service blocks (experimental)".
+pub struct ServicesViewState {
+    pub selected: usize,
+}
+
 pub struct App {
     pub canvas_path: PathBuf,
     pub raw: String,
@@ -411,6 +432,27 @@ pub struct App {
     /// being purely in-memory. Same "one thing at a time" precedence as
     /// `var_form`/`block_picker`/`source_editor`.
     pub reset_session_confirm: bool,
+    /// Every `service` block this TUI process has spawned and still knows
+    /// about (running, crashed, or explicitly stopped) — this process's
+    /// own registry, not shared with a `meshfox view` server pointed at
+    /// the same canvas (only the lock file, `meshfox_core::service_lock`,
+    /// keeps the two honest about who owns what). **Experimental**, see
+    /// SPEC.md's "Service blocks (experimental)".
+    pub services: HashMap<(String, String), ServiceHandle>,
+    /// `(running, crashed)` across `services` — recomputed by
+    /// `tick_services`, not on every render (unlike `constraint_stats`,
+    /// which only changes on a document reload) since a service's own
+    /// status changes independently of the document, on its own schedule.
+    /// `None` when `services` is empty, so the footer renders nothing
+    /// rather than a vacuous "0/0".
+    pub service_stats: Option<(usize, usize)>,
+    /// A service lock conflict awaiting the user's confirm/cancel — see
+    /// `ServiceConflictState`'s own doc comment.
+    pub service_conflict: Option<ServiceConflictState>,
+    /// The `v` services list view (every service at once, not scoped to
+    /// the currently selected node) — `Some` while open. See
+    /// `ServicesViewState`'s own doc comment.
+    pub services_view: Option<ServicesViewState>,
 }
 
 /// One block's most recent successful run this session — see
@@ -579,6 +621,10 @@ impl App {
             link_preview_image: HashMap::new(),
             session_runs: HashMap::new(),
             reset_session_confirm: false,
+            services: HashMap::new(),
+            service_stats: None,
+            service_conflict: None,
+            services_view: None,
         };
         if let Some(target) = initial_node {
             if let Some(idx) = app.rows.iter().position(|r| r.node_id == target) {
@@ -611,20 +657,28 @@ impl App {
             self.on_block_picker_key(key).await;
             return;
         }
+        if self.services_view.is_some() {
+            self.on_services_view_key(key).await;
+            return;
+        }
         if self.reset_session_confirm {
             self.on_reset_session_confirm_key(key);
             return;
         }
+        if self.service_conflict.is_some() {
+            self.on_service_conflict_key(key).await;
+            return;
+        }
 
         match key.code {
-            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('q') => self.quit(),
             KeyCode::Esc => {
                 if self.show_help {
                     self.show_help = false;
                 } else if self.fullscreen.is_some() {
                     self.fullscreen = None;
                 } else {
-                    self.should_quit = true;
+                    self.quit();
                 }
             }
             KeyCode::Char('?') => self.show_help = !self.show_help,
@@ -656,6 +710,10 @@ impl App {
             KeyCode::Char('R') => self.trigger_run(false).await,
             KeyCode::Char('K') => self.kill_running(),
             KeyCode::Char('S') => self.reset_session_confirm = true,
+            // Opens the services list view — **experimental**, see
+            // `open_services_view`'s own doc comment and SPEC.md's
+            // "Service blocks (experimental)".
+            KeyCode::Char('v') => self.open_services_view(),
             KeyCode::Char('o') => self.trigger_open_file(),
             KeyCode::Char('c') => self.trigger_configure(),
             KeyCode::Char('e') => self.open_source_editor(),
@@ -2177,6 +2235,92 @@ impl App {
         let step_canvas_path = located.origin.as_deref().unwrap_or(&self.canvas_path).to_path_buf();
         let cwd = crate::canvas_root_dir(&step_canvas_path).to_path_buf();
 
+        // `service` blocks branch out here, before the normal spawn-and-
+        // wait path below: "done" is "spawned", not "exited" — see
+        // SPEC.md's "Service blocks (experimental)". Mirrors
+        // `meshfox run`'s own `run_async` (crates/cli/src/main.rs) and the
+        // web server's `run_block` (crates/server/src/lib.rs) service
+        // branches.
+        if block.service {
+            let key = (addr.node_id.clone(), addr.block_name.clone());
+            if let Some(existing) = self.services.get(&key) {
+                if matches!(existing.status(), ServiceStatus::Running) {
+                    // Already running (e.g. pulled in as a dependency
+                    // twice, or from an earlier run this session) —
+                    // nothing to do, just report it and move on.
+                    if let Some(run) = &mut self.run {
+                        run.lines.push(format!(
+                            "==> {} (service already running, pid {})",
+                            addr.block_name, existing.pid
+                        ));
+                        run.idx += 1;
+                    }
+                    Box::pin(self.advance_run()).await;
+                    return;
+                }
+            }
+
+            let lock_path =
+                meshfox_core::service_lock_path(&step_canvas_path, &addr.node_id, &addr.block_name);
+            match meshfox_core::service_lock::check(&lock_path) {
+                Ok(meshfox_core::ServiceLockState::Free) => {}
+                Ok(meshfox_core::ServiceLockState::Held { info, .. }) => {
+                    self.status = format!(
+                        "service {:?} already running elsewhere (pid {}, via {}) — confirm to kill & restart",
+                        addr.block_name, info.pid, info.owner
+                    );
+                    self.service_conflict = Some(ServiceConflictState {
+                        block_name: addr.block_name.clone(),
+                        owner_pid: info.pid,
+                        owner_desc: info.owner,
+                        lock_path,
+                    });
+                    return;
+                }
+                Err(e) => {
+                    self.status = format!("failed to check service lock for {:?}: {e}", addr.block_name);
+                    if let Some(run) = &mut self.run {
+                        run.finished = true;
+                        run.had_failure = true;
+                    }
+                    return;
+                }
+            }
+
+            let mut resolved_block = block.clone();
+            resolved_block.interpreter = effective_interpreter;
+            match meshfox_server::services::spawn(
+                addr.node_id.clone(),
+                addr.block_name.clone(),
+                resolved_block,
+                env,
+                cwd,
+                step_canvas_path,
+                "tui",
+            ) {
+                Ok(handle) => {
+                    let pid = handle.pid;
+                    self.services.insert(key, handle);
+                    self.tick_services();
+                    if let Some(run) = &mut self.run {
+                        run.lines
+                            .push(format!("==> {} (service started, pid {})", addr.block_name, pid));
+                        run.idx += 1;
+                    }
+                }
+                Err(e) => {
+                    self.status = format!("failed to start service {:?}: {e}", addr.block_name);
+                    if let Some(run) = &mut self.run {
+                        run.finished = true;
+                        run.had_failure = true;
+                    }
+                    return;
+                }
+            }
+            Box::pin(self.advance_run()).await;
+            return;
+        }
+
         if block.tty {
             if let Some(run) = &mut self.run {
                 run.lines.push(format!(
@@ -2516,6 +2660,175 @@ impl App {
                 self.advance_run().await;
             }
         }
+    }
+
+    /// Recomputes `service_stats` from `services` — called from `mod.rs`'s
+    /// periodic tick (so the footer/row glyphs stay current even when
+    /// nothing else is happening) and right after anything here changes
+    /// the registry (spawn/stop/restart), for immediate feedback rather
+    /// than waiting for the next tick. Doesn't drain any output — each
+    /// `ServiceHandle`'s own background task (`meshfox_server::services`)
+    /// already keeps `status()`/`log_snapshot()` live on its own.
+    pub fn tick_services(&mut self) {
+        let (mut running, mut crashed) = (0usize, 0usize);
+        for handle in self.services.values() {
+            match handle.status() {
+                ServiceStatus::Running => running += 1,
+                ServiceStatus::Crashed { .. } => crashed += 1,
+                ServiceStatus::Stopped => {}
+            }
+        }
+        self.service_stats = if self.services.is_empty() {
+            None
+        } else {
+            Some((running, crashed))
+        };
+    }
+
+    /// `y`/Enter: kills whatever the lock file named as owner and retries
+    /// the same chain step (`self.run.idx` is unchanged, so `advance_run`
+    /// naturally re-attempts it). `n`/Esc: cancels — the chain ends here,
+    /// same "block errors out" outcome `meshfox run`'s own declined
+    /// prompt has. See `ServiceConflictState`'s own doc comment.
+    async fn on_service_conflict_key(&mut self, key: KeyEvent) {
+        let Some(conflict) = self.service_conflict.take() else { return };
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                if conflict.owner_pid != 0 {
+                    // SAFETY: same whole-process-group SIGKILL every other
+                    // kill path in this codebase uses — this pid comes
+                    // from the lock file on disk, not a live
+                    // `ServiceHandle` this process already holds.
+                    unsafe {
+                        libc::kill(-(conflict.owner_pid as libc::pid_t), libc::SIGKILL);
+                    }
+                }
+                let _ = meshfox_core::service_lock::release(&conflict.lock_path);
+                self.status = format!("killed pid {} — restarting {:?}", conflict.owner_pid, conflict.block_name);
+                Box::pin(self.advance_run()).await;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.status = format!(
+                    "cancelled — {:?} is already running elsewhere",
+                    conflict.block_name
+                );
+                if let Some(run) = &mut self.run {
+                    run.finished = true;
+                    run.had_failure = true;
+                }
+            }
+            _ => {
+                // Any other key: leave it parked, waiting for a real answer.
+                self.service_conflict = Some(conflict);
+            }
+        }
+    }
+
+    /// `v` on a row with a `service` block: stops it if running, restarts
+    /// it otherwise (crashed or stopped) — the TUI's lightweight
+    /// stand-in for the webui's dedicated service panel (no separate
+    /// browsing view here; the tree itself, via `TreeRow::has_service` and
+    /// the row glyph, is already the list). Acts on every service
+    /// belonging to the selected node — same row-level (not per-block)
+    /// granularity `has_service`/the glyph already use. No-op for a row
+    /// with no active service to act on.
+    /// `v` — opens the services list view (every service this process
+    /// knows about at once, not scoped to the selected node), or reports
+    /// there's nothing to show yet. See `ServicesViewState`.
+    fn open_services_view(&mut self) {
+        if self.services.is_empty() {
+            self.status = "no services running yet".into();
+            return;
+        }
+        self.services_view = Some(ServicesViewState { selected: 0 });
+    }
+
+    /// A stable, sorted key order for `services` — the services view (and
+    /// its own key handler) index into this rather than trusting
+    /// `HashMap`'s own arbitrary iteration order to stay put between
+    /// frames/keypresses.
+    fn sorted_service_keys(&self) -> Vec<(String, String)> {
+        let mut keys: Vec<(String, String)> = self.services.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    /// `j`/`k`/arrows navigate, `s` stops the selected service (no-op if
+    /// it isn't running), `r` restarts it (no-op if it's already
+    /// running — use `s` first), `q`/Esc closes the view. **Experimental**,
+    /// see SPEC.md's "Service blocks (experimental)".
+    async fn on_services_view_key(&mut self, key: KeyEvent) {
+        let keys = self.sorted_service_keys();
+        if keys.is_empty() {
+            self.services_view = None;
+            return;
+        }
+        let selected = self
+            .services_view
+            .as_ref()
+            .map(|v| v.selected)
+            .unwrap_or(0)
+            .min(keys.len() - 1);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.services_view = None;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(view) = &mut self.services_view {
+                    view.selected = selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(view) = &mut self.services_view {
+                    view.selected = (selected + 1).min(keys.len() - 1);
+                }
+            }
+            KeyCode::Char('s') => {
+                let key = keys[selected].clone();
+                if let Some(handle) = self.services.get(&key) {
+                    if matches!(handle.status(), ServiceStatus::Running) {
+                        let _ = handle.stop();
+                        self.status = format!("stopped {}", key.1);
+                    }
+                }
+                self.tick_services();
+            }
+            KeyCode::Char('r') => {
+                let key = keys[selected].clone();
+                if let Some(handle) = self.services.get(&key) {
+                    match meshfox_server::services::restart(handle) {
+                        Ok(restarted) => {
+                            self.status = format!("restarted {} (pid {})", key.1, restarted.pid);
+                            self.services.insert(key, restarted);
+                        }
+                        Err(e) => {
+                            self.status = format!("failed to restart {}: {e}", key.1);
+                        }
+                    }
+                }
+                self.tick_services();
+            }
+            _ => {}
+        }
+    }
+
+    /// Stops every running `service` (see `services`' own doc comment)
+    /// before actually quitting — unlike `meshfox view`, this TUI process
+    /// *is* the only thing keeping a service tracked at all (no separate
+    /// backing server to keep it reachable after the interactive session
+    /// ends), so letting `q`/Esc exit without this would silently orphan
+    /// it the same way an unhandled external kill would (see
+    /// `crates/server/src/lib.rs`'s `spawn_shutdown_signal_handler` for
+    /// the webui's own equivalent — this is the TUI's, for its own
+    /// in-app quit path specifically; an *external* kill of this process
+    /// while it's running still isn't caught, same known gap tracked in
+    /// TODO.canvas.md for the webui's watcher process). **Experimental**,
+    /// see SPEC.md's "Service blocks (experimental)".
+    fn quit(&mut self) {
+        for handle in self.services.values() {
+            let _ = handle.stop();
+        }
+        self.should_quit = true;
     }
 
     fn kill_running(&mut self) {

@@ -12,7 +12,7 @@ import { implicitDepsForBlock, interpreterVarRefsNaive, type ClientVarDecl } fro
 import { AnsiText } from "./AnsiText";
 import { NodeTextEditor } from "./NodeTextEditor";
 import { fetchNodeFileContent, fetchLinkPreview, type LinkPreview } from "./api";
-import type { ConstraintStatusDto, NodeType } from "./types";
+import type { ConstraintStatusDto, NodeType, ServiceStatusDto } from "./types";
 
 /**
  * A relative `![](...)`/link target inside a node's rendered body normally
@@ -166,7 +166,16 @@ export interface LiveBlockState {
    * Purely a client-side inference — the server itself has no such status,
    * it just stops sending events for a chain it gave up on partway
    * through. */
-  status: "queued" | "running" | "done" | "killed" | "skipped" | "blocked";
+  /** `"started"` — a `service` block's own `"service-started"` event (see
+   * `./api.ts`'s `RunEvent`, SPEC.md's "Service blocks (experimental)"):
+   * the process was spawned and the chain moved on immediately, so there's
+   * no eventual `step-end`/exit code to reach `"done"`/`"killed"` from —
+   * this is the terminal state for a service step's own live display, a
+   * static "started" (see `LiveRunOutput`) rather than an indefinitely
+   * spinning `"running"`. Ongoing status/log/resource tracking for the
+   * process itself lives in the service panel (`ServicePanel.tsx`), not
+   * here. */
+  status: "queued" | "running" | "started" | "done" | "killed" | "skipped" | "blocked";
   /** Set (only for the block whose button was actually clicked) when that
    * click was "⛓ run chain" rather than plain "run" — lets the two buttons'
    * labels change independently: whichever one was clicked shows
@@ -348,6 +357,13 @@ export interface MeshNodeData {
    * constraint fences (nothing to roll up into the title-bar badge below),
    * not "0 constraints, 0 passing". */
   constraintResults?: ConstraintStatusDto[];
+  /** Every `service` block belonging to this node (matched by `nodeId`,
+   * folded in client-side from a separately-polled `GET /api/services` —
+   * see `App.tsx`'s own service-polling effect), for the title-bar
+   * `ServiceBadge` below and the global service panel. **Experimental**,
+   * see SPEC.md's "Service blocks (experimental)". Absent or empty means
+   * this node has no known service blocks. */
+  services?: ServiceStatusDto[];
   /** file-node display mode — `"code"` shows a read-only, syntax-highlighted
    * preview of the target file's own content instead of a plain link. */
   display?: "link" | "code";
@@ -406,6 +422,10 @@ export interface MeshNodeData {
    * whole canvas, which re-evaluates every constraint server-side (see
    * App.tsx's `load`) and refreshes this node's badge/messages. */
   onRecheckConstraint: () => void;
+  /** Opens the global service panel (see App.tsx's `ServicePanel`), scrolled
+   * to this node's own services — the title-bar `ServiceBadge`'s click
+   * target. **Experimental**, see SPEC.md's "Service blocks (experimental)". */
+  onOpenServicePanel: () => void;
   /** Creates a new child node under this one — the "+" button (inline in
    * the title bar for a group, floating at the right edge otherwise). */
   onAddChild: () => void;
@@ -816,6 +836,38 @@ function ConstraintBadge({ status }: { status: ConstraintStatusDto | undefined }
       title={status.ok ? "Constraints pass" : status.messages.join("\n")}
     >
       {status.ok ? "✓" : "✗"}
+    </span>
+  );
+}
+
+/** Small title-bar pill for a node's own `service` blocks (see SPEC.md's
+ * "Service blocks (experimental)") — reuses only `ConstraintBadge`'s visual
+ * language (green ok / red fail pill), not any of its logic: a service's
+ * pass/fail is "is anything crashed", not a constraint check, and clicking
+ * it opens the global service panel rather than expanding inline detail.
+ * Renders nothing for a node with no known service blocks. A distinct glyph
+ * (●/⚠, not ✓/✗) so a node with both a failing constraint and a crashed
+ * service shows two visually distinguishable badges. */
+function ServiceBadge({ services, onOpen }: { services: ServiceStatusDto[] | undefined; onOpen: () => void }) {
+  if (!services || services.length === 0) return null;
+  const anyCrashed = services.some((s) => s.status === "crashed");
+  const title = anyCrashed
+    ? `${services.filter((s) => s.status === "crashed").length} service(s) crashed — click to open`
+    : `${services.length} service(s) — click to open`;
+  return (
+    <span
+      className={
+        anyCrashed
+          ? "mesh-node-service-badge mesh-node-service-badge-fail"
+          : "mesh-node-service-badge mesh-node-service-badge-ok"
+      }
+      title={title}
+      onClick={(e) => {
+        e.stopPropagation();
+        onOpen();
+      }}
+    >
+      {anyCrashed ? "⚠" : "●"}
     </span>
   );
 }
@@ -1398,6 +1450,13 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
     window.setTimeout(() => el.classList.remove("mesh-code-block-flash"), JUMP_HIGHLIGHT_MS);
   };
 
+  // This block's own live entry in the polled service registry (see
+  // `MeshNodeData.services`'s doc comment) — `undefined` both for a
+  // non-`service` block and for a `service` block never yet spawned (or
+  // spawned by a different process that hasn't registered here). Drives
+  // the tag's own dot color/animation right on the block, not just the
+  // node-level `ServiceBadge` — see this tag's own render site below.
+  const serviceStatus = seg.service ? data.services?.find((s) => s.block === seg.name)?.status : undefined;
   const runLabel = !runBusy ? `run ${seg.name}` : queued ? "queued…" : `running ${seg.name}…`;
   const chainLabel = !chainBusy ? `⛓ run chain: ${seg.name}` : queued ? "queued…" : "running chain…";
   // `tty` opens a `TtyPanel` (a real terminal) instead of streaming
@@ -1429,6 +1488,26 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
             tty
           </span>
         )}
+        {seg.service && (
+          <span
+            className={
+              serviceStatus === "running"
+                ? "mesh-service-tag mesh-service-tag-running"
+                : serviceStatus === "crashed"
+                  ? "mesh-service-tag mesh-service-tag-crashed"
+                  : "mesh-service-tag mesh-service-tag-idle"
+            }
+            title={
+              serviceStatus === "running"
+                ? "Service running — click ⚙ services for status/log/stop"
+                : serviceStatus === "crashed"
+                  ? "Service crashed — click ⚙ services for its exit code/log"
+                  : "Service not running. Starts a long-lived background process instead of running to completion — 'done' means spawned, not exited. Experimental, see SPEC.md's 'Service blocks (experimental)'."
+            }
+          >
+            service
+          </span>
+        )}
         <button
           disabled={queued || running}
           onClick={runHandler}
@@ -1446,15 +1525,34 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
             {chainLabel}
           </button>
         )}
-        {running && (
+        {seg.service ? (
+          // A service outlives the request that spawned it — the ordinary
+          // kill button (`onKill`, `runId`-scoped to *this* run) is a
+          // no-op for it by the time anyone would click it (the run
+          // already ended with `service-started`, see App.tsx). Open the
+          // service panel instead — stop/restart/log all live there, not
+          // here. Shown regardless of `running`: a service already up from
+          // an earlier session (before this page even loaded) still needs
+          // this way in, not just while a fresh run is streaming.
           <button
             type="button"
-            className="mesh-kill-button"
-            onClick={() => data.onKill(seg.name)}
-            title="Kill this run — terminates the process (and anything it spawned), and stops the rest of its dependency chain, in case it's hung"
+            className="mesh-service-manage-button"
+            onClick={data.onOpenServicePanel}
+            title="Open the service panel — status, log, resource usage, stop/restart"
           >
-            ⏹ kill
+            ⚙ services
           </button>
+        ) : (
+          running && (
+            <button
+              type="button"
+              className="mesh-kill-button"
+              onClick={() => data.onKill(seg.name)}
+              title="Kill this run — terminates the process (and anything it spawned), and stops the rest of its dependency chain, in case it's hung"
+            >
+              ⏹ kill
+            </button>
+          )
         )}
       </div>
       {expanded && (
@@ -1733,6 +1831,8 @@ function LiveRunOutput({
       <>killed{duration}</>
     ) : live.status === "running" ? (
       <>running… {live.startedAt !== undefined && <LiveElapsed startedAt={live.startedAt} />}</>
+    ) : live.status === "started" ? (
+      <>started</>
     ) : (
       <>
         output · exit {live.exitCode}
@@ -1740,7 +1840,15 @@ function LiveRunOutput({
       </>
     );
   const exitState =
-    live.status === "killed" ? "killed" : live.status === "running" ? "running" : live.exitCode === 0 ? "ok" : "fail";
+    live.status === "killed"
+      ? "killed"
+      : live.status === "running"
+        ? "running"
+        : live.status === "started"
+          ? "started"
+          : live.exitCode === 0
+            ? "ok"
+            : "fail";
   // `RunEvent::Output`'s own `stream` tag (see `App.tsx`'s `appendOutputLine`)
   // is what makes this possible at all: `live.stdoutText`/`.stderrText`
   // accumulate separately from `live.text` (the merged view, still used
@@ -2646,6 +2754,7 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
           {nodeRunning && <RunningSpinner />}
           {!nodeRunning && nodeFailed && <FailedBadge />}
           <ConstraintBadge status={constraintStatus} />
+          <ServiceBadge services={data.services} onOpen={data.onOpenServicePanel} />
           {/* Read-only: these stay right in the title bar, same as always
            * — nothing here competes with `NodeResizer`'s own handles (only
            * shown in edit mode), so there's no small-node crowding to

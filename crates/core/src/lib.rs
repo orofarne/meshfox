@@ -22,6 +22,7 @@ pub mod locate;
 pub mod mdcanvas;
 pub mod options;
 pub mod output;
+pub mod service_lock;
 pub mod staticgen;
 pub mod subsup;
 pub mod syntax_dirs;
@@ -52,6 +53,7 @@ pub use locate::{locate_node, LocateError, LocatedNode};
 pub use mdcanvas::{parse_fold_override, parse_tags, FenceAttrsPatch, NodeMeta, ParseError};
 pub use options::{declared_options, OptionsError};
 pub use output::{cached_output_hash, format_duration_ms, write_output, ExecOutput};
+pub use service_lock::{lock_path as service_lock_path, LockInfo as ServiceLockInfo, LockState as ServiceLockState};
 pub use staticgen::{Asset, EdgeView, NodeView, Position, SiteData};
 pub use tag_colors::{
     annotate_effective_colors, declared_tag_colors, effective_color, TagColorError,

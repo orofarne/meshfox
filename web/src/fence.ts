@@ -176,6 +176,13 @@ export interface CodeSegment {
    * interactive process exits, return to the canvas immediately instead of
    * leaving the panel open showing its exit code until closed by hand. */
   autoclose: boolean;
+  /** Mirrors `core::fence::CodeBlock.service` — **experimental**, see
+   * SPEC.md's "Service blocks (experimental)". This block starts a
+   * long-lived background process instead of one that runs to completion;
+   * mutually exclusive with `tty`/`cache`. Drives `MeshNode.tsx`'s
+   * `mesh-service-badge` tag and its "manage services" button in place of
+   * the ordinary kill button. */
+  service: boolean;
   /** Raw `deps="a,b"` entries, in document order — a bare name is a block
    * in this same node, `node-id/block-name` is a block elsewhere. See
    * `./deps.ts` for resolving these into concrete addresses. */
@@ -467,6 +474,7 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
     const cache = attrs.cache !== undefined && attrs.cache !== "false";
     const tty = attrs.tty !== undefined && attrs.tty !== "false";
     const autoclose = attrs.autoclose !== undefined && attrs.autoclose !== "false";
+    const service = attrs.service !== undefined && attrs.service !== "false";
     const isDefault = attrs.default !== undefined && attrs.default !== "false";
     const outputMarkdown = attrs.output === "markdown";
     const interpreter = attrs.interpreter;
@@ -509,7 +517,7 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
       }
     }
 
-    segments.push({ type: "code", lang, name, cache, tty, autoclose, deps, envRefs, default: isDefault, outputMarkdown, interpreter, code: codeLines.join("\n"), output });
+    segments.push({ type: "code", lang, name, cache, tty, autoclose, service, deps, envRefs, default: isDefault, outputMarkdown, interpreter, code: codeLines.join("\n"), output });
     i = cursor;
   }
   flushMarkdown();

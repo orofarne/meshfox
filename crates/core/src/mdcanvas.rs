@@ -846,6 +846,7 @@ pub struct FenceAttrsPatch {
     pub default: Option<bool>,
     pub tty: Option<bool>,
     pub autoclose: Option<bool>,
+    pub service: Option<bool>,
     pub deps: Option<Vec<BlockRef>>,
     pub env: Option<Vec<EnvRef>>,
     pub interpreter: Option<Option<String>>,
@@ -953,6 +954,9 @@ pub fn set_fence_attrs(
     if patch.autoclose.unwrap_or(block.autoclose) {
         parts.push("autoclose".to_string());
     }
+    if patch.service.unwrap_or(block.service) {
+        parts.push("service".to_string());
+    }
     if patch.always.unwrap_or(block.always) {
         parts.push("always".to_string());
     }
@@ -973,7 +977,8 @@ pub fn set_fence_attrs(
     // fields) — carry it over verbatim instead of silently dropping it
     // just because `FenceAttrsPatch` doesn't know its name yet.
     const KNOWN_ATTRS: &[&str] = &[
-        "name", "deps", "env", "cache", "tty", "autoclose", "always", "default", "interpreter",
+        "name", "deps", "env", "cache", "tty", "autoclose", "service", "always", "default",
+        "interpreter",
     ];
     let mut extra: Vec<(&str, &str)> = block
         .attrs

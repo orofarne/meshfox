@@ -376,6 +376,19 @@ Lives inside a node's Markdown text, as fence-info-string attributes:
   "Interactive (`tty`) blocks" below for how the CLI and web UI actually
   run one, and that section's own `autoclose` for returning to the canvas
   automatically once it exits.
+- `service` — **experimental, may change** — optional flag (`service` or
+  `service="true"`); starts a long-lived background process instead of
+  one that runs to completion — a dev server, say. Unlike every other
+  runnable block, "done" fires the moment the process is *spawned*, not
+  when it exits: a `deps=` chain that reaches a `service` block continues
+  immediately, without waiting for it. Mutually exclusive with `tty`/
+  `cache` (`meshfox validate` error) — a service is non-interactive by
+  definition, and never exits under normal operation, so there's no
+  deterministic "exit code plus text" for `cache` to save/replay either.
+  A `service` block may freely be a `deps=`/`from=` target of another
+  block, or have its own `deps=` — the chain-walk semantics already
+  generalize, since "done" is just defined differently for it. See
+  "Service blocks (experimental)" below.
 - `output="markdown"` — optional; changes how a `cache`d run's captured
   stdout is written back (see "Cached output" below). By default it's
   wrapped in a passive ` ```text ` fence, shown verbatim. With
@@ -693,6 +706,55 @@ back the moment its process exits, `autoclose` or not.
   "Cached output" below doesn't apply to `tty` blocks — a tool that
   auto-detects color support (`cargo`, `git`, ...) sees a real terminal
   and colors its output without needing `--color=always`.
+
+## Service blocks (experimental)
+
+**Experimental — the attribute name and behavior here may still change.**
+
+A `service` block (see its flag above) starts a long-lived background
+process — a dev server, most commonly — instead of one that runs to
+completion. Where every other runnable block's "done" means "exited",
+a `service` block's means "spawned": a `deps=` chain that reaches one
+continues immediately, and the process keeps running independently,
+tracked/observable/stoppable/restartable separately from the run that
+started it, until it's explicitly stopped or its owning process exits.
+
+**Ownership**: a service is tied to the lifetime of whichever OS process
+spawned it — the `meshfox view` server, `meshfox tui`, or a `meshfox run`
+invocation. It's tracked in a lock file under `.meshfox/services/`
+(gitignored local machine state, same convention as the venv/resolved-var
+caches) recording the owning process. If that lock file already names
+another live (or dead-but-unreleased) process when a `service` block is
+about to start, the user is always prompted — kill the recorded process
+and start fresh, or cancel (the block errors out) — never resolved
+silently either way, whether the recorded owner turns out to still be
+alive or not.
+
+- **Web UI** (`meshfox view`) — a started service gets a second title-bar
+  badge on its node (next to the constraint badge), green while running,
+  red if it crashed; clicking it (or the toolbar's own aggregate pill,
+  next to the constraints one) opens a panel listing every service this
+  server process knows about — status, log, CPU/memory, uptime, and
+  Stop/Restart. Closing every browser tab does *not* stop a running
+  service or exit the server early — the whole point of tracking it here
+  is that it survives a page reload.
+- **TUI** (`meshfox tui`) — a node with a `service` block shows a small
+  dot next to its title: white when idle, a smoothly pulsing green while
+  running, red if crashed. `v`, with that node selected, stops it if
+  running or restarts it otherwise; the footer shows a running/crashed
+  count. Quitting the TUI (`q`/Esc) stops every service it owns first —
+  unlike the web UI, there's no separate long-lived server behind a TUI
+  session for a service to keep being tracked by once it ends.
+- **`meshfox run`** — starting a service no longer means the command
+  exits once its chain finishes: it stays attached, streaming each
+  service's own output to the console (prefixed by block name), until
+  either every service it started has stopped on its own or the user
+  hits Ctrl-C — which stops all of them before exiting. A one-shot
+  invocation that never started a service behaves exactly as before.
+
+**Restart is local only**: restarting a service restarts just that one
+process, with the exact parameters it was last started with — it never
+touches, reruns, or even looks at anything that depends on it.
 
 ## Variables
 
@@ -1297,7 +1359,7 @@ leading token instead of a `key=value` pair (`crates/core/src/fence.rs`):
     lang            ::= bare-value
 
     runnable-attr   ::= 'name' | 'cache' | 'default' | 'deps' | 'env' | 'tty'
-                     | 'autoclose' | 'always' | 'interpreter'
+                     | 'autoclose' | 'service' | 'always' | 'interpreter'
     constraint-attr ::= 'constraint' | 'name'
 
 A runnable fence additionally requires `lang` to be `bash` or `sh`, *or* its

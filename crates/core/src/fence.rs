@@ -30,6 +30,21 @@ pub struct CodeBlock {
     /// code (and whatever it last printed) on screen until a deliberate
     /// keypress. See SPEC.md's "Interactive (`tty`) blocks".
     pub autoclose: bool,
+    /// Explicit `service` flag (`service` or `service="true"`) —
+    /// **experimental**, see SPEC.md's "Service blocks (experimental)".
+    /// This block starts a long-lived background process instead of one
+    /// that runs to completion: a `deps=` chain treats *spawning* it (not
+    /// its eventual exit) as "done" and continues immediately, and the
+    /// process keeps running, tracked/observable/stoppable/restartable
+    /// separately, until explicitly stopped or its owning meshfox process
+    /// exits. Mutually exclusive with `tty`/`cache` and with a `button`
+    /// fence — enforced by `crate::deps::validate`, not here. (`autoclose`
+    /// is transitively excluded too: it's already rejected on any non-`tty`
+    /// block, and `service` can never validly carry `tty`.)
+    /// A `service` block may freely appear in another block's `deps=`, or
+    /// have its own `deps=` — the chain-walk semantics already generalize,
+    /// since "done" is just defined as "spawned" instead of "exited 0".
+    pub service: bool,
     /// Explicit `always` flag (`always` or `always="true"`) — opts this
     /// block out of the webui/TUI session-freshness skip entirely (see
     /// `AppState::session_runs`/`App::session_runs`): even when it's
@@ -450,6 +465,7 @@ const FENCE_ATTRS: &[&str] = &[
     "cache",
     "tty",
     "autoclose",
+    "service",
     "always",
     "default",
     "interpreter",
@@ -484,6 +500,7 @@ fn build_code_block(
     let default = attrs.get("default").map(|v| v != "false").unwrap_or(false);
     let tty = attrs.get("tty").map(|v| v != "false").unwrap_or(false);
     let autoclose = attrs.get("autoclose").map(|v| v != "false").unwrap_or(false);
+    let service = attrs.get("service").map(|v| v != "false").unwrap_or(false);
     let always = attrs.get("always").map(|v| v != "false").unwrap_or(false);
     let deps = parse_deps(&attrs);
     let env = parse_env(&attrs);
@@ -495,6 +512,7 @@ fn build_code_block(
         default,
         tty,
         autoclose,
+        service,
         always,
         deps,
         env,
@@ -1048,6 +1066,20 @@ mod tests {
         let blocks = scan_code_blocks(md);
         assert!(blocks[0].autoclose);
         assert!(!blocks[1].autoclose);
+    }
+
+    #[test]
+    fn service_flag_defaults_to_false() {
+        let md = "```bash name=\"x\"\necho hi\n```\n";
+        assert!(!scan_code_blocks(md)[0].service);
+    }
+
+    #[test]
+    fn service_flag_parses_bare_and_explicit_false() {
+        let md = "```bash name=\"x\" service\necho hi\n```\n\n```bash name=\"y\" service=false\necho hi\n```\n";
+        let blocks = scan_code_blocks(md);
+        assert!(blocks[0].service);
+        assert!(!blocks[1].service);
     }
 
     #[test]

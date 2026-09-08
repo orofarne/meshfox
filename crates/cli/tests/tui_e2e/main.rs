@@ -30,3 +30,4 @@ mod mouse_modals;
 mod mouse_output_pane;
 mod mouse_resize;
 mod mouse_run_buttons;
+mod services;

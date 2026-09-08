@@ -14,7 +14,10 @@ mod markdown;
 mod source_editor;
 mod theme;
 mod tree;
-mod ui;
+// `pub(crate)` (not the default private) so `syntax_registry.rs`'s own
+// tests can reference `ui::SOURCE_EDITOR_THEME` directly rather than
+// hardcoding a second copy of it that could silently drift out of sync.
+pub(crate) mod ui;
 
 use std::collections::HashMap;
 use std::io;
@@ -202,6 +205,15 @@ async fn main_loop(
 
         let has_proc = app.run.as_ref().is_some_and(|r| r.proc.is_some());
         let has_file_proc = app.file_run.as_ref().is_some_and(|r| r.proc.is_some());
+        // Not draining any output here — each `ServiceHandle`'s own
+        // background task (`meshfox_server::services`) already keeps its
+        // `status()`/`log_snapshot()` live on its own; this just redraws
+        // the tree glyph/footer aggregate periodically while at least one
+        // service exists, gated the same way `has_proc`/`has_file_proc`
+        // are so it's a true no-op (no wakeups at all) once `services` is
+        // empty. **Experimental**, see SPEC.md's "Service blocks
+        // (experimental)".
+        let has_services = !app.services.is_empty();
         tokio::select! {
             maybe_ev = input_rx.recv() => {
                 match maybe_ev {
@@ -226,6 +238,9 @@ async fn main_loop(
             }
             Some(msg) = link_preview_rx.recv() => {
                 app.on_link_preview_msg(msg);
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(300)), if has_services => {
+                app.tick_services();
             }
         }
     }

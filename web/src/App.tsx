@@ -37,10 +37,17 @@ import {
   watchChanges,
   clearLayout,
   resetSession,
+  fetchServices,
+  fetchServiceLog,
+  stopService,
+  restartService,
+  forceStartService,
   type RunEvent,
   type NodePatch,
 } from "./api";
-import type { CanvasDoc, CanvasNode, ExtraEdgeDto, VarStatus } from "./types";
+import type { CanvasDoc, CanvasNode, ExtraEdgeDto, ServiceStatusDto, VarStatus } from "./types";
+import { ServicePanel } from "./ServicePanel";
+import { ServiceLockConflictDialog } from "./ServiceLockConflictDialog";
 import { pathTo, deriveEdges, findRoot, visibleNodeIds, subtreeIds } from "./tree";
 import { computeAutoLayout, FOLDED_HEIGHT, type LayoutBox } from "./autolayout";
 import { buildBlockGraph, resolveChain, type BlockAddr } from "./deps";
@@ -259,6 +266,29 @@ function countOccurrences(haystack: string, needle: string): number {
 export default function App() {
   const [canvas, setCanvas] = useState<CanvasDoc | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Every `service` block this server process has ever spawned, polled
+  // independently of `canvas`/`fetchCanvas` (a service's lifetime spans
+  // many requests/page-loads — see `MeshNodeData.services`'s own doc
+  // comment). **Experimental**, see SPEC.md's "Service blocks (experimental)".
+  const [services, setServices] = useState<ServiceStatusDto[]>([]);
+  // Whether the global service panel (`ServicePanel.tsx`) is open — opened
+  // by a title-bar `ServiceBadge` click (scoped to that node, see
+  // `servicePanelFocusNodeId` below) or by the toolbar's own services pill
+  // (unscoped — every service, same "global panel" spot the toolbar's
+  // `constraintStats` pill lives in).
+  const [servicePanelOpen, setServicePanelOpen] = useState(false);
+  // Which service to pre-select when the panel opens — `null` for
+  // "whichever" (the toolbar pill's own case). Set alongside
+  // `servicePanelOpen` itself, never read while it's `false`.
+  const [servicePanelFocusNodeId, setServicePanelFocusNodeId] = useState<string | null>(null);
+  // A `"service-lock-conflict"` event awaiting the user's confirm/cancel —
+  // see `runBlockStream`'s `onEvent` handling below and `ServiceLockConflictDialog`.
+  const [serviceConflict, setServiceConflict] = useState<{
+    nodeId: string;
+    block: string;
+    ownerPid: number;
+    ownerDesc: string;
+  } | null>(null);
   // Briefly `true` right after a successful "reset session" click — purely
   // informational feedback (same `.saving-indicator` styling the layout
   // autosave uses), since the button itself has no other visible effect
@@ -584,6 +614,47 @@ export default function App() {
     load();
   }, [load]);
 
+  // Polls `GET /api/services` so every node's badge/the service panel stay
+  // current across a page reload and while nothing's actively streaming a
+  // run — plain interval, not SSE/WS, same "no live transport beyond
+  // /api/run's own NDJSON" posture the rest of this app already has.
+  // **Experimental**, see SPEC.md's "Service blocks (experimental)".
+  useEffect(() => {
+    let cancelled = false;
+    const poll = () => {
+      fetchServices()
+        .then((list) => {
+          if (!cancelled) setServices(list);
+        })
+        .catch(() => {
+          // Best-effort — a transient fetch failure just leaves the last
+          // known list in place until the next tick.
+        });
+    };
+    poll();
+    const id = setInterval(poll, 3000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, []);
+
+  // Folds the polled `services` list into every node's own `data.services`
+  // (matched by `nodeId`) — the service-equivalent of `liveBlocks`' own
+  // incremental-patch effects below, just reacting to a whole fresh list
+  // landing every poll tick instead of one NDJSON event at a time.
+  useEffect(() => {
+    setNodes((nds) =>
+      nds.map((n) => {
+        const mine = services.filter((s) => s.nodeId === n.id);
+        const prev = n.data.services ?? [];
+        if (prev.length === 0 && mine.length === 0) return n;
+        if (JSON.stringify(prev) === JSON.stringify(mine)) return n;
+        return { ...n, data: { ...n.data, services: mine } };
+      }),
+    );
+  }, [services, setNodes]);
+
   // True once `/api/watch`'s connection has ended for any reason — which,
   // for a purely local server with no other reason to drop a live
   // connection, means the server process itself has stopped (see
@@ -847,6 +918,35 @@ export default function App() {
               break;
             case "done":
               break;
+            case "service-started":
+              // Fixes this block's own live status as a static "started"
+              // (see `LiveBlockState.status`/`LiveRunOutput`) instead of
+              // leaving it stuck on "running" forever — a service step
+              // never gets a `step-end` to clear that, since "done" for it
+              // means "spawned", not "exited". This also clears
+              // `RunningSpinner`'s own `nodeRunning` check for this node,
+              // since the service panel/badge is the right place to watch
+              // it from here on, not a spinner that never resolves.
+              patchLiveBlock(event.nodeId, event.block, {
+                status: "started",
+                runId: undefined,
+                exitCode: undefined,
+                durationMs: undefined,
+              });
+              // The registry (and the badge/panel) is polled independently
+              // (see the `services` effect above) — nudge it right away
+              // rather than waiting up to the next tick for this run's own
+              // service to show up as running.
+              fetchServices().then(setServices).catch(() => {});
+              break;
+            case "service-lock-conflict":
+              setServiceConflict({
+                nodeId: event.nodeId,
+                block: event.block,
+                ownerPid: event.ownerPid,
+                ownerDesc: event.ownerDesc,
+              });
+              break;
           }
         }, vars, saveSecrets);
         blockStuckQueued();
@@ -951,6 +1051,13 @@ export default function App() {
               setError(event.message);
               break;
             case "done":
+              break;
+            case "service-started":
+            case "service-lock-conflict":
+              // A `file` node has no fenced code blocks at all (see this
+              // function's own doc comment), so `service` (a fence-only
+              // attribute) can never actually apply here — these only exist
+              // to keep this switch exhaustive over `RunEvent`.
               break;
           }
         });
@@ -1539,6 +1646,11 @@ export default function App() {
             target: n.target,
             caption: n.caption,
             constraintResults: n.constraintResults,
+            // Populated by the dedicated `services`-patch effect right
+            // after this (deliberately not read here — this whole effect
+            // only depends on `[canvas]`, see its own closing comment; a
+            // fresh empty array is corrected within the same render pass).
+            services: [],
             display: n.display,
             lang: n.lang,
             interpreter: n.interpreter,
@@ -1554,6 +1666,10 @@ export default function App() {
             onRunTty: (blockName: string, withDeps: boolean, autoclose: boolean) =>
               handleRunTty(n.id, blockName, withDeps, autoclose),
             onRecheckConstraint: () => load(),
+            onOpenServicePanel: () => {
+              setServicePanelFocusNodeId(n.id);
+              setServicePanelOpen(true);
+            },
             onOpenFile: () => handleOpenFile(n.id),
             onOpenFileFolder: () => handleOpenFileFolder(n.id),
             onAddChild: () => handleAddChild(n.id),
@@ -2629,6 +2745,27 @@ export default function App() {
             🛡 {constraintStats.total - constraintStats.failed}/{constraintStats.total}
           </span>
         )}
+        {services.length > 0 && (
+          <button
+            type="button"
+            className={
+              services.some((s) => s.status === "crashed")
+                ? "service-stats service-stats-fail"
+                : "service-stats service-stats-ok"
+            }
+            title={
+              services.some((s) => s.status === "crashed")
+                ? `${services.filter((s) => s.status === "crashed").length} of ${services.length} service(s) crashed — click to open`
+                : `${services.filter((s) => s.status === "running").length}/${services.length} service(s) running — click to open`
+            }
+            onClick={() => {
+              setServicePanelFocusNodeId(null);
+              setServicePanelOpen(true);
+            }}
+          >
+            ⚙ {services.filter((s) => s.status === "running").length}/{services.length}
+          </button>
+        )}
         {editMode ? (
           <>
             <span className="mode-badge mode-badge-edit">editing</span>
@@ -2714,6 +2851,7 @@ export default function App() {
       dirty,
       error,
       constraintStats,
+      services,
       hasConfigurableVars,
       handleConfigure,
       themePreference,
@@ -2936,6 +3074,41 @@ export default function App() {
             handleResetSession();
           }}
           onCancel={() => setResetSessionConfirmOpen(false)}
+        />
+      )}
+      {servicePanelOpen && (
+        <ServicePanel
+          services={services}
+          focusNodeId={servicePanelFocusNodeId}
+          onClose={() => setServicePanelOpen(false)}
+          onStop={(nodeId, block) => {
+            stopService(nodeId, block)
+              .then(() => fetchServices())
+              .then(setServices)
+              .catch((e) => setError(String(e)));
+          }}
+          onRestart={(nodeId, block) => {
+            restartService(nodeId, block)
+              .then(() => fetchServices())
+              .then(setServices)
+              .catch((e) => setError(String(e)));
+          }}
+        />
+      )}
+      {serviceConflict && canvas && (
+        <ServiceLockConflictDialog
+          block={serviceConflict.block}
+          ownerPid={serviceConflict.ownerPid}
+          ownerDesc={serviceConflict.ownerDesc}
+          onCancel={() => setServiceConflict(null)}
+          onKillAndStart={() => {
+            const path = pathTo(canvas, serviceConflict.nodeId);
+            setServiceConflict(null);
+            forceStartService(path, serviceConflict.block)
+              .then(() => fetchServices())
+              .then(setServices)
+              .catch((e) => setError(String(e)));
+          }}
         />
       )}
       {reparentPromptNode && (

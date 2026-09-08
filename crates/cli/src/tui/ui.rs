@@ -7,12 +7,13 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 use ratatui_image::Image;
+use std::collections::HashMap;
 use std::sync::Arc;
 use syntect::parsing::SyntaxSet;
 
 use edtui::{EditorView, LineNumbers, SyntaxHighlighter};
 
-use super::app::{App, Focus};
+use super::app::{App, Focus, ServiceConflictState, ServicesViewState};
 use super::theme::{ACCENT, BORDER, FAIL, OK};
 use super::markdown::Segment;
 use super::source_editor::SourceEditorState;
@@ -43,7 +44,19 @@ fn tree_row_color(color: Option<&str>) -> Option<Color> {
 /// list (rather than a handful of pre-joined strings) is what lets
 /// `wrap_word_indices` below wrap the *whole* row — title, tags, and badge
 /// alike — instead of only the title while silently clipping the rest.
-fn tree_row_words(row: &TreeRow, title_style: Style) -> Vec<(String, Style)> {
+/// This node's own live service state, as far as row rendering cares —
+/// aggregated across every service belonging to it (same row-level, not
+/// per-block, granularity `TreeRow::has_service` already uses). Computed
+/// once per `render_tree` call (not per row) from `App.services` — see
+/// that function's own comment. **Experimental**, see SPEC.md's "Service
+/// blocks (experimental)".
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ServiceRowState {
+    Running,
+    Crashed,
+}
+
+fn tree_row_words(row: &TreeRow, title_style: Style, service: Option<ServiceRowState>) -> Vec<(String, Style)> {
     let mut words: Vec<(String, Style)> = row
         .title
         .split_whitespace()
@@ -53,6 +66,14 @@ fn tree_row_words(row: &TreeRow, title_style: Style) -> Vec<(String, Style)> {
         Some(true) => words.push(("✓".to_string(), Style::default().fg(OK))),
         Some(false) => words.push(("✗".to_string(), Style::default().fg(FAIL))),
         None => {}
+    }
+    if row.has_service {
+        let (glyph, color) = match service {
+            Some(ServiceRowState::Running) => ("●service", OK),
+            Some(ServiceRowState::Crashed) => ("⚠service", FAIL),
+            None => ("○service", Color::DarkGray),
+        };
+        words.push((glyph.to_string(), Style::default().fg(color)));
     }
     for tag in &row.tags {
         words.push((format!("#{tag}"), Style::default().fg(Color::Cyan)));
@@ -118,9 +139,23 @@ fn wrap_word_indices(word_widths: &[usize], first_width: usize, cont_width: usiz
 /// Theme/language edtui's own bundled `syntect` highlighting uses for the
 /// source editor — always Markdown, since that's what every file this
 /// editor can open (a canvas or a plain-Markdown include target) actually
-/// is. "dracula" is the theme edtui's own docs/examples default to; not
-/// otherwise meaningful here.
-const SOURCE_EDITOR_THEME: &str = "dracula";
+/// is. Same `"base16-ocean.dark"` the read-only preview pane's own
+/// highlighter already uses (`markdown.rs`), so both panes read as the
+/// same product. This used to be `"dracula"` — edtui's own docs/examples
+/// default to that name, but it's *not* one of the themes `syntect::
+/// highlighting::ThemeSet::load_defaults()` actually bundles (confirmed
+/// directly: `["InspiredGitHub", "Solarized (dark)", "Solarized (light)",
+/// "base16-eighties.dark", "base16-mocha.dark", "base16-ocean.dark",
+/// "base16-ocean.light"]`, no "dracula" anywhere in it) — the lookup
+/// always silently missed and fell through to `crate::syntax_registry::
+/// with_meshfox_scope_colors`'s caller's own `.or_else(|| ...values()
+/// .next()...)` fallback, landing on *whichever* bundled theme happened to
+/// be first in the `HashMap`'s own (arbitrary, unspecified) iteration
+/// order — never a deliberate choice at all. See that same module's
+/// `with_meshfox_scope_colors` for the other half of this fix (forcing a
+/// legible base/default foreground regardless of which theme ends up
+/// loaded).
+pub(crate) const SOURCE_EDITOR_THEME: &str = "base16-ocean.dark";
 /// Falls back to plain `"md"` (`find_syntax_by_token`, extension-based) only
 /// if `crate::syntax_registry::MESHFOX_MARKDOWN_SYNTAX_NAME` somehow isn't
 /// registered — never actually expected (it's bundled into the binary, see
@@ -261,6 +296,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
         render_var_form(f, area, vf);
     } else if app.reset_session_confirm {
         render_reset_session_confirm(f, area);
+    } else if let Some(conflict) = &app.service_conflict {
+        render_service_conflict(f, area, conflict);
+    } else if let Some(sv) = &app.services_view {
+        render_services_view(f, area, &*app, sv);
     } else if app.show_help {
         render_help(f, area, &*app);
     }
@@ -284,6 +323,25 @@ fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
     // Borders on both sides of the list eat 2 columns of `area.width`.
     let content_width = area.width.saturating_sub(2) as usize;
 
+    // Computed once per call (owned, no borrow conflict with `app.rows`
+    // below) rather than threading `&App.services` all the way into
+    // `tree_row_words` — a node's live status, aggregated across every
+    // service belonging to it (crashed wins over running, same "worst
+    // status shown" convention `ServiceBadge` uses in the webui).
+    // **Experimental**, see SPEC.md's "Service blocks (experimental)".
+    let mut service_by_node: HashMap<String, ServiceRowState> = HashMap::new();
+    for ((node_id, _), handle) in &app.services {
+        let state = match handle.status() {
+            meshfox_server::services::ServiceStatus::Running => ServiceRowState::Running,
+            meshfox_server::services::ServiceStatus::Crashed { .. } => ServiceRowState::Crashed,
+            meshfox_server::services::ServiceStatus::Stopped => continue,
+        };
+        let entry = service_by_node.entry(node_id.clone()).or_insert(state);
+        if state == ServiceRowState::Crashed {
+            *entry = ServiceRowState::Crashed;
+        }
+    }
+
     let items: Vec<ListItem> = app
         .rows
         .iter()
@@ -302,7 +360,7 @@ fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
                 None => Style::default(),
             };
 
-            let words = tree_row_words(row, title_style);
+            let words = tree_row_words(row, title_style, service_by_node.get(&row.node_id).copied());
             let word_widths: Vec<usize> = words.iter().map(|(t, _)| t.chars().count()).collect();
             // Row 0 also carries the indent + disclosure marker + type
             // marker; continuation rows only re-indent by the disclosure
@@ -625,6 +683,9 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     if app.has_configurable_vars() {
         hint.push_str(" · c configure");
     }
+    if app.service_stats.is_some() {
+        hint.push_str(" · v services");
+    }
     hint.push_str(" · ? help · q quit");
 
     let mut spans = Vec::new();
@@ -639,6 +700,19 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                 ),
                 OK,
             )
+        };
+        spans.push(Span::styled(text, Style::default().fg(color)));
+        spans.push(Span::styled("  ·  ", Style::default().fg(Color::DarkGray)));
+    }
+    // **Experimental**, see SPEC.md's "Service blocks (experimental)" —
+    // recomputed by `App::tick_services`, not derived here (unlike
+    // `constraint_stats`, service status changes on its own schedule, not
+    // just on a document reload).
+    if let Some((running, crashed)) = app.service_stats {
+        let (text, color) = if crashed > 0 {
+            (format!("{crashed} service(s) crashed"), FAIL)
+        } else {
+            (format!("{running} service(s) running"), OK)
         };
         spans.push(Span::styled(text, Style::default().fg(color)));
         spans.push(Span::styled("  ·  ", Style::default().fg(Color::DarkGray)));
@@ -889,6 +963,147 @@ fn render_reset_session_confirm(f: &mut Frame, area: Rect) {
     );
 }
 
+/// A `service` step's lock-conflict confirm — see `App::service_conflict`
+/// and `App::on_service_conflict_key`. Same fixed-size shape as
+/// `render_reset_session_confirm`. **Experimental**, see SPEC.md's
+/// "Service blocks (experimental)".
+fn render_service_conflict(f: &mut Frame, area: Rect, conflict: &ServiceConflictState) {
+    let rect = centered_rect(60, 8, area);
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(FAIL))
+        .title(" service already running ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let message = Paragraph::new(format!(
+        "{:?} is already running elsewhere — pid {}, started via {}. Kill that process and start a fresh one here, or cancel and leave it running.",
+        conflict.block_name, conflict.owner_pid, conflict.owner_desc
+    ))
+    .wrap(Wrap { trim: true });
+    f.render_widget(message, rows[0]);
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "y/enter kill & start · n/esc cancel",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        rows[1],
+    );
+}
+
+/// The `v` services list view (`App::services_view`) — every `service`
+/// this process knows about at once, sorted the same stable
+/// `(node_id, block_name)` order `App::sorted_service_keys` uses so the
+/// selected row stays put between frames. **Experimental**, see SPEC.md's
+/// "Service blocks (experimental)".
+fn render_services_view(f: &mut Frame, area: Rect, app: &App, sv: &ServicesViewState) {
+    let mut keys: Vec<(&String, &String)> = app.services.keys().map(|(n, b)| (n, b)).collect();
+    keys.sort();
+    let selected = sv.selected.min(keys.len().saturating_sub(1));
+
+    // Large, near-fullscreen (not `block_picker_rect`'s content-sized
+    // shape) — unlike a plain picker, this also needs room to actually
+    // show a service's own retained log underneath the list.
+    let width = (area.width * 9 / 10).max(30).min(area.width);
+    let height = (area.height * 4 / 5).max(10).min(area.height);
+    let rect = centered_rect(width, height, area);
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .title(" services ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let list_height = (keys.len() as u16 + 2).clamp(3, 8);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(list_height),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    let (list_area, log_title_area, log_area, hint_area) = (rows[0], rows[1], rows[2], rows[3]);
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "j/k select · s stop · r restart · q/esc close",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        hint_area,
+    );
+
+    let items: Vec<ListItem> = keys
+        .iter()
+        .filter_map(|&(node_id, block_name)| {
+            let handle = app.services.get(&(node_id.clone(), block_name.clone()))?;
+            let (status_text, color) = match handle.status() {
+                meshfox_server::services::ServiceStatus::Running => ("running", OK),
+                meshfox_server::services::ServiceStatus::Crashed { exit_code } => {
+                    return Some(ListItem::new(Line::from(vec![
+                        Span::raw(format!("{block_name}  ")),
+                        Span::styled(format!("crashed (exit {exit_code})"), Style::default().fg(FAIL)),
+                        Span::styled(format!("  {node_id}"), Style::default().fg(Color::DarkGray)),
+                    ])));
+                }
+                meshfox_server::services::ServiceStatus::Stopped => ("stopped", Color::DarkGray),
+            };
+            Some(ListItem::new(Line::from(vec![
+                Span::raw(format!("{block_name}  ")),
+                Span::styled(format!("{status_text} · pid {}", handle.pid), Style::default().fg(color)),
+                Span::styled(format!("  {node_id}"), Style::default().fg(Color::DarkGray)),
+            ])))
+        })
+        .collect();
+
+    let mut state = ListState::default();
+    state.select(Some(selected));
+    let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    f.render_stateful_widget(list, list_area, &mut state);
+
+    // The selected service's own retained output (`ServiceHandle::
+    // log_snapshot` — kept live by its own background drain task, see
+    // `meshfox_server::services`) — this is the actual answer to "how do
+    // I see the daemon's log" in the TUI. Always the *tail* (whatever fits
+    // `log_area`'s own height), auto-following as more arrives — no manual
+    // scrollback yet, same "good enough for now" scope as everything else
+    // marked **experimental** here.
+    if let Some(&(node_id, block_name)) = keys.get(selected) {
+        f.render_widget(
+            Line::from(Span::styled(
+                format!("── {block_name} log ──"),
+                Style::default().fg(Color::DarkGray),
+            )),
+            log_title_area,
+        );
+        if let Some(handle) = app.services.get(&(node_id.clone(), block_name.clone())) {
+            let log = handle.log_snapshot();
+            let take = log_area.height as usize;
+            let start = log.len().saturating_sub(take);
+            let lines: Vec<Line> = log[start..]
+                .iter()
+                .map(|(stream, text)| {
+                    let style = match stream {
+                        meshfox_server::stream_exec::OutputStream::Stderr => Style::default().fg(FAIL),
+                        meshfox_server::stream_exec::OutputStream::Stdout => Style::default(),
+                    };
+                    Line::from(Span::styled(text.as_str(), style))
+                })
+                .collect();
+            f.render_widget(Paragraph::new(Text::from(lines)), log_area);
+        }
+    }
+}
+
 fn render_help(f: &mut Frame, area: Rect, app: &App) {
     let mut items = vec![
         "tab             cycle focus: tree -> document -> output -> tree",
@@ -914,6 +1129,14 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
     if app.has_configurable_vars() {
         items.push(
             "c               configure every declared variable (see SPEC.md's \"Variables\")",
+        );
+    }
+    if app.service_stats.is_some() {
+        items.push(
+            "v               open the services list (stop/restart any of them) —",
+        );
+        items.push(
+            "                experimental, see SPEC.md's \"Service blocks (experimental)\"",
         );
     }
     items.extend([

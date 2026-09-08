@@ -8,6 +8,8 @@ Only **direct** dependencies are listed by name below; the full transitive tree 
 
 It grew by one more once `crates/cli`'s `main` gained an explicit `rustls::crypto::ring::default_provider().install_default()` call — `rustls` (already reachable transitively via `headless_chrome`/`self_update`'s own `ureq` backend, and via `meshfox_server`'s `reqwest` feature flags) was promoted to a real, direct `crates/cli` dependency so that call has something to name; picking the `ring` backend there (rather than the default `aws-lc-rs`) keeps only one crypto backend compiled into the binary, matching `reqwest`'s own `rustls-no-provider` feature choice in `meshfox_server`. `Apache-2.0 OR ISC OR MIT` — permissive, no new copyleft exception.
 
+It grew by one more once `service` blocks (see SPEC.md's "Service blocks (experimental)") gained per-process CPU/memory/uptime sampling for the webui's service panel and the TUI's own service view — `sysinfo` (MIT), used from `crates/server`'s new `services` module (shared by both, since the TUI links this crate as a library rather than talking to it over HTTP).
+
 ## MIT License
 <!-- meshfox:node id="license-file" type="file" display="code" -->
 
@@ -54,6 +56,7 @@ Direct dependencies across `crates/core`, `crates/server`, `crates/cli` (`cargo 
 | starlark | Apache-2.0 |
 | syntect | MIT |
 | syntect-tmlanguage | MIT OR Apache-2.0 |
+| sysinfo | MIT |
 | tera | MIT |
 | thiserror | MIT OR Apache-2.0 |
 | time | MIT OR Apache-2.0 |

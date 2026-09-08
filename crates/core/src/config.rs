@@ -38,9 +38,18 @@ pub fn local_config_path(canvas_root: &Path) -> PathBuf {
 /// file rather than an error: this is optional configuration a project may
 /// never have, not a required manifest.
 pub fn load(canvas_root: &Path) -> toml::Table {
-    let mut merged = global_config_path()
-        .map(|p| read_table(&p))
-        .unwrap_or_default();
+    load_from(global_config_path().as_deref(), canvas_root)
+}
+
+/// `load`'s own pure implementation, taking the global path explicitly
+/// instead of resolving it from `$HOME` itself — split out so a test can
+/// exercise "no global config at all" (`global_path: None`) without
+/// depending on whether *this* machine happens to have a real
+/// `~/.meshfox/config.toml` (`load_is_empty_when_neither_file_exists`
+/// used to, and would spuriously fail on a developer's own machine that
+/// has one — see that test's own doc comment).
+fn load_from(global_path: Option<&Path>, canvas_root: &Path) -> toml::Table {
+    let mut merged = global_path.map(read_table).unwrap_or_default();
     let local = read_table(&local_config_path(canvas_root));
     deep_merge(&mut merged, local);
     merged
@@ -149,10 +158,18 @@ mod tests {
         assert_eq!(base, table);
     }
 
+    /// Exercises `load_from` directly with `global_path: None` — plain
+    /// `load` always *also* merges this machine's real
+    /// `~/.meshfox/config.toml` (via `global_config_path`), so a developer
+    /// who actually has one (not unusual — this repo's own `CLAUDE.md`
+    /// tells an agent to keep one updated) would otherwise make this test
+    /// spuriously fail on their own machine for a reason that has nothing
+    /// to do with what it's meant to check: a directory with no *local*
+    /// config either really does load empty.
     #[test]
     fn load_is_empty_when_neither_file_exists() {
         let dir = tempfile_dir();
-        assert!(load(&dir).is_empty());
+        assert!(load_from(None, &dir).is_empty());
     }
 
     fn tempfile_dir() -> PathBuf {

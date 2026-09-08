@@ -56,6 +56,10 @@ pub enum DepsError {
     CacheTtyConflict(String, String),
     #[error("node {0:?} block {1:?}: `autoclose` only means anything on a `tty` block")]
     AutocloseWithoutTty(String, String),
+    #[error("node {0:?} block {1:?}: `service` and `tty` are mutually exclusive — a service is a non-interactive background process, not something handed a real terminal")]
+    ServiceTtyConflict(String, String),
+    #[error("node {0:?} block {1:?}: `service` and `cache` are mutually exclusive — a service never exits under normal operation, so there's no completed output for `cache` to freeze")]
+    ServiceCacheConflict(String, String),
     #[error("node {0:?} block {1:?}: a `button` fence can't also carry `{2}` — it has no real code of its own to run under it")]
     ButtonAttrConflict(String, String, &'static str),
     #[error(transparent)]
@@ -342,6 +346,12 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
             if block.autoclose && !block.tty {
                 return Err(DepsError::AutocloseWithoutTty(node.id.clone(), name.clone()));
             }
+            if block.service && block.tty {
+                return Err(DepsError::ServiceTtyConflict(node.id.clone(), name.clone()));
+            }
+            if block.service && block.cache {
+                return Err(DepsError::ServiceCacheConflict(node.id.clone(), name.clone()));
+            }
             if crate::exec::is_button(&block.lang) {
                 let conflict = if block.interpreter.is_some() {
                     Some("interpreter")
@@ -351,6 +361,8 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
                     Some("env")
                 } else if block.tty {
                     Some("tty")
+                } else if block.service {
+                    Some("service")
                 } else {
                     None
                 };
@@ -569,6 +581,88 @@ mod tests {
         assert_eq!(
             validate(&c).unwrap_err(),
             DepsError::ButtonAttrConflict("root".to_string(), "go".to_string(), "tty")
+        );
+    }
+
+    #[test]
+    fn validate_catches_service_and_tty_on_the_same_block() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```bash name=\"srv\" service tty\nnpm run start\n```\n",
+        ));
+        assert_eq!(
+            validate(&c).unwrap_err(),
+            DepsError::ServiceTtyConflict("root".to_string(), "srv".to_string())
+        );
+    }
+
+    #[test]
+    fn validate_catches_service_and_cache_on_the_same_block() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```bash name=\"srv\" service cache\nnpm run start\n```\n",
+        ));
+        assert_eq!(
+            validate(&c).unwrap_err(),
+            DepsError::ServiceCacheConflict("root".to_string(), "srv".to_string())
+        );
+    }
+
+    #[test]
+    fn validate_catches_service_and_autoclose_on_the_same_block_via_the_autoclose_check() {
+        // No dedicated service+autoclose error: `autoclose` on a non-`tty`
+        // block is already rejected unconditionally, and `service` can
+        // never validly carry `tty` (ServiceTtyConflict) — so this
+        // combination is already unreachable without tripping one of those
+        // two existing checks first.
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```bash name=\"srv\" service autoclose\nnpm run start\n```\n",
+        ));
+        assert_eq!(
+            validate(&c).unwrap_err(),
+            DepsError::AutocloseWithoutTty("root".to_string(), "srv".to_string())
+        );
+    }
+
+    #[test]
+    fn validate_catches_button_with_service() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```button name=\"go\" service\n```\n",
+        ));
+        assert_eq!(
+            validate(&c).unwrap_err(),
+            DepsError::ButtonAttrConflict("root".to_string(), "go".to_string(), "service")
+        );
+    }
+
+    #[test]
+    fn validate_ok_for_a_plain_service_block() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```bash name=\"srv\" service\nnpm run start\n```\n",
+        ));
+        assert!(validate(&c).is_ok());
+    }
+
+    #[test]
+    fn service_block_may_be_a_deps_target_and_have_its_own_deps() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```bash name=\"install\" cache\nnpm install\n```\n\n",
+            "```bash name=\"srv\" service deps=\"install\"\nnpm run start\n```\n\n",
+            "```bash name=\"smoke\" deps=\"srv\"\ncurl localhost\n```\n",
+        ));
+        assert!(validate(&c).is_ok());
+        let chain = resolve_chain(&c, BlockAddr::new("root", "smoke")).unwrap();
+        assert_eq!(
+            chain,
+            vec![
+                BlockAddr::new("root", "install"),
+                BlockAddr::new("root", "srv"),
+                BlockAddr::new("root", "smoke"),
+            ]
         );
     }
 

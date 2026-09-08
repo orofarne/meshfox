@@ -39,6 +39,11 @@ use tower_http::cors::CorsLayer;
 /// HTTP, it links this crate as a plain library.
 pub mod link_preview;
 mod pty_exec;
+/// `pub` so `meshfox-cli`'s TUI can share the exact same live-service
+/// registry primitives (spawn/stop/restart/resource-sampling) the webui
+/// server uses — see its own module doc comment for why the TUI links this
+/// crate as a library rather than talking to it over HTTP.
+pub mod services;
 /// `pub` so `meshfox-cli` can reuse the same async spawn/kill primitives
 /// for `meshfox run`'s real-time output — see its `main.rs`.
 pub mod stream_exec;
@@ -122,6 +127,12 @@ struct AppState {
     /// Never persisted anywhere and never touched by anything but this
     /// process's own runs — restarting `meshfox view` starts fresh.
     session_runs: Mutex<HashMap<(String, String), SessionRun>>,
+    /// Every `service` block this process has spawned and still knows
+    /// about (running, crashed, or just-stopped — never removed on its
+    /// own), keyed by `(node_id, block_name)` — see `crate::services`'s own
+    /// module doc comment for why this is a real persistent registry, not
+    /// a per-request kill-switch like `runs` above.
+    services: Mutex<HashMap<(String, String), services::ServiceHandle>>,
     /// Where this worker's own coordinating watcher (or, eventually, a
     /// persistent GUI daemon) is listening — `None` only for a worker
     /// started without one (the `#[cfg(test)]` server, or a hand-run
@@ -206,6 +217,21 @@ struct TabGuard {
     state: Arc<AppState>,
 }
 
+/// True if any `service` this process has spawned is still `Running` —
+/// consulted by `TabGuard`'s auto-exit re-check so closing the last open
+/// tab doesn't kill a service the whole point of the service panel is to
+/// keep tracking across page reloads/tab closures. A service is tied to
+/// its owning process (see SPEC.md's "Service blocks (experimental)"), and
+/// this *is* that process, so exiting anyway would kill it too.
+fn has_running_services(state: &AppState) -> bool {
+    state
+        .services
+        .lock()
+        .unwrap()
+        .values()
+        .any(|s| matches!(s.status(), services::ServiceStatus::Running))
+}
+
 impl Drop for TabGuard {
     fn drop(&mut self) {
         let remaining = self.state.open_tabs.fetch_sub(1, Ordering::SeqCst) - 1;
@@ -216,7 +242,7 @@ impl Drop for TabGuard {
             let state = Arc::clone(&self.state);
             tokio::spawn(async move {
                 tokio::time::sleep(AUTO_EXIT_GRACE).await;
-                if state.open_tabs.load(Ordering::SeqCst) == 0 {
+                if state.open_tabs.load(Ordering::SeqCst) == 0 && !has_running_services(&state) {
                     println!("meshfox: last open tab closed, exiting");
                     std::process::exit(0);
                 }
@@ -762,6 +788,29 @@ enum RunEvent {
     TtyStart {
         node_id: String,
         block: String,
+    },
+    /// Terminal for *this step only* (the chain keeps going, same as
+    /// `StepSkipped`) — emitted for a `service` block (see
+    /// `meshfox_core::CodeBlock::service`) right after it's spawned,
+    /// instead of `Output`*/`StepEnd`: a service's "done" is defined as
+    /// "spawned", not "exited", so nothing here ever waits for an exit
+    /// code. See SPEC.md's "Service blocks (experimental)".
+    ServiceStarted {
+        node_id: String,
+        block: String,
+        pid: u32,
+    },
+    /// Terminal for this run — a `service` step's lock file (`.meshfox/
+    /// services/...`, see `meshfox_core::service_lock`) is already held by
+    /// another live-or-stale process. Per the product decision, this is
+    /// always surfaced for confirmation, never silently resolved either
+    /// way — the client shows a confirm dialog and, if the user agrees,
+    /// retries via `POST /api/services/:id/force-start`.
+    ServiceLockConflict {
+        node_id: String,
+        block: String,
+        owner_pid: u32,
+        owner_desc: String,
     },
     StepEnd {
         node_id: String,
@@ -2804,6 +2853,87 @@ async fn run_block(
                 resolved_block.interpreter = Some(meshfox_core::resolve_interpreter(spec, &resolved_vars));
             }
 
+            // `service` blocks branch out here, before the normal
+            // spawn-and-wait-for-exit path below: "done" for a service is
+            // "spawned", not "exited" — see SPEC.md's "Service blocks
+            // (experimental)" and `crate::services`'s own module doc
+            // comment for the persistent registry this populates.
+            if resolved_block.service {
+                let key = (addr.node_id.clone(), addr.block_name.clone());
+                let already_running = state
+                    .services
+                    .lock()
+                    .unwrap()
+                    .get(&key)
+                    .filter(|s| matches!(s.status(), services::ServiceStatus::Running))
+                    .map(|s| s.pid);
+                if let Some(pid) = already_running {
+                    // This process already owns a live instance of this
+                    // exact service (e.g. a "run chain" that pulls it in
+                    // as a dependency, run twice) — nothing to do, just
+                    // report it as started again.
+                    yield Ok(ndjson_line(&RunEvent::ServiceStarted {
+                        node_id: addr.node_id.clone(),
+                        block: addr.block_name.clone(),
+                        pid,
+                    }));
+                    continue;
+                }
+
+                let lock_path = meshfox_core::service_lock_path(
+                    canvas_path_for_step,
+                    &addr.node_id,
+                    &addr.block_name,
+                );
+                match meshfox_core::service_lock::check(&lock_path) {
+                    Ok(meshfox_core::ServiceLockState::Free) => {}
+                    Ok(meshfox_core::ServiceLockState::Held { info, .. }) => {
+                        yield Ok(ndjson_line(&RunEvent::ServiceLockConflict {
+                            node_id: addr.node_id.clone(),
+                            block: addr.block_name.clone(),
+                            owner_pid: info.pid,
+                            owner_desc: info.owner,
+                        }));
+                        // Reuses the same "no trailing Done" suppression
+                        // `/api/kill` sets for `Killed` — `ServiceLockConflict`
+                        // is terminal for this run too (see its own doc
+                        // comment), and would otherwise fall through to the
+                        // loop's post-break `Done` below.
+                        killed = true;
+                        break;
+                    }
+                    Err(e) => {
+                        yield Ok(ndjson_line(&RunEvent::Error { message: e.to_string() }));
+                        break;
+                    }
+                }
+
+                match services::spawn(
+                    addr.node_id.clone(),
+                    addr.block_name.clone(),
+                    resolved_block.clone(),
+                    block_env.clone(),
+                    cwd.clone(),
+                    canvas_path_for_step.to_path_buf(),
+                    "webui",
+                ) {
+                    Ok(handle) => {
+                        let pid = handle.pid;
+                        state.services.lock().unwrap().insert(key, handle);
+                        yield Ok(ndjson_line(&RunEvent::ServiceStarted {
+                            node_id: addr.node_id.clone(),
+                            block: addr.block_name.clone(),
+                            pid,
+                        }));
+                    }
+                    Err(e) => {
+                        yield Ok(ndjson_line(&RunEvent::Error { message: e.to_string() }));
+                        break;
+                    }
+                }
+                continue;
+            }
+
             let step_started = std::time::Instant::now();
             let mut proc = match stream_exec::spawn_block(
                 &resolved_block,
@@ -3706,6 +3836,269 @@ async fn relay_tty_step(
     TtyStepOutcome::Exited(pty.wait().await)
 }
 
+/// One entry of `GET /api/services`'s response — see `crate::services`'s own
+/// module doc comment for the registry this is read off of.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ServiceDto {
+    node_id: String,
+    block: String,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_code: Option<i32>,
+    pid: u32,
+    /// Milliseconds since this instance was spawned — recomputed fresh on
+    /// every response rather than sending an absolute timestamp, since
+    /// `ServiceHandle::started_at` is a monotonic `Instant`, not wall-clock
+    /// time.
+    uptime_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu_percent: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mem_bytes: Option<u64>,
+}
+
+fn service_dto(node_id: &str, block: &str, handle: &services::ServiceHandle) -> ServiceDto {
+    let (status, exit_code) = match handle.status() {
+        services::ServiceStatus::Running => ("running", None),
+        services::ServiceStatus::Crashed { exit_code } => ("crashed", Some(exit_code)),
+        services::ServiceStatus::Stopped => ("stopped", None),
+    };
+    let sample = services::sample(handle.pid);
+    ServiceDto {
+        node_id: node_id.to_string(),
+        block: block.to_string(),
+        status,
+        exit_code,
+        pid: handle.pid,
+        uptime_ms: handle.started_at.elapsed().as_millis() as u64,
+        cpu_percent: sample.as_ref().map(|s| s.cpu_percent),
+        mem_bytes: sample.as_ref().map(|s| s.mem_bytes),
+    }
+}
+
+/// `GET /api/services` — every `service` block this process has ever
+/// spawned and still knows about (running, crashed, or explicitly
+/// stopped), for a freshly-loaded/refreshed webui tab to repopulate the
+/// service panel from — see `crate::services`'s own module doc comment for
+/// why this can't just be inferred from an in-flight `/api/run` stream.
+async fn get_services(State(state): State<Arc<AppState>>) -> Json<Vec<ServiceDto>> {
+    let services = state.services.lock().unwrap();
+    Json(
+        services
+            .iter()
+            .map(|((node_id, block), handle)| service_dto(node_id, block, handle))
+            .collect(),
+    )
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServiceKeyQuery {
+    node_id: String,
+    block: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ServiceLogLine {
+    stream: stream_exec::OutputStream,
+    text: String,
+}
+
+/// `GET /api/services/log?nodeId=..&block=..` — the service's full retained
+/// output buffer (see `crate::services`'s `RingBuffer`), polled rather than
+/// streamed: simple and proportionate at this scale, no second live
+/// transport alongside `/api/run`'s NDJSON one.
+async fn get_service_log(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ServiceKeyQuery>,
+) -> Result<Json<Vec<ServiceLogLine>>, ApiError> {
+    let services = state.services.lock().unwrap();
+    let handle = services.get(&(q.node_id.clone(), q.block.clone())).ok_or_else(|| {
+        ApiError(StatusCode::NOT_FOUND, format!("no service {:?}/{:?}", q.node_id, q.block))
+    })?;
+    Ok(Json(
+        handle
+            .log_snapshot()
+            .into_iter()
+            .map(|(stream, text)| ServiceLogLine { stream, text })
+            .collect(),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServiceKeyRequest {
+    node_id: String,
+    block: String,
+}
+
+/// `POST /api/services/stop` — kills the service's whole process group
+/// (`ServiceHandle::stop`) and releases its lock file. The registry entry
+/// itself is kept (now `Stopped`), not removed, so the panel can still show
+/// "stopped" rather than the service just vanishing.
+async fn stop_service(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ServiceKeyRequest>,
+) -> Result<StatusCode, ApiError> {
+    let services = state.services.lock().unwrap();
+    let handle = services.get(&(req.node_id.clone(), req.block.clone())).ok_or_else(|| {
+        ApiError(StatusCode::NOT_FOUND, format!("no service {:?}/{:?}", req.node_id, req.block))
+    })?;
+    handle
+        .stop()
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ServiceActionResponse {
+    pid: u32,
+}
+
+/// `POST /api/services/restart` — stops the running instance and spawns a
+/// fresh one with the exact parameters it was last started with (see
+/// `crate::services::restart`'s own doc comment: "local only", never
+/// touches anything that depends on this service).
+async fn restart_service(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ServiceKeyRequest>,
+) -> Result<Json<ServiceActionResponse>, ApiError> {
+    let mut services = state.services.lock().unwrap();
+    let key = (req.node_id.clone(), req.block.clone());
+    let old = services.get(&key).ok_or_else(|| {
+        ApiError(StatusCode::NOT_FOUND, format!("no service {:?}/{:?}", req.node_id, req.block))
+    })?;
+    let restarted =
+        services::restart(old).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let pid = restarted.pid;
+    services.insert(key, restarted);
+    Ok(Json(ServiceActionResponse { pid }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ForceStartServiceRequest {
+    path: Vec<String>,
+    block: String,
+    #[serde(default)]
+    vars: HashMap<String, String>,
+}
+
+/// `POST /api/services/force-start` — the confirm side of a `RunEvent::
+/// ServiceLockConflict`: kills whatever process the lock file currently
+/// names as owner, releases the lock, and starts the service fresh. Only
+/// resolves this *one* block's own `env=` (not the whole `deps=` chain —
+/// by the time a conflict was hit, everything upstream of it in the
+/// original request had already run) against `req.vars` plus whatever's
+/// already cached/session-known; a variable only ever produced by a
+/// `from=` source that hasn't run in *this* request fails with a clear
+/// message telling the caller to re-run the chain instead, rather than
+/// silently guessing.
+async fn force_start_service(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ForceStartServiceRequest>,
+) -> Result<Json<ServiceActionResponse>, ApiError> {
+    let raw_snapshot = state.raw.lock().unwrap().clone();
+    let canvas = resolved_canvas(&raw_snapshot, &state.canvas_path)?;
+    let path: Vec<&str> = req.path.iter().map(String::as_str).collect();
+    let chain = meshfox_core::resolve_run_chain(&canvas, &path, &req.block, false)?;
+    let target = chain
+        .last()
+        .cloned()
+        .ok_or_else(|| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "empty chain".to_string()))?;
+
+    let needed = meshfox_core::env_var_names_for_chain(&canvas, &chain);
+    let decls = meshfox_core::declared_vars(&canvas)
+        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    let relevant_decls: Vec<_> = decls.iter().filter(|d| needed.contains(&d.name)).cloned().collect();
+    validate_var_overrides(&relevant_decls, &req.vars)?;
+    let resolved_vars = {
+        let cache = state.vars_cache.lock().unwrap();
+        let resolved = meshfox_core::resolve_vars(&relevant_decls, &req.vars, &cache, &HashMap::new());
+        if !resolved.missing.is_empty() {
+            let names: Vec<&str> = resolved.missing.iter().map(|d| d.name.as_str()).collect();
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!(
+                    "can't force-start without re-running the chain — missing variable(s): {} \
+                     (only available once their own `from=` source has actually run in this request)",
+                    names.join(", ")
+                ),
+            ));
+        }
+        resolved.values
+    };
+
+    let located = locate_node(&state, &raw_snapshot, &target.node_id)?;
+    let node_text = Canvas::from_markdown(&located.raw)
+        .ok()
+        .and_then(|c| c.node(&located.local_id).map(|n| n.text.clone()))
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("node {:?} not found", target.node_id)))?;
+    let canvas_path_for_step = located.origin.clone().unwrap_or_else(|| state.canvas_path.clone());
+    let cwd = canvas_root_dir(&canvas_path_for_step).to_path_buf();
+    let block = meshfox_core::scan_runnable_blocks(&target.node_id, &node_text)
+        .into_iter()
+        .find(|b| b.name.as_deref() == Some(target.block_name.as_str()))
+        .ok_or_else(|| {
+            ApiError(
+                StatusCode::NOT_FOUND,
+                format!("no runnable block named {:?} in node {:?}", target.block_name, target.node_id),
+            )
+        })?;
+    if !block.service {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("block {:?} is not a `service` block", target.block_name),
+        ));
+    }
+
+    let block_env = meshfox_core::map_block_env(&block.env, &resolved_vars);
+    let mut resolved_block = block.clone();
+    if let Some(spec) = &block.interpreter {
+        resolved_block.interpreter = Some(meshfox_core::resolve_interpreter(spec, &resolved_vars));
+    }
+
+    let lock_path =
+        meshfox_core::service_lock_path(&canvas_path_for_step, &target.node_id, &target.block_name);
+    if let meshfox_core::ServiceLockState::Held { info, .. } = meshfox_core::service_lock::check(&lock_path)
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    {
+        if info.pid != 0 {
+            // SAFETY: same whole-process-group SIGKILL every other kill
+            // path here uses (see `services::kill_process_group`, private
+            // to that module) — inlined here because this pid comes from
+            // the lock file on disk, not a live `ServiceHandle` this
+            // process itself already holds.
+            let ret = unsafe { libc::kill(-(info.pid as libc::pid_t), libc::SIGKILL) };
+            if ret != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+                return Err(ApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    io::Error::last_os_error().to_string(),
+                ));
+            }
+        }
+        meshfox_core::service_lock::release(&lock_path)
+            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
+    let handle = services::spawn(
+        target.node_id.clone(),
+        target.block_name.clone(),
+        resolved_block,
+        block_env,
+        cwd,
+        canvas_path_for_step,
+        "webui",
+    )
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let pid = handle.pid;
+    state.services.lock().unwrap().insert((target.node_id, target.block_name), handle);
+    Ok(Json(ServiceActionResponse { pid }))
+}
+
 /// Cancels an in-flight run started by `run_block` — kills whichever step
 /// is currently executing (`SIGKILL`, via `stream_exec::SpawnedProcess::
 /// kill`, which reaches the whole process group a hung script spawned, not
@@ -3955,6 +4348,7 @@ async fn build_state(
         auto_exit,
         link_preview_cache: link_preview::PreviewCache::new(),
         session_runs: Mutex::new(HashMap::new()),
+        services: Mutex::new(HashMap::new()),
         watcher_socket,
     }))
 }
@@ -3986,6 +4380,11 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/run", post(run_block))
         .route("/api/run/tty", get(run_block_tty))
         .route("/api/kill", post(kill_run))
+        .route("/api/services", get(get_services))
+        .route("/api/services/log", get(get_service_log))
+        .route("/api/services/stop", post(stop_service))
+        .route("/api/services/restart", post(restart_service))
+        .route("/api/services/force-start", post(force_start_service))
         .route("/api/session/reset", post(reset_session))
         .route("/api/watch", get(watch_changes))
         .route("/api/include-asset", get(get_include_asset))
@@ -4017,6 +4416,7 @@ pub async fn run(
 ) -> std::io::Result<()> {
     let state = build_state(canvas_path.clone(), auto_exit, watcher_socket.clone()).await?;
     spawn_file_watcher(Arc::clone(&state));
+    spawn_shutdown_signal_handler(Arc::clone(&state));
     let app = build_app(state);
 
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).await?;
@@ -4039,6 +4439,46 @@ pub async fn run(
     }
 
     axum::serve(listener, app).await
+}
+
+/// Ties every `service` block this process owns to this process's own
+/// lifetime for real — not just the graceful "no tabs left" path
+/// (`TabGuard`, which deliberately stays *up* while a service runs), but an
+/// involuntary external termination too: `SIGTERM` (what a VS Code webview
+/// tab closing sends this worker, `editors/vscode/src/coordinator.ts`'s
+/// `killWorker`/`dispose` — deliberately *not* changed to check for
+/// running services first, see SPEC.md's "Service blocks (experimental)"),
+/// `SIGINT` (Ctrl-C), `SIGHUP` (the owning terminal closing). Each of these
+/// stops every registered service the same reliable way the panel's own
+/// Stop button does (`ServiceHandle::stop`'s whole-process-group kill) —
+/// deliberately *not* solved by putting a service in this process's own
+/// process group instead: that would break `stop`'s ability to
+/// selectively kill just one service's whole subtree without also
+/// reaching every sibling service (or this process itself). `SIGKILL`
+/// can't be handled here or anywhere — POSIX makes it uncatchable by
+/// design, so a hard `kill -9` (or the OOM killer) is the one termination
+/// path nothing can stop from orphaning a running service.
+fn spawn_shutdown_signal_handler(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        let Ok(mut sigterm) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        else {
+            return;
+        };
+        let Ok(mut sighup) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        else {
+            return;
+        };
+        tokio::select! {
+            _ = sigterm.recv() => {}
+            _ = sighup.recv() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+        let handles: Vec<_> = state.services.lock().unwrap().drain().map(|(_, h)| h).collect();
+        for handle in handles {
+            let _ = handle.stop();
+        }
+        std::process::exit(0);
+    });
 }
 
 /// Binds `canvas_path` to an OS-assigned local port and serves it in the
@@ -6962,5 +7402,295 @@ mod syntax_endpoint_tests {
         assert_eq!(status, 404);
 
         std::fs::remove_dir_all(&canvas_dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod service_endpoint_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    fn write_test_canvas(contents: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("meshfox-services-test-{}.canvas.md", uuid::Uuid::new_v4()));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    fn cleanup(canvas_path: &std::path::Path) {
+        let _ = std::fs::remove_file(canvas_path);
+        let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(canvas_path));
+        let dir = canvas_path.parent().map(|p| p.join(".meshfox").join("services"));
+        if let Some(dir) = dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    async fn get(addr: SocketAddr, path: &str) -> (u16, String) {
+        let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.expect("read");
+        let mut parts = response.splitn(2, "\r\n\r\n");
+        let head = parts.next().unwrap_or_default();
+        let body = parts.next().unwrap_or_default();
+        let status = head
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        (status, body.to_string())
+    }
+
+    async fn post_json(addr: SocketAddr, path: &str, body: &str) -> (u16, String) {
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.expect("read");
+        let mut parts = response.splitn(2, "\r\n\r\n");
+        let head = parts.next().unwrap_or_default();
+        let resp_body = parts.next().unwrap_or_default();
+        let status = head
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        (status, resp_body.to_string())
+    }
+
+    const SERVICE_CANVAS: &str = concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "```bash name=\"srv\" service\necho starting\nsleep 30\n```\n",
+    );
+
+    #[tokio::test]
+    async fn run_block_spawns_a_service_and_it_shows_up_as_running() {
+        let canvas_path = write_test_canvas(SERVICE_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, body) =
+            post_json(addr, "/api/run", r#"{"path":[],"block":"srv"}"#).await;
+        assert_eq!(status, 200, "unexpected body: {body}");
+        assert!(
+            body.contains("\"type\":\"service-started\""),
+            "expected a service-started event, got: {body}"
+        );
+        // The request itself returns fast (well under the block's own
+        // `sleep 30`) with a normal `done` — proof the chain didn't wait
+        // for the service to exit, just for it to spawn.
+        assert!(
+            body.contains("\"type\":\"done\""),
+            "chain should complete normally right after spawning the service: {body}"
+        );
+        assert!(
+            !body.contains("\"type\":\"step-end\""),
+            "a service step should never report an exit code — it never waits for one: {body}"
+        );
+
+        let (status, list_body) = get(addr, "/api/services").await;
+        assert_eq!(status, 200);
+        let services: Vec<serde_json::Value> = serde_json::from_str(&list_body).unwrap();
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0]["nodeId"], "root");
+        assert_eq!(services[0]["block"], "srv");
+        assert_eq!(services[0]["status"], "running");
+        assert!(services[0]["pid"].as_u64().unwrap() > 0);
+
+        let _ = post_json(
+            addr,
+            "/api/services/stop",
+            r#"{"nodeId":"root","block":"srv"}"#,
+        )
+        .await;
+        cleanup(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn running_a_chain_twice_does_not_spawn_a_second_instance() {
+        let canvas_path = write_test_canvas(SERVICE_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status1, _) = post_json(addr, "/api/run", r#"{"path":[],"block":"srv"}"#).await;
+        assert_eq!(status1, 200);
+        let (_, list1) = get(addr, "/api/services").await;
+        let pid1 = serde_json::from_str::<Vec<serde_json::Value>>(&list1).unwrap()[0]["pid"]
+            .as_u64()
+            .unwrap();
+
+        let (status2, _) = post_json(addr, "/api/run", r#"{"path":[],"block":"srv"}"#).await;
+        assert_eq!(status2, 200);
+        let (_, list2) = get(addr, "/api/services").await;
+        let services2: Vec<serde_json::Value> = serde_json::from_str(&list2).unwrap();
+        assert_eq!(services2.len(), 1, "must not spawn a duplicate instance");
+        assert_eq!(services2[0]["pid"].as_u64().unwrap(), pid1, "same pid, not restarted");
+
+        let _ = post_json(
+            addr,
+            "/api/services/stop",
+            r#"{"nodeId":"root","block":"srv"}"#,
+        )
+        .await;
+        cleanup(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn stop_marks_the_service_stopped_not_crashed() {
+        let canvas_path = write_test_canvas(SERVICE_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let _ = post_json(addr, "/api/run", r#"{"path":[],"block":"srv"}"#).await;
+
+        let (status, _) = post_json(
+            addr,
+            "/api/services/stop",
+            r#"{"nodeId":"root","block":"srv"}"#,
+        )
+        .await;
+        assert_eq!(status, 204);
+
+        // Poll briefly for the background drain task to record the exit.
+        let mut services: Vec<serde_json::Value> = Vec::new();
+        for _ in 0..50 {
+            let (_, list) = get(addr, "/api/services").await;
+            services = serde_json::from_str(&list).unwrap();
+            if services[0]["status"] != "running" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(services[0]["status"], "stopped");
+
+        cleanup(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn restart_gives_the_service_a_new_pid() {
+        let canvas_path = write_test_canvas(SERVICE_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let _ = post_json(addr, "/api/run", r#"{"path":[],"block":"srv"}"#).await;
+        let (_, list) = get(addr, "/api/services").await;
+        let old_pid = serde_json::from_str::<Vec<serde_json::Value>>(&list).unwrap()[0]["pid"]
+            .as_u64()
+            .unwrap();
+
+        let (status, body) = post_json(
+            addr,
+            "/api/services/restart",
+            r#"{"nodeId":"root","block":"srv"}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "unexpected body: {body}");
+        let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_ne!(resp["pid"].as_u64().unwrap(), old_pid);
+
+        let (_, list) = get(addr, "/api/services").await;
+        let services: Vec<serde_json::Value> = serde_json::from_str(&list).unwrap();
+        assert_eq!(services[0]["status"], "running");
+
+        let _ = post_json(
+            addr,
+            "/api/services/stop",
+            r#"{"nodeId":"root","block":"srv"}"#,
+        )
+        .await;
+        cleanup(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn service_log_reports_captured_output_lines() {
+        let canvas_path = write_test_canvas(SERVICE_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let _ = post_json(addr, "/api/run", r#"{"path":[],"block":"srv"}"#).await;
+
+        let mut lines: Vec<serde_json::Value> = Vec::new();
+        for _ in 0..50 {
+            let (_, body) = get(addr, "/api/services/log?nodeId=root&block=srv").await;
+            lines = serde_json::from_str(&body).unwrap();
+            if !lines.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(lines[0]["text"], "starting");
+        assert_eq!(lines[0]["stream"], "stdout");
+
+        let _ = post_json(
+            addr,
+            "/api/services/stop",
+            r#"{"nodeId":"root","block":"srv"}"#,
+        )
+        .await;
+        cleanup(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn a_pre_existing_lock_from_another_process_is_reported_as_a_conflict() {
+        let canvas_path = write_test_canvas(SERVICE_CANVAS);
+        // Simulate another process already owning this service — some
+        // large, never-really-assigned pid stands in for "definitely not
+        // us and definitely not alive", same trick `service_lock`'s own
+        // tests use.
+        let lock_path = meshfox_core::service_lock_path(&canvas_path, "root", "srv");
+        meshfox_core::service_lock::acquire(&lock_path, 999_999, "tui").unwrap();
+
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let (status, body) = post_json(addr, "/api/run", r#"{"path":[],"block":"srv"}"#).await;
+        assert_eq!(status, 200, "unexpected body: {body}");
+        assert!(
+            body.contains("\"type\":\"service-lock-conflict\""),
+            "expected a service-lock-conflict event, got: {body}"
+        );
+        assert!(
+            body.contains("\"ownerPid\":999999"),
+            "expected the conflicting owner's pid reported, got: {body}"
+        );
+        assert!(
+            !body.contains("\"type\":\"done\""),
+            "a lock conflict is terminal for the run, no Done should follow: {body}"
+        );
+
+        let (status, list_body) = get(addr, "/api/services").await;
+        assert_eq!(status, 200);
+        assert_eq!(list_body, "[]", "nothing should have actually been spawned");
+
+        cleanup(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn force_start_kills_the_stale_owner_and_starts_the_service() {
+        let canvas_path = write_test_canvas(SERVICE_CANVAS);
+        let lock_path = meshfox_core::service_lock_path(&canvas_path, "root", "srv");
+        meshfox_core::service_lock::acquire(&lock_path, 999_999, "tui").unwrap();
+
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let (status, body) = post_json(
+            addr,
+            "/api/services/force-start",
+            r#"{"path":[],"block":"srv","vars":{}}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "unexpected body: {body}");
+        let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(resp["pid"].as_u64().unwrap() > 0);
+
+        let (_, list_body) = get(addr, "/api/services").await;
+        let services: Vec<serde_json::Value> = serde_json::from_str(&list_body).unwrap();
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0]["status"], "running");
+
+        let _ = post_json(
+            addr,
+            "/api/services/stop",
+            r#"{"nodeId":"root","block":"srv"}"#,
+        )
+        .await;
+        cleanup(&canvas_path);
     }
 }

@@ -39,6 +39,16 @@ pub const SIMPLE_RUNNABLE: &str = concat!(
     "```bash name=\"leaf\" cache\necho tui-e2e-marker-output\n```\n",
 );
 
+/// Root's own sole block is a `service` — **experimental**, see SPEC.md's
+/// "Service blocks (experimental)". `echo` first so the process is
+/// confirmed up (its own line reaches stdout) before the long `sleep`,
+/// same shape `crates/cli/tests/service_run_cmd.rs` already uses. Used by
+/// `services.rs`.
+pub const SERVICE_RUNNABLE: &str = concat!(
+    "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+    "```bash name=\"srv\" service\necho tui-e2e-service-marker\nsleep 30\n```\n",
+);
+
 /// A `button` fence (see SPEC.md's "Button fences") over one block — the
 /// one real "run"-looking clickable affordance the document pane renders
 /// today (`▶ Go (r to run)`, `markdown.rs`'s `BUTTON_LANG` branch);
