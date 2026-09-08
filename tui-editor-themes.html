@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TUI Editor Themes</title>
+<style>
+:root {
+  --bg: #f7f6f3;
+  --panel: #ffffff;
+  --text: #1c1c1c;
+  --muted: #6b6b6b;
+  --border: #e2ded6;
+  --accent: #b5651d;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #17161a;
+    --panel: #201f24;
+    --text: #eee9e2;
+    --muted: #a39d92;
+    --border: #37343a;
+    --accent: #e0975a;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #17161a;
+  --panel: #201f24;
+  --text: #eee9e2;
+  --muted: #a39d92;
+  --border: #37343a;
+  --accent: #e0975a;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  padding: 32px 20px 60px;
+  max-width: 1180px;
+  margin: 0 auto;
+}
+header { margin-bottom: 28px; }
+h1 { font-size: 1.5rem; margin: 0 0 8px; }
+header p { color: var(--muted); font-size: 0.92rem; line-height: 1.55; max-width: 760px; margin: 0 0 6px; }
+header code {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-size: 0.85em;
+}
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+  gap: 20px;
+}
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.card-head h2 {
+  font-size: 0.95rem;
+  margin: 0;
+  font-weight: 600;
+}
+.badge {
+  font-size: 0.68rem;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  padding: 1px 8px;
+  white-space: nowrap;
+}
+.term {
+  font-family: "SF Mono", "Menlo", "Consolas", monospace;
+  font-size: 12.5px;
+  line-height: 1.5;
+  padding: 12px 14px;
+  overflow-x: auto;
+  white-space: pre;
+}
+.term .line { min-height: 1.5em; }
+.card-foot {
+  padding: 8px 14px;
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+}
+.card-foot code {
+  font-family: "SF Mono", "Menlo", "Consolas", monospace;
+  font-size: 11.5px;
+  color: var(--muted);
+  white-space: pre;
+  line-height: 1.4;
+}
+footer {
+  margin-top: 30px;
+  color: var(--muted);
+  font-size: 0.85rem;
+  line-height: 1.6;
+}
+footer code {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 6px;
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>TUI editor themes — real rendered colors</h1>
+  <p>Every one of <code>syntect</code>'s bundled themes, run through meshfox's actual highlighting code (grammar + <code>with_meshfox_scope_colors</code>) against a sample mirroring your own canvas — meshfox marker comments, a heading, the <code>service</code>-flagged fence, a table. Colors and backgrounds below are the exact hex values that code produces, not approximations.</p>
+  <p>Pick one and set it in <code>.meshfox/config.toml</code> (local, next to the canvas) or <code>~/.meshfox/config.toml</code> (global) — each card's footer shows the exact snippet.</p>
+</header>
+
+<div class="grid">
+
+    <section class="card">
+      <div class="card-head">
+        <h2>InspiredGitHub</h2>
+        
+      </div>
+      <div class="term" style="background:#ffffff">
+<div class="line"><span style="color:#a71d5d">&lt;!--</span><span style="color:#969896"> </span><span style="color:#ea580c">meshfox:canvas</span><span style="color:#969896"> </span><span style="color:#a71d5d">--&gt;</span></div>
+<div class="line"><span style="color:#a71d5d">#</span><span style="color:#201a14"> </span><span style="color:#201a14">kotoprovod.gitazone.org</span></div>
+<div class="line"><span style="color:#a71d5d">&lt;!--</span><span style="color:#969896"> </span><span style="color:#ea580c">meshfox:node</span><span style="color:#969896"> </span><span style="color:#96660a">id</span><span style="color:#1b7a43">=&quot;root&quot;</span><span style="color:#969896"> </span><span style="color:#a71d5d">--&gt;</span></div>
+<div class="line">&nbsp;</div>
+<div class="line"><span style="color:#a71d5d">##</span><span style="color:#201a14"> </span><span style="color:#201a14">Локальная разработка</span></div>
+<div class="line">&nbsp;</div>
+<div class="line"><span style="color:#a71d5d">```</span><span style="color:#0086b3">bash</span><span style="color:#201a14"> name=&quot;run&quot; deps=&quot;npm-install&quot; service</span></div>
+<div class="line"><span style="color:#201a14">npm run start</span></div>
+<div class="line"><span style="color:#a71d5d">```</span></div>
+<div class="line">&nbsp;</div>
+<div class="line"><span style="color:#201a14">|</span><span style="color:#201a14"> Поле </span><span style="color:#201a14">|</span><span style="color:#201a14"> Назначение </span><span style="color:#201a14">|</span></div>
+<div class="line"><span style="color:#201a14">|</span><span style="color:#201a14">---</span><span style="color:#201a14">|</span><span style="color:#201a14">---</span><span style="color:#201a14">|</span></div>
+<div class="line"><span style="color:#201a14">|</span><span style="color:#201a14"> status </span><span style="color:#201a14">|</span><span style="color:#201a14"> catalog-new  # см. значения ниже</span></div>
+      </div>
+      <div class="card-foot">
+        <code>[tui]<br>editor_theme = "InspiredGitHub"</code>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>Solarized (dark)</h2>
+        
+      </div>
+      <div class="term" style="background:#002b36">
+<div class="line"><span style="color:#586e75">&lt;!--</span><span style="color:#586e75"> </span><span style="color:#ff6e15">meshfox:canvas</span><span style="color:#586e75"> </span><span style="color:#586e75">--&gt;</span></div>
+<div class="line"><span style="color:#b58900">#</span><span style="color:#b58900"> </span><span style="color:#cb4b16">kotoprovod.gitazone.org</span></div>
+<div class="line"><span style="color:#586e75">&lt;!--</span><span style="color:#586e75"> </span><span style="color:#ff6e15">meshfox:node</span><span style="color:#586e75"> </span><span style="color:#d8b656">id</span><span style="color:#6fcf97">=&quot;root&quot;</span><span style="color:#586e75"> </span><span style="color:#586e75">--&gt;</span></div>
+<div class="line">&nbsp;</div>
+<div class="line"><span style="color:#b58900">##</span><span style="color:#b58900"> </span><span style="color:#cb4b16">Локальная разработка</span></div>
+<div class="line">&nbsp;</div>
+<div class="line"><span style="color:#f8f8f2">```</span><span style="color:#cb4b16">bash</span><span style="color:#f8f8f2"> name=&quot;run&quot; deps=&quot;npm-install&quot; service</span></div>
+<div class="line"><span style="color:#f8f8f2">npm run start</span></div>
+<div class="line"><span style="color:#f8f8f2">```</span></div>
+<div class="line">&nbsp;</div>
+<div class="line"><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2"> Поле </span><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2"> Назначение </span><span style="color:#f8f8f2">|</span></div>
+<div class="line"><span style="color:#f8f8f2">|</span><span style="color:#657b83">---</span><span style="color:#f8f8f2">|</span><span style="color:#657b83">---</span><span style="color:#f8f8f2">|</span></div>
+<div class="line"><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2"> status </span><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2"> catalog-new  # см. значения ниже</span></div>
+      </div>
+      <div class="card-foot">
+        <code>[tui]<br>editor_theme = "Solarized (dark)"</code>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>Solarized (light)</h2>
+        
+      </div>
+      <div class="term" style="background:#fdf6e3">
+<div class="line"><span style="color:#93a1a1">&lt;!--</span><span style="color:#93a1a1"> </span><span style="color:#ea580c">meshfox:canvas</span><span style="color:#93a1a1"> </span><span style="color:#93a1a1">--&gt;</span></div>
+<div class="line"><span style="color:#b58900">#</span><span style="color:#b58900"> </span><span style="color:#cb4b16">kotoprovod.gitazone.org</span></div>
+<div class="line"><span style="color:#93a1a1">&lt;!--</span><span style="color:#93a1a1"> </span><span style="color:#ea580c">meshfox:node</span><span style="color:#93a1a1"> </span><span style="color:#96660a">id</span><span style="color:#1b7a43">=&quot;root&quot;</span><span style="color:#93a1a1"> </span><span style="color:#93a1a1">--&gt;</span></div>
+<div class="line">&nbsp;</div>
+<div class="line"><span style="color:#b58900">##</span><span style="color:#b58900"> </span><span style="color:#cb4b16">Локальная разработка</span></div>
+<div class="line">&nbsp;</div>
+<div class="line"><span style="color:#201a14">```</span><span style="color:#cb4b16">bash</span><span style="color:#201a14"> name=&quot;run&quot; deps=&quot;npm-install&quot; service</span></div>
+<div class="line"><span style="color:#201a14">npm run start</span></div>
+<div class="line"><span style="color:#201a14">```</span></div>
+<div class="line">&nbsp;</div>
+<div class="line"><span style="color:#201a14">|</span><span style="color:#201a14"> Поле </span><span style="color:#201a14">|</span><span style="color:#201a14"> Назначение </span><span style="color:#201a14">|</span></div>
+<div class="line"><span style="color:#201a14">|</span><span style="color:#657b83">---</span><span style="color:#201a14">|</span><span style="color:#657b83">---</span><span style="color:#201a14">|</span></div>
+<div class="line"><span style="color:#201a14">|</span><span style="color:#201a14"> status </span><span style="color:#201a14">|</span><span style="color:#201a14"> catalog-new  # см. значения ниже</span></div>
+      </div>
+      <div class="card-foot">
+        <code>[tui]<br>editor_theme = "Solarized (light)"</code>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>base16-eighties.dark</h2>
+        
+      </div>
+      <div class="term" style="background:#2d2d2d">
+<div class="line"><span style="color:#747369">&lt;!--</span><span style="color:#747369"> </span><span style="color:#ff6e15">meshfox:canvas</span><span style="color:#747369"> </span><span style="color:#747369">--&gt;</span></div>
+<div class="line"><span style="color:#6699cc">#</span><span style="color:#f8f8f2"> </span><span style="color:#6699cc">kotoprovod.gitazone.org</span></div>
+<div class="line"><span style="color:#747369">&lt;!--</span><span style="color:#747369"> </span><span style="color:#ff6e15">meshfox:node</span><span style="color:#747369"> </span><span style="color:#d8b656">id</span><span style="color:#6fcf97">=&quot;root&quot;</span><span style="color:#747369"> </span><span style="color:#747369">--&gt;</span></div>
+<div class="line">&nbsp;</div>
+<div class="line"><span style="color:#6699cc">##</span><span style="color:#f8f8f2"> </span><span style="color:#6699cc">Локальная разработка</span></div>
+<div class="line">&nbsp;</div>
+<div class="line"><span style="color:#f8f8f2">```</span><span style="color:#f99157">bash</span><span style="color:#f8f8f2"> name=&quot;run&quot; deps=&quot;npm-install&quot; service</span></div>
+<div class="line"><span style="color:#f8f8f2">npm run start</span></div>
+<div class="line"><span style="color:#f8f8f2">```</span></div>
+<div class="line">&nbsp;</div>
+<div class="line"><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2"> Поле </span><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2"> Назначение </span><span style="color:#f8f8f2">|</span></div>
+<div class="line"><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2">---</span><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2">---</span><span style="color:#f8f8f2">|</span></div>
+<div class="line"><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2"> status </span><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2"> catalog-new  # см. значения ниже</span></div>
+      </div>
+      <div class="card-foot">
+        <code>[tui]<br>editor_theme = "base16-eighties.dark"</code>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>base16-mocha.dark</h2>
+        
+      </div>
+      <div class="term" style="background:#3b3228">
+<div class="line"><span style="color:#7e705a">&lt;!--</span><span style="color:#7e705a"> </span><span style="color:#ff6e15">meshfox:canvas</span><span style="color:#7e705a"> </span><span style="color:#7e705a">--&gt;</span></div>
+<div class="line"><span style="color:#8ab3b5">#</span><span style="color:#f8f8f2"> </span><span style="color:#8ab3b5">kotoprovod.gitazone.org</span></div>
+<div class="line"><span style="color:#7e705a">&lt;!--</span><span style="color:#7e705a"> </span><span style="color:#ff6e15">meshfox:node</span><span style="color:#7e705a"> </span><span style="color:#d8b656">id</span><span style="color:#6fcf97">=&quot;root&quot;</span><span style="color:#7e705a"> </span><span style="color:#7e705a">--&gt;</span></div>
+<div class="line">&nbsp;</div>
+<div class="line"><span style="color:#8ab3b5">##</span><span style="color:#f8f8f2"> </span><span style="color:#8ab3b5">Локальная разработка</span></div>
+<div class="line">&nbsp;</div>
+<div class="line"><span style="color:#f8f8f2">```</span><span style="color:#d28b71">bash</span><span style="color:#f8f8f2"> name=&quot;run&quot; deps=&quot;npm-install&quot; service</span></div>
+<div class="line"><span style="color:#f8f8f2">npm run start</span></div>
+<div class="line"><span style="color:#f8f8f2">```</span></div>
+<div class="line">&nbsp;</div>
+<div class="line"><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2"> Поле </span><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2"> Назначение </span><span style="color:#f8f8f2">|</span></div>
+<div class="line"><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2">---</span><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2">---</span><span style="color:#f8f8f2">|</span></div>
+<div class="line"><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2"> status </span><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2"> catalog-new  # см. значения ниже</span></div>
+      </div>
+      <div class="card-foot">
+        <code>[tui]<br>editor_theme = "base16-mocha.dark"</code>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>base16-ocean.dark</h2>
+        <span class="badge">current default</span>
+      </div>
+      <div class="term" style="background:#2b303b">
+<div class="line"><span style="color:#65737e">&lt;!--</span><span style="color:#65737e"> </span><span style="color:#ff6e15">meshfox:canvas</span><span style="color:#65737e"> </span><span style="color:#65737e">--&gt;</span></div>
+<div class="line"><span style="color:#8fa1b3">#</span><span style="color:#f8f8f2"> </span><span style="color:#8fa1b3">kotoprovod.gitazone.org</span></div>
+<div class="line"><span style="color:#65737e">&lt;!--</span><span style="color:#65737e"> </span><span style="color:#ff6e15">meshfox:node</span><span style="color:#65737e"> </span><span style="color:#d8b656">id</span><span style="color:#6fcf97">=&quot;root&quot;</span><span style="color:#65737e"> </span><span style="color:#65737e">--&gt;</span></div>
+<div class="line">&nbsp;</div>
+<div class="line"><span style="color:#8fa1b3">##</span><span style="color:#f8f8f2"> </span><span style="color:#8fa1b3">Локальная разработка</span></div>
+<div class="line">&nbsp;</div>
+<div class="line"><span style="color:#f8f8f2">```</span><span style="color:#d08770">bash</span><span style="color:#f8f8f2"> name=&quot;run&quot; deps=&quot;npm-install&quot; service</span></div>
+<div class="line"><span style="color:#f8f8f2">npm run start</span></div>
+<div class="line"><span style="color:#f8f8f2">```</span></div>
+<div class="line">&nbsp;</div>
+<div class="line"><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2"> Поле </span><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2"> Назначение </span><span style="color:#f8f8f2">|</span></div>
+<div class="line"><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2">---</span><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2">---</span><span style="color:#f8f8f2">|</span></div>
+<div class="line"><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2"> status </span><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2"> catalog-new  # см. значения ниже</span></div>
+      </div>
+      <div class="card-foot">
+        <code>[tui]<br>editor_theme = "base16-ocean.dark"</code>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>base16-ocean.light</h2>
+        
+      </div>
+      <div class="term" style="background:#eff1f5">
+<div class="line"><span style="color:#a7adba">&lt;!--</span><span style="color:#a7adba"> </span><span style="color:#ea580c">meshfox:canvas</span><span style="color:#a7adba"> </span><span style="color:#a7adba">--&gt;</span></div>
+<div class="line"><span style="color:#8fa1b3">#</span><span style="color:#201a14"> </span><span style="color:#8fa1b3">kotoprovod.gitazone.org</span></div>
+<div class="line"><span style="color:#a7adba">&lt;!--</span><span style="color:#a7adba"> </span><span style="color:#ea580c">meshfox:node</span><span style="color:#a7adba"> </span><span style="color:#96660a">id</span><span style="color:#1b7a43">=&quot;root&quot;</span><span style="color:#a7adba"> </span><span style="color:#a7adba">--&gt;</span></div>
+<div class="line">&nbsp;</div>
+<div class="line"><span style="color:#8fa1b3">##</span><span style="color:#201a14"> </span><span style="color:#8fa1b3">Локальная разработка</span></div>
+<div class="line">&nbsp;</div>
+<div class="line"><span style="color:#201a14">```</span><span style="color:#d08770">bash</span><span style="color:#201a14"> name=&quot;run&quot; deps=&quot;npm-install&quot; service</span></div>
+<div class="line"><span style="color:#201a14">npm run start</span></div>
+<div class="line"><span style="color:#201a14">```</span></div>
+<div class="line">&nbsp;</div>
+<div class="line"><span style="color:#201a14">|</span><span style="color:#201a14"> Поле </span><span style="color:#201a14">|</span><span style="color:#201a14"> Назначение </span><span style="color:#201a14">|</span></div>
+<div class="line"><span style="color:#201a14">|</span><span style="color:#201a14">---</span><span style="color:#201a14">|</span><span style="color:#201a14">---</span><span style="color:#201a14">|</span></div>
+<div class="line"><span style="color:#201a14">|</span><span style="color:#201a14"> status </span><span style="color:#201a14">|</span><span style="color:#201a14"> catalog-new  # см. значения ниже</span></div>
+      </div>
+      <div class="card-foot">
+        <code>[tui]<br>editor_theme = "base16-ocean.light"</code>
+      </div>
+    </section>
+</div>
+
+<footer>
+  Plain prose and meshfox's own marker/attribute colors (orange keyword, yellow attribute name, green attribute value) are pinned the same across every theme by <code>with_meshfox_scope_colors</code> — what actually differs between themes here is the background, comment dimness, and heading/code-fence-language accent color.
+</footer>
+</body>
+</html>

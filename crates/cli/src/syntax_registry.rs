@@ -158,25 +158,68 @@ pub fn build_syntax_set(canvas_root: &Path) -> SyntaxSet {
 }
 
 /// Same hex values as the web side's own `--accent`/`--syntax-attr`/
-/// `--syntax-value` *dark*-mode CSS custom properties (`web/src/
-/// meshfoxGrammar.ts`'s `MESHFOX_DARK_HEX`) — the TUI has no light/dark
-/// toggle of its own (just whichever single `syntect` theme
-/// `ui::SOURCE_EDITOR_THEME` resolves to), and every bundled `syntect`
-/// theme this could plausibly resolve to (`dracula`, `base16-ocean.dark`,
-/// ...) is a dark-background one, so the dark palette is the only one that
-/// makes sense as a single default. Returns a modified copy — `theme` is
-/// typically a bundled `syntect` theme with no rules at all for meshfox's
-/// own scope names (`keyword.other.meshfox`/etc, from
-/// `crates/cli/src/grammars/meshfox.tmLanguage.json`), so without this a
-/// meshfox marker just renders in whatever plain-text color the theme
+/// `--syntax-value` CSS custom properties (`web/src/meshfoxGrammar.ts`'s
+/// `MESHFOX_DARK_HEX`/`MESHFOX_LIGHT_HEX`) — picked by `theme`'s own
+/// background luminance rather than a single hardcoded set. This used to
+/// *only* have the dark-mode set, pinned unconditionally, on the reasoning
+/// that "the TUI has no light/dark toggle of its own, and every bundled
+/// theme is dark" — true when `ui::SOURCE_EDITOR_THEME` was the only theme
+/// ever in play, but no longer once `[tui] editor_theme` in
+/// `.meshfox/config.toml` (`resolve_editor_theme`) let a user pick any
+/// bundled theme, including the three light-background ones
+/// (`InspiredGitHub`, `Solarized (light)`, `base16-ocean.light`) — the
+/// dark-mode off-white/orange/yellow/green pins are all light colors,
+/// nearly invisible against a white/cream background (confirmed directly:
+/// the theme-preview artifact built to let a user compare themes showed
+/// exactly this — plain text unreadable on every light theme). Returns a
+/// modified copy — `theme` is typically a bundled `syntect` theme with no
+/// rules at all for meshfox's own scope names (`keyword.other.meshfox`/etc,
+/// from `crates/cli/src/grammars/meshfox.tmLanguage.json`), so without this
+/// a meshfox marker just renders in whatever plain-text color the theme
 /// happens to default unmatched scopes to — confirmed directly (a
 /// throwaway scratch test comparing `HighlightLines` output before/after
 /// this call, on a real `<!-- meshfox:node ... -->` line).
 pub fn with_meshfox_scope_colors(mut theme: syntect::highlighting::Theme) -> syntect::highlighting::Theme {
     use syntect::highlighting::{Color, FontStyle, StyleModifier, ThemeItem};
-    let accent = Color { r: 0xff, g: 0x6e, b: 0x15, a: 0xff };
-    let attr = Color { r: 0xd8, g: 0xb6, b: 0x56, a: 0xff };
-    let value = Color { r: 0x6f, g: 0xcf, b: 0x97, a: 0xff };
+
+    // Standard relative-luminance-ish weighting (ITU-R BT.601), same
+    // formula a terminal/editor typically uses to decide "is this
+    // background light or dark" — good enough for a binary pick between
+    // two pre-built palettes below, not aiming for WCAG-precise contrast.
+    // No `background` at all (not something any bundled theme actually
+    // hits, but `Option` either way) defaults to the dark-mode palette,
+    // matching this function's own pre-light-theme behavior.
+    let is_light_bg = theme
+        .settings
+        .background
+        .map(|bg| {
+            let luminance =
+                0.299 * bg.r as f32 + 0.587 * bg.g as f32 + 0.114 * bg.b as f32;
+            luminance > 128.0
+        })
+        .unwrap_or(false);
+
+    let (foreground, accent, attr, value) = if is_light_bg {
+        // `web/src/index.css`'s own light-mode `--fg`/`--accent`/
+        // `--syntax-attr`/`--syntax-value`.
+        (
+            Color { r: 0x20, g: 0x1a, b: 0x14, a: 0xff },
+            Color { r: 0xea, g: 0x58, b: 0x0c, a: 0xff },
+            Color { r: 0x96, g: 0x66, b: 0x0a, a: 0xff },
+            Color { r: 0x1b, g: 0x7a, b: 0x43, a: 0xff },
+        )
+    } else {
+        // `web/src/index.css`'s own dark-mode set — this file's original
+        // pins, unchanged for every dark bundled theme (`ui::
+        // SOURCE_EDITOR_THEME`'s default included).
+        (
+            Color { r: 0xf8, g: 0xf8, b: 0xf2, a: 0xff },
+            Color { r: 0xff, g: 0x6e, b: 0x15, a: 0xff },
+            Color { r: 0xd8, g: 0xb6, b: 0x56, a: 0xff },
+            Color { r: 0x6f, g: 0xcf, b: 0x97, a: 0xff },
+        )
+    };
+
     // `edtui`'s own `SyntaxHighlighter` colors *every* span from `syntect`'s
     // per-line highlight, including plain text with no matching scope at
     // all (`edtui::view::syntax_higlighting::highlight_line` — see its
@@ -189,10 +232,11 @@ pub fn with_meshfox_scope_colors(mut theme: syntect::highlighting::Theme) -> syn
     // this file's own vivid accent/attr/value colors just below —
     // confirmed directly (plain prose, generic YAML, attribute values all
     // rendered noticeably dimmer than real syntax tokens in the same
-    // buffer) — so this pins a clearly legible off-white explicitly,
-    // regardless of which bundled theme (`ui::SOURCE_EDITOR_THEME`) is
-    // actually in use.
-    theme.settings.foreground = Some(Color { r: 0xf8, g: 0xf8, b: 0xf2, a: 0xff });
+    // buffer) — so this pins a clearly legible foreground explicitly,
+    // regardless of which bundled theme (`ui::SOURCE_EDITOR_THEME`, or a
+    // config override) is actually in use — just now one of two pins
+    // (light/dark) rather than always the dark one.
+    theme.settings.foreground = Some(foreground);
     theme.scopes.push(ThemeItem {
         scope: "keyword.other.meshfox".parse().unwrap(),
         style: StyleModifier { foreground: Some(accent), background: None, font_style: Some(FontStyle::BOLD) },
@@ -206,6 +250,36 @@ pub fn with_meshfox_scope_colors(mut theme: syntect::highlighting::Theme) -> syn
         style: StyleModifier { foreground: Some(value), background: None, font_style: None },
     });
     theme
+}
+
+/// Picks which bundled `syntect` theme the TUI's syntax highlighting (both
+/// `tui::markdown::Highlighter`'s read-only preview and `tui::ui`'s
+/// full-screen source editor — see this module's own top-of-file doc
+/// comment) actually uses: `[tui] editor_theme = "..."` in
+/// `.meshfox/config.toml` (local, next to the canvas) or
+/// `~/.meshfox/config.toml` (global) — same `meshfox_core::config`
+/// local-wins loading every other config key already goes through (see
+/// `README.md`'s "Calling an AI agent from a block" section for the
+/// precedent, `interpreters.agent.provider`). A name that isn't actually
+/// one of `syntect::highlighting::ThemeSet::load_defaults()`'s own bundled
+/// themes (a typo, or a name from some other syntect setup entirely) is
+/// silently ignored rather than passed through — this used to be exactly
+/// how `crate::tui::ui::SOURCE_EDITOR_THEME` ended up pinned to `"dracula"`,
+/// a name that was never valid at all (see that constant's own doc
+/// comment), so an unchecked config value would just reintroduce the same
+/// bug via a different door. Unset, or invalid, falls back to
+/// `crate::tui::ui::SOURCE_EDITOR_THEME`.
+pub fn resolve_editor_theme(canvas_root: &Path) -> String {
+    let configured = meshfox_core::config::load(canvas_root)
+        .get("tui")
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("editor_theme"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    match configured {
+        Some(name) if syntect::highlighting::ThemeSet::load_defaults().themes.contains_key(&name) => name,
+        _ => crate::tui::ui::SOURCE_EDITOR_THEME.to_string(),
+    }
 }
 
 /// Adds every grammar in `dir` to `builder` — `.sublime-syntax` files via
@@ -621,6 +695,49 @@ mod meshfox_grammar_tests {
             assert_eq!(
                 style.foreground, pinned_foreground,
                 "plain text {text:?} should use the pinned legible foreground, not a dim bundled default"
+            );
+        }
+    }
+
+    /// Regression test for the bug the theme-preview artifact surfaced: this
+    /// function used to pin the same near-white foreground (`0xf8f8f2`)
+    /// regardless of the bundled theme's own background, which is invisible
+    /// against a light theme's white/cream background — only ever caught
+    /// once `[tui] editor_theme` (`resolve_editor_theme`) made light bundled
+    /// themes (`InspiredGitHub`, `Solarized (light)`, `base16-ocean.light`)
+    /// actually reachable, not just the single dark default. Proves a real
+    /// light-background bundled theme gets a dark foreground instead.
+    #[test]
+    fn plain_unscoped_text_on_a_light_bundled_theme_uses_a_dark_foreground_not_the_dark_mode_pin() {
+        let root = std::env::temp_dir().join("meshfox-grammar-test-never-created");
+        let ss = build_syntax_set(&root);
+        let syntax = ss
+            .find_syntax_by_name(MESHFOX_MARKDOWN_SYNTAX_NAME)
+            .expect("the bundled meshfox-markdown grammar should always be present");
+
+        let ts = syntect::highlighting::ThemeSet::load_defaults();
+        let base_theme = ts
+            .themes
+            .get("InspiredGitHub")
+            .expect("InspiredGitHub should be a real bundled syntect theme (a light one)")
+            .clone();
+        assert!(
+            matches!(base_theme.settings.background, Some(bg) if bg.r > 200 && bg.g > 200 && bg.b > 200),
+            "InspiredGitHub should actually have a light background — otherwise this test isn't exercising the light-theme branch at all"
+        );
+        let theme = with_meshfox_scope_colors(base_theme);
+
+        let mut hl = syntect::easy::HighlightLines::new(syntax, &theme);
+        let ranges = hl.highlight_line("just plain prose, no markup at all\n", &ss).unwrap();
+
+        let dark_mode_pin = syntect::highlighting::Color { r: 0xf8, g: 0xf8, b: 0xf2, a: 0xff };
+        for (style, text) in &ranges {
+            if text.trim().is_empty() {
+                continue;
+            }
+            assert_ne!(
+                style.foreground, dark_mode_pin,
+                "plain text {text:?} on a light theme should not use the near-white dark-mode pin — invisible on a light background"
             );
         }
     }

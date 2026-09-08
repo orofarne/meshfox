@@ -155,6 +155,13 @@ fn wrap_word_indices(word_widths: &[usize], first_width: usize, cont_width: usiz
 /// `with_meshfox_scope_colors` for the other half of this fix (forcing a
 /// legible base/default foreground regardless of which theme ends up
 /// loaded).
+///
+/// This is only the *default* now — `App::editor_theme`
+/// (`crate::syntax_registry::resolve_editor_theme`) picks a
+/// user-configured `[tui] editor_theme` override when one is set and
+/// actually valid, falling back to this constant otherwise; `render`
+/// threads `App::editor_theme` into `render_source_editor` rather than
+/// this constant being read directly there anymore.
 pub(crate) const SOURCE_EDITOR_THEME: &str = "base16-ocean.dark";
 /// Falls back to plain `"md"` (`find_syntax_by_token`, extension-based) only
 /// if `crate::syntax_registry::MESHFOX_MARKDOWN_SYNTAX_NAME` somehow isn't
@@ -272,7 +279,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // own module docs.
     if let Some(se) = &mut app.source_editor {
         let syntax_set = Arc::clone(app.highlighter.syntax_set());
-        render_source_editor(f, area, se, &syntax_set);
+        render_source_editor(f, area, se, &syntax_set, &app.editor_theme);
         return;
     }
 
@@ -1176,7 +1183,13 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
 /// the `edtui` buffer itself, and a footer (error, or the keybinding
 /// hint) — plus the file-switcher (`Ctrl-f`) as a `render_block_picker`-
 /// style overlay on top when open.
-fn render_source_editor(f: &mut Frame, area: Rect, se: &mut SourceEditorState, syntax_set: &Arc<SyntaxSet>) {
+fn render_source_editor(
+    f: &mut Frame,
+    area: Rect,
+    se: &mut SourceEditorState,
+    syntax_set: &Arc<SyntaxSet>,
+    theme_name: &str,
+) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1213,7 +1226,7 @@ fn render_source_editor(f: &mut Frame, area: Rect, se: &mut SourceEditorState, s
         .cloned()
         .map(|syntax_ref| {
             let theme_set = syntect::highlighting::ThemeSet::load_defaults();
-            let theme = theme_set.themes.get(SOURCE_EDITOR_THEME).cloned();
+            let theme = theme_set.themes.get(theme_name).cloned();
             let theme = theme.or_else(|| theme_set.themes.values().next().cloned());
             let theme = theme.expect("syntect ships at least one theme");
             // Bundled `syntect` themes have no rules at all for meshfox's

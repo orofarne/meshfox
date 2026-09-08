@@ -94,7 +94,7 @@ impl Highlighter {
     /// outside tests, so this is `cfg(test)` rather than plain `pub`.
     #[cfg(test)]
     pub fn new() -> Self {
-        Self::with_syntax_set(SyntaxSet::load_defaults_newlines())
+        Self::with_syntax_set(SyntaxSet::load_defaults_newlines(), crate::tui::ui::SOURCE_EDITOR_THEME)
     }
 
     /// Same as `new`, but the `SyntaxSet` also includes whatever custom
@@ -102,15 +102,19 @@ impl Highlighter {
     /// `canvas_root` (locally, `.meshfox/syntax/`) or `~/.meshfox/syntax/`
     /// (globally) — the constructor the real app uses; `new` stays
     /// defaults-only for tests that don't care about local grammars.
-    pub fn with_extra_syntaxes(canvas_root: &Path) -> Self {
-        Self::with_syntax_set(crate::syntax_registry::build_syntax_set(canvas_root))
+    /// `theme_name` is `crate::syntax_registry::resolve_editor_theme`'s own
+    /// result — same theme the full-screen source editor uses (`tui::ui`),
+    /// so this read-only preview pane and that editor read as one product,
+    /// not two independently-themed surfaces.
+    pub fn with_extra_syntaxes(canvas_root: &Path, theme_name: &str) -> Self {
+        Self::with_syntax_set(crate::syntax_registry::build_syntax_set(canvas_root), theme_name)
     }
 
-    fn with_syntax_set(syntax_set: SyntaxSet) -> Self {
+    fn with_syntax_set(syntax_set: SyntaxSet, theme_name: &str) -> Self {
         let theme_set = ThemeSet::load_defaults();
         let theme = theme_set
             .themes
-            .get("base16-ocean.dark")
+            .get(theme_name)
             .cloned()
             .unwrap_or_else(|| {
                 theme_set

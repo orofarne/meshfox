@@ -340,6 +340,14 @@ pub struct App {
     /// `on_resize_drag`, cleared on the matching `Up(Left)`.
     resize_drag: Option<ResizeDrag>,
     pub highlighter: Highlighter,
+    /// `crate::syntax_registry::resolve_editor_theme`'s result, resolved
+    /// once at startup from `[tui] editor_theme` in `.meshfox/config.toml`
+    /// (local or global) — the bundled `syntect` theme name `highlighter`
+    /// above and `ui::render_source_editor`'s own fullscreen editor both
+    /// use, so the two panes stay visually consistent. Falls back to
+    /// `ui::SOURCE_EDITOR_THEME` when unset or not an actually-bundled
+    /// theme name — see `resolve_editor_theme`'s own doc comment.
+    pub editor_theme: String,
     pub picker: Picker,
     pub run: Option<RunState>,
     pub file_run: Option<FileRunState>,
@@ -571,6 +579,7 @@ impl App {
         // Computed before `canvas_path` is moved into the struct literal
         // below (its `canvas_path,` shorthand field).
         let syntax_root = crate::canvas_root_dir(&canvas_path).to_path_buf();
+        let editor_theme = crate::syntax_registry::resolve_editor_theme(&syntax_root);
 
         let mut app = App {
             canvas_path,
@@ -598,7 +607,8 @@ impl App {
             tree_width_pct: ui::DEFAULT_TREE_WIDTH_PCT,
             output_height: ui::DEFAULT_OUTPUT_HEIGHT,
             resize_drag: None,
-            highlighter: Highlighter::with_extra_syntaxes(&syntax_root),
+            highlighter: Highlighter::with_extra_syntaxes(&syntax_root, &editor_theme),
+            editor_theme,
             picker,
             run: None,
             file_run: None,
