@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.2
+
+- Fixed: running a `tty` block inside the canvas webview failed with a
+  Content Security Policy error instead of connecting — the tty
+  WebSocket was built from `location.host`, which inside a real VS Code
+  webview is the webview's own `vscode-webview://` origin, not the
+  meshfox server; it now uses `document.baseURI`, which follows the
+  `<base href>` this extension injects to point at the real server. The
+  webview's own CSP also only allowed `http(s)` in `connect-src`, which
+  doesn't cover `ws` connections to the same host — it now allows both.
+
 ## 0.2.1
 
 - Fixed: pasting text into a node's body editor (or the whole-document

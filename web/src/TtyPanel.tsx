@@ -159,8 +159,17 @@ export function TtyPanel({ path, blockName, withDeps, persist, vars, saveSecrets
       cols: String(term.cols),
       rows: String(term.rows),
     });
-    const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const ws = new WebSocket(`${proto}//${location.host}/api/run/tty?${params}`);
+    // `location.*` reflects the webview's own navigation origin
+    // (`vscode-webview://<id>`) inside the VS Code host, not the real
+    // meshfox server — `document.baseURI` is what follows the `<base
+    // href>` that `editors/vscode/src/canvasHtml.ts` injects to point
+    // relative resource/fetch/XHR URLs at the server (see that file's own
+    // doc comment). In a plain browser tab there's no `<base>` tag, so
+    // `document.baseURI` is just the page's own URL — same behavior as
+    // before.
+    const base = new URL(document.baseURI);
+    const proto = base.protocol === "https:" ? "wss:" : "ws:";
+    const ws = new WebSocket(`${proto}//${base.host}/api/run/tty?${params}`);
     ws.binaryType = "arraybuffer";
     wsRef.current = ws;
 

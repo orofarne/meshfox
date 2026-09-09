@@ -101,11 +101,17 @@ code {
 
 export function canvasAppHtml(indexHtml: string, baseUrl: string, fragment: string | undefined): string {
   const origin = new URL(baseUrl).origin;
+  // CSP host-sources match by scheme, and `ws`/`wss` aren't treated as
+  // upgrades of `http`/`https` the way `https` is treated as an upgrade of
+  // `http` — an `http://…` source in `connect-src` does not cover a `ws://`
+  // request to that same host, so `TtyPanel.tsx`'s tty WebSocket needs its
+  // own explicit entry alongside the plain origin.
+  const wsOrigin = origin.replace(/^http/, "ws");
   const nonce = randomBytes(16).toString("base64");
   const csp =
     `default-src 'none'; script-src ${origin} 'wasm-unsafe-eval' 'nonce-${nonce}'; ` +
     `style-src ${origin} 'unsafe-inline'; img-src ${origin} data:; font-src ${origin} data:; ` +
-    `connect-src ${origin};`;
+    `connect-src ${origin} ${wsOrigin};`;
   // A classic (non-`type="module"`) inline script runs synchronously as
   // the parser reaches it, before any `type="module"` script later in the
   // document (those are deferred by default) — so this always sets the
