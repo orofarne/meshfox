@@ -1018,7 +1018,12 @@ a {
  * (still gated on the outer element's own `data-suggested`/`data-type`) —
  * this sharp-cornered triangle needs `.mesh-node-clip`'s own `overflow:
  * hidden` to actually clip to the shared rounded corner; on the outer,
- * now-unclipped `.mesh-node` it would poke past the curve instead. */
+ * now-unclipped `.mesh-node` it would poke past the curve instead.
+ * Uses `--node-accent` (set inline on `.mesh-node` alongside its custom
+ * `borderColor`/`boxShadow` when the node has an explicit color — see
+ * MeshNode.tsx) so a colored node's corner matches its own color instead
+ * of always being the theme's `--accent`, which it falls back to when no
+ * custom color is set. */
 .mesh-node[data-suggested="false"]:not([data-type="group"]) .mesh-node-clip::before {
   content: "";
   position: absolute;
@@ -1026,7 +1031,7 @@ a {
   left: 0;
   width: 0;
   height: 0;
-  border-top: 10px solid var(--accent);
+  border-top: 10px solid var(--node-accent, var(--accent));
   border-right: 10px solid transparent;
   opacity: 0.55;
   pointer-events: none;

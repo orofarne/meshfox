@@ -2452,6 +2452,25 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
     onBlur: commitTitleEdit,
   };
   const nodeColor = resolveNodeColor(data.effectiveColor ?? data.color);
+  // `data.fixedHeight` (see its own doc comment) is the last-saved height,
+  // refreshed only once a resize gesture ends, `handleSaveLayout` persists
+  // it, and the refetched canvas flows back down through props — a full
+  // network round trip. Applied unconditionally, that stale value fights
+  // React Flow's own live per-frame resize of this node's outer wrapper:
+  // dragging the bottom edge grew the wrapper live but this root `<div>`
+  // stayed pinned to the old height, so nothing visibly changed until the
+  // round trip landed; dragging the top edge additionally moves `y` live
+  // (unmasked, so the box visibly slid), while the height stayed frozen —
+  // together reading as "the node got dragged, not resized". `liveHeight`
+  // is this component's own running height during an active drag (kept
+  // straight from `NodeResizer`'s per-frame `onResize`), so the box tracks
+  // the cursor instead of the stale prop; cleared once `data.fixedHeight`
+  // itself changes to (presumably) the just-saved value, hand-off back to
+  // the prop is silent since by then they agree.
+  const [liveHeight, setLiveHeight] = useState<number | undefined>(undefined);
+  useEffect(() => {
+    setLiveHeight(undefined);
+  }, [data.fixedHeight]);
   // A heading-only node (no body Markdown at all) has nothing to show in
   // its body area — that's just dead space under a left-aligned title, so
   // it gets a distinct, centered-title layout instead, in edit mode too:
@@ -2616,15 +2635,31 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
       data-folded={data.folded}
       data-focused={data.focused ?? false}
       style={{
-        ...(nodeColor ? { borderColor: nodeColor, boxShadow: `inset 4px 0 0 ${nodeColor}` } : undefined),
+        ...(nodeColor
+          ? ({
+              borderColor: nodeColor,
+              boxShadow: `inset 4px 0 0 ${nodeColor}`,
+              "--node-accent": nodeColor,
+            } as React.CSSProperties)
+          : undefined),
         ...(data.maxHeight !== undefined ? { maxHeight: data.maxHeight } : undefined),
-        ...(data.fixedHeight !== undefined ? { height: data.fixedHeight } : undefined),
+        ...(liveHeight !== undefined
+          ? { height: liveHeight }
+          : data.fixedHeight !== undefined
+            ? { height: data.fixedHeight }
+            : undefined),
       }}
     >
       {data.nodeType !== "group" && (
         <NodeResizer
           minWidth={100}
           minHeight={100}
+          // Live per-frame height while a drag is in progress (see
+          // `liveHeight`'s own doc comment above) — width needs no such
+          // override since nothing here ever pins it the way `fixedHeight`
+          // pins height.
+          onResize={(_event, params) => setLiveHeight(params.height)}
+          onResizeEnd={(_event, params) => setLiveHeight(params.height)}
           // Colors the corner handles only — not the plain `color` prop,
           // which `ResizeControl`'s own implementation applies to *both*
           // variants (`{ [isHandleControl ? 'backgroundColor' : 'borderColor']: color }`,
