@@ -2941,16 +2941,18 @@ impl App {
         }
     }
 
-    /// `c` — walks every declared non-secret, non-session variable in the
-    /// whole document (regardless of which, if any, block currently
-    /// references it via `env=`), same scope `meshfox configure` covers,
-    /// all shown at once with each one's currently-resolved value as the
-    /// pre-filled suggestion. Confirming (even unchanged) writes it to the
-    /// cache — the browser counterpart is `VarsForm` opened from the
+    /// `c` — walks every declared non-secret, non-session, non-`from=`
+    /// variable in the whole document (regardless of which, if any, block
+    /// currently references it via `env=`), same scope `meshfox configure`
+    /// covers, all shown at once with each one's currently-resolved value
+    /// as the pre-filled suggestion. Confirming (even unchanged) writes it
+    /// to the cache — the browser counterpart is `VarsForm` opened from the
     /// toolbar's "configure" button; see `crates/server/src/lib.rs`'s
-    /// `/api/vars/configure`. A no-op (past a status message) when
-    /// there's nothing configurable, or while a run/another form/the
-    /// block picker is already active.
+    /// `/api/vars/configure`/`get_configure_vars`, whose filter this
+    /// mirrors: a `from`-declared variable is computed by running its own
+    /// block, never something to configure by hand. A no-op (past a status
+    /// message) when there's nothing configurable, or while a run/another
+    /// form/the block picker is already active.
     fn trigger_configure(&mut self) {
         if self.var_form.is_some() || self.block_picker.is_some() {
             return;
@@ -2962,12 +2964,12 @@ impl App {
         let decls: Vec<VarDecl> = self
             .decls
             .iter()
-            .filter(|d| !d.secret && !d.session)
+            .filter(|d| !d.secret && !d.session && d.from.is_none())
             .cloned()
             .collect();
         if decls.is_empty() {
             self.status =
-                "meshfox: this canvas declares no configurable (non-secret, non-session) variable(s)"
+                "meshfox: this canvas declares no configurable (non-secret, non-session, non-from=) variable(s)"
                     .into();
             return;
         }
@@ -2985,11 +2987,14 @@ impl App {
 
     /// Whether the footer/help hint for `c` (configure) should be shown at
     /// all — same "configurable" definition `trigger_configure` itself
-    /// uses (declared, non-secret, non-session; a document that declares
-    /// only secret/session variables has nothing `c` could usefully do,
-    /// same as the CLI's own `configure` skipping them).
+    /// uses (declared, non-secret, non-session, non-`from=`; a document
+    /// that declares only secret/session/computed variables has nothing
+    /// `c` could usefully do, same as the CLI's own `configure` skipping
+    /// them).
     pub fn has_configurable_vars(&self) -> bool {
-        self.decls.iter().any(|d| !d.secret && !d.session)
+        self.decls
+            .iter()
+            .any(|d| !d.secret && !d.session && d.from.is_none())
     }
 
     fn cancel_var_form(&mut self) {
@@ -3449,5 +3454,76 @@ mod tests {
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         )
+    }
+
+    /// A `from=`-declared variable is computed by running its own block,
+    /// never something a human edits directly — `trigger_configure`/
+    /// `has_configurable_vars` must exclude it, same as the web UI's
+    /// `get_configure_vars` (`crates/server/src/lib.rs`) already does.
+    #[tokio::test]
+    async fn configure_excludes_from_declared_variables() {
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-tui-configure-from-var-test-{}",
+            uuid_like()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.md");
+        std::fs::write(
+            &path,
+            concat!(
+                "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+                "<!-- meshfox:var name=\"COMPUTED\" from=\"root/produce\" -->\n",
+                "<!-- meshfox:var name=\"NORMAL\" prompt=\"A normal var\" default=\"x\" -->\n\n",
+                "```bash name=\"produce\"\necho hi\n```\n",
+            ),
+        )
+        .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(path, tx, None).unwrap();
+
+        assert!(app.has_configurable_vars());
+
+        app.trigger_configure();
+        let form = app.var_form.as_ref().expect("configure should open a form");
+        assert_eq!(
+            form.decls.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            vec!["NORMAL"],
+            "COMPUTED (from=) must not show up as a configurable field"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Same exclusion, but for a document where `from=` is the *only*
+    /// declared variable — `has_configurable_vars` must say there's
+    /// nothing to configure, and `c` must show its "nothing configurable"
+    /// status instead of opening an empty form.
+    #[tokio::test]
+    async fn configure_reports_nothing_to_configure_when_only_from_declared() {
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-tui-configure-only-from-var-test-{}",
+            uuid_like()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.md");
+        std::fs::write(
+            &path,
+            concat!(
+                "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+                "<!-- meshfox:var name=\"COMPUTED\" from=\"root/produce\" -->\n\n",
+                "```bash name=\"produce\"\necho hi\n```\n",
+            ),
+        )
+        .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(path, tx, None).unwrap();
+
+        assert!(!app.has_configurable_vars());
+
+        app.trigger_configure();
+        assert!(app.var_form.is_none());
+        assert!(app.status.contains("no configurable"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

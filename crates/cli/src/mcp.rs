@@ -62,6 +62,9 @@ use tokio::sync::{mpsc, Mutex};
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const SWEEP_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_SEND_TIMEOUT_MS: u64 = 60_000;
+/// How long a timed-out `debug_send` gives the hung command to exit after
+/// `SIGTERM` before escalating to `SIGKILL` — see `DebugSession::terminate_on_timeout`.
+const TERM_GRACE: Duration = Duration::from_secs(2);
 const CANVAS_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Set (to any value) only in the environment of a process `canvas_open`
@@ -204,6 +207,7 @@ struct DebugSession {
     last_used: Instant,
 }
 
+#[derive(Debug)]
 struct SendOutcome {
     stdout: String,
     stderr: String,
@@ -228,10 +232,35 @@ impl DebugSession {
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
         command.kill_on_drop(true);
-        // Same reasoning as `stream_exec::SpawnedProcess::kill`: a fresh
-        // process group so `stop()` can reach everything this shell itself
-        // spawns, not just `bash`.
-        command.process_group(0);
+        // `setsid()` — not the simpler `process_group(0)` this used to be —
+        // for two reasons at once: it still makes this shell the leader of
+        // its own new process group (pgid == its own pid), which is all
+        // `stop()`/`terminate_on_timeout`/`signal_group` below actually need
+        // to reach everything this shell spawns; but it *also* detaches
+        // from any controlling
+        // terminal, which `process_group(0)` alone does not do. That
+        // detachment matters because libpq's password prompt
+        // (`simple_prompt`) opens `/dev/tty` directly, bypassing stdin/
+        // stdout entirely — if a controlling terminal is inherited from
+        // whatever launched `meshfox mcp`, that open succeeds and the
+        // prompt blocks forever on a tty nobody will ever type into. With
+        // no controlling terminal, `open("/dev/tty")` fails outright
+        // (`ENXIO`) and libpq falls back to stdin, which fails fast instead
+        // (see TODO.canvas.md's "PGPASSWORD-подстановка..." node). Not
+        // combined with `process_group(0)`: `setsid()` requires the caller
+        // not already be a process group leader, and `process_group(0)`'s
+        // `setpgid` may run before this closure does.
+        //
+        // SAFETY: the only syscall here is `setsid()` itself, which is
+        // async-signal-safe — safe to call between fork and exec.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
 
         let mut child = command.spawn()?;
         let stdin = child.stdin.take().expect("piped stdin");
@@ -270,12 +299,13 @@ impl DebugSession {
     /// printed to *both* streams with the real exit code so completion is
     /// only declared once both stdout and stderr have delivered everything
     /// up to that point (they're unrelated pipes with no ordering
-    /// guarantee between them). If `code` itself times out or never
-    /// finishes, the session is still alive afterward — but this call
-    /// can't tell that command's own trailing output apart from whatever
-    /// the *next* `debug_send` gets back; `debug_stop`/a fresh session is
-    /// the clean way out of that, not something this method tries to
-    /// detect or fix.
+    /// guarantee between them). If `code` itself times out, this call can't
+    /// tell that command's own trailing output apart from whatever a next
+    /// call might get back — so instead of leaving it running and letting
+    /// later `debug_send`s queue up behind it forever, it kills the whole
+    /// session (`terminate_on_timeout`) and reports `session_ended`; a
+    /// fresh `debug_start` is the clean way back in, same as after an
+    /// explicit `debug_stop`.
     async fn send(&mut self, code: &str, timeout: Duration) -> std::io::Result<SendOutcome> {
         self.last_used = Instant::now();
         let marker = format!("__meshfox_done_{}__", uuid::Uuid::new_v4().simple());
@@ -295,12 +325,13 @@ impl DebugSession {
         while !(stdout_done && stderr_done) {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
+                self.terminate_on_timeout().await;
                 return Ok(SendOutcome {
                     stdout: stdout_lines.join("\n"),
                     stderr: stderr_lines.join("\n"),
                     exit_code,
                     timed_out: true,
-                    session_ended: false,
+                    session_ended: true,
                 });
             }
             match tokio::time::timeout(remaining, self.lines_rx.recv()).await {
@@ -332,12 +363,13 @@ impl DebugSession {
                     });
                 }
                 Err(_) => {
+                    self.terminate_on_timeout().await;
                     return Ok(SendOutcome {
                         stdout: stdout_lines.join("\n"),
                         stderr: stderr_lines.join("\n"),
                         exit_code,
                         timed_out: true,
-                        session_ended: false,
+                        session_ended: true,
                     });
                 }
             }
@@ -352,18 +384,37 @@ impl DebugSession {
     }
 
     async fn stop(&mut self) {
-        let _ = self.kill_group();
+        let _ = self.signal_group(libc::SIGKILL);
         let _ = self.child.wait().await;
     }
 
-    fn kill_group(&self) -> std::io::Result<()> {
+    /// Escalated kill for a `code` that blew through its `debug_send`
+    /// timeout: `SIGTERM` first, so anything that traps it (or just needs a
+    /// moment to flush/close a connection) can exit cleanly, then — only if
+    /// it's still alive after `TERM_GRACE` — `SIGKILL`, which can't be
+    /// caught or ignored. Whole group either way, same as `stop()`, since
+    /// there's no way to tell this session's shell apart from whatever
+    /// hung command it's still waiting on (see `send`'s own doc comment) —
+    /// this ends the session, it doesn't try to save it.
+    async fn terminate_on_timeout(&mut self) {
+        let _ = self.signal_group(libc::SIGTERM);
+        if tokio::time::timeout(TERM_GRACE, self.child.wait())
+            .await
+            .is_err()
+        {
+            let _ = self.signal_group(libc::SIGKILL);
+            let _ = self.child.wait().await;
+        }
+    }
+
+    fn signal_group(&self, signal: libc::c_int) -> std::io::Result<()> {
         let Some(pid) = self.child.id() else {
             return Ok(()); // already reaped
         };
         // SAFETY: `libc::kill` with a negative pid signals every process in
         // that process group; `pid` is this session's own leader pid (see
-        // `spawn`'s `process_group(0)`).
-        let ret = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+        // `spawn`'s `setsid()`).
+        let ret = unsafe { libc::kill(-(pid as libc::pid_t), signal) };
         if ret != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
             return Err(std::io::Error::last_os_error());
         }
@@ -409,9 +460,11 @@ struct DebugSendParams {
     /// cwd, and exported variables every earlier `debug_send` in this
     /// session left behind.
     code: String,
-    /// How long to wait for `code` to finish before giving up (the session
-    /// keeps running either way — see `timed_out` in the result). Defaults
-    /// to 60000 (one minute).
+    /// How long to wait for `code` to finish before giving up. On timeout
+    /// the whole session is killed (`SIGTERM`, then `SIGKILL` if it's still
+    /// alive shortly after) and ends — see `timed_out`/`session_ended` in
+    /// the result; call `debug_start` again for a fresh one. Defaults to
+    /// 60000 (one minute).
     #[serde(default)]
     timeout_ms: Option<u64>,
 }
@@ -1802,9 +1855,62 @@ impl ServerHandler for MeshfoxMcpRoot {
 
 #[cfg(test)]
 mod tests {
-    use super::{node_json, MeshfoxMcpRoot};
+    use super::{node_json, DebugSession, MeshfoxMcpRoot};
     use meshfox_core::Canvas;
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn debug_session_has_no_controlling_terminal() {
+        let cwd = std::env::temp_dir();
+        let mut session = DebugSession::spawn(&cwd, HashMap::new()).unwrap();
+        // Without a controlling terminal, `/dev/tty` can't be opened at all
+        // (`ENXIO`) — this is what stops libpq's password prompt from
+        // blocking forever on a tty nobody will ever write to (see
+        // TODO.canvas.md's "PGPASSWORD-подстановка..." node).
+        let outcome = session
+            .send(": > /dev/tty", Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(
+            !outcome.timed_out && outcome.exit_code != 0,
+            "writing to /dev/tty should fail fast, not hang or succeed: {outcome:?}"
+        );
+        session.stop().await;
+    }
+
+    #[tokio::test]
+    async fn debug_send_timeout_kills_a_command_that_exits_on_sigterm() {
+        let cwd = std::env::temp_dir();
+        let mut session = DebugSession::spawn(&cwd, HashMap::new()).unwrap();
+        let outcome = session
+            .send("sleep 30", Duration::from_millis(200))
+            .await
+            .unwrap();
+        assert!(outcome.timed_out);
+        assert!(outcome.session_ended);
+        assert!(
+            session.child.try_wait().unwrap().is_some(),
+            "the shell should already be reaped by the time send() returns"
+        );
+    }
+
+    #[tokio::test]
+    async fn debug_send_timeout_escalates_to_sigkill_when_sigterm_is_ignored() {
+        let cwd = std::env::temp_dir();
+        let mut session = DebugSession::spawn(&cwd, HashMap::new()).unwrap();
+        let outcome = session
+            .send("trap '' TERM; sleep 30", Duration::from_millis(200))
+            .await
+            .unwrap();
+        assert!(outcome.timed_out);
+        assert!(outcome.session_ended);
+        assert!(
+            session.child.try_wait().unwrap().is_some(),
+            "SIGKILL after the grace period should have reaped the shell by now"
+        );
+    }
 
     #[test]
     fn node_json_omits_body_by_default_and_includes_it_when_asked() {
