@@ -24,7 +24,8 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::ListState;
-use ratatui_image::picker::Picker;
+use ratatui_image::picker::cap_parser::QueryStdioOptions;
+use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::Protocol;
 
 use super::ui;
@@ -596,12 +597,7 @@ impl App {
         }
         let constraint_stats = constraint_stats(&display_canvas);
         let rows = tree::flatten(&display_canvas, &expanded);
-        // `Picker::from_query_stdio()` (protocol auto-detection) turned out
-        // to be unreliable across real terminals in practice — a terminal
-        // that doesn't actually support the protocol it gets detected as
-        // just renders nothing, silently. Half-blocks are pure Unicode +
-        // color, so they render everywhere, tmux included.
-        let picker = Picker::halfblocks();
+        let picker = build_picker();
         let known_raw = Arc::new(Mutex::new(raw.clone()));
         // Computed before `canvas_path` is moved into the struct literal
         // below (its `canvas_path,` shorthand field).
@@ -3116,6 +3112,33 @@ fn decode_data_url_image(url: &str) -> Option<image::DynamicImage> {
     }
     let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, payload).ok()?;
     image::load_from_memory(&bytes).ok()
+}
+
+/// `Picker::from_query_stdio()` does a real capability round-trip (writes
+/// an escape sequence, reads the terminal's actual reply — see `mod.rs`'s
+/// raw-mode-first ordering, which exists for exactly this call) rather
+/// than guessing from env vars, and it already falls back to
+/// `ProtocolType::Halfblocks` on its own whenever detection is
+/// inconclusive.
+///
+/// iTerm2 (and terminals in its family — see ratatui-image's own
+/// compatibility matrix entry for Warp: "Kitty unicode-placeholders part
+/// not implemented") answers that same round-trip's Kitty-transmission
+/// probe with "OK", but never implemented the Unicode-placeholder
+/// placement extension `ratatui_image::protocol::kitty::Kitty` actually
+/// renders through — so trusting that probe there doesn't silently fall
+/// back to halfblocks, it draws a screenful of visible placeholder/
+/// diacritic glyphs where the image should be. `from_query_stdio` already
+/// special-cases WezTerm/Konsole the same way (see its own
+/// `blacklist_protocols` handling) for an equivalent false-positive; this
+/// adds iTerm2 to that list from our side so its own env-based
+/// `iterm2_from_env()` hint wins instead.
+fn build_picker() -> Picker {
+    let mut options = QueryStdioOptions::default();
+    if std::env::var("TERM_PROGRAM").is_ok_and(|t| t.contains("iTerm")) {
+        options.blacklist_protocols.push(ProtocolType::Kitty);
+    }
+    Picker::from_query_stdio_with_options(options).unwrap_or_else(|_| Picker::halfblocks())
 }
 
 /// `path` is a real file for every ordinary `Segment::Image`, but a
