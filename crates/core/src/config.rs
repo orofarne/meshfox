@@ -55,7 +55,7 @@ fn load_from(global_path: Option<&Path>, canvas_root: &Path) -> toml::Table {
     merged
 }
 
-fn read_table(path: &Path) -> toml::Table {
+pub(crate) fn read_table(path: &Path) -> toml::Table {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|s| s.parse::<toml::Table>().ok())

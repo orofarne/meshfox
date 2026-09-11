@@ -1433,14 +1433,44 @@ fn load_var_cache_or_exit(canvas_path: &Path) -> VarCache {
 }
 
 /// A non-secret declaration's currently-resolved value with no overrides
-/// in play — env, then cache, then its own `default` — same precedence
-/// `vars::resolve` uses, minus the `--set`/form-override step `configure`
-/// doesn't take. Shown as the prompt's own default so Enter keeps it.
-fn current_value(decl: &VarDecl, cache: &VarCache) -> Option<String> {
-    std::env::var(&decl.name)
-        .ok()
-        .or_else(|| cache.get(&decl.name).map(str::to_string))
-        .or_else(|| decl.default.clone())
+/// in play — env, then cache, then shared/global config, then its own
+/// `default` — same precedence `vars::resolve_with_shared` uses, minus the
+/// `--set`/form-override step `configure` doesn't take. Shown as the
+/// prompt's own default so Enter keeps it. Returns the shared origin
+/// alongside the value when that's where it came from, so `configure` can
+/// annotate the prompt with "(inherited from ...)".
+fn current_value(
+    decl: &VarDecl,
+    cache: &VarCache,
+    shared: &meshfox_core::SharedEnv,
+) -> (Option<String>, Option<meshfox_core::SharedOrigin>) {
+    if let Ok(v) = std::env::var(&decl.name) {
+        return (Some(v), None);
+    }
+    if let Some(v) = cache.get(&decl.name) {
+        return (Some(v.to_string()), None);
+    }
+    if let Some(sv) = shared.get(&decl.name) {
+        return (Some(sv.value.clone()), Some(sv.origin.clone()));
+    }
+    (decl.default.clone(), None)
+}
+
+/// Short, human-readable note for `configure`'s terminal prompt when a
+/// field's current value was inherited from shared/global config — see
+/// `current_value`.
+fn shared_origin_note(origin: &meshfox_core::SharedOrigin) -> String {
+    match origin {
+        meshfox_core::SharedOrigin::Project => {
+            "(inherited from this project's .meshfox/config.toml)".to_string()
+        }
+        meshfox_core::SharedOrigin::Global { path: Some(p) } => {
+            format!("(inherited from ~/.meshfox/config.toml, scoped to {p})")
+        }
+        meshfox_core::SharedOrigin::Global { path: None } => {
+            "(inherited from ~/.meshfox/config.toml)".to_string()
+        }
+    }
 }
 
 fn configure(canvas_path: &PathBuf) {
@@ -1476,6 +1506,7 @@ fn configure(canvas_path: &PathBuf) {
     }
 
     let mut cache = load_var_cache_or_exit(canvas_path);
+    let shared = meshfox_core::load_shared_env(canvas_root_dir(canvas_path));
     if skipped_count > 0 {
         println!(
             "({skipped_count} secret/session variable(s) skipped -- never cached, always asked fresh at run time)"
@@ -1483,7 +1514,10 @@ fn configure(canvas_path: &PathBuf) {
     }
 
     for decl in configurable.iter().copied() {
-        let current = current_value(decl, &cache);
+        let (current, origin) = current_value(decl, &cache, &shared);
+        if let Some(origin) = &origin {
+            println!("{} {}", decl.prompt, shared_origin_note(origin));
+        }
         let value = prompt::ask(decl, current.as_deref()).unwrap_or_else(|e| {
             eprintln!("failed to read input: {e}");
             std::process::exit(1);
@@ -2066,11 +2100,13 @@ fn resolve_refs_or_prompt(
     overrides: &mut HashMap<String, String>,
     computed: &HashMap<String, String>,
     cache: &mut VarCache,
+    shared: &meshfox_core::SharedEnv,
 ) -> HashMap<String, String> {
     if refs.is_empty() {
         return HashMap::new();
     }
-    let mut resolution = meshfox_core::resolve_block_env(refs, decls, overrides, cache, computed);
+    let mut resolution =
+        meshfox_core::resolve_block_env_with_shared(refs, decls, overrides, cache, computed, shared);
     // A `from`-declared (computed) variable is never prompted for — if its
     // source block hasn't produced a value by the time this block needs
     // it, that's a hard failure (chain ordering should have run the source
@@ -2138,8 +2174,9 @@ fn resolve_block_env_or_prompt(
     overrides: &mut HashMap<String, String>,
     computed: &HashMap<String, String>,
     cache: &mut VarCache,
+    shared: &meshfox_core::SharedEnv,
 ) -> HashMap<String, String> {
-    resolve_refs_or_prompt(&block.env, decls, overrides, computed, cache)
+    resolve_refs_or_prompt(&block.env, decls, overrides, computed, cache, shared)
 }
 
 /// Resolves `block`'s own `interpreter=` (see SPEC.md's "Runnable code
@@ -2155,6 +2192,7 @@ fn resolve_block_interpreter_or_prompt(
     overrides: &mut HashMap<String, String>,
     computed: &HashMap<String, String>,
     cache: &mut VarCache,
+    shared: &meshfox_core::SharedEnv,
 ) -> Option<String> {
     let spec = block.interpreter.as_deref()?;
     let names = meshfox_core::interpreter_var_refs(spec);
@@ -2168,7 +2206,7 @@ fn resolve_block_interpreter_or_prompt(
             var_name: n.clone(),
         })
         .collect();
-    let values = resolve_refs_or_prompt(&refs, decls, overrides, computed, cache);
+    let values = resolve_refs_or_prompt(&refs, decls, overrides, computed, cache, shared);
     Some(meshfox_core::resolve_interpreter(spec, &values))
 }
 
@@ -2206,6 +2244,7 @@ fn preflight_chain_vars(
     overrides: &mut HashMap<String, String>,
     computed: &HashMap<String, String>,
     cache: &mut VarCache,
+    shared: &meshfox_core::SharedEnv,
 ) {
     let mut missing: Vec<VarDecl> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -2240,7 +2279,8 @@ fn preflight_chain_vars(
         }
         let refs: Vec<meshfox_core::EnvRef> =
             block.env.iter().cloned().chain(interpreter_refs).collect();
-        let resolution = meshfox_core::resolve_block_env(&refs, decls, overrides, cache, computed);
+        let resolution =
+            meshfox_core::resolve_block_env_with_shared(&refs, decls, overrides, cache, computed, shared);
         for decl in resolution.missing {
             if seen.insert(decl.name.clone()) {
                 missing.push(decl);
@@ -2464,6 +2504,7 @@ async fn run_async(
     let mut overrides: HashMap<String, String> = set.into_iter().collect();
     validate_set_overrides_or_exit(&decls, &overrides);
     let mut var_cache = load_var_cache_or_exit(canvas_path);
+    let shared_env = meshfox_core::load_shared_env(canvas_root_dir(canvas_path));
     persist_set_overrides(&decls, &overrides, &mut var_cache);
     // Values produced by `from=` source blocks already run earlier in this
     // invocation — kept entirely separate from `overrides` (`--set`) so a
@@ -2584,7 +2625,15 @@ async fn run_async(
         // `preflight_chain_vars`'s own doc comment for why (a `PGPASSWORD`
         // only the tail of a long chain references shouldn't only surface
         // after everything ahead of it has already run).
-        preflight_chain_vars(&chain, &canvas, &decls, &mut overrides, &computed, &mut var_cache);
+        preflight_chain_vars(
+            &chain,
+            &canvas,
+            &decls,
+            &mut overrides,
+            &computed,
+            &mut var_cache,
+            &shared_env,
+        );
 
         for addr in chain {
             let key = (addr.node_id.clone(), addr.block_name.clone());
@@ -2647,7 +2696,14 @@ async fn run_async(
             }
 
             let mut block_env =
-                resolve_block_env_or_prompt(&block, &decls, &mut overrides, &computed, &mut var_cache);
+                resolve_block_env_or_prompt(
+                    &block,
+                    &decls,
+                    &mut overrides,
+                    &computed,
+                    &mut var_cache,
+                    &shared_env,
+                );
             // If some declared variable is `from=`-sourced from *this*
             // block, give it a fresh output file to write `NAME=value`
             // lines to — see `meshfox_core::varout`. Ordinary blocks (the
@@ -2669,6 +2725,7 @@ async fn run_async(
                 &mut overrides,
                 &computed,
                 &mut var_cache,
+                &shared_env,
             );
             let step_cwd = canvas_root_dir(located.origin.as_deref().unwrap_or(canvas_path));
 

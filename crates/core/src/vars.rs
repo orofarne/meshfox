@@ -673,6 +673,16 @@ pub struct ResolvedVars {
     /// so a non-empty list here means either it failed, or it didn't write
     /// this name to its own output — either way, nothing to ask a human).
     pub unresolved_from: Vec<VarDecl>,
+    /// Keyed by decl name — present only for a name whose winning value in
+    /// `values` actually came from the shared/global tier (see
+    /// `resolve_with_shared`), never for one resolved by an override,
+    /// process env, the document cache, or a plain `default`, and never
+    /// for a `from`-declared one. A caller (web form, TUI) uses this to
+    /// show "inherited from shared config" next to a field. A decl that
+    /// only *indirectly* picks up a shared value through another decl's
+    /// `default_var=`/`choices_var=` does not itself get an entry here —
+    /// this tracks direct shared resolution only, not transitively.
+    pub origins: HashMap<String, crate::shared_env::SharedOrigin>,
 }
 
 /// Resolves `decls` against, in priority order: `overrides` (explicit
@@ -727,9 +737,29 @@ pub fn resolve(
     cache: &crate::varcache::VarCache,
     computed: &HashMap<String, String>,
 ) -> ResolvedVars {
+    resolve_with_shared(decls, overrides, cache, computed, &crate::shared_env::SharedEnv::new())
+}
+
+/// Same as `resolve`, but additionally consults `shared` (see
+/// `crate::shared_env::load`) as a precedence tier between the on-disk
+/// document `cache` and a declaration's own `default`. Unlike `cache`,
+/// `shared` is **not** skipped for a `session`-flagged decl: `session`
+/// only means "never remembered past this one run" (the on-disk cache),
+/// not "never read from anything but overrides/env/default" -- a
+/// `session` decl already still reads the live process environment, and
+/// `shared` is the same kind of live external input, just sourced from a
+/// config file instead of the process's own env block.
+pub fn resolve_with_shared(
+    decls: &[VarDecl],
+    overrides: &HashMap<String, String>,
+    cache: &crate::varcache::VarCache,
+    computed: &HashMap<String, String>,
+    shared: &crate::shared_env::SharedEnv,
+) -> ResolvedVars {
     let mut values = HashMap::new();
     let mut missing = Vec::new();
     let mut unresolved_from = Vec::new();
+    let mut origins = HashMap::new();
     for decl in topo_order(decls) {
         if decl.from.is_some() {
             match computed.get(&decl.name) {
@@ -741,7 +771,7 @@ pub fn resolve(
             continue;
         }
 
-        // override -> env -> cache first, same three steps as any other
+        // override -> env -> cache -> shared, same steps as any other
         // decl -- none of these need `default_var`/`choices_var`
         // substitution at all, since they already supply a final answer
         // outright. Checking them before touching `default_var`/
@@ -752,32 +782,43 @@ pub fn resolve(
         // `from=` source has ever run) -- there's nothing to defer for if
         // nothing downstream needs the substituted value in the first
         // place.
-        let already_resolved = overrides
-            .get(&decl.name)
-            .cloned()
-            .or_else(|| std::env::var(&decl.name).ok())
-            .or_else(|| {
-                // `session` skips the cache entirely -- never remembered
-                // past this one resolution pass, see `VarDecl::session`'s
-                // own doc comment for how a caller avoids re-prompting on
-                // every block within one run. `secret` does *not* skip the
-                // cache here: nothing in this module ever *writes* one
-                // there (`resolve` only reads `cache`, never mutates it),
-                // but a `secret` value can still legitimately be sitting in
-                // it -- a caller explicitly opted a specific answer into
-                // being persisted anyway (the web UI's "save (plaintext)"
-                // checkbox, `RunRequest::save_secrets`/`TtyRunQuery::
-                // save_secrets` in `meshfox-server`), or the cache file was
-                // hand-edited (it's a small, hand-editable dotenv file, see
-                // `crate::varcache`'s own doc comment). Refusing to read it
-                // back here would make that persistence a silent no-op.
-                if decl.session {
-                    None
-                } else {
-                    cache.get(&decl.name).map(str::to_string)
-                }
-            });
+        let mut shared_origin: Option<crate::shared_env::SharedOrigin> = None;
+        let already_resolved: Option<String> = if let Some(v) = overrides.get(&decl.name) {
+            Some(v.clone())
+        } else if let Ok(v) = std::env::var(&decl.name) {
+            Some(v)
+        } else if !decl.session {
+            // `secret` does *not* skip the cache here: nothing in this
+            // module ever *writes* one there (`resolve`/`resolve_with_
+            // shared` only read `cache`, never mutate it), but a `secret`
+            // value can still legitimately be sitting in it -- a caller
+            // explicitly opted a specific answer into being persisted
+            // anyway (the web UI's "save (plaintext)" checkbox,
+            // `RunRequest::save_secrets`/`TtyRunQuery::save_secrets` in
+            // `meshfox-server`), or the cache file was hand-edited (it's a
+            // small, hand-editable dotenv file, see `crate::varcache`'s
+            // own doc comment). Refusing to read it back here would make
+            // that persistence a silent no-op.
+            if let Some(v) = cache.get(&decl.name) {
+                Some(v.to_string())
+            } else if let Some(sv) = shared.get(&decl.name) {
+                shared_origin = Some(sv.origin.clone());
+                Some(sv.value.clone())
+            } else {
+                None
+            }
+        } else if let Some(sv) = shared.get(&decl.name) {
+            // `session` skips the cache step above entirely, but still
+            // consults `shared` -- see this function's own doc comment.
+            shared_origin = Some(sv.origin.clone());
+            Some(sv.value.clone())
+        } else {
+            None
+        };
         if let Some(v) = already_resolved {
+            if let Some(origin) = shared_origin {
+                origins.insert(decl.name.clone(), origin);
+            }
             values.insert(decl.name.clone(), v);
             continue;
         }
@@ -823,6 +864,7 @@ pub fn resolve(
         values,
         missing,
         unresolved_from,
+        origins,
     }
 }
 
@@ -881,6 +923,9 @@ pub struct BlockEnvResolution {
     /// `ResolvedVars::unresolved_from`. A caller must treat this as a hard
     /// error, never a prompt.
     pub unresolved_from: Vec<VarDecl>,
+    /// Keyed by the declared variable's own name (not its block-local
+    /// `env=` rename) — see `ResolvedVars::origins`.
+    pub origins: HashMap<String, crate::shared_env::SharedOrigin>,
 }
 
 /// Resolves *only* the declared variables a single block's own `env=`
@@ -897,6 +942,26 @@ pub fn resolve_block_env(
     cache: &crate::varcache::VarCache,
     computed: &HashMap<String, String>,
 ) -> BlockEnvResolution {
+    resolve_block_env_with_shared(
+        env_refs,
+        decls,
+        overrides,
+        cache,
+        computed,
+        &crate::shared_env::SharedEnv::new(),
+    )
+}
+
+/// Same as `resolve_block_env`, but additionally consults `shared` — see
+/// `resolve_with_shared`.
+pub fn resolve_block_env_with_shared(
+    env_refs: &[crate::fence::EnvRef],
+    decls: &[VarDecl],
+    overrides: &HashMap<String, String>,
+    cache: &crate::varcache::VarCache,
+    computed: &HashMap<String, String>,
+    shared: &crate::shared_env::SharedEnv,
+) -> BlockEnvResolution {
     // The closure, not just the literal names in `env_refs`: a var
     // referenced only via another (directly-needed) var's `default_var`/
     // `choices_var` still has to be resolved here too, or that other
@@ -908,11 +973,12 @@ pub fn resolve_block_env(
         .filter(|d| needed.contains(d.name.as_str()))
         .cloned()
         .collect();
-    let resolved = resolve(&relevant, overrides, cache, computed);
+    let resolved = resolve_with_shared(&relevant, overrides, cache, computed, shared);
     BlockEnvResolution {
         env: map_block_env(env_refs, &resolved.values),
         missing: resolved.missing,
         unresolved_from: resolved.unresolved_from,
+        origins: resolved.origins,
     }
 }
 

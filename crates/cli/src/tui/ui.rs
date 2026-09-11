@@ -818,8 +818,9 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
         .decls
         .iter()
         .zip(vf.inputs.iter())
+        .zip(vf.origins.iter())
         .enumerate()
-        .map(|(i, (decl, input))| {
+        .map(|(i, ((decl, input), origin))| {
             let masked;
             let shown: &str = if decl.secret {
                 masked = "*".repeat(input.chars().count());
@@ -839,11 +840,23 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
                     format!("{shown}{}", if i == vf.selected { "_" } else { "" })
                 }
             };
-            let prefix = format!("{}: ", decl.prompt);
+            // `[shared]`/`[global]` when this field's value was inherited
+            // from a project-/global-config `[[env]]` section (see
+            // `meshfox_core::shared_env`) — the terminal counterpart to
+            // the web `VarsForm`'s "inherited" badge. Typing over the
+            // field just overrides it, same as any other answer.
+            let origin_tag = match origin {
+                Some(meshfox_core::SharedOrigin::Project) => " [shared]",
+                Some(meshfox_core::SharedOrigin::Global { .. }) => " [global]",
+                None => "",
+            };
+            let prefix = format!("{}{origin_tag}: ", decl.prompt);
             let value_budget = (inner.width as usize).saturating_sub(prefix.chars().count());
             let value = tail_fit(&value, value_budget);
             ListItem::new(Line::from(vec![
-                Span::raw(prefix),
+                Span::raw(decl.prompt.clone()),
+                Span::styled(origin_tag, Style::default().fg(Color::DarkGray)),
+                Span::raw(": "),
                 Span::styled(value, Style::default().fg(Color::LightGreen)),
             ]))
         })

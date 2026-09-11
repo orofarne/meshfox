@@ -23,6 +23,7 @@ pub mod mdcanvas;
 pub mod options;
 pub mod output;
 pub mod service_lock;
+pub mod shared_env;
 pub mod staticgen;
 pub mod subsup;
 pub mod syntax_dirs;
@@ -54,6 +55,7 @@ pub use mdcanvas::{parse_fold_override, parse_tags, FenceAttrsPatch, NodeMeta, P
 pub use options::{declared_options, OptionsError};
 pub use output::{cached_output_hash, format_duration_ms, write_output, ExecOutput};
 pub use service_lock::{lock_path as service_lock_path, LockInfo as ServiceLockInfo, LockState as ServiceLockState};
+pub use shared_env::{load as load_shared_env, SharedEnv, SharedOrigin, SharedVar};
 pub use staticgen::{Asset, EdgeView, NodeView, Position, SiteData};
 pub use tag_colors::{
     annotate_effective_colors, declared_tag_colors, effective_color, TagColorError,
@@ -66,8 +68,9 @@ pub use varout::{
 };
 pub use vars::{
     close_over_var_refs, declared_vars, map_block_env, resolve as resolve_vars,
-    resolve_block_env, validate_env_refs, validate_value, validate_var_refs, validate_var_scope,
-    BlockEnvResolution, ResolvedVars, VarDecl, VarType, VarsError,
+    resolve_block_env, resolve_block_env_with_shared, resolve_with_shared, validate_env_refs,
+    validate_value, validate_var_refs, validate_var_scope, BlockEnvResolution, ResolvedVars,
+    VarDecl, VarType, VarsError,
 };
 
 pub use attrs::UnknownAttrError;

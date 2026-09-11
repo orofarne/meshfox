@@ -818,7 +818,14 @@ impl MeshfoxMcp {
                 })?;
             }
         }
-        let resolved = meshfox_core::resolve_vars(&relevant, &params.vars, &cache, &HashMap::new());
+        let shared = meshfox_core::load_shared_env(crate::canvas_root_dir(&self.canvas_path));
+        let resolved = meshfox_core::resolve_with_shared(
+            &relevant,
+            &params.vars,
+            &cache,
+            &HashMap::new(),
+            &shared,
+        );
         if !resolved.missing.is_empty() {
             let names: Vec<&str> = resolved.missing.iter().map(|d| d.name.as_str()).collect();
             return Err(invalid_params(format!(

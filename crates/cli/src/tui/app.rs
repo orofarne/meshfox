@@ -16,7 +16,7 @@ use meshfox_core::deps::BlockAddr;
 use meshfox_core::fence::{self, scan_runnable_blocks};
 use meshfox_core::mdcanvas;
 use meshfox_core::output::{write_output, ExecOutput};
-use meshfox_core::vars::{declared_vars, resolve_block_env, BlockEnvResolution, VarDecl, VarType};
+use meshfox_core::vars::{declared_vars, BlockEnvResolution, VarDecl, VarType};
 use meshfox_core::{Canvas, FileDisplay, Node, NodeType, VarCache};
 use meshfox_server::services::{ServiceHandle, ServiceStatus};
 use meshfox_server::stream_exec::{OutputStream, SpawnedProcess};
@@ -85,6 +85,13 @@ pub struct VarFormState {
     /// with `current_value` (so submitting untouched just confirms the
     /// suggestion).
     pub inputs: Vec<String>,
+    /// Parallel to `decls`/`inputs` — `Some` when the field's `inputs`
+    /// entry was pre-filled from shared/global config (see
+    /// `meshfox_core::shared_env`) rather than an override/process env/the
+    /// on-disk document cache, so `render_var_form` can badge it. Editing
+    /// the field just overwrites `inputs` normally; submitting persists it
+    /// to the document cache like any other answer, which is the override.
+    pub origins: Vec<Option<meshfox_core::SharedOrigin>>,
     pub selected: usize,
     /// `true` for a `c`-triggered walk of every declared (non-secret)
     /// variable (see `trigger_configure`), `false` for the ordinary
@@ -509,11 +516,21 @@ pub enum LinkPreviewMsg {
 /// already failed, or it wouldn't be missing) and for `trigger_configure`'s
 /// "every declared variable" form (where it's the actual point: show
 /// what's already resolved, not just the bare `default`).
-fn current_value(decl: &VarDecl, cache: &VarCache) -> Option<String> {
-    std::env::var(&decl.name)
-        .ok()
-        .or_else(|| cache.get(&decl.name).map(str::to_string))
-        .or_else(|| decl.default.clone())
+fn current_value(
+    decl: &VarDecl,
+    cache: &VarCache,
+    shared: &meshfox_core::SharedEnv,
+) -> (Option<String>, Option<meshfox_core::SharedOrigin>) {
+    if let Ok(v) = std::env::var(&decl.name) {
+        return (Some(v), None);
+    }
+    if let Some(v) = cache.get(&decl.name) {
+        return (Some(v.to_string()), None);
+    }
+    if let Some(sv) = shared.get(&decl.name) {
+        return (Some(sv.value.clone()), Some(sv.origin.clone()));
+    }
+    (decl.default.clone(), None)
 }
 
 /// A var form field's starting value, coerced to something its own
@@ -526,21 +543,31 @@ fn current_value(decl: &VarDecl, cache: &VarCache) -> Option<String> {
 /// left/right cycle could never have produced itself. `String`/`Int`
 /// fields are free text, so whatever `current_value` found (or an empty
 /// string) passes through unchanged.
-fn initial_field_input(decl: &VarDecl, cache: &VarCache) -> String {
-    let suggestion = current_value(decl, cache);
-    match decl.var_type {
+fn initial_field_input(
+    decl: &VarDecl,
+    cache: &VarCache,
+    shared: &meshfox_core::SharedEnv,
+) -> (String, Option<meshfox_core::SharedOrigin>) {
+    let (suggestion, origin) = current_value(decl, cache, shared);
+    let value = match decl.var_type {
         VarType::Bool => if suggestion.as_deref() == Some("true") {
             "true"
         } else {
             "false"
         }
         .to_string(),
-        VarType::Select => match suggestion {
-            Some(v) if decl.choices.iter().any(|c| c == &v) => v,
+        VarType::Select => match &suggestion {
+            Some(v) if decl.choices.iter().any(|c| c == v) => v.clone(),
             _ => decl.choices.first().cloned().unwrap_or_default(),
         },
-        VarType::String | VarType::Int => suggestion.unwrap_or_default(),
-    }
+        VarType::String | VarType::Int => suggestion.clone().unwrap_or_default(),
+    };
+    // Only actually shared if the field's control displays the raw
+    // suggestion unchanged -- a `select` falling back to its first choice,
+    // or a `bool` coerced from something that isn't literally "true"/
+    // "false", isn't really showing the shared value at all.
+    let origin = if suggestion.as_deref() == Some(value.as_str()) { origin } else { None };
+    (value, origin)
 }
 
 impl App {
@@ -1948,14 +1975,16 @@ impl App {
             return None;
         }
         if !resolution.missing.is_empty() {
-            let inputs = resolution
+            let shared = meshfox_core::load_shared_env(crate::canvas_root_dir(&self.canvas_path));
+            let (inputs, origins): (Vec<String>, Vec<Option<meshfox_core::SharedOrigin>>) = resolution
                 .missing
                 .iter()
-                .map(|d| initial_field_input(d, &self.var_cache))
-                .collect();
+                .map(|d| initial_field_input(d, &self.var_cache, &shared))
+                .unzip();
             self.var_form = Some(VarFormState {
                 decls: resolution.missing,
                 inputs,
+                origins,
                 selected: 0,
                 configuring: false,
             });
@@ -2021,18 +2050,26 @@ impl App {
         block: &meshfox_core::CodeBlock,
         computed: &HashMap<String, String>,
     ) -> HashMap<String, String> {
-        let env_resolution =
-            resolve_block_env(&block.env, &self.decls, &self.run_overrides, &self.var_cache, computed);
+        let shared = meshfox_core::load_shared_env(crate::canvas_root_dir(&self.canvas_path));
+        let env_resolution = meshfox_core::resolve_block_env_with_shared(
+            &block.env,
+            &self.decls,
+            &self.run_overrides,
+            &self.var_cache,
+            computed,
+            &shared,
+        );
         let interp_refs = Self::interp_env_refs(block);
         let interp_resolution = if interp_refs.is_empty() {
             None
         } else {
-            Some(resolve_block_env(
+            Some(meshfox_core::resolve_block_env_with_shared(
                 &interp_refs,
                 &self.decls,
                 &self.run_overrides,
                 &self.var_cache,
                 computed,
+                &shared,
             ))
         };
         Self::project_fingerprint_vars(block, &env_resolution, interp_resolution.as_ref())
@@ -2128,23 +2165,26 @@ impl App {
             // otherwise force an interactive prompt just to decide whether
             // to skip); a block that isn't skippable reuses this exact
             // same resolution afterward instead of resolving twice.
-            let env_resolution = resolve_block_env(
+            let shared = meshfox_core::load_shared_env(crate::canvas_root_dir(&self.canvas_path));
+            let env_resolution = meshfox_core::resolve_block_env_with_shared(
                 &block.env,
                 &self.decls,
                 &self.run_overrides,
                 &self.var_cache,
                 &self.run_computed,
+                &shared,
             );
             let interp_refs = Self::interp_env_refs(&block);
             let interp_resolution = if interp_refs.is_empty() {
                 None
             } else {
-                Some(resolve_block_env(
+                Some(meshfox_core::resolve_block_env_with_shared(
                     &interp_refs,
                     &self.decls,
                     &self.run_overrides,
                     &self.var_cache,
                     &self.run_computed,
+                    &shared,
                 ))
             };
             let fingerprint_vars =
@@ -2973,13 +3013,15 @@ impl App {
                     .into();
             return;
         }
-        let inputs = decls
+        let shared = meshfox_core::load_shared_env(crate::canvas_root_dir(&self.canvas_path));
+        let (inputs, origins): (Vec<String>, Vec<Option<meshfox_core::SharedOrigin>>) = decls
             .iter()
-            .map(|d| initial_field_input(d, &self.var_cache))
-            .collect();
+            .map(|d| initial_field_input(d, &self.var_cache, &shared))
+            .unzip();
         self.var_form = Some(VarFormState {
             decls,
             inputs,
+            origins,
             selected: 0,
             configuring: true,
         });

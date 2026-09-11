@@ -914,9 +914,12 @@ invocation just reads it from there without asking again.
 Resolving one declared variable (for whichever block's `env=` asked for
 it) tries, in order: an explicit override (`meshfox run --set
 NAME=value`, or a value submitted through the web UI's form) → the
-process environment → the on-disk cache (skipped entirely for `secret`/
-`session`) → the declaration's own `default` (skipped entirely for
-`required` — see above). Whatever isn't resolved by any of those needs an
+process environment → the on-disk per-document cache (skipped entirely
+for `session`; a `secret` value *can* be sitting in it if a caller
+explicitly opted it in — see below) → shared/global config (see
+"Shared/global config" below — **not** skipped for `session`) → the
+declaration's own `default` (skipped entirely for `required` — see
+above). Whatever isn't resolved by any of those needs an
 interactive answer — a terminal prompt for the CLI, a form for the web
 UI — which, for a non-secret, non-session variable, is then written to
 the cache so a later run of *any* block referencing the same variable
@@ -931,6 +934,68 @@ file, meant to be `.gitignore`d, the same way `CMakeCache.txt` usually
 is. It's safe to hand-edit or delete: deleting it just means every
 non-secret, non-session variable gets asked about again next time some
 block's `env=` needs it.
+
+### Shared/global config (`[[env]]`)
+
+A value many canvases need in common (DB credentials, an API base URL,
+...) can be declared once instead of being re-entered — or re-`--set` —
+per document, in either or both of the same two TOML files meshfox's own
+tool settings (unrelated to `meshfox:var`) already come from, under a
+separate top-level `env` key (not merged with the rest of that table):
+
+- `~/.meshfox/config.toml` — **global**, every project on this machine.
+- `<canvas_root>/.meshfox/config.toml` — **project/local**, this one
+  canvas tree.
+
+```toml
+[[env]]
+# no path= -- applies to every canvas that reads this file
+vars = { DB_USER = "alice" }
+
+[[env]]
+path = "~/work/projectA"
+vars = { DB_URL = "postgres://projA-db/app", DB_USER = "projA_svc" }
+```
+
+`path=` scopes a global `[[env]]` section to canvases rooted under that
+directory — the same idea as git's `includeIf "gitdir:..."`, needed so two
+unrelated projects' global entries can reuse the same variable *name*
+without colliding. It can be a single string or an array of strings
+(`path = ["~/work/projectA", "~/work/projectB"]`), matching if the canvas
+is under *any* one of them — handy for one section covering several
+unrelated directories without repeating the same `vars=` in multiple
+`[[env]]` blocks. It's optional in the project file too (rarely needed —
+the file is already project-scoped), resolved relative to `canvas_root`
+there instead of `$HOME`. Matching is by path *component*, not string
+prefix (a scope of `~/work/projectA` never matches `~/work/projectAB`),
+via `canonicalize` where possible. When more than one section in the same
+file matches a given canvas, the most path-specific one wins for each
+variable name (an unscoped section is the least specific); on a tie, the
+later section in the file wins.
+
+**Precedence**: project file always wins over global, regardless of
+scoping specificity — this is the escape hatch for overriding an inherited
+value on one canvas tree. Within the resolution chain above, shared/global
+config sits between the per-document cache and each declaration's own
+`default` — an explicit `--set`/submitted-form override, the process
+environment, and an already-cached per-document answer all still win over
+it, same "override" story the cache itself already offers. Unlike the
+per-document cache, this tier is **not** skipped for a `session`
+declaration — `session` only means "never remembered past this one run",
+not "never read from anything but overrides/env/default", and shared
+config is a live external input the same way the process environment
+already is for a `session` variable.
+
+Both the web UI and the TUI show, per field, when its currently-resolved
+value was inherited this way (a small "project"/"global" badge next to the
+prompt) — typing a new value overrides it normally, persisted to the
+per-document cache exactly like any other answer, so it's remembered for
+that one canvas from then on. A `required` variable satisfied only by
+shared config resolves silently, with no confirmation prompt — the same
+behavior a cached answer already has today.
+
+No encryption: both files are plain TOML, same caveat the per-document
+cache already carries.
 
 ### Computed variables (`from=`)
 

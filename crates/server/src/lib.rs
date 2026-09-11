@@ -366,6 +366,37 @@ struct VarStatus {
     resolved: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     value: Option<String>,
+    /// Set when `resolved`'s winning value actually came from a shared
+    /// project-/global-config `[[env]]` section (see
+    /// `meshfox_core::shared_env`) rather than an override/process env/
+    /// the per-document cache — lets the UI badge a field as "inherited"
+    /// while still letting the user type their own value to override it
+    /// (which persists as a normal document-cache entry, same mechanism
+    /// as any other answer). Shown even for a `secret` field — it only
+    /// says *where* the value came from, never the value itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inherited_from: Option<VarOrigin>,
+}
+
+/// The web-facing shape of `meshfox_core::SharedOrigin` — see
+/// `VarStatus::inherited_from`.
+#[derive(Debug, Serialize)]
+#[serde(tag = "scope", rename_all = "camelCase")]
+enum VarOrigin {
+    Project,
+    Global {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
+}
+
+impl From<&meshfox_core::SharedOrigin> for VarOrigin {
+    fn from(origin: &meshfox_core::SharedOrigin) -> Self {
+        match origin {
+            meshfox_core::SharedOrigin::Project => VarOrigin::Project,
+            meshfox_core::SharedOrigin::Global { path } => VarOrigin::Global { path: path.clone() },
+        }
+    }
 }
 
 /// Addresses the same block `RunRequest` does, flattened into query
@@ -437,7 +468,14 @@ async fn get_vars(
         .filter(|d| closure.contains(d.name.as_str()))
         .cloned()
         .collect();
-    let resolved = meshfox_core::resolve_vars(&decls_for_resolve, &HashMap::new(), &cache, &computed);
+    let shared = meshfox_core::load_shared_env(canvas_root_dir(&state.canvas_path));
+    let resolved = meshfox_core::resolve_with_shared(
+        &decls_for_resolve,
+        &HashMap::new(),
+        &cache,
+        &computed,
+        &shared,
+    );
     // A decl that needed prompting carries its own *materialized*
     // default/choices (substituted from `default_var`/`choices_var`) in
     // `resolved.missing`, not the raw `relevant` copy — see
@@ -563,6 +601,7 @@ fn var_status(d: meshfox_core::VarDecl, resolved: &meshfox_core::ResolvedVars) -
     // a `default` — fall back to that `default` here purely so the form
     // still has something to pre-fill, without marking it `resolved`.
     let value = resolved_value.or_else(|| d.default.clone());
+    let inherited_from = resolved.origins.get(&d.name).map(VarOrigin::from);
     VarStatus {
         name: d.name,
         var_type: d.var_type.as_str(),
@@ -571,6 +610,7 @@ fn var_status(d: meshfox_core::VarDecl, resolved: &meshfox_core::ResolvedVars) -
         secret: d.secret,
         resolved: is_resolved,
         value: if d.secret { None } else { value },
+        inherited_from,
     }
 }
 
@@ -637,7 +677,14 @@ async fn get_configure_vars(
         .filter(|d| closure.contains(d.name.as_str()))
         .cloned()
         .collect();
-    let resolved = meshfox_core::resolve_vars(&decls_for_resolve, &HashMap::new(), &cache, &computed);
+    let shared = meshfox_core::load_shared_env(canvas_root_dir(&state.canvas_path));
+    let resolved = meshfox_core::resolve_with_shared(
+        &decls_for_resolve,
+        &HashMap::new(),
+        &cache,
+        &computed,
+        &shared,
+    );
     let missing_by_name: HashMap<&str, &meshfox_core::VarDecl> =
         resolved.missing.iter().map(|d| (d.name.as_str(), d)).collect();
     let statuses = configurable
@@ -2646,8 +2693,14 @@ async fn run_block(
     // block runs, mid-chain, below.
     let mut resolved_vars = {
         let mut cache = state.vars_cache.lock().unwrap();
-        let resolved =
-            meshfox_core::resolve_vars(&relevant_decls, &req.vars, &cache, &HashMap::new());
+        let shared = meshfox_core::load_shared_env(canvas_root_dir(&state.canvas_path));
+        let resolved = meshfox_core::resolve_with_shared(
+            &relevant_decls,
+            &req.vars,
+            &cache,
+            &HashMap::new(),
+            &shared,
+        );
         if !resolved.missing.is_empty() {
             let names: Vec<&str> = resolved.missing.iter().map(|d| d.name.as_str()).collect();
             return Err(ApiError(
@@ -3247,11 +3300,13 @@ async fn run_block_tty(
     // resolved incrementally, mid-chain, by `run_tty_chain` instead.
     let resolved_vars = {
         let mut cache = state.vars_cache.lock().unwrap();
-        let resolved = meshfox_core::resolve_vars(
+        let shared = meshfox_core::load_shared_env(canvas_root_dir(&state.canvas_path));
+        let resolved = meshfox_core::resolve_with_shared(
             &relevant_decls,
             &requested_vars,
             &cache,
             &HashMap::new(),
+            &shared,
         );
         if !resolved.missing.is_empty() {
             let names: Vec<&str> = resolved.missing.iter().map(|d| d.name.as_str()).collect();
@@ -4017,7 +4072,14 @@ async fn force_start_service(
     validate_var_overrides(&relevant_decls, &req.vars)?;
     let resolved_vars = {
         let cache = state.vars_cache.lock().unwrap();
-        let resolved = meshfox_core::resolve_vars(&relevant_decls, &req.vars, &cache, &HashMap::new());
+        let shared = meshfox_core::load_shared_env(canvas_root_dir(&state.canvas_path));
+        let resolved = meshfox_core::resolve_with_shared(
+            &relevant_decls,
+            &req.vars,
+            &cache,
+            &HashMap::new(),
+            &shared,
+        );
         if !resolved.missing.is_empty() {
             let names: Vec<&str> = resolved.missing.iter().map(|d| d.name.as_str()).collect();
             return Err(ApiError(

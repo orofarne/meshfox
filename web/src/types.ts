@@ -166,6 +166,12 @@ export interface ServiceStatusDto {
   memBytes?: number;
 }
 
+/** Where a `VarStatus`'s resolved value came from, when it was inherited
+ * from a shared project-/global-config `[[env]]` section rather than an
+ * override/process env/the per-document cache — see
+ * `VarStatus.inheritedFrom`. Mirrors the server's `VarOrigin` enum. */
+export type VarOrigin = { scope: "project" } | { scope: "global"; path?: string };
+
 export interface VarStatus {
   name: string;
   type: "string" | "int" | "bool" | "select";
@@ -174,4 +180,8 @@ export interface VarStatus {
   secret: boolean;
   resolved: boolean;
   value?: string;
+  /** Set when `resolved`'s value was inherited from shared/global config
+   * rather than entered for this document — the UI shows this as a badge
+   * next to the field; typing a value still overrides it normally. */
+  inheritedFrom?: VarOrigin;
 }

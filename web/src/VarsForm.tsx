@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from "react";
-import type { VarStatus } from "./types";
+import type { VarOrigin, VarStatus } from "./types";
 
 interface VarsFormProps {
   /** For the pre-run gate (`handleRun`), only the *missing* declared
@@ -37,6 +37,20 @@ const INT_PATTERN = /^[+-]?\d+$/;
 
 function isValidValue(v: VarStatus, value: string): boolean {
   return v.type !== "int" || INT_PATTERN.test(value);
+}
+
+// Short label + title-attribute detail for an "inherited" badge — see
+// `VarStatus.inheritedFrom`/`meshfox_core::shared_env`.
+function inheritedLabel(origin: VarOrigin): { text: string; title: string } {
+  if (origin.scope === "project") {
+    return { text: "project", title: "Inherited from this project's .meshfox/config.toml" };
+  }
+  return {
+    text: "global",
+    title: origin.path
+      ? `Inherited from ~/.meshfox/config.toml (scoped to ${origin.path})`
+      : "Inherited from ~/.meshfox/config.toml",
+  };
 }
 
 function initialValue(v: VarStatus): string {
@@ -115,7 +129,14 @@ export function VarsForm({
         {vars.map((v, i) => (
           <div key={v.name} className="vars-modal-field-group">
           <label className="vars-modal-field">
-            <span>{v.prompt}</span>
+            <span>
+              {v.prompt}
+              {v.inheritedFrom && (
+                <span className="vars-modal-inherited" title={inheritedLabel(v.inheritedFrom).title}>
+                  {inheritedLabel(v.inheritedFrom).text}
+                </span>
+              )}
+            </span>
             {v.type === "bool" ? (
               <input
                 type="checkbox"
