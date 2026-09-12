@@ -41,12 +41,16 @@ import {
   fetchServiceLog,
   stopService,
   restartService,
-  forceStartService,
+  forceRun,
+  fetchActiveRuns,
+  subscribeRun,
   type RunEvent,
   type NodePatch,
+  type ActiveRunDto,
 } from "./api";
 import type { CanvasDoc, CanvasNode, ExtraEdgeDto, ServiceStatusDto, VarStatus } from "./types";
 import { ServicePanel } from "./ServicePanel";
+import { TtySessionsPanel } from "./TtySessionsPanel";
 import { ServiceLockConflictDialog } from "./ServiceLockConflictDialog";
 import { pathTo, deriveEdges, findRoot, visibleNodeIds, subtreeIds } from "./tree";
 import { computeAutoLayout, FOLDED_HEIGHT, type LayoutBox } from "./autolayout";
@@ -282,12 +286,23 @@ export default function App() {
   // `servicePanelOpen` itself, never read while it's `false`.
   const [servicePanelFocusNodeId, setServicePanelFocusNodeId] = useState<string | null>(null);
   // A `"service-lock-conflict"` event awaiting the user's confirm/cancel —
-  // see `runBlockStream`'s `onEvent` handling below and `ServiceLockConflictDialog`.
+  // see `executeRun`'s `onEvent` handling below and `ServiceLockConflictDialog`.
+  // Not necessarily a `service` any more (see that event's own doc
+  // comment in api.ts) — `conflictNodeId`/`conflictBlock` name the
+  // *contested* address (a chain's own dependency, not necessarily
+  // `requestBlock` itself), while `requestNodeId`/`requestBlock`/
+  // `withDeps`/`vars`/`saveSecrets` are what's needed to retry the
+  // *original* request via `forceRun` on confirm.
   const [serviceConflict, setServiceConflict] = useState<{
-    nodeId: string;
-    block: string;
+    conflictNodeId: string;
+    conflictBlock: string;
     ownerPid: number;
     ownerDesc: string;
+    requestNodeId: string;
+    requestBlock: string;
+    withDeps: boolean;
+    vars?: Record<string, string>;
+    saveSecrets?: string[];
   } | null>(null);
   // Briefly `true` right after a successful "reset session" click — purely
   // informational feedback (same `.saving-indicator` styling the layout
@@ -522,6 +537,11 @@ export default function App() {
     vars?: Record<string, string>;
     saveSecrets?: string[];
     autoclose: boolean;
+    /** Set only when reattaching to an already-running session from
+     * `TtySessionsPanel` (`GET /api/run/tty/attach`) rather than starting
+     * a fresh one — every field above is ignored in this mode, see
+     * `TtyPanel`'s own `attachTo` prop. */
+    attachTo?: { nodeId: string; block: string };
   } | null>(null);
   // Which node's settings modal (title/type/color/target/edges) is open,
   // if any — see NodeSettings.tsx. Opened only via a node's own gear
@@ -638,6 +658,36 @@ export default function App() {
       clearInterval(id);
     };
   }, []);
+
+  // Which live `tty` sessions this server process currently knows about —
+  // polled the same way `services` is, just filtered down to `kind ===
+  // "tty" && status === "running"` (see `crates/server/src/lib.rs`'s own
+  // `get_active_runs`). Drives both the toolbar pill's own count and
+  // `TtySessionsPanel`'s list.
+  const [liveTtySessions, setLiveTtySessions] = useState<ActiveRunDto[]>([]);
+  const [ttySessionsPanelOpen, setTtySessionsPanelOpen] = useState(false);
+  const refreshLiveTtySessions = useCallback(() => {
+    return fetchActiveRuns()
+      .then((runs) => {
+        setLiveTtySessions(runs.filter((r) => r.kind === "tty" && r.status === "running"));
+      })
+      .catch(() => {
+        // Best-effort — a transient fetch failure just leaves the last
+        // known list in place until the next tick.
+      });
+  }, []);
+  useEffect(() => {
+    let cancelled = false;
+    const poll = () => {
+      if (!cancelled) refreshLiveTtySessions();
+    };
+    poll();
+    const id = setInterval(poll, 3000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [refreshLiveTtySessions]);
 
   // Folds the polled `services` list into every node's own `data.services`
   // (matched by `nodeId`) — the service-equivalent of `liveBlocks`' own
@@ -765,6 +815,11 @@ export default function App() {
       withDeps: boolean,
       vars?: Record<string, string>,
       saveSecrets?: string[],
+      /** Set only when retrying a request that just hit a lock conflict
+       * (`ServiceLockConflictDialog`'s "kill and start") — the one
+       * specific address to force-take, routing this call through
+       * `forceRun` instead of `runBlockStream`. */
+      force?: { nodeId: string; block: string },
     ) => {
       if (!canvas) return;
       const path = pathTo(canvas, nodeId);
@@ -846,8 +901,15 @@ export default function App() {
         // block's output to the file. When `withDeps`, the server
         // automatically expands this into the block's full `deps=` chain
         // (see SPEC.md); otherwise only `blockName` itself runs. Streams
-        // one event per line as it happens (see ./api.ts).
-        await runBlockStream(path, blockName, editMode, withDeps, (event: RunEvent) => {
+        // one event per line as it happens (see ./api.ts). Routes through
+        // `forceRun` instead when retrying after a lock conflict (see
+        // this function's own `force` param).
+        const stream = force
+          ? (onEvent: (event: RunEvent) => void) =>
+              forceRun(path, blockName, editMode, withDeps, onEvent, force, vars, saveSecrets)
+          : (onEvent: (event: RunEvent) => void) =>
+              runBlockStream(path, blockName, editMode, withDeps, onEvent, vars, saveSecrets);
+        await stream((event: RunEvent) => {
           switch (event.type) {
             case "started":
               runId = event.runId;
@@ -941,14 +1003,19 @@ export default function App() {
               break;
             case "service-lock-conflict":
               setServiceConflict({
-                nodeId: event.nodeId,
-                block: event.block,
+                conflictNodeId: event.nodeId,
+                conflictBlock: event.block,
                 ownerPid: event.ownerPid,
                 ownerDesc: event.ownerDesc,
+                requestNodeId: nodeId,
+                requestBlock: blockName,
+                withDeps,
+                vars,
+                saveSecrets,
               });
               break;
           }
-        }, vars, saveSecrets);
+        });
         blockStuckQueued();
         // Reloading clears every node's `liveBlocks` (see the canvas-load
         // effect below) — worth it when it picks up a `cache`d block's
@@ -967,6 +1034,79 @@ export default function App() {
     },
     [canvas, editMode, load, blockGraph, setNodes, patchLiveBlock],
   );
+
+  // Reconciles this tab's own `liveBlocks` against the server's registry
+  // of still-running (or just-finished) plain-block runs (`GET
+  // /api/runs`) — once, right after the canvas first loads. Without this,
+  // reloading a tab (or opening a fresh one) while a plain block is
+  // mid-run shows nothing for it at all until the user clicks Run again,
+  // even though the process itself is still going and its output has been
+  // sitting in the server's own registry the whole time (see
+  // `run_registry`'s own module doc comment, `crates/server/src/lib.rs`).
+  // Deliberately only once per page load (a plain `useRef` flag, not keyed
+  // to the canvas's own identity) — not on every later reload `/api/watch`
+  // triggers for an unrelated edit, since re-subscribing to something
+  // already being watched would just race with itself. `tty` sessions are
+  // handled by `TtySessionsPanel`/reattach instead of `liveBlocks` — see
+  // this effect's own `kind` filter.
+  const reconciledActiveRunsRef = useRef(false);
+  useEffect(() => {
+    if (!canvas || reconciledActiveRunsRef.current) return;
+    reconciledActiveRunsRef.current = true;
+    fetchActiveRuns()
+      .then((runs) => {
+        for (const run of runs) {
+          if (run.kind !== "plain") continue;
+          patchLiveBlock(run.nodeId, run.block, {
+            status: run.status === "killed" ? "killed" : run.status === "exited" ? "done" : "running",
+            text: "",
+            stdoutText: undefined,
+            stderrText: undefined,
+            exitCode: run.exitCode,
+            runId: undefined,
+            // Backdated so `LiveElapsed` (`Date.now() - startedAt`) shows
+            // the real elapsed time immediately instead of restarting its
+            // own clock from the moment this tab happened to notice.
+            startedAt: run.status === "running" ? Date.now() - run.uptimeMs : undefined,
+            durationMs: run.status === "exited" ? run.uptimeMs : undefined,
+          });
+          subscribeRun(run.nodeId, run.block, 0, (event) => {
+            switch (event.type) {
+              case "line":
+                setNodes((nds) =>
+                  nds.map((n) => {
+                    if (n.id !== run.nodeId) return n;
+                    const prev = n.data.liveBlocks[run.block] ?? { status: "running", text: "" };
+                    return {
+                      ...n,
+                      data: {
+                        ...n.data,
+                        liveBlocks: { ...n.data.liveBlocks, [run.block]: appendOutputLine(prev, event) },
+                      },
+                    };
+                  }),
+                );
+                break;
+              case "done":
+                patchLiveBlock(run.nodeId, run.block, {
+                  status: event.outcome === "killed" ? "killed" : "done",
+                  exitCode: event.exitCode,
+                  runId: undefined,
+                });
+                break;
+            }
+          }).catch(() => {
+            // Best-effort — if the subscribe stream itself fails partway
+            // through, just leave whatever was already shown; nothing
+            // meaningful to retry automatically here.
+          });
+        }
+      })
+      .catch(() => {
+        // No active runs to reconcile, or the endpoint failed — either
+        // way, not worth surfacing as a page-level error.
+      });
+  }, [canvas, patchLiveBlock, setNodes]);
 
   // Runs a runnable `file` node's `interpreter target` (see
   // `api.ts`'s `runFileStream`) — the file-node counterpart to
@@ -2766,6 +2906,16 @@ export default function App() {
             ⚙ {services.filter((s) => s.status === "running").length}/{services.length}
           </button>
         )}
+        {liveTtySessions.length > 0 && (
+          <button
+            type="button"
+            className="service-stats service-stats-ok"
+            title={`${liveTtySessions.length} live terminal session(s) — click to reopen`}
+            onClick={() => setTtySessionsPanelOpen(true)}
+          >
+            🖥 {liveTtySessions.length}
+          </button>
+        )}
         {editMode ? (
           <>
             <span className="mode-badge mode-badge-edit">editing</span>
@@ -3006,7 +3156,11 @@ export default function App() {
       )}
       {ttySession && (
         <TtyPanel
-          key={`${ttySession.path.join("/")}/${ttySession.blockName}`}
+          key={
+            ttySession.attachTo
+              ? `attach:${ttySession.attachTo.nodeId}/${ttySession.attachTo.block}`
+              : `${ttySession.path.join("/")}/${ttySession.blockName}`
+          }
           path={ttySession.path}
           blockName={ttySession.blockName}
           withDeps={ttySession.withDeps}
@@ -3014,7 +3168,23 @@ export default function App() {
           vars={ttySession.vars}
           saveSecrets={ttySession.saveSecrets}
           autoclose={ttySession.autoclose}
+          attachTo={ttySession.attachTo}
           onClose={() => setTtySession(null)}
+        />
+      )}
+      {ttySessionsPanelOpen && (
+        <TtySessionsPanel
+          sessions={liveTtySessions}
+          onClose={() => setTtySessionsPanelOpen(false)}
+          onReopen={(nodeId, block) => {
+            setTtySessionsPanelOpen(false);
+            setTtySession({ path: [], blockName: block, withDeps: false, autoclose: false, attachTo: { nodeId, block } });
+          }}
+          onKill={(nodeId, block) => {
+            killRun({ nodeId, block })
+              .then(() => refreshLiveTtySessions())
+              .catch((e) => setError(String(e)));
+          }}
         />
       )}
       {expandedNode && (
@@ -3097,17 +3267,17 @@ export default function App() {
       )}
       {serviceConflict && canvas && (
         <ServiceLockConflictDialog
-          block={serviceConflict.block}
+          block={serviceConflict.conflictBlock}
           ownerPid={serviceConflict.ownerPid}
           ownerDesc={serviceConflict.ownerDesc}
           onCancel={() => setServiceConflict(null)}
           onKillAndStart={() => {
-            const path = pathTo(canvas, serviceConflict.nodeId);
+            const c = serviceConflict;
             setServiceConflict(null);
-            forceStartService(path, serviceConflict.block)
-              .then(() => fetchServices())
-              .then(setServices)
-              .catch((e) => setError(String(e)));
+            executeRun(c.requestNodeId, c.requestBlock, c.withDeps, c.vars, c.saveSecrets, {
+              nodeId: c.conflictNodeId,
+              block: c.conflictBlock,
+            });
           }}
         />
       )}

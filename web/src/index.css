@@ -2718,6 +2718,43 @@ a {
   padding: 0.3rem 0.75rem;
 }
 
+/* Live terminal ("tty") sessions panel — same card/header chrome as
+ * `.service-panel`, but a flat single-column list (no master-detail split,
+ * nothing to show besides "reopen"/"kill" per row) rather than reusing
+ * `.service-panel-list`'s own fixed sidebar width/border-right. */
+.tty-sessions-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  flex: 1;
+  min-width: 260px;
+  overflow-y: auto;
+}
+
+.tty-sessions-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.5rem;
+  border: 1px solid transparent;
+  border-radius: 4px;
+}
+
+.tty-sessions-row:hover {
+  background: var(--bg);
+}
+
+.tty-sessions-row-actions {
+  display: flex;
+  gap: 0.4rem;
+  margin-left: auto;
+}
+
+.tty-sessions-row-actions button {
+  font-size: 0.8rem;
+  padding: 0.25rem 0.6rem;
+}
+
 .service-panel-log {
   flex: 1;
   min-height: 0;

@@ -116,12 +116,21 @@ impl ServiceHandle {
     }
 }
 
-/// Spawns `block` as a service: starts the process, acquires its lock file
-/// (`meshfox_core::service_lock`, at `lock_path` — the caller is expected to
-/// have already resolved any conflict via `service_lock::check` before
-/// calling this), and hands back a `ServiceHandle` whose `status`/log stay
-/// live in the background regardless of whether anything is watching them
-/// right now.
+/// Spawns `block` as a service and hands back a `ServiceHandle` whose
+/// `status`/log stay live in the background regardless of whether anything
+/// is watching them right now. **The caller must already hold this
+/// address's lock** (`meshfox_core::service_lock::acquire`, at the exact
+/// path `meshfox_core::service_lock_path(&canvas_path, &node_id,
+/// &block_name)` computes — this recomputes and trusts the same path,
+/// it doesn't acquire it) before calling this — this used to acquire it
+/// internally, but the caller now needs to have already claimed the lock
+/// as part of a possibly-larger, all-or-nothing batch (see the webui's own
+/// up-front, whole-chain lock pass) before committing to spawning anything,
+/// so a second `acquire` in here would just conflict with the caller's own.
+/// Released by `ServiceHandle::stop` (explicit stop/restart) or by the
+/// background drain task itself the moment it notices the process exited
+/// on its own (`Crashed`) — either way, the lock's lifetime now exactly
+/// tracks the process's own, not any one caller's request.
 pub fn spawn(
     node_id: String,
     block_name: String,
@@ -134,11 +143,16 @@ pub fn spawn(
     let lock_path = meshfox_core::service_lock_path(&canvas_path, &node_id, &block_name);
     let proc = stream_exec::spawn_block(&block, &env, Some(&cwd), Some(&canvas_path))?;
     let pid = proc.child.id().unwrap_or(0);
-    meshfox_core::service_lock::acquire(&lock_path, pid, owner)?;
+    // The lock the caller already claimed was necessarily acquired with a
+    // placeholder pid (the real one doesn't exist until right *now*) — fix
+    // it up to the real child pid so a later `is_alive`/force-kill against
+    // this lock file actually targets the right process, not whatever
+    // acquired it originally.
+    let _ = meshfox_core::service_lock::update_owner_pid(&lock_path, pid);
 
     let status = Arc::new(Mutex::new(ServiceStatus::Running));
     let log = Arc::new(Mutex::new(RingBuffer::new(LOG_CAPACITY)));
-    spawn_drain_task(proc, Arc::clone(&status), Arc::clone(&log));
+    spawn_drain_task(proc, Arc::clone(&status), Arc::clone(&log), lock_path.clone());
 
     Ok(ServiceHandle {
         node_id,
@@ -155,9 +169,15 @@ pub fn spawn(
 /// Stops `old` and spawns a fresh process with the exact parameters it was
 /// last started with (see `RespawnRecipe`'s own doc comment) — "local
 /// only" restart, per the product decision: this never touches, or even
-/// looks at, anything that depends on `old`.
+/// looks at, anything that depends on `old`. `old.stop()` already released
+/// `old`'s own lock, so this reacquires it itself before calling `spawn`
+/// (see that function's own doc comment on why it no longer does this
+/// internally) — nothing else can have taken it in between, since `stop`
+/// and this call happen back to back with no `.await` for anyone else to
+/// run in between.
 pub fn restart(old: &ServiceHandle) -> io::Result<ServiceHandle> {
     old.stop()?;
+    meshfox_core::service_lock::acquire(&old.lock_path, std::process::id(), &old.respawn.owner)?;
     spawn(
         old.node_id.clone(),
         old.block_name.clone(),
@@ -172,11 +192,18 @@ pub fn restart(old: &ServiceHandle) -> io::Result<ServiceHandle> {
 /// Drains `proc`'s output into `log` for as long as it runs, then reaps it
 /// and records whatever `ServiceStatus` that leaves it in — `Crashed` for
 /// an unexpected exit, left alone (already `Stopped`) if `ServiceHandle::
-/// stop` already flipped it first.
+/// stop` already flipped it first. Also releases `lock_path` on a `Crashed`
+/// exit — `stop` already releases it for a deliberate stop, but an
+/// unexpected exit used to leave the lock file behind forever (until the
+/// whole process exited or someone explicitly stopped it), which meant a
+/// crashed service's own address stayed permanently "held by us" even
+/// though nothing was actually running under it — quietly wrong even
+/// before this module tried to generalize locking to every block kind.
 fn spawn_drain_task(
     mut proc: SpawnedProcess,
     status: Arc<Mutex<ServiceStatus>>,
     log: Arc<Mutex<RingBuffer>>,
+    lock_path: PathBuf,
 ) {
     tokio::spawn(async move {
         while let Some((stream, line)) = proc.output_rx.recv().await {
@@ -186,6 +213,7 @@ fn spawn_drain_task(
         let mut current = status.lock().unwrap();
         if !matches!(*current, ServiceStatus::Stopped) {
             *current = ServiceStatus::Crashed { exit_code };
+            let _ = meshfox_core::service_lock::release(&lock_path);
         }
     });
 }
@@ -255,10 +283,28 @@ mod tests {
         dir.join("doc.canvas.md")
     }
 
+    /// Test-only stand-in for what a real caller now must do itself before
+    /// calling `spawn` — acquire the address's lock first (see `spawn`'s
+    /// own doc comment on why it no longer does this internally).
+    fn spawn_locked(
+        node_id: String,
+        block_name: String,
+        block: meshfox_core::CodeBlock,
+        env: HashMap<String, String>,
+        cwd: PathBuf,
+        canvas_path: PathBuf,
+        owner: &str,
+    ) -> io::Result<ServiceHandle> {
+        let lock_path = meshfox_core::service_lock_path(&canvas_path, &node_id, &block_name);
+        meshfox_core::service_lock::acquire(&lock_path, std::process::id(), owner)
+            .map_err(io::Error::from)?;
+        spawn(node_id, block_name, block, env, cwd, canvas_path, owner)
+    }
+
     #[tokio::test]
     async fn spawn_acquires_the_lock_file_and_reports_running() {
         let canvas_path = tmp_canvas_path("spawn");
-        let handle = spawn(
+        let handle = spawn_locked(
             "root".to_string(),
             "srv".to_string(),
             test_block("sleep 30"),
@@ -286,7 +332,7 @@ mod tests {
     #[tokio::test]
     async fn stop_releases_the_lock_and_marks_stopped_not_crashed() {
         let canvas_path = tmp_canvas_path("stop");
-        let handle = spawn(
+        let handle = spawn_locked(
             "root".to_string(),
             "srv".to_string(),
             test_block("sleep 30"),
@@ -317,7 +363,7 @@ mod tests {
     #[tokio::test]
     async fn an_unexpected_exit_is_reported_as_crashed() {
         let canvas_path = tmp_canvas_path("crash");
-        let handle = spawn(
+        let handle = spawn_locked(
             "root".to_string(),
             "srv".to_string(),
             test_block("exit 7"),
@@ -346,7 +392,7 @@ mod tests {
     #[tokio::test]
     async fn log_snapshot_captures_output_lines() {
         let canvas_path = tmp_canvas_path("log");
-        let handle = spawn(
+        let handle = spawn_locked(
             "root".to_string(),
             "srv".to_string(),
             test_block("echo one; echo two; sleep 30"),
@@ -380,7 +426,7 @@ mod tests {
     #[tokio::test]
     async fn restart_stops_the_old_process_and_starts_a_new_one_with_a_different_pid() {
         let canvas_path = tmp_canvas_path("restart");
-        let handle = spawn(
+        let handle = spawn_locked(
             "root".to_string(),
             "srv".to_string(),
             test_block("sleep 30"),

@@ -452,9 +452,16 @@ export type RunEvent =
    * "exited", so there's no `exitCode`/`durationMs` here. **Experimental**,
    * see SPEC.md's "Service blocks (experimental)". */
   | { type: "service-started"; nodeId: string; block: string; pid: number }
-  /** Terminal for the whole run (no `done` follows — same as `killed`) — the
-   * service's lock file is already held by another live-or-stale process.
-   * Show a confirm dialog; on confirm, call `forceStartService`. */
+  /** Terminal for the whole run (no `done` follows — same as `killed`) —
+   * `nodeId`/`block`'s own address (any kind of block, not just
+   * `service` — a chain's own dependency can just as easily be the one
+   * that's contested) is already locked by another live-or-stale process.
+   * Never actually streamed by the server any more (queued-time locking
+   * means a conflict is always known before a run's response even
+   * starts) — synthesized client-side from a `409` response instead (see
+   * `streamRunResponse`), so `onEvent`'s existing switch handles it the
+   * same way regardless. Show a confirm dialog; on confirm, call
+   * `forceRun`. */
   | { type: "service-lock-conflict"; nodeId: string; block: string; ownerPid: number; ownerDesc: string };
 
 /**
@@ -497,12 +504,44 @@ export async function runBlockStream(
       saveSecrets: saveSecrets ?? [],
     }),
   });
+  await streamRunResponse(res, "/api/run", onEvent);
+}
+
+/** Shape of a `409` conflict response from `/api/run`/`/api/run/force` —
+ * queued-time locking (see `crates/server/src/lib.rs`'s own
+ * `acquire_chain_locks`) means every lock a run will ever need is claimed
+ * before the response even starts, so a conflict is reported this way —
+ * a plain HTTP status with a JSON body — rather than as a streamed event;
+ * nothing has been sent to the client yet either way. */
+interface LockConflictBody {
+  nodeId: string;
+  block: string;
+  ownerPid: number;
+  ownerDesc: string;
+}
+
+/** Shared response handling for `runBlockStream`/`forceRun`: a `409`
+ * becomes a synthetic `"service-lock-conflict"` event (same shape either
+ * would have streamed before this endpoint's locking became queued-time —
+ * see that `RunEvent` variant's own doc comment) so `onEvent`'s existing
+ * switch handles it unchanged; anything else not-ok is a real rejection;
+ * otherwise the body streams as NDJSON, one `RunEvent` per line. */
+async function streamRunResponse(
+  res: Response,
+  label: string,
+  onEvent: (event: RunEvent) => void,
+): Promise<void> {
+  if (res.status === 409) {
+    const conflict = (await res.json()) as LockConflictBody;
+    onEvent({ type: "service-lock-conflict", ...conflict });
+    return;
+  }
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(text || `POST /api/run: ${res.status}`);
+    throw new Error(text || `${label}: ${res.status}`);
   }
   if (!res.body) {
-    throw new Error("POST /api/run: response had no body to stream");
+    throw new Error(`${label}: response had no body to stream`);
   }
 
   const reader = res.body.getReader();
@@ -517,6 +556,99 @@ export async function runBlockStream(
       const line = buffered.slice(0, newlineAt);
       buffered = buffered.slice(newlineAt + 1);
       if (line.trim()) onEvent(JSON.parse(line) as RunEvent);
+    }
+  }
+}
+
+/**
+ * The confirm side of a `"service-lock-conflict"` event, generalized to
+ * any block kind (not just `service` — see `crates/server/src/lib.rs`'s
+ * own `force_run` doc comment): force-kills whatever the conflict's own
+ * lock names, then re-runs the *exact same* request that hit it —
+ * `path`/`block`/`persist`/`withDeps`/`vars`/`saveSecrets` all mirror
+ * `runBlockStream`'s own arguments for the original run: `force` is the
+ * one specific `{nodeId, block}` address the conflict named (not
+ * necessarily `block` itself — a chain's own dependency can just as
+ * easily be the one that's contested). Streams the same way
+ * `runBlockStream` does; can itself resolve with *another* conflict (a
+ * different address, or a fresh race) for the caller to offer forcing
+ * again.
+ */
+export async function forceRun(
+  path: string[],
+  block: string,
+  persist: boolean,
+  withDeps: boolean,
+  onEvent: (event: RunEvent) => void,
+  force: { nodeId: string; block: string },
+  vars?: Record<string, string>,
+  saveSecrets?: string[],
+): Promise<void> {
+  const res = await fetch("/api/run/force", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      path,
+      block,
+      persist,
+      noDeps: !withDeps,
+      vars: vars ?? {},
+      saveSecrets: saveSecrets ?? [],
+      force: { nodeId: force.nodeId, block: force.block },
+    }),
+  });
+  await streamRunResponse(res, "/api/run/force", onEvent);
+}
+
+/** One line of `subscribeRun`'s own streamed NDJSON response — a much
+ * smaller vocabulary than `RunEvent` (see `crates/server/src/lib.rs`'s own
+ * `SubscribeEvent`): this only ever watches one address's own
+ * `run_registry::RunHandle`, independent of whatever chain/request
+ * originally started it. */
+export type SubscribeEvent =
+  | { type: "line"; seq: number; stream: "stdout" | "stderr"; text: string }
+  | { type: "done"; outcome: "exited" | "killed"; exitCode?: number };
+
+/**
+ * Watches one address's own most recent plain-block run — replays every
+ * buffered line at or after `sinceSeq` (`0` for "everything still
+ * buffered"), then tails live output until the run's own terminal outcome,
+ * at which point the stream ends. Resolves normally (no events at all) if
+ * this address has never been run, or its run has since been superseded
+ * by a fresh one under a different registry entry — `404` is treated the
+ * same as "nothing to show", not an error, since a caller reconciling
+ * every block on page load can't tell in advance which ones are actually
+ * live.
+ */
+export async function subscribeRun(
+  nodeId: string,
+  block: string,
+  sinceSeq: number,
+  onEvent: (event: SubscribeEvent) => void,
+): Promise<void> {
+  const params = new URLSearchParams({ nodeId, block, sinceSeq: String(sinceSeq) });
+  const res = await fetch(`/api/run/subscribe?${params}`);
+  if (res.status === 404) return;
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `GET /api/run/subscribe: ${res.status}`);
+  }
+  if (!res.body) {
+    throw new Error("GET /api/run/subscribe: response had no body to stream");
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffered = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffered += decoder.decode(value, { stream: true });
+    let newlineAt: number;
+    while ((newlineAt = buffered.indexOf("\n")) >= 0) {
+      const line = buffered.slice(0, newlineAt);
+      buffered = buffered.slice(newlineAt + 1);
+      if (line.trim()) onEvent(JSON.parse(line) as SubscribeEvent);
     }
   }
 }
@@ -593,17 +725,20 @@ export async function openNodeFileFolder(nodeId: string): Promise<void> {
 }
 
 /**
- * Cancels an in-flight run started by `runBlockStream` (`runId` comes from
- * that stream's first `"started"` event) — kills whichever block is
- * currently executing and stops the rest of its dependency chain. A 404
- * (already finished, or an unknown id) is treated the same as success:
- * either way, there's nothing left to kill.
+ * Cancels an in-flight run — either by `runId` (from `runBlockStream`'s own
+ * `"started"` event, the connection that actually started it) or by
+ * address (`{nodeId, block}`, for a tab that only ever knew about it via
+ * `/api/run/subscribe`/`/api/run/tty/attach` and so never had a `runId` to
+ * begin with — see `crates/server/src/lib.rs`'s own `KillRequest`). A 404
+ * (already finished, or an unknown id/address) is treated the same as
+ * success: either way, there's nothing left to kill.
  */
-export async function killRun(runId: string): Promise<void> {
+export async function killRun(target: string | { nodeId: string; block: string }): Promise<void> {
+  const body = typeof target === "string" ? { runId: target } : { nodeId: target.nodeId, block: target.block };
   const res = await fetch("/api/kill", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ runId }),
+    body: JSON.stringify(body),
   });
   if (!res.ok && res.status !== 404) {
     throw new Error(`POST /api/kill: ${res.status}`);
@@ -619,6 +754,32 @@ export async function killRun(runId: string): Promise<void> {
 export async function fetchServices(): Promise<ServiceStatusDto[]> {
   const res = await fetch("/api/services");
   if (!res.ok) throw new Error(`GET /api/services: ${res.status}`);
+  return res.json();
+}
+
+/** One entry of `fetchActiveRuns`'s own result — see that function's doc
+ * comment. */
+export interface ActiveRunDto {
+  nodeId: string;
+  block: string;
+  kind: "plain" | "tty";
+  status: "running" | "exited" | "killed";
+  exitCode?: number;
+  uptimeMs: number;
+}
+
+/**
+ * Every plain-block run and `tty` session this server process currently
+ * knows about (running, or the most recent one for that address), whether
+ * or not any tab is currently watching it — what a freshly-loaded/
+ * reloaded tab reconciles its own live state against on mount (see
+ * `App.tsx`'s reconciliation effect) and what `TtySessionsPanel` lists to
+ * reattach to. The `kind === "plain"` equivalent of `fetchServices` — see
+ * `crates/server/src/lib.rs`'s own `get_active_runs`.
+ */
+export async function fetchActiveRuns(): Promise<ActiveRunDto[]> {
+  const res = await fetch("/api/runs");
+  if (!res.ok) throw new Error(`GET /api/runs: ${res.status}`);
   return res.json();
 }
 

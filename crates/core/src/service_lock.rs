@@ -90,14 +90,129 @@ fn parse(contents: &str) -> Option<LockInfo> {
     Some(LockInfo { pid, owner })
 }
 
-/// Writes a fresh lock file recording `pid`/`owner`, creating
-/// `.meshfox/services/` if needed. Overwrites unconditionally — callers are
-/// expected to have already called `check` and resolved any conflict
-/// (including asking the user) before acquiring.
-pub fn acquire(path: &Path, pid: u32, owner: &str) -> io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+/// Why `acquire` failed — distinguishes "someone else already holds it"
+/// (the caller may want to show *who*, or force-kill-and-retry) from a
+/// genuine I/O problem (permissions, disk full, ...).
+#[derive(Debug)]
+pub enum AcquireError {
+    /// Something else already holds this lock — best-effort info about who
+    /// (read back from the file right after losing the race; `LockInfo {
+    /// pid: 0, owner: "unknown" }` in the vanishingly rare case the file
+    /// vanished again between losing the race and reading it back).
+    Conflict(LockInfo),
+    Io(io::Error),
+}
+
+impl std::fmt::Display for AcquireError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AcquireError::Conflict(info) => {
+                write!(f, "lock already held by pid {} ({})", info.pid, info.owner)
+            }
+            AcquireError::Io(e) => write!(f, "{e}"),
+        }
     }
+}
+
+impl std::error::Error for AcquireError {}
+
+/// Flattens a conflict into a plain `io::Error` (`AlreadyExists`) — lets
+/// every existing `acquire(..)?` call site that only ever handled a bare
+/// `io::Result` keep compiling/behaving exactly as before (it already did
+/// its own separate `check` for conflict *info*; this is just what a plain
+/// `?` now sees for the rare case that check-then-act call missed).
+impl From<AcquireError> for io::Error {
+    fn from(e: AcquireError) -> Self {
+        match e {
+            AcquireError::Conflict(info) => io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("lock already held by pid {} ({})", info.pid, info.owner),
+            ),
+            AcquireError::Io(e) => e,
+        }
+    }
+}
+
+/// Atomically creates a fresh lock file recording `pid`/`owner` — an
+/// exclusive create (`O_EXCL`-equivalent), not a plain overwrite, so two
+/// processes (or two threads in one process) racing to acquire the same
+/// path can never both believe they won: exactly one `create_new` succeeds,
+/// the other gets `AcquireError::Conflict`. Creates `.meshfox/services/` if
+/// needed. Unlike the old check-then-write shape, callers no longer need to
+/// (and shouldn't) call `check` first to decide whether to acquire — only
+/// to *display* who currently holds it before deciding whether to retry/
+/// force.
+pub fn acquire(path: &Path, pid: u32, owner: &str) -> Result<(), AcquireError> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(AcquireError::Io)?;
+    }
+    let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            let info = match check(path) {
+                Ok(LockState::Held { info, .. }) => info,
+                // Raced again: held a moment ago (our `create_new` lost),
+                // free now (they released between then and this `check`).
+                // Best-effort placeholder — the caller's real signal here
+                // is "conflict, try again", not this specific info.
+                Ok(LockState::Free) => LockInfo { pid: 0, owner: "unknown".to_string() },
+                Err(e2) => return Err(AcquireError::Io(e2)),
+            };
+            return Err(AcquireError::Conflict(info));
+        }
+        Err(e) => return Err(AcquireError::Io(e)),
+    };
+    use std::io::Write as _;
+    file.write_all(format!("pid={pid}\nowner={owner}\n").as_bytes())
+        .map_err(AcquireError::Io)
+}
+
+/// Forcibly takes over `path`: kills whatever process the current holder's
+/// own pid names (whole process group, `SIGKILL` — same reach as every
+/// other kill in this codebase, since every spawner makes its child the
+/// leader of a fresh group), releases the now-stale lock file, then
+/// acquires a fresh one for `pid`/`owner`. Consolidates the "kill the pid
+/// recorded on disk, even though it may belong to a process this one has no
+/// live handle for" pattern every force-run/force-start path needs, instead
+/// of each caller hand-rolling its own `unsafe { libc::kill(...) }`. A
+/// no-op (straight to `acquire`) if `path` turns out already free by the
+/// time this runs.
+pub fn kill_and_acquire(path: &Path, pid: u32, owner: &str) -> io::Result<()> {
+    if let LockState::Held { info, .. } = check(path)? {
+        if info.pid != 0 {
+            // SAFETY: see `is_alive`'s own comment on `kill(.., 0)`; here we
+            // actually deliver `SIGKILL` to the whole process group `-pid`
+            // leads, which is exactly the group every spawner in this
+            // codebase creates for its own child.
+            let ret = unsafe { libc::kill(-(info.pid as libc::pid_t), libc::SIGKILL) };
+            if ret != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        release(path)?;
+    }
+    acquire(path, pid, owner).map_err(io::Error::from)
+}
+
+/// Overwrites the pid recorded in a lock file this caller already holds —
+/// for when the real pid of whatever a lock protects only becomes known
+/// *after* the lock itself was already claimed (a spawned child's pid
+/// isn't known until it's actually spawned, but a queued-time lock — see
+/// `crates/server/src/lib.rs`'s own up-front, whole-chain locking — has to
+/// be atomically claimed *before* that, using a placeholder pid, purely to
+/// win the race against a concurrent attempt on the same address). Not
+/// itself atomic/exclusive like `acquire` — this assumes the caller
+/// already exclusively owns `path` and is just correcting its own record,
+/// not claiming it fresh. Keeps whatever `owner` string the file already
+/// had; a missing/unparseable existing file (shouldn't happen in practice —
+/// the caller is expected to have just `acquire`d it) falls back to an
+/// empty owner rather than failing outright.
+pub fn update_owner_pid(path: &Path, pid: u32) -> io::Result<()> {
+    let owner = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| parse(&s))
+        .map(|info| info.owner)
+        .unwrap_or_default();
     std::fs::write(path, format!("pid={pid}\nowner={owner}\n"))
 }
 
@@ -212,6 +327,108 @@ mod tests {
         let dir = tmp_dir("release-missing");
         let path = dir.join("x.lock");
         assert!(release(&path).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn second_acquire_of_an_already_held_lock_is_a_conflict_not_an_overwrite() {
+        let dir = tmp_dir("acquire-conflict");
+        let path = dir.join("x.lock");
+        acquire(&path, 111, "webui").unwrap();
+        match acquire(&path, 222, "tui") {
+            Err(AcquireError::Conflict(info)) => {
+                assert_eq!(info, LockInfo { pid: 111, owner: "webui".to_string() });
+            }
+            other => panic!("expected a conflict against the first owner, got {other:?}"),
+        }
+        // The loser must not have clobbered the winner's file.
+        assert_eq!(
+            check(&path).unwrap(),
+            LockState::Held {
+                info: LockInfo { pid: 111, owner: "webui".to_string() },
+                alive: false,
+            }
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn concurrent_acquire_attempts_have_exactly_one_winner() {
+        // Same real race a cross-process file lock exists to arbitrate,
+        // reproduced with threads racing the same path — `create_new` is
+        // atomic at the OS level regardless of whether the two callers are
+        // threads or separate processes, so this exercises the same
+        // guarantee. If `acquire` ever regressed to check-then-write, both
+        // could plausibly "win" here.
+        let dir = tmp_dir("acquire-race");
+        let path = std::sync::Arc::new(dir.join("x.lock"));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8u32)
+            .map(|i| {
+                let path = std::sync::Arc::clone(&path);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    acquire(&path, 1000 + i, "race").is_ok()
+                })
+            })
+            .collect();
+        let wins = handles.into_iter().map(|h| h.join().unwrap()).filter(|&ok| ok).count();
+        assert_eq!(wins, 1, "exactly one racer should have won the lock");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn kill_and_acquire_takes_over_a_lock_whose_owner_is_gone() {
+        let dir = tmp_dir("kill-and-acquire");
+        let path = dir.join("x.lock");
+        // A huge, never-assigned pid stands in for "the recorded owner is
+        // already gone" — `kill_and_acquire` should tolerate `ESRCH` from
+        // signaling it (same as every other whole-process-group kill in
+        // this codebase) and still take over the lock.
+        acquire(&path, 999_999, "tui").unwrap();
+        kill_and_acquire(&path, std::process::id(), "webui").unwrap();
+        assert_eq!(
+            check(&path).unwrap(),
+            LockState::Held {
+                info: LockInfo { pid: std::process::id(), owner: "webui".to_string() },
+                alive: true,
+            }
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn update_owner_pid_corrects_the_pid_while_keeping_the_owner() {
+        let dir = tmp_dir("update-owner-pid");
+        let path = dir.join("x.lock");
+        // Same shape a queued-time acquire uses: claim with a placeholder
+        // pid first (the calling process's own, before anything real has
+        // spawned yet), then correct it once a real child's pid is known.
+        acquire(&path, std::process::id(), "webui").unwrap();
+        update_owner_pid(&path, 555).unwrap();
+        assert_eq!(
+            check(&path).unwrap(),
+            LockState::Held {
+                info: LockInfo { pid: 555, owner: "webui".to_string() },
+                alive: false,
+            }
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn kill_and_acquire_on_an_already_free_path_just_acquires() {
+        let dir = tmp_dir("kill-and-acquire-free");
+        let path = dir.join("x.lock");
+        kill_and_acquire(&path, std::process::id(), "webui").unwrap();
+        assert_eq!(
+            check(&path).unwrap(),
+            LockState::Held {
+                info: LockInfo { pid: std::process::id(), owner: "webui".to_string() },
+                alive: true,
+            }
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

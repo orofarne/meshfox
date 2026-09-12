@@ -36,15 +36,46 @@ pub struct PtyProcess {
 }
 
 impl PtyProcess {
-    /// Forwards `bytes` to the pty's stdin — what the client types.
+    /// This session's own pid — the whole-process-group leader `kill`
+    /// signals. Exposed so a caller that claimed this address's lock with
+    /// a placeholder pid *before* spawning (see `crates/server/src/lib.rs`'s
+    /// own up-front, queued-time locking) can correct it to the real one
+    /// right after this session actually starts.
+    pub fn pid(&self) -> i32 {
+        self.pid
+    }
+
+    /// Forwards `bytes` to the pty's stdin — what the client types. Real
+    /// callers now go through `input_sender` instead (see its own doc
+    /// comment on why — this crate's own `tty_registry` needs to keep
+    /// writing after moving the whole `PtyProcess` elsewhere); kept as the
+    /// simpler direct API for a caller (this module's own tests) that
+    /// never needs to do that.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn write(&self, bytes: Vec<u8>) {
         let _ = self.input_tx.send(bytes);
+    }
+
+    /// A cloned handle to this session's own input channel — for a caller
+    /// that needs to keep writing to this pty from elsewhere after this
+    /// `PtyProcess` value itself has been moved (e.g. into the task that
+    /// exclusively drains `output_rx`); functionally identical to calling
+    /// `write` on the original value.
+    pub fn input_sender(&self) -> mpsc::UnboundedSender<Vec<u8>> {
+        self.input_tx.clone()
+    }
+
+    /// Same reasoning as `input_sender`, for `resize`.
+    pub fn resize_sender(&self) -> mpsc::UnboundedSender<(u16, u16)> {
+        self.resize_tx.clone()
     }
 
     /// Tells the pty (and whatever's reading `$COLUMNS`/`$LINES` or
     /// polling `TIOCGWINSZ` inside it) its terminal has this many
     /// columns/rows — the browser's `xterm.js` + fit-addon size, kept in
     /// sync so a full-screen program (`vim`, `htop`, ...) draws correctly.
+    /// Same "real callers use `resize_sender` now" note as `write`.
+    #[allow(dead_code)]
     pub fn resize(&self, cols: u16, rows: u16) {
         let _ = self.resize_tx.send((cols, rows));
     }

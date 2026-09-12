@@ -2415,6 +2415,12 @@ async fn run_file_node_cli(canvas_path: &Path, node: &Node) -> Result<(), String
     )
     .map_err(|e| e.to_string())?;
 
+    // Pinned once, outside the loop — see `run_async`'s own identical
+    // fix and comment (further down in this file) for why recreating
+    // `tokio::signal::ctrl_c()` fresh on every loop iteration (the shape
+    // this used to have) can silently miss a real Ctrl-C in the gap
+    // between one listener dropping and the next registering.
+    let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
     loop {
         tokio::select! {
             line = proc.output_rx.recv() => {
@@ -2432,7 +2438,7 @@ async fn run_file_node_cli(canvas_path: &Path, node: &Node) -> Result<(), String
                     }
                 }
             }
-            _ = tokio::signal::ctrl_c() => {
+            _ = &mut ctrl_c => {
                 eprintln!("^C — killing and stopping");
                 let _ = proc.kill();
                 let _ = proc.child.wait().await;
@@ -2741,9 +2747,14 @@ async fn run_async(
                 let owner_path = located.origin.as_deref().unwrap_or(canvas_path);
                 let lock_path =
                     meshfox_core::service_lock_path(owner_path, &addr.node_id, &addr.block_name);
-                match meshfox_core::service_lock::check(&lock_path) {
-                    Ok(meshfox_core::ServiceLockState::Free) => {}
-                    Ok(meshfox_core::ServiceLockState::Held { info, .. }) => {
+                // Atomic acquire up front (closes the old check-then-act
+                // gap this used to have) — `meshfox_server::services::spawn`
+                // no longer claims this itself (see its own doc comment),
+                // so every caller, this one included, must hold it before
+                // calling that.
+                match meshfox_core::service_lock::acquire(&lock_path, std::process::id(), "cli") {
+                    Ok(()) => {}
+                    Err(meshfox_core::service_lock::AcquireError::Conflict(info)) => {
                         if !prompt::stdin_is_tty() || !std::io::stdout().is_terminal() {
                             eprintln!(
                                 "error running {:?}: service already running (pid {}, started via {}) — refusing to guess without an interactive terminal to ask",
@@ -2764,21 +2775,22 @@ async fn run_async(
                             had_failure = true;
                             break;
                         }
-                        if info.pid != 0 {
-                            // SAFETY: same whole-process-group SIGKILL every
-                            // other kill path here uses (see
-                            // `meshfox_server::services`' private
-                            // `kill_process_group`) — inlined because this
-                            // pid comes from the lock file on disk, not a
-                            // live `ServiceHandle` this process already
-                            // holds.
-                            unsafe {
-                                libc::kill(-(info.pid as libc::pid_t), libc::SIGKILL);
-                            }
+                        // Whole-process-group `SIGKILL` on whatever pid the
+                        // lock file names, release, reacquire — same shared
+                        // helper the webui's own force-run path uses now
+                        // (`meshfox_core::service_lock::kill_and_acquire`),
+                        // instead of a hand-rolled `unsafe { libc::kill }`.
+                        if let Err(e) = meshfox_core::service_lock::kill_and_acquire(
+                            &lock_path,
+                            std::process::id(),
+                            "cli",
+                        ) {
+                            eprintln!("error running {:?}: {e}", addr.block_name);
+                            had_failure = true;
+                            break;
                         }
-                        let _ = meshfox_core::service_lock::release(&lock_path);
                     }
-                    Err(e) => {
+                    Err(meshfox_core::service_lock::AcquireError::Io(e)) => {
                         eprintln!("error running {:?}: {e}", addr.block_name);
                         had_failure = true;
                         break;
@@ -2801,6 +2813,11 @@ async fn run_async(
                         services.push(handle);
                     }
                     Err(e) => {
+                        // Nothing actually ended up running under the lock
+                        // this just claimed — release it, or a later rerun
+                        // would see a permanently stuck "conflict" against
+                        // this same process for no real reason.
+                        let _ = meshfox_core::service_lock::release(&lock_path);
                         // Doesn't stop already-running services from
                         // earlier in this same invocation — a later
                         // service failing to start is no reason to tear
@@ -2868,6 +2885,17 @@ async fn run_async(
                     }
                 };
 
+                // Pinned once per step, outside this loop — recreating
+                // `tokio::signal::ctrl_c()` fresh on every *output line*
+                // (the shape this used to have) briefly drops the previous
+                // listener before the next one registers on every single
+                // iteration, a real gap a real Ctrl-C can land in and be
+                // missed entirely (confirmed via the identical bug in the
+                // `service`-watch loop further down this file, which had
+                // the same pattern at a 200ms-tick granularity instead of
+                // per-line). One listener per step, not per line, closes
+                // that gap for the whole step's own duration.
+                let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
                 loop {
                     tokio::select! {
                         line = proc.output_rx.recv() => {
@@ -2893,7 +2921,7 @@ async fn run_async(
                                 }
                             }
                         }
-                        _ = tokio::signal::ctrl_c() => {
+                        _ = &mut ctrl_c => {
                             eprintln!("^C — killing {:?} and stopping", addr.block_name);
                             let _ = proc.kill();
                             let _ = proc.child.wait().await;
@@ -3013,6 +3041,15 @@ async fn run_async(
         let mut printed = vec![0usize; services.len()];
         let mut crash_reported = vec![false; services.len()];
         let mut any_crashed = false;
+        // Pinned once, outside the loop, and polled by `&mut` reference on
+        // every iteration below — *not* a fresh `tokio::signal::ctrl_c()`
+        // call each time around (the shape this used to have): recreating
+        // it every 200ms briefly drops the previous listener before the
+        // next one registers, a real gap a real SIGINT can land in and be
+        // missed entirely, with nothing left afterward to ever notice it
+        // (this loop has no other way to observe "a signal already came
+        // in"). One long-lived listener has no such gap.
+        let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
         'watch: loop {
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
@@ -3043,7 +3080,7 @@ async fn run_async(
                         break 'watch;
                     }
                 }
-                _ = tokio::signal::ctrl_c() => {
+                _ = &mut ctrl_c => {
                     println!("^C — stopping {} service(s)", services.len());
                     stop_all_services(&services);
                     std::process::exit(130); // 128 + SIGINT, the usual convention

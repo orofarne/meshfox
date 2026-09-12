@@ -44,6 +44,14 @@ mod pty_exec;
 /// server uses — see its own module doc comment for why the TUI links this
 /// crate as a library rather than talking to it over HTTP.
 pub mod services;
+/// Webui-only (not shared with the CLI/TUI, unlike `services` — see this
+/// module's own doc comment for why a plain block's reconnect-safe output
+/// is specifically a multi-tab-webui concern) registry for a plain
+/// block's own most recent run.
+mod run_registry;
+/// Webui-only multi-viewer registry for a `tty` block's own live pty
+/// session — see its own module doc comment.
+mod tty_registry;
 /// `pub` so `meshfox-cli` can reuse the same async spawn/kill primitives
 /// for `meshfox run`'s real-time output — see its `main.rs`.
 pub mod stream_exec;
@@ -133,6 +141,21 @@ struct AppState {
     /// module doc comment for why this is a real persistent registry, not
     /// a per-request kill-switch like `runs` above.
     services: Mutex<HashMap<(String, String), services::ServiceHandle>>,
+    /// A plain (non-`service`, non-`tty`) block's most recently
+    /// started run, keyed by address — lets its live/final output survive
+    /// a reconnect or a second tab watching the same block, the same way
+    /// `services` already does for `service` blocks (see
+    /// `run_registry`'s own module doc comment). Only ever holds the
+    /// *current* run for a given address; Part B's queued-time locking
+    /// already guarantees there's never more than one in flight, so a
+    /// fresh run of the same address simply replaces the old entry here —
+    /// no separate expiry/GC needed.
+    runs_registry: Mutex<HashMap<(String, String), Arc<run_registry::RunHandle>>>,
+    /// Same idea as `runs_registry`, for a `tty` block's own live pty
+    /// session instead of a plain block's own line-oriented output — see
+    /// `tty_registry`'s own module doc comment. Also only ever holds the
+    /// *current* session for a given address, for the same reason.
+    tty_registry: Mutex<HashMap<(String, String), Arc<tty_registry::TtySessionHandle>>>,
     /// Where this worker's own coordinating watcher (or, eventually, a
     /// persistent GUI daemon) is listening — `None` only for a worker
     /// started without one (the `#[cfg(test)]` server, or a hand-run
@@ -303,6 +326,142 @@ impl Drop for RunGuard {
     fn drop(&mut self) {
         self.state.runs.lock().unwrap().remove(&self.run_id);
     }
+}
+
+/// Who already holds a contested address's lock — enough for a client to
+/// show "X is already running (pid N, started via webui)" and offer a
+/// force-retry (`force_run`, below). Reported as a plain `409 Conflict` HTTP
+/// response, not a streamed `RunEvent` — see `acquire_chain_locks`'s own
+/// doc comment for why this is always known *before* a run's response even
+/// starts, so there's no need to open a stream just to report it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LockConflict {
+    node_id: String,
+    block: String,
+    owner_pid: u32,
+    owner_desc: String,
+}
+
+fn lock_conflict_response(conflict: &LockConflict) -> Response {
+    let body = serde_json::to_string(conflict).expect("LockConflict always serializes");
+    Response::builder()
+        .status(StatusCode::CONFLICT)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// Every address in `chain` that actually needs its own lock claimed before
+/// this run can start — every entry `forced_reruns` says won't be skipped
+/// as already-fresh, minus a `service` address that's already a live,
+/// `Running` instance in this very process (its own lock is already held
+/// from when it was first spawned — nothing new to acquire, see
+/// `AppState.services`). Deliberately built from `forced_reruns` alone
+/// (already computed by `compute_forced_reruns` before this is ever called)
+/// rather than re-resolving each block's own kind/fingerprint a second
+/// time: neither `service` nor `tty` ever populates `session_runs` (see
+/// `SessionRun`'s own doc comment), so `compute_forced_reruns` already
+/// treats every such address as "no skip mechanism, always forced" on its
+/// own — exactly the set this needs, service-liveness aside. Still needs
+/// `locate_node` (not a full block scan) per address, purely to find which
+/// file it actually lives in — `meshfox_core::service_lock_path` needs a
+/// canvas path, and an `include`d node's can differ from the primary
+/// document's own.
+fn steps_needing_a_lock(
+    state: &AppState,
+    raw_snapshot: &str,
+    chain: &[meshfox_core::BlockAddr],
+    forced_reruns: &std::collections::HashSet<meshfox_core::BlockAddr>,
+) -> Vec<(meshfox_core::BlockAddr, PathBuf)> {
+    let mut out = Vec::new();
+    for addr in chain {
+        if !forced_reruns.contains(addr) {
+            continue;
+        }
+        let key = (addr.node_id.clone(), addr.block_name.clone());
+        let already_live_service = state
+            .services
+            .lock()
+            .unwrap()
+            .get(&key)
+            .is_some_and(|s| matches!(s.status(), services::ServiceStatus::Running));
+        if already_live_service {
+            continue;
+        }
+        // A bad node/block reference surfaces as a normal `RunEvent::Error`
+        // once the real per-step loop re-locates it for real — nothing to
+        // lock for an address that doesn't even resolve.
+        let Ok(located) = locate_node(state, raw_snapshot, &addr.node_id) else {
+            continue;
+        };
+        let canvas_path_for_step = located.origin.clone().unwrap_or_else(|| state.canvas_path.clone());
+        let lock_path = meshfox_core::service_lock_path(&canvas_path_for_step, &addr.node_id, &addr.block_name);
+        out.push((addr.clone(), lock_path));
+    }
+    out
+}
+
+/// What `acquire_chain_locks` failed with — a real conflict (someone/
+/// something already holds one of the needed locks) versus a plain I/O
+/// problem acquiring one (surfaced as a `500`, not a `409`, since it isn't
+/// really "in use").
+enum ChainLockError {
+    Conflict(LockConflict),
+    Io(io::Error),
+}
+
+/// Attempts to acquire every lock `steps_needing_a_lock` returned, in
+/// address order — all-or-nothing: the first conflict releases every lock
+/// this same call already won, so a run either starts with *every* step it
+/// will need already exclusively claimed by this process, or doesn't start
+/// at all (the "queued" locking this crate's own design notes describe —
+/// a step is never partway locked once some *other* step later in the same
+/// chain turns out contested). Because this always runs before the
+/// response even begins (both `run_block`'s plain NDJSON body and
+/// `run_block_tty`'s WebSocket upgrade call it from their own pre-stream
+/// setup), a conflict can be reported as an ordinary HTTP error rather
+/// than a streamed terminal event — nothing has been sent to the client
+/// yet either way.
+///
+/// On success, returns the paths actually acquired, in the same order —
+/// the caller's own per-step loop removes an address from this set the
+/// moment its fate is decided (released immediately once a *plain* step
+/// finishes; left alone, without releasing, once a `service`/`tty` step
+/// actually starts running under it, since that lock's lifetime now
+/// tracks the running process, not this one request) and, at the very
+/// end, releases whatever is still left — every address whose turn never
+/// came because an earlier step failed or the run was killed.
+fn acquire_chain_locks(
+    targets: &[(meshfox_core::BlockAddr, PathBuf)],
+    owner: &str,
+) -> Result<HashMap<(String, String), PathBuf>, ChainLockError> {
+    let mut acquired: HashMap<(String, String), PathBuf> = HashMap::new();
+    for (addr, path) in targets {
+        match meshfox_core::service_lock::acquire(path, std::process::id(), owner) {
+            Ok(()) => {
+                acquired.insert((addr.node_id.clone(), addr.block_name.clone()), path.clone());
+            }
+            Err(meshfox_core::service_lock::AcquireError::Conflict(info)) => {
+                for path in acquired.values() {
+                    let _ = meshfox_core::service_lock::release(path);
+                }
+                return Err(ChainLockError::Conflict(LockConflict {
+                    node_id: addr.node_id.clone(),
+                    block: addr.block_name.clone(),
+                    owner_pid: info.pid,
+                    owner_desc: info.owner,
+                }));
+            }
+            Err(meshfox_core::service_lock::AcquireError::Io(e)) => {
+                for path in acquired.values() {
+                    let _ = meshfox_core::service_lock::release(path);
+                }
+                return Err(ChainLockError::Io(e));
+            }
+        }
+    }
+    Ok(acquired)
 }
 
 #[derive(Debug, Deserialize)]
@@ -766,7 +925,23 @@ async fn post_configure_vars(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct KillRequest {
-    run_id: String,
+    /// The connection-scoped kill switch `RunEvent::Started` handed back —
+    /// still the only way to kill a `service`/`tty` step still inside its
+    /// own *pre-registry* setup, or a chain step that hasn't reached the
+    /// plain-block registry path at all (a still-running node/var
+    /// resolution, vanishingly brief in practice). Mutually exclusive with
+    /// `node_id`/`block` below — a request names one or the other, not
+    /// both (both absent, or both present, is a client bug).
+    #[serde(default)]
+    run_id: Option<String>,
+    /// Kills whatever's currently registered for this address in
+    /// `AppState::runs_registry` — usable by a tab that never itself
+    /// started the run (a reconnect, or a second tab watching via
+    /// `/api/run/subscribe`) and so never had a `runId` to begin with.
+    #[serde(default)]
+    node_id: Option<String>,
+    #[serde(default)]
+    block: Option<String>,
 }
 
 /// One line of `/api/run`'s streamed NDJSON response body (`application/
@@ -847,18 +1022,14 @@ enum RunEvent {
         block: String,
         pid: u32,
     },
-    /// Terminal for this run — a `service` step's lock file (`.meshfox/
-    /// services/...`, see `meshfox_core::service_lock`) is already held by
-    /// another live-or-stale process. Per the product decision, this is
-    /// always surfaced for confirmation, never silently resolved either
-    /// way — the client shows a confirm dialog and, if the user agrees,
-    /// retries via `POST /api/services/:id/force-start`.
-    ServiceLockConflict {
-        node_id: String,
-        block: String,
-        owner_pid: u32,
-        owner_desc: String,
-    },
+    // A lock conflict on any block (not just `service`) is now reported
+    // *before* a run's response even starts — a plain `409 Conflict` HTTP
+    // response (see `LockConflict`/`lock_conflict_response`), not a
+    // streamed terminal event, since queued-time locking (see
+    // `acquire_chain_locks`) means every conflict this whole chain will
+    // ever hit is already known before anything runs. What used to be a
+    // `ServiceLockConflict` variant here lived only because service-lock
+    // checking used to happen mid-stream, one step at a time.
     StepEnd {
         node_id: String,
         block: String,
@@ -2645,6 +2816,67 @@ async fn run_block(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RunRequest>,
 ) -> Result<Response, ApiError> {
+    run_block_impl(state, req).await
+}
+
+/// `POST /api/run/force` — the generalized escape hatch for a `409` lock
+/// conflict `run_block`/`run_block_tty` reported: force-kills whatever the
+/// conflict's own lock file names (`meshfox_core::service_lock::
+/// kill_and_acquire`, the same whole-process-group `SIGKILL`-then-reacquire
+/// every force path in this codebase already used to hand-roll for
+/// `service` alone), then just re-runs the exact same request that hit the
+/// conflict. Only ever takes over *one* specific address at a time — if the
+/// same chain turns out to conflict on a *different* address too (a second
+/// concurrent run elsewhere in the chain, or a fresh race since the first
+/// conflict was reported), this reports that as a fresh `409` the same way
+/// `run_block_impl` always does, for the client to force again.
+async fn force_run(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ForceRunRequest>,
+) -> Result<Response, ApiError> {
+    let raw_snapshot = state.raw.lock().unwrap().clone();
+    let located = locate_node(&state, &raw_snapshot, &req.force.node_id)?;
+    let canvas_path_for_target = located.origin.unwrap_or_else(|| state.canvas_path.clone());
+    let lock_path = meshfox_core::service_lock_path(
+        &canvas_path_for_target,
+        &req.force.node_id,
+        &req.force.block,
+    );
+    // Claim it just long enough to prove the old owner is actually gone,
+    // then release it again immediately — `run_block_impl` below runs its
+    // own full up-front locking pass over the whole chain (this address
+    // included) from scratch, and would otherwise conflict with *this*
+    // call's own claim (an atomic `acquire` can't tell "already held by us,
+    // moments ago, on purpose" from a genuine second claimant). A fresh
+    // claimant slipping in during the brief gap is an acceptable, rare
+    // race — the client's own cue to force again, same as any other
+    // conflict `run_block_impl` might report.
+    meshfox_core::service_lock::kill_and_acquire(&lock_path, std::process::id(), "webui")
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let _ = meshfox_core::service_lock::release(&lock_path);
+    run_block_impl(state, req.run).await
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ForceRunRequest {
+    #[serde(flatten)]
+    run: RunRequest,
+    /// Which address to force-take — the exact `(nodeId, block)` a prior
+    /// `409` conflict response named. Not necessarily the block the run
+    /// itself targets — a chain's own dependency can just as easily be the
+    /// one that's contested.
+    force: ForceTarget,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ForceTarget {
+    node_id: String,
+    block: String,
+}
+
+async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Response, ApiError> {
     let raw_snapshot = state.raw.lock().unwrap().clone();
     // Include-resolved (not just `parse_or_error`) so `path`/`block` below
     // can address a node spliced in from an `include` — its id in the
@@ -2749,6 +2981,20 @@ async fn run_block(
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?
     };
 
+    // Queued-time, transactional locking: claim every address this chain
+    // will actually need to run *before* anything starts, all-or-nothing —
+    // see `acquire_chain_locks`'s own doc comment. Nothing has been sent to
+    // the client yet at this point, so a conflict is just an ordinary HTTP
+    // response, not a streamed event.
+    let lock_targets = steps_needing_a_lock(&state, &raw_snapshot, &chain, &forced_reruns);
+    let mut held_locks = match acquire_chain_locks(&lock_targets, "webui") {
+        Ok(locks) => locks,
+        Err(ChainLockError::Conflict(conflict)) => return Ok(lock_conflict_response(&conflict)),
+        Err(ChainLockError::Io(e)) => {
+            return Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        }
+    };
+
     let run_id = uuid::Uuid::new_v4().to_string();
     let (kill_tx, mut kill_rx) = oneshot::channel::<()>();
     state.runs.lock().unwrap().insert(run_id.clone(), kill_tx);
@@ -2757,6 +3003,20 @@ async fn run_block(
         // Dropped at the end of this block (however it ends — see
         // `RunGuard`'s own doc comment) to remove the registry entry.
         let _guard = RunGuard { state: Arc::clone(&state), run_id: run_id.clone() };
+        // Whatever's still left in `held_locks` once this generator ends —
+        // whether by reaching the bottom normally, `break`ing out of the
+        // main loop early, or being dropped mid-stream by a client
+        // disconnect — gets released here: a `service`/`tty` step that
+        // actually started running is removed from this map (not released)
+        // the moment it starts, so this only ever sweeps up addresses whose
+        // turn never came, or that were mid-execution as a *plain* step
+        // when the stream ended one way or another. Runs before `_guard`
+        // (declared after it), same reverse-declaration-order `Drop` every
+        // other guard here already relies on. `ReleaseRemainingLocks` is
+        // shared with `run_tty_chain`'s own use of it, see that struct's
+        // own doc comment.
+        let mut _release_guard = ReleaseRemainingLocks(std::mem::take(&mut held_locks));
+        let held_locks = &mut _release_guard.0;
 
         yield Ok::<_, io::Error>(ndjson_line(&RunEvent::Started { run_id: run_id.clone() }));
 
@@ -2924,7 +3184,10 @@ async fn run_block(
                     // This process already owns a live instance of this
                     // exact service (e.g. a "run chain" that pulls it in
                     // as a dependency, run twice) — nothing to do, just
-                    // report it as started again.
+                    // report it as started again. `steps_needing_a_lock`
+                    // already excluded this address from `held_locks` for
+                    // exactly this reason — its own lock, held since it was
+                    // first spawned, is untouched by this request.
                     yield Ok(ndjson_line(&RunEvent::ServiceStarted {
                         node_id: addr.node_id.clone(),
                         block: addr.block_name.clone(),
@@ -2933,34 +3196,14 @@ async fn run_block(
                     continue;
                 }
 
-                let lock_path = meshfox_core::service_lock_path(
-                    canvas_path_for_step,
-                    &addr.node_id,
-                    &addr.block_name,
-                );
-                match meshfox_core::service_lock::check(&lock_path) {
-                    Ok(meshfox_core::ServiceLockState::Free) => {}
-                    Ok(meshfox_core::ServiceLockState::Held { info, .. }) => {
-                        yield Ok(ndjson_line(&RunEvent::ServiceLockConflict {
-                            node_id: addr.node_id.clone(),
-                            block: addr.block_name.clone(),
-                            owner_pid: info.pid,
-                            owner_desc: info.owner,
-                        }));
-                        // Reuses the same "no trailing Done" suppression
-                        // `/api/kill` sets for `Killed` — `ServiceLockConflict`
-                        // is terminal for this run too (see its own doc
-                        // comment), and would otherwise fall through to the
-                        // loop's post-break `Done` below.
-                        killed = true;
-                        break;
-                    }
-                    Err(e) => {
-                        yield Ok(ndjson_line(&RunEvent::Error { message: e.to_string() }));
-                        break;
-                    }
-                }
-
+                // The lock for this address was already claimed up front
+                // (`acquire_chain_locks`, before this response even
+                // started) — `services::spawn` no longer acquires it
+                // itself (see that function's own doc comment), so this
+                // just spawns and hands ownership of the lock's lifetime to
+                // the new `ServiceHandle` (removed from `held_locks`
+                // without releasing — `ServiceHandle::stop`/its own crash
+                // detection release it from here on).
                 match services::spawn(
                     addr.node_id.clone(),
                     addr.block_name.clone(),
@@ -2972,6 +3215,7 @@ async fn run_block(
                 ) {
                     Ok(handle) => {
                         let pid = handle.pid;
+                        held_locks.remove(&key);
                         state.services.lock().unwrap().insert(key, handle);
                         yield Ok(ndjson_line(&RunEvent::ServiceStarted {
                             node_id: addr.node_id.clone(),
@@ -2980,6 +3224,9 @@ async fn run_block(
                         }));
                     }
                     Err(e) => {
+                        if let Some(path) = held_locks.remove(&key) {
+                            let _ = meshfox_core::service_lock::release(&path);
+                        }
                         yield Ok(ndjson_line(&RunEvent::Error { message: e.to_string() }));
                         break;
                     }
@@ -2988,7 +3235,7 @@ async fn run_block(
             }
 
             let step_started = std::time::Instant::now();
-            let mut proc = match stream_exec::spawn_block(
+            let proc = match stream_exec::spawn_block(
                 &resolved_block,
                 &block_env,
                 Some(&cwd),
@@ -2996,53 +3243,107 @@ async fn run_block(
             ) {
                 Ok(p) => p,
                 Err(e) => {
+                    if let Some(path) = held_locks.remove(&(addr.node_id.clone(), addr.block_name.clone())) {
+                        let _ = meshfox_core::service_lock::release(&path);
+                    }
                     yield Ok(ndjson_line(&RunEvent::Error { message: e.to_string() }));
                     break;
                 }
             };
+            // This address's lock (if `steps_needing_a_lock` claimed one)
+            // was necessarily acquired with a placeholder pid before this
+            // process existed — correct it now so a concurrent force-run
+            // against it targets the real child, not whatever placeholder
+            // won the original race.
+            if let Some(path) = held_locks.get(&(addr.node_id.clone(), addr.block_name.clone())) {
+                let _ = meshfox_core::service_lock::update_owner_pid(path, proc.child.id().unwrap_or(0));
+            }
 
             let mut full_output = String::new();
             let mut stdout_only = String::new();
             let mut stderr_only = String::new();
+            // Registering this run — instead of draining `proc` directly
+            // here — is what lets its output survive this one connection:
+            // a reconnect or a second tab can subscribe to the exact same
+            // `run_registry::RunHandle` via `/api/run/subscribe` and see
+            // everything from wherever it left off, not just whatever this
+            // one stream happens to relay. This connection is itself just
+            // the *first* subscriber, from seq 0 (nothing buffered yet).
+            //
+            // This address's lock (if `steps_needing_a_lock` claimed one)
+            // is handed to `track` below rather than released here once
+            // this step's own `StepEnd` is reached — the process it
+            // protects now outlives this one connection, so its lock has
+            // to too: releasing it whenever *this generator* happens to
+            // end (a client disconnect long before the real process
+            // exits, say) would free the address while the process is
+            // still genuinely running under it, letting a second, truly
+            // concurrent request start right on top of it. `track`'s own
+            // background task releases it once the process actually ends,
+            // regardless of who is or isn't still watching.
+            let lock_path_for_run =
+                held_locks.remove(&(addr.node_id.clone(), addr.block_name.clone()));
+            let run_handle =
+                run_registry::track(addr.node_id.clone(), addr.block_name.clone(), proc, lock_path_for_run);
+            state.runs_registry.lock().unwrap().insert(
+                (addr.node_id.clone(), addr.block_name.clone()),
+                Arc::clone(&run_handle),
+            );
+            let (_backlog, mut run_rx) = run_handle.subscribe_from(0);
+            let mut kill_requested = false;
             let exit_code = loop {
                 tokio::select! {
-                    line = proc.output_rx.recv() => {
-                        match line {
-                            Some((stream, text)) => {
-                                full_output.push_str(&text);
+                    event = run_rx.recv() => {
+                        match event {
+                            Ok(run_registry::RunEvent::Line(line)) => {
+                                full_output.push_str(&line.text);
                                 full_output.push('\n');
-                                match stream {
+                                match line.stream {
                                     stream_exec::OutputStream::Stdout => {
-                                        stdout_only.push_str(&text);
+                                        stdout_only.push_str(&line.text);
                                         stdout_only.push('\n');
                                     }
                                     stream_exec::OutputStream::Stderr => {
-                                        stderr_only.push_str(&text);
+                                        stderr_only.push_str(&line.text);
                                         stderr_only.push('\n');
                                     }
                                 }
                                 yield Ok(ndjson_line(&RunEvent::Output {
                                     node_id: addr.node_id.clone(),
                                     block: addr.block_name.clone(),
-                                    stream,
-                                    text,
+                                    stream: line.stream,
+                                    text: line.text,
                                 }));
                             }
-                            None => {
-                                let status = proc.child.wait().await;
-                                break status.ok().and_then(|s| s.code()).unwrap_or(-1);
+                            Ok(run_registry::RunEvent::Done(run_registry::RunOutcome::Exited { exit_code })) => {
+                                break exit_code;
+                            }
+                            Ok(run_registry::RunEvent::Done(run_registry::RunOutcome::Killed)) => {
+                                yield Ok(ndjson_line(&RunEvent::Killed {
+                                    node_id: addr.node_id.clone(),
+                                    block: addr.block_name.clone(),
+                                }));
+                                killed = true;
+                                break -1;
+                            }
+                            // `Done` never actually carries `Running` (see
+                            // `run_registry::track`'s own loop) and a
+                            // dropped/lagged channel only happens if this
+                            // subscription itself got badly behind — either
+                            // way there's nothing meaningful left to relay.
+                            Ok(run_registry::RunEvent::Done(run_registry::RunOutcome::Running)) | Err(_) => {
+                                break -1;
                             }
                         }
                     }
-                    _ = &mut kill_rx => {
-                        let _ = proc.kill();
-                        let _ = proc.child.wait().await;
-                        yield Ok(ndjson_line(&RunEvent::Killed {
-                            node_id: addr.node_id.clone(),
-                            block: addr.block_name.clone(),
-                        }));
-                        killed = true;
-                        break -1;
+                    // Only armed once — after firing, this connection's own
+                    // kill request has been delivered to the registry
+                    // (which every subscriber, not just this one, will see
+                    // resolve as `Done(Killed)` above); re-arming it would
+                    // just fire again immediately for no reason.
+                    _ = &mut kill_rx, if !kill_requested => {
+                        kill_requested = true;
+                        run_handle.kill();
                     }
                 }
             };
@@ -3058,6 +3359,9 @@ async fn run_block(
                 duration_ms,
             }));
             final_exit_code = exit_code;
+            // This step's own lock (if any) was already handed off to
+            // `run_handle`'s own background task above — nothing left to
+            // release here (see that call site's own comment on why).
 
             // Read back whatever this step wrote to its own vars-out file
             // (if it had one) and fold the type-validated values straight
@@ -3351,6 +3655,18 @@ async fn run_block_tty(
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?
     };
 
+    // Same queued-time, transactional locking `run_block` does — see its
+    // own doc comment on the equivalent line. Still entirely pre-upgrade,
+    // so a conflict is a plain HTTP response, not a WebSocket frame.
+    let lock_targets = steps_needing_a_lock(&state, &raw_snapshot, &chain, &forced_reruns);
+    let held_locks = match acquire_chain_locks(&lock_targets, "webui") {
+        Ok(locks) => locks,
+        Err(ChainLockError::Conflict(conflict)) => return Ok(lock_conflict_response(&conflict)),
+        Err(ChainLockError::Io(e)) => {
+            return Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        }
+    };
+
     let run_id = uuid::Uuid::new_v4().to_string();
     let (kill_tx, kill_rx) = oneshot::channel::<()>();
     state.runs.lock().unwrap().insert(run_id.clone(), kill_tx);
@@ -3368,8 +3684,25 @@ async fn run_block_tty(
             cols,
             rows,
             kill_rx,
+            held_locks,
         )
     }))
+}
+
+/// Releases every lock still left in `0` on drop — same "sweep whatever
+/// wasn't explicitly resolved" guard `run_block`'s own
+/// `ReleaseRemainingLocks` is, factored out here so `run_tty_chain` (a
+/// plain `async fn` with several early `return`s, not a `stream!`
+/// generator) gets the exact same "released no matter how this function
+/// actually ends" guarantee without duplicating the `Drop` impl.
+struct ReleaseRemainingLocks(HashMap<(String, String), PathBuf>);
+
+impl Drop for ReleaseRemainingLocks {
+    fn drop(&mut self) {
+        for path in self.0.values() {
+            let _ = meshfox_core::service_lock::release(path);
+        }
+    }
 }
 
 /// Sends one `RunEvent` as a WebSocket text frame (JSON) — the WS
@@ -3404,11 +3737,22 @@ async fn run_tty_chain(
     cols: u16,
     rows: u16,
     mut kill_rx: oneshot::Receiver<()>,
+    held_locks: HashMap<(String, String), PathBuf>,
 ) {
     let _guard = RunGuard {
         state: Arc::clone(&state),
         run_id: run_id.clone(),
     };
+    // Released on drop, however this function actually ends (a clean
+    // finish, `killed`, or an early `return` on a dead socket) — see
+    // `ReleaseRemainingLocks`'s own doc comment. No `service` step can ever
+    // reach this function (`tty`/`service` are mutually exclusive, see
+    // `DepsError::ServiceTtyConflict`), so — unlike `run_block` — nothing
+    // here ever needs to *remove* an address from this map without
+    // releasing it: every address this function locks (plain or `tty`)
+    // is released the moment its own step ends, and this only ever
+    // sweeps up whatever a kill/disconnect/failure left unresolved.
+    let mut held_locks = ReleaseRemainingLocks(held_locks);
 
     if !send_event(
         &mut socket,
@@ -3567,6 +3911,9 @@ async fn run_tty_chain(
                 return;
             }
             match relay_tty_step(
+                &state,
+                addr.node_id.clone(),
+                addr.block_name.clone(),
                 &mut socket,
                 &block.code,
                 resolved_block.interpreter.as_deref(),
@@ -3576,6 +3923,13 @@ async fn run_tty_chain(
                 cols,
                 rows,
                 &mut kill_rx,
+                // Handed off by value, not borrowed — ownership (and the
+                // responsibility to release it once the session actually
+                // ends, not whenever this one connection does) transfers
+                // to the `tty_registry::TtySessionHandle` this call
+                // registers, same reasoning `run_registry::track`'s own
+                // callers already follow for a plain block's lock.
+                held_locks.0.remove(&(addr.node_id.clone(), addr.block_name.clone())),
             )
             .await
             {
@@ -3588,7 +3942,7 @@ async fn run_tty_chain(
                 TtyStepOutcome::Disconnected => return,
             }
         } else {
-            let mut proc = match stream_exec::spawn_block(
+            let proc = match stream_exec::spawn_block(
                 &resolved_block,
                 &block_env,
                 Some(&cwd),
@@ -3596,6 +3950,9 @@ async fn run_tty_chain(
             ) {
                 Ok(p) => p,
                 Err(e) => {
+                    if let Some(path) = held_locks.0.remove(&(addr.node_id.clone(), addr.block_name.clone())) {
+                        let _ = meshfox_core::service_lock::release(&path);
+                    }
                     send_event(
                         &mut socket,
                         &RunEvent::Error {
@@ -3606,44 +3963,72 @@ async fn run_tty_chain(
                     break;
                 }
             };
+            if let Some(path) = held_locks.0.get(&(addr.node_id.clone(), addr.block_name.clone())) {
+                let _ = meshfox_core::service_lock::update_owner_pid(path, proc.child.id().unwrap_or(0));
+            }
+            // Same registry-backed detachment `run_block_impl` uses for
+            // its own plain steps — see its own doc comment, including on
+            // why this address's lock (if any) is handed to `track` below
+            // instead of being released once this step's own loop ends —
+            // a client disconnect here must not free a lock the process
+            // is still genuinely running under.
+            let lock_path_for_run =
+                held_locks.0.remove(&(addr.node_id.clone(), addr.block_name.clone()));
+            let run_handle =
+                run_registry::track(addr.node_id.clone(), addr.block_name.clone(), proc, lock_path_for_run);
+            state.runs_registry.lock().unwrap().insert(
+                (addr.node_id.clone(), addr.block_name.clone()),
+                Arc::clone(&run_handle),
+            );
+            let (_backlog, mut run_rx) = run_handle.subscribe_from(0);
+            let mut kill_requested = false;
             loop {
                 tokio::select! {
-                    line = proc.output_rx.recv() => {
-                        match line {
-                            Some((stream, text)) => {
-                                full_output.push_str(&text);
+                    event = run_rx.recv() => {
+                        match event {
+                            Ok(run_registry::RunEvent::Line(line)) => {
+                                full_output.push_str(&line.text);
                                 full_output.push('\n');
-                                match stream {
+                                match line.stream {
                                     stream_exec::OutputStream::Stdout => {
-                                        stdout_only.push_str(&text);
+                                        stdout_only.push_str(&line.text);
                                         stdout_only.push('\n');
                                     }
                                     stream_exec::OutputStream::Stderr => {
-                                        stderr_only.push_str(&text);
+                                        stderr_only.push_str(&line.text);
                                         stderr_only.push('\n');
                                     }
                                 }
                                 if !send_event(&mut socket, &RunEvent::Output {
                                     node_id: addr.node_id.clone(),
                                     block: addr.block_name.clone(),
-                                    stream,
-                                    text,
+                                    stream: line.stream,
+                                    text: line.text,
                                 }).await {
-                                    let _ = proc.kill();
+                                    // Client gone — this run keeps going in
+                                    // the background regardless (any other
+                                    // subscriber, or a reconnect, still
+                                    // sees it through), same as
+                                    // `run_block_impl`'s stream simply not
+                                    // being polled any more.
                                     return;
                                 }
                             }
-                            None => {
-                                let status = proc.child.wait().await;
-                                break status.ok().and_then(|s| s.code()).unwrap_or(-1);
+                            Ok(run_registry::RunEvent::Done(run_registry::RunOutcome::Exited { exit_code })) => {
+                                break exit_code;
+                            }
+                            Ok(run_registry::RunEvent::Done(run_registry::RunOutcome::Killed)) => {
+                                killed = true;
+                                break -1;
+                            }
+                            Ok(run_registry::RunEvent::Done(run_registry::RunOutcome::Running)) | Err(_) => {
+                                break -1;
                             }
                         }
                     }
-                    _ = &mut kill_rx => {
-                        let _ = proc.kill();
-                        let _ = proc.child.wait().await;
-                        killed = true;
-                        break -1;
+                    _ = &mut kill_rx, if !kill_requested => {
+                        kill_requested = true;
+                        run_handle.kill();
                     }
                 }
             }
@@ -3676,6 +4061,10 @@ async fn run_tty_chain(
             return;
         }
         final_exit_code = exit_code;
+        // This step's own lock (`tty` or plain) was already handed off —
+        // to `relay_tty_step`'s own `tty_registry::track` call or this
+        // loop's own `run_registry::track` call, above — nothing left to
+        // release here (see either call site's own comment on why).
 
         // Read back whatever this step wrote to its own vars-out file (if
         // it had one) and fold the type-validated values straight into
@@ -3818,7 +4207,21 @@ enum TtyStepOutcome {
 /// frames, incoming binary frames go to the pty's stdin, incoming text
 /// frames are parsed as a `ResizeMessage`.
 #[allow(clippy::too_many_arguments)]
+/// Relays one `tty` step over `socket` once it's already in "raw I/O" mode
+/// (right after `RunEvent::TtyStart`), *as one viewer of* the address's own
+/// `tty_registry::TtySessionHandle` — this connection is never the pty's
+/// sole owner any more (see that module's own doc comment): closing it
+/// (`Message::Close`/a dropped socket) only removes *this* viewer from the
+/// session's size negotiation and returns `Disconnected`, it doesn't kill
+/// anything — the session keeps running for any other attached viewer, or
+/// for a future `/api/run/tty/attach` reconnect, exactly like a real `tmux`
+/// pane surviving a detach. Only an explicit `/api/kill` (the `kill_rx`
+/// arm below) or the process exiting on its own actually ends it.
+#[allow(clippy::too_many_arguments)]
 async fn relay_tty_step(
+    state: &Arc<AppState>,
+    node_id: String,
+    block_name: String,
     socket: &mut WebSocket,
     code: &str,
     interpreter: Option<&str>,
@@ -3828,10 +4231,14 @@ async fn relay_tty_step(
     cols: u16,
     rows: u16,
     kill_rx: &mut oneshot::Receiver<()>,
+    lock_path: Option<PathBuf>,
 ) -> TtyStepOutcome {
-    let mut pty = match pty_exec::spawn(code, interpreter, envs, cwd, canvas_path, cols, rows) {
+    let pty = match pty_exec::spawn(code, interpreter, envs, cwd, canvas_path, cols, rows) {
         Ok(p) => p,
         Err(e) => {
+            if let Some(path) = &lock_path {
+                let _ = meshfox_core::service_lock::release(path);
+            }
             send_event(
                 socket,
                 &RunEvent::Error {
@@ -3842,53 +4249,192 @@ async fn relay_tty_step(
             return TtyStepOutcome::Exited(-1);
         }
     };
+    // Same placeholder-pid correction `run_block`'s own plain-block spawn
+    // path does — this address's lock (if any) was necessarily claimed
+    // before this pty existed.
+    if let Some(path) = &lock_path {
+        let _ = meshfox_core::service_lock::update_owner_pid(path, pty.pid() as u32);
+    }
 
-    loop {
+    // `lock_path` (if any) is handed to `track` below by value — its
+    // background task releases it once the session actually ends, not
+    // whenever this one connection does (see `tty_registry::track`'s own
+    // doc comment on why: this session outlives whatever connection
+    // started it, so its lock has to too).
+    let handle = tty_registry::track(node_id.clone(), block_name.clone(), pty, lock_path);
+    state.tty_registry.lock().unwrap().insert((node_id, block_name), Arc::clone(&handle));
+
+    let (backlog, mut rx) = handle.attach();
+    if !backlog.is_empty() && socket.send(Message::Binary(backlog)).await.is_err() {
+        return TtyStepOutcome::Disconnected;
+    }
+    let viewer_id = handle.register_viewer(cols, rows);
+    let mut kill_requested = false;
+
+    let outcome = loop {
         tokio::select! {
-            chunk = pty.output_rx.recv() => {
-                match chunk {
-                    Some(bytes) => {
-                        if socket.send(Message::Binary(bytes)).await.is_err() {
-                            let _ = pty.kill();
-                            return TtyStepOutcome::Disconnected;
+            event = rx.recv() => {
+                match event {
+                    Ok(tty_registry::TtyEvent::Bytes(bytes)) => {
+                        if socket.send(Message::Binary(bytes.to_vec())).await.is_err() {
+                            handle.forget_viewer(viewer_id);
+                            break TtyStepOutcome::Disconnected;
                         }
                     }
-                    // Pty closed — the step's process (and anything it
-                    // spawned) has exited; `pty.wait()` below resolves
-                    // right away.
-                    None => break,
+                    Ok(tty_registry::TtyEvent::Done(tty_registry::RunOutcome::Exited { exit_code })) => {
+                        handle.forget_viewer(viewer_id);
+                        break TtyStepOutcome::Exited(exit_code);
+                    }
+                    Ok(tty_registry::TtyEvent::Done(tty_registry::RunOutcome::Killed)) => {
+                        handle.forget_viewer(viewer_id);
+                        break TtyStepOutcome::Killed;
+                    }
+                    Ok(tty_registry::TtyEvent::Done(tty_registry::RunOutcome::Running)) | Err(_) => {
+                        handle.forget_viewer(viewer_id);
+                        break TtyStepOutcome::Exited(-1);
+                    }
                 }
             }
             msg = socket.recv() => {
                 match msg {
-                    Some(Ok(Message::Binary(bytes))) => pty.write(bytes),
+                    Some(Ok(Message::Binary(bytes))) => handle.write(bytes),
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(resize) = serde_json::from_str::<ResizeMessage>(&text) {
-                            pty.resize(resize.cols.max(1), resize.rows.max(1));
+                            handle.resize_viewer(viewer_id, resize.cols.max(1), resize.rows.max(1));
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None => {
-                        let _ = pty.kill();
-                        return TtyStepOutcome::Disconnected;
-                    }
-                    Some(Err(_)) => {
-                        let _ = pty.kill();
-                        return TtyStepOutcome::Disconnected;
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => {
+                        handle.forget_viewer(viewer_id);
+                        break TtyStepOutcome::Disconnected;
                     }
                     // Ping/Pong: axum answers Pings internally; nothing to
                     // relay to the pty either way.
                     Some(Ok(_)) => {}
                 }
             }
-            _ = &mut *kill_rx => {
-                let _ = pty.kill();
-                pty.wait().await;
-                return TtyStepOutcome::Killed;
+            // Only armed once — after firing, this connection's own kill
+            // request has been delivered to the registry, which every
+            // attached viewer (not just this one) will see resolve as
+            // `Done(Killed)` above; re-arming would just fire again
+            // immediately for no reason (same pattern `run_block_impl`'s
+            // own plain-step loop uses).
+            _ = &mut *kill_rx, if !kill_requested => {
+                kill_requested = true;
+                handle.kill();
+            }
+        }
+    };
+    outcome
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AttachTtyQuery {
+    node_id: String,
+    block: String,
+    #[serde(default = "default_tty_cols")]
+    cols: u16,
+    #[serde(default = "default_tty_rows")]
+    rows: u16,
+}
+
+fn default_tty_cols() -> u16 {
+    80
+}
+
+fn default_tty_rows() -> u16 {
+    24
+}
+
+/// `GET /api/run/tty/attach?nodeId=..&block=..&cols=..&rows=..` — joins an
+/// *already-running* `tty` session as an additional viewer, without
+/// spawning anything: replays its full still-buffered byte history, then
+/// relays live output/input exactly like the connection that originally
+/// started it (see `relay_tty_step`'s own doc comment — this is the exact
+/// same "just a viewer" relationship to the session, just without ever
+/// having spawned it). `404` if this address has no live session right
+/// now (never started, or it's already finished and nothing is tracking
+/// it any more — a finished session's own final byte history is still
+/// attachable for as long as it stays the *current* entry for this
+/// address, same as `run_registry`'s equivalent for a plain block).
+async fn attach_tty(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<AttachTtyQuery>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, ApiError> {
+    let key = (query.node_id.clone(), query.block.clone());
+    let Some(handle) = state.tty_registry.lock().unwrap().get(&key).cloned() else {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            format!("no tty session for {:?}/{:?}", query.node_id, query.block),
+        ));
+    };
+    let cols = query.cols.max(1);
+    let rows = query.rows.max(1);
+    Ok(ws.on_upgrade(move |socket| relay_tty_viewer(handle, socket, cols, rows)))
+}
+
+/// The actual attach loop `attach_tty` upgrades into — see its own doc
+/// comment. No local kill switch here (unlike `relay_tty_step`'s own
+/// `kill_rx`): an attach-only viewer never has a `runId` of its own to
+/// begin with, so killing this session is always done by address, via the
+/// ordinary `POST /api/kill {nodeId, block}` path (already reaches the
+/// exact same `TtySessionHandle` through `AppState::tty_registry`) rather
+/// than anything this socket needs to carry itself.
+async fn relay_tty_viewer(
+    handle: Arc<tty_registry::TtySessionHandle>,
+    mut socket: WebSocket,
+    cols: u16,
+    rows: u16,
+) {
+    let (backlog, mut rx) = handle.attach();
+    if !backlog.is_empty() && socket.send(Message::Binary(backlog)).await.is_err() {
+        return;
+    }
+    // Already finished by the time this attached — tell this late viewer
+    // right away instead of waiting on a broadcast that already fired
+    // before `rx` existed (same race-freedom reasoning `subscribe_run`
+    // documents for a plain block's own equivalent).
+    if !matches!(handle.outcome(), tty_registry::RunOutcome::Running) {
+        let _ = socket.send(Message::Close(None)).await;
+        return;
+    }
+
+    let viewer_id = handle.register_viewer(cols, rows);
+    loop {
+        tokio::select! {
+            event = rx.recv() => {
+                match event {
+                    Ok(tty_registry::TtyEvent::Bytes(bytes)) => {
+                        if socket.send(Message::Binary(bytes.to_vec())).await.is_err() {
+                            handle.forget_viewer(viewer_id);
+                            return;
+                        }
+                    }
+                    Ok(tty_registry::TtyEvent::Done(_)) | Err(_) => {
+                        handle.forget_viewer(viewer_id);
+                        let _ = socket.send(Message::Close(None)).await;
+                        return;
+                    }
+                }
+            }
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Binary(bytes))) => handle.write(bytes),
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(resize) = serde_json::from_str::<ResizeMessage>(&text) {
+                            handle.resize_viewer(viewer_id, resize.cols.max(1), resize.rows.max(1));
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => {
+                        handle.forget_viewer(viewer_id);
+                        return;
+                    }
+                    Some(Ok(_)) => {}
+                }
             }
         }
     }
-
-    TtyStepOutcome::Exited(pty.wait().await)
 }
 
 /// One entry of `GET /api/services`'s response — see `crate::services`'s own
@@ -3945,6 +4491,71 @@ async fn get_services(State(state): State<Arc<AppState>>) -> Json<Vec<ServiceDto
             .map(|((node_id, block), handle)| service_dto(node_id, block, handle))
             .collect(),
     )
+}
+
+/// One entry of `GET /api/runs`'s response — see that handler's own doc
+/// comment.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ActiveRunDto {
+    node_id: String,
+    block: String,
+    /// `"plain"` (`run_registry`) or `"tty"` (`tty_registry`) — a client
+    /// only ever wants to reconcile/reattach to one or the other
+    /// differently (a plain block's live output vs. a real terminal), so
+    /// this is what it switches on rather than trying to infer the kind
+    /// from anything else in this DTO.
+    kind: &'static str,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_code: Option<i32>,
+    uptime_ms: u64,
+}
+
+/// `GET /api/runs` — every plain-block run and `tty` session this process
+/// currently knows about (running, or the most recent one for that
+/// address — see `run_registry`/`tty_registry`'s own module doc comments
+/// on why an entry outlives any single request), regardless of which
+/// connection (if any) is currently watching it. What a freshly-loaded or
+/// reloaded tab reconciles its own live-output state against on mount —
+/// without this, reloading a tab mid-run shows nothing for a block that's
+/// actually still (or again) running, even though its output has been
+/// sitting in the server's own registry the whole time — same role
+/// `GET /api/services` already plays for `service` blocks, generalized to
+/// the two other kinds of run this server now separately tracks.
+async fn get_active_runs(State(state): State<Arc<AppState>>) -> Json<Vec<ActiveRunDto>> {
+    let mut out = Vec::new();
+    for handle in state.runs_registry.lock().unwrap().values() {
+        let (status, exit_code) = match handle.outcome() {
+            run_registry::RunOutcome::Running => ("running", None),
+            run_registry::RunOutcome::Exited { exit_code } => ("exited", Some(exit_code)),
+            run_registry::RunOutcome::Killed => ("killed", None),
+        };
+        out.push(ActiveRunDto {
+            node_id: handle.node_id.clone(),
+            block: handle.block_name.clone(),
+            kind: "plain",
+            status,
+            exit_code,
+            uptime_ms: handle.uptime_ms(),
+        });
+    }
+    for handle in state.tty_registry.lock().unwrap().values() {
+        let (status, exit_code) = match handle.outcome() {
+            tty_registry::RunOutcome::Running => ("running", None),
+            tty_registry::RunOutcome::Exited { exit_code } => ("exited", Some(exit_code)),
+            tty_registry::RunOutcome::Killed => ("killed", None),
+        };
+        out.push(ActiveRunDto {
+            node_id: handle.node_id.clone(),
+            block: handle.block_name.clone(),
+            kind: "tty",
+            status,
+            exit_code,
+            uptime_ms: handle.uptime_ms(),
+        });
+    }
+    Json(out)
 }
 
 #[derive(Debug, Deserialize)]
@@ -4125,26 +4736,15 @@ async fn force_start_service(
 
     let lock_path =
         meshfox_core::service_lock_path(&canvas_path_for_step, &target.node_id, &target.block_name);
-    if let meshfox_core::ServiceLockState::Held { info, .. } = meshfox_core::service_lock::check(&lock_path)
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    {
-        if info.pid != 0 {
-            // SAFETY: same whole-process-group SIGKILL every other kill
-            // path here uses (see `services::kill_process_group`, private
-            // to that module) — inlined here because this pid comes from
-            // the lock file on disk, not a live `ServiceHandle` this
-            // process itself already holds.
-            let ret = unsafe { libc::kill(-(info.pid as libc::pid_t), libc::SIGKILL) };
-            if ret != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
-                return Err(ApiError(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    io::Error::last_os_error().to_string(),
-                ));
-            }
-        }
-        meshfox_core::service_lock::release(&lock_path)
-            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    }
+    // Whole-process-group `SIGKILL` on whatever pid the lock file names
+    // (even one this process has no live `ServiceHandle` for), release,
+    // reacquire — a no-op straight to acquiring if the lock's already
+    // free — same shared helper `force_run`'s own generalized conflict
+    // path uses now (see `meshfox_core::service_lock::kill_and_acquire`'s
+    // own doc comment); `services::spawn` no longer acquires this itself
+    // (see its own doc comment), so this must run before it either way.
+    meshfox_core::service_lock::kill_and_acquire(&lock_path, std::process::id(), "webui")
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let handle = services::spawn(
         target.node_id.clone(),
@@ -4169,13 +4769,179 @@ async fn force_start_service(
 /// means "it already finished" as "it never existed" — the client treats
 /// either the same way (nothing left to kill).
 async fn kill_run(State(state): State<Arc<AppState>>, Json(req): Json<KillRequest>) -> StatusCode {
-    match state.runs.lock().unwrap().remove(&req.run_id) {
-        Some(tx) => {
-            let _ = tx.send(());
-            StatusCode::NO_CONTENT
-        }
-        None => StatusCode::NOT_FOUND,
+    if let Some(run_id) = &req.run_id {
+        return match state.runs.lock().unwrap().remove(run_id) {
+            Some(tx) => {
+                let _ = tx.send(());
+                StatusCode::NO_CONTENT
+            }
+            None => StatusCode::NOT_FOUND,
+        };
     }
+    if let (Some(node_id), Some(block)) = (&req.node_id, &req.block) {
+        let key = (node_id.clone(), block.clone());
+        // A plain block and a `tty` block can never share an address (see
+        // `DepsError::ServiceTtyConflict` — this crate never registers a
+        // `tty` block in `runs_registry` or a plain one in `tty_registry`
+        // to begin with), so checking both registries here is never
+        // ambiguous about which one this address actually belongs to.
+        let plain_handle = state.runs_registry.lock().unwrap().get(&key).cloned();
+        // `RunHandle`/`TtySessionHandle::kill` are both idempotent/harmless
+        // if the run already finished on its own between this lookup and
+        // the call — still `204` either way, since there's no meaningful
+        // difference to the caller between "killed it" and "it was
+        // already done".
+        if let Some(handle) = plain_handle {
+            handle.kill();
+            return StatusCode::NO_CONTENT;
+        }
+        let tty_handle = state.tty_registry.lock().unwrap().get(&key).cloned();
+        return match tty_handle {
+            Some(handle) => {
+                handle.kill();
+                StatusCode::NO_CONTENT
+            }
+            None => StatusCode::NOT_FOUND,
+        };
+    }
+    StatusCode::BAD_REQUEST
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubscribeRunQuery {
+    node_id: String,
+    block: String,
+    /// Replay every buffered line at or after this sequence number, then
+    /// keep tailing live — `0` (the default, and what a client's very
+    /// first subscribe always uses) replays everything still buffered.
+    /// A reconnecting client instead sends whatever `seq` its own
+    /// last-seen `line` event carried, so it never sees a line twice.
+    #[serde(default)]
+    since_seq: u64,
+}
+
+/// One line of `/api/run/subscribe`'s streamed NDJSON response — a much
+/// smaller vocabulary than `RunEvent` (no `StepStart`/chain-level
+/// concepts at all): this endpoint watches exactly one address's own
+/// `run_registry::RunHandle`, independent of whatever request originally
+/// started it or which step of a larger chain it was.
+// `rename_all` on an enum only renames the *variant* tag (`"line"`/
+// `"done"`) — it does *not* also rename each struct variant's own fields;
+// that needs the separate `rename_all_fields` (same combo `RunEvent`,
+// above, already uses). Missing it here meant `exit_code` shipped to the
+// client as literal snake_case instead of `exitCode`, so `event.exitCode`
+// read back as `undefined` on every `"done"` event — indistinguishable
+// from a genuinely missing value, which is exactly what let a
+// *successful* reconciled run get treated as failed (`undefined !== 0`).
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+enum SubscribeEvent {
+    Line {
+        seq: u64,
+        stream: stream_exec::OutputStream,
+        text: String,
+    },
+    /// Terminal — always the last line this endpoint ever sends for a
+    /// given connection. `exit_code` is only present for `outcome:
+    /// "exited"`.
+    Done {
+        outcome: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+    },
+}
+
+fn done_event(outcome: &run_registry::RunOutcome) -> SubscribeEvent {
+    match outcome {
+        run_registry::RunOutcome::Exited { exit_code } => {
+            SubscribeEvent::Done { outcome: "exited", exit_code: Some(*exit_code) }
+        }
+        run_registry::RunOutcome::Killed => SubscribeEvent::Done { outcome: "killed", exit_code: None },
+        // Never actually reached from `subscribe_run` below (only called
+        // once `outcome()` has already been checked to not be `Running`)
+        // — `"exited"`-with-no-code is a harmless, honest fallback rather
+        // than a silent lie about the process having actually exited.
+        run_registry::RunOutcome::Running => SubscribeEvent::Done { outcome: "exited", exit_code: None },
+    }
+}
+
+fn subscribe_ndjson_line(event: &SubscribeEvent) -> Bytes {
+    let mut line = serde_json::to_string(event).expect("SubscribeEvent always serializes");
+    line.push('\n');
+    Bytes::from(line)
+}
+
+/// `GET /api/run/subscribe?nodeId=..&block=..&sinceSeq=0` — watches one
+/// address's most recent run independent of whatever request originally
+/// started it (see `run_registry`'s own module doc comment): replays
+/// every buffered line at or after `sinceSeq`, then tails live output
+/// until the run's own terminal outcome, at which point the stream ends.
+/// `404` if this address has never been run at all (or its process this
+/// server knows about has since been replaced by a fresh run under a
+/// different `RunHandle` — same "at most one live entry per address"
+/// invariant `AppState::runs_registry` documents).
+async fn subscribe_run(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<SubscribeRunQuery>,
+) -> Result<Response, ApiError> {
+    let key = (query.node_id.clone(), query.block.clone());
+    let Some(handle) = state.runs_registry.lock().unwrap().get(&key).cloned() else {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            format!("no run for {:?}/{:?}", query.node_id, query.block),
+        ));
+    };
+
+    let stream = async_stream::stream! {
+        // Subscribing *before* checking whether this run has already
+        // finished (rather than the other way around) is what makes this
+        // race-free — see `subscribe_from`'s own doc comment: if `outcome`
+        // below still reads `Running`, the drain task hasn't reached
+        // "record outcome, then broadcast Done" yet, so this subscription
+        // (already registered) is guaranteed to still receive that
+        // eventual broadcast.
+        let (backlog, mut rx) = handle.subscribe_from(query.since_seq);
+        for line in backlog {
+            yield Ok::<_, io::Error>(subscribe_ndjson_line(&SubscribeEvent::Line {
+                seq: line.seq,
+                stream: line.stream,
+                text: line.text,
+            }));
+        }
+        let already_done = handle.outcome();
+        if !matches!(already_done, run_registry::RunOutcome::Running) {
+            yield Ok(subscribe_ndjson_line(&done_event(&already_done)));
+            return;
+        }
+        loop {
+            match rx.recv().await {
+                Ok(run_registry::RunEvent::Line(line)) => {
+                    yield Ok(subscribe_ndjson_line(&SubscribeEvent::Line {
+                        seq: line.seq,
+                        stream: line.stream,
+                        text: line.text,
+                    }));
+                }
+                Ok(run_registry::RunEvent::Done(outcome)) => {
+                    yield Ok(subscribe_ndjson_line(&done_event(&outcome)));
+                    break;
+                }
+                // Channel closed (shouldn't happen — the drain task always
+                // sends `Done` before its own `tx` is dropped) or this
+                // subscriber fell far enough behind the ring buffer's own
+                // cap to miss messages — either way, nothing meaningful
+                // left to relay.
+                Err(_) => break,
+            }
+        }
+    };
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-ndjson")
+        .body(Body::from_stream(stream))
+        .unwrap())
 }
 
 /// Forgets every block's session-freshness record (`AppState::session_runs`)
@@ -4411,6 +5177,8 @@ async fn build_state(
         link_preview_cache: link_preview::PreviewCache::new(),
         session_runs: Mutex::new(HashMap::new()),
         services: Mutex::new(HashMap::new()),
+        runs_registry: Mutex::new(HashMap::new()),
+        tty_registry: Mutex::new(HashMap::new()),
         watcher_socket,
     }))
 }
@@ -4440,8 +5208,12 @@ fn build_app(state: Arc<AppState>) -> Router {
         )
         .route("/api/link-preview", get(get_link_preview))
         .route("/api/run", post(run_block))
+        .route("/api/run/force", post(force_run))
+        .route("/api/run/subscribe", get(subscribe_run))
         .route("/api/run/tty", get(run_block_tty))
+        .route("/api/run/tty/attach", get(attach_tty))
         .route("/api/kill", post(kill_run))
+        .route("/api/runs", get(get_active_runs))
         .route("/api/services", get(get_services))
         .route("/api/services/log", get(get_service_log))
         .route("/api/services/stop", post(stop_service))
@@ -5727,6 +6499,25 @@ mod ws_tests {
         }
     }
 
+    async fn get(addr: SocketAddr, path: &str) -> (u16, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.expect("read");
+        let mut parts = response.splitn(2, "\r\n\r\n");
+        let head = parts.next().unwrap_or_default();
+        let body = parts.next().unwrap_or_default();
+        let status = head
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        (status, body.to_string())
+    }
+
     const TTY_CANVAS: &str = concat!(
         "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
         "## Shell\n<!-- meshfox:node id=\"shell\" -->\n\n",
@@ -5877,6 +6668,118 @@ mod ws_tests {
         let step_end = next_event(&mut ws).await;
         assert_eq!(step_end["type"], "step-end");
         assert_eq!(step_end["exitCode"], 0);
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn a_second_viewer_attaches_to_the_same_live_session_and_survives_the_first_leaving() {
+        let canvas_path = write_test_canvas(TTY_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let url = format!("ws://{addr}/api/run/tty?path=shell&block=interactive&cols=80&rows=24");
+        let (mut ws1, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+
+        next_event(&mut ws1).await; // started
+        next_event(&mut ws1).await; // step-start
+        next_event(&mut ws1).await; // tty-start
+        read_until(&mut ws1, "ready").await;
+
+        // A second viewer attaches to the *same* address — no chain
+        // resolution, no spawning, just joining what's already running.
+        let attach_url =
+            format!("ws://{addr}/api/run/tty/attach?nodeId=shell&block=interactive&cols=80&rows=24");
+        let (mut ws2, _) = tokio_tungstenite::connect_async(attach_url).await.expect("attach");
+        // The attacher gets the already-buffered "ready" as backlog,
+        // without the process ever having to print it again.
+        read_until(&mut ws2, "ready").await;
+
+        // Close the *originating* connection entirely — the session must
+        // keep running for the still-attached second viewer, not die with
+        // it (the whole point of this feature).
+        ws1.close(None).await.ok();
+
+        // Typing into the *second* connection still reaches the same pty.
+        ws2.send(WsMessage::Binary(b"hello\n".to_vec().into()))
+            .await
+            .expect("send input");
+        read_until(&mut ws2, "got: hello").await;
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn killing_a_tty_session_by_address_closes_every_attached_viewer() {
+        let canvas_path = write_test_canvas(concat!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Shell\n<!-- meshfox:node id=\"shell\" -->\n\n",
+            "```bash name=\"interactive\" tty\necho ready; sleep 30\n```\n",
+        ));
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let url = format!("ws://{addr}/api/run/tty?path=shell&block=interactive&cols=80&rows=24");
+        let (mut ws1, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+        next_event(&mut ws1).await; // started
+        next_event(&mut ws1).await; // step-start
+        next_event(&mut ws1).await; // tty-start
+        read_until(&mut ws1, "ready").await;
+
+        let attach_url =
+            format!("ws://{addr}/api/run/tty/attach?nodeId=shell&block=interactive&cols=80&rows=24");
+        let (mut ws2, _) = tokio_tungstenite::connect_async(attach_url).await.expect("attach");
+        read_until(&mut ws2, "ready").await;
+
+        // Kill by address alone — this test never even looks at `runId`,
+        // matching a client that only ever knew about this session via
+        // `attach`, never the request that originally started it.
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        let body = r#"{"nodeId":"shell","block":"interactive"}"#;
+        let request = format!(
+            "POST /api/kill HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.expect("read");
+        assert!(response.starts_with("HTTP/1.1 204"), "unexpected response: {response}");
+
+        // The attached viewer sees the session end too, even though it
+        // never held any kill switch of its own — either a close frame or
+        // the socket just ending are both "it's over" from this side.
+        let next = ws2.next().await;
+        assert!(
+            matches!(next, Some(Ok(WsMessage::Close(_))) | None),
+            "expected the attached viewer's socket to close, got: {next:?}"
+        );
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn active_runs_lists_a_live_tty_session() {
+        let canvas_path = write_test_canvas(concat!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Shell\n<!-- meshfox:node id=\"shell\" -->\n\n",
+            "```bash name=\"interactive\" tty\necho ready; sleep 30\n```\n",
+        ));
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let url = format!("ws://{addr}/api/run/tty?path=shell&block=interactive&cols=80&rows=24");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+        next_event(&mut ws).await; // started
+        next_event(&mut ws).await; // step-start
+        next_event(&mut ws).await; // tty-start
+        read_until(&mut ws, "ready").await;
+
+        let (status, body) = get(addr, "/api/runs").await;
+        assert_eq!(status, 200, "unexpected body: {body}");
+        let runs: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let entry = runs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["nodeId"] == "shell" && r["block"] == "interactive")
+            .unwrap_or_else(|| panic!("expected an active-runs entry for shell/interactive, got: {body}"));
+        assert_eq!(entry["kind"], "tty");
+        assert_eq!(entry["status"], "running");
 
         let _ = std::fs::remove_file(&canvas_path);
     }
@@ -7474,17 +8377,25 @@ mod service_endpoint_tests {
     use tokio::net::TcpStream;
 
     fn write_test_canvas(contents: &str) -> PathBuf {
-        let mut path = std::env::temp_dir();
-        path.push(format!("meshfox-services-test-{}.canvas.md", uuid::Uuid::new_v4()));
+        // Each test gets its *own* directory, not just a uniquely-named
+        // file directly in the shared OS temp dir — `service_lock_path`
+        // keys a lock file by canvas file name within a `.meshfox/
+        // services/` sibling of the canvas's own *directory*, and
+        // `cleanup` (below) `remove_dir_all`s that whole directory; sharing
+        // one flat temp dir across every test in this module means any one
+        // test's cleanup nukes every other concurrently-running test's own
+        // still-in-use lock files out from under it (a real, observed
+        // source of cross-test flakiness once more than a couple of tests
+        // here started exercising locks concurrently).
+        let dir = std::env::temp_dir().join(format!("meshfox-services-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("doc.canvas.md");
         std::fs::write(&path, contents).unwrap();
         path
     }
 
     fn cleanup(canvas_path: &std::path::Path) {
-        let _ = std::fs::remove_file(canvas_path);
-        let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(canvas_path));
-        let dir = canvas_path.parent().map(|p| p.join(".meshfox").join("services"));
-        if let Some(dir) = dir {
+        if let Some(dir) = canvas_path.parent() {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
@@ -7704,19 +8615,16 @@ mod service_endpoint_tests {
 
         let addr = spawn_test_server(canvas_path.clone()).await;
         let (status, body) = post_json(addr, "/api/run", r#"{"path":[],"block":"srv"}"#).await;
-        assert_eq!(status, 200, "unexpected body: {body}");
-        assert!(
-            body.contains("\"type\":\"service-lock-conflict\""),
-            "expected a service-lock-conflict event, got: {body}"
-        );
-        assert!(
-            body.contains("\"ownerPid\":999999"),
-            "expected the conflicting owner's pid reported, got: {body}"
-        );
-        assert!(
-            !body.contains("\"type\":\"done\""),
-            "a lock conflict is terminal for the run, no Done should follow: {body}"
-        );
+        // Queued-time locking means every lock this run would need is
+        // claimed *before* the response even starts — a conflict is a
+        // plain `409` with a JSON body, not a streamed terminal event
+        // (nothing has been sent to the client yet either way).
+        assert_eq!(status, 409, "unexpected body: {body}");
+        let conflict: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(conflict["nodeId"], "root");
+        assert_eq!(conflict["block"], "srv");
+        assert_eq!(conflict["ownerPid"], 999_999);
+        assert_eq!(conflict["ownerDesc"], "tui");
 
         let (status, list_body) = get(addr, "/api/services").await;
         assert_eq!(status, 200);
@@ -7753,6 +8661,384 @@ mod service_endpoint_tests {
             r#"{"nodeId":"root","block":"srv"}"#,
         )
         .await;
+        cleanup(&canvas_path);
+    }
+}
+
+/// Queued-time, address-scoped locking for *any* runnable block — not just
+/// `service` (see `service_endpoint_tests`, above, for the service-specific
+/// cases) — covers the explicit "forbid parallel execution of the same
+/// block" behavior (`acquire_chain_locks`/`steps_needing_a_lock`) and its
+/// generalized force-run escape hatch (`force_run`).
+#[cfg(test)]
+mod run_lock_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    fn write_test_canvas(contents: &str) -> PathBuf {
+        // Own directory per test, not a flat shared temp dir — see
+        // `service_endpoint_tests::write_test_canvas`'s own doc comment on
+        // why a shared `.meshfox/services/` directory across concurrently-
+        // running tests is a real cross-test-flakiness hazard once more
+        // than a couple of tests touch locks at once (this whole module's
+        // entire point).
+        let dir = std::env::temp_dir().join(format!("meshfox-run-lock-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("doc.canvas.md");
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    fn cleanup(canvas_path: &std::path::Path) {
+        if let Some(dir) = canvas_path.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    async fn post_json(addr: SocketAddr, path: &str, body: &str) -> (u16, String) {
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.expect("read");
+        let mut parts = response.splitn(2, "\r\n\r\n");
+        let head = parts.next().unwrap_or_default();
+        let resp_body = parts.next().unwrap_or_default();
+        let status = head
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        (status, resp_body.to_string())
+    }
+
+    async fn get(addr: SocketAddr, path: &str) -> (u16, String) {
+        let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.expect("read");
+        let mut parts = response.splitn(2, "\r\n\r\n");
+        let head = parts.next().unwrap_or_default();
+        let body = parts.next().unwrap_or_default();
+        let status = head
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        (status, body.to_string())
+    }
+
+    const PLAIN_CANVAS: &str = concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "```bash name=\"slow\"\nsleep 0.3\necho done\n```\n",
+    );
+
+    #[tokio::test]
+    async fn a_client_disconnecting_mid_run_does_not_free_the_lock_while_it_keeps_running() {
+        // Regression test: the up-front lock used to be released whenever
+        // *this generator* ended (including a client disconnect), not
+        // when the process it protects actually finished — since the
+        // process itself now survives a disconnect (that's the whole
+        // point of `run_registry`), that meant a disconnect could free the
+        // address's lock while a real process was still genuinely running
+        // under it, letting a second, truly concurrent request start right
+        // on top of it.
+        let canvas_path = write_test_canvas(PLAIN_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        // A raw connection, closed abruptly partway through — simulating
+        // a tab reload/close mid-stream, unlike `post_json`'s own
+        // read-to-completion helper.
+        let body = r#"{"path":[],"block":"slow"}"#;
+        let request = format!(
+            "POST /api/run HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        {
+            let mut stream = TcpStream::connect(addr).await.expect("connect");
+            stream.write_all(request.as_bytes()).await.expect("write");
+            // Enough to know the server actually started running the
+            // block (past `started`/`step-start`) before this connection
+            // gets dropped, unread, at the end of this block.
+            let mut buf = [0u8; 256];
+            let _ = stream.read(&mut buf).await;
+        } // `stream` dropped here — an abrupt client disconnect.
+
+        // The block's own `sleep 0.3` means it's still running at this
+        // point — a second, genuinely concurrent request right now must
+        // still see the lock held, not incorrectly freed by the first
+        // request's own connection having just dropped.
+        let (status, body) = post_json(addr, "/api/run", r#"{"path":[],"block":"slow"}"#).await;
+        assert_eq!(
+            status, 409,
+            "the lock should still be held by the still-running first request: {body}"
+        );
+
+        // Once the (disconnected, but still server-side-running) first
+        // request's own block actually finishes, the lock frees up again
+        // normally.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let (status, body) = post_json(addr, "/api/run", r#"{"path":[],"block":"slow"}"#).await;
+        assert_eq!(status, 200, "unexpected body: {body}");
+        assert!(body.contains("\"type\":\"done\""));
+
+        cleanup(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn a_run_already_in_progress_anywhere_rejects_a_second_one() {
+        let canvas_path = write_test_canvas(PLAIN_CANVAS);
+        // Simulates this exact address already being mid-execution — same
+        // deterministic stand-in `service_endpoint_tests`'s own lock-
+        // conflict test uses (a real concurrent HTTP race would work too,
+        // but is inherently timing-sensitive; this exercises the exact
+        // same `acquire_chain_locks` conflict path without depending on
+        // scheduling). Our own test pid stands in for "a live process" —
+        // unlike the *stale*-owner tests elsewhere, `is_alive` here is
+        // true, matching "genuinely still running", not "abandoned".
+        let lock_path = meshfox_core::service_lock_path(&canvas_path, "root", "slow");
+        meshfox_core::service_lock::acquire(&lock_path, std::process::id(), "webui").unwrap();
+
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let (status, body) = post_json(addr, "/api/run", r#"{"path":[],"block":"slow"}"#).await;
+        assert_eq!(status, 409, "unexpected body: {body}");
+        let conflict: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(conflict["nodeId"], "root");
+        assert_eq!(conflict["block"], "slow");
+        assert_eq!(conflict["ownerPid"], std::process::id());
+
+        meshfox_core::service_lock::release(&lock_path).unwrap();
+        cleanup(&canvas_path);
+    }
+
+    // A real two-concurrent-`tokio::join!`-requests variant was tried here
+    // and deliberately removed: under enough system load (this whole test
+    // module's own real subprocess spawns are plenty), the *second* request
+    // can genuinely not reach the server until well after the first has
+    // already finished and released its lock — both then legitimately
+    // succeed, which isn't a locking bug, just this test's own assumption
+    // that `tokio::join!` guarantees server-side overlap not holding up
+    // under contention. `a_run_already_in_progress_anywhere_rejects_a_
+    // second_one` (above) exercises the exact same `acquire_chain_locks`
+    // conflict path deterministically instead, without depending on real
+    // scheduling — that's the reliable regression test for this guarantee.
+
+    #[tokio::test]
+    async fn once_the_first_run_finishes_the_lock_is_free_again() {
+        let canvas_path = write_test_canvas(PLAIN_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, body) = post_json(addr, "/api/run", r#"{"path":[],"block":"slow"}"#).await;
+        assert_eq!(status, 200, "unexpected body: {body}");
+
+        // The first run has already fully completed (`post_json` only
+        // returns once the connection closes, i.e. after `Done`) — its own
+        // execution-scoped lock must already be released, so a fresh run
+        // right after succeeds rather than conflicting with itself.
+        let (status, body) = post_json(addr, "/api/run", r#"{"path":[],"block":"slow"}"#).await;
+        assert_eq!(status, 200, "unexpected body: {body}");
+        assert!(body.contains("\"type\":\"done\""));
+
+        cleanup(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn force_run_takes_over_a_stale_conflict_and_completes() {
+        let canvas_path = write_test_canvas(PLAIN_CANVAS);
+        // Same "definitely not us, definitely not alive" stand-in
+        // `service_endpoint_tests` already uses for a stale owner.
+        let lock_path = meshfox_core::service_lock_path(&canvas_path, "root", "slow");
+        meshfox_core::service_lock::acquire(&lock_path, 999_999, "tui").unwrap();
+
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let (status, body) = post_json(addr, "/api/run", r#"{"path":[],"block":"slow"}"#).await;
+        assert_eq!(status, 409, "unexpected body: {body}");
+        let conflict: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(conflict["ownerPid"], 999_999);
+
+        let (status, body) = post_json(
+            addr,
+            "/api/run/force",
+            r#"{"path":[],"block":"slow","force":{"nodeId":"root","block":"slow"}}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "unexpected body: {body}");
+        assert!(
+            body.contains("\"type\":\"done\""),
+            "force-run should have completed the block normally: {body}"
+        );
+
+        cleanup(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn subscribe_to_an_address_that_never_ran_is_a_404() {
+        let canvas_path = write_test_canvas(PLAIN_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, _) = get(addr, "/api/run/subscribe?nodeId=root&block=slow&sinceSeq=0").await;
+        assert_eq!(status, 404);
+
+        cleanup(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn a_second_connection_watches_the_same_run_via_subscribe() {
+        let canvas_path = write_test_canvas(PLAIN_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let run = tokio::spawn(async move {
+            post_json(addr, "/api/run", r#"{"path":[],"block":"slow"}"#).await
+        });
+        // Give the run a moment to actually register itself in
+        // `runs_registry` (near-instant once the request's own preamble
+        // clears) before subscribing to it from a second, independent
+        // connection — well short of its own 0.3s sleep either way.
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+        let (sub_status, sub_body) =
+            get(addr, "/api/run/subscribe?nodeId=root&block=slow&sinceSeq=0").await;
+        assert_eq!(sub_status, 200, "unexpected body: {sub_body}");
+        assert!(
+            sub_body.contains("\"type\":\"line\"") && sub_body.contains("\"text\":\"done\""),
+            "expected the block's own output line replayed/tailed, got: {sub_body}"
+        );
+        assert!(
+            sub_body.contains("\"type\":\"done\"") && sub_body.contains("\"outcome\":\"exited\""),
+            "expected a terminal done/exited event once the run finished, got: {sub_body}"
+        );
+
+        let (run_status, run_body) = run.await.unwrap();
+        assert_eq!(run_status, 200, "unexpected body: {run_body}");
+        assert!(
+            run_body.contains("\"type\":\"done\""),
+            "the originating connection's own run should be unaffected by being watched: {run_body}"
+        );
+
+        cleanup(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn subscribing_after_a_run_already_finished_still_replays_it() {
+        let canvas_path = write_test_canvas(PLAIN_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (run_status, _) = post_json(addr, "/api/run", r#"{"path":[],"block":"slow"}"#).await;
+        assert_eq!(run_status, 200);
+
+        // The run is long over by now (`post_json` only returns once the
+        // connection closes, i.e. after `done`) — its `RunHandle` should
+        // still be sitting in the registry with its buffered log intact.
+        let (sub_status, sub_body) =
+            get(addr, "/api/run/subscribe?nodeId=root&block=slow&sinceSeq=0").await;
+        assert_eq!(sub_status, 200, "unexpected body: {sub_body}");
+        assert!(sub_body.contains("\"text\":\"done\""));
+        assert!(sub_body.contains("\"type\":\"done\"") && sub_body.contains("\"outcome\":\"exited\""));
+        // Regression test: `SubscribeEvent` used to derive `rename_all =
+        // "camelCase"` alone, which (unlike `RunEvent`'s own combo further
+        // up this file) only renames the *variant* tag on an enum, not the
+        // fields inside a struct variant — missing the separate
+        // `rename_all_fields` meant `exit_code` shipped as literal
+        // snake_case, which the frontend's camelCase-typed `exitCode` read
+        // back as `undefined` — indistinguishable from a genuinely missing
+        // value, and enough to make a *successful* reconciled run
+        // (`undefined !== 0`) show up as failed.
+        assert!(
+            sub_body.contains("\"exitCode\":0"),
+            "expected a camelCase exitCode field, got: {sub_body}"
+        );
+        assert!(
+            !sub_body.contains("exit_code"),
+            "exit_code leaked through in snake_case: {sub_body}"
+        );
+
+        cleanup(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn killing_by_address_stops_a_run_no_run_id_needed() {
+        let canvas_path = write_test_canvas(PLAIN_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let run = tokio::spawn(async move {
+            post_json(addr, "/api/run", r#"{"path":[],"block":"slow"}"#).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+        let (kill_status, _) = post_json(
+            addr,
+            "/api/kill",
+            r#"{"nodeId":"root","block":"slow"}"#,
+        )
+        .await;
+        assert_eq!(kill_status, 204);
+
+        let (run_status, run_body) = run.await.unwrap();
+        assert_eq!(run_status, 200, "unexpected body: {run_body}");
+        assert!(
+            run_body.contains("\"type\":\"killed\""),
+            "expected the run to report killed, got: {run_body}"
+        );
+
+        cleanup(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn active_runs_lists_a_still_running_plain_block() {
+        let canvas_path = write_test_canvas(PLAIN_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let run = tokio::spawn(async move {
+            post_json(addr, "/api/run", r#"{"path":[],"block":"slow"}"#).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+        let (status, body) = get(addr, "/api/runs").await;
+        assert_eq!(status, 200, "unexpected body: {body}");
+        let runs: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let entry = runs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["nodeId"] == "root" && r["block"] == "slow")
+            .unwrap_or_else(|| panic!("expected an active-runs entry for root/slow, got: {body}"));
+        assert_eq!(entry["kind"], "plain");
+        assert_eq!(entry["status"], "running");
+
+        let (run_status, _) = run.await.unwrap();
+        assert_eq!(run_status, 200);
+
+        cleanup(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn active_runs_still_lists_a_just_finished_run() {
+        let canvas_path = write_test_canvas(PLAIN_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (run_status, _) = post_json(addr, "/api/run", r#"{"path":[],"block":"slow"}"#).await;
+        assert_eq!(run_status, 200);
+
+        let (status, body) = get(addr, "/api/runs").await;
+        assert_eq!(status, 200, "unexpected body: {body}");
+        let runs: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let entry = runs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["nodeId"] == "root" && r["block"] == "slow")
+            .unwrap_or_else(|| panic!("expected an active-runs entry for root/slow, got: {body}"));
+        assert_eq!(entry["kind"], "plain");
+        assert_eq!(entry["status"], "exited");
+        assert_eq!(entry["exitCode"], 0);
+
         cleanup(&canvas_path);
     }
 }

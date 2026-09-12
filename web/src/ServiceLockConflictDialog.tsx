@@ -8,13 +8,13 @@ interface ServiceLockConflictDialogProps {
 
 /**
  * Confirmation dialog for a `"service-lock-conflict"` run event (see
- * App.tsx's `serviceConflict` state and `api.ts`'s `RunEvent`) —
- * **experimental**, see SPEC.md's "Service blocks (experimental)". A
- * service's lock file (`.meshfox/services/...`) is already held by another
- * live-or-stale process; per the product decision this is always surfaced
- * here, never silently resolved either way. Reuses `AutoLayoutConfirmDialog`'s
- * modal shape, with `DeleteNodeDialog`'s red "destructive" button style
- * since confirming here kills another process.
+ * App.tsx's `serviceConflict` state and `api.ts`'s `RunEvent`) — despite
+ * the name, not `service`-specific any more: any block's own address can
+ * be locked by another process now (see that event's own doc comment),
+ * not just a `service` block's. Per the product decision this is always
+ * surfaced here, never silently resolved either way. Reuses
+ * `AutoLayoutConfirmDialog`'s modal shape, with `DeleteNodeDialog`'s red
+ * "destructive" button style since confirming here kills another process.
  */
 export function ServiceLockConflictDialog({
   block,
@@ -26,7 +26,7 @@ export function ServiceLockConflictDialog({
   return (
     <div className="vars-modal-backdrop" onClick={onCancel}>
       <div className="vars-modal" onClick={(e) => e.stopPropagation()}>
-        <h3>Service already running</h3>
+        <h3>Already running elsewhere</h3>
         <p className="vars-modal-hint">
           "{block}" is already running elsewhere — pid {ownerPid}, started via {ownerDesc}. Kill that process and
           start a fresh one here, or cancel and leave it running.

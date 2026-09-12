@@ -2308,9 +2308,12 @@ impl App {
 
             let lock_path =
                 meshfox_core::service_lock_path(&step_canvas_path, &addr.node_id, &addr.block_name);
-            match meshfox_core::service_lock::check(&lock_path) {
-                Ok(meshfox_core::ServiceLockState::Free) => {}
-                Ok(meshfox_core::ServiceLockState::Held { info, .. }) => {
+            // Atomic acquire up front, same as the CLI's `run` command and
+            // the webui — `meshfox_server::services::spawn` no longer
+            // claims this itself (see its own doc comment).
+            match meshfox_core::service_lock::acquire(&lock_path, std::process::id(), "tui") {
+                Ok(()) => {}
+                Err(meshfox_core::service_lock::AcquireError::Conflict(info)) => {
                     self.status = format!(
                         "service {:?} already running elsewhere (pid {}, via {}) — confirm to kill & restart",
                         addr.block_name, info.pid, info.owner
@@ -2323,8 +2326,8 @@ impl App {
                     });
                     return;
                 }
-                Err(e) => {
-                    self.status = format!("failed to check service lock for {:?}: {e}", addr.block_name);
+                Err(meshfox_core::service_lock::AcquireError::Io(e)) => {
+                    self.status = format!("failed to claim service lock for {:?}: {e}", addr.block_name);
                     if let Some(run) = &mut self.run {
                         run.finished = true;
                         run.had_failure = true;
@@ -2355,6 +2358,9 @@ impl App {
                     }
                 }
                 Err(e) => {
+                    // Nothing actually ended up running under the lock
+                    // just claimed above — release it.
+                    let _ = meshfox_core::service_lock::release(&lock_path);
                     self.status = format!("failed to start service {:?}: {e}", addr.block_name);
                     if let Some(run) = &mut self.run {
                         run.finished = true;
@@ -2740,15 +2746,17 @@ impl App {
         let Some(conflict) = self.service_conflict.take() else { return };
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                if conflict.owner_pid != 0 {
-                    // SAFETY: same whole-process-group SIGKILL every other
-                    // kill path in this codebase uses — this pid comes
-                    // from the lock file on disk, not a live
-                    // `ServiceHandle` this process already holds.
-                    unsafe {
-                        libc::kill(-(conflict.owner_pid as libc::pid_t), libc::SIGKILL);
-                    }
-                }
+                // Kill the stale/foreign owner, reacquire, then release
+                // again right away — the retry below (`advance_run`, same
+                // `idx`) does its own fresh `acquire` when it re-reaches
+                // this service's branch, so this only needs to prove the
+                // old owner is actually gone, same shape `force_run`'s own
+                // webui conflict-recovery path uses (see its doc comment).
+                let _ = meshfox_core::service_lock::kill_and_acquire(
+                    &conflict.lock_path,
+                    std::process::id(),
+                    "tui",
+                );
                 let _ = meshfox_core::service_lock::release(&conflict.lock_path);
                 self.status = format!("killed pid {} — restarting {:?}", conflict.owner_pid, conflict.block_name);
                 Box::pin(self.advance_run()).await;

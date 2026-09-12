@@ -58,6 +58,16 @@ interface TtyPanelProps {
    * deliberate or abnormal end, not "the process finished on its own",
    * which is the one case `autoclose` is about. */
   autoclose: boolean;
+  /** When set, joins an *already-running* session (`GET /api/run/tty/
+   * attach`) instead of starting a fresh one via `/api/run/tty` — every
+   * prop above is ignored in this mode (see `TtySessionsPanel`'s own
+   * "reopen"). There's no chain/`step-start`/`tty-start` preamble to wait
+   * for here (this endpoint never sends any `TtyRunEvent` JSON at all,
+   * only raw pty bytes) — the mount effect flips straight to `"tty"`
+   * status on `ws.onopen`, and killing goes by address
+   * (`{nodeId, block}`) rather than a `runId`, since an attach-only
+   * connection never has one. */
+  attachTo?: { nodeId: string; block: string };
   onClose: () => void;
 }
 
@@ -82,23 +92,39 @@ function statusLabel(status: Status, exitCode: number | undefined, errorMsg: str
 
 /**
  * A `tty` block's run panel: a real interactive terminal (`xterm.js`)
- * wired to `/api/run/tty`'s WebSocket, rendered via a portal — the same
- * fixed-overlay-over-everything approach `NodeTextEditor` uses, and for the
- * same reason (a node's own box is nowhere near big enough, and is at the
- * mercy of the canvas's current pan/zoom). Unlike `NodeTextEditor`, this
- * also supports collapsing into a small corner pill without ending the
- * session — minimizing only ever changes CSS (`visibility`, not `display`,
- * and never a `fit()`/resize), so a full-screen program running inside
- * (`vim`, `htop`, an interactive shell) never sees its terminal size change
- * just because the panel was tucked out of the way; only actually resizing
- * the *expanded* panel (or the window) does that.
+ * wired to `/api/run/tty` (or, in attach mode, `/api/run/tty/attach`) over a
+ * WebSocket, rendered via a portal — the same fixed-overlay-over-everything
+ * approach `NodeTextEditor` uses, and for the same reason (a node's own box
+ * is nowhere near big enough, and is at the mercy of the canvas's current
+ * pan/zoom). Unlike `NodeTextEditor`, this also supports collapsing into a
+ * small corner pill without ending the session — minimizing only ever
+ * changes CSS (`visibility`, not `display`, and never a `fit()`/resize), so
+ * a full-screen program running inside (`vim`, `htop`, an interactive
+ * shell) never sees its terminal size change just because the panel was
+ * tucked out of the way; only actually resizing the *expanded* panel (or
+ * the window) does that.
  *
- * One WebSocket per mount, for the panel's whole lifetime — closing it
- * (however: the × button, or just unmounting) closes the socket, which the
- * server reads as "client gone" and kills whatever's still running (see
- * `pty_exec::PtyProcess::kill`), same as closing a real terminal window.
+ * One WebSocket per mount, for the panel's whole lifetime — but closing it
+ * (the × button, or just unmounting) no longer ends the session itself
+ * (see `tty_registry`'s own module doc comment,
+ * `crates/server/src/tty_registry.rs`): the server only ever removes *this*
+ * viewer from the size negotiation and keeps the pty running in the
+ * background, the same way `tmux` survives a client detaching. Only an
+ * explicit "⏹ kill" (or the process exiting on its own) actually ends it —
+ * see `handleKill`. A closed/unmounted-but-still-running session shows up
+ * in `TtySessionsPanel` for reattaching later (`attachTo`, below).
  */
-export function TtyPanel({ path, blockName, withDeps, persist, vars, saveSecrets, autoclose, onClose }: TtyPanelProps) {
+export function TtyPanel({
+  path,
+  blockName,
+  withDeps,
+  persist,
+  vars,
+  saveSecrets,
+  autoclose,
+  attachTo,
+  onClose,
+}: TtyPanelProps) {
   const dark = usePrefersDark();
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -109,19 +135,9 @@ export function TtyPanel({ path, blockName, withDeps, persist, vars, saveSecrets
   const [status, setStatus] = useState<Status>("connecting");
   const [exitCode, setExitCode] = useState<number | undefined>(undefined);
   const [errorMsg, setErrorMsg] = useState<string | undefined>(undefined);
-  const [activeBlock, setActiveBlock] = useState(blockName);
+  const [activeBlock, setActiveBlock] = useState(attachTo?.block ?? blockName);
   const [collapsed, setCollapsed] = useState(false);
   const [canKill, setCanKill] = useState(false);
-  // True while the × button's own "still running — kill it?" confirmation
-  // is up — only the × goes through this; the header's dedicated "⏹ kill"
-  // button (see `handleKill` below) stays a direct, unconfirmed action,
-  // same as it always was. The two read as different enough gestures to
-  // warrant different gates: "kill" is reached for *specifically to* end
-  // the session, right there in plain sight next to the terminal's own
-  // output, while "×" is the same close affordance every other panel in
-  // this app has, where ending a live process is a side effect a user
-  // reaching for "close this window" might not expect.
-  const [confirmingClose, setConfirmingClose] = useState(false);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -149,16 +165,23 @@ export function TtyPanel({ path, blockName, withDeps, persist, vars, saveSecrets
     term.focus();
     termRef.current = term;
 
-    const params = new URLSearchParams({
-      path: path.join(","),
-      block: blockName,
-      noDeps: String(!withDeps),
-      persist: String(persist),
-      vars: JSON.stringify(vars ?? {}),
-      saveSecrets: JSON.stringify(saveSecrets ?? []),
-      cols: String(term.cols),
-      rows: String(term.rows),
-    });
+    const params = attachTo
+      ? new URLSearchParams({
+          nodeId: attachTo.nodeId,
+          block: attachTo.block,
+          cols: String(term.cols),
+          rows: String(term.rows),
+        })
+      : new URLSearchParams({
+          path: path.join(","),
+          block: blockName,
+          noDeps: String(!withDeps),
+          persist: String(persist),
+          vars: JSON.stringify(vars ?? {}),
+          saveSecrets: JSON.stringify(saveSecrets ?? []),
+          cols: String(term.cols),
+          rows: String(term.rows),
+        });
     // `location.*` reflects the webview's own navigation origin
     // (`vscode-webview://<id>`) inside the VS Code host, not the real
     // meshfox server — `document.baseURI` is what follows the `<base
@@ -169,9 +192,22 @@ export function TtyPanel({ path, blockName, withDeps, persist, vars, saveSecrets
     // before.
     const base = new URL(document.baseURI);
     const proto = base.protocol === "https:" ? "wss:" : "ws:";
-    const ws = new WebSocket(`${proto}//${base.host}/api/run/tty?${params}`);
+    const endpoint = attachTo ? "/api/run/tty/attach" : "/api/run/tty";
+    const ws = new WebSocket(`${proto}//${base.host}${endpoint}?${params}`);
     ws.binaryType = "arraybuffer";
     wsRef.current = ws;
+
+    if (attachTo) {
+      // No chain to resolve, no `step-start`/`tty-start` to wait for —
+      // this endpoint only ever sends raw pty bytes, so the moment the
+      // socket is open, this *is* an interactive session already in
+      // progress.
+      ws.onopen = () => {
+        ttyActiveRef.current = true;
+        setCanKill(true);
+        setStatus("tty");
+      };
+    }
 
     ws.onmessage = (ev) => {
       if (typeof ev.data === "string") {
@@ -265,10 +301,11 @@ export function TtyPanel({ path, blockName, withDeps, persist, vars, saveSecrets
       term.dispose();
     };
     // Mount-once: `path`/`blockName`/`withDeps`/`persist`/`vars`/
-    // `saveSecrets` address exactly the one run this panel was opened for
-    // — a real change to any of them means a different run, which means a
-    // fresh `TtyPanel` (a new `key` from the caller), not a live-reconnect
-    // of this one.
+    // `saveSecrets`/`attachTo` address exactly the one run (or session to
+    // attach to) this panel was opened for — a real change to any of them
+    // means a different run, which means a fresh `TtyPanel` (a new `key`
+    // from the caller, see `App.tsx`'s own `ttySession`-keyed render), not
+    // a live-reconnect of this one.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -289,7 +326,13 @@ export function TtyPanel({ path, blockName, withDeps, persist, vars, saveSecrets
   }, [collapsed]);
 
   const handleKill = () => {
-    if (runIdRef.current) killRun(runIdRef.current).catch(() => {});
+    // An attach-only connection never gets a `runId` of its own (see this
+    // component's own `attachTo` doc comment) — kill by address instead.
+    if (attachTo) {
+      killRun({ nodeId: attachTo.nodeId, block: attachTo.block }).catch(() => {});
+    } else if (runIdRef.current) {
+      killRun(runIdRef.current).catch(() => {});
+    }
   };
   const handleClose = () => {
     wsRef.current?.close();
@@ -306,24 +349,12 @@ export function TtyPanel({ path, blockName, withDeps, persist, vars, saveSecrets
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoclose, status]);
-  // The × button's own click handler — `canKill` (true from `started`
-  // until the run's own step-end/killed/error, see the WebSocket handler
-  // above) is exactly "is there a live process this would kill", so
-  // that's the gate: ask first when there is one, close straight away
-  // (nothing to lose) once the run's already finished on its own.
-  const handleCloseClick = () => {
-    if (canKill) {
-      setConfirmingClose(true);
-      return;
-    }
-    handleClose();
-  };
-
   return createPortal(
     // Unlike NodeTextEditor's backdrop, a click here never closes the
-    // panel — this session may still be running something interactive, and
-    // closing it kills the process (see `handleClose`'s doc comment on
-    // `TtyPanel`'s own JSDoc above); only the explicit × button does that.
+    // panel — this is a real terminal someone may be mid-command in, and a
+    // stray backdrop click shouldn't whisk it away; only the explicit ×
+    // button does that (which, unlike before, no longer ends the session —
+    // see this component's own JSDoc — so there's nothing to confirm).
     <div className={`mesh-tty-backdrop${collapsed ? " collapsed" : ""}`}>
       <div className="mesh-tty-panel">
         <div className="mesh-tty-head">
@@ -340,7 +371,7 @@ export function TtyPanel({ path, blockName, withDeps, persist, vars, saveSecrets
             <button type="button" onClick={() => setCollapsed(true)} title="Minimize — session keeps running">
               _
             </button>
-            <button type="button" onClick={handleCloseClick} title="Close (ends the session if still running)">
+            <button type="button" onClick={handleClose} title="Close (session keeps running in the background)">
               ✕
             </button>
           </span>
@@ -363,25 +394,6 @@ export function TtyPanel({ path, blockName, withDeps, persist, vars, saveSecrets
         <button type="button" className="mesh-tty-pill" onClick={() => setCollapsed(false)}>
           ▶ {activeBlock} · {statusLabel(status, exitCode, errorMsg)}
         </button>
-      )}
-      {confirmingClose && (
-        <div className="vars-modal-backdrop" onClick={() => setConfirmingClose(false)}>
-          <div className="vars-modal" onClick={(e) => e.stopPropagation()}>
-            <h3>Close this session?</h3>
-            <p className="vars-modal-hint">
-              {activeBlock} is still running — closing this terminal kills it, same as closing a real terminal
-              window.
-            </p>
-            <div className="vars-modal-actions">
-              <button type="button" onClick={() => setConfirmingClose(false)}>
-                cancel
-              </button>
-              <button type="button" className="node-settings-delete-button" onClick={handleClose}>
-                close &amp; kill
-              </button>
-            </div>
-          </div>
-        </div>
       )}
     </div>,
     document.body,
