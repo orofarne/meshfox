@@ -21,7 +21,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// How many recent output lines a service's log keeps — old lines fall off
 /// the front once this fills up. Generous enough for a dev server's own
@@ -112,7 +112,14 @@ impl ServiceHandle {
     pub fn stop(&self) -> io::Result<()> {
         *self.status.lock().unwrap() = ServiceStatus::Stopped;
         let _ = meshfox_core::service_lock::release(&self.lock_path);
-        kill_process_group(self.pid)
+        let result = kill_process_group(self.pid);
+        // Doesn't wait for `self.pid` to actually be gone first — a still-
+        // running descendant that's already detached into its own group
+        // (see `kill_orphaned_descendants`'s own doc comment) is
+        // independent of `self.pid` by definition, so there's nothing to
+        // gain by waiting on it here.
+        kill_orphaned_descendants(self.pid);
+        result
     }
 }
 
@@ -199,6 +206,12 @@ pub fn restart(old: &ServiceHandle) -> io::Result<ServiceHandle> {
 /// crashed service's own address stayed permanently "held by us" even
 /// though nothing was actually running under it — quietly wrong even
 /// before this module tried to generalize locking to every block kind.
+/// How often the drain task below re-scans for `pid`'s own descendants
+/// while it's still running — see `spawn_drain_task`'s own doc comment on
+/// `seen_descendants` for why this has to happen *before* the process
+/// actually exits, not just once afterward.
+const DESCENDANT_SCAN_INTERVAL: Duration = Duration::from_millis(250);
+
 fn spawn_drain_task(
     mut proc: SpawnedProcess,
     status: Arc<Mutex<ServiceStatus>>,
@@ -206,10 +219,51 @@ fn spawn_drain_task(
     lock_path: PathBuf,
 ) {
     tokio::spawn(async move {
-        while let Some((stream, line)) = proc.output_rx.recv().await {
-            log.lock().unwrap().push(stream, line);
+        // Captured before `wait()` below — a `tokio::process::Child` can
+        // stop reporting its own id once it's been reaped.
+        let pid = proc.child.id().unwrap_or(0);
+        // Every descendant pid of `pid` ever noticed while this process
+        // was still alive — see `kill_orphaned_descendants`'s own doc
+        // comment for the daemonizing-tool scenario this exists for.
+        // Crucially, this has to accumulate *during* the loop below, not
+        // just get scanned fresh once the process has already exited: the
+        // kernel reparents an orphan away (to pid 1) essentially the
+        // moment its own parent is reaped, which — for a normal, prompt
+        // exit — has typically *already happened* by the time anything
+        // downstream of `proc.child.wait()` gets around to looking, so a
+        // single post-exit scan routinely finds nothing at all (confirmed
+        // directly: the very first version of this fix, a one-shot scan
+        // right after `wait()`, reliably missed the daemonized descendant
+        // in `services::tests::
+        // an_exit_leaving_a_daemonized_descendant_alive_still_gets_it_killed`).
+        let mut seen_descendants: std::collections::HashSet<sysinfo::Pid> =
+            std::collections::HashSet::new();
+        let mut scan_interval = tokio::time::interval(DESCENDANT_SCAN_INTERVAL);
+        loop {
+            tokio::select! {
+                line = proc.output_rx.recv() => {
+                    match line {
+                        Some((stream, text)) => log.lock().unwrap().push(stream, text),
+                        None => break,
+                    }
+                }
+                _ = scan_interval.tick() => {
+                    seen_descendants.extend(descendant_pids(pid));
+                }
+            }
         }
         let exit_code = proc.child.wait().await.ok().and_then(|s| s.code()).unwrap_or(-1);
+        // One last scan too — belt and suspenders alongside the
+        // accumulated history above, for whatever's still reachable this
+        // way (a descendant that hasn't been reparented away yet, say).
+        seen_descendants.extend(descendant_pids(pid));
+        for descendant in seen_descendants {
+            // SAFETY: an ordinary, single `SIGKILL` by pid — no process-
+            // group semantics involved, unlike `kill_process_group`.
+            unsafe {
+                libc::kill(descendant.as_u32() as libc::pid_t, libc::SIGKILL);
+            }
+        }
         let mut current = status.lock().unwrap();
         if !matches!(*current, ServiceStatus::Stopped) {
             *current = ServiceStatus::Crashed { exit_code };
@@ -236,6 +290,63 @@ fn kill_process_group(pid: u32) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// One-shot convenience: `descendant_pids(pid)` (see its own doc comment),
+/// `SIGKILL`ed directly by pid, not through `kill_process_group`'s whole-
+/// group signal. Exists for what that whole-group kill can't reach: a
+/// tool that daemonizes internally (forks, then has the fork call `setsid`
+/// to detach into its own brand-new session and process group before
+/// doing anything else) ends up with a live process that was never a
+/// member of `pid`'s own group to begin with — confirmed directly against
+/// a real service (an Elixir/Erlang app, `mix run --no-halt`): its own
+/// tracked process exited normally, but left a `beam.smp` node still
+/// running, fully reparented to pid 1, invisible to both
+/// `kill_process_group` and (once the lock file this module released the
+/// moment it saw that "normal" exit) to any later force-start's own
+/// stale-owner kill too. A single call site's worth of best-effort — see
+/// `spawn_drain_task`'s own repeated-scan use of `descendant_pids` for why
+/// a caller watching a process across its *whole* lifetime needs more than
+/// one call here to reliably catch this.
+pub(crate) fn kill_orphaned_descendants(pid: u32) {
+    for descendant in descendant_pids(pid) {
+        // SAFETY: a single, ordinary `SIGKILL` by pid — no process-group
+        // semantics involved here, unlike `kill_process_group` above.
+        unsafe {
+            libc::kill(descendant.as_u32() as libc::pid_t, libc::SIGKILL);
+        }
+    }
+}
+
+/// Every still-alive process currently descended from `pid` — children,
+/// grandchildren, and so on — found by scanning every process this
+/// machine currently has for one whose `parent()` matches something
+/// already found reachable from `pid`, breadth-first (not a `pgrep`/`ps`
+/// shell-out, reusing the `sysinfo` dependency `services::sample` already
+/// has). A snapshot of *right now* only — see `spawn_drain_task`'s own
+/// `seen_descendants` for why a caller that cares about a process that
+/// might exit and get reparented away before it gets around to killing
+/// anything needs to call this repeatedly over the watched process's
+/// whole lifetime, not just once at the end.
+fn descendant_pids(pid: u32) -> Vec<sysinfo::Pid> {
+    if pid == 0 {
+        return Vec::new();
+    }
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+
+    let root = sysinfo::Pid::from_u32(pid);
+    let mut frontier = vec![root];
+    let mut descendants = Vec::new();
+    while let Some(parent) = frontier.pop() {
+        for (candidate_pid, process) in sys.processes() {
+            if process.parent() == Some(parent) {
+                descendants.push(*candidate_pid);
+                frontier.push(*candidate_pid);
+            }
+        }
+    }
+    descendants
 }
 
 /// A service's CPU/memory usage right now — `None` if `pid` isn't a
@@ -387,6 +498,105 @@ mod tests {
         assert_eq!(status, ServiceStatus::Crashed { exit_code: 7 });
 
         std::fs::remove_dir_all(canvas_path.parent().unwrap()).ok();
+    }
+
+    /// Regression test for a real orphan found against a live document
+    /// (`amulettie/search/README.canvas.md`'s `app` service — `mix run
+    /// --no-halt`, an Elixir/Erlang app): its own tracked process exits
+    /// normally at some point, but a `beam.smp` node it started keeps
+    /// running, fully reparented to pid 1 — daemonized via the classic
+    /// double-fork-and-`setsid` pattern, which detaches the real long-lived
+    /// process into its own brand-new session/process group *before*
+    /// anything here ever gets a chance to see it as part of `pid`'s own
+    /// group. `kill_process_group` alone can never reach a process that
+    /// was never in that group to begin with — this simulates the same
+    /// shape with a small Python script instead of a real Erlang install,
+    /// and checks `kill_orphaned_descendants` (called from the drain
+    /// task's own unexpected-exit path) catches it anyway.
+    #[tokio::test]
+    async fn an_exit_leaving_a_daemonized_descendant_alive_still_gets_it_killed() {
+        let canvas_path = tmp_canvas_path("daemonize");
+        let dir = canvas_path.parent().unwrap().to_path_buf();
+        let marker = dir.join("descendant.pid");
+        // The detached child also closes its own inherited stdout/stderr
+        // (redirecting to `/dev/null`) — same as a real well-behaved
+        // daemon (confirmed BEAM itself does this too), and necessary
+        // here for the same reason: without it, the pipe `stream_exec`
+        // reads this service's own output from would stay held open by
+        // the still-running descendant even after the wrapper (the
+        // parent branch, right below) exits, so the wrapper's own exit
+        // would never even be observed as EOF in the first place. The
+        // parent branch also waits a bit before exiting — `spawn_drain_
+        // task`'s own periodic scan (`DESCENDANT_SCAN_INTERVAL`) needs at
+        // least one real tick to land while the descendant is still
+        // reachable through the wrapper; a real daemonizing service
+        // (BEAM's own boot alone takes whole seconds) always has far more
+        // slack than this in practice — an immediate exit right after
+        // forking would race the very first scan for no reason this test
+        // needs to reproduce.
+        let script = format!(
+            "python3 <<'PYEOF'\nimport os, sys, time\npid = os.fork()\nif pid > 0:\n    time.sleep(1)\n    sys.exit(0)\nos.setsid()\ndevnull = os.open(os.devnull, os.O_RDWR)\nos.dup2(devnull, 0)\nos.dup2(devnull, 1)\nos.dup2(devnull, 2)\nwith open({marker:?}, 'w') as f:\n    f.write(str(os.getpid()))\ntime.sleep(30)\nPYEOF\n",
+        );
+
+        let handle = spawn_locked(
+            "root".to_string(),
+            "srv".to_string(),
+            test_block(&script),
+            HashMap::new(),
+            dir.clone(),
+            canvas_path.clone(),
+            "cli",
+        )
+        .unwrap();
+
+        // Wait for the daemonized descendant to exist and report its own
+        // (freshly detached) pid.
+        let mut descendant_pid: Option<u32> = None;
+        for _ in 0..100 {
+            if let Ok(s) = std::fs::read_to_string(&marker) {
+                if let Ok(p) = s.trim().parse::<u32>() {
+                    descendant_pid = Some(p);
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let descendant_pid = descendant_pid.expect("descendant never wrote its own pid");
+        assert!(
+            meshfox_core::service_lock::is_alive(descendant_pid),
+            "descendant should be running before its wrapper exits"
+        );
+
+        // Wait for the wrapper's own exit to be noticed — an *unexpected*
+        // one, `Crashed`, since nothing here ever called `stop()`.
+        let mut status = handle.status();
+        for _ in 0..100 {
+            if !matches!(status, ServiceStatus::Running) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            status = handle.status();
+        }
+        assert!(
+            matches!(status, ServiceStatus::Crashed { .. }),
+            "wrapper should be reported crashed: {status:?}"
+        );
+
+        // The whole point: the daemonized descendant shouldn't survive
+        // that, even though it was never a member of the wrapper's own
+        // process group by the time anything tried to clean it up.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut still_alive = meshfox_core::service_lock::is_alive(descendant_pid);
+        while still_alive && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            still_alive = meshfox_core::service_lock::is_alive(descendant_pid);
+        }
+        assert!(
+            !still_alive,
+            "daemonized descendant pid {descendant_pid} survived its wrapper's exit — orphaned, not swept up"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

@@ -6,12 +6,27 @@ import remarkImageAttrs from "./remarkImageAttrs";
 import remarkSubSup from "./remarkSubSup";
 import remarkGfmAlerts from "./remarkGfmAlerts";
 import { highlightToHtml } from "./shiki";
-import { BUTTON_LANG, defaultBlock, parseBody, type BodySegment, type CodeSegment, type ConstraintSegment } from "./fence";
+import {
+  BUTTON_LANG,
+  FORM_LANG,
+  defaultBlock,
+  parseBody,
+  parseFormFields,
+  type BodySegment,
+  type CodeSegment,
+  type ConstraintSegment,
+} from "./fence";
 import { parseBlockRef, blockDomId } from "./deps";
 import { implicitDepsForBlock, interpreterVarRefsNaive, type ClientVarDecl } from "./vars";
 import { AnsiText } from "./AnsiText";
 import { NodeTextEditor } from "./NodeTextEditor";
-import { fetchNodeFileContent, fetchLinkPreview, type LinkPreview } from "./api";
+import {
+  fetchNodeFileContent,
+  fetchLinkPreview,
+  fetchFormFields,
+  type LinkPreview,
+  type FormFieldStatus,
+} from "./api";
 import type { ConstraintStatusDto, NodeType, ServiceStatusDto } from "./types";
 
 /**
@@ -410,6 +425,13 @@ export interface MeshNodeData {
    * skips `deps=`) or "⛓ run chain" (true, runs the chain first). */
   onRun: (blockName: string, withDeps: boolean) => void;
   onKill: (blockName: string) => void;
+  /** A `form`-lang fence's own Send button (see SPEC.md's "Form fences")
+   * — submits `values` (keyed by the declared `meshfox:var` name each
+   * field targets), which the server commits into its session-lifetime
+   * override store and uses to kick off whichever `autorun` blocks the
+   * change reaches. Never runs `blockName` itself — a form has no code of
+   * its own; see `FormBlock`. */
+  onSubmitForm: (blockName: string, values: Record<string, string>) => void;
   /** `tty` blocks only — opens a `TtyPanel` (a real interactive terminal)
    * instead of streaming captured output the way `onRun` does. Same
    * `withDeps` meaning: plain "run" (false) vs "⛓ run chain" (true).
@@ -1384,12 +1406,32 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
   if (seg.lang === BUTTON_LANG) {
     return <ButtonBlock seg={seg} data={data} nodeId={nodeId} />;
   }
-  // Expanded by default (unlike a constraint fence — see
-  // `ConstraintFenceBlock`): a runnable block's own code and output are
-  // usually the point of reading a node at all. The run/chain/kill buttons
-  // in the head stay available either way, so collapsing one doesn't stop
-  // it from being run — just hides its source and output until reopened.
+  // A `form` fence has no real code either — SPEC.md's "Form fences": its
+  // body is a `field var=` list, rendered as labeled inputs + a Send
+  // button instead of a code editor (same non-executing-fence family as
+  // `button`, same dispatch-on-`lang` pattern just above).
+  if (seg.lang === FORM_LANG) {
+    return <FormBlock seg={seg} data={data} nodeId={nodeId} />;
+  }
+  // Two independent fold states, each with its own head-bar control:
+  // - `expanded` — the block as a whole (code *and* output together),
+  //   the original fold toggle this block has always had, always starts
+  //   expanded. Collapsing it hides everything, same as collapsing the
+  //   containing node would (just scoped to this one block).
+  // - `sourceExpanded` — source only, defaults to collapsed when the
+  //   fence's own `fold` attribute says so (see SPEC.md's "Runnable code
+  //   fences"). Unlike a constraint fence (see `ConstraintFenceBlock`), a
+  //   runnable block's own source isn't always the point of reading a
+  //   node that's already running and producing output; `fold` exists
+  //   for exactly that case (a `form`/`autorun` block whose own result
+  //   table is the point, not its source) — collapsing *this* one never
+  //   hides the block's own output (see this component's own render
+  //   below): a reader watching an `autorun` block's result doesn't want
+  //   it to vanish every time they fold the source back out of the way.
+  // The run/chain/kill buttons in the head stay available regardless of
+  // either.
   const [expanded, setExpanded] = useState(true);
+  const [sourceExpanded, setSourceExpanded] = useState(() => !seg.fold);
   const live = data.liveBlocks[seg.name];
   const queued = live?.status === "queued";
   const running = live?.status === "running";
@@ -1476,9 +1518,23 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
         <FoldToggle
           folded={!expanded}
           onToggle={() => setExpanded((e) => !e)}
-          foldedTitle="Show the code"
-          unfoldedTitle="Hide the code"
+          foldedTitle="Show this block (code + output)"
+          unfoldedTitle="Collapse this block (code + output)"
         />
+        {expanded && (
+          <button
+            type="button"
+            className={
+              sourceExpanded
+                ? "mesh-code-source-toggle nodrag"
+                : "mesh-code-source-toggle mesh-code-source-toggle-collapsed nodrag"
+            }
+            onClick={() => setSourceExpanded((s) => !s)}
+            title={sourceExpanded ? "Hide the code (output stays visible)" : "Show the code"}
+          >
+            ‹/›
+          </button>
+        )}
         <span className="mesh-code-lang">
           {seg.lang}
           {seg.interpreter && <span className="mesh-code-interpreter"> #!{seg.interpreter}</span>}
@@ -1557,7 +1613,7 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
       </div>
       {expanded && (
         <>
-          {(hasDeps || hasImplicitDeps) && (
+          {sourceExpanded && (hasDeps || hasImplicitDeps) && (
             <div className="mesh-code-deps">
               {hasDeps && (
                 <>
@@ -1619,7 +1675,14 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
               )}
             </div>
           )}
-          <HighlightedCode code={seg.code} lang={seg.lang} />
+          {sourceExpanded && <HighlightedCode code={seg.code} lang={seg.lang} />}
+          {/* Deliberately outside `sourceExpanded` (but still inside the
+           * whole-block `expanded`) — folding just the source away
+           * shouldn't also hide whatever it already produced (see this
+           * component's own `sourceExpanded` doc comment/SPEC.md's
+           * "Runnable code fences", the `fold` attribute this decoupling
+           * exists for); collapsing the *whole* block still hides both
+           * together, same as it always has. */}
           {!seg.tty && <RunOutput seg={seg} live={live} assetBase={data.assetBase} />}
         </>
       )}
@@ -1664,6 +1727,122 @@ function ButtonBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeDa
           ⏹ kill
         </button>
       )}
+    </div>
+  );
+}
+
+// Mirrors `VarsForm.tsx`'s own `isValidValue`/`INT_PATTERN` — kept as a
+// separate copy rather than importing from there (that component owns the
+// document-wide "configure variables" modal; this is a structurally
+// unrelated surface that happens to need the same one check).
+const FORM_FIELD_INT_PATTERN = /^[+-]?\d+$/;
+
+function isValidFormFieldValue(f: FormFieldStatus, value: string): boolean {
+  return f.type !== "int" || FORM_FIELD_INT_PATTERN.test(value);
+}
+
+function initialFormFieldValue(f: FormFieldStatus): string {
+  if (f.value !== undefined) return f.value;
+  if (f.type === "bool") return "false";
+  if (f.type === "select") return f.choices?.[0] ?? "";
+  return "";
+}
+
+/**
+ * A `form`-lang fence (see SPEC.md's "Form fences"): fetches its own
+ * `field var=` list server-side (`GET /api/form/fields` — the server
+ * re-derives it from the canvas, never trusts a client-parsed copy for
+ * anything that affects correctness) and renders each as a labeled input,
+ * same per-type control `VarsForm.tsx`'s own "configure variables" modal
+ * already uses, plus a Send button. Nothing happens live as values are
+ * typed — only clicking Send (`data.onSubmitForm`) commits them, which is
+ * what may in turn auto-start an `autorun` block elsewhere (never this
+ * block itself — a form has no code of its own to run).
+ */
+function FormBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData; nodeId: string }) {
+  const [fields, setFields] = useState<FormFieldStatus[] | null>(null);
+  const [sendCaption, setSendCaption] = useState("Send");
+  const [values, setValues] = useState<Record<string, string>>({});
+  const [error, setError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchFormFields(nodeId, seg.name)
+      .then(({ send, fields: f }) => {
+        if (cancelled) return;
+        setSendCaption(send);
+        setFields(f);
+        setValues(Object.fromEntries(f.map((field) => [field.name, initialFormFieldValue(field)])));
+      })
+      .catch((e) => {
+        if (!cancelled) setError(String(e));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [nodeId, seg.name, seg.code]);
+
+  const set = (name: string, value: string) => setValues((prev) => ({ ...prev, [name]: value }));
+
+  const handleSend = () => {
+    if (!fields) return;
+    const invalid = fields.find((f) => !isValidFormFieldValue(f, values[f.name] ?? ""));
+    if (invalid) {
+      setError(`${invalid.prompt} needs a whole number (like 42 or -3), not ${JSON.stringify(values[invalid.name])}.`);
+      return;
+    }
+    setError(null);
+    setSubmitting(true);
+    try {
+      data.onSubmitForm(seg.name, values);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  if (fields === null) {
+    return (
+      <div className="mesh-form-block" id={blockDomId({ nodeId, blockName: seg.name })}>
+        {error ? <p className="vars-modal-error">{error}</p> : <p>loading form…</p>}
+      </div>
+    );
+  }
+
+  return (
+    <div className="mesh-form-block" id={blockDomId({ nodeId, blockName: seg.name })}>
+      {error && <p className="vars-modal-error">{error}</p>}
+      {fields.map((f, i) => (
+        <label key={f.name} className="vars-modal-field">
+          <span>{f.label ?? f.prompt}</span>
+          {f.type === "bool" ? (
+            <input
+              type="checkbox"
+              checked={values[f.name] === "true"}
+              onChange={(e) => set(f.name, e.target.checked ? "true" : "false")}
+            />
+          ) : f.type === "select" ? (
+            <select value={values[f.name] ?? ""} onChange={(e) => set(f.name, e.target.value)} autoFocus={i === 0}>
+              {(f.choices ?? []).map((c) => (
+                <option key={c} value={c}>
+                  {c}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <input
+              type={f.type === "int" ? "number" : f.secret ? "password" : "text"}
+              step={f.type === "int" ? 1 : undefined}
+              value={values[f.name] ?? ""}
+              onChange={(e) => set(f.name, e.target.value)}
+              autoFocus={i === 0}
+            />
+          )}
+        </label>
+      ))}
+      <button type="button" className="mesh-run-button" disabled={submitting} onClick={handleSend}>
+        {sendCaption}
+      </button>
     </div>
   );
 }

@@ -3256,11 +3256,20 @@ fn annotate(block: &meshfox_core::CodeBlock) -> String {
     if meshfox_core::is_button(&block.lang) {
         annotations.push("button".to_string());
     }
+    if meshfox_core::is_form(&block.lang) {
+        annotations.push("form".to_string());
+    }
     if block.cache {
         annotations.push("cache".to_string());
     }
     if block.tty {
         annotations.push("tty".to_string());
+    }
+    if block.autorun {
+        annotations.push("autorun".to_string());
+    }
+    if block.fold {
+        annotations.push("fold".to_string());
     }
     if block.default {
         annotations.push("default".to_string());

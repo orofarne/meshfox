@@ -59,6 +59,41 @@ pub struct CodeBlock {
     /// dependency — the block actually requested already always runs for
     /// real regardless. See SPEC.md's "Runnable code fences".
     pub always: bool,
+    /// Explicit `autorun` flag (`autorun` or `autorun="true"`) — in a live
+    /// session (`meshfox view`/`meshfox tui`, never one-shot `meshfox run`),
+    /// re-runs this block's full chain automatically whenever the *resolved
+    /// value* of a variable it references (via `env=`/`interpreter=`,
+    /// transitively through `from=`/`default_var=`/`choices_var=`) changes —
+    /// instead of waiting for a manual run. Doesn't change what running the
+    /// block does, only when it's triggered, so (like `cache`/`tty`/
+    /// `default`/`always`) it's deliberately left out of `fingerprint`. See
+    /// `crate::autorun_blocks_for_changed_vars` for the actual trigger,
+    /// and SPEC.md's "Runnable code fences". Mutually exclusive with `tty`
+    /// (enforced by `crate::deps::validate`, not here) — there's no human to
+    /// hand a terminal to when a variable changes unattended.
+    pub autorun: bool,
+    /// `render="..."` — swaps this block's default display from "code +
+    /// run controls" to a custom widget for the named kind, with the raw
+    /// fence source reachable only via an explicit edit toggle. Parsed
+    /// leniently (any string, including one this version doesn't recognize
+    /// — same posture as `output=`'s own string handling) so a future
+    /// meshfox version can add a new kind without an older one choking on
+    /// it; `crate::deps::validate` is what actually checks the value against
+    /// the known-kind registry (`RENDER_KINDS`). See SPEC.md's "Runnable
+    /// code fences".
+    pub render: Option<String>,
+    /// Explicit `fold` flag (`fold` or `fold="true"`) — a per-*block*
+    /// authored default (deliberately not a document-wide `meshfox:option`
+    /// — a block whose own result is the point, like a `form`/`autorun`
+    /// pair producing a live table, wants its own source out of the way
+    /// regardless of what any other block in the document wants): this
+    /// block's own source starts collapsed when its owning node is shown,
+    /// one click away via the same fold toggle that already exists in its
+    /// head. Never hides the block's own output — only its source; purely
+    /// a display default, so (like `cache`/`tty`/`default`/`always`/
+    /// `autorun`) it's deliberately left out of `fingerprint`. See
+    /// SPEC.md's "Runnable code fences".
+    pub fold: bool,
     /// Other blocks this one depends on (`deps="a,b"`) — run before this
     /// one, automatically, whenever this block runs. See `crate::deps`.
     pub deps: Vec<BlockRef>,
@@ -470,7 +505,18 @@ const FENCE_ATTRS: &[&str] = &[
     "default",
     "interpreter",
     "output",
+    "autorun",
+    "render",
+    "send",
+    "fold",
 ];
+
+/// Known `render=` values — see `CodeBlock::render`'s own doc comment and
+/// SPEC.md's "Runnable code fences". Checked only by `crate::deps::validate`
+/// (`meshfox validate`), never at parse time — parsing itself stays lenient
+/// so an unrecognized kind never fails to *parse*, only to *validate*, the
+/// same split `unknown_fence_attr` already draws for attribute names.
+pub const RENDER_KINDS: &[&str] = &["form"];
 
 /// `meshfox validate`-only: the first runnable fence anywhere in
 /// `markdown` with an attribute not in `FENCE_ATTRS` — checked over every
@@ -502,6 +548,9 @@ fn build_code_block(
     let autoclose = attrs.get("autoclose").map(|v| v != "false").unwrap_or(false);
     let service = attrs.get("service").map(|v| v != "false").unwrap_or(false);
     let always = attrs.get("always").map(|v| v != "false").unwrap_or(false);
+    let autorun = attrs.get("autorun").map(|v| v != "false").unwrap_or(false);
+    let render = attrs.get("render").cloned();
+    let fold = attrs.get("fold").map(|v| v != "false").unwrap_or(false);
     let deps = parse_deps(&attrs);
     let env = parse_env(&attrs);
     let interpreter = attrs.get("interpreter").cloned();
@@ -514,6 +563,9 @@ fn build_code_block(
         autoclose,
         service,
         always,
+        autorun,
+        render,
+        fold,
         deps,
         env,
         interpreter,
@@ -1095,6 +1147,51 @@ mod tests {
         let blocks = scan_code_blocks(md);
         assert!(blocks[0].always);
         assert!(!blocks[1].always);
+    }
+
+    #[test]
+    fn autorun_flag_defaults_to_false() {
+        let md = "```bash name=\"x\"\necho hi\n```\n";
+        assert!(!scan_code_blocks(md)[0].autorun);
+    }
+
+    #[test]
+    fn autorun_flag_parses_bare_and_explicit_false() {
+        let md =
+            "```bash name=\"x\" autorun\necho hi\n```\n\n```bash name=\"y\" autorun=false\necho hi\n```\n";
+        let blocks = scan_code_blocks(md);
+        assert!(blocks[0].autorun);
+        assert!(!blocks[1].autorun);
+    }
+
+    #[test]
+    fn render_defaults_to_none() {
+        let md = "```bash name=\"x\"\necho hi\n```\n";
+        assert_eq!(scan_code_blocks(md)[0].render, None);
+    }
+
+    #[test]
+    fn render_parses_any_string_leniently() {
+        let md = "```bash name=\"x\" render=\"form\"\necho hi\n```\n\n```bash name=\"y\" render=\"not-a-real-kind\"\necho hi\n```\n";
+        let blocks = scan_code_blocks(md);
+        assert_eq!(blocks[0].render, Some("form".to_string()));
+        // Lenient at parse time -- an unrecognized kind is still parsed;
+        // `deps::validate` is what actually rejects it (see deps.rs tests).
+        assert_eq!(blocks[1].render, Some("not-a-real-kind".to_string()));
+    }
+
+    #[test]
+    fn fold_flag_defaults_to_false() {
+        let md = "```bash name=\"x\"\necho hi\n```\n";
+        assert!(!scan_code_blocks(md)[0].fold);
+    }
+
+    #[test]
+    fn fold_flag_parses_bare_and_explicit_false() {
+        let md = "```bash name=\"x\" fold\necho hi\n```\n\n```bash name=\"y\" fold=false\necho hi\n```\n";
+        let blocks = scan_code_blocks(md);
+        assert!(blocks[0].fold);
+        assert!(!blocks[1].fold);
     }
 
     #[test]

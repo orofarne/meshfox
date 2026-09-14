@@ -44,6 +44,7 @@ import {
   forceRun,
   fetchActiveRuns,
   subscribeRun,
+  submitForm,
   type RunEvent,
   type NodePatch,
   type ActiveRunDto,
@@ -729,20 +730,6 @@ export default function App() {
   const pendingExternalChange = useRef(false);
 
   useEffect(() => {
-    const stop = watchChanges(
-      () => {
-        if (sourceModeRef.current) {
-          pendingExternalChange.current = true;
-          return;
-        }
-        load();
-      },
-      () => setServerGone(true),
-    );
-    return stop;
-  }, [load]);
-
-  useEffect(() => {
     if (!sourceMode && pendingExternalChange.current) {
       pendingExternalChange.current = false;
       load();
@@ -803,6 +790,140 @@ export default function App() {
       );
     },
     [setNodes],
+  );
+
+  // One `subscribeRun` watch per address can end up started twice for the
+  // exact same triggered run: `handleSubmitForm` starts one straight from
+  // `submitForm`'s own response, and this same tab's own `/api/watch`
+  // connection *also* receives the server's `"run-started"` broadcast for
+  // that very same run (see `ServerEvent::RunStarted`'s own doc comment —
+  // it fires for every plain-block run, not just one some *other* tab
+  // triggered) and would start a second, fully independent one. Two
+  // readers both replaying the same buffered backlog from `sinceSeq: 0`
+  // and both appending to the same `liveBlocks[blockName].text` race and
+  // double up — confirmed directly: a resubmitted form's table briefly
+  // showed the *previous* submission's rows concatenated above the new
+  // ones (see `web/e2e/form-autorun-output.spec.ts`, written specifically
+  // to catch this). Keyed by address, bumped at the start of every
+  // `watchAutorunBlock` call and captured locally — an event handler
+  // whose own generation has since been superseded (a newer call for the
+  // same address started after it) is a stale reader and silently drops
+  // every further event, leaving only the latest call's own reader
+  // actually mutating `liveBlocks`.
+  const autorunWatchGeneration = useRef<Map<string, number>>(new Map());
+
+  // Claims `key` (an address, `"<nodeId>::<block>"`) as of *this* call —
+  // bumps its generation and returns a checker any later event handler for
+  // this same call should gate every state mutation on. Shared by
+  // `watchAutorunBlock` and the "reconcile active runs on page load"
+  // effect below: both independently decide, for the very same possible
+  // address, "subscribe and fold the backlog into `liveBlocks`" — without
+  // a shared generation counter between the two, whichever one lost the
+  // race would keep mutating state after the other one (correctly) took
+  // over, the same double-write this was written to fix for
+  // `watchAutorunBlock` alone.
+  const beginAddressWatch = useCallback((key: string) => {
+    const generation = (autorunWatchGeneration.current.get(key) ?? 0) + 1;
+    autorunWatchGeneration.current.set(key, generation);
+    return () => autorunWatchGeneration.current.get(key) === generation;
+  }, []);
+
+  // Watches one address's own most recent plain-block run via
+  // `subscribeRun` and folds it into `liveBlocks` the same way a self-
+  // initiated run already does (`patchLiveBlock`/the `"output"` handling
+  // in `executeRun` below) — used both right after this tab's own form
+  // Send (`handleSubmitForm`, from the response's own `autorunTriggered`
+  // list) and for a *different* tab's `autorun` run, discovered passively
+  // via `/api/watch`'s `"run-started"` event (see the `watchChanges` call
+  // below, and `ServerEvent::RunStarted`'s own doc comment server-side).
+  // `subscribeRun` itself is a harmless no-op (resolves with no events at
+  // all) if this address never actually ran, or its run already finished
+  // and was superseded before this connects — so calling it speculatively
+  // is always safe. Deliberately simpler than `executeRun`'s own
+  // `RunEvent` handling: `subscribeRun`'s vocabulary has no per-step
+  // `started`/`step-start` (just `line`/`done` for the one address being
+  // watched), so there's no `runId` to attach — the Kill button stays
+  // disabled for a run discovered this way, same open gap `LiveBlockState.
+  // runId`'s own doc comment flags.
+  const watchAutorunBlock = useCallback(
+    (targetNodeId: string, blockName: string) => {
+      const isCurrent = beginAddressWatch(`${targetNodeId}::${blockName}`);
+
+      patchLiveBlock(targetNodeId, blockName, {
+        status: "running",
+        text: "",
+        stdoutText: undefined,
+        stderrText: undefined,
+        exitCode: undefined,
+        runId: undefined,
+        startedAt: Date.now(),
+        durationMs: undefined,
+      });
+      subscribeRun(targetNodeId, blockName, 0, (event) => {
+        if (!isCurrent()) return;
+        if (event.type === "line") {
+          setNodes((nds) =>
+            nds.map((n) => {
+              if (n.id !== targetNodeId) return n;
+              const prev: LiveBlockState = n.data.liveBlocks[blockName] ?? { status: "running", text: "" };
+              return {
+                ...n,
+                data: {
+                  ...n.data,
+                  liveBlocks: { ...n.data.liveBlocks, [blockName]: appendOutputLine(prev, event) },
+                },
+              };
+            }),
+          );
+        } else {
+          patchLiveBlock(targetNodeId, blockName, {
+            status: event.outcome === "killed" ? "killed" : "done",
+            exitCode: event.exitCode,
+          });
+        }
+      }).catch(() => {
+        // A transient fetch failure here just means this one passive watch
+        // missed its updates — the block's own next real run (manual or
+        // another autorun) re-syncs everything, same best-effort posture
+        // the rest of this app's background refreshes already have.
+      });
+    },
+    [beginAddressWatch, patchLiveBlock, setNodes],
+  );
+
+  useEffect(() => {
+    const stop = watchChanges(
+      () => {
+        if (sourceModeRef.current) {
+          pendingExternalChange.current = true;
+          return;
+        }
+        load();
+      },
+      () => setServerGone(true),
+      (nodeId, block) => watchAutorunBlock(nodeId, block),
+    );
+    return stop;
+  }, [load, watchAutorunBlock]);
+
+  // A `form`-lang fence's own Send button (see SPEC.md's "Form fences") —
+  // commits `values` server-side and immediately starts watching every
+  // `autorun` block the submission triggered (`watchAutorunBlock`), rather
+  // than waiting on the `"run-started"` `/api/watch` event that exists
+  // for *other* tabs — this one already knows the addresses directly from
+  // `submitForm`'s own response.
+  const handleSubmitForm = useCallback(
+    async (nodeId: string, blockName: string, values: Record<string, string>) => {
+      try {
+        const result = await submitForm(nodeId, blockName, values);
+        for (const addr of result.autorunTriggered) {
+          watchAutorunBlock(addr.nodeId, addr.block);
+        }
+      } catch (e) {
+        setError(String(e));
+      }
+    },
+    [watchAutorunBlock],
   );
 
   // Actually starts a run — split out from `handleRun` (below) so the
@@ -1057,6 +1178,18 @@ export default function App() {
       .then((runs) => {
         for (const run of runs) {
           if (run.kind !== "plain") continue;
+          // Claims this address the same way `watchAutorunBlock` does
+          // (same shared generation counter, `beginAddressWatch`) — this
+          // effect and that one independently decide, for the very same
+          // address, "subscribe and fold the backlog into `liveBlocks`";
+          // without sharing one counter between them, whichever call
+          // loses the race would keep mutating state after the other
+          // (correctly) took over — confirmed directly: a fresh page
+          // load racing an in-flight `autorun` trigger for the same
+          // block could show a stale, already-superseded run's own
+          // leftover output instead of (or mixed with) the real current
+          // one.
+          const isCurrent = beginAddressWatch(`${run.nodeId}::${run.block}`);
           patchLiveBlock(run.nodeId, run.block, {
             status: run.status === "killed" ? "killed" : run.status === "exited" ? "done" : "running",
             text: "",
@@ -1071,6 +1204,7 @@ export default function App() {
             durationMs: run.status === "exited" ? run.uptimeMs : undefined,
           });
           subscribeRun(run.nodeId, run.block, 0, (event) => {
+            if (!isCurrent()) return;
             switch (event.type) {
               case "line":
                 setNodes((nds) =>
@@ -1106,7 +1240,7 @@ export default function App() {
         // No active runs to reconcile, or the endpoint failed — either
         // way, not worth surfacing as a page-level error.
       });
-  }, [canvas, patchLiveBlock, setNodes]);
+  }, [canvas, beginAddressWatch, patchLiveBlock, setNodes]);
 
   // Runs a runnable `file` node's `interpreter target` (see
   // `api.ts`'s `runFileStream`) — the file-node counterpart to
@@ -1345,12 +1479,26 @@ export default function App() {
   // at that one moment, never the `runId` a real run later attaches.
   // `setNodes`'s updater always receives the latest state instead,
   // regardless of when this closure was created.
+  //
+  // Falls back to killing by address (`{nodeId, block}`) when there's no
+  // `runId` to target — exactly `killRun`'s own documented fallback case:
+  // a run discovered passively via `watchAutorunBlock` (an `autorun` block
+  // this tab never itself started — either this tab's own form Send, or
+  // another tab's, or the page-load reconciliation effect) never gets a
+  // `runId` attached (`subscribeRun`'s vocabulary has none to give), but
+  // its Kill button still renders and is clickable since it only gates on
+  // `status === "running"`, not on `runId` — without this fallback, that
+  // click silently did nothing at all.
   const handleKill = useCallback(
     (nodeId: string, blockName: string) => {
       setNodes((nds) => {
         const node = nds.find((n) => n.id === nodeId);
         const runId = node?.data.liveBlocks[blockName]?.runId;
-        if (runId) killRun(runId).catch((e) => setError(String(e)));
+        if (runId) {
+          killRun(runId).catch((e) => setError(String(e)));
+        } else {
+          killRun({ nodeId, block: blockName }).catch((e) => setError(String(e)));
+        }
         return nds; // read-only — the eventual "killed" event updates state
       });
     },
@@ -1803,6 +1951,8 @@ export default function App() {
             plainMarkdownInclude: n.plainMarkdownInclude,
             onRun: (blockName: string, withDeps: boolean) => handleRun(n.id, blockName, withDeps),
             onKill: (blockName: string) => handleKill(n.id, blockName),
+            onSubmitForm: (blockName: string, values: Record<string, string>) =>
+              handleSubmitForm(n.id, blockName, values),
             onRunTty: (blockName: string, withDeps: boolean, autoclose: boolean) =>
               handleRunTty(n.id, blockName, withDeps, autoclose),
             onRecheckConstraint: () => load(),
@@ -2242,7 +2392,7 @@ export default function App() {
     setEdges((eds) =>
       eds.map((e) => (e.type === "extra" || e.type === "tree" ? { ...e, data: { ...e.data, editMode } } : e)),
     );
-  }, [editMode, setNodes, setEdges, handleRun, handleKill, handleRunTty, toggleFold, load]);
+  }, [editMode, setNodes, setEdges, handleRun, handleKill, handleRunTty, handleSubmitForm, toggleFold, load]);
 
   // Every node reachable without descending into a folded subtree, in
   // document (depth-first) order — the same order keyboard nav's j/k walks

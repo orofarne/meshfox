@@ -51,6 +51,66 @@ export async function saveConfigureVars(answers: Record<string, string>): Promis
   if (!res.ok) throw new Error(`POST /api/vars/configure: ${res.status}`);
 }
 
+/** One field of a `form`-lang fence's own `GET /api/form/fields` response
+ * — a declared variable's usual `VarStatus` plus whatever `label=`
+ * override the field itself carries (falls back to `prompt`/`name` when
+ * absent, same as `meshfox_core::form::FormField.label`). */
+export type FormFieldStatus = VarStatus & { label?: string };
+
+/**
+ * Resolves one `form`-lang fence's own `field var=` list into display-
+ * ready status, server-side (the server re-derives the field list itself
+ * from the canvas — see `crates/server/src/lib.rs`'s `get_form_fields` —
+ * rather than trusting anything the client might claim). `send` is the
+ * fence's own `send=` caption, already defaulted to `"Send"` server-side.
+ * Addressed by flat `nodeId` (the same possibly-namespaced id `GET
+ * /api/canvas` already sends), not a root-relative `path` the way
+ * `fetchVars`/`runBlockStream` address a block — this endpoint (like
+ * `submitForm`) never needs to know which file on disk owns the node, so
+ * there's nothing a path would add.
+ */
+export async function fetchFormFields(
+  nodeId: string,
+  block: string,
+): Promise<{ send: string; fields: FormFieldStatus[] }> {
+  const params = new URLSearchParams({ nodeId, block });
+  const res = await fetch(`/api/form/fields?${params}`);
+  if (!res.ok) throw new Error(`GET /api/form/fields: ${res.status}`);
+  return res.json();
+}
+
+/**
+ * The submit side of a `form`-lang fence's own Send button (see SPEC.md's
+ * "Form fences"): commits `values` into the server's session-lifetime
+ * override store (never the on-disk cache — every variable a form targets
+ * is implicitly `session`-scoped) and kicks off whichever `autorun` blocks
+ * the just-changed values reach. `values`' keys not among this specific
+ * form's own declared fields are silently ignored server-side — the same
+ * defensive posture `POST /api/vars/configure` already has toward an
+ * unrecognized name. `autorunTriggered` is every block address the
+ * server just started in the background — pass each to `subscribeRun`
+ * (or fold into `liveBlocks` the same way, see `App.tsx`'s
+ * `watchAutorunBlock`) to watch it without waiting on a `"run-started"`
+ * `/api/watch` event, which exists for a passive tab that didn't submit
+ * this form itself.
+ */
+export async function submitForm(
+  nodeId: string,
+  block: string,
+  values: Record<string, string>,
+): Promise<{ saved: number; autorunTriggered: { nodeId: string; block: string }[] }> {
+  const res = await fetch("/api/form/submit", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ nodeId, block, values }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `POST /api/form/submit: ${res.status}`);
+  }
+  return res.json();
+}
+
 /**
  * Replaces the document's whole set of declared `meshfox:option` names
  * (see SPEC.md's "Options") with exactly `options`, in the given order —
@@ -919,7 +979,21 @@ const WATCH_RECONNECT_DELAYS_MS = [200, 400, 800, 1600, 3200, 3200];
  * very tab that's mid-reload instead of letting it finish. The reconnect
  * retries above are the backstop for when `pagehide` loses that race.
  */
-export function watchChanges(onChanged: () => void, onDisconnected: () => void): () => void {
+export function watchChanges(
+  onChanged: () => void,
+  onDisconnected: () => void,
+  /** A `"run-started"` event — a plain block just started running in this
+   * server process, whether or not *this* tab was the one that triggered
+   * it (see `crates/server/src/lib.rs`'s `ServerEvent::RunStarted`). In
+   * practice, today, only ever fired for an `autorun` block's own
+   * server-triggered run (`submit_form`'s own trigger) — the tab that
+   * actually clicked Send already learns the same addresses directly from
+   * `submitForm`'s response (see `App.tsx`'s `handleSubmitForm`) and
+   * doesn't need this; it's for every *other* open tab on the same
+   * document. Optional — a caller that doesn't care about autorun-
+   * triggered runs elsewhere just omits it. */
+  onRunStarted?: (nodeId: string, block: string) => void,
+): () => void {
   const controller = new AbortController();
   let leaving = false;
   let stopped = false;
@@ -951,8 +1025,12 @@ export function watchChanges(onChanged: () => void, onDisconnected: () => void):
         const line = buffered.slice(0, newlineAt);
         buffered = buffered.slice(newlineAt + 1);
         if (!line.trim()) continue;
-        const event = JSON.parse(line) as { type: string };
-        if (event.type === "changed") onChanged();
+        const event = JSON.parse(line) as { type: string; nodeId?: string; block?: string };
+        if (event.type === "changed") {
+          onChanged();
+        } else if (event.type === "run-started" && event.nodeId !== undefined && event.block !== undefined) {
+          onRunStarted?.(event.nodeId, event.block);
+        }
       }
     }
     // The stream ending is itself a drop (the server never sends a

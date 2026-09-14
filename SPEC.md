@@ -398,6 +398,55 @@ Lives inside a node's Markdown text, as fence-info-string attributes:
   package), which then renders as an actual table rather than
   preformatted text. Any other value (or omitting the attribute) keeps the
   default text rendering.
+- `autorun` — optional flag (`autorun` or `autorun="true"`); in a live
+  session (`meshfox view`/`meshfox tui` — never one-shot `meshfox run`,
+  which has no ongoing session to react within), re-runs this block's full
+  chain automatically whenever the *resolved value* of a variable it
+  references (via `env=`/`interpreter=`, transitively through `from=`/
+  `default_var=`/`choices_var=`) changes, instead of waiting for a manual
+  run. This is a *trigger*, not a new execution model — the session-
+  freshness machinery above (fingerprint comparison, `compute_forced_reruns`'s
+  forward/backward cascade) is exactly what already decides whether a
+  change actually makes this block stale; `autorun` just means a live
+  session acts on that the moment it happens rather than waiting for the
+  next manual "⛓ run chain". The natural source of such a change is a
+  `form` fence's own Send (see "Form fences" below), but nothing requires
+  one — any resolved-value change reaches it the same way, including one
+  var's own `from=` source producing a different result. Mutually
+  exclusive with `tty` (`meshfox validate` error) — there's no human to
+  hand a terminal to when a variable changes unattended.
+- `render="..."` — optional; swaps this block's default display from
+  "code + run controls" to a custom widget for the named kind, with the
+  raw fence source reachable only via an explicit edit toggle (the web
+  UI's pencil-to-edit-body affordance/the TUI's node-body editor — same
+  uniform per-node mechanism every other kind of body content already
+  uses, not a new per-block one). Parsed leniently — any value, including
+  one a given meshfox version doesn't recognize, still *parses*; only
+  `meshfox validate` rejects an unrecognized kind, so a canvas authored
+  against a newer version doesn't fail to open on an older one, just
+  falls back to the plain code view for that one block. The only kind
+  today is `"form"` (see "Form fences" below) — deliberately left open
+  for a future kind (e.g. rendering a `cache`d block's own tabular output
+  as a chart) rather than hard-coded to that one case.
+- `fold` — optional flag (`fold` or `fold="true"`), **web UI only** (the
+  TUI has no per-block source fold at all today — every runnable fence's
+  code always shows in full there). Starts this one block's own source
+  collapsed, one click away via a dedicated `‹/›` toggle in its head —
+  distinct from the block's own ▸/▾ fold toggle right next to it, which
+  collapses the block as a whole (code *and* output together, same as it
+  always has). Folding just the source this way never hides the block's
+  *output* (unlike either of the other two levels — the block's own
+  whole-block toggle, or collapsing the block's containing node — which
+  both hide everything). Deliberately a per-*block* attribute, not a
+  document-wide option (contrast `unfold`/"Options" above, which do apply
+  to the whole document) — whether one particular block's own source is
+  worth hiding by default has nothing to do with what every *other* block
+  in the document wants. The natural case is a `form`/`autorun` pair (see
+  "Form fences" below) whose own result (a live table, say) is the point
+  to keep looking at, not its source. Session-only, same as the fold
+  state itself — not remembered past a reload, and has no effect on
+  `fold=` on `meshfox:node` (a different attribute on a different
+  construct, for folding a whole *node*, not one block's source).
 
 Supported languages without an `interpreter=` attribute: `bash` (`sh` is an
 alias for it). A fence in any other language never counts as runnable at
@@ -519,6 +568,74 @@ wherever that block itself happens to live.
   same as it would with no button involved.
 - Scope: `deps=` never crosses an `include` boundary (see "What crosses
   the include boundary" above) — neither does a button's own addressing.
+
+## Form fences
+
+A `` ```form `` fence, same non-executing family as `button` above, is a
+small visual form for setting one or more *node-scoped* `meshfox:var`s
+(see "Variables" below) without opening the document-wide "configure
+variables" modal — a way to give a canvas a real input surface instead of
+only ever prompting before a run. Its body is a line-based list, one
+`field` per line, rather than code or a caption:
+
+    <!-- meshfox:var name="REGION" type="select" choices="us,eu" -->
+
+    ```form name="pick-region" send="Apply"
+    field var="REGION" label="AWS Region"
+    ```
+
+    ```bash name="show-region" env="$REGION" autorun
+    echo "region is $REGION"
+    ```
+
+- `field var="NAME" [label="..."]` — one declared `meshfox:var` shown as
+  one labeled input, in document order; `label=` overrides the display
+  text, falling back to the variable's own `prompt` (itself defaulting to
+  `name`) when omitted. Rendered using exactly the same per-type control
+  the document-wide "configure variables" form already uses for that
+  variable's own `type`/`choices` (a checkbox for `bool`, a dropdown for
+  `select`, a masked input for `secret`, ...) — a form fence doesn't
+  invent a second type system, it's a different *view* onto the same
+  `meshfox:var` declarations. Every `field var=` must resolve to a
+  variable actually visible in scope from the form's own node (the same
+  node-subtree rule a node-scoped `env=` reference already follows — see
+  "Variables" below) and must *not* name a `from=`-computed variable —
+  submitting a value for one would let a human override what its source
+  block computes, exactly what `from=` exists to prevent; `meshfox
+  validate` rejects either case.
+- `send="..."` — the Send button's own caption, on the fence's info
+  string (not a `field` line) — falls back to a plain `"Send"` when
+  omitted.
+- `name="..."` — required, same addressing convention as any other
+  runnable fence (`meshfox run`-style `node-id/block-name`, or a bare name
+  within the same node) — except a form is never actually *run* this way:
+  there's no code to execute, so `meshfox run`/`POST /api/run` against a
+  form block fails with a clear error rather than silently doing nothing.
+  It's addressed instead by whatever submits it — the web UI's own
+  rendered Send button, the TUI's inline field-and-Send rendering (`i` to
+  start editing it, or a click) — never by a document's own `deps=`.
+- **Nothing happens live as a field is edited.** Clicking Send is the one
+  and only moment values take effect: every field's current value is
+  committed together, into a *session-lifetime* store (the web server's
+  own process memory for `meshfox view`; the TUI's own process memory for
+  `meshfox tui`) — never the on-disk per-document cache, since every
+  variable a form targets is already implicitly `session`-scoped by being
+  node-scoped in the first place (see "Variables" below). This is also
+  exactly the moment `autorun` (above) reacts: submitting triggers every
+  `autorun`-flagged block whose own variable closure the just-changed
+  values reach, automatically, with no separate "run" click — the
+  combination this section opened with. A value committed this way is
+  visible to every block's `env=` for the rest of that session, not just
+  whichever `autorun` block happened to react to this particular Send.
+- A form fence can't declare its own `deps=`, `env=`, `interpreter=`,
+  `cache`, `tty`, `service`, or `autorun` — none of those presuppose a
+  real process of the form's own, which it never has (same reasoning
+  `button` already gives for the four it rejects). It also can't be named
+  in *another* block's `deps=` — unlike a `button`, a form has no "done"
+  state at all (nothing runs, ever), so there's nothing for a dependent
+  to wait on.
+- Scope: like `button`, a form's own addressing never crosses an
+  `include` boundary.
 
 ## Constraint fences
 
@@ -1172,9 +1289,18 @@ newer one, just without acting on whichever option it doesn't know about.
 
 Hand-editing the comment directly always works, but the web UI's toolbar
 also has an "options" button that toggles a known option (currently just
-`unfold`) without touching the file by hand — it writes the same comment.
-An unrecognized declaration already in the file is left exactly as-is
-either way, whichever recognized ones are also toggled alongside it.
+`unfold`/`auto-timestamps`) without touching the file by hand — it writes
+the same comment. An unrecognized declaration already in the file is left
+exactly as-is either way, whichever recognized ones are also toggled
+alongside it.
+
+Not every per-block display default belongs here, though — see `fold=` on
+a *runnable fence* (distinct from `meshfox:node`'s own `fold=`; "Runnable
+code fences" below) for one that's deliberately a per-block attribute
+instead of a document-wide option: a block's own source being worth
+collapsing by default is a property of that one block (a `form`/`autorun`
+pair whose own result table is the point, say — see "Form fences" above),
+not something a whole document should default for every block at once.
 
 ## Tag colors
 
@@ -1425,14 +1551,31 @@ leading token instead of a `key=value` pair (`crates/core/src/fence.rs`):
 
     runnable-attr   ::= 'name' | 'cache' | 'default' | 'deps' | 'env' | 'tty'
                      | 'autoclose' | 'service' | 'always' | 'interpreter'
+                     | 'autorun' | 'render' | 'output' | 'send' | 'fold'
     constraint-attr ::= 'constraint' | 'name'
 
 A runnable fence additionally requires `lang` to be `bash` or `sh`, *or* its
-own `interpreter=` attribute set (see "Runnable code fences"); a constraint
+own `interpreter=` attribute set (see "Runnable code fences") — `button`
+and `form` (see their own sections above) are runnable-addressable the
+same way without either, having no real code of their own to require a
+language for in the first place. A constraint
 fence requires `lang = 'starlark'`
 *and* the bare `constraint` flag (see "Constraint fences") — again,
 cross-cutting rules enforced by the fence scanner/`meshfox validate`, not
-expressible in `fence-info` alone.
+expressible in `fence-info` alone. `send=` only means anything on a
+`lang = 'form'` fence, same as `autoclose` only meaning anything on a
+`tty` one.
+
+A `form` fence's own body (unlike every other runnable fence's, which is
+the code/caption itself) is a separate line-based grammar, not Markdown
+or code:
+
+    form-body  ::= { ws } [ field-line { '\n' { ws } field-line } ] { ws }
+    field-line ::= 'field' ws attr-list
+    field-attr ::= 'var' | 'label'
+
+A blank line between `field-line`s is allowed (and ignored); any other
+non-blank line is a parse error.
 
 ### Values with their own inner structure
 

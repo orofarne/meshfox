@@ -187,6 +187,17 @@ pub struct RunState {
     pub stdout_only: String,
     /// Just this step's stderr lines — see `stdout_only` above.
     pub stderr_only: String,
+    /// Whether the step currently occupying `stdout_only`/`stderr_only`
+    /// above declares the fence attribute `output="markdown"` — set
+    /// alongside them, right before that step is actually spawned
+    /// (`advance_run`), from the very `CodeBlock` about to run. Lets
+    /// `render_output` (`ui.rs`) show that step's captured stdout as real,
+    /// rendered Markdown once it's done, the same live-view treatment the
+    /// web UI's `MeshNode.tsx` (`LiveRunOutput`) already gives it — see
+    /// `crate::output::render_output_block_markdown`'s own doc comment for
+    /// why this is a stdout-only, `cache`-independent live preview rather
+    /// than reusing the on-disk cached-output splice.
+    pub output_markdown: bool,
     /// Reset to `Instant::now()` right before each step is actually
     /// spawned (`advance_run`) — read back once its exit code is known
     /// (`on_output_line`) to time it into `ExecOutput::duration_ms`, the
@@ -365,6 +376,14 @@ pub struct App {
     pub var_form: Option<VarFormState>,
     pub status: String,
     pub show_help: bool,
+    /// How far the `?` help modal's own content is scrolled down — counts
+    /// wrapped display rows (post word-wrap), same convention
+    /// `render_help`'s own `Paragraph::scroll` uses; reset to `0` every
+    /// time help is (re-)opened. Unclamped here, clamped at render time
+    /// against the modal's actual wrapped row count, same "state is
+    /// unclamped, rendering clamps" convention `doc_scroll`/`output_scroll`
+    /// already use.
+    pub help_scroll: u16,
     pub should_quit: bool,
     /// The fullscreen raw-source editor (`e`) — `Some` takes over
     /// rendering entirely (see `ui::render`) instead of the usual 3-pane
@@ -469,6 +488,77 @@ pub struct App {
     /// the currently selected node) — `Some` while open. See
     /// `ServicesViewState`'s own doc comment.
     pub services_view: Option<ServicesViewState>,
+    /// Values a `form` fence's own Send has committed this TUI process's
+    /// lifetime (see `submit_inline_form`) — every variable a form field
+    /// targets is implicitly `session`-scoped by its own `meshfox:var`
+    /// declaration (node-scoped, per `meshfox_core::declared_vars`), so
+    /// there's nothing for the on-disk `var_cache` to mean here. Unlike
+    /// `run_overrides`, **never** cleared by `start_run` — a form's
+    /// submitted value has to outlive the one run it happened to trigger,
+    /// for every later run (manual or `autorun`-triggered) within the same
+    /// process to keep seeing it. Folded into `run_overrides` at every
+    /// variable-resolution call site, underneath it — see
+    /// `effective_overrides`. Cleared alongside `session_runs` by
+    /// `reset_session`.
+    pub session_vars: HashMap<String, String>,
+    /// A `form`-lang fence currently open in the Document pane — `Some`
+    /// the moment a field/Send is clicked or entered via `i`, whether or
+    /// not it's actively claiming the keymap right now (see `editing`).
+    /// Only one at a time, same "whichever was opened most recently wins"
+    /// rule `var_form`/`block_picker` already have, but — unlike those —
+    /// this does *not* sit in `on_key`'s "one thing at a time" precedence
+    /// chain by itself: the rest of the document stays visible/scrollable
+    /// around it. Only `editing` does.
+    pub active_inline_form: Option<InlineFormState>,
+    /// Addresses `meshfox_core::autorun_blocks_for_changed_vars` found for
+    /// the most recent `submit_inline_form`, still waiting their turn —
+    /// there is exactly one foreground run slot (`self.run`), so N
+    /// triggered blocks can't just be N back-to-back `start_run` calls the
+    /// way the web server's own (independently `tokio::spawn`ed) trigger
+    /// can. Drained one at a time by `advance_run`, right where it would
+    /// otherwise just mark the current chain finished and return — see
+    /// that function's own doc comment. A chain that ends in failure still
+    /// lets the next queued address start; one broken autorun shouldn't
+    /// block an unrelated one.
+    pub pending_autoruns: std::collections::VecDeque<BlockAddr>,
+}
+
+/// One field of a `form`-lang fence currently open in the Document pane,
+/// paired with the `meshfox:var` it targets — parallel arrays with
+/// `InlineFormState::inputs`, same shape `VarFormState` already uses for
+/// the (unrelated) global "configure variables" modal.
+pub struct InlineFormState {
+    pub node_id: String,
+    pub block_name: String,
+    /// `field var=`/`label=` entries, in document order — resolved once
+    /// when this form is first opened (click or `i`); re-opening after an
+    /// edit re-derives this fresh, so a hand-edited `field` line is always
+    /// reflected the next time the form is entered.
+    pub fields: Vec<meshfox_core::FormField>,
+    /// Parallel to `fields` — the declared `meshfox:var` each one targets,
+    /// for type-aware editing/`validate_value` exactly the way `var_form`
+    /// already does. A `field var=` naming something `meshfox validate`
+    /// would have already rejected (out of scope, `from=`-computed, or
+    /// just undeclared) is silently dropped from both `fields` and this —
+    /// see `App::try_build_inline_form`.
+    pub decls: Vec<VarDecl>,
+    /// Parallel to `fields`/`decls` — one live editable buffer per field,
+    /// pre-filled from `App::session_vars` (if already submitted this
+    /// session) or else the same cache/shared/default fallback
+    /// `initial_field_input` already gives `var_form`.
+    pub inputs: Vec<String>,
+    /// Which field is focused — `fields.len()` (one past the last field)
+    /// means the virtual "Send" row is focused instead of any real field.
+    pub selected: usize,
+    /// Whether this form is actively claiming the keymap right now (see
+    /// `on_key`'s precedence chain) — `false` the moment it's merely open
+    /// (so `markdown::render` still draws its live `inputs`) but not
+    /// focused; `true` from a field/Send click, or `i`, until `Esc` hands
+    /// arrow keys back to ordinary document scrolling. Unlike
+    /// `cancel_var_form`, there's no "cancel back to" — `Esc` only ever
+    /// flips this to `false`, never clears `active_inline_form` itself or
+    /// discards `inputs`.
+    pub editing: bool,
 }
 
 /// One block's most recent successful run this session — see
@@ -641,6 +731,7 @@ impl App {
             var_form: None,
             status: String::new(),
             show_help: false,
+            help_scroll: 0,
             should_quit: false,
             source_editor: None,
             constraint_stats,
@@ -658,6 +749,9 @@ impl App {
             service_stats: None,
             service_conflict: None,
             services_view: None,
+            session_vars: HashMap::new(),
+            active_inline_form: None,
+            pending_autoruns: std::collections::VecDeque::new(),
         };
         if let Some(target) = initial_node {
             if let Some(idx) = app.rows.iter().position(|r| r.node_id == target) {
@@ -702,19 +796,48 @@ impl App {
             self.on_service_conflict_key(key).await;
             return;
         }
+        // Same "claims the whole keymap" precedence as every modal above —
+        // without this, `j`/`k`/PageUp/PageDown (meant to scroll *this*
+        // popup) fell through to the main match below and scrolled/moved
+        // selection in whichever pane was focused underneath instead, and
+        // a letter this popup doesn't otherwise recognize (`r`, say) could
+        // still trigger its ordinary action right through the open help.
+        if self.show_help {
+            self.on_help_key(key);
+            return;
+        }
+        // Unlike the modals above, `active_inline_form` only claims the
+        // keymap while it's actually `editing` — merely being open (so
+        // `markdown::render` draws its live `inputs`) leaves ordinary
+        // document scrolling untouched, since the form reads as part of
+        // the document, not a screen-covering dialog. See
+        // `InlineFormState::editing`'s own doc comment.
+        if self.active_inline_form.as_ref().is_some_and(|f| f.editing) {
+            self.on_inline_form_key(key).await;
+            return;
+        }
+        if key.code == KeyCode::Char('i') && self.focus == Focus::Document {
+            self.try_enter_inline_form();
+            return;
+        }
 
         match key.code {
             KeyCode::Char('q') => self.quit(),
             KeyCode::Esc => {
-                if self.show_help {
-                    self.show_help = false;
-                } else if self.fullscreen.is_some() {
+                if self.fullscreen.is_some() {
                     self.fullscreen = None;
                 } else {
                     self.quit();
                 }
             }
-            KeyCode::Char('?') => self.show_help = !self.show_help,
+            // `show_help` is never true here — while it is, the early
+            // return above (`on_help_key`) already claimed this keypress.
+            // Reset to the top every time it's (re-)opened, so scrolling
+            // down, closing, and reopening doesn't land mid-scroll.
+            KeyCode::Char('?') => {
+                self.show_help = true;
+                self.help_scroll = 0;
+            }
             KeyCode::Tab => {
                 self.focus = match self.focus {
                     Focus::Tree => Focus::Document,
@@ -884,6 +1007,251 @@ impl App {
                 vf.inputs[i] = choices[next].clone();
             }
             VarType::String | VarType::Int => {}
+        }
+    }
+
+    /// Resolves `node_id`/`block_name` into a fresh `InlineFormState`, if
+    /// it's actually addressable as a `form`-lang fence — `None` for
+    /// anything else (wrong lang, block not found), same lenient "just
+    /// don't open" posture as a click on a non-existent `ClickTarget`
+    /// would already have to tolerate. A `field var=` naming something not
+    /// in `self.decls` at all is silently dropped (see
+    /// `InlineFormState::decls`'s own doc comment) — `meshfox validate` is
+    /// what would have caught that at authoring time, not this.
+    fn try_build_inline_form(&self, node_id: &str, block_name: &str) -> Option<InlineFormState> {
+        let node = self.display_canvas.node(node_id)?;
+        let block = scan_runnable_blocks(node_id, &node.text)
+            .into_iter()
+            .find(|b| b.name.as_deref() == Some(block_name))?;
+        if !meshfox_core::is_form(&block.lang) {
+            return None;
+        }
+        let form = meshfox_core::form_block(&block).ok()?;
+        let shared = meshfox_core::load_shared_env(crate::canvas_root_dir(&self.canvas_path));
+        let mut fields = Vec::new();
+        let mut decls = Vec::new();
+        let mut inputs = Vec::new();
+        for field in form.fields {
+            let Some(decl) = self.decls.iter().find(|d| d.name == field.var) else {
+                continue;
+            };
+            let input = self.session_vars.get(&field.var).cloned().unwrap_or_else(|| {
+                initial_field_input(decl, &self.var_cache, &shared).0
+            });
+            fields.push(field);
+            decls.push(decl.clone());
+            inputs.push(input);
+        }
+        Some(InlineFormState {
+            node_id: node_id.to_string(),
+            block_name: block_name.to_string(),
+            fields,
+            decls,
+            inputs,
+            selected: 0,
+            editing: false,
+        })
+    }
+
+    /// `i`, while `Focus::Document` — opens (and immediately starts
+    /// editing) the selected node's own `form`-lang fence, if it has
+    /// exactly one. With more than one, there's nothing unambiguous for a
+    /// bare keypress to pick — same posture `trigger_run`'s own
+    /// `BlockPickerState` fallback takes for "more than one runnable
+    /// block" — so this just leaves a status hint; a mouse click on the
+    /// specific form's own field/Send still works regardless.
+    fn try_enter_inline_form(&mut self) {
+        let Some(row) = self.rows.get(self.selected) else {
+            return;
+        };
+        let node_id = row.node_id.clone();
+        let Some(node) = self.display_canvas.node(&node_id) else {
+            return;
+        };
+        let form_blocks: Vec<String> = scan_runnable_blocks(&node_id, &node.text)
+            .into_iter()
+            .filter(|b| meshfox_core::is_form(&b.lang))
+            .filter_map(|b| b.name)
+            .collect();
+        match form_blocks.as_slice() {
+            [] => self.status = "no form in this node".into(),
+            [name] => {
+                if let Some(mut form) = self.try_build_inline_form(&node_id, name) {
+                    form.editing = true;
+                    self.active_inline_form = Some(form);
+                    self.render_current_document();
+                } else {
+                    self.status = "meshfox: this form has no usable fields".into();
+                }
+            }
+            _ => {
+                self.status =
+                    "more than one form in this node — click the one you want".into();
+            }
+        }
+    }
+
+    /// Keyboard handling while `active_inline_form` is actually `editing`
+    /// — modeled directly on `on_var_form_key`, just scoped to one form's
+    /// own `fields`/`decls`/`inputs` instead of every declared variable at
+    /// once, and with an extra virtual "Send" position
+    /// (`selected == fields.len()`) `Tab`/arrows can land on.
+    async fn on_inline_form_key(&mut self, key: KeyEvent) {
+        let Some(form) = &self.active_inline_form else { return };
+        let send_idx = form.fields.len();
+        match key.code {
+            KeyCode::Enter => self.submit_inline_form().await,
+            KeyCode::Esc => {
+                if let Some(form) = &mut self.active_inline_form {
+                    form.editing = false;
+                }
+                self.render_current_document();
+            }
+            KeyCode::Up | KeyCode::BackTab => {
+                if let Some(form) = &mut self.active_inline_form {
+                    form.selected = form.selected.checked_sub(1).unwrap_or(send_idx);
+                }
+                self.render_current_document();
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                if let Some(form) = &mut self.active_inline_form {
+                    form.selected = (form.selected + 1) % (send_idx + 1);
+                }
+                self.render_current_document();
+            }
+            KeyCode::Left => {
+                self.cycle_inline_form_field(-1);
+                self.render_current_document();
+            }
+            KeyCode::Right => {
+                self.cycle_inline_form_field(1);
+                self.render_current_document();
+            }
+            KeyCode::Backspace => {
+                if let Some(form) = &mut self.active_inline_form {
+                    let i = form.selected;
+                    if i < form.decls.len()
+                        && matches!(form.decls[i].var_type, VarType::String | VarType::Int)
+                    {
+                        form.inputs[i].pop();
+                    }
+                }
+                self.render_current_document();
+            }
+            KeyCode::Char(c) => {
+                if let Some(form) = &mut self.active_inline_form {
+                    let i = form.selected;
+                    if i < form.decls.len() {
+                        let allowed = match form.decls[i].var_type {
+                            VarType::String => true,
+                            VarType::Int => {
+                                c.is_ascii_digit()
+                                    || ((c == '-' || c == '+') && form.inputs[i].is_empty())
+                            }
+                            VarType::Bool | VarType::Select => false,
+                        };
+                        if allowed {
+                            form.inputs[i].push(c);
+                        }
+                    }
+                }
+                self.render_current_document();
+            }
+            _ => {}
+        }
+    }
+
+    /// Left/right on the focused field of `active_inline_form` — mirrors
+    /// `cycle_var_form_field` exactly, just against `InlineFormState`.
+    /// A no-op when the virtual "Send" row (`selected == fields.len()`) is
+    /// focused — nothing to cycle there.
+    fn cycle_inline_form_field(&mut self, dir: i32) {
+        let Some(form) = &mut self.active_inline_form else { return };
+        let i = form.selected;
+        if i >= form.decls.len() {
+            return;
+        }
+        match form.decls[i].var_type {
+            VarType::Bool => {
+                form.inputs[i] = if form.inputs[i] == "true" {
+                    "false"
+                } else {
+                    "true"
+                }
+                .to_string();
+            }
+            VarType::Select => {
+                let choices = &form.decls[i].choices;
+                if choices.is_empty() {
+                    return;
+                }
+                let len = choices.len() as i32;
+                let current = choices
+                    .iter()
+                    .position(|c| c == &form.inputs[i])
+                    .map(|p| p as i32)
+                    .unwrap_or(0);
+                let next = (current + dir).rem_euclid(len) as usize;
+                form.inputs[i] = choices[next].clone();
+            }
+            VarType::String | VarType::Int => {}
+        }
+    }
+
+    /// Validates every field (same `validate_value` check `submit_var_form`
+    /// already does, same "stay open, jump focus to the offender" recovery
+    /// on failure), then commits them all into `self.session_vars` — never
+    /// `run_overrides`/the on-disk `var_cache`, since every field here
+    /// targets an implicitly-`session` var (see `InlineFormState`'s own
+    /// doc comment). Unlike `submit_var_form`, the form stays open
+    /// afterward (just `editing = false`) — it reads as part of the
+    /// document, so there's nothing to close back out of. Finishes by
+    /// queuing every `autorun` block the just-changed values reach
+    /// (`meshfox_core::autorun_blocks_for_changed_vars`) and, if no run is
+    /// currently using the one foreground slot, kicking off the first of
+    /// them right away — `advance_run`'s own "chain exhausted" hook drains
+    /// the rest.
+    async fn submit_inline_form(&mut self) {
+        {
+            let Some(form) = &self.active_inline_form else { return };
+            if let Some((i, e)) = form
+                .decls
+                .iter()
+                .zip(form.inputs.iter())
+                .enumerate()
+                .find_map(|(i, (d, v))| meshfox_core::validate_value(d, v).err().map(|e| (i, e)))
+            {
+                let form = self.active_inline_form.as_mut().unwrap();
+                form.selected = i;
+                self.status = format!("meshfox: {e}");
+                return;
+            }
+        }
+        let Some(form) = &self.active_inline_form else { return };
+        let mut changed = HashSet::new();
+        for (field, value) in form.fields.iter().zip(form.inputs.iter()) {
+            self.session_vars.insert(field.var.clone(), value.clone());
+            changed.insert(field.var.clone());
+        }
+        if let Some(form) = &mut self.active_inline_form {
+            form.editing = false;
+        }
+        self.render_current_document();
+
+        let triggered = meshfox_core::autorun_blocks_for_changed_vars(&self.display_canvas, &changed);
+        let count = triggered.len();
+        self.pending_autoruns.extend(triggered);
+        self.status = if count == 0 {
+            "meshfox: form submitted".into()
+        } else {
+            format!("meshfox: form submitted — {count} autorun block(s) queued")
+        };
+        let idle = self.run.as_ref().map_or(true, |r| r.finished)
+            && self.file_run.as_ref().map_or(true, |r| r.finished);
+        if idle {
+            if let Some(addr) = self.pending_autoruns.pop_front() {
+                self.start_run(addr.node_id, addr.block_name, true).await;
+            }
         }
     }
 
@@ -1066,6 +1434,37 @@ impl App {
                 self.start_run(node_id, block_name, true).await;
             }
             ClickTarget::JumpToNode { node_id } => self.jump_to_node(&node_id),
+            ClickTarget::FormField { node_id, block_name, field_index } => {
+                self.ensure_inline_form_open(&node_id, &block_name);
+                if let Some(form) = &mut self.active_inline_form {
+                    if field_index < form.fields.len() {
+                        form.selected = field_index;
+                        form.editing = true;
+                    }
+                }
+                self.render_current_document();
+            }
+            ClickTarget::FormSend { node_id, block_name } => {
+                self.ensure_inline_form_open(&node_id, &block_name);
+                self.submit_inline_form().await;
+            }
+        }
+    }
+
+    /// Makes sure `active_inline_form` is open for exactly this
+    /// `(node_id, block_name)` — rebuilding it fresh if it's currently
+    /// open for a *different* form (only one at a time, same rule
+    /// `var_form`/`block_picker` already have), or wasn't open at all.
+    /// Already being open for the *same* form is left untouched, so an
+    /// in-progress edit (`inputs`) survives clicking a different field of
+    /// the same form.
+    fn ensure_inline_form_open(&mut self, node_id: &str, block_name: &str) {
+        let already_this_one = self
+            .active_inline_form
+            .as_ref()
+            .is_some_and(|f| f.node_id == node_id && f.block_name == block_name);
+        if !already_this_one {
+            self.active_inline_form = self.try_build_inline_form(node_id, block_name);
         }
     }
 
@@ -1573,6 +1972,33 @@ impl App {
         // duplicate declaration) just means no implicit deps are shown.
         let decls = meshfox_core::declared_vars(&self.display_canvas).unwrap_or_default();
 
+        // Current display value for every `form`-field-targeted variable —
+        // what's already been submitted this session, with whichever
+        // field is actively being typed into right now (if any) overlaid
+        // on top so the form reads as live while editing. Only overlaid
+        // while `editing` is actually true: that's also the one window
+        // `on_key`'s precedence chain makes it impossible to navigate away
+        // from this exact node (arrow keys move the focused field instead
+        // of the tree selection), so the overlay can never land on a
+        // different node's same-named variable by accident — see
+        // `InlineFormState::editing`'s own doc comment.
+        let mut form_values: HashMap<String, String> = self.session_vars.clone();
+        // Which row of which form fence is actually focused right now, if
+        // any — only while `active_inline_form` is both open *and*
+        // `editing` (see that field's own doc comment for why arrow keys
+        // can't have navigated to a different node in the meantime), so
+        // `markdown::render` can draw a visible focus indicator on it (see
+        // `render`'s own `form_focus` parameter doc comment).
+        let mut form_focus: Option<(&str, usize)> = None;
+        if let Some(form) = &self.active_inline_form {
+            if form.editing {
+                for (field, value) in form.fields.iter().zip(form.inputs.iter()) {
+                    form_values.insert(field.var.clone(), value.clone());
+                }
+                form_focus = Some((form.block_name.as_str(), form.selected));
+            }
+        }
+
         // `file` nodes with `display="code"` (see SPEC.md) show the
         // target's own file content, read fresh off disk — same as the
         // browser's read-only preview — rather than the node's own body
@@ -1603,8 +2029,15 @@ impl App {
                 // intro for the file content, not a footnote on it.
                 self.doc_segments = Vec::new();
                 if let Some(caption) = &node.caption {
-                    let (segs, regions) =
-                        markdown::render(caption, &base_dir, &self.highlighter, &node.id, &decls);
+                    let (segs, regions) = markdown::render(
+                        caption,
+                        &base_dir,
+                        &self.highlighter,
+                        &node.id,
+                        &decls,
+                        &form_values,
+                        None,
+                    );
                     // `regions` came back indexed into `segs` alone —
                     // offset by how many segments already precede it (none,
                     // here, but kept explicit rather than assumed) so they
@@ -1624,7 +2057,15 @@ impl App {
             }
         }
 
-        let (segs, regions) = markdown::render(&node.text, &base_dir, &self.highlighter, &node.id, &decls);
+        let (segs, regions) = markdown::render(
+            &node.text,
+            &base_dir,
+            &self.highlighter,
+            &node.id,
+            &decls,
+            &form_values,
+            form_focus,
+        );
         self.doc_segments = segs;
         self.doc_click_regions = regions;
 
@@ -1928,6 +2369,7 @@ impl App {
             full_output: String::new(),
             stdout_only: String::new(),
             stderr_only: String::new(),
+            output_markdown: false,
             step_started: std::time::Instant::now(),
             current_node_text: String::new(),
             had_failure: false,
@@ -2047,10 +2489,11 @@ impl App {
         computed: &HashMap<String, String>,
     ) -> HashMap<String, String> {
         let shared = meshfox_core::load_shared_env(crate::canvas_root_dir(&self.canvas_path));
+        let overrides = self.effective_overrides();
         let env_resolution = meshfox_core::resolve_block_env_with_shared(
             &block.env,
             &self.decls,
-            &self.run_overrides,
+            &overrides,
             &self.var_cache,
             computed,
             &shared,
@@ -2062,13 +2505,27 @@ impl App {
             Some(meshfox_core::resolve_block_env_with_shared(
                 &interp_refs,
                 &self.decls,
-                &self.run_overrides,
+                &overrides,
                 &self.var_cache,
                 computed,
                 &shared,
             ))
         };
         Self::project_fingerprint_vars(block, &env_resolution, interp_resolution.as_ref())
+    }
+
+    /// `self.session_vars` (a form's own Send) folded underneath
+    /// `self.run_overrides` (whatever this *specific* run's own `--set`-
+    /// equivalent already carries, from an answered `var_form` prompt) —
+    /// the map every variable-resolution call site in this module actually
+    /// passes as `resolve_block_env_with_shared`'s `overrides` argument.
+    /// Mirrors the web server's own `effective_overrides`
+    /// (`crates/server/src/lib.rs`) — a per-run override still wins over a
+    /// stored session value.
+    fn effective_overrides(&self) -> HashMap<String, String> {
+        let mut overrides = self.session_vars.clone();
+        overrides.extend(self.run_overrides.iter().map(|(k, v)| (k.clone(), v.clone())));
+        overrides
     }
 
     /// Drives the current run forward until it either starts a process
@@ -2103,6 +2560,19 @@ impl App {
                 };
                 if let Some(run) = &mut self.run {
                     run.finished = true;
+                }
+                // This process has exactly one foreground run slot — a
+                // `submit_inline_form` that triggered more than one
+                // `autorun` block can't start them all at once the way the
+                // web server's own (independently `tokio::spawn`ed) trigger
+                // does. Drain the queue one at a time, right as the slot
+                // frees up — whether the chain that just finished was
+                // killed, failed, or succeeded: one broken autorun
+                // shouldn't block an unrelated one. `Box::pin` breaks the
+                // `advance_run`<->`start_run` mutual-recursion cycle Rust
+                // would otherwise refuse to size.
+                if let Some(addr) = self.pending_autoruns.pop_front() {
+                    Box::pin(self.start_run(addr.node_id, addr.block_name, true)).await;
                 }
                 return;
             }
@@ -2162,10 +2632,11 @@ impl App {
             // to skip); a block that isn't skippable reuses this exact
             // same resolution afterward instead of resolving twice.
             let shared = meshfox_core::load_shared_env(crate::canvas_root_dir(&self.canvas_path));
+            let overrides = self.effective_overrides();
             let env_resolution = meshfox_core::resolve_block_env_with_shared(
                 &block.env,
                 &self.decls,
-                &self.run_overrides,
+                &overrides,
                 &self.var_cache,
                 &self.run_computed,
                 &shared,
@@ -2177,7 +2648,7 @@ impl App {
                 Some(meshfox_core::resolve_block_env_with_shared(
                     &interp_refs,
                     &self.decls,
-                    &self.run_overrides,
+                    &overrides,
                     &self.var_cache,
                     &self.run_computed,
                     &shared,
@@ -2407,6 +2878,8 @@ impl App {
                 run.full_output.clear();
                 run.stdout_only.clear();
                 run.stderr_only.clear();
+                run.output_markdown =
+                    block.attrs.get("output").map(String::as_str) == Some("markdown");
                 run.step_started = std::time::Instant::now();
                 run.lines.push(format!("==> {}", addr.block_name));
             }
@@ -2910,6 +3383,8 @@ impl App {
     /// cache. See TODO.canvas.md: "Сброс сессии".
     fn reset_session(&mut self) {
         self.session_runs.clear();
+        self.session_vars.clear();
+        self.pending_autoruns.clear();
         self.status = "session reset".into();
     }
 
@@ -2920,6 +3395,35 @@ impl App {
     /// (see that component's doc comment): the reset is harmless to the
     /// file/cache but still easy to trigger by accident and mildly costly to
     /// shrug off, so `S` alone shouldn't fire it immediately.
+    /// Keyboard handling while the `?` help modal is open — claims the
+    /// whole keymap (see `on_key`'s own precedence chain), same posture
+    /// every other modal already takes. `j`/`k`/arrows/`PageUp`/`PageDown`/
+    /// `Ctrl-u`/`Ctrl-d` scroll the modal's own content instead of falling
+    /// through to whatever pane is focused underneath — `render_help`
+    /// clamps `help_scroll` against the actual wrapped row count, so
+    /// there's no need to bound it here (same "state is unclamped,
+    /// rendering clamps" convention `doc_scroll`/`output_scroll` use).
+    fn on_help_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => self.show_help = false,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.help_scroll = self.help_scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.help_scroll = self.help_scroll.saturating_add(1);
+            }
+            KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(10),
+            KeyCode::PageDown => self.help_scroll = self.help_scroll.saturating_add(10),
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.help_scroll = self.help_scroll.saturating_sub(10);
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.help_scroll = self.help_scroll.saturating_add(10);
+            }
+            _ => {}
+        }
+    }
+
     fn on_reset_session_confirm_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {

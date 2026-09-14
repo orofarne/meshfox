@@ -1,14 +1,14 @@
-//! End-to-end proof that a running `service` block's process doesn't
-//! survive as an orphan when its owning `meshfox view` worker is killed by
-//! `SIGTERM` — the exact signal `editors/vscode/src/coordinator.ts`'s
-//! `killWorker`/`dispose` send when a webview tab closes or the extension
-//! deactivates (see `crates/server/src/lib.rs`'s
-//! `spawn_shutdown_signal_handler`). Spawns the worker the same way that
-//! coordinator does — `meshfox view <path> --watcher-socket <socket>`
-//! directly, not a bare `meshfox view <path>` (which instead becomes a
-//! *watcher* that spawns its own worker child — see `crates/cli/src/
-//! watcher.rs`'s own doc comment — a different process entirely, and not
-//! what's under test here).
+//! End-to-end proof that neither a running `service` block's process nor a
+//! plain block's process that's still mid-run survives as an orphan when
+//! its owning `meshfox view` worker is killed by `SIGTERM` — the exact
+//! signal `editors/vscode/src/coordinator.ts`'s `killWorker`/`dispose` send
+//! when a webview tab closes or the extension deactivates (see
+//! `crates/server/src/lib.rs`'s `spawn_shutdown_signal_handler`). Spawns
+//! the worker the same way that coordinator does — `meshfox view <path>
+//! --watcher-socket <socket>` directly, not a bare `meshfox view <path>`
+//! (which instead becomes a *watcher* that spawns its own worker child —
+//! see `crates/cli/src/watcher.rs`'s own doc comment — a different process
+//! entirely, and not what's under test here).
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -174,6 +174,128 @@ fn killing_the_worker_stops_a_running_service_instead_of_orphaning_it() {
         !still_alive,
         "service pid {service_pid} survived the worker's SIGTERM — it was orphaned, not stopped"
     );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Counts the lines in `path`, or 0 if it doesn't exist yet.
+fn tick_count(path: &std::path::Path) -> usize {
+    std::fs::read_to_string(path).map(|s| s.lines().count()).unwrap_or(0)
+}
+
+/// Same proof as `killing_the_worker_stops_a_running_service_instead_of_
+/// orphaning_it` above, for a *plain* (non-`service`) block that's still
+/// mid-run when the worker is killed — every spawned block, service or
+/// not, lands in its own process group (`stream_exec::spawn_bash`'s own
+/// `process_group(0)`), specifically so `kill_process_group`/the run
+/// registry's own `kill()` can reach a whole subtree without also hitting
+/// unrelated siblings — but that same isolation means nothing about the
+/// OS's own process hierarchy stops a plain block from surviving its
+/// parent's death on its own; it has to be swept up explicitly, the exact
+/// thing this test is checking for. `GET /api/runs`'s own `ActiveRunDto`
+/// has no `pid` field (unlike `GET /api/services`'s), so this checks the
+/// block's own liveness indirectly instead of by pid: it appends a tick to
+/// a file once a second, and the test asserts that stops advancing once
+/// the worker is killed, rather than reaching all 30 ticks on its own
+/// schedule regardless.
+#[test]
+fn killing_the_worker_stops_a_currently_running_plain_block_instead_of_orphaning_it() {
+    let dir = unique_dir();
+    let canvas_path = dir.join("doc.canvas.md");
+    let heartbeat_path = dir.join("heartbeat.txt");
+    std::fs::write(
+        &canvas_path,
+        format!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n{}",
+            format_args!(
+                "```bash name=\"slow\"\necho ready\nfor i in $(seq 1 30); do echo tick >> {}; sleep 1; done\n```\n",
+                heartbeat_path.display()
+            )
+        ),
+    )
+    .unwrap();
+
+    let fake_socket = dir.join("fake.sock");
+    let mut child = meshfox()
+        .args([
+            "view",
+            canvas_path.to_str().unwrap(),
+            "--port",
+            "0",
+            "--watcher-socket",
+            fake_socket.to_str().unwrap(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn meshfox view");
+    let worker_pid = child.id();
+
+    let port = read_bound_port(&mut child);
+
+    // `http()` reads its response to completion, and this block's own run
+    // streams for the whole ~30s it takes to finish — run it on its own
+    // thread so this test can get on with killing the worker mid-run
+    // instead of waiting on it.
+    let run_thread = std::thread::spawn(move || {
+        http(port, "POST", "/api/run", r#"{"path":[],"block":"slow"}"#)
+    });
+
+    // Wait for the block to actually start ticking before touching
+    // anything — same "prove it was genuinely running before the kill"
+    // requirement the service test's own `is_alive` check up front has.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while tick_count(&heartbeat_path) == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        tick_count(&heartbeat_path) >= 1,
+        "block should have ticked at least once before the kill"
+    );
+
+    // The exact signal `editors/vscode/src/coordinator.ts`'s `killWorker`/
+    // `dispose` send (Node's default `ChildProcess.kill()`).
+    unsafe {
+        libc::kill(worker_pid as libc::pid_t, libc::SIGTERM);
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if let Ok(Some(_)) = child.try_wait() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        matches!(child.try_wait(), Ok(Some(_))),
+        "worker should have exited after SIGTERM"
+    );
+
+    // Give the (now-exited) worker's own kill-the-block call a moment to
+    // actually land, same reasoning the service test's own equivalent
+    // wait has — then confirm the tick count has genuinely stopped
+    // advancing (not just paused for a beat): sampled twice, a second
+    // apart (this block's own tick interval), well after the kill.
+    std::thread::sleep(Duration::from_millis(500));
+    let count_after_kill = tick_count(&heartbeat_path);
+    std::thread::sleep(Duration::from_secs(2));
+    let count_later = tick_count(&heartbeat_path);
+    assert_eq!(
+        count_after_kill, count_later,
+        "block kept ticking after the worker's SIGTERM ({count_after_kill} -> {count_later} ticks) — it was orphaned, not stopped"
+    );
+    assert!(
+        count_later < 30,
+        "block reached its full 30 ticks on its own schedule — the kill never reached it at all"
+    );
+
+    // The run's own HTTP connection should also have been torn down
+    // rather than left hanging once the worker process is gone.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !run_thread.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(run_thread.is_finished(), "the run's own HTTP connection never closed after the worker died");
 
     std::fs::remove_dir_all(&dir).ok();
 }

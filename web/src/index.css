@@ -1888,6 +1888,22 @@ a {
   color: inherit;
 }
 
+/* The source-only fold toggle (`‹/›`, distinct from the ▸/▾ whole-block
+ * toggle right before it) — same borderless icon-button treatment, dimmed
+ * while the source it controls is hidden so the two states are visually
+ * distinguishable at a glance without changing the glyph itself. */
+.mesh-code-source-toggle {
+  padding: 0.2rem 0.35rem;
+  margin-right: 0.3rem;
+  border-color: transparent;
+  color: inherit;
+  font-family: monospace;
+}
+
+.mesh-code-source-toggle-collapsed {
+  opacity: 0.5;
+}
+
 /* A block with `deps=` always runs its whole dependency chain first — this
  * button needs to visibly read as "more than one thing is about to run",
  * not just a recolor, so it also gets its own icon/label (see MeshNode). */
@@ -1956,6 +1972,42 @@ a {
   padding: 0.15rem 0.5rem;
   font-size: 0.75rem;
   cursor: pointer;
+}
+
+/* MeshNode.tsx's `FormBlock` — a `render="form"`-style fence (SPEC.md's
+ * "Form fences"): its own field rows plus a Send button, sitting directly
+ * in the node body same as `.mesh-button-block` (no card/border of its
+ * own) — each field reuses `.vars-modal-field`'s styling verbatim. */
+.mesh-form-block {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin: 0.6rem 0;
+}
+
+.mesh-form-block:first-child {
+  margin-top: 0;
+}
+
+.mesh-form-block button.mesh-run-button {
+  align-self: flex-start;
+  font-size: 0.95rem;
+  font-weight: 600;
+  padding: 0.5rem 1rem;
+  border-radius: 6px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+}
+
+.mesh-form-block button.mesh-run-button:hover {
+  filter: brightness(1.08);
+}
+
+.mesh-form-block button.mesh-run-button:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 
 .mesh-code-block pre {

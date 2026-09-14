@@ -202,7 +202,7 @@ fn uuid_like_suffix() -> String {
 /// sample, a `json` snippet, ...) from being mistaken for "the" runnable
 /// block in a node that has no real meshfox structure of its own.
 pub fn is_supported_lang(lang: &str) -> bool {
-    matches!(lang, "bash" | "sh" | BUTTON_LANG)
+    matches!(lang, "bash" | "sh" | BUTTON_LANG | FORM_LANG)
 }
 
 /// The fence "language" for a `button` shortcut fence (see SPEC.md's
@@ -221,6 +221,25 @@ pub fn is_button(lang: &str) -> bool {
     lang == BUTTON_LANG
 }
 
+/// The fence "language" for a `form` fence (see SPEC.md's "Form fences") —
+/// a runnable-addressable fence with no real code of its own, same
+/// non-executing family as `button` (`BUTTON_LANG`). Its body is a
+/// line-based list of `field var="..."` entries (see `crate::form`)
+/// referencing existing `meshfox:var` declarations, plus an optional
+/// `send=` caption; submitting it writes values into a session-lifetime
+/// override store rather than running anything. Always recognized, same as
+/// `bash`/`sh`/`button` — see `is_supported_lang` — but `crate::deps::
+/// validate` rejects `interpreter=`/`cache`/`env=`/`tty`/`service`/`deps=`/
+/// `autorun` alongside it, since none of those mean anything without a real
+/// process of the block's own, and a form has no "done" state for anything
+/// else to depend on.
+pub const FORM_LANG: &str = "form";
+
+/// True if `lang` is the `form` pseudo-language — see `FORM_LANG`.
+pub fn is_form(lang: &str) -> bool {
+    lang == FORM_LANG
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +249,7 @@ mod tests {
         assert!(is_supported_lang("bash"));
         assert!(is_supported_lang("sh"));
         assert!(is_supported_lang("button"));
+        assert!(is_supported_lang("form"));
         assert!(!is_supported_lang("yaml"));
         assert!(!is_supported_lang("ruby"));
     }
@@ -238,6 +258,14 @@ mod tests {
     fn is_button_matches_only_the_button_lang() {
         assert!(is_button("button"));
         assert!(!is_button("bash"));
+        assert!(!is_button("form"));
+    }
+
+    #[test]
+    fn is_form_matches_only_the_form_lang() {
+        assert!(is_form("form"));
+        assert!(!is_form("bash"));
+        assert!(!is_form("button"));
     }
 
     #[test]

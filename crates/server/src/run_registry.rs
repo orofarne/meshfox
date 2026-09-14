@@ -16,6 +16,7 @@
 
 use crate::stream_exec::{OutputStream, SpawnedProcess};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, oneshot};
 
@@ -106,7 +107,17 @@ pub struct RunHandle {
     /// started_at` plays, for `GET /api/runs`'s own `uptimeMs` (lets a
     /// client that reconnects mid-run show a real elapsed time instead of
     /// restarting its own clock from the moment it happened to notice).
+    /// For a handle that started life via `reserve` (see its own doc
+    /// comment), this is when the *address* was reserved, not necessarily
+    /// when a real process actually started under it.
     started_at: std::time::Instant,
+    /// Set once (by `attach`) or resolved-without-ever-attaching (by
+    /// `resolve_if_unreached`) — whichever happens first wins, and the
+    /// other becomes a no-op. Only meaningful for a handle that started
+    /// life via `reserve`; `track` (which attaches immediately) sets it
+    /// right away, so it's always `true` for a handle nothing else ever
+    /// needs to check it on.
+    attached: AtomicBool,
 }
 
 impl RunHandle {
@@ -138,47 +149,72 @@ impl RunHandle {
     pub fn kill(&self) -> bool {
         self.kill_tx.lock().unwrap().take().map(|tx| tx.send(())).is_some()
     }
+
+    /// Resolves this handle as `outcome` — but only if `attach` was never
+    /// actually called on it (a no-op once a real process has taken over;
+    /// that process's own eventual completion is authoritative, not
+    /// whatever the caller passes here). Exists for a handle created via
+    /// `reserve` and never followed up with `attach` at all — a chain that
+    /// reserves its own requested block's identity up front (see
+    /// `crate::run_block_impl`'s own use of this) but never actually
+    /// reaches that step, an earlier dependency failing and breaking the
+    /// chain, say. Without this, a subscriber that raced ahead and is
+    /// already waiting on the reservation would see nothing further, ever
+    /// — no line, no `Done` — since nothing else would ever resolve it.
+    pub fn resolve_if_unreached(&self, outcome: RunOutcome) {
+        if self.attached.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        *self.outcome.lock().unwrap() = outcome.clone();
+        let _ = self.tx.send(RunEvent::Done(outcome));
+    }
 }
 
-/// Registers `proc` (already spawned by the caller — this doesn't spawn
-/// anything itself, mirroring `services::spawn`'s own division of labor)
-/// and hands back a handle whose log/outcome stay live in the background
-/// regardless of who's watching right now. The caller is expected to
-/// insert the returned handle into a registry keyed by address *before*
-/// anyone else can look it up.
-///
-/// `lock_path`, if given, is released *by this background task itself*
-/// once the process actually exits or is killed — never by the caller's
-/// own request-scoped cleanup. This matters specifically because this
-/// process now outlives whatever request started it (that's the whole
-/// point): if the lock were instead released whenever the *originating*
-/// connection's own generator happened to end (e.g. a client disconnect,
-/// long before this process actually finishes), the address would look
-/// falsely free while the real process is still running under it — a
-/// second, genuinely concurrent request could then start right on top of
-/// it, exactly the thing the whole lock exists to prevent. Tying the
-/// release to this task's own completion instead means the lock's
-/// lifetime always matches the process's own, regardless of who is or
-/// isn't still watching.
-pub fn track(
-    node_id: String,
-    block_name: String,
-    mut proc: SpawnedProcess,
-    lock_path: Option<std::path::PathBuf>,
-) -> Arc<RunHandle> {
+/// Reserves an address's *next* run identity synchronously, before any
+/// process has actually spawned for it — an empty, still-`Running` handle
+/// a caller can insert into a registry keyed by address right away. Exists
+/// to close a race `crate::run_block_impl` documents at its own call site:
+/// between "a request that will start a new run for this address has been
+/// accepted" and "a process has actually spawned for it" there can be real
+/// wall-clock time (an earlier step in the same chain still running, say)
+/// — a subscriber that looks the address up in that window must find
+/// *this*, not whatever the previous, already-finished run left behind.
+/// `attach` below wires a real process into this exact handle once one
+/// exists; `resolve_if_unreached` resolves it if that never happens.
+pub fn reserve(node_id: String, block_name: String) -> Arc<RunHandle> {
     let (tx, _) = broadcast::channel(1024);
-    let (kill_tx, mut kill_rx) = oneshot::channel();
-    let handle = Arc::new(RunHandle {
+    Arc::new(RunHandle {
         node_id,
         block_name,
         log: Arc::new(Mutex::new(RingBuffer::new(LOG_CAPACITY))),
         outcome: Arc::new(Mutex::new(RunOutcome::Running)),
         tx,
-        kill_tx: Mutex::new(Some(kill_tx)),
+        kill_tx: Mutex::new(None),
         started_at: std::time::Instant::now(),
-    });
+        attached: AtomicBool::new(false),
+    })
+}
 
-    let task_handle = Arc::clone(&handle);
+/// Wires an already-spawned process into `handle` (from `reserve`) — same
+/// division of labor `services::spawn` already has (this doesn't spawn
+/// `proc` itself, just drains it). A no-op (drops `proc` without draining
+/// it) if `handle` was already attached or resolved — shouldn't happen in
+/// practice (each handle's own chain step only ever calls this once), but
+/// safe rather than double-spawning a drain task over the same handle.
+///
+/// `lock_path`, if given, is released *by this background task itself*
+/// once the process actually exits or is killed — see `track`'s own doc
+/// comment (still accurate here) for why that has to be tied to the
+/// process's own completion rather than whatever caller happened to start
+/// it.
+pub fn attach(handle: &Arc<RunHandle>, mut proc: SpawnedProcess, lock_path: Option<std::path::PathBuf>) {
+    if handle.attached.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let (kill_tx, mut kill_rx) = oneshot::channel();
+    *handle.kill_tx.lock().unwrap() = Some(kill_tx);
+
+    let task_handle = Arc::clone(handle);
     tokio::spawn(async move {
         let outcome = loop {
             tokio::select! {
@@ -212,7 +248,19 @@ pub fn track(
             let _ = meshfox_core::service_lock::release(&path);
         }
     });
+}
 
+/// Reserves and immediately attaches `proc` in one call — every caller
+/// that doesn't need the gap between the two closed (see `reserve`'s own
+/// doc comment for the one that does) just wants this.
+pub fn track(
+    node_id: String,
+    block_name: String,
+    proc: SpawnedProcess,
+    lock_path: Option<std::path::PathBuf>,
+) -> Arc<RunHandle> {
+    let handle = reserve(node_id, block_name);
+    attach(&handle, proc, lock_path);
     handle
 }
 

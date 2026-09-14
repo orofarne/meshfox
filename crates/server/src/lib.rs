@@ -116,8 +116,9 @@ struct AppState {
     /// Fires whenever the on-disk file changes for a reason other than this
     /// server's own writes (see `spawn_file_watcher`) — `watch_changes`
     /// forwards each one to its connected client as a `changed` event so
-    /// the UI can reload.
-    change_tx: broadcast::Sender<()>,
+    /// the UI can reload. Also carries a `RunStarted` event — see
+    /// `ServerEvent`'s own doc comment.
+    change_tx: broadcast::Sender<ServerEvent>,
     /// Whether the process should exit on its own once every `/api/watch`
     /// connection has gone (see `TabGuard`) — off for e.g. the e2e test
     /// server, which cycles through pages with brief all-tabs-closed gaps
@@ -135,6 +136,18 @@ struct AppState {
     /// Never persisted anywhere and never touched by anything but this
     /// process's own runs — restarting `meshfox view` starts fresh.
     session_runs: Mutex<HashMap<(String, String), SessionRun>>,
+    /// Resolved values for a `form` fence's own `field var=` entries (see
+    /// SPEC.md's "Form fences"), submitted via `POST /api/form/submit` —
+    /// same "never persisted, never touched by anything but this process's
+    /// own runs" lifetime as `session_runs` (cleared alongside it in
+    /// `reset_session`), since every variable a form targets is itself
+    /// implicitly `session`-scoped by its own `meshfox:var` declaration
+    /// (node-scoped, per `meshfox_core::declared_vars`) — there'd be
+    /// nothing for an on-disk cache entry to mean here. Folded into the
+    /// `overrides` map at every variable-resolution call site, underneath
+    /// whatever that specific call's own one-shot override already
+    /// supplies — see `effective_overrides`.
+    session_vars: Mutex<HashMap<String, String>>,
     /// Every `service` block this process has spawned and still knows
     /// about (running, crashed, or just-stopped — never removed on its
     /// own), keyed by `(node_id, block_name)` — see `crate::services`'s own
@@ -184,9 +197,25 @@ impl AppState {
     fn save(&self, raw: &str) -> std::io::Result<()> {
         std::fs::write(&self.canvas_path, raw)?;
         *self.raw.lock().unwrap() = raw.to_string();
-        let _ = self.change_tx.send(());
+        let _ = self.change_tx.send(ServerEvent::Changed);
         Ok(())
     }
+}
+
+/// `session_vars` (a form's own Send, see `submit_form`) folded underneath
+/// `request_vars` (whatever one-shot override this specific call already
+/// carries — a `RunRequest.vars`/`TtyRunQuery.vars` entry, or none at all)
+/// — the map every variable-resolution call site actually passes as its
+/// `overrides` argument. A request-specific override still wins over a
+/// stored session value, same "most specific wins" precedence every other
+/// override tier here already has.
+fn effective_overrides(
+    state: &AppState,
+    request_vars: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut overrides = state.session_vars.lock().unwrap().clone();
+    overrides.extend(request_vars.iter().map(|(k, v)| (k.clone(), v.clone())));
+    overrides
 }
 
 /// One block's most recent successful run this session — see
@@ -306,7 +335,7 @@ fn spawn_file_watcher(state: Arc<AppState>) {
             if *raw != contents {
                 *raw = contents;
                 drop(raw);
-                let _ = state.change_tx.send(());
+                let _ = state.change_tx.send(ServerEvent::Changed);
             }
         }
     });
@@ -325,6 +354,26 @@ struct RunGuard {
 impl Drop for RunGuard {
     fn drop(&mut self) {
         self.state.runs.lock().unwrap().remove(&self.run_id);
+    }
+}
+
+/// Resolves `run_block_impl`'s own target-address reservation (see that
+/// call site's own doc comment) if the chain's execution never actually
+/// reaches the requested block's own step — an earlier dependency failing
+/// and breaking the loop, say, or the client disconnecting before then.
+/// `run_registry::RunHandle::resolve_if_unreached` is itself the guard
+/// against a double-resolve (a no-op once `run_registry::attach` already
+/// took over) — this struct just guarantees *something* calls it on every
+/// way this generator can end, the same reasoning `RunGuard` above exists
+/// for. `None` once the target step's own `attach` call has already
+/// consumed it (see that call site).
+struct ResolveReservationOnDrop(Option<Arc<run_registry::RunHandle>>);
+
+impl Drop for ResolveReservationOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.resolve_if_unreached(run_registry::RunOutcome::Exited { exit_code: -1 });
+        }
     }
 }
 
@@ -628,9 +677,10 @@ async fn get_vars(
         .cloned()
         .collect();
     let shared = meshfox_core::load_shared_env(canvas_root_dir(&state.canvas_path));
+    let overrides = effective_overrides(&state, &HashMap::new());
     let resolved = meshfox_core::resolve_with_shared(
         &decls_for_resolve,
-        &HashMap::new(),
+        &overrides,
         &cache,
         &computed,
         &shared,
@@ -1065,8 +1115,26 @@ enum RunEvent {
     },
 }
 
-fn ndjson_line(event: &RunEvent) -> Bytes {
-    let mut line = serde_json::to_string(event).expect("RunEvent always serializes");
+/// Events `GET /api/watch`'s long-lived NDJSON stream carries, one per
+/// open browser tab — see `watch_changes`. `Changed` is the event that
+/// already existed (a `()` payload before `render=`/`autorun` needed this
+/// to carry a second shape); `RunStarted` is new, for a passive tab (one
+/// that didn't itself click run) to discover a plain-block run it should
+/// subscribe to — in practice, today, only ever fired for an `autorun`
+/// block's own server-triggered run (see `trigger_autoruns`), though
+/// nothing stops a future caller from firing it for any other plain-block
+/// run too; `GET /api/run/subscribe` is already address-keyed, not
+/// initiator-keyed, so it already supports being watched by a tab that
+/// never started it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "kebab-case", rename_all_fields = "camelCase")]
+enum ServerEvent {
+    Changed,
+    RunStarted { node_id: String, block: String },
+}
+
+fn ndjson_line<T: Serialize>(event: &T) -> Bytes {
+    let mut line = serde_json::to_string(event).expect("event always serializes");
     line.push('\n');
     Bytes::from(line)
 }
@@ -2842,6 +2910,25 @@ async fn force_run(
         &req.force.node_id,
         &req.force.block,
     );
+    // Snapshot the stale owner's own descendants *before* killing it — see
+    // `services::kill_orphaned_descendants`'s own doc comment: a tool that
+    // daemonizes internally (forks, then the fork `setsid`s into its own
+    // new process group) can leave a live process `kill_and_acquire`'s
+    // whole-group `SIGKILL` below never reaches, because it was never a
+    // member of that group to begin with — and once the *recorded* pid is
+    // actually dead, anything it daemonized off may already have been
+    // reparented away (to pid 1) and become unreachable this way, so this
+    // has to run while there's still a chance the old owner (and whatever
+    // it forked) is genuinely alive. A second sweep right after covers
+    // anything that only shows up once the group-kill itself lands.
+    let stale_pid = match meshfox_core::service_lock::check(&lock_path) {
+        Ok(meshfox_core::service_lock::LockState::Held { info, .. }) => Some(info.pid),
+        _ => None,
+    };
+    if let Some(pid) = stale_pid {
+        services::kill_orphaned_descendants(pid);
+    }
+
     // Claim it just long enough to prove the old owner is actually gone,
     // then release it again immediately — `run_block_impl` below runs its
     // own full up-front locking pass over the whole chain (this address
@@ -2854,6 +2941,9 @@ async fn force_run(
     meshfox_core::service_lock::kill_and_acquire(&lock_path, std::process::id(), "webui")
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let _ = meshfox_core::service_lock::release(&lock_path);
+    if let Some(pid) = stale_pid {
+        services::kill_orphaned_descendants(pid);
+    }
     run_block_impl(state, req.run).await
 }
 
@@ -2923,12 +3013,13 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
     // `relevant_decls` lands in `resolved.unresolved_from`, not `missing` —
     // it's not an error yet, just not resolvable until its own source
     // block runs, mid-chain, below.
+    let overrides = effective_overrides(&state, &req.vars);
     let mut resolved_vars = {
         let mut cache = state.vars_cache.lock().unwrap();
         let shared = meshfox_core::load_shared_env(canvas_root_dir(&state.canvas_path));
         let resolved = meshfox_core::resolve_with_shared(
             &relevant_decls,
-            &req.vars,
+            &overrides,
             &cache,
             &HashMap::new(),
             &shared,
@@ -2995,6 +3086,43 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
         }
     };
 
+    // Reserves the requested block's own next-run identity in
+    // `runs_registry` *now*, synchronously, before this function returns —
+    // closes a race a passive watcher (an `autorun`-triggered run this tab
+    // never itself started, see `trigger_autorun`/the web UI's
+    // `watchAutorunBlock`) can otherwise hit: this chain's own dependencies
+    // (a `deps=`-only readiness check, say) can take real wall-clock time
+    // before this requested block's own step is ever reached in the loop
+    // below, and `GET /api/run/subscribe` looks this exact address up in
+    // `runs_registry` the moment it's asked — if that still held the
+    // *previous* run's already-finished handle in the meantime, a
+    // subscriber that raced ahead of this chain's own dependencies would
+    // attach to stale, already-`Done` data and give up right there, never
+    // learning the real (fresh) output this run goes on to produce
+    // (confirmed directly against a real `form`+`autorun` block whose
+    // target depends on a slow readiness check: the *first* Send after a
+    // value change silently kept showing the previous value's own result,
+    // and only a second, redundant Send — racing against an already-
+    // finished first run instead of an in-flight one — happened to show
+    // the right thing). Reserving this address's own next-run identity
+    // *before* returning closes that window: a subscriber that races ahead
+    // now finds an empty, still-`Running` placeholder to wait on instead of
+    // a finished one to (wrongly) trust. `run_registry::attach`, below in
+    // the loop, fills it in once a real process for this specific step
+    // actually spawns; `ResolveReservationOnDrop` resolves it if the chain
+    // never reaches that point at all (an earlier dependency failing and
+    // breaking the loop, say), so an already-waiting subscriber isn't left
+    // hanging on a `Running` outcome forever.
+    let target_reservation = chain.last().map(|target| {
+        let reserved = run_registry::reserve(target.node_id.clone(), target.block_name.clone());
+        state
+            .runs_registry
+            .lock()
+            .unwrap()
+            .insert((target.node_id.clone(), target.block_name.clone()), Arc::clone(&reserved));
+        reserved
+    });
+
     let run_id = uuid::Uuid::new_v4().to_string();
     let (kill_tx, mut kill_rx) = oneshot::channel::<()>();
     state.runs.lock().unwrap().insert(run_id.clone(), kill_tx);
@@ -3017,6 +3145,10 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
         // own doc comment.
         let mut _release_guard = ReleaseRemainingLocks(std::mem::take(&mut held_locks));
         let held_locks = &mut _release_guard.0;
+        // See `target_reservation`'s own doc comment above — resolved here
+        // if this generator ends (however it ends) without the requested
+        // block's own step ever being reached below.
+        let mut _reservation_guard = ResolveReservationOnDrop(target_reservation.clone());
 
         yield Ok::<_, io::Error>(ndjson_line(&RunEvent::Started { run_id: run_id.clone() }));
 
@@ -3283,8 +3415,27 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
             // regardless of who is or isn't still watching.
             let lock_path_for_run =
                 held_locks.remove(&(addr.node_id.clone(), addr.block_name.clone()));
-            let run_handle =
-                run_registry::track(addr.node_id.clone(), addr.block_name.clone(), proc, lock_path_for_run);
+            // The requested block's own step reuses the reservation made
+            // before this stream even started (see `target_reservation`'s
+            // own doc comment) — a subscriber that raced ahead of this
+            // chain's own dependencies and is already waiting on it needs
+            // to see *this* process's own output, not a brand-new handle
+            // it never had a chance to find. Any other (pulled-in
+            // dependency) step has no such reservation and just tracks a
+            // fresh handle as before.
+            let run_handle = match (is_requested_target, &target_reservation) {
+                (true, Some(reserved)) => {
+                    run_registry::attach(reserved, proc, lock_path_for_run);
+                    _reservation_guard.0 = None;
+                    Arc::clone(reserved)
+                }
+                _ => run_registry::track(
+                    addr.node_id.clone(),
+                    addr.block_name.clone(),
+                    proc,
+                    lock_path_for_run,
+                ),
+            };
             state.runs_registry.lock().unwrap().insert(
                 (addr.node_id.clone(), addr.block_name.clone()),
                 Arc::clone(&run_handle),
@@ -3473,6 +3624,392 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
         .unwrap())
 }
 
+/// Runs `addr`'s own full chain, unattended — triggered by `submit_form`
+/// for every `autorun`-flagged block a just-submitted form's values affect
+/// (see `meshfox_core::autorun_blocks_for_changed_vars`). Reuses
+/// `run_block_impl` wholesale (session-freshness skip, locking, `cache`
+/// write-back, everything) rather than duplicating any of its chain-
+/// execution logic — the only new part is building a synthetic
+/// `RunRequest` addressed via `Canvas::id_path_to` (the inverse of the
+/// path-walk `run_block_impl` itself does to resolve `path`+`block`, since
+/// `addr` is already a flat, resolved address with no path of its own —
+/// see this function's own call site for why a hand-rolled
+/// `vec![addr.node_id]` would be wrong for anything but a root-level
+/// node).
+///
+/// Deliberately `.await`ed by `submit_form` itself (not `tokio::spawn`ed
+/// wholesale) up through the *first* `run_block_impl` call — that's the
+/// call that (barring a lock conflict, the rare case handled below)
+/// synchronously reserves this address's own next-run identity in
+/// `runs_registry` (see `run_block_impl`'s own `target_reservation` doc
+/// comment) before this function returns at all. Only once that's settled
+/// does the actual chain execution get handed off to a background task —
+/// confirmed directly that skipping this and backgrounding the whole
+/// thing (the original shape here) reopens exactly the race
+/// `target_reservation` exists to close: a subscriber that calls
+/// `/api/run/subscribe` right after `submit_form`'s own HTTP response
+/// (which is every passive `autorun` watcher, having no stream of its own
+/// to wait on first) could still race ahead of even a *scheduling* delay
+/// before the spawned task's own `run_block_impl` call ever ran, not just
+/// the execution-time delay the reservation itself was built to survive.
+///
+/// Always `persist: false`, even for a `cache` block: a variable changing
+/// through a form submission is not the same thing as a user clicking
+/// "Edit" and explicitly asking for the canvas file itself to be
+/// rewritten — see SPEC.md's "Form fences".
+/// How many times a `409` lock conflict is retried before giving up on
+/// that one trigger — see the retry loop's own doc comment for why a
+/// conflict here is expected to be transient far more often than a
+/// user-initiated run's own conflict is.
+const AUTORUN_CONFLICT_RETRIES: u32 = 20;
+const AUTORUN_CONFLICT_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+async fn trigger_autorun(state: Arc<AppState>, addr: meshfox_core::BlockAddr) {
+    let raw = state.raw.lock().unwrap().clone();
+    let Ok(canvas) = resolved_canvas(&raw, &state.canvas_path) else {
+        return;
+    };
+    let Some(path) = canvas.id_path_to(&addr.node_id) else {
+        return;
+    };
+    let build_req = move || RunRequest {
+        path: path.clone(),
+        block: addr.block_name.clone(),
+        persist: false,
+        no_deps: false,
+        vars: HashMap::new(),
+        save_secrets: std::collections::HashSet::new(),
+    };
+
+    let Ok(response) = run_block_impl(Arc::clone(&state), build_req()).await else {
+        return;
+    };
+    if response.status() != StatusCode::CONFLICT {
+        drain_autorun_response_in_background(response);
+        return;
+    }
+
+    // Conflicted on this very first, synchronously-awaited attempt — from
+    // here on, retrying is fully backgrounded again: `submit_form`'s own
+    // caller only needs the reservation guarantee above for the common
+    // uncontended case, and a *contended* address is rare enough (see the
+    // loop's own doc comment on why) that it staying exactly as racy as it
+    // always has been is an acceptable trade for not blocking every
+    // form's own Send on a rare retry loop's worst case (up to
+    // `AUTORUN_CONFLICT_RETRIES * AUTORUN_CONFLICT_RETRY_DELAY`).
+    tokio::spawn(async move {
+        // A chain-lock conflict on this exact address (`acquire_chain_locks`,
+        // inside `run_block_impl`) is expected to be transient far more
+        // often than a user-initiated run's own conflict is: the most
+        // likely cause is this *same* block's own previous autorun-
+        // triggered run (or a manual run of it) still finishing up, which
+        // releases the lock itself within moments of its own chain ending
+        // — not a stuck process someone needs to confirm force-killing,
+        // the way a person watching a `409` dialog would decide. Unlike a
+        // manual run, there's no one watching this trigger to ask, so
+        // retry a few times, briefly, rather than silently dropping a
+        // form's own Send on the floor the moment two submissions land
+        // close together (e.g. resubmitting again right after the
+        // previous table finished rendering, before the server's own
+        // chain-execution task has actually returned and released its
+        // lock — see `web/e2e/form-autorun-output.spec.ts`, written
+        // specifically to repeat a submission and catch this).
+        for attempt in 1..AUTORUN_CONFLICT_RETRIES {
+            tokio::time::sleep(AUTORUN_CONFLICT_RETRY_DELAY).await;
+            let Ok(response) = run_block_impl(Arc::clone(&state), build_req()).await else {
+                return;
+            };
+            if response.status() == StatusCode::CONFLICT {
+                if attempt + 1 < AUTORUN_CONFLICT_RETRIES {
+                    continue;
+                }
+                return;
+            }
+            let mut body = response.into_body().into_data_stream();
+            while futures_util::StreamExt::next(&mut body).await.is_some() {}
+            return;
+        }
+    });
+}
+
+/// Drives a non-conflict `run_block_impl` response to completion without
+/// anyone reading its body — nothing inside `run_block_impl`'s own
+/// `async_stream::stream!` executes until the stream is actually polled,
+/// so a response nobody drains would otherwise just sit there having done
+/// nothing. Backgrounded: `trigger_autorun`'s own caller only needed this
+/// response to exist (see its doc comment), not to finish.
+fn drain_autorun_response_in_background(response: Response) {
+    tokio::spawn(async move {
+        let mut body = response.into_body().into_data_stream();
+        while futures_util::StreamExt::next(&mut body).await.is_some() {}
+    });
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubmitFormRequest {
+    /// The form's own owning node, addressed by flat id — see
+    /// `FormFieldsQuery::node_id`'s own doc comment for why this (unlike
+    /// `RunRequest`) addresses by id rather than a root-relative path.
+    node_id: String,
+    block: String,
+    /// Raw field values the client is submitting — only entries whose key
+    /// matches one of this *specific* form's own `field var=` names are
+    /// ever looked at; everything else is silently ignored, same posture
+    /// `post_configure_vars` already takes toward an unrecognized key.
+    /// Never trusted blindly: the form's own field list is re-derived here
+    /// from the canvas itself, not from anything the client claims.
+    values: HashMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TriggeredRun {
+    node_id: String,
+    block: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SubmitFormResponse {
+    saved: usize,
+    /// Every `autorun` block this submission just kicked off, so the
+    /// client can start watching each one (`GET /api/run/subscribe`)
+    /// immediately rather than waiting on the `run-started` event over
+    /// `/api/watch` — see `ServerEvent::RunStarted`'s own doc comment for
+    /// why that event exists too (a *different* tab, one that didn't
+    /// submit this form itself, still needs a way to find out).
+    autorun_triggered: Vec<TriggeredRun>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FormFieldsQuery {
+    /// The form's own owning node, addressed by flat id (the same
+    /// possibly-`{include_id}/{original_id}`-namespaced id `GET
+    /// /api/canvas` already sends the browser) — not a root-relative
+    /// `path` the way `RunRequest`/`VarsQuery` address a block, since
+    /// neither of this endpoint (nor `submit_form`) ever needs to know
+    /// which real file on disk owns the node (they never write to the
+    /// canvas file at all) — just to read its current declarations out of
+    /// the already-include-resolved `canvas`.
+    node_id: String,
+    block: String,
+}
+
+/// One `field var=...` entry, with its declared variable's current
+/// display status (`VarStatus`, same shape `GET /api/vars` already uses)
+/// plus whatever `label=` override the field itself carries.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FormFieldStatus {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    #[serde(flatten)]
+    var: VarStatus,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FormFieldsResponse {
+    /// `send="..."` caption, defaulted to a plain `"Send"` here (rather
+    /// than leaving it `None` for the client to default) so every
+    /// consumer agrees on the fallback.
+    send: String,
+    fields: Vec<FormFieldStatus>,
+}
+
+/// `GET /api/form/fields` — resolves one `form`-lang fence's own `field
+/// var=` list into display-ready status, server-side (same defensive
+/// posture `submit_form` takes: the client names a block, never a field
+/// list of its own). Scoped to exactly this one form, unlike `GET
+/// /api/vars`/`/api/vars/configure` — a form only ever shows its own
+/// declared fields, not a whole chain's or the whole document's.
+async fn get_form_fields(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<FormFieldsQuery>,
+) -> Result<Json<FormFieldsResponse>, ApiError> {
+    let raw = state.raw.lock().unwrap().clone();
+    let canvas = resolved_canvas(&raw, &state.canvas_path)?;
+    let node = canvas.node(&query.node_id).ok_or_else(|| {
+        ApiError(StatusCode::NOT_FOUND, format!("no node {:?}", query.node_id))
+    })?;
+    let block = meshfox_core::scan_runnable_blocks(&node.id, &node.text)
+        .into_iter()
+        .find(|b| b.name.as_deref() == Some(query.block.as_str()))
+        .ok_or_else(|| {
+            ApiError(
+                StatusCode::NOT_FOUND,
+                format!(
+                    "no runnable block named {:?} in node {:?}",
+                    query.block, node.id
+                ),
+            )
+        })?;
+    if !meshfox_core::is_form(&block.lang) {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "block {:?} in node {:?} isn't a `form` fence",
+                query.block, node.id
+            ),
+        ));
+    }
+    let form = meshfox_core::form_block(&block)
+        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    let decls = meshfox_core::declared_vars(&canvas)
+        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+
+    // The form's own fields, in order, paired with their own `label=` (if
+    // any) — a `field var=` naming something that somehow isn't declared
+    // (shouldn't happen past `meshfox validate`, but this endpoint doesn't
+    // re-run that check) is just skipped rather than erroring the whole
+    // form out.
+    let mut field_decls: Vec<meshfox_core::VarDecl> = Vec::new();
+    let mut labels: Vec<Option<String>> = Vec::new();
+    for field in &form.fields {
+        if let Some(decl) = decls.iter().find(|d| d.name == field.var) {
+            field_decls.push(decl.clone());
+            labels.push(field.label.clone());
+        }
+    }
+
+    // Same reasoning as `get_vars`: a `choices_var`/`default_var` chain
+    // reaching a `from=`-computed variable needs that variable's own
+    // source block actually run to show real choices.
+    let computed =
+        materialize_choices_and_defaults(&canvas, &decls, &field_decls, &state.canvas_path).await;
+    let closure =
+        meshfox_core::close_over_var_refs(&decls, field_decls.iter().map(|d| d.name.as_str()));
+    let decls_for_resolve: Vec<_> = decls
+        .iter()
+        .filter(|d| closure.contains(d.name.as_str()))
+        .cloned()
+        .collect();
+    let cache = state.vars_cache.lock().unwrap();
+    let shared = meshfox_core::load_shared_env(canvas_root_dir(&state.canvas_path));
+    let overrides = effective_overrides(&state, &HashMap::new());
+    let resolved = meshfox_core::resolve_with_shared(
+        &decls_for_resolve,
+        &overrides,
+        &cache,
+        &computed,
+        &shared,
+    );
+    let missing_by_name: HashMap<&str, &meshfox_core::VarDecl> =
+        resolved.missing.iter().map(|d| (d.name.as_str(), d)).collect();
+    let fields = field_decls
+        .into_iter()
+        .zip(labels)
+        .map(|(d, label)| {
+            let materialized = missing_by_name
+                .get(d.name.as_str())
+                .map(|m| (*m).clone())
+                .unwrap_or(d);
+            FormFieldStatus {
+                label,
+                var: var_status(materialized, &resolved),
+            }
+        })
+        .collect();
+    Ok(Json(FormFieldsResponse {
+        send: form.send.unwrap_or_else(|| "Send".to_string()),
+        fields,
+    }))
+}
+
+/// `POST /api/form/submit` — the submit side of a `form`-lang fence's own
+/// Send button (see SPEC.md's "Form fences"): commits `req.values` into
+/// `AppState::session_vars` (never the on-disk
+/// `vars_cache` — every variable a form targets is implicitly `session`,
+/// see `meshfox_core::declared_vars`), then kicks off every `autorun`
+/// block whose own variable closure the just-changed values actually
+/// reach (`meshfox_core::autorun_blocks_for_changed_vars`).
+async fn submit_form(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SubmitFormRequest>,
+) -> Result<Json<SubmitFormResponse>, ApiError> {
+    let raw = state.raw.lock().unwrap().clone();
+    let canvas = resolved_canvas(&raw, &state.canvas_path)?;
+    let node = canvas
+        .node(&req.node_id)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {:?}", req.node_id)))?;
+    let block = meshfox_core::scan_runnable_blocks(&node.id, &node.text)
+        .into_iter()
+        .find(|b| b.name.as_deref() == Some(req.block.as_str()))
+        .ok_or_else(|| {
+            ApiError(
+                StatusCode::NOT_FOUND,
+                format!(
+                    "no runnable block named {:?} in node {:?}",
+                    req.block, node.id
+                ),
+            )
+        })?;
+    if !meshfox_core::is_form(&block.lang) {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "block {:?} in node {:?} isn't a `form` fence",
+                req.block, node.id
+            ),
+        ));
+    }
+    let form = meshfox_core::form_block(&block)
+        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    let decls = meshfox_core::declared_vars(&canvas)
+        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    let decls_by_name: HashMap<&str, &meshfox_core::VarDecl> =
+        decls.iter().map(|d| (d.name.as_str(), d)).collect();
+
+    let mut changed = std::collections::HashSet::new();
+    let mut saved = 0usize;
+    {
+        let mut session_vars = state.session_vars.lock().unwrap();
+        for field in &form.fields {
+            let Some(value) = req.values.get(&field.var) else {
+                continue;
+            };
+            let Some(decl) = decls_by_name.get(field.var.as_str()) else {
+                continue;
+            };
+            meshfox_core::validate_value(decl, value)
+                .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+            session_vars.insert(field.var.clone(), value.clone());
+            changed.insert(field.var.clone());
+            saved += 1;
+        }
+    }
+
+    let triggered = meshfox_core::autorun_blocks_for_changed_vars(&canvas, &changed);
+    for addr in &triggered {
+        // Awaited (not `tokio::spawn`ed away) — see `trigger_autorun`'s
+        // own doc comment for why this needs to run synchronously far
+        // enough to reserve the address before this handler returns.
+        // `RunStarted` is broadcast only *after* that, so a passive tab
+        // that reacts to it (see `ServerEvent::RunStarted`'s own doc
+        // comment) never races ahead of the very reservation this exists
+        // to guarantee, same reasoning that applies to this submitting
+        // tab's own immediate `subscribeRun` off this response.
+        trigger_autorun(Arc::clone(&state), addr.clone()).await;
+        let _ = state.change_tx.send(ServerEvent::RunStarted {
+            node_id: addr.node_id.clone(),
+            block: addr.block_name.clone(),
+        });
+    }
+
+    Ok(Json(SubmitFormResponse {
+        saved,
+        autorun_triggered: triggered
+            .into_iter()
+            .map(|a| TriggeredRun {
+                node_id: a.node_id,
+                block: a.block_name,
+            })
+            .collect(),
+    }))
+}
+
 /// The first block in `chain` (if any) flagged `tty` — `meshfox validate`'s
 /// rule that a `tty` block may only be a `deps=` target of *another* `tty`
 /// block (enforced inside `resolve_run_chain` itself, via
@@ -3602,12 +4139,13 @@ async fn run_block_tty(
     // `computed` (the empty map here) means a `from`-declared decl in
     // `relevant_decls` lands in `unresolved_from`, not `missing` — it's
     // resolved incrementally, mid-chain, by `run_tty_chain` instead.
+    let overrides = effective_overrides(&state, &requested_vars);
     let resolved_vars = {
         let mut cache = state.vars_cache.lock().unwrap();
         let shared = meshfox_core::load_shared_env(canvas_root_dir(&state.canvas_path));
         let resolved = meshfox_core::resolve_with_shared(
             &relevant_decls,
-            &requested_vars,
+            &overrides,
             &cache,
             &HashMap::new(),
             &shared,
@@ -4954,6 +5492,7 @@ async fn subscribe_run(
 /// to here. See TODO.canvas.md: "Сброс сессии".
 async fn reset_session(State(state): State<Arc<AppState>>) -> StatusCode {
     state.session_runs.lock().unwrap().clear();
+    state.session_vars.lock().unwrap().clear();
     StatusCode::NO_CONTENT
 }
 
@@ -4978,8 +5517,19 @@ async fn watch_changes(State(state): State<Arc<AppState>>) -> Response {
         yield Ok::<_, io::Error>(Bytes::from_static(b"{\"type\":\"connected\"}\n"));
         // The `Closed` arm never actually fires: `change_tx`'s sender lives
         // in `AppState`, which outlives every connection.
-        while let Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) = rx.recv().await {
-            yield Ok(Bytes::from_static(b"{\"type\":\"changed\"}\n"));
+        loop {
+            match rx.recv().await {
+                Ok(event) => yield Ok(ndjson_line(&event)),
+                // Lagged behind the broadcast channel's own buffer — we no
+                // longer know exactly what was missed, so (same posture the
+                // old `()`-payload version already had for this arm) fall
+                // back to a plain `Changed`, safe for the client to treat
+                // as "something happened, reload to be sure".
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    yield Ok(ndjson_line(&ServerEvent::Changed))
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
         }
     };
 
@@ -5176,6 +5726,7 @@ async fn build_state(
         auto_exit,
         link_preview_cache: link_preview::PreviewCache::new(),
         session_runs: Mutex::new(HashMap::new()),
+        session_vars: Mutex::new(HashMap::new()),
         services: Mutex::new(HashMap::new()),
         runs_registry: Mutex::new(HashMap::new()),
         tty_registry: Mutex::new(HashMap::new()),
@@ -5209,6 +5760,8 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/link-preview", get(get_link_preview))
         .route("/api/run", post(run_block))
         .route("/api/run/force", post(force_run))
+        .route("/api/form/fields", get(get_form_fields))
+        .route("/api/form/submit", post(submit_form))
         .route("/api/run/subscribe", get(subscribe_run))
         .route("/api/run/tty", get(run_block_tty))
         .route("/api/run/tty/attach", get(attach_tty))
@@ -5275,23 +5828,32 @@ pub async fn run(
     axum::serve(listener, app).await
 }
 
-/// Ties every `service` block this process owns to this process's own
-/// lifetime for real — not just the graceful "no tabs left" path
-/// (`TabGuard`, which deliberately stays *up* while a service runs), but an
-/// involuntary external termination too: `SIGTERM` (what a VS Code webview
-/// tab closing sends this worker, `editors/vscode/src/coordinator.ts`'s
+/// Ties every process this worker owns to this process's own lifetime for
+/// real — not just the graceful "no tabs left" path (`TabGuard`, which
+/// deliberately stays *up* while a service runs), but an involuntary
+/// external termination too: `SIGTERM` (what a VS Code webview tab closing
+/// sends this worker, `editors/vscode/src/coordinator.ts`'s
 /// `killWorker`/`dispose` — deliberately *not* changed to check for
 /// running services first, see SPEC.md's "Service blocks (experimental)"),
-/// `SIGINT` (Ctrl-C), `SIGHUP` (the owning terminal closing). Each of these
-/// stops every registered service the same reliable way the panel's own
-/// Stop button does (`ServiceHandle::stop`'s whole-process-group kill) —
-/// deliberately *not* solved by putting a service in this process's own
-/// process group instead: that would break `stop`'s ability to
-/// selectively kill just one service's whole subtree without also
-/// reaching every sibling service (or this process itself). `SIGKILL`
-/// can't be handled here or anywhere — POSIX makes it uncatchable by
-/// design, so a hard `kill -9` (or the OOM killer) is the one termination
-/// path nothing can stop from orphaning a running service.
+/// `SIGINT` (Ctrl-C), `SIGHUP` (the owning terminal closing). Covers all
+/// three registries this process tracks a live child process under —
+/// `services` (a `service` block, `ServiceHandle::stop`'s whole-process-
+/// group kill, same as the panel's own Stop button), `runs_registry` (a
+/// *plain* block still mid-run, `RunHandle::kill`, same as the web UI's
+/// own Kill button), `tty_registry` (an attached interactive terminal,
+/// `TtySessionHandle::kill`) — every one of these spawns its own process
+/// (`stream_exec::spawn_bash`'s own `process_group(0)`) in its *own*
+/// process group, deliberately not this one (so each can be killed
+/// selectively, by address, without also reaching an unrelated sibling or
+/// this process itself) — which also means none of them dies on its own
+/// just because this process does; nothing but this explicit sweep stops
+/// any of them from surviving as an orphan (confirmed directly: before
+/// `runs_registry`/`tty_registry` were added here, a plain block that was
+/// still mid-run when the worker got `SIGTERM`'d kept right on running,
+/// see `crates/cli/tests/service_shutdown_cmd.rs`'s own two tests).
+/// `SIGKILL` can't be handled here or anywhere — POSIX makes it
+/// uncatchable by design, so a hard `kill -9` (or the OOM killer) is the
+/// one termination path nothing can stop from orphaning any of these.
 fn spawn_shutdown_signal_handler(state: Arc<AppState>) {
     tokio::spawn(async move {
         let Ok(mut sigterm) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -5307,10 +5869,32 @@ fn spawn_shutdown_signal_handler(state: Arc<AppState>) {
             _ = sighup.recv() => {}
             _ = tokio::signal::ctrl_c() => {}
         }
-        let handles: Vec<_> = state.services.lock().unwrap().drain().map(|(_, h)| h).collect();
-        for handle in handles {
+        let service_handles: Vec<_> = state.services.lock().unwrap().drain().map(|(_, h)| h).collect();
+        for handle in service_handles {
             let _ = handle.stop();
         }
+        let run_handles: Vec<_> = state.runs_registry.lock().unwrap().drain().map(|(_, h)| h).collect();
+        for handle in run_handles {
+            handle.kill();
+        }
+        let tty_handles: Vec<_> = state.tty_registry.lock().unwrap().drain().map(|(_, h)| h).collect();
+        for handle in tty_handles {
+            handle.kill();
+        }
+        // Unlike `ServiceHandle::stop` above (a synchronous `libc::kill`
+        // call, already fully done by the time its loop returns),
+        // `RunHandle::kill`/`TtySessionHandle::kill` only *signal* their
+        // own already-spawned drain task via a oneshot channel — the
+        // actual `libc::kill` for one of these only happens once that
+        // task is next polled and notices it (see `run_registry::attach`'s
+        // own `tokio::select!` loop). `std::process::exit` right after
+        // sending those signals would very likely beat the scheduler to
+        // it and exit before any of them ran at all (confirmed directly —
+        // without this, a plain block kept right on running after the
+        // signals above were sent). A brief real sleep, not just a
+        // cooperative `yield_now`, gives the runtime's other worker
+        // threads an actual window to pick up and finish each one first.
+        tokio::time::sleep(Duration::from_millis(200)).await;
         std::process::exit(0);
     });
 }
@@ -8090,6 +8674,339 @@ mod vars_endpoint_tests {
         assert_eq!(statuses[0]["value"], "dev-key");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod form_endpoint_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    fn write_test_canvas(contents: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "meshfox-form-test-{}.canvas.md",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    async fn get(addr: SocketAddr, path: &str) -> (u16, String) {
+        let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.expect("read");
+        let mut parts = response.splitn(2, "\r\n\r\n");
+        let head = parts.next().unwrap_or_default();
+        let body = parts.next().unwrap_or_default();
+        let status = head
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        (status, body.to_string())
+    }
+
+    async fn post_json(addr: SocketAddr, path: &str, body: &str) -> (u16, String) {
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.expect("read");
+        let mut parts = response.splitn(2, "\r\n\r\n");
+        let head = parts.next().unwrap_or_default();
+        let body = parts.next().unwrap_or_default();
+        let status = head
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        (status, body.to_string())
+    }
+
+    /// Polls `GET /api/runs` until it reports `block` as `exited` (or the
+    /// deadline passes) — `submit_form`'s own autorun trigger is
+    /// deliberately fire-and-forget (the HTTP response returns the moment
+    /// values are saved, not once every triggered chain finishes), so a
+    /// test needs to wait for it the same way a real passive tab watching
+    /// `/api/run/subscribe` would.
+    async fn wait_for_exit(addr: SocketAddr, node_id: &str, block: &str) -> Option<i64> {
+        for _ in 0..100 {
+            let (status, body) = get(addr, "/api/runs").await;
+            if status == 200 {
+                if let Ok(runs) = serde_json::from_str::<Vec<serde_json::Value>>(&body) {
+                    if let Some(run) = runs
+                        .iter()
+                        .find(|r| r["nodeId"] == node_id && r["block"] == block)
+                    {
+                        if run["status"] == "exited" {
+                            return run["exitCode"].as_i64();
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        None
+    }
+
+    const FORM_CANVAS: &str = concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "## Config\n<!-- meshfox:node id=\"config\" -->\n\n",
+        "<!-- meshfox:var name=\"REGION\" type=\"select\" choices=\"us,eu\" -->\n\n",
+        "```form name=\"pick-region\" send=\"Apply\"\n",
+        "field var=\"REGION\" label=\"AWS Region\"\n",
+        "```\n\n",
+        "```bash name=\"show-region\" env=\"$REGION\" autorun\necho \"region is $REGION\"\n```\n",
+    );
+
+    #[tokio::test]
+    async fn get_form_fields_returns_the_forms_own_fields_and_send_caption() {
+        let canvas_path = write_test_canvas(FORM_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, body) =
+            get(addr, "/api/form/fields?nodeId=config&block=pick-region").await;
+        assert_eq!(status, 200, "unexpected body: {body}");
+        let resp: serde_json::Value = serde_json::from_str(&body).expect("valid response JSON");
+        assert_eq!(resp["send"], "Apply");
+        assert_eq!(resp["fields"].as_array().unwrap().len(), 1);
+        assert_eq!(resp["fields"][0]["label"], "AWS Region");
+        assert_eq!(resp["fields"][0]["name"], "REGION");
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn get_form_fields_404s_for_an_unknown_block() {
+        let canvas_path = write_test_canvas(FORM_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, _) = get(addr, "/api/form/fields?nodeId=config&block=nope").await;
+        assert_eq!(status, 404);
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn get_form_fields_422s_for_a_non_form_block() {
+        let canvas_path = write_test_canvas(FORM_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, _) = get(addr, "/api/form/fields?nodeId=config&block=show-region").await;
+        assert_eq!(status, 422);
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn submit_form_saves_only_the_forms_own_recognized_fields() {
+        let canvas_path = write_test_canvas(FORM_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, body) = post_json(
+            addr,
+            "/api/form/submit",
+            r#"{"nodeId":"config","block":"pick-region","values":{"REGION":"eu","UNRELATED":"ignored"}}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "unexpected body: {body}");
+        let resp: serde_json::Value = serde_json::from_str(&body).expect("valid response JSON");
+        assert_eq!(resp["saved"], 1);
+        assert_eq!(resp["autorunTriggered"].as_array().unwrap().len(), 1);
+        assert_eq!(resp["autorunTriggered"][0]["nodeId"], "config");
+        assert_eq!(resp["autorunTriggered"][0]["block"], "show-region");
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn submit_form_rejects_an_invalid_typed_value() {
+        let canvas_path = write_test_canvas(FORM_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, _) = post_json(
+            addr,
+            "/api/form/submit",
+            r#"{"nodeId":"config","block":"pick-region","values":{"REGION":"not-a-choice"}}"#,
+        )
+        .await;
+        // `select`'s own `validate_value` only ever rejects membership once
+        // `choices`/`choices_var` is actually substituted -- a literal
+        // `choices=` list (this canvas's case) always is, so this should
+        // be a 422, same as `POST /api/vars/configure` would report.
+        assert_eq!(status, 422);
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn submit_form_never_writes_to_the_on_disk_cache() {
+        let canvas_path = write_test_canvas(FORM_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, _) = post_json(
+            addr,
+            "/api/form/submit",
+            r#"{"nodeId":"config","block":"pick-region","values":{"REGION":"eu"}}"#,
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        // A node-scoped var is implicitly `session` -- `submit_form` must
+        // never persist it the way `POST /api/vars/configure` would.
+        let cache_path = meshfox_core::varcache::cache_path(&canvas_path);
+        assert!(!cache_path.exists(), "REGION should never reach the on-disk cache");
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn submit_form_triggers_the_autorun_block_and_it_actually_runs() {
+        let canvas_path = write_test_canvas(FORM_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, _) = post_json(
+            addr,
+            "/api/form/submit",
+            r#"{"nodeId":"config","block":"pick-region","values":{"REGION":"eu"}}"#,
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        let exit_code = wait_for_exit(addr, "config", "show-region").await;
+        assert_eq!(exit_code, Some(0), "autorun-triggered block never finished");
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn a_later_get_vars_sees_the_session_value_a_form_just_submitted() {
+        let canvas_path = write_test_canvas(FORM_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        // Before submitting, REGION has no default -- unresolved.
+        let (_, before) = get(addr, "/api/vars?path=config&block=show-region").await;
+        let before: Vec<serde_json::Value> = serde_json::from_str(&before).unwrap();
+        assert_eq!(before[0]["resolved"], false);
+
+        let (status, _) = post_json(
+            addr,
+            "/api/form/submit",
+            r#"{"nodeId":"config","block":"pick-region","values":{"REGION":"eu"}}"#,
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        let (_, after) = get(addr, "/api/vars?path=config&block=show-region").await;
+        let after: Vec<serde_json::Value> = serde_json::from_str(&after).unwrap();
+        assert_eq!(after[0]["resolved"], true);
+        assert_eq!(after[0]["value"], "eu");
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn reset_session_clears_a_forms_submitted_value_too() {
+        let canvas_path = write_test_canvas(FORM_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, _) = post_json(
+            addr,
+            "/api/form/submit",
+            r#"{"nodeId":"config","block":"pick-region","values":{"REGION":"eu"}}"#,
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        let (status, _) = post_json(addr, "/api/session/reset", "{}").await;
+        assert_eq!(status, 204);
+
+        let (_, after) = get(addr, "/api/vars?path=config&block=show-region").await;
+        let after: Vec<serde_json::Value> = serde_json::from_str(&after).unwrap();
+        assert_eq!(
+            after[0]["resolved"], false,
+            "reset-session should forget a form's submitted session value too"
+        );
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    /// Regression test for a real race reported against a live document
+    /// (an amulettie/search block: a `form`+`autorun` table depending on a
+    /// slow "is the backend up yet" readiness check): the *first* Send
+    /// after changing the query kept showing the *previous* query's own
+    /// result, and only a second, redundant Send (which happened to race
+    /// an already-finished run instead of a genuinely in-flight one)
+    /// showed the right thing. Root cause: `submit_form`'s own HTTP
+    /// response returns the moment values are saved, long before this
+    /// chain's own slow dependency (`wait`, standing in for the real
+    /// readiness check) lets the requested block's own step actually
+    /// spawn — a subscriber that races ahead of that (as a passive
+    /// `autorun` watcher always does, having no stream of its own to wait
+    /// on first) used to find the *previous* run's already-`Done` handle
+    /// still sitting in `runs_registry` and trust it as current. See
+    /// `run_block_impl`'s own `target_reservation` doc comment for the fix.
+    #[tokio::test]
+    async fn a_subscriber_racing_an_autoruns_slow_dependency_sees_the_fresh_output_not_stale() {
+        const RACE_CANVAS: &str = concat!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Config\n<!-- meshfox:node id=\"config\" -->\n\n",
+            "<!-- meshfox:var name=\"QUERY\" default=\"old\" -->\n\n",
+            "```form name=\"query-form\" send=\"Apply\"\n",
+            "field var=\"QUERY\" label=\"Query\"\n",
+            "```\n\n",
+            // `always` — otherwise this dependency's own fingerprint is
+            // unchanged from the seed run below and it gets skipped as
+            // "already fresh this session" on the form-triggered run,
+            // collapsing the race window this test exists to exercise
+            // down to nothing (confirmed directly: without this, the test
+            // still passed even with the fix reverted).
+            "```bash name=\"wait\" always\nsleep 0.3\necho waited\n```\n\n",
+            "```bash name=\"table\" env=\"QUERY\" deps=\"wait\" autorun\necho \"value is $QUERY\"\n```\n",
+        );
+        let canvas_path = write_test_canvas(RACE_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        // Seed a stale, already-finished run of `table` with the *old*
+        // value — a real completed run already sitting in the registry
+        // before the form is ever touched, same as the bug report.
+        let (status, body) =
+            post_json(addr, "/api/run", r#"{"path":["config"],"block":"table"}"#).await;
+        assert_eq!(status, 200, "unexpected body: {body}");
+
+        // Submit a *new* value, then subscribe immediately — no delay —
+        // so this reliably races `table`'s own slow `wait` dependency,
+        // which hasn't even started yet by the time this subscribes.
+        let (status, body) = post_json(
+            addr,
+            "/api/form/submit",
+            r#"{"nodeId":"config","block":"query-form","values":{"QUERY":"new"}}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "unexpected body: {body}");
+
+        let (sub_status, sub_body) =
+            get(addr, "/api/run/subscribe?nodeId=config&block=table&sinceSeq=0").await;
+        assert_eq!(sub_status, 200, "unexpected body: {sub_body}");
+        assert!(
+            sub_body.contains(r#""text":"value is new""#),
+            "a subscriber that raced the slow dependency should still see the fresh run's own output: {sub_body}"
+        );
+        assert!(
+            !sub_body.contains(r#""text":"value is old""#),
+            "a subscriber should never see the stale run's own output as if it were current: {sub_body}"
+        );
+
+        let _ = std::fs::remove_file(&canvas_path);
     }
 }
 

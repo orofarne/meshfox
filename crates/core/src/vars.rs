@@ -140,6 +140,8 @@ pub enum VarsError {
     UndeclaredVarRef(String, String, &'static str),
     #[error("cycle in default_var=/choices_var= references: {}", .0.join(" -> "))]
     VarRefCycle(Vec<String>),
+    #[error("node {0:?} form {1:?} has a `field var=\"{2}\"`, but {2:?} is from=-computed — a form field can't target a computed variable, that would let a submitted value impersonate one its source block never produced")]
+    FormFieldTargetsComputedVar(String, String, String),
 }
 
 /// Splits a comma-separated `choices=`-style string into trimmed,
@@ -486,14 +488,28 @@ pub fn validate_var_scope(canvas: &Canvas) -> Result<(), VarsError> {
         .iter()
         .map(|s| (s.decl.name.as_str(), s.owner_node.as_str()))
         .collect();
+    let decls_by_name: HashMap<&str, &VarDecl> =
+        scanned.iter().map(|s| (s.decl.name.as_str(), &s.decl)).collect();
     for node in &canvas.nodes {
         for block in crate::fence::scan_runnable_blocks(&node.id, &node.text) {
-            let refs: Vec<(String, &'static str)> = block
+            let mut refs: Vec<(String, &'static str)> = block
                 .env
                 .iter()
                 .map(|e| (e.var_name.clone(), "env"))
                 .chain(interpreter_refs(&block).into_iter().map(|n| (n, "interpreter")))
                 .collect();
+            // A `form` fence's own `field var=` is just as much a
+            // reference to a declared variable as `env=`/`interpreter=`
+            // are — same node-subtree scoping rule applies. An invalid
+            // form (bad body syntax) is skipped here rather than erroring
+            // — `crate::deps::validate`'s own `form_block` call is what
+            // surfaces that, this pass only cares about already-valid
+            // field references.
+            if crate::exec::is_form(&block.lang) {
+                if let Ok(form) = crate::form::form_block(&block) {
+                    refs.extend(form.fields.into_iter().map(|f| (f.var, "field")));
+                }
+            }
             for (var_name, via) in refs {
                 if let Some(owner) = owners.get(var_name.as_str()) {
                     if !is_within_subtree(canvas, &node.id, owner) {
@@ -504,6 +520,17 @@ pub fn validate_var_scope(canvas: &Canvas) -> Result<(), VarsError> {
                             (*owner).to_string(),
                             via,
                         ));
+                    }
+                }
+                if via == "field" {
+                    if let Some(decl) = decls_by_name.get(var_name.as_str()) {
+                        if decl.from.is_some() {
+                            return Err(VarsError::FormFieldTargetsComputedVar(
+                                node.id.clone(),
+                                block.name.clone().unwrap_or_default(),
+                                var_name,
+                            ));
+                        }
                     }
                 }
             }
@@ -1246,6 +1273,56 @@ mod tests {
                 "PYTHON".to_string(),
                 "venv".to_string(),
                 "interpreter",
+            )
+        );
+    }
+
+    #[test]
+    fn validate_var_scope_ok_when_a_form_field_targets_a_var_in_its_own_subtree() {
+        let doc = concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Queries\n<!-- meshfox:node id=\"queries\" -->\n\n",
+            "<!-- meshfox:var name=\"MANUFACTURER_QUERY\" default=\"Sanofi\" -->\n\n",
+            "```form name=\"pick\"\nfield var=\"MANUFACTURER_QUERY\"\n```\n",
+        );
+        assert!(validate_var_scope(&canvas(doc)).is_ok());
+    }
+
+    #[test]
+    fn validate_var_scope_catches_a_form_field_from_outside_the_owning_subtree() {
+        let doc = concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Queries\n<!-- meshfox:node id=\"queries\" -->\n\n",
+            "<!-- meshfox:var name=\"MANUFACTURER_QUERY\" default=\"Sanofi\" -->\n\n",
+            "## Unrelated\n<!-- meshfox:node id=\"unrelated\" -->\n\n",
+            "```form name=\"pick\"\nfield var=\"MANUFACTURER_QUERY\"\n```\n",
+        );
+        assert_eq!(
+            validate_var_scope(&canvas(doc)).unwrap_err(),
+            VarsError::VarOutOfScope(
+                "unrelated".to_string(),
+                "pick".to_string(),
+                "MANUFACTURER_QUERY".to_string(),
+                "queries".to_string(),
+                "field",
+            )
+        );
+    }
+
+    #[test]
+    fn validate_var_scope_catches_a_form_field_targeting_a_computed_var() {
+        let doc = concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "<!-- meshfox:var name=\"RESOURCE_ID\" from=\"provision\" -->\n\n",
+            "```bash name=\"provision\" cache\necho id=abc\n```\n\n",
+            "```form name=\"pick\"\nfield var=\"RESOURCE_ID\"\n```\n",
+        );
+        assert_eq!(
+            validate_var_scope(&canvas(doc)).unwrap_err(),
+            VarsError::FormFieldTargetsComputedVar(
+                "root".to_string(),
+                "pick".to_string(),
+                "RESOURCE_ID".to_string(),
             )
         );
     }

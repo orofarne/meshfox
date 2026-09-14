@@ -25,6 +25,7 @@ mod fixtures;
 mod harness;
 mod mouse_deps_line;
 mod mouse_drag_dblclick;
+mod mouse_form;
 mod mouse_horizontal_scroll;
 mod mouse_modals;
 mod mouse_output_pane;

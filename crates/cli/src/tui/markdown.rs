@@ -52,6 +52,19 @@ pub enum ClickTarget {
     /// counterpart to the web UI's `jumpTo`: moves the tree's own selection
     /// to the named block's owning node.
     JumpToNode { node_id: String },
+    /// One field row of a `form`-lang fence — opens (or refocuses)
+    /// `App::active_inline_form` on this field, in edit mode. `field_index`
+    /// indexes that form's own `fields`/`decls`/`inputs`, in document
+    /// order. See SPEC.md's "Form fences".
+    FormField {
+        node_id: String,
+        block_name: String,
+        field_index: usize,
+    },
+    /// A `form`-lang fence's own `[send caption]` row — submits it
+    /// directly, no prior field focus needed, same one-click convention
+    /// `RunBlock` already has for a `button` fence's marker.
+    FormSend { node_id: String, block_name: String },
 }
 
 /// One clickable span inside a rendered `Segment::Text`, in the segment's
@@ -289,6 +302,16 @@ pub fn render(
     hl: &Highlighter,
     node_id: &str,
     decls: &[meshfox_core::vars::VarDecl],
+    form_values: &std::collections::HashMap<String, String>,
+    // `Some((block_name, selected_index))` while this node's own inline
+    // form is actively `editing` (see `App::active_inline_form`'s own doc
+    // comment) — lets the form-lang branch of `TagEnd::CodeBlock` draw a
+    // visible focus indicator (reversed row, blinking `_` text cursor) on
+    // whichever field/Send row is currently selected, the same convention
+    // `render_var_form` (`ui.rs`) already uses for the unrelated "configure
+    // variables" modal. `None` whenever this form is merely open (not
+    // `editing`) or this isn't the node it belongs to — no focus to show.
+    form_focus: Option<(&str, usize)>,
 ) -> (Vec<Segment>, Vec<ClickRegion>) {
     // Pre-scanned once so `Tag::CodeBlock`'s own handling (`start`) can
     // resolve a fence's *real* run name — including the implicit "sole
@@ -296,7 +319,7 @@ pub fn render(
     // doc comment) — by matching its byte span, rather than re-deriving
     // that same implicit-naming rule a second time here.
     let runnable = meshfox_core::fence::scan_runnable_blocks(node_id, md);
-    let mut renderer = Renderer::new(base_dir, hl, node_id, decls, &runnable);
+    let mut renderer = Renderer::new(base_dir, hl, node_id, decls, &runnable, form_values, form_focus);
     // `ENABLE_GFM` is what makes `pulldown-cmark` recognize `> [!NOTE]`/...
     // alert blockquotes (`Tag::BlockQuote(Some(kind))`, marker line
     // already stripped) — see `start`'s own `Tag::BlockQuote` arm below.
@@ -345,6 +368,19 @@ struct Renderer<'a> {
     /// including one only assigned implicitly (see `render`'s own doc
     /// comment).
     runnable: &'a [meshfox_core::fence::CodeBlock],
+    /// Current display value for every `form`-field-targeted variable,
+    /// keyed by var name — `App::render_current_document`'s own
+    /// `session_vars`/declared-default fallback, with whichever field is
+    /// actively being typed into (`App::active_inline_form`) overlaid on
+    /// top. Consulted only by the `form`-lang branch of `TagEnd::CodeBlock`
+    /// — see `Segment`'s own doc comment for why this has to be resolved
+    /// by the caller rather than here: a form field's value can come from
+    /// a live, per-keystroke edit buffer that has nothing to do with this
+    /// node body's own Markdown.
+    form_values: &'a std::collections::HashMap<String, String>,
+    /// `render`'s own `form_focus` parameter, threaded straight through —
+    /// see that parameter's own doc comment.
+    form_focus: Option<(&'a str, usize)>,
     segments: Vec<Segment>,
     click_regions: Vec<ClickRegion>,
     lines: Vec<Line<'static>>,
@@ -362,6 +398,11 @@ struct Renderer<'a> {
     /// `TagEnd::CodeBlock` into `dep_line`'s explicit/implicit deps line.
     code_deps: Option<String>,
     code_env: Option<String>,
+    /// This fence's own `send=` attribute, if any — only meaningful on a
+    /// `lang="form"` fence (see `TagEnd::CodeBlock`'s own form branch);
+    /// falls back to a plain `"Send"` when omitted, same default
+    /// `meshfox_core::form::FormBlock::send` itself documents.
+    code_send: Option<String>,
     /// This fence's own *resolved* run name — its explicit `name=`, or (a
     /// lone unnamed fence) the implicit one `fence::scan_runnable_blocks`
     /// would assign it — looked up against `runnable` when the fence
@@ -434,6 +475,8 @@ impl<'a> Renderer<'a> {
         node_id: &'a str,
         decls: &'a [meshfox_core::vars::VarDecl],
         runnable: &'a [meshfox_core::fence::CodeBlock],
+        form_values: &'a std::collections::HashMap<String, String>,
+        form_focus: Option<(&'a str, usize)>,
     ) -> Self {
         Renderer {
             base_dir,
@@ -441,6 +484,8 @@ impl<'a> Renderer<'a> {
             node_id,
             decls,
             runnable,
+            form_values,
+            form_focus,
             segments: Vec::new(),
             click_regions: Vec::new(),
             lines: Vec::new(),
@@ -453,6 +498,7 @@ impl<'a> Renderer<'a> {
             code_interpreter: None,
             code_deps: None,
             code_env: None,
+            code_send: None,
             code_click_name: None,
             code_buf: String::new(),
             output_region: None,
@@ -820,6 +866,7 @@ impl<'a> Renderer<'a> {
             }
             Tag::CodeBlock(kind) => {
                 self.flush_paragraph();
+                self.code_send = None;
                 let (lang, name, interpreter, deps, env) = match kind {
                     // The info string carries meshfox's own attributes past
                     // the language token (`name="..."`, `cache`, ...) — see
@@ -834,6 +881,7 @@ impl<'a> Renderer<'a> {
                         let interpreter = attrs.remove("interpreter");
                         let deps = attrs.remove("deps");
                         let env = attrs.remove("env");
+                        self.code_send = attrs.remove("send");
                         (lang, name, interpreter, deps, env)
                     }
                     CodeBlockKind::Indented => ("text".to_string(), None, None, None, None),
@@ -1077,8 +1125,123 @@ impl<'a> Renderer<'a> {
                 let interpreter = self.code_interpreter.take();
                 let deps_raw = self.code_deps.take();
                 let env_raw = self.code_env.take();
+                let send_raw = self.code_send.take();
                 let click_name = self.code_click_name.take();
                 let code = std::mem::take(&mut self.code_buf);
+                if lang == meshfox_core::FORM_LANG {
+                    // Same non-executing, no-frame family as `button`
+                    // (below) — a form has no real code to
+                    // syntax-highlight, just a `field var=` list to show
+                    // as labeled rows plus a Send row. `parse_form_body`
+                    // never errors out this renderer even on a malformed
+                    // body (a stray non-`field` line, say) — that's
+                    // `meshfox validate`'s job to report; here it's just
+                    // "nothing usable to show" (see `name.clone()`'s own
+                    // fallback for `form_name`, used only for the parse
+                    // error this renderer then discards).
+                    let form_name = name.clone().unwrap_or_default();
+                    let fields = meshfox_core::parse_form_body(&form_name, &code).unwrap_or_default();
+                    let send_caption = send_raw.unwrap_or_else(|| "Send".to_string());
+                    let label_style = Style::default().fg(super::theme::DEP);
+                    let value_style = Style::default()
+                        .fg(super::theme::ACCENT)
+                        .add_modifier(Modifier::UNDERLINED);
+                    let marker_style = Style::default()
+                        .fg(super::theme::ACCENT)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+                    // Which row (a field, by index, or the virtual Send row
+                    // at `fields.len()`) is actually focused right now, if
+                    // any — only when `self.form_focus` names *this* fence's
+                    // own resolved block name, not some other form fence
+                    // elsewhere in the same node. See `render`'s own
+                    // `form_focus` doc comment.
+                    let focused_index = match (self.form_focus, click_name.as_deref()) {
+                        (Some((focus_block, idx)), Some(this_block)) if focus_block == this_block => {
+                            Some(idx)
+                        }
+                        _ => None,
+                    };
+
+                    let mut lines: Vec<Line<'static>> = Vec::new();
+                    let mut col_ends: Vec<u16> = Vec::new();
+                    for (i, field) in fields.iter().enumerate() {
+                        let focused = focused_index == Some(i);
+                        let label = field.label.clone().unwrap_or_else(|| field.var.clone());
+                        let value = self.form_values.get(&field.var).cloned().unwrap_or_default();
+                        let prefix = format!("{label}: ");
+                        let col_end = (prefix.chars().count() + value.chars().count().max(1)) as u16;
+                        // A blinking `_` text cursor on the focused row's
+                        // own value, same convention `render_var_form`
+                        // (`ui.rs`) already uses for its own text fields —
+                        // but only for a `String`/`Int` var (a `Bool`/
+                        // `Select` field is a toggle/cycle, not free text,
+                        // so there's nothing for a text cursor to mark; an
+                        // undeclared/unknown var — `None` here — defaults
+                        // to showing one anyway, same as a plain text field
+                        // would, rather than silently showing none).
+                        let var_type = self.decls.iter().find(|d| d.name == field.var).map(|d| d.var_type);
+                        let cursor = focused
+                            && !matches!(
+                                var_type,
+                                Some(meshfox_core::vars::VarType::Bool)
+                                    | Some(meshfox_core::vars::VarType::Select)
+                            );
+                        let mut shown = if value.is_empty() { " ".to_string() } else { value };
+                        if cursor {
+                            shown.push('_');
+                        }
+                        let mut value_span = Span::styled(shown, value_style);
+                        let mut label_span = Span::styled(prefix, label_style);
+                        if focused {
+                            label_span = label_span.patch_style(Style::default().add_modifier(Modifier::REVERSED));
+                            value_span = value_span.patch_style(
+                                Style::default().add_modifier(if cursor {
+                                    Modifier::REVERSED | Modifier::SLOW_BLINK
+                                } else {
+                                    Modifier::REVERSED
+                                }),
+                            );
+                        }
+                        lines.push(Line::from(vec![label_span, value_span]));
+                        col_ends.push(col_end);
+                    }
+                    let send_line = format!("[{send_caption}]");
+                    let send_col_end = send_line.chars().count() as u16;
+                    let mut send_span = Span::styled(send_line, marker_style);
+                    if focused_index == Some(fields.len()) {
+                        send_span = send_span.patch_style(Style::default().add_modifier(Modifier::REVERSED));
+                    }
+                    lines.push(Line::from(send_span));
+
+                    self.push_segment(Segment::Text(lines));
+                    if let Some(block_name) = click_name {
+                        let segment_index = self.segments.len() - 1;
+                        for (i, col_end) in col_ends.into_iter().enumerate() {
+                            self.click_regions.push(ClickRegion {
+                                segment_index,
+                                line_index: i,
+                                col_start: 0,
+                                col_end,
+                                target: ClickTarget::FormField {
+                                    node_id: self.node_id.to_string(),
+                                    block_name: block_name.clone(),
+                                    field_index: i,
+                                },
+                            });
+                        }
+                        self.click_regions.push(ClickRegion {
+                            segment_index,
+                            line_index: fields.len(),
+                            col_start: 0,
+                            col_end: send_col_end,
+                            target: ClickTarget::FormSend {
+                                node_id: self.node_id.to_string(),
+                                block_name,
+                            },
+                        });
+                    }
+                    return;
+                }
                 if lang == meshfox_core::BUTTON_LANG {
                     // No frame, no fill — a bold accent marker instead.
                     // The caption *is* the fence's own body (falling back
@@ -1302,7 +1465,8 @@ mod tests {
     fn a_data_url_image_becomes_a_segment_image_keyed_by_the_url_itself() {
         let hl = Highlighter::new();
         let md = "![a pixel](data:image/png;base64,iVBORw0KGgo=)\n";
-        let (segments, _clicks) = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
+        let (segments, _clicks) =
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
         let Segment::Image { path, alt, .. } = segments
             .into_iter()
             .find(|s| matches!(s, Segment::Image { .. }))
@@ -1314,11 +1478,67 @@ mod tests {
         assert_eq!(alt, "");
     }
 
+    // TUI complaint: an inline form's currently-focused field had no visible
+    // indicator at all — every row looked identical regardless of which one
+    // arrow keys/tab would actually edit. The focused row should now come
+    // back reversed (same convention `render_var_form` already uses for its
+    // own modal), and a `String`/`Int` field's value should carry a blinking
+    // `_` text cursor while it's the focused one — not otherwise.
+    #[test]
+    fn a_focused_string_field_gets_a_reversed_row_and_a_blinking_cursor() {
+        let hl = Highlighter::new();
+        let md = "```form name=\"f\"\nfield var=\"NAME\" label=\"Name\"\n```\n";
+        let decls = vec![meshfox_core::vars::VarDecl {
+            name: "NAME".to_string(),
+            prompt: "Name".to_string(),
+            var_type: meshfox_core::vars::VarType::String,
+            default: None,
+            choices: Vec::new(),
+            secret: false,
+            required: false,
+            from: None,
+            session: false,
+            default_var: None,
+            choices_var: None,
+        }];
+        let mut values = std::collections::HashMap::new();
+        values.insert("NAME".to_string(), "abc".to_string());
+
+        let (unfocused, _) = render(md, Path::new("/x"), &hl, "n", &decls, &values, None);
+        let (focused, _) = render(md, Path::new("/x"), &hl, "n", &decls, &values, Some(("f", 0)));
+
+        let value_span = |segs: &[Segment]| -> Span<'static> {
+            let Segment::Text(lines) = segs.iter().find(|s| matches!(s, Segment::Text(_))).unwrap()
+            else {
+                unreachable!()
+            };
+            lines[0].spans[1].clone()
+        };
+        let unfocused_value = value_span(&unfocused);
+        let focused_value = value_span(&focused);
+
+        assert_eq!(unfocused_value.content.as_ref(), "abc");
+        assert!(
+            !unfocused_value.style.add_modifier.contains(Modifier::REVERSED),
+            "an unfocused field row shouldn't be reversed"
+        );
+        assert_eq!(
+            focused_value.content.as_ref(),
+            "abc_",
+            "the focused field's own value should carry a trailing text cursor"
+        );
+        assert!(
+            focused_value.style.add_modifier.contains(Modifier::REVERSED),
+            "the focused field's row should be reversed so it's visibly the one in focus"
+        );
+    }
+
     #[test]
     fn an_http_image_is_still_inert_text_not_a_segment_image() {
         let hl = Highlighter::new();
         let md = "![x](https://example.com/pic.png)\n";
-        let (segments, _clicks) = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
+        let (segments, _clicks) =
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
         assert!(!segments.iter().any(|s| matches!(s, Segment::Image { .. })));
     }
 
@@ -1346,7 +1566,8 @@ mod tests {
     fn image_percent_attrs_become_a_sizing_hint() {
         let hl = Highlighter::new();
         let md = "![alt](pic.png){width=50% height=25%}\n";
-        let (segments, _clicks) = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
+        let (segments, _clicks) =
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
         let Segment::Image {
             width_percent,
             height_percent,
@@ -1366,7 +1587,8 @@ mod tests {
     fn image_absolute_attrs_are_parsed_but_have_no_tui_effect() {
         let hl = Highlighter::new();
         let md = "![alt](pic.png){width=300}\n";
-        let (segments, _clicks) = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
+        let (segments, _clicks) =
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
         let Segment::Image { width_percent, .. } = segments
             .into_iter()
             .find(|s| matches!(s, Segment::Image { .. }))
@@ -1381,7 +1603,8 @@ mod tests {
     fn text_right_after_an_image_with_no_attrs_marker_is_rendered_normally() {
         let hl = Highlighter::new();
         let md = "![alt](pic.png) just text\n";
-        let (segments, _clicks) = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
+        let (segments, _clicks) =
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
         assert!(segment_text(&segments).contains("just text"));
     }
 
@@ -1390,7 +1613,8 @@ mod tests {
     fn subscript_and_superscript_render_as_unicode_small_forms() {
         let hl = Highlighter::new();
         let md = "H~2~O and x^n^\n";
-        let (segments, _clicks) = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
+        let (segments, _clicks) =
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
         assert_eq!(segment_text(&segments), "H₂O and xⁿ");
     }
 
@@ -1398,7 +1622,8 @@ mod tests {
     fn subsup_falls_back_to_literal_when_not_fully_mapped_to_unicode() {
         let hl = Highlighter::new();
         let md = "x~query~\n";
-        let (segments, _clicks) = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
+        let (segments, _clicks) =
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
         assert_eq!(segment_text(&segments), "x~query~");
     }
 
@@ -1406,7 +1631,8 @@ mod tests {
     fn subsup_never_applies_inside_a_code_block() {
         let hl = Highlighter::new();
         let md = "```text\nx~2~\n```\n";
-        let (segments, _clicks) = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
+        let (segments, _clicks) =
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
         assert!(segment_text(&segments).contains("x~2~"));
     }
 
@@ -1416,7 +1642,8 @@ mod tests {
     fn a_gfm_alert_blockquote_gets_a_styled_title_line() {
         let hl = Highlighter::new();
         let md = "> [!WARNING]\n> be careful\n";
-        let (segments, _clicks) = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
+        let (segments, _clicks) =
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
         let text = segment_text(&segments);
         assert!(text.contains("Warning"), "{text}");
         assert!(text.contains("be careful"), "{text}");
@@ -1427,7 +1654,8 @@ mod tests {
     fn an_ordinary_blockquote_gets_no_title_line() {
         let hl = Highlighter::new();
         let md = "> just a quote\n";
-        let (segments, _clicks) = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
+        let (segments, _clicks) =
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
         let text = segment_text(&segments);
         assert!(text.contains("just a quote"), "{text}");
         assert!(!text.contains("Note"), "{text}");
@@ -1443,7 +1671,8 @@ mod tests {
     fn task_list_items_show_a_checkbox_after_their_bullet() {
         let hl = Highlighter::new();
         let md = "- [ ] todo\n- [x] done\n";
-        let (segments, _clicks) = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
+        let (segments, _clicks) =
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
         let text = segment_text(&segments);
         assert!(text.contains("[ ] todo"), "{text}");
         assert!(text.contains("[x] done"), "{text}");
@@ -1453,7 +1682,8 @@ mod tests {
     fn a_numeric_footnote_reference_renders_as_unicode_superscript() {
         let hl = Highlighter::new();
         let md = "See[^1].\n\n[^1]: A note.\n";
-        let (segments, _clicks) = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
+        let (segments, _clicks) =
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
         let text = segment_text(&segments);
         assert!(text.contains("See¹."), "{text}");
         assert!(!text.contains("[^1]"), "{text}");
@@ -1463,7 +1693,8 @@ mod tests {
     fn a_footnote_definition_gets_a_bracketed_label_and_its_body() {
         let hl = Highlighter::new();
         let md = "See[^1].\n\n[^1]: A note.\n";
-        let (segments, _clicks) = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
+        let (segments, _clicks) =
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
         let text = segment_text(&segments);
         assert!(text.contains("[1]"), "{text}");
         assert!(text.contains("A note."), "{text}");
@@ -1475,7 +1706,8 @@ mod tests {
         // 'q' has no superscript Unicode glyph, so "note" (which does map
         // fully) is deliberately not used here — want the fallback path.
         let md = "See[^query].\n\n[^query]: A note.\n";
-        let (segments, _clicks) = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
+        let (segments, _clicks) =
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
         let text = segment_text(&segments);
         assert!(text.contains("See[query]."), "{text}");
     }
@@ -1484,7 +1716,8 @@ mod tests {
     fn a_fences_own_interpreter_attr_shows_up_as_a_shebang_suffix_on_its_header() {
         let hl = Highlighter::new();
         let md = "```python name=\"seed\" interpreter=\"python3 -u\"\nprint(1)\n```\n";
-        let (segments, _clicks) = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
+        let (segments, _clicks) =
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
         let text = segment_text(&segments);
         // Exactly as written in the attribute — no case-folding — mirrors
         // the web UI's own `mesh-code-interpreter` suffix.
@@ -1495,7 +1728,8 @@ mod tests {
     fn a_fence_with_no_interpreter_attr_has_no_shebang_suffix() {
         let hl = Highlighter::new();
         let md = "```bash name=\"build\" cache\necho hi\n```\n";
-        let (segments, _clicks) = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
+        let (segments, _clicks) =
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
         let text = segment_text(&segments);
         assert!(!text.contains("#!"), "{text}");
     }
@@ -1504,7 +1738,8 @@ mod tests {
     fn a_button_fence_renders_its_body_as_the_caption_with_a_run_hint() {
         let hl = Highlighter::new();
         let md = "```button name=\"full-import\" deps=\"build\"\n🚀 Run everything\n```\n";
-        let (segments, _clicks) = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
+        let (segments, _clicks) =
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
         let text = segment_text(&segments);
         assert!(text.contains("🚀 Run everything"), "{text}");
         assert!(text.contains("(r to run)"), "{text}");
@@ -1517,7 +1752,8 @@ mod tests {
     fn a_button_fence_falls_back_to_its_name_when_the_body_is_blank() {
         let hl = Highlighter::new();
         let md = "```button name=\"full-import\" deps=\"build\"\n```\n";
-        let (segments, _clicks) = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
+        let (segments, _clicks) =
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
         let text = segment_text(&segments);
         assert!(text.contains("full-import"), "{text}");
     }
@@ -1526,7 +1762,8 @@ mod tests {
     fn a_button_fences_caption_is_rendered_as_a_bold_accent_marker() {
         let hl = Highlighter::new();
         let md = "```button name=\"full-import\" deps=\"build\"\nRun everything\n```\n";
-        let (segments, _clicks) = render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[]);
+        let (segments, _clicks) =
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
         let Segment::Text(lines) = &segments[0] else {
             panic!("expected a text segment");
         };

@@ -16,6 +16,7 @@ mod dotenv;
 pub mod exec;
 pub mod fence;
 pub mod file_read;
+pub mod form;
 pub mod image_attrs;
 pub mod include;
 pub mod locate;
@@ -39,16 +40,17 @@ pub use canvas::{ArrowEnd, Canvas, EdgeLineStyle, ExtraEdge, FileDisplay, Node, 
 pub use constraint::{evaluate as evaluate_constraints, ConstraintResult, ConstraintStatus};
 pub use deps::{compute_forced_reruns, BlockAddr, DepsError};
 pub use exec::{
-    interpreter_var_refs, is_button, is_supported_lang, resolve_command, resolve_interpreter,
-    split_interpreter, ResolvedCommand, BUTTON_LANG,
+    interpreter_var_refs, is_button, is_form, is_supported_lang, resolve_command,
+    resolve_interpreter, split_interpreter, ResolvedCommand, BUTTON_LANG, FORM_LANG,
 };
 pub use fence::{
     fingerprint, parse_deps_list, parse_env_list, scan_code_blocks, scan_runnable_blocks,
-    session_fingerprint, BlockRef, CodeBlock, EnvRef,
+    session_fingerprint, BlockRef, CodeBlock, EnvRef, RENDER_KINDS,
 };
 pub use file_read::{
     confine, preview, ConfineError, FilePreview, PreviewError, FILE_PREVIEW_MAX_BYTES,
 };
+pub use form::{form_block, parse_form_body, FormBlock, FormError, FormField};
 pub use include::IncludeError;
 pub use locate::{locate_node, LocateError, LocatedNode};
 pub use mdcanvas::{parse_fold_override, parse_tags, FenceAttrsPatch, NodeMeta, ParseError};
@@ -166,14 +168,7 @@ pub fn env_var_names_for_chain(
             .iter()
             .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()))
         {
-            needed.extend(block.env.iter().map(|er| er.var_name.clone()));
-            // A block's own `interpreter=` can reference a declared
-            // variable too (`$NAME` — see `exec::interpreter_var_refs`),
-            // and needs it resolved just as much as an `env=` reference
-            // does — it's what decides what actually gets spawned.
-            if let Some(spec) = &block.interpreter {
-                needed.extend(exec::interpreter_var_refs(spec));
-            }
+            needed.extend(direct_var_seed(block));
         }
     }
     // Not just the names literally in each block's own env= -- a var
@@ -187,6 +182,58 @@ pub fn env_var_names_for_chain(
     // parse error is `meshfox validate`'s job to report, not this one's.
     let decls = vars::declared_vars(canvas).unwrap_or_default();
     vars::close_over_var_refs(&decls, needed.iter().map(String::as_str))
+}
+
+/// Every declared-variable name `block` itself directly references, via
+/// either `env=` or (if it's a whole `$NAME` token) `interpreter=` — the
+/// *seed* a closure over `default_var=`/`choices_var=` (`vars::
+/// close_over_var_refs`) starts from. Shared by `env_var_names_for_chain`
+/// (which unions this across a whole chain) and
+/// `autorun_blocks_for_changed_vars` (which needs it per block, to decide
+/// whether *this one* block cares about a variable that just changed).
+fn direct_var_seed(block: &CodeBlock) -> Vec<String> {
+    let mut names: Vec<String> = block.env.iter().map(|e| e.var_name.clone()).collect();
+    if let Some(spec) = &block.interpreter {
+        names.extend(exec::interpreter_var_refs(spec));
+    }
+    names
+}
+
+/// Every `autorun`-flagged block anywhere in `canvas` whose own variable
+/// closure (`env=`/`interpreter=`, transitively through `default_var=`/
+/// `choices_var=` — see `direct_var_seed`/`vars::close_over_var_refs`)
+/// intersects `changed` — the addresses a live session (the web server,
+/// the TUI) should re-run for real, unprompted, right after committing a
+/// new resolved value for one or more of `changed`'s names (typically a
+/// `form` fence's own Send — see SPEC.md's "Form fences"). This only
+/// decides *which* blocks to re-run, not *how*: the caller still goes
+/// through the ordinary `deps::resolve_chain`/`compute_forced_reruns`
+/// machinery for each one, exactly as a manually-triggered "run chain"
+/// already would — `autorun` changes when a run starts, never what
+/// running it does. A malformed `meshfox:var` declaration anywhere in the
+/// document degrades to "no closure beyond the literal names", same
+/// graceful-degradation posture `env_var_names_for_chain` already takes,
+/// rather than failing this lookup entirely.
+pub fn autorun_blocks_for_changed_vars(
+    canvas: &Canvas,
+    changed: &std::collections::HashSet<String>,
+) -> Vec<BlockAddr> {
+    let decls = vars::declared_vars(canvas).unwrap_or_default();
+    let mut out = Vec::new();
+    for node in &canvas.nodes {
+        for block in scan_runnable_blocks(&node.id, &node.text) {
+            if !block.autorun {
+                continue;
+            }
+            let Some(name) = &block.name else { continue };
+            let seed = direct_var_seed(&block);
+            let closure = vars::close_over_var_refs(&decls, seed.iter().map(String::as_str));
+            if closure.iter().any(|n| changed.contains(n)) {
+                out.push(BlockAddr::new(node.id.clone(), name.clone()));
+            }
+        }
+    }
+    out
 }
 
 /// Resolves `path` + `block_name` to the block to actually address: tries
@@ -390,6 +437,59 @@ mod tests {
         assert_eq!(
             needed,
             ["X".to_string(), "BASE".to_string()].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn autorun_blocks_for_changed_vars_finds_a_block_that_autorun_references_the_changed_var() {
+        let doc = concat!(
+            "# Project\n\n## Tests\n<!-- meshfox:node -->\n\n",
+            "```bash name=\"build\" env=\"$X\" autorun\necho build\n```\n",
+        );
+        let canvas = Canvas::from_markdown(doc).unwrap();
+        let changed = ["X".to_string()].into_iter().collect();
+        assert_eq!(
+            autorun_blocks_for_changed_vars(&canvas, &changed),
+            vec![BlockAddr::new("tests", "build")]
+        );
+    }
+
+    #[test]
+    fn autorun_blocks_for_changed_vars_skips_a_non_autorun_block() {
+        let doc = concat!(
+            "# Project\n\n## Tests\n<!-- meshfox:node -->\n\n",
+            "```bash name=\"build\" env=\"$X\"\necho build\n```\n",
+        );
+        let canvas = Canvas::from_markdown(doc).unwrap();
+        let changed = ["X".to_string()].into_iter().collect();
+        assert!(autorun_blocks_for_changed_vars(&canvas, &changed).is_empty());
+    }
+
+    #[test]
+    fn autorun_blocks_for_changed_vars_skips_an_autorun_block_that_does_not_reference_it() {
+        let doc = concat!(
+            "# Project\n\n## Tests\n<!-- meshfox:node -->\n\n",
+            "```bash name=\"build\" env=\"$Y\" autorun\necho build\n```\n",
+        );
+        let canvas = Canvas::from_markdown(doc).unwrap();
+        let changed = ["X".to_string()].into_iter().collect();
+        assert!(autorun_blocks_for_changed_vars(&canvas, &changed).is_empty());
+    }
+
+    #[test]
+    fn autorun_blocks_for_changed_vars_finds_a_reference_reached_only_through_default_var() {
+        let doc = concat!(
+            "# Project\n\n",
+            "<!-- meshfox:var name=\"BASE\" default=\"1\" -->\n",
+            "<!-- meshfox:var name=\"X\" default_var=\"BASE\" -->\n\n",
+            "## Tests\n<!-- meshfox:node -->\n\n",
+            "```bash name=\"build\" env=\"$X\" autorun\necho build\n```\n",
+        );
+        let canvas = Canvas::from_markdown(doc).unwrap();
+        let changed = ["BASE".to_string()].into_iter().collect();
+        assert_eq!(
+            autorun_blocks_for_changed_vars(&canvas, &changed),
+            vec![BlockAddr::new("tests", "build")]
         );
     }
 

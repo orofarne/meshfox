@@ -93,6 +93,19 @@ impl SpawnedProcess {
 /// carries its own `interpreter=` attribute naming one explicitly. See
 /// `spawn_block`.
 pub fn supports(block: &meshfox_core::CodeBlock) -> bool {
+    // A `form` fence is addressable (`scan_runnable_blocks` picks it up,
+    // same as `button`, so a form's own `field var=`/`send=` can be
+    // resolved/submitted by id+name) but never *runnable* in this sense —
+    // it has no real code, and (unlike `button`) no `deps=` chain either,
+    // since `crate::deps::validate` rejects both `deps=` and `autorun` on
+    // one. Rejecting it here, rather than letting it fall through to
+    // `is_supported_lang`'s otherwise-true answer, is what makes `meshfox
+    // run`/`POST /api/run` against a form block fail with a clear
+    // "no executor registered for language \"form\"" instead of silently
+    // spawning a no-op the way a `button` fence legitimately does.
+    if meshfox_core::is_form(&block.lang) {
+        return false;
+    }
     block.interpreter.is_some() || meshfox_core::is_supported_lang(&block.lang)
 }
 
@@ -639,6 +652,21 @@ mod tests {
         assert!(supports(&test_block("sh", None, "echo hi")));
     }
 
+    #[test]
+    fn a_form_fence_is_never_reported_as_supported() {
+        // Unlike `button` (a legitimate no-op target, run for its `deps=`
+        // chain), a `form` fence has no real code and no `deps=` chain —
+        // `meshfox run`/`POST /api/run` against one should fail loudly,
+        // not silently spawn a no-op.
+        let md = "```form name=\"x\"\nfield var=\"Y\"\n```\n";
+        let block = meshfox_core::scan_code_blocks(md).remove(0);
+        assert!(!supports(&block));
+        // `button` stays a supported no-op, unaffected by this.
+        let md = "```button name=\"go\"\nRun it\n```\n";
+        let block = meshfox_core::scan_code_blocks(md).remove(0);
+        assert!(supports(&block));
+    }
+
     fn block_with_lang(lang: &str) -> meshfox_core::CodeBlock {
         meshfox_core::CodeBlock {
             lang: lang.to_string(),
@@ -649,6 +677,9 @@ mod tests {
             autoclose: false,
             service: false,
             always: false,
+            autorun: false,
+            render: None,
+            fold: false,
             deps: Vec::new(),
             env: Vec::new(),
             interpreter: None,

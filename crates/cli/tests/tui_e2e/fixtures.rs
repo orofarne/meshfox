@@ -105,3 +105,17 @@ pub const WIDE_OUTPUT_LINE: &str = concat!(
     "echo \"${a}-${b}-${mid}-${c}-${d}\"\n",
     "```\n",
 );
+
+/// A `session` var, a `form` fence exposing it as one field, and an
+/// `autorun` block whose `env=` references it — the smallest fixture that
+/// exercises the whole `render=`/`form`/`autorun` chain end to end:
+/// the form has to render inline (not as raw code), typing into its field
+/// and clicking its Send marker has to commit the value, and that alone —
+/// with no `r` press — has to start `show`'s own chain. Used by
+/// `mouse_form.rs`.
+pub const FORM_AUTORUN: &str = concat!(
+    "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+    "<!-- meshfox:var name=\"GREETING\" session -->\n\n",
+    "```form name=\"pick\" send=\"Send\"\nfield var=\"GREETING\" label=\"Greeting\"\n```\n\n",
+    "```bash name=\"show\" env=\"$GREETING\" autorun\necho \"greeting is $GREETING\"\n```\n",
+);

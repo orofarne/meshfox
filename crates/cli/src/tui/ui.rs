@@ -637,12 +637,49 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let lines: Option<&[String]> = if let Some(run) = &app.run {
-        Some(&run.lines)
+    // The plain `==>`/exit-code transcript, always shown as-is — plus, once
+    // a step whose own block declared `output="markdown"` is done, that
+    // step's captured stdout rendered as real Markdown right below it (see
+    // `RunState::output_markdown`'s own doc comment). Mirrors the "raw
+    // while running, rendered once done" treatment the web UI's own live
+    // view (`MeshNode.tsx`'s `LiveRunOutput`) already gives it — until now
+    // this pane never looked at `output=` at all, so a `cache`-less
+    // `output="markdown"` block (nothing for `write_output` to ever splice
+    // into the Document pane) had nowhere it would *ever* render as
+    // anything but raw text.
+    let content: Option<Vec<Line<'static>>> = if let Some(run) = &app.run {
+        let mut lines: Vec<Line<'static>> = run.lines.iter().map(|l| Line::from(l.clone())).collect();
+        if run.finished && run.output_markdown && !run.stdout_only.trim().is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::styled("── rendered markdown ──", Style::default().fg(super::theme::DEP)));
+            let base_dir = app
+                .canvas_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .to_path_buf();
+            let node_id = run.chain.last().map(|a| a.node_id.as_str()).unwrap_or("");
+            let (segs, _clicks) = super::markdown::render(
+                &run.stdout_only,
+                &base_dir,
+                &app.highlighter,
+                node_id,
+                &[],
+                &HashMap::new(),
+                None,
+            );
+            for seg in segs {
+                if let Segment::Text(seg_lines) = seg {
+                    lines.extend(seg_lines);
+                }
+            }
+        }
+        Some(lines)
     } else {
-        app.file_run.as_ref().map(|run| run.lines.as_slice())
+        app.file_run
+            .as_ref()
+            .map(|run| run.lines.iter().map(|l| Line::from(l.clone())).collect())
     };
-    let text: Text = if let Some(lines) = lines {
+    let text: Text = if let Some(lines) = content {
         // `output_scroll` counts lines back from the bottom (see its own
         // doc comment) — clamped here (not in `App::scroll_output`, same
         // "state is unclamped, rendering clamps" convention `doc_scroll`/
@@ -653,12 +690,7 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
         let scroll = (app.output_scroll as usize).min(max_scroll);
         let end = lines.len() - scroll;
         let start = end.saturating_sub(take);
-        Text::from(
-            lines[start..end]
-                .iter()
-                .map(|l| Line::from(l.as_str()))
-                .collect::<Vec<_>>(),
-        )
+        Text::from(lines[start..end].to_vec())
     } else if !app.status.is_empty() {
         Text::from(Line::from(Span::styled(
             app.status.as_str(),
@@ -1142,6 +1174,10 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         "e               edit this node's own file, full-screen (Ctrl-s save,",
         "                Ctrl-f switch file, Ctrl-n heading->node, Ctrl-p",
         "                suggest attributes/tags, mouse click/drag/scroll, esc close)",
+        "i               (Document focus) open/focus this node's own form —",
+        "                tab/down next field, shift-tab/up previous, left/right",
+        "                toggle a bool or cycle a select, enter submits the whole",
+        "                form, esc stops editing (leaves it open, still visible)",
     ];
     if app.selected_is_open_target() {
         items.push("o               open this file node's target in the OS's default application");
@@ -1162,7 +1198,7 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
     items.extend([
         "PageUp/Down     scroll the focused pane (document or output)",
         "Ctrl-u / Ctrl-d scroll the focused pane (document or output)",
-        "?               toggle this help",
+        "?               toggle this help (j/k/PageUp/Down scroll it while open)",
         "q / esc         quit",
         "",
         "mouse: click a tree row to select it, or its ▾/▸ marker to",
@@ -1179,17 +1215,47 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         "same as `meshfox run` — this UI reappears once it exits",
     ]);
 
-    let rect = centered_rect(62, items.len() as u16 + 2, area);
+    // A handful of these lines run past 60 columns (the old fixed-62-wide
+    // box's own usable width, after its 2-column border) — with no
+    // `.wrap()`, `Paragraph` just clips a line at the pane's right edge
+    // instead of wrapping it, which is what actually cut text off (not a
+    // vertical scrolling problem, though a short terminal still needs one
+    // too — see below). 78 comfortably fits every line here as of this
+    // writing; still `.wrap()`ped regardless, so a future longer line (or a
+    // narrower real terminal, via `centered_rect`'s own `.min(area.width)`)
+    // degrades to wrapping instead of silently truncating again.
+    let outer_width = 78u16.min(area.width);
+    let inner_width = outer_width.saturating_sub(2);
+    let lines = items.into_iter().map(Line::from).collect::<Vec<_>>();
+    let measured = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
+    let total_rows = measured.line_count(inner_width) as u16;
+
+    // Sized to fit every (wrapped) row when the terminal is tall enough,
+    // same as before — only a short terminal now caps the box height and
+    // relies on `help_scroll` (below) to reach the rest, instead of
+    // silently dropping whatever didn't fit.
+    let outer_height = (total_rows + 2).min(area.height);
+    let rect = centered_rect(outer_width, outer_height, area);
     f.render_widget(Clear, rect);
+    let inner_height = rect.height.saturating_sub(2);
+    let max_scroll = total_rows.saturating_sub(inner_height);
+    let scroll = app.help_scroll.min(max_scroll);
+    let title = if max_scroll > 0 {
+        format!(" keybindings (↑/↓ scroll — {scroll}/{max_scroll}) ")
+    } else {
+        " keybindings ".to_string()
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ACCENT))
-        .title(" keybindings ");
+        .title(title);
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
-    let lines = items.into_iter().map(Line::from).collect::<Vec<_>>();
-    f.render_widget(Paragraph::new(lines), inner);
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((scroll, 0)),
+        inner,
+    );
 }
 
 /// The fullscreen source editor (`e`) — header (which file, dirty state),
@@ -1506,6 +1572,167 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A finished step whose own block declares `output="markdown"` gets its
+    // captured stdout rendered as real Markdown in the Output pane, not
+    // left as literal `| a | b |` pipe-table text — see
+    // `RunState::output_markdown`'s own doc comment for why this pane
+    // needed to start looking at `output=` at all. `render_output` never
+    // executes anything itself — `run` is built by hand, exactly the shape
+    // `advance_run`/`on_output_line` would have left it in once a
+    // `output="markdown"` step finishes.
+    #[test]
+    fn render_output_shows_a_finished_output_markdown_steps_stdout_as_a_real_table() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use meshfox_core::deps::BlockAddr;
+
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-render-output-markdown-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.canvas.md");
+        std::fs::write(
+            &path,
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+             ```bash name=\"table\" cache output=\"markdown\"\necho hi\n```\n",
+        )
+        .unwrap();
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(path.clone(), tx, None).expect("valid test canvas");
+        app.run = Some(crate::tui::app::RunState {
+            chain: vec![BlockAddr::new("root", "table")],
+            idx: 1,
+            proc: None,
+            lines: vec!["==> table".to_string(), "(exit 0 · 5ms)".to_string()],
+            full_output: String::new(),
+            stdout_only: "| score | name |\n|---|---|\n| 1.0 | ZMARKERZ |\n".to_string(),
+            stderr_only: String::new(),
+            output_markdown: true,
+            step_started: std::time::Instant::now(),
+            current_node_text: String::new(),
+            had_failure: false,
+            killed: false,
+            finished: true,
+            pending_vars_out: None,
+            forced_reruns: Default::default(),
+        });
+
+        let backend = TestBackend::new(40, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let area = Rect::new(0, 0, 40, 20);
+        terminal.draw(|f| render_output(f, area, &app)).unwrap();
+
+        let buf = terminal.backend().buffer();
+        let mut screen = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if let Some(cell) = buf.cell((x, y)) {
+                    screen.push_str(cell.symbol());
+                }
+            }
+            screen.push('\n');
+        }
+        assert!(
+            screen.contains("ZMARKERZ"),
+            "the table's own cell text should be on screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("|---|---|"),
+            "the raw pipe-table syntax should have been rendered, not left as literal text:\n{screen}"
+        );
+        assert!(
+            screen.contains("───"),
+            "a real rendered table draws its own header rule (render_table's `─` line):\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn test_app() -> App {
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-render-help-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.canvas.md");
+        std::fs::write(&path, "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n").unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(path, tx, None).expect("valid test canvas")
+    }
+
+    fn render_to_screen(area: Rect, mut draw: impl FnMut(&mut ratatui::Frame)) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f)).unwrap();
+        let buf = terminal.backend().buffer();
+        let mut screen = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if let Some(cell) = buf.cell((x, y)) {
+                    screen.push_str(cell.symbol());
+                }
+            }
+            screen.push('\n');
+        }
+        screen
+    }
+
+    // A long keybindings-help line (over the box's old fixed 60-usable-
+    // column width) used to just get cut off at the right border —
+    // `Paragraph` clips instead of wrapping without an explicit `.wrap()`.
+    // On a narrow terminal, `render_help` now wraps it onto another row
+    // instead — its own tail text should still be on screen somewhere,
+    // not silently dropped.
+    #[test]
+    fn render_help_wraps_a_long_line_instead_of_clipping_it() {
+        let mut app = test_app();
+        app.show_help = true;
+        let area = Rect::new(0, 0, 40, 40);
+        let screen = render_to_screen(area, |f| render_help(f, area, &app));
+        assert!(
+            screen.contains("esc close)"),
+            "a long help line's own tail should still appear (wrapped), not be clipped off:\n{screen}"
+        );
+    }
+
+    // On a terminal too short to fit every keybindings-help line at once,
+    // the last line used to just be silently dropped (`Paragraph` clips
+    // instead of scrolling without an explicit `.scroll()`). Scrolling
+    // (`App::help_scroll`, driven by `on_help_key`) should reach it.
+    #[test]
+    fn render_help_scrolls_to_reach_content_that_does_not_fit() {
+        let mut app = test_app();
+        app.show_help = true;
+        let area = Rect::new(0, 0, 100, 10);
+        let unscrolled = render_to_screen(area, |f| render_help(f, area, &app));
+        assert!(
+            !unscrolled.contains("this UI reappears once it exits"),
+            "the last help line shouldn't already be visible on such a short terminal:\n{unscrolled}"
+        );
+
+        // `render_help` clamps `help_scroll` against the actual wrapped
+        // row count (see its own doc comment) — a value this large just
+        // means "scroll all the way to the bottom", same as
+        // `on_help_key`'s own repeated-`j`/`PageDown` presses would
+        // eventually reach.
+        app.help_scroll = u16::MAX;
+        let scrolled = render_to_screen(area, |f| render_help(f, area, &app));
+        assert!(
+            scrolled.contains("this UI reappears once it exits"),
+            "scrolling down should eventually reach the last help line:\n{scrolled}"
+        );
     }
 
     // TODO.canvas.md: "Tags in TUI" — end to end through `render_tree`

@@ -209,6 +209,26 @@ export interface CodeSegment {
    * `defaultBlockName`), whether or not this flag is set — same "explicit
    * flag OR self-named" rule `core::fence::is_default` uses. */
   default: boolean;
+  /** Mirrors `core::fence::CodeBlock.autorun` — in a live session, re-runs
+   * this block's full chain automatically whenever a variable it
+   * references changes, instead of waiting for a manual run. See SPEC.md's
+   * "Runnable code fences" and `App.tsx`'s autorun-triggered-run handling. */
+  autorun: boolean;
+  /** Mirrors `core::fence::CodeBlock.render` — swaps this block's default
+   * display from "code + run controls" to a custom widget for the named
+   * kind (today, only `"form"`); `undefined` when unset. See SPEC.md's
+   * "Runnable code fences". UI-hint only, same convention as the rest of
+   * this file — `MeshNode.tsx` actually dispatches on `lang === FORM_LANG`
+   * for the one kind that exists today, not on this field; it's parsed
+   * here purely so a future kind has somewhere to read it from. */
+  render?: string;
+  /** Mirrors `core::fence::CodeBlock.fold` — this block's own source
+   * starts collapsed (its output still shows regardless — see
+   * `MeshNode.tsx`'s `RunnableCodeBlock`) instead of the usual expanded
+   * default; one click on the same fold toggle next to the block's
+   * language label expands it back. Purely a per-block authored default,
+   * not a document-wide setting — see SPEC.md's "Runnable code fences". */
+  fold: boolean;
   /** Mirrors `core::fence::CodeBlock.interpreter` — a shebang-style
    * command+flags string (`interpreter="python3 -u"`) this block runs
    * under instead of the implicit `bash`/`sh` executor. When set, `lang`
@@ -277,13 +297,20 @@ function fenceIndentOk(line: string): boolean {
  * that just errors when clicked, since the server's own
  * `candidate_fences` never considered it a candidate to begin with. */
 function isSupportedLang(lang: string): boolean {
-  return lang === "bash" || lang === "sh" || lang === BUTTON_LANG;
+  return lang === "bash" || lang === "sh" || lang === BUTTON_LANG || lang === FORM_LANG;
 }
 
 /** Mirrors `core::exec::BUTTON_LANG` — the fence "language" for a `button`
  * shortcut fence: always runnable, but its own body is never executed (see
  * `CodeSegment.label`/SPEC.md's "Button fences"). */
 export const BUTTON_LANG = "button";
+
+/** Mirrors `core::exec::FORM_LANG` — the fence "language" for a `form`
+ * fence (SPEC.md's "Form fences"): also always runnable-addressable (same
+ * non-executing family as `button`), but its own body is a `field var=`
+ * list rather than a caption — see `parseFormFields`/`MeshNode.tsx`'s
+ * `FormBlock`. */
+export const FORM_LANG = "form";
 
 /** A fence is a runnable candidate if its `lang` is one `isSupportedLang`
  * already knows, or it carries its own `interpreter=` attribute naming
@@ -476,6 +503,9 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
     const autoclose = attrs.autoclose !== undefined && attrs.autoclose !== "false";
     const service = attrs.service !== undefined && attrs.service !== "false";
     const isDefault = attrs.default !== undefined && attrs.default !== "false";
+    const autorun = attrs.autorun !== undefined && attrs.autorun !== "false";
+    const render = attrs.render;
+    const fold = attrs.fold !== undefined && attrs.fold !== "false";
     const outputMarkdown = attrs.output === "markdown";
     const interpreter = attrs.interpreter;
     const envRefs = attrs.env !== undefined ? parseEnvList(attrs.env) : [];
@@ -517,7 +547,7 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
       }
     }
 
-    segments.push({ type: "code", lang, name, cache, tty, autoclose, service, deps, envRefs, default: isDefault, outputMarkdown, interpreter, code: codeLines.join("\n"), output });
+    segments.push({ type: "code", lang, name, cache, tty, autoclose, service, deps, envRefs, default: isDefault, autorun, render, fold, outputMarkdown, interpreter, code: codeLines.join("\n"), output });
     i = cursor;
   }
   flushMarkdown();
@@ -547,4 +577,35 @@ export function defaultBlock(markdown: string, nodeId: string): CodeSegment | nu
  * flag too. */
 export function defaultBlockName(markdown: string, nodeId: string): string | null {
   return defaultBlock(markdown, nodeId)?.name ?? null;
+}
+
+/** One `field var="NAME" [label="..."]` line of a `form` fence's body —
+ * mirrors `core::form::FormField`. */
+export interface FormField {
+  var: string;
+  label?: string;
+}
+
+/**
+ * Parses a `form`-lang fence's own body into its `field` list, in document
+ * order — direct port of `core::form::parse_form_body`'s line-based
+ * grammar: a blank line is ignored, every other line must be `field ...`.
+ * UI-hint only (see `CodeSegment.render`'s own doc comment) — a malformed
+ * line (anything not blank and not starting with `field`) is silently
+ * skipped here rather than erroring, since `meshfox validate`/the server's
+ * `GET /api/form/fields` are the actual authority on whether a form is
+ * well-formed; this only ever feeds a best-effort inline render.
+ */
+export function parseFormFields(code: string): FormField[] {
+  const fields: FormField[] = [];
+  for (const rawLine of code.split("\n")) {
+    const line = rawLine.trim();
+    if (line.length === 0) continue;
+    if (line !== "field" && !line.startsWith("field ") && !line.startsWith("field\t")) continue;
+    const rest = line.slice("field".length);
+    const attrs = attrsFromTokens(tokenize(rest));
+    if (attrs.var === undefined) continue;
+    fields.push({ var: attrs.var, label: attrs.label });
+  }
+  return fields;
 }

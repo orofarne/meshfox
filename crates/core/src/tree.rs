@@ -60,6 +60,44 @@ impl Canvas {
         Ok(current)
     }
 
+    /// The inverse of `resolve_path`: given a node's own (flat) `id`,
+    /// returns the same root-excluding id-path that would resolve back to
+    /// it — `[]` for the root itself, `["tests", "smoke-test"]` for a node
+    /// reached that way. Walks `Node::parent` upward rather than searching
+    /// down from the root, so it's cheap even for a node deep in a large
+    /// tree. `None` if `node_id` doesn't exist, or (defensively) if
+    /// following `parent` links ever revisits a node already seen — a
+    /// cycle that shouldn't exist in a well-formed `Canvas` (parsing
+    /// already rejects one), but this is the one place that would
+    /// otherwise loop forever if it somehow did.
+    ///
+    /// For a caller that already has a resolved node id (e.g.
+    /// `meshfox_core::BlockAddr::node_id`, from `deps::resolve_chain`/
+    /// `autorun_blocks_for_changed_vars`) and needs to address it the same
+    /// `path` + `block_name` way the CLI/web API's `resolve_run_chain`
+    /// does, without re-deriving a path by hand.
+    pub fn id_path_to(&self, node_id: &str) -> Option<Vec<String>> {
+        let mut segments = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut current = self.node(node_id)?;
+        loop {
+            if !seen.insert(current.id.clone()) {
+                return None;
+            }
+            segments.push(current.id.clone());
+            match &current.parent {
+                Some(parent_id) => current = self.node(parent_id)?,
+                None => {
+                    // `current` is the root -- not itself part of the path.
+                    segments.pop();
+                    break;
+                }
+            }
+        }
+        segments.reverse();
+        Some(segments)
+    }
+
     /// Every runnable code block in the canvas, in tree order (depth-first,
     /// same traversal shape `mdcanvas::render_node` uses), each paired with
     /// the node-id path to reach its owning node from the root.
@@ -151,6 +189,31 @@ mod tests {
         let c = sample();
         let node = c.resolve_path(&["tests", "examples", "test1"]).unwrap();
         assert_eq!(node.id, "test1");
+    }
+
+    #[test]
+    fn id_path_to_is_the_inverse_of_resolve_path() {
+        let c = sample();
+        assert_eq!(
+            c.id_path_to("test1"),
+            Some(vec!["tests".to_string(), "examples".to_string(), "test1".to_string()])
+        );
+        // Round-trips back through resolve_path.
+        let path = c.id_path_to("test1").unwrap();
+        let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
+        assert_eq!(c.resolve_path(&path_refs).unwrap().id, "test1");
+    }
+
+    #[test]
+    fn id_path_to_is_empty_for_the_root_itself() {
+        let c = sample();
+        assert_eq!(c.id_path_to("root"), Some(Vec::new()));
+    }
+
+    #[test]
+    fn id_path_to_is_none_for_an_unknown_id() {
+        let c = sample();
+        assert_eq!(c.id_path_to("nope"), None);
     }
 
     #[test]

@@ -62,8 +62,20 @@ pub enum DepsError {
     ServiceCacheConflict(String, String),
     #[error("node {0:?} block {1:?}: a `button` fence can't also carry `{2}` — it has no real code of its own to run under it")]
     ButtonAttrConflict(String, String, &'static str),
+    #[error("node {0:?} block {1:?}: a `form` fence can't also carry `{2}` — it has no real code of its own to run under it, and no \"done\" state for a dependency/dependent edge to mean anything")]
+    FormAttrConflict(String, String, &'static str),
+    #[error("node {0:?} block {1:?}: `autorun` and `tty` are mutually exclusive — there's no human to hand a terminal to when a variable changes unattended")]
+    AutorunTtyConflict(String, String),
+    #[error("node {0:?} block {1:?}: `send=` only means anything on a `form` fence")]
+    SendWithoutForm(String, String),
+    #[error("node {0:?} block {1:?}: unknown render={2:?} — known kinds are {3:?}")]
+    UnknownRenderKind(String, String, String, &'static [&'static str]),
+    #[error("node {0:?} block {1:?}: `deps=` names {2:?}, a `form` fence — a form has no \"done\" state, so nothing can depend on it")]
+    FormCannotBeDepsTarget(String, String, BlockAddr),
     #[error(transparent)]
     Vars(#[from] crate::vars::VarsError),
+    #[error(transparent)]
+    Form(#[from] crate::form::FormError),
 }
 
 pub fn resolve_ref(owner_node_id: &str, r: &BlockRef) -> BlockAddr {
@@ -352,6 +364,22 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
             if block.service && block.cache {
                 return Err(DepsError::ServiceCacheConflict(node.id.clone(), name.clone()));
             }
+            if block.autorun && block.tty {
+                return Err(DepsError::AutorunTtyConflict(node.id.clone(), name.clone()));
+            }
+            if block.attrs.contains_key("send") && !crate::exec::is_form(&block.lang) {
+                return Err(DepsError::SendWithoutForm(node.id.clone(), name.clone()));
+            }
+            if let Some(kind) = &block.render {
+                if !crate::fence::RENDER_KINDS.contains(&kind.as_str()) {
+                    return Err(DepsError::UnknownRenderKind(
+                        node.id.clone(),
+                        name.clone(),
+                        kind.clone(),
+                        crate::fence::RENDER_KINDS,
+                    ));
+                }
+            }
             if crate::exec::is_button(&block.lang) {
                 let conflict = if block.interpreter.is_some() {
                     Some("interpreter")
@@ -363,6 +391,8 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
                     Some("tty")
                 } else if block.service {
                     Some("service")
+                } else if block.autorun {
+                    Some("autorun")
                 } else {
                     None
                 };
@@ -371,6 +401,44 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
                         node.id.clone(),
                         name.clone(),
                         attr,
+                    ));
+                }
+            }
+            if crate::exec::is_form(&block.lang) {
+                let conflict = if block.interpreter.is_some() {
+                    Some("interpreter")
+                } else if block.cache {
+                    Some("cache")
+                } else if !block.env.is_empty() {
+                    Some("env")
+                } else if block.tty {
+                    Some("tty")
+                } else if block.service {
+                    Some("service")
+                } else if block.autorun {
+                    Some("autorun")
+                } else if !block.deps.is_empty() {
+                    Some("deps")
+                } else {
+                    None
+                };
+                if let Some(attr) = conflict {
+                    return Err(DepsError::FormAttrConflict(
+                        node.id.clone(),
+                        name.clone(),
+                        attr,
+                    ));
+                }
+                crate::form::form_block(block)?;
+            }
+            for dep in &block.deps {
+                let dep_addr = resolve_ref(&node.id, dep);
+                let dep_block = find_block(canvas, &dep_addr)?;
+                if crate::exec::is_form(&dep_block.lang) {
+                    return Err(DepsError::FormCannotBeDepsTarget(
+                        node.id.clone(),
+                        name.clone(),
+                        dep_addr,
                     ));
                 }
             }
@@ -1067,5 +1135,187 @@ mod tests {
                 BlockAddr::new("root", "validate"),
             ])
         );
+    }
+
+    #[test]
+    fn validate_catches_autorun_and_tty_on_the_same_block() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```bash name=\"shell\" tty autorun\nbash\n```\n",
+        ));
+        assert_eq!(
+            validate(&c).unwrap_err(),
+            DepsError::AutorunTtyConflict("root".to_string(), "shell".to_string())
+        );
+    }
+
+    #[test]
+    fn validate_ok_for_an_autorun_block_with_no_tty() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "<!-- meshfox:var name=\"X\" default=\"1\" -->\n\n",
+            "```bash name=\"build\" env=\"$X\" autorun\necho build\n```\n",
+        ));
+        assert!(validate(&c).is_ok());
+    }
+
+    #[test]
+    fn validate_catches_send_on_a_non_form_fence() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```bash name=\"build\" send=\"Go\"\necho build\n```\n",
+        ));
+        assert_eq!(
+            validate(&c).unwrap_err(),
+            DepsError::SendWithoutForm("root".to_string(), "build".to_string())
+        );
+    }
+
+    #[test]
+    fn validate_ok_for_a_known_render_kind() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```bash name=\"build\" render=\"form\"\necho build\n```\n",
+        ));
+        assert!(validate(&c).is_ok());
+    }
+
+    #[test]
+    fn validate_catches_an_unknown_render_kind() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```bash name=\"build\" render=\"chart\"\necho build\n```\n",
+        ));
+        assert_eq!(
+            validate(&c).unwrap_err(),
+            DepsError::UnknownRenderKind(
+                "root".to_string(),
+                "build".to_string(),
+                "chart".to_string(),
+                crate::fence::RENDER_KINDS,
+            )
+        );
+    }
+
+    #[test]
+    fn validate_ok_for_a_plain_form_fence() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "<!-- meshfox:var name=\"X\" default=\"1\" -->\n\n",
+            "```form name=\"pick\" send=\"Go\"\nfield var=\"X\"\n```\n",
+        ));
+        assert!(validate(&c).is_ok());
+    }
+
+    #[test]
+    fn validate_catches_form_with_env() {
+        let c = canvas(concat!(
+            "<!-- meshfox:var name=\"X\" default=\"1\" -->\n",
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```form name=\"pick\" env=\"X\"\n```\n",
+        ));
+        assert_eq!(
+            validate(&c).unwrap_err(),
+            DepsError::FormAttrConflict("root".to_string(), "pick".to_string(), "env")
+        );
+    }
+
+    #[test]
+    fn validate_catches_form_with_cache() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```form name=\"pick\" cache\n```\n",
+        ));
+        assert_eq!(
+            validate(&c).unwrap_err(),
+            DepsError::FormAttrConflict("root".to_string(), "pick".to_string(), "cache")
+        );
+    }
+
+    #[test]
+    fn validate_catches_form_with_tty() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```form name=\"pick\" tty\n```\n",
+        ));
+        assert_eq!(
+            validate(&c).unwrap_err(),
+            DepsError::FormAttrConflict("root".to_string(), "pick".to_string(), "tty")
+        );
+    }
+
+    #[test]
+    fn validate_catches_form_with_service() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```form name=\"pick\" service\n```\n",
+        ));
+        assert_eq!(
+            validate(&c).unwrap_err(),
+            DepsError::FormAttrConflict("root".to_string(), "pick".to_string(), "service")
+        );
+    }
+
+    #[test]
+    fn validate_catches_form_with_autorun() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```form name=\"pick\" autorun\n```\n",
+        ));
+        assert_eq!(
+            validate(&c).unwrap_err(),
+            DepsError::FormAttrConflict("root".to_string(), "pick".to_string(), "autorun")
+        );
+    }
+
+    #[test]
+    fn validate_catches_form_with_its_own_deps() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```bash name=\"build\" cache\necho build\n```\n\n",
+            "```form name=\"pick\" deps=\"build\"\n```\n",
+        ));
+        assert_eq!(
+            validate(&c).unwrap_err(),
+            DepsError::FormAttrConflict("root".to_string(), "pick".to_string(), "deps")
+        );
+    }
+
+    #[test]
+    fn validate_catches_form_with_interpreter() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```form name=\"pick\" interpreter=\"python3\"\n```\n",
+        ));
+        assert_eq!(
+            validate(&c).unwrap_err(),
+            DepsError::FormAttrConflict("root".to_string(), "pick".to_string(), "interpreter")
+        );
+    }
+
+    #[test]
+    fn validate_catches_a_form_fence_as_someone_elses_deps_target() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```form name=\"pick\"\n```\n\n",
+            "```bash name=\"build\" deps=\"pick\"\necho build\n```\n",
+        ));
+        assert_eq!(
+            validate(&c).unwrap_err(),
+            DepsError::FormCannotBeDepsTarget(
+                "root".to_string(),
+                "build".to_string(),
+                BlockAddr::new("root", "pick"),
+            )
+        );
+    }
+
+    #[test]
+    fn validate_catches_a_form_field_with_a_bad_body_line() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```form name=\"pick\"\nnot a field line\n```\n",
+        ));
+        assert!(matches!(validate(&c).unwrap_err(), DepsError::Form(_)));
     }
 }

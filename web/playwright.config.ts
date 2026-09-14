@@ -85,6 +85,17 @@ const GROUP_ENTER_FIREFOX_PORT = 4611;
 // a concurrent read/write from the other's.
 const COPY_PASTE_PORT = 4612;
 const COPY_PASTE_FIREFOX_PORT = 4613;
+// Twenty-fourth server + port for form-autorun-output.spec.ts — same
+// reasoning again, its own fixture (form-autorun-output.canvas.md, a
+// node-scoped `form` paired with an `autorun`/`output="markdown"` block)
+// and port.
+const FORM_AUTORUN_OUTPUT_PORT = 4614;
+// Twenty-fifth server + port for reload-live-run.spec.ts — same reasoning
+// again, its own fixture (reload-live-run.canvas.md, a several-seconds-
+// long block) and port, so reloading mid-run here never races a
+// concurrent run against the same block from some other suite sharing a
+// server.
+const RELOAD_LIVE_RUN_PORT = 4615;
 // Ninth server + port for document-options.spec.ts — same reasoning
 // again, its own fixture (document-options.canvas.md) and port, so its
 // own `PUT /api/options` writes never collide with any other suite's
@@ -307,6 +318,16 @@ export default defineConfig({
         baseURL: `http://127.0.0.1:${browser === "firefox" ? COPY_PASTE_FIREFOX_PORT : COPY_PASTE_PORT}`,
       },
     },
+    {
+      name: `${browser}-form-autorun-output`,
+      testMatch: /(^|\/)form-autorun-output\.spec\.ts$/,
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${FORM_AUTORUN_OUTPUT_PORT}` },
+    },
+    {
+      name: `${browser}-reload-live-run`,
+      testMatch: /(^|\/)reload-live-run\.spec\.ts$/,
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${RELOAD_LIVE_RUN_PORT}` },
+    },
   ]),
   webServer: [
     {
@@ -461,6 +482,18 @@ export default defineConfig({
     {
       command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/copy-paste-firefox.canvas.md --port ${COPY_PASTE_FIREFOX_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${COPY_PASTE_FIREFOX_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/form-autorun-output.canvas.md --port ${FORM_AUTORUN_OUTPUT_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${FORM_AUTORUN_OUTPUT_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/reload-live-run.canvas.md --port ${RELOAD_LIVE_RUN_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${RELOAD_LIVE_RUN_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
