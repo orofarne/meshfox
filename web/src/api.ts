@@ -1,4 +1,4 @@
-import type { CanvasDoc, ExtraEdgeDto, NodeType, ServiceStatusDto, VarStatus } from "./types";
+import type { CanvasDoc, CanvasNode, ExtraEdgeDto, NodeType, ServiceStatusDto, VarStatus } from "./types";
 
 export async function fetchCanvas(): Promise<CanvasDoc> {
   const res = await fetch("/api/canvas");
@@ -939,13 +939,24 @@ export async function clearLayout(): Promise<CanvasDoc> {
 const WATCH_RECONNECT_DELAYS_MS = [200, 400, 800, 1600, 3200, 3200];
 
 /**
- * Opens a long-lived connection to `/api/watch` (NDJSON, one line per event)
- * for as long as this tab stays open, transparently reconnecting (see
- * `WATCH_RECONNECT_DELAYS_MS`) whenever the connection drops. The server
- * counts each open connection as one open tab and, once every one of them
- * has stayed gone past its own grace period, exits on its own (see
- * README's roadmap) — so this is meant to be called once, for the lifetime
- * of the page, not per-request.
+ * Opens a long-lived WebSocket to `/api/watch` for as long as this tab stays
+ * open, transparently reconnecting (see `WATCH_RECONNECT_DELAYS_MS`)
+ * whenever the connection drops. The server counts each open connection as
+ * one open tab and, once every one of them has stayed gone past its own
+ * grace period, exits on its own (see README's roadmap) — so this is meant
+ * to be called once, for the lifetime of the page, not per-request.
+ *
+ * Each event the server sends carries a `seq` (see
+ * `crates/server/src/canvas_events.rs`) — this function tracks the highest
+ * one it's seen and passes it back as `?since=` on every reconnect, so a
+ * dropped connection can tell "nothing happened while I was gone" from
+ * "something did, but I can't see what any more" (the server's own
+ * backlog buffer only holds so much) instead of just resuming blind and
+ * possibly missing the one change that happened during the gap. Either the
+ * initial `"connected"` message reporting `resync: true`, or a mid-stream
+ * `"resync"` message (the *live* broadcast falling behind, a different gap
+ * than the backlog one), triggers `onChanged()` itself — a full refetch is
+ * always a safe way to resolve "can't tell what changed."
  *
  * `onChanged` fires for each `"changed"` event: the on-disk file changed
  * from underneath the server (an external edit), so the caller should
@@ -958,27 +969,41 @@ const WATCH_RECONNECT_DELAYS_MS = [200, 400, 800, 1600, 3200, 3200];
  * dead server: waking a sleeping/hibernated laptop (the loopback socket can
  * come back looking reset even though the server process never exited), and
  * — on Firefox specifically — refreshing the tab, where the outgoing page's
- * fetch can observe the connection die before its own `pagehide` handler
+ * socket can observe the connection die before its own `pagehide` handler
  * (below) has had a chance to mark it as leaving. Retrying instead of
  * reacting immediately gives both cases a chance to resolve themselves: the
  * hibernate case by the retry simply succeeding once the socket is usable
  * again, the refresh case because the retry is scheduled with `setTimeout`
  * on a page that's already being torn down by the navigation, so it never
- * actually fires. Returns a function that stops watching (aborts the
- * underlying request and any pending retry) without itself triggering
+ * actually fires. Returns a function that stops watching (closes the
+ * underlying socket and any pending retry) without itself triggering
  * `onDisconnected`.
  *
  * A reload (or any other navigation away from this tab) also closes the
- * connection out from under the fetch, from the browser's side, not this
- * function's own `AbortController` — indistinguishable, by error alone,
- * from the server itself actually having died. `pagehide` fires first in
- * the common case (reload, back/forward, closing the tab), so it's used
- * here to tell "this tab is leaving" apart from "the server is gone":
+ * connection out from under the socket, from the browser's side, not this
+ * function's own call to `.close()` — indistinguishable, by a close event
+ * alone, from the server itself actually having died. `pagehide` fires
+ * first in the common case (reload, back/forward, closing the tab), so it's
+ * used here to tell "this tab is leaving" apart from "the server is gone":
  * without it, a plain reload would misread its own connection drop as the
  * server having stopped and (see App.tsx's `serverGone`) try to close the
  * very tab that's mid-reload instead of letting it finish. The reconnect
  * retries above are the backstop for when `pagehide` loses that race.
  */
+/** `"node-upserted"`/`"node-removed"`/`"nodes-reordered"` — the precise,
+ * per-operation counterpart to `"changed"` (see `crates/server/src/lib.rs`'s
+ * own `ServerEvent` doc comment): a client that applies these in place
+ * never needs the blanket `onChanged` reload for the mutation they
+ * describe. `node` is already the exact same shape a `GET /api/canvas`
+ * response's own `nodes` array entries are (same server-side type),
+ * fully annotated (effective color, constraint status) — App.tsx's own
+ * `onNodeOp` handler patches `canvas.nodes` with it directly, no
+ * reshaping needed. */
+export type NodeOpEvent =
+  | { type: "node-upserted"; node: CanvasNode }
+  | { type: "node-removed"; nodeId: string; keepChildren: boolean }
+  | { type: "nodes-reordered"; parentId: string; childIds: string[] };
+
 export function watchChanges(
   onChanged: () => void,
   onDisconnected: () => void,
@@ -993,58 +1018,94 @@ export function watchChanges(
    * document. Optional — a caller that doesn't care about autorun-
    * triggered runs elsewhere just omits it. */
   onRunStarted?: (nodeId: string, block: string) => void,
+  /** See `NodeOpEvent`'s own doc comment. Optional — a caller that skips
+   * this just falls back to `onChanged`'s full reload for these too (see
+   * below), same graceful degradation the server's own `ServerEvent` doc
+   * comment describes for a client that doesn't know these event types
+   * at all yet. */
+  onNodeOp?: (op: NodeOpEvent) => void,
 ): () => void {
-  const controller = new AbortController();
   let leaving = false;
   let stopped = false;
   let retryTimer: ReturnType<typeof setTimeout> | undefined;
+  let socket: WebSocket | undefined;
+  // The highest `seq` seen so far, across reconnects within this page's
+  // lifetime — `undefined` until the first event ever arrives, which
+  // naturally asks for no backlog at all on the very first connect.
+  let lastSeq: number | undefined;
   const markLeaving = () => {
     leaving = true;
   };
   window.addEventListener("pagehide", markLeaving);
 
-  const connectOnce = async (onEstablished: () => void): Promise<void> => {
-    const res = await fetch("/api/watch", { signal: controller.signal });
-    if (!res.ok || !res.body) {
-      throw new Error(`GET /api/watch: ${res.status}`);
-    }
-    // A response is in hand — this attempt reached the server, so any
-    // future drop is a fresh problem and should restart the backoff from
-    // its shortest delay rather than resume wherever a much earlier,
-    // unrelated attempt left off.
-    onEstablished();
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffered = "";
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffered += decoder.decode(value, { stream: true });
-      let newlineAt: number;
-      while ((newlineAt = buffered.indexOf("\n")) >= 0) {
-        const line = buffered.slice(0, newlineAt);
-        buffered = buffered.slice(newlineAt + 1);
-        if (!line.trim()) continue;
-        const event = JSON.parse(line) as { type: string; nodeId?: string; block?: string };
-        if (event.type === "changed") {
+  const socketUrl = () => {
+    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const since = lastSeq !== undefined ? `?since=${lastSeq}` : "";
+    return `${proto}//${window.location.host}/api/watch${since}`;
+  };
+
+  const connectOnce = (onEstablished: () => void): Promise<void> =>
+    new Promise((_resolve, reject) => {
+      const ws = new WebSocket(socketUrl());
+      socket = ws;
+      ws.onopen = () => onEstablished();
+      ws.onmessage = (ev) => {
+        const event = JSON.parse(ev.data as string) as {
+          type: string;
+          seq?: number;
+          nodeId?: string;
+          block?: string;
+          resync?: boolean;
+          node?: CanvasNode;
+          keepChildren?: boolean;
+          parentId?: string;
+          childIds?: string[];
+        };
+        if (event.seq !== undefined) lastSeq = event.seq;
+        if (event.type === "changed" || (event.type === "connected" && event.resync) || event.type === "resync") {
           onChanged();
         } else if (event.type === "run-started" && event.nodeId !== undefined && event.block !== undefined) {
           onRunStarted?.(event.nodeId, event.block);
+        } else if (event.type === "node-upserted" && event.node !== undefined) {
+          if (onNodeOp) onNodeOp({ type: "node-upserted", node: event.node });
+          else onChanged();
+        } else if (
+          event.type === "node-removed" &&
+          event.nodeId !== undefined &&
+          event.keepChildren !== undefined
+        ) {
+          if (onNodeOp) onNodeOp({ type: "node-removed", nodeId: event.nodeId, keepChildren: event.keepChildren });
+          else onChanged();
+        } else if (
+          event.type === "nodes-reordered" &&
+          event.parentId !== undefined &&
+          event.childIds !== undefined
+        ) {
+          if (onNodeOp) onNodeOp({ type: "nodes-reordered", parentId: event.parentId, childIds: event.childIds });
+          else onChanged();
         }
-      }
-    }
-    // The stream ending is itself a drop (the server never sends a
-    // deliberate "goodbye" event) — fall through to the retry logic below
-    // exactly like a network error would.
-    throw new Error("GET /api/watch: stream ended");
-  };
+      };
+      // The stream ending is itself a drop (the server never sends a
+      // deliberate "goodbye" event before closing) — reject exactly like a
+      // connection error would, so the retry logic below handles both the
+      // same way. `onerror` always precedes `onclose` for a WebSocket, so
+      // driving the reject from `onclose` alone (not double-rejecting) is
+      // enough.
+      // Fires for a real drop *and* for this function's own returned
+      // `stop()` closing the socket deliberately — `run`'s own `stopped`
+      // check (below) is what tells those two apart, not anything here.
+      ws.onclose = () => {
+        if (socket === ws) socket = undefined;
+        reject(new Error("WS /api/watch: closed"));
+      };
+    });
 
   const run = (attempt: number) => {
     let established = false;
     connectOnce(() => {
       established = true;
     }).catch(() => {
-      if (leaving || stopped || controller.signal.aborted) return;
+      if (leaving || stopped) return;
       const nextAttempt = established ? 0 : attempt;
       if (nextAttempt >= WATCH_RECONNECT_DELAYS_MS.length) {
         onDisconnected();
@@ -1059,6 +1120,6 @@ export function watchChanges(
     stopped = true;
     window.removeEventListener("pagehide", markLeaving);
     if (retryTimer !== undefined) clearTimeout(retryTimer);
-    controller.abort();
+    socket?.close();
   };
 }

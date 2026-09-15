@@ -48,6 +48,7 @@ import {
   type RunEvent,
   type NodePatch,
   type ActiveRunDto,
+  type NodeOpEvent,
 } from "./api";
 import type { CanvasDoc, CanvasNode, ExtraEdgeDto, ServiceStatusDto, VarStatus } from "./types";
 import { ServicePanel } from "./ServicePanel";
@@ -70,6 +71,7 @@ import { ResetSessionConfirmDialog } from "./ResetSessionConfirmDialog";
 import { ReparentChoiceDialog } from "./ReparentChoiceDialog";
 import { DeletableEdge } from "./DeletableEdge";
 import { CanvasSourceEditor } from "./CanvasSourceEditor";
+import { ConsolePanel, type ConsoleLine } from "./ConsolePanel";
 import { getThemePreference, setThemePreference, type ThemePreference } from "./theme";
 
 const nodeTypes = { mesh: MeshNode };
@@ -255,6 +257,17 @@ function appendOutputLine(prev: LiveBlockState, event: { stream: "stdout" | "std
     stderrText: event.stream === "stderr" ? append(prev.stderrText) : prev.stderrText,
   };
 }
+
+/** How many attempts, per streamed line, the console will keep around before
+ * dropping the oldest — same order of magnitude as the server's own
+ * per-run ring buffers (`crates/server/src/run_registry.rs`'s
+ * `LOG_CAPACITY`), for the same reasoning: generous for real use, small
+ * enough to never be a real memory concern. */
+const CONSOLE_MAX_LINES = 2000;
+
+/** How long the console stays expanded after the last run activity before
+ * auto-collapsing — mirrors the TUI's own `App::CONSOLE_COLLAPSE_GRACE`. */
+const CONSOLE_COLLAPSE_GRACE_MS = 10_000;
 
 function countOccurrences(haystack: string, needle: string): number {
   if (!needle) return 0;
@@ -690,6 +703,57 @@ export default function App() {
     };
   }, [refreshLiveTtySessions]);
 
+  // The "console" — a rolling transcript of the most recent run's output,
+  // aggregated across every block it touches, independent of which node
+  // happens to be visible/selected. The TUI equivalent (`crates/cli/src/tui`'s
+  // Output pane) keeps the same shape and the same collapse/auto-expand
+  // policy — see that pane's own doc comments for the parity this mirrors.
+  // Not persisted anywhere (a plain `useState`, gone on reload) — same "just
+  // a live monitor" scope `LiveBlockState` itself already has.
+  const [consoleLines, setConsoleLines] = useState<ConsoleLine[]>([]);
+  const [consoleCollapsed, setConsoleCollapsed] = useState(true);
+  // A ref, not state — updated far too often (every streamed line) to
+  // re-render on, only ever read from the auto-collapse effect below.
+  const consoleLastActivityRef = useRef<number>(0);
+  const appendConsoleLine = useCallback(
+    (nodeId: string, block: string, event: { stream: "stdout" | "stderr"; text: string }) => {
+      consoleLastActivityRef.current = Date.now();
+      setConsoleLines((lines) => {
+        const next = [...lines, { nodeId, block, stream: event.stream, text: event.text }];
+        return next.length > CONSOLE_MAX_LINES ? next.slice(next.length - CONSOLE_MAX_LINES) : next;
+      });
+    },
+    [],
+  );
+  // Any block actively running right now, across the whole canvas — drives
+  // both "expand immediately" and the auto-collapse timer's own guard,
+  // mirroring the TUI's `console_tick`'s own `proc.is_some()` check.
+  const anyBlockRunning = nodes.some((n) =>
+    Object.values(n.data.liveBlocks).some((b) => b.status === "running" || b.status === "queued"),
+  );
+  const anyBlockRunningRef = useRef(anyBlockRunning);
+  useEffect(() => {
+    anyBlockRunningRef.current = anyBlockRunning;
+  }, [anyBlockRunning]);
+  // Opening is *not* driven from here — only a run whose own chain has 2+
+  // blocks should auto-expand the console (see `executeRun`'s own
+  // `previewChain.length >= 2` check, mirroring the TUI's
+  // `resolved_chain_len` gate); a lone block's output isn't worth losing
+  // canvas space over. This effect only ever *closes* it again, once
+  // everything has been idle for a while — regardless of why it was open.
+  useEffect(() => {
+    if (anyBlockRunning) return;
+    // Only polling while something *could* still need to re-collapse —
+    // same "true no-op once there's nothing left to check" reasoning the
+    // TUI's own guarded tick has.
+    const id = setInterval(() => {
+      if (!anyBlockRunningRef.current && Date.now() - consoleLastActivityRef.current >= CONSOLE_COLLAPSE_GRACE_MS) {
+        setConsoleCollapsed(true);
+      }
+    }, 500);
+    return () => clearInterval(id);
+  }, [anyBlockRunning]);
+
   // Folds the polled `services` list into every node's own `data.services`
   // (matched by `nodeId`) — the service-equivalent of `liveBlocks`' own
   // incremental-patch effects below, just reacting to a whole fresh list
@@ -862,6 +926,7 @@ export default function App() {
       subscribeRun(targetNodeId, blockName, 0, (event) => {
         if (!isCurrent()) return;
         if (event.type === "line") {
+          appendConsoleLine(targetNodeId, blockName, event);
           setNodes((nds) =>
             nds.map((n) => {
               if (n.id !== targetNodeId) return n;
@@ -888,7 +953,86 @@ export default function App() {
         // the rest of this app's background refreshes already have.
       });
     },
-    [beginAddressWatch, patchLiveBlock, setNodes],
+    [beginAddressWatch, patchLiveBlock, setNodes, appendConsoleLine],
+  );
+
+  // Applies one `NodeOpEvent` (see its own doc comment) to `canvas.nodes`
+  // in place — the precise counterpart to the plain reload `onChanged`
+  // below does, for a mutation made by *another* client (or a different
+  // tab/TUI on the same worker) on this exact document. Deliberately only
+  // ever patches `canvas` itself, never `nodes`/`edges` (the derived React
+  // Flow state) directly — the existing canvas-load effect already turns
+  // any `canvas` change into the right `nodes`/`edges` update (auto-layout,
+  // group nesting, every per-node callback), so reusing it here for real
+  // means this never has to duplicate (and risk drifting from) that logic.
+  const handleNodeOp = useCallback(
+    (op: NodeOpEvent) => {
+      if (sourceModeRef.current) {
+        // Same "defer, don't apply mid-edit" posture `onChanged` already
+        // has for this case — `load()` once source mode closes picks up
+        // everything that happened while it was open in one shot, this op
+        // included.
+        pendingExternalChange.current = true;
+        return;
+      }
+      if (op.type === "node-removed" && op.keepChildren) {
+        // Never actually sent today (the server falls back to a plain
+        // `changed` for its own `?children=reparent` branch — see
+        // `ServerEvent::NodeRemoved`'s own doc comment) — kept as a safe
+        // fallback rather than silently leaving orphaned `parent`
+        // references in `canvas.nodes` if a future caller ever does send
+        // it without also teaching this branch how to reparent them.
+        load();
+        return;
+      }
+      setCanvas((prev) => {
+        if (!prev) return prev;
+        if (op.type === "node-upserted") {
+          const idx = prev.nodes.findIndex((n) => n.id === op.node.id);
+          const nodes =
+            idx === -1
+              ? [...prev.nodes, op.node]
+              : prev.nodes.map((n, i) => (i === idx ? op.node : n));
+          return { ...prev, nodes };
+        }
+        if (op.type === "node-removed") {
+          // `keepChildren` is always `false` by the time execution reaches
+          // here (see the early-return above) — the whole subtree goes,
+          // found by repeatedly widening the removal set to any node whose
+          // own `parent` is already in it, until nothing new joins.
+          const toRemove = new Set<string>([op.nodeId]);
+          let grew = true;
+          while (grew) {
+            grew = false;
+            for (const n of prev.nodes) {
+              if (n.parent !== undefined && toRemove.has(n.parent) && !toRemove.has(n.id)) {
+                toRemove.add(n.id);
+                grew = true;
+              }
+            }
+          }
+          return { ...prev, nodes: prev.nodes.filter((n) => !toRemove.has(n.id)) };
+        }
+        // "nodes-reordered": reassigns `parentId`'s own children, in their
+        // existing array *slots*, to the new order `childIds` gives —
+        // every other node (including every other parent's own children)
+        // keeps its exact position, so this can never disturb anything
+        // this op doesn't actually describe.
+        const positions: number[] = [];
+        prev.nodes.forEach((n, i) => {
+          if (n.parent === op.parentId) positions.push(i);
+        });
+        const byId = new Map(prev.nodes.map((n) => [n.id, n]));
+        const nodes = [...prev.nodes];
+        op.childIds.forEach((id, i) => {
+          const node = byId.get(id);
+          const pos = positions[i];
+          if (node && pos !== undefined) nodes[pos] = node;
+        });
+        return { ...prev, nodes };
+      });
+    },
+    [load],
   );
 
   useEffect(() => {
@@ -902,9 +1046,10 @@ export default function App() {
       },
       () => setServerGone(true),
       (nodeId, block) => watchAutorunBlock(nodeId, block),
+      handleNodeOp,
     );
     return stop;
-  }, [load, watchAutorunBlock]);
+  }, [load, watchAutorunBlock, handleNodeOp]);
 
   // A `form`-lang fence's own Send button (see SPEC.md's "Form fences") —
   // commits `values` server-side and immediately starts watching every
@@ -963,6 +1108,13 @@ export default function App() {
         } catch {
           previewChain = [{ nodeId, blockName }];
         }
+      }
+      // Auto-open the console only for a real chain — a single block's own
+      // output isn't worth losing canvas space over (see the TUI's own
+      // `resolved_chain_len` gate for the same rule there).
+      if (previewChain.length >= 2) {
+        consoleLastActivityRef.current = Date.now();
+        setConsoleCollapsed(false);
       }
       const queuedByNode = new Map<string, string[]>();
       for (const addr of previewChain) {
@@ -1071,6 +1223,7 @@ export default function App() {
               });
               break;
             case "output":
+              appendConsoleLine(event.nodeId, event.block, event);
               setNodes((nds) =>
                 nds.map((n) => {
                   if (n.id !== event.nodeId) return n;
@@ -1153,7 +1306,7 @@ export default function App() {
         setError(String(e));
       }
     },
-    [canvas, editMode, load, blockGraph, setNodes, patchLiveBlock],
+    [canvas, editMode, load, blockGraph, setNodes, patchLiveBlock, appendConsoleLine],
   );
 
   // Reconciles this tab's own `liveBlocks` against the server's registry
@@ -1207,6 +1360,7 @@ export default function App() {
             if (!isCurrent()) return;
             switch (event.type) {
               case "line":
+                appendConsoleLine(run.nodeId, run.block, event);
                 setNodes((nds) =>
                   nds.map((n) => {
                     if (n.id !== run.nodeId) return n;
@@ -1240,7 +1394,7 @@ export default function App() {
         // No active runs to reconcile, or the endpoint failed — either
         // way, not worth surfacing as a page-level error.
       });
-  }, [canvas, beginAddressWatch, patchLiveBlock, setNodes]);
+  }, [canvas, beginAddressWatch, patchLiveBlock, setNodes, appendConsoleLine]);
 
   // Runs a runnable `file` node's `interpreter target` (see
   // `api.ts`'s `runFileStream`) — the file-node counterpart to
@@ -1296,6 +1450,7 @@ export default function App() {
               });
               break;
             case "output":
+              appendConsoleLine(event.nodeId, event.block, event);
               setNodes((nds) =>
                 nds.map((n) => {
                   if (n.id !== event.nodeId) return n;
@@ -1339,7 +1494,7 @@ export default function App() {
         setError(String(e));
       }
     },
-    [patchLiveBlock, setNodes],
+    [patchLiveBlock, setNodes, appendConsoleLine],
   );
 
   // Gate in front of `executeRun`: checks whether any declared
@@ -3035,6 +3190,14 @@ export default function App() {
             🛡 {constraintStats.total - constraintStats.failed}/{constraintStats.total}
           </span>
         )}
+        <button
+          type="button"
+          className="service-stats service-stats-ok"
+          title="Console — a live transcript of the most recent run's output"
+          onClick={() => setConsoleCollapsed((c) => !c)}
+        >
+          ⎙ Console
+        </button>
         {services.length > 0 && (
           <button
             type="button"
@@ -3322,6 +3485,7 @@ export default function App() {
           onClose={() => setTtySession(null)}
         />
       )}
+      <ConsolePanel open={!consoleCollapsed} lines={consoleLines} onClose={() => setConsoleCollapsed(true)} />
       {ttySessionsPanelOpen && (
         <TtySessionsPanel
           sessions={liveTtySessions}

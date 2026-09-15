@@ -37,13 +37,43 @@ fn tree_row_color(color: Option<&str>) -> Option<Color> {
     Some(Color::Rgb(r, g, b))
 }
 
+/// This node's own live run status, as far as row rendering cares —
+/// aggregated across every block belonging to it, mirroring the web UI's
+/// own `nodeRunning`/`nodeFailed` (`MeshNode.tsx`): `Running` wins over
+/// `Failed` (a node re-running a block that failed last time shows the
+/// spinner, not the X), and `Failed` means the node's own last-run block
+/// exited non-zero or was killed. Computed once per `render_tree` call
+/// (not per row) from `App.run`/`App.file_run`/`App.step_output` — see
+/// that function's own comment.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunRowState {
+    Running,
+    Failed,
+}
+
+/// A Braille "dots" spinner frame, indexed by `App::spinner_tick` — see
+/// that field's own doc comment for why a plain per-redraw counter, not
+/// wall-clock time: this pane doesn't redraw on any fixed schedule fast
+/// enough to sample every 100ms-ish slice of real time, so deriving the
+/// frame from elapsed time meant consecutive draws routinely landed many
+/// frames apart and visibly jumped. Indexing by tick count instead means
+/// every draw shows exactly the next frame after the last one drawn,
+/// however much real time actually passed in between.
+fn spinner_frame(tick: u32) -> char {
+    const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    FRAMES[tick as usize % FRAMES.len()]
+}
+
 /// Everything a tree row's title line is made of, flattened into
 /// individually-wrappable words, each carrying its own style — the title's
-/// own words, then (if present) the constraint mark, each tag, and the
-/// runnable/cache/tty badge, in that order. Keeping this as a flat word
-/// list (rather than a handful of pre-joined strings) is what lets
-/// `wrap_word_indices` below wrap the *whole* row — title, tags, and badge
-/// alike — instead of only the title while silently clipping the rest.
+/// own words, then (if present) the run-status badge, the constraint mark,
+/// the service glyph, each tag, and the runnable/cache/tty badge, in that
+/// order (same relative placement as the web UI's own title bar — run
+/// status right after the title, ahead of everything else). Keeping this
+/// as a flat word list (rather than a handful of pre-joined strings) is
+/// what lets `wrap_word_indices` below wrap the *whole* row — title, tags,
+/// and badges alike — instead of only the title while silently clipping
+/// the rest.
 /// This node's own live service state, as far as row rendering cares —
 /// aggregated across every service belonging to it (same row-level, not
 /// per-block, granularity `TreeRow::has_service` already uses). Computed
@@ -56,12 +86,27 @@ enum ServiceRowState {
     Crashed,
 }
 
-fn tree_row_words(row: &TreeRow, title_style: Style, service: Option<ServiceRowState>) -> Vec<(String, Style)> {
+fn tree_row_words(
+    row: &TreeRow,
+    title_style: Style,
+    service: Option<ServiceRowState>,
+    run_status: Option<RunRowState>,
+    spinner_tick: u32,
+) -> Vec<(String, Style)> {
     let mut words: Vec<(String, Style)> = row
         .title
         .split_whitespace()
         .map(|w| (w.to_string(), title_style))
         .collect();
+    match run_status {
+        Some(RunRowState::Running) => {
+            words.push((spinner_frame(spinner_tick).to_string(), Style::default().fg(ACCENT)));
+        }
+        Some(RunRowState::Failed) => {
+            words.push(("✗".to_string(), Style::default().fg(FAIL)));
+        }
+        None => {}
+    }
     match row.constraint_ok {
         Some(true) => words.push(("✓".to_string(), Style::default().fg(OK))),
         Some(false) => words.push(("✗".to_string(), Style::default().fg(FAIL))),
@@ -218,6 +263,15 @@ pub struct PaneLayout {
 /// what `compute_layout` itself would already refuse to shrink further.
 pub(super) const MIN_MAIN_HEIGHT: u16 = 6;
 
+/// The Tree pane's own width, in columns, while `App::tree_collapsed` is
+/// set — the Tree/Document split's counterpart to `console_collapsed`'s
+/// `Constraint::Length(1)`. Unlike Output's collapsed strip (a full-width
+/// row, plenty of room for its own title text), Tree collapses along its
+/// *width*, so there's no meaningful room left for a label — just enough
+/// for `render_tree`'s own borderless "▸" handle, still wide enough to
+/// register a click.
+pub(super) const TREE_COLLAPSED_WIDTH: u16 = 2;
+
 /// `fullscreen` (see `App::fullscreen`), when set, collapses the other two
 /// panes to empty rects and gives whichever one it names the whole area
 /// above the footer — a click/scroll's own `point_in(layout.tree, ...)`/
@@ -230,7 +284,20 @@ pub(super) const MIN_MAIN_HEIGHT: u16 = 6;
 /// tree/document horizontal split and the Output pane's own height; both
 /// are ignored while `fullscreen` is set, same as before either field
 /// existed.
-pub fn compute_layout(area: Rect, fullscreen: Option<Focus>, tree_width_pct: u16, output_height: u16) -> PaneLayout {
+/// `console_collapsed`/`tree_collapsed` (see `App`'s own fields) shrink the
+/// Output row to a 1-line strip / the Tree column to `TREE_COLLAPSED_WIDTH`
+/// instead of their usual `output_height`/`tree_width_pct` — collapsing
+/// only ever shrinks a pane along its own axis, it never disappears
+/// entirely, so it stays visible/clickable to expand manually at any time
+/// (see `App::on_mouse`'s own collapsed-strip click handling for each).
+pub fn compute_layout(
+    area: Rect,
+    fullscreen: Option<Focus>,
+    tree_width_pct: u16,
+    output_height: u16,
+    console_collapsed: bool,
+    tree_collapsed: bool,
+) -> PaneLayout {
     if let Some(pane) = fullscreen {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -246,22 +313,30 @@ pub fn compute_layout(area: Rect, fullscreen: Option<Focus>, tree_width_pct: u16
         };
     }
 
+    let output_row_height = if console_collapsed { 1 } else { output_height };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(MIN_MAIN_HEIGHT),
-            Constraint::Length(output_height),
+            Constraint::Length(output_row_height),
             Constraint::Length(FOOTER_HEIGHT),
         ])
         .split(area);
 
-    let main = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(tree_width_pct),
-            Constraint::Percentage(100 - tree_width_pct),
-        ])
-        .split(chunks[0]);
+    let main = if tree_collapsed {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(TREE_COLLAPSED_WIDTH), Constraint::Min(0)])
+            .split(chunks[0])
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(tree_width_pct),
+                Constraint::Percentage(100 - tree_width_pct),
+            ])
+            .split(chunks[0])
+    };
 
     PaneLayout {
         tree: main[0],
@@ -283,7 +358,14 @@ pub fn render(f: &mut Frame, app: &mut App) {
         return;
     }
 
-    let layout = compute_layout(area, app.fullscreen, app.tree_width_pct, app.output_height);
+    let layout = compute_layout(
+        area,
+        app.fullscreen,
+        app.tree_width_pct,
+        app.output_height,
+        app.console_collapsed,
+        app.tree_collapsed,
+    );
 
     match app.fullscreen {
         None => {
@@ -307,6 +389,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
         render_service_conflict(f, area, conflict);
     } else if let Some(sv) = &app.services_view {
         render_services_view(f, area, &*app, sv);
+    } else if let Some(tv) = &app.tty_sessions_view {
+        render_tty_sessions_view(f, area, &*app, tv);
     } else if app.show_help {
         render_help(f, area, &*app);
     }
@@ -327,6 +411,22 @@ fn type_marker(t: NodeType) -> &'static str {
 }
 
 fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
+    if app.tree_collapsed {
+        // A narrow, borderless handle — no room for a title the way
+        // Output's own collapsed strip shows one (that one collapses along
+        // its *height*, where a whole row is free for text; this collapses
+        // along *width* instead, down to `ui::TREE_COLLAPSED_WIDTH`
+        // columns). Just a repeating "▸" column instead, running the full
+        // height so the same "click anywhere on it to reopen" affordance
+        // `App::on_mouse` already gives Output's own strip works here too,
+        // regardless of which row a click actually lands on.
+        let style = pane_border(app.focus == Focus::Tree);
+        let line = format!("▸{}", " ".repeat(area.width.saturating_sub(1) as usize));
+        let lines: Vec<Line> = (0..area.height).map(|_| Line::styled(line.clone(), style)).collect();
+        f.render_widget(Paragraph::new(Text::from(lines)), area);
+        return;
+    }
+
     // Borders on both sides of the list eat 2 columns of `area.width`.
     let content_width = area.width.saturating_sub(2) as usize;
 
@@ -349,6 +449,38 @@ fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
         }
     }
 
+    // Same "aggregate per node, running wins over failed" model as the web
+    // UI's own `nodeRunning`/`nodeFailed` (`MeshNode.tsx`) — see
+    // `RunRowState`'s own doc comment. `running_node` is whichever single
+    // node currently owns the in-flight block/file run (there's only ever
+    // one foreground run at a time, see `App::advance_run`'s own doc
+    // comment); `failed_nodes` folds in every address `App.step_output`
+    // last recorded a non-zero exit for (a worker-mode kill writes one too
+    // — see `App::on_run_event`'s own `Killed` arm — since a local-mode
+    // kill already gets one for free once its process's exit status
+    // resolves, non-zero or not), plus a `file` node's own last failed run.
+    let mut running_nodes: std::collections::HashSet<&str> = app.external_running.keys().map(|addr| addr.node_id.as_str()).collect();
+    running_nodes.extend(
+        app.run
+            .as_ref()
+            .and_then(super::app::RunState::current_addr)
+            .map(|addr| addr.node_id.as_str()),
+    );
+    if let Some(file_run) = app.file_run.as_ref().filter(|f| f.proc.is_some()) {
+        running_nodes.insert(file_run.node_id.as_str());
+    }
+    let mut failed_nodes: std::collections::HashSet<&str> = app
+        .step_output
+        .iter()
+        .filter(|(_, so)| so.exit_code != 0)
+        .map(|(addr, _)| addr.node_id.as_str())
+        .collect();
+    if let Some(file_run) = &app.file_run {
+        if file_run.had_failure {
+            failed_nodes.insert(file_run.node_id.as_str());
+        }
+    }
+
     let items: Vec<ListItem> = app
         .rows
         .iter()
@@ -367,7 +499,20 @@ fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
                 None => Style::default(),
             };
 
-            let words = tree_row_words(row, title_style, service_by_node.get(&row.node_id).copied());
+            let run_status = if running_nodes.contains(row.node_id.as_str()) {
+                Some(RunRowState::Running)
+            } else if failed_nodes.contains(row.node_id.as_str()) {
+                Some(RunRowState::Failed)
+            } else {
+                None
+            };
+            let words = tree_row_words(
+                row,
+                title_style,
+                service_by_node.get(&row.node_id).copied(),
+                run_status,
+                app.spinner_tick,
+            );
             let word_widths: Vec<usize> = words.iter().map(|(t, _)| t.chars().count()).collect();
             // Row 0 also carries the indent + disclosure marker + type
             // marker; continuation rows only re-indent by the disclosure
@@ -609,7 +754,7 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
 
 fn render_output(f: &mut Frame, area: Rect, app: &App) {
     let title = if let Some(run) = &app.run {
-        if run.proc.is_some() {
+        if run.is_running() {
             " Output (running — K to kill) ".to_string()
         } else if run.killed {
             " Output (killed) ".to_string()
@@ -629,6 +774,16 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
     } else {
         " Output ".to_string()
     };
+
+    if app.console_collapsed {
+        // A 1-row strip (see `compute_layout`) — no border (there's no room
+        // for one plus content), just the same title text a click here
+        // expands back into the full pane.
+        let line = Line::styled(format!("▸{}", title.trim()), pane_border(app.focus == Focus::Output));
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(pane_border(app.focus == Focus::Output))
@@ -666,6 +821,7 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
                 &[],
                 &HashMap::new(),
                 None,
+                &HashMap::new(),
             );
             for seg in segs {
                 if let Segment::Text(seg_lines) = seg {
@@ -714,7 +870,7 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
 
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     let mut hint = String::from(
-        "tab focus · f fullscreen focused pane · j/k move/scroll · enter expand · h/l collapse/expand · r run · R run (no deps) · K kill · e edit",
+        "tab focus · f fullscreen focused pane · z collapse focused pane · j/k move/scroll · enter expand · h/l collapse/expand · r run · R run (no deps) · K kill · e edit",
     );
     if app.selected_is_open_target() {
         hint.push_str(" · o open");
@@ -724,6 +880,9 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     }
     if app.service_stats.is_some() {
         hint.push_str(" · v services");
+    }
+    if app.worker_port.is_some() {
+        hint.push_str(" · t live terminals");
     }
     hint.push_str(" · ? help · q quit");
 
@@ -1055,10 +1214,74 @@ fn render_service_conflict(f: &mut Frame, area: Rect, conflict: &ServiceConflict
 /// `(node_id, block_name)` order `App::sorted_service_keys` uses so the
 /// selected row stays put between frames. **Experimental**, see SPEC.md's
 /// "Service blocks (experimental)".
+/// One row's worth of pre-rendered display for `render_services_view` —
+/// built once, up front, from whichever of `app.services` (local mode) or
+/// `app.service_list` (worker mode, see that field's own doc comment) is
+/// actually live, so the rest of this function never needs to branch on
+/// `app.worker_port` again.
+struct ServiceRow {
+    node_id: String,
+    block_name: String,
+    line: Line<'static>,
+}
+
 fn render_services_view(f: &mut Frame, area: Rect, app: &App, sv: &ServicesViewState) {
-    let mut keys: Vec<(&String, &String)> = app.services.keys().map(|(n, b)| (n, b)).collect();
-    keys.sort();
-    let selected = sv.selected.min(keys.len().saturating_sub(1));
+    let rows: Vec<ServiceRow> = if app.worker_port.is_some() {
+        let mut list: Vec<&crate::worker_client::ServiceDto> = app.service_list.iter().collect();
+        list.sort_by(|a, b| (&a.node_id, &a.block).cmp(&(&b.node_id, &b.block)));
+        list.into_iter()
+            .map(|dto| {
+                let line = match dto.status.as_str() {
+                    "running" => Line::from(vec![
+                        Span::raw(format!("{}  ", dto.block)),
+                        Span::styled(format!("running · pid {}", dto.pid), Style::default().fg(OK)),
+                        Span::styled(format!("  {}", dto.node_id), Style::default().fg(Color::DarkGray)),
+                    ]),
+                    "crashed" => Line::from(vec![
+                        Span::raw(format!("{}  ", dto.block)),
+                        Span::styled(
+                            format!("crashed (exit {})", dto.exit_code.unwrap_or(-1)),
+                            Style::default().fg(FAIL),
+                        ),
+                        Span::styled(format!("  {}", dto.node_id), Style::default().fg(Color::DarkGray)),
+                    ]),
+                    _ => Line::from(vec![
+                        Span::raw(format!("{}  ", dto.block)),
+                        Span::styled("stopped", Style::default().fg(Color::DarkGray)),
+                        Span::styled(format!("  {}", dto.node_id), Style::default().fg(Color::DarkGray)),
+                    ]),
+                };
+                ServiceRow { node_id: dto.node_id.clone(), block_name: dto.block.clone(), line }
+            })
+            .collect()
+    } else {
+        let mut keys: Vec<(&String, &String)> = app.services.keys().map(|(n, b)| (n, b)).collect();
+        keys.sort();
+        keys.into_iter()
+            .filter_map(|(node_id, block_name)| {
+                let handle = app.services.get(&(node_id.clone(), block_name.clone()))?;
+                let line = match handle.status() {
+                    meshfox_server::services::ServiceStatus::Running => Line::from(vec![
+                        Span::raw(format!("{block_name}  ")),
+                        Span::styled(format!("running · pid {}", handle.pid), Style::default().fg(OK)),
+                        Span::styled(format!("  {node_id}"), Style::default().fg(Color::DarkGray)),
+                    ]),
+                    meshfox_server::services::ServiceStatus::Crashed { exit_code } => Line::from(vec![
+                        Span::raw(format!("{block_name}  ")),
+                        Span::styled(format!("crashed (exit {exit_code})"), Style::default().fg(FAIL)),
+                        Span::styled(format!("  {node_id}"), Style::default().fg(Color::DarkGray)),
+                    ]),
+                    meshfox_server::services::ServiceStatus::Stopped => Line::from(vec![
+                        Span::raw(format!("{block_name}  ")),
+                        Span::styled("stopped", Style::default().fg(Color::DarkGray)),
+                        Span::styled(format!("  {node_id}"), Style::default().fg(Color::DarkGray)),
+                    ]),
+                };
+                Some(ServiceRow { node_id: node_id.clone(), block_name: block_name.clone(), line })
+            })
+            .collect()
+    };
+    let selected = sv.selected.min(rows.len().saturating_sub(1));
 
     // Large, near-fullscreen (not `block_picker_rect`'s content-sized
     // shape) — unlike a plain picker, this also needs room to actually
@@ -1074,8 +1297,8 @@ fn render_services_view(f: &mut Frame, area: Rect, app: &App, sv: &ServicesViewS
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
-    let list_height = (keys.len() as u16 + 2).clamp(3, 8);
-    let rows = Layout::default()
+    let list_height = (rows.len() as u16 + 2).clamp(3, 8);
+    let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(list_height),
@@ -1084,7 +1307,7 @@ fn render_services_view(f: &mut Frame, area: Rect, app: &App, sv: &ServicesViewS
             Constraint::Length(1),
         ])
         .split(inner);
-    let (list_area, log_title_area, log_area, hint_area) = (rows[0], rows[1], rows[2], rows[3]);
+    let (list_area, log_title_area, log_area, hint_area) = (layout[0], layout[1], layout[2], layout[3]);
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -1094,51 +1317,38 @@ fn render_services_view(f: &mut Frame, area: Rect, app: &App, sv: &ServicesViewS
         hint_area,
     );
 
-    let items: Vec<ListItem> = keys
-        .iter()
-        .filter_map(|&(node_id, block_name)| {
-            let handle = app.services.get(&(node_id.clone(), block_name.clone()))?;
-            let (status_text, color) = match handle.status() {
-                meshfox_server::services::ServiceStatus::Running => ("running", OK),
-                meshfox_server::services::ServiceStatus::Crashed { exit_code } => {
-                    return Some(ListItem::new(Line::from(vec![
-                        Span::raw(format!("{block_name}  ")),
-                        Span::styled(format!("crashed (exit {exit_code})"), Style::default().fg(FAIL)),
-                        Span::styled(format!("  {node_id}"), Style::default().fg(Color::DarkGray)),
-                    ])));
-                }
-                meshfox_server::services::ServiceStatus::Stopped => ("stopped", Color::DarkGray),
-            };
-            Some(ListItem::new(Line::from(vec![
-                Span::raw(format!("{block_name}  ")),
-                Span::styled(format!("{status_text} · pid {}", handle.pid), Style::default().fg(color)),
-                Span::styled(format!("  {node_id}"), Style::default().fg(Color::DarkGray)),
-            ])))
-        })
-        .collect();
+    let items: Vec<ListItem> = rows.iter().map(|r| ListItem::new(r.line.clone())).collect();
 
     let mut state = ListState::default();
     state.select(Some(selected));
     let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     f.render_stateful_widget(list, list_area, &mut state);
 
-    // The selected service's own retained output (`ServiceHandle::
-    // log_snapshot` — kept live by its own background drain task, see
-    // `meshfox_server::services`) — this is the actual answer to "how do
-    // I see the daemon's log" in the TUI. Always the *tail* (whatever fits
-    // `log_area`'s own height), auto-following as more arrives — no manual
-    // scrollback yet, same "good enough for now" scope as everything else
-    // marked **experimental** here.
-    if let Some(&(node_id, block_name)) = keys.get(selected) {
+    // The selected service's own retained output — `ServiceHandle::
+    // log_snapshot()` directly in local mode (kept live by its own
+    // background drain task, see `meshfox_server::services`), or
+    // `app.service_log`'s last poll in worker mode (see that field's own
+    // doc comment — an async fetch has no place in a synchronous render
+    // function). Always the *tail* (whatever fits `log_area`'s own
+    // height), auto-following as more arrives — no manual scrollback yet,
+    // same "good enough for now" scope as everything else marked
+    // **experimental** here.
+    if let Some(row) = rows.get(selected) {
         f.render_widget(
             Line::from(Span::styled(
-                format!("── {block_name} log ──"),
+                format!("── {} log ──", row.block_name),
                 Style::default().fg(Color::DarkGray),
             )),
             log_title_area,
         );
-        if let Some(handle) = app.services.get(&(node_id.clone(), block_name.clone())) {
-            let log = handle.log_snapshot();
+        let log: Vec<(meshfox_server::stream_exec::OutputStream, String)> = if app.worker_port.is_some() {
+            app.service_log.clone()
+        } else if let Some(handle) = app.services.get(&(row.node_id.clone(), row.block_name.clone())) {
+            handle.log_snapshot()
+        } else {
+            Vec::new()
+        };
+        {
             let take = log_area.height as usize;
             let start = log.len().saturating_sub(take);
             let lines: Vec<Line> = log[start..]
@@ -1156,9 +1366,63 @@ fn render_services_view(f: &mut Frame, area: Rect, app: &App, sv: &ServicesViewS
     }
 }
 
+/// The `t` live-terminals view — every `tty` session the shared worker
+/// currently knows about (`App::live_tty_sessions`, from `GET /api/runs`),
+/// whoever started it. A flat list, no per-item detail body the way
+/// `render_services_view` has (there's no retained log to show — the
+/// session's own live bytes are the point, only visible once actually
+/// attached) — same "closer to a plain picker than a full panel" shape
+/// the web UI's own `TtySessionsPanel` has.
+fn render_tty_sessions_view(f: &mut Frame, area: Rect, app: &App, tv: &super::app::TtySessionsViewState) {
+    let sessions = &app.live_tty_sessions;
+    let selected = tv.selected.min(sessions.len().saturating_sub(1));
+
+    let rect = block_picker_rect(area, sessions.len());
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .title(" live terminals ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let (list_area, hint_area) = (layout[0], layout[1]);
+
+    let items: Vec<ListItem> = sessions
+        .iter()
+        .map(|s| {
+            ListItem::new(Line::from(vec![
+                Span::raw(format!("{}  ", s.block)),
+                Span::styled(
+                    format!("running · {}", meshfox_core::format_duration_ms(s.uptime_ms)),
+                    Style::default().fg(OK),
+                ),
+                Span::styled(format!("  {}", s.node_id), Style::default().fg(Color::DarkGray)),
+            ]))
+        })
+        .collect();
+    let mut state = ListState::default();
+    state.select(Some(selected));
+    let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    f.render_stateful_widget(list, list_area, &mut state);
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "j/k select · enter attach · K kill · q/esc close",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        hint_area,
+    );
+}
+
 fn render_help(f: &mut Frame, area: Rect, app: &App) {
     let mut items = vec![
         "tab             cycle focus: tree -> document -> output -> tree",
+        "                (shift-tab: reverse)",
         "j / k / ↑ / ↓   move selection (tree) or scroll (document/output)",
         "enter           expand/collapse node",
         "l / →           expand node",
@@ -1169,6 +1433,8 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         "K               kill the running block",
         "f               expand the focused pane to fill the screen, or",
         "                shrink it back (esc also shrinks it back)",
+        "z               collapse/expand the focused Tree/Output pane — same",
+        "                as clicking its title bar or collapsed handle",
         "S               reset session — forget which blocks already ran,",
         "                so the next chain run re-runs every dependency",
         "e               edit this node's own file, full-screen (Ctrl-s save,",
@@ -1193,6 +1459,17 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         );
         items.push(
             "                experimental, see SPEC.md's \"Service blocks (experimental)\"",
+        );
+    }
+    if app.worker_port.is_some() {
+        items.push(
+            "t               live terminals — every tty session the shared worker",
+        );
+        items.push(
+            "                knows about, started here, another TUI, or a browser tab;",
+        );
+        items.push(
+            "                enter attaches (joins as a viewer), K kills it",
         );
     }
     items.extend([
@@ -1516,8 +1793,8 @@ mod tests {
     // short line after it must actually appear somewhere on screen — the
     // pre-fix version clipped the former and drew the latter overlapping
     // the former's own last (visible) row instead of below it.
-    #[test]
-    fn render_document_does_not_clip_a_long_wrapped_line_or_the_segment_after_it() {
+    #[tokio::test]
+    async fn render_document_does_not_clip_a_long_wrapped_line_or_the_segment_after_it() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
@@ -1545,7 +1822,7 @@ mod tests {
         .unwrap();
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(path, tx, None).expect("valid test canvas");
+        let mut app = App::new(path, tx, None, None).await.expect("valid test canvas");
 
         let backend = TestBackend::new(20, 20);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1582,8 +1859,8 @@ mod tests {
     // executes anything itself — `run` is built by hand, exactly the shape
     // `advance_run`/`on_output_line` would have left it in once a
     // `output="markdown"` step finishes.
-    #[test]
-    fn render_output_shows_a_finished_output_markdown_steps_stdout_as_a_real_table() {
+    #[tokio::test]
+    async fn render_output_shows_a_finished_output_markdown_steps_stdout_as_a_real_table() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         use meshfox_core::deps::BlockAddr;
@@ -1605,11 +1882,12 @@ mod tests {
         .unwrap();
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(path.clone(), tx, None).expect("valid test canvas");
+        let mut app = App::new(path.clone(), tx, None, None).await.expect("valid test canvas");
         app.run = Some(crate::tui::app::RunState {
             chain: vec![BlockAddr::new("root", "table")],
             idx: 1,
             proc: None,
+            http_rx: None,
             lines: vec!["==> table".to_string(), "(exit 0 · 5ms)".to_string()],
             full_output: String::new(),
             stdout_only: "| score | name |\n|---|---|\n| 1.0 | ZMARKERZ |\n".to_string(),
@@ -1623,6 +1901,11 @@ mod tests {
             pending_vars_out: None,
             forced_reruns: Default::default(),
         });
+        // Bypasses `start_run` (which is what flips this in real use) since
+        // this test builds `RunState` by hand — without it the console
+        // defaults to collapsed and `render_output` would only draw the
+        // 1-line strip this test isn't checking for.
+        app.console_collapsed = false;
 
         let backend = TestBackend::new(40, 20);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1655,7 +1938,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn test_app() -> App {
+    async fn test_app() -> App {
         let dir = std::env::temp_dir().join(format!(
             "meshfox-render-help-test-{}",
             std::time::SystemTime::now()
@@ -1667,7 +1950,7 @@ mod tests {
         let path = dir.join("canvas.canvas.md");
         std::fs::write(&path, "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n").unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        App::new(path, tx, None).expect("valid test canvas")
+        App::new(path, tx, None, None).await.expect("valid test canvas")
     }
 
     fn render_to_screen(area: Rect, mut draw: impl FnMut(&mut ratatui::Frame)) -> String {
@@ -1695,9 +1978,9 @@ mod tests {
     // On a narrow terminal, `render_help` now wraps it onto another row
     // instead — its own tail text should still be on screen somewhere,
     // not silently dropped.
-    #[test]
-    fn render_help_wraps_a_long_line_instead_of_clipping_it() {
-        let mut app = test_app();
+    #[tokio::test]
+    async fn render_help_wraps_a_long_line_instead_of_clipping_it() {
+        let mut app = test_app().await;
         app.show_help = true;
         let area = Rect::new(0, 0, 40, 40);
         let screen = render_to_screen(area, |f| render_help(f, area, &app));
@@ -1711,9 +1994,9 @@ mod tests {
     // the last line used to just be silently dropped (`Paragraph` clips
     // instead of scrolling without an explicit `.scroll()`). Scrolling
     // (`App::help_scroll`, driven by `on_help_key`) should reach it.
-    #[test]
-    fn render_help_scrolls_to_reach_content_that_does_not_fit() {
-        let mut app = test_app();
+    #[tokio::test]
+    async fn render_help_scrolls_to_reach_content_that_does_not_fit() {
+        let mut app = test_app().await;
         app.show_help = true;
         let area = Rect::new(0, 0, 100, 10);
         let unscrolled = render_to_screen(area, |f| render_help(f, area, &app));
@@ -1738,8 +2021,8 @@ mod tests {
     // TODO.canvas.md: "Tags in TUI" — end to end through `render_tree`
     // itself, over a real `App`/canvas, mirroring the `render_document`
     // integration test above.
-    #[test]
-    fn render_tree_shows_a_nodes_tags_next_to_its_title() {
+    #[tokio::test]
+    async fn render_tree_shows_a_nodes_tags_next_to_its_title() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
@@ -1759,7 +2042,7 @@ mod tests {
         .unwrap();
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(path, tx, None).expect("valid test canvas");
+        let mut app = App::new(path, tx, None, None).await.expect("valid test canvas");
 
         let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1791,8 +2074,8 @@ mod tests {
     // clip everything past the pane's width — this asserts the title's
     // own tail, every tag, and the badge all still show up somewhere on
     // screen (on wrapped continuation rows), not silently dropped.
-    #[test]
-    fn render_tree_wraps_a_long_title_instead_of_clipping_it_or_its_tags_and_badge() {
+    #[tokio::test]
+    async fn render_tree_wraps_a_long_title_instead_of_clipping_it_or_its_tags_and_badge() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
@@ -1818,7 +2101,7 @@ mod tests {
         .unwrap();
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(path, tx, None).expect("valid test canvas");
+        let mut app = App::new(path, tx, None, None).await.expect("valid test canvas");
 
         // Narrow enough that "ALFA BRAVO CHARLIE DELTA ECHO  #bag #improvement  [run,cache]"
         // (73+ chars) cannot possibly fit on one row.

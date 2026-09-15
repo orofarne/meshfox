@@ -27,6 +27,7 @@ mod prompt;
 mod syntax_registry;
 mod tui;
 mod watcher;
+mod worker_client;
 
 /// `commit <hash> (<date>)`, or `<tag> (<date>)` for a build made from a
 /// release tag, captured at build time by `build.rs` from the repo `meshfox`
@@ -1734,7 +1735,7 @@ fn view_worker(canvas_path: PathBuf, port: u16, auto_exit: bool, watcher_socket:
         eprintln!("failed to start async runtime: {e}");
         std::process::exit(1);
     });
-    if let Err(e) = runtime.block_on(meshfox_server::run(canvas_path, port, auto_exit, Some(watcher_socket))) {
+    if let Err(e) = runtime.block_on(meshfox_server::run(canvas_path, port, auto_exit, Some(watcher_socket), false)) {
         eprintln!("meshfox view: {e}");
         std::process::exit(1);
     }
@@ -3438,6 +3439,22 @@ fn apply_node_add_with_extras(
 }
 
 fn node_rm(canvas_path: &Path, node_id: &str, keep_children: bool) {
+    if let Some(port) = worker_client::discover(canvas_path) {
+        let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+            eprintln!("failed to start async runtime: {e}");
+            std::process::exit(1);
+        });
+        return match runtime.block_on(worker_client::remove_node(port, node_id, keep_children)) {
+            Ok(()) => println!(
+                "meshfox node rm: deleted {node_id:?}{} via the running worker on port {port}",
+                if keep_children { " (children promoted)" } else { "" }
+            ),
+            Err(e) => {
+                eprintln!("meshfox node rm: {e} (worker on port {port})");
+                std::process::exit(1);
+            }
+        };
+    }
     let raw = read_raw_or_exit(canvas_path);
     match apply_node_rm(&raw, node_id, keep_children) {
         Ok(updated) => {
@@ -3622,9 +3639,8 @@ fn apply_node_set_id(raw: &str, node_id: &str, new_id: &str) -> Result<String, S
 }
 
 fn node_body(canvas_path: &Path, node_id: &str, file: Option<PathBuf>) {
-    let raw = read_raw_or_exit(canvas_path);
-    let new_body = match file {
-        Some(path) => std::fs::read_to_string(&path).unwrap_or_else(|e| {
+    let new_body = match &file {
+        Some(path) => std::fs::read_to_string(path).unwrap_or_else(|e| {
             eprintln!("failed to read {}: {e}", path.display());
             std::process::exit(1);
         }),
@@ -3640,6 +3656,24 @@ fn node_body(canvas_path: &Path, node_id: &str, file: Option<PathBuf>) {
             buf
         }
     };
+
+    if let Some(port) = worker_client::discover(canvas_path) {
+        let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+            eprintln!("failed to start async runtime: {e}");
+            std::process::exit(1);
+        });
+        return match runtime.block_on(worker_client::update_node_body(port, node_id, &new_body)) {
+            Ok(()) => println!(
+                "meshfox node body: updated {node_id:?} via the running worker on port {port}"
+            ),
+            Err(e) => {
+                eprintln!("meshfox node body: {e} (worker on port {port})");
+                std::process::exit(1);
+            }
+        };
+    }
+
+    let raw = read_raw_or_exit(canvas_path);
     match apply_node_body(&raw, node_id, &new_body) {
         Ok(updated) => {
             write_raw_or_exit(canvas_path, &updated);

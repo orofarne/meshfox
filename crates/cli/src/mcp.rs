@@ -991,6 +991,12 @@ impl MeshfoxMcp {
         &self,
         Parameters(params): Parameters<NodeBodyParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(port) = crate::worker_client::discover(&self.canvas_path) {
+            crate::worker_client::update_node_body(port, &params.node_id, &params.body)
+                .await
+                .map_err(invalid_params)?;
+            return Ok(CallToolResult::structured(json!({ "updated": params.node_id })));
+        }
         let raw = self.read_raw()?;
         let updated = crate::apply_node_body(&raw, &params.node_id, &params.body)
             .map_err(invalid_params)?;
@@ -1071,6 +1077,14 @@ impl MeshfoxMcp {
         &self,
         Parameters(params): Parameters<NodeRmParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(port) = crate::worker_client::discover(&self.canvas_path) {
+            crate::worker_client::remove_node(port, &params.node_id, params.keep_children)
+                .await
+                .map_err(invalid_params)?;
+            return Ok(CallToolResult::structured(
+                json!({ "deleted": params.node_id, "keep_children": params.keep_children }),
+            ));
+        }
         let raw = self.read_raw()?;
         let updated = crate::apply_node_rm(&raw, &params.node_id, params.keep_children)
             .map_err(invalid_params)?;

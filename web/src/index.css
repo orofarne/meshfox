@@ -2834,3 +2834,80 @@ a {
   text-align: left;
   padding: 0.5rem 0.75rem;
 }
+
+/* ConsolePanel.tsx — bottom-docked, semi-transparent, slides up over the
+ * canvas rather than claiming layout space (unlike every other global
+ * panel here, a centered `.vars-modal-backdrop` overlay) — deliberately its
+ * own dark terminal-like look regardless of the app's light/dark theme,
+ * same convention a devtools/terminal console overlay usually keeps. */
+.console-panel {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 280px;
+  max-height: 45vh;
+  display: flex;
+  flex-direction: column;
+  background: rgba(18, 18, 22, 0.88);
+  backdrop-filter: blur(6px);
+  color: #e8e8ea;
+  border-top: 1px solid rgba(255, 255, 255, 0.14);
+  box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.25);
+  transform: translateY(100%);
+  transition: transform 0.18s ease-out;
+  z-index: 45;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+}
+
+.console-panel-open {
+  transform: translateY(0);
+}
+
+.console-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.3rem 0.75rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.console-panel-close {
+  background: transparent;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 0.85rem;
+  opacity: 0.75;
+  padding: 0.1rem 0.4rem;
+}
+
+.console-panel-close:hover {
+  opacity: 1;
+}
+
+.console-panel-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0.4rem 0.75rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.console-line-addr {
+  color: #8ab4f8;
+  opacity: 0.85;
+}
+
+.console-line-stderr {
+  color: #ff9a9a;
+}
+
+.console-panel-empty {
+  opacity: 0.6;
+  font-style: italic;
+}

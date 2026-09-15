@@ -312,6 +312,14 @@ pub fn render(
     // variables" modal. `None` whenever this form is merely open (not
     // `editing`) or this isn't the node it belongs to — no focus to show.
     form_focus: Option<(&str, usize)>,
+    // Live output from the most recent run, for whichever of this node's own
+    // blocks it covers — keyed by block name (already scoped to this
+    // `node_id` by the caller, see `App::render_current_document`). The TUI
+    // equivalent of the web UI's `LiveRunOutput`: shown right under a
+    // runnable fence in `TagEnd::CodeBlock`, same spot an on-disk cached
+    // `OutputRegion` would occupy, but sourced from `App::step_output`
+    // instead of the document's own text — this never touches `md` at all.
+    live_output: &std::collections::HashMap<String, super::app::StepOutput>,
 ) -> (Vec<Segment>, Vec<ClickRegion>) {
     // Pre-scanned once so `Tag::CodeBlock`'s own handling (`start`) can
     // resolve a fence's *real* run name — including the implicit "sole
@@ -319,7 +327,7 @@ pub fn render(
     // doc comment) — by matching its byte span, rather than re-deriving
     // that same implicit-naming rule a second time here.
     let runnable = meshfox_core::fence::scan_runnable_blocks(node_id, md);
-    let mut renderer = Renderer::new(base_dir, hl, node_id, decls, &runnable, form_values, form_focus);
+    let mut renderer = Renderer::new(base_dir, hl, node_id, decls, &runnable, form_values, form_focus, live_output);
     // `ENABLE_GFM` is what makes `pulldown-cmark` recognize `> [!NOTE]`/...
     // alert blockquotes (`Tag::BlockQuote(Some(kind))`, marker line
     // already stripped) — see `start`'s own `Tag::BlockQuote` arm below.
@@ -381,6 +389,9 @@ struct Renderer<'a> {
     /// `render`'s own `form_focus` parameter, threaded straight through —
     /// see that parameter's own doc comment.
     form_focus: Option<(&'a str, usize)>,
+    /// `render`'s own `live_output` parameter, threaded straight through —
+    /// see that parameter's own doc comment.
+    live_output: &'a std::collections::HashMap<String, super::app::StepOutput>,
     segments: Vec<Segment>,
     click_regions: Vec<ClickRegion>,
     lines: Vec<Line<'static>>,
@@ -477,6 +488,7 @@ impl<'a> Renderer<'a> {
         runnable: &'a [meshfox_core::fence::CodeBlock],
         form_values: &'a std::collections::HashMap<String, String>,
         form_focus: Option<(&'a str, usize)>,
+        live_output: &'a std::collections::HashMap<String, super::app::StepOutput>,
     ) -> Self {
         Renderer {
             base_dir,
@@ -486,6 +498,7 @@ impl<'a> Renderer<'a> {
             runnable,
             form_values,
             form_focus,
+            live_output,
             segments: Vec::new(),
             click_regions: Vec::new(),
             lines: Vec::new(),
@@ -625,6 +638,57 @@ impl<'a> Renderer<'a> {
                 target: ClickTarget::JumpToNode { node_id },
             });
         }
+    }
+
+    /// Renders `block_name`'s own live output (`App::step_output`, the most
+    /// recent run's already-finished result for this exact block) right
+    /// under the fence it belongs to — same framed-box convention the
+    /// on-disk `OutputRegion` splice uses for *cached* output, distinguished
+    /// by a "· live" marker in the header, since the two can legitimately
+    /// coexist (a fresh live run of a block whose last `cache`d result is
+    /// still sitting in the document). Deliberately simpler than
+    /// `OutputRegion`'s own handling: always plain text (no nested Markdown
+    /// re-render for `output="markdown"` blocks — that richer treatment
+    /// stays specific to the Output pane's own chain-wide view for now).
+    fn push_live_output(&mut self, block_name: &str, live: &super::app::StepOutput) {
+        let border = Style::default().fg(super::theme::DEP);
+        // Flagged, not specially rendered — see this method's own doc
+        // comment on why `output="markdown"` doesn't get the Output pane's
+        // richer nested-Markdown treatment here (yet).
+        let kind = if live.output_markdown { " · markdown" } else { "" };
+        // `live.duration_ms`/`exit_code` are just placeholders until a run
+        // discovered passively (`App::on_external_run_event`) reaches its
+        // own terminal event — showing "done · 0ms" the moment its first
+        // line streams in would be a straight-up lie about a run that's
+        // still going. A self-triggered run never has `running: true` here
+        // at all (see `StepOutput::running`'s own doc comment) — its own
+        // exit code/duration are already real by the time this struct
+        // exists.
+        let header = if live.running {
+            format!("┌─ output: {block_name} · live{kind} · running ──")
+        } else {
+            let status = if live.exit_code == 0 { "done" } else { "failed" };
+            format!(
+                "┌─ output: {block_name} · live{kind} · {status} · {} ──",
+                meshfox_core::format_duration_ms(live.duration_ms)
+            )
+        };
+        let mut framed: Vec<Line<'static>> = vec![Line::from(Span::styled(header, border))];
+        let mut any_output = false;
+        for text in [&live.stdout, &live.stderr] {
+            for line in text.lines() {
+                any_output = true;
+                framed.push(Line::from(vec![
+                    Span::styled("│ ", border),
+                    Span::raw(line.to_string()),
+                ]));
+            }
+        }
+        if !any_output {
+            framed.push(Line::from(Span::styled("│ (no output)", border)));
+        }
+        framed.push(Line::from(Span::styled("└─", border)));
+        self.push_segment(Segment::Text(framed));
     }
 
     /// Prefixes every line of `seg` with a purple `│ ` — the "markdown"
@@ -1355,6 +1419,11 @@ impl<'a> Renderer<'a> {
                 }
                 self.push_segment(Segment::Text(framed));
                 self.push_dep_clicks(dep_clicks);
+                if let Some(block_name) = &click_name {
+                    if let Some(live) = self.live_output.get(block_name.as_str()) {
+                        self.push_live_output(block_name, live);
+                    }
+                }
             }
             TagEnd::List(_) => {
                 self.list_stack.pop();
@@ -1466,7 +1535,7 @@ mod tests {
         let hl = Highlighter::new();
         let md = "![a pixel](data:image/png;base64,iVBORw0KGgo=)\n";
         let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
         let Segment::Image { path, alt, .. } = segments
             .into_iter()
             .find(|s| matches!(s, Segment::Image { .. }))
@@ -1504,8 +1573,8 @@ mod tests {
         let mut values = std::collections::HashMap::new();
         values.insert("NAME".to_string(), "abc".to_string());
 
-        let (unfocused, _) = render(md, Path::new("/x"), &hl, "n", &decls, &values, None);
-        let (focused, _) = render(md, Path::new("/x"), &hl, "n", &decls, &values, Some(("f", 0)));
+        let (unfocused, _) = render(md, Path::new("/x"), &hl, "n", &decls, &values, None, &std::collections::HashMap::new());
+        let (focused, _) = render(md, Path::new("/x"), &hl, "n", &decls, &values, Some(("f", 0)), &std::collections::HashMap::new());
 
         let value_span = |segs: &[Segment]| -> Span<'static> {
             let Segment::Text(lines) = segs.iter().find(|s| matches!(s, Segment::Text(_))).unwrap()
@@ -1538,7 +1607,7 @@ mod tests {
         let hl = Highlighter::new();
         let md = "![x](https://example.com/pic.png)\n";
         let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
         assert!(!segments.iter().any(|s| matches!(s, Segment::Image { .. })));
     }
 
@@ -1567,7 +1636,7 @@ mod tests {
         let hl = Highlighter::new();
         let md = "![alt](pic.png){width=50% height=25%}\n";
         let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
         let Segment::Image {
             width_percent,
             height_percent,
@@ -1588,7 +1657,7 @@ mod tests {
         let hl = Highlighter::new();
         let md = "![alt](pic.png){width=300}\n";
         let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
         let Segment::Image { width_percent, .. } = segments
             .into_iter()
             .find(|s| matches!(s, Segment::Image { .. }))
@@ -1604,7 +1673,7 @@ mod tests {
         let hl = Highlighter::new();
         let md = "![alt](pic.png) just text\n";
         let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
         assert!(segment_text(&segments).contains("just text"));
     }
 
@@ -1614,7 +1683,7 @@ mod tests {
         let hl = Highlighter::new();
         let md = "H~2~O and x^n^\n";
         let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
         assert_eq!(segment_text(&segments), "H₂O and xⁿ");
     }
 
@@ -1623,7 +1692,7 @@ mod tests {
         let hl = Highlighter::new();
         let md = "x~query~\n";
         let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
         assert_eq!(segment_text(&segments), "x~query~");
     }
 
@@ -1632,7 +1701,7 @@ mod tests {
         let hl = Highlighter::new();
         let md = "```text\nx~2~\n```\n";
         let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
         assert!(segment_text(&segments).contains("x~2~"));
     }
 
@@ -1643,7 +1712,7 @@ mod tests {
         let hl = Highlighter::new();
         let md = "> [!WARNING]\n> be careful\n";
         let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
         let text = segment_text(&segments);
         assert!(text.contains("Warning"), "{text}");
         assert!(text.contains("be careful"), "{text}");
@@ -1655,7 +1724,7 @@ mod tests {
         let hl = Highlighter::new();
         let md = "> just a quote\n";
         let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
         let text = segment_text(&segments);
         assert!(text.contains("just a quote"), "{text}");
         assert!(!text.contains("Note"), "{text}");
@@ -1672,7 +1741,7 @@ mod tests {
         let hl = Highlighter::new();
         let md = "- [ ] todo\n- [x] done\n";
         let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
         let text = segment_text(&segments);
         assert!(text.contains("[ ] todo"), "{text}");
         assert!(text.contains("[x] done"), "{text}");
@@ -1683,7 +1752,7 @@ mod tests {
         let hl = Highlighter::new();
         let md = "See[^1].\n\n[^1]: A note.\n";
         let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
         let text = segment_text(&segments);
         assert!(text.contains("See¹."), "{text}");
         assert!(!text.contains("[^1]"), "{text}");
@@ -1694,7 +1763,7 @@ mod tests {
         let hl = Highlighter::new();
         let md = "See[^1].\n\n[^1]: A note.\n";
         let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
         let text = segment_text(&segments);
         assert!(text.contains("[1]"), "{text}");
         assert!(text.contains("A note."), "{text}");
@@ -1707,7 +1776,7 @@ mod tests {
         // fully) is deliberately not used here — want the fallback path.
         let md = "See[^query].\n\n[^query]: A note.\n";
         let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
         let text = segment_text(&segments);
         assert!(text.contains("See[query]."), "{text}");
     }
@@ -1717,7 +1786,7 @@ mod tests {
         let hl = Highlighter::new();
         let md = "```python name=\"seed\" interpreter=\"python3 -u\"\nprint(1)\n```\n";
         let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
         let text = segment_text(&segments);
         // Exactly as written in the attribute — no case-folding — mirrors
         // the web UI's own `mesh-code-interpreter` suffix.
@@ -1729,7 +1798,7 @@ mod tests {
         let hl = Highlighter::new();
         let md = "```bash name=\"build\" cache\necho hi\n```\n";
         let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
         let text = segment_text(&segments);
         assert!(!text.contains("#!"), "{text}");
     }
@@ -1739,7 +1808,7 @@ mod tests {
         let hl = Highlighter::new();
         let md = "```button name=\"full-import\" deps=\"build\"\n🚀 Run everything\n```\n";
         let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
         let text = segment_text(&segments);
         assert!(text.contains("🚀 Run everything"), "{text}");
         assert!(text.contains("(r to run)"), "{text}");
@@ -1753,7 +1822,7 @@ mod tests {
         let hl = Highlighter::new();
         let md = "```button name=\"full-import\" deps=\"build\"\n```\n";
         let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
         let text = segment_text(&segments);
         assert!(text.contains("full-import"), "{text}");
     }
@@ -1763,7 +1832,7 @@ mod tests {
         let hl = Highlighter::new();
         let md = "```button name=\"full-import\" deps=\"build\"\nRun everything\n```\n";
         let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None);
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
         let Segment::Text(lines) = &segments[0] else {
             panic!("expected a text segment");
         };

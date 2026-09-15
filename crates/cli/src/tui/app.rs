@@ -102,6 +102,22 @@ pub struct VarFormState {
     pub configuring: bool,
 }
 
+/// Set by `App::start_run_via_worker` when `GET /api/vars` finds something
+/// still unresolved — consumed by `submit_var_form` to resume into
+/// `begin_http_run`/`begin_http_tty_run` with the form's answers, instead
+/// of `advance_run` (the local-mode resume path `configuring: false`
+/// already takes).
+pub struct PendingHttpRun {
+    pub node_id: String,
+    pub block_name: String,
+    pub with_deps: bool,
+    pub port: u16,
+    pub force: Option<(String, String)>,
+    /// See `App::target_chain_has_tty` — which of `begin_http_run`/
+    /// `begin_http_tty_run` to resume into.
+    pub is_tty: bool,
+}
+
 /// Human-readable label for a dependency's own block — bare `block_name`
 /// when it lives in the same node as the block depending on it, otherwise
 /// `node_id/block_name` — mirrors the convention `core::fence::fingerprint`
@@ -159,6 +175,42 @@ pub struct PendingTty {
     pub autoclose: bool,
 }
 
+/// The worker-routed equivalent of `PendingTty` — a *already-connected*
+/// `/api/run/tty` socket (see `crate::worker_client::tty_connect`) waiting
+/// for `mod.rs`'s event loop to hand it the terminal. Connecting happens in
+/// `App::begin_http_tty_run` (an ordinary async call, no terminal access
+/// needed for that part — only the actual byte relay needs `mod.rs`'s
+/// raw-mode/alternate-screen control), so unlike `PendingTty` this doesn't
+/// carry spawn parameters, just the live socket itself plus what the
+/// handoff needs to print/decide with: `block_name` for the same "==>
+/// {block}" banner `PendingTty`'s handoff prints, `autoclose` mirroring
+/// `PendingTty::autoclose` (the *last* tty block found in the chain scan —
+/// see `App::target_chain_tty_autoclose`).
+pub struct PendingHttpTty {
+    pub socket: crate::worker_client::TtySocket,
+    pub block_name: String,
+    pub autoclose: bool,
+}
+
+/// An `/api/run/tty/attach` socket (see `crate::worker_client::tty_attach`)
+/// waiting for `mod.rs`'s event loop to hand it the terminal — the "join a
+/// session I didn't start" counterpart to `PendingHttpTty`, from the `t`
+/// live-terminals view (`App::attach_selected_tty_session`). No
+/// `autoclose` field: an attach-only viewer has no chain of its own to
+/// skip back to (see `mod.rs`'s `run_http_tty_attach_handoff`).
+pub struct PendingHttpTtyAttach {
+    pub socket: crate::worker_client::TtySocket,
+    pub block_name: String,
+}
+
+/// The `t` live-terminals view — see `App::live_tty_sessions`,
+/// `App::on_tty_sessions_view_key`, `ui::render_tty_sessions_view`. Only
+/// ever open in worker mode (fallback/no-worker TUI has no registry of
+/// *other* connections' sessions to list — see `App::open_tty_sessions_view`).
+pub struct TtySessionsViewState {
+    pub selected: usize,
+}
+
 /// A canvas-target `file`-node "open" waiting for `mod.rs`'s event loop to
 /// hand the terminal to a nested child TUI — the terminal counterpart to
 /// `PendingTty` above, and to the web UI's cross-canvas navigation (see
@@ -179,6 +231,13 @@ pub struct RunState {
     pub chain: Vec<BlockAddr>,
     pub idx: usize,
     pub proc: Option<SpawnedProcess>,
+    /// The worker-routed equivalent of `proc` — `Some` while
+    /// `begin_http_run`'s `POST /api/run`(`/force`) stream is still being
+    /// forwarded (see `worker_client::run_stream`); mutually exclusive with
+    /// `proc` (a given `RunState` is either local-mode or worker-mode, never
+    /// both). `App::on_run_event` drains this the same way `on_output_line`
+    /// drains `proc`'s own channel — see `RunState::is_running`.
+    pub http_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::worker_client::RunEvent>>,
     pub lines: Vec<String>,
     pub full_output: String,
     /// Just this step's stdout lines, reset alongside `full_output` at the
@@ -228,6 +287,66 @@ pub struct RunState {
     pub forced_reruns: HashSet<BlockAddr>,
 }
 
+impl RunState {
+    /// Whether the event loop (`mod.rs::main_loop`) still has something to
+    /// poll for this run — local-mode's `proc` or worker-mode's `http_rx`,
+    /// mutually exclusive, so exactly one or neither is ever set.
+    pub fn is_running(&self) -> bool {
+        self.proc.is_some() || self.http_rx.is_some()
+    }
+
+    /// The chain address currently executing, if any — `ui::render_tree`'s
+    /// own running-spinner badge reads this to know which row to animate.
+    /// The two modes address "current" differently: local mode's `chain`
+    /// is the *whole* resolved chain up front, with `idx` pointing at
+    /// today's step, while worker mode's `chain` is instead built
+    /// incrementally, one `RunEvent::StepStart` push at a time (see
+    /// `App::on_run_event`'s own doc comment on why — "steps seen so far,
+    /// most recent last") — so its own last entry, not `chain[idx]`, is
+    /// the one currently running.
+    pub fn current_addr(&self) -> Option<&BlockAddr> {
+        if self.proc.is_some() {
+            self.chain.get(self.idx)
+        } else if self.http_rx.is_some() {
+            self.chain.last()
+        } else {
+            None
+        }
+    }
+}
+
+/// A snapshot of one step's own isolated output, taken the moment it
+/// completes (`App::on_output_line`) — `RunState::stdout_only`/
+/// `stderr_only` only ever hold the *current* step's own (reset at the start
+/// of the next one, see their own doc comments), so without this, a step's
+/// output would be visible in the Document pane only while it was the one
+/// actually running, gone the instant the chain moved past it. Keyed by
+/// address in `App::step_output`; a later run of the same block simply
+/// overwrites its entry — only the most recent run's output matters here,
+/// same "not persisted, just a live monitor" scope the console itself has.
+/// Despite the doc comment above (written back when every constructor sat
+/// behind a terminal `RunEvent`), an entry can now also represent a run
+/// that's still *in flight* — see `running`.
+#[derive(Clone)]
+pub struct StepOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub output_markdown: bool,
+    pub exit_code: i32,
+    pub duration_ms: u64,
+    /// `true` only while `App::on_external_run_event` is still streaming
+    /// this entry in (a run this session discovered passively, not yet at
+    /// its own terminal event) — every other constructor sets this `false`,
+    /// since a self-triggered run only ever inserts a `StepOutput` once the
+    /// step has actually finished (`exit_code`/`duration_ms` are already
+    /// real by then). `markdown::push_live_output` reads this before
+    /// trusting `exit_code == 0` to mean "done" — an in-flight entry's own
+    /// `exit_code` is just a `0` placeholder until the real outcome
+    /// arrives, which would otherwise render as a false "done" the moment
+    /// the very first line streams in.
+    pub running: bool,
+}
+
 /// A runnable `file` node's own single execution — no `deps=` chain, no
 /// `cache`, no `meshfox:var`, unlike a fenced block's `RunState`, since a
 /// `file` node has none of those; see `App::start_file_run`. Kept as its
@@ -235,6 +354,11 @@ pub struct RunState {
 /// built entirely around a `BlockAddr` chain) for the same reason the web
 /// UI's `run_file_node` is its own endpoint, distinct from `run_block`.
 pub struct FileRunState {
+    /// Which row's running-spinner/failed-badge (`ui::render_tree`) this
+    /// execution belongs to — a `file` node has no `BlockAddr` of its own
+    /// to key off of (see this struct's own doc comment), so the node id
+    /// is tracked directly instead.
+    pub node_id: String,
     pub proc: Option<SpawnedProcess>,
     pub lines: Vec<String>,
     pub had_failure: bool,
@@ -255,6 +379,26 @@ pub struct ServiceConflictState {
     pub owner_pid: u32,
     pub owner_desc: String,
     pub lock_path: PathBuf,
+    /// `Some` when this conflict came from a worker-routed run's `409`
+    /// (`App::begin_http_run`) rather than a local `service_lock` acquire —
+    /// `lock_path` is meaningless in that case (there is no local lock file
+    /// to kill-and-acquire); `on_service_conflict_key`'s `y` branch retries
+    /// via `POST /api/run/force` instead.
+    pub http_retry: Option<HttpRunRetry>,
+}
+
+/// What to re-issue, and how, after a worker-routed run's lock conflict is
+/// confirmed away — see `ServiceConflictState::http_retry`.
+pub struct HttpRunRetry {
+    pub node_id: String,
+    pub block_name: String,
+    pub with_deps: bool,
+    pub port: u16,
+    pub force_node_id: String,
+    pub force_block: String,
+    /// See `App::target_chain_has_tty` — which of `begin_http_run`/
+    /// `begin_http_tty_run` to retry into.
+    pub is_tty: bool,
 }
 
 /// The `v` services list view — see `App::services_view`,
@@ -347,6 +491,27 @@ pub struct App {
     /// two panes (`resize_drag`/`on_resize_drag`); clamped to
     /// `MIN_TREE_WIDTH_PCT..=MAX_TREE_WIDTH_PCT`.
     pub tree_width_pct: u16,
+    /// Whether the Tree pane is collapsed to a narrow, borderless handle
+    /// (`ui::TREE_COLLAPSED_WIDTH` columns wide) instead of its usual
+    /// `tree_width_pct` share of the tree/document row — the Tree pane's
+    /// own counterpart to `console_collapsed`, along its width instead of
+    /// Output's height. Unlike `console_collapsed`, nothing auto-collapses
+    /// or auto-expands this over time; it only ever changes via a
+    /// deliberate action (`z`, clicking the pane's own title bar/handle) or
+    /// gaining keyboard focus while collapsed (see `on_key`'s `Tab`
+    /// handler) — Tree has no "just finished, no longer needs the space"
+    /// moment the way a run's own transcript does.
+    pub tree_collapsed: bool,
+    /// Which pane (if any) is currently expanded purely because it
+    /// happened to gain focus (`Tab`/`BackTab`) while collapsed — not
+    /// because anyone actually asked to see it (clicking its title bar/
+    /// collapsed handle, `z`, `f`, or a chain run actually starting).
+    /// Cleared, and that pane collapsed right back, the moment focus
+    /// moves anywhere else (see `set_focus`) — the terminal equivalent of
+    /// a sidebar that auto-hides again once you look away, rather than
+    /// staying pinned open just because focus happened to pass through it
+    /// once.
+    auto_expanded_pane: Option<Focus>,
     /// The Output pane's own height, in rows — `ui::compute_layout`'s own
     /// `Constraint::Length`. Adjustable the same way as `tree_width_pct`,
     /// via the border between the tree/document row and Output; clamped to
@@ -368,9 +533,81 @@ pub struct App {
     /// theme name — see `resolve_editor_theme`'s own doc comment.
     pub editor_theme: String,
     pub picker: Picker,
+    /// A real worker for this canvas was reachable at startup — this
+    /// process's own embedded one, or another process's (`mod.rs::run`'s
+    /// `worker_lock` dance). `Some(port)` keeps every HTTP-routed area
+    /// (canvas load, run, services, source-editor save, external-change
+    /// watch, `tty`) enabled for this whole session; `None` degrades all of
+    /// them to their original direct-file/local-process behavior. Never
+    /// flips from `Some` back to `None` after startup except for the one
+    /// area that hit a real error (each area degrades independently, same
+    /// "don't fail the whole session over one bad request" posture
+    /// `App::new`'s own canvas-load fallback already has) — this field
+    /// itself always reflects the *original* startup decision.
+    pub worker_port: Option<u16>,
+    /// Set only while a `VarFormState` opened by `start_run_via_worker` is
+    /// waiting on an answer — see `PendingHttpRun`'s own doc comment.
+    pub pending_http_run: Option<PendingHttpRun>,
     pub run: Option<RunState>,
     pub file_run: Option<FileRunState>,
+    /// Live per-step output from the most recent run, kept around after
+    /// `RunState`/`FileRunState` moves past a step — see `StepOutput`'s own
+    /// doc comment. Consulted by `render_current_document`/`markdown::render`
+    /// to splice a block's own live output right under it, the TUI
+    /// equivalent of the web UI's `LiveRunOutput`.
+    pub step_output: HashMap<BlockAddr, StepOutput>,
+    /// Addresses currently running as part of a run this TUI session
+    /// didn't itself start — another frontend's manual run, `force_run`,
+    /// or a server-triggered `autorun`, discovered passively via
+    /// `worker_client::WatchEvent::RunStarted` and streamed via
+    /// `worker_client::subscribe_run` (`App::on_external_run_event`). Feeds
+    /// `ui::render_tree`'s running-spinner badge the same way `self.run`'s
+    /// own current step already does for a self-triggered run; removed
+    /// once that run's own `Done` arrives (`step_output` keeps the settled
+    /// result, same as any other finished step).
+    pub external_running: HashMap<BlockAddr, std::time::Instant>,
+    /// Whether the Output pane (the "console" — a running transcript of the
+    /// most recent chain/file run, not scoped to one block) is collapsed to
+    /// its 1-line title strip — see `ui::compute_layout`. Starts collapsed;
+    /// `start_run`/`start_file_run` expand it, `mod.rs`'s periodic tick
+    /// re-collapses it once nothing is running and `console_last_activity`
+    /// is stale (see `App::console_is_active`/`console_tick`).
+    pub console_collapsed: bool,
+    /// Touched on every streamed output line and on every run/step
+    /// finishing (`on_output_line`/`on_file_output_line`/`resume_after_tty`)
+    /// — `None` only before the very first run this session. The 10s
+    /// auto-collapse window (`console_tick`) is measured from here, not
+    /// from when the run *started*, so a long-running chain never gets
+    /// collapsed out from under itself just because it's been a while since
+    /// the initial expand.
+    pub console_last_activity: Option<std::time::Instant>,
+    /// Animation phase for `ui::render_tree`'s running-spinner badge —
+    /// advanced by exactly one step (`advance_spinner`) each time `mod.rs`'s
+    /// own dedicated spinner tick fires, rather than derived from wall-clock
+    /// time. Wall-clock-based framing looked right in principle but wasn't:
+    /// nothing actually redraws on a fixed schedule fast enough to sample
+    /// every frame, so consecutive draws could land many frames apart and
+    /// visibly jump/skip. Ticking a plain counter once per redraw instead
+    /// means every draw this pane is running through *always* shows the
+    /// very next frame, however far apart in real time two draws happen to
+    /// land — see `mod.rs`'s own spinner-tick `select!` arm.
+    pub spinner_tick: u32,
     pub pending_tty: Option<PendingTty>,
+    /// The worker-routed equivalent of `pending_tty` — see
+    /// `PendingHttpTty`'s own doc comment.
+    pub pending_http_tty: Option<PendingHttpTty>,
+    /// See `PendingHttpTtyAttach`'s own doc comment.
+    pub pending_http_tty_attach: Option<PendingHttpTtyAttach>,
+    /// The `t` live-terminals view's own state — `None` when closed. Its
+    /// list is `live_tty_sessions`, refreshed on open and after every
+    /// attach/kill (same "refetch, don't try to patch incrementally"
+    /// posture `services_view`'s own worker-mode branch already has).
+    pub tty_sessions_view: Option<TtySessionsViewState>,
+    /// Last-fetched `GET /api/runs`, filtered to `kind == "tty" && status
+    /// == "running"` — see `open_tty_sessions_view`. Empty (not `None`)
+    /// when the view is closed; only meaningful while `tty_sessions_view`
+    /// is `Some`.
+    pub live_tty_sessions: Vec<crate::worker_client::ActiveRunDto>,
     pub pending_child_canvas: Option<PendingChildCanvas>,
     pub block_picker: Option<BlockPickerState>,
     pub var_form: Option<VarFormState>,
@@ -488,6 +725,21 @@ pub struct App {
     /// the currently selected node) — `Some` while open. See
     /// `ServicesViewState`'s own doc comment.
     pub services_view: Option<ServicesViewState>,
+    /// The worker-routed equivalent of `services`/`service_stats` — every
+    /// `GET /api/services` entry as of the last poll (`refresh_services`,
+    /// on a periodic tick from `mod.rs` whenever `worker_port` is `Some`,
+    /// the same ~3s cadence the web UI's own service panel already polls
+    /// at). `sorted_service_keys`/`on_services_view_key`/
+    /// `ui::render_services_view` read from this instead of `services`
+    /// whenever a worker is reachable — see each one's own worker-mode
+    /// branch.
+    pub service_list: Vec<crate::worker_client::ServiceDto>,
+    /// The currently-selected service's own retained log, as of the last
+    /// `refresh_service_log` poll — the worker-routed equivalent of
+    /// `ServiceHandle::log_snapshot()` (`GET /api/services/log`, which,
+    /// unlike the list above, is only worth fetching while the services
+    /// view is actually open and pointed at this one entry).
+    pub service_log: Vec<(meshfox_server::stream_exec::OutputStream, String)>,
     /// Values a `form` fence's own Send has committed this TUI process's
     /// lifetime (see `submit_inline_form`) — every variable a form field
     /// targets is implicitly `session`-scoped by its own `meshfox:var`
@@ -661,13 +913,90 @@ fn initial_field_input(
     (value, origin)
 }
 
+/// A worker-reported `VarStatus` reshaped into the `VarDecl` shape
+/// `VarFormState`/`render_var_form`/`validate_value` already work with —
+/// see `var_form_from_statuses`. Fields the wire status doesn't carry
+/// (`required`/`from`/`session`/`default_var`/`choices_var`) get harmless
+/// defaults: the worker has already decided this needs asking (that's why
+/// it came back `resolved: false`), and none of those fields change how a
+/// single already-missing value is prompted for or validated.
+fn var_decl_from_status(status: &crate::worker_client::VarStatus) -> VarDecl {
+    let var_type = match status.var_type.as_str() {
+        "int" => VarType::Int,
+        "bool" => VarType::Bool,
+        "select" => VarType::Select,
+        _ => VarType::String,
+    };
+    VarDecl {
+        name: status.name.clone(),
+        var_type,
+        prompt: status.prompt.clone(),
+        default: status.value.clone(),
+        choices: status.choices.clone(),
+        secret: status.secret,
+        required: false,
+        from: None,
+        session: false,
+        default_var: None,
+        choices_var: None,
+    }
+}
+
+/// Builds the `VarFormState` `start_run_via_worker` opens when `GET
+/// /api/vars` finds something unresolved — the worker-routed counterpart to
+/// `park_on_unresolved`'s local-mode form, pre-filling each field from the
+/// status's own `value` (the worker has already computed the same
+/// default/cache/env suggestion `initial_field_input` would have) and
+/// `inherited_from` rather than re-deriving them from a local `VarCache`.
+fn var_form_from_statuses(missing: Vec<crate::worker_client::VarStatus>) -> VarFormState {
+    let mut decls = Vec::with_capacity(missing.len());
+    let mut inputs = Vec::with_capacity(missing.len());
+    let mut origins = Vec::with_capacity(missing.len());
+    for status in &missing {
+        inputs.push(status.value.clone().unwrap_or_default());
+        origins.push(status.inherited_from.clone().map(|o| match o {
+            crate::worker_client::VarOrigin::Project => meshfox_core::SharedOrigin::Project,
+            crate::worker_client::VarOrigin::Global { path } => meshfox_core::SharedOrigin::Global { path },
+        }));
+        decls.push(var_decl_from_status(status));
+    }
+    VarFormState { decls, inputs, origins, selected: 0, configuring: false }
+}
+
 impl App {
-    pub fn new(
+    /// `worker_port`, when `Some`, means a real worker (this process's own
+    /// embedded one, or another process's) was confirmed reachable at
+    /// startup (`mod.rs::run`) — `App` then loads the canvas from it
+    /// (`GET /api/canvas`, already include-resolved server-side) instead of
+    /// reading/parsing the file itself, and every later HTTP-routed area
+    /// (run/services/save/watch/tty — see each one's own doc comment) stays
+    /// enabled for the rest of this session. `None` (lock unreadable, or
+    /// the embedded worker's own bind failed) degrades every one of those
+    /// areas to their original direct-file/local-process behavior instead
+    /// of failing this call outright — a locally-recoverable plumbing
+    /// hiccup shouldn't take down an interactive session someone's actively
+    /// working in.
+    pub async fn new(
         canvas_path: PathBuf,
         link_preview_tx: tokio::sync::mpsc::UnboundedSender<LinkPreviewMsg>,
         initial_node: Option<&str>,
+        worker_port: Option<u16>,
     ) -> io::Result<App> {
-        let raw = std::fs::read_to_string(&canvas_path)?;
+        let mut worker_port = worker_port;
+        let raw = match worker_port {
+            Some(port) => match crate::worker_client::get_canvas_raw(port).await {
+                Ok(raw) => raw,
+                Err(e) => {
+                    // Degrade for the rest of this session rather than
+                    // fail the whole launch over one bad request to a
+                    // worker that otherwise seemed reachable.
+                    worker_port = None;
+                    eprintln!("meshfox tui: couldn't load the canvas from the worker on port {port} ({e}) — continuing without it");
+                    std::fs::read_to_string(&canvas_path)?
+                }
+            },
+            None => std::fs::read_to_string(&canvas_path)?,
+        };
         let canvas = Canvas::from_markdown(&raw).map_err(|e| io::Error::other(e.to_string()))?;
         let decls = declared_vars(&canvas).unwrap_or_default();
         let var_cache = VarCache::load(&canvas_path).unwrap_or_else(|_| VarCache::in_memory());
@@ -718,14 +1047,27 @@ impl App {
             fullscreen: None,
             last_click: None,
             tree_width_pct: ui::DEFAULT_TREE_WIDTH_PCT,
+            tree_collapsed: false,
+            auto_expanded_pane: None,
             output_height: ui::DEFAULT_OUTPUT_HEIGHT,
             resize_drag: None,
             highlighter: Highlighter::with_extra_syntaxes(&syntax_root, &editor_theme),
             editor_theme,
             picker,
+            worker_port,
+            pending_http_run: None,
             run: None,
             file_run: None,
+            step_output: HashMap::new(),
+            external_running: HashMap::new(),
+            console_collapsed: true,
+            console_last_activity: None,
+            spinner_tick: 0,
             pending_tty: None,
+            pending_http_tty: None,
+            pending_http_tty_attach: None,
+            tty_sessions_view: None,
+            live_tty_sessions: Vec::new(),
             pending_child_canvas: None,
             block_picker: None,
             var_form: None,
@@ -749,6 +1091,8 @@ impl App {
             service_stats: None,
             service_conflict: None,
             services_view: None,
+            service_list: Vec::new(),
+            service_log: Vec::new(),
             session_vars: HashMap::new(),
             active_inline_form: None,
             pending_autoruns: std::collections::VecDeque::new(),
@@ -772,7 +1116,7 @@ impl App {
                         self.apply_external_reload(pending);
                     }
                 }
-                SourceEditorOutcome::Save => self.save_source_editor(),
+                SourceEditorOutcome::Save => self.save_source_editor().await,
             }
             return;
         }
@@ -786,6 +1130,10 @@ impl App {
         }
         if self.services_view.is_some() {
             self.on_services_view_key(key).await;
+            return;
+        }
+        if self.tty_sessions_view.is_some() {
+            self.on_tty_sessions_view_key(key).await;
             return;
         }
         if self.reset_session_confirm {
@@ -839,11 +1187,31 @@ impl App {
                 self.help_scroll = 0;
             }
             KeyCode::Tab => {
-                self.focus = match self.focus {
+                let new_focus = match self.focus {
                     Focus::Tree => Focus::Document,
                     Focus::Document => Focus::Output,
                     Focus::Output => Focus::Tree,
                 };
+                self.set_focus(new_focus);
+                // Gaining focus always means "I want to actually see this
+                // pane" — a collapsed Tree/Output would otherwise leave
+                // Tab cycling through a pane that's just a sliver on
+                // screen, with no visible sign anything changed. Only a
+                // *peek* though (see `peek_pane_on_focus`'s own doc
+                // comment) — `set_focus` above already collapsed whichever
+                // pane focus just left, if it was only open for the same
+                // reason.
+                self.peek_pane_on_focus(new_focus);
+            }
+            // Shift-Tab — the same cycle, backwards.
+            KeyCode::BackTab => {
+                let new_focus = match self.focus {
+                    Focus::Tree => Focus::Output,
+                    Focus::Output => Focus::Document,
+                    Focus::Document => Focus::Tree,
+                };
+                self.set_focus(new_focus);
+                self.peek_pane_on_focus(new_focus);
             }
             KeyCode::Up | KeyCode::Char('k') => match self.focus {
                 Focus::Tree => self.move_selection(-1),
@@ -864,14 +1232,19 @@ impl App {
             }
             KeyCode::Char('r') => self.trigger_run(true).await,
             KeyCode::Char('R') => self.trigger_run(false).await,
-            KeyCode::Char('K') => self.kill_running(),
+            KeyCode::Char('K') => self.kill_running().await,
             KeyCode::Char('S') => self.reset_session_confirm = true,
             // Opens the services list view — **experimental**, see
             // `open_services_view`'s own doc comment and SPEC.md's
             // "Service blocks (experimental)".
-            KeyCode::Char('v') => self.open_services_view(),
+            KeyCode::Char('v') => self.open_services_view().await,
+            // Opens the live-terminals view — every `tty` session the
+            // shared worker currently knows about, whether started by
+            // this TUI, another one, or a browser tab. See
+            // `open_tty_sessions_view`'s own doc comment.
+            KeyCode::Char('t') => self.open_tty_sessions_view().await,
             KeyCode::Char('o') => self.trigger_open_file(),
-            KeyCode::Char('c') => self.trigger_configure(),
+            KeyCode::Char('c') => self.trigger_configure().await,
             KeyCode::Char('e') => self.open_source_editor(),
             // The keyboard counterpart to clicking a pane's own `[+]`/`[-]`
             // title-row icon or double-clicking its title (`on_mouse`) —
@@ -883,12 +1256,31 @@ impl App {
             // currently focused — leaves focus untouched either way, so
             // toggling back out lands right where toggling in did.
             KeyCode::Char('f') => {
-                self.fullscreen = if self.fullscreen == Some(self.focus) {
-                    None
+                if self.fullscreen == Some(self.focus) {
+                    self.fullscreen = None;
                 } else {
-                    Some(self.focus)
-                };
+                    self.fullscreen = Some(self.focus);
+                    // A collapsed pane's own render function (`ui::
+                    // render_output`/`render_tree`) checks its own
+                    // collapsed flag *before* looking at `fullscreen` — so
+                    // fullscreening a currently-collapsed pane would hide
+                    // the other two but still only show that pane's own
+                    // collapsed handle/strip, with the rest of the screen
+                    // simply blank. Expanding here is what actually makes
+                    // `f` work as "expand" from the collapsed state. This
+                    // is an explicit action, not a focus-driven peek, so
+                    // the pane stays expanded once `f` is pressed again —
+                    // no `auto_expanded_pane` bookkeeping here.
+                    self.expand_pane(self.focus);
+                }
             }
+            // The keyboard counterpart to clicking a pane's own title bar
+            // (Tree/Output; a no-op on Document, which has no collapsed
+            // state) or its collapsed handle — same "mouse-only has no
+            // visible affordance on a TUI" reasoning `f` already has for
+            // fullscreen (see its own doc comment above, and the footer
+            // hint/`?` help).
+            KeyCode::Char('z') => self.toggle_collapse_focused(),
             KeyCode::PageDown => match self.focus {
                 Focus::Output => self.scroll_output(10),
                 _ => self.scroll_document(10),
@@ -1229,14 +1621,54 @@ impl App {
         }
         let Some(form) = &self.active_inline_form else { return };
         let mut changed = HashSet::new();
+        let mut values = HashMap::new();
         for (field, value) in form.fields.iter().zip(form.inputs.iter()) {
             self.session_vars.insert(field.var.clone(), value.clone());
             changed.insert(field.var.clone());
+            values.insert(field.var.clone(), value.clone());
         }
+        let (form_node_id, form_block_name) = {
+            let form = self.active_inline_form.as_ref().unwrap();
+            (form.node_id.clone(), form.block_name.clone())
+        };
         if let Some(form) = &mut self.active_inline_form {
             form.editing = false;
         }
         self.render_current_document();
+
+        // Worker mode: the run has to happen wherever `state.session_vars`
+        // actually lives — this TUI's own `self.session_vars` above is
+        // just a local pre-fill convenience for reopening the form (see
+        // `InlineFormState::inputs`'s own doc comment), not what a
+        // worker-side run would ever consult. `POST /api/form/submit`
+        // saves the values server-side and runs every autorun block they
+        // reach *there*, before returning — computing `changed`/
+        // `autorun_blocks_for_changed_vars` and driving `start_run`
+        // ourselves (the fallback branch below) would run the same blocks
+        // a *second* time, against a canvas snapshot that never actually
+        // saw the new value.
+        if let Some(port) = self.worker_port {
+            match crate::worker_client::submit_form(port, &form_node_id, &form_block_name, values).await {
+                Ok(triggered) => {
+                    self.status = if triggered.is_empty() {
+                        "meshfox: form submitted".into()
+                    } else {
+                        format!("meshfox: form submitted — {} autorun block(s) started", triggered.len())
+                    };
+                    // Nothing further to do here: `spawn_worker_watcher`/
+                    // `on_external_run_event` (already built to show any
+                    // passively-discovered run's live output, not just an
+                    // autorun's — see their own doc comments) pick up the
+                    // `RunStarted` this submission just caused the same
+                    // way a *different* tab/TUI submitting this exact form
+                    // would rely on.
+                }
+                Err(e) => {
+                    self.status = format!("meshfox: failed to submit form: {e}");
+                }
+            }
+            return;
+        }
 
         let triggered = meshfox_core::autorun_blocks_for_changed_vars(&self.display_canvas, &changed);
         let count = triggered.len();
@@ -1322,7 +1754,14 @@ impl App {
             self.on_modal_mouse(mouse, area);
             return;
         }
-        let layout = ui::compute_layout(area, self.fullscreen, self.tree_width_pct, self.output_height);
+        let layout = ui::compute_layout(
+            area,
+            self.fullscreen,
+            self.tree_width_pct,
+            self.output_height,
+            self.console_collapsed,
+            self.tree_collapsed,
+        );
 
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -1339,30 +1778,55 @@ impl App {
                 }
 
                 if point_in(layout.tree, mouse.column, mouse.row) {
-                    self.toggle_fullscreen_on_title_click(Focus::Tree, layout.tree, &mouse, is_double_click);
-                    let inner_x = layout.tree.x + 1; // left border
-                    let inner_y = layout.tree.y + 1; // top border
-                    if mouse.row >= inner_y {
-                        let clicked = self.list_state.offset() + (mouse.row - inner_y) as usize;
-                        if let Some(row) = self.rows.get(clicked) {
-                            // "  " * depth (indent) then a 2-column-wide
-                            // disclosure marker — see `ui::render_tree`'s
-                            // own `indent`/`disclosure` spans, which this
-                            // has to stay in step with.
-                            let disclosure_col = inner_x + row.depth as u16 * 2;
-                            let on_disclosure = row.has_children
-                                && mouse.column >= disclosure_col
-                                && mouse.column < disclosure_col + 2;
+                    if self.tree_collapsed {
+                        // The collapsed handle is just a narrow column —
+                        // clicking anywhere on it expands the tree back,
+                        // same "click it to reopen" affordance Output's
+                        // own collapsed strip already has. An explicit
+                        // click, not a focus-driven peek, so it stays
+                        // expanded even after focus later moves away.
+                        self.set_focus(Focus::Tree);
+                        self.expand_pane(Focus::Tree);
+                    } else {
+                        let (toggled_fullscreen, hit_title_row) = self.toggle_fullscreen_on_title_click(
+                            Focus::Tree,
+                            layout.tree,
+                            &mouse,
+                            is_double_click,
+                        );
+                        // A plain click that hit the title row but wasn't
+                        // itself a fullscreen toggle — mirrors Output's own
+                        // "click the title bar to collapse" affordance (see
+                        // its own branch below for why: otherwise there'd
+                        // be no way back to the collapsed handle at all,
+                        // Tree having no auto-collapse timer of its own).
+                        if hit_title_row && !toggled_fullscreen && self.fullscreen != Some(Focus::Tree) {
+                            self.tree_collapsed = true;
+                        }
+                        let inner_x = layout.tree.x + 1; // left border
+                        let inner_y = layout.tree.y + 1; // top border
+                        if mouse.row >= inner_y {
+                            let clicked = self.list_state.offset() + (mouse.row - inner_y) as usize;
+                            if let Some(row) = self.rows.get(clicked) {
+                                // "  " * depth (indent) then a 2-column-wide
+                                // disclosure marker — see `ui::render_tree`'s
+                                // own `indent`/`disclosure` spans, which this
+                                // has to stay in step with.
+                                let disclosure_col = inner_x + row.depth as u16 * 2;
+                                let on_disclosure = row.has_children
+                                    && mouse.column >= disclosure_col
+                                    && mouse.column < disclosure_col + 2;
 
-                            if clicked != self.selected {
-                                self.selected = clicked;
-                                self.doc_scroll = 0;
-                                self.render_current_document();
-                            }
-                            if on_disclosure {
-                                self.toggle_expand();
-                            } else if is_double_click {
-                                self.trigger_run(true).await;
+                                if clicked != self.selected {
+                                    self.selected = clicked;
+                                    self.doc_scroll = 0;
+                                    self.render_current_document();
+                                }
+                                if on_disclosure {
+                                    self.toggle_expand();
+                                } else if is_double_click {
+                                    self.trigger_run(true).await;
+                                }
                             }
                         }
                     }
@@ -1377,7 +1841,33 @@ impl App {
                         self.activate_click_target(target).await;
                     }
                 } else if point_in(layout.output, mouse.column, mouse.row) {
-                    self.toggle_fullscreen_on_title_click(Focus::Output, layout.output, &mouse, is_double_click);
+                    if self.console_collapsed {
+                        // The collapsed strip is just one row — clicking
+                        // anywhere on it expands the console, rather than
+                        // trying to hit-test a real title row that barely
+                        // exists at this height. An explicit click, not a
+                        // focus-driven peek, so it stays expanded even
+                        // after focus later moves away.
+                        self.set_focus(Focus::Output);
+                        self.expand_pane(Focus::Output);
+                    } else {
+                        let (toggled_fullscreen, hit_title_row) = self.toggle_fullscreen_on_title_click(
+                            Focus::Output,
+                            layout.output,
+                            &mouse,
+                            is_double_click,
+                        );
+                        // A plain click that hit the title row but wasn't
+                        // itself a fullscreen toggle (not on the `[+]`/`[-]`
+                        // icon, not a double-click) — mirrors the collapsed
+                        // strip's own "click it to reopen" affordance in
+                        // reverse, since otherwise the only way back to
+                        // that compact strip is waiting out
+                        // `CONSOLE_COLLAPSE_GRACE` after a run finishes.
+                        if hit_title_row && !toggled_fullscreen && self.fullscreen != Some(Focus::Output) {
+                            self.console_collapsed = true;
+                        }
+                    }
                 }
             }
             MouseEventKind::ScrollDown => {
@@ -1631,19 +2121,26 @@ impl App {
     /// flush against `rect`'s own top-right corner via
     /// `Line::right_aligned`) or was a double-click anywhere else on that
     /// same title row — toggles `fullscreen` for it, same as pressing `f`
-    /// while it's focused would.
-    fn toggle_fullscreen_on_title_click(&mut self, pane: Focus, rect: Rect, mouse: &MouseEvent, is_double_click: bool) {
-        self.focus = pane;
+    /// while it's focused would. Returns `(toggled_fullscreen, hit_title_row)`
+    /// — the Output branch of `on_mouse` uses a plain (single, non-icon)
+    /// click that hit the title row but didn't itself toggle fullscreen
+    /// for its own "collapse back down" action (see that branch's own
+    /// comment).
+    fn toggle_fullscreen_on_title_click(&mut self, pane: Focus, rect: Rect, mouse: &MouseEvent, is_double_click: bool) -> (bool, bool) {
+        self.set_focus(pane);
         let icon_start = rect
             .x
             .saturating_add(rect.width)
             .saturating_sub(1 + ui::FULLSCREEN_ICON_WIDTH);
-        let on_icon = mouse.row == rect.y
+        let hit_title_row = mouse.row == rect.y;
+        let on_icon = hit_title_row
             && mouse.column >= icon_start
             && mouse.column < icon_start + ui::FULLSCREEN_ICON_WIDTH;
-        if on_icon || (is_double_click && mouse.row == rect.y) {
+        let toggled = on_icon || (is_double_click && hit_title_row);
+        if toggled {
             self.fullscreen = if self.fullscreen == Some(pane) { None } else { Some(pane) };
         }
+        (toggled, hit_title_row)
     }
 
     fn toggle_expand(&mut self) {
@@ -1910,23 +2407,46 @@ impl App {
     /// (and `raw`/`canvas`, if the primary document was what got saved)
     /// afterward, same as any other on-disk change here, so the tree/
     /// document panes reflect the edit the moment the editor closes.
-    fn save_source_editor(&mut self) {
-        let Some(se) = &mut self.source_editor else {
+    /// Routes through the worker (`PUT /api/canvas/raw`) when this is the
+    /// primary canvas and one is reachable, instead of `std::fs::write` —
+    /// same lost-update-race reasoning `worker_client`'s other callers
+    /// already have. An `include` target file isn't addressable through
+    /// that endpoint the same way (it addresses an include by *node id* via
+    /// `?include=`, not by this editor's own path), so it always falls back
+    /// to a direct write, same as when no worker is reachable at all.
+    async fn save_source_editor(&mut self) {
+        let Some(se) = &self.source_editor else {
             return;
         };
         let text = se.editor.lines.to_string();
-        if se.is_canvas {
+        let is_canvas = se.is_canvas;
+        let path = se.path.clone();
+
+        if is_canvas {
             if let Err(e) = Canvas::from_markdown(&text) {
-                se.error = Some(e.to_string());
+                self.source_editor.as_mut().unwrap().error = Some(e.to_string());
                 return;
             }
         }
-        if let Err(e) = std::fs::write(&se.path, &text) {
-            se.error = Some(format!("failed to write {}: {e}", se.path.display()));
+
+        let is_primary = path == self.canvas_path;
+        let write_result = if is_primary {
+            if let Some(port) = self.worker_port {
+                crate::worker_client::put_canvas_raw(port, &text).await
+            } else {
+                std::fs::write(&path, &text).map_err(|e| format!("failed to write {}: {e}", path.display()))
+            }
+        } else {
+            std::fs::write(&path, &text).map_err(|e| format!("failed to write {}: {e}", path.display()))
+        };
+        if let Err(e) = write_result {
+            self.source_editor.as_mut().unwrap().error = Some(e);
             return;
         }
-        let is_primary = se.path == self.canvas_path;
-        se.mark_saved();
+
+        if let Some(se) = self.source_editor.as_mut() {
+            se.mark_saved();
+        }
         if is_primary {
             self.raw = text.clone();
             if let Ok(reparsed) = Canvas::from_markdown(&text) {
@@ -1999,6 +2519,18 @@ impl App {
             }
         }
 
+        // This node's own blocks' live output from the most recent run, if
+        // any — see `StepOutput`'s own doc comment. Filtered down to just
+        // this node up front so `markdown::render` (called from more than
+        // one branch below) can do a plain by-name lookup instead of every
+        // caller re-filtering the same global map.
+        let live_output: HashMap<String, StepOutput> = self
+            .step_output
+            .iter()
+            .filter(|(addr, _)| addr.node_id == node.id)
+            .map(|(addr, so)| (addr.block_name.clone(), so.clone()))
+            .collect();
+
         // `file` nodes with `display="code"` (see SPEC.md) show the
         // target's own file content, read fresh off disk — same as the
         // browser's read-only preview — rather than the node's own body
@@ -2037,6 +2569,7 @@ impl App {
                         &decls,
                         &form_values,
                         None,
+                        &live_output,
                     );
                     // `regions` came back indexed into `segs` alone —
                     // offset by how many segments already precede it (none,
@@ -2065,6 +2598,7 @@ impl App {
             &decls,
             &form_values,
             form_focus,
+            &live_output,
         );
         self.doc_segments = segs;
         self.doc_click_regions = regions;
@@ -2306,7 +2840,547 @@ impl App {
         });
     }
 
+    /// Node-id path from the root's own children down to (and including)
+    /// `node_id` — what `RunRequest`/`VarsQuery`/etc. address a block by
+    /// (see their own field doc comments server-side), unlike the flat
+    /// `node_id` the rest of this file already works with (`BlockAddr`,
+    /// `deps::resolve_chain`, ...). Empty for a root-owned block, matching
+    /// that same convention. Walks `self.display_canvas`'s own `parent`
+    /// chain, same as `App::new`'s deep-link ancestor expansion already
+    /// does.
+    fn path_to(&self, node_id: &str) -> Vec<String> {
+        if self.display_canvas.node(node_id).and_then(|n| n.parent.clone()).is_none() {
+            return Vec::new();
+        }
+        let mut chain = vec![node_id.to_string()];
+        let mut current = node_id.to_string();
+        while let Some(parent) = self.display_canvas.node(&current).and_then(|n| n.parent.clone()) {
+            if self.display_canvas.node(&parent).and_then(|n| n.parent.clone()).is_none() {
+                break;
+            }
+            chain.push(parent.clone());
+            current = parent;
+        }
+        chain.reverse();
+        chain
+    }
+
+    /// Whether resolving `node_id`/`block_name`'s own chain (`deps=` if
+    /// `with_deps`, `from=` only otherwise — same choice `start_run_local`
+    /// makes) touches a `tty` block anywhere in it, not just at the target
+    /// itself — a `tty` block may be an explicit or implicit dependency of
+    /// any other block (`meshfox_core::deps`'s own module doc comment), so
+    /// this can't just check the target block alone. Mirrors
+    /// `crates/server/src/lib.rs`'s own `find_tty_block` exactly (same
+    /// "resolved canvas, scan each address's own node text" approach), just
+    /// against `display_canvas` locally instead of a request's own
+    /// resolved snapshot — decides whether `start_run_via_worker` routes
+    /// through `begin_http_run` (`POST /api/run`) or `begin_http_tty_run`
+    /// (`GET /api/run/tty`, the only one of the two the server actually
+    /// accepts a tty-touching chain on at all). Returns the *last* tty
+    /// block's own `autoclose` flag found while walking the chain (`None`
+    /// if none are `tty` at all) — a chain can touch more than one `tty`
+    /// step, and the last one is the one whose own flag actually governs
+    /// whether the handoff pauses at the end (see `PendingHttpTty::autoclose`).
+    fn target_chain_tty_autoclose(&self, node_id: &str, block_name: &str, with_deps: bool) -> Option<bool> {
+        let target = BlockAddr::new(node_id.to_string(), block_name.to_string());
+        let chain_result = if with_deps {
+            meshfox_core::deps::resolve_chain(&self.display_canvas, target)
+        } else {
+            meshfox_core::deps::resolve_from_chain(&self.display_canvas, target)
+        };
+        let Ok(chain) = chain_result else { return None };
+        let mut autoclose = None;
+        for addr in &chain {
+            let Some(block) = self
+                .display_canvas
+                .node(&addr.node_id)
+                .map(|node| meshfox_core::scan_runnable_blocks(&addr.node_id, &node.text))
+                .unwrap_or_default()
+                .into_iter()
+                .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()) && b.tty)
+            else {
+                continue;
+            };
+            autoclose = Some(block.autoclose);
+        }
+        autoclose
+    }
+
+    /// Length of `node_id`/`block_name`'s own resolved chain (`deps=` if
+    /// `with_deps`, `from=` only otherwise) — same resolution
+    /// `target_chain_tty_autoclose` does, just counting steps instead of
+    /// scanning for `tty`. Used to decide whether starting this run should
+    /// auto-open the console: a single-block run doesn't need it, only a
+    /// multi-block chain does (see `begin_http_run`'s call site). Worker
+    /// mode doesn't know its own chain length up front the way local mode's
+    /// `chain: Vec<BlockAddr>` does (it's built incrementally from
+    /// `StepStart` events as they arrive), so this resolves it locally
+    /// against `display_canvas` purely to make that same decision early. `0`
+    /// if resolution fails for any reason — treated as "don't auto-open"
+    /// rather than guessing.
+    fn resolved_chain_len(&self, node_id: &str, block_name: &str, with_deps: bool) -> usize {
+        let target = BlockAddr::new(node_id.to_string(), block_name.to_string());
+        let chain_result = if with_deps {
+            meshfox_core::deps::resolve_chain(&self.display_canvas, target)
+        } else {
+            meshfox_core::deps::resolve_from_chain(&self.display_canvas, target)
+        };
+        chain_result.map(|chain| chain.len()).unwrap_or(0)
+    }
+
+    /// The lock file a `service_lock`-backed address (`node_id`/`block`)
+    /// would be locked under — same computation `advance_run`'s own
+    /// service branch does (`located.origin.as_deref().unwrap_or(&self
+    /// .canvas_path)` then `service_lock_path`), just resolved from
+    /// scratch here since a worker-routed `LockConflict` only reports the
+    /// address, not which file it lives in. Used by
+    /// `on_service_conflict_key`'s `is_tty` retry branch to kill the stale/
+    /// foreign owner directly (see `TtyConnectError::Conflict`'s own doc
+    /// comment for why a tty conflict retries this way instead of through
+    /// a `force` request parameter).
+    fn lock_path_for(&self, node_id: &str, block: &str) -> PathBuf {
+        let origin = meshfox_core::locate_node(&self.raw, &self.canvas_path, node_id)
+            .ok()
+            .and_then(|l| l.origin);
+        let canvas_path = origin.as_deref().unwrap_or(&self.canvas_path);
+        meshfox_core::service_lock_path(canvas_path, node_id, block)
+    }
+
+    /// The worker-routed path `start_run` takes when a worker is reachable
+    /// — pre-checks `GET /api/vars` (replacing `park_on_unresolved`'s lazy,
+    /// per-step discovery with a single up-front check across the whole
+    /// chain, the same gate the web UI's own `handleRun` already runs
+    /// before `executeRun`), opening the same `VarFormState` modal on
+    /// anything still unresolved, then starts the run for real — through
+    /// `begin_http_tty_run` when `target_chain_tty_autoclose` finds a
+    /// `tty` block anywhere in the chain (the server's plain `/api/run`
+    /// rejects one outright, see its own `find_tty_block` check), through
+    /// `begin_http_run` otherwise. `force`, when given, names the address
+    /// a prior plain-run `LockConflict` reported — see
+    /// `on_service_conflict_key`'s worker-routed branch — and skips the
+    /// vars check entirely (already done on the first attempt); never set
+    /// for a tty retry, which instead goes through `lock_path_for` (see
+    /// `TtyConnectError::Conflict`'s own doc comment).
+    async fn start_run_via_worker(
+        &mut self,
+        node_id: String,
+        block_name: String,
+        with_deps: bool,
+        port: u16,
+        force: Option<(String, String)>,
+        extra_vars: HashMap<String, String>,
+    ) {
+        let path = self.path_to(&node_id);
+        let is_tty = self.target_chain_tty_autoclose(&node_id, &block_name, with_deps).is_some();
+        if force.is_none() {
+            match crate::worker_client::get_vars(port, &path, &block_name, !with_deps).await {
+                Ok(statuses) => {
+                    let missing: Vec<_> = statuses.into_iter().filter(|v| !v.resolved).collect();
+                    if !missing.is_empty() {
+                        self.pending_http_run = Some(PendingHttpRun {
+                            node_id,
+                            block_name,
+                            with_deps,
+                            port,
+                            force,
+                            is_tty,
+                        });
+                        self.var_form = Some(var_form_from_statuses(missing));
+                        return;
+                    }
+                }
+                Err(e) => {
+                    self.status = format!("meshfox: failed to check variables: {e}");
+                    return;
+                }
+            }
+        }
+        if is_tty {
+            self.begin_http_tty_run(node_id, block_name, with_deps, port, extra_vars).await;
+        } else {
+            self.begin_http_run(node_id, block_name, with_deps, port, extra_vars, force).await;
+        }
+    }
+
+    /// Actually starts a worker-routed interactive run (`GET
+    /// /api/run/tty`) — connects the socket (an ordinary async call, no
+    /// terminal access needed yet) and parks it as `pending_http_tty` for
+    /// `mod.rs`'s event loop to actually hand the terminal to on its next
+    /// iteration (see `PendingHttpTty`'s own doc comment) — the
+    /// worker-routed counterpart to `advance_run`'s local `pending_tty`
+    /// branch. A `409` reuses the same `ServiceConflictState` modal
+    /// `begin_http_run`'s own conflict branch does, just with
+    /// `HttpRunRetry::is_tty` set so `on_service_conflict_key` retries the
+    /// right way (see `TtyConnectError::Conflict`'s own doc comment).
+    async fn begin_http_tty_run(
+        &mut self,
+        node_id: String,
+        block_name: String,
+        with_deps: bool,
+        port: u16,
+        vars: HashMap<String, String>,
+    ) {
+        let path = self.path_to(&node_id);
+        let autoclose = self
+            .target_chain_tty_autoclose(&node_id, &block_name, with_deps)
+            .unwrap_or(false);
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        match crate::worker_client::tty_connect(
+            port,
+            &path,
+            &block_name,
+            !with_deps,
+            vars,
+            std::collections::HashSet::new(),
+            cols,
+            rows,
+        )
+        .await
+        {
+            Ok(socket) => {
+                self.status.clear();
+                self.pending_http_tty = Some(PendingHttpTty {
+                    socket,
+                    block_name,
+                    autoclose,
+                });
+            }
+            Err(crate::worker_client::TtyConnectError::Conflict(conflict)) => {
+                self.status = format!(
+                    "meshfox: {:?}/{:?} is locked by pid {} ({}) — y to kill and retry, n to cancel",
+                    conflict.node_id, conflict.block, conflict.owner_pid, conflict.owner_desc
+                );
+                self.service_conflict = Some(ServiceConflictState {
+                    block_name: conflict.block.clone(),
+                    owner_pid: conflict.owner_pid,
+                    owner_desc: conflict.owner_desc.clone(),
+                    lock_path: PathBuf::new(),
+                    http_retry: Some(HttpRunRetry {
+                        node_id,
+                        block_name,
+                        with_deps,
+                        port,
+                        force_node_id: conflict.node_id.clone(),
+                        force_block: conflict.block.clone(),
+                        is_tty: true,
+                    }),
+                });
+            }
+            Err(e) => {
+                self.status = format!("meshfox: failed to start interactive session: {e}");
+            }
+        }
+    }
+
+    /// Actually starts a worker-routed run (`POST /api/run`/`force`) and
+    /// wires its streamed `RunEvent`s into a fresh `RunState` the same
+    /// rendering code (`ui.rs`/`markdown.rs`'s live-output splice) already
+    /// reads regardless of which mode populated it — see
+    /// `App::on_run_event` for the folding itself.
+    async fn begin_http_run(
+        &mut self,
+        node_id: String,
+        block_name: String,
+        with_deps: bool,
+        port: u16,
+        vars: HashMap<String, String>,
+        force: Option<(String, String)>,
+    ) {
+        let path = self.path_to(&node_id);
+        self.output_scroll = 0;
+        self.output_hscroll = 0;
+        self.status.clear();
+        // Only worth auto-opening the console for a real chain — a single
+        // block's own output isn't worth losing screen space over. Worker
+        // mode doesn't know its own chain length yet at this point (it's
+        // built incrementally from `StepStart` events), so resolve it
+        // locally just for this decision — see `resolved_chain_len`'s own
+        // doc comment.
+        if self.resolved_chain_len(&node_id, &block_name, with_deps) >= 2 {
+            self.console_collapsed = false;
+            self.console_last_activity = Some(std::time::Instant::now());
+        }
+        match crate::worker_client::run_stream(
+            port,
+            &path,
+            &block_name,
+            !with_deps,
+            vars,
+            std::collections::HashSet::new(),
+            force,
+        )
+        .await
+        {
+            Ok(http_rx) => {
+                self.run = Some(RunState {
+                    chain: Vec::new(),
+                    idx: 0,
+                    proc: None,
+                    http_rx: Some(http_rx),
+                    lines: Vec::new(),
+                    full_output: String::new(),
+                    stdout_only: String::new(),
+                    stderr_only: String::new(),
+                    output_markdown: false,
+                    step_started: std::time::Instant::now(),
+                    current_node_text: String::new(),
+                    had_failure: false,
+                    killed: false,
+                    finished: false,
+                    pending_vars_out: None,
+                    forced_reruns: HashSet::new(),
+                });
+            }
+            Err(crate::worker_client::RunStartError::Conflict(conflict)) => {
+                self.status = format!(
+                    "meshfox: {:?}/{:?} is locked by pid {} ({}) — y to kill and retry, n to cancel",
+                    conflict.node_id, conflict.block, conflict.owner_pid, conflict.owner_desc
+                );
+                self.service_conflict = Some(ServiceConflictState {
+                    block_name: conflict.block.clone(),
+                    owner_pid: conflict.owner_pid,
+                    owner_desc: conflict.owner_desc.clone(),
+                    lock_path: PathBuf::new(),
+                    http_retry: Some(HttpRunRetry {
+                        node_id,
+                        block_name,
+                        with_deps,
+                        port,
+                        force_node_id: conflict.node_id.clone(),
+                        force_block: conflict.block.clone(),
+                        is_tty: false,
+                    }),
+                });
+            }
+            Err(e) => {
+                self.status = format!("meshfox: failed to start run: {e}");
+            }
+        }
+    }
+
+    /// Folds one streamed `RunEvent` (`worker_client::run_stream`) into the
+    /// current worker-routed `RunState` — the worker-mode counterpart to
+    /// `on_output_line`/`advance_run`'s own local-mode step-by-step
+    /// updates. Populates the exact same fields those do, so
+    /// `ui.rs`/`markdown.rs`'s rendering never needs to know which mode
+    /// produced them.
+    pub async fn on_run_event(&mut self, event: Option<crate::worker_client::RunEvent>) {
+        use crate::worker_client::RunEvent;
+        self.console_last_activity = Some(std::time::Instant::now());
+        let Some(run) = &mut self.run else { return };
+        let Some(event) = event else {
+            // The channel closed without a terminal event (the worker died
+            // mid-stream, say) — same "can't tell what happened, stop
+            // waiting" posture a local `proc`'s output channel closing
+            // unexpectedly would already need.
+            run.http_rx = None;
+            run.finished = true;
+            self.status = "meshfox: lost the worker's run stream".into();
+            return;
+        };
+        match event {
+            RunEvent::Started { .. } => {}
+            RunEvent::StepStart { node_id, block } => {
+                run.chain.push(BlockAddr::new(node_id, block));
+                run.idx += 1;
+                run.stdout_only.clear();
+                run.stderr_only.clear();
+                run.step_started = std::time::Instant::now();
+            }
+            RunEvent::StepSkipped { node_id, block, output, duration_ms } => {
+                run.lines.push(format!("==> {block} (skipped, already fresh this session)"));
+                run.lines.push(output.clone());
+                run.lines.push(format!("(skipped · {})", meshfox_core::format_duration_ms(duration_ms)));
+                self.step_output.insert(
+                    BlockAddr::new(node_id, block),
+                    StepOutput { stdout: output, stderr: String::new(), output_markdown: false, exit_code: 0, duration_ms, running: false },
+                );
+            }
+            RunEvent::Output { node_id: _, block: _, stream, text } => {
+                run.lines.push(text.clone());
+                run.full_output.push_str(&text);
+                run.full_output.push('\n');
+                match stream {
+                    meshfox_server::stream_exec::OutputStream::Stdout => {
+                        run.stdout_only.push_str(&text);
+                        run.stdout_only.push('\n');
+                    }
+                    meshfox_server::stream_exec::OutputStream::Stderr => {
+                        run.stderr_only.push_str(&text);
+                        run.stderr_only.push('\n');
+                    }
+                }
+            }
+            RunEvent::TtyStart { .. } => {}
+            RunEvent::ServiceStarted { node_id: _, block, pid } => {
+                run.lines.push(format!("==> {block} (service started, pid {pid})"));
+            }
+            RunEvent::StepEnd { node_id, block, exit_code, duration_ms } => {
+                run.lines.push(format!(
+                    "(exit {exit_code} · {})",
+                    meshfox_core::format_duration_ms(duration_ms)
+                ));
+                self.step_output.insert(
+                    BlockAddr::new(node_id, block),
+                    StepOutput {
+                        stdout: run.stdout_only.clone(),
+                        stderr: run.stderr_only.clone(),
+                        output_markdown: run.output_markdown,
+                        exit_code,
+                        duration_ms,
+                        running: false,
+                    },
+                );
+                if exit_code != 0 {
+                    run.had_failure = true;
+                }
+            }
+            RunEvent::Killed { node_id, block } => {
+                run.killed = true;
+                run.finished = true;
+                run.http_rx = None;
+                self.status = "run killed".into();
+                // Local mode gets a `step_output` entry for free once a
+                // killed process's exit status actually resolves
+                // (`on_output_line`'s own `None` branch always inserts
+                // one, non-zero or not) — the server never sends a
+                // `StepEnd` for a killed step (see `run_block_impl`/
+                // `run_tty_chain`'s own "killed short-circuits before
+                // StepEnd" shape), so this is worker mode's own
+                // equivalent, needed for `ui::render_tree`'s failed-badge
+                // aggregation to see this address at all.
+                self.step_output.insert(
+                    BlockAddr::new(node_id, block),
+                    StepOutput {
+                        stdout: run.stdout_only.clone(),
+                        stderr: run.stderr_only.clone(),
+                        output_markdown: run.output_markdown,
+                        exit_code: -1,
+                        duration_ms: run.step_started.elapsed().as_millis() as u64,
+                        running: false,
+                    },
+                );
+            }
+            RunEvent::Error { message } => {
+                run.had_failure = true;
+                run.finished = true;
+                run.http_rx = None;
+                self.status = format!("meshfox: {message}");
+            }
+            RunEvent::Done { .. } => {
+                run.finished = true;
+                run.http_rx = None;
+                self.status = if run.killed {
+                    "run killed".into()
+                } else if run.had_failure {
+                    "run finished with a failure".into()
+                } else {
+                    "run finished".into()
+                };
+                if let Some(addr) = self.pending_autoruns.pop_front() {
+                    if let Some(port) = self.worker_port {
+                        Box::pin(self.start_run_via_worker(addr.node_id, addr.block_name, true, port, None, HashMap::new())).await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Folds one `worker_client::SubscribeEvent` for `addr` into
+    /// `step_output`/`external_running` — the passive-watch counterpart to
+    /// `on_run_event`, for a run this TUI session never itself started
+    /// (see `worker_client::WatchEvent::RunStarted`'s own doc comment and
+    /// the web UI's `watchAutorunBlock`, which this mirrors). Skips
+    /// addresses this session's own `self.run` already owns: that run
+    /// already folds its output into the very same `step_output` map via
+    /// `on_run_event`, so a passive subscription racing alongside it would
+    /// only double up on writes that already agree.
+    ///
+    /// Unlike a self-triggered run, there's no live `RunState` to hold a
+    /// growing `stdout_only`/`stderr_only` between lines — `step_output`'s
+    /// own entry is grown in place instead, one `Line` at a time, so
+    /// `render_current_document`'s live-splice shows this run's output
+    /// growing the same way it would for a run this session started
+    /// itself. `output_markdown` is looked up fresh from `display_canvas`
+    /// (this TUI never resolved this block's own attributes for a run it
+    /// didn't start) — best-effort `false` if the block can't be found
+    /// (already gone from a since-edited canvas, say).
+    pub fn on_external_run_event(&mut self, addr: BlockAddr, event: crate::worker_client::SubscribeEvent) {
+        use crate::worker_client::SubscribeEvent;
+        if self.run.as_ref().is_some_and(|r| r.chain.contains(&addr)) {
+            return;
+        }
+        match event {
+            SubscribeEvent::Line { stream, text } => {
+                // `external_running` not yet holding this address means
+                // this is the first `Line` of a *fresh* subscription (a
+                // new `WatchEvent::RunStarted`, in `spawn_run_subscriber`)
+                // — `subscribe_run` always replays from the new run's own
+                // `RunHandle` (a fresh ring buffer, `since_seq` unused
+                // here), so without clearing the stale entry first, a
+                // second trigger of the same form-`autorun` block would
+                // just keep appending onto whatever the *previous* run
+                // left behind here, showing every past run's output
+                // stacked instead of only the current one.
+                if !self.external_running.contains_key(&addr) {
+                    self.step_output.remove(&addr);
+                }
+                self.external_running.entry(addr.clone()).or_insert_with(std::time::Instant::now);
+                let entry = self.step_output.entry(addr.clone()).or_insert_with(|| StepOutput {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    output_markdown: self
+                        .display_canvas
+                        .node(&addr.node_id)
+                        .map(|n| meshfox_core::scan_runnable_blocks(&addr.node_id, &n.text))
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()))
+                        .is_some_and(|b| b.attrs.get("output").map(String::as_str) == Some("markdown")),
+                    exit_code: 0,
+                    duration_ms: 0,
+                    running: true,
+                });
+                entry.running = true;
+                let line = match stream {
+                    meshfox_server::stream_exec::OutputStream::Stdout => &mut entry.stdout,
+                    meshfox_server::stream_exec::OutputStream::Stderr => &mut entry.stderr,
+                };
+                line.push_str(&text);
+                line.push('\n');
+            }
+            SubscribeEvent::Done { exit_code } => {
+                let started = self.external_running.remove(&addr);
+                if let Some(entry) = self.step_output.get_mut(&addr) {
+                    entry.exit_code = exit_code.unwrap_or(-1);
+                    entry.running = false;
+                    if let Some(started) = started {
+                        entry.duration_ms = started.elapsed().as_millis() as u64;
+                    }
+                }
+            }
+        }
+        if self.rows.get(self.selected).is_some_and(|row| row.node_id == addr.node_id) {
+            self.render_current_document();
+        }
+    }
+
+    /// Dispatches to the worker-routed path (`start_run_via_worker`) when a
+    /// worker is reachable, `start_run_local`'s original direct-file/
+    /// local-process chain-driving otherwise. Every call site here calls
+    /// this, never either half directly, so the branch lives in exactly
+    /// one place.
     async fn start_run(&mut self, node_id: String, block_name: String, with_deps: bool) {
+        if let Some(port) = self.worker_port {
+            self.start_run_via_worker(node_id, block_name, with_deps, port, None, HashMap::new())
+                .await;
+            return;
+        }
+        self.start_run_local(node_id, block_name, with_deps).await;
+    }
+
+    async fn start_run_local(&mut self, node_id: String, block_name: String, with_deps: bool) {
         let target = BlockAddr::new(node_id, block_name);
         // Include-resolved (not just `self.canvas`) so `target` can name a
         // node spliced in from an `include` — same namespaced id
@@ -2361,10 +3435,12 @@ impl App {
 
         self.output_scroll = 0;
         self.output_hscroll = 0;
+        let chain_len = chain.len();
         self.run = Some(RunState {
             chain,
             idx: 0,
             proc: None,
+            http_rx: None,
             lines: Vec::new(),
             full_output: String::new(),
             stdout_only: String::new(),
@@ -2381,6 +3457,12 @@ impl App {
         self.run_overrides.clear();
         self.run_computed.clear();
         self.status.clear();
+        // Only worth auto-opening the console for a real chain — a single
+        // block's own output isn't worth losing screen space over.
+        if chain_len >= 2 {
+            self.console_collapsed = false;
+            self.console_last_activity = Some(std::time::Instant::now());
+        }
         self.advance_run().await;
     }
 
@@ -2794,6 +3876,7 @@ impl App {
                         owner_pid: info.pid,
                         owner_desc: info.owner,
                         lock_path,
+                        http_retry: None,
                     });
                     return;
                 }
@@ -2999,11 +4082,16 @@ impl App {
                 self.output_scroll = 0;
                 self.output_hscroll = 0;
                 self.file_run = Some(FileRunState {
+                    node_id: node_id.clone(),
                     proc: Some(proc),
                     lines: vec![format!("==> {node_id}")],
                     had_failure: false,
                     finished: false,
                 });
+                // A file run is always a single execution — never a
+                // multi-block chain — so it never auto-opens the console
+                // (see `resolved_chain_len`'s call sites for the chain-run
+                // equivalent of this rule).
             }
             Err(e) => {
                 self.status = format!("failed to run {node_id:?}: {e}");
@@ -3016,6 +4104,7 @@ impl App {
     /// fenced block (no `cache`, no `meshfox:var`, no chain to advance).
     pub async fn on_file_output_line(&mut self, line: Option<(OutputStream, String)>) {
         let Some(run) = &mut self.file_run else { return };
+        self.console_last_activity = Some(std::time::Instant::now());
         match line {
             Some((_, text)) => run.lines.push(text),
             None => {
@@ -3035,6 +4124,7 @@ impl App {
     /// so there's never cached output to write back for this step, unlike
     /// `on_output_line`'s non-tty completion path.
     pub async fn resume_after_tty(&mut self, exit_code: i32) {
+        self.console_last_activity = Some(std::time::Instant::now());
         let from_value_error = self.apply_pending_vars_out(exit_code);
         if let Some(run) = &mut self.run {
             run.lines.push(format!("(exited {exit_code})"));
@@ -3048,10 +4138,32 @@ impl App {
         self.advance_run().await;
     }
 
+    /// The worker-routed equivalent of `resume_after_tty` — called by
+    /// `mod.rs` once `bridge_http_tty`'s relay loop returns. Unlike local
+    /// mode, there's no `RunState`/chain `idx` to advance here at all: the
+    /// *entire* chain (deps and interactive step alike) already ran
+    /// server-side over the one `/api/run/tty` connection
+    /// `begin_http_tty_run` opened — see `PendingHttpTty`'s own doc
+    /// comment for why this never populates `self.run` in the first
+    /// place. Only draining `pending_autoruns` (same "one foreground run
+    /// slot" reasoning `advance_run`'s own chain-exhausted branch has)
+    /// carries over.
+    pub async fn resume_after_http_tty(&mut self, exit_code: i32) {
+        self.status = if exit_code == 0 {
+            "run finished".into()
+        } else {
+            "run finished with a failure".into()
+        };
+        if let Some(addr) = self.pending_autoruns.pop_front() {
+            Box::pin(self.start_run(addr.node_id, addr.block_name, true)).await;
+        }
+    }
+
     pub async fn on_output_line(&mut self, line: Option<(OutputStream, String)>) {
         if self.run.is_none() {
             return;
         }
+        self.console_last_activity = Some(std::time::Instant::now());
         match line {
             Some((stream, text)) => {
                 let run = self.run.as_mut().unwrap();
@@ -3080,7 +4192,7 @@ impl App {
                 let status = proc.child.wait().await;
                 let exit_code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
 
-                let (addr, node_text, full_output, stdout_only, stderr_only, duration_ms) = {
+                let (addr, node_text, full_output, stdout_only, stderr_only, duration_ms, output_markdown) = {
                     let run = self.run.as_ref().unwrap();
                     (
                         run.chain[run.idx].clone(),
@@ -3089,12 +4201,28 @@ impl App {
                         run.stdout_only.clone(),
                         run.stderr_only.clone(),
                         run.step_started.elapsed().as_millis() as u64,
+                        run.output_markdown,
                     )
                 };
                 self.run.as_mut().unwrap().lines.push(format!(
                     "(exit {exit_code} · {})",
                     meshfox_core::format_duration_ms(duration_ms)
                 ));
+                // Snapshot before the chain moves on — `stdout_only`/
+                // `stderr_only` reset for the next step (see their own doc
+                // comment), so this is the last moment this step's own
+                // output is available anywhere but here.
+                self.step_output.insert(
+                    addr.clone(),
+                    StepOutput {
+                        stdout: stdout_only.clone(),
+                        stderr: stderr_only.clone(),
+                        output_markdown,
+                        exit_code,
+                        duration_ms,
+                        running: false,
+                    },
+                );
 
                 let from_value_error = self.apply_pending_vars_out(exit_code);
 
@@ -3194,6 +4322,158 @@ impl App {
     /// than waiting for the next tick. Doesn't drain any output — each
     /// `ServiceHandle`'s own background task (`meshfox_server::services`)
     /// already keeps `status()`/`log_snapshot()` live on its own.
+    /// Whether the console (Output pane) still needs `mod.rs`'s periodic
+    /// tick calling `console_tick` — i.e. it's expanded, and either
+    /// something's running (so re-collapsing wouldn't be correct yet, but
+    /// the tick still has to keep checking in case it stops) or the 10s
+    /// grace window since the last activity hasn't been confirmed stale
+    /// yet. `false` once it's already collapsed, so the tick isn't
+    /// scheduled at all when there's nothing left for it to do.
+    pub fn console_pending_collapse(&self) -> bool {
+        !self.console_collapsed
+    }
+
+    /// Whether `pane` is currently collapsed — always `false` for
+    /// `Focus::Document`, which has no collapsed state of its own.
+    fn is_pane_collapsed(&self, pane: Focus) -> bool {
+        match pane {
+            Focus::Tree => self.tree_collapsed,
+            Focus::Output => self.console_collapsed,
+            Focus::Document => false,
+        }
+    }
+
+    /// Collapses `pane` outright — a no-op for `Focus::Document`.
+    fn collapse_pane(&mut self, pane: Focus) {
+        match pane {
+            Focus::Tree => self.tree_collapsed = true,
+            Focus::Output => self.console_collapsed = true,
+            Focus::Document => {}
+        }
+    }
+
+    /// Un-collapses `pane` outright, as a deliberate action (clicking its
+    /// title bar/collapsed handle, `z`, `f`) — unlike `peek_pane_on_focus`,
+    /// this always clears `auto_expanded_pane` for it (if set), so it
+    /// stays open on its own terms regardless of where focus goes next,
+    /// rather than snapping back closed the instant focus happens to move
+    /// elsewhere.
+    fn expand_pane(&mut self, pane: Focus) {
+        match pane {
+            Focus::Tree => self.tree_collapsed = false,
+            Focus::Output => {
+                self.console_collapsed = false;
+                // `console_last_activity` has to move too: it's `None`
+                // until the very first run this session (see its own doc
+                // comment), and `console_tick`'s own `map_or(true, ..)`
+                // treats `None` as "already stale" — without this, the
+                // very next tick (`mod.rs`'s 500ms poll while anything is
+                // expanded) would immediately re-collapse it right back
+                // before anyone could see the difference.
+                self.console_last_activity = Some(std::time::Instant::now());
+            }
+            Focus::Document => {}
+        }
+        if self.auto_expanded_pane == Some(pane) {
+            self.auto_expanded_pane = None;
+        }
+    }
+
+    /// Changes `self.focus`, first collapsing whatever pane focus is
+    /// *leaving* if `auto_expanded_pane` says it was only expanded as a
+    /// side effect of gaining that focus a moment ago (see that field's
+    /// own doc comment) — shared by every focus-changing action (`Tab`/
+    /// `BackTab`, clicking any pane, via `toggle_fullscreen_on_title_click`
+    /// and the Tree/Output collapsed-handle click handlers).
+    fn set_focus(&mut self, new_focus: Focus) {
+        if self.focus != new_focus && self.auto_expanded_pane == Some(self.focus) {
+            self.collapse_pane(self.focus);
+            self.auto_expanded_pane = None;
+        }
+        self.focus = new_focus;
+    }
+
+    /// `Tab`/`BackTab` landing on a collapsed Tree/Output — expands it for
+    /// as long as focus actually stays there (see `set_focus`'s own
+    /// collapse-on-blur logic), rather than leaving focus on an invisible
+    /// sliver with no visible sign anything changed.
+    fn peek_pane_on_focus(&mut self, pane: Focus) {
+        if self.is_pane_collapsed(pane) {
+            self.expand_pane(pane);
+            self.auto_expanded_pane = Some(pane);
+        }
+    }
+
+    /// `z` — toggles collapse for whichever pane is focused; a no-op on
+    /// Document (no collapsed state of its own) or on a pane that's
+    /// currently fullscreen (collapsing it there would just blank the
+    /// fullscreen area — see `expand_pane`'s own doc comment for the
+    /// mirror-image reasoning on entering fullscreen instead).
+    fn toggle_collapse_focused(&mut self) {
+        if self.fullscreen == Some(self.focus) {
+            return;
+        }
+        if self.is_pane_collapsed(self.focus) {
+            self.expand_pane(self.focus);
+        } else {
+            self.collapse_pane(self.focus);
+            if self.auto_expanded_pane == Some(self.focus) {
+                self.auto_expanded_pane = None;
+            }
+        }
+    }
+
+    /// Whether `ui::render_tree`'s running-spinner badge is showing on any
+    /// row at all right now — gates `mod.rs`'s own spinner tick, the same
+    /// "no wakeups scheduled once there's nothing to animate" reasoning
+    /// `console_pending_collapse`/`has_services` already follow for their
+    /// own ticks.
+    pub fn spinner_active(&self) -> bool {
+        self.run.as_ref().is_some_and(RunState::is_running)
+            || self.file_run.as_ref().is_some_and(|f| f.proc.is_some())
+            || !self.external_running.is_empty()
+    }
+
+    /// Advances `spinner_tick` by one frame — see that field's own doc
+    /// comment for why a plain counter, not wall-clock time. Wrapping is
+    /// harmless: only ever read modulo the frame count.
+    pub fn advance_spinner(&mut self) {
+        self.spinner_tick = self.spinner_tick.wrapping_add(1);
+    }
+
+    /// How long the console stays expanded after the last run/step
+    /// activity (`console_last_activity`) before `console_tick` collapses
+    /// it again — only actually applies once nothing is running, since
+    /// every streamed line/step completion refreshes `console_last_activity`
+    /// on its own.
+    const CONSOLE_COLLAPSE_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Re-collapses the console once nothing is running and it's been at
+    /// least [`Self::CONSOLE_COLLAPSE_GRACE`] since the last activity —
+    /// called from `mod.rs`'s periodic tick, guarded by
+    /// `console_pending_collapse` so this is only ever polled while the
+    /// console is actually expanded.
+    pub fn console_tick(&mut self) {
+        // Never auto-collapse out from under the user while they're
+        // actually looking at it — whether that's keyboard focus or having
+        // it fullscreened (fullscreen implies focus too, but is checked
+        // explicitly in case that ever changes independently).
+        if self.focus == Focus::Output || self.fullscreen == Some(Focus::Output) {
+            return;
+        }
+        let running = self.run.as_ref().is_some_and(RunState::is_running)
+            || self.file_run.as_ref().is_some_and(|r| r.proc.is_some());
+        if running {
+            return;
+        }
+        let stale = self
+            .console_last_activity
+            .map_or(true, |t| t.elapsed() >= Self::CONSOLE_COLLAPSE_GRACE);
+        if stale {
+            self.console_collapsed = true;
+        }
+    }
+
     pub fn tick_services(&mut self) {
         let (mut running, mut crashed) = (0usize, 0usize);
         for handle in self.services.values() {
@@ -3210,6 +4490,47 @@ impl App {
         };
     }
 
+    /// The worker-routed equivalent of `tick_services` — refetches `GET
+    /// /api/services` into `service_list` and recomputes `service_stats`
+    /// from its own `status` strings (`"running"`/`"crashed"`/anything
+    /// else counts as neither, matching `service_dto`'s own three-way
+    /// split server-side). Called from `mod.rs`'s periodic tick whenever
+    /// `worker_port` is `Some`, same ~3s cadence the web UI's own service
+    /// panel already polls at. A failed request (worker gone, say) just
+    /// leaves the last-known list/stats in place rather than clearing
+    /// them — a transient hiccup shouldn't flash the footer badge away.
+    pub async fn refresh_services(&mut self) {
+        let Some(port) = self.worker_port else { return };
+        let Ok(list) = crate::worker_client::list_services(port).await else {
+            return;
+        };
+        let (mut running, mut crashed) = (0usize, 0usize);
+        for dto in &list {
+            match dto.status.as_str() {
+                "running" => running += 1,
+                "crashed" => crashed += 1,
+                _ => {}
+            }
+        }
+        self.service_stats = if list.is_empty() { None } else { Some((running, crashed)) };
+        self.service_list = list;
+    }
+
+    /// Refreshes `service_log` for one service — the worker-routed
+    /// equivalent of calling `ServiceHandle::log_snapshot()` directly at
+    /// render time (impossible here since fetching it is an async HTTP
+    /// call, not a synchronous read — see `service_log`'s own doc
+    /// comment). Called right after the services view's selection changes
+    /// and on `mod.rs`'s periodic tick while the view is open, so the log
+    /// panel stays live without `render_services_view` itself ever
+    /// touching the network.
+    pub async fn refresh_service_log(&mut self, node_id: &str, block: &str) {
+        let Some(port) = self.worker_port else { return };
+        if let Ok(log) = crate::worker_client::get_service_log(port, node_id, block).await {
+            self.service_log = log;
+        }
+    }
+
     /// `y`/Enter: kills whatever the lock file named as owner and retries
     /// the same chain step (`self.run.idx` is unchanged, so `advance_run`
     /// naturally re-attempts it). `n`/Esc: cancels — the chain ends here,
@@ -3219,6 +4540,44 @@ impl App {
         let Some(conflict) = self.service_conflict.take() else { return };
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                if let Some(retry) = conflict.http_retry {
+                    self.status = format!("killed pid {} — restarting {:?}", conflict.owner_pid, conflict.block_name);
+                    if retry.is_tty {
+                        // No `/api/run/tty/force` to retry through (see
+                        // `TtyConnectError::Conflict`'s own doc comment) —
+                        // kill the stale/foreign owner directly against the
+                        // same on-disk lock file the worker itself would
+                        // use, release it right back, then just reconnect;
+                        // the worker's own subsequent lock acquire succeeds
+                        // cleanly since the file is provably free again.
+                        let lock_path = self.lock_path_for(&retry.force_node_id, &retry.force_block);
+                        let _ = meshfox_core::service_lock::kill_and_acquire(
+                            &lock_path,
+                            std::process::id(),
+                            "tui",
+                        );
+                        let _ = meshfox_core::service_lock::release(&lock_path);
+                        Box::pin(self.begin_http_tty_run(
+                            retry.node_id,
+                            retry.block_name,
+                            retry.with_deps,
+                            retry.port,
+                            HashMap::new(),
+                        ))
+                        .await;
+                    } else {
+                        Box::pin(self.begin_http_run(
+                            retry.node_id,
+                            retry.block_name,
+                            retry.with_deps,
+                            retry.port,
+                            HashMap::new(),
+                            Some((retry.force_node_id, retry.force_block)),
+                        ))
+                        .await;
+                    }
+                    return;
+                }
                 // Kill the stale/foreign owner, reacquire, then release
                 // again right away — the retry below (`advance_run`, same
                 // `idx`) does its own fresh `acquire` when it re-reaches
@@ -3262,7 +4621,18 @@ impl App {
     /// `v` — opens the services list view (every service this process
     /// knows about at once, not scoped to the selected node), or reports
     /// there's nothing to show yet. See `ServicesViewState`.
-    fn open_services_view(&mut self) {
+    async fn open_services_view(&mut self) {
+        if self.worker_port.is_some() {
+            self.refresh_services().await;
+            if self.service_list.is_empty() {
+                self.status = "no services running yet".into();
+                return;
+            }
+            self.services_view = Some(ServicesViewState { selected: 0 });
+            let key = self.sorted_service_keys()[0].clone();
+            self.refresh_service_log(&key.0, &key.1).await;
+            return;
+        }
         if self.services.is_empty() {
             self.status = "no services running yet".into();
             return;
@@ -3270,12 +4640,17 @@ impl App {
         self.services_view = Some(ServicesViewState { selected: 0 });
     }
 
-    /// A stable, sorted key order for `services` — the services view (and
-    /// its own key handler) index into this rather than trusting
-    /// `HashMap`'s own arbitrary iteration order to stay put between
-    /// frames/keypresses.
-    fn sorted_service_keys(&self) -> Vec<(String, String)> {
-        let mut keys: Vec<(String, String)> = self.services.keys().cloned().collect();
+    /// A stable, sorted key order for `services`/`service_list` (whichever
+    /// is live — see each field's own doc comment) — the services view
+    /// (and its own key handler) index into this rather than trusting
+    /// `HashMap`'s own arbitrary iteration order, or `service_list`'s own
+    /// last-poll response order, to stay put between frames/keypresses.
+    pub(super) fn sorted_service_keys(&self) -> Vec<(String, String)> {
+        let mut keys: Vec<(String, String)> = if self.worker_port.is_some() {
+            self.service_list.iter().map(|d| (d.node_id.clone(), d.block.clone())).collect()
+        } else {
+            self.services.keys().cloned().collect()
+        };
         keys.sort();
         keys
     }
@@ -3296,6 +4671,49 @@ impl App {
             .map(|v| v.selected)
             .unwrap_or(0)
             .min(keys.len() - 1);
+        if let Some(port) = self.worker_port {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.services_view = None;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    let new_selected = selected.saturating_sub(1);
+                    if let Some(view) = &mut self.services_view {
+                        view.selected = new_selected;
+                    }
+                    let key = keys[new_selected].clone();
+                    self.refresh_service_log(&key.0, &key.1).await;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let new_selected = (selected + 1).min(keys.len() - 1);
+                    if let Some(view) = &mut self.services_view {
+                        view.selected = new_selected;
+                    }
+                    let key = keys[new_selected].clone();
+                    self.refresh_service_log(&key.0, &key.1).await;
+                }
+                KeyCode::Char('s') => {
+                    let (node_id, block) = keys[selected].clone();
+                    match crate::worker_client::stop_service(port, &node_id, &block).await {
+                        Ok(()) => self.status = format!("stopped {block}"),
+                        Err(e) => self.status = format!("failed to stop {block}: {e}"),
+                    }
+                    self.refresh_services().await;
+                    self.refresh_service_log(&node_id, &block).await;
+                }
+                KeyCode::Char('r') => {
+                    let (node_id, block) = keys[selected].clone();
+                    match crate::worker_client::restart_service(port, &node_id, &block).await {
+                        Ok(pid) => self.status = format!("restarted {block} (pid {pid})"),
+                        Err(e) => self.status = format!("failed to restart {block}: {e}"),
+                    }
+                    self.refresh_services().await;
+                    self.refresh_service_log(&node_id, &block).await;
+                }
+                _ => {}
+            }
+            return;
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.services_view = None;
@@ -3339,6 +4757,119 @@ impl App {
         }
     }
 
+    /// Opens the `t` live-terminals view — every `tty` session this
+    /// worker process currently knows about (started by this TUI, another
+    /// TUI, or a browser tab, see `crates/server/src/lib.rs`'s own
+    /// `get_active_runs`), whether or not anything is still attached to
+    /// it. Worker-only: fallback (no-worker) mode has no shared registry
+    /// of *other* connections' sessions to list at all — the only `tty`
+    /// session it could ever know about is one this very process is
+    /// already in the middle of running, which already has the terminal.
+    async fn open_tty_sessions_view(&mut self) {
+        let Some(port) = self.worker_port else {
+            self.status = "live terminal sessions need a worker — none reachable".into();
+            return;
+        };
+        match crate::worker_client::list_active_runs(port).await {
+            Ok(runs) => {
+                self.live_tty_sessions =
+                    runs.into_iter().filter(|r| r.kind == "tty" && r.status == "running").collect();
+            }
+            Err(e) => {
+                self.status = format!("failed to list live terminals: {e}");
+                return;
+            }
+        }
+        if self.live_tty_sessions.is_empty() {
+            self.status = "no live terminal sessions".into();
+            return;
+        }
+        self.tty_sessions_view = Some(TtySessionsViewState { selected: 0 });
+    }
+
+    /// `j`/`k`/arrows navigate, `enter` attaches to the selected session
+    /// (`attach_selected_tty_session`), `K` kills it (same `POST /api/kill`
+    /// any other run/session address goes through), `q`/Esc closes the
+    /// view.
+    async fn on_tty_sessions_view_key(&mut self, key: KeyEvent) {
+        let Some(port) = self.worker_port else {
+            self.tty_sessions_view = None;
+            return;
+        };
+        if self.live_tty_sessions.is_empty() {
+            self.tty_sessions_view = None;
+            return;
+        }
+        let selected = self
+            .tty_sessions_view
+            .as_ref()
+            .map(|v| v.selected)
+            .unwrap_or(0)
+            .min(self.live_tty_sessions.len() - 1);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.tty_sessions_view = None;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(view) = &mut self.tty_sessions_view {
+                    view.selected = selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(view) = &mut self.tty_sessions_view {
+                    view.selected = (selected + 1).min(self.live_tty_sessions.len() - 1);
+                }
+            }
+            KeyCode::Enter => {
+                let session = self.live_tty_sessions[selected].clone();
+                self.tty_sessions_view = None;
+                self.attach_tty_session(port, session.node_id, session.block).await;
+            }
+            KeyCode::Char('K') => {
+                let session = self.live_tty_sessions[selected].clone();
+                match crate::worker_client::kill_run(port, &session.node_id, &session.block).await {
+                    Ok(()) => self.status = format!("killed {}", session.block),
+                    Err(e) => self.status = format!("failed to kill {}: {e}", session.block),
+                }
+                match crate::worker_client::list_active_runs(port).await {
+                    Ok(runs) => {
+                        self.live_tty_sessions = runs
+                            .into_iter()
+                            .filter(|r| r.kind == "tty" && r.status == "running")
+                            .collect();
+                    }
+                    Err(_) => self.live_tty_sessions.clear(),
+                }
+                if self.live_tty_sessions.is_empty() {
+                    self.tty_sessions_view = None;
+                } else if let Some(view) = &mut self.tty_sessions_view {
+                    view.selected = view.selected.min(self.live_tty_sessions.len() - 1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Connects `worker_client::tty_attach` and parks the result as
+    /// `pending_http_tty_attach` for `mod.rs`'s event loop to hand the
+    /// terminal to on its next iteration — the attach counterpart to
+    /// `begin_http_tty_run`. A session can finish (or simply stop existing
+    /// — killed by someone else, say) between this view listing it and the
+    /// keypress that picks it, so a `404` here is a normal, unsurprising
+    /// outcome, not a bug to alarm about.
+    async fn attach_tty_session(&mut self, port: u16, node_id: String, block: String) {
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        match crate::worker_client::tty_attach(port, &node_id, &block, cols, rows).await {
+            Ok(socket) => {
+                self.status.clear();
+                self.pending_http_tty_attach = Some(PendingHttpTtyAttach { socket, block_name: block });
+            }
+            Err(e) => {
+                self.status = format!("failed to attach to {block:?}: {e}");
+            }
+        }
+    }
+
     /// Stops every running `service` (see `services`' own doc comment)
     /// before actually quitting — unlike `meshfox view`, this TUI process
     /// *is* the only thing keeping a service tracked at all (no separate
@@ -3358,13 +4889,19 @@ impl App {
         self.should_quit = true;
     }
 
-    fn kill_running(&mut self) {
+    async fn kill_running(&mut self) {
         if let Some(run) = &mut self.run {
             if let Some(proc) = &run.proc {
                 let _ = proc.kill();
+                run.killed = true;
+                self.status = "killing...".into();
+            } else if run.http_rx.is_some() {
+                if let (Some(port), Some(addr)) = (self.worker_port, run.chain.last()) {
+                    let (node_id, block) = (addr.node_id.clone(), addr.block_name.clone());
+                    self.status = "killing...".into();
+                    let _ = crate::worker_client::kill_run(port, &node_id, &block).await;
+                }
             }
-            run.killed = true;
-            self.status = "killing...".into();
         }
         if let Some(run) = &mut self.file_run {
             if let Some(proc) = &run.proc {
@@ -3476,6 +5013,69 @@ impl App {
         let Some(vf) = self.var_form.take() else {
             return;
         };
+        if let Some(pending) = self.pending_http_run.take() {
+            // Worker-routed resume: the worker itself persists each
+            // non-secret answer to its own cache once the run actually
+            // starts (`run_block_impl`'s own doc comment) — this process's
+            // local `var_cache`/`run_overrides` play no part in HTTP mode,
+            // so just collect the form's answers and hand them straight to
+            // `begin_http_run`.
+            let vars: HashMap<String, String> = vf
+                .decls
+                .iter()
+                .zip(vf.inputs.iter())
+                .map(|(d, v)| (d.name.clone(), v.clone()))
+                .collect();
+            if pending.is_tty {
+                self.begin_http_tty_run(
+                    pending.node_id,
+                    pending.block_name,
+                    pending.with_deps,
+                    pending.port,
+                    vars,
+                )
+                .await;
+            } else {
+                self.begin_http_run(
+                    pending.node_id,
+                    pending.block_name,
+                    pending.with_deps,
+                    pending.port,
+                    vars,
+                    pending.force,
+                )
+                .await;
+            }
+            return;
+        }
+        // Worker mode's own `c` flow: `self.var_cache` below is this
+        // *process's* own on-disk cache handle, not the worker's — writing
+        // to it here would silently have no effect on a subsequent
+        // worker-routed run, which resolves against the *worker's* own
+        // `state.vars_cache` (`GET /api/vars`) and never looks at this
+        // process's copy at all. `vf.configuring` only reaches here (never
+        // through the `pending_http_run` branch above, which is worker
+        // mode's own missing-var-before-run path) via `trigger_configure`,
+        // so this is the only case that needs it.
+        if vf.configuring {
+            if let Some(port) = self.worker_port {
+                let vars: HashMap<String, String> = vf
+                    .decls
+                    .iter()
+                    .zip(vf.inputs.iter())
+                    .map(|(d, v)| (d.name.clone(), v.clone()))
+                    .collect();
+                match crate::worker_client::post_configure_vars(port, vars).await {
+                    Ok(saved) => {
+                        self.status = format!("meshfox: saved {saved} declared variable(s) to the cache");
+                    }
+                    Err(e) => {
+                        self.status = format!("meshfox: failed to save configured variable(s): {e}");
+                    }
+                }
+                return;
+            }
+        }
         for (decl, value) in vf.decls.iter().zip(vf.inputs.iter()) {
             if !decl.secret && !decl.session {
                 let _ = self.var_cache.set(&decl.name, value);
@@ -3501,12 +5101,41 @@ impl App {
     /// block, never something to configure by hand. A no-op (past a status
     /// message) when there's nothing configurable, or while a run/another
     /// form/the block picker is already active.
-    fn trigger_configure(&mut self) {
+    async fn trigger_configure(&mut self) {
         if self.var_form.is_some() || self.block_picker.is_some() {
             return;
         }
         if self.run.as_ref().is_some_and(|r| !r.finished) {
             self.status = "a run is already in progress — press K to kill it first".into();
+            return;
+        }
+        // Worker mode: `self.var_cache` is this *process's* own on-disk
+        // cache handle — reading it directly here would show (and, on
+        // submit, write to) a copy the worker's own `state.vars_cache`
+        // never sees, which is what silently made a value "configured" in
+        // the TUI have no effect on a worker-routed run right after (the
+        // run resolves against the *worker's* cache, via `GET /api/vars`,
+        // never this process's own). `GET /api/vars/configure` is the
+        // worker's own already-materialized answer (choices/defaults from
+        // a `from=` source it may have had to run to compute) to exactly
+        // this same question.
+        if let Some(port) = self.worker_port {
+            match crate::worker_client::get_configure_vars(port).await {
+                Ok(statuses) => {
+                    if statuses.is_empty() {
+                        self.status =
+                            "meshfox: this canvas declares no configurable (non-secret, non-session, non-from=) variable(s)"
+                                .into();
+                        return;
+                    }
+                    let mut form = var_form_from_statuses(statuses);
+                    form.configuring = true;
+                    self.var_form = Some(form);
+                }
+                Err(e) => {
+                    self.status = format!("meshfox: failed to list configurable variables: {e}");
+                }
+            }
             return;
         }
         let decls: Vec<VarDecl> = self
@@ -3801,7 +5430,7 @@ mod tests {
         let child_path = dir.join("child.canvas.md");
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(base_path.clone(), tx, None).unwrap();
+        let mut app = App::new(base_path.clone(), tx, None, None).await.unwrap();
 
         app.start_run("child/leaf".to_string(), "report".to_string(), true)
             .await;
@@ -3883,7 +5512,7 @@ mod tests {
         .unwrap();
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(base_path.clone(), tx, None).unwrap();
+        let mut app = App::new(base_path.clone(), tx, None, None).await.unwrap();
         // Expand ancestors so the rows under test are actually visible —
         // `tree::flatten` only ever auto-expands depth 0 (the root).
         app.expanded.insert("child".to_string());
@@ -3956,7 +5585,7 @@ mod tests {
         )
         .unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(path, tx, None).unwrap();
+        let mut app = App::new(path, tx, None, None).await.unwrap();
 
         app.session_runs.insert(
             ("root".to_string(), "dep".to_string()),
@@ -3992,7 +5621,7 @@ mod tests {
         )
         .unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(path, tx, None).unwrap();
+        let mut app = App::new(path, tx, None, None).await.unwrap();
         app.session_runs.insert(
             ("root".to_string(), "dep".to_string()),
             SessionRun {
@@ -4056,11 +5685,11 @@ mod tests {
         )
         .unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(path, tx, None).unwrap();
+        let mut app = App::new(path, tx, None, None).await.unwrap();
 
         assert!(app.has_configurable_vars());
 
-        app.trigger_configure();
+        app.trigger_configure().await;
         let form = app.var_form.as_ref().expect("configure should open a form");
         assert_eq!(
             form.decls.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
@@ -4093,11 +5722,11 @@ mod tests {
         )
         .unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(path, tx, None).unwrap();
+        let mut app = App::new(path, tx, None, None).await.unwrap();
 
         assert!(!app.has_configurable_vars());
 
-        app.trigger_configure();
+        app.trigger_configure().await;
         assert!(app.var_form.is_none());
         assert!(app.status.contains("no configurable"));
 

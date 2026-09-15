@@ -34,6 +34,7 @@ pub mod tree;
 pub mod varcache;
 pub mod varout;
 pub mod vars;
+pub mod worker_lock;
 
 pub use builtin_interpreter::{is_builtin, resolve_builtin_spec, resolve_with_env};
 pub use canvas::{ArrowEnd, Canvas, EdgeLineStyle, ExtraEdge, FileDisplay, Node, NodeType};

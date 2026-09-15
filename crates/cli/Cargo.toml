@@ -74,6 +74,25 @@ libc = "0.2"
 # self_update both pull it in through ureq), this just makes it the one
 # process-wide default so reqwest has a provider to use at all.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# `worker_client` — routes a `node <op>`/MCP mutation through an already-
+# running `meshfox view` worker's own `/api/nodes*` instead of editing the
+# canvas file directly (see that module's own doc comment). Already a real
+# transitive dependency via `meshfox-server`; this just makes it a direct
+# one, same version/feature set (plus `json`, unused server-side but needed
+# here for `RequestBuilder::json`/`Response::json`, and `query`, for
+# `worker_client::subscribe_run`'s `?nodeId=..&block=..`), so nothing new
+# beyond `serde_urlencoded` actually gets compiled in.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "query", "stream"] }
+# `worker_client`'s WS calls (`/api/watch`, `/api/run/tty*`) — same pinned
+# version already proven against this exact server's own WS endpoints as a
+# dev-dependency of `meshfox-server` (its own WS integration tests); promoted
+# to a real dependency here since the TUI is a real, non-test WS client of
+# them now.
+tokio-tungstenite = "0.30.0"
+# `worker_client::run_stream`'s own NDJSON-body reader — `reqwest::Response::
+# bytes_stream()` needs `StreamExt` to poll; already a real dependency of
+# `meshfox-server` at this same version, reused rather than re-pinned.
+futures-util = "0.3.33"
 
 [dev-dependencies]
 portable-pty = "0.9"

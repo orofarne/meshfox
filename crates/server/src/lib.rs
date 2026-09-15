@@ -19,7 +19,8 @@ use axum::{
     Json, Router,
 };
 use meshfox_core::{
-    mdcanvas, Canvas, ExecOutput, ExtraEdge, FileDisplay, NodeMeta, NodeType, RunError, VarCache,
+    mdcanvas, worker_lock, Canvas, ExecOutput, ExtraEdge, FileDisplay, NodeMeta, NodeType,
+    RunError, VarCache,
 };
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
@@ -52,6 +53,12 @@ mod run_registry;
 /// Webui-only multi-viewer registry for a `tty` block's own live pty
 /// session — see its own module doc comment.
 mod tty_registry;
+/// Generic seq + ring-buffer + `subscribe_from` primitive — see its own
+/// module doc comment.
+mod seq_log;
+/// Sequenced broadcast log backing `/api/watch` — see its own module doc
+/// comment.
+mod canvas_events;
 /// `pub` so `meshfox-cli` can reuse the same async spawn/kill primitives
 /// for `meshfox run`'s real-time output — see its `main.rs`.
 pub mod stream_exec;
@@ -113,12 +120,12 @@ struct AppState {
     /// against `TabGuard` exiting the process before the auto-opened (or
     /// manually visited) tab has even had a chance to connect yet.
     ever_connected: AtomicBool,
-    /// Fires whenever the on-disk file changes for a reason other than this
-    /// server's own writes (see `spawn_file_watcher`) — `watch_changes`
-    /// forwards each one to its connected client as a `changed` event so
-    /// the UI can reload. Also carries a `RunStarted` event — see
-    /// `ServerEvent`'s own doc comment.
-    change_tx: broadcast::Sender<ServerEvent>,
+    /// Sequenced log of every `ServerEvent` (canvas changes, autorun
+    /// triggers) — `watch_changes` forwards each one to its connected
+    /// `/api/watch` client, plus enough backlog for a reconnecting client to
+    /// tell "nothing missed" from "do a full resync" instead of just
+    /// resuming blind. See `canvas_events`'s own module doc comment.
+    canvas_events: canvas_events::CanvasEventLog,
     /// Whether the process should exit on its own once every `/api/watch`
     /// connection has gone (see `TabGuard`) — off for e.g. the e2e test
     /// server, which cycles through pages with brief all-tabs-closed gaps
@@ -195,9 +202,21 @@ impl AppState {
     /// that every other tab needs to hear about actually happens, covers
     /// that gap without touching the watcher's own external-change logic.
     fn save(&self, raw: &str) -> std::io::Result<()> {
+        self.save_with_event(raw, ServerEvent::Changed)
+    }
+
+    /// Same as `save`, but broadcasts `event` instead of the generic
+    /// `Changed` — `commit_located` uses this to push a precise
+    /// `NodeUpserted`/`NodeRemoved`/`NodesReordered` for a mutation that
+    /// landed in the primary canvas file, so a client watching for those
+    /// can apply it in place instead of reloading (see `ServerEvent`'s own
+    /// doc comment). Still always updates `self.raw` and writes the file
+    /// exactly like `save` — `event` only changes what gets broadcast, not
+    /// what gets persisted.
+    fn save_with_event(&self, raw: &str, event: ServerEvent) -> std::io::Result<()> {
         std::fs::write(&self.canvas_path, raw)?;
         *self.raw.lock().unwrap() = raw.to_string();
-        let _ = self.change_tx.send(ServerEvent::Changed);
+        self.canvas_events.push(event);
         Ok(())
     }
 }
@@ -335,7 +354,7 @@ fn spawn_file_watcher(state: Arc<AppState>) {
             if *raw != contents {
                 *raw = contents;
                 drop(raw);
-                let _ = state.change_tx.send(ServerEvent::Changed);
+                state.canvas_events.push(ServerEvent::Changed);
             }
         }
     });
@@ -1118,19 +1137,54 @@ enum RunEvent {
 /// Events `GET /api/watch`'s long-lived NDJSON stream carries, one per
 /// open browser tab — see `watch_changes`. `Changed` is the event that
 /// already existed (a `()` payload before `render=`/`autorun` needed this
-/// to carry a second shape); `RunStarted` is new, for a passive tab (one
-/// that didn't itself click run) to discover a plain-block run it should
-/// subscribe to — in practice, today, only ever fired for an `autorun`
-/// block's own server-triggered run (see `trigger_autoruns`), though
-/// nothing stops a future caller from firing it for any other plain-block
-/// run too; `GET /api/run/subscribe` is already address-keyed, not
+/// to carry a second shape); `RunStarted` lets a passive tab or TUI
+/// session (one that didn't itself click run) discover a plain-block run
+/// it should subscribe to — broadcast by `run_block_impl` for *every*
+/// caller (an ordinary manual run, `force_run`, or `trigger_autorun`
+/// alike, see its own `target_reservation` doc comment), not just
+/// `autorun`. `GET /api/run/subscribe` is already address-keyed, not
 /// initiator-keyed, so it already supports being watched by a tab that
 /// never started it.
+///
+/// `NodeUpserted`/`NodeRemoved`/`NodesReordered` are the precise,
+/// per-operation counterpart to `Changed`, for a client that wants to
+/// apply a tree mutation in place instead of reloading the whole document
+/// on every edit — see TODO.canvas.md's "WS push на мутации дерева" for
+/// the fuller design rationale. `commit_located` is what actually pushes
+/// these, from each mutating `/api/nodes*` handler, in *addition* to
+/// `Changed` still covering the cases these three don't (an edit landing
+/// in an `include` target file, or one that ripples across more nodes
+/// than a single op can cleanly describe — `rename_node_id`/`clear_node_id`,
+/// and `remove_node`'s own `?children=reparent` branch, still just push
+/// `Changed`, see their own call sites). A client that doesn't know these
+/// three yet can simply ignore them — they never replace `Changed` at the
+/// same seq, only accompany it, so an old client watching only `Changed`
+/// keeps working unmodified.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case", rename_all_fields = "camelCase")]
 enum ServerEvent {
     Changed,
     RunStarted { node_id: String, block: String },
+    /// A node was created, or an existing one's own fields (title/body/
+    /// meta/edges/parent) changed — `node.parent` already says where it
+    /// belongs, so a fresh id a client hasn't seen is exactly "insert
+    /// this", and a known id is "replace what you have for it with this".
+    /// Covers `create_node`, `update_node`, `clear_node_layout`, and
+    /// `reparent_node` (a structural-parent change is just a `parent`
+    /// field change from this shape's point of view).
+    NodeUpserted { node: Box<meshfox_core::Node> },
+    /// `node_id`'s own subtree was deleted outright (`keep_children:
+    /// false` — `mdcanvas::delete_node`) — never sent for the `?children=
+    /// reparent` branch (`mdcanvas::delete_node_reparent_children`), which
+    /// changes every direct child's own `parent` too and just pushes
+    /// `Changed` instead rather than also emitting one `NodeUpserted` per
+    /// promoted child.
+    NodeRemoved { node_id: String, keep_children: bool },
+    /// `parent_id`'s direct children are now ordered exactly as
+    /// `child_ids` lists them (`move_sibling`) — sent as the *whole* new
+    /// order rather than a "moved X before/after Y" delta so a client
+    /// never has to reconstruct one from the other.
+    NodesReordered { parent_id: String, child_ids: Vec<String> },
 }
 
 fn ndjson_line<T: Serialize>(event: &T) -> Bytes {
@@ -1139,6 +1193,7 @@ fn ndjson_line<T: Serialize>(event: &T) -> Bytes {
     Bytes::from(line)
 }
 
+#[derive(Debug)]
 struct ApiError(StatusCode, String);
 
 impl IntoResponse for ApiError {
@@ -1310,20 +1365,69 @@ fn locate_node(state: &AppState, primary_raw: &str, id: &str) -> Result<LocatedN
 /// re-read `state.raw`/call `canvas_response` afterward for the response:
 /// for an include target, that's what actually picks the edit back up
 /// (`include::resolve` always reads the target fresh from disk), the same
-/// way a follow-up `GET /api/canvas` would.
-fn commit_located(state: &AppState, located: &LocatedNode, raw: &str) -> Result<(), ApiError> {
+/// way a follow-up `GET /api/canvas` would. `op` is the precise
+/// `NodeUpserted`/`NodeRemoved`/`NodesReordered` this particular mutation
+/// is (see `ServerEvent`'s own doc comment) — broadcast instead of the
+/// generic `Changed` when this lands in the *primary* file, so a client
+/// watching for it can apply it in place. Ignored for an include target
+/// (`Some(path)` below): that write doesn't go through `AppState::save`
+/// at all (there's no single in-memory `state.raw` for an include target
+/// to update), and always broadcasts the generic `Changed` regardless of
+/// `op` — teaching every op's client-side apply logic about "which file"
+/// isn't worth it yet for what's still a rare edit path.
+fn commit_located(state: &AppState, located: &LocatedNode, raw: &str, op: ServerEvent) -> Result<(), ApiError> {
     match &located.origin {
         None => {
             state
-                .save(raw)
+                .save_with_event(raw, op)
                 .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         }
         Some(path) => {
             std::fs::write(path, raw)
                 .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            // Unlike the `None` arm above, this write doesn't go through
+            // `AppState::save` (there's no single in-memory `state.raw` for
+            // an include target to update) — broadcast here explicitly, or
+            // an edit to an included node would otherwise go unnoticed by
+            // every connected tab until the next 500ms file-watcher poll.
+            state.canvas_events.push(ServerEvent::Changed);
         }
     }
     Ok(())
+}
+
+/// Builds a `NodeUpserted` event carrying `local_id`'s own current,
+/// fully-annotated state — the shared last step every `commit_located`
+/// call site that adds/changes a single node's own fields uses, since each
+/// mutation function itself only produces the *patched document text*, not
+/// the node's own final `meshfox_core::Node` in isolation. Resolves
+/// `raw` the same way `canvas_response` does (`include` splicing,
+/// `constraint::annotate_status`, `annotate_effective_colors`) so a
+/// client applying this incrementally sees exactly the same node shape a
+/// full `GET /api/canvas` would have given it — skipping either
+/// annotation here would silently show a tag-derived color or a
+/// constraint pass/fail badge as unset until the next full reload
+/// happened to refresh it. Doing this full a pass *again* right after
+/// `commit_located`'s caller already did its own `canvas_response` (or is
+/// about to) is redundant work, not a correctness concern — an accepted
+/// cost of the two computations not sharing a call site, given each
+/// happens for a different reason (persisting the response's own snapshot
+/// vs. building this broadcast's single-node payload). Falls back to
+/// `ServerEvent::Changed` if `local_id` somehow isn't in `raw` (shouldn't
+/// happen — every call site already validated `raw` parses and contains
+/// this id before reaching here) or if resolution fails, rather than
+/// panicking over what would only ever be a broadcast-payload oddity, not
+/// a request failure the client already got its own `200` response for.
+fn node_upserted_event(raw: &str, canvas_path: &std::path::Path, local_id: &str) -> ServerEvent {
+    let Ok(mut canvas) = resolved_canvas(raw, canvas_path) else {
+        return ServerEvent::Changed;
+    };
+    meshfox_core::constraint::annotate_status(&mut canvas, Some(canvas_root_dir(canvas_path)));
+    meshfox_core::annotate_effective_colors(&mut canvas);
+    match canvas.node(local_id).cloned() {
+        Some(node) => ServerEvent::NodeUpserted { node: Box::new(node) },
+        None => ServerEvent::Changed,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1654,7 +1758,8 @@ async fn clear_node_layout(
     };
     let updated = mdcanvas::set_node_meta(&located.raw, &located.local_id, &meta)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}")))?;
-    commit_located(&state, &located, &updated)?;
+    let op = node_upserted_event(&updated, &state.canvas_path, &located.local_id);
+    commit_located(&state, &located, &updated, op)?;
     let response_raw = state.raw.lock().unwrap().clone();
     canvas_response(&response_raw, &state.canvas_path)
 }
@@ -1691,7 +1796,7 @@ async fn create_node(
     // it first so the new node is actually written into the file the
     // parent lives in, same as editing an existing node there already is.
     let located = locate_node(&state, &primary_raw, &req.parent_id)?;
-    let (updated, _new_id) = mdcanvas::insert_child_node_random_id(
+    let (updated, new_id) = mdcanvas::insert_child_node_random_id(
         &located.raw,
         &located.local_id,
         &req.title,
@@ -1705,7 +1810,8 @@ async fn create_node(
     // Insertion can't actually break parsing, but validate anyway — same
     // validate-before-commit shape every other mutating endpoint here uses.
     parse_or_error(&updated)?;
-    commit_located(&state, &located, &updated)?;
+    let op = node_upserted_event(&updated, &state.canvas_path, &new_id);
+    commit_located(&state, &located, &updated, op)?;
     let response_raw = state.raw.lock().unwrap().clone();
     canvas_response(&response_raw, &state.canvas_path)
 }
@@ -2076,7 +2182,8 @@ async fn update_node(
     // target's) yet.
     parse_or_error(&raw)?;
 
-    commit_located(&state, &located, &raw)?;
+    let op = node_upserted_event(&raw, &state.canvas_path, &local_id);
+    commit_located(&state, &located, &raw, op)?;
     let response_raw = state.raw.lock().unwrap().clone();
     canvas_response(&response_raw, &state.canvas_path)
 }
@@ -2570,7 +2677,17 @@ async fn remove_node(
     }
     .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}")))?;
     parse_or_error(&updated)?;
-    commit_located(&state, &located, &updated)?;
+    // `reparent` changes every direct child's own `parent` too, not just
+    // removing `id` — describing that fully would mean one `NodeUpserted`
+    // per promoted child on top of the removal itself. Not worth it yet
+    // for what's the less common of the two delete modes — falls back to
+    // the generic `Changed` (a full reload), same as before this feature.
+    let op = if reparent {
+        ServerEvent::Changed
+    } else {
+        ServerEvent::NodeRemoved { node_id: local_id.clone(), keep_children: false }
+    };
+    commit_located(&state, &located, &updated, op)?;
     let response_raw = state.raw.lock().unwrap().clone();
     canvas_response(&response_raw, &state.canvas_path)
 }
@@ -2702,7 +2819,8 @@ async fn reparent_node(
             }
         }
     }
-    commit_located(&state, &located, &updated)?;
+    let op = node_upserted_event(&updated, &state.canvas_path, local_id);
+    commit_located(&state, &located, &updated, op)?;
     let response_raw = state.raw.lock().unwrap().clone();
     canvas_response(&response_raw, &state.canvas_path)
 }
@@ -2773,8 +2891,29 @@ async fn move_sibling(
         };
         ApiError(status, e.to_string())
     })?;
-    parse_or_error(&updated)?;
-    commit_located(&state, &located, &updated)?;
+    // Sent as the *whole* new sibling order (not a "moved before/after"
+    // delta) so a client never has to reconstruct one from the other —
+    // see `ServerEvent::NodesReordered`'s own doc comment. `new_canvas.
+    // nodes` is already in document order, which for siblings *is* tree
+    // order, so this is just "every node whose `parent` matches, in the
+    // order they already come back in" — no separate sort needed.
+    let new_canvas = parse_or_error(&updated)?;
+    let op = match new_canvas.node(&located.local_id).and_then(|n| n.parent.clone()) {
+        Some(parent_id) => {
+            let child_ids: Vec<String> = new_canvas
+                .nodes
+                .iter()
+                .filter(|n| n.parent.as_deref() == Some(parent_id.as_str()))
+                .map(|n| n.id.clone())
+                .collect();
+            ServerEvent::NodesReordered { parent_id, child_ids }
+        }
+        // No parent (the root) — `move_sibling` requires two siblings
+        // under a common parent, so this can't actually happen; falls
+        // back to a full reload rather than assuming.
+        None => ServerEvent::Changed,
+    };
+    commit_located(&state, &located, &updated, op)?;
     let response_raw = state.raw.lock().unwrap().clone();
     canvas_response(&response_raw, &state.canvas_path)
 }
@@ -2815,7 +2954,12 @@ async fn rename_node_id(
             ApiError(status, e.to_string())
         })?;
     parse_or_error(&updated)?;
-    commit_located(&state, &located, &updated)?;
+    // An id rename ripples into every other node's own `parent=`/
+    // `meshfox:edge from=` reference plus any `deps=` fence text — too
+    // much for `NodeUpserted`'s single-node shape to describe accurately;
+    // falls back to the generic `Changed` (a full reload), same as before
+    // this feature.
+    commit_located(&state, &located, &updated, ServerEvent::Changed)?;
     let response_raw = state.raw.lock().unwrap().clone();
     canvas_response(&response_raw, &state.canvas_path)
 }
@@ -2850,7 +2994,9 @@ async fn clear_node_id(
     let (updated, local_new_id) = mdcanvas::clear_node_id(&located.raw, &located.local_id)
         .map_err(|e| ApiError(StatusCode::NOT_FOUND, e.to_string()))?;
     parse_or_error(&updated)?;
-    commit_located(&state, &located, &updated)?;
+    // Same reasoning as `rename_node_id`: an id change ripples too far for
+    // `NodeUpserted` — falls back to the generic `Changed`.
+    commit_located(&state, &located, &updated, ServerEvent::Changed)?;
     let response_raw = state.raw.lock().unwrap().clone();
     let Json(canvas) = canvas_response(&response_raw, &state.canvas_path)?;
     let new_id = match &located.origin {
@@ -3120,6 +3266,21 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
             .lock()
             .unwrap()
             .insert((target.node_id.clone(), target.block_name.clone()), Arc::clone(&reserved));
+        // Broadcast right after reservation, not before — same
+        // race-freedom reasoning as the reservation itself: a passive
+        // watcher (`GET /api/watch`) that reacts to this by immediately
+        // calling `GET /api/run/subscribe` needs `runs_registry` to
+        // already hold this address's entry by the time this event
+        // reaches it. Every caller of `run_block_impl` goes through here —
+        // an ordinary manual run, `force_run`, and `trigger_autorun` alike
+        // — so a passive tab/TUI session sees *any* rerun of a block it's
+        // displaying, not just an autorun-triggered one (the only case
+        // this event used to cover, back when `submit_form` broadcast it
+        // itself after `trigger_autorun` returned).
+        state.canvas_events.push(ServerEvent::RunStarted {
+            node_id: target.node_id.clone(),
+            block: target.block_name.clone(),
+        });
         reserved
     });
 
@@ -3985,17 +4146,12 @@ async fn submit_form(
     for addr in &triggered {
         // Awaited (not `tokio::spawn`ed away) — see `trigger_autorun`'s
         // own doc comment for why this needs to run synchronously far
-        // enough to reserve the address before this handler returns.
-        // `RunStarted` is broadcast only *after* that, so a passive tab
-        // that reacts to it (see `ServerEvent::RunStarted`'s own doc
-        // comment) never races ahead of the very reservation this exists
-        // to guarantee, same reasoning that applies to this submitting
-        // tab's own immediate `subscribeRun` off this response.
+        // enough to reserve the address before this handler returns. The
+        // `RunStarted` broadcast itself now happens inside
+        // `run_block_impl` (see its own `target_reservation` doc comment)
+        // — `trigger_autorun` calls that for every triggered address, so
+        // there's nothing left to broadcast here.
         trigger_autorun(Arc::clone(&state), addr.clone()).await;
-        let _ = state.change_tx.send(ServerEvent::RunStarted {
-            node_id: addr.node_id.clone(),
-            block: addr.block_name.clone(),
-        });
     }
 
     Ok(Json(SubmitFormResponse {
@@ -4827,9 +4983,43 @@ async fn relay_tty_step(
                         handle.forget_viewer(viewer_id);
                         break TtyStepOutcome::Killed;
                     }
-                    Ok(tty_registry::TtyEvent::Done(tty_registry::RunOutcome::Running)) | Err(_) => {
+                    Ok(tty_registry::TtyEvent::Done(tty_registry::RunOutcome::Running)) | Err(broadcast::error::RecvError::Closed) => {
                         handle.forget_viewer(viewer_id);
                         break TtyStepOutcome::Exited(-1);
+                    }
+                    // This connection's own receiver fell more than
+                    // `tty_registry`'s broadcast capacity behind the live
+                    // tail (a fast-redrawing full-screen program like
+                    // `tabiew` can produce enough chunks per redraw for
+                    // this to happen even to the *originating* connection
+                    // under load) — see `relay_tty_viewer`'s identical arm
+                    // for the full reasoning on why this can't just be
+                    // folded into the `Err(_) => exited(-1)` case above:
+                    // that would falsely report a still-running pty as
+                    // having exited (a lie `run_tty_chain`'s own caller
+                    // would act on), not merely drop a passive viewer.
+                    // Re-subscribing and replaying the current backlog
+                    // recovers the same way; `handle.outcome()` catches
+                    // the case where the session *also* genuinely ended in
+                    // the gap this missed.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let (backlog, fresh_rx) = handle.attach();
+                        rx = fresh_rx;
+                        if !backlog.is_empty() && socket.send(Message::Binary(backlog)).await.is_err() {
+                            handle.forget_viewer(viewer_id);
+                            break TtyStepOutcome::Disconnected;
+                        }
+                        match handle.outcome() {
+                            tty_registry::RunOutcome::Running => {}
+                            tty_registry::RunOutcome::Exited { exit_code } => {
+                                handle.forget_viewer(viewer_id);
+                                break TtyStepOutcome::Exited(exit_code);
+                            }
+                            tty_registry::RunOutcome::Killed => {
+                                handle.forget_viewer(viewer_id);
+                                break TtyStepOutcome::Killed;
+                            }
+                        }
                     }
                 }
             }
@@ -4949,10 +5139,49 @@ async fn relay_tty_viewer(
                             return;
                         }
                     }
-                    Ok(tty_registry::TtyEvent::Done(_)) | Err(_) => {
+                    Ok(tty_registry::TtyEvent::Done(_)) | Err(broadcast::error::RecvError::Closed) => {
                         handle.forget_viewer(viewer_id);
                         let _ = socket.send(Message::Close(None)).await;
                         return;
+                    }
+                    // This viewer's own receiver fell more than
+                    // `tty_registry`'s broadcast capacity (1024 messages)
+                    // behind the live tail — a slow WebSocket/browser
+                    // watching a fast-redrawing full-screen program
+                    // (`tabiew`, say) is exactly the case this handles.
+                    // Lumping this in with the `Err(_) => close` arm below
+                    // (as this used to) treated falling behind as if the
+                    // session itself had ended: this viewer's socket got
+                    // silently closed (a blank terminal, then
+                    // "disconnected") the moment it couldn't keep up,
+                    // while the session — and every *other* viewer, an
+                    // originating TUI connection's own `relay_tty_step`
+                    // included — kept going completely fine. Re-
+                    // subscribing via `attach()` (same call the initial
+                    // connection above used) gets a fresh receiver plus
+                    // whatever's *currently* in the byte-history ring
+                    // buffer — replaying that lets xterm.js's own parser
+                    // resync from a recent, coherent state instead of
+                    // wherever the skipped chunk happened to leave it.
+                    // `attach()` alone can't tell whether the session
+                    // *itself* also ended in the gap this missed (a
+                    // `Done` broadcast the old, now-abandoned `rx` would
+                    // never see) — `handle.outcome()` is what actually
+                    // answers that, same check the pre-loop code above
+                    // already makes for a viewer that attaches after the
+                    // fact.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let (backlog, fresh_rx) = handle.attach();
+                        rx = fresh_rx;
+                        if !backlog.is_empty() && socket.send(Message::Binary(backlog)).await.is_err() {
+                            handle.forget_viewer(viewer_id);
+                            return;
+                        }
+                        if !matches!(handle.outcome(), tty_registry::RunOutcome::Running) {
+                            handle.forget_viewer(viewer_id);
+                            let _ = socket.send(Message::Close(None)).await;
+                            return;
+                        }
                     }
                 }
             }
@@ -5440,7 +5669,14 @@ async fn subscribe_run(
         // (already registered) is guaranteed to still receive that
         // eventual broadcast.
         let (backlog, mut rx) = handle.subscribe_from(query.since_seq);
+        // Tracks the highest `seq` actually yielded so far — what a
+        // `Lagged` recovery below re-subscribes from, the same gap-free
+        // resync a reconnecting client already gets via `since_seq`
+        // itself, just driven from inside this one long-lived connection
+        // instead of a fresh request.
+        let mut last_seq = query.since_seq;
         for line in backlog {
+            last_seq = line.seq;
             yield Ok::<_, io::Error>(subscribe_ndjson_line(&SubscribeEvent::Line {
                 seq: line.seq,
                 stream: line.stream,
@@ -5455,6 +5691,7 @@ async fn subscribe_run(
         loop {
             match rx.recv().await {
                 Ok(run_registry::RunEvent::Line(line)) => {
+                    last_seq = line.seq;
                     yield Ok(subscribe_ndjson_line(&SubscribeEvent::Line {
                         seq: line.seq,
                         stream: line.stream,
@@ -5466,11 +5703,38 @@ async fn subscribe_run(
                     break;
                 }
                 // Channel closed (shouldn't happen — the drain task always
-                // sends `Done` before its own `tx` is dropped) or this
-                // subscriber fell far enough behind the ring buffer's own
-                // cap to miss messages — either way, nothing meaningful
-                // left to relay.
-                Err(_) => break,
+                // sends `Done` before its own `tx` is dropped): nothing
+                // meaningful left to relay.
+                Err(broadcast::error::RecvError::Closed) => break,
+                // This subscriber fell more than the registry's own
+                // broadcast capacity behind the live tail — treating this
+                // the same as the run actually ending (as this used to)
+                // silently truncated a busy/verbose block's own output the
+                // moment a slow consumer (this exact endpoint's own TUI
+                // caller, `App::on_external_run_event`, folding output
+                // into a redraw-driven UI) couldn't keep up, well before
+                // the run was actually done. Re-subscribing from
+                // `last_seq + 1` (same backlog-replay path a reconnecting
+                // client's own `since_seq` already exercises, just driven
+                // from inside this connection instead of a fresh request)
+                // recovers the missed lines instead of just giving up.
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    let (backlog, fresh_rx) = handle.subscribe_from(last_seq + 1);
+                    rx = fresh_rx;
+                    for line in backlog {
+                        last_seq = line.seq;
+                        yield Ok(subscribe_ndjson_line(&SubscribeEvent::Line {
+                            seq: line.seq,
+                            stream: line.stream,
+                            text: line.text,
+                        }));
+                    }
+                    let outcome = handle.outcome();
+                    if !matches!(outcome, run_registry::RunOutcome::Running) {
+                        yield Ok(subscribe_ndjson_line(&done_event(&outcome)));
+                        break;
+                    }
+                }
             }
         }
     };
@@ -5496,48 +5760,118 @@ async fn reset_session(State(state): State<Arc<AppState>>) -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
-/// Streams NDJSON `{"type": "..."}` lines for as long as the client stays
-/// connected — one long-lived connection per open browser tab. Serves two
-/// purposes at once: forwards every `changed` event the file-watcher thread
-/// broadcasts (see `spawn_file_watcher`) so the UI can reload after an
-/// external edit, and doubles as both tab tracking (`TabGuard` above) and
-/// the client's own liveness check on the server — the stream simply ends
-/// (the fetch's reader sees `done`) the moment this process exits, which is
-/// how the UI notices the server itself has stopped, no separate polling
-/// needed.
-async fn watch_changes(State(state): State<Arc<AppState>>) -> Response {
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WatchQuery {
+    /// The last `seq` this client already saw, from a previous connection —
+    /// omitted (or, equivalently, any value at or past the buffer's own
+    /// live edge) means "no backlog interest, just start me from now", the
+    /// shape a first-time (non-reconnecting) client wants. See
+    /// `canvas_events::CanvasEventLog::subscribe_from`.
+    #[serde(default = "default_watch_since")]
+    since: u64,
+}
+
+fn default_watch_since() -> u64 {
+    u64::MAX
+}
+
+/// `{"type":"connected","resync":bool}` — sent once, right after upgrade.
+/// `resync: true` means the client's requested `since` had already fallen
+/// out of the backlog buffer, so whatever backlog follows (if any) can't be
+/// trusted as complete: the client should do a full canvas refetch right
+/// away rather than wait for a future event to prompt it.
+fn watch_connected_msg(resync: bool) -> Message {
+    Message::Text(
+        serde_json::json!({"type": "connected", "resync": resync}).to_string(),
+    )
+}
+
+/// One `ServerEvent` off `canvas_events`, still exactly the same
+/// `{"type":"changed"}`/`{"type":"run-started",...}` shape the old NDJSON
+/// stream already sent — just with `seq` spliced into the same object so a
+/// later reconnect can resume from exactly here. `ServerEvent`'s own
+/// `#[serde(tag = "type")]` and a plain extra field can't both come from one
+/// `#[derive(Serialize)]` type without fighting serde's enum tagging, so
+/// this splices `seq` into the already-serialized value directly instead.
+fn watch_event_msg(item: &canvas_events::SeqEvent) -> Message {
+    let mut value = serde_json::to_value(&item.item).expect("ServerEvent always serializes");
+    if let serde_json::Value::Object(map) = &mut value {
+        map.insert("seq".to_string(), serde_json::Value::from(item.seq));
+    }
+    Message::Text(value.to_string())
+}
+
+/// The live broadcast receiver itself fell behind (unrelated to the initial
+/// backlog gap `watch_connected_msg` reports — this is the *live* tail
+/// lagging, a receiver-side buffer overrun) — same "can't promise
+/// completeness, resync" signal, sent mid-stream instead of just at connect
+/// time.
+fn watch_resync_msg() -> Message {
+    Message::Text(serde_json::json!({"type": "resync"}).to_string())
+}
+
+/// `GET /api/watch?since=<seq>` — a WebSocket, one long-lived connection per
+/// open browser tab. Forwards every `ServerEvent` (`canvas_events`) —
+/// canvas mutations from any client, autorun triggers, an externally-edited
+/// file the watcher thread noticed — so the UI can reload, and doubles as
+/// both tab tracking (`TabGuard` above) and the client's own liveness check
+/// on the server (the socket simply closes the moment this process exits).
+/// `since` lets a reconnecting client ask "did I miss anything" instead of
+/// just resuming blind — see `WatchWireMessage::Connected`.
+async fn watch_changes(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<WatchQuery>,
+    ws: WebSocketUpgrade,
+) -> Response {
     state.open_tabs.fetch_add(1, Ordering::SeqCst);
     state.ever_connected.store(true, Ordering::SeqCst);
-    let mut rx = state.change_tx.subscribe();
+    ws.on_upgrade(move |socket| relay_canvas_events(state, socket, query.since))
+}
 
-    let stream = async_stream::stream! {
-        // Dropped when this generator is (i.e. the client disconnects) —
-        // see `TabGuard`'s own doc comment.
-        let _guard = TabGuard { state: Arc::clone(&state) };
-        yield Ok::<_, io::Error>(Bytes::from_static(b"{\"type\":\"connected\"}\n"));
-        // The `Closed` arm never actually fires: `change_tx`'s sender lives
-        // in `AppState`, which outlives every connection.
-        loop {
-            match rx.recv().await {
-                Ok(event) => yield Ok(ndjson_line(&event)),
-                // Lagged behind the broadcast channel's own buffer — we no
-                // longer know exactly what was missed, so (same posture the
-                // old `()`-payload version already had for this arm) fall
-                // back to a plain `Changed`, safe for the client to treat
-                // as "something happened, reload to be sure".
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    yield Ok(ndjson_line(&ServerEvent::Changed))
+async fn relay_canvas_events(state: Arc<AppState>, mut socket: WebSocket, since: u64) {
+    // Dropped when this task ends (i.e. the client disconnects) — see
+    // `TabGuard`'s own doc comment.
+    let _guard = TabGuard { state: Arc::clone(&state) };
+    let (backlog, mut rx, gap) = state.canvas_events.subscribe_from(since);
+
+    if socket.send(watch_connected_msg(gap)).await.is_err() {
+        return;
+    }
+    for item in &backlog {
+        if socket.send(watch_event_msg(item)).await.is_err() {
+            return;
+        }
+    }
+
+    loop {
+        tokio::select! {
+            event = rx.recv() => {
+                let msg = match event {
+                    Ok(item) => watch_event_msg(&item),
+                    // Fell behind the *live* broadcast channel's own buffer
+                    // (distinct from the backlog-buffer gap checked above) —
+                    // same "can't guarantee completeness" posture.
+                    Err(broadcast::error::RecvError::Lagged(_)) => watch_resync_msg(),
+                    // Never actually fires: `canvas_events`'s sender lives in
+                    // `AppState`, which outlives every connection.
+                    Err(broadcast::error::RecvError::Closed) => break,
+                };
+                if socket.send(msg).await.is_err() {
+                    break;
                 }
-                Err(broadcast::error::RecvError::Closed) => break,
+            }
+            msg = socket.recv() => {
+                match msg {
+                    // This channel is server→client only; a client never
+                    // needs to send anything meaningful, just closes when
+                    // it's done watching.
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    Some(Ok(_)) => {}
+                }
             }
         }
-    };
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/x-ndjson")
-        .body(Body::from_stream(stream))
-        .unwrap()
+    }
 }
 
 #[derive(Deserialize)]
@@ -5713,7 +6047,6 @@ async fn build_state(
     }
 
     let vars_cache = VarCache::load(&canvas_path)?;
-    let (change_tx, _) = broadcast::channel(16);
 
     Ok(Arc::new(AppState {
         canvas_path,
@@ -5722,7 +6055,7 @@ async fn build_state(
         vars_cache: Mutex::new(vars_cache),
         open_tabs: AtomicUsize::new(0),
         ever_connected: AtomicBool::new(false),
-        change_tx,
+        canvas_events: canvas_events::CanvasEventLog::new(),
         auto_exit,
         link_preview_cache: link_preview::PreviewCache::new(),
         session_runs: Mutex::new(HashMap::new()),
@@ -5788,6 +6121,14 @@ fn build_app(state: Arc<AppState>) -> Router {
 /// port instead — the actual bound port is read back from the listener
 /// below.
 ///
+/// Before doing any of that, contends for `canvas_path`'s own
+/// `worker_lock` (see that module's doc comment) — if another, unrelated
+/// `meshfox view` invocation (a *different* watcher process, not just a
+/// second tab of this one) is already serving this exact file, this call
+/// reports that worker's existing port to its own watcher instead of
+/// binding a second listener, and returns immediately without ever
+/// building state or serving anything itself.
+///
 /// `watcher_socket`, when given, names the coordinator this worker reports
 /// its own bound port to (`watcher_protocol::notify_ready`) and forwards a
 /// `.canvas.md` "↗ open" to (`open_node_file`) — see that module's own doc
@@ -5795,11 +6136,91 @@ fn build_app(state: Arc<AppState>) -> Router {
 /// anything else — that's the coordinator's job, always, uniformly,
 /// whether this is the very first canvas a `meshfox view <path>` invocation
 /// asked for or one navigated to afterward.
+///
+/// `quiet` suppresses every direct `println!`/`eprintln!` below — for a
+/// caller that embeds this as a background worker inside some other
+/// terminal UI of its own (the TUI, spawning this unconditionally at
+/// startup so CLI/MCP/webui have something real to discover — see
+/// `crates/cli/src/tui/mod.rs::run`) rather than being the whole process,
+/// where a stray write to the shared stdout would corrupt its own
+/// rendering. `meshfox view`'s own worker (`view_worker`, `main.rs`) passes
+/// `false`, unchanged from before this parameter existed.
+///
+/// Thin wrapper around `serve_as_worker`: does the `worker_lock` decision
+/// itself, then hands off. A caller that needs to make that same decision
+/// *before* deciding whether to call this at all (the TUI, which needs to
+/// know synchronously whether it's the worker or just found someone else's
+/// — see `serve_as_worker`'s own doc comment) should call
+/// `worker_lock::try_acquire` and `serve_as_worker` directly instead of
+/// this, to avoid two separate `flock` attempts on the same file racing
+/// each other from two tasks in the same process.
 pub async fn run(
     canvas_path: PathBuf,
     port: u16,
     auto_exit: bool,
     watcher_socket: Option<PathBuf>,
+    quiet: bool,
+) -> std::io::Result<()> {
+    let lock_guard = match worker_lock::try_acquire(&canvas_path) {
+        Ok(worker_lock::Acquired::Us(guard)) => Some(guard),
+        Ok(worker_lock::Acquired::Other { port: existing_port }) => {
+            if !quiet {
+                println!(
+                    "meshfox: {} is already served on port {existing_port} — reusing that worker instead of starting a new one",
+                    canvas_path.display()
+                );
+            }
+            if let Some(socket) = &watcher_socket {
+                if let Err(e) =
+                    watcher_protocol::notify_ready(socket, &canvas_path, existing_port).await
+                {
+                    if !quiet {
+                        eprintln!(
+                            "meshfox: couldn't reach the watcher to report the existing worker's port ({e})"
+                        );
+                    }
+                }
+            }
+            return Ok(());
+        }
+        Err(e) => {
+            if !quiet {
+                eprintln!(
+                    "meshfox: couldn't acquire the worker lock for {} ({e}) — serving anyway, without cross-invocation dedup",
+                    canvas_path.display()
+                );
+            }
+            None
+        }
+    };
+
+    serve_as_worker(canvas_path, port, auto_exit, watcher_socket, quiet, lock_guard, None).await
+}
+
+/// Actually binds and serves `canvas_path`, given a `worker_lock` decision
+/// the caller already made (`run`'s own `try_acquire` match, above, or the
+/// TUI's identical one at startup — see `crates/cli/src/tui/mod.rs::run`).
+/// `lock_guard` is `Some` when the caller confirmed it's the one to serve
+/// this file (holding it keeps that true for as long as this future lives
+/// — see `worker_lock::LockGuard`'s own doc comment), `None` only for
+/// `run`'s own "the lock itself couldn't even be read — serve anyway,
+/// without cross-invocation dedup" degrade path.
+///
+/// `ready_tx`, when given, is sent the actual bound port the moment it's
+/// known — for a caller that needs it synchronously to make its own HTTP
+/// calls back to this same worker (again, the TUI: it spawns this as a
+/// background task and awaits `ready_tx`'s receiver once, right after, to
+/// learn its own port — see that module's own doc comment). `run`'s own
+/// callers don't need this (they learn the port via stdout or
+/// `watcher_protocol::notify_ready` instead), so it passes `None`.
+pub async fn serve_as_worker(
+    canvas_path: PathBuf,
+    port: u16,
+    auto_exit: bool,
+    watcher_socket: Option<PathBuf>,
+    quiet: bool,
+    mut lock_guard: Option<worker_lock::LockGuard>,
+    ready_tx: Option<tokio::sync::oneshot::Sender<u16>>,
 ) -> std::io::Result<()> {
     let state = build_state(canvas_path.clone(), auto_exit, watcher_socket.clone()).await?;
     spawn_file_watcher(Arc::clone(&state));
@@ -5808,10 +6229,24 @@ pub async fn run(
 
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).await?;
     let addr = listener.local_addr()?;
-    println!(
-        "meshfox: serving {} on http://{addr}",
-        canvas_path.display()
-    );
+    if !quiet {
+        println!(
+            "meshfox: serving {} on http://{addr}",
+            canvas_path.display()
+        );
+    }
+
+    if let Some(guard) = &mut lock_guard {
+        if let Err(e) = guard.write_port(addr.port()) {
+            if !quiet {
+                eprintln!("meshfox: couldn't record this worker's port in its lock file ({e})");
+            }
+        }
+    }
+
+    if let Some(tx) = ready_tx {
+        let _ = tx.send(addr.port());
+    }
 
     // Best-effort, same reasoning `open_browser` used to have for
     // `open::that` failing: a watcher that's gone, or was never given at
@@ -5821,7 +6256,9 @@ pub async fn run(
     // *does* surface, in `open_node_file`).
     if let Some(socket) = &watcher_socket {
         if let Err(e) = watcher_protocol::notify_ready(socket, &canvas_path, addr.port()).await {
-            eprintln!("meshfox: couldn't reach the watcher to report this worker's port ({e})");
+            if !quiet {
+                eprintln!("meshfox: couldn't reach the watcher to report this worker's port ({e})");
+            }
         }
     }
 
@@ -6031,7 +6468,7 @@ mod clear_layout_tests {
             .expect("valid test canvas");
         // Subscribed *before* the mutation, exactly like a real `/api/watch`
         // connection that was already open when a sibling tab saved.
-        let mut change_rx = state.change_tx.subscribe();
+        let (_backlog, mut change_rx, _gap) = state.canvas_events.subscribe_from(0);
 
         if let Err(e) = clear_node_layout(State(state), Path("a".to_string())).await {
             panic!("clear-layout failed: {}", e.1);
@@ -6059,6 +6496,213 @@ mod clear_layout_tests {
             Err(e) => e,
         };
         assert_eq!(err.0, StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+}
+
+/// Every mutating `/api/nodes*` endpoint's own precise `ServerEvent`
+/// broadcast (`NodeUpserted`/`NodeRemoved`/`NodesReordered`, or a
+/// deliberate `Changed` fallback) — see `ServerEvent`'s own doc comment
+/// and TODO.canvas.md's "WS push на мутации дерева" for the design this
+/// implements. Same direct-call-the-handler-and-inspect-the-broadcast
+/// pattern `clear_layout_tests::save_broadcasts_a_changed_event_to_other_tabs`
+/// already established, just asserting on the specific variant/payload
+/// instead of merely "something fired".
+#[cfg(test)]
+mod node_op_broadcast_tests {
+    use super::*;
+
+    fn write_test_canvas(contents: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "meshfox-node-op-broadcast-test-{}.canvas.md",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    const TWO_SIBLINGS: &str = concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "## A\n<!-- meshfox:node id=\"a\" -->\n\nbody a\n\n",
+        "## B\n<!-- meshfox:node id=\"b\" -->\n\nbody b\n",
+    );
+
+    /// Pulls the one `ServerEvent` a mutation just broadcast — panics if
+    /// none arrived, same "a save must always broadcast something"
+    /// invariant `save_broadcasts_a_changed_event_to_other_tabs` already
+    /// checks, just also handing the event back for the caller's own
+    /// variant/payload assertion.
+    fn recv_event(rx: &mut broadcast::Receiver<canvas_events::SeqEvent>) -> ServerEvent {
+        rx.try_recv().expect("mutation should have broadcast an event").item
+    }
+
+    #[tokio::test]
+    async fn create_node_broadcasts_node_upserted_for_the_new_node() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None)
+            .await
+            .expect("valid test canvas");
+        let (_backlog, mut rx, _gap) = state.canvas_events.subscribe_from(0);
+
+        let req = CreateNodeRequest { parent_id: "root".to_string(), title: "New Child".to_string() };
+        let Json(canvas) = create_node(State(state), Json(req)).await.expect("create should succeed");
+
+        match recv_event(&mut rx) {
+            ServerEvent::NodeUpserted { node } => {
+                assert_eq!(node.title, "New Child");
+                assert_eq!(node.parent.as_deref(), Some("root"));
+                // The broadcast node's own id should be a real, addressable
+                // id in the response the same request just got back — not
+                // some placeholder a client couldn't actually look up.
+                assert!(canvas.node(&node.id).is_some());
+            }
+            other => panic!("expected NodeUpserted, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn update_node_body_broadcasts_node_upserted_with_the_new_body() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None)
+            .await
+            .expect("valid test canvas");
+        let (_backlog, mut rx, _gap) = state.canvas_events.subscribe_from(0);
+
+        let req = UpdateNodeRequest {
+            title: None,
+            node_type: None,
+            color: None,
+            target: None,
+            text: Some("new body a".to_string()),
+            extra_parents: None,
+            display: None,
+            lang: None,
+            interpreter: None,
+            preview: None,
+            tags: None,
+            edge_label: None,
+            fold: None,
+        };
+        let _ = update_node(State(state), Path("a".to_string()), Json(req))
+            .await
+            .expect("update should succeed");
+
+        match recv_event(&mut rx) {
+            ServerEvent::NodeUpserted { node } => {
+                assert_eq!(node.id, "a");
+                assert_eq!(node.text, "new body a");
+            }
+            other => panic!("expected NodeUpserted, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn remove_node_default_broadcasts_node_removed() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None)
+            .await
+            .expect("valid test canvas");
+        let (_backlog, mut rx, _gap) = state.canvas_events.subscribe_from(0);
+
+        let _ = remove_node(State(state), Path("a".to_string()), Query(DeleteNodeQuery { children: None }))
+            .await
+            .expect("remove should succeed");
+
+        match recv_event(&mut rx) {
+            ServerEvent::NodeRemoved { node_id, keep_children } => {
+                assert_eq!(node_id, "a");
+                assert!(!keep_children);
+            }
+            other => panic!("expected NodeRemoved, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    // The `?children=reparent` branch changes every promoted child's own
+    // `parent` too, not just removing the target — too much for a single
+    // `NodeRemoved` to describe accurately (see that call site's own
+    // comment), so it deliberately falls back to a plain `Changed` instead.
+    #[tokio::test]
+    async fn remove_node_with_reparent_children_falls_back_to_changed() {
+        let canvas_path = write_test_canvas(concat!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## A\n<!-- meshfox:node id=\"a\" -->\n\nbody a\n\n",
+            "### A1\n<!-- meshfox:node id=\"a1\" -->\n\nbody a1\n",
+        ));
+        let state = build_state(canvas_path.clone(), false, None)
+            .await
+            .expect("valid test canvas");
+        let (_backlog, mut rx, _gap) = state.canvas_events.subscribe_from(0);
+
+        let _ = remove_node(
+            State(state),
+            Path("a".to_string()),
+            Query(DeleteNodeQuery { children: Some("reparent".to_string()) }),
+        )
+        .await
+        .expect("remove should succeed");
+
+        match recv_event(&mut rx) {
+            ServerEvent::Changed => {}
+            other => panic!("expected a Changed fallback, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn move_sibling_broadcasts_the_whole_new_sibling_order() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None)
+            .await
+            .expect("valid test canvas");
+        let (_backlog, mut rx, _gap) = state.canvas_events.subscribe_from(0);
+
+        // "a" starts before "b" — move it to sit after "b" instead.
+        let req = MoveSiblingRequest { before: None, after: Some("b".to_string()) };
+        let _ = move_sibling(State(state), Path("a".to_string()), Json(req))
+            .await
+            .expect("move should succeed");
+
+        match recv_event(&mut rx) {
+            ServerEvent::NodesReordered { parent_id, child_ids } => {
+                assert_eq!(parent_id, "root");
+                assert_eq!(child_ids, vec!["b".to_string(), "a".to_string()]);
+            }
+            other => panic!("expected NodesReordered, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    // An id rename ripples into every other node's own `parent=`/`meshfox:
+    // edge from=` reference — too much for `NodeUpserted`'s single-node
+    // shape, so it deliberately keeps the generic `Changed` (a full
+    // reload) instead of a precise op.
+    #[tokio::test]
+    async fn rename_node_id_falls_back_to_changed() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None)
+            .await
+            .expect("valid test canvas");
+        let (_backlog, mut rx, _gap) = state.canvas_events.subscribe_from(0);
+
+        let req = RenameNodeIdRequest { new_id: "a-renamed".to_string() };
+        let _ = rename_node_id(State(state), Path("a".to_string()), Json(req))
+            .await
+            .expect("rename should succeed");
+
+        match recv_event(&mut rx) {
+            ServerEvent::Changed => {}
+            other => panic!("expected a Changed fallback, got {other:?}"),
+        }
 
         let _ = std::fs::remove_file(&canvas_path);
     }
@@ -7334,6 +7978,72 @@ mod ws_tests {
             matches!(next, Some(Ok(WsMessage::Close(_))) | None),
             "expected the attached viewer's socket to close, got: {next:?}"
         );
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn an_attached_viewer_that_falls_behind_recovers_instead_of_disconnecting() {
+        // Regression coverage for a real bug: a slow viewer (a browser tab
+        // over a real network, xterm.js parsing every frame — nowhere near
+        // as fast as a loopback TUI socket reading straight into a raw
+        // buffer) watching a fast-redrawing full-screen program could fall
+        // behind `tty_registry`'s 1024-message broadcast capacity, and
+        // `relay_tty_viewer`/`relay_tty_step` used to treat *any*
+        // `rx.recv()` error — a lagged receiver included — as if the
+        // session itself had ended, silently closing that viewer's socket
+        // (a blank terminal, then "disconnected") while the session and
+        // every other viewer kept going fine. `read()`'s own 4096-byte cap
+        // (`pty_exec::spawn`) means any burst over `1024 * 4096` bytes
+        // guarantees at least 1024 separate broadcast sends *regardless*
+        // of how the kernel batches the writes that produced it — this
+        // burst is comfortably past that.
+        let canvas_path = write_test_canvas(concat!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Shell\n<!-- meshfox:node id=\"shell\" -->\n\n",
+            "```bash name=\"interactive\" tty\n",
+            "echo ready; read line\n",
+            "head -c 6000000 /dev/zero | tr '\\0' 'x'; echo\n",
+            "echo BURST-DONE\n",
+            "read line2; echo \"got: $line2\"\n",
+            "```\n",
+        ));
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let url = format!("ws://{addr}/api/run/tty?path=shell&block=interactive&cols=80&rows=24");
+        let (mut ws1, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+        next_event(&mut ws1).await; // started
+        next_event(&mut ws1).await; // step-start
+        next_event(&mut ws1).await; // tty-start
+        read_until(&mut ws1, "ready").await;
+
+        let attach_url =
+            format!("ws://{addr}/api/run/tty/attach?nodeId=shell&block=interactive&cols=80&rows=24");
+        let (mut ws2, _) = tokio_tungstenite::connect_async(attach_url).await.expect("attach");
+        // Give `relay_tty_viewer` a moment to actually reach `handle.
+        // attach()` (subscribing) before the burst below starts — a WS
+        // client's own `connect_async` returning doesn't itself guarantee
+        // the server's `on_upgrade` callback has already run that far.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Deliberately never reading from `ws2` here is what makes this
+        // deterministic: its own relay task's `socket.send()` eventually
+        // blocks on ordinary TCP backpressure once the OS send buffer
+        // fills, which stalls that task's own `rx.recv()` loop for the
+        // whole burst — guaranteeing it falls behind, rather than merely
+        // *risking* it under an ordinary timing race.
+        ws1.send(WsMessage::Binary(b"\n".to_vec().into())).await.expect("unblock read");
+        // Draining `ws1` (the *originating* connection, read continuously
+        // throughout) confirms the several-MB burst has fully landed
+        // server-side before `ws2` ever looks at it.
+        read_until(&mut ws1, "BURST-DONE").await;
+
+        // *Now* start reading `ws2` — before the fix, its relay task's own
+        // `rx.recv()` would see this as the session having ended and close
+        // the socket having shown nothing at all; after it, it resyncs via
+        // a fresh `attach()` snapshot and keeps going.
+        read_until(&mut ws2, "BURST-DONE").await;
+        ws2.send(WsMessage::Binary(b"hello\n".to_vec().into())).await.expect("send input");
+        read_until(&mut ws2, "got: hello").await;
 
         let _ = std::fs::remove_file(&canvas_path);
     }

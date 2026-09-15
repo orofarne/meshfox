@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 /// (`crate::RunEvent`) sends over the wire, so the web UI's live view can
 /// split the two apart too, not just a `cache`d run's persisted result
 /// (`core::output::ExecOutput::stdout`/`.stderr`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OutputStream {
     Stdout,
