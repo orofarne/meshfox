@@ -299,7 +299,7 @@ export default function App() {
   // "whichever" (the toolbar pill's own case). Set alongside
   // `servicePanelOpen` itself, never read while it's `false`.
   const [servicePanelFocusNodeId, setServicePanelFocusNodeId] = useState<string | null>(null);
-  // A `"service-lock-conflict"` event awaiting the user's confirm/cancel —
+  // A `"lock-conflict"` event awaiting the user's confirm/cancel —
   // see `executeRun`'s `onEvent` handling below and `ServiceLockConflictDialog`.
   // Not necessarily a `service` any more (see that event's own doc
   // comment in api.ts) — `conflictNodeId`/`conflictBlock` name the
@@ -1275,7 +1275,7 @@ export default function App() {
               // service to show up as running.
               fetchServices().then(setServices).catch(() => {});
               break;
-            case "service-lock-conflict":
+            case "lock-conflict":
               setServiceConflict({
                 conflictNodeId: event.nodeId,
                 conflictBlock: event.block,
@@ -1482,7 +1482,7 @@ export default function App() {
             case "done":
               break;
             case "service-started":
-            case "service-lock-conflict":
+            case "lock-conflict":
               // A `file` node has no fenced code blocks at all (see this
               // function's own doc comment), so `service` (a fence-only
               // attribute) can never actually apply here — these only exist
@@ -1979,11 +1979,40 @@ export default function App() {
       foldedNodeIds,
     });
     const byId = new Map(canvas.nodes.map((n) => [n.id, n]));
-    setNodes(
-      canvas.nodes.map((n) => {
+    setNodes((prevNodes) => {
+      // React Flow's own click-driven `.selected` (what `NodeToolbar`'s
+      // `isVisible` and the `.selected` box-shadow key off) lives only on
+      // these node objects, not in `canvas`/anywhere else — a full replace
+      // below with fresh objects would otherwise silently deselect
+      // whatever was selected on every canvas reload (an edit made *through*
+      // the selected node's own toolbar, like the ↑/↓ sibling-reorder
+      // buttons, reloads `canvas` and used to lose its own toolbar and
+      // selection highlight as a result). Carried forward by id instead.
+      const selectedIds = new Set(prevNodes.filter((n) => n.selected).map((n) => n.id));
+      return canvas.nodes.map((n) => {
         const isGroup = n.type === "group";
         const isFolded = foldedNodeIds.has(n.id);
-        const suggested = n.x === undefined || n.y === undefined;
+        // Nothing about this node's box — position *or* size — has ever
+        // been authored; still fully driven by this session's own auto-
+        // layout guess (see `MeshNodeData.suggested`'s own doc comment,
+        // which already promised "position/size", not just position).
+        // Deliberately broader than "has a position": dragging a
+        // `NodeResizer` handle alone (bottom-right corner, say) authors
+        // `width`/`height` without ever touching `x`/`y` — checking only
+        // x/y here used to leave that node's corner/↺ button hidden and
+        // let the remeasure effect below keep silently snapping its real,
+        // deliberately-resized box back to the auto-layout guess (both
+        // read this same flag).
+        const suggested =
+          n.x === undefined && n.y === undefined && n.width === undefined && n.height === undefined;
+        // Sibling reorder (↑/↓) is specifically about whether
+        // `mdcanvas::reorder_by_position` sorts this node by its own y/x —
+        // it does that (and only that) based on x/y alone, so a node with
+        // an authored width/height but no x/y is still governed by
+        // document/heading order among its equally-unpositioned siblings
+        // and still needs the manual buttons, regardless of `suggested`
+        // above.
+        const autoOrdered = n.x === undefined || n.y === undefined;
         const box: LayoutBox | undefined = boxes.get(n.id);
         // A direct child of a `group` stores x/y relative to that group's
         // own anchor, not absolute (see SPEC.md) — React Flow's own
@@ -1996,7 +2025,7 @@ export default function App() {
         const groupParent = rawParent?.type === "group" ? rawParent : undefined;
         // Document-order neighbors among the same structural parent's
         // children — an auto-placed node's own heading order (see
-        // `suggested` above) is its *only* sibling order, and moving it
+        // `autoOrdered` above) is its *only* sibling order, and moving it
         // past its immediate neighbor either way is exactly what
         // `mdcanvas::move_sibling` does. `undefined` at either end (already
         // first/last) hides the corresponding button entirely rather than
@@ -2037,6 +2066,7 @@ export default function App() {
         return {
           id: n.id,
           type: "mesh",
+          selected: selectedIds.has(n.id),
           // `parentId` is React Flow's own native parent/child nesting —
           // once set, `position` above is relative to the parent (exactly
           // what a group member's own x/y already means, see above) and
@@ -2119,11 +2149,11 @@ export default function App() {
             onOpenFileFolder: () => handleOpenFileFolder(n.id),
             onAddChild: () => handleAddChild(n.id),
             onMoveUp:
-              suggested && prevSibling
+              autoOrdered && prevSibling
                 ? () => handleMoveSibling(n.id, { before: prevSibling.id })
                 : undefined,
             onMoveDown:
-              suggested && nextSibling
+              autoOrdered && nextSibling
                 ? () => handleMoveSibling(n.id, { after: nextSibling.id })
                 : undefined,
             onClearLayout: suggested ? undefined : () => handleClearNodeLayout(n.id),
@@ -2136,8 +2166,8 @@ export default function App() {
             onRequestDelete: () => setDeleteConfirmNodeId(n.id),
           },
         };
-      }),
-    );
+      });
+    });
     const derivedEdges = deriveEdges(canvas);
     // Two extra edges sharing the same *unordered* node pair — in
     // practice always exactly a mutual link, `A->B` declared alongside
@@ -3125,8 +3155,18 @@ export default function App() {
         };
       }),
     };
+    // For every node *not* in `layout` above (still fully auto this save),
+    // pass along where it's currently actually drawn as a same-request-only
+    // sort hint (see `saveCanvas`'s own doc comment) — lets a sibling that
+    // *is* being positioned this save slot in among them by where it
+    // visually landed, rather than always sorting before all of them.
+    const layoutHints: Record<string, { x: number; y: number }> = {};
+    for (const n of nodes) {
+      if (layout.has(n.id)) continue;
+      layoutHints[n.id] = { x: n.position.x, y: n.position.y };
+    }
     try {
-      await saveCanvas(updated);
+      await saveCanvas(updated, layoutHints);
       // Re-fetch rather than `setCanvas(updated)`: `updated` only carries
       // the positions/sizes this client already knew about, but saving can
       // shift server-computed values it didn't — most importantly every

@@ -129,11 +129,25 @@ export async function updateOptions(options: string[]): Promise<CanvasDoc> {
   return res.json();
 }
 
-export async function saveCanvas(canvas: CanvasDoc): Promise<void> {
+/**
+ * `layoutHints` — a same-request-only sort hint for the server's own
+ * `mdcanvas::reorder_by_position` (see its doc comment), keyed by node id:
+ * this tab's own current on-screen position for a node it did *not* just
+ * drag/resize this save (still auto-placed). Without it, a lone freshly-
+ * positioned node among otherwise-auto siblings always sorts before every
+ * one of them regardless of its own `y` (App.tsx's `handleSaveLayout`
+ * builds this from `nodes`, which always has a real numeric position for
+ * every node, positioned or not). Never persisted as real `x`/`y` on the
+ * nodes it's about — purely advisory for this one save's reorder pass.
+ */
+export async function saveCanvas(
+  canvas: CanvasDoc,
+  layoutHints?: Record<string, { x: number; y: number }>,
+): Promise<void> {
   const res = await fetch("/api/canvas", {
     method: "PUT",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(canvas),
+    body: JSON.stringify({ ...canvas, layoutHints: layoutHints ?? {} }),
   });
   if (!res.ok) throw new Error(`PUT /api/canvas: ${res.status}`);
 }
@@ -480,9 +494,10 @@ export async function clearNodeId(id: string): Promise<{ id: string; doc: Canvas
 }
 
 // Mirrors crates/server/src/lib.rs's `RunEvent` (JSON shape, camelCase) —
-// one of these per line of /api/run's streamed `application/x-ndjson`
-// response body. `started` is always first; `killed`/`error`/`done` are
-// each terminal for the run (no further lines follow).
+// one of these per WebSocket text frame /api/run's streamed response sends.
+// `started` is (almost) always first; `killed`/`error`/`done`/
+// `lock-conflict` are each terminal for the run (no further messages
+// follow).
 export type RunEvent =
   | { type: "started"; runId: string }
   | { type: "step-start"; nodeId: string; block: string }
@@ -516,13 +531,14 @@ export type RunEvent =
    * `nodeId`/`block`'s own address (any kind of block, not just
    * `service` — a chain's own dependency can just as easily be the one
    * that's contested) is already locked by another live-or-stale process.
-   * Never actually streamed by the server any more (queued-time locking
-   * means a conflict is always known before a run's response even
-   * starts) — synthesized client-side from a `409` response instead (see
-   * `streamRunResponse`), so `onEvent`'s existing switch handles it the
-   * same way regardless. Show a confirm dialog; on confirm, call
-   * `forceRun`. */
-  | { type: "service-lock-conflict"; nodeId: string; block: string; ownerPid: number; ownerDesc: string };
+   * Queued-time locking means this is always known before any step
+   * actually runs, so it's (almost) always the very first message on the
+   * socket — a browser `WebSocket` can't read a pre-upgrade HTTP status/
+   * body at all, so the server always completes the upgrade and reports
+   * this as a stream event instead (see `crates/server/src/lib.rs`'s own
+   * `pump_run_response_into_ws` doc comment) rather than a rejected
+   * connection. Show a confirm dialog; on confirm, call `forceRun`. */
+  | { type: "lock-conflict"; nodeId: string; block: string; ownerPid: number; ownerDesc: string };
 
 /**
  * Running is always allowed. `persist` controls whether a `cache`d block's
@@ -552,76 +568,61 @@ export async function runBlockStream(
    * `VarsForm`'s own "save (plaintext)" checkbox. */
   saveSecrets?: string[],
 ): Promise<void> {
-  const res = await fetch("/api/run", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      path,
-      block,
-      persist,
-      noDeps: !withDeps,
-      vars: vars ?? {},
-      saveSecrets: saveSecrets ?? [],
-    }),
+  const params = new URLSearchParams({
+    path: path.join(","),
+    block,
+    persist: String(persist),
+    noDeps: String(!withDeps),
+    vars: JSON.stringify(vars ?? {}),
+    saveSecrets: JSON.stringify(saveSecrets ?? []),
   });
-  await streamRunResponse(res, "/api/run", onEvent);
+  await openEventSocket(wsUrl(`/api/run?${params}`), onEvent);
 }
 
-/** Shape of a `409` conflict response from `/api/run`/`/api/run/force` —
- * queued-time locking (see `crates/server/src/lib.rs`'s own
- * `acquire_chain_locks`) means every lock a run will ever need is claimed
- * before the response even starts, so a conflict is reported this way —
- * a plain HTTP status with a JSON body — rather than as a streamed event;
- * nothing has been sent to the client yet either way. */
-interface LockConflictBody {
-  nodeId: string;
-  block: string;
-  ownerPid: number;
-  ownerDesc: string;
+/** Builds a `ws(s)://`-scheme URL for a path on this same origin — every
+ * run-starting endpoint is a WebSocket now, not a plain `fetch()`, but
+ * still lives at a relative `/api/...` path the same way the old HTTP
+ * calls did, so this just swaps the scheme rather than hardcoding a host. */
+function wsUrl(path: string): string {
+  const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${scheme}//${window.location.host}${path}`;
 }
 
-/** Shared response handling for `runBlockStream`/`forceRun`: a `409`
- * becomes a synthetic `"service-lock-conflict"` event (same shape either
- * would have streamed before this endpoint's locking became queued-time —
- * see that `RunEvent` variant's own doc comment) so `onEvent`'s existing
- * switch handles it unchanged; anything else not-ok is a real rejection;
- * otherwise the body streams as NDJSON, one `RunEvent` per line. */
-async function streamRunResponse(
-  res: Response,
-  label: string,
-  onEvent: (event: RunEvent) => void,
-): Promise<void> {
-  if (res.status === 409) {
-    const conflict = (await res.json()) as LockConflictBody;
-    onEvent({ type: "service-lock-conflict", ...conflict });
-    return;
-  }
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(text || `${label}: ${res.status}`);
-  }
-  if (!res.body) {
-    throw new Error(`${label}: response had no body to stream`);
-  }
-
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffered = "";
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffered += decoder.decode(value, { stream: true });
-    let newlineAt: number;
-    while ((newlineAt = buffered.indexOf("\n")) >= 0) {
-      const line = buffered.slice(0, newlineAt);
-      buffered = buffered.slice(newlineAt + 1);
-      if (line.trim()) onEvent(JSON.parse(line) as RunEvent);
-    }
-  }
+/** Opens `url` as a WebSocket, calls `onEvent` for every JSON text frame it
+ * sends, and resolves once the socket closes — the shared plumbing behind
+ * `runBlockStream`/`forceRun`/`runFileStream`/`subscribeRun`, now that all
+ * four are WebSocket endpoints instead of HTTP-streamed responses (see
+ * `crates/server/src/lib.rs`'s own `pump_run_response_into_ws` doc comment
+ * for why even a pre-stream failure — a bad chain, a lock conflict, a
+ * missing run to subscribe to — arrives as an ordinary message instead of
+ * a rejected connection: a browser `WebSocket` has no way to read a failed
+ * handshake's own status/body at all). Only actually rejects for a
+ * genuine transport-level failure (the worker isn't listening, a
+ * malformed URL) — an `onerror` that fires before the socket ever closes. */
+function openEventSocket<T>(url: string, onEvent: (event: T) => void): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const ws = new WebSocket(url);
+    ws.onmessage = (ev) => {
+      if (typeof ev.data === "string") onEvent(JSON.parse(ev.data) as T);
+    };
+    ws.onerror = () => {
+      if (!settled) {
+        settled = true;
+        reject(new Error(`${url}: WebSocket error`));
+      }
+    };
+    ws.onclose = () => {
+      if (!settled) {
+        settled = true;
+        resolve();
+      }
+    };
+  });
 }
 
 /**
- * The confirm side of a `"service-lock-conflict"` event, generalized to
+ * The confirm side of a `"lock-conflict"` event, generalized to
  * any block kind (not just `service` — see `crates/server/src/lib.rs`'s
  * own `force_run` doc comment): force-kills whatever the conflict's own
  * lock names, then re-runs the *exact same* request that hit it —
@@ -644,20 +645,17 @@ export async function forceRun(
   vars?: Record<string, string>,
   saveSecrets?: string[],
 ): Promise<void> {
-  const res = await fetch("/api/run/force", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      path,
-      block,
-      persist,
-      noDeps: !withDeps,
-      vars: vars ?? {},
-      saveSecrets: saveSecrets ?? [],
-      force: { nodeId: force.nodeId, block: force.block },
-    }),
+  const params = new URLSearchParams({
+    path: path.join(","),
+    block,
+    persist: String(persist),
+    noDeps: String(!withDeps),
+    vars: JSON.stringify(vars ?? {}),
+    saveSecrets: JSON.stringify(saveSecrets ?? []),
+    forceNodeId: force.nodeId,
+    forceBlock: force.block,
   });
-  await streamRunResponse(res, "/api/run/force", onEvent);
+  await openEventSocket(wsUrl(`/api/run/force?${params}`), onEvent);
 }
 
 /** One line of `subscribeRun`'s own streamed NDJSON response — a much
@@ -687,30 +685,7 @@ export async function subscribeRun(
   onEvent: (event: SubscribeEvent) => void,
 ): Promise<void> {
   const params = new URLSearchParams({ nodeId, block, sinceSeq: String(sinceSeq) });
-  const res = await fetch(`/api/run/subscribe?${params}`);
-  if (res.status === 404) return;
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(text || `GET /api/run/subscribe: ${res.status}`);
-  }
-  if (!res.body) {
-    throw new Error("GET /api/run/subscribe: response had no body to stream");
-  }
-
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffered = "";
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffered += decoder.decode(value, { stream: true });
-    let newlineAt: number;
-    while ((newlineAt = buffered.indexOf("\n")) >= 0) {
-      const line = buffered.slice(0, newlineAt);
-      buffered = buffered.slice(newlineAt + 1);
-      if (line.trim()) onEvent(JSON.parse(line) as SubscribeEvent);
-    }
-  }
+  await openEventSocket(wsUrl(`/api/run/subscribe?${params}`), onEvent);
 }
 
 /**
@@ -724,29 +699,7 @@ export async function subscribeRun(
  * a `file` node has no `deps=` chain or cache to opt into.
  */
 export async function runFileStream(nodeId: string, onEvent: (event: RunEvent) => void): Promise<void> {
-  const res = await fetch(`/api/nodes/${encodeURIComponent(nodeId)}/run`, { method: "POST" });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(text || `POST /api/nodes/${nodeId}/run: ${res.status}`);
-  }
-  if (!res.body) {
-    throw new Error(`POST /api/nodes/${nodeId}/run: response had no body to stream`);
-  }
-
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffered = "";
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffered += decoder.decode(value, { stream: true });
-    let newlineAt: number;
-    while ((newlineAt = buffered.indexOf("\n")) >= 0) {
-      const line = buffered.slice(0, newlineAt);
-      buffered = buffered.slice(newlineAt + 1);
-      if (line.trim()) onEvent(JSON.parse(line) as RunEvent);
-    }
-  }
+  await openEventSocket(wsUrl(`/api/nodes/${encodeURIComponent(nodeId)}/run`), onEvent);
 }
 
 /**
@@ -877,7 +830,7 @@ export async function restartService(nodeId: string, block: string): Promise<{ p
   return res.json();
 }
 
-/** The confirm side of a `"service-lock-conflict"` event: kills whatever
+/** The confirm side of a `"lock-conflict"` event: kills whatever
  * process the lock file currently names as owner, releases the lock, and
  * starts the service fresh. `path`/`block`/`vars` mirror `runBlockStream`'s
  * own arguments for the same block. */

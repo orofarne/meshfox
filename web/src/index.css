@@ -1007,9 +1007,9 @@ a {
   pointer-events: auto;
 }
 
-/* A small filled top-left corner marks a node whose position/size come from
- * real x/y saved in the file, rather than this session's own auto-layout
- * guess (see App.tsx's `suggested`). Deliberately subtle and on the
+/* A small filled top-left corner marks a node with any real, authored
+ * position or size (x/y/w/h) saved in the file, rather than this session's
+ * own auto-layout guess for all four (see App.tsx's `suggested`). Deliberately subtle and on the
  * opposite state from the old dashed-border treatment this replaced: once a
  * canvas is arranged, *most* nodes are authored, so flagging every
  * unauthored one (dashed, on the common case) read as "something's wrong

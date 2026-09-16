@@ -3101,6 +3101,7 @@ impl App {
             self.console_collapsed = false;
             self.console_last_activity = Some(std::time::Instant::now());
         }
+        use crate::worker_client::RunEvent;
         match crate::worker_client::run_stream(
             port,
             &path,
@@ -3112,46 +3113,57 @@ impl App {
         )
         .await
         {
-            Ok(http_rx) => {
-                self.run = Some(RunState {
-                    chain: Vec::new(),
-                    idx: 0,
-                    proc: None,
-                    http_rx: Some(http_rx),
-                    lines: Vec::new(),
-                    full_output: String::new(),
-                    stdout_only: String::new(),
-                    stderr_only: String::new(),
-                    output_markdown: false,
-                    step_started: std::time::Instant::now(),
-                    current_node_text: String::new(),
-                    had_failure: false,
-                    killed: false,
-                    finished: false,
-                    pending_vars_out: None,
-                    forced_reruns: HashSet::new(),
-                });
-            }
-            Err(crate::worker_client::RunStartError::Conflict(conflict)) => {
-                self.status = format!(
-                    "meshfox: {:?}/{:?} is locked by pid {} ({}) — y to kill and retry, n to cancel",
-                    conflict.node_id, conflict.block, conflict.owner_pid, conflict.owner_desc
-                );
-                self.service_conflict = Some(ServiceConflictState {
-                    block_name: conflict.block.clone(),
-                    owner_pid: conflict.owner_pid,
-                    owner_desc: conflict.owner_desc.clone(),
-                    lock_path: PathBuf::new(),
-                    http_retry: Some(HttpRunRetry {
-                        node_id,
-                        block_name,
-                        with_deps,
-                        port,
-                        force_node_id: conflict.node_id.clone(),
-                        force_block: conflict.block.clone(),
-                        is_tty: false,
-                    }),
-                });
+            Ok(mut http_rx) => {
+                // A lock conflict is no longer a connect-time error (a
+                // browser `WebSocket` can't read a rejected-handshake
+                // status/body, so the server always completes the upgrade
+                // and reports it as the very first streamed event instead
+                // — see `worker_client::run_stream`'s own doc comment) —
+                // peek at it here, before a `RunState` even exists, same
+                // as the old connect-time `Err` branch used to.
+                match http_rx.recv().await {
+                    Some(RunEvent::LockConflict { node_id: conflict_node, block: conflict_block, owner_pid, owner_desc }) => {
+                        self.status = format!(
+                            "meshfox: {conflict_node:?}/{conflict_block:?} is locked by pid {owner_pid} ({owner_desc}) — y to kill and retry, n to cancel"
+                        );
+                        self.service_conflict = Some(ServiceConflictState {
+                            block_name: conflict_block.clone(),
+                            owner_pid,
+                            owner_desc,
+                            lock_path: PathBuf::new(),
+                            http_retry: Some(HttpRunRetry {
+                                node_id,
+                                block_name,
+                                with_deps,
+                                port,
+                                force_node_id: conflict_node,
+                                force_block: conflict_block,
+                                is_tty: false,
+                            }),
+                        });
+                    }
+                    first => {
+                        self.run = Some(RunState {
+                            chain: Vec::new(),
+                            idx: 0,
+                            proc: None,
+                            http_rx: Some(http_rx),
+                            lines: Vec::new(),
+                            full_output: String::new(),
+                            stdout_only: String::new(),
+                            stderr_only: String::new(),
+                            output_markdown: false,
+                            step_started: std::time::Instant::now(),
+                            current_node_text: String::new(),
+                            had_failure: false,
+                            killed: false,
+                            finished: false,
+                            pending_vars_out: None,
+                            forced_reruns: HashSet::new(),
+                        });
+                        self.on_run_event(first).await;
+                    }
+                }
             }
             Err(e) => {
                 self.status = format!("meshfox: failed to start run: {e}");
@@ -3235,6 +3247,18 @@ impl App {
                 if exit_code != 0 {
                     run.had_failure = true;
                 }
+            }
+            RunEvent::LockConflict { node_id, block, owner_pid, owner_desc } => {
+                // Only ever arrives as the very first event, handled
+                // directly by `begin_http_run` before a `RunState` even
+                // exists — reaching here is defensive-only (shouldn't
+                // happen). Same terminal-failure shape as `RunEvent::Error`.
+                run.had_failure = true;
+                run.finished = true;
+                run.http_rx = None;
+                self.status = format!(
+                    "meshfox: {node_id:?}/{block:?} is locked by pid {owner_pid} ({owner_desc})"
+                );
             }
             RunEvent::Killed { node_id, block } => {
                 run.killed = true;

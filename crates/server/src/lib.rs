@@ -398,11 +398,17 @@ impl Drop for ResolveReservationOnDrop {
 
 /// Who already holds a contested address's lock — enough for a client to
 /// show "X is already running (pid N, started via webui)" and offer a
-/// force-retry (`force_run`, below). Reported as a plain `409 Conflict` HTTP
-/// response, not a streamed `RunEvent` — see `acquire_chain_locks`'s own
-/// doc comment for why this is always known *before* a run's response even
-/// starts, so there's no need to open a stream just to report it.
-#[derive(Debug, Clone, Serialize)]
+/// force-retry (`force_run`, below). Internally still built as a plain
+/// `409 Conflict` HTTP response (`lock_conflict_response`) — the same
+/// shape `acquire_chain_locks`'s own doc comment describes, known *before*
+/// any step actually runs — but `pump_run_response_into_ws` (the WS layer
+/// every run-starting endpoint upgrades through) recognizes that status and
+/// re-emits it as a `RunEvent::LockConflict` first message instead of a
+/// rejected upgrade, since a browser `WebSocket` can't read a pre-upgrade
+/// HTTP status/body at all. `Deserialize` here is for that same
+/// `pump_run_response_into_ws` to read the body back out of the `409`
+/// response it just built.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LockConflict {
     node_id: String,
@@ -1091,14 +1097,27 @@ enum RunEvent {
         block: String,
         pid: u32,
     },
-    // A lock conflict on any block (not just `service`) is now reported
-    // *before* a run's response even starts — a plain `409 Conflict` HTTP
-    // response (see `LockConflict`/`lock_conflict_response`), not a
-    // streamed terminal event, since queued-time locking (see
-    // `acquire_chain_locks`) means every conflict this whole chain will
-    // ever hit is already known before anything runs. What used to be a
-    // `ServiceLockConflict` variant here lived only because service-lock
-    // checking used to happen mid-stream, one step at a time.
+    /// A lock conflict on any block (not just `service`) is known *before*
+    /// a run's actual per-step loop ever starts — queued-time locking (see
+    /// `acquire_chain_locks`) means every conflict this whole chain will
+    /// ever hit is already known before anything runs. Sent as the very
+    /// first message in place of `Started` (`run_block`/`force_run` are
+    /// WebSocket endpoints — a browser's native `WebSocket` has no way to
+    /// read a rejected/failed handshake's own status or body, so this
+    /// can't be reported as an HTTP status the way it briefly was when
+    /// these were still plain HTTP-streamed endpoints; see
+    /// `pump_run_response_into_ws`). A precursor to this same idea,
+    /// `ServiceLockConflict`, lived here once before for an unrelated
+    /// reason (service-lock checking used to happen mid-stream, one step
+    /// at a time) and was removed once locking became queued-time — this
+    /// isn't reviving that old mid-stream case, just moving where an
+    /// already-queued-time conflict gets reported from.
+    LockConflict {
+        node_id: String,
+        block: String,
+        owner_pid: u32,
+        owner_desc: String,
+    },
     StepEnd {
         node_id: String,
         block: String,
@@ -1191,6 +1210,77 @@ fn ndjson_line<T: Serialize>(event: &T) -> Bytes {
     let mut line = serde_json::to_string(event).expect("event always serializes");
     line.push('\n');
     Bytes::from(line)
+}
+
+fn run_event_msg(event: &RunEvent) -> Message {
+    Message::Text(serde_json::to_string(event).expect("RunEvent always serializes"))
+}
+
+/// Drives `run_block_impl`/`run_file_node`'s own `Result<Response, ApiError>` (an
+/// ordinary NDJSON-streaming `application/x-ndjson` body on success, a plain HTTP
+/// error status otherwise) into an *already-upgraded* WebSocket — one
+/// `Message::Text` per NDJSON line on success, or the pre-stream failure
+/// converted into a single first-and-only message otherwise. Neither of those
+/// two functions' own bodies change at all for this: whatever they already
+/// build as an HTTP response is exactly what this reads back out and re-sends
+/// as WS frames, so `run_block`/`force_run`/`run_file_node` are the only
+/// functions that actually need to know they're WebSocket endpoints now, not
+/// plain HTTP-streamed ones.
+///
+/// Why every pre-stream failure has to become a message instead of staying a
+/// rejected upgrade (a `409`/`422`/`404` HTTP status, same as before this
+/// existed): a browser's native `WebSocket` has no way to read a failed
+/// handshake's own status code or body at all — only a content-free
+/// `onerror` + `onclose`. A Rust WS client (`tokio-tungstenite`, TUI's own)
+/// *can* read that (confirmed already working for `/api/run/tty`'s own
+/// pre-upgrade `409`), but the web UI can't, so relying on it here would
+/// make every one of these failures silently invisible in a browser. Once
+/// the socket is open, both clients can read an ordinary JSON text message
+/// equally well.
+async fn pump_run_response_into_ws(mut socket: WebSocket, result: Result<Response, ApiError>) {
+    use futures_util::StreamExt;
+    let response = match result {
+        Ok(r) => r,
+        Err(e) => e.into_response(),
+    };
+    let status = response.status();
+    if status == StatusCode::OK {
+        let mut body = response.into_body().into_data_stream();
+        while let Some(Ok(bytes)) = body.next().await {
+            // Each item is already exactly one `ndjson_line()`'s worth (always
+            // ends in `\n`) — reading the body's own stream items directly,
+            // not a re-parsed wire transfer, so items are never split/merged
+            // the way reading a real HTTP connection byte-by-byte could.
+            let text = String::from_utf8_lossy(&bytes);
+            if socket.send(Message::Text(text.trim_end().to_string())).await.is_err() {
+                return;
+            }
+        }
+        // A plain `drop(socket)` here never sends a WS `Close` frame —
+        // just the underlying TCP connection going away, which a strict
+        // client (`tokio-tungstenite`, TUI's own) reports as `Protocol(
+        // ResetWithoutClosingHandshake)` instead of a clean end of stream.
+        let _ = socket.close().await;
+        return;
+    }
+    let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap_or_default();
+    let event = if status == StatusCode::CONFLICT {
+        match serde_json::from_slice::<LockConflict>(&body_bytes) {
+            Ok(c) => RunEvent::LockConflict {
+                node_id: c.node_id,
+                block: c.block,
+                owner_pid: c.owner_pid,
+                owner_desc: c.owner_desc,
+            },
+            Err(e) => RunEvent::Error { message: e.to_string() },
+        }
+    } else {
+        RunEvent::Error { message: String::from_utf8_lossy(&body_bytes).into_owned() }
+    };
+    let _ = socket.send(run_event_msg(&event)).await;
+    let _ = socket.close().await;
 }
 
 #[derive(Debug)]
@@ -1562,6 +1652,35 @@ async fn put_canvas_raw(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// One entry of `PutCanvasRequest::layout_hints` — a node's current
+/// on-screen position, per `reorder_by_position`'s own `hints` parameter.
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct LayoutHint {
+    x: f64,
+    y: f64,
+}
+
+/// `PUT /api/canvas`'s request body — `canvas` flattened in directly (same
+/// shape this endpoint always took) plus `layoutHints`, a same-request-only
+/// sort hint for `mdcanvas::reorder_by_position` (see that function's own
+/// doc comment for why it exists): the web UI's own live auto-layout
+/// position for a node it did *not* itself just drag/resize this save (see
+/// `App.tsx`'s `handleSaveLayout`), keyed by that node's own possibly-
+/// namespaced client-visible id — same id space `canvas.nodes[].id`
+/// already uses. Never treated as authored data; `put_canvas` below splits
+/// it into one local-id-keyed map per file (primary vs. each `include`
+/// target) the same way it already does for `canvas.nodes` itself, since
+/// `reorder_by_position` runs once per file and only knows that file's own
+/// local ids.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PutCanvasRequest {
+    #[serde(flatten)]
+    canvas: Canvas,
+    #[serde(default)]
+    layout_hints: HashMap<String, LayoutHint>,
+}
+
 /// Saves the position/size/color of every node in `canvas` back into the
 /// file, patching each node's `meshfox:node` comment line in place (see
 /// `mdcanvas::set_node_meta`) rather than regenerating the whole document —
@@ -1572,8 +1691,9 @@ async fn put_canvas_raw(
 /// first created in.
 async fn put_canvas(
     State(state): State<Arc<AppState>>,
-    Json(canvas): Json<Canvas>,
+    Json(req): Json<PutCanvasRequest>,
 ) -> Result<StatusCode, ApiError> {
+    let canvas = req.canvas;
     let primary_raw = state.raw.lock().unwrap().clone();
     // Same routing every other mutating endpoint does (see `locate_node`):
     // a node here may have been spliced in from an include, in which case
@@ -1644,11 +1764,37 @@ async fn put_canvas(
         }
     }
 
-    if let Some(reordered) = mdcanvas::reorder_by_position(&primary_out) {
+    // Split the flat, client-namespaced `layout_hints` into one local-id-
+    // keyed map per file — same routing every node in the main loop above
+    // already went through, since `reorder_by_position` runs once per file
+    // and only knows that file's own local ids. A hint naming a node that
+    // no longer resolves to anything is silently dropped, same tolerance
+    // the main loop above already has.
+    let mut primary_hints: HashMap<String, (f64, f64)> = HashMap::new();
+    let mut included_hints: HashMap<PathBuf, HashMap<String, (f64, f64)>> = HashMap::new();
+    for (id, hint) in &req.layout_hints {
+        let Ok(located) = locate_node(&state, &primary_raw, id) else {
+            continue;
+        };
+        match &located.origin {
+            None => {
+                primary_hints.insert(located.local_id, (hint.x, hint.y));
+            }
+            Some(path) => {
+                included_hints
+                    .entry(path.clone())
+                    .or_default()
+                    .insert(located.local_id, (hint.x, hint.y));
+            }
+        }
+    }
+
+    if let Some(reordered) = mdcanvas::reorder_by_position(&primary_out, &primary_hints) {
         primary_out = reordered;
     }
-    for raw in included_out.values_mut() {
-        if let Some(reordered) = mdcanvas::reorder_by_position(raw) {
+    for (path, raw) in included_out.iter_mut() {
+        let hints = included_hints.get(path).cloned().unwrap_or_default();
+        if let Some(reordered) = mdcanvas::reorder_by_position(raw, &hints) {
             *raw = reordered;
         }
     }
@@ -2383,6 +2529,20 @@ async fn get_syntax_file(
     ))
 }
 
+/// `GET /api/nodes/:id/run` — the WS upgrade wrapper around `run_file_node_
+/// impl`: see `pump_run_response_into_ws`'s own doc comment for why this
+/// always upgrades and reports pre-stream failures as a first message
+/// instead of a rejected upgrade.
+async fn run_file_node(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    ws.on_upgrade(move |socket| async move {
+        pump_run_response_into_ws(socket, run_file_node_impl(state, id).await).await;
+    })
+}
+
 /// Runs a runnable `file` node's `interpreter target` (see
 /// `meshfox_core::Node::is_runnable_file`) — the counterpart to `run_block`
 /// for a node that has no fenced code of its own to run, just a target file
@@ -2394,10 +2554,7 @@ async fn get_syntax_file(
 /// handling work unchanged. No `deps=`/`cache`/`env=`/`tty` concepts apply
 /// here — a `file` node's body is just a link, nothing to chain, cache, or
 /// seize a terminal for.
-async fn run_file_node(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Result<Response, ApiError> {
+async fn run_file_node_impl(state: Arc<AppState>, id: String) -> Result<Response, ApiError> {
     let primary_raw = state.raw.lock().unwrap().clone();
     let located = locate_node(&state, &primary_raw, &id)?;
     let canvas = parse_or_error(&located.raw)?;
@@ -3014,48 +3171,131 @@ async fn clear_node_id(
     Ok(Json(ClearNodeIdResponse { id: new_id, canvas }))
 }
 
-/// Runs the requested block plus — automatically, same as the CLI, unless
-/// `no_deps` is set — every block it transitively `deps=`-depends on, in
-/// dependency order, stopping early if a step exits non-zero (running what
-/// depends on a failed step wouldn't mean anything). Streams progress as
-/// `RunEvent`s (NDJSON, one per line) rather than waiting for everything to
-/// finish: chain
-/// resolution happens up front and still fails with a normal HTTP error if
-/// the request doesn't even make sense (dangling block, a cycle) — nothing
-/// has started yet at that point — but once resolved, the response is
-/// `200 OK` immediately and every subsequent failure (missing node/block,
-/// no executor, a step exiting non-zero, a kill) is reported in-stream
-/// instead of as an HTTP status, since headers are already sent.
-async fn run_block(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<RunRequest>,
-) -> Result<Response, ApiError> {
-    run_block_impl(state, req).await
+/// Query params for `run_block`'s own `GET /api/run` WebSocket upgrade —
+/// same fields `RunRequest`'s JSON body used to carry, query-string-encoded
+/// the same way `TtyRunQuery` already does for `/api/run/tty` (`vars`/
+/// `saveSecrets` as JSON-stringified query values, since a `GET` upgrade has
+/// no body to put them in).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunWsQuery {
+    #[serde(default)]
+    path: String,
+    block: String,
+    #[serde(default)]
+    no_deps: bool,
+    #[serde(default)]
+    persist: bool,
+    #[serde(default)]
+    vars: String,
+    #[serde(default)]
+    save_secrets: String,
 }
 
-/// `POST /api/run/force` — the generalized escape hatch for a `409` lock
-/// conflict `run_block`/`run_block_tty` reported: force-kills whatever the
-/// conflict's own lock file names (`meshfox_core::service_lock::
-/// kill_and_acquire`, the same whole-process-group `SIGKILL`-then-reacquire
-/// every force path in this codebase already used to hand-roll for
-/// `service` alone), then just re-runs the exact same request that hit the
-/// conflict. Only ever takes over *one* specific address at a time — if the
-/// same chain turns out to conflict on a *different* address too (a second
-/// concurrent run elsewhere in the chain, or a fresh race since the first
-/// conflict was reported), this reports that as a fresh `409` the same way
-/// `run_block_impl` always does, for the client to force again.
-async fn force_run(
+/// Parses the query-string-encoded fields every run-starting WS endpoint
+/// shares (`RunWsQuery`/`ForceRunWsQuery`) into the `RunRequest` `run_block_
+/// impl` already expects — shared so the JSON-parsing/error-shape for `vars`/
+/// `saveSecrets` lives in exactly one place despite the two query structs
+/// themselves being separate (query-string `Deserialize` doesn't reliably
+/// support `#[serde(flatten)]` the way a JSON body's `ForceRunRequest` used
+/// to rely on, so `TtyRunQuery`'s own precedent — a flat, fully-duplicated
+/// struct — is what `ForceRunWsQuery` below follows instead).
+fn parse_run_request(
+    path: &str,
+    block: String,
+    no_deps: bool,
+    persist: bool,
+    vars: &str,
+    save_secrets: &str,
+) -> Result<RunRequest, ApiError> {
+    let path: Vec<String> = if path.is_empty() {
+        Vec::new()
+    } else {
+        path.split(',').map(String::from).collect()
+    };
+    let vars: HashMap<String, String> = if vars.is_empty() {
+        HashMap::new()
+    } else {
+        serde_json::from_str(vars)
+            .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("invalid `vars`: {e}")))?
+    };
+    let save_secrets: std::collections::HashSet<String> = if save_secrets.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        serde_json::from_str(save_secrets)
+            .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("invalid `saveSecrets`: {e}")))?
+    };
+    Ok(RunRequest { path, block, persist, no_deps, vars, save_secrets })
+}
+
+/// `GET /api/run` — runs the requested block plus — automatically, same as
+/// the CLI, unless `noDeps` is set — every block it transitively `deps=`-
+/// depends on, in dependency order, stopping early if a step exits non-zero
+/// (running what depends on a failed step wouldn't mean anything). A
+/// WebSocket, not a plain HTTP-streamed response (see `pump_run_response_
+/// into_ws`'s own doc comment for why): the socket always opens, and every
+/// `RunEvent` — `Started` first on success, or a single `LockConflict`/
+/// `Error` instead if the chain can't even start — arrives as a `Message::
+/// Text` frame.
+async fn run_block(
+    ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
-    Json(req): Json<ForceRunRequest>,
-) -> Result<Response, ApiError> {
+    Query(query): Query<RunWsQuery>,
+) -> Response {
+    ws.on_upgrade(move |socket| async move {
+        let result = match parse_run_request(
+            &query.path,
+            query.block,
+            query.no_deps,
+            query.persist,
+            &query.vars,
+            &query.save_secrets,
+        ) {
+            Ok(req) => run_block_impl(state, req).await,
+            Err(e) => Err(e),
+        };
+        pump_run_response_into_ws(socket, result).await;
+    })
+}
+
+/// Query params for `force_run`'s own `GET /api/run/force` WebSocket
+/// upgrade — `RunWsQuery`'s own fields (duplicated, not shared via
+/// `#[serde(flatten)]` — see `parse_run_request`'s own doc comment) plus
+/// `forceNodeId`/`forceBlock`, the exact `(nodeId, block)` a prior
+/// `LockConflict` message named. Not necessarily the block the run itself
+/// targets — a chain's own dependency can just as easily be the one that's
+/// contested.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ForceRunWsQuery {
+    #[serde(default)]
+    path: String,
+    block: String,
+    #[serde(default)]
+    no_deps: bool,
+    #[serde(default)]
+    persist: bool,
+    #[serde(default)]
+    vars: String,
+    #[serde(default)]
+    save_secrets: String,
+    force_node_id: String,
+    force_block: String,
+}
+
+/// The force-kill prep `force_run` does before its own `run_block_impl`
+/// call, extracted so the WS wrapper below can run it *inside* the post-
+/// upgrade closure — same "every pre-stream failure becomes a message, not
+/// a rejected upgrade" reasoning `pump_run_response_into_ws` documents,
+/// applied here too (a bad `force` address, or a failed
+/// `kill_and_acquire`, used to be a plain HTTP error before the socket
+/// ever opened).
+async fn force_run_kill_prep(state: &AppState, force: &ForceTarget) -> Result<(), ApiError> {
     let raw_snapshot = state.raw.lock().unwrap().clone();
-    let located = locate_node(&state, &raw_snapshot, &req.force.node_id)?;
+    let located = locate_node(state, &raw_snapshot, &force.node_id)?;
     let canvas_path_for_target = located.origin.unwrap_or_else(|| state.canvas_path.clone());
-    let lock_path = meshfox_core::service_lock_path(
-        &canvas_path_for_target,
-        &req.force.node_id,
-        &req.force.block,
-    );
+    let lock_path =
+        meshfox_core::service_lock_path(&canvas_path_for_target, &force.node_id, &force.block);
     // Snapshot the stale owner's own descendants *before* killing it — see
     // `services::kill_orphaned_descendants`'s own doc comment: a tool that
     // daemonizes internally (forks, then the fork `setsid`s into its own
@@ -3090,19 +3330,40 @@ async fn force_run(
     if let Some(pid) = stale_pid {
         services::kill_orphaned_descendants(pid);
     }
-    run_block_impl(state, req.run).await
+    Ok(())
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ForceRunRequest {
-    #[serde(flatten)]
-    run: RunRequest,
-    /// Which address to force-take — the exact `(nodeId, block)` a prior
-    /// `409` conflict response named. Not necessarily the block the run
-    /// itself targets — a chain's own dependency can just as easily be the
-    /// one that's contested.
-    force: ForceTarget,
+/// `GET /api/run/force` — the generalized escape hatch for a `LockConflict`
+/// `run_block`/`run_block_tty` reported: force-kills whatever the
+/// conflict's own lock file names, then just re-runs the exact same
+/// request that hit it. Only ever takes over *one* specific address at a
+/// time — if the same chain turns out to conflict on a *different* address
+/// too (a second concurrent run elsewhere in the chain, or a fresh race
+/// since the first conflict was reported), this reports that as a fresh
+/// `LockConflict` the same way `run_block_impl` always does, for the
+/// client to force again.
+async fn force_run(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ForceRunWsQuery>,
+) -> Response {
+    ws.on_upgrade(move |socket| async move {
+        let force = ForceTarget { node_id: query.force_node_id, block: query.force_block };
+        let result: Result<Response, ApiError> = async {
+            force_run_kill_prep(&state, &force).await?;
+            let req = parse_run_request(
+                &query.path,
+                query.block,
+                query.no_deps,
+                query.persist,
+                &query.vars,
+                &query.save_secrets,
+            )?;
+            run_block_impl(state, req).await
+        }
+        .await;
+        pump_run_response_into_ws(socket, result).await;
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -5649,8 +5910,34 @@ fn subscribe_ndjson_line(event: &SubscribeEvent) -> Bytes {
 /// different `RunHandle` — same "at most one live entry per address"
 /// invariant `AppState::runs_registry` documents).
 async fn subscribe_run(
+    ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
     Query(query): Query<SubscribeRunQuery>,
+) -> Response {
+    ws.on_upgrade(move |socket| async move {
+        // A `404` here (no such run) is a deliberate silent no-op —
+        // `subscribeRun`'s own client-side doc comment already treats "the
+        // stream ended having sent nothing" as equivalent to "nothing to
+        // show", so this just upgrades and immediately drops the socket
+        // with zero messages rather than routing through
+        // `pump_run_response_into_ws`'s generic `Error`-message behavior.
+        match subscribe_run_impl(state, query).await {
+            Ok(response) => pump_run_response_into_ws(socket, Ok(response)).await,
+            // Same "always send a real WS Close frame, never just drop the
+            // TCP connection" reasoning `pump_run_response_into_ws` itself
+            // documents — otherwise a strict client sees `Protocol(
+            // ResetWithoutClosingHandshake)` instead of a clean, empty
+            // stream.
+            Err(_) => {
+                let _ = socket.close().await;
+            }
+        }
+    })
+}
+
+async fn subscribe_run_impl(
+    state: Arc<AppState>,
+    query: SubscribeRunQuery,
 ) -> Result<Response, ApiError> {
     let key = (query.node_id.clone(), query.block.clone());
     let Some(handle) = state.runs_registry.lock().unwrap().get(&key).cloned() else {
@@ -6081,7 +6368,7 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/nodes/:id/rename-id", post(rename_node_id))
         .route("/api/nodes/:id/clear-id", post(clear_node_id))
         .route("/api/nodes/:id/file-content", get(get_node_file_content))
-        .route("/api/nodes/:id/run", post(run_file_node))
+        .route("/api/nodes/:id/run", get(run_file_node))
         .route("/api/nodes/:id/open", post(open_node_file))
         .route("/api/nodes/:id/open-folder", post(open_node_file_folder))
         .route("/api/options", put(put_options))
@@ -6091,8 +6378,8 @@ fn build_app(state: Arc<AppState>) -> Router {
             get(get_configure_vars).post(post_configure_vars),
         )
         .route("/api/link-preview", get(get_link_preview))
-        .route("/api/run", post(run_block))
-        .route("/api/run/force", post(force_run))
+        .route("/api/run", get(run_block))
+        .route("/api/run/force", get(force_run))
         .route("/api/form/fields", get(get_form_fields))
         .route("/api/form/submit", post(submit_form))
         .route("/api/run/subscribe", get(subscribe_run))
@@ -7526,7 +7813,7 @@ mod include_edit_tests {
         canvas.node_mut("child/leaf").expect("child/leaf present").x = Some(123.0);
         canvas.node_mut("child/leaf").expect("child/leaf present").y = Some(456.0);
 
-        let status = put_canvas(State(state), Json(canvas))
+        let status = put_canvas(State(state), Json(PutCanvasRequest { canvas, layout_hints: HashMap::new() }))
             .await
             .unwrap_or_else(|e| panic!("put_canvas failed: {}", e.1));
         assert_eq!(status, StatusCode::NO_CONTENT);
@@ -7541,6 +7828,121 @@ mod include_edit_tests {
         );
 
         let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
+    }
+
+    // TODO.canvas.md: "Одна перетащенная нода становится первой в списке" —
+    // `layout_hints` lets `put_canvas` slot a freshly-positioned node in
+    // among its still-unpositioned siblings by where the client's own
+    // auto-layout actually rendered them, instead of `reorder_by_position`
+    // always sorting it before every one of them (any real number beats
+    // the implicit `f64::INFINITY` an unpositioned sibling sorts by
+    // without a hint).
+    #[tokio::test]
+    async fn put_canvas_uses_layout_hints_to_place_a_positioned_node_among_auto_siblings() {
+        let mut canvas_path = std::env::temp_dir();
+        canvas_path.push(format!("meshfox-layout-hints-test-{}.canvas.md", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &canvas_path,
+            concat!(
+                "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+                "## One\n<!-- meshfox:node id=\"one\" -->\n\nbody\n\n",
+                "## Two\n<!-- meshfox:node id=\"two\" -->\n\nbody\n\n",
+                "## Target\n<!-- meshfox:node id=\"target\" -->\n\nbody\n",
+            ),
+        )
+        .unwrap();
+        let state = build_state(canvas_path.clone(), false, None)
+            .await
+            .expect("valid test canvas");
+
+        let primary_raw = state.raw.lock().unwrap().clone();
+        let mut canvas =
+            resolved_canvas(&primary_raw, &state.canvas_path).unwrap_or_else(|e| panic!("resolve failed: {}", e.1));
+        // The client's own auto-layout rendered `one` at y=0 and `two` at
+        // y=100 — `target`'s own newly-authored y=50 should land between
+        // them, not before both.
+        canvas.node_mut("target").expect("target present").x = Some(0.0);
+        canvas.node_mut("target").expect("target present").y = Some(50.0);
+        let layout_hints = HashMap::from([
+            ("one".to_string(), LayoutHint { x: 0.0, y: 0.0 }),
+            ("two".to_string(), LayoutHint { x: 0.0, y: 100.0 }),
+        ]);
+
+        let status = put_canvas(State(state), Json(PutCanvasRequest { canvas, layout_hints }))
+            .await
+            .unwrap_or_else(|e| panic!("put_canvas failed: {}", e.1));
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let after = std::fs::read_to_string(&canvas_path).unwrap();
+        let pos = |id: &str| after.find(&format!("id=\"{id}\"")).unwrap();
+        assert!(pos("one") < pos("target"), "after: {after}");
+        assert!(pos("target") < pos("two"), "after: {after}");
+        // A hint is never persisted as a real x/y on the nodes it's about.
+        assert!(!after.contains("id=\"one\" x=") && !after.contains("id=\"one\" y="));
+        assert!(!after.contains("id=\"two\" x=") && !after.contains("id=\"two\" y="));
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    // Same mechanism as the primary-document test above, but for a node
+    // living inside an `include` target — `put_canvas` has to split the
+    // flat, client-namespaced `layout_hints` map into one *local*-id-keyed
+    // map per file before handing it to that file's own
+    // `reorder_by_position` call, the same routing `canvas.nodes` itself
+    // already goes through.
+    #[tokio::test]
+    async fn put_canvas_layout_hints_are_routed_to_the_right_included_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-layout-hints-include-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("child.canvas.md"),
+            concat!(
+                "<!-- meshfox:canvas -->\n# Child\n<!-- meshfox:node id=\"root\" -->\n\n",
+                "## One\n<!-- meshfox:node id=\"one\" -->\n\nbody\n\n",
+                "## Two\n<!-- meshfox:node id=\"two\" -->\n\nbody\n\n",
+                "## Target\n<!-- meshfox:node id=\"target\" -->\n\nbody\n",
+            ),
+        )
+        .unwrap();
+        let base_path = dir.join("base.canvas.md");
+        std::fs::write(
+            &base_path,
+            concat!(
+                "<!-- meshfox:canvas -->\n# Base\n<!-- meshfox:node id=\"base\" -->\n\n",
+                "## Child\n<!-- meshfox:node id=\"child\" type=\"include\" -->\n\n[child](./child.canvas.md)\n",
+            ),
+        )
+        .unwrap();
+        let state = build_state(base_path.clone(), false, None)
+            .await
+            .expect("valid test canvas");
+
+        let primary_raw = state.raw.lock().unwrap().clone();
+        let mut canvas =
+            resolved_canvas(&primary_raw, &state.canvas_path).unwrap_or_else(|e| panic!("resolve failed: {}", e.1));
+        canvas.node_mut("child/target").expect("child/target present").x = Some(0.0);
+        canvas.node_mut("child/target").expect("child/target present").y = Some(50.0);
+        // Keyed by the *namespaced* id the client actually sees, same as
+        // every other node-addressed field in this request.
+        let layout_hints = HashMap::from([
+            ("child/one".to_string(), LayoutHint { x: 0.0, y: 0.0 }),
+            ("child/two".to_string(), LayoutHint { x: 0.0, y: 100.0 }),
+        ]);
+
+        let status = put_canvas(State(state), Json(PutCanvasRequest { canvas, layout_hints }))
+            .await
+            .unwrap_or_else(|e| panic!("put_canvas failed: {}", e.1));
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let child_after = std::fs::read_to_string(dir.join("child.canvas.md")).unwrap();
+        let pos = |id: &str| child_after.find(&format!("id=\"{id}\"")).unwrap();
+        assert!(pos("one") < pos("target"), "child file: {child_after}");
+        assert!(pos("target") < pos("two"), "child file: {child_after}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -8254,11 +8656,26 @@ mod run_file_tests {
         out
     }
 
-    fn ndjson_events(body: &str) -> Vec<serde_json::Value> {
-        body.lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| serde_json::from_str(l).expect("valid RunEvent JSON"))
-            .collect()
+    /// Connects to `path` (a WS-upgrading run endpoint) and collects every
+    /// `RunEvent` text frame until the socket closes — `run_file_node`'s
+    /// own equivalent of `ws_tests::next_event`, just collecting the whole
+    /// sequence at once since these tests don't need to interleave sends.
+    async fn run_ws_events(addr: SocketAddr, path: &str) -> Vec<serde_json::Value> {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+        let url = format!("ws://{addr}{path}");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+        let mut events = Vec::new();
+        while let Some(msg) = ws.next().await {
+            match msg.expect("no ws error") {
+                WsMessage::Text(t) => {
+                    events.push(serde_json::from_str(&t).expect("valid RunEvent JSON"));
+                }
+                WsMessage::Close(_) => break,
+                _ => continue,
+            }
+        }
+        events
     }
 
     #[tokio::test]
@@ -8278,10 +8695,7 @@ mod run_file_tests {
         std::fs::write(&target_path, "#!/bin/sh\necho hi from seed\n").unwrap();
 
         let addr = spawn_test_server(canvas_path.clone()).await;
-        let (status, body) = post(addr, "/api/nodes/seed/run").await;
-        assert_eq!(status, 200);
-
-        let events = ndjson_events(&body);
+        let events = run_ws_events(addr, "/api/nodes/seed/run").await;
         assert_eq!(events[0]["type"], "started");
         assert_eq!(events[1]["type"], "step-start");
         assert_eq!(events[1]["nodeId"], "seed");
@@ -8316,11 +8730,12 @@ mod run_file_tests {
         ));
 
         let addr = spawn_test_server(canvas_path.clone()).await;
-        let (status, body) = post(addr, "/api/nodes/seed/run").await;
-        assert_eq!(status, 422);
+        let events = run_ws_events(addr, "/api/nodes/seed/run").await;
+        assert_eq!(events[0]["type"], "error");
+        let message = events[0]["message"].as_str().unwrap_or_default();
         assert!(
-            body.contains("isn't a runnable file node"),
-            "unexpected body: {body}"
+            message.contains("isn't a runnable file node"),
+            "unexpected message: {message}"
         );
 
         let _ = std::fs::remove_file(&canvas_path);
@@ -8332,8 +8747,8 @@ mod run_file_tests {
             "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
         );
         let addr = spawn_test_server(canvas_path.clone()).await;
-        let (status, _) = post(addr, "/api/nodes/nope/run").await;
-        assert_eq!(status, 404);
+        let events = run_ws_events(addr, "/api/nodes/nope/run").await;
+        assert_eq!(events[0]["type"], "error");
         let _ = std::fs::remove_file(&canvas_path);
     }
 
@@ -8410,63 +8825,26 @@ mod run_file_tests {
 #[cfg(test)]
 mod run_block_include_tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
 
-    /// Same de-chunking `run_file_tests::post`/`dechunk` already do (`/api/run`'s
-    /// response streams chunked NDJSON too), just with a JSON body like
-    /// `vars_endpoint_tests::post_json`.
-    async fn post_json(addr: SocketAddr, path: &str, body: &str) -> (u16, String) {
-        let request = format!(
-            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        let mut stream = TcpStream::connect(addr).await.expect("connect");
-        stream.write_all(request.as_bytes()).await.expect("write");
-        let mut response = String::new();
-        stream.read_to_string(&mut response).await.expect("read");
-        let mut parts = response.splitn(2, "\r\n\r\n");
-        let head = parts.next().unwrap_or_default();
-        let raw_body = parts.next().unwrap_or_default();
-        let status = head
-            .lines()
-            .next()
-            .and_then(|l| l.split_whitespace().nth(1))
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let body = if head
-            .to_ascii_lowercase()
-            .contains("transfer-encoding: chunked")
-        {
-            dechunk(raw_body)
-        } else {
-            raw_body.to_string()
-        };
-        (status, body)
-    }
-
-    fn dechunk(raw: &str) -> String {
-        let mut out = String::new();
-        let mut rest = raw;
-        while let Some(nl) = rest.find("\r\n") {
-            let Ok(size) = usize::from_str_radix(rest[..nl].trim(), 16) else {
-                break;
-            };
-            rest = &rest[nl + 2..];
-            if size == 0 || size > rest.len() {
-                break;
+    /// `/api/run` is a WS upgrade now — connects to `/api/run?{query}` and
+    /// collects every `RunEvent` text frame until the socket closes, same
+    /// role `ndjson_events` used to play for the old chunked-HTTP body.
+    async fn run_ws_events(addr: SocketAddr, query: &str) -> Vec<serde_json::Value> {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+        let url = format!("ws://{addr}/api/run?{query}");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+        let mut events = Vec::new();
+        while let Some(msg) = ws.next().await {
+            match msg.expect("no ws error") {
+                WsMessage::Text(t) => {
+                    events.push(serde_json::from_str(&t).expect("valid RunEvent JSON"));
+                }
+                WsMessage::Close(_) => break,
+                _ => continue,
             }
-            out.push_str(&rest[..size]);
-            rest = rest[size..].strip_prefix("\r\n").unwrap_or(rest);
         }
-        out
-    }
-
-    fn ndjson_events(body: &str) -> Vec<serde_json::Value> {
-        body.lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| serde_json::from_str(l).expect("valid RunEvent JSON"))
-            .collect()
+        events
     }
 
     /// A primary `base.canvas.md` including `child.canvas.md`, the child's
@@ -8505,15 +8883,11 @@ mod run_block_include_tests {
         let child_path = base_path.parent().unwrap().join("child.canvas.md");
         let addr = spawn_test_server(base_path.clone()).await;
 
-        let (status, body) = post_json(
+        let events = run_ws_events(
             addr,
-            "/api/run",
-            r#"{"path":["child","child/root","child/leaf"],"block":"report","persist":true}"#,
+            "path=child,child/root,child/leaf&block=report&persist=true",
         )
         .await;
-        assert_eq!(status, 200, "unexpected body: {body}");
-
-        let events = ndjson_events(&body);
         assert!(
             events.iter().any(|e| e["type"] == "step-start" && e["nodeId"] == "child/leaf"),
             "expected a step-start for child/leaf, got: {events:?}"
@@ -8574,11 +8948,7 @@ mod run_block_include_tests {
         .unwrap();
 
         let addr = spawn_test_server(canvas_path.clone()).await;
-        let (status, body) =
-            post_json(addr, "/api/run", r#"{"path":[],"block":"root","persist":false}"#).await;
-        assert_eq!(status, 200, "unexpected body: {body}");
-
-        let events = ndjson_events(&body);
+        let events = run_ws_events(addr, "block=root&persist=false").await;
         let output_events: Vec<(Option<&str>, Option<&str>)> = events
             .iter()
             .filter(|e| e["type"] == "output")
@@ -8640,13 +9010,6 @@ mod session_skip_tests {
         (status, body)
     }
 
-    fn ndjson_events(body: &str) -> Vec<serde_json::Value> {
-        body.lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| serde_json::from_str(l).expect("valid RunEvent JSON"))
-            .collect()
-    }
-
     // `step-start` is emitted unconditionally, even for a step that turns
     // out to be skipped a moment later (see `run_block`'s own doc comment
     // on `RunEvent::StepSkipped`) -- "actually ran" means it reached a real
@@ -8676,16 +9039,21 @@ mod session_skip_tests {
     }
 
     async fn run_target(addr: SocketAddr) -> Vec<serde_json::Value> {
-        let (status, body) = request(
-            addr,
-            "POST",
-            "/api/run",
-            "application/json",
-            r#"{"path":[],"block":"target","persist":true}"#,
-        )
-        .await;
-        assert_eq!(status, 200, "unexpected body: {body}");
-        ndjson_events(&body)
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+        let url = format!("ws://{addr}/api/run?block=target&persist=true");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+        let mut events = Vec::new();
+        while let Some(msg) = ws.next().await {
+            match msg.expect("no ws error") {
+                WsMessage::Text(t) => {
+                    events.push(serde_json::from_str(&t).expect("valid RunEvent JSON"));
+                }
+                WsMessage::Close(_) => break,
+                _ => continue,
+            }
+        }
+        events
     }
 
     #[tokio::test]
@@ -8922,6 +9290,32 @@ mod vars_endpoint_tests {
         ));
         std::fs::write(&path, contents).unwrap();
         path
+    }
+
+    /// `/api/run` is a WS upgrade now — `params` are query-string params
+    /// (`Url::parse_with_params` handles percent-encoding, same convention
+    /// `worker_client::tty_connect` already uses for its own `vars`/
+    /// `saveSecrets` JSON-encoded query values). Collects every `RunEvent`
+    /// text frame until the socket closes.
+    async fn run_ws_events(addr: SocketAddr, params: &[(&str, &str)]) -> Vec<serde_json::Value> {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+        let url = reqwest::Url::parse_with_params(&format!("ws://{addr}/api/run"), params)
+            .expect("valid url");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url.as_str())
+            .await
+            .expect("connect");
+        let mut events = Vec::new();
+        while let Some(msg) = ws.next().await {
+            match msg.expect("no ws error") {
+                WsMessage::Text(t) => {
+                    events.push(serde_json::from_str(&t).expect("valid RunEvent JSON"));
+                }
+                WsMessage::Close(_) => break,
+                _ => continue,
+            }
+        }
+        events
     }
 
     /// Plain (non-chunked) GET — `/api/vars`'s response is a single JSON
@@ -9179,13 +9573,15 @@ mod vars_endpoint_tests {
         let canvas_path = write_test_canvas(SECRET_ENV_CANVAS);
         let addr = spawn_test_server(canvas_path.clone()).await;
 
-        let (status, body) = post_json(
+        let events = run_ws_events(
             addr,
-            "/api/run",
-            r#"{"path":[],"block":"use-token","vars":{"API_TOKEN":"sk-secret"}}"#,
+            &[
+                ("block", "use-token"),
+                ("vars", r#"{"API_TOKEN":"sk-secret"}"#),
+            ],
         )
         .await;
-        assert_eq!(status, 200, "unexpected body: {body}");
+        assert_eq!(events[0]["type"], "started", "unexpected events: {events:?}");
 
         let cache = VarCache::load(&canvas_path).expect("load cache");
         assert_eq!(cache.get("API_TOKEN"), None);
@@ -9199,13 +9595,16 @@ mod vars_endpoint_tests {
         let canvas_path = write_test_canvas(SECRET_ENV_CANVAS);
         let addr = spawn_test_server(canvas_path.clone()).await;
 
-        let (status, body) = post_json(
+        let events = run_ws_events(
             addr,
-            "/api/run",
-            r#"{"path":[],"block":"use-token","vars":{"API_TOKEN":"sk-secret"},"saveSecrets":["API_TOKEN"]}"#,
+            &[
+                ("block", "use-token"),
+                ("vars", r#"{"API_TOKEN":"sk-secret"}"#),
+                ("saveSecrets", r#"["API_TOKEN"]"#),
+            ],
         )
         .await;
-        assert_eq!(status, 200, "unexpected body: {body}");
+        assert_eq!(events[0]["type"], "started", "unexpected events: {events:?}");
 
         let cache = VarCache::load(&canvas_path).expect("load cache");
         assert_eq!(
@@ -9232,13 +9631,16 @@ mod vars_endpoint_tests {
         let canvas_path = write_test_canvas(SECRET_ENV_CANVAS);
         let addr = spawn_test_server(canvas_path.clone()).await;
 
-        let (status, body) = post_json(
+        let events = run_ws_events(
             addr,
-            "/api/run",
-            r#"{"path":[],"block":"use-token","vars":{"API_TOKEN":"sk-secret"},"saveSecrets":["API_TOKEN"]}"#,
+            &[
+                ("block", "use-token"),
+                ("vars", r#"{"API_TOKEN":"sk-secret"}"#),
+                ("saveSecrets", r#"["API_TOKEN"]"#),
+            ],
         )
         .await;
-        assert_eq!(status, 200, "unexpected body: {body}");
+        assert_eq!(events[0]["type"], "started", "unexpected events: {events:?}");
 
         // `GET /api/vars` (what the pre-run form checks before ever
         // opening) now sees it as resolved — so the browser wouldn't even
@@ -9260,8 +9662,8 @@ mod vars_endpoint_tests {
         // for something already resolved) must still succeed by reading the
         // saved value back from the cache, not fail with "missing required
         // variable(s)".
-        let (status, body) = post_json(addr, "/api/run", r#"{"path":[],"block":"use-token","vars":{}}"#).await;
-        assert_eq!(status, 200, "unexpected body: {body}");
+        let events = run_ws_events(addr, &[("block", "use-token")]).await;
+        assert_eq!(events[0]["type"], "started", "unexpected events: {events:?}");
 
         let _ = std::fs::remove_file(&canvas_path);
         let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));
@@ -9326,14 +9728,20 @@ mod vars_endpoint_tests {
         let canvas_path = write_test_canvas(TYPED_CANVAS);
         let addr = spawn_test_server(canvas_path.clone()).await;
 
-        let (status, body) = post_json(
+        let events = run_ws_events(
             addr,
-            "/api/run",
-            r#"{"path":[],"block":"run","vars":{"COUNT":"not-a-number","VERBOSE":"true","LEVEL":"debug"}}"#,
+            &[
+                ("block", "run"),
+                (
+                    "vars",
+                    r#"{"COUNT":"not-a-number","VERBOSE":"true","LEVEL":"debug"}"#,
+                ),
+            ],
         )
         .await;
-        assert_eq!(status, 422);
-        assert!(body.contains("COUNT"), "unexpected body: {body}");
+        assert_eq!(events[0]["type"], "error", "unexpected events: {events:?}");
+        let message = events[0]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("COUNT"), "unexpected message: {message}");
 
         let _ = std::fs::remove_file(&canvas_path);
         let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));
@@ -9440,6 +9848,55 @@ mod form_endpoint_tests {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
         (status, body.to_string())
+    }
+
+    /// `/api/run` is a WS upgrade now — `params` are query-string params.
+    /// Collects every `RunEvent` text frame until the socket closes (i.e.
+    /// until the run itself is done), same "block until finished" shape
+    /// the old chunked-HTTP `post_json`/`/api/run` call used to have.
+    async fn run_ws_events(addr: SocketAddr, params: &[(&str, &str)]) -> Vec<serde_json::Value> {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+        let url = reqwest::Url::parse_with_params(&format!("ws://{addr}/api/run"), params)
+            .expect("valid url");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url.as_str())
+            .await
+            .expect("connect");
+        let mut events = Vec::new();
+        while let Some(msg) = ws.next().await {
+            match msg.expect("no ws error") {
+                WsMessage::Text(t) => {
+                    events.push(serde_json::from_str(&t).expect("valid RunEvent JSON"));
+                }
+                WsMessage::Close(_) => break,
+                _ => continue,
+            }
+        }
+        events
+    }
+
+    /// `/api/run/subscribe` is a WS upgrade now — connects to `path` (a
+    /// full `/api/run/subscribe?...` query string) and concatenates every
+    /// `SubscribeEvent` text frame (one per line) until the socket closes,
+    /// the same shape the old chunked-NDJSON body gave callers that just
+    /// wanted to substring-search the whole transcript.
+    async fn subscribe_ws_body(addr: SocketAddr, path: &str) -> String {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+        let url = format!("ws://{addr}{path}");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+        let mut body = String::new();
+        while let Some(msg) = ws.next().await {
+            match msg.expect("no ws error") {
+                WsMessage::Text(t) => {
+                    body.push_str(&t);
+                    body.push('\n');
+                }
+                WsMessage::Close(_) => break,
+                _ => continue,
+            }
+        }
+        body
     }
 
     /// Polls `GET /api/runs` until it reports `block` as `exited` (or the
@@ -9689,9 +10146,8 @@ mod form_endpoint_tests {
         // Seed a stale, already-finished run of `table` with the *old*
         // value — a real completed run already sitting in the registry
         // before the form is ever touched, same as the bug report.
-        let (status, body) =
-            post_json(addr, "/api/run", r#"{"path":["config"],"block":"table"}"#).await;
-        assert_eq!(status, 200, "unexpected body: {body}");
+        let events = run_ws_events(addr, &[("path", "config"), ("block", "table")]).await;
+        assert_eq!(events[0]["type"], "started", "unexpected events: {events:?}");
 
         // Submit a *new* value, then subscribe immediately — no delay —
         // so this reliably races `table`'s own slow `wait` dependency,
@@ -9704,9 +10160,9 @@ mod form_endpoint_tests {
         .await;
         assert_eq!(status, 200, "unexpected body: {body}");
 
-        let (sub_status, sub_body) =
-            get(addr, "/api/run/subscribe?nodeId=config&block=table&sinceSeq=0").await;
-        assert_eq!(sub_status, 200, "unexpected body: {sub_body}");
+        let sub_body =
+            subscribe_ws_body(addr, "/api/run/subscribe?nodeId=config&block=table&sinceSeq=0")
+                .await;
         assert!(
             sub_body.contains(r#""text":"value is new""#),
             "a subscriber that raced the slow dependency should still see the fresh run's own output: {sub_body}"
@@ -10071,28 +10527,49 @@ mod service_endpoint_tests {
         "```bash name=\"srv\" service\necho starting\nsleep 30\n```\n",
     );
 
+    /// `/api/run` is a WS upgrade now — `params` are query-string params.
+    /// Collects every `RunEvent` text frame until the socket closes.
+    async fn run_ws_events(addr: SocketAddr, params: &[(&str, &str)]) -> Vec<serde_json::Value> {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+        let url = reqwest::Url::parse_with_params(&format!("ws://{addr}/api/run"), params)
+            .expect("valid url");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url.as_str())
+            .await
+            .expect("connect");
+        let mut events = Vec::new();
+        while let Some(msg) = ws.next().await {
+            match msg.expect("no ws error") {
+                WsMessage::Text(t) => {
+                    events.push(serde_json::from_str(&t).expect("valid RunEvent JSON"));
+                }
+                WsMessage::Close(_) => break,
+                _ => continue,
+            }
+        }
+        events
+    }
+
     #[tokio::test]
     async fn run_block_spawns_a_service_and_it_shows_up_as_running() {
         let canvas_path = write_test_canvas(SERVICE_CANVAS);
         let addr = spawn_test_server(canvas_path.clone()).await;
 
-        let (status, body) =
-            post_json(addr, "/api/run", r#"{"path":[],"block":"srv"}"#).await;
-        assert_eq!(status, 200, "unexpected body: {body}");
+        let events = run_ws_events(addr, &[("block", "srv")]).await;
         assert!(
-            body.contains("\"type\":\"service-started\""),
-            "expected a service-started event, got: {body}"
+            events.iter().any(|e| e["type"] == "service-started"),
+            "expected a service-started event, got: {events:?}"
         );
         // The request itself returns fast (well under the block's own
         // `sleep 30`) with a normal `done` — proof the chain didn't wait
         // for the service to exit, just for it to spawn.
         assert!(
-            body.contains("\"type\":\"done\""),
-            "chain should complete normally right after spawning the service: {body}"
+            events.iter().any(|e| e["type"] == "done"),
+            "chain should complete normally right after spawning the service: {events:?}"
         );
         assert!(
-            !body.contains("\"type\":\"step-end\""),
-            "a service step should never report an exit code — it never waits for one: {body}"
+            !events.iter().any(|e| e["type"] == "step-end"),
+            "a service step should never report an exit code — it never waits for one: {events:?}"
         );
 
         let (status, list_body) = get(addr, "/api/services").await;
@@ -10118,15 +10595,15 @@ mod service_endpoint_tests {
         let canvas_path = write_test_canvas(SERVICE_CANVAS);
         let addr = spawn_test_server(canvas_path.clone()).await;
 
-        let (status1, _) = post_json(addr, "/api/run", r#"{"path":[],"block":"srv"}"#).await;
-        assert_eq!(status1, 200);
+        let events1 = run_ws_events(addr, &[("block", "srv")]).await;
+        assert_eq!(events1[0]["type"], "started", "unexpected events: {events1:?}");
         let (_, list1) = get(addr, "/api/services").await;
         let pid1 = serde_json::from_str::<Vec<serde_json::Value>>(&list1).unwrap()[0]["pid"]
             .as_u64()
             .unwrap();
 
-        let (status2, _) = post_json(addr, "/api/run", r#"{"path":[],"block":"srv"}"#).await;
-        assert_eq!(status2, 200);
+        let events2 = run_ws_events(addr, &[("block", "srv")]).await;
+        assert_eq!(events2[0]["type"], "started", "unexpected events: {events2:?}");
         let (_, list2) = get(addr, "/api/services").await;
         let services2: Vec<serde_json::Value> = serde_json::from_str(&list2).unwrap();
         assert_eq!(services2.len(), 1, "must not spawn a duplicate instance");
@@ -10145,7 +10622,7 @@ mod service_endpoint_tests {
     async fn stop_marks_the_service_stopped_not_crashed() {
         let canvas_path = write_test_canvas(SERVICE_CANVAS);
         let addr = spawn_test_server(canvas_path.clone()).await;
-        let _ = post_json(addr, "/api/run", r#"{"path":[],"block":"srv"}"#).await;
+        let _ = run_ws_events(addr, &[("block", "srv")]).await;
 
         let (status, _) = post_json(
             addr,
@@ -10174,7 +10651,7 @@ mod service_endpoint_tests {
     async fn restart_gives_the_service_a_new_pid() {
         let canvas_path = write_test_canvas(SERVICE_CANVAS);
         let addr = spawn_test_server(canvas_path.clone()).await;
-        let _ = post_json(addr, "/api/run", r#"{"path":[],"block":"srv"}"#).await;
+        let _ = run_ws_events(addr, &[("block", "srv")]).await;
         let (_, list) = get(addr, "/api/services").await;
         let old_pid = serde_json::from_str::<Vec<serde_json::Value>>(&list).unwrap()[0]["pid"]
             .as_u64()
@@ -10207,7 +10684,7 @@ mod service_endpoint_tests {
     async fn service_log_reports_captured_output_lines() {
         let canvas_path = write_test_canvas(SERVICE_CANVAS);
         let addr = spawn_test_server(canvas_path.clone()).await;
-        let _ = post_json(addr, "/api/run", r#"{"path":[],"block":"srv"}"#).await;
+        let _ = run_ws_events(addr, &[("block", "srv")]).await;
 
         let mut lines: Vec<serde_json::Value> = Vec::new();
         for _ in 0..50 {
@@ -10241,17 +10718,16 @@ mod service_endpoint_tests {
         meshfox_core::service_lock::acquire(&lock_path, 999_999, "tui").unwrap();
 
         let addr = spawn_test_server(canvas_path.clone()).await;
-        let (status, body) = post_json(addr, "/api/run", r#"{"path":[],"block":"srv"}"#).await;
+        let events = run_ws_events(addr, &[("block", "srv")]).await;
         // Queued-time locking means every lock this run would need is
-        // claimed *before* the response even starts — a conflict is a
-        // plain `409` with a JSON body, not a streamed terminal event
-        // (nothing has been sent to the client yet either way).
-        assert_eq!(status, 409, "unexpected body: {body}");
-        let conflict: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(conflict["nodeId"], "root");
-        assert_eq!(conflict["block"], "srv");
-        assert_eq!(conflict["ownerPid"], 999_999);
-        assert_eq!(conflict["ownerDesc"], "tui");
+        // claimed *before* any step actually runs — the socket still
+        // opens (a browser `WebSocket` can't read a pre-upgrade status),
+        // but the very first message is a `lock-conflict`, not `started`.
+        assert_eq!(events[0]["type"], "lock-conflict", "unexpected events: {events:?}");
+        assert_eq!(events[0]["nodeId"], "root");
+        assert_eq!(events[0]["block"], "srv");
+        assert_eq!(events[0]["ownerPid"], 999_999);
+        assert_eq!(events[0]["ownerDesc"], "tui");
 
         let (status, list_body) = get(addr, "/api/services").await;
         assert_eq!(status, 200);
@@ -10300,8 +10776,64 @@ mod service_endpoint_tests {
 #[cfg(test)]
 mod run_lock_tests {
     use super::*;
+    use futures_util::StreamExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+    use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+
+    type TestSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+    /// `/api/run` is a WS upgrade now — connects to `/api/run?{query}` and
+    /// returns the still-open socket, for a test that needs to read a few
+    /// events and then act (drop the connection, race a second one) rather
+    /// than just collecting everything to the end.
+    async fn connect_run_ws(addr: SocketAddr, query: &str) -> TestSocket {
+        let url = format!("ws://{addr}/api/run?{query}");
+        let (ws, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+        ws
+    }
+
+    async fn next_run_event(ws: &mut TestSocket) -> serde_json::Value {
+        match ws.next().await.expect("socket open").expect("no ws error") {
+            WsMessage::Text(t) => serde_json::from_str(&t).expect("valid RunEvent JSON"),
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    /// Collects every `RunEvent` text frame until the socket closes.
+    async fn run_ws_events(addr: SocketAddr, query: &str) -> Vec<serde_json::Value> {
+        let mut ws = connect_run_ws(addr, query).await;
+        let mut events = Vec::new();
+        while let Some(msg) = ws.next().await {
+            match msg.expect("no ws error") {
+                WsMessage::Text(t) => {
+                    events.push(serde_json::from_str(&t).expect("valid RunEvent JSON"));
+                }
+                WsMessage::Close(_) => break,
+                _ => continue,
+            }
+        }
+        events
+    }
+
+    /// `/api/run/subscribe` is a WS upgrade now too — collects every
+    /// `SubscribeEvent` text frame until the socket closes.
+    async fn subscribe_ws_events(addr: SocketAddr, query: &str) -> Vec<serde_json::Value> {
+        let url = format!("ws://{addr}{query}");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+        let mut events = Vec::new();
+        while let Some(msg) = ws.next().await {
+            match msg.expect("no ws error") {
+                WsMessage::Text(t) => {
+                    events.push(serde_json::from_str(&t).expect("valid RunEvent JSON"));
+                }
+                WsMessage::Close(_) => break,
+                _ => continue,
+            }
+        }
+        events
+    }
 
     fn write_test_canvas(contents: &str) -> PathBuf {
         // Own directory per test, not a flat shared temp dir — see
@@ -10380,41 +10912,37 @@ mod run_lock_tests {
         let canvas_path = write_test_canvas(PLAIN_CANVAS);
         let addr = spawn_test_server(canvas_path.clone()).await;
 
-        // A raw connection, closed abruptly partway through — simulating
-        // a tab reload/close mid-stream, unlike `post_json`'s own
-        // read-to-completion helper.
-        let body = r#"{"path":[],"block":"slow"}"#;
-        let request = format!(
-            "POST /api/run HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
         {
-            let mut stream = TcpStream::connect(addr).await.expect("connect");
-            stream.write_all(request.as_bytes()).await.expect("write");
+            // A WS connection, dropped abruptly partway through —
+            // simulating a tab reload/close mid-stream, unlike
+            // `run_ws_events`'s own read-to-close helper.
+            let mut ws = connect_run_ws(addr, "block=slow").await;
             // Enough to know the server actually started running the
             // block (past `started`/`step-start`) before this connection
             // gets dropped, unread, at the end of this block.
-            let mut buf = [0u8; 256];
-            let _ = stream.read(&mut buf).await;
-        } // `stream` dropped here — an abrupt client disconnect.
+            let started = next_run_event(&mut ws).await;
+            assert_eq!(started["type"], "started");
+        } // `ws` dropped here — an abrupt client disconnect.
 
         // The block's own `sleep 0.3` means it's still running at this
         // point — a second, genuinely concurrent request right now must
         // still see the lock held, not incorrectly freed by the first
         // request's own connection having just dropped.
-        let (status, body) = post_json(addr, "/api/run", r#"{"path":[],"block":"slow"}"#).await;
+        let events = run_ws_events(addr, "block=slow").await;
         assert_eq!(
-            status, 409,
-            "the lock should still be held by the still-running first request: {body}"
+            events[0]["type"], "lock-conflict",
+            "the lock should still be held by the still-running first request: {events:?}"
         );
 
         // Once the (disconnected, but still server-side-running) first
         // request's own block actually finishes, the lock frees up again
         // normally.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let (status, body) = post_json(addr, "/api/run", r#"{"path":[],"block":"slow"}"#).await;
-        assert_eq!(status, 200, "unexpected body: {body}");
-        assert!(body.contains("\"type\":\"done\""));
+        let events = run_ws_events(addr, "block=slow").await;
+        assert!(
+            events.iter().any(|e| e["type"] == "done"),
+            "unexpected events: {events:?}"
+        );
 
         cleanup(&canvas_path);
     }
@@ -10434,12 +10962,11 @@ mod run_lock_tests {
         meshfox_core::service_lock::acquire(&lock_path, std::process::id(), "webui").unwrap();
 
         let addr = spawn_test_server(canvas_path.clone()).await;
-        let (status, body) = post_json(addr, "/api/run", r#"{"path":[],"block":"slow"}"#).await;
-        assert_eq!(status, 409, "unexpected body: {body}");
-        let conflict: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(conflict["nodeId"], "root");
-        assert_eq!(conflict["block"], "slow");
-        assert_eq!(conflict["ownerPid"], std::process::id());
+        let events = run_ws_events(addr, "block=slow").await;
+        assert_eq!(events[0]["type"], "lock-conflict", "unexpected events: {events:?}");
+        assert_eq!(events[0]["nodeId"], "root");
+        assert_eq!(events[0]["block"], "slow");
+        assert_eq!(events[0]["ownerPid"], std::process::id());
 
         meshfox_core::service_lock::release(&lock_path).unwrap();
         cleanup(&canvas_path);
@@ -10462,16 +10989,16 @@ mod run_lock_tests {
         let canvas_path = write_test_canvas(PLAIN_CANVAS);
         let addr = spawn_test_server(canvas_path.clone()).await;
 
-        let (status, body) = post_json(addr, "/api/run", r#"{"path":[],"block":"slow"}"#).await;
-        assert_eq!(status, 200, "unexpected body: {body}");
+        let events = run_ws_events(addr, "block=slow").await;
+        assert_eq!(events[0]["type"], "started", "unexpected events: {events:?}");
 
-        // The first run has already fully completed (`post_json` only
-        // returns once the connection closes, i.e. after `Done`) — its own
+        // The first run has already fully completed (`run_ws_events` only
+        // returns once the socket closes, i.e. after `Done`) — its own
         // execution-scoped lock must already be released, so a fresh run
         // right after succeeds rather than conflicting with itself.
-        let (status, body) = post_json(addr, "/api/run", r#"{"path":[],"block":"slow"}"#).await;
-        assert_eq!(status, 200, "unexpected body: {body}");
-        assert!(body.contains("\"type\":\"done\""));
+        let events = run_ws_events(addr, "block=slow").await;
+        assert_eq!(events[0]["type"], "started", "unexpected events: {events:?}");
+        assert!(events.iter().any(|e| e["type"] == "done"));
 
         cleanup(&canvas_path);
     }
@@ -10485,21 +11012,35 @@ mod run_lock_tests {
         meshfox_core::service_lock::acquire(&lock_path, 999_999, "tui").unwrap();
 
         let addr = spawn_test_server(canvas_path.clone()).await;
-        let (status, body) = post_json(addr, "/api/run", r#"{"path":[],"block":"slow"}"#).await;
-        assert_eq!(status, 409, "unexpected body: {body}");
-        let conflict: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(conflict["ownerPid"], 999_999);
+        let events = run_ws_events(addr, "block=slow").await;
+        assert_eq!(events[0]["type"], "lock-conflict", "unexpected events: {events:?}");
+        assert_eq!(events[0]["ownerPid"], 999_999);
 
-        let (status, body) = post_json(
-            addr,
-            "/api/run/force",
-            r#"{"path":[],"block":"slow","force":{"nodeId":"root","block":"slow"}}"#,
+        let url = reqwest::Url::parse_with_params(
+            &format!("ws://{addr}/api/run/force"),
+            &[
+                ("block", "slow"),
+                ("forceNodeId", "root"),
+                ("forceBlock", "slow"),
+            ],
         )
-        .await;
-        assert_eq!(status, 200, "unexpected body: {body}");
+        .expect("valid url");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url.as_str())
+            .await
+            .expect("connect");
+        let mut events = Vec::new();
+        while let Some(msg) = ws.next().await {
+            match msg.expect("no ws error") {
+                WsMessage::Text(t) => {
+                    events.push(serde_json::from_str::<serde_json::Value>(&t).expect("valid RunEvent JSON"));
+                }
+                WsMessage::Close(_) => break,
+                _ => continue,
+            }
+        }
         assert!(
-            body.contains("\"type\":\"done\""),
-            "force-run should have completed the block normally: {body}"
+            events.iter().any(|e| e["type"] == "done"),
+            "force-run should have completed the block normally: {events:?}"
         );
 
         cleanup(&canvas_path);
@@ -10510,8 +11051,13 @@ mod run_lock_tests {
         let canvas_path = write_test_canvas(PLAIN_CANVAS);
         let addr = spawn_test_server(canvas_path.clone()).await;
 
-        let (status, _) = get(addr, "/api/run/subscribe?nodeId=root&block=slow&sinceSeq=0").await;
-        assert_eq!(status, 404);
+        // A 404 here is a deliberate silent no-op: the socket still
+        // upgrades (a browser `WebSocket` can't read a pre-upgrade
+        // status), but closes immediately with zero messages.
+        let events =
+            subscribe_ws_events(addr, "/api/run/subscribe?nodeId=root&block=slow&sinceSeq=0")
+                .await;
+        assert!(events.is_empty(), "expected no events, got: {events:?}");
 
         cleanup(&canvas_path);
     }
@@ -10521,32 +11067,31 @@ mod run_lock_tests {
         let canvas_path = write_test_canvas(PLAIN_CANVAS);
         let addr = spawn_test_server(canvas_path.clone()).await;
 
-        let run = tokio::spawn(async move {
-            post_json(addr, "/api/run", r#"{"path":[],"block":"slow"}"#).await
-        });
+        let run = tokio::spawn(async move { run_ws_events(addr, "block=slow").await });
         // Give the run a moment to actually register itself in
         // `runs_registry` (near-instant once the request's own preamble
         // clears) before subscribing to it from a second, independent
         // connection — well short of its own 0.3s sleep either way.
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;
 
-        let (sub_status, sub_body) =
-            get(addr, "/api/run/subscribe?nodeId=root&block=slow&sinceSeq=0").await;
-        assert_eq!(sub_status, 200, "unexpected body: {sub_body}");
+        let sub_events =
+            subscribe_ws_events(addr, "/api/run/subscribe?nodeId=root&block=slow&sinceSeq=0")
+                .await;
         assert!(
-            sub_body.contains("\"type\":\"line\"") && sub_body.contains("\"text\":\"done\""),
-            "expected the block's own output line replayed/tailed, got: {sub_body}"
+            sub_events.iter().any(|e| e["type"] == "line" && e["text"] == "done"),
+            "expected the block's own output line replayed/tailed, got: {sub_events:?}"
         );
         assert!(
-            sub_body.contains("\"type\":\"done\"") && sub_body.contains("\"outcome\":\"exited\""),
-            "expected a terminal done/exited event once the run finished, got: {sub_body}"
+            sub_events
+                .iter()
+                .any(|e| e["type"] == "done" && e["outcome"] == "exited"),
+            "expected a terminal done/exited event once the run finished, got: {sub_events:?}"
         );
 
-        let (run_status, run_body) = run.await.unwrap();
-        assert_eq!(run_status, 200, "unexpected body: {run_body}");
+        let run_events = run.await.unwrap();
         assert!(
-            run_body.contains("\"type\":\"done\""),
-            "the originating connection's own run should be unaffected by being watched: {run_body}"
+            run_events.iter().any(|e| e["type"] == "done"),
+            "the originating connection's own run should be unaffected by being watched: {run_events:?}"
         );
 
         cleanup(&canvas_path);
@@ -10557,17 +11102,21 @@ mod run_lock_tests {
         let canvas_path = write_test_canvas(PLAIN_CANVAS);
         let addr = spawn_test_server(canvas_path.clone()).await;
 
-        let (run_status, _) = post_json(addr, "/api/run", r#"{"path":[],"block":"slow"}"#).await;
-        assert_eq!(run_status, 200);
+        let run_events = run_ws_events(addr, "block=slow").await;
+        assert!(run_events.iter().any(|e| e["type"] == "done"));
 
-        // The run is long over by now (`post_json` only returns once the
-        // connection closes, i.e. after `done`) — its `RunHandle` should
+        // The run is long over by now (`run_ws_events` only returns once
+        // the socket closes, i.e. after `done`) — its `RunHandle` should
         // still be sitting in the registry with its buffered log intact.
-        let (sub_status, sub_body) =
-            get(addr, "/api/run/subscribe?nodeId=root&block=slow&sinceSeq=0").await;
-        assert_eq!(sub_status, 200, "unexpected body: {sub_body}");
-        assert!(sub_body.contains("\"text\":\"done\""));
-        assert!(sub_body.contains("\"type\":\"done\"") && sub_body.contains("\"outcome\":\"exited\""));
+        let sub_events =
+            subscribe_ws_events(addr, "/api/run/subscribe?nodeId=root&block=slow&sinceSeq=0")
+                .await;
+        assert!(sub_events.iter().any(|e| e["type"] == "line" && e["text"] == "done"));
+        assert!(
+            sub_events
+                .iter()
+                .any(|e| e["type"] == "done" && e["outcome"] == "exited")
+        );
         // Regression test: `SubscribeEvent` used to derive `rename_all =
         // "camelCase"` alone, which (unlike `RunEvent`'s own combo further
         // up this file) only renames the *variant* tag on an enum, not the
@@ -10577,13 +11126,17 @@ mod run_lock_tests {
         // back as `undefined` — indistinguishable from a genuinely missing
         // value, and enough to make a *successful* reconciled run
         // (`undefined !== 0`) show up as failed.
-        assert!(
-            sub_body.contains("\"exitCode\":0"),
-            "expected a camelCase exitCode field, got: {sub_body}"
+        let done_event = sub_events
+            .iter()
+            .find(|e| e["type"] == "done")
+            .expect("a done event");
+        assert_eq!(
+            done_event["exitCode"], 0,
+            "expected a camelCase exitCode field, got: {done_event:?}"
         );
         assert!(
-            !sub_body.contains("exit_code"),
-            "exit_code leaked through in snake_case: {sub_body}"
+            done_event.get("exit_code").is_none(),
+            "exit_code leaked through in snake_case: {done_event:?}"
         );
 
         cleanup(&canvas_path);
@@ -10594,9 +11147,7 @@ mod run_lock_tests {
         let canvas_path = write_test_canvas(PLAIN_CANVAS);
         let addr = spawn_test_server(canvas_path.clone()).await;
 
-        let run = tokio::spawn(async move {
-            post_json(addr, "/api/run", r#"{"path":[],"block":"slow"}"#).await
-        });
+        let run = tokio::spawn(async move { run_ws_events(addr, "block=slow").await });
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;
 
         let (kill_status, _) = post_json(
@@ -10607,11 +11158,10 @@ mod run_lock_tests {
         .await;
         assert_eq!(kill_status, 204);
 
-        let (run_status, run_body) = run.await.unwrap();
-        assert_eq!(run_status, 200, "unexpected body: {run_body}");
+        let run_events = run.await.unwrap();
         assert!(
-            run_body.contains("\"type\":\"killed\""),
-            "expected the run to report killed, got: {run_body}"
+            run_events.iter().any(|e| e["type"] == "killed"),
+            "expected the run to report killed, got: {run_events:?}"
         );
 
         cleanup(&canvas_path);
@@ -10622,9 +11172,7 @@ mod run_lock_tests {
         let canvas_path = write_test_canvas(PLAIN_CANVAS);
         let addr = spawn_test_server(canvas_path.clone()).await;
 
-        let run = tokio::spawn(async move {
-            post_json(addr, "/api/run", r#"{"path":[],"block":"slow"}"#).await
-        });
+        let run = tokio::spawn(async move { run_ws_events(addr, "block=slow").await });
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;
 
         let (status, body) = get(addr, "/api/runs").await;
@@ -10639,8 +11187,8 @@ mod run_lock_tests {
         assert_eq!(entry["kind"], "plain");
         assert_eq!(entry["status"], "running");
 
-        let (run_status, _) = run.await.unwrap();
-        assert_eq!(run_status, 200);
+        let run_events = run.await.unwrap();
+        assert!(run_events.iter().any(|e| e["type"] == "done"));
 
         cleanup(&canvas_path);
     }
@@ -10650,8 +11198,8 @@ mod run_lock_tests {
         let canvas_path = write_test_canvas(PLAIN_CANVAS);
         let addr = spawn_test_server(canvas_path.clone()).await;
 
-        let (run_status, _) = post_json(addr, "/api/run", r#"{"path":[],"block":"slow"}"#).await;
-        assert_eq!(run_status, 200);
+        let run_events = run_ws_events(addr, "block=slow").await;
+        assert!(run_events.iter().any(|e| e["type"] == "done"));
 
         let (status, body) = get(addr, "/api/runs").await;
         assert_eq!(status, 200, "unexpected body: {body}");

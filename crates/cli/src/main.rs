@@ -4185,8 +4185,11 @@ fn node_reorder(canvas_path: &Path) {
 }
 
 fn apply_node_reorder(raw: &str) -> Result<String, String> {
-    let updated =
-        mdcanvas::reorder_by_position(raw).ok_or_else(|| "failed to parse".to_string())?;
+    // No client-side auto-layout to hint from here (a bare CLI/MCP call,
+    // not the web UI's own drag) — same "unpositioned siblings sort last,
+    // stable" behavior `reorder_by_position` always had.
+    let updated = mdcanvas::reorder_by_position(raw, &std::collections::HashMap::new())
+        .ok_or_else(|| "failed to parse".to_string())?;
     validate_patch(&updated)?;
     Ok(updated)
 }

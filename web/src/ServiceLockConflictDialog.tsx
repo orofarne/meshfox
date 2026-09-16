@@ -7,7 +7,7 @@ interface ServiceLockConflictDialogProps {
 }
 
 /**
- * Confirmation dialog for a `"service-lock-conflict"` run event (see
+ * Confirmation dialog for a `"lock-conflict"` run event (see
  * App.tsx's `serviceConflict` state and `api.ts`'s `RunEvent`) — despite
  * the name, not `service`-specific any more: any block's own address can
  * be locked by another process now (see that event's own doc comment),

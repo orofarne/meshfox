@@ -91,6 +91,35 @@ fn is_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
+/// `/api/run` is a WS upgrade now, not an HTTP-chunked `POST` — spins up a
+/// throwaway tokio runtime just for this one round trip (the rest of this
+/// file's tests stay plain sync `#[test]`s, so this is a smaller, more
+/// localized change than converting the whole file to `#[tokio::test]`).
+/// Drains every `RunEvent` text frame until the socket closes and joins
+/// them back into a newline-separated string — the same shape `http()`'s
+/// own callers here used to get back from the old chunked-HTTP body.
+fn run_ws_events(port: u16, query: &str) -> String {
+    tokio::runtime::Runtime::new()
+        .expect("build a tokio runtime")
+        .block_on(async {
+            use futures_util::StreamExt;
+            let url = format!("ws://127.0.0.1:{port}/api/run?{query}");
+            let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+            let mut body = String::new();
+            while let Some(msg) = ws.next().await {
+                match msg.expect("no ws error") {
+                    tokio_tungstenite::tungstenite::Message::Text(t) => {
+                        body.push_str(&t);
+                        body.push('\n');
+                    }
+                    tokio_tungstenite::tungstenite::Message::Close(_) => break,
+                    _ => continue,
+                }
+            }
+            body
+        })
+}
+
 #[test]
 fn killing_the_worker_stops_a_running_service_instead_of_orphaning_it() {
     let dir = unique_dir();
@@ -122,13 +151,7 @@ fn killing_the_worker_stops_a_running_service_instead_of_orphaning_it() {
 
     let port = read_bound_port(&mut child);
 
-    let (status, body) = http(
-        port,
-        "POST",
-        "/api/run",
-        r#"{"path":[],"block":"srv"}"#,
-    );
-    assert_eq!(status, 200, "unexpected /api/run body: {body}");
+    let body = run_ws_events(port, "block=srv");
     assert!(
         body.contains("\"type\":\"service-started\""),
         "expected a service-started event, got: {body}"
@@ -237,9 +260,7 @@ fn killing_the_worker_stops_a_currently_running_plain_block_instead_of_orphaning
     // streams for the whole ~30s it takes to finish — run it on its own
     // thread so this test can get on with killing the worker mid-run
     // instead of waiting on it.
-    let run_thread = std::thread::spawn(move || {
-        http(port, "POST", "/api/run", r#"{"path":[],"block":"slow"}"#)
-    });
+    let run_thread = std::thread::spawn(move || run_ws_events(port, "block=slow"));
 
     // Wait for the block to actually start ticking before touching
     // anything — same "prove it was genuinely running before the kill"

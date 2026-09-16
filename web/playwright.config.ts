@@ -157,6 +157,15 @@ const SEARCH_PAN_PORT = 4608;
 // an authored `width`/`height` — see `MeshNode.tsx`'s `useAutoFitTitleFontSize`)
 // and port.
 const AUTOFIT_TITLE_PORT = 4609;
+// Twenty-sixth/seventh server + port for drag-reorder.spec.ts — same
+// GROUP_DRAG_FIREFOX_PORT-style split as above (its own fixture pair,
+// drag-reorder.canvas.md/drag-reorder-firefox.canvas.md, and two ports):
+// this suite's own drag genuinely rewrites its fixture on disk, so a real
+// write from one browser's run could otherwise race — or simply run
+// against the *other* browser's already-mutated file — a concurrent
+// read/write from the other's.
+const DRAG_REORDER_PORT = 4616;
+const DRAG_REORDER_FIREFOX_PORT = 4617;
 
 // Taller than Playwright's 720px default — the app's own `minZoom` (0.5)
 // is a hard floor on how far "fit view" can zoom out, and deps.canvas.md's
@@ -328,6 +337,15 @@ export default defineConfig({
       testMatch: /(^|\/)reload-live-run\.spec\.ts$/,
       use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${RELOAD_LIVE_RUN_PORT}` },
     },
+    {
+      name: `${browser}-drag-reorder`,
+      testMatch: /(^|\/)drag-reorder\.spec\.ts$/,
+      use: {
+        ...device,
+        viewport: VIEWPORT,
+        baseURL: `http://127.0.0.1:${browser === "firefox" ? DRAG_REORDER_FIREFOX_PORT : DRAG_REORDER_PORT}`,
+      },
+    },
   ]),
   webServer: [
     {
@@ -494,6 +512,18 @@ export default defineConfig({
     {
       command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/reload-live-run.canvas.md --port ${RELOAD_LIVE_RUN_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${RELOAD_LIVE_RUN_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/drag-reorder.canvas.md --port ${DRAG_REORDER_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${DRAG_REORDER_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/drag-reorder-firefox.canvas.md --port ${DRAG_REORDER_FIREFOX_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${DRAG_REORDER_FIREFOX_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },

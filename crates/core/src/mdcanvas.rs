@@ -1889,8 +1889,26 @@ pub fn delete_node(markdown: &str, node_id: &str) -> Option<String> {
 /// canvas layout — sorted by `y`, then `x` among ties — without touching
 /// heading depth, any node's own content, or extra (`meshfox:edge`) parents,
 /// which don't define a document order in the first place. A child with no
-/// recorded position sorts after every positioned sibling, keeping its
-/// relative order among other unpositioned siblings stable.
+/// recorded position falls back to `hints` (keyed by this document's own
+/// local node id — a caller juggling several files, like `put_canvas`, is
+/// responsible for splitting a flat/namespaced hint map into one per file
+/// first) for that one comparison only — never written back to the file,
+/// unlike a real `x`/`y`. Still sorts after every *actually* positioned
+/// sibling with a lower or equal real value, same as before hints existed;
+/// one with neither a real position nor a hint sorts last of all, keeping
+/// its relative order among other such siblings stable (`f64::INFINITY`
+/// on both axes).
+///
+/// `hints` exists so a client that itself computes a live auto-layout (the
+/// web UI — see `App.tsx`'s `handleSaveLayout`) can tell this function
+/// where an *unpositioned* sibling currently renders, without this crate
+/// ever needing to know anything about layout itself: it's just numbers to
+/// sort by, supplied externally, same as a real `x`/`y` would be. Without
+/// this, a lone freshly-positioned node among otherwise-auto siblings
+/// always sorted first regardless of its own `y` (any real number is less
+/// than every unpositioned sibling's implicit `f64::INFINITY`) — surprising
+/// the first time a single drag reordered an entire, otherwise-untouched
+/// list.
 ///
 /// Since siblings never change depth or parent here, this is just a
 /// rearrangement of whole subtree byte ranges (each already contiguous and
@@ -1900,7 +1918,7 @@ pub fn delete_node(markdown: &str, node_id: &str) -> Option<String> {
 /// Called by the server on every canvas save so the on-disk heading order
 /// always matches what's drawn, not just each node's individually-patched
 /// `x`/`y`. Returns `None` if `markdown` doesn't parse.
-pub fn reorder_by_position(markdown: &str) -> Option<String> {
+pub fn reorder_by_position(markdown: &str, hints: &HashMap<String, (f64, f64)>) -> Option<String> {
     let segments = scan(markdown);
     let ids = assign_ids(&segments).ok()?;
     let parents = resolve_parent_ids(&segments, &ids).ok()?;
@@ -1918,6 +1936,18 @@ pub fn reorder_by_position(markdown: &str) -> Option<String> {
         }
     }
 
+    // Per-axis: a real value always wins; otherwise `hints` (keyed by this
+    // node's own local id) if the caller supplied one for it; otherwise
+    // dead last, same as before hints existed at all.
+    fn sort_pos(node: &Node, id: &str, hints: &HashMap<String, (f64, f64)>) -> (f64, f64) {
+        let hint = hints.get(id);
+        (
+            node.y.or_else(|| hint.map(|h| h.1)).unwrap_or(f64::INFINITY),
+            node.x.or_else(|| hint.map(|h| h.0)).unwrap_or(f64::INFINITY),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn build(
         idx: usize,
         markdown: &str,
@@ -1926,6 +1956,7 @@ pub fn reorder_by_position(markdown: &str) -> Option<String> {
         parents: &[Option<String>],
         nodes: &[Node],
         children: &HashMap<usize, Vec<usize>>,
+        hints: &HashMap<String, (f64, f64)>,
     ) -> String {
         let own_start = segments[idx].heading_span.start;
         let mut kids = children.get(&idx).cloned().unwrap_or_default();
@@ -1938,19 +1969,15 @@ pub fn reorder_by_position(markdown: &str) -> Option<String> {
 
         let mut out = markdown[own_start..own_end].to_string();
         kids.sort_by(|&a, &b| {
-            let ya = nodes[a].y.unwrap_or(f64::INFINITY);
-            let yb = nodes[b].y.unwrap_or(f64::INFINITY);
+            let (ya, xa) = sort_pos(&nodes[a], &ids[a], hints);
+            let (yb, xb) = sort_pos(&nodes[b], &ids[b], hints);
             ya.partial_cmp(&yb)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| {
-                    let xa = nodes[a].x.unwrap_or(f64::INFINITY);
-                    let xb = nodes[b].x.unwrap_or(f64::INFINITY);
-                    xa.partial_cmp(&xb).unwrap_or(std::cmp::Ordering::Equal)
-                })
+                .then_with(|| xa.partial_cmp(&xb).unwrap_or(std::cmp::Ordering::Equal))
         });
         for ci in kids {
             out.push_str(&build(
-                ci, markdown, segments, ids, parents, nodes, children,
+                ci, markdown, segments, ids, parents, nodes, children, hints,
             ));
         }
         out
@@ -1966,6 +1993,7 @@ pub fn reorder_by_position(markdown: &str) -> Option<String> {
         &parents,
         &canvas.nodes,
         &children,
+        hints,
     ));
     Some(out)
 }
@@ -3947,7 +3975,7 @@ Reused from Tests as well.
         // DOC's siblings are already laid out top-to-bottom, left-to-right,
         // so re-tiling the document in the same order must reproduce it
         // byte-for-byte, not just parse to an equal `Canvas`.
-        let reordered = reorder_by_position(DOC).unwrap();
+        let reordered = reorder_by_position(DOC, &HashMap::new()).unwrap();
         assert_eq!(reordered, DOC);
         let tests_pos = reordered.find("id=\"tests\"").unwrap();
         let examples_pos = reordered.find("id=\"examples\"").unwrap();
@@ -3971,7 +3999,7 @@ Reused from Tests as well.
 ## C Left
 <!-- meshfox:node id="c-left" x=0 y=100 -->
 "#;
-        let reordered = reorder_by_position(doc).unwrap();
+        let reordered = reorder_by_position(doc, &HashMap::new()).unwrap();
         let c = parse(&reordered).unwrap();
         assert!(same_ids(&c, &parse(doc).unwrap())); // same nodes, just reshuffled
         let pos = |id: &str| reordered.find(&format!("id=\"{id}\"")).unwrap();
@@ -3996,11 +4024,70 @@ Reused from Tests as well.
 ## No Position Two
 <!-- meshfox:node id="np-two" -->
 "#;
-        let reordered = reorder_by_position(doc).unwrap();
+        let reordered = reorder_by_position(doc, &HashMap::new()).unwrap();
         let pos = |id: &str| reordered.find(&format!("id=\"{id}\"")).unwrap();
         assert!(pos("placed") < pos("np-one"));
         // relative order among unpositioned siblings is preserved as-is.
         assert!(pos("np-one") < pos("np-two"));
+    }
+
+    #[test]
+    fn reorder_by_position_uses_a_hint_to_slot_a_lone_positioned_node_in_place() {
+        // Without a hint, `placed`'s own real y=50 would still sort before
+        // *both* unpositioned siblings regardless of its value (any real
+        // number beats `f64::INFINITY`) — exactly the surprise a lone drag
+        // among otherwise-auto siblings used to cause. A hint placing
+        // `np-one` at y=0 and `np-two` at y=100 (matching where the client's
+        // own auto-layout actually drew them) lets `placed`'s real y=50
+        // land in between, where it visually belongs.
+        let doc = r#"# Root
+<!-- meshfox:node id="root" -->
+
+## No Position One
+<!-- meshfox:node id="np-one" -->
+
+## No Position Two
+<!-- meshfox:node id="np-two" -->
+
+## Placed
+<!-- meshfox:node id="placed" x=0 y=50 -->
+"#;
+        let hints = HashMap::from([
+            ("np-one".to_string(), (0.0, 0.0)),
+            ("np-two".to_string(), (0.0, 100.0)),
+        ]);
+        let reordered = reorder_by_position(doc, &hints).unwrap();
+        let c = parse(&reordered).unwrap();
+        assert!(same_ids(&c, &parse(doc).unwrap()));
+        let pos = |id: &str| reordered.find(&format!("id=\"{id}\"")).unwrap();
+        assert!(pos("np-one") < pos("placed"));
+        assert!(pos("placed") < pos("np-two"));
+
+        // A hint is never written back as a real x/y — only `placed`'s own
+        // authored position appears in the output at all.
+        assert!(!reordered.contains("np-one\" x=") && !reordered.contains("np-one\" y="));
+        assert!(!reordered.contains("np-two\" x=") && !reordered.contains("np-two\" y="));
+    }
+
+    #[test]
+    fn reorder_by_position_ignores_a_hint_for_an_already_positioned_node() {
+        // A hint is only ever a *fallback* for a missing real value — one
+        // supplied for a node that already has its own real x/y (however
+        // stale relative to the hint) must never override it.
+        let doc = r#"# Root
+<!-- meshfox:node id="root" -->
+
+## A
+<!-- meshfox:node id="a" x=0 y=0 -->
+
+## B
+<!-- meshfox:node id="b" x=0 y=100 -->
+"#;
+        // If this hint were honored over `a`'s own real y=0, it would sort
+        // after `b` instead.
+        let hints = HashMap::from([("a".to_string(), (0.0, 200.0))]);
+        let reordered = reorder_by_position(doc, &hints).unwrap();
+        assert_eq!(reordered, doc, "a real y/x must always win over a hint");
     }
 
     #[test]
@@ -4017,7 +4104,7 @@ Reused from Tests as well.
 ### Child A
 <!-- meshfox:node id="child-a" x=0 y=0 -->
 "#;
-        let reordered = reorder_by_position(doc).unwrap();
+        let reordered = reorder_by_position(doc, &HashMap::new()).unwrap();
         let c = parse(&reordered).unwrap();
         assert!(same_ids(&c, &parse(doc).unwrap()));
         let pos = |id: &str| reordered.find(&format!("id=\"{id}\"")).unwrap();
@@ -4028,7 +4115,7 @@ Reused from Tests as well.
 
     #[test]
     fn reorder_by_position_missing_root_is_none() {
-        assert_eq!(reorder_by_position("not a heading at all"), None);
+        assert_eq!(reorder_by_position("not a heading at all", &HashMap::new()), None);
     }
 
     fn abc_doc() -> &'static str {

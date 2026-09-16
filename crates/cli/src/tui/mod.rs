@@ -925,6 +925,14 @@ fn print_tty_transcript_event(event: crate::worker_client::RunEvent) -> TtyPrelu
             print!("{message}\r\n");
             TtyPreludeOutcome::Continue
         }
+        // `/api/run/tty` still reports a conflict as a pre-upgrade `409`
+        // (`TtyConnectError::Conflict`), not a streamed event — this arm
+        // exists only for exhaustiveness against the shared `RunEvent`
+        // enum and should never actually be reached here.
+        RunEvent::LockConflict { node_id, block, owner_pid, owner_desc } => {
+            print!("{node_id:?}/{block:?} is locked by pid {owner_pid} ({owner_desc})\r\n");
+            TtyPreludeOutcome::Done(-1)
+        }
         RunEvent::Done { exit_code } => TtyPreludeOutcome::Done(exit_code),
     }
 }

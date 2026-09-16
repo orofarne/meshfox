@@ -62,6 +62,13 @@ test("clicking ↓ moves a node after its next sibling, even a positioned one", 
   await expect.poll(() => fetchRaw(page).then((r) => r.indexOf('id="alpha"') > r.indexOf('id="positioned"'))).toBe(
     true,
   );
+  // Regression: the canvas reload this move triggers used to rebuild every
+  // React Flow node from scratch without carrying `selected` forward,
+  // which deselected whatever node was just acted on — dropping its own
+  // floating `NodeToolbar` (and the "selected" highlight) right as the
+  // move it just triggered lands, instead of leaving it selected/focused.
+  await expect(page.locator(".mesh-node-toolbar")).toBeVisible();
+  await expect(moveDownButton(page)).toBeVisible();
 
   await page.evaluate(
     (raw) => fetch("/api/canvas/raw", { method: "PUT", headers: { "content-type": "text/plain" }, body: raw }),
@@ -80,6 +87,9 @@ test("clicking ↑ moves a node before its previous sibling", async ({ page }) =
   await expect
     .poll(() => fetchRaw(page).then((r) => r.indexOf('id="gamma"') < r.indexOf('id="beta"')))
     .toBe(true);
+  // Same regression as the ↓ test above, the other direction.
+  await expect(page.locator(".mesh-node-toolbar")).toBeVisible();
+  await expect(moveUpButton(page)).toBeVisible();
 
   await page.evaluate(
     (raw) => fetch("/api/canvas/raw", { method: "PUT", headers: { "content-type": "text/plain" }, body: raw }),

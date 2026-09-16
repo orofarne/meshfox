@@ -259,43 +259,35 @@ pub enum SubscribeEvent {
 /// `GET /api/run/subscribe?nodeId=..&block=..` — watches one address's own
 /// most recent run independent of whoever started it (a passive tab/TUI
 /// session reacting to `WatchEvent::RunStarted`, mirroring the web UI's
-/// own `watchAutorunBlock`). Replays every buffered line, then tails live
-/// output until the run's own terminal outcome, at which point the channel
-/// closes. `since_seq` is always `0` here (unlike the web UI, which
-/// reconnects with its own last-seen `seq` — TUI only ever opens one
-/// subscription per run, ended by the server's own terminal event, so
-/// there's no reconnect case to resume). A `404` (this address has never
-/// run, or the reservation raced ahead of `runs_registry` somehow) or any
-/// other request failure just yields an empty channel — best-effort, same
-/// as the web UI's own `.catch()` on this call.
+/// own `watchAutorunBlock`). A WebSocket, not an HTTP-streamed response —
+/// replays every buffered line, then tails live output until the run's own
+/// terminal outcome, at which point the socket closes. `since_seq` is
+/// always `0` here (unlike the web UI, which reconnects with its own
+/// last-seen `seq` — TUI only ever opens one subscription per run, ended by
+/// the server's own terminal event, so there's no reconnect case to
+/// resume). This address never having run at all (or the reservation
+/// racing ahead of `runs_registry` somehow) is a deliberate silent no-op
+/// server-side (the socket upgrades, then closes immediately with zero
+/// messages) — indistinguishable here from a connect failure, and handled
+/// the same way: just an empty channel, best-effort, same as the web UI's
+/// own `.catch()` on this call.
 pub fn subscribe_run(port: u16, node_id: String, block: String) -> tokio::sync::mpsc::UnboundedReceiver<SubscribeEvent> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
         use futures_util::StreamExt;
-        let res = reqwest::Client::new()
-            .get(format!("{}/api/run/subscribe", base_url(port)))
-            .query(&[("nodeId", node_id.as_str()), ("block", block.as_str())])
-            .send()
-            .await;
-        let Ok(res) = res else { return };
-        if !res.status().is_success() {
+        let url = reqwest::Url::parse_with_params(
+            &format!("ws://127.0.0.1:{port}/api/run/subscribe"),
+            &[("nodeId", node_id.as_str()), ("block", block.as_str())],
+        );
+        let Ok(url) = url else { return };
+        let Ok((mut ws, _)) = tokio_tungstenite::connect_async(url.as_str()).await else {
             return;
-        }
-        let mut bytes_stream = res.bytes_stream();
-        let mut buf = String::new();
-        while let Some(chunk) = bytes_stream.next().await {
-            let Ok(chunk) = chunk else { break };
-            buf.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(newline_at) = buf.find('\n') {
-                let line = buf[..newline_at].to_string();
-                buf.drain(..=newline_at);
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let Ok(event) = serde_json::from_str::<SubscribeEvent>(&line) else { continue };
-                if tx.send(event).is_err() {
-                    return;
-                }
+        };
+        while let Some(Ok(msg)) = ws.next().await {
+            let tokio_tungstenite::tungstenite::Message::Text(text) = msg else { continue };
+            let Ok(event) = serde_json::from_str::<SubscribeEvent>(&text) else { continue };
+            if tx.send(event).is_err() {
+                return;
             }
         }
     });
@@ -445,16 +437,20 @@ pub async fn submit_form(
     Ok(response.autorun_triggered.into_iter().map(|t| (t.node_id, t.block)).collect())
 }
 
-/// Mirrors `crates/server/src/lib.rs`'s own `RunEvent` — the NDJSON
-/// vocabulary `POST /api/run`'s streamed response speaks. `stream` reuses
-/// `meshfox_server::stream_exec::OutputStream` directly (already the exact
-/// type the server itself serializes there) rather than a second copy of
-/// the same two-variant enum. Every variant's fields mirror the wire shape
-/// exactly, even ones no current consumer reads (`Started::run_id`, most
-/// variants' own `node_id`/`block` once `App::on_run_event`/
-/// `print_tty_transcript_event` only need a handful) — trimming fields a
-/// future consumer would want back out just to silence `dead_code` isn't
-/// worth it for a type whose only job is matching the server's own shape.
+/// Mirrors `crates/server/src/lib.rs`'s own `RunEvent` — the WebSocket
+/// vocabulary `GET /api/run`'s streamed response speaks (one `Message::
+/// Text` per event). `stream` reuses `meshfox_server::stream_exec::
+/// OutputStream` directly (already the exact type the server itself
+/// serializes there) rather than a second copy of the same two-variant
+/// enum. Every variant's fields mirror the wire shape exactly, even ones no
+/// current consumer reads (`Started::run_id`, most variants' own `node_id`/
+/// `block` once `App::on_run_event`/`print_tty_transcript_event` only need
+/// a handful) — trimming fields a future consumer would want back out just
+/// to silence `dead_code` isn't worth it for a type whose only job is
+/// matching the server's own shape. `LockConflict` is the one variant with
+/// no local-mode/`RunState` equivalent at all — see `run_stream`'s own doc
+/// comment on why it arrives as a stream event rather than a connect-time
+/// error.
 #[allow(dead_code)]
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case", rename_all_fields = "camelCase")]
@@ -465,16 +461,22 @@ pub enum RunEvent {
     Output { node_id: String, block: String, stream: OutputStream, text: String },
     TtyStart { node_id: String, block: String },
     ServiceStarted { node_id: String, block: String, pid: u32 },
+    LockConflict { node_id: String, block: String, owner_pid: u32, owner_desc: String },
     StepEnd { node_id: String, block: String, exit_code: i32, duration_ms: u64 },
     Killed { node_id: String, block: String },
     Error { message: String },
     Done { exit_code: i32 },
 }
 
-/// A `409` from `POST /api/run`/`force-start` — mirrors
-/// `crates/server/src/lib.rs`'s own `LockConflict`, reported before any
-/// streaming ever starts (queued-time locking checks every address a chain
-/// will touch up front — see that struct's own doc comment).
+/// A `409` from `POST /api/run/tty`/`force-start` — mirrors
+/// `crates/server/src/lib.rs`'s own `LockConflict` struct, reported before
+/// any streaming ever starts there (queued-time locking checks every
+/// address a chain will touch up front — see that struct's own doc
+/// comment). `run_stream`'s own conflict instead arrives as a
+/// `RunEvent::LockConflict` stream event (same fields) — this struct is
+/// only still needed for `tty_connect_error`'s pre-upgrade `409`, which
+/// `/api/run/tty` still uses (out of scope for the `/api/run` WS
+/// conversion — see TODO.canvas.md).
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LockConflict {
@@ -484,41 +486,26 @@ pub struct LockConflict {
     pub owner_desc: String,
 }
 
-#[derive(Debug)]
-pub enum RunStartError {
-    /// A `409` — some address this chain would touch is already locked by
-    /// another process. The caller's own confirm flow re-issues the same
-    /// request with `force` set to this exact address (see `run_stream`'s
-    /// own `force` parameter) — the "kill the stale/live owner and take
-    /// over" step, same as `service_lock::kill_and_acquire` used to do
-    /// locally.
-    Conflict(LockConflict),
-    Other(String),
-}
-
-impl std::fmt::Display for RunStartError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RunStartError::Conflict(c) => write!(
-                f,
-                "{:?}/{:?} is locked by pid {} ({})",
-                c.node_id, c.block, c.owner_pid, c.owner_desc
-            ),
-            RunStartError::Other(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-/// `POST /api/run` (or `POST /api/run/force` when `force` is `Some`) —
-/// starts a whole chain run server-side and streams it back as NDJSON
-/// `RunEvent`s, forwarded one at a time on the returned channel by a
-/// background task (so the caller can `select!`/`recv()` it the same way
-/// `RunState::proc`'s own `output_rx` already works, rather than holding
-/// the HTTP response open on the caller's own poll). The channel closes
-/// (returns `None`) once a terminal event (`Done`/`Killed`/`Error`) has
-/// been forwarded, or if the connection drops early — a caller that cares
-/// about the difference should have already seen the terminal event by
-/// then in the normal case.
+/// `GET /api/run` (or `GET /api/run/force` when `force` is `Some`) —
+/// starts a whole chain run server-side and streams it back over a
+/// WebSocket as `RunEvent`s, forwarded one at a time on the returned
+/// channel by a background task (so the caller can `select!`/`recv()` it
+/// the same way `RunState::proc`'s own `output_rx` already works, rather
+/// than holding the socket open on the caller's own poll). The channel
+/// closes (returns `None`) once a terminal event (`Done`/`Killed`/`Error`)
+/// has been forwarded, or if the connection drops early — a caller that
+/// cares about the difference should have already seen the terminal event
+/// by then in the normal case.
+///
+/// Unlike the old HTTP-chunked version, a lock conflict is no longer a
+/// connect-time error at all — a browser's native `WebSocket` can't read a
+/// failed handshake's own status/body, so the server always completes the
+/// upgrade and reports a conflict as the very first streamed
+/// `RunEvent::LockConflict` instead (see `crates/server/src/lib.rs`'s own
+/// `pump_run_response_into_ws` doc comment). This function can now only
+/// fail on a genuine transport-level problem (the worker isn't listening,
+/// a malformed URL) — the caller (`App::begin_http_run`) is the one that
+/// inspects the very first event on the returned channel for `LockConflict`.
 pub async fn run_stream(
     port: u16,
     path: &[String],
@@ -527,60 +514,35 @@ pub async fn run_stream(
     vars: HashMap<String, String>,
     save_secrets: HashSet<String>,
     force: Option<(String, String)>,
-) -> Result<tokio::sync::mpsc::UnboundedReceiver<RunEvent>, RunStartError> {
-    let body = serde_json::json!({
-        "path": path,
-        "block": block,
-        "noDeps": no_deps,
-        "vars": vars,
-        "saveSecrets": save_secrets,
-    });
-    let url = match &force {
-        None => format!("{}/api/run", base_url(port)),
-        Some(_) => format!("{}/api/run/force", base_url(port)),
-    };
-    let body = match &force {
-        None => body,
-        Some((node_id, block)) => {
-            let mut body = body;
-            body["force"] = serde_json::json!({ "nodeId": node_id, "block": block });
-            body
-        }
-    };
-    let res = reqwest::Client::new()
-        .post(url)
-        .json(&body)
-        .send()
+) -> Result<tokio::sync::mpsc::UnboundedReceiver<RunEvent>, String> {
+    let vars_json = serde_json::to_string(&vars).map_err(|e| e.to_string())?;
+    let secrets_json = serde_json::to_string(&save_secrets).map_err(|e| e.to_string())?;
+    let route = if force.is_some() { "/api/run/force" } else { "/api/run" };
+    let mut params = vec![
+        ("path", path.join(",")),
+        ("block", block.to_string()),
+        ("noDeps", no_deps.to_string()),
+        ("vars", vars_json),
+        ("saveSecrets", secrets_json),
+    ];
+    if let Some((force_node_id, force_block)) = &force {
+        params.push(("forceNodeId", force_node_id.clone()));
+        params.push(("forceBlock", force_block.clone()));
+    }
+    let url = reqwest::Url::parse_with_params(&format!("ws://127.0.0.1:{port}{route}"), &params)
+        .map_err(|e| e.to_string())?;
+    let (mut ws, _) = tokio_tungstenite::connect_async(url.as_str())
         .await
-        .map_err(|e| RunStartError::Other(e.to_string()))?;
-    if res.status() == reqwest::StatusCode::CONFLICT {
-        let conflict: LockConflict = res.json().await.map_err(|e| RunStartError::Other(e.to_string()))?;
-        return Err(RunStartError::Conflict(conflict));
-    }
-    if !res.status().is_success() {
-        let status = res.status();
-        let text = res.text().await.unwrap_or_default();
-        return Err(RunStartError::Other(if text.is_empty() { status.to_string() } else { text }));
-    }
+        .map_err(|e| e.to_string())?;
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
         use futures_util::StreamExt;
-        let mut bytes_stream = res.bytes_stream();
-        let mut buf = String::new();
-        while let Some(chunk) = bytes_stream.next().await {
-            let Ok(chunk) = chunk else { break };
-            buf.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(newline_at) = buf.find('\n') {
-                let line = buf[..newline_at].to_string();
-                buf.drain(..=newline_at);
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let Ok(event) = serde_json::from_str::<RunEvent>(&line) else { continue };
-                if tx.send(event).is_err() {
-                    return;
-                }
+        while let Some(Ok(msg)) = ws.next().await {
+            let tokio_tungstenite::tungstenite::Message::Text(text) = msg else { continue };
+            let Ok(event) = serde_json::from_str::<RunEvent>(&text) else { continue };
+            if tx.send(event).is_err() {
+                return;
             }
         }
     });
@@ -610,10 +572,12 @@ pub type TtySocket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::Maybe
 
 #[derive(Debug)]
 pub enum TtyConnectError {
-    /// A `409` — same meaning as `RunStartError::Conflict`, just returned
-    /// pre-upgrade as a plain HTTP response rather than a streamed event
-    /// (there's no NDJSON stream to speak of yet at this point). Unlike a
-    /// plain run's conflict, there's no `/api/run/tty/force` to retry
+    /// A `409` — same meaning as a plain run's `RunEvent::LockConflict`,
+    /// just returned pre-upgrade as a plain HTTP response rather than a
+    /// streamed event (`/api/run/tty` keeps its own older pre-upgrade-`409`
+    /// shape — out of scope for the `/api/run` WS conversion, see
+    /// TODO.canvas.md). Unlike a plain run's conflict, there's no
+    /// `/api/run/tty/force` to retry
     /// through (`TtyRunQuery` has no `force` field at all) — the confirm
     /// flow instead kills the stale/foreign owner directly via
     /// `meshfox_core::service_lock` against the same on-disk lock file the
