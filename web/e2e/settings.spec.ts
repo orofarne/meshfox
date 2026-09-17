@@ -13,13 +13,13 @@ import { clickFitViewAndWait, disableDefaultFold, selectNode, toolbarButton } fr
 // including `color` (turning an absent color into a stored `color=""`), and
 // once by always including the *resolved* node type — which, for an
 // `include` node, is never actually `"include"` (the server always resolves
-// one into a `group`/`text` node before it reaches the client; see
-// `crates/core/src/include.rs`), so resending it silently overwrote the raw
-// `type="include"` with whatever it happened to resolve to, destroying the
-// include outright. `NodeSettings.tsx`'s `buildPatch` now diffs against the
-// node's original values and sends only what actually changed — this suite
-// is the regression test for that, across every node type the settings
-// modal can show.
+// one into a `text` node before it reaches the client, its target's own
+// content dumped straight into its body; see `crates/core/src/include.rs`),
+// so resending it silently overwrote the raw `type="include"` with `"text"`,
+// destroying the include outright. `NodeSettings.tsx`'s `buildPatch` now
+// diffs against the node's original values and sends only what actually
+// changed — this suite is the regression test for that, across every node
+// type the settings modal can show.
 
 async function openSettings(page: Page, nodeId: string) {
   const node = page.locator(`.react-flow__node[data-id="${nodeId}"]`);
@@ -42,11 +42,10 @@ function fetchRaw(page: Page): Promise<string> {
 }
 
 test.beforeEach(async ({ page }) => {
-  // This fixture nests real nodes (group-node -> group-child,
-  // include-canvas -> its own spliced children) that App.tsx's
-  // fold-everything-with-children-by-default behavior would otherwise
-  // hide on first load — this suite is about NodeSettings, not fold, so
-  // start from every node visible instead.
+  // This fixture nests real nodes (group-node -> group-child) that
+  // App.tsx's fold-everything-with-children-by-default behavior would
+  // otherwise hide on first load — this suite is about NodeSettings, not
+  // fold, so start from every node visible instead.
   await disableDefaultFold(page, "root");
   await page.goto("/");
   await page.waitForSelector(".mesh-node");
@@ -66,8 +65,7 @@ test.beforeEach(async ({ page }) => {
 // - a `file` node, plain link display
 // - a `file` node, code-preview display + a language hint + an interpreter
 // - a `link` node
-// - an `include` node whose target is plain Markdown (resolves to `text`)
-// - an `include` node whose target is itself a canvas (resolves to `group`)
+// - an `include` node (resolves to `text`, its target's content dumped in)
 // - a `group` node, and one of its structural children
 const NODE_IDS = [
   "root",
@@ -76,8 +74,7 @@ const NODE_IDS = [
   "file-link",
   "file-code",
   "link-node",
-  "include-text",
-  "include-canvas",
+  "include-node",
   "group-node",
   "group-child",
 ];

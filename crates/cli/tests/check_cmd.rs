@@ -1,9 +1,10 @@
 //! End-to-end test for `meshfox check` resolving includes before
 //! evaluating constraints — the composed-tree behavior it needs to share
 //! with `meshfox view`/the tui (`meshfox_core::constraint::annotate_status`
-//! called after `include::resolve` there), so a constraint fence living
-//! inside an included canvas is actually reachable from the including
-//! document rather than silently skipped.
+//! called after `include::resolve` there), so a constraint fence written
+//! inside an include target's own text is actually reachable from the
+//! including document (dumped straight into the include node's own body)
+//! rather than silently skipped.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -56,13 +57,13 @@ fn check_catches_a_failing_constraint_inside_an_included_canvas() {
         "expected a non-zero exit for a failing constraint"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    // The constraint lives in the spliced-in node, addressed under its
-    // namespaced id — proof `check` actually reached inside the include
-    // rather than only looking at `base.canvas.md`'s own (constraint-free)
-    // content.
+    // The constraint fence lives in the include target's own dumped-in
+    // text, addressed under the include node's own id ("child") — proof
+    // `check` actually reached inside the include rather than only
+    // looking at `base.canvas.md`'s own (constraint-free) content.
     assert!(
-        stderr.contains("child/root"),
-        "expected the namespaced label in stderr, got: {stderr}"
+        stderr.contains("child"),
+        "expected the include node's own label in stderr, got: {stderr}"
     );
     assert!(
         stderr.contains("always fails"),

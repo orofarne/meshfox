@@ -62,17 +62,6 @@ pub fn is_canvas_path(path: &std::path::Path) -> bool {
     path.to_string_lossy().ends_with(".canvas.md")
 }
 
-/// Whether `path` (whose `contents` the caller already has in hand) counts
-/// as a canvas: either its name ends in `.canvas.md`, or it's a plain `.md`
-/// file that opens with the `meshfox:canvas` marker (see [`has_marker`]) —
-/// this is how e.g. README.md itself can be treated as a canvas without
-/// being renamed. The one rule used, up to now, independently by
-/// `include::resolve`/`include::list_includes` and the CLI's own
-/// `find_canvas()`.
-pub fn is_canvas(path: &std::path::Path, contents: &str) -> bool {
-    is_canvas_path(path) || has_marker(contents)
-}
-
 /// Splits a `file`/`link` node's `target` on its first `#` into the path
 /// portion and an optional fragment — e.g. `other.canvas.md#some-node` deep
 /// links to node `some-node` in that canvas. The fragment must be stripped
@@ -389,8 +378,6 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
             constraint_results: Vec::new(),
             effective_color: None,
             asset_base: None,
-            origin_path: None,
-            origin_id: None,
             plain_markdown_include: false,
         });
     }
@@ -2297,9 +2284,9 @@ fn parse_heading(line: &str) -> Option<(u8, String)> {
 /// Rewrites every top-level (fence-aware, see `fence::fenced_byte_ranges`)
 /// Markdown heading in `markdown`, adding `shift` to its level and clamping
 /// to 6 (CommonMark's ceiling — headings can't nest any deeper). Used by
-/// `crate::include` to nest an included plain-Markdown document's own
-/// heading hierarchy under the node that includes it, so e.g. its top-level
-/// `#` doesn't collide with the including document's actual root.
+/// `crate::include` to nest an included document's own heading hierarchy
+/// under the node that includes it, so e.g. its top-level `#` doesn't
+/// collide with the including document's actual root.
 pub fn shift_headings(markdown: &str, shift: u8) -> String {
     shift_headings_range(markdown, 0..markdown.len(), shift as i8)
 }
@@ -3456,25 +3443,6 @@ Reused from Tests as well.
     }
 
     #[test]
-    fn include_node_parses_target_from_single_link() {
-        let doc =
-            "# Root\n\n## Spec\n<!-- meshfox:node type=\"include\" -->\n\n[spec](./SPEC.md)\n";
-        let c = parse(doc).unwrap();
-        let n = c.node("spec").unwrap();
-        assert_eq!(n.node_type, NodeType::Include);
-        assert_eq!(n.target.as_deref(), Some("./SPEC.md"));
-    }
-
-    #[test]
-    fn include_node_rejects_extra_text_around_link() {
-        let doc = "# Root\n\n## Spec\n<!-- meshfox:node type=\"include\" -->\n\nsee [spec](./SPEC.md) please\n";
-        assert_eq!(
-            parse(doc).unwrap_err(),
-            ParseError::InvalidLinkBody("spec".to_string(), "include")
-        );
-    }
-
-    #[test]
     fn shift_headings_moves_top_level_headings_down_and_skips_fences() {
         let md = "# Title\n\nintro\n\n```text\n# not a heading\n```\n\n## Section\nbody\n";
         let shifted = shift_headings(md, 2);
@@ -3496,6 +3464,25 @@ Reused from Tests as well.
     fn shift_headings_zero_is_a_no_op() {
         let md = "# Title\n\nbody\n";
         assert_eq!(shift_headings(md, 0), md);
+    }
+
+    #[test]
+    fn include_node_parses_target_from_single_link() {
+        let doc =
+            "# Root\n\n## Spec\n<!-- meshfox:node type=\"include\" -->\n\n[spec](./SPEC.md)\n";
+        let c = parse(doc).unwrap();
+        let n = c.node("spec").unwrap();
+        assert_eq!(n.node_type, NodeType::Include);
+        assert_eq!(n.target.as_deref(), Some("./SPEC.md"));
+    }
+
+    #[test]
+    fn include_node_rejects_extra_text_around_link() {
+        let doc = "# Root\n\n## Spec\n<!-- meshfox:node type=\"include\" -->\n\nsee [spec](./SPEC.md) please\n";
+        assert_eq!(
+            parse(doc).unwrap_err(),
+            ParseError::InvalidLinkBody("spec".to_string(), "include")
+        );
     }
 
     #[test]

@@ -585,10 +585,9 @@ fn lock_conflict_response(conflict: &LockConflict) -> Response {
 /// `SessionRun`'s own doc comment), so `compute_forced_reruns` already
 /// treats every such address as "no skip mechanism, always forced" on its
 /// own — exactly the set this needs, service-liveness aside. Still needs
-/// `locate_node` (not a full block scan) per address, purely to find which
-/// file it actually lives in — `meshfox_core::service_lock_path` needs a
-/// canvas path, and an `include`d node's can differ from the primary
-/// document's own.
+/// `locate_node` (not a full block scan) per address, purely to confirm it
+/// actually resolves to a real node — a bad address just gets skipped here,
+/// left for the real per-step loop to report as a normal `RunEvent::Error`.
 fn steps_needing_a_lock(
     state: &AppState,
     raw_snapshot: &str,
@@ -613,11 +612,10 @@ fn steps_needing_a_lock(
         // A bad node/block reference surfaces as a normal `RunEvent::Error`
         // once the real per-step loop re-locates it for real — nothing to
         // lock for an address that doesn't even resolve.
-        let Ok(located) = locate_node(state, raw_snapshot, &addr.node_id) else {
+        let Ok(_located) = locate_node(raw_snapshot, &addr.node_id) else {
             continue;
         };
-        let canvas_path_for_step = located.origin.clone().unwrap_or_else(|| state.canvas_path.clone());
-        let lock_path = meshfox_core::service_lock_path(&canvas_path_for_step, &addr.node_id, &addr.block_name);
+        let lock_path = meshfox_core::service_lock_path(&state.canvas_path, &addr.node_id, &addr.block_name);
         out.push((addr.clone(), lock_path));
     }
     out
@@ -1546,90 +1544,40 @@ async fn get_canvas(State(state): State<Arc<AppState>>) -> Result<Json<Canvas>, 
     canvas_response(&raw, &state.canvas_path)
 }
 
-/// Which physical file (and node id *in that file*) a mutating endpoint
-/// should actually read/patch/write for a given node id as seen in the
-/// composed/resolved canvas the UI displays — `state`'s own document
-/// itself, or, for a node spliced in from a canvas `include`, the include
-/// target's own file, addressed by its un-namespaced id there
-/// (`Node::origin_path`/`origin_id`, set by `include::resolve`). Every
-/// mutating endpoint below routes through this first instead of assuming
-/// `id` lives in `state`'s own raw text — that assumption is what made
-/// editing an included subtree fail with a spurious "no node" before.
-/// `None` for `state`'s own document (already cached as
-/// `state.canvas_path`/`state.raw`); `Some(path)` for an include target —
-/// `raw` in that case is read fresh from disk each time rather than
-/// cached in `AppState`, since it isn't the file this server session
-/// "owns". Same struct `meshfox_core::locate_node`/`meshfox run`/the TUI
-/// use — kept as a type alias here rather than a fresh definition so
-/// every existing `located.origin`/`.raw`/`.local_id` reference below
-/// stays untouched.
+/// Resolves a node id to its raw text and (unchanged, since there's only
+/// ever one file) local id — every mutating endpoint below routes through
+/// this first rather than assuming `id` is well-formed on its own, so a bad
+/// id surfaces as a normal 404 in one place instead of every call site
+/// re-deriving its own "not found" handling. Same struct
+/// `meshfox_core::locate_node`/`meshfox run`/the TUI use — kept as a type
+/// alias here rather than a fresh definition so every existing
+/// `located.raw`/`.local_id` reference below stays untouched.
 type LocatedNode = meshfox_core::LocatedNode;
 
 /// Thin `ApiError`-flavored wrapper around `meshfox_core::locate_node` —
 /// same lookup CLI/TUI now share, just with this server's own established
-/// HTTP status codes and wording for each failure mode (unchanged from
-/// before this was factored out into core).
-fn locate_node(state: &AppState, primary_raw: &str, id: &str) -> Result<LocatedNode, ApiError> {
-    meshfox_core::locate_node(primary_raw, &state.canvas_path, id).map_err(|e| match e {
+/// HTTP status codes and wording for each failure mode.
+fn locate_node(primary_raw: &str, id: &str) -> Result<LocatedNode, ApiError> {
+    meshfox_core::locate_node(primary_raw, id).map_err(|e| match e {
         meshfox_core::LocateError::Parse(e) => {
-            ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
-        }
-        meshfox_core::LocateError::Include(e) => {
             ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
         }
         meshfox_core::LocateError::NotFound(id) => {
             ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}"))
         }
-        meshfox_core::LocateError::NoOwnIdentity(id) => ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!(
-                "node {id:?} lives inside an included canvas that can't be edited from here yet \
-                 (it was included as plain Markdown rather than a .canvas.md, so it has no node \
-                 identity of its own to write back to — open its own file directly to edit it)"
-            ),
-        ),
-        meshfox_core::LocateError::Io(path, e) => ApiError(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to read include target {path}: {e}"),
-        ),
     })
 }
 
-/// Writes `raw` back to wherever `located` says it actually came from —
-/// `state`'s own file (also updating its in-memory cache, same as every
-/// mutating endpoint already did) or an include target's file directly
-/// (never cached — see `LocatedNode::origin`). The caller still has to
-/// re-read `state.raw`/call `canvas_response` afterward for the response:
-/// for an include target, that's what actually picks the edit back up
-/// (`include::resolve` always reads the target fresh from disk), the same
-/// way a follow-up `GET /api/canvas` would. `op` is the precise
-/// `NodeUpserted`/`NodeRemoved`/`NodesReordered` this particular mutation
-/// is (see `ServerEvent`'s own doc comment) — broadcast instead of the
-/// generic `Changed` when this lands in the *primary* file, so a client
-/// watching for it can apply it in place. Ignored for an include target
-/// (`Some(path)` below): that write doesn't go through `AppState::save`
-/// at all (there's no single in-memory `state.raw` for an include target
-/// to update), and always broadcasts the generic `Changed` regardless of
-/// `op` — teaching every op's client-side apply logic about "which file"
-/// isn't worth it yet for what's still a rare edit path.
-fn commit_located(state: &AppState, located: &LocatedNode, raw: &str, op: ServerEvent) -> Result<(), ApiError> {
-    match &located.origin {
-        None => {
-            state
-                .save_with_event(raw, op)
-                .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        }
-        Some(path) => {
-            std::fs::write(path, raw)
-                .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            // Unlike the `None` arm above, this write doesn't go through
-            // `AppState::save` (there's no single in-memory `state.raw` for
-            // an include target to update) — broadcast here explicitly, or
-            // an edit to an included node would otherwise go unnoticed by
-            // every connected tab until the next 500ms file-watcher poll.
-            state.canvas_events.push(ServerEvent::Changed);
-        }
-    }
+/// Writes `raw` back to `state`'s own file (also updating its in-memory
+/// cache), broadcasting `op` — the precise `NodeUpserted`/`NodeRemoved`/
+/// `NodesReordered` this particular mutation is (see `ServerEvent`'s own
+/// doc comment) — so a client watching for it can apply it in place.
+/// `located` isn't consulted here (there's only ever one file to write to)
+/// — kept as a parameter so every existing call site stays untouched.
+fn commit_located(state: &AppState, _located: &LocatedNode, raw: &str, op: ServerEvent) -> Result<(), ApiError> {
+    state
+        .save_with_event(raw, op)
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(())
 }
 
@@ -1673,12 +1621,10 @@ struct IncludeManifestEntry {
     node_id: String,
     title: String,
     target: String,
-    depth: u32,
-    is_canvas: bool,
 }
 
-/// Every `include` reachable from the document (however deeply nested),
-/// resolved to the file it points at but without splicing anything in
+/// Every `include` declared directly in the document, resolved to the file
+/// it points at but without dumping anything in
 /// (`meshfox_core::include::list_includes`) — what powers the Source-mode
 /// editor's file picker (see `get_canvas_raw`/`put_canvas_raw`'s own
 /// `?include=` param): the primary document's own entry is implicit (the
@@ -1695,8 +1641,6 @@ async fn get_includes(
             node_id: i.node_id,
             title: i.title,
             target: i.target,
-            depth: i.depth,
-            is_canvas: i.is_canvas,
         })
         .collect();
     Ok(Json(entries))
@@ -1711,14 +1655,14 @@ struct SourceFileQuery {
 }
 
 /// Which file Source mode is actually pointed at — `state`'s own document,
-/// always canvas-shaped, or an include target, which is only required to
-/// parse as a canvas itself when it's a *canvas* include (`is_canvas`) —
-/// a plain-Markdown include target is, by definition, ordinary prose with
-/// no `meshfox:canvas` structure to hold it to (see `crate::include`'s own
-/// module docs), so validating it as one would reject perfectly good text.
+/// always canvas-shaped, or an include target, which is never required to
+/// parse as a canvas itself (an include's own content is always dumped in
+/// verbatim, never parsed as meshfox structure — see `crate::include`'s
+/// own module docs), so validating it as one would reject perfectly good
+/// text.
 enum SourceFile {
     Primary,
-    Include { path: PathBuf, is_canvas: bool },
+    Include { path: PathBuf },
 }
 
 /// Resolves `query`'s optional `?include=<nodeId>` to the file Source mode
@@ -1736,10 +1680,7 @@ fn resolve_source_file(state: &AppState, include: Option<&str>) -> Result<Source
     meshfox_core::include::list_includes(&canvas, &state.canvas_path)
         .into_iter()
         .find(|i| i.node_id == include_id)
-        .map(|i| SourceFile::Include {
-            path: i.path,
-            is_canvas: i.is_canvas,
-        })
+        .map(|i| SourceFile::Include { path: i.path })
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no include {include_id:?}")))
 }
 
@@ -1776,13 +1717,7 @@ async fn put_canvas_raw(
     body: String,
 ) -> Result<StatusCode, ApiError> {
     let target = resolve_source_file(&state, query.include.as_deref())?;
-    if !matches!(
-        target,
-        SourceFile::Include {
-            is_canvas: false,
-            ..
-        }
-    ) {
+    if matches!(target, SourceFile::Primary) {
         parse_or_error(&body)?;
     }
     match target {
@@ -1791,7 +1726,7 @@ async fn put_canvas_raw(
                 .save(&body)
                 .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         }
-        SourceFile::Include { path, .. } => {
+        SourceFile::Include { path } => {
             std::fs::write(&path, &body)
                 .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         }
@@ -1812,13 +1747,10 @@ struct LayoutHint {
 /// sort hint for `mdcanvas::reorder_by_position` (see that function's own
 /// doc comment for why it exists): the web UI's own live auto-layout
 /// position for a node it did *not* itself just drag/resize this save (see
-/// `App.tsx`'s `handleSaveLayout`), keyed by that node's own possibly-
-/// namespaced client-visible id — same id space `canvas.nodes[].id`
-/// already uses. Never treated as authored data; `put_canvas` below splits
-/// it into one local-id-keyed map per file (primary vs. each `include`
-/// target) the same way it already does for `canvas.nodes` itself, since
-/// `reorder_by_position` runs once per file and only knows that file's own
-/// local ids.
+/// `App.tsx`'s `handleSaveLayout`), keyed by node id. Never treated as
+/// authored data; `put_canvas` below re-keys it by each node's own local id
+/// (same as `canvas.nodes` itself) before handing it to
+/// `reorder_by_position`.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PutCanvasRequest {
@@ -1842,14 +1774,7 @@ async fn put_canvas(
 ) -> Result<StatusCode, ApiError> {
     let canvas = req.canvas;
     let primary_raw = state.raw.lock().unwrap().clone();
-    // Same routing every other mutating endpoint does (see `locate_node`):
-    // a node here may have been spliced in from an include, in which case
-    // its `meshfox:node` comment lives in a different file entirely.
-    // Batched up per file (rather than one `locate_node`/write per node)
-    // so a drag/resize touching several nodes in the same included canvas
-    // patches that file's raw text incrementally and writes it once.
     let mut primary_out = primary_raw.clone();
-    let mut included_out: HashMap<PathBuf, String> = HashMap::new();
 
     for node in &canvas.nodes {
         // Include nodes never reach the client as such (`get_canvas`
@@ -1860,12 +1785,10 @@ async fn put_canvas(
             continue;
         }
         // A node the client posted back that no longer resolves to
-        // anything (deleted meanwhile, or an include target that can't be
-        // located — e.g. plain-Markdown include content, which has no
-        // `meshfox:node` identity of its own) is skipped rather than
-        // failing the whole batch, same "no-op for what doesn't apply"
-        // tolerance `set_node_meta` returning `None` already had here.
-        let Ok(located) = locate_node(&state, &primary_raw, &node.id) else {
+        // anything (deleted meanwhile) is skipped rather than failing the
+        // whole batch, same "no-op for what doesn't apply" tolerance
+        // `set_node_meta` returning `None` already had here.
+        let Ok(located) = locate_node(&primary_raw, &node.id) else {
             continue;
         };
         // A group's *size* is always derived from its members, never
@@ -1892,72 +1815,32 @@ async fn put_canvas(
             tags: node.tags.clone(),
             created_at: node.created_at.clone(),
         };
-        match &located.origin {
-            None => {
-                if let Some(patched) =
-                    mdcanvas::set_node_meta(&primary_out, &located.local_id, &meta)
-                {
-                    primary_out = patched;
-                }
-            }
-            Some(path) => {
-                let current = included_out
-                    .entry(path.clone())
-                    .or_insert_with(|| located.raw.clone());
-                if let Some(patched) = mdcanvas::set_node_meta(current, &located.local_id, &meta) {
-                    *current = patched;
-                }
-            }
+        if let Some(patched) = mdcanvas::set_node_meta(&primary_out, &located.local_id, &meta) {
+            primary_out = patched;
         }
     }
 
-    // Split the flat, client-namespaced `layout_hints` into one local-id-
-    // keyed map per file — same routing every node in the main loop above
-    // already went through, since `reorder_by_position` runs once per file
-    // and only knows that file's own local ids. A hint naming a node that
-    // no longer resolves to anything is silently dropped, same tolerance
-    // the main loop above already has.
+    // Re-key the flat, client-visible `layout_hints` by each node's own
+    // local id before handing it to `reorder_by_position`. A hint naming a
+    // node that no longer resolves to anything is silently dropped, same
+    // tolerance the main loop above already has.
     let mut primary_hints: HashMap<String, (f64, f64)> = HashMap::new();
-    let mut included_hints: HashMap<PathBuf, HashMap<String, (f64, f64)>> = HashMap::new();
     for (id, hint) in &req.layout_hints {
-        let Ok(located) = locate_node(&state, &primary_raw, id) else {
+        let Ok(located) = locate_node(&primary_raw, id) else {
             continue;
         };
-        match &located.origin {
-            None => {
-                primary_hints.insert(located.local_id, (hint.x, hint.y));
-            }
-            Some(path) => {
-                included_hints
-                    .entry(path.clone())
-                    .or_default()
-                    .insert(located.local_id, (hint.x, hint.y));
-            }
-        }
+        primary_hints.insert(located.local_id, (hint.x, hint.y));
     }
 
     if let Some(reordered) = mdcanvas::reorder_by_position(&primary_out, &primary_hints) {
         primary_out = reordered;
     }
-    for (path, raw) in included_out.iter_mut() {
-        let hints = included_hints.get(path).cloned().unwrap_or_default();
-        if let Some(reordered) = mdcanvas::reorder_by_position(raw, &hints) {
-            *raw = reordered;
-        }
-    }
 
     parse_or_error(&primary_out)?;
-    for raw in included_out.values() {
-        parse_or_error(raw)?;
-    }
 
     state
         .save(&primary_out)
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    for (path, raw) in &included_out {
-        std::fs::write(path, raw)
-            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1981,7 +1864,7 @@ async fn put_canvas(
 /// fully revert a group to synthetic placement too, not leave a stale
 /// dragged anchor behind. Unlike `put_canvas` (which only ever sees the
 /// *resolved* canvas, where an `include` node has already been rewritten to
-/// `text`/`group` by `include::resolve`), this reads straight off the raw,
+/// `text` by `include::resolve`), this reads straight off the raw,
 /// unresolved parse — here, an `include` node is still the node that
 /// *declares* the include right in this file, with its own real
 /// `meshfox:node` comment (position and all), so it must be cleared exactly
@@ -2048,7 +1931,7 @@ async fn clear_node_layout(
     Path(id): Path<String>,
 ) -> Result<Json<Canvas>, ApiError> {
     let primary_raw = state.raw.lock().unwrap().clone();
-    let located = locate_node(&state, &primary_raw, &id)?;
+    let located = locate_node(&primary_raw, &id)?;
     let canvas = parse_or_error(&located.raw)?;
     let node = canvas
         .node(&located.local_id)
@@ -2136,7 +2019,7 @@ async fn create_node(
     // adding a child under something inside an included canvas) — locate
     // it first so the new node is actually written into the file the
     // parent lives in, same as editing an existing node there already is.
-    let located = locate_node(&state, &primary_raw, &req.parent_id)?;
+    let located = locate_node(&primary_raw, &req.parent_id)?;
     let insert = if req.title_slug_id {
         mdcanvas::insert_child_node
     } else {
@@ -2347,20 +2230,13 @@ async fn update_node(
     Json(req): Json<UpdateNodeRequest>,
 ) -> Result<Json<Canvas>, ApiError> {
     let primary_raw = state.raw.lock().unwrap().clone();
-    // `id` may name a node spliced in from an include — route the whole
-    // edit to the file it actually lives in (see `locate_node`) instead
-    // of always patching `state`'s own document.
-    let located = locate_node(&state, &primary_raw, &id)?;
+    let located = locate_node(&primary_raw, &id)?;
     let mut raw = located.raw.clone();
     let local_id = located.local_id.clone();
 
     // A `from=` in `extraParents` names another node the same way `id`
-    // itself was named — the composed/possibly-namespaced id the UI
-    // showed it as — so it needs the same translation before it can be
-    // written into `local_id`'s own file, and can only ever name a node
-    // in that *same* file (an edge can't cross an include boundary: a
-    // `meshfox:edge from="..."` is only ever resolved against its own
-    // document's own id set — see `mdcanvas::parse`).
+    // itself was named — just confirms it actually resolves before it's
+    // written into a `meshfox:edge from="..."` line.
     let extra_parents_local = req
         .extra_parents
         .as_ref()
@@ -2368,17 +2244,7 @@ async fn update_node(
             edges
                 .iter()
                 .map(|e| {
-                    let from_located = locate_node(&state, &primary_raw, &e.from)?;
-                    if from_located.origin != located.origin {
-                        return Err(ApiError(
-                            StatusCode::UNPROCESSABLE_ENTITY,
-                            format!(
-                                "can't add an edge from {:?} to {id:?} — they live in different \
-                                 files (an edge can't cross an include boundary)",
-                                e.from
-                            ),
-                        ));
-                    }
+                    let from_located = locate_node(&primary_raw, &e.from)?;
                     Ok(ExtraEdge {
                         from: from_located.local_id,
                         ..e.clone()
@@ -2661,7 +2527,7 @@ async fn update_block_attrs(
         .map(meshfox_core::parse_env_list);
 
     let primary_raw = state.raw.lock().unwrap().clone();
-    let located = locate_node(&state, &primary_raw, &id)?;
+    let located = locate_node(&primary_raw, &id)?;
     let not_found = || {
         ApiError(
             StatusCode::NOT_FOUND,
@@ -2776,7 +2642,7 @@ async fn get_node_file_content(
     Path(id): Path<String>,
 ) -> Result<Json<FileContentResponse>, ApiError> {
     let primary_raw = state.raw.lock().unwrap().clone();
-    let located = locate_node(&state, &primary_raw, &id)?;
+    let located = locate_node(&primary_raw, &id)?;
     let canvas = parse_or_error(&located.raw)?;
     let node = canvas
         .node(&located.local_id)
@@ -2794,7 +2660,7 @@ async fn get_node_file_content(
         )
     })?;
 
-    let canvas_path = located.origin.as_deref().unwrap_or(&state.canvas_path);
+    let canvas_path = &state.canvas_path;
     let canvas_dir = canvas_root_dir(canvas_path);
     let preview = meshfox_core::preview(canvas_dir, target).map_err(|e| match e {
         meshfox_core::PreviewError::Confine(meshfox_core::ConfineError::DirNotFound(_, e)) => {
@@ -2930,7 +2796,7 @@ async fn run_file_node(
 /// seize a terminal for.
 async fn run_file_node_impl(state: Arc<AppState>, id: String) -> Result<Response, ApiError> {
     let primary_raw = state.raw.lock().unwrap().clone();
-    let located = locate_node(&state, &primary_raw, &id)?;
+    let located = locate_node(&primary_raw, &id)?;
     let canvas = parse_or_error(&located.raw)?;
     let node = canvas
         .node(&located.local_id)
@@ -2953,7 +2819,7 @@ async fn run_file_node_impl(state: Arc<AppState>, id: String) -> Result<Response
             )
         })?;
     let target = node.target.as_deref().expect("checked by is_runnable_file");
-    let canvas_path = located.origin.as_deref().unwrap_or(&state.canvas_path);
+    let canvas_path = &state.canvas_path;
     let resolved_path = resolve_confined_target(canvas_path, target)?;
     // Same file `canvas_path` above already resolved to (the primary
     // document, or the `include` target this node actually lives in) —
@@ -3052,7 +2918,7 @@ async fn open_node_file(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let primary_raw = state.raw.lock().unwrap().clone();
-    let located = locate_node(&state, &primary_raw, &id)?;
+    let located = locate_node(&primary_raw, &id)?;
     let canvas = parse_or_error(&located.raw)?;
     let node = canvas
         .node(&located.local_id)
@@ -3070,7 +2936,7 @@ async fn open_node_file(
         )
     })?;
     let (target_path, fragment) = meshfox_core::mdcanvas::split_target_fragment(target);
-    let canvas_path = located.origin.as_deref().unwrap_or(&state.canvas_path);
+    let canvas_path = &state.canvas_path;
     let resolved = resolve_confined_target(canvas_path, target_path)?;
 
     let socket = state.watcher_socket.as_deref().ok_or_else(|| {
@@ -3117,7 +2983,7 @@ async fn open_node_file_folder(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let primary_raw = state.raw.lock().unwrap().clone();
-    let located = locate_node(&state, &primary_raw, &id)?;
+    let located = locate_node(&primary_raw, &id)?;
     let canvas = parse_or_error(&located.raw)?;
     let node = canvas
         .node(&located.local_id)
@@ -3135,7 +3001,7 @@ async fn open_node_file_folder(
         )
     })?;
     let (target_path, _fragment) = meshfox_core::mdcanvas::split_target_fragment(target);
-    let canvas_path = located.origin.as_deref().unwrap_or(&state.canvas_path);
+    let canvas_path = &state.canvas_path;
     let resolved = resolve_confined_target(canvas_path, target_path)?;
     let folder = resolved.parent().ok_or_else(|| {
         ApiError(
@@ -3188,7 +3054,7 @@ async fn remove_node(
     Query(query): Query<DeleteNodeQuery>,
 ) -> Result<Json<Canvas>, ApiError> {
     let primary_raw = state.raw.lock().unwrap().clone();
-    let located = locate_node(&state, &primary_raw, &id)?;
+    let located = locate_node(&primary_raw, &id)?;
     let local_id = &located.local_id;
     let canvas = parse_or_error(&located.raw)?;
     let node = canvas
@@ -3242,23 +3108,8 @@ async fn reparent_node(
     Json(req): Json<ReparentNodeRequest>,
 ) -> Result<Json<Canvas>, ApiError> {
     let primary_raw = state.raw.lock().unwrap().clone();
-    let located = locate_node(&state, &primary_raw, &id)?;
-    let located_parent = locate_node(&state, &primary_raw, &req.new_parent_id)?;
-    // In practice this can't actually happen — an extra-parent `from=` is
-    // only ever resolved against its own document's own id set (see
-    // `update_node`'s same check), so `id`'s declared extra parents can
-    // never point outside whichever file `id` itself lives in. Checked
-    // anyway, defensively, rather than relying on that invariant holding.
-    if located.origin != located_parent.origin {
-        return Err(ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!(
-                "can't reparent {id:?} onto {:?} — they live in different files \
-                 (reparenting across an include boundary isn't supported)",
-                req.new_parent_id
-            ),
-        ));
-    }
+    let located = locate_node(&primary_raw, &id)?;
+    let located_parent = locate_node(&primary_raw, &req.new_parent_id)?;
     let raw = located.raw.clone();
     let local_id = &located.local_id;
     let local_parent_id = &located_parent.local_id;
@@ -3391,21 +3242,8 @@ async fn move_sibling(
     };
 
     let primary_raw = state.raw.lock().unwrap().clone();
-    let located = locate_node(&state, &primary_raw, &id)?;
-    let located_target = locate_node(&state, &primary_raw, &target_id)?;
-    // Same defensive check `reparent_node` makes: in practice this can't
-    // actually happen, since `mdcanvas::move_sibling` requires the two
-    // ids to share a structural parent, and a parent/child relationship
-    // never crosses an include boundary — checked anyway rather than
-    // relying on that invariant holding.
-    if located.origin != located_target.origin {
-        return Err(ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!(
-                "can't move {id:?} relative to {target_id:?} — they live in different files"
-            ),
-        ));
-    }
+    let located = locate_node(&primary_raw, &id)?;
+    let located_target = locate_node(&primary_raw, &target_id)?;
 
     let updated = mdcanvas::move_sibling(
         &located.raw,
@@ -3469,7 +3307,7 @@ async fn rename_node_id(
     Json(req): Json<RenameNodeIdRequest>,
 ) -> Result<Json<Canvas>, ApiError> {
     let primary_raw = state.raw.lock().unwrap().clone();
-    let located = locate_node(&state, &primary_raw, &id)?;
+    let located = locate_node(&primary_raw, &id)?;
     // `req.newId` is a fresh id being assigned, not a reference to an
     // existing (possibly-namespaced) one — used verbatim as the new local
     // id in whichever file `id` lives in; `include::resolve` re-derives
@@ -3501,10 +3339,8 @@ struct ClearNodeIdResponse {
     /// usually unchanged in practice (an untouched auto-generated id is
     /// already `slug(title)`, so there's nothing to rename, just the now-
     /// redundant attribute to drop), but potentially a freshly-derived
-    /// slug if the title's since diverged. Composed with its include
-    /// namespace already, same shape as every id in `canvas` — the client
-    /// has no other way to learn it, since it isn't necessarily the id it
-    /// asked to clear.
+    /// slug if the title's since diverged — the client has no other way to
+    /// learn it, since it isn't necessarily the id it asked to clear.
     id: String,
     canvas: Canvas,
 }
@@ -3521,7 +3357,7 @@ async fn clear_node_id(
     Path(id): Path<String>,
 ) -> Result<Json<ClearNodeIdResponse>, ApiError> {
     let primary_raw = state.raw.lock().unwrap().clone();
-    let located = locate_node(&state, &primary_raw, &id)?;
+    let located = locate_node(&primary_raw, &id)?;
     let (updated, local_new_id) = mdcanvas::clear_node_id(&located.raw, &located.local_id)
         .map_err(|e| ApiError(StatusCode::NOT_FOUND, e.to_string()))?;
     parse_or_error(&updated)?;
@@ -3530,19 +3366,7 @@ async fn clear_node_id(
     commit_located(&state, &located, &updated, ServerEvent::Changed)?;
     let response_raw = state.raw.lock().unwrap().clone();
     let Json(canvas) = canvas_response(&response_raw, &state.canvas_path)?;
-    let new_id = match &located.origin {
-        None => local_new_id,
-        Some(origin) => canvas
-            .nodes
-            .iter()
-            .find(|n| {
-                n.origin_id.as_deref() == Some(local_new_id.as_str())
-                    && n.origin_path.as_deref() == origin.to_str()
-            })
-            .map(|n| n.id.clone())
-            .unwrap_or(local_new_id),
-    };
-    Ok(Json(ClearNodeIdResponse { id: new_id, canvas }))
+    Ok(Json(ClearNodeIdResponse { id: local_new_id, canvas }))
 }
 
 /// Query params for `run_block`'s own `GET /api/run` WebSocket upgrade —
@@ -3666,10 +3490,9 @@ struct ForceRunWsQuery {
 /// ever opened).
 async fn force_run_kill_prep(state: &AppState, force: &ForceTarget) -> Result<(), ApiError> {
     let raw_snapshot = state.raw.lock().unwrap().clone();
-    let located = locate_node(state, &raw_snapshot, &force.node_id)?;
-    let canvas_path_for_target = located.origin.unwrap_or_else(|| state.canvas_path.clone());
+    locate_node(&raw_snapshot, &force.node_id)?;
     let lock_path =
-        meshfox_core::service_lock_path(&canvas_path_for_target, &force.node_id, &force.block);
+        meshfox_core::service_lock_path(&state.canvas_path, &force.node_id, &force.block);
     // Snapshot the stale owner's own descendants *before* killing it — see
     // `services::kill_orphaned_descendants`'s own doc comment: a tool that
     // daemonizes internally (forks, then the fork `setsid`s into its own
@@ -3971,40 +3794,34 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
                 .get(&None)
                 .cloned()
                 .unwrap_or_else(|| state.raw.lock().unwrap().clone());
-            let mut located = match locate_node(&state, &primary_raw_now, &addr.node_id) {
+            let located = match locate_node(&primary_raw_now, &addr.node_id) {
                 Ok(l) => l,
                 Err(e) => {
                     yield Ok(ndjson_line(&RunEvent::Error { message: e.1 }));
                     break;
                 }
             };
-            // An earlier step in *this* chain may have already patched
-            // this exact file's own cache (below) — `locate_node` itself
-            // has no way to know that (it always reads a non-primary
-            // file fresh off disk), so override with this run's own copy
-            // when there is one, same reasoning `raw` alone used to
-            // carry across iterations before per-file tracking existed.
-            if let Some(cached) = file_raws.get(&located.origin) {
-                located.raw = cached.clone();
-            }
 
-            // Re-parse so an earlier step's freshly-patched cache (above)
-            // is visible before this one runs — same reasoning `meshfox
-            // run`'s CLI loop already has.
-            let node_text = match Canvas::from_markdown(&located.raw)
-                .ok()
-                .and_then(|c| c.node(&located.local_id).map(|n| n.text.clone()))
-            {
-                Some(text) => text,
-                None => {
-                    yield Ok(ndjson_line(&RunEvent::Error {
-                        message: format!("node {:?} not found", addr.node_id),
-                    }));
-                    break;
-                }
+            // Re-parse (include-resolved, so a block living inside an
+            // `include` node's own dumped body is visible too — see
+            // `Node::cwd`) so an earlier step's freshly-patched cache
+            // (above) is visible before this one runs — same reasoning
+            // `meshfox run`'s CLI loop already has.
+            let Ok(step_canvas) = resolved_canvas(&located.raw, &state.canvas_path) else {
+                yield Ok(ndjson_line(&RunEvent::Error {
+                    message: format!("node {:?} not found", addr.node_id),
+                }));
+                break;
             };
-            let canvas_path_for_step = located.origin.as_deref().unwrap_or(&state.canvas_path);
-            let cwd = canvas_root_dir(canvas_path_for_step).to_path_buf();
+            let Some(step_node) = step_canvas.node(&addr.node_id) else {
+                yield Ok(ndjson_line(&RunEvent::Error {
+                    message: format!("node {:?} not found", addr.node_id),
+                }));
+                break;
+            };
+            let node_text = step_node.text.clone();
+            let canvas_path_for_step = &state.canvas_path;
+            let cwd = step_node.cwd(canvas_root_dir(canvas_path_for_step));
             let Some(block) = meshfox_core::scan_runnable_blocks(&addr.node_id, &node_text)
                 .into_iter()
                 .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()))
@@ -4356,7 +4173,16 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
                 }
             }
 
-            if persist && block.cache {
+            // Never persisted for a block living inside an `include` node's
+            // own dumped body — that node's real, on-disk body is just the
+            // bare link `include::resolve` dumped this text *over*, so
+            // writing a cache comment back into `step_node.text` and
+            // patching the *link's own* body with it would clobber the
+            // link outright (same reason `update_node` rejects a direct
+            // text edit on one of these). The run still streams its output
+            // live either way — this only skips the `meshfox:output`
+            // write-back.
+            if persist && block.cache && !step_node.plain_markdown_include {
                 let result = ExecOutput {
                     exit_code,
                     output: full_output.clone(),
@@ -4366,7 +4192,7 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
                 };
                 if let Some(updated) = meshfox_core::write_output(&node_text, &addr.block_name, &result) {
                     if let Some(patched) = mdcanvas::set_node_body(&located.raw, &located.local_id, &updated) {
-                        file_raws.insert(located.origin.clone(), patched);
+                        file_raws.insert(None, patched);
                     }
                 }
             }
@@ -4389,18 +4215,11 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
 
         // Persist whatever completed, even if the chain was killed partway
         // through — a step that had already finished and been folded into
-        // `file_raws` (above) shouldn't lose its freshly-cached output
-        // just because a *later* step in the same chain got killed. Every
-        // touched file is persisted, not just the primary one — a step
-        // that lives in an `include` target writes straight to that
-        // file's own path (mirrors `commit_located`).
+        // `file_raws` (above) shouldn't lose its freshly-cached output just
+        // because a *later* step in the same chain got killed.
         if persist {
-            for (origin, content) in file_raws {
-                let result = match &origin {
-                    None => state.save(&content),
-                    Some(path) => std::fs::write(path, &content),
-                };
-                if let Err(e) = result {
+            if let Some(content) = file_raws.remove(&None) {
+                if let Err(e) = state.save(&content) {
                     yield Ok(ndjson_line(&RunEvent::Error { message: e.to_string() }));
                 }
             }
@@ -5116,38 +4935,42 @@ async fn run_tty_chain(
             .get(&None)
             .cloned()
             .unwrap_or_else(|| state.raw.lock().unwrap().clone());
-        let mut located = match locate_node(&state, &primary_raw_now, &addr.node_id) {
+        let located = match locate_node(&primary_raw_now, &addr.node_id) {
             Ok(l) => l,
             Err(e) => {
                 send_event(&mut socket, &RunEvent::Error { message: e.1 }).await;
                 break;
             }
         };
-        if let Some(cached) = file_raws.get(&located.origin) {
-            located.raw = cached.clone();
-        }
 
-        // Re-parse so an earlier step's freshly-patched cache (above) is
-        // visible before this one runs — same reasoning `run_block`
+        // Re-parse (include-resolved, so a block living inside an
+        // `include` node's own dumped body is visible too — see
+        // `Node::cwd`) so an earlier step's freshly-patched cache (above)
+        // is visible before this one runs — same reasoning `run_block`
         // already has.
-        let node_text = match Canvas::from_markdown(&located.raw)
-            .ok()
-            .and_then(|c| c.node(&located.local_id).map(|n| n.text.clone()))
-        {
-            Some(text) => text,
-            None => {
-                send_event(
-                    &mut socket,
-                    &RunEvent::Error {
-                        message: format!("node {:?} not found", addr.node_id),
-                    },
-                )
-                .await;
-                break;
-            }
+        let Ok(step_canvas) = resolved_canvas(&located.raw, &state.canvas_path) else {
+            send_event(
+                &mut socket,
+                &RunEvent::Error {
+                    message: format!("node {:?} not found", addr.node_id),
+                },
+            )
+            .await;
+            break;
         };
-        let canvas_path_for_step = located.origin.as_deref().unwrap_or(&state.canvas_path);
-        let cwd = canvas_root_dir(canvas_path_for_step).to_path_buf();
+        let Some(step_node) = step_canvas.node(&addr.node_id) else {
+            send_event(
+                &mut socket,
+                &RunEvent::Error {
+                    message: format!("node {:?} not found", addr.node_id),
+                },
+            )
+            .await;
+            break;
+        };
+        let node_text = step_node.text.clone();
+        let canvas_path_for_step = &state.canvas_path;
+        let cwd = step_node.cwd(canvas_root_dir(canvas_path_for_step));
         let Some(block) = meshfox_core::scan_runnable_blocks(&addr.node_id, &node_text)
             .into_iter()
             .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()))
@@ -5457,7 +5280,9 @@ async fn run_tty_chain(
         // error) — `!block.tty` here is belt-and-suspenders against ever
         // writing a `tty` step's (empty) `full_output` into the file for a
         // document that reached this endpoint without being validated.
-        if persist && block.cache && !block.tty {
+        // Never persisted for a block living inside an `include` node's own
+        // dumped body — see the HTTP chain loop's own identical guard.
+        if persist && block.cache && !block.tty && !step_node.plain_markdown_include {
             let result = ExecOutput {
                 exit_code,
                 output: full_output.clone(),
@@ -5468,7 +5293,7 @@ async fn run_tty_chain(
             if let Some(updated) = meshfox_core::write_output(&node_text, &addr.block_name, &result)
             {
                 if let Some(patched) = mdcanvas::set_node_body(&located.raw, &located.local_id, &updated) {
-                    file_raws.insert(located.origin.clone(), patched);
+                    file_raws.insert(None, patched);
                 }
             }
         }
@@ -5490,12 +5315,8 @@ async fn run_tty_chain(
     }
 
     if persist {
-        for (origin, content) in file_raws {
-            let result = match &origin {
-                None => state.save(&content),
-                Some(path) => std::fs::write(path, &content),
-            };
-            if let Err(e) = result {
+        if let Some(content) = file_raws.remove(&None) {
+            if let Err(e) = state.save(&content) {
                 send_event(
                     &mut socket,
                     &RunEvent::Error {
@@ -6107,13 +5928,13 @@ async fn force_start_service(
         resolved.values
     };
 
-    let located = locate_node(&state, &raw_snapshot, &target.node_id)?;
-    let node_text = Canvas::from_markdown(&located.raw)
-        .ok()
-        .and_then(|c| c.node(&located.local_id).map(|n| n.text.clone()))
+    let located = locate_node(&raw_snapshot, &target.node_id)?;
+    let step_canvas = resolved_canvas(&located.raw, &state.canvas_path)?;
+    let step_node = step_canvas
+        .node(&target.node_id)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("node {:?} not found", target.node_id)))?;
-    let canvas_path_for_step = located.origin.clone().unwrap_or_else(|| state.canvas_path.clone());
-    let cwd = canvas_root_dir(&canvas_path_for_step).to_path_buf();
+    let node_text = step_node.text.clone();
+    let cwd = step_node.cwd(canvas_root_dir(&state.canvas_path));
     let block = meshfox_core::scan_runnable_blocks(&target.node_id, &node_text)
         .into_iter()
         .find(|b| b.name.as_deref() == Some(target.block_name.as_str()))
@@ -6137,7 +5958,7 @@ async fn force_start_service(
     }
 
     let lock_path =
-        meshfox_core::service_lock_path(&canvas_path_for_step, &target.node_id, &target.block_name);
+        meshfox_core::service_lock_path(&state.canvas_path, &target.node_id, &target.block_name);
     // Whole-process-group `SIGKILL` on whatever pid the lock file names
     // (even one this process has no live `ServiceHandle` for), release,
     // reacquire — a no-op straight to acquiring if the lock's already
@@ -6154,7 +5975,7 @@ async fn force_start_service(
         resolved_block,
         block_env,
         cwd,
-        canvas_path_for_step,
+        state.canvas_path.clone(),
         "webui",
     )
     .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -7916,13 +7737,6 @@ mod include_edit_tests {
         }
     }
 
-    fn expect_ok_create(result: Result<Json<CreateNodeResponse>, ApiError>) -> Canvas {
-        match result {
-            Ok(Json(response)) => response.canvas,
-            Err(e) => panic!("request failed: {}", e.1),
-        }
-    }
-
     fn expect_err(result: Result<Json<Canvas>, ApiError>) -> ApiError {
         match result {
             Ok(_) => panic!("expected an error"),
@@ -7930,9 +7744,10 @@ mod include_edit_tests {
         }
     }
 
-    /// A primary `base.canvas.md` including `child.canvas.md` (namespaced
-    /// `child/root`/`child/leaf` once resolved), in a fresh temp dir shared
-    /// by both files — returns the primary document's own path.
+    /// A primary `base.canvas.md` including `child.canvas.md` (dumped in as
+    /// the `child` node's own body text once resolved — see
+    /// `crate::include`), in a fresh temp dir shared by both files — returns
+    /// the primary document's own path.
     fn write_base_and_child_canvas() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "meshfox-include-edit-test-{}",
@@ -7979,234 +7794,6 @@ mod include_edit_tests {
         "## B\n<!-- meshfox:node id=\"b\" -->\n\nbody b\n",
     );
 
-    #[tokio::test]
-    async fn update_node_edits_an_included_nodes_own_file_not_the_primary_one() {
-        let base_path = write_base_and_child_canvas();
-        let child_path = base_path.parent().unwrap().join("child.canvas.md");
-        let base_before = std::fs::read_to_string(&base_path).unwrap();
-        let state = build_state(base_path.clone(), false, None)
-            .await
-            .expect("valid test canvas");
-
-        let mut req = blank_update_request();
-        req.text = Some("new leaf body".to_string());
-        let updated =
-            expect_ok(update_node(State(state), Path("child/leaf".to_string()), Json(req)).await);
-
-        let leaf = updated
-            .node("child/leaf")
-            .expect("child/leaf still present");
-        assert_eq!(leaf.text, "new leaf body");
-        // The primary document itself is untouched — the edit landed in
-        // `child.canvas.md`, addressed there by its own local id `leaf`.
-        assert_eq!(std::fs::read_to_string(&base_path).unwrap(), base_before);
-        assert!(std::fs::read_to_string(&child_path)
-            .unwrap()
-            .contains("new leaf body"));
-
-        let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
-    }
-
-    #[tokio::test]
-    async fn create_node_under_an_included_parent_writes_into_the_included_file() {
-        let base_path = write_base_and_child_canvas();
-        let child_path = base_path.parent().unwrap().join("child.canvas.md");
-        let state = build_state(base_path.clone(), false, None)
-            .await
-            .expect("valid test canvas");
-
-        let updated = expect_ok_create(
-            create_node(
-                State(state),
-                Json(CreateNodeRequest {
-                    parent_id: "child/root".to_string(),
-                    title: "New Kid".to_string(),
-                    title_slug_id: false,
-                }),
-            )
-            .await,
-        );
-
-        let new_node = updated
-            .nodes
-            .iter()
-            .find(|n| n.title == "New Kid")
-            .expect("new node present in the response");
-        assert_eq!(new_node.parent.as_deref(), Some("child/root"));
-        assert!(std::fs::read_to_string(&child_path)
-            .unwrap()
-            .contains("New Kid"));
-
-        let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
-    }
-
-    #[tokio::test]
-    async fn remove_node_deletes_from_the_included_file_and_leaves_the_primary_document_alone() {
-        let base_path = write_base_and_child_canvas();
-        let child_path = base_path.parent().unwrap().join("child.canvas.md");
-        let base_before = std::fs::read_to_string(&base_path).unwrap();
-        let state = build_state(base_path.clone(), false, None)
-            .await
-            .expect("valid test canvas");
-
-        let updated = expect_ok(
-            remove_node(
-                State(state),
-                Path("child/leaf".to_string()),
-                Query(DeleteNodeQuery { children: None }),
-            )
-            .await,
-        );
-
-        assert!(updated.node("child/leaf").is_none());
-        assert_eq!(std::fs::read_to_string(&base_path).unwrap(), base_before);
-        assert!(!std::fs::read_to_string(&child_path)
-            .unwrap()
-            .contains("Leaf"));
-
-        let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
-    }
-
-    #[tokio::test]
-    async fn rename_node_id_renames_within_the_included_file() {
-        let base_path = write_base_and_child_canvas();
-        let state = build_state(base_path.clone(), false, None)
-            .await
-            .expect("valid test canvas");
-
-        let updated = expect_ok(
-            rename_node_id(
-                State(state),
-                Path("child/leaf".to_string()),
-                Json(RenameNodeIdRequest {
-                    new_id: "renamed-leaf".to_string(),
-                }),
-            )
-            .await,
-        );
-
-        assert!(updated.node("child/leaf").is_none());
-        let renamed = updated
-            .node("child/renamed-leaf")
-            .expect("renamed node present under its new namespaced id");
-        assert_eq!(renamed.title, "Leaf");
-
-        let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
-    }
-
-    #[tokio::test]
-    async fn move_sibling_resolves_within_the_included_file() {
-        // `write_base_and_child_canvas`'s child only has one child of its
-        // own ("leaf") — not enough siblings to move anything relative to.
-        // Give it a second one first via the ordinary create-node path.
-        let base_path = write_base_and_child_canvas();
-        let child_path = base_path.parent().unwrap().join("child.canvas.md");
-        let state = build_state(base_path.clone(), false, None)
-            .await
-            .expect("valid test canvas");
-
-        let created = expect_ok_create(
-            create_node(
-                State(state.clone()),
-                Json(CreateNodeRequest {
-                    parent_id: "child/root".to_string(),
-                    title: "Second Leaf".to_string(),
-                    title_slug_id: false,
-                }),
-            )
-            .await,
-        );
-        // `create_node` assigns a random id, not a slug of the title (see
-        // `insert_child_node_random_id`) — look it up by title instead of
-        // assuming "child/second-leaf".
-        let second_leaf_id = created
-            .nodes
-            .iter()
-            .find(|n| n.title == "Second Leaf")
-            .expect("new node present in the response")
-            .id
-            .clone();
-
-        let updated = expect_ok(
-            move_sibling(
-                State(state),
-                Path(second_leaf_id.clone()),
-                Json(MoveSiblingRequest {
-                    before: Some("child/leaf".to_string()),
-                    after: None,
-                }),
-            )
-            .await,
-        );
-
-        let root = updated.node("child/root").expect("child/root present");
-        let order: Vec<&str> = updated
-            .nodes
-            .iter()
-            .filter(|n| n.parent.as_deref() == Some(&root.id))
-            .map(|n| n.id.as_str())
-            .collect();
-        assert_eq!(order, vec![second_leaf_id.as_str(), "child/leaf"]);
-        // The move landed in the include target's own file, not the
-        // primary document — same "writes into the include target, not
-        // base.canvas.md" contract every other mutating endpoint here
-        // already has — with the reordering visible in its raw heading
-        // order too, not just the resolved response.
-        let local_id = second_leaf_id.strip_prefix("child/").unwrap();
-        let child_raw = std::fs::read_to_string(&child_path).unwrap();
-        assert!(
-            child_raw.find(&format!("id=\"{local_id}\"")).unwrap() < child_raw.find("id=\"leaf\"").unwrap()
-        );
-
-        let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
-    }
-
-    #[tokio::test]
-    async fn clear_node_layout_resolves_within_the_included_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "meshfox-clear-node-layout-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let child_path = dir.join("child.canvas.md");
-        std::fs::write(
-            &child_path,
-            concat!(
-                "<!-- meshfox:canvas -->\n# Child\n<!-- meshfox:node id=\"root\" -->\n\nintro\n\n",
-                "## Leaf\n<!-- meshfox:node id=\"leaf\" x=50 y=60 w=100 h=60 -->\n\nleaf body\n",
-            ),
-        )
-        .unwrap();
-        let base_path = dir.join("base.canvas.md");
-        std::fs::write(
-            &base_path,
-            concat!(
-                "<!-- meshfox:canvas -->\n# Base\n<!-- meshfox:node id=\"base\" -->\n\n",
-                "## Child\n<!-- meshfox:node id=\"child\" type=\"include\" -->\n\n[child](./child.canvas.md)\n",
-            ),
-        )
-        .unwrap();
-        let base_before = std::fs::read_to_string(&base_path).unwrap();
-        let state = build_state(base_path.clone(), false, None)
-            .await
-            .expect("valid test canvas");
-
-        let Json(updated) =
-            match clear_node_layout(State(state), Path("child/leaf".to_string())).await {
-                Ok(json) => json,
-                Err(e) => panic!("clear-layout failed: {}", e.1),
-            };
-        let leaf = updated.node("child/leaf").expect("child/leaf present");
-        assert_eq!(leaf.x, None);
-        assert_eq!(leaf.y, None);
-        // Landed in the include target's own file, not the primary
-        // document — same contract every other mutating endpoint here has.
-        assert_eq!(std::fs::read_to_string(&base_path).unwrap(), base_before);
-        assert!(!std::fs::read_to_string(&child_path).unwrap().contains("x=50"));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     fn expect_ok_clear(result: Result<Json<ClearNodeIdResponse>, ApiError>) -> ClearNodeIdResponse {
         match result {
             Ok(Json(body)) => body,
@@ -8233,40 +7820,16 @@ mod include_edit_tests {
     }
 
     #[tokio::test]
-    async fn clear_node_id_resolves_within_the_included_file_and_reports_the_namespaced_id() {
-        let base_path = write_base_and_child_canvas();
-        let child_path = base_path.parent().unwrap().join("child.canvas.md");
-        let state = build_state(base_path.clone(), false, None)
-            .await
-            .expect("valid test canvas");
-
-        // "leaf"'s id is already `slugify("Leaf")` — clearing it should be
-        // a no-op rename, just dropping the now-redundant attribute, still
-        // reachable under the same namespaced id afterward.
-        let body = expect_ok_clear(clear_node_id(State(state), Path("child/leaf".to_string())).await);
-
-        assert_eq!(body.id, "child/leaf");
-        assert!(body.canvas.node("child/leaf").is_some());
-        assert!(!std::fs::read_to_string(&child_path).unwrap().contains(r#"id="leaf""#));
-        // The primary document itself is untouched — same "writes into the
-        // include target, not base.canvas.md" contract every other
-        // mutating endpoint here already has.
-        assert!(!std::fs::read_to_string(&base_path).unwrap().contains("leaf"));
-
-        let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
-    }
-
-    #[tokio::test]
     async fn clear_node_id_rederives_from_the_title_when_the_id_had_diverged() {
-        let base_path = write_base_and_child_canvas();
-        let state = build_state(base_path.clone(), false, None)
+        let canvas_path = write_simple_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None)
             .await
             .expect("valid test canvas");
 
         expect_ok(
             rename_node_id(
                 State(state.clone()),
-                Path("child/leaf".to_string()),
+                Path("a".to_string()),
                 Json(RenameNodeIdRequest {
                     new_id: "custom-id".to_string(),
                 }),
@@ -8274,14 +7837,13 @@ mod include_edit_tests {
             .await,
         );
 
-        let body =
-            expect_ok_clear(clear_node_id(State(state), Path("child/custom-id".to_string())).await);
+        let body = expect_ok_clear(clear_node_id(State(state), Path("custom-id".to_string())).await);
 
-        assert_eq!(body.id, "child/leaf");
-        assert!(body.canvas.node("child/leaf").is_some());
-        assert!(body.canvas.node("child/custom-id").is_none());
+        assert_eq!(body.id, "a");
+        assert!(body.canvas.node("a").is_some());
+        assert!(body.canvas.node("custom-id").is_none());
 
-        let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
+        let _ = std::fs::remove_file(&canvas_path);
     }
 
     #[tokio::test]
@@ -8516,38 +8078,6 @@ mod include_edit_tests {
         let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
     }
 
-    #[tokio::test]
-    async fn put_canvas_persists_a_dragged_included_nodes_position_into_its_own_file() {
-        let base_path = write_base_and_child_canvas();
-        let child_path = base_path.parent().unwrap().join("child.canvas.md");
-        let base_before = std::fs::read_to_string(&base_path).unwrap();
-        let state = build_state(base_path.clone(), false, None)
-            .await
-            .expect("valid test canvas");
-
-        let primary_raw = state.raw.lock().unwrap().clone();
-        let mut canvas = resolved_canvas(&primary_raw, &state.canvas_path)
-            .unwrap_or_else(|e| panic!("resolve failed: {}", e.1));
-        canvas.node_mut("child/leaf").expect("child/leaf present").x = Some(123.0);
-        canvas.node_mut("child/leaf").expect("child/leaf present").y = Some(456.0);
-
-        let status = put_canvas(State(state), Json(PutCanvasRequest { canvas, layout_hints: HashMap::new() }))
-            .await
-            .unwrap_or_else(|e| panic!("put_canvas failed: {}", e.1));
-        assert_eq!(status, StatusCode::NO_CONTENT);
-
-        // The primary document is untouched — the position landed in
-        // `child.canvas.md`, addressed there by its own local id `leaf`.
-        assert_eq!(std::fs::read_to_string(&base_path).unwrap(), base_before);
-        let child_after = std::fs::read_to_string(&child_path).unwrap();
-        assert!(
-            child_after.contains("id=\"leaf\" x=123 y=456"),
-            "child file: {child_after}"
-        );
-
-        let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
-    }
-
     // TODO.canvas.md: "Одна перетащенная нода становится первой в списке" —
     // `layout_hints` lets `put_canvas` slot a freshly-positioned node in
     // among its still-unpositioned siblings by where the client's own
@@ -8602,67 +8132,6 @@ mod include_edit_tests {
         let _ = std::fs::remove_file(&canvas_path);
     }
 
-    // Same mechanism as the primary-document test above, but for a node
-    // living inside an `include` target — `put_canvas` has to split the
-    // flat, client-namespaced `layout_hints` map into one *local*-id-keyed
-    // map per file before handing it to that file's own
-    // `reorder_by_position` call, the same routing `canvas.nodes` itself
-    // already goes through.
-    #[tokio::test]
-    async fn put_canvas_layout_hints_are_routed_to_the_right_included_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "meshfox-layout-hints-include-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("child.canvas.md"),
-            concat!(
-                "<!-- meshfox:canvas -->\n# Child\n<!-- meshfox:node id=\"root\" -->\n\n",
-                "## One\n<!-- meshfox:node id=\"one\" -->\n\nbody\n\n",
-                "## Two\n<!-- meshfox:node id=\"two\" -->\n\nbody\n\n",
-                "## Target\n<!-- meshfox:node id=\"target\" -->\n\nbody\n",
-            ),
-        )
-        .unwrap();
-        let base_path = dir.join("base.canvas.md");
-        std::fs::write(
-            &base_path,
-            concat!(
-                "<!-- meshfox:canvas -->\n# Base\n<!-- meshfox:node id=\"base\" -->\n\n",
-                "## Child\n<!-- meshfox:node id=\"child\" type=\"include\" -->\n\n[child](./child.canvas.md)\n",
-            ),
-        )
-        .unwrap();
-        let state = build_state(base_path.clone(), false, None)
-            .await
-            .expect("valid test canvas");
-
-        let primary_raw = state.raw.lock().unwrap().clone();
-        let mut canvas =
-            resolved_canvas(&primary_raw, &state.canvas_path).unwrap_or_else(|e| panic!("resolve failed: {}", e.1));
-        canvas.node_mut("child/target").expect("child/target present").x = Some(0.0);
-        canvas.node_mut("child/target").expect("child/target present").y = Some(50.0);
-        // Keyed by the *namespaced* id the client actually sees, same as
-        // every other node-addressed field in this request.
-        let layout_hints = HashMap::from([
-            ("child/one".to_string(), LayoutHint { x: 0.0, y: 0.0 }),
-            ("child/two".to_string(), LayoutHint { x: 0.0, y: 100.0 }),
-        ]);
-
-        let status = put_canvas(State(state), Json(PutCanvasRequest { canvas, layout_hints }))
-            .await
-            .unwrap_or_else(|e| panic!("put_canvas failed: {}", e.1));
-        assert_eq!(status, StatusCode::NO_CONTENT);
-
-        let child_after = std::fs::read_to_string(dir.join("child.canvas.md")).unwrap();
-        let pos = |id: &str| child_after.find(&format!("id=\"{id}\"")).unwrap();
-        assert!(pos("one") < pos("target"), "child file: {child_after}");
-        assert!(pos("target") < pos("two"), "child file: {child_after}");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     #[tokio::test]
     async fn get_includes_lists_the_child_canvas_include() {
         let base_path = write_base_and_child_canvas();
@@ -8678,8 +8147,6 @@ mod include_edit_tests {
         assert_eq!(entries[0].node_id, "child");
         assert_eq!(entries[0].title, "Child");
         assert_eq!(entries[0].target, "./child.canvas.md");
-        assert_eq!(entries[0].depth, 0);
-        assert!(entries[0].is_canvas);
 
         let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
     }
@@ -9230,55 +8697,6 @@ mod ws_tests {
         let _ = std::fs::remove_file(&canvas_path);
     }
 
-    #[tokio::test]
-    async fn tty_websocket_runs_a_step_that_lives_inside_an_included_canvas() {
-        let dir = std::env::temp_dir().join(format!(
-            "meshfox-tty-include-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("child.canvas.md"),
-            concat!(
-                "<!-- meshfox:canvas -->\n# Child\n<!-- meshfox:node id=\"root\" -->\n\n",
-                "## Shell\n<!-- meshfox:node id=\"shell\" -->\n\n",
-                "```bash name=\"interactive\" tty\necho ready; pwd -P\n```\n",
-            ),
-        )
-        .unwrap();
-        let base_path = dir.join("base.canvas.md");
-        std::fs::write(
-            &base_path,
-            concat!(
-                "<!-- meshfox:canvas -->\n# Base\n<!-- meshfox:node id=\"base\" -->\n\n",
-                "## Child\n<!-- meshfox:node id=\"child\" type=\"include\" -->\n\n[child](./child.canvas.md)\n",
-            ),
-        )
-        .unwrap();
-
-        let addr = spawn_test_server(base_path.clone()).await;
-        let url = format!(
-            "ws://{addr}/api/run/tty?path=child,child%2Froot,child%2Fshell&block=interactive&cols=80&rows=24"
-        );
-        let (mut ws, _) = tokio_tungstenite::connect_async(url)
-            .await
-            .expect("connect");
-
-        next_event(&mut ws).await; // started
-        let step_start = next_event(&mut ws).await;
-        assert_eq!(step_start["nodeId"], "child/shell");
-        next_event(&mut ws).await; // tty-start
-
-        let want_cwd = dir.canonicalize().unwrap().to_string_lossy().into_owned();
-        let output = read_until(&mut ws, &want_cwd).await;
-        assert!(
-            output.contains(&want_cwd),
-            "expected the included file's own directory ({want_cwd}) as PWD, got: {output}"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// Posts to `/api/kill` without pulling in a full HTTP client crate —
     /// a bare `TcpStream` with a hand-written request is enough for this
     /// one call. Returns the response status code.
@@ -9493,55 +8911,10 @@ mod run_file_tests {
         let _ = std::fs::remove_file(&canvas_path);
     }
 
-    #[tokio::test]
-    async fn open_node_file_resolves_a_nodes_id_across_an_include() {
-        // `open_node_file` used to look `id` up only in the primary
-        // document's own raw text, so a node spliced in from a canvas
-        // `include` — addressed by its namespaced id, e.g. "child/note" —
-        // always 404'd even though it exists (TODO.canvas.md: "Открытие
-        // файала во вложенном канвасе"). It should route through
-        // `locate_node`, same as every mutating endpoint already does.
-        // `note` isn't a `file` node, so a *found*-but-rejected 422 proves
-        // the lookup now succeeds, without this test ever invoking the OS
-        // opener the way a real `file` node target would.
-        let dir = std::env::temp_dir().join(format!(
-            "meshfox-open-include-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("child.canvas.md"),
-            concat!(
-                "<!-- meshfox:canvas -->\n# Child\n<!-- meshfox:node id=\"root\" -->\n\n",
-                "## Note\n<!-- meshfox:node id=\"note\" -->\n\nnot a file node\n",
-            ),
-        )
-        .unwrap();
-        let canvas_path = dir.join("base.canvas.md");
-        std::fs::write(
-            &canvas_path,
-            concat!(
-                "<!-- meshfox:canvas -->\n# Base\n<!-- meshfox:node id=\"base\" -->\n\n",
-                "## Child\n<!-- meshfox:node id=\"child\" type=\"include\" -->\n\n[child](./child.canvas.md)\n",
-            ),
-        )
-        .unwrap();
-
-        let addr = spawn_test_server(canvas_path.clone()).await;
-        let (status, body) = post(addr, "/api/nodes/child%2Fnote/open").await;
-        assert_eq!(
-            status, 422,
-            "expected the included node to be found (and rejected only for not \
-             being a file node), got: {body}"
-        );
-        assert!(body.contains("not a file node"), "unexpected body: {body}");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }
 
 #[cfg(test)]
-mod run_block_include_tests {
+mod run_block_ws_tests {
     use super::*;
 
     /// `/api/run` is a WS upgrade now — connects to `/api/run?{query}` and
@@ -9563,84 +8936,6 @@ mod run_block_include_tests {
             }
         }
         events
-    }
-
-    /// A primary `base.canvas.md` including `child.canvas.md`, the child's
-    /// own `leaf` node carrying one runnable, cacheable block that reports
-    /// its own `pwd` — namespaced `child/leaf`/`report` once resolved.
-    fn write_base_and_child_canvas() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "meshfox-run-include-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("child.canvas.md"),
-            concat!(
-                "<!-- meshfox:canvas -->\n# Child\n<!-- meshfox:node id=\"root\" -->\n\n",
-                "## Leaf\n<!-- meshfox:node id=\"leaf\" -->\n\n",
-                "```bash name=\"report\" cache\npwd -P\n```\n",
-            ),
-        )
-        .unwrap();
-        let base_path = dir.join("base.canvas.md");
-        std::fs::write(
-            &base_path,
-            concat!(
-                "<!-- meshfox:canvas -->\n# Base\n<!-- meshfox:node id=\"base\" -->\n\n",
-                "## Child\n<!-- meshfox:node id=\"child\" type=\"include\" -->\n\n[child](./child.canvas.md)\n",
-            ),
-        )
-        .unwrap();
-        base_path
-    }
-
-    #[tokio::test]
-    async fn runs_a_block_that_lives_inside_an_included_canvas() {
-        let base_path = write_base_and_child_canvas();
-        let child_path = base_path.parent().unwrap().join("child.canvas.md");
-        let addr = spawn_test_server(base_path.clone()).await;
-
-        let events = run_ws_events(
-            addr,
-            "path=child,child/root,child/leaf&block=report&persist=true",
-        )
-        .await;
-        assert!(
-            events.iter().any(|e| e["type"] == "step-start" && e["nodeId"] == "child/leaf"),
-            "expected a step-start for child/leaf, got: {events:?}"
-        );
-        let step_end = events
-            .iter()
-            .find(|e| e["type"] == "step-end")
-            .unwrap_or_else(|| panic!("expected a step-end event, got: {events:?}"));
-        assert_eq!(step_end["exitCode"], 0);
-        let output_event = events
-            .iter()
-            .find(|e| e["type"] == "output")
-            .unwrap_or_else(|| panic!("expected an output event, got: {events:?}"));
-        // `pwd -P` ran with the *included* file's own directory as `PWD` —
-        // same directory `child.canvas.md` itself lives in, not wherever
-        // `base.canvas.md` (the primary document) is.
-        assert_eq!(
-            output_event["text"],
-            child_path
-                .parent()
-                .unwrap()
-                .canonicalize()
-                .unwrap()
-                .to_string_lossy()
-                .as_ref(),
-        );
-
-        // Cache landed in `child.canvas.md`, addressed there by its own
-        // local id `leaf` — the primary document is untouched.
-        let base_after = std::fs::read_to_string(&base_path).unwrap();
-        assert!(!base_after.contains("meshfox:output"));
-        let child_after = std::fs::read_to_string(&child_path).unwrap();
-        assert!(child_after.contains("meshfox:output name=\"report\""));
-
-        let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
     }
 
     /// Not include-specific — just reuses this module's own `post_json`/
@@ -9679,6 +8974,66 @@ mod run_block_include_tests {
         );
 
         let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    /// Regression test: a runnable, `cache`-flagged fence living inside an
+    /// `include` node's own dumped-in body used to have its cache write-back
+    /// naively patch the *include node's own body* in the primary file —
+    /// clobbering its real content (a bare `[label](target)` link) with the
+    /// dumped text plus a `meshfox:output` comment, corrupting the include
+    /// outright (a real bug, caught by running `meshfox run` against exactly
+    /// this shape by hand). The block still runs, with the target file's own
+    /// directory as `PWD` — only the cache write-back is skipped.
+    #[tokio::test]
+    async fn a_cacheable_block_inside_an_include_runs_but_is_never_cached() {
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-run-include-nocache-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("child.canvas.md"),
+            concat!(
+                "<!-- meshfox:canvas -->\n# Child\n<!-- meshfox:node id=\"root\" -->\n\n",
+                "```bash name=\"report\" cache\npwd -P\n```\n",
+            ),
+        )
+        .unwrap();
+        let base_path = dir.join("base.canvas.md");
+        std::fs::write(
+            &base_path,
+            concat!(
+                "<!-- meshfox:canvas -->\n# Base\n<!-- meshfox:node id=\"base\" -->\n\n",
+                "## Child\n<!-- meshfox:node id=\"child\" type=\"include\" -->\n\n[child](./child.canvas.md)\n",
+            ),
+        )
+        .unwrap();
+        let base_before = std::fs::read_to_string(&base_path).unwrap();
+
+        let addr = spawn_test_server(base_path.clone()).await;
+        let events = run_ws_events(addr, "path=child&block=report&persist=true").await;
+
+        let step_end = events
+            .iter()
+            .find(|e| e["type"] == "step-end")
+            .unwrap_or_else(|| panic!("expected a step-end event, got: {events:?}"));
+        assert_eq!(step_end["exitCode"], 0, "events: {events:?}");
+        let output_event = events
+            .iter()
+            .find(|e| e["type"] == "output")
+            .unwrap_or_else(|| panic!("expected an output event, got: {events:?}"));
+        assert_eq!(
+            output_event["text"],
+            dir.canonicalize().unwrap().to_string_lossy().as_ref(),
+            "events: {events:?}"
+        );
+
+        // Untouched — the include node's own body is still just the link,
+        // not clobbered with the dumped content plus a cache comment.
+        let base_after = std::fs::read_to_string(&base_path).unwrap();
+        assert_eq!(base_after, base_before, "base.canvas.md was mutated");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -10465,52 +9820,6 @@ mod vars_endpoint_tests {
         let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));
     }
 
-    /// Regression test: `get_vars` used to parse only the primary document
-    /// (`parse_or_error`, no include splicing), so a `path` addressing a
-    /// node spliced in from an `include` could never be found there —
-    /// `resolve_target` fails with `RunError::Tree`, which `get_vars`
-    /// surfaced as a 404. `run_block` already resolved includes correctly
-    /// (see its own `resolved_canvas` call) — this only ever broke the
-    /// pre-run "what's still missing" check, not the run itself.
-    #[tokio::test]
-    async fn get_vars_resolves_a_block_that_lives_inside_an_included_canvas() {
-        let dir = std::env::temp_dir().join(format!(
-            "meshfox-vars-include-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("env.canvas.md"),
-            concat!(
-                "<!-- meshfox:canvas -->\n# Env\n<!-- meshfox:node id=\"root\" -->\n\n",
-                "<!-- meshfox:var name=\"API_KEY\" default=\"dev-key\" -->\n\n",
-                "## Setup\n<!-- meshfox:node id=\"setup\" -->\n\n",
-                "```bash name=\"prepare\"\necho prepare\n```\n\n",
-                "```bash name=\"resolve\" env=\"$API_KEY\"\necho $API_KEY\n```\n",
-            ),
-        )
-        .unwrap();
-        let base_path = dir.join("base.canvas.md");
-        std::fs::write(
-            &base_path,
-            concat!(
-                "<!-- meshfox:canvas -->\n# Base\n<!-- meshfox:node id=\"base\" -->\n\n",
-                "## Env\n<!-- meshfox:node id=\"env\" type=\"include\" -->\n\n[env](./env.canvas.md)\n",
-            ),
-        )
-        .unwrap();
-
-        let addr = spawn_test_server(base_path.clone()).await;
-        let (status, body) = get(addr, "/api/vars?path=env,env/root,env/setup&block=resolve").await;
-        assert_eq!(status, 200, "unexpected body: {body}");
-        let statuses: Vec<serde_json::Value> =
-            serde_json::from_str(&body).expect("valid VarStatus JSON");
-        assert_eq!(statuses.len(), 1);
-        assert_eq!(statuses[0]["name"], "API_KEY");
-        assert_eq!(statuses[0]["value"], "dev-key");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }
 
 #[cfg(test)]

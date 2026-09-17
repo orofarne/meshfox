@@ -140,8 +140,8 @@ manual path, not gated by it.
   - `display="link"` (default) or `display="code"` — `code` shows the
     target's own file content as a read-only, non-runnable syntax-highlighted
     preview instead of a plain clickable link. The file is read fresh from
-    disk on every view, confined to the canvas's own directory tree (same
-    boundary `include` targets are resolved within) — never written back.
+    disk on every view, confined to the canvas's own directory tree —
+    never written back.
   - `lang="..."` — syntax-highlighting language hint for `display="code"`
     (e.g. `lang="rust"`). Optional; when omitted, the language is guessed
     from the target's file extension. Ignored when `display` isn't `code`.
@@ -150,7 +150,7 @@ manual path, not gated by it.
     own arguments would be — quoting is honored), to run against `target`,
     making the node runnable: `interpreter target` (the target's path
     resolved relative to the canvas's own directory, confined to it — same
-    boundary `display="code"`/`include` targets are resolved within).
+    boundary `display="code"` targets are resolved within).
     Optional; omitted means the node isn't runnable this way. The web UI's
     "▷ run" button (next to "expand", in a runnable node's title bar)
     invokes this the same way it does a `text` node's default code block.
@@ -195,84 +195,50 @@ manual path, not gated by it.
     [meshfox](https://github.com/orofarne/meshfox)
     ```
 - **`include`** — same link-plus-optional-caption body as `file`/`link`,
-  but the target (another `.md` or `.canvas.md` file) is spliced in
-  *dynamically* by whatever consumer resolves includes — never written
-  back to disk. `run`/`validate` see the bare link (and caption, if any),
-  same as `file`/`link`. See "Includes" below.
+  but the target's own raw file content is dumped in *dynamically* by
+  whatever consumer resolves includes, as this node's own body — never
+  written back to disk. `run`/`validate` see the bare link (and caption,
+  if any), same as `file`/`link`. See "Includes" below.
 
 Any other `type=` value, a non-empty `group` body, or a `file`/`link`/
 `include` body that doesn't start with a single link (or whose caption
 carries block-level Markdown) is a parse error (`meshfox validate` catches
-these, plus a missing/cyclic/unparseable include target).
+these, plus a missing include target).
 
 There's no node type for a constraint contract — a Starlark check is an
 embedded fence living in any node's ordinary body, alongside its prose and
 runnable code, same as a `` ```bash name="..." `` fence. See "Constraint
 fences" below.
 
+A `file` node whose target is another `.canvas.md` file doesn't splice
+that file's content in — it opens it as its own, separately-isolated
+canvas (own process, own crash/hang boundary), the same "click through"
+`meshfox view`/`meshfox tui` already use for cross-canvas navigation, with
+an optional `#node-id` fragment deep-linking to a node in it.
+
 ## Includes
 
-`type="include"` dynamically splices another file's content into this
-node, resolved fresh every time a consumer asks for it (e.g. the server,
-before serving `GET /api/canvas` to `meshfox view`) — nothing is ever
-written into the including file. `run`/`validate` operate on a single
-file's raw text and never resolve includes; only `validate` reaches far
-enough in to catch a broken target, a parse error in it, or a cycle.
+`type="include"` dynamically dumps another file's raw content into this
+node's own body, resolved fresh every time a consumer asks for it (e.g.
+the server, before serving `GET /api/canvas` to `meshfox view`) — nothing
+is ever written into the including file. `run`/`validate` operate on a
+single file's raw text and never resolve includes; only `validate` reaches
+far enough in to catch a missing target.
 
-The target is told apart as a **canvas** or **plain Markdown** the same way
-auto-discovery already does: `.canvas.md` suffix, or a plain `.md` file
-that opens with the `meshfox:canvas` marker.
+The target's own content is always taken verbatim — headings shifted down
+(clamped to H6, CommonMark's ceiling) by the include node's own level, so
+e.g. its top-level `#` doesn't read as a second document root once
+nested — even when the target happens to be a `.canvas.md` with meshfox
+structure of its own: an include never parses that structure, never
+introduces a new addressable node, and never recurses into an `include`
+marker written inside the target's own text. The include node itself
+becomes `text`, its body marked as belonging to the target file rather
+than the including document — not editable per-node (open the target file
+directly, or Source mode's file picker, to change it).
 
-- **canvas target** — parsed and spliced in as real children. Every
-  spliced node's `id` is namespaced `{include_id}/{original_id}` to avoid
-  collisions with the including document (and with any other include
-  spliced in alongside it), and every level is shifted down by the include
-  node's own level. The include node itself becomes a `group`.
-- **plain Markdown target** — has no meshfox structure of its own, so it
-  becomes the include node's own body verbatim, except every heading in it
-  is shifted down (clamped to H6, CommonMark's ceiling) by the include
-  node's own level — so e.g. the target's top-level `#` doesn't read as a
-  second document root once nested. The include node becomes `text`.
-
-An included file can itself declare includes; those are resolved too,
-with a cycle (A includes B includes A) reported as an error rather than
-recursing forever.
-
-### What crosses the include boundary
-
-Position (`x`/`y`) needs no special handling: a spliced node's coordinates
-are already relative to its nearest `group` ancestor (see "File structure"
-above), and the include node itself becomes a `group`, so an included
-subtree lays out correctly with no rewriting at all. A structural
-`meshfox:edge` inside the included content is rewritten to the namespaced
-id automatically, same as `parent`.
-
-Two other features interact with includes very differently, because one
-runs against the raw single file and the other against the fully composed
-tree:
-
-- **Runnable-fence `deps=`** (see "Runnable code fences") never crosses an
-  include boundary, deliberately: `run`/`list`/`deps::validate` all work
-  on one file's raw text (per "Includes" above), so a `deps=` reference is
-  only ever resolved against that same file's own, un-namespaced node
-  ids. A block inside an included canvas can't be depended on from the
-  including document, or vice versa — and an *internal* cross-node
-  `deps="other-node/block"` reference inside a file stays valid whether
-  that file is run standalone or spliced into a parent, precisely because
-  it's never evaluated post-splice.
-- **Constraint fences** (see "Constraint fences") are the opposite: `meshfox
-  view`, the terminal viewer, and `meshfox check` all evaluate constraints
-  against the fully resolved, composed document — so a constraint fence
-  living inside an included canvas is checked there too, and `self`/
-  `doc.children()`/`.descendants()`/`.nodes_with_tag(...)` navigation from
-  it sees the same spliced-in tree everything else does. The one thing
-  that *doesn't* survive splicing is a constraint script that hardcodes a
-  literal node id (`doc.node("some-id")`): once the file it's written in
-  gets included elsewhere, that id is renamed to
-  `{include_id}/{original_id}` and the hardcoded reference stops
-  resolving. Prefer relative navigation (`self`, `.children()`,
-  `.descendants()`) or tag lookups (`.nodes_with_tag(...)`) over a literal
-  id in any constraint that might end up inside an included file.
+A `file` node's `display="code"` is the read-only-preview counterpart for
+a target you want to *show* without folding its content into this node's
+own body at all — see "Node types" above.
 
 ## Runnable code fences
 
@@ -566,8 +532,8 @@ wherever that block itself happens to live.
   "every consumer, every time" semantics. A pipeline step that genuinely
   needs to never be session-skipped still opts in with its own `always`,
   same as it would with no button involved.
-- Scope: `deps=` never crosses an `include` boundary (see "What crosses
-  the include boundary" above) — neither does a button's own addressing.
+- Scope: `deps=` only ever resolves against node ids in the same file, same
+  as a button's own addressing.
 
 ## Form fences
 
@@ -634,8 +600,8 @@ only ever prompting before a run. Its body is a line-based list, one
   in *another* block's `deps=` — unlike a `button`, a form has no "done"
   state at all (nothing runs, ever), so there's nothing for a dependent
   to wait on.
-- Scope: like `button`, a form's own addressing never crosses an
-  `include` boundary.
+- Scope: like `button`, a form's own addressing only ever resolves within
+  the same file.
 
 ## Constraint fences
 
@@ -743,20 +709,15 @@ The script sees:
 
 Beyond these, and Starlark's own built-ins (`len`, `range`, string
 methods, list/dict comprehensions, ...), the sandbox has nothing: no
-network, no way to see any other node's fully-resolved include tree, and
-no way to mutate the document — a constraint only ever reads and reports.
-The only I/O it can trigger at all is the five `file`-node methods above,
-and even those don't run arbitrary code or touch an arbitrary path: the
-target was the document author's own choice, visible right there as the
-node's link, and the read only happens when the tool driving `meshfox
-check` (or the server, evaluating every constraint on every canvas load)
-passes it a base directory to resolve targets against in the first place —
-an in-memory canvas that was never read from a real file makes every one
-of these calls return `None`. A `file` node spliced in from an `include`
-target resolves its own target against *that* target's own directory
-instead, same as any other relative reference in an included node's body
-— the tool-supplied base directory is only the fallback for a `file` node
-that lives directly in the document being checked. Evaluation is
+network access, and no way to mutate the document — a constraint only ever
+reads and reports. The only I/O it can trigger at all is the five
+`file`-node methods above, and even those don't run arbitrary code or
+touch an arbitrary path: the target was the document author's own choice,
+visible right there as the node's link, and the read only happens when the
+tool driving `meshfox check` (or the server, evaluating every constraint
+on every canvas load) passes it a base directory to resolve targets
+against in the first place — an in-memory canvas that was never read from
+a real file makes every one of these calls return `None`. Evaluation is
 resource-bounded (instruction
 count, call depth, heap size); a script that times out or errors (syntax
 error, unbound name, ...) counts as a failing constraint, with that error
@@ -1446,7 +1407,7 @@ that as the new file's root body:
     > This note is only visible here, in a plain Markdown viewer.
     <!-- /meshfox:comment -->
 
-A `file`/`link`/`include` node's body rule ("starts with exactly one
+A `file`/`link` node's body rule ("starts with exactly one
 Markdown link") is checked *after* stripping — a comment-wrapped blurb
 alongside the link doesn't count against it. Fence-aware, same as heading/node-comment
 scanning elsewhere in this spec: a marker written literally inside a code

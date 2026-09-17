@@ -17,8 +17,7 @@ pub struct Canvas {
     /// `mdcanvas::parse` itself (a malformed declaration shouldn't break
     /// basic parsing — `meshfox validate` is what surfaces that loudly, see
     /// `options::declared_options`); populated by whichever consumer wants
-    /// it, same convention `Node::constraint_results`/`asset_base` already
-    /// use.
+    /// it, same convention `Node::constraint_results` already uses.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<String>,
 }
@@ -41,11 +40,13 @@ pub enum NodeType {
     Link,
     Group,
     /// Body is a single Markdown link, same shape as `File`/`Link` — but
-    /// the target is another Markdown (or `.canvas.md`) file whose content
-    /// gets spliced in dynamically wherever a consumer resolves includes
-    /// (`crate::include::resolve`, called by the server before serving
-    /// `GET /api/canvas`). Never resolved on disk: `run`/`validate` parse
-    /// the raw file and see the bare link, same as `file`/`link`.
+    /// the target's own raw text gets dumped verbatim into this node's own
+    /// body wherever a consumer resolves includes (`crate::include::resolve`,
+    /// called by the server before serving `GET /api/canvas`). Never parsed
+    /// as meshfox structure of its own, even if the target happens to be a
+    /// `.canvas.md` — an include never introduces a new addressable node.
+    /// Never resolved on disk by `run`/`validate`: they parse the raw file
+    /// and see the bare link, same as `file`/`link`.
     Include,
 }
 
@@ -320,46 +321,23 @@ pub struct Node {
     pub effective_color: Option<String>,
     /// Absolute directory a relative asset reference (an `![](...)` image,
     /// or a plain link) inside this node's `text` should resolve against,
-    /// when that differs from the including document's own directory —
-    /// i.e. this node's body came from an `include` target that lives
-    /// elsewhere on disk (see `crate::include::resolve`). `None` for every
-    /// node that wasn't spliced in from an include, which keeps resolving
-    /// relative to the canvas file's own directory as before. Never set by
+    /// when that differs from this document's own directory — i.e. this
+    /// node's body came from an `include` target that lives elsewhere on
+    /// disk (see `crate::include::resolve`). `None` for every node that
+    /// wasn't spliced in from an include, which keeps resolving relative
+    /// to the canvas file's own directory as before. Never set by
     /// `mdcanvas::parse` itself, same as `constraint_results`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asset_base: Option<String>,
-    /// Where this node's own content actually lives on disk, when that
-    /// differs from the document being viewed — i.e. this node was
-    /// spliced in from a canvas `include` target (`crate::include::resolve`).
-    /// `origin_path` is that target file's own canonical path; `origin_id`
-    /// is this node's id *within that file*, before `include::resolve`
-    /// namespaced it to `{include_id}/{original_id}` (see `Node::id`).
-    /// `None` for every node that lives directly in the document being
-    /// viewed, including the `include` node itself (only its *spliced-in
-    /// descendants* get an origin). Never set by `mdcanvas::parse`, and
-    /// never sent over the wire (`#[serde(skip)]`, unlike `asset_base`) —
-    /// this is a same-process breadcrumb for a consumer that wants to
-    /// *write back* to the right file (the server's mutating endpoints
-    /// re-derive it themselves by resolving again, rather than trusting a
-    /// client-echoed path).
-    #[serde(skip)]
-    pub origin_path: Option<String>,
-    #[serde(skip)]
-    pub origin_id: Option<String>,
-    /// `true` for a `text` node whose body is actually a plain-Markdown
-    /// `include` target's transcluded content (shifted headings and all —
-    /// see `crate::include::resolve`), not this node's own real text.
-    /// Unlike a canvas-`include` descendant (which keeps a real, separate
-    /// on-disk identity via `origin_path`/`origin_id` and is safely
-    /// editable through the normal per-node write path), this node's id
-    /// and body both belong to the *including* document — there's no
-    /// well-defined way to write a per-node body edit back to "the
-    /// target file", since the target has no meshfox structure of its
-    /// own to address. `false` for every other node, including a
-    /// canvas-include descendant. Sent over the wire (unlike
-    /// `origin_path`/`origin_id`) so a client can steer a would-be editor
-    /// toward the whole-file Source-mode view of the real target file
-    /// instead of a per-node body editor that can only ever fail to save.
+    /// `true` for a `text` node whose body is actually an `include`
+    /// target's dumped content (shifted headings and all — see
+    /// `crate::include::resolve`), not this node's own real text. There's
+    /// no well-defined way to write a per-node body edit back to "the
+    /// target file" — the target has no meshfox structure of its own to
+    /// address, and its content was never parsed as one anyway — so a
+    /// client steers a would-be editor toward the whole-file Source-mode
+    /// view of the real target file instead of a per-node body editor that
+    /// can only ever fail to save. `false` for every other node.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub plain_markdown_include: bool,
 }
@@ -381,12 +359,9 @@ impl Node {
     /// The directory this node's own runnable block(s) should execute
     /// in: `asset_base` (the directory of the `include` target this node
     /// was actually spliced in from) when set, otherwise `canvas_dir` —
-    /// the *primary* canvas file's own directory. This is what gives each
-    /// canvas its own `PWD` regardless of nesting: a node spliced in from
-    /// `sub/other.canvas.md` runs with `sub/` as `PWD`, even though the
-    /// document being viewed is the top-level canvas elsewhere on disk —
-    /// same "which file does this node really belong to" resolution
-    /// `asset_base` already drives for relative asset references.
+    /// the canvas file's own directory. This is what gives a block found
+    /// inside an include node's dumped body its own `PWD`, matching where
+    /// the target file that text actually came from lives on disk.
     pub fn cwd(&self, canvas_dir: &std::path::Path) -> std::path::PathBuf {
         self.asset_base
             .as_deref()

@@ -43,13 +43,12 @@ const PRIMARY = "primary";
  * a rejected save leaves both the file and this editor's contents
  * untouched, with the parser's own error shown so it's fixable.
  *
- * A document that pulls in other files via `include` (see SPEC.md) is
- * still just one *visual* canvas — the graph view already lets an
- * included subtree's nodes be dragged/edited transparently, writing back
- * to whichever file they actually live in. The picker below is Source
+ * A document that pulls in other files via `include` (see SPEC.md) shows
+ * each one's own content dumped straight into its own node's body in the
+ * graph view — one *visual* canvas either way. The picker below is Source
  * mode's own equivalent: pick "this document" (the default) or any
- * include, however deeply nested, to view/edit *its* raw text instead —
- * still one file at a time, since that's what's actually on disk.
+ * include to view/edit *its* raw text instead — still one file at a time,
+ * since that's what's actually on disk.
  */
 export function CanvasSourceEditor({ initialInclude, onSaved, onClose, onDirtyChange }: CanvasSourceEditorProps) {
   const [includes, setIncludes] = useState<IncludeManifestEntry[]>([]);
@@ -131,7 +130,6 @@ export function CanvasSourceEditor({ initialInclude, onSaved, onClose, onDirtyCh
             <option value={PRIMARY}>This document</option>
             {includes.map((inc) => (
               <option key={inc.nodeId} value={inc.nodeId}>
-                {"  ".repeat(inc.depth + 1)}
                 {"↳ "}
                 {inc.title} ({inc.target})
               </option>

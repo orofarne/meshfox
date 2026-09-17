@@ -293,7 +293,7 @@ impl SourceEditorState {
                 } else {
                     self.files
                         .get(self.file_picker_selected - 1)
-                        .map(|i| (i.path.clone(), i.is_canvas))
+                        .map(|i| (i.path.clone(), false))
                 };
                 if let Some((path, is_canvas)) = target {
                     self.switch_to(path, is_canvas);

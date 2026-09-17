@@ -2329,16 +2329,12 @@ impl App {
     /// `e` — opens the fullscreen source editor (`source_editor.rs`) on
     /// whichever real file the selected node's content actually lives in,
     /// with the cursor at that node's own body. Mirrors the server's own
-    /// `locate_node` (`crates/server/src/lib.rs`): a node found directly
-    /// in `display_canvas` with no `origin_path`/`origin_id` of its own
-    /// lives in the primary document (including a canvas-`include` node
-    /// itself, which by then is a `group` with an empty body — nothing
-    /// node-specific to jump to beyond its own heading, same as any other
-    /// node); one that does carry an origin is a canvas-`include`
-    /// descendant, with a real separate on-disk identity; and
-    /// `plain_markdown_include` (see that field's own doc comment) is the
-    /// one case with no per-node identity inside its target at all — just
-    /// opens that file at the top.
+    /// `locate_node` (`crates/server/src/lib.rs`): a node found directly in
+    /// `display_canvas` lives in the primary document. `plain_markdown_include`
+    /// (see that field's own doc comment) is the one case with no per-node
+    /// identity of its own at all — its target's own content was dumped
+    /// straight into this node's body, so there's no node-specific cursor
+    /// position to jump to; just opens that file at the top.
     fn open_source_editor(&mut self) {
         let Some(row) = self.rows.get(self.selected) else {
             return;
@@ -2349,9 +2345,7 @@ impl App {
         };
 
         let (path, is_canvas, local_id): (PathBuf, bool, Option<String>) =
-            if let (Some(p), Some(local)) = (&node.origin_path, &node.origin_id) {
-                (PathBuf::from(p), true, Some(local.clone()))
-            } else if node.plain_markdown_include {
+            if node.plain_markdown_include {
                 match meshfox_core::include::list_includes(&self.canvas, &self.canvas_path)
                     .into_iter()
                     .find(|i| i.node_id == node_id)
@@ -2779,21 +2773,11 @@ impl App {
             }
         }
 
-        // Finds which real file `node_id` actually lives in — itself or
-        // an `include` target elsewhere on disk (see `advance_run`'s own
-        // doc comment) — a fenced block spliced in from an `include` used
-        // to be entirely unreachable from here.
-        let located = match meshfox_core::locate_node(&self.raw, &self.canvas_path, &node_id) {
-            Ok(l) => l,
-            Err(e) => {
-                self.status = e.to_string();
-                return;
-            }
-        };
-        let Some(node_text) = Canvas::from_markdown(&located.raw)
-            .ok()
-            .and_then(|c| c.node(&located.local_id).map(|n| n.text.clone()))
-        else {
+        // Include-resolved (not just `Canvas::from_markdown`) so a block
+        // living inside an `include` node's own dumped body is found here
+        // too — same `self.display_canvas` the `file`-node check above
+        // already trusts.
+        let Some(node_text) = self.display_canvas.node(&node_id).map(|n| n.text.clone()) else {
             self.status = format!("node {node_id:?} not found");
             return;
         };
@@ -2930,21 +2914,12 @@ impl App {
     }
 
     /// The lock file a `service_lock`-backed address (`node_id`/`block`)
-    /// would be locked under — same computation `advance_run`'s own
-    /// service branch does (`located.origin.as_deref().unwrap_or(&self
-    /// .canvas_path)` then `service_lock_path`), just resolved from
-    /// scratch here since a worker-routed `LockConflict` only reports the
-    /// address, not which file it lives in. Used by
-    /// `on_service_conflict_key`'s `is_tty` retry branch to kill the stale/
-    /// foreign owner directly (see `TtyConnectError::Conflict`'s own doc
-    /// comment for why a tty conflict retries this way instead of through
-    /// a `force` request parameter).
+    /// would be locked under. Used by `on_service_conflict_key`'s `is_tty`
+    /// retry branch to kill the stale/foreign owner directly (see
+    /// `TtyConnectError::Conflict`'s own doc comment for why a tty conflict
+    /// retries this way instead of through a `force` request parameter).
     fn lock_path_for(&self, node_id: &str, block: &str) -> PathBuf {
-        let origin = meshfox_core::locate_node(&self.raw, &self.canvas_path, node_id)
-            .ok()
-            .and_then(|l| l.origin);
-        let canvas_path = origin.as_deref().unwrap_or(&self.canvas_path);
-        meshfox_core::service_lock_path(canvas_path, node_id, block)
+        meshfox_core::service_lock_path(&self.canvas_path, node_id, block)
     }
 
     /// The worker-routed path `start_run` takes when a worker is reachable
@@ -3647,7 +3622,7 @@ impl App {
         // early `return` (chain exhausted, an error, or a step that
         // genuinely needs to run) or falls through to spawn a step once
         // one is found that isn't skippable.
-        let (addr, located, node_text, block, env_resolution, interp_resolution) = loop {
+        let (addr, node_text, cwd, block, env_resolution, interp_resolution) = loop {
             let Some((idx, len)) = self.run.as_ref().map(|r| (r.idx, r.chain.len())) else {
                 return;
             };
@@ -3684,29 +3659,16 @@ impl App {
             }
 
             let addr = self.run.as_ref().unwrap().chain[idx].clone();
-            // Finds which real file `addr.node_id` actually lives in —
-            // itself (the primary document) or an `include` target
-            // elsewhere on disk, however deeply nested — so a block
-            // spliced in from an `include` is addressable here at all, and
-            // its own `cache`/`PWD` land in the right file (see
-            // `Node::cwd`'s own reasoning; mirrors the web UI's
-            // `run_block`/`run_tty_chain`).
-            let located =
-                match meshfox_core::locate_node(&self.raw, &self.canvas_path, &addr.node_id) {
-                    Ok(l) => l,
-                    Err(e) => {
-                        self.status = e.to_string();
-                        if let Some(run) = &mut self.run {
-                            run.finished = true;
-                            run.had_failure = true;
-                        }
-                        return;
-                    }
-                };
-            let Some(node_text) = Canvas::from_markdown(&located.raw)
+            // Include-resolved (not just `Canvas::from_markdown`) so a
+            // block living inside an `include` node's own dumped body is
+            // visible here too — see `Node::cwd`.
+            let step_node = Canvas::from_markdown(&self.raw)
                 .ok()
-                .and_then(|c| c.node(&located.local_id).map(|n| n.text.clone()))
-            else {
+                .and_then(|primary| {
+                    meshfox_core::include::resolve(&primary, &self.canvas_path).ok()
+                })
+                .and_then(|canvas| canvas.node(&addr.node_id).cloned());
+            let Some(step_node) = step_node else {
                 self.status = format!("node {:?} not found", addr.node_id);
                 if let Some(run) = &mut self.run {
                     run.finished = true;
@@ -3714,6 +3676,8 @@ impl App {
                 }
                 return;
             };
+            let node_text = step_node.text.clone();
+            let cwd = step_node.cwd(crate::canvas_root_dir(&self.canvas_path));
             let Some(block) = scan_runnable_blocks(&addr.node_id, &node_text)
                 .into_iter()
                 .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()))
@@ -3800,7 +3764,7 @@ impl App {
                 }
             }
 
-            break (addr, located, node_text, block, env_resolution, interp_resolution);
+            break (addr, node_text, cwd, block, env_resolution, interp_resolution);
         };
 
         let Some(mut env) = self.park_on_unresolved(env_resolution) else {
@@ -3855,8 +3819,7 @@ impl App {
         // it just parks the request and returns; `mod.rs`'s loop picks
         // `pending_tty` up before its next `select!` and calls
         // `resume_after_tty` once the child exits.
-        let step_canvas_path = located.origin.as_deref().unwrap_or(&self.canvas_path).to_path_buf();
-        let cwd = crate::canvas_root_dir(&step_canvas_path).to_path_buf();
+        let step_canvas_path = self.canvas_path.clone();
 
         // `service` blocks branch out here, before the normal spawn-and-
         // wait path below: "done" is "spawned", not "exited" — see
@@ -4062,10 +4025,7 @@ impl App {
     /// `interpreter` set) as `interpreter target`, streaming output live —
     /// the TUI counterpart to the web UI's own "▷ run" button on a `file`
     /// node's title bar (`run_file_node` in `crates/server/src/lib.rs`),
-    /// previously the only way to run one at all. `node`'s own
-    /// `origin_path`, when set (spliced in from an `include`), names the
-    /// *real* file `target`/`PWD` resolve relative to, confined to it —
-    /// same boundary the web UI's `resolve_confined_target` enforces.
+    /// previously the only way to run one at all.
     async fn start_file_run(&mut self, node_id: String, node: Node) {
         let interpreter = node
             .interpreter
@@ -4080,12 +4040,7 @@ impl App {
             }
         };
         let target = node.target.as_deref().expect("checked by is_runnable_file");
-        let origin_path = node
-            .origin_path
-            .as_deref()
-            .map(Path::new)
-            .unwrap_or(&self.canvas_path);
-        let origin_dir = crate::canvas_root_dir(origin_path);
+        let origin_dir = crate::canvas_root_dir(&self.canvas_path);
         let resolved_target = match meshfox_core::confine(origin_dir, target) {
             Ok(p) => p,
             Err(e) => {
@@ -4265,41 +4220,38 @@ impl App {
                         // Re-located (rather than stashed from `advance_run`)
                         // since it's cheap and this is the only place that
                         // needs it again — an earlier step in this same
-                        // chain may have already patched this exact file
-                        // (primary or `include` target), so re-reading it
-                        // fresh here (via `locate_node`) picks that up
-                        // rather than risking a stale in-memory copy.
-                        if let Ok(located) = meshfox_core::locate_node(
-                            &self.raw,
-                            &self.canvas_path,
-                            &addr.node_id,
-                        ) {
-                            if let Some(updated) =
-                                write_output(&node_text, &addr.block_name, &result)
-                            {
-                                if let Some(patched) = mdcanvas::set_node_body(
-                                    &located.raw,
-                                    &located.local_id,
-                                    &updated,
-                                ) {
-                                    match &located.origin {
-                                        None => {
-                                            self.raw = patched;
-                                            let _ =
-                                                std::fs::write(&self.canvas_path, &self.raw);
-                                            *self.known_raw.lock().unwrap() = self.raw.clone();
-                                            if let Ok(reparsed) = Canvas::from_markdown(&self.raw)
-                                            {
-                                                self.canvas = reparsed;
-                                            }
+                        // chain may have already patched this file, so
+                        // re-reading it fresh here (via `locate_node`) picks
+                        // that up rather than risking a stale in-memory copy.
+                        // Never persisted for a block living inside an
+                        // `include` node's own dumped body (that node's
+                        // real, on-disk body is just the bare link
+                        // `include::resolve` dumped this text over) — same
+                        // reasoning the web server's own chain loops have.
+                        let is_include_node = Canvas::from_markdown(&self.raw)
+                            .ok()
+                            .and_then(|c| c.node(&addr.node_id).map(|n| n.node_type))
+                            == Some(NodeType::Include);
+                        if !is_include_node {
+                            if let Ok(located) = meshfox_core::locate_node(&self.raw, &addr.node_id) {
+                                if let Some(updated) =
+                                    write_output(&node_text, &addr.block_name, &result)
+                                {
+                                    if let Some(patched) = mdcanvas::set_node_body(
+                                        &located.raw,
+                                        &located.local_id,
+                                        &updated,
+                                    ) {
+                                        self.raw = patched;
+                                        let _ = std::fs::write(&self.canvas_path, &self.raw);
+                                        *self.known_raw.lock().unwrap() = self.raw.clone();
+                                        if let Ok(reparsed) = Canvas::from_markdown(&self.raw) {
+                                            self.canvas = reparsed;
                                         }
-                                        Some(path) => {
-                                            let _ = std::fs::write(path, &patched);
-                                        }
+                                        self.rebuild_display_canvas();
+                                        self.rebuild_rows();
+                                        self.render_current_document();
                                     }
-                                    self.rebuild_display_canvas();
-                                    self.rebuild_rows();
-                                    self.render_current_document();
                                 }
                             }
                         }
@@ -5417,17 +5369,20 @@ mod tests {
         assert!(huge.width <= 500 && huge.height <= 500);
     }
 
-    /// End-to-end: `start_run`/`advance_run`/`on_output_line` finding,
-    /// running, and caching a block that lives inside an `include` target
-    /// — same limitation `crates/server/src/lib.rs`'s own
-    /// `run_block_include_tests` and `crates/cli/tests/run_cmd.rs` used to
-    /// have (a block only reachable through an `include` was simply
-    /// unaddressable — `self.canvas` is deliberately never
-    /// `include`-resolved, see its own doc comment) before
-    /// `meshfox_core::locate_node` was wired into `start_run`/
-    /// `advance_run`/`on_output_line`.
+    /// End-to-end: `start_run`/`advance_run`/`on_output_line` finding and
+    /// running a block that lives inside an `include` node's own dumped-in
+    /// body — same limitation `crates/server/src/lib.rs`'s own chain-
+    /// execution loops and `crates/cli/tests/run_cmd.rs` used to have (a
+    /// block only reachable through an `include` was simply unaddressable
+    /// — `self.canvas` is deliberately never `include`-resolved, see its
+    /// own doc comment) before `meshfox_core::include::resolve` was wired
+    /// into `advance_run`. Never cached, even with `cache` set on the
+    /// fence — the include node's real on-disk body is just the bare link,
+    /// nowhere to write a `meshfox:output` comment without clobbering it
+    /// (same reasoning `crates/server/src/lib.rs`'s own chain loops guard
+    /// against — see their `plain_markdown_include` check).
     #[tokio::test]
-    async fn runs_finds_and_caches_a_block_inside_an_included_canvas() {
+    async fn runs_a_block_inside_an_included_node_without_caching() {
         let dir = std::env::temp_dir().join(format!(
             "meshfox-tui-run-include-test-{}",
             uuid_like()
@@ -5451,17 +5406,19 @@ mod tests {
             ),
         )
         .unwrap();
-        let child_path = dir.join("child.canvas.md");
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(base_path.clone(), tx, None, None).await.unwrap();
 
-        app.start_run("child/leaf".to_string(), "report".to_string(), true)
+        // `child.canvas.md`'s own content (headings and all) is dumped
+        // verbatim into the `child` node's own body — no separate
+        // `child/root`/`child/leaf` nodes exist, so `report` is addressed
+        // directly under `child`, the include node's own id.
+        app.start_run("child".to_string(), "report".to_string(), true)
             .await;
 
         // Mirrors `mod.rs`'s own main loop: drain the spawned process's
-        // output, then signal EOF (`None`) so `on_output_line` reaps it,
-        // writes the cache, and advances the chain.
+        // output, then signal EOF (`None`) so `on_output_line` reaps it.
         loop {
             let has_proc = app.run.as_ref().is_some_and(|r| r.proc.is_some());
             if !has_proc {
@@ -5492,8 +5449,6 @@ mod tests {
 
         let base_after = std::fs::read_to_string(&base_path).unwrap();
         assert!(!base_after.contains("meshfox:output"));
-        let child_after = std::fs::read_to_string(&child_path).unwrap();
-        assert!(child_after.contains("meshfox:output name=\"report\""));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5501,27 +5456,22 @@ mod tests {
     /// `trigger_run` (the actual `r`/`R` keybinding handler) used to guard
     /// on `self.canvas.node(&node_id)` directly — which, unlike
     /// `self.display_canvas`, is deliberately never `include`-resolved —
-    /// so selecting a row spliced in from an `include` and pressing `r`
+    /// so selecting a row dumped in from an `include` and pressing `r`
     /// always bailed with "this comes from an `include`...", regardless of
     /// what `start_run`/`advance_run` themselves could already handle.
-    /// Covers both a fenced block and a runnable `file` node, since they
-    /// take different branches inside `trigger_run`.
     #[tokio::test]
-    async fn trigger_run_reaches_both_a_block_and_a_file_node_inside_an_included_canvas() {
+    async fn trigger_run_reaches_a_block_inside_an_included_node() {
         let dir = std::env::temp_dir().join(format!(
             "meshfox-tui-trigger-run-include-test-{}",
             uuid_like()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("seed.sh"), "#!/bin/sh\necho hi from seed\n").unwrap();
         std::fs::write(
             dir.join("child.canvas.md"),
             concat!(
                 "<!-- meshfox:canvas -->\n# Child\n<!-- meshfox:node id=\"root\" -->\n\n",
                 "## Leaf\n<!-- meshfox:node id=\"leaf\" -->\n\n",
-                "```bash name=\"report\" cache\necho hi from leaf\n```\n\n",
-                "## Seed\n<!-- meshfox:node id=\"seed\" type=\"file\" interpreter=\"bash\" -->\n\n",
-                "[seed](./seed.sh)\n",
+                "```bash name=\"report\" cache\necho hi from leaf\n```\n",
             ),
         )
         .unwrap();
@@ -5537,18 +5487,17 @@ mod tests {
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(base_path.clone(), tx, None, None).await.unwrap();
-        // Expand ancestors so the rows under test are actually visible —
-        // `tree::flatten` only ever auto-expands depth 0 (the root).
-        app.expanded.insert("child".to_string());
-        app.expanded.insert("child/root".to_string());
         app.rebuild_rows();
 
-        let leaf_idx = app
+        // No separate `child/leaf` row exists — `child.canvas.md`'s own
+        // content is dumped straight into the `child` row's own body, with
+        // `report` addressed under `child`'s own id.
+        let child_idx = app
             .rows
             .iter()
-            .position(|r| r.node_id == "child/leaf")
-            .expect("child/leaf row visible");
-        app.selected = leaf_idx;
+            .position(|r| r.node_id == "child")
+            .expect("child row visible");
+        app.selected = child_idx;
         app.trigger_run(true).await;
         assert!(
             app.status.is_empty(),
@@ -5564,36 +5513,11 @@ mod tests {
         }
         let run = app.run.as_ref().expect("a run was started");
         assert!(!run.had_failure, "lines: {:?}", run.lines);
-        let child_after = std::fs::read_to_string(dir.join("child.canvas.md")).unwrap();
-        assert!(child_after.contains("meshfox:output name=\"report\""));
+        assert!(run.lines.iter().any(|l| l.contains("hi from leaf")), "lines: {:?}", run.lines);
 
-        app.run = None;
-        let seed_idx = app
-            .rows
-            .iter()
-            .position(|r| r.node_id == "child/seed")
-            .expect("child/seed row visible");
-        app.selected = seed_idx;
-        app.trigger_run(true).await;
-        loop {
-            if !app.file_run.as_ref().is_some_and(|r| r.proc.is_some()) {
-                break;
-            }
-            let line = app
-                .file_run
-                .as_mut()
-                .unwrap()
-                .proc
-                .as_mut()
-                .unwrap()
-                .output_rx
-                .recv()
-                .await;
-            app.on_file_output_line(line).await;
-        }
-        let file_run = app.file_run.as_ref().expect("a file run was started");
-        assert!(!file_run.had_failure, "lines: {:?}", file_run.lines);
-        assert!(file_run.lines.iter().any(|l| l.contains("hi from seed")));
+        // Never cached — the include node's own body is just the link.
+        let base_after = std::fs::read_to_string(&base_path).unwrap();
+        assert!(!base_after.contains("meshfox:output"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

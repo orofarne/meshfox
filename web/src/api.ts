@@ -153,23 +153,15 @@ export async function saveCanvas(
 }
 
 /**
- * One `include` reachable from the document (however deeply nested,
- * however the primary document reached it), resolved to the file it
- * points at but without splicing its content in — powers Source mode's
- * file picker (`includeNodeId` below), alongside the implicit "this
- * document" option that isn't in this list. `depth` is 0 for an include
- * declared directly in the primary document, 1 for one nested inside a
- * depth-0 include's own target, and so on — enough to indent a flat list
- * into a tree client-side. `isCanvas` is `false` for a plain-Markdown
- * target (nothing to open in Source mode as its own file — see
- * `NodeSettings`' read-only note on that case) or a broken/cyclic one.
+ * One `include` declared directly in the document, resolved to the file it
+ * points at but without dumping its content in — powers Source mode's file
+ * picker (`includeNodeId` below), alongside the implicit "this document"
+ * option that isn't in this list.
  */
 export interface IncludeManifestEntry {
   nodeId: string;
   title: string;
   target: string;
-  depth: number;
-  isCanvas: boolean;
 }
 
 export async function fetchIncludes(): Promise<IncludeManifestEntry[]> {

@@ -1696,11 +1696,7 @@ fn render_source_file_picker(f: &mut Frame, area: Rect, se: &SourceEditorState) 
 
     let mut items = vec![ListItem::new(Line::from("this document"))];
     items.extend(se.files.iter().map(|inc| {
-        let indent = "  ".repeat(inc.depth as usize);
-        ListItem::new(Line::from(format!(
-            "{indent}↳ {} ({})",
-            inc.title, inc.target
-        )))
+        ListItem::new(Line::from(format!("↳ {} ({})", inc.title, inc.target)))
     }));
 
     let mut state = ListState::default();

@@ -37,15 +37,10 @@ at once: a color preset, tags, and an extra incoming edge.
 
 [example](https://example.com)
 
-## Include (plain Markdown target)
-<!-- meshfox:node id="include-text" type="include" -->
+## Include
+<!-- meshfox:node id="include-node" type="include" -->
 
 [included](./settings-include-target.md)
-
-## Include (canvas target)
-<!-- meshfox:node id="include-canvas" type="include" -->
-
-[included](./settings-include-target.canvas.md)
 
 ## Group
 <!-- meshfox:node id="group-node" type="group" -->

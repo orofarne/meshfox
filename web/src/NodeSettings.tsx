@@ -141,8 +141,8 @@ export function NodeSettings({ node, allNodes, onChange, onRenameId, onClearId, 
 
   // Only whatever actually differs from `node`'s own original values —
   // matters a lot more here than it would look: `node.type` is never
-  // literally `"include"` (the server always resolves one into a `group`
-  // or `text` before it ever reaches the client — see
+  // literally `"include"` (the server always resolves one into a `text`
+  // node before it ever reaches the client — see
   // `crates/core/src/include.rs`), so unconditionally resending `nodeType`
   // (as this used to) would silently rewrite an include node's real
   // on-disk `type="include"` into whatever it happened to resolve to,

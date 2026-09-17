@@ -166,11 +166,7 @@ fn globals() -> Globals {
 /// `.json()`/`.yaml()`/`.toml()`/`.csv()`; `None` when `canvas` wasn't read
 /// from a real file (an in-memory/test canvas, or a caller that doesn't
 /// want constraints touching disk at all), which makes every one of those
-/// calls return `None` rather than erroring. A node spliced in from an
-/// `include` target resolves against *its own* directory instead
-/// (`Node::asset_base`, set by `include::resolve` — same as any other
-/// relative reference in an included node's body) — `base_dir` is only
-/// the fallback for a `file` node that lives directly in `canvas` itself.
+/// calls return `None` rather than erroring.
 pub fn evaluate(canvas: &Canvas, base_dir: Option<&Path>) -> Vec<ConstraintResult> {
     let prelude = build_prelude(canvas, base_dir);
     let globals = globals();
@@ -395,14 +391,7 @@ fn file_data_literals(node: &Node, base_dir: Option<&Path>) -> FileDataLiterals 
     if node.node_type != NodeType::File {
         return none();
     }
-    // A node spliced in from an `include` target resolves its own relative
-    // references against *that* target's directory, not the top-level
-    // canvas's — same as any other relative reference in an included
-    // node's body (see `Node::asset_base`); `base_dir` is only the
-    // fallback for a `file` node that lives directly in the document
-    // `evaluate` was called on.
-    let dir = node.asset_base.as_deref().map(Path::new).or(base_dir);
-    let (Some(dir), Some(target)) = (dir, node.target.as_deref()) else {
+    let (Some(dir), Some(target)) = (base_dir, node.target.as_deref()) else {
         return none();
     };
     let Ok(preview) = crate::file_read::preview(dir, target) else {
@@ -846,42 +835,6 @@ mod tests {
              ```\n",
         );
         let results = evaluate(&c, Some(&dir));
-        assert!(results[0].ok, "{:?}", results[0].messages);
-    }
-
-    #[test]
-    fn file_node_content_resolves_against_asset_base_not_the_top_level_base_dir() {
-        // Mirrors a `file` node spliced in from an `include` target: its
-        // own relative reference resolves against *that* target's
-        // directory (`Node::asset_base`, set by `include::resolve`), not
-        // the top-level document's own directory `evaluate` was called
-        // with -- a real bug caught by actually running `meshfox check`
-        // through README.md's real include chain (LICENSE.canvas.md and
-        // examples/constraints.canvas.md, both included), not by any
-        // in-memory test alone.
-        let included_dir = tmp_dir("asset-base-included");
-        std::fs::write(
-            included_dir.join("data.txt"),
-            "from the included file's own directory",
-        )
-        .unwrap();
-        let unrelated_dir = tmp_dir("asset-base-unrelated");
-
-        let mut c = canvas(
-            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
-             ## Data\n<!-- meshfox:node id=\"data\" type=\"file\" -->\n\n[data](data.txt)\n\n\
-             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
-             ```starlark constraint\n\
-             if doc.node(\"data\").content() != \"from the included file's own directory\":\n\
-             \x20   fail(\"unexpected content: \" + str(doc.node(\"data\").content()))\n\
-             ```\n",
-        );
-        c.node_mut("data").unwrap().asset_base = Some(included_dir.to_string_lossy().into_owned());
-
-        // `base_dir` here is a real directory, just not the right one --
-        // proof `asset_base` takes priority over it rather than being
-        // ignored.
-        let results = evaluate(&c, Some(&unrelated_dir));
         assert!(results[0].ok, "{:?}", results[0].messages);
     }
 

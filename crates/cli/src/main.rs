@@ -277,9 +277,8 @@ enum Command {
     /// "every node tagged `table` has exactly one `file` child") — implies
     /// `validate` first, since an unparseable file has no constraints to
     /// run. Resolves includes first (same as `validate`/`view`/`static`),
-    /// so a constraint sees the fully composed document — including one
-    /// that lives inside an included canvas, evaluated against its
-    /// namespaced `{include_id}/{original_id}` — same tree the web UI
+    /// so a constraint sees the fully resolved document — an `include`
+    /// node's own dumped-in content included — same tree the web UI
     /// checks, not just this file in isolation. Exits non-zero if the file
     /// (or any include target) fails to parse, an include is broken, or
     /// any constraint fails, so it's usable as a pre-commit/CI check
@@ -2443,9 +2442,8 @@ async fn run_worker_tty(
 /// job here (`reparent_node`'s own doc comment) — this never touches that
 /// math at all. Fetches the node's *current* extra parents via
 /// `include::resolve` (not the primary-document-only `Canvas::from_markdown`
-/// `apply_node_mv` uses) — a strict superset, not a narrower behavior: an
-/// include-spliced node's own namespaced id works here even though the
-/// direct-file fallback never supported one.
+/// `apply_node_mv` uses) — same resolved view every other worker-routed
+/// read here already goes through.
 async fn node_mv_via_worker(
     port: u16,
     canvas_path: &Path,
