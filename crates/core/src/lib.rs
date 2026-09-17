@@ -36,7 +36,7 @@ pub mod varout;
 pub mod vars;
 pub mod worker_lock;
 
-pub use builtin_interpreter::{is_builtin, resolve_builtin_spec, resolve_with_env};
+pub use builtin_interpreter::{is_builtin, resolve_builtin_spec, resolve_with_env, ResolvedInterpreter};
 pub use canvas::{ArrowEnd, Canvas, EdgeLineStyle, ExtraEdge, FileDisplay, Node, NodeType};
 pub use constraint::{evaluate as evaluate_constraints, ConstraintResult, ConstraintStatus};
 pub use deps::{compute_forced_reruns, BlockAddr, DepsError};

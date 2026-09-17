@@ -10,10 +10,10 @@
 //! a worker never needs to know or care whether the process on the other
 //! end is this crate's own watcher or something else entirely.
 //!
-//! Three messages, all one-way — no response payload a caller needs to act
-//! on, since opening a browser tab (or a plain file) is the *coordinator's*
-//! job now, not something a caller waits for a port back to do itself (see
-//! `crate::open_node_file`):
+//! Four messages. Three are one-way — no response payload a caller needs to
+//! act on, since opening a browser tab (or a plain file) is the
+//! *coordinator's* job now, not something a caller waits for a port back to
+//! do itself (see `crate::open_node_file`):
 //! - [`Message::Ready`] — sent once by a freshly-spawned worker, right
 //!   after it binds its listener. Replaces the old `--port-file` polling
 //!   entirely: the coordinator just gets told, instead of having to notice.
@@ -31,6 +31,19 @@
 //!   own watcher and the macOS menu-bar daemon, a fresh editor tab for the
 //!   VS Code extension's coordinator) without the worker itself knowing or
 //!   caring which one it's talking to.
+//!
+//! The fourth, [`Message::GetPort`], is the odd one out: sent not by a
+//! worker but by any *other* client (`tui`, `run`, `node <op>`, MCP — see
+//! `crates/cli/src/coordinator.rs`) that wants to become an HTTP/WS client
+//! of whichever worker the coordinator manages for a canvas, without
+//! opening a browser tab for it. Unlike the other three, this one gets a
+//! reply: after get-or-spawning a worker exactly like `Open` would, the
+//! coordinator writes one JSON response line back on the *same* connection
+//! before closing it — `{"port": u16}` on success, `{"error": string}` on
+//! failure — see [`request_port`]. Every coordinator implementation that
+//! wants `server_socket` clients to work against it needs to answer this
+//! one; the macOS daemon is the first (see `macos/MeshfoxDaemon/Sources/
+//! MeshfoxDaemon/UnixSocketServer.swift`'s `getPort` handler).
 //!
 //! A connection failure (the coordinator's socket doesn't exist, or
 //! nothing answers) is surfaced as a plain `io::Error` to the caller — see
@@ -67,6 +80,19 @@ pub enum Message {
     /// `.md`). No fragment, no port to wait for: fire-and-forget, same as
     /// `Open` once a worker's already running.
     OpenFile { path: PathBuf },
+    /// "Get-or-spawn a worker for `canvas_path`, don't open a browser tab,
+    /// just tell me its port" — see this module's own doc comment. The only
+    /// variant that gets a reply; see [`request_port`].
+    GetPort { canvas_path: PathBuf },
+}
+
+/// The one JSON line a coordinator writes back after a [`Message::GetPort`]
+/// — see [`request_port`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum PortResponse {
+    Port { port: u16 },
+    Error { error: String },
 }
 
 /// Sends `msg` to the coordinator listening at `socket_path` as one
@@ -134,6 +160,44 @@ pub async fn request_open_file(socket_path: &Path, path: &Path) -> io::Result<()
         },
     )
     .await
+}
+
+/// [`Message::GetPort`] — get-or-spawn a worker for `canvas_path` and learn
+/// its port, without opening a browser tab. Unlike every other function
+/// here, this one reads a reply back on the same connection before
+/// returning — see this module's own doc comment and [`PortResponse`]. A
+/// coordinator-reported `{"error": ...}` comes back as
+/// `io::ErrorKind::Other`; a connection failure or a malformed/missing
+/// reply as `io::ErrorKind::InvalidData`. Used by
+/// `crates/cli/src/coordinator.rs` whenever `server_socket` is configured —
+/// see that module for why every other core-launch operation (`tui`, `run`,
+/// `node <op>`, MCP) goes through this instead of `worker_lock`.
+pub async fn request_port(socket_path: &Path, canvas_path: &Path) -> io::Result<u16> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let mut stream = UnixStream::connect(socket_path).await?;
+    let mut line = serde_json::to_string(&Message::GetPort {
+        canvas_path: canvas_path.to_path_buf(),
+    })
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    line.push('\n');
+    stream.write_all(line.as_bytes()).await?;
+
+    let (read_half, _write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    let mut reply = String::new();
+    reader.read_line(&mut reply).await?;
+    if reply.trim().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "coordinator closed the connection without answering get_port",
+        ));
+    }
+    match serde_json::from_str::<PortResponse>(reply.trim()) {
+        Ok(PortResponse::Port { port }) => Ok(port),
+        Ok(PortResponse::Error { error }) => Err(io::Error::other(error)),
+        Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
+    }
 }
 
 #[cfg(test)]
@@ -234,6 +298,67 @@ mod tests {
             other => panic!("expected OpenFile, got {other:?}"),
         }
 
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn request_port_reads_back_the_coordinators_reply() {
+        let socket_path = temp_socket_path("get-port");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let canvas_path = PathBuf::from("/tmp/some.canvas.md");
+        let send_task = tokio::spawn({
+            let socket_path = socket_path.clone();
+            let canvas_path = canvas_path.clone();
+            async move { request_port(&socket_path, &canvas_path).await }
+        });
+
+        // `read_line`, not `read_to_string` — unlike the fire-and-forget
+        // messages' own tests above, `request_port`'s client keeps its
+        // write half open to read a reply back afterward, so there's no
+        // EOF for `read_to_string` to ever see.
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let msg: Message = serde_json::from_str(line.trim()).unwrap();
+        match msg {
+            Message::GetPort { canvas_path: p } => assert_eq!(p, canvas_path),
+            other => panic!("expected GetPort, got {other:?}"),
+        }
+        write_half.write_all(b"{\"port\":4242}\n").await.unwrap();
+
+        assert_eq!(send_task.await.unwrap().unwrap(), 4242);
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn request_port_surfaces_a_coordinator_reported_error() {
+        let socket_path = temp_socket_path("get-port-error");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let canvas_path = PathBuf::from("/tmp/bad.canvas.md");
+        let send_task = tokio::spawn({
+            let socket_path = socket_path.clone();
+            let canvas_path = canvas_path.clone();
+            async move { request_port(&socket_path, &canvas_path).await }
+        });
+
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        write_half
+            .write_all(b"{\"error\":\"couldn't spawn a worker\"}\n")
+            .await
+            .unwrap();
+
+        let err = send_task.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("couldn't spawn a worker"));
         let _ = std::fs::remove_file(&socket_path);
     }
 

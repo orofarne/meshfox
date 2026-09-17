@@ -55,16 +55,12 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{mpsc, Mutex};
+use tokio::process::Command;
+use tokio::sync::Mutex;
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const SWEEP_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_SEND_TIMEOUT_MS: u64 = 60_000;
-/// How long a timed-out `debug_send` gives the hung command to exit after
-/// `SIGTERM` before escalating to `SIGKILL` — see `DebugSession::terminate_on_timeout`.
-const TERM_GRACE: Duration = Duration::from_secs(2);
 const CANVAS_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Set (to any value) only in the environment of a process `canvas_open`
@@ -131,10 +127,28 @@ fn invalid_params(msg: impl Into<String>) -> ErrorData {
 // Leaf: one process, one canvas file — the original implementation.
 // =======================================================================
 
+/// One tracked debug session, from this MCP process's own point of view —
+/// either a `DebugSession` it spawned and owns directly (`coordinator::
+/// resolve` found no live worker), or just the address of a worker's own
+/// session it started remotely via `/api/debug/*` (see `crate::coordinator`'s
+/// own doc comment for why *every* call site here, not just this one,
+/// treats "a local worker" and "an externally-configured `server_socket`"
+/// as the same kind of "become a client instead" decision).
+enum DebugHandle {
+    Local(Arc<Mutex<meshfox_server::debug_session::DebugSession>>),
+    /// The worker's own session id (usually — but not necessarily, if a
+    /// caller supplied its own — equal to this map's own key) and which
+    /// port it lives on. `debug_send`/`debug_stop` must reach *this exact*
+    /// worker, not whatever `coordinator::resolve` happens to return next
+    /// time — resolving once at `debug_start` and remembering it here is
+    /// what guarantees that.
+    Remote { port: u16, session_id: String },
+}
+
 #[derive(Clone)]
 struct MeshfoxMcp {
     canvas_path: PathBuf,
-    sessions: Arc<Mutex<HashMap<String, Arc<Mutex<DebugSession>>>>>,
+    sessions: Arc<Mutex<HashMap<String, DebugHandle>>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -147,6 +161,15 @@ impl MeshfoxMcp {
         }
     }
 
+    /// Only ever sweeps `DebugHandle::Local` sessions — a `Remote` one
+    /// lives on the worker's own registry, which this MCP process is just
+    /// one possible client of among however many others (another CLI
+    /// invocation, a `tui`, a different MCP session) might be talking to
+    /// the same worker; idle-eviction for those has to be the worker's own
+    /// job to mean anything, and isn't implemented there yet (see
+    /// `crates/server/src/lib.rs`'s `debug_sessions` field/`/api/debug/*` —
+    /// a remote session currently only ever goes away via an explicit
+    /// `debug_stop`, `session_ended`, or the whole worker exiting).
     fn spawn_idle_sweep(&self) {
         let sessions = Arc::clone(&self.sessions);
         tokio::spawn(async move {
@@ -155,16 +178,18 @@ impl MeshfoxMcp {
                 let idle_ids: Vec<String> = {
                     let map = sessions.lock().await;
                     let mut idle = Vec::new();
-                    for (id, session) in map.iter() {
-                        if session.lock().await.last_used.elapsed() > IDLE_TIMEOUT {
-                            idle.push(id.clone());
+                    for (id, handle) in map.iter() {
+                        if let DebugHandle::Local(session) = handle {
+                            if session.lock().await.idle_for() > IDLE_TIMEOUT {
+                                idle.push(id.clone());
+                            }
                         }
                     }
                     idle
                 };
                 for id in idle_ids {
                     let removed = sessions.lock().await.remove(&id);
-                    if let Some(session) = removed {
+                    if let Some(DebugHandle::Local(session)) = removed {
                         session.lock().await.stop().await;
                     }
                 }
@@ -189,244 +214,6 @@ impl MeshfoxMcp {
             )
         })
     }
-}
-
-// ---------------------------------------------------------------------
-// Debug session
-// ---------------------------------------------------------------------
-
-enum StreamLine {
-    Out(String),
-    Err(String),
-}
-
-struct DebugSession {
-    child: Child,
-    stdin: ChildStdin,
-    lines_rx: mpsc::UnboundedReceiver<StreamLine>,
-    last_used: Instant,
-}
-
-#[derive(Debug)]
-struct SendOutcome {
-    stdout: String,
-    stderr: String,
-    exit_code: i32,
-    timed_out: bool,
-    session_ended: bool,
-}
-
-impl DebugSession {
-    fn spawn(cwd: &std::path::Path, envs: HashMap<String, String>) -> std::io::Result<Self> {
-        let mut command = Command::new("bash");
-        // `--noprofile --norc`: a plain interactive-less shell, not a login
-        // shell — nothing from the user's own `.bashrc` should silently
-        // change how a debug snippet behaves. Reads commands from its own
-        // stdin pipe, same as `bash < script.sh` — not a pty (see this
-        // module's own doc comment for why: separate stdout/stderr, no
-        // ANSI/terminal concerns to strip).
-        command.arg("--noprofile").arg("--norc");
-        command.current_dir(cwd);
-        command.envs(envs);
-        command.stdin(Stdio::piped());
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::piped());
-        command.kill_on_drop(true);
-        // `setsid()` — not the simpler `process_group(0)` this used to be —
-        // for two reasons at once: it still makes this shell the leader of
-        // its own new process group (pgid == its own pid), which is all
-        // `stop()`/`terminate_on_timeout`/`signal_group` below actually need
-        // to reach everything this shell spawns; but it *also* detaches
-        // from any controlling
-        // terminal, which `process_group(0)` alone does not do. That
-        // detachment matters because libpq's password prompt
-        // (`simple_prompt`) opens `/dev/tty` directly, bypassing stdin/
-        // stdout entirely — if a controlling terminal is inherited from
-        // whatever launched `meshfox mcp`, that open succeeds and the
-        // prompt blocks forever on a tty nobody will ever type into. With
-        // no controlling terminal, `open("/dev/tty")` fails outright
-        // (`ENXIO`) and libpq falls back to stdin, which fails fast instead
-        // (see TODO.canvas.md's "PGPASSWORD-подстановка..." node). Not
-        // combined with `process_group(0)`: `setsid()` requires the caller
-        // not already be a process group leader, and `process_group(0)`'s
-        // `setpgid` may run before this closure does.
-        //
-        // SAFETY: the only syscall here is `setsid()` itself, which is
-        // async-signal-safe — safe to call between fork and exec.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-
-        let mut child = command.spawn()?;
-        let stdin = child.stdin.take().expect("piped stdin");
-        let stdout = child.stdout.take().expect("piped stdout");
-        let stderr = child.stderr.take().expect("piped stderr");
-
-        let (tx, rx) = mpsc::unbounded_channel();
-        let tx_out = tx.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if tx_out.send(StreamLine::Out(line)).is_err() {
-                    break;
-                }
-            }
-        });
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if tx.send(StreamLine::Err(line)).is_err() {
-                    break;
-                }
-            }
-        });
-
-        Ok(DebugSession {
-            child,
-            stdin,
-            lines_rx: rx,
-            last_used: Instant::now(),
-        })
-    }
-
-    /// Runs `code` in this session's own shell and waits for it to finish —
-    /// marked by a unique sentinel line this call appends after `code`,
-    /// printed to *both* streams with the real exit code so completion is
-    /// only declared once both stdout and stderr have delivered everything
-    /// up to that point (they're unrelated pipes with no ordering
-    /// guarantee between them). If `code` itself times out, this call can't
-    /// tell that command's own trailing output apart from whatever a next
-    /// call might get back — so instead of leaving it running and letting
-    /// later `debug_send`s queue up behind it forever, it kills the whole
-    /// session (`terminate_on_timeout`) and reports `session_ended`; a
-    /// fresh `debug_start` is the clean way back in, same as after an
-    /// explicit `debug_stop`.
-    async fn send(&mut self, code: &str, timeout: Duration) -> std::io::Result<SendOutcome> {
-        self.last_used = Instant::now();
-        let marker = format!("__meshfox_done_{}__", uuid::Uuid::new_v4().simple());
-        let wrapped = format!(
-            "{code}\n__mfx_rc=$?\nprintf '%s %s\\n' '{marker}' \"$__mfx_rc\" >&2\nprintf '%s %s\\n' '{marker}' \"$__mfx_rc\" >&1\n"
-        );
-        self.stdin.write_all(wrapped.as_bytes()).await?;
-        self.stdin.flush().await?;
-
-        let mut stdout_lines = Vec::new();
-        let mut stderr_lines = Vec::new();
-        let mut exit_code: i32 = -1;
-        let mut stdout_done = false;
-        let mut stderr_done = false;
-        let deadline = tokio::time::Instant::now() + timeout;
-
-        while !(stdout_done && stderr_done) {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                self.terminate_on_timeout().await;
-                return Ok(SendOutcome {
-                    stdout: stdout_lines.join("\n"),
-                    stderr: stderr_lines.join("\n"),
-                    exit_code,
-                    timed_out: true,
-                    session_ended: true,
-                });
-            }
-            match tokio::time::timeout(remaining, self.lines_rx.recv()).await {
-                Ok(Some(StreamLine::Out(line))) => match strip_marker(&line, &marker) {
-                    Some(rc) => {
-                        exit_code = rc;
-                        stdout_done = true;
-                    }
-                    None => stdout_lines.push(line),
-                },
-                Ok(Some(StreamLine::Err(line))) => match strip_marker(&line, &marker) {
-                    Some(rc) => {
-                        exit_code = rc;
-                        stderr_done = true;
-                    }
-                    None => stderr_lines.push(line),
-                },
-                // Both streams closed — the shell itself exited (e.g. the
-                // debug code called `exit`) — nothing more will ever
-                // arrive, so stop waiting rather than spin until the
-                // timeout for no reason.
-                Ok(None) => {
-                    return Ok(SendOutcome {
-                        stdout: stdout_lines.join("\n"),
-                        stderr: stderr_lines.join("\n"),
-                        exit_code,
-                        timed_out: false,
-                        session_ended: true,
-                    });
-                }
-                Err(_) => {
-                    self.terminate_on_timeout().await;
-                    return Ok(SendOutcome {
-                        stdout: stdout_lines.join("\n"),
-                        stderr: stderr_lines.join("\n"),
-                        exit_code,
-                        timed_out: true,
-                        session_ended: true,
-                    });
-                }
-            }
-        }
-        Ok(SendOutcome {
-            stdout: stdout_lines.join("\n"),
-            stderr: stderr_lines.join("\n"),
-            exit_code,
-            timed_out: false,
-            session_ended: false,
-        })
-    }
-
-    async fn stop(&mut self) {
-        let _ = self.signal_group(libc::SIGKILL);
-        let _ = self.child.wait().await;
-    }
-
-    /// Escalated kill for a `code` that blew through its `debug_send`
-    /// timeout: `SIGTERM` first, so anything that traps it (or just needs a
-    /// moment to flush/close a connection) can exit cleanly, then — only if
-    /// it's still alive after `TERM_GRACE` — `SIGKILL`, which can't be
-    /// caught or ignored. Whole group either way, same as `stop()`, since
-    /// there's no way to tell this session's shell apart from whatever
-    /// hung command it's still waiting on (see `send`'s own doc comment) —
-    /// this ends the session, it doesn't try to save it.
-    async fn terminate_on_timeout(&mut self) {
-        let _ = self.signal_group(libc::SIGTERM);
-        if tokio::time::timeout(TERM_GRACE, self.child.wait())
-            .await
-            .is_err()
-        {
-            let _ = self.signal_group(libc::SIGKILL);
-            let _ = self.child.wait().await;
-        }
-    }
-
-    fn signal_group(&self, signal: libc::c_int) -> std::io::Result<()> {
-        let Some(pid) = self.child.id() else {
-            return Ok(()); // already reaped
-        };
-        // SAFETY: `libc::kill` with a negative pid signals every process in
-        // that process group; `pid` is this session's own leader pid (see
-        // `spawn`'s `setsid()`).
-        let ret = unsafe { libc::kill(-(pid as libc::pid_t), signal) };
-        if ret != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
-    }
-}
-
-/// `line` is the sentinel this session's own `send` appended, if it starts
-/// with `marker` — returns the exit code it carries. Anything else is
-/// real output from the code that ran, passed through unchanged.
-fn strip_marker(line: &str, marker: &str) -> Option<i32> {
-    line.strip_prefix(marker)?.trim().parse().ok()
 }
 
 // ---------------------------------------------------------------------
@@ -767,6 +554,22 @@ impl MeshfoxMcp {
         &self,
         Parameters(params): Parameters<DebugStartParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        match crate::coordinator::resolve(&self.canvas_path)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+        {
+            crate::coordinator::Resolved::Us(_guard) => self.debug_start_local(params).await,
+            crate::coordinator::Resolved::Other(port) => self.debug_start_remote(port, params).await,
+        }
+    }
+
+    /// Today's original in-process path: spawns a
+    /// `meshfox_server::debug_session::DebugSession` directly and tracks it
+    /// under `DebugHandle::Local`.
+    async fn debug_start_local(
+        &self,
+        params: DebugStartParams,
+    ) -> Result<CallToolResult, ErrorData> {
         let raw = self.read_raw()?;
         let canvas = Canvas::from_markdown(&raw).map_err(|e| invalid_params(e.to_string()))?;
         let node = canvas
@@ -845,20 +648,49 @@ impl MeshfoxMcp {
         let envs = meshfox_core::map_block_env(&block.env, &resolved.values);
         let cwd = node.cwd(crate::canvas_root_dir(&self.canvas_path));
 
-        let session = DebugSession::spawn(&cwd, envs).map_err(|e| {
+        let session = meshfox_server::debug_session::DebugSession::spawn(&cwd, envs).map_err(|e| {
             ErrorData::internal_error(format!("failed to start debug session: {e}"), None)
         })?;
         let session_id = uuid::Uuid::new_v4().to_string();
         self.sessions
             .lock()
             .await
-            .insert(session_id.clone(), Arc::new(Mutex::new(session)));
+            .insert(session_id.clone(), DebugHandle::Local(Arc::new(Mutex::new(session))));
 
         Ok(CallToolResult::structured(json!({
             "session_id": session_id,
             "node_id": params.node_id,
             "block_name": block.name,
             "cwd": cwd.display().to_string(),
+        })))
+    }
+
+    /// `coordinator::resolve` found a live worker — start the session there
+    /// instead (`POST /api/debug/start`), tracked under `DebugHandle::
+    /// Remote` keyed by the *worker's own* session id (no separate local id
+    /// needed on top of it).
+    async fn debug_start_remote(
+        &self,
+        port: u16,
+        params: DebugStartParams,
+    ) -> Result<CallToolResult, ErrorData> {
+        let (session_id, block_name, cwd) = crate::worker_client::debug_start(
+            port,
+            &params.node_id,
+            params.block_name.as_deref(),
+            params.vars,
+        )
+        .await
+        .map_err(invalid_params)?;
+        self.sessions.lock().await.insert(
+            session_id.clone(),
+            DebugHandle::Remote { port, session_id: session_id.clone() },
+        );
+        Ok(CallToolResult::structured(json!({
+            "session_id": session_id,
+            "node_id": params.node_id,
+            "block_name": block_name,
+            "cwd": cwd,
         })))
     }
 
@@ -869,29 +701,48 @@ impl MeshfoxMcp {
         &self,
         Parameters(params): Parameters<DebugSendParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let session = {
+        let handle = {
             let sessions = self.sessions.lock().await;
-            sessions
-                .get(&params.session_id)
-                .cloned()
-                .ok_or_else(|| invalid_params(format!("no debug session {:?}", params.session_id)))?
+            match sessions.get(&params.session_id) {
+                Some(DebugHandle::Local(session)) => Some(DebugHandle::Local(Arc::clone(session))),
+                Some(DebugHandle::Remote { port, session_id }) => {
+                    Some(DebugHandle::Remote { port: *port, session_id: session_id.clone() })
+                }
+                None => None,
+            }
+        }
+        .ok_or_else(|| invalid_params(format!("no debug session {:?}", params.session_id)))?;
+
+        let timeout_ms = params.timeout_ms.unwrap_or(DEFAULT_SEND_TIMEOUT_MS);
+        let (stdout, stderr, exit_code, timed_out, session_ended) = match handle {
+            DebugHandle::Local(session) => {
+                let outcome = {
+                    let mut session = session.lock().await;
+                    session
+                        .send(&params.code, Duration::from_millis(timeout_ms))
+                        .await
+                        .map_err(|e| {
+                            ErrorData::internal_error(format!("debug session write/read failed: {e}"), None)
+                        })?
+                };
+                (outcome.stdout, outcome.stderr, outcome.exit_code, outcome.timed_out, outcome.session_ended)
+            }
+            DebugHandle::Remote { port, session_id } => {
+                let outcome = crate::worker_client::debug_send(port, &session_id, &params.code, timeout_ms)
+                    .await
+                    .map_err(invalid_params)?;
+                (outcome.stdout, outcome.stderr, outcome.exit_code, outcome.timed_out, outcome.session_ended)
+            }
         };
-        let timeout = Duration::from_millis(params.timeout_ms.unwrap_or(DEFAULT_SEND_TIMEOUT_MS));
-        let outcome = {
-            let mut session = session.lock().await;
-            session.send(&params.code, timeout).await.map_err(|e| {
-                ErrorData::internal_error(format!("debug session write/read failed: {e}"), None)
-            })?
-        };
-        if outcome.session_ended {
+        if session_ended {
             self.sessions.lock().await.remove(&params.session_id);
         }
         Ok(CallToolResult::structured(json!({
-            "stdout": outcome.stdout,
-            "stderr": outcome.stderr,
-            "exit_code": outcome.exit_code,
-            "timed_out": outcome.timed_out,
-            "session_ended": outcome.session_ended,
+            "stdout": stdout,
+            "stderr": stderr,
+            "exit_code": exit_code,
+            "timed_out": timed_out,
+            "session_ended": session_ended,
         })))
     }
 
@@ -902,11 +753,15 @@ impl MeshfoxMcp {
     ) -> Result<CallToolResult, ErrorData> {
         let removed = self.sessions.lock().await.remove(&params.session_id);
         match removed {
-            Some(session) => {
+            Some(DebugHandle::Local(session)) => {
                 session.lock().await.stop().await;
-                Ok(CallToolResult::structured(
-                    json!({ "stopped": params.session_id }),
-                ))
+                Ok(CallToolResult::structured(json!({ "stopped": params.session_id })))
+            }
+            Some(DebugHandle::Remote { port, session_id }) => {
+                crate::worker_client::debug_stop(port, &session_id)
+                    .await
+                    .map_err(invalid_params)?;
+                Ok(CallToolResult::structured(json!({ "stopped": params.session_id })))
             }
             None => Err(invalid_params(format!(
                 "no debug session {:?}",
@@ -941,6 +796,20 @@ impl MeshfoxMcp {
         &self,
         Parameters(params): Parameters<NodeAddParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(port) = crate::coordinator::discover(&self.canvas_path).await {
+            let new_id = crate::worker_client::create_node(port, &params.parent_id, &params.title, true)
+                .await
+                .map_err(invalid_params)?;
+            let meta_fields = params.fields.into_node_meta_fields();
+            if params.body.is_some() || meta_fields.is_set() {
+                let update = crate::node_update_from_fields(&meta_fields, params.body.as_deref())
+                    .map_err(invalid_params)?;
+                crate::worker_client::update_node(port, &new_id, &update)
+                    .await
+                    .map_err(invalid_params)?;
+            }
+            return Ok(CallToolResult::structured(json!({ "node_id": new_id })));
+        }
         let raw = self.read_raw()?;
         let (updated, new_id) = crate::apply_node_add_with_extras(
             &raw,
@@ -961,6 +830,20 @@ impl MeshfoxMcp {
         &self,
         Parameters(params): Parameters<NodeMetaParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        // `clear_position` has no worker-routed equivalent (see
+        // `NodeMetaFields`'s own doc comment in main.rs) — falls through
+        // to the direct-file path unconditionally for that one case.
+        if !params.clear_position {
+            if let Some(port) = crate::coordinator::discover(&self.canvas_path).await {
+                let meta_fields = params.fields.into_node_meta_fields();
+                let update = crate::node_update_from_fields(&meta_fields, None)
+                    .map_err(invalid_params)?;
+                crate::worker_client::update_node(port, &params.node_id, &update)
+                    .await
+                    .map_err(invalid_params)?;
+                return Ok(CallToolResult::structured(json!({ "updated": params.node_id })));
+            }
+        }
         let raw = self.read_raw()?;
         let f = params.fields;
         let updated = crate::apply_node_meta(
@@ -991,7 +874,7 @@ impl MeshfoxMcp {
         &self,
         Parameters(params): Parameters<NodeBodyParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Some(port) = crate::worker_client::discover(&self.canvas_path) {
+        if let Some(port) = crate::coordinator::discover(&self.canvas_path).await {
             crate::worker_client::update_node_body(port, &params.node_id, &params.body)
                 .await
                 .map_err(invalid_params)?;
@@ -1025,7 +908,6 @@ impl MeshfoxMcp {
         &self,
         Parameters(params): Parameters<NodeBlockParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let raw = self.read_raw()?;
         let (cache, no_cache) = bool_pair(params.cache);
         let (always, no_always) = bool_pair(params.always);
         let (default, no_default) = bool_pair(params.default);
@@ -1033,8 +915,8 @@ impl MeshfoxMcp {
         let (autoclose, no_autoclose) = bool_pair(params.autoclose);
         let (service, no_service) = bool_pair(params.service);
         let args = crate::BlockArgs {
-            rename: params.rename,
-            lang: params.lang,
+            rename: params.rename.clone(),
+            lang: params.lang.clone(),
             cache,
             no_cache,
             always,
@@ -1047,14 +929,26 @@ impl MeshfoxMcp {
             no_autoclose,
             service,
             no_service,
-            deps: params.deps,
+            deps: params.deps.clone(),
             clear_deps: params.clear_deps,
-            env: params.env,
+            env: params.env.clone(),
             clear_env: params.clear_env,
-            interpreter: params.interpreter,
+            interpreter: params.interpreter.clone(),
             clear_interpreter: params.clear_interpreter,
             code_file: None,
         };
+        if let Some(port) = crate::coordinator::discover(&self.canvas_path).await {
+            let update = crate::block_attrs_update_from_args(&args, params.code.as_deref())
+                .map_err(invalid_params)?;
+            crate::worker_client::set_block_attrs(port, &params.node_id, &params.block_name, &update)
+                .await
+                .map_err(invalid_params)?;
+            return Ok(CallToolResult::structured(json!({
+                "updated": params.node_id,
+                "block": params.block_name,
+            })));
+        }
+        let raw = self.read_raw()?;
         let updated = crate::apply_node_block(
             &raw,
             &params.node_id,
@@ -1077,7 +971,7 @@ impl MeshfoxMcp {
         &self,
         Parameters(params): Parameters<NodeRmParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Some(port) = crate::worker_client::discover(&self.canvas_path) {
+        if let Some(port) = crate::coordinator::discover(&self.canvas_path).await {
             crate::worker_client::remove_node(port, &params.node_id, params.keep_children)
                 .await
                 .map_err(invalid_params)?;
@@ -1099,6 +993,15 @@ impl MeshfoxMcp {
         &self,
         Parameters(params): Parameters<NodeMvParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(port) = crate::coordinator::discover(&self.canvas_path).await {
+            crate::node_mv_via_worker(port, &self.canvas_path, &params.node_id, &params.new_parent_id)
+                .await
+                .map_err(invalid_params)?;
+            return Ok(CallToolResult::structured(json!({
+                "moved": params.node_id,
+                "new_parent_id": params.new_parent_id,
+            })));
+        }
         let raw = self.read_raw()?;
         let updated = crate::apply_node_mv(&raw, &params.node_id, &params.new_parent_id)
             .map_err(invalid_params)?;
@@ -1116,6 +1019,19 @@ impl MeshfoxMcp {
         &self,
         Parameters(params): Parameters<NodeRenameParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(port) = crate::coordinator::discover(&self.canvas_path).await {
+            let update = crate::worker_client::NodeUpdate {
+                title: Some(params.title.clone()),
+                ..Default::default()
+            };
+            crate::worker_client::update_node(port, &params.node_id, &update)
+                .await
+                .map_err(invalid_params)?;
+            return Ok(CallToolResult::structured(json!({
+                "renamed": params.node_id,
+                "title": params.title,
+            })));
+        }
         let raw = self.read_raw()?;
         let updated =
             crate::apply_node_rename(&raw, &params.node_id, &params.title).map_err(invalid_params)?;
@@ -1133,6 +1049,15 @@ impl MeshfoxMcp {
         &self,
         Parameters(params): Parameters<NodeSetIdParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(port) = crate::coordinator::discover(&self.canvas_path).await {
+            crate::worker_client::rename_node_id(port, &params.node_id, &params.new_id)
+                .await
+                .map_err(invalid_params)?;
+            return Ok(CallToolResult::structured(json!({
+                "old_id": params.node_id,
+                "new_id": params.new_id,
+            })));
+        }
         let raw = self.read_raw()?;
         let updated = crate::apply_node_set_id(&raw, &params.node_id, &params.new_id)
             .map_err(invalid_params)?;
@@ -1150,6 +1075,24 @@ impl MeshfoxMcp {
         &self,
         Parameters(params): Parameters<NodeEdgesParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(port) = crate::coordinator::discover(&self.canvas_path).await {
+            let edges: Vec<meshfox_core::ExtraEdge> = params
+                .from
+                .iter()
+                .map(|p| meshfox_core::ExtraEdge::new(p.as_str()))
+                .collect();
+            let update = crate::worker_client::NodeUpdate {
+                extra_parents: Some(edges),
+                ..Default::default()
+            };
+            crate::worker_client::update_node(port, &params.node_id, &update)
+                .await
+                .map_err(invalid_params)?;
+            return Ok(CallToolResult::structured(json!({
+                "updated": params.node_id,
+                "extra_parents": params.from,
+            })));
+        }
         let raw = self.read_raw()?;
         let updated =
             crate::apply_node_edges(&raw, &params.node_id, &params.from).map_err(invalid_params)?;
@@ -1167,6 +1110,30 @@ impl MeshfoxMcp {
         &self,
         Parameters(params): Parameters<NodeMoveParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(port) = crate::coordinator::discover(&self.canvas_path).await {
+            let (target_id, is_before) = match (&params.before, &params.after) {
+                (Some(t), None) => (t.clone(), true),
+                (None, Some(t)) => (t.clone(), false),
+                (None, None) => {
+                    return Err(invalid_params(
+                        "exactly one of before/after is required".to_string(),
+                    ))
+                }
+                (Some(_), Some(_)) => {
+                    return Err(invalid_params(
+                        "before and after are mutually exclusive".to_string(),
+                    ))
+                }
+            };
+            crate::worker_client::move_sibling(port, &params.node_id, &target_id, is_before)
+                .await
+                .map_err(invalid_params)?;
+            return Ok(CallToolResult::structured(json!({
+                "moved": params.node_id,
+                "position": if is_before { "before" } else { "after" },
+                "target_id": target_id,
+            })));
+        }
         let raw = self.read_raw()?;
         let (updated, target_id, position) = crate::apply_node_move(
             &raw,
@@ -1190,6 +1157,12 @@ impl MeshfoxMcp {
         &self,
         Parameters(_params): Parameters<NodeReorderParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(port) = crate::coordinator::discover(&self.canvas_path).await {
+            crate::worker_client::reorder_document(port)
+                .await
+                .map_err(invalid_params)?;
+            return Ok(CallToolResult::structured(json!({ "reordered": true })));
+        }
         let raw = self.read_raw()?;
         let updated = crate::apply_node_reorder(&raw).map_err(invalid_params)?;
         self.write_raw(&updated)?;
@@ -1876,7 +1849,8 @@ impl ServerHandler for MeshfoxMcpRoot {
 
 #[cfg(test)]
 mod tests {
-    use super::{node_json, DebugSession, MeshfoxMcpRoot};
+    use super::{node_json, MeshfoxMcpRoot};
+    use meshfox_server::debug_session::DebugSession;
     use meshfox_core::Canvas;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1912,7 +1886,7 @@ mod tests {
         assert!(outcome.timed_out);
         assert!(outcome.session_ended);
         assert!(
-            session.child.try_wait().unwrap().is_some(),
+            session.has_exited(),
             "the shell should already be reaped by the time send() returns"
         );
     }
@@ -1928,7 +1902,7 @@ mod tests {
         assert!(outcome.timed_out);
         assert!(outcome.session_ended);
         assert!(
-            session.child.try_wait().unwrap().is_some(),
+            session.has_exited(),
             "SIGKILL after the grace period should have reaped the shell by now"
         );
     }

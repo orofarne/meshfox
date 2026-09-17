@@ -261,7 +261,7 @@ meshfox -h
 ```
 <!-- meshfox:output name="usage-help" hash="d456ec0a" -->
 ````text
-exit code: 0 · 18ms
+exit code: 0 · 31ms
 
 
  /\_/\
@@ -278,7 +278,6 @@ Commands:
   configure      Interactively resolve every declared `meshfox:var` (see SPEC.md's "Variables") and save the answers to the on-disk cache (`.meshfox/<filename>.env`, next to the canvas file) so `run` doesn't have to ask again. Shows each variable's currently-resolved value as the prompt's own default — press Enter to keep it. Secret variables are never cached, so there's nothing for this to save for them; they're skipped here and asked for fresh at run time instead. Requires an interactive terminal
   create         Create a new, empty canvas file: just the `meshfox:canvas` marker followed by a lone root heading (`#`) named after the file itself (its name with a trailing `.canvas.md`/`.md` stripped). Fails if the file already exists — this never overwrites
   view           Start the local web UI: canvas view, run buttons. Opens read-only — running a block is always allowed, but click "Edit" in the browser to unlock dragging, resizing, saving layout, and persisting a `cache`d block's output back into the file
-  open           Hand a `.canvas.md` off to the persistent macOS menu-bar daemon (`macos/MeshfoxDaemon`, "core-only" MVP — see TODO.canvas.md's "Ссылки и навигация между канвасами") instead of starting a private `meshfox view` session of your own. Deliberately never a fallback for `view` or vice versa — the two are different guarantees: `view` blocks in your terminal and everything it spawned dies when you kill it; `open` hands off and returns immediately, to whatever keeps running (and stays reachable) independent of this process. Requires the daemon: if it's not already running, this starts it (if installed) and waits for it to come up — it does *not* silently fall back to `view`'s own private-watcher behavior on failure; see the error message for what to do instead. macOS only for now — the daemon itself doesn't exist anywhere else yet
   tui            An ncurses-style terminal viewer — browse the node tree, read a node's rendered Markdown body (syntax-highlighted code, local images shown inline where the terminal supports it), and run blocks with live streamed output, right in the terminal. Same deps-chain/cache/`meshfox:var` handling as `meshfox run`/`meshfox view`. A `tty` block hands the real terminal over to it, same as `meshfox run`'s own `tty` handling. The tree/document panes' own mouse support covers clicking a tree row to select it (or its ▾/▸ marker to expand/collapse) and scrolling either pane; each row's title is also colored to match the node's own `color=`. `e` opens a fullscreen raw-source editor (vim-style modal input via `edtui`, meshfox-specific syntax highlighting, full mouse support — click to position the cursor, drag to select, scroll to move the viewport) on the selected node's own file — the terminal counterpart to the browser UI's Source mode. `Ctrl-f` switches between the document and any `include`d file; `Ctrl-n` turns the heading under the cursor into a node in one keystroke; `Ctrl-p` suggests attributes for the current `meshfox:node`/`meshfox:edge` comment or runnable-fence line, or, with the cursor inside a `tags=` value, tags already used elsewhere in the document. Still no *structural* editing beyond that (use `meshfox node ...` or the browser UI's Edit mode for that)
   mcp            An MCP stdio server giving an AI agent tool-call access to every canvas file under the current directory, without shelling out to this same binary. Takes no arguments — a host launches it the same way as any other stdio MCP server: `{"command": "meshfox", "args": ["mcp"]}`, and whichever directory it's started in becomes its root. Multi-canvas by design, but keeps "one file, one process" isolation underneath: `canvas_open`/`canvas_close`/`canvas_list` manage a registry of canvases, each backed by its own spawned, isolated child process (a crash or hung debug session on one canvas can't affect another) — resolved only under that root directory, never above it. Every other tool requires that `canvas_id` as its first argument, mirroring its single-canvas equivalent exactly: a stateful debug session (`debug_start`/`debug_send`/`debug_stop` — a persistent `bash` kept alive in a node/block's own resolved cwd/env, so a multi-step snippet's state — exported vars, files it wrote — survives between calls, unlike a one-shot `meshfox run`) and thin wrappers around the whole `node <op>` surface — every subcommand, not just a subset: `show`/`find` (find as structured JSON, CSS-selector matching, same as `node find`) and the mutating `add`/`meta`/`body`/`block`/`rm`/`mv`/`rename`/`set_id`/`edges`/ `move`/`reorder`. Deliberately does *not* attempt batch/ transactional multi-edit or optimistic-concurrency write conflicts (see TODO.canvas.md's own "MCP-редактирование файла"/"Оптимистичная конкурентность" — still open design questions, not implemented here) — every write here is the same immediate read-modify-write `node <op>` already does
   validate       Validate that a file parses as a meshfox canvas — same checks `run`/`view` already do before touching anything (single root, no duplicate ids, no dangling `meshfox:edge` targets, `group`/ `file`/`link` body rules) — without executing anything or writing the file back. Exits non-zero on a parse error, so it's usable as a pre-commit/CI check
@@ -468,33 +467,16 @@ Options:
 ```
 <!-- /meshfox:output -->
 
-### macOS menu-bar app (`open`, experimental)
+### macOS menu-bar app (`server_socket`, experimental)
 <!-- meshfox:node id="macos-menu-bar-app-open-experimental" -->
 
-`Meshfox.app` is a menu-bar-only daemon (no Dock icon) that also handles Finder's double-click/drag-onto-icon/"Open With" on a `.canvas.md` — see [macos/app.canvas.md](./macos/app.canvas.md) for the build/install steps (`swift build`, ad-hoc signing, installs to `~/Applications/Meshfox.app`). Installed separately from the `meshfox` binary itself; not built by default.
+`Meshfox.app` is a menu-bar-only daemon (no Dock icon) that also handles Finder's double-click/drag-onto-icon/"Open With" on a `.canvas.md` — see [macos/app.canvas.md](./macos/app.canvas.md) for the build/install steps (`swift build`, ad-hoc signing, installs to `~/Applications/Meshfox.app`, registers a LaunchAgent for it), including the exact `server_socket` line to add to `~/.meshfox/config.toml` once it's installed. Installed separately from the `meshfox` binary itself; not built by default.
 
-`meshfox open <target>` (optionally `target#node-id` for a deep link, same syntax a `file`-node target already supports) hands a canvas off to this daemon instead of starting a private `meshfox view` session of your own. Deliberately never a fallback for `view` or vice versa — the two are different guarantees: `view` blocks in your terminal and everything it spawned dies when you kill it; `open` hands off and returns immediately, to whatever keeps running (and stays reachable) independent of this process. If the daemon isn't already running, `open` starts it (if installed) and waits for it to come up — it does *not* silently fall back to `view`'s own behavior on failure.
+Once `server_socket` is set, every core-launch operation (`view`, `tui`, `run`, `node <op>`, `mcp`'s `debug_*`) becomes a client of whatever the daemon manages instead of spawning its own. `meshfox view <path>` in particular hands the canvas off to the daemon and exits immediately (prints a short confirmation) rather than starting a private session of its own — the daemon starts a worker for it if none exists yet, and opens a browser tab.
+
+The daemon's own socket is always reachable once its LaunchAgent is installed — launchd itself creates and holds it open via socket activation, spawning (or waking) the actual daemon process on first connection rather than requiring it to already be running. No client anywhere (this CLI, the VS Code extension) needs to know how to find or launch the `.app` itself: a configured-but-unreachable `server_socket` means the LaunchAgent isn't installed at all, reported as a real error rather than a silent fallback to running standalone.
 
 macOS only for now — the daemon itself doesn't exist anywhere else yet.
-
-```bash name="open-help" cache
-meshfox open -h
-```
-<!-- meshfox:output name="open-help" hash="0c0f4120" -->
-```text
-exit code: 0 · 20ms
-
-Hand a `.canvas.md` off to the persistent macOS menu-bar daemon (`macos/MeshfoxDaemon`, "core-only" MVP — see TODO.canvas.md's "Ссылки и навигация между канвасами") instead of starting a private `meshfox view` session of your own. Deliberately never a fallback for `view` or vice versa — the two are different guarantees: `view` blocks in your terminal and everything it spawned dies when you kill it; `open` hands off and returns immediately, to whatever keeps running (and stays reachable) independent of this process. Requires the daemon: if it's not already running, this starts it (if installed) and waits for it to come up — it does *not* silently fall back to `view`'s own private-watcher behavior on failure; see the error message for what to do instead. macOS only for now — the daemon itself doesn't exist anywhere else yet
-
-Usage: meshfox open <TARGET>
-
-Arguments:
-  <TARGET>  Path to the `.canvas.md` file, optionally with `#node-id` for a deep link straight to that node (same syntax a `file`-node target already supports — `meshfox_core::mdcanvas::split_target_fragment`)
-
-Options:
-  -h, --help  Print help
-```
-<!-- /meshfox:output -->
 
 ### Terminal viewer
 <!-- meshfox:node id="usage-tui" -->
@@ -615,11 +597,11 @@ mcp-inspector meshfox mcp
 ### VS Code extension
 <!-- meshfox:node id="vs-code-extension-experimental" -->
 
-[`editors/vscode/`](./editors/vscode/) — opens `.canvas.md` files (and any other `.md` whose first line is the `<!-- meshfox:canvas -->` marker — this document included) as the same interactive node canvas the browser UI shows, embedded directly in an editor tab instead of a browser one. The extension acts as its own private coordinator (mirroring `crates/cli/src/watcher.rs`'s own role, reimplemented in TypeScript over the same wire protocol `meshfox open` above also speaks): it spawns a `meshfox view --watcher-socket` worker per open canvas and points that tab's webview at its local port. Read-only from VS Code's own perspective, same as the browser UI itself — click "Edit" inside the canvas to unlock dragging/resizing/saving layout.
+[`editors/vscode/`](./editors/vscode/) — opens `.canvas.md` files (and any other `.md` whose first line is the `<!-- meshfox:canvas -->` marker — this document included) as the same interactive node canvas the browser UI shows, embedded directly in an editor tab instead of a browser one. The extension acts as its own private coordinator (mirroring `crates/cli/src/watcher.rs`'s own role, reimplemented in TypeScript over the same `meshfox_server::watcher_protocol` wire protocol the macOS daemon above also speaks): it spawns a `meshfox view --watcher-socket` worker per open canvas and points that tab's webview at its local port. Read-only from VS Code's own perspective, same as the browser UI itself — click "Edit" inside the canvas to unlock dragging/resizing/saving layout.
 
 Also ships a small TextMate injection grammar that highlights meshfox's own bookkeeping comments (`meshfox:node`/`meshfox:edge`/`meshfox:var`/...) wherever the raw file is shown as plain text instead of through the canvas editor — git diffs/blame, "Open With... → Text Editor".
 
-On the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=Orofarne.meshfox-vscode) — install straight from there, or see [editors/vscode/README.md](./editors/vscode/README.md) for building/installing the `.vsix` locally instead, and the extension's own limitations (macOS/Linux only for now, same watcher-socket protocol as `meshfox open` above).
+On the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=Orofarne.meshfox-vscode) — install straight from there, or see [editors/vscode/README.md](./editors/vscode/README.md) for building/installing the `.vsix` locally instead, and the extension's own limitations (macOS/Linux only for now, same watcher-socket protocol as the macOS daemon above).
 
 ### Static export (experimental)
 <!-- meshfox:node id="usage-static" -->

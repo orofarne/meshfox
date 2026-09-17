@@ -302,6 +302,15 @@ async fn handle_connection(stream: UnixStream, registry: Arc<Registry>, exe: Pat
             }
         }
         Message::OpenFile { path } => open_plain_file(path),
+        // Deliberately unsupported here: `GetPort` is the one message that
+        // needs a reply, but this function's own `stream` is already
+        // dropped by the time `match msg` runs (the `BufReader` reading
+        // `line` above owns it, and goes out of scope right after). A
+        // persistent, addressable coordinator (the macOS daemon, e.g.)
+        // implements this; this watcher is a private, per-`view`-invocation
+        // process nobody's `server_socket` has a reason to point at — see
+        // `crates/cli/src/coordinator.rs`'s own doc comment.
+        Message::GetPort { .. } => {}
     }
 }
 

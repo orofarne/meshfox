@@ -71,6 +71,13 @@ pub fn resolve_builtin_spec(spec: &str) -> io::Result<Option<String>> {
     Ok(Some(materialize(builtin)?.display().to_string()))
 }
 
+/// The resolved interpreter path, plus every `(name, value)` env var pair
+/// it should be spawned with — `resolve_with_env`'s own return shape,
+/// pulled out to a named type only to keep that signature legible (a
+/// nested tuple-in-tuple return type is otherwise exactly the kind of
+/// thing `clippy::type_complexity` exists to flag).
+pub type ResolvedInterpreter = (String, Vec<(String, String)>);
+
 /// `resolve_builtin_spec` plus the `MESHFOX_*` env vars that resolution
 /// should carry with it — the one place a caller actually spawning a
 /// builtin (as opposed to just checking `is_builtin`) should go through.
@@ -94,7 +101,7 @@ pub fn resolve_with_env(
     cwd: Option<&Path>,
     canvas_path: Option<&Path>,
     env_names: &[String],
-) -> io::Result<Option<(String, Vec<(String, String)>)>> {
+) -> io::Result<Option<ResolvedInterpreter>> {
     let Some(interpreter_path) = resolve_builtin_spec(spec)? else {
         return Ok(None);
     };

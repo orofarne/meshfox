@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.0
+
+- New: if `server_socket` is set in `.meshfox/config.toml` (local, next to
+  the canvas, or `~/.meshfox/config.toml` globally), this extension now
+  becomes a client of that external coordinator (e.g. the macOS menu-bar
+  daemon) instead of spawning its own private `meshfox view` worker per
+  canvas — the same worker a `tui`/`run`/another editor window sees stays
+  shared instead of racing a separate one this extension started on its
+  own. Falls back to today's own private-spawn behavior when unset, or
+  fails clearly (shown in the canvas tab) if it's set but unreachable,
+  rather than silently spawning a separate worker anyway.
+
 ## 0.2.2
 
 - Fixed: running a `tty` block inside the canvas webview failed with a

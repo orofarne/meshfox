@@ -75,6 +75,22 @@ fn deep_merge(base: &mut toml::Table, overlay: toml::Table) {
     }
 }
 
+/// `server_socket = "/path/to/socket"` in `.meshfox/config.toml` (local or
+/// global, same local-wins load every other setting here goes through) —
+/// the control-socket path of an external coordinator (see
+/// `meshfox_server::watcher_protocol`) that every core-launch operation
+/// (`view`, `tui`, `node <op>`, `run`, MCP `debug_*`) should become a pure
+/// client of, instead of spawning/discovering a worker of its own. Unset
+/// (the default) changes nothing for any caller — see each call site's own
+/// doc comment for its fallback.
+pub fn server_socket(canvas_root: &Path) -> Option<PathBuf> {
+    server_socket_from_table(&load(canvas_root))
+}
+
+fn server_socket_from_table(table: &toml::Table) -> Option<PathBuf> {
+    table.get("server_socket").and_then(|v| v.as_str()).map(PathBuf::from)
+}
+
 /// Flattens a config table into `MESHFOX_CONFIG_<PATH>` env-var pairs —
 /// `[interpreters.agent] provider = "codex"` becomes
 /// `MESHFOX_CONFIG_INTERPRETERS_AGENT_PROVIDER=codex`, dashes in a key
@@ -143,6 +159,22 @@ mod tests {
     fn flatten_to_env_skips_arrays() {
         let table: toml::Table = "list = [1, 2, 3]\n".parse().unwrap();
         assert!(flatten_to_env(&table).is_empty());
+    }
+
+    #[test]
+    fn server_socket_from_table_reads_the_top_level_string_key() {
+        let table: toml::Table = "server_socket = \"/tmp/coordinator.sock\"\n".parse().unwrap();
+        assert_eq!(
+            server_socket_from_table(&table),
+            Some(PathBuf::from("/tmp/coordinator.sock"))
+        );
+    }
+
+    #[test]
+    fn server_socket_from_table_is_none_when_unset_or_wrong_type() {
+        assert_eq!(server_socket_from_table(&toml::Table::new()), None);
+        let table: toml::Table = "server_socket = 4\n".parse().unwrap();
+        assert_eq!(server_socket_from_table(&table), None);
     }
 
     #[test]

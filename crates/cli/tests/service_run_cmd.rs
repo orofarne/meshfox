@@ -24,7 +24,18 @@ fn unique_dir() -> PathBuf {
 }
 
 fn meshfox() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_meshfox"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_meshfox"));
+    // Isolates this process from the real machine's own
+    // `~/.meshfox/config.toml` — `meshfox_core::config` reads
+    // `$HOME/.meshfox/config.toml` unconditionally, so a developer with
+    // (say) `server_socket` set for their own daily use would otherwise
+    // have `meshfox run` below silently routed through *their* real
+    // external coordinator instead of the in-process path this test means
+    // to check (confirmed live: this exact leak broke this file's own
+    // service test — and a sibling suite, `run_cmd.rs` — once
+    // `server_socket` was set on the machine this was developed on).
+    cmd.env("HOME", unique_dir());
+    cmd
 }
 
 fn is_alive(pid: u32) -> bool {

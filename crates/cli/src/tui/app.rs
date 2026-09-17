@@ -1678,8 +1678,8 @@ impl App {
         } else {
             format!("meshfox: form submitted — {count} autorun block(s) queued")
         };
-        let idle = self.run.as_ref().map_or(true, |r| r.finished)
-            && self.file_run.as_ref().map_or(true, |r| r.finished);
+        let idle = self.run.as_ref().is_none_or(|r| r.finished)
+            && self.file_run.as_ref().is_none_or(|r| r.finished);
         if idle {
             if let Some(addr) = self.pending_autoruns.pop_front() {
                 self.start_run(addr.node_id, addr.block_name, true).await;
@@ -4389,7 +4389,7 @@ impl App {
                 self.console_collapsed = false;
                 // `console_last_activity` has to move too: it's `None`
                 // until the very first run this session (see its own doc
-                // comment), and `console_tick`'s own `map_or(true, ..)`
+                // comment), and `console_tick`'s own `is_none_or(..)`
                 // treats `None` as "already stale" — without this, the
                 // very next tick (`mod.rs`'s 500ms poll while anything is
                 // expanded) would immediately re-collapse it right back
@@ -4492,7 +4492,7 @@ impl App {
         }
         let stale = self
             .console_last_activity
-            .map_or(true, |t| t.elapsed() >= Self::CONSOLE_COLLAPSE_GRACE);
+            .is_none_or(|t| t.elapsed() >= Self::CONSOLE_COLLAPSE_GRACE);
         if stale {
             self.console_collapsed = true;
         }

@@ -59,19 +59,22 @@ pub async fn run(canvas_path: PathBuf, initial_node: Option<String>) -> io::Resu
 
     // TUI is always a client of *some* worker for this file from here on —
     // its own embedded one if nobody else's is running, someone else's
-    // otherwise — never both parsing/writing the file directly the way it
-    // used to. This does its own `worker_lock::try_acquire` (rather than
-    // letting `meshfox_server::run` do it internally, as `view_worker`
-    // does) specifically so it can learn the resolved port *synchronously*,
-    // needed before any of `App`'s own HTTP calls can work — see
-    // `meshfox_server::serve_as_worker`'s own doc comment for why this is a
-    // separate, lower-level entry point from `run` for exactly this reason.
-    // `None` (lock unreadable, or the embedded bind itself failed) degrades
-    // `App` to today's direct-file/local-process behavior for this session,
-    // with a status warning, rather than failing outright — see
-    // `App::new`'s own doc comment.
-    let worker_port = match meshfox_core::worker_lock::try_acquire(&canvas_path) {
-        Ok(meshfox_core::worker_lock::Acquired::Us(guard)) => {
+    // otherwise (a local sibling `view`/`tui` session, or an externally-
+    // configured coordinator — see `crate::coordinator`'s own doc comment
+    // for why both feed the same decision) — never both parsing/writing the
+    // file directly the way it used to. `coordinator::resolve` is called
+    // directly here (rather than letting `meshfox_server::run` do its own
+    // `worker_lock` internally, as `view_worker` does) specifically so this
+    // can learn the resolved port *synchronously*, needed before any of
+    // `App`'s own HTTP calls can work — see `meshfox_server::serve_as_worker`'s
+    // own doc comment for why that's a separate, lower-level entry point
+    // from `run` for exactly this reason. A resolve failure (a configured
+    // `server_socket` that's unreachable, or the local lock file itself
+    // couldn't be read) is a real, printed error, not a silent degrade to
+    // today's direct-file/local-process behavior — matching every other
+    // core-launch operation's own "no silent fallback" posture.
+    let worker_port = match crate::coordinator::resolve(&canvas_path).await {
+        Ok(crate::coordinator::Resolved::Us(guard)) => {
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
             // `auto_exit: false` matters here specifically — with `true`, a
             // browser tab that peeked at this worker and then closed would
@@ -88,10 +91,19 @@ pub async fn run(canvas_path: PathBuf, initial_node: Option<String>) -> io::Resu
                 Some(guard),
                 Some(ready_tx),
             ));
+            // The embedded bind itself failing (distinct from `resolve`'s
+            // own error above) still degrades gracefully — `ready_rx`
+            // simply never fires, and `App::new` already has its own
+            // direct-file/local-process fallback for `worker_port: None`.
             ready_rx.await.ok()
         }
-        Ok(meshfox_core::worker_lock::Acquired::Other { port }) => Some(port),
-        Err(_) => None,
+        Ok(crate::coordinator::Resolved::Other(port)) => Some(port),
+        Err(e) => {
+            disable_raw_mode()?;
+            execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+            eprintln!("meshfox tui: couldn't reach a worker for this canvas: {e}");
+            std::process::exit(1);
+        }
     };
 
     let result = match App::new(canvas_path, link_preview_tx, initial_node.as_deref(), worker_port).await {
@@ -948,7 +960,15 @@ fn print_tty_transcript_event(event: crate::worker_client::RunEvent) -> TtyPrelu
 /// `{"cols":..,"rows":..}` text frame whenever it changes — the only thing
 /// a text frame ever means client-to-server once `TtyStart` has arrived
 /// (see `TtySocket`'s own doc comment).
-async fn bridge_http_tty(socket: &mut crate::worker_client::TtySocket) -> i32 {
+///
+/// `pub(crate)`, not private — `crate::main`'s own `run_via_worker` reuses
+/// this verbatim for `meshfox run`'s worker-routed `tty` handling. Nothing
+/// in here or in what it calls touches this TUI's own `Terminal`/alt-screen
+/// state at all (that's all in this module's *caller*,
+/// `run_http_tty_handoff`, which a plain `run` invocation has no
+/// equivalent of — it's never in an alt screen to begin with, just needs
+/// its own raw-mode enable/disable around this call).
+pub(crate) async fn bridge_http_tty(socket: &mut crate::worker_client::TtySocket) -> i32 {
     use futures_util::StreamExt;
     use tokio_tungstenite::tungstenite::Message;
 

@@ -65,7 +65,7 @@ impl LockGuard {
     pub fn write_port(&mut self, port: u16) -> io::Result<()> {
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0))?;
-        write!(self.file, "port={port}\n")?;
+        writeln!(self.file, "port={port}")?;
         self.file.flush()
     }
 }
@@ -93,6 +93,11 @@ pub fn try_acquire(canvas_path: &Path) -> io::Result<Acquired> {
         .read(true)
         .write(true)
         .create(true)
+        // Explicit, not the default: this handle may end up on the losing
+        // side of the `flock` below (`Acquired::Other`), in which case
+        // truncating here would wipe the current holder's own `port=...`
+        // line out from under it before we even know who won.
+        .truncate(false)
         .open(&path)?;
     // SAFETY: `flock(2)` on a valid, open fd we exclusively own here;
     // `LOCK_EX | LOCK_NB` never blocks — it fails fast with `EWOULDBLOCK`

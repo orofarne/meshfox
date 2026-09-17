@@ -14,6 +14,12 @@ let package = Package(
     name: "MeshfoxDaemon",
     platforms: [.macOS(.v13)],
     targets: [
-        .executableTarget(name: "MeshfoxDaemon")
+        // Exposes `<launch.h>`'s `launch_activate_socket` — not bridged
+        // into Swift by any higher-level framework, so this app can inherit
+        // the socket a `Sockets`-declaring LaunchAgent already bound for it
+        // (see `UnixSocketServer.swift`'s own doc comment on socket
+        // activation) instead of always binding one itself.
+        .systemLibrary(name: "CLaunch"),
+        .executableTarget(name: "MeshfoxDaemon", dependencies: ["CLaunch"])
     ]
 )

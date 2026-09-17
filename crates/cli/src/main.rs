@@ -13,14 +13,14 @@
 
 use clap::{Args, Parser, Subcommand};
 use meshfox_core::{
-    mdcanvas, Canvas, ExtraEdge, FenceAttrsPatch, FileDisplay, Node, NodeMeta, NodeType, TreeError,
-    VarCache, VarDecl,
+    mdcanvas, Canvas, ExtraEdge, FenceAttrsPatch, FileDisplay, Node, NodeMeta, NodeType, VarCache,
+    VarDecl, VarType,
 };
 use std::collections::HashMap;
 use std::io::IsTerminal;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+mod coordinator;
 mod mcp;
 mod pdf;
 mod prompt;
@@ -154,6 +154,14 @@ enum Command {
     /// running a block is always allowed, but click "Edit" in the browser
     /// to unlock dragging, resizing, saving layout, and persisting a
     /// `cache`d block's output back into the file.
+    ///
+    /// If `server_socket` is configured (`.meshfox/config.toml` — see
+    /// `meshfox_core::config`), a top-level invocation hands the canvas off
+    /// to that external coordinator instead of becoming its own watcher:
+    /// prints a short confirmation and exits immediately, the same
+    /// "hands off and returns, to whatever keeps running independent of
+    /// this process" contract the now-removed `meshfox open` command used
+    /// to have (see `crate::coordinator::hand_off_to_configured_coordinator`).
     View {
         #[command(flatten)]
         canvas: CanvasOpt,
@@ -188,25 +196,6 @@ enum Command {
         /// arm below). Not meant to be passed by hand.
         #[arg(long, hide = true)]
         watcher_socket: Option<PathBuf>,
-    },
-    /// Hand a `.canvas.md` off to the persistent macOS menu-bar daemon
-    /// (`macos/MeshfoxDaemon`, "core-only" MVP — see TODO.canvas.md's
-    /// "Ссылки и навигация между канвасами") instead of starting a private
-    /// `meshfox view` session of your own. Deliberately never a fallback
-    /// for `view` or vice versa — the two are different guarantees: `view`
-    /// blocks in your terminal and everything it spawned dies when you
-    /// kill it; `open` hands off and returns immediately, to whatever
-    /// keeps running (and stays reachable) independent of this process.
-    /// Requires the daemon: if it's not already running, this starts it
-    /// (if installed) and waits for it to come up — it does *not* silently
-    /// fall back to `view`'s own private-watcher behavior on failure; see
-    /// the error message for what to do instead. macOS only for now — the
-    /// daemon itself doesn't exist anywhere else yet.
-    Open {
-        /// Path to the `.canvas.md` file, optionally with `#node-id` for a
-        /// deep link straight to that node (same syntax a `file`-node
-        /// target already supports — `meshfox_core::mdcanvas::split_target_fragment`).
-        target: String,
     },
     /// An ncurses-style terminal viewer — browse the node
     /// tree, read a node's rendered Markdown body (syntax-highlighted code,
@@ -802,18 +791,18 @@ enum NodeCommand {
     /// a created/updated date range — the three axes AND together; any
     /// may be omitted. `selector` alone (its original form, still the
     /// default when nothing else is given) behaves byte-for-byte as
-    /// before: the CSS engine stays the right tool for structure (`#todo
-    /// > .bag`, tag/type/color matching, arbitrary-depth nesting) —
-    /// `--text`/the date flags are independent predicates layered next to
-    /// it, not a CSS extension, since CSS selectors have no
-    /// substring-search or numeric-range primitives to begin with. The
+    /// before: the CSS engine stays the right tool for structure
+    /// (`#todo > .bag`, tag/type/color matching, arbitrary-depth
+    /// nesting) — `--text`/the date flags are independent predicates
+    /// layered next to it, not a CSS extension, since CSS selectors have
+    /// no substring-search or numeric-range primitives to begin with. The
     /// tree maps onto CSS almost directly: a node is an element, each tag
     /// is a class (`.bag`), `id`/`type`/`color` are ordinary attributes
-    /// (`[type="file"]`), and structural nesting is DOM nesting — `#todo
-    /// > .bag` for direct children, `#todo .bag` for descendants at any
-    /// depth. Matching runs against a synthetic HTML document built from
-    /// the canvas tree (never against real rendered content) via
-    /// `scraper` — the same CSS engine a browser uses, not a bespoke
+    /// (`[type="file"]`), and structural nesting is DOM nesting —
+    /// `#todo > .bag` for direct children, `#todo .bag` for descendants
+    /// at any depth. Matching runs against a synthetic HTML document
+    /// built from the canvas tree (never against real rendered content)
+    /// via `scraper` — the same CSS engine a browser uses, not a bespoke
     /// query language to learn.
     Find {
         /// Path to the .canvas.md file. If omitted: auto-discover the
@@ -1128,11 +1117,10 @@ fn main() {
                         write_canvas_template(&canvas_path);
                         println!("meshfox view: created {}", canvas_path.display());
                     }
-                    view_watcher(canvas_path, port, !no_open, !no_auto_exit)
+                    view_or_hand_off(canvas_path, port, no_open, no_auto_exit)
                 }
             }
         }
-        Command::Open { target } => open_via_daemon(&target),
         Command::Tui { canvas, node } => {
             let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
             tui(canvas_path, node)
@@ -1760,109 +1748,33 @@ fn view_watcher(canvas_path: PathBuf, port: u16, open_browser: bool, auto_exit: 
     }
 }
 
-/// `~/Library/Application Support/meshfox/daemon.sock` — must match
-/// `macos/MeshfoxDaemon/Sources/MeshfoxDaemon/main.swift`'s own
-/// `defaultSocketPath()` exactly; nothing shares this string between the
-/// two languages beyond both being documented to use it.
-#[cfg(target_os = "macos")]
-fn daemon_socket_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(Path::new(&home).join("Library/Application Support/meshfox/daemon.sock"))
-}
-
-/// Where the daemon app itself lives, if it's installed at all —
-/// `$MESHFOX_DAEMON_BIN` first (not for normal use, just for developing/
-/// testing this against a `swift build` output instead of the real
-/// installed app), then the real conventional install location
-/// `macos/app.canvas.md`'s own `build` installs to: `~/Applications/Meshfox.app`
-/// (ad-hoc signed, no App Store — same `~/Applications` convention the
-/// project's now-retired `MeshfoxCanvas.app` already established).
-#[cfg(target_os = "macos")]
-fn resolve_daemon_app() -> Option<PathBuf> {
-    if let Some(over) = std::env::var_os("MESHFOX_DAEMON_BIN") {
-        let p = PathBuf::from(over);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    let home = std::env::var_os("HOME")?;
-    let conventional = Path::new(&home).join("Applications/Meshfox.app/Contents/MacOS/Meshfox");
-    conventional.is_file().then_some(conventional)
-}
-
-/// `meshfox open <target>` — see `Command::Open`'s own doc comment for
-/// the contract this follows (never a silent fallback to `view`'s private
-/// watcher). Three outcomes, checked in order: the daemon's socket is
-/// already live (just send `Open` and return); the socket's dead but the
-/// app is installed (start it, wait for the socket to come up, then send);
-/// neither (a real, actionable error — not a silent fallback).
-#[cfg(target_os = "macos")]
-fn open_via_daemon(target: &str) {
-    let (path_str, fragment) = meshfox_core::mdcanvas::split_target_fragment(target);
-    let canonical = match Path::new(path_str).canonicalize() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("meshfox open: {path_str}: {e}");
-            std::process::exit(1);
-        }
-    };
-    let fragment = fragment.map(str::to_string);
-
-    let Some(socket) = daemon_socket_path() else {
-        eprintln!("meshfox open: HOME isn't set — can't locate the daemon's own socket path");
-        std::process::exit(1);
-    };
-
+/// A top-level `meshfox view <path>` invocation's own entry point: hands
+/// off to a configured `server_socket` coordinator instead of becoming a
+/// watcher, if one's configured — see
+/// `coordinator::hand_off_to_configured_coordinator`'s own doc comment for
+/// the exact contract this replaces (the former `meshfox open` command).
+fn view_or_hand_off(canvas_path: PathBuf, port: u16, no_open: bool, no_auto_exit: bool) {
     let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
         eprintln!("failed to start async runtime: {e}");
         std::process::exit(1);
     });
-
-    runtime.block_on(async {
-        if meshfox_server::watcher_protocol::request_open(&socket, &canonical, fragment.clone())
-            .await
-            .is_ok()
-        {
-            return; // already running — handed off, nothing more to do
-        }
-
-        let Some(app) = resolve_daemon_app() else {
-            eprintln!(
-                "meshfox open: no meshfox daemon is running, and none is installed \
-                 (checked $MESHFOX_DAEMON_BIN and ~/Applications/Meshfox.app) — \
-                 install the daemon, or use `meshfox view` instead"
+    let fragment = None; // `view`'s own path argument has no `#node-id` deep-link syntax.
+    match runtime.block_on(coordinator::hand_off_to_configured_coordinator(&canvas_path, fragment)) {
+        Ok(Some(())) => {
+            println!(
+                "meshfox view: handed {} off to the configured coordinator",
+                canvas_path.display()
             );
-            std::process::exit(1);
-        };
-        if let Err(e) = std::process::Command::new(&app).spawn() {
-            eprintln!("meshfox open: couldn't start the daemon ({}): {e}", app.display());
+        }
+        Ok(None) => {
+            drop(runtime);
+            view_watcher(canvas_path, port, !no_open, !no_auto_exit);
+        }
+        Err(e) => {
+            eprintln!("meshfox view: {e}");
             std::process::exit(1);
         }
-
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
-        loop {
-            if meshfox_server::watcher_protocol::request_open(&socket, &canonical, fragment.clone())
-                .await
-                .is_ok()
-            {
-                return;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                eprintln!("meshfox open: started the daemon, but it never came up");
-                std::process::exit(1);
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        }
-    });
-}
-
-#[cfg(not(target_os = "macos"))]
-fn open_via_daemon(_target: &str) {
-    eprintln!(
-        "meshfox open: not supported on this platform yet — the persistent daemon only \
-         exists for macOS so far (see TODO.canvas.md). Use `meshfox view` instead."
-    );
-    std::process::exit(1);
+    }
 }
 
 fn tui(canvas_path: PathBuf, initial_node: Option<String>) {
@@ -1996,14 +1908,14 @@ fn node_path_string(canvas: &Canvas, node_id: &str) -> String {
 }
 
 /// "did you mean ...?" suggestion for a node-id path segment `run` (via
-/// `resolve_run_chain`/`Canvas::resolve_path`) couldn't find
-/// (`TreeError::NodeNotFound`). An exact id match *anywhere else* in the
-/// tree wins outright regardless of distance — by far the most common real
-/// mistake is the right node id addressed with the wrong (missing/extra)
-/// ancestor chain, not a typo in the id itself. Falls back to the closest
-/// id by edit distance, only offered when close enough to plausibly be a
-/// typo rather than a coincidence — `None` means nothing found worth
-/// suggesting.
+/// `resolve_run_chain`/`Canvas::resolve_path`, or the worker-routed
+/// counterpart in `run_via_worker`) couldn't find. An exact id match
+/// *anywhere else* in the tree wins outright regardless of distance — by
+/// far the most common real mistake is the right node id addressed with
+/// the wrong (missing/extra) ancestor chain, not a typo in the id itself.
+/// Falls back to the closest id by edit distance, only offered when close
+/// enough to plausibly be a typo rather than a coincidence — `None` means
+/// nothing found worth suggesting.
 fn closest_node_path(canvas: &Canvas, missing: &str) -> Option<String> {
     let addressable = || canvas.nodes.iter().filter(|n| n.parent.is_some());
     if let Some(exact) = addressable().find(|n| n.id == missing) {
@@ -2078,414 +1990,6 @@ fn persist_set_overrides(
     }
 }
 
-/// Resolves `refs` (declared-variable references in `crate::fence::EnvRef`
-/// shape) — prompting for whatever's still missing — and returns the
-/// resolved values keyed by each ref's own `local_name`. Shared by
-/// `resolve_block_env_or_prompt` (`refs` is a block's real `env=` list) and
-/// `resolve_block_interpreter_or_prompt` (`refs` is a synthetic one built
-/// from that block's own `interpreter=` references — see
-/// `meshfox_core::interpreter_var_refs` — where `local_name == var_name`
-/// always, there being no renaming concept for those). Tries `overrides`
-/// (`--set`)/the process environment/the on-disk cache/each declaration's
-/// own `default` first (`resolve_block_env` — a `required` declaration
-/// skips that last step, so it shows up here even when it has a `default`);
-/// whatever that leaves missing gets a terminal prompt — pre-filled with
-/// the declaration's own `default` so a `required` one can just be
-/// confirmed with Enter — its non-secret answer saved back to the cache so
-/// a later reference to the same variable, `env=` or `interpreter=`, in the
-/// same invocation doesn't ask again. Exits with an error instead of
-/// prompting when stdin isn't a terminal, same as `configure`.
-fn resolve_refs_or_prompt(
-    refs: &[meshfox_core::EnvRef],
-    decls: &[VarDecl],
-    overrides: &mut HashMap<String, String>,
-    computed: &HashMap<String, String>,
-    cache: &mut VarCache,
-    shared: &meshfox_core::SharedEnv,
-) -> HashMap<String, String> {
-    if refs.is_empty() {
-        return HashMap::new();
-    }
-    let mut resolution =
-        meshfox_core::resolve_block_env_with_shared(refs, decls, overrides, cache, computed, shared);
-    // A `from`-declared (computed) variable is never prompted for — if its
-    // source block hasn't produced a value by the time this block needs
-    // it, that's a hard failure (chain ordering should have run the source
-    // first; see `deps::resolve_chain`'s implicit `from=` edges), not
-    // something a human can answer.
-    if !resolution.unresolved_from.is_empty() {
-        let names: Vec<&str> = resolution
-            .unresolved_from
-            .iter()
-            .map(|d| d.name.as_str())
-            .collect();
-        eprintln!(
-            "meshfox run: computed variable(s) {} have no value — their from= source block \
-             either didn't run, failed, or didn't produce them",
-            names.join(", ")
-        );
-        std::process::exit(1);
-    }
-    if resolution.missing.is_empty() {
-        return resolution.env;
-    }
-    if !prompt::stdin_is_tty() {
-        let names: Vec<&str> = resolution.missing.iter().map(|d| d.name.as_str()).collect();
-        eprintln!(
-            "meshfox run: missing required variable(s): {} — pass --set NAME=VALUE, set the \
-             environment variable, or run `meshfox configure` first",
-            names.join(", ")
-        );
-        std::process::exit(1);
-    }
-    for decl in &resolution.missing {
-        let value = prompt::ask(decl, decl.default.as_deref()).unwrap_or_else(|e| {
-            eprintln!("failed to read input: {e}");
-            std::process::exit(1);
-        });
-        if !decl.secret && !decl.session {
-            cache.set(&decl.name, &value).unwrap_or_else(|e| {
-                eprintln!("failed to save {}: {e}", decl.name);
-                std::process::exit(1);
-            });
-        }
-        // Fed back into `overrides` regardless of secret/session -- it's
-        // already checked ahead of the cache in `resolve()`, so this is
-        // what keeps a later block in the *same* invocation from
-        // re-prompting for a variable that skips the cache (secret,
-        // session, or both). A plain variable ends up here too, which is
-        // harmless (it's already in `cache` by now, so the next lookup
-        // would find it there anyway).
-        overrides.insert(decl.name.clone(), value.clone());
-        // A block could (unusually) reference the same declared variable
-        // under more than one local name — fill in every one of them.
-        for er in refs.iter().filter(|er| er.var_name == decl.name) {
-            resolution.env.insert(er.local_name.clone(), value.clone());
-        }
-    }
-    resolution.env
-}
-
-/// Resolves *only* the declared variables `block`'s own `env=` references
-/// (see SPEC.md's "Variables") — a block with no `env=` never resolves or
-/// prompts for anything, however many variables the document declares.
-fn resolve_block_env_or_prompt(
-    block: &meshfox_core::CodeBlock,
-    decls: &[VarDecl],
-    overrides: &mut HashMap<String, String>,
-    computed: &HashMap<String, String>,
-    cache: &mut VarCache,
-    shared: &meshfox_core::SharedEnv,
-) -> HashMap<String, String> {
-    resolve_refs_or_prompt(&block.env, decls, overrides, computed, cache, shared)
-}
-
-/// Resolves `block`'s own `interpreter=` (see SPEC.md's "Runnable code
-/// fences") into the literal command actually spawned — substituting every
-/// `$NAME` reference it contains (`meshfox_core::interpreter_var_refs`),
-/// prompting for whatever's still missing exactly like `env=` already
-/// does. `None` when `block` has no `interpreter=` at all; `Some` unchanged
-/// when it has one but references no variable (a plain literal spec, the
-/// common case).
-fn resolve_block_interpreter_or_prompt(
-    block: &meshfox_core::CodeBlock,
-    decls: &[VarDecl],
-    overrides: &mut HashMap<String, String>,
-    computed: &HashMap<String, String>,
-    cache: &mut VarCache,
-    shared: &meshfox_core::SharedEnv,
-) -> Option<String> {
-    let spec = block.interpreter.as_deref()?;
-    let names = meshfox_core::interpreter_var_refs(spec);
-    if names.is_empty() {
-        return Some(spec.to_string());
-    }
-    let refs: Vec<meshfox_core::EnvRef> = names
-        .iter()
-        .map(|n| meshfox_core::EnvRef {
-            local_name: n.clone(),
-            var_name: n.clone(),
-        })
-        .collect();
-    let values = resolve_refs_or_prompt(&refs, decls, overrides, computed, cache, shared);
-    Some(meshfox_core::resolve_interpreter(spec, &values))
-}
-
-/// Resolves — and prompts for whatever's still missing — every declared
-/// variable the *whole* chain will need, before any of its blocks actually
-/// run. Without this, `run_async`'s own per-block loop only ever resolves
-/// (and prompts for) a block's own `env=` right before *that* block runs
-/// (`resolve_block_env_or_prompt`) — fine for a block near the front of the
-/// chain, but for one near the back (e.g. a `PGPASSWORD` only `migrate`/
-/// `load` reference, at the tail of a long download→extract→merge→...
-/// chain) that means sitting through everything ahead of it first, only to
-/// be interrupted by a password prompt right as the real work was about to
-/// finish — exactly the friction this preflight exists to avoid, and
-/// already how the web UI's own pre-run `VarsForm` behaves (it resolves the
-/// whole chain's variables via `GET /api/vars` before starting anything at
-/// all). Walks the chain in order, resolving+prompting incrementally (so
-/// answering one variable earlier in the chain is visible to a later
-/// step's own `default_var=`/`choices_var=` reference to it, same as within
-/// a single `resolve_block_env_or_prompt` call) — every answer lands in
-/// `overrides`/`cache` exactly like that function's own prompt loop, so the
-/// *real* per-block execution afterward just finds everything already
-/// resolved and never prompts again.
-///
-/// Deliberately does **not** treat a `from=`-computed variable's
-/// `unresolved_from` as an error here — nothing has run yet at preflight
-/// time, so a computed variable *always* looks unresolved at this point;
-/// `resolve_block_env_or_prompt`'s own per-block call (right before that
-/// specific block actually runs) is what still catches a genuinely broken
-/// one (its source block failed or never produced it), at the point where
-/// that's actually knowable.
-fn preflight_chain_vars(
-    chain: &[meshfox_core::BlockAddr],
-    canvas: &Canvas,
-    decls: &[VarDecl],
-    overrides: &mut HashMap<String, String>,
-    computed: &HashMap<String, String>,
-    cache: &mut VarCache,
-    shared: &meshfox_core::SharedEnv,
-) {
-    let mut missing: Vec<VarDecl> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for addr in chain {
-        let Some(node) = canvas.node(&addr.node_id) else {
-            continue; // surfaced properly by the real per-step loop below
-        };
-        let Some(block) = meshfox_core::scan_runnable_blocks(&addr.node_id, &node.text)
-            .into_iter()
-            .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()))
-        else {
-            continue;
-        };
-        // `env=` plus a synthetic ref per `interpreter=`'s own `$NAME`
-        // reference (see `resolve_block_interpreter_or_prompt`) — the whole
-        // chain's preflight has to ask about both, not just `env=`, or a
-        // `$PYTHON`-only reference would still surface its own prompt late,
-        // defeating the point of this function.
-        let interpreter_refs: Vec<meshfox_core::EnvRef> = block
-            .interpreter
-            .as_deref()
-            .map(meshfox_core::interpreter_var_refs)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|n| meshfox_core::EnvRef {
-                local_name: n.clone(),
-                var_name: n,
-            })
-            .collect();
-        if block.env.is_empty() && interpreter_refs.is_empty() {
-            continue;
-        }
-        let refs: Vec<meshfox_core::EnvRef> =
-            block.env.iter().cloned().chain(interpreter_refs).collect();
-        let resolution =
-            meshfox_core::resolve_block_env_with_shared(&refs, decls, overrides, cache, computed, shared);
-        for decl in resolution.missing {
-            if seen.insert(decl.name.clone()) {
-                missing.push(decl);
-            }
-        }
-    }
-    if missing.is_empty() {
-        return;
-    }
-    if !prompt::stdin_is_tty() {
-        let names: Vec<&str> = missing.iter().map(|d| d.name.as_str()).collect();
-        eprintln!(
-            "meshfox run: missing required variable(s): {} — pass --set NAME=VALUE, set the \
-             environment variable, or run `meshfox configure` first",
-            names.join(", ")
-        );
-        std::process::exit(1);
-    }
-    for decl in &missing {
-        let value = prompt::ask(decl, decl.default.as_deref()).unwrap_or_else(|e| {
-            eprintln!("failed to read input: {e}");
-            std::process::exit(1);
-        });
-        if !decl.secret && !decl.session {
-            cache.set(&decl.name, &value).unwrap_or_else(|e| {
-                eprintln!("failed to save {}: {e}", decl.name);
-                std::process::exit(1);
-            });
-        }
-        overrides.insert(decl.name.clone(), value);
-    }
-}
-
-/// Runs a `tty` block: connects the child directly to the real terminal
-/// (stdin/stdout/stderr all inherited) instead of the piped/captured
-/// `stream_exec::spawn_bash` every other block goes through — so anything
-/// that needs a genuine terminal (an interactive shell, `read -p`, `ssh`,
-/// an editor, a password prompt) works exactly as it would run standalone.
-/// Caller (`run_async`) has already checked stdin/stdout are actually a
-/// terminal before calling this.
-///
-/// The child is left in `meshfox`'s own process group (no
-/// `.process_group(0)`, unlike `stream_exec::spawn_bash`) so it stays part
-/// of the terminal's *foreground* group and can read from it without
-/// getting stopped by `SIGTTIN` — the same reason it must never become a
-/// background job. That, in turn, means the terminal delivers `SIGINT`
-/// (Ctrl+C) to `meshfox` itself and the child simultaneously and
-/// independently, the same way a real interactive shell and whatever
-/// foreground job it's running both see it. `meshfox` must not react by
-/// exiting or killing the child here (default disposition, or the
-/// same-process kill this file's non-`tty` branch does) — that would tear
-/// the child away from the terminal mid-session while it might still be
-/// legitimately running (e.g. an interactive `bash` that, like any
-/// interactive shell, ignores `SIGINT` for itself and only lets it affect
-/// whatever *it's* currently running in its own foreground). So `meshfox`
-/// just absorbs every `SIGINT` while waiting and keeps waiting — the
-/// child, as its own independent process, decides for itself whether that
-/// signal ends it or not.
-async fn run_tty_block(
-    code: &str,
-    interpreter: Option<&str>,
-    envs: &HashMap<String, String>,
-    cwd: &Path,
-    canvas_path: &Path,
-) -> std::io::Result<i32> {
-    let env_names: Vec<String> = envs.keys().cloned().collect();
-    let resolved = meshfox_core::resolve_command(code, interpreter, Some(cwd), Some(canvas_path), &env_names)?;
-    let spawned = tokio::process::Command::new(&resolved.program)
-        .args(&resolved.args)
-        .envs(envs)
-        .envs(resolved.extra_envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .current_dir(cwd)
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .spawn();
-    let mut child = match spawned {
-        Ok(child) => child,
-        Err(e) => {
-            if let Some(path) = &resolved.cleanup {
-                let _ = std::fs::remove_file(path);
-            }
-            return Err(e);
-        }
-    };
-
-    let result = loop {
-        tokio::select! {
-            status = child.wait() => break Ok(status?.code().unwrap_or(-1)),
-            _ = tokio::signal::ctrl_c() => continue,
-        }
-    };
-    if let Some(path) = &resolved.cleanup {
-        let _ = std::fs::remove_file(path);
-    }
-    result
-}
-
-/// Runs a runnable `file` node (`type="file"` with both `target` and
-/// `interpreter` set — see `meshfox_core::Node::is_runnable_file`) as
-/// `interpreter target`, streaming output live — the CLI counterpart to
-/// the web UI's own "▷ run" button on a `file` node's title bar
-/// (`run_file_node` in `crates/server/src/lib.rs`), which was previously
-/// the only way to run one at all. Unlike a fenced block, a `file` node
-/// has no `deps=`/`cache`/`env=` of its own — this is always a single,
-/// uncached, unchained execution. `node.origin_path`, when set (the node
-/// was spliced in from an `include` target), names the *real* file
-/// `target`/`PWD` resolve relative to, confined to it — same boundary the
-/// web UI's `resolve_confined_target` enforces.
-async fn run_file_node_cli(canvas_path: &Path, node: &Node) -> Result<(), String> {
-    let interpreter = node
-        .interpreter
-        .as_deref()
-        .expect("checked by is_runnable_file");
-    let (program, args) = meshfox_core::split_interpreter(interpreter)
-        .ok_or_else(|| format!("interpreter={interpreter:?} isn't a valid shell-word command"))?;
-    let target = node.target.as_deref().expect("checked by is_runnable_file");
-    let origin_path = node
-        .origin_path
-        .as_deref()
-        .map(Path::new)
-        .unwrap_or(canvas_path);
-    let origin_dir = canvas_root_dir(origin_path);
-    let resolved_target = meshfox_core::confine(origin_dir, target).map_err(|e| e.to_string())?;
-
-    let mut proc = meshfox_server::stream_exec::spawn_process(
-        &program,
-        args.iter()
-            .map(std::ffi::OsStr::new)
-            .chain([resolved_target.as_os_str()]),
-        Some(origin_dir),
-    )
-    .map_err(|e| e.to_string())?;
-
-    // Pinned once, outside the loop — see `run_async`'s own identical
-    // fix and comment (further down in this file) for why recreating
-    // `tokio::signal::ctrl_c()` fresh on every loop iteration (the shape
-    // this used to have) can silently miss a real Ctrl-C in the gap
-    // between one listener dropping and the next registering.
-    let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
-    loop {
-        tokio::select! {
-            line = proc.output_rx.recv() => {
-                match line {
-                    Some((_, text)) => println!("{text}"),
-                    None => {
-                        let status = proc.child.wait().await;
-                        let exit_code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
-                        println!("(exit {exit_code})");
-                        return if exit_code == 0 {
-                            Ok(())
-                        } else {
-                            Err(format!("exited with code {exit_code}"))
-                        };
-                    }
-                }
-            }
-            _ = &mut ctrl_c => {
-                eprintln!("^C — killing and stopping");
-                let _ = proc.kill();
-                let _ = proc.child.wait().await;
-                std::process::exit(130); // 128 + SIGINT, the usual convention
-            }
-        }
-    }
-}
-
-/// Same chain-resolution/dedup/stop-on-failure logic `run` always had, but
-/// executes each step with `meshfox_server::stream_exec` (the same async,
-/// killable executor `meshfox view` uses) instead of `core`'s blocking
-/// one — output prints line by line as the process produces it, instead
-/// of all at once after it exits (which is also why the exit code now
-/// prints *after* the output, not on the same line as `==> name`: it
-/// genuinely isn't known any sooner). Ctrl+C kills whichever step is
-/// currently running — the *whole process group* it spawned, not just
-/// `bash` itself, so a hung child (`sleep`, a server it started, ...)
-/// doesn't survive as an orphan — and stops there, persisting whatever
-/// earlier steps already completed.
-/// A bare `y`/`N` confirm prompt on the real terminal — used only for a
-/// `service` block's lock-conflict prompt (see SPEC.md's "Service blocks
-/// (experimental)"): unlike `prompt::ask` (a typed `meshfox:var` answer),
-/// this isn't tied to any declared variable, just plain yes/no. Empty
-/// input (bare Enter) counts as "no" — the safer default for "kill
-/// another process".
-/// Stops every service this invocation has spawned so far — called at
-/// every early-bailout point in `run_async` once `services` could be
-/// non-empty (see that variable's own doc comment for why this can't just
-/// be `kill_on_drop`).
-fn stop_all_services(services: &[meshfox_server::services::ServiceHandle]) {
-    for handle in services {
-        let _ = handle.stop();
-    }
-}
-
-fn confirm_yn(question: &str) -> bool {
-    print!("{question} [y/N] ");
-    let _ = std::io::stdout().flush();
-    let mut line = String::new();
-    if std::io::stdin().read_line(&mut line).is_err() {
-        return false;
-    }
-    matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
-}
-
 async fn run_async(
     canvas_path: &PathBuf,
     mut args: Vec<String>,
@@ -2501,580 +2005,295 @@ async fn run_async(
         std::process::exit(1);
     });
 
-    // Declared once up front; each executed block below (in the main
-    // loop) resolves only the subset its own `env=` actually references
-    // (see `resolve_block_env_or_prompt`) — never the whole document's
-    // variables just because *some* block somewhere declares one.
     // `meshfox:var` only ever lives in the root node, which is always in
     // the primary document — never affected by an `include`.
     let decls = declared_vars_or_exit(canvas_path, &initial_raw);
-    let mut overrides: HashMap<String, String> = set.into_iter().collect();
+    let overrides: HashMap<String, String> = set.into_iter().collect();
     validate_set_overrides_or_exit(&decls, &overrides);
     let mut var_cache = load_var_cache_or_exit(canvas_path);
-    let shared_env = meshfox_core::load_shared_env(canvas_root_dir(canvas_path));
     persist_set_overrides(&decls, &overrides, &mut var_cache);
-    // Values produced by `from=` source blocks already run earlier in this
-    // invocation — kept entirely separate from `overrides` (`--set`) so a
-    // computed variable can never be impersonated by a command-line flag;
-    // see `vars::resolve`'s doc comment.
-    let mut computed: HashMap<String, String> = HashMap::new();
 
-    // Each touched file's own accumulated edits, across every requested
-    // block name's whole chain — `None` for the primary document
-    // (`canvas_path` itself), `Some(path)` for a block that lives inside
-    // an `include` target elsewhere on disk. Populated lazily, the first
-    // time a step in that file actually caches output; persisted to every
-    // entry's own file at the very end (or on Ctrl+C below) — mirrors the
-    // web UI's own `run_block`/`run_tty_chain` (`crates/server/src/lib.rs`).
-    let mut file_raws: HashMap<Option<PathBuf>, String> = HashMap::new();
-    let write_all_files = |file_raws: &HashMap<Option<PathBuf>, String>| {
-        for (origin, content) in file_raws {
-            let target = origin.as_deref().unwrap_or(canvas_path.as_path());
-            if let Err(e) = std::fs::write(target, content) {
-                eprintln!("failed to write {}: {e}", target.display());
+    // `run` becomes a pure client instead of executing in-process the
+    // moment a worker for this file exists — a local `view`/`tui` session
+    // (found via `worker_lock`), an externally-configured `server_socket`
+    // coordinator, or (below) one this very invocation spins up itself.
+    // `Other` hands the whole thing to `run_via_worker`, which needs none
+    // of this function's own chain-resolution/`from=`-wiring/cache
+    // machinery below — the worker's own `/api/run` already does all of
+    // that server-side in one call. `--set` overrides are already
+    // persisted into the on-disk var cache above regardless of which path
+    // runs — same file the worker's own `state.vars_cache` reads, so
+    // there's nothing worker-specific to redo here.
+    //
+    // `Us` used to just drop its `LockGuard` immediately and fall straight
+    // through to the in-process loop below — a snapshot, not a held lock,
+    // so a second `run` (or a `node <op>`) starting moments later saw "Us"
+    // too and raced this one at the file level instead of ever seeing
+    // "Other". Now it spins up its own core in the background instead —
+    // the same `serve_as_worker` call `crate::tui::mod`'s own startup
+    // already makes for itself — and holds the guard for that core's
+    // whole lifetime (this process's own, since nothing outlives a plain
+    // `run` invocation), so a concurrent caller now genuinely finds a
+    // worker to join instead of a moment where nobody's there yet.
+    //
+    // `run_via_worker` handles a `tty` step itself (per requested name, via
+    // `run_worker_tty`'s own `/api/run/tty` pty relay — see its doc
+    // comment) — no reason left to bypass worker-routing for one at this
+    // outer level the way an earlier version of this function did.
+    match coordinator::resolve(canvas_path).await {
+        Ok(coordinator::Resolved::Us(guard)) => {
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            // `auto_exit: false` — this core's only client for now is
+            // this very `run` invocation; nothing should exit it out
+            // from under a still-running chain. `quiet: true` — this
+            // core's own `println!`s (e.g. "serving ... on http://...")
+            // would otherwise land intermixed with `run_via_worker`'s
+            // own clean, `RunEvent`-driven console output.
+            tokio::spawn(meshfox_server::serve_as_worker(
+                canvas_path.clone(),
+                0,
+                false,
+                None,
+                true,
+                Some(guard),
+                Some(ready_tx),
+            ));
+            match ready_rx.await {
+                Ok(port) => {
+                    return run_via_worker(port, canvas_path, &path, &block_names, no_deps, overrides)
+                        .await;
+                }
+                Err(_) => {
+                    eprintln!("meshfox run: failed to start the core for this file");
+                    std::process::exit(1);
+                }
             }
         }
+        Ok(coordinator::Resolved::Other(port)) => {
+            return run_via_worker(port, canvas_path, &path, &block_names, no_deps, overrides).await;
+        }
+        Err(e) => {
+            eprintln!("meshfox run: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Whether any of `block_names`' own resolved chains (deps included, unless
+/// `no_deps`) contains a `tty` step. Two call sites, two different
+/// purposes: `run_via_worker` calls this per requested name (against the
+/// worker's own fetched raw canvas) to pick between its own two streaming
+/// endpoints (`run_worker_tty`'s pty relay vs the plain `RunEvent`-only
+/// stream) — see that module's own doc comment. `false` for anything that
+/// fails to parse or resolve here — not this function's job to report
+/// that; whichever path the caller ends up choosing already has its own
+/// real error message for it.
+fn chain_contains_tty(
+    canvas_path: &Path,
+    raw: &str,
+    path: &[&str],
+    block_names: &[&str],
+    no_deps: bool,
+) -> bool {
+    let Ok(primary) = Canvas::from_markdown(raw) else {
+        return false;
     };
-
-    let mut had_failure = false;
-    let mut already_ran: std::collections::HashSet<(String, String)> =
-        std::collections::HashSet::new();
-    // Every `service` block this invocation has spawned — kept alive (not
-    // waited on) here, then either streamed-and-watched after the whole
-    // chain finishes (see the bottom of this function) or stopped on
-    // Ctrl-C (`stop_all_services`, called at every exit point below that
-    // can be reached once this is non-empty). **Experimental**, see
-    // SPEC.md's "Service blocks (experimental)": ownership is tied to
-    // *this* process's own lifetime — note that's *not* automatic via
-    // `SpawnedProcess`'s `.kill_on_drop(true)`, which only ever fires on a
-    // graceful in-process `Drop` (a normal `return`/scope exit); `std::
-    // process::exit` skips destructors entirely (documented Rust
-    // behavior), so every early-bailout path below has to call
-    // `stop_all_services` explicitly or a service spawned earlier in this
-    // same invocation would survive as an orphan.
-    let mut services: Vec<meshfox_server::services::ServiceHandle> = Vec::new();
+    let Ok(canvas) = meshfox_core::include::resolve(&primary, canvas_path) else {
+        return false;
+    };
     for name in block_names {
-        // Re-resolve each iteration so a block run earlier in this loop
-        // (which may have patched a file's own entry in `file_raws`) is
-        // reflected before the next one — same reasoning the web UI's
-        // per-step re-parse has. Include-resolved (not just
-        // `Canvas::from_markdown`) so `path`/`name` can address a node
-        // spliced in from an `include` — its id in the resolved tree is
-        // namespaced (`{include_id}/{original_id}`), same as `meshfox
-        // list`/the web UI already show it.
-        let primary_raw_now = file_raws
-            .get(&None)
-            .cloned()
-            .unwrap_or_else(|| initial_raw.clone());
-        let primary_canvas = match Canvas::from_markdown(&primary_raw_now) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("failed to parse {}: {e}", canvas_path.display());
-                stop_all_services(&services);
-                std::process::exit(1);
-            }
+        let Ok(chain) = meshfox_core::resolve_run_chain(&canvas, path, name, !no_deps) else {
+            continue;
         };
-        let canvas = match meshfox_core::include::resolve(&primary_canvas, canvas_path) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("failed to resolve includes in {}: {e}", canvas_path.display());
-                stop_all_services(&services);
-                std::process::exit(1);
-            }
-        };
-
-        // Running a block automatically runs whatever it `deps=` on first,
-        // in dependency order — same chain the web UI's "⛓ run chain"
-        // button triggers — unless `--no-deps` was passed, in which case
-        // only `name` itself runs, same as the UI's plain "run" button. A
-        // block with no deps resolves to just itself either way.
-        let chain = match meshfox_core::resolve_run_chain(&canvas, &path, name, !no_deps) {
-            Ok(chain) => chain,
-            Err(e) => {
-                // Not a fenced-block address — maybe `path`+`name` together
-                // name a runnable `file` node instead (`type="file"
-                // interpreter="..."`, previously only runnable from the web
-                // UI's own "▷ run" button) — same "the trailing segment
-                // names the node itself" shortcut a fenced block's own
-                // implicit/default naming already gets.
-                let full_path: Vec<&str> = path.iter().copied().chain([name]).collect();
-                match canvas.resolve_path(&full_path) {
-                    Ok(node) if node.is_runnable_file() => {
-                        let node = node.clone();
-                        if let Err(msg) = run_file_node_cli(canvas_path, &node).await {
-                            eprintln!("error running {name:?}: {msg}");
-                            had_failure = true;
-                        }
-                    }
-                    _ => {
-                        let misplaced_canvas_hint =
-                            run_hint_for_misplaced_canvas(&full_path).unwrap_or_default();
-                        let did_you_mean = match &e {
-                            meshfox_core::RunError::Tree(TreeError::NodeNotFound(missing)) => {
-                                closest_node_path(&canvas, missing)
-                                    .map(|p| format!(" (did you mean `{p} {name}`?)"))
-                                    .unwrap_or_default()
-                            }
-                            _ => String::new(),
-                        };
-                        eprintln!(
-                            "error resolving dependencies for {name:?}: {e}{did_you_mean}{misplaced_canvas_hint}"
-                        );
-                        had_failure = true;
-                    }
-                }
+        for addr in &chain {
+            let Some(node) = canvas.node(&addr.node_id) else {
                 continue;
-            }
-        };
-
-        // Ask for everything the *whole* chain will need up front, rather
-        // than waiting for each block's own turn to prompt for it — see
-        // `preflight_chain_vars`'s own doc comment for why (a `PGPASSWORD`
-        // only the tail of a long chain references shouldn't only surface
-        // after everything ahead of it has already run).
-        preflight_chain_vars(
-            &chain,
-            &canvas,
-            &decls,
-            &mut overrides,
-            &computed,
-            &mut var_cache,
-            &shared_env,
-        );
-
-        for addr in chain {
-            let key = (addr.node_id.clone(), addr.block_name.clone());
-            if !already_ran.insert(key) {
-                continue; // shared dependency, already run for an earlier requested name
-            }
-
-            // Re-fetches per step too, for the same reason as above —
-            // `locate_node` finds which real file `addr.node_id` actually
-            // lives in (itself, or an `include` target), reading that
-            // file's own current content: this run's own freshly-cached
-            // copy if an earlier step in this chain already touched it,
-            // otherwise fresh off disk.
-            let primary_raw_now = file_raws
-                .get(&None)
-                .cloned()
-                .unwrap_or_else(|| initial_raw.clone());
-            let mut located =
-                match meshfox_core::locate_node(&primary_raw_now, canvas_path, &addr.node_id) {
-                    Ok(l) => l,
-                    Err(e) => {
-                        eprintln!("error running {:?}: {e}", addr.block_name);
-                        had_failure = true;
-                        break;
-                    }
-                };
-            if let Some(cached) = file_raws.get(&located.origin) {
-                located.raw = cached.clone();
-            }
-
-            let Some(node_text) = Canvas::from_markdown(&located.raw)
-                .ok()
-                .and_then(|c| c.node(&located.local_id).map(|n| n.text.clone()))
-            else {
-                eprintln!(
-                    "error running {:?}: node {:?} not found",
-                    addr.block_name, addr.node_id
-                );
-                had_failure = true;
-                break;
             };
-            let Some(block) = meshfox_core::scan_runnable_blocks(&addr.node_id, &node_text)
-                .into_iter()
-                .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()))
-            else {
-                eprintln!(
-                    "error running {:?}: no runnable block named {:?} in node {:?}",
-                    addr.block_name, addr.block_name, addr.node_id
-                );
-                had_failure = true;
-                break;
-            };
-            if !meshfox_server::stream_exec::supports(&block) {
-                eprintln!(
-                    "error running {:?}: no executor registered for language {:?}",
-                    addr.block_name, block.lang
-                );
-                had_failure = true;
-                break;
-            }
-
-            let mut block_env =
-                resolve_block_env_or_prompt(
-                    &block,
-                    &decls,
-                    &mut overrides,
-                    &computed,
-                    &mut var_cache,
-                    &shared_env,
-                );
-            // If some declared variable is `from=`-sourced from *this*
-            // block, give it a fresh output file to write `NAME=value`
-            // lines to — see `meshfox_core::varout`. Ordinary blocks (the
-            // overwhelming majority) never see this env var at all.
-            let from_decls = meshfox_core::from_targets(&decls, &addr);
-            let vars_out_path = if from_decls.is_empty() {
-                None
-            } else {
-                let path = meshfox_core::allocate_vars_out_path();
-                block_env.insert(
-                    meshfox_core::VARS_OUT_ENV.to_string(),
-                    path.display().to_string(),
-                );
-                Some(path)
-            };
-            let effective_interpreter = resolve_block_interpreter_or_prompt(
-                &block,
-                &decls,
-                &mut overrides,
-                &computed,
-                &mut var_cache,
-                &shared_env,
-            );
-            let step_cwd = canvas_root_dir(located.origin.as_deref().unwrap_or(canvas_path));
-
-            // `service` blocks branch out here, before the normal
-            // spawn-and-wait path below: "done" is "spawned", not
-            // "exited" — see SPEC.md's "Service blocks (experimental)".
-            // Ownership is tied to this process's own lifetime; it stays
-            // running in the background (`services`, above) until this
-            // invocation either finishes its whole chain and stays
-            // attached to stream/watch it (bottom of this function) or is
-            // interrupted.
-            if block.service {
-                let owner_path = located.origin.as_deref().unwrap_or(canvas_path);
-                let lock_path =
-                    meshfox_core::service_lock_path(owner_path, &addr.node_id, &addr.block_name);
-                // Atomic acquire up front (closes the old check-then-act
-                // gap this used to have) — `meshfox_server::services::spawn`
-                // no longer claims this itself (see its own doc comment),
-                // so every caller, this one included, must hold it before
-                // calling that.
-                match meshfox_core::service_lock::acquire(&lock_path, std::process::id(), "cli") {
-                    Ok(()) => {}
-                    Err(meshfox_core::service_lock::AcquireError::Conflict(info)) => {
-                        if !prompt::stdin_is_tty() || !std::io::stdout().is_terminal() {
-                            eprintln!(
-                                "error running {:?}: service already running (pid {}, started via {}) — refusing to guess without an interactive terminal to ask",
-                                addr.block_name, info.pid, info.owner
-                            );
-                            had_failure = true;
-                            break;
-                        }
-                        let proceed = confirm_yn(&format!(
-                            "Service {:?} is already running (pid {}, started via {}). Kill it and start fresh?",
-                            addr.block_name, info.pid, info.owner
-                        ));
-                        if !proceed {
-                            eprintln!(
-                                "meshfox run: cancelled — {:?} is already running elsewhere",
-                                addr.block_name
-                            );
-                            had_failure = true;
-                            break;
-                        }
-                        // Whole-process-group `SIGKILL` on whatever pid the
-                        // lock file names, release, reacquire — same shared
-                        // helper the webui's own force-run path uses now
-                        // (`meshfox_core::service_lock::kill_and_acquire`),
-                        // instead of a hand-rolled `unsafe { libc::kill }`.
-                        if let Err(e) = meshfox_core::service_lock::kill_and_acquire(
-                            &lock_path,
-                            std::process::id(),
-                            "cli",
-                        ) {
-                            eprintln!("error running {:?}: {e}", addr.block_name);
-                            had_failure = true;
-                            break;
-                        }
-                    }
-                    Err(meshfox_core::service_lock::AcquireError::Io(e)) => {
-                        eprintln!("error running {:?}: {e}", addr.block_name);
-                        had_failure = true;
-                        break;
-                    }
-                }
-
-                let mut resolved_block = block.clone();
-                resolved_block.interpreter = effective_interpreter.clone();
-                match meshfox_server::services::spawn(
-                    addr.node_id.clone(),
-                    addr.block_name.clone(),
-                    resolved_block,
-                    block_env.clone(),
-                    step_cwd.to_path_buf(),
-                    owner_path.to_path_buf(),
-                    "cli",
-                ) {
-                    Ok(handle) => {
-                        println!("==> {} (service started, pid {})", addr.block_name, handle.pid);
-                        services.push(handle);
-                    }
-                    Err(e) => {
-                        // Nothing actually ended up running under the lock
-                        // this just claimed — release it, or a later rerun
-                        // would see a permanently stuck "conflict" against
-                        // this same process for no real reason.
-                        let _ = meshfox_core::service_lock::release(&lock_path);
-                        // Doesn't stop already-running services from
-                        // earlier in this same invocation — a later
-                        // service failing to start is no reason to tear
-                        // those down too.
-                        eprintln!("error running {:?}: {e}", addr.block_name);
-                        had_failure = true;
-                        break;
-                    }
-                }
-                continue;
-            }
-
-            println!("==> {}", addr.block_name);
-
-            let mut full_output = String::new();
-            let mut stdout_only = String::new();
-            let mut stderr_only = String::new();
-            let step_started = std::time::Instant::now();
-            let exit_code = if block.tty {
-                if !prompt::stdin_is_tty() || !std::io::stdout().is_terminal() {
-                    eprintln!(
-                        "error running {:?}: requires an interactive terminal (stdin/stdout isn't one)",
-                        addr.block_name
-                    );
-                    had_failure = true;
-                    break;
-                }
-                match run_tty_block(
-                    &block.code,
-                    effective_interpreter.as_deref(),
-                    &block_env,
-                    step_cwd,
-                    located.origin.as_deref().unwrap_or(canvas_path),
-                )
-                .await
-                {
-                    Ok(code) => code,
-                    Err(e) => {
-                        eprintln!("error running {:?}: {e}", addr.block_name);
-                        had_failure = true;
-                        break;
-                    }
-                }
-            } else {
-                // `spawn_block` reads `interpreter` off the `CodeBlock` it's
-                // given rather than taking it as a separate parameter (see
-                // its own doc comment) — a block-with-overridden-interpreter
-                // clone is how the fully-substituted (`$NAME` -> its
-                // resolved value) command actually reaches it, same trick
-                // `run_block`/`run_tty_chain` (`crates/server/src/lib.rs`)
-                // and the TUI's own `advance_run` use.
-                let mut resolved_block = block.clone();
-                resolved_block.interpreter = effective_interpreter.clone();
-                let mut proc = match meshfox_server::stream_exec::spawn_block(
-                    &resolved_block,
-                    &block_env,
-                    Some(step_cwd),
-                    Some(located.origin.as_deref().unwrap_or(canvas_path)),
-                ) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("error running {:?}: {e}", addr.block_name);
-                        had_failure = true;
-                        break;
-                    }
-                };
-
-                // Pinned once per step, outside this loop — recreating
-                // `tokio::signal::ctrl_c()` fresh on every *output line*
-                // (the shape this used to have) briefly drops the previous
-                // listener before the next one registers on every single
-                // iteration, a real gap a real Ctrl-C can land in and be
-                // missed entirely (confirmed via the identical bug in the
-                // `service`-watch loop further down this file, which had
-                // the same pattern at a 200ms-tick granularity instead of
-                // per-line). One listener per step, not per line, closes
-                // that gap for the whole step's own duration.
-                let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
-                loop {
-                    tokio::select! {
-                        line = proc.output_rx.recv() => {
-                            match line {
-                                Some((stream, text)) => {
-                                    println!("{text}");
-                                    full_output.push_str(&text);
-                                    full_output.push('\n');
-                                    match stream {
-                                        meshfox_server::stream_exec::OutputStream::Stdout => {
-                                            stdout_only.push_str(&text);
-                                            stdout_only.push('\n');
-                                        }
-                                        meshfox_server::stream_exec::OutputStream::Stderr => {
-                                            stderr_only.push_str(&text);
-                                            stderr_only.push('\n');
-                                        }
-                                    }
-                                }
-                                None => {
-                                    let status = proc.child.wait().await;
-                                    break status.ok().and_then(|s| s.code()).unwrap_or(-1);
-                                }
-                            }
-                        }
-                        _ = &mut ctrl_c => {
-                            eprintln!("^C — killing {:?} and stopping", addr.block_name);
-                            let _ = proc.kill();
-                            let _ = proc.child.wait().await;
-                            // Persist whatever completed before this step, same
-                            // as the web UI's Kill does — no reason to lose
-                            // already-cached output just because a *later*
-                            // step got interrupted.
-                            write_all_files(&file_raws);
-                            // Also stop any `service` block(s) already
-                            // started earlier in this same invocation — see
-                            // `services`' own doc comment.
-                            stop_all_services(&services);
-                            std::process::exit(130); // 128 + SIGINT, the usual convention
-                        }
-                    }
-                }
-            };
-            let step_duration_ms = step_started.elapsed().as_millis() as u64;
-            println!(
-                "(exit {exit_code} · {})",
-                meshfox_core::format_duration_ms(step_duration_ms)
-            );
-
-            // Read back whatever this block wrote to its own vars-out file
-            // (if it was a `from=` target for anything) and fold the
-            // (type-validated) values into `computed`, for whatever later
-            // step in this same chain declared `from=` this block. Only
-            // trusted on a `0` exit — see SPEC.md's "Variables".
-            let mut from_value_error = false;
-            if let Some(path) = &vars_out_path {
-                match meshfox_core::read_and_cleanup_vars_out(path) {
-                    Ok(produced) if exit_code == 0 => {
-                        for decl in &from_decls {
-                            match produced.get(&decl.name) {
-                                Some(value) => match meshfox_core::validate_value(decl, value) {
-                                    Ok(()) => {
-                                        computed.insert(decl.name.clone(), value.clone());
-                                    }
-                                    Err(e) => {
-                                        eprintln!(
-                                            "error running {:?}: computed variable {:?} is invalid: {e}",
-                                            addr.block_name, decl.name
-                                        );
-                                        from_value_error = true;
-                                    }
-                                },
-                                None => {
-                                    eprintln!(
-                                        "error running {:?}: block produced no value for {:?} \
-                                         (declared from=\"{}/{}\")",
-                                        addr.block_name, decl.name, addr.node_id, addr.block_name
-                                    );
-                                    from_value_error = true;
-                                }
-                            }
-                        }
-                    }
-                    Ok(_) => {} // nonzero exit — handled by the check below, don't also validate
-                    Err(e) => {
-                        eprintln!(
-                            "error running {:?}: failed to read computed variables: {e}",
-                            addr.block_name
-                        );
-                        from_value_error = true;
-                    }
-                }
-            }
-
-            // `tty` and `cache` are mutually exclusive (a `meshfox
-            // validate` error) — `block.tty` here is belt-and-suspenders
-            // against writing a `tty` block's (empty) `full_output` back
-            // into the file for a document `run` was pointed at without
-            // ever being validated first.
-            if block.cache && !block.tty {
-                let result = meshfox_core::ExecOutput {
-                    exit_code,
-                    output: full_output,
-                    duration_ms: step_duration_ms,
-                    stdout: stdout_only,
-                    stderr: stderr_only,
-                };
-                if let Some(updated) =
-                    meshfox_core::write_output(&node_text, &addr.block_name, &result)
-                {
-                    if let Some(patched) =
-                        mdcanvas::set_node_body(&located.raw, &located.local_id, &updated)
-                    {
-                        file_raws.insert(located.origin.clone(), patched);
-                    }
-                }
-            }
-
-            if exit_code != 0 || from_value_error {
-                had_failure = true;
-                // Running what depends on a failed step wouldn't mean
-                // anything — stop this chain, move on to the next
-                // requested name (if any).
-                break;
+            let blocks = meshfox_core::scan_runnable_blocks(&addr.node_id, &node.text);
+            if blocks
+                .iter()
+                .any(|b| b.name.as_deref() == Some(addr.block_name.as_str()) && b.tty)
+            {
+                return true;
             }
         }
     }
+    false
+}
 
-    write_all_files(&file_raws);
+/// `run_async`'s own coordinator-routed path (see its own call site's doc
+/// comment) — driven entirely through `crate::worker_client`'s existing
+/// run/vars calls, the same ones TUI's own run orchestration already uses.
+/// Deliberately much smaller than the in-process loop above: dependency
+/// resolution, `from=`/computed-var wiring between chain steps, and
+/// cache/persist semantics are all the worker's own job inside a single
+/// `worker_client::run_stream` call per requested block name — this only
+/// owns var preflight (mirroring `preflight_chain_vars`'s own interactive
+/// UX, against the worker's dep-aware `GET /api/vars` instead of a
+/// locally-resolved chain) and turning each streamed `RunEvent` into the
+/// same console shape the in-process loop already prints.
+///
+/// A `tty` step is handled specially per requested name (see
+/// `run_worker_tty`, checked via `chain_contains_tty` right after
+/// `preflight_worker_vars` succeeds, below) rather than through this
+/// function's own ordinary `run_stream_persisted`/`drain_worker_run_events`
+/// pair — the plain `RunEvent`-only stream those two use has no
+/// binary-frame vocabulary for actual pty bytes at all.
+///
+/// One remaining known gap against the in-process path, flagged inline
+/// below rather than silently papered over: a `service` block conflict
+/// (`RunEvent::LockConflict`) has no interactive kill-and-retry here the
+/// way the in-process path's `confirm_yn` does — `/api/run/force` exists
+/// server-side for this, just not wired up here.
+async fn run_via_worker(
+    port: u16,
+    canvas_path: &Path,
+    path: &[&str],
+    block_names: &[&str],
+    no_deps: bool,
+    mut overrides: HashMap<String, String>,
+) {
+    let path: Vec<String> = path.iter().map(|s| s.to_string()).collect();
+    let mut had_failure = false;
+    // Every `(nodeId, block)` any requested name's own chain started as a
+    // `service` — accumulated across the whole loop below (mirroring the
+    // in-process path's own `services: Vec<ServiceHandle>`), then watched
+    // together once every requested name has been dispatched (see the
+    // "stay attached" loop after this one).
+    let mut started_services: Vec<(String, String)> = Vec::new();
 
-    // Any `service` block(s) started above are still running — stay
-    // attached (unlike an ordinary chain, which just exits once every
-    // step is done) so `meshfox run` reads as "start this dev server and
-    // watch it" rather than silently detaching, streaming each one's log
-    // lines (docker-compose-style, prefixed by block name) until either
-    // every one of them stops on its own or the user hits Ctrl-C. See
-    // SPEC.md's "Service blocks (experimental)".
-    if !services.is_empty() {
+    for name in block_names {
+        // Mirrors the in-process loop's own "not a fenced-block address —
+        // maybe `path`+`name` together name a runnable `file` node
+        // instead" fallback (see `run_async`'s own `resolve_run_chain`
+        // error arm) — a `get_vars` 404/422 here means exactly the same
+        // thing server-side, just discovered a step later since this path
+        // never parses the canvas itself. Checked *before* trusting that
+        // error as final, not after, so a real file-node address (e.g. a
+        // node whose only content is a runnable target file) keeps working
+        // once a worker exists, exactly as it already does with no worker
+        // at all — this is what `include_edit_tests`' sibling suite,
+        // `crates/cli/tests/run_cmd.rs`, actually caught missing here.
+        let vars = match preflight_worker_vars(port, &path, name, no_deps, &mut overrides).await {
+            Ok(vars) => vars,
+            Err(chain_err) => {
+                match resolve_worker_file_node(port, canvas_path, &path, name).await {
+                    Some(node_id) => {
+                        match worker_client::run_file_node_stream(port, &node_id).await {
+                            Ok(rx) => {
+                                if !drain_worker_run_events(rx, port, name, &mut started_services).await {
+                                    had_failure = true;
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("error running {name:?}: {e} (worker on port {port})");
+                                had_failure = true;
+                            }
+                        }
+                        continue;
+                    }
+                    None => {
+                        let hint = worker_did_you_mean_hint(canvas_path, port, &path, name).await;
+                        eprintln!("meshfox run: {chain_err}{hint}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        };
+
+        // A `tty` step needs the real pty-relay socket (`/api/run/tty`),
+        // never the plain `RunEvent`-only stream `run_stream_persisted`
+        // connects to (which has no binary-frame vocabulary at all for
+        // actual pty bytes) — checked per requested `name` here, reusing
+        // `chain_contains_tty` against the *worker's own* raw canvas (the
+        // one source of truth once a worker exists) rather than this
+        // process's own possibly-stale copy. `run_async`'s own top-level
+        // check only ever gates *whether to route through a worker at
+        // all* — this is the finer-grained "which of the worker's own two
+        // streaming endpoints does this particular name need" decision.
+        if let Ok(raw) = worker_client::get_canvas_raw(port).await {
+            let path_str: Vec<&str> = path.iter().map(String::as_str).collect();
+            if chain_contains_tty(canvas_path, &raw, &path_str, &[name], no_deps) {
+                if !run_worker_tty(port, &path, name, no_deps, vars).await {
+                    had_failure = true;
+                }
+                continue;
+            }
+        }
+
+        let rx = match worker_client::run_stream_persisted(
+            port,
+            &path,
+            name,
+            no_deps,
+            vars,
+            std::collections::HashSet::new(),
+            None,
+        )
+        .await
+        {
+            Ok(rx) => rx,
+            Err(e) => {
+                eprintln!("error running {name:?}: {e} (worker on port {port})");
+                had_failure = true;
+                continue;
+            }
+        };
+        if !drain_worker_run_events(rx, port, name, &mut started_services).await {
+            had_failure = true;
+        }
+    }
+
+    // Mirrors the in-process loop's own tail exactly (see its own doc
+    // comment on why `meshfox run` stays attached to a `service` block
+    // instead of exiting once the chain that started it is "done") —
+    // just polled over HTTP (`worker_client::get_service_log`/
+    // `list_services`) instead of a local `ServiceHandle`, since the
+    // service itself is a worker-owned, `crates/server/src/services.rs`-
+    // registered process now, not one this CLI process spawned directly.
+    if !started_services.is_empty() {
         println!(
             "meshfox: {} service(s) running — streaming their output below; Ctrl-C stops them and exits",
-            services.len()
+            started_services.len()
         );
-        let mut printed = vec![0usize; services.len()];
-        let mut crash_reported = vec![false; services.len()];
+        let mut printed = vec![0usize; started_services.len()];
+        let mut crash_reported = vec![false; started_services.len()];
         let mut any_crashed = false;
-        // Pinned once, outside the loop, and polled by `&mut` reference on
-        // every iteration below — *not* a fresh `tokio::signal::ctrl_c()`
-        // call each time around (the shape this used to have): recreating
-        // it every 200ms briefly drops the previous listener before the
-        // next one registers, a real gap a real SIGINT can land in and be
-        // missed entirely, with nothing left afterward to ever notice it
-        // (this loop has no other way to observe "a signal already came
-        // in"). One long-lived listener has no such gap.
         let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
         'watch: loop {
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
+                    let services = worker_client::list_services(port).await.unwrap_or_default();
                     let mut any_running = false;
-                    for (i, handle) in services.iter().enumerate() {
-                        let log = handle.log_snapshot();
+                    for (i, (node_id, block)) in started_services.iter().enumerate() {
+                        let log = worker_client::get_service_log(port, node_id, block)
+                            .await
+                            .unwrap_or_default();
                         for (stream, text) in log.iter().skip(printed[i]) {
                             let tag = match stream {
                                 meshfox_server::stream_exec::OutputStream::Stderr => " (stderr)",
                                 meshfox_server::stream_exec::OutputStream::Stdout => "",
                             };
-                            println!("[{}]{tag} {text}", handle.block_name);
+                            println!("[{block}]{tag} {text}");
                         }
                         printed[i] = log.len();
-                        match handle.status() {
-                            meshfox_server::services::ServiceStatus::Running => any_running = true,
-                            meshfox_server::services::ServiceStatus::Crashed { exit_code } => {
+                        let status = services
+                            .iter()
+                            .find(|s| &s.node_id == node_id && &s.block == block)
+                            .map(|s| s.status.as_str());
+                        match status {
+                            Some("running") => any_running = true,
+                            Some("crashed") => {
                                 any_crashed = true;
                                 if !crash_reported[i] {
-                                    eprintln!("[{}] crashed (exit {exit_code})", handle.block_name);
+                                    eprintln!("[{block}] crashed");
                                     crash_reported[i] = true;
                                 }
                             }
-                            meshfox_server::services::ServiceStatus::Stopped => {}
+                            // "stopped", or gone from the list entirely
+                            // (the worker itself exited) — either way,
+                            // nothing more to watch for this one.
+                            _ => {}
                         }
                     }
                     if !any_running {
@@ -3082,8 +2301,10 @@ async fn run_async(
                     }
                 }
                 _ = &mut ctrl_c => {
-                    println!("^C — stopping {} service(s)", services.len());
-                    stop_all_services(&services);
+                    println!("^C — stopping {} service(s)", started_services.len());
+                    for (node_id, block) in &started_services {
+                        let _ = worker_client::stop_service(port, node_id, block).await;
+                    }
                     std::process::exit(130); // 128 + SIGINT, the usual convention
                 }
             }
@@ -3095,6 +2316,374 @@ async fn run_async(
 
     if had_failure {
         std::process::exit(1);
+    }
+}
+
+/// `run_async`'s own coordinator-routed path, checked only once
+/// `preflight_worker_vars` has already failed to resolve `path`+`name` as
+/// a fenced-block chain: fetches the worker's own raw canvas text (the
+/// same one `App::new`/`crate::worker_client::get_canvas_raw` already use
+/// for this purpose elsewhere) and resolves it *locally* — the one place
+/// this coordinator-routed path parses anything client-side at all, purely
+/// to answer "is this actually a runnable `file` node?" rather than to run
+/// anything itself. `None` for any failure along the way (unreachable
+/// worker, unparseable canvas, unresolvable path, or a real node that just
+/// isn't a runnable file) — the caller already has the original chain-
+/// resolution error to report in every one of those cases, so there's
+/// nothing more specific worth surfacing from here.
+async fn resolve_worker_file_node(
+    port: u16,
+    canvas_path: &Path,
+    path: &[String],
+    name: &str,
+) -> Option<String> {
+    let raw = worker_client::get_canvas_raw(port).await.ok()?;
+    let primary = Canvas::from_markdown(&raw).ok()?;
+    let canvas = meshfox_core::include::resolve(&primary, canvas_path).ok()?;
+    let full_path: Vec<&str> = path.iter().map(String::as_str).chain(std::iter::once(name)).collect();
+    let node = canvas.resolve_path(&full_path).ok()?;
+    node.is_runnable_file().then(|| node.id.clone())
+}
+
+/// A "did you mean ...?" suffix for `chain_err`'s own message once *both*
+/// `preflight_worker_vars` and `resolve_worker_file_node` have given up on
+/// `path`+`name` — computed by re-resolving it locally against the
+/// worker's own raw canvas purely for this diagnostic (the structured
+/// `TreeError` the in-process path used to match on never reaches this
+/// process at all once resolution happens server-side; `chain_err` itself
+/// is only ever the server's already-stringified message by the time it
+/// gets here). Empty string for anything that isn't specifically an
+/// unresolvable node-id-path segment, or that fails to even re-fetch/parse
+/// — same "nothing worth suggesting" posture `closest_node_path` already
+/// has.
+async fn worker_did_you_mean_hint(canvas_path: &Path, port: u16, path: &[String], name: &str) -> String {
+    let Ok(raw) = worker_client::get_canvas_raw(port).await else {
+        return String::new();
+    };
+    let Ok(primary) = Canvas::from_markdown(&raw) else {
+        return String::new();
+    };
+    let Ok(canvas) = meshfox_core::include::resolve(&primary, canvas_path) else {
+        return String::new();
+    };
+    let path_str: Vec<&str> = path.iter().map(String::as_str).collect();
+    match meshfox_core::resolve_run_chain(&canvas, &path_str, name, true) {
+        Err(meshfox_core::RunError::Tree(meshfox_core::TreeError::NodeNotFound(missing))) => {
+            closest_node_path(&canvas, &missing)
+                .map(|p| format!(" (did you mean `{p} {name}`?)"))
+                .unwrap_or_default()
+        }
+        _ => String::new(),
+    }
+}
+
+/// Runs one `tty`-containing chain through the worker's own pty-relay
+/// socket (`GET /api/run/tty`) instead of the plain `RunEvent`-only stream
+/// every other worker-routed name uses — real interactive bytes each
+/// direction need a binary-frame vocabulary `run_stream_persisted`'s own
+/// endpoint doesn't have at all. Reuses `crate::tui::bridge_http_tty`
+/// verbatim (see its own doc comment for why that's safe: nothing in it
+/// touches TUI-specific state) — this function's only own job is the
+/// raw-mode enable/disable TUI's alt-screen already keeps on for its whole
+/// session, which a plain `run` invocation has to switch on/off itself
+/// around the call instead.
+async fn run_worker_tty(
+    port: u16,
+    path: &[String],
+    name: &str,
+    no_deps: bool,
+    vars: HashMap<String, String>,
+) -> bool {
+    if !prompt::stdin_is_tty() || !std::io::stdout().is_terminal() {
+        eprintln!("error running {name:?}: requires an interactive terminal (stdin/stdout isn't one)");
+        return false;
+    }
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let mut socket = match worker_client::tty_connect(
+        port,
+        path,
+        name,
+        no_deps,
+        vars,
+        std::collections::HashSet::new(),
+        cols,
+        rows,
+    )
+    .await
+    {
+        Ok(socket) => socket,
+        Err(worker_client::TtyConnectError::Conflict(c)) => {
+            eprintln!(
+                "error running {name:?}: already running elsewhere (pid {}, started via {}) — \
+                 killing and retrying isn't wired up yet for a worker-routed tty run; stop it there first and rerun",
+                c.owner_pid, c.owner_desc
+            );
+            return false;
+        }
+        Err(worker_client::TtyConnectError::Other(e)) => {
+            eprintln!("error running {name:?}: {e} (worker on port {port})");
+            return false;
+        }
+    };
+    let _ = crossterm::terminal::enable_raw_mode();
+    let exit_code = crate::tui::bridge_http_tty(&mut socket).await;
+    let _ = crossterm::terminal::disable_raw_mode();
+    let _ = futures_util::SinkExt::close(&mut socket).await;
+    exit_code == 0
+}
+
+/// Worker-routed counterpart to `apply_node_mv`'s own two-step direct-file
+/// dance: add an extra-parent edge from `new_parent_id` first (if `node_id`
+/// doesn't already declare one), then promote it via
+/// `worker_client::reparent_node` — `crates/server/src/lib.rs::reparent_node`
+/// only ever promotes an *existing* extra-parent edge, same precondition
+/// the direct-file path works around the same way (see `apply_node_mv`'s
+/// own doc comment). Unlike `apply_node_mv`, the position-frame conversion
+/// a move into/out of/between groups needs is entirely the server's own
+/// job here (`reparent_node`'s own doc comment) — this never touches that
+/// math at all. Fetches the node's *current* extra parents via
+/// `include::resolve` (not the primary-document-only `Canvas::from_markdown`
+/// `apply_node_mv` uses) — a strict superset, not a narrower behavior: an
+/// include-spliced node's own namespaced id works here even though the
+/// direct-file fallback never supported one.
+async fn node_mv_via_worker(
+    port: u16,
+    canvas_path: &Path,
+    node_id: &str,
+    new_parent_id: &str,
+) -> Result<(), String> {
+    let raw = worker_client::get_canvas_raw(port).await.map_err(|e| e.to_string())?;
+    let primary = Canvas::from_markdown(&raw).map_err(|e| e.to_string())?;
+    let canvas = meshfox_core::include::resolve(&primary, canvas_path).map_err(|e| e.to_string())?;
+    let node = canvas
+        .node(node_id)
+        .ok_or_else(|| format!("no node {node_id:?}"))?;
+    if node.parent.is_none() {
+        return Err("can't move the root node".to_string());
+    }
+    if canvas.node(new_parent_id).is_none() {
+        return Err(format!("no node {new_parent_id:?}"));
+    }
+    if !node.extra_parents.iter().any(|e| e.from == new_parent_id) {
+        let mut extra_parents = node.extra_parents.clone();
+        extra_parents.push(ExtraEdge::new(new_parent_id));
+        let update = worker_client::NodeUpdate {
+            extra_parents: Some(extra_parents),
+            ..Default::default()
+        };
+        worker_client::update_node(port, node_id, &update).await?;
+    }
+    worker_client::reparent_node(port, node_id, new_parent_id).await
+}
+
+/// Drains one requested name's own `RunEvent` stream to completion (a
+/// fenced-block chain from `run_stream_persisted`, or a single file node
+/// from `run_file_node_stream` — same event vocabulary either way, see
+/// `run_file_node`'s own doc comment server-side), printing the same
+/// console shape the in-process loop already does. Returns whether this
+/// name's own run was clean (`true`) or reported *some* failure (`false`)
+/// — never exits the process itself, so a single failing name in a
+/// multi-name `meshfox run a,b,c` doesn't stop the rest from being
+/// attempted, matching the in-process loop's own `had_failure`-without-
+/// early-exit posture.
+async fn drain_worker_run_events(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<worker_client::RunEvent>,
+    port: u16,
+    name: &str,
+    started_services: &mut Vec<(String, String)>,
+) -> bool {
+    let mut had_failure = false;
+    {
+        // The address `StepStart` most recently named — who Ctrl-C below
+        // asks the worker to kill. `run_stream`'s own chain may run several
+        // steps in sequence; only the currently-executing one is ever a
+        // meaningful kill target.
+        let mut current_step: Option<(String, String)> = None;
+        // One listener for this whole chain's stream, not recreated per
+        // event — same reasoning the in-process loop's own per-step
+        // `ctrl_c` binding documents (recreating it too often leaves a gap
+        // a real SIGINT can land in and be missed).
+        let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
+        loop {
+            tokio::select! {
+                event = rx.recv() => {
+                    let Some(event) = event else {
+                        // Channel closed without a terminal event reaching
+                        // it (a dropped connection mid-stream) — nothing
+                        // more to do for this requested name.
+                        break;
+                    };
+                    match event {
+                        worker_client::RunEvent::Started { .. } => {}
+                        worker_client::RunEvent::StepStart { node_id, block } => {
+                            println!("==> {block}");
+                            current_step = Some((node_id, block));
+                        }
+                        worker_client::RunEvent::StepSkipped { block, output, .. } => {
+                            // No equivalent in the in-process loop above,
+                            // which always re-executes every step
+                            // regardless of a previous cached run — this is
+                            // the worker's own session-fingerprint skip
+                            // logic (see `crates/server/src/lib.rs`'s
+                            // `compute_forced_reruns`), a deliberate benefit
+                            // of joining a shared session rather than a gap
+                            // to hide.
+                            println!("==> {block} (already run this session, skipped)");
+                            if !output.is_empty() {
+                                println!("{output}");
+                            }
+                        }
+                        worker_client::RunEvent::Output { stream, text, .. } => match stream {
+                            meshfox_server::stream_exec::OutputStream::Stdout => println!("{text}"),
+                            meshfox_server::stream_exec::OutputStream::Stderr => eprintln!("{text}"),
+                        },
+                        worker_client::RunEvent::ServiceStarted { node_id, block, pid } => {
+                            println!("==> {block} (service started, pid {pid})");
+                            started_services.push((node_id, block));
+                        }
+                        worker_client::RunEvent::StepEnd { exit_code, duration_ms, .. } => {
+                            println!(
+                                "(exit {exit_code} · {})",
+                                meshfox_core::format_duration_ms(duration_ms)
+                            );
+                        }
+                        worker_client::RunEvent::LockConflict { block, owner_pid, owner_desc, .. } => {
+                            eprintln!(
+                                "error running {block:?}: already running elsewhere (pid {owner_pid}, started via {owner_desc}) — \
+                                 killing and retrying isn't wired up yet for a worker-routed run; stop it there first and rerun"
+                            );
+                            had_failure = true;
+                        }
+                        // Shouldn't actually happen: `run_via_worker`'s own
+                        // per-name `chain_contains_tty` check routes a real
+                        // `tty` step through `run_worker_tty`'s pty relay
+                        // instead, before this stream is ever opened at
+                        // all — kept only for exhaustiveness/defense, e.g.
+                        // if that check somehow missed a step this stream
+                        // still reaches.
+                        worker_client::RunEvent::TtyStart { block, .. } => {
+                            eprintln!(
+                                "error running {block:?}: unexpected `tty` step on the plain run stream \
+                                 (this is a bug — `run_via_worker`'s own tty pre-check should have caught it)"
+                            );
+                            had_failure = true;
+                        }
+                        worker_client::RunEvent::Killed { block, .. } => {
+                            eprintln!("{block:?} was killed");
+                            had_failure = true;
+                        }
+                        worker_client::RunEvent::Error { message } => {
+                            eprintln!("error running {name:?}: {message}");
+                            had_failure = true;
+                        }
+                        worker_client::RunEvent::Done { exit_code } => {
+                            if exit_code != 0 {
+                                had_failure = true;
+                            }
+                            break;
+                        }
+                    }
+                }
+                _ = &mut ctrl_c => {
+                    if let Some((node_id, block)) = &current_step {
+                        let _ = worker_client::kill_run(port, node_id, block).await;
+                    }
+                    eprintln!("^C — asked the worker to stop {name:?}");
+                    // No local `file_raws`/`write_all_files` to flush here
+                    // — the worker persists a `cache`d step's output as
+                    // each step actually completes (`crates/server/src/lib.rs`'s
+                    // own `persist` handling), not batched up for this
+                    // process to write out at the end the way the
+                    // in-process path's own `file_raws` map is.
+                    std::process::exit(130); // 128 + SIGINT, the usual convention
+                }
+            }
+        }
+    }
+    !had_failure
+}
+
+/// `run_via_worker`'s own var preflight — mirrors `preflight_chain_vars`'s
+/// interactive UX (check `overrides` first, otherwise prompt, refuse
+/// non-interactively) against the worker's own dep-aware `GET /api/vars`
+/// instead of a locally-resolved chain. Only returns entries for variables
+/// this call is *overriding* (an `--set` value, or a fresh interactive
+/// answer) — anything the worker already reports `resolved: true` for is
+/// left out entirely and resolved server-side from its own cache/env/
+/// default, exactly as if this call had never mentioned it; sending it
+/// again would be harmless but redundant. A prompted-for, non-secret
+/// answer is folded back into `overrides` (not written to the on-disk
+/// cache directly) — `worker_client::run_stream`'s own request already
+/// persists any non-secret entry in its `vars` to the worker's on-disk
+/// cache itself (`crates/server/src/lib.rs`'s `run_block_impl`, the exact
+/// file `crate::VarCache` also reads), so a later requested block name in
+/// this same invocation just sees it there already, and there's nothing
+/// separate for this function to persist on its own.
+async fn preflight_worker_vars(
+    port: u16,
+    path: &[String],
+    name: &str,
+    no_deps: bool,
+    overrides: &mut HashMap<String, String>,
+) -> Result<HashMap<String, String>, String> {
+    let statuses = worker_client::get_vars(port, path, name, no_deps).await?;
+    let mut vars = HashMap::new();
+    let mut missing: Vec<String> = Vec::new();
+    for status in &statuses {
+        if let Some(value) = overrides.get(&status.name) {
+            vars.insert(status.name.clone(), value.clone());
+            continue;
+        }
+        if status.resolved {
+            continue; // already resolvable server-side (cache/env/default) — nothing to override
+        }
+        if !prompt::stdin_is_tty() {
+            missing.push(status.name.clone());
+            continue;
+        }
+        let decl = var_decl_from_status(status);
+        let value = prompt::ask(&decl, decl.default.as_deref()).map_err(|e| e.to_string())?;
+        if !status.secret {
+            overrides.insert(status.name.clone(), value.clone());
+        }
+        vars.insert(status.name.clone(), value);
+    }
+    if !missing.is_empty() {
+        return Err(format!(
+            "missing required variable(s): {} — pass --set NAME=VALUE, set the environment \
+             variable, or run interactively",
+            missing.join(", ")
+        ));
+    }
+    Ok(vars)
+}
+
+/// A synthetic `VarDecl` built from a worker-reported `VarStatus`, just
+/// enough for `prompt::ask` to reuse the exact same interactive UX
+/// (secret masking, `select`/`bool`/`int` validation) the in-process path
+/// already has. `VarStatus` is a strictly smaller wire-shaped view than a
+/// real `VarDecl` (the server has already fully resolved everything
+/// `from`/`session`/`default_var`/`choices_var` would have affected by the
+/// time it reports one) — those fields are left at their now-meaningless
+/// defaults, since none of them change `ask`'s own prompting behavior.
+fn var_decl_from_status(status: &worker_client::VarStatus) -> VarDecl {
+    VarDecl {
+        name: status.name.clone(),
+        var_type: match status.var_type.as_str() {
+            "int" => VarType::Int,
+            "bool" => VarType::Bool,
+            "select" => VarType::Select,
+            _ => VarType::String,
+        },
+        prompt: status.prompt.clone(),
+        default: None,
+        choices: status.choices.clone(),
+        secret: status.secret,
+        required: false,
+        from: None,
+        session: false,
+        default_var: None,
+        choices_var: None,
     }
 }
 
@@ -3346,8 +2935,47 @@ fn node_add(
     body_file: Option<PathBuf>,
     fields: NodeMetaFields,
 ) {
-    let raw = read_raw_or_exit(canvas_path);
     let body = body_file.as_deref().map(read_body_source_or_exit);
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+        eprintln!("failed to start async runtime: {e}");
+        std::process::exit(1);
+    });
+    if let Some(port) = runtime.block_on(coordinator::discover(canvas_path)) {
+        // `title_slug_id: true` — `node add` has always produced a
+        // title-slug id (`mdcanvas::insert_child_node`), never the web
+        // UI's own random one; routing through a worker can't be allowed
+        // to change which scheme a caller gets back (see
+        // `crates/server/src/lib.rs`'s `CreateNodeRequest::title_slug_id`
+        // doc comment).
+        let new_id = match runtime.block_on(worker_client::create_node(port, parent_id, title, true)) {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("meshfox node add: {e} (worker on port {port})");
+                std::process::exit(1);
+            }
+        };
+        if body.is_some() || fields.is_set() {
+            let update = match node_update_from_fields(&fields, body.as_deref()) {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("meshfox node add: added {new_id:?}, but {e}");
+                    std::process::exit(1);
+                }
+            };
+            if let Err(e) = runtime.block_on(worker_client::update_node(port, &new_id, &update)) {
+                eprintln!(
+                    "meshfox node add: added {new_id:?}, but failed to set its extra fields: {e} \
+                     (worker on port {port})"
+                );
+                std::process::exit(1);
+            }
+        }
+        println!(
+            "meshfox node add: added {new_id:?} under {parent_id:?} via the running worker on port {port}"
+        );
+        return;
+    }
+    let raw = read_raw_or_exit(canvas_path);
     match apply_node_add_with_extras(&raw, parent_id, title, body.as_deref(), fields) {
         Ok((updated, new_id)) => {
             write_raw_or_exit(canvas_path, &updated);
@@ -3439,11 +3067,11 @@ fn apply_node_add_with_extras(
 }
 
 fn node_rm(canvas_path: &Path, node_id: &str, keep_children: bool) {
-    if let Some(port) = worker_client::discover(canvas_path) {
-        let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
-            eprintln!("failed to start async runtime: {e}");
-            std::process::exit(1);
-        });
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+        eprintln!("failed to start async runtime: {e}");
+        std::process::exit(1);
+    });
+    if let Some(port) = runtime.block_on(coordinator::discover(canvas_path)) {
         return match runtime.block_on(worker_client::remove_node(port, node_id, keep_children)) {
             Ok(()) => println!(
                 "meshfox node rm: deleted {node_id:?}{} via the running worker on port {port}",
@@ -3495,6 +3123,21 @@ fn apply_node_rm(raw: &str, node_id: &str, keep_children: bool) -> Result<String
 }
 
 fn node_mv(canvas_path: &Path, node_id: &str, new_parent_id: &str) {
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+        eprintln!("failed to start async runtime: {e}");
+        std::process::exit(1);
+    });
+    if let Some(port) = runtime.block_on(coordinator::discover(canvas_path)) {
+        return match runtime.block_on(node_mv_via_worker(port, canvas_path, node_id, new_parent_id)) {
+            Ok(()) => println!(
+                "meshfox node mv: moved {node_id:?} under {new_parent_id:?} via the running worker on port {port}"
+            ),
+            Err(e) => {
+                eprintln!("meshfox node mv: {e} (worker on port {port})");
+                std::process::exit(1);
+            }
+        };
+    }
     let raw = read_raw_or_exit(canvas_path);
     match apply_node_mv(&raw, node_id, new_parent_id) {
         Ok(updated) => {
@@ -3584,6 +3227,25 @@ fn apply_node_mv(raw: &str, node_id: &str, new_parent_id: &str) -> Result<String
 }
 
 fn node_rename(canvas_path: &Path, node_id: &str, title: &str) {
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+        eprintln!("failed to start async runtime: {e}");
+        std::process::exit(1);
+    });
+    if let Some(port) = runtime.block_on(coordinator::discover(canvas_path)) {
+        let update = worker_client::NodeUpdate {
+            title: Some(title.to_string()),
+            ..Default::default()
+        };
+        return match runtime.block_on(worker_client::update_node(port, node_id, &update)) {
+            Ok(()) => println!(
+                "meshfox node rename: renamed {node_id:?} via the running worker on port {port}"
+            ),
+            Err(e) => {
+                eprintln!("meshfox node rename: {e} (worker on port {port})");
+                std::process::exit(1);
+            }
+        };
+    }
     let raw = read_raw_or_exit(canvas_path);
     match apply_node_rename(&raw, node_id, title) {
         Ok(updated) => {
@@ -3608,6 +3270,37 @@ fn apply_node_rename(raw: &str, node_id: &str, title: &str) -> Result<String, St
 }
 
 fn node_set_id(canvas_path: &Path, node_id: &str, new_id: &str) {
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+        eprintln!("failed to start async runtime: {e}");
+        std::process::exit(1);
+    });
+    if let Some(port) = runtime.block_on(coordinator::discover(canvas_path)) {
+        return match runtime.block_on(worker_client::rename_node_id(port, node_id, new_id)) {
+            Ok(()) => {
+                println!(
+                    "meshfox node set-id: renamed {node_id:?} to {new_id:?} via the running worker on port {port}"
+                );
+                // Same post-success `deps=` sanity check the direct-file
+                // path runs — the server's own `rename-id` endpoint
+                // doesn't do this itself, so it's replicated here against
+                // a fresh fetch rather than silently dropped.
+                if let Ok(raw) = runtime.block_on(worker_client::get_canvas_raw(port)) {
+                    if let Ok(canvas) = Canvas::from_markdown(&raw) {
+                        if let Err(e) = meshfox_core::deps::validate(&canvas) {
+                            eprintln!(
+                                "meshfox node set-id: warning: {e} (a deps= reference may need fixing by hand — \
+                                 see `meshfox validate`)"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("meshfox node set-id: {e} (worker on port {port})");
+                std::process::exit(1);
+            }
+        };
+    }
     let raw = read_raw_or_exit(canvas_path);
     match apply_node_set_id(&raw, node_id, new_id) {
         Ok(updated) => {
@@ -3657,11 +3350,11 @@ fn node_body(canvas_path: &Path, node_id: &str, file: Option<PathBuf>) {
         }
     };
 
-    if let Some(port) = worker_client::discover(canvas_path) {
-        let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
-            eprintln!("failed to start async runtime: {e}");
-            std::process::exit(1);
-        });
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+        eprintln!("failed to start async runtime: {e}");
+        std::process::exit(1);
+    });
+    if let Some(port) = runtime.block_on(coordinator::discover(canvas_path)) {
         return match runtime.block_on(worker_client::update_node_body(port, node_id, &new_body)) {
             Ok(()) => println!(
                 "meshfox node body: updated {node_id:?} via the running worker on port {port}"
@@ -3771,6 +3464,28 @@ struct BlockArgs {
 
 fn node_block(canvas_path: &Path, node_id: &str, block_name: &str, args: BlockArgs) {
     let code = args.code_file.as_deref().map(read_body_source_or_exit);
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+        eprintln!("failed to start async runtime: {e}");
+        std::process::exit(1);
+    });
+    if let Some(port) = runtime.block_on(coordinator::discover(canvas_path)) {
+        let update = match block_attrs_update_from_args(&args, code.as_deref()) {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("meshfox node block: {e}");
+                std::process::exit(1);
+            }
+        };
+        return match runtime.block_on(worker_client::set_block_attrs(port, node_id, block_name, &update)) {
+            Ok(()) => println!(
+                "meshfox node block: updated {block_name:?} in {node_id:?} via the running worker on port {port}"
+            ),
+            Err(e) => {
+                eprintln!("meshfox node block: {e} (worker on port {port})");
+                std::process::exit(1);
+            }
+        };
+    }
     let raw = read_raw_or_exit(canvas_path);
     match apply_node_block(&raw, node_id, block_name, &args, code.as_deref()) {
         Ok(updated) => {
@@ -3797,6 +3512,69 @@ fn resolve_bool_pair(on: bool, off: bool, on_flag: &str, off_flag: &str) -> Resu
         (false, true) => Ok(Some(false)),
         (false, false) => Ok(None),
     }
+}
+
+/// Builds a `worker_client::BlockAttrsUpdate` from `BlockArgs`, resolving
+/// each `--x`/`--no-x` pair and the `--deps`/`--clear-deps`,
+/// `--env`/`--clear-env`, `--interpreter`/`--clear-interpreter` mutual-
+/// exclusion checks the same way `apply_node_block` does — `deps`/`env`
+/// are sent as the same raw comma-separated text those flags already are
+/// (see `BlockAttrsUpdate`'s own doc comment for why), not pre-parsed into
+/// a typed list, so there's nothing to convert here beyond the
+/// `--clear-*` flags' own "send an empty string" convention.
+fn block_attrs_update_from_args(
+    args: &BlockArgs,
+    code: Option<&str>,
+) -> Result<worker_client::BlockAttrsUpdate, String> {
+    let cache = resolve_bool_pair(args.cache, args.no_cache, "--cache", "--no-cache")?;
+    let always = resolve_bool_pair(args.always, args.no_always, "--always", "--no-always")?;
+    let default = resolve_bool_pair(args.default, args.no_default, "--default", "--no-default")?;
+    let tty = resolve_bool_pair(args.tty, args.no_tty, "--tty", "--no-tty")?;
+    let autoclose = resolve_bool_pair(
+        args.autoclose,
+        args.no_autoclose,
+        "--autoclose",
+        "--no-autoclose",
+    )?;
+    let service = resolve_bool_pair(args.service, args.no_service, "--service", "--no-service")?;
+
+    if args.deps.is_some() && args.clear_deps {
+        return Err("--deps is mutually exclusive with --clear-deps".to_string());
+    }
+    let deps = if args.clear_deps {
+        Some(String::new())
+    } else {
+        args.deps.clone()
+    };
+
+    if args.env.is_some() && args.clear_env {
+        return Err("--env is mutually exclusive with --clear-env".to_string());
+    }
+    let env = if args.clear_env {
+        Some(String::new())
+    } else {
+        args.env.clone()
+    };
+
+    if args.interpreter.is_some() && args.clear_interpreter {
+        return Err("--interpreter is mutually exclusive with --clear-interpreter".to_string());
+    }
+
+    Ok(worker_client::BlockAttrsUpdate {
+        name: args.rename.clone(),
+        lang: args.lang.clone(),
+        cache,
+        always,
+        default,
+        tty,
+        autoclose,
+        service,
+        deps,
+        env,
+        interpreter: args.interpreter.clone(),
+        clear_interpreter: args.clear_interpreter,
+        code: code.map(str::to_string),
+    })
 }
 
 /// Pure logic behind `node block`: resolve every flag pair, look up the
@@ -3914,7 +3692,52 @@ fn parse_display(s: &str) -> Result<FileDisplay, String> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Builds a `worker_client::NodeUpdate` from `NodeMetaFields` (plus an
+/// optional new body, for `node add`'s own `--body-file`), parsing/
+/// validating `--type`/`--display`/`--tags` the same way the direct-file
+/// `apply_node_meta` does. Unlike that function, this never fetches the
+/// node's *current* value for anything — `PATCH /api/nodes/:id` already
+/// merges each sent field with whatever the node currently has server-side
+/// (`req.x.or(existing_x)`, etc. — see `UpdateNodeRequest`'s own doc
+/// comment), so there's nothing left for a client to merge itself.
+/// Deliberately doesn't replicate `apply_node_meta`'s own "`--preview`
+/// only applies to link nodes" upfront rejection — checking that would
+/// need the node's current type, which (unlike every other field here)
+/// isn't knowable without a separate fetch; the server just silently
+/// drops `preview` for a non-link node instead, which is a harmless no-op,
+/// not data loss.
+fn node_update_from_fields(
+    fields: &NodeMetaFields,
+    body: Option<&str>,
+) -> Result<worker_client::NodeUpdate, String> {
+    let node_type = fields.node_type.as_deref().map(parse_node_type).transpose()?;
+    let display = fields.display.as_deref().map(parse_display).transpose()?;
+    let tags = match &fields.tags {
+        None => None,
+        Some(s) => {
+            validate_tags_input(s)?;
+            Some(meshfox_core::parse_tags(Some(s)))
+        }
+    };
+    Ok(worker_client::NodeUpdate {
+        text: body.map(str::to_string),
+        x: fields.x,
+        y: fields.y,
+        width: fields.width,
+        height: fields.height,
+        color: fields.color.clone(),
+        node_type,
+        display,
+        lang: fields.lang.clone(),
+        interpreter: fields.interpreter.clone(),
+        preview: fields.preview,
+        fold: fields.fold.clone(),
+        tags,
+        created_at: fields.created_at.clone(),
+        ..Default::default()
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn node_meta(
     canvas_path: &Path,
@@ -3934,6 +3757,53 @@ fn node_meta(
     tags: Option<String>,
     created_at: Option<String>,
 ) {
+    // `--clear-position` has no worker-routed equivalent: `PATCH
+    // /api/nodes/:id` can only leave x/y/width/height untouched or set
+    // them to a new value, never explicitly clear one back to unset (no
+    // sentinel for that exists on this endpoint, unlike `fold`'s own
+    // "true"/"false"/"default" string) — falls through to the direct-file
+    // path unconditionally for this one case rather than silently
+    // dropping the clear, same "known gap, real fallback, not a silent
+    // no-op" posture `run`'s own `tty` exception already established.
+    if !clear_position {
+        let fields = NodeMetaFields {
+            x,
+            y,
+            width,
+            height,
+            color: color.clone(),
+            node_type: node_type.clone(),
+            display: display.clone(),
+            lang: lang.clone(),
+            interpreter: interpreter.clone(),
+            preview,
+            fold: fold.clone(),
+            tags: tags.clone(),
+            created_at: created_at.clone(),
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+            eprintln!("failed to start async runtime: {e}");
+            std::process::exit(1);
+        });
+        if let Some(port) = runtime.block_on(coordinator::discover(canvas_path)) {
+            let update = match node_update_from_fields(&fields, None) {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("meshfox node meta: {e}");
+                    std::process::exit(1);
+                }
+            };
+            return match runtime.block_on(worker_client::update_node(port, node_id, &update)) {
+                Ok(()) => println!(
+                    "meshfox node meta: updated {node_id:?} via the running worker on port {port}"
+                ),
+                Err(e) => {
+                    eprintln!("meshfox node meta: {e} (worker on port {port})");
+                    std::process::exit(1);
+                }
+            };
+        }
+    }
     let raw = read_raw_or_exit(canvas_path);
     match apply_node_meta(
         &raw,
@@ -4103,8 +3973,29 @@ fn apply_node_meta(
 }
 
 fn node_edges(canvas_path: &Path, node_id: &str, from: Vec<String>, clear: bool) {
-    let raw = read_raw_or_exit(canvas_path);
     let extra_parents: Vec<String> = if clear { Vec::new() } else { from };
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+        eprintln!("failed to start async runtime: {e}");
+        std::process::exit(1);
+    });
+    if let Some(port) = runtime.block_on(coordinator::discover(canvas_path)) {
+        let edges: Vec<ExtraEdge> = extra_parents.iter().map(|p| ExtraEdge::new(p.as_str())).collect();
+        let update = worker_client::NodeUpdate {
+            extra_parents: Some(edges),
+            ..Default::default()
+        };
+        return match runtime.block_on(worker_client::update_node(port, node_id, &update)) {
+            Ok(()) => println!(
+                "meshfox node edges: set {} extra parent(s) on {node_id:?} via the running worker on port {port}",
+                extra_parents.len()
+            ),
+            Err(e) => {
+                eprintln!("meshfox node edges: {e} (worker on port {port})");
+                std::process::exit(1);
+            }
+        };
+    }
+    let raw = read_raw_or_exit(canvas_path);
     match apply_node_edges(&raw, node_id, &extra_parents) {
         Ok(updated) => {
             write_raw_or_exit(canvas_path, &updated);
@@ -4133,6 +4024,34 @@ fn apply_node_edges(raw: &str, node_id: &str, extra_parents: &[String]) -> Resul
 }
 
 fn node_move(canvas_path: &Path, node_id: &str, before: Option<String>, after: Option<String>) {
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+        eprintln!("failed to start async runtime: {e}");
+        std::process::exit(1);
+    });
+    if let Some(port) = runtime.block_on(coordinator::discover(canvas_path)) {
+        let (target_id, is_before) = match (&before, &after) {
+            (Some(t), None) => (t.clone(), true),
+            (None, Some(t)) => (t.clone(), false),
+            (None, None) => {
+                eprintln!("meshfox node move: exactly one of --before/--after is required");
+                std::process::exit(1);
+            }
+            (Some(_), Some(_)) => {
+                eprintln!("meshfox node move: --before and --after are mutually exclusive");
+                std::process::exit(1);
+            }
+        };
+        return match runtime.block_on(worker_client::move_sibling(port, node_id, &target_id, is_before)) {
+            Ok(()) => println!(
+                "meshfox node move: moved {node_id:?} {} {target_id:?} via the running worker on port {port}",
+                if is_before { "before" } else { "after" }
+            ),
+            Err(e) => {
+                eprintln!("meshfox node move: {e} (worker on port {port})");
+                std::process::exit(1);
+            }
+        };
+    }
     let raw = read_raw_or_exit(canvas_path);
     match apply_node_move(&raw, node_id, before.as_deref(), after.as_deref()) {
         Ok((updated, target_id, position)) => {
@@ -4168,6 +4087,21 @@ fn apply_node_move(
 }
 
 fn node_reorder(canvas_path: &Path) {
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+        eprintln!("failed to start async runtime: {e}");
+        std::process::exit(1);
+    });
+    if let Some(port) = runtime.block_on(coordinator::discover(canvas_path)) {
+        return match runtime.block_on(worker_client::reorder_document(port)) {
+            Ok(()) => println!(
+                "meshfox node reorder: resynced sibling order via the running worker on port {port}"
+            ),
+            Err(e) => {
+                eprintln!("meshfox node reorder: {e} (worker on port {port})");
+                std::process::exit(1);
+            }
+        };
+    }
     let raw = read_raw_or_exit(canvas_path);
     match apply_node_reorder(&raw) {
         Ok(updated) => {

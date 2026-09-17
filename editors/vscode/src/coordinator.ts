@@ -4,9 +4,10 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { ChildProcess, spawn } from "child_process";
-import { parseWorkerMessage } from "./protocol";
+import { parseWorkerMessage, requestPort } from "./protocol";
 import { VIEW_TYPE, resolveExecutablePath } from "./constants";
 import { showInstallInstructions } from "./updates";
+import { resolveServerSocket } from "./config";
 
 const READY_TIMEOUT_MS = 15000;
 
@@ -37,6 +38,17 @@ function canonical(p: string): string {
  * per VS Code window: binds a private Unix socket, spawns one `meshfox
  * view --watcher-socket <that socket>` worker per open canvas, and tracks
  * each worker's port once its own `Ready` message arrives.
+ *
+ * This is deliberately *not* promoted into a persistent, externally-
+ * addressable coordinator of its own — its lifetime is tied to one VS Code
+ * window, exactly the "random client" coupling a real external coordinator
+ * (the macOS daemon; a future cross-platform `meshfox serve`) exists to
+ * avoid (see TODO.canvas.md's "VS Code расширение — клиент внешнего
+ * координатора"). Instead, `getOrSpawnWorker` becomes a pure *client* of
+ * one when `server_socket` is configured, falling back to this class's own
+ * private spawn-and-track behavior otherwise — the same `Us`/`Other`
+ * decision every other meshfox frontend now makes via
+ * `crates/cli/src/coordinator.rs::resolve` on the Rust side.
  *
  * Unix-socket only — same known gap as meshfox's own watcher (see
  * TODO.canvas.md's "Полноценная поддержка Windows"), so `start()` refuses
@@ -134,9 +146,35 @@ export class Coordinator implements vscode.Disposable {
   }
 
   /** Returns the port an already-running (or freshly spawned) worker for
-   * `fsPath` is serving on, waiting for its `Ready` message if needed. */
+   * `fsPath` is serving on, waiting for its `Ready` message if needed.
+   *
+   * If `server_socket` is configured (`config.ts`'s own local-wins-over-
+   * global load, same as every other core-launch operation now checks —
+   * see `crates/cli/src/coordinator.rs`'s own doc comment on the Rust
+   * side), this *always* routes through that external coordinator instead
+   * — get-or-spawn becomes its job, this extension never binds a worker of
+   * its own for that canvas. A configured-but-unreachable coordinator is a
+   * real, propagated error (surfaced in the webview via `errorHtml`, same
+   * as any other failure here) rather than a silent fallback to this
+   * extension's own private spawn — the user asked for an external
+   * coordinator specifically, so quietly giving them a different guarantee
+   * (no longer sharing state with whatever else that coordinator manages)
+   * would be worse than a clear error.
+   *
+   * Known gap, not solved here: a worker an external coordinator spawned
+   * reports its own `Ready`/`Open`/`OpenFile` messages back to *that*
+   * coordinator's socket, not this extension's private one — a cross-
+   * canvas "↗ open" click inside such a tab surfaces wherever the external
+   * coordinator sends it (a browser tab, for the macOS daemon), not a new
+   * VS Code editor tab the way navigating from a locally-spawned worker's
+   * tab does. Not blocking for a first pass; worth a TODO.canvas.md
+   * follow-up if it turns out to matter in practice. */
   async getOrSpawnWorker(fsPath: string): Promise<number> {
     const key = canonical(fsPath);
+    const externalSocket = resolveServerSocket(fsPath);
+    if (externalSocket !== undefined) {
+      return requestPort(externalSocket, key);
+    }
     let entry = this.workers.get(key);
     if (entry?.port !== undefined) {
       return entry.port;

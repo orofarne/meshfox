@@ -296,6 +296,7 @@ fn heading_style(level: HeadingLevel) -> Style {
 /// against it; anything that parses as an absolute URL (`http(s)://...`) is
 /// shown as a plain link instead of fetched, matching this being a local
 /// document viewer, not a browser.
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     md: &str,
     base_dir: &Path,
@@ -480,6 +481,7 @@ struct OutputRegion {
 }
 
 impl<'a> Renderer<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         base_dir: &'a Path,
         hl: &'a Highlighter,

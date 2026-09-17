@@ -14,6 +14,12 @@ enum WatcherMessage {
     /// Rust side's `Message::OpenFile` doc comment for why this is a
     /// separate case rather than a reused field on `.open`.
     case openFile(path: String)
+    /// "Get-or-spawn a worker for `canvasPath`, don't open a browser tab,
+    /// just tell me its port" — the one message that gets a reply on the
+    /// same connection instead of being fire-and-forget; see the Rust
+    /// side's `Message::GetPort`/`PortResponse` doc comments and
+    /// `UnixSocketServer`'s own handling of this case specifically.
+    case getPort(canvasPath: String)
 }
 
 extension WatcherMessage: Decodable {
@@ -40,6 +46,9 @@ extension WatcherMessage: Decodable {
         case "open_file":
             let path = try container.decode(String.self, forKey: .path)
             self = .openFile(path: path)
+        case "get_port":
+            let path = try container.decode(String.self, forKey: .canvasPath)
+            self = .getPort(canvasPath: path)
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .op,
@@ -57,5 +66,31 @@ extension WatcherMessage: Decodable {
     static func parse(line: String) -> WatcherMessage? {
         guard let data = line.data(using: .utf8) else { return nil }
         return try? JSONDecoder().decode(WatcherMessage.self, from: data)
+    }
+}
+
+/// The one JSON line written back after a `.getPort` request — mirrors the
+/// Rust side's own (untagged) `PortResponse`: exactly one of `port`/`error`
+/// present, never both. See `UnixSocketServer`'s own handling of `.getPort`
+/// for where this gets written.
+enum PortReply {
+    case port(UInt16)
+    case error(String)
+}
+
+extension PortReply: Encodable {
+    private enum CodingKeys: String, CodingKey {
+        case port
+        case error
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .port(let port):
+            try container.encode(port, forKey: .port)
+        case .error(let message):
+            try container.encode(message, forKey: .error)
+        }
     }
 }

@@ -18,6 +18,10 @@ final class Session {
     var port: UInt16?
     var pendingOpen: PendingOpen
     let process: Process
+    /// Every still-unanswered `get_port` request waiting on this session's
+    /// own `Ready` — drained (each called exactly once) by `markReady`.
+    /// Empty for a session nobody's asked `getPort` about yet.
+    var pendingPortRequests: [(PortReply) -> Void] = []
 
     init(canvasPath: String, process: Process, pendingOpen: PendingOpen) {
         self.canvasPath = canvasPath
@@ -57,9 +61,16 @@ final class SessionStore {
         let dir = (socketPath as NSString).deletingLastPathComponent
         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
 
-        let server = UnixSocketServer(path: socketPath) { [weak self] line in
-            self?.handleLine(line)
-        }
+        let server = UnixSocketServer(
+            path: socketPath,
+            onLine: { [weak self] line in
+                self?.handleLine(line)
+            },
+            onGetPort: { [weak self] canvasPath, completion in
+                self?.getPort(path: canvasPath, completion: completion)
+                    ?? completion(.error("daemon is shutting down"))
+            }
+        )
         try server.start()
         self.server = server
     }
@@ -81,7 +92,40 @@ final class SessionStore {
             openCanvas(path: canvasPath, fragment: fragment)
         case .openFile(let path):
             openFile(path: path)
+        case .getPort:
+            // Never actually reaches here — `UnixSocketServer` intercepts
+            // `get_port` itself and calls `getPort(path:completion:)`
+            // directly, since (unlike everything else routed through
+            // `onLine`) it needs a reply on the same connection. Kept only
+            // so this switch stays exhaustive.
+            break
         }
+    }
+
+    /// "Get-or-spawn a worker for `canvasPath`, tell me its port" —
+    /// `UnixSocketServer`'s own `get_port` handling calls this directly
+    /// (not via `handleLine`) since it needs the reply `completion`
+    /// provides. Never opens a browser tab (`pendingOpen: .none`) — that's
+    /// `openCanvas`'s own job. `completion` may run synchronously (a port's
+    /// already known) or later, from `markReady` (still spawning) —
+    /// exactly once either way.
+    func getPort(path canvasPath: String, completion: @escaping (PortReply) -> Void) {
+        let canonical = Self.canonicalize(canvasPath)
+
+        lock.lock()
+        if let existing = sessions[canonical] {
+            if let port = existing.port {
+                lock.unlock()
+                completion(.port(port))
+            } else {
+                existing.pendingPortRequests.append(completion)
+                lock.unlock()
+            }
+            return
+        }
+        lock.unlock()
+
+        spawnWorker(canonicalPath: canonical, pendingOpen: .none, initialPortRequest: completion)
     }
 
     /// A worker's own `Ready` arrived — record its port, and open a tab
@@ -94,17 +138,23 @@ final class SessionStore {
         let session = sessions[canvasPath]
         session?.port = port
         let pending = session?.pendingOpen
+        let portRequests = session?.pendingPortRequests ?? []
+        session?.pendingPortRequests = []
         lock.unlock()
         if case .wanted(let fragment) = pending {
             openBrowserTab(port: port, fragment: fragment)
+        }
+        for completion in portRequests {
+            completion(.port(port))
         }
         notifyChange()
     }
 
     /// "Show the user `canvasPath`" — the one path every source of that
     /// request funnels through: a worker's own cross-canvas "↗ open"
-    /// (over the socket, from `handleLine`), `meshfox open` (also over the
-    /// socket — it's just another client of the exact same protocol), and
+    /// (over the socket, from `handleLine`), `meshfox view`'s own
+    /// `server_socket` hand-off (also over the socket — it's just another
+    /// client of the exact same protocol), and
     /// Finder handing this app a file directly (`AppDelegate.application(_:open:)`,
     /// called in-process — no socket hop needed since we're already inside
     /// the one process that owns `SessionStore`). Same three-way dispatch
@@ -127,7 +177,7 @@ final class SessionStore {
         }
         lock.unlock()
 
-        spawnWorker(canonicalPath: canonical, pendingOpen: .wanted(fragment: fragment))
+        spawnWorker(canonicalPath: canonical, pendingOpen: .wanted(fragment: fragment), initialPortRequest: nil)
     }
 
     /// A "↗ open" on a plain (non-canvas) file node's target — this
@@ -154,13 +204,20 @@ final class SessionStore {
     /// unlike the CLI's own private watcher, this daemon never starts with
     /// an initial canvas of its own (see `main.swift`); every session it
     /// ever has came from an explicit `Open`.
-    private func spawnWorker(canonicalPath: String, pendingOpen: PendingOpen) {
+    private func spawnWorker(
+        canonicalPath: String,
+        pendingOpen: PendingOpen,
+        initialPortRequest: ((PortReply) -> Void)?
+    ) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: meshfoxPath)
         process.arguments = ["view", canonicalPath, "--port", "0", "--watcher-socket", socketPath]
         process.standardInput = FileHandle.nullDevice
 
         let session = Session(canvasPath: canonicalPath, process: process, pendingOpen: pendingOpen)
+        if let initialPortRequest {
+            session.pendingPortRequests = [initialPortRequest]
+        }
         process.terminationHandler = { [weak self] _ in
             self?.remove(canonicalPath: canonicalPath)
         }
@@ -176,14 +233,25 @@ final class SessionStore {
             lock.lock()
             sessions.removeValue(forKey: canonicalPath)
             lock.unlock()
+            initialPortRequest?(.error("couldn't spawn a worker: \(error.localizedDescription)"))
             notifyChange()
         }
     }
 
+    /// A session's worker is gone — normal exit (its own tabs all closed)
+    /// or a crash before ever reporting `Ready`. Either way, nobody's
+    /// waiting `getPort` on it should be left blocked forever
+    /// (`UnixSocketServer.replyToGetPort`'s semaphore has no other way to
+    /// wake up) — fail every still-pending request explicitly rather than
+    /// silently dropping them.
     private func remove(canonicalPath: String) {
         lock.lock()
+        let portRequests = sessions[canonicalPath]?.pendingPortRequests ?? []
         sessions.removeValue(forKey: canonicalPath)
         lock.unlock()
+        for completion in portRequests {
+            completion(.error("worker exited before reporting a port"))
+        }
         notifyChange()
     }
 

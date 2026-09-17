@@ -32,8 +32,10 @@ func resolveMeshfoxPath() -> String? {
 }
 
 /// `~/Library/Application Support/meshfox/daemon.sock` — the well-known
-/// socket path a future `meshfox open` (unlike `meshfox view`'s own
-/// private per-invocation one) connects to directly, no bootstrap-race
+/// socket path a Rust-side `server_socket` setting in `~/.meshfox/config.toml`
+/// (`crates/core/src/config.rs`) points at to connect here directly instead
+/// of any `meshfox view`/`tui`/`run`/`node <op>`/`mcp` invocation spawning
+/// its own worker (see `crates/cli/src/coordinator.rs`) — no bootstrap-race
 /// needed since this app itself is the only thing that ever creates it.
 /// `Application Support` (not `Caches`/`../tmp`) since this is meant to be
 /// long-lived for as long as the daemon runs, same idiom any other
@@ -56,8 +58,10 @@ app.delegate = delegate
 // Menu-bar-only — no Dock icon, no app switcher entry. Launching with no
 // arguments just starts the daemon; it never opens an initial canvas of
 // its own (contrast `meshfox view`'s private watcher) — every session it
-// ever tracks comes from an explicit `Open` request, whether from a
-// worker's own cross-canvas navigation or (eventually) `meshfox open`.
+// ever tracks comes from an explicit `Open`/`GetPort` request, whether
+// from a worker's own cross-canvas navigation or a `server_socket`-
+// configured client (`view`'s own hand-off, `tui`, `run`, `node <op>`,
+// `mcp`).
 app.setActivationPolicy(.accessory)
 
 // `kill <pid>`/Activity Monitor "Quit"/force-quit all bypass the "Quit"

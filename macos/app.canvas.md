@@ -7,8 +7,21 @@ AppDelegate) that also handles Finder's "open documents" Apple Event —
 double-click/drag-onto-icon/"Open With" on a `.canvas.md` — the same role a
 separate `MeshfoxCanvas.app` (an AppleScript droplet) used to play, folded
 in here instead of kept as a second app, since the daemon already has all
-the machinery a plain droplet didn't: a persistent, `meshfox open`-reachable
-socket, session tracking, a menu to see/kill what's running.
+the machinery a plain droplet didn't: a persistent socket, session
+tracking, a menu to see/kill what's running.
+
+To make `view`/`tui`/`run`/`node <op>`/`mcp` actually use this daemon as
+their shared coordinator instead of each spawning its own worker, add
+`server_socket` to `~/.meshfox/config.toml`:
+
+```toml
+server_socket = "/Users/<you>/Library/Application Support/meshfox/daemon.sock"
+```
+
+(the exact path `MeshfoxDaemon/Sources/MeshfoxDaemon/main.swift`'s own
+`defaultSocketPath()` uses — see `crates/core/src/config.rs`'s
+`server_socket` and `crates/cli/src/coordinator.rs` on the Rust side for
+what reads this).
 
 Bundle id `net.orofarne.meshfox`; the app is named plainly "Meshfox"
 everywhere a user sees it (Finder, `/Applications`, the tray icon's own
@@ -27,19 +40,21 @@ to re-run.
 executable target (`swift build`/`swift run`, no Xcode project needed):
 `Protocol.swift` (the wire format, mirrors `crates/server/src/watcher_protocol.rs`
 byte-for-byte), `UnixSocketServer.swift` (raw POSIX socket — deliberately
-not `Network.framework`, see its own doc comment), `SessionStore.swift`
-(spawns/tracks/kills `meshfox view --watcher-socket` workers, the daemon's
-own counterpart to `crates/cli/src/watcher.rs`'s `Registry`), `AppDelegate.swift`
-(the tray menu + Finder's `application(_:open:)`), `main.swift` (resolves
-the `meshfox` binary, sets up `SIGTERM`/`SIGINT` handling, starts the run
-loop).
+not `Network.framework`, see its own doc comment; also where
+`launch_activate_socket` inherits a launchd-bound socket when this app runs
+under its own LaunchAgent, see `build`'s own "Socket activation" section),
+`SessionStore.swift` (spawns/tracks/kills `meshfox view --watcher-socket`
+workers, the daemon's own counterpart to `crates/cli/src/watcher.rs`'s
+`Registry`), `AppDelegate.swift` (the tray menu + Finder's
+`application(_:open:)`), `main.swift` (resolves the `meshfox` binary, sets
+up `SIGTERM`/`SIGINT` handling, starts the run loop). `CLaunch/` is a tiny
+system-library target exposing `<launch.h>`'s `launch_activate_socket` —
+not bridged into Swift by any higher-level framework.
 
-`MESHFOX_BIN`/`MESHFOX_DAEMON_BIN` environment variables — not for normal
-use, just for developing/testing this daemon (respectively: which `meshfox`
-CLI it spawns workers with, and — read by `meshfox open` on the Rust side,
-`crates/cli/src/main.rs::resolve_daemon_app` — which daemon binary counts
-as "installed") against a `target/debug`/`swift build` output instead of
-whatever's actually installed.
+`MESHFOX_BIN` environment variable — not for normal use, just for
+developing/testing this daemon against a `target/debug`/`swift build`
+`meshfox` output instead of whatever's actually installed; which `meshfox`
+CLI this daemon spawns workers with.
 
 ## Build & install
 <!-- meshfox:node id="build" -->
@@ -65,15 +80,34 @@ own (narrower) extension list ever gets consulted (checked directly with
 `mdimport -t`, not assumed), so a `canvas.md`-specific claim would never
 win regardless of specificity.
 
-The final `open -a` both warms up LaunchServices' trust in this app's own
-type claims (a freshly ad-hoc-signed app's claims start out "untrusted" and
-lose out to a "trusted" one during type resolution until the app has
-actually been launched once — same finding as before) *and* is the daemon's
-real first launch — unlike the old droplet (which needed
-`MESHFOX_CANVAS_OPENER_WARMUP` to suppress a dialog on this specific
-launch), a plain no-arguments launch here is already exactly what a normal
-first run looks like: tray icon appears, starts listening. Nothing further
-to suppress.
+The `open -a` right after signing/registering warms up LaunchServices'
+trust in this app's own type claims (a freshly ad-hoc-signed app's claims
+start out "untrusted" and lose out to a "trusted" one during type
+resolution until the app has actually been launched once — same finding as
+before); that one-off instance is then killed again immediately —
+everything from here on is the *LaunchAgent*'s own job (see below), and
+letting this warmup instance keep running would race it for the very same
+socket.
+
+**Socket activation (LaunchAgent), replacing "just run the app and hope it
+stays up":** registers `~/Library/LaunchAgents/net.orofarne.meshfox.plist`
+with `launchctl bootstrap` — `RunAtLoad` (starts at login), `KeepAlive`
+with `SuccessfulExit: false` (restarts on a crash, *not* after a clean
+"Quit" — a normal `exit(0)` isn't a "successful exit" in launchd's own
+sense to restart from... it is a successful exit, which is exactly why
+`SuccessfulExit: false` means "don't restart after one" — see `man
+launchd.plist`), and a `Sockets` entry naming the same well-known path
+`main.swift`'s own `defaultSocketPath()` uses. That last part is the actual
+point: launchd itself creates and holds that socket open from the moment
+this LaunchAgent is loaded, independent of whether the daemon process
+happens to be running at any given instant — a client (`meshfox`'s own
+`coordinator::resolve`, or this extension) can always connect immediately;
+launchd spawns (or wakes) the real process behind the scenes on first use,
+handing it the already-bound fd via `launch_activate_socket` (see
+`UnixSocketServer.swift`). This is what let every "find the app, spawn it,
+poll until its socket comes up" retry logic on the client side (Rust *and*
+TypeScript) go away entirely — there's no "not started yet" state for a
+client to ever observe once this LaunchAgent is loaded.
 
 ```bash always
 set -euo pipefail
@@ -132,8 +166,33 @@ LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchSe
 "$LSREGISTER" -f "$APP"
 
 open -a "$APP"
+sleep 2
+pkill -f "$APP/Contents/MacOS/Meshfox" 2>/dev/null || true
+sleep 1
+
+LABEL="$BUNDLE_ID"
+AGENT_PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+SOCKET_PATH="$HOME/Library/Application Support/meshfox/daemon.sock"
+mkdir -p "$HOME/Library/LaunchAgents" "$(dirname "$SOCKET_PATH")"
+
+launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+
+plutil -create xml1 "$AGENT_PLIST"
+"$PB" -c "Add :Label string $LABEL" "$AGENT_PLIST"
+"$PB" -c "Add :ProgramArguments array" "$AGENT_PLIST"
+"$PB" -c "Add :ProgramArguments:0 string $APP/Contents/MacOS/Meshfox" "$AGENT_PLIST"
+"$PB" -c "Add :RunAtLoad bool true" "$AGENT_PLIST"
+"$PB" -c "Add :KeepAlive dict" "$AGENT_PLIST"
+"$PB" -c "Add :KeepAlive:SuccessfulExit bool false" "$AGENT_PLIST"
+"$PB" -c "Add :Sockets dict" "$AGENT_PLIST"
+"$PB" -c "Add :Sockets:Listener dict" "$AGENT_PLIST"
+"$PB" -c "Add :Sockets:Listener:SockPathName string $SOCKET_PATH" "$AGENT_PLIST"
+"$PB" -c "Add :Sockets:Listener:SockType string stream" "$AGENT_PLIST"
+
+launchctl bootstrap "gui/$(id -u)" "$AGENT_PLIST"
 
 echo "Installed $APP"
+echo "Registered LaunchAgent $AGENT_PLIST (socket: $SOCKET_PATH)"
 ```
 
 ## Package for sharing
@@ -168,14 +227,21 @@ echo "ad-hoc signed, not notarized, so Gatekeeper will otherwise refuse it)."
 ## Uninstall
 <!-- meshfox:node id="uninstall" -->
 
-Kills any running instance (so a stale process doesn't keep the socket
-file/tray icon around after this), removes the installed app, and
-unregisters it.
+Unregisters the LaunchAgent first (`launchctl bootout`, which also stops
+the running instance it manages), removes its plist, then falls back to a
+plain `pkill` too (covers a manually-launched instance predating the
+LaunchAgent, or a `swift run` left over from development) before removing
+the installed app and unregistering it from LaunchServices.
 
 ```bash
 set -euo pipefail
 
 APP="$HOME/Applications/Meshfox.app"
+LABEL="net.orofarne.meshfox"
+AGENT_PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+
+launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+rm -f "$AGENT_PLIST"
 
 pkill -f "$APP/Contents/MacOS/Meshfox" 2>/dev/null || true
 

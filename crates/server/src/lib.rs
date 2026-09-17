@@ -19,8 +19,8 @@ use axum::{
     Json, Router,
 };
 use meshfox_core::{
-    mdcanvas, worker_lock, Canvas, ExecOutput, ExtraEdge, FileDisplay, NodeMeta, NodeType,
-    RunError, VarCache,
+    mdcanvas, worker_lock, Canvas, ExecOutput, ExtraEdge, FenceAttrsPatch, FileDisplay, NodeMeta,
+    NodeType, RunError, VarCache,
 };
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
@@ -38,6 +38,7 @@ use tower_http::cors::CorsLayer;
 /// OpenGraph parsing + cache in-process (see its own `App` struct) rather
 /// than duplicating it — the TUI doesn't talk to `meshfox serve` over
 /// HTTP, it links this crate as a plain library.
+pub mod debug_session;
 pub mod link_preview;
 mod pty_exec;
 /// `pub` so `meshfox-cli`'s TUI can share the exact same live-service
@@ -176,6 +177,16 @@ struct AppState {
     /// `tty_registry`'s own module doc comment. Also only ever holds the
     /// *current* session for a given address, for the same reason.
     tty_registry: Mutex<HashMap<(String, String), Arc<tty_registry::TtySessionHandle>>>,
+    /// Every live `debug_session::DebugSession` a `crate::coordinator`-routed
+    /// MCP/CLI client has started against this worker, keyed by a
+    /// server-issued session id — see `/api/debug/*`. `tokio::sync::Mutex`,
+    /// not `std::sync::Mutex`, since `DebugSession::send`/`stop` are
+    /// `async` and can run for up to a `send`'s own timeout (default one
+    /// minute); a per-session lock held that long must never be a
+    /// blocking-thread lock. The outer map's own lock is only ever held
+    /// just long enough to look up/insert/remove an `Arc`, never across an
+    /// `.await`.
+    debug_sessions: Mutex<HashMap<String, Arc<tokio::sync::Mutex<debug_session::DebugSession>>>>,
     /// Where this worker's own coordinating watcher (or, eventually, a
     /// persistent GUI daemon) is listening — `None` only for a worker
     /// started without one (the `#[cfg(test)]` server, or a hand-run
@@ -1869,6 +1880,26 @@ async fn clear_layout(State(state): State<Arc<AppState>>) -> Result<Json<Canvas>
     canvas_response(&raw, &state.canvas_path)
 }
 
+/// Re-sorts every parent's own structural children by their real/auto-
+/// placed position (`mdcanvas::reorder_by_position`) — the same pass
+/// `PUT /api/canvas`'s own save flow already runs automatically on every
+/// save, exposed as its own standalone endpoint so a worker-routed CLI/MCP
+/// `node reorder` (which has no client-side auto-layout to hint from) can
+/// trigger it directly, mirroring `apply_node_reorder`'s own direct-file
+/// behavior exactly: no layout hints, so an unpositioned sibling sorts
+/// last, stably. Scoped to the primary document only, same as
+/// `clear_layout` above — an include target's own sibling order lives in
+/// a separate file, untouched by this.
+async fn reorder_siblings(State(state): State<Arc<AppState>>) -> Result<Json<Canvas>, ApiError> {
+    let raw = state.raw.lock().unwrap().clone();
+    let updated = mdcanvas::reorder_by_position(&raw, &HashMap::new())
+        .ok_or_else(|| ApiError(StatusCode::UNPROCESSABLE_ENTITY, "failed to parse".to_string()))?;
+    state
+        .save(&updated)
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    canvas_response(&updated, &state.canvas_path)
+}
+
 /// Clears node `id`'s own authored `x`/`y`/`w`/`h`, reverting it to
 /// auto-placement — the same per-node operation `clear_layout` above runs
 /// over every node in the document at once, narrowed to just this one
@@ -1915,39 +1946,67 @@ async fn clear_node_layout(
 struct CreateNodeRequest {
     parent_id: String,
     title: String,
+    /// `false` (the default — the field the existing web client never
+    /// sends at all) keeps today's `insert_child_node_random_id` behavior.
+    /// `true` uses the plain title-slug `insert_child_node` instead — for
+    /// `crate::coordinator`-routed CLI/MCP `node add` (TODO.canvas.md:
+    /// "worker-routing для node add/meta отложен"), which has always
+    /// produced a readable, title-derived id for a *direct-file* `node
+    /// add` and needs the exact same id scheme once routed through a
+    /// worker instead — a caller that can't predict which scheme it'll
+    /// get back can't reliably use the new node's id for anything
+    /// afterward (a follow-up `node body`, say).
+    #[serde(default)]
+    title_slug_id: bool,
+}
+
+/// The new node's own id, alongside the whole (already-updated) canvas —
+/// `#[serde(flatten)]` so every existing field `Json<Canvas>` alone used to
+/// return is still there, at the same top level, for the web client's own
+/// unchanged parsing; `newId` is simply new surface next to it. Neither
+/// `insert_child_node` nor `insert_child_node_random_id` lets a caller
+/// predict the id it's about to produce, so this is the only way a
+/// worker-routed `node add` can learn it at all.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateNodeResponse {
+    new_id: String,
+    #[serde(flatten)]
+    canvas: Canvas,
 }
 
 /// Adds a new, empty-bodied child heading node under `parentId`, as the
-/// last item in its existing subtree (see
-/// `mdcanvas::insert_child_node_random_id`). Deliberately doesn't set a
+/// last item in its existing subtree. Deliberately doesn't set a
 /// position — the web client's own auto-layout places it using the same
 /// tree-aware default any other position-less node gets, which for a fresh
 /// child means "to the right of its parent", exactly what the UI's "add
 /// child" button wants without any extra placement logic here.
 ///
-/// Uses `insert_child_node_random_id`, not the plain title-slug
-/// `insert_child_node` CLI/MCP `node add` uses — the web UI's "add child"
-/// button no longer opens a settings dialog first (TODO.canvas.md:
+/// Uses `insert_child_node_random_id` by default, not the plain title-slug
+/// `insert_child_node` CLI/MCP `node add` uses directly — the web UI's "add
+/// child" button no longer opens a settings dialog first (TODO.canvas.md:
 /// "Позволить редактировать заголовок прямо на канвасе"), so `req.title`
 /// here is only ever the placeholder the client is about to let the user
 /// overwrite inline, never a real title worth deriving an id from (see
-/// TODO.canvas.md: "Id-хэши вместо new-node-X по умолчанию").
+/// TODO.canvas.md: "Id-хэши вместо new-node-X по умолчанию") — unless
+/// `req.title_slug_id` opts into the other scheme instead (see
+/// `CreateNodeRequest::title_slug_id`'s own doc comment).
 async fn create_node(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateNodeRequest>,
-) -> Result<Json<Canvas>, ApiError> {
+) -> Result<Json<CreateNodeResponse>, ApiError> {
     let primary_raw = state.raw.lock().unwrap().clone();
     // `parentId` may itself name a node spliced in from an include (e.g.
     // adding a child under something inside an included canvas) — locate
     // it first so the new node is actually written into the file the
     // parent lives in, same as editing an existing node there already is.
     let located = locate_node(&state, &primary_raw, &req.parent_id)?;
-    let (updated, new_id) = mdcanvas::insert_child_node_random_id(
-        &located.raw,
-        &located.local_id,
-        &req.title,
-    )
-    .ok_or_else(|| {
+    let insert = if req.title_slug_id {
+        mdcanvas::insert_child_node
+    } else {
+        mdcanvas::insert_child_node_random_id
+    };
+    let (updated, new_id) = insert(&located.raw, &located.local_id, &req.title).ok_or_else(|| {
         ApiError(
             StatusCode::NOT_FOUND,
             format!("no node {:?}", req.parent_id),
@@ -1959,7 +2018,8 @@ async fn create_node(
     let op = node_upserted_event(&updated, &state.canvas_path, &new_id);
     commit_located(&state, &located, &updated, op)?;
     let response_raw = state.raw.lock().unwrap().clone();
-    canvas_response(&response_raw, &state.canvas_path)
+    let Json(canvas) = canvas_response(&response_raw, &state.canvas_path)?;
+    Ok(Json(CreateNodeResponse { new_id, canvas }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2048,6 +2108,29 @@ struct UpdateNodeRequest {
     /// explicit override, `"default"` clears back to "follow the
     /// document's own default" (see `resolve_fold_override`).
     fold: Option<String>,
+    /// Absolute position/size — `None` leaves each untouched, same
+    /// convention as every other field here. Added for `crate::coordinator`-
+    /// routed CLI/MCP `node meta` (TODO.canvas.md: "worker-routing для
+    /// node add/meta отложен"): the web UI itself never sends these through
+    /// this endpoint (a node is only ever moved/resized by drag, which has
+    /// its own dedicated endpoints), so this is new surface for a caller
+    /// that already has to pass *some* value, not something the existing
+    /// web client needs to change to keep using. `width`/`height` are
+    /// rejected below for a group node (real or becoming one via
+    /// `nodeType` in the same request) — its box is always derived from
+    /// its children, never stored, same invariant `crate::main`'s own
+    /// `apply_node_meta` already enforces client-side for the direct-file
+    /// path this is the worker-routed counterpart to.
+    x: Option<f64>,
+    y: Option<f64>,
+    width: Option<f64>,
+    height: Option<f64>,
+    /// `None` leaves it untouched; explicit RFC3339 string (already
+    /// validated CLI-side by `apply_node_meta` for the direct-file path,
+    /// validated here too since this endpoint has its own callers now)
+    /// replaces it. No "clear" sentinel — same as the direct-file path,
+    /// which only ever adds/overwrites this, never removes it.
+    created_at: Option<String>,
 }
 
 /// `req.fold`'s string sentinel (see `UpdateNodeRequest::fold`'s own doc
@@ -2244,6 +2327,28 @@ async fn update_node(
         title = new_title.clone();
     }
 
+    // Same invariant `crate::main`'s own `apply_node_meta` enforces for the
+    // direct-file path: a group's box is always derived from its children,
+    // never stored — reject an explicit width/height for one outright
+    // (whether it already is a group, or is becoming one via `nodeType` in
+    // this same request) rather than silently writing (and immediately
+    // ignoring) a size nothing will ever read back.
+    if final_type == NodeType::Group && (req.width.is_some() || req.height.is_some()) {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "group nodes never store a size — their box is always derived from their children"
+                .to_string(),
+        ));
+    }
+    if let Some(created_at) = &req.created_at {
+        if !meshfox_core::timestamp::is_valid_rfc3339(created_at) {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("invalid createdAt {created_at:?} — expected RFC3339"),
+            ));
+        }
+    }
+
     if req.title.is_some()
         || req.node_type.is_some()
         || req.color.is_some()
@@ -2254,6 +2359,11 @@ async fn update_node(
         || req.tags.is_some()
         || req.fold.is_some()
         || req.edge_label.is_some()
+        || req.x.is_some()
+        || req.y.is_some()
+        || req.width.is_some()
+        || req.height.is_some()
+        || req.created_at.is_some()
     {
         // This also has the side effect of pinning the node's `id=`
         // attribute explicitly the moment any of its metadata changes,
@@ -2285,11 +2395,22 @@ async fn update_node(
             Some(s) if s.trim().is_empty() => None,
             Some(s) => Some(s.clone()),
         };
+        // Groups never store a width/height regardless of what's in `x`/
+        // `y` here (already rejected above if the request tried to set
+        // one) — carrying `existing` width/height forward for a group
+        // would just re-write whatever stray value was already there
+        // instead of actually clearing it, so force both to `None` for
+        // one, same as `crate::main`'s own `apply_node_meta`.
+        let (final_width, final_height) = if final_type == NodeType::Group {
+            (None, None)
+        } else {
+            (req.width.or(width), req.height.or(height))
+        };
         let meta = NodeMeta {
-            x,
-            y,
-            width,
-            height,
+            x: req.x.or(x),
+            y: req.y.or(y),
+            width: final_width,
+            height: final_height,
             color: req.color.clone().or(existing_color),
             node_type: req.node_type,
             display,
@@ -2299,7 +2420,7 @@ async fn update_node(
             edge_label,
             fold: resolve_fold_override(req.fold.as_deref(), existing_fold)?,
             tags: req.tags.clone().unwrap_or(existing_tags),
-            created_at: existing_created_at,
+            created_at: req.created_at.clone().or(existing_created_at),
         };
         raw = mdcanvas::set_node_meta(&raw, &local_id, &meta).ok_or_else(not_found)?;
     }
@@ -2330,6 +2451,123 @@ async fn update_node(
 
     let op = node_upserted_event(&raw, &state.canvas_path, &local_id);
     commit_located(&state, &located, &raw, op)?;
+    let response_raw = state.raw.lock().unwrap().clone();
+    canvas_response(&response_raw, &state.canvas_path)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateBlockAttrsRequest {
+    name: Option<String>,
+    lang: Option<String>,
+    cache: Option<bool>,
+    always: Option<bool>,
+    default: Option<bool>,
+    tty: Option<bool>,
+    autoclose: Option<bool>,
+    service: Option<bool>,
+    /// Comma-separated `deps=` list, same syntax `--deps`/CLI's own `node
+    /// block` already accepts (parsed via `meshfox_core::parse_deps_list`)
+    /// — `None` leaves it untouched, `Some("")` clears it, anything else
+    /// replaces it outright. A plain `Option<String>` carries this instead
+    /// of a typed list since `meshfox_core::fence::BlockRef` has no
+    /// `Serialize`/`Deserialize` of its own — reusing the exact text
+    /// syntax the CLI already parses avoids needing one just for this.
+    deps: Option<String>,
+    /// Same convention as `deps`, for `env=` (`meshfox_core::parse_env_list`).
+    env: Option<String>,
+    /// `None` (the field not sent) leaves the interpreter untouched.
+    /// `clearInterpreter: true` clears it back to unset (mutually
+    /// exclusive with `interpreter` being set at the same time, same as
+    /// the CLI's own `--interpreter`/`--clear-interpreter`) — plain
+    /// `Option<String>` can't reach that third "explicitly cleared" state
+    /// on its own, so this mirrors the CLI's own two-field shape instead
+    /// of inventing a new sentinel convention.
+    interpreter: Option<String>,
+    #[serde(default)]
+    clear_interpreter: bool,
+    /// New code, replacing everything between the fence's own delimiter
+    /// lines. `None` leaves it untouched.
+    code: Option<String>,
+}
+
+/// Rewrites one runnable fence's own info-string attributes (and,
+/// optionally, its code) inside node `id` — the worker-routed counterpart
+/// to CLI/MCP `node block`'s own direct-file `apply_node_block`, which
+/// this mirrors field-for-field (see that function's own doc comment for
+/// why each tri-state is shaped the way it is). No web UI caller exists
+/// for this yet — the browser UI has no fence-attribute editor of its own
+/// — so every field here is new surface, not a behavior change for
+/// anything already using `/api/nodes*`.
+async fn update_block_attrs(
+    State(state): State<Arc<AppState>>,
+    Path((id, block_name)): Path<(String, String)>,
+    Json(req): Json<UpdateBlockAttrsRequest>,
+) -> Result<Json<Canvas>, ApiError> {
+    if req.interpreter.is_some() && req.clear_interpreter {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "interpreter is mutually exclusive with clearInterpreter".to_string(),
+        ));
+    }
+    let interpreter = if req.clear_interpreter {
+        Some(None)
+    } else {
+        req.interpreter.clone().map(Some)
+    };
+    let deps = req
+        .deps
+        .as_deref()
+        .map(meshfox_core::parse_deps_list);
+    let env = req
+        .env
+        .as_deref()
+        .map(meshfox_core::parse_env_list);
+
+    let primary_raw = state.raw.lock().unwrap().clone();
+    let located = locate_node(&state, &primary_raw, &id)?;
+    let not_found = || {
+        ApiError(
+            StatusCode::NOT_FOUND,
+            format!("no runnable code block named {block_name:?} in node {id:?}"),
+        )
+    };
+
+    let canvas = parse_or_error(&located.raw)?;
+    let node = canvas.node(&located.local_id).ok_or_else(not_found)?;
+    if !meshfox_core::scan_runnable_blocks(&located.local_id, &node.text)
+        .iter()
+        .any(|b| b.name.as_deref() == Some(block_name.as_str()))
+    {
+        return Err(not_found());
+    }
+
+    let deps_touched = req.deps.is_some();
+    let patch = FenceAttrsPatch {
+        name: req.name.clone(),
+        lang: req.lang.clone(),
+        cache: req.cache,
+        always: req.always,
+        default: req.default,
+        tty: req.tty,
+        autoclose: req.autoclose,
+        service: req.service,
+        deps,
+        env,
+        interpreter,
+        code: req.code.clone(),
+    };
+    let updated = mdcanvas::set_fence_attrs(&located.raw, &located.local_id, &block_name, &patch)
+        .ok_or_else(not_found)?;
+    parse_or_error(&updated)?;
+    if deps_touched {
+        let updated_canvas = parse_or_error(&updated)?;
+        meshfox_core::deps::validate(&updated_canvas)
+            .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    }
+
+    let op = node_upserted_event(&updated, &state.canvas_path, &located.local_id);
+    commit_located(&state, &located, &updated, op)?;
     let response_raw = state.raw.lock().unwrap().clone();
     canvas_response(&response_raw, &state.canvas_path)
 }
@@ -5161,7 +5399,7 @@ enum TtyStepOutcome {
 /// (right after `RunEvent::TtyStart`): pty output bytes go out as binary
 /// frames, incoming binary frames go to the pty's stdin, incoming text
 /// frames are parsed as a `ResizeMessage`.
-#[allow(clippy::too_many_arguments)]
+///
 /// Relays one `tty` step over `socket` once it's already in "raw I/O" mode
 /// (right after `RunEvent::TtyStart`), *as one viewer of* the address's own
 /// `tty_registry::TtySessionHandle` — this connection is never the pty's
@@ -5789,6 +6027,205 @@ async fn force_start_service(
     Ok(Json(ServiceActionResponse { pid }))
 }
 
+/// Default `debug_send` timeout — mirrors `crate::mcp`'s own
+/// `DEFAULT_SEND_TIMEOUT_MS` (`crates/cli/src/mcp.rs`) exactly, since a
+/// `coordinator`-routed `debug_send` should behave identically to the
+/// in-process one it replaces.
+const DEFAULT_DEBUG_SEND_TIMEOUT_MS: u64 = 60_000;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DebugStartRequest {
+    node_id: String,
+    #[serde(default)]
+    block_name: Option<String>,
+    #[serde(default)]
+    vars: HashMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DebugStartResponse {
+    session_id: String,
+    node_id: String,
+    block_name: Option<String>,
+    cwd: String,
+}
+
+/// `POST /api/debug/start` — the `crate::coordinator`-routed counterpart to
+/// `crate::mcp`'s own in-process `debug_start` (deliberately plain
+/// POST/JSON, not a WS upgrade: this is one request, one reply, nothing to
+/// stream — unlike `/api/run/tty`'s own reason for upgrading). Same
+/// resolution `mcp.rs::debug_start` does today: a node's runnable blocks,
+/// its declared `env=` variables against `req.vars`/the on-disk var cache/
+/// shared env, and its own resolved `cwd` — deliberately *not*
+/// `locate_node`'s include-aware resolution (mirrors `mcp.rs`'s own
+/// simpler `Canvas::from_markdown(&raw).node(...)`, which never resolves
+/// includes either, so a session's identity doesn't quietly gain a
+/// capability the in-process path it replaces never had).
+async fn debug_start(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<DebugStartRequest>,
+) -> Result<Json<DebugStartResponse>, ApiError> {
+    let raw = state.raw.lock().unwrap().clone();
+    let canvas = Canvas::from_markdown(&raw)
+        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    let node = canvas
+        .node(&req.node_id)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {:?}", req.node_id)))?;
+    let blocks = meshfox_core::scan_runnable_blocks(&req.node_id, &node.text);
+    let block = match &req.block_name {
+        Some(name) => blocks
+            .iter()
+            .find(|b| b.name.as_deref() == Some(name.as_str()))
+            .ok_or_else(|| {
+                ApiError(
+                    StatusCode::NOT_FOUND,
+                    format!("no runnable block named {name:?} in node {:?}", req.node_id),
+                )
+            })?,
+        None => meshfox_core::fence::default_block(&req.node_id, &blocks)
+            .map_err(|names| {
+                ApiError(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!(
+                        "node {:?} has more than one default-eligible block ({}); pass blockName explicitly",
+                        req.node_id,
+                        names.join(", ")
+                    ),
+                )
+            })?
+            .ok_or_else(|| {
+                ApiError(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("node {:?} has no default block; pass blockName explicitly", req.node_id),
+                )
+            })?,
+    };
+
+    let needed: std::collections::HashSet<String> =
+        block.env.iter().map(|r| r.var_name.clone()).collect();
+    let decls = meshfox_core::declared_vars(&canvas)
+        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    let relevant: Vec<_> = decls.iter().filter(|d| needed.contains(&d.name)).cloned().collect();
+    validate_var_overrides(&relevant, &req.vars)?;
+
+    let mut cache = state.vars_cache.lock().unwrap();
+    let shared = meshfox_core::load_shared_env(canvas_root_dir(&state.canvas_path));
+    let resolved =
+        meshfox_core::resolve_with_shared(&relevant, &req.vars, &cache, &HashMap::new(), &shared);
+    if !resolved.missing.is_empty() {
+        let names: Vec<&str> = resolved.missing.iter().map(|d| d.name.as_str()).collect();
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("missing required variable(s): {} — pass them in `vars`", names.join(", ")),
+        ));
+    }
+    for (name, value) in &req.vars {
+        if relevant.iter().any(|d| &d.name == name && !d.secret && !d.session) {
+            let _ = cache.set(name, value);
+        }
+    }
+    drop(cache);
+
+    let envs = meshfox_core::map_block_env(&block.env, &resolved.values);
+    let cwd = node.cwd(canvas_root_dir(&state.canvas_path));
+
+    let session = debug_session::DebugSession::spawn(&cwd, envs)
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to start debug session: {e}")))?;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    state
+        .debug_sessions
+        .lock()
+        .unwrap()
+        .insert(session_id.clone(), Arc::new(tokio::sync::Mutex::new(session)));
+
+    Ok(Json(DebugStartResponse {
+        session_id,
+        node_id: req.node_id,
+        block_name: block.name.clone(),
+        cwd: cwd.display().to_string(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DebugSendRequest {
+    session_id: String,
+    code: String,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DebugSendResponse {
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+    timed_out: bool,
+    session_ended: bool,
+}
+
+/// `POST /api/debug/send` — the `crate::coordinator`-routed counterpart to
+/// `crate::mcp`'s own in-process `debug_send`. `404` if `sessionId` is
+/// unknown to *this* worker specifically — a caller that resolved a
+/// different worker (or hit this one after it restarted) gets a real error
+/// rather than silently doing nothing, same "no silent fallback" posture
+/// every other coordinator-routed operation this session added has.
+async fn debug_send(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<DebugSendRequest>,
+) -> Result<Json<DebugSendResponse>, ApiError> {
+    let session = state
+        .debug_sessions
+        .lock()
+        .unwrap()
+        .get(&req.session_id)
+        .cloned()
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no debug session {:?}", req.session_id)))?;
+    let timeout = Duration::from_millis(req.timeout_ms.unwrap_or(DEFAULT_DEBUG_SEND_TIMEOUT_MS));
+    let outcome = {
+        let mut session = session.lock().await;
+        session
+            .send(&req.code, timeout)
+            .await
+            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("debug session write/read failed: {e}")))?
+    };
+    if outcome.session_ended {
+        state.debug_sessions.lock().unwrap().remove(&req.session_id);
+    }
+    Ok(Json(DebugSendResponse {
+        stdout: outcome.stdout,
+        stderr: outcome.stderr,
+        exit_code: outcome.exit_code,
+        timed_out: outcome.timed_out,
+        session_ended: outcome.session_ended,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DebugStopRequest {
+    session_id: String,
+}
+
+/// `POST /api/debug/stop` — the `crate::coordinator`-routed counterpart to
+/// `crate::mcp`'s own in-process `debug_stop`.
+async fn debug_stop(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<DebugStopRequest>,
+) -> Result<StatusCode, ApiError> {
+    let removed = state.debug_sessions.lock().unwrap().remove(&req.session_id);
+    match removed {
+        Some(session) => {
+            session.lock().await.stop().await;
+            Ok(StatusCode::NO_CONTENT)
+        }
+        None => Err(ApiError(StatusCode::NOT_FOUND, format!("no debug session {:?}", req.session_id))),
+    }
+}
+
 /// Cancels an in-flight run started by `run_block` — kills whichever step
 /// is currently executing (`SIGKILL`, via `stream_exec::SpawnedProcess::
 /// kill`, which reaches the whole process group a hung script spawned, not
@@ -6350,6 +6787,7 @@ async fn build_state(
         services: Mutex::new(HashMap::new()),
         runs_registry: Mutex::new(HashMap::new()),
         tty_registry: Mutex::new(HashMap::new()),
+        debug_sessions: Mutex::new(HashMap::new()),
         watcher_socket,
     }))
 }
@@ -6360,10 +6798,12 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/canvas/raw", get(get_canvas_raw).put(put_canvas_raw))
         .route("/api/includes", get(get_includes))
         .route("/api/canvas/clear-layout", post(clear_layout))
+        .route("/api/canvas/reorder-siblings", post(reorder_siblings))
         .route("/api/nodes", post(create_node))
         .route("/api/nodes/:id", patch(update_node).delete(remove_node))
         .route("/api/nodes/:id/reparent", post(reparent_node))
         .route("/api/nodes/:id/move", post(move_sibling))
+        .route("/api/nodes/:id/block/:block_name", patch(update_block_attrs))
         .route("/api/nodes/:id/clear-layout", post(clear_node_layout))
         .route("/api/nodes/:id/rename-id", post(rename_node_id))
         .route("/api/nodes/:id/clear-id", post(clear_node_id))
@@ -6392,6 +6832,9 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/services/stop", post(stop_service))
         .route("/api/services/restart", post(restart_service))
         .route("/api/services/force-start", post(force_start_service))
+        .route("/api/debug/start", post(debug_start))
+        .route("/api/debug/send", post(debug_send))
+        .route("/api/debug/stop", post(debug_stop))
         .route("/api/session/reset", post(reset_session))
         .route("/api/watch", get(watch_changes))
         .route("/api/include-asset", get(get_include_asset))
@@ -6833,8 +7276,13 @@ mod node_op_broadcast_tests {
             .expect("valid test canvas");
         let (_backlog, mut rx, _gap) = state.canvas_events.subscribe_from(0);
 
-        let req = CreateNodeRequest { parent_id: "root".to_string(), title: "New Child".to_string() };
-        let Json(canvas) = create_node(State(state), Json(req)).await.expect("create should succeed");
+        let req = CreateNodeRequest {
+            parent_id: "root".to_string(),
+            title: "New Child".to_string(),
+            title_slug_id: false,
+        };
+        let Json(CreateNodeResponse { canvas, .. }) =
+            create_node(State(state), Json(req)).await.expect("create should succeed");
 
         match recv_event(&mut rx) {
             ServerEvent::NodeUpserted { node } => {
@@ -6873,6 +7321,11 @@ mod node_op_broadcast_tests {
             tags: None,
             edge_label: None,
             fold: None,
+            x: None,
+            y: None,
+            width: None,
+            height: None,
+            created_at: None,
         };
         let _ = update_node(State(state), Path("a".to_string()), Json(req))
             .await
@@ -7306,12 +7759,24 @@ mod include_edit_tests {
             tags: None,
             edge_label: None,
             fold: None,
+            x: None,
+            y: None,
+            width: None,
+            height: None,
+            created_at: None,
         }
     }
 
     fn expect_ok(result: Result<Json<Canvas>, ApiError>) -> Canvas {
         match result {
             Ok(Json(canvas)) => canvas,
+            Err(e) => panic!("request failed: {}", e.1),
+        }
+    }
+
+    fn expect_ok_create(result: Result<Json<CreateNodeResponse>, ApiError>) -> Canvas {
+        match result {
+            Ok(Json(response)) => response.canvas,
             Err(e) => panic!("request failed: {}", e.1),
         }
     }
@@ -7352,6 +7817,26 @@ mod include_edit_tests {
         base_path
     }
 
+    /// A plain, single-file canvas — for tests here that don't care about
+    /// include-splicing at all, unlike this module's own
+    /// `write_base_and_child_canvas`.
+    fn write_simple_canvas(contents: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-include-edit-test-simple-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("doc.canvas.md");
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    const TWO_SIBLINGS: &str = concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "## A\n<!-- meshfox:node id=\"a\" -->\n\nbody a\n\n",
+        "## B\n<!-- meshfox:node id=\"b\" -->\n\nbody b\n",
+    );
+
     #[tokio::test]
     async fn update_node_edits_an_included_nodes_own_file_not_the_primary_one() {
         let base_path = write_base_and_child_canvas();
@@ -7388,12 +7873,13 @@ mod include_edit_tests {
             .await
             .expect("valid test canvas");
 
-        let updated = expect_ok(
+        let updated = expect_ok_create(
             create_node(
                 State(state),
                 Json(CreateNodeRequest {
                     parent_id: "child/root".to_string(),
                     title: "New Kid".to_string(),
+                    title_slug_id: false,
                 }),
             )
             .await,
@@ -7477,12 +7963,13 @@ mod include_edit_tests {
             .await
             .expect("valid test canvas");
 
-        let created = expect_ok(
+        let created = expect_ok_create(
             create_node(
                 State(state.clone()),
                 Json(CreateNodeRequest {
                     parent_id: "child/root".to_string(),
                     title: "Second Leaf".to_string(),
+                    title_slug_id: false,
                 }),
             )
             .await,
@@ -7739,6 +8226,95 @@ mod include_edit_tests {
         assert_eq!(node.caption.as_deref(), Some("A short note."));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `x`/`y`/`width`/`height`/`createdAt` — added for `crate::coordinator`-
+    /// routed CLI/MCP `node meta` (see `UpdateNodeRequest`'s own doc
+    /// comment); the existing web client never sends these through this
+    /// endpoint at all, so this is purely new surface, not a behavior
+    /// change for anything already using it.
+    #[tokio::test]
+    async fn update_node_sets_position_size_and_created_at() {
+        let canvas_path = write_simple_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None)
+            .await
+            .expect("valid test canvas");
+
+        let mut req = blank_update_request();
+        req.x = Some(10.0);
+        req.y = Some(20.0);
+        req.width = Some(200.0);
+        req.height = Some(100.0);
+        req.created_at = Some("2026-01-01T00:00:00Z".to_string());
+        let updated = expect_ok(update_node(State(state), Path("a".to_string()), Json(req)).await);
+        let node = updated.node("a").unwrap();
+        assert_eq!(node.x, Some(10.0));
+        assert_eq!(node.y, Some(20.0));
+        assert_eq!(node.width, Some(200.0));
+        assert_eq!(node.height, Some(100.0));
+        assert_eq!(node.created_at.as_deref(), Some("2026-01-01T00:00:00Z"));
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn update_node_rejects_width_or_height_on_a_group() {
+        let canvas_path = write_simple_canvas(concat!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Bag\n<!-- meshfox:node id=\"bag\" type=\"group\" -->\n",
+        ));
+        let state = build_state(canvas_path.clone(), false, None)
+            .await
+            .expect("valid test canvas");
+
+        let mut req = blank_update_request();
+        req.width = Some(200.0);
+        let err = expect_err(update_node(State(state), Path("bag".to_string()), Json(req)).await);
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn update_node_rejects_an_invalid_created_at() {
+        let canvas_path = write_simple_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None)
+            .await
+            .expect("valid test canvas");
+
+        let mut req = blank_update_request();
+        req.created_at = Some("not-a-date".to_string());
+        let err = expect_err(update_node(State(state), Path("a".to_string()), Json(req)).await);
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    /// `titleSlugId: true` — for `crate::coordinator`-routed CLI/MCP `node
+    /// add`, which has always produced a title-slug id and needs the exact
+    /// same scheme once routed through a worker (see `CreateNodeRequest`'s
+    /// own doc comment). Default (`false`, or omitted) keeps today's random
+    /// id, checked by the existing `create_node_broadcasts_node_upserted_
+    /// for_the_new_node` test elsewhere.
+    #[tokio::test]
+    async fn create_node_with_title_slug_id_uses_a_readable_id() {
+        let canvas_path = write_simple_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None)
+            .await
+            .expect("valid test canvas");
+
+        let req = CreateNodeRequest {
+            parent_id: "root".to_string(),
+            title: "My New Child".to_string(),
+            title_slug_id: true,
+        };
+        let Json(response) = create_node(State(state), Json(req))
+            .await
+            .expect("create should succeed");
+        assert_eq!(response.new_id, "my-new-child");
+        assert!(response.canvas.node("my-new-child").is_some());
+
+        let _ = std::fs::remove_file(&canvas_path);
     }
 
     #[tokio::test]
@@ -10768,6 +11344,136 @@ mod service_endpoint_tests {
     }
 }
 
+#[cfg(test)]
+mod debug_endpoint_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    fn write_test_canvas(contents: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("meshfox-debug-endpoint-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("doc.canvas.md");
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    fn cleanup(canvas_path: &std::path::Path) {
+        if let Some(dir) = canvas_path.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    async fn post_json(addr: SocketAddr, path: &str, body: &str) -> (u16, String) {
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.expect("read");
+        let mut parts = response.splitn(2, "\r\n\r\n");
+        let head = parts.next().unwrap_or_default();
+        let resp_body = parts.next().unwrap_or_default();
+        let status = head
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        (status, resp_body.to_string())
+    }
+
+    const DEBUG_CANVAS: &str = concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "```bash name=\"snippet\"\necho hi\n```\n",
+    );
+
+    /// A `/api/debug/start` → `/api/debug/send` → `/api/debug/stop` round
+    /// trip against a real spawned worker — the `crate::coordinator`-routed
+    /// counterpart to `crate::mcp`'s own in-process debug-session tests
+    /// (`debug_send_timeout_kills_a_command_that_exits_on_sigterm` etc.,
+    /// which cover `DebugSession`'s own timeout/escalation logic directly
+    /// and don't need repeating here — this only checks the HTTP plumbing
+    /// around it: state survives between separate requests, keyed by
+    /// `sessionId`, exactly like the in-process `self.sessions` map does
+    /// across separate MCP tool calls).
+    #[tokio::test]
+    async fn start_send_stop_round_trip_persists_state_between_calls() {
+        let canvas_path = write_test_canvas(DEBUG_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, body) = post_json(
+            addr,
+            "/api/debug/start",
+            r#"{"nodeId":"root","blockName":"snippet","vars":{}}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "unexpected body: {body}");
+        let start: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let session_id = start["sessionId"].as_str().unwrap().to_string();
+        assert_eq!(start["blockName"], "snippet");
+
+        // A variable exported in one `send` call is still visible in the
+        // next — the whole point of a debug session over a one-shot `run`.
+        let (status, _) = post_json(
+            addr,
+            "/api/debug/send",
+            &serde_json::json!({"sessionId": session_id, "code": "export FOO=bar"}).to_string(),
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        let (status, body) = post_json(
+            addr,
+            "/api/debug/send",
+            &serde_json::json!({"sessionId": session_id, "code": "echo $FOO"}).to_string(),
+        )
+        .await;
+        assert_eq!(status, 200, "unexpected body: {body}");
+        let outcome: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(outcome["stdout"], "bar");
+        assert_eq!(outcome["exitCode"], 0);
+        assert_eq!(outcome["sessionEnded"], false);
+
+        let (status, _) = post_json(
+            addr,
+            "/api/debug/stop",
+            &serde_json::json!({"sessionId": session_id}).to_string(),
+        )
+        .await;
+        assert_eq!(status, 204);
+
+        // The session is gone — a further `send` against the same id 404s.
+        let (status, _) = post_json(
+            addr,
+            "/api/debug/send",
+            &serde_json::json!({"sessionId": session_id, "code": "echo again"}).to_string(),
+        )
+        .await;
+        assert_eq!(status, 404);
+
+        cleanup(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn start_404s_for_an_unknown_node() {
+        let canvas_path = write_test_canvas(DEBUG_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, _) = post_json(
+            addr,
+            "/api/debug/start",
+            r#"{"nodeId":"nope","vars":{}}"#,
+        )
+        .await;
+        assert_eq!(status, 404);
+
+        cleanup(&canvas_path);
+    }
+}
+
 /// Queued-time, address-scoped locking for *any* runnable block — not just
 /// `service` (see `service_endpoint_tests`, above, for the service-specific
 /// cases) — covers the explicit "forbid parallel execution of the same
@@ -11215,5 +11921,175 @@ mod run_lock_tests {
         assert_eq!(entry["exitCode"], 0);
 
         cleanup(&canvas_path);
+    }
+}
+
+#[cfg(test)]
+mod node_block_and_reorder_endpoint_tests {
+    use super::*;
+
+    fn write_test_canvas(contents: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-node-block-reorder-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("doc.canvas.md");
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    fn blank_block_request() -> UpdateBlockAttrsRequest {
+        UpdateBlockAttrsRequest {
+            name: None,
+            lang: None,
+            cache: None,
+            always: None,
+            default: None,
+            tty: None,
+            autoclose: None,
+            service: None,
+            deps: None,
+            env: None,
+            interpreter: None,
+            clear_interpreter: false,
+            code: None,
+        }
+    }
+
+    const ONE_BLOCK: &str = concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "```bash name=\"hi\"\necho hi\n```\n",
+    );
+
+    #[tokio::test]
+    async fn update_block_attrs_sets_cache() {
+        let canvas_path = write_test_canvas(ONE_BLOCK);
+        let state = build_state(canvas_path.clone(), false, None)
+            .await
+            .expect("valid test canvas");
+
+        let mut req = blank_block_request();
+        req.cache = Some(true);
+        let Json(updated) = update_block_attrs(
+            State(state),
+            Path(("root".to_string(), "hi".to_string())),
+            Json(req),
+        )
+        .await
+        .expect("update should succeed");
+        let node = updated.node("root").unwrap();
+        let blocks = meshfox_core::scan_runnable_blocks("root", &node.text);
+        let block = blocks.iter().find(|b| b.name.as_deref() == Some("hi")).unwrap();
+        assert!(block.cache);
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn update_block_attrs_sets_and_clears_deps() {
+        let canvas_path = write_test_canvas(concat!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```bash name=\"a\"\necho a\n```\n\n",
+            "```bash name=\"b\"\necho b\n```\n",
+        ));
+        let state = build_state(canvas_path.clone(), false, None)
+            .await
+            .expect("valid test canvas");
+
+        let mut req = blank_block_request();
+        req.deps = Some("a".to_string());
+        let Json(updated) = update_block_attrs(
+            State(state.clone()),
+            Path(("root".to_string(), "b".to_string())),
+            Json(req),
+        )
+        .await
+        .expect("update should succeed");
+        let node = updated.node("root").unwrap();
+        let blocks = meshfox_core::scan_runnable_blocks("root", &node.text);
+        let block_b = blocks.iter().find(|b| b.name.as_deref() == Some("b")).unwrap();
+        assert_eq!(block_b.deps.len(), 1);
+        assert_eq!(block_b.deps[0].block_name, "a");
+
+        let mut clear_req = blank_block_request();
+        clear_req.deps = Some(String::new());
+        let Json(cleared) = update_block_attrs(
+            State(state),
+            Path(("root".to_string(), "b".to_string())),
+            Json(clear_req),
+        )
+        .await
+        .expect("clear should succeed");
+        let node = cleared.node("root").unwrap();
+        let blocks = meshfox_core::scan_runnable_blocks("root", &node.text);
+        let block_b = blocks.iter().find(|b| b.name.as_deref() == Some("b")).unwrap();
+        assert!(block_b.deps.is_empty());
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn update_block_attrs_404s_for_an_unknown_block_name() {
+        let canvas_path = write_test_canvas(ONE_BLOCK);
+        let state = build_state(canvas_path.clone(), false, None)
+            .await
+            .expect("valid test canvas");
+
+        let req = blank_block_request();
+        let err = update_block_attrs(
+            State(state),
+            Path(("root".to_string(), "nope".to_string())),
+            Json(req),
+        )
+        .await
+        .expect_err("expected a 404");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn update_block_attrs_rejects_interpreter_with_clear_interpreter() {
+        let canvas_path = write_test_canvas(ONE_BLOCK);
+        let state = build_state(canvas_path.clone(), false, None)
+            .await
+            .expect("valid test canvas");
+
+        let mut req = blank_block_request();
+        req.interpreter = Some("python3".to_string());
+        req.clear_interpreter = true;
+        let err = update_block_attrs(
+            State(state),
+            Path(("root".to_string(), "hi".to_string())),
+            Json(req),
+        )
+        .await
+        .expect_err("expected a 422");
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn reorder_siblings_resorts_children_by_position() {
+        let canvas_path = write_test_canvas(concat!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## B\n<!-- meshfox:node id=\"b\" x=0 y=0 -->\n\n",
+            "## A\n<!-- meshfox:node id=\"a\" x=0 y=-100 -->\n\n",
+        ));
+        let state = build_state(canvas_path.clone(), false, None)
+            .await
+            .expect("valid test canvas");
+
+        let Json(updated) = reorder_siblings(State(state))
+            .await
+            .expect("reorder should succeed");
+        let ids: Vec<&str> = updated.nodes.iter().map(|n| n.id.as_str()).collect();
+        let pos_a = ids.iter().position(|&id| id == "a").unwrap();
+        let pos_b = ids.iter().position(|&id| id == "b").unwrap();
+        assert!(pos_a < pos_b, "expected a (y=-100) before b (y=0), got {ids:?}");
+
+        let _ = std::fs::remove_file(&canvas_path);
     }
 }

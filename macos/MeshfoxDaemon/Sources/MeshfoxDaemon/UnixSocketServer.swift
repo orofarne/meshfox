@@ -2,6 +2,15 @@ import Foundation
 #if canImport(Darwin)
 import Darwin
 #endif
+import CLaunch
+
+/// The `Sockets` dictionary key this app's own LaunchAgent plist
+/// (`macos/app.canvas.md`'s `install-launch-agent` node) declares its
+/// socket entry under — must match exactly, it's how `launch_activate_socket`
+/// finds the right one. Arbitrary otherwise; not the socket *path* itself
+/// (that's still `defaultSocketPath()` in `main.swift`, which the plist
+/// also names).
+private let launchSocketName = "Listener"
 
 /// A persistent, well-known Unix domain socket listener — the daemon's own
 /// counterpart to `crates/cli/src/watcher.rs`'s private per-invocation one.
@@ -18,14 +27,35 @@ import Darwin
 /// per accepted connection with that raw line, off the main thread —
 /// callers that touch UI state must hop back to `DispatchQueue.main`
 /// themselves (see `SessionStore`).
+///
+/// `get_port` is the one request that gets a reply on the same connection
+/// (see `Protocol.swift`'s own doc comment on `WatcherMessage.getPort`) —
+/// `onGetPort` is called instead of `onLine` for that one op, *without*
+/// waiting for the peer's own EOF first (the Rust client,
+/// `watcher_protocol::request_port`, keeps its write half open to read the
+/// reply, so it never sends one): `handleClient` blocks its own background
+/// thread on `onGetPort`'s completion, then writes the reply and closes.
 final class UnixSocketServer {
     private let path: String
     private let onLine: (String) -> Void
+    private let onGetPort: (String, @escaping (PortReply) -> Void) -> Void
     private var listenFD: Int32 = -1
+    /// Whether `listenFD` is a socket this instance itself created (own
+    /// `path` file, safe — and necessary — to `unlink` in `stop()`) versus
+    /// one inherited from launchd via socket activation (launchd's own
+    /// socket, tied to the LaunchAgent's lifetime, not this run's — see
+    /// `stop()`'s own doc comment for why unlinking that one would be
+    /// actively harmful).
+    private var ownsSocketFile = false
 
-    init(path: String, onLine: @escaping (String) -> Void) {
+    init(
+        path: String,
+        onLine: @escaping (String) -> Void,
+        onGetPort: @escaping (String, @escaping (PortReply) -> Void) -> Void
+    ) {
         self.path = path
         self.onLine = onLine
+        self.onGetPort = onGetPort
     }
 
     enum ServerError: Error, CustomStringConvertible {
@@ -48,13 +78,78 @@ final class UnixSocketServer {
         String(cString: strerror(errno))
     }
 
-    /// Binds and starts listening, then returns immediately — the accept
-    /// loop runs on its own background thread. A stale socket file left
-    /// behind by an unclean previous exit is removed first (nothing can be
-    /// listening behind a leftover file from a process that's already
-    /// gone), same reasoning the old `view_registry`'s `serve()` had for
-    /// its own bind.
+    /// Starts listening, then returns immediately — the accept loop runs on
+    /// its own background thread. Two ways this can happen: inheriting an
+    /// already-bound-and-listening socket launchd created for us (socket
+    /// activation — see `activatedSocketFD`), or binding one ourselves the
+    /// old way, when this process isn't running under launchd's management
+    /// at all (a plain `swift run`, or `open -a` before the LaunchAgent is
+    /// installed). Tries the former first; only self-binds as a fallback.
     func start() throws {
+        if let fd = activatedSocketFD() {
+            listenFD = fd
+            ownsSocketFile = false
+            startAcceptLoop()
+            return
+        }
+        try startBoundSocket()
+    }
+
+    /// Inherits a socket launchd already bound for this LaunchAgent's own
+    /// `Sockets.\(launchSocketName)` entry (`macos/app.canvas.md`'s
+    /// `install-launch-agent` node) — `nil` (not an error) whenever this
+    /// process isn't running under launchd's management at all, which is
+    /// the ordinary case for a `swift run`/manual `open -a` launch outside
+    /// the installed LaunchAgent. Every documented failure code (`ENOENT`:
+    /// no such socket declared for this job; `ESRCH`: not managed by
+    /// launchd at all; `EALREADY`: already activated once) means exactly
+    /// "nothing to inherit" here, not a real error — `start()`'s own
+    /// fallback to binding one itself is the correct response to all three.
+    private func activatedSocketFD() -> Int32? {
+        // The C signature wants `int * _Nonnull *` — a pointer to a
+        // non-optional `UnsafeMutablePointer<Int32>`. An
+        // implicitly-unwrapped `var fds: UnsafeMutablePointer<Int32>!`
+        // looks like it should bridge to that directly, but doesn't:
+        // confirmed live (a real crash report, not theoretical) — taking
+        // `&fds` there force-unwraps its *current* value (nil, before the
+        // call has run at all) immediately, trapping with "Unexpectedly
+        // found nil" before `launch_activate_socket` is ever even reached.
+        // `Optional<UnsafeMutablePointer<Int32>>` and a bare
+        // `UnsafeMutablePointer<Int32>` share the exact same memory layout
+        // in Swift (pointer optionals cost nothing extra — nil *is* the
+        // null pointer bit pattern), so rebinding a pointer to the
+        // optional's storage as if it pointed to the non-optional type is
+        // safe and is the standard way to bridge this: no eager unwrap, no
+        // dummy initial value needed.
+        var fdsOpt: UnsafeMutablePointer<Int32>?
+        var count = 0
+        let rc = withUnsafeMutablePointer(to: &fdsOpt) { optPtr -> Int32 in
+            optPtr.withMemoryRebound(to: UnsafeMutablePointer<Int32>.self, capacity: 1) { nonOptPtr in
+                launchSocketName.withCString { namePtr in
+                    launch_activate_socket(namePtr, nonOptPtr, &count)
+                }
+            }
+        }
+        guard rc == 0, count > 0, let fds = fdsOpt else { return nil }
+        defer { free(fds) }
+        return fds[0]
+    }
+
+    private func startAcceptLoop() {
+        let thread = Thread { [weak self] in
+            self?.acceptLoop()
+        }
+        thread.name = "meshfox-daemon-socket-accept"
+        thread.start()
+    }
+
+    /// The pre-socket-activation path, kept as the fallback for whenever
+    /// nothing was inherited: binds `path` ourselves. A stale socket file
+    /// left behind by an unclean previous exit is removed first (nothing
+    /// can be listening behind a leftover file from a process that's
+    /// already gone), same reasoning the old `view_registry`'s `serve()`
+    /// had for its own bind.
+    private func startBoundSocket() throws {
         unlink(path) // best-effort; ENOENT if it never existed is fine
 
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
@@ -94,12 +189,8 @@ final class UnixSocketServer {
         }
 
         listenFD = fd
-
-        let thread = Thread { [weak self] in
-            self?.acceptLoop()
-        }
-        thread.name = "meshfox-daemon-socket-accept"
-        thread.start()
+        ownsSocketFile = true
+        startAcceptLoop()
     }
 
     private func acceptLoop() {
@@ -144,6 +235,15 @@ final class UnixSocketServer {
             if foundLine == nil, let newlineIndex = data.firstIndex(of: 0x0A) {
                 let lineData = data[data.startIndex..<newlineIndex]
                 foundLine = String(data: lineData, encoding: .utf8)
+                // `get_port` alone gets a reply, and its own client never
+                // shuts down its write half waiting for one — looping on
+                // for an EOF that's never coming would just hang this
+                // thread. Every other op still falls through to the
+                // EOF-then-`onLine` path below, unchanged.
+                if let line = foundLine, case let .getPort(canvasPath)? = WatcherMessage.parse(line: line) {
+                    replyToGetPort(fd: fd, canvasPath: canvasPath)
+                    return
+                }
             }
         }
         if let line = foundLine {
@@ -151,14 +251,42 @@ final class UnixSocketServer {
         }
     }
 
-    /// Stops accepting new connections and removes the socket file. Not
-    /// called on the "Quit" path today (the whole process exits right
-    /// after, which cleans the fd up anyway) — kept for symmetry/tests.
+    /// Blocks this background thread on `onGetPort`'s completion (itself
+    /// possibly async — see `SessionStore.getPort`, which may need to wait
+    /// for a freshly-spawned worker's own `Ready`), then writes the one
+    /// JSON reply line and returns, closing the connection.
+    private func replyToGetPort(fd: Int32, canvasPath: String) {
+        let semaphore = DispatchSemaphore(value: 0)
+        var reply: PortReply = .error("no response")
+        onGetPort(canvasPath) { result in
+            reply = result
+            semaphore.signal()
+        }
+        semaphore.wait()
+        guard var replyData = try? JSONEncoder().encode(reply) else { return }
+        replyData.append(0x0A)
+        replyData.withUnsafeBytes { raw in
+            _ = write(fd, raw.baseAddress, raw.count)
+        }
+    }
+
+    /// Stops accepting new connections. Only removes the socket file when
+    /// this instance bound it itself (`ownsSocketFile`) — a launchd-
+    /// activated socket belongs to the LaunchAgent's own lifetime, not this
+    /// one run's: unlinking it here would break launchd's own ability to
+    /// on-demand-relaunch this app on the *next* connection (a fresh
+    /// `connect()` needs the pathname to still resolve to the socket
+    /// launchd is holding open on our behalf), turning a clean "Quit" into
+    /// "nobody can ever reach this again until the LaunchAgent itself is
+    /// reloaded." Called on every shutdown path (`AppDelegate.shutdown`),
+    /// not just tests, now that getting this wrong would actually matter.
     func stop() {
         if listenFD >= 0 {
             close(listenFD)
             listenFD = -1
         }
-        unlink(path)
+        if ownsSocketFile {
+            unlink(path)
+        }
     }
 }

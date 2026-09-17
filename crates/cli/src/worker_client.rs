@@ -1,12 +1,13 @@
-//! Thin HTTP client so `node <op>` (CLI) and MCP's leaf tool handlers can
-//! route a mutation through an already-running `meshfox view` worker (see
-//! `meshfox_core::worker_lock`) instead of editing the canvas file directly
-//! — closes the lost-update race between a worker's own in-memory state and
-//! an independent CLI/MCP read-modify-write (TODO.canvas.md's
-//! "Оптимистичная конкурентность при записи файла" /
-//! "MCP-редактирование файла (batch/транзакционно)"): when a worker already
-//! exists, there's no race to detect in the first place, since it's the
-//! only thing touching the file at all.
+//! Thin HTTP/WS client so any core-launch operation (`view`, `tui`, `run`,
+//! `node <op>`, MCP) can route through an already-running worker (see
+//! `crate::coordinator::resolve`, which decides *whether* one applies here)
+//! instead of touching the canvas file or running a block directly — closes
+//! the lost-update race between a worker's own in-memory state and an
+//! independent CLI/MCP read-modify-write (TODO.canvas.md's "Оптимистичная
+//! конкурентность при записи файла" / "MCP-редактирование файла (batch/
+//! транзакционно)"): when a worker already exists, there's no race to
+//! detect in the first place, since it's the only thing touching the file
+//! at all.
 //!
 //! Only wired into ops that map cleanly onto an existing `/api/nodes*`
 //! endpoint with identical semantics to their direct-file counterpart —
@@ -24,26 +25,9 @@
 //! in TODO.canvas.md rather than silently done differently than direct-file
 //! editing does them.
 
-use meshfox_core::worker_lock::{self, Acquired};
+use meshfox_core::{ExtraEdge, FileDisplay, NodeType};
 use meshfox_server::stream_exec::OutputStream;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
-
-/// `Some(port)` if another process is already serving `canvas_path` as a
-/// `meshfox view` worker; `None` if there's no live worker (the common
-/// case) or the lock itself couldn't even be read (permissions, ...) —
-/// treated the same as "no worker", since the caller always has a working
-/// direct-file fallback for that case. A non-blocking peek: this never
-/// becomes the worker itself, even momentarily beyond the instant
-/// `try_acquire` takes to check — an `Us` guard is dropped immediately,
-/// releasing the flock right back.
-pub fn discover(canvas_path: &Path) -> Option<u16> {
-    match worker_lock::try_acquire(canvas_path) {
-        Ok(Acquired::Other { port }) => Some(port),
-        Ok(Acquired::Us(_guard)) => None,
-        Err(_) => None,
-    }
-}
 
 /// `http://127.0.0.1:<port>/api/nodes/<id>` — built via `path_segments_mut`
 /// (not a hand-rolled `format!`) so a node id containing characters that
@@ -60,19 +44,69 @@ fn node_url(port: u16, node_id: &str) -> Result<reqwest::Url, String> {
     Ok(url)
 }
 
-/// PATCH `/api/nodes/:id` with just `{"text": body}` — the same
-/// `mdcanvas::set_node_body` primitive `update_node`'s own `req.text`
-/// handling already applies (`crates/server/src/lib.rs::update_node`), so
-/// this has identical semantics to `apply_node_body`'s direct-file version.
-pub async fn update_node_body(port: u16, node_id: &str, body: &str) -> Result<(), String> {
+/// Field-for-field mirror of `crates/server/src/lib.rs`'s own
+/// `UpdateNodeRequest` — every field left at `None`/`Default::default()`
+/// leaves that piece of the node untouched, same "not sent" convention the
+/// server side already documents on each field there. One shared type for
+/// every CLI/MCP `node <op>` that boils down to a `PATCH /api/nodes/:id`
+/// once a worker exists (`meta`/`rename`/`edges`, and `node add`'s own
+/// follow-up fields) rather than a narrower struct per caller.
+#[derive(Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeUpdate {
+    pub title: Option<String>,
+    pub node_type: Option<NodeType>,
+    pub color: Option<String>,
+    pub target: Option<String>,
+    pub text: Option<String>,
+    pub extra_parents: Option<Vec<ExtraEdge>>,
+    pub display: Option<FileDisplay>,
+    pub lang: Option<String>,
+    pub interpreter: Option<String>,
+    pub preview: Option<bool>,
+    pub tags: Option<Vec<String>>,
+    pub edge_label: Option<String>,
+    /// `"true"`/`"false"`/`"default"` — same string-sentinel convention
+    /// `UpdateNodeRequest::fold`'s own doc comment explains (a plain
+    /// `Option<bool>` can't reach a "clear the override back to unset"
+    /// third state on its own).
+    pub fold: Option<String>,
+    pub x: Option<f64>,
+    pub y: Option<f64>,
+    pub width: Option<f64>,
+    pub height: Option<f64>,
+    pub created_at: Option<String>,
+}
+
+/// PATCH `/api/nodes/:id` with whatever `update` actually sets — the
+/// worker-routed counterpart to `crates/server/src/lib.rs::update_node`,
+/// which this has identical semantics to (including its group-node
+/// width/height rejection and `createdAt` RFC3339 validation, both
+/// surfaced here as an ordinary `Err` same as any other `422`).
+pub async fn update_node(port: u16, node_id: &str, update: &NodeUpdate) -> Result<(), String> {
     let url = node_url(port, node_id)?;
     let res = reqwest::Client::new()
         .patch(url)
-        .json(&serde_json::json!({ "text": body }))
+        .json(update)
         .send()
         .await
         .map_err(|e| e.to_string())?;
     into_result(res).await
+}
+
+/// `update_node` with just `text` set — the same `mdcanvas::set_node_body`
+/// primitive `update_node`'s own `req.text` handling already applies, so
+/// this has identical semantics to `apply_node_body`'s direct-file version.
+pub async fn update_node_body(port: u16, node_id: &str, body: &str) -> Result<(), String> {
+    update_node(
+        port,
+        node_id,
+        &NodeUpdate {
+            text: Some(body.to_string()),
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 /// DELETE `/api/nodes/:id[?children=reparent]` — the same
@@ -86,6 +120,169 @@ pub async fn remove_node(port: u16, node_id: &str, keep_children: bool) -> Resul
     }
     let res = reqwest::Client::new()
         .delete(url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    into_result(res).await
+}
+
+/// POST `/api/nodes` — the worker-routed counterpart to CLI/MCP `node
+/// add`. `title_slug_id: true` requests the plain title-slug id scheme
+/// `node add` has always produced (`mdcanvas::insert_child_node`) instead
+/// of the web UI's own random one — see `crates/server/src/lib.rs`'s
+/// `CreateNodeRequest::title_slug_id` doc comment for why a caller needs
+/// to opt into this explicitly rather than the id scheme depending on
+/// whether a worker happens to be running. Returns the new node's own id
+/// (`CreateNodeResponse::newId`) — nothing about either insertion function
+/// lets a caller predict it in advance.
+pub async fn create_node(
+    port: u16,
+    parent_id: &str,
+    title: &str,
+    title_slug_id: bool,
+) -> Result<String, String> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Response {
+        new_id: String,
+    }
+    let res = reqwest::Client::new()
+        .post(format!("{}/api/nodes", base_url(port)))
+        .json(&serde_json::json!({
+            "parentId": parent_id,
+            "title": title,
+            "titleSlugId": title_slug_id,
+        }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        return Err(if text.is_empty() { status.to_string() } else { text });
+    }
+    res.json::<Response>().await.map(|r| r.new_id).map_err(|e| e.to_string())
+}
+
+/// POST `/api/nodes/:id/reparent` — the same `mdcanvas::reparent_node`
+/// primitive `apply_node_mv`'s own direct-file path (`crates/cli/src/main.rs`)
+/// calls, including the position-frame conversion it does server-side
+/// (see that endpoint's own doc comment) — this client never needs to
+/// replicate that math itself. `newParentId` must already be one of the
+/// node's declared extra parents; `crate::main::node_mv`'s worker-routed
+/// path adds that edge first via `update_node`'s own `extra_parents`
+/// before calling this, mirroring `apply_node_mv`'s own two-step shape.
+pub async fn reparent_node(port: u16, node_id: &str, new_parent_id: &str) -> Result<(), String> {
+    let mut url = node_url(port, node_id)?;
+    url.path_segments_mut()
+        .map_err(|_| "couldn't build the worker's reparent URL".to_string())?
+        .push("reparent");
+    let res = reqwest::Client::new()
+        .post(url)
+        .json(&serde_json::json!({ "newParentId": new_parent_id }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    into_result(res).await
+}
+
+/// POST `/api/nodes/:id/move` — the same `mdcanvas::move_sibling`
+/// primitive `apply_node_move`'s own direct-file path calls; `before`
+/// selects which of `MoveSiblingRequest`'s own mutually-exclusive
+/// `before`/`after` fields carries `target_id`.
+pub async fn move_sibling(
+    port: u16,
+    node_id: &str,
+    target_id: &str,
+    before: bool,
+) -> Result<(), String> {
+    let mut url = node_url(port, node_id)?;
+    url.path_segments_mut()
+        .map_err(|_| "couldn't build the worker's move URL".to_string())?
+        .push("move");
+    let body = if before {
+        serde_json::json!({ "before": target_id })
+    } else {
+        serde_json::json!({ "after": target_id })
+    };
+    let res = reqwest::Client::new()
+        .post(url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    into_result(res).await
+}
+
+/// POST `/api/nodes/:id/rename-id` — the same `mdcanvas::rename_node_id`
+/// primitive `apply_node_set_id`'s own direct-file path (CLI `node
+/// set_id`/`mdcanvas::rename_node_id`) calls.
+pub async fn rename_node_id(port: u16, node_id: &str, new_id: &str) -> Result<(), String> {
+    let mut url = node_url(port, node_id)?;
+    url.path_segments_mut()
+        .map_err(|_| "couldn't build the worker's rename-id URL".to_string())?
+        .push("rename-id");
+    let res = reqwest::Client::new()
+        .post(url)
+        .json(&serde_json::json!({ "newId": new_id }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    into_result(res).await
+}
+
+/// Field-for-field mirror of `crates/server/src/lib.rs`'s own
+/// `UpdateBlockAttrsRequest` — see that struct's own doc comment for why
+/// `deps`/`env` carry the same comma-separated text syntax the CLI already
+/// parses instead of a typed list, and why `interpreter`/`clearInterpreter`
+/// are a two-field pair rather than a nested-Option sentinel.
+#[derive(Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockAttrsUpdate {
+    pub name: Option<String>,
+    pub lang: Option<String>,
+    pub cache: Option<bool>,
+    pub always: Option<bool>,
+    pub default: Option<bool>,
+    pub tty: Option<bool>,
+    pub autoclose: Option<bool>,
+    pub service: Option<bool>,
+    pub deps: Option<String>,
+    pub env: Option<String>,
+    pub interpreter: Option<String>,
+    pub clear_interpreter: bool,
+    pub code: Option<String>,
+}
+
+/// PATCH `/api/nodes/:id/block/:blockName` — the worker-routed counterpart
+/// to CLI/MCP `node block`'s own direct-file `apply_node_block`.
+pub async fn set_block_attrs(
+    port: u16,
+    node_id: &str,
+    block_name: &str,
+    update: &BlockAttrsUpdate,
+) -> Result<(), String> {
+    let mut url = node_url(port, node_id)?;
+    url.path_segments_mut()
+        .map_err(|_| "couldn't build the worker's block-attrs URL".to_string())?
+        .push("block")
+        .push(block_name);
+    let res = reqwest::Client::new()
+        .patch(url)
+        .json(update)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    into_result(res).await
+}
+
+/// POST `/api/canvas/reorder-siblings` — the worker-routed counterpart to
+/// CLI/MCP `node reorder`'s own direct-file `apply_node_reorder`. No node
+/// id at all: this re-sorts every parent's children in the whole document
+/// at once, same as the direct-file path does.
+pub async fn reorder_document(port: u16) -> Result<(), String> {
+    let res = reqwest::Client::new()
+        .post(format!("{}/api/canvas/reorder-siblings", base_url(port)))
         .send()
         .await
         .map_err(|e| e.to_string())?;
@@ -506,11 +703,48 @@ pub struct LockConflict {
 /// fail on a genuine transport-level problem (the worker isn't listening,
 /// a malformed URL) — the caller (`App::begin_http_run`) is the one that
 /// inspects the very first event on the returned channel for `LockConflict`.
+///
+/// Always `persist: false` on the wire — see [`run_stream_persisted`] for
+/// the CLI's own `persist: true` variant and why the two callers differ.
 pub async fn run_stream(
     port: u16,
     path: &[String],
     block: &str,
     no_deps: bool,
+    vars: HashMap<String, String>,
+    save_secrets: HashSet<String>,
+    force: Option<(String, String)>,
+) -> Result<tokio::sync::mpsc::UnboundedReceiver<RunEvent>, String> {
+    run_stream_inner(port, path, block, no_deps, false, vars, save_secrets, force).await
+}
+
+/// Same as [`run_stream`], but with `persist: true` — the CLI's own
+/// `run_via_worker` (`crates/cli/src/main.rs`) needs this so a `cache`
+/// block's output actually lands back in the file the way `meshfox run`
+/// has always guaranteed, in-process or not; TUI's own `run_stream` calls
+/// stay on the persist-`false` default above (a TUI run is closer to the
+/// web UI's own preview-first posture — explicit "save to file" is its own
+/// separate action there, not implied by every run).
+#[allow(clippy::too_many_arguments)]
+pub async fn run_stream_persisted(
+    port: u16,
+    path: &[String],
+    block: &str,
+    no_deps: bool,
+    vars: HashMap<String, String>,
+    save_secrets: HashSet<String>,
+    force: Option<(String, String)>,
+) -> Result<tokio::sync::mpsc::UnboundedReceiver<RunEvent>, String> {
+    run_stream_inner(port, path, block, no_deps, true, vars, save_secrets, force).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_stream_inner(
+    port: u16,
+    path: &[String],
+    block: &str,
+    no_deps: bool,
+    persist: bool,
     vars: HashMap<String, String>,
     save_secrets: HashSet<String>,
     force: Option<(String, String)>,
@@ -522,6 +756,7 @@ pub async fn run_stream(
         ("path", path.join(",")),
         ("block", block.to_string()),
         ("noDeps", no_deps.to_string()),
+        ("persist", persist.to_string()),
         ("vars", vars_json),
         ("saveSecrets", secrets_json),
     ];
@@ -531,6 +766,44 @@ pub async fn run_stream(
     }
     let url = reqwest::Url::parse_with_params(&format!("ws://127.0.0.1:{port}{route}"), &params)
         .map_err(|e| e.to_string())?;
+    let (mut ws, _) = tokio_tungstenite::connect_async(url.as_str())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        use futures_util::StreamExt;
+        while let Some(Ok(msg)) = ws.next().await {
+            let tokio_tungstenite::tungstenite::Message::Text(text) = msg else { continue };
+            let Ok(event) = serde_json::from_str::<RunEvent>(&text) else { continue };
+            if tx.send(event).is_err() {
+                return;
+            }
+        }
+    });
+    Ok(rx)
+}
+
+/// `GET /api/nodes/:id/run` — the file-node counterpart to [`run_stream`]/
+/// [`run_stream_persisted`]: runs a runnable `file` node's own `interpreter
+/// target` and streams the exact same `RunEvent` vocabulary a fenced-block
+/// chain does (`crates/server/src/lib.rs`'s own `run_file_node` doc comment
+/// — `nodeId`/`block` both set to the node's own id, no `deps=`/`cache`/
+/// `env=`/`tty` concepts to worry about here, so no query params at all).
+/// Used by `crate::run_via_worker`'s own fallback for exactly the case a
+/// fenced-block chain's own `get_vars`/`run_stream_persisted` can't
+/// address: `path`+`name` naming a node whose body is just a link to an
+/// external target rather than a fenced block.
+pub async fn run_file_node_stream(
+    port: u16,
+    node_id: &str,
+) -> Result<tokio::sync::mpsc::UnboundedReceiver<RunEvent>, String> {
+    let mut url = reqwest::Url::parse(&format!("ws://127.0.0.1:{port}/api/nodes"))
+        .map_err(|e| e.to_string())?;
+    url.path_segments_mut()
+        .map_err(|_| "couldn't build the worker's node-run URL".to_string())?
+        .push(node_id)
+        .push("run");
     let (mut ws, _) = tokio_tungstenite::connect_async(url.as_str())
         .await
         .map_err(|e| e.to_string())?;
@@ -826,5 +1099,87 @@ pub async fn restart_service(port: u16, node_id: &str, block: &str) -> Result<u3
         pid: u32,
     }
     res.json::<Resp>().await.map(|r| r.pid).map_err(|e| e.to_string())
+}
+
+// =======================================================================
+// Debug sessions — `mcp.rs`'s `DebugHandle::Remote` routes here once
+// `coordinator::resolve` finds a live worker, instead of owning a
+// `meshfox_server::debug_session::DebugSession` directly. See
+// `crates/server/src/lib.rs`'s `/api/debug/*` handlers for the exact wire
+// shape these mirror.
+// =======================================================================
+
+/// `POST /api/debug/start` — `(session_id, block_name, cwd)`. `node_id`
+/// isn't returned separately since the caller already has it (it's an
+/// input, echoed back unchanged server-side).
+pub async fn debug_start(
+    port: u16,
+    node_id: &str,
+    block_name: Option<&str>,
+    vars: HashMap<String, String>,
+) -> Result<(String, Option<String>, String), String> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Response {
+        session_id: String,
+        block_name: Option<String>,
+        cwd: String,
+    }
+    let res = reqwest::Client::new()
+        .post(format!("{}/api/debug/start", base_url(port)))
+        .json(&serde_json::json!({ "nodeId": node_id, "blockName": block_name, "vars": vars }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        return Err(if text.is_empty() { status.to_string() } else { text });
+    }
+    let response: Response = res.json().await.map_err(|e| e.to_string())?;
+    Ok((response.session_id, response.block_name, response.cwd))
+}
+
+/// Mirrors `crates/server/src/lib.rs`'s own `DebugSendResponse` exactly.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DebugSendOutcome {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+    pub timed_out: bool,
+    pub session_ended: bool,
+}
+
+/// `POST /api/debug/send`.
+pub async fn debug_send(
+    port: u16,
+    session_id: &str,
+    code: &str,
+    timeout_ms: u64,
+) -> Result<DebugSendOutcome, String> {
+    let res = reqwest::Client::new()
+        .post(format!("{}/api/debug/send", base_url(port)))
+        .json(&serde_json::json!({ "sessionId": session_id, "code": code, "timeoutMs": timeout_ms }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        return Err(if text.is_empty() { status.to_string() } else { text });
+    }
+    res.json().await.map_err(|e| e.to_string())
+}
+
+/// `POST /api/debug/stop`.
+pub async fn debug_stop(port: u16, session_id: &str) -> Result<(), String> {
+    let res = reqwest::Client::new()
+        .post(format!("{}/api/debug/stop", base_url(port)))
+        .json(&serde_json::json!({ "sessionId": session_id }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    into_result(res).await
 }
 
