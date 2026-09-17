@@ -48,6 +48,20 @@ final class SessionStore {
     private let meshfoxPath: String
     private var server: UnixSocketServer?
 
+    /// How long a freshly spawned worker gets to report `Ready` before this
+    /// store gives up on it — a real worker binding a port is fast (well
+    /// under a second normally), so this is generous specifically so it
+    /// never fires under ordinary load. Exists so a worker that never
+    /// reports `Ready` at all (crashed before binding, or — the incident
+    /// this was added for — a coordinator restart landing in a state where
+    /// `Ready` never reaches `markReady`) fails every `getPort` caller
+    /// waiting on it instead of leaving them (and, transitively, whatever
+    /// `meshfox` CLI invocation is blocked in `request_port` on the other
+    /// end) hanging forever. Shorter than that client-side timeout
+    /// (`REQUEST_PORT_TIMEOUT`, `crates/server/src/watcher_protocol.rs`)
+    /// so *this* is normally what answers first.
+    private let getPortTimeoutSeconds: TimeInterval = 15
+
     /// Fired (always on the main queue) whenever `sessions` changes —
     /// `AppDelegate` rebuilds the menu from `allSessions` in response.
     var onChange: (() -> Void)?
@@ -229,6 +243,9 @@ final class SessionStore {
 
         do {
             try process.run()
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + getPortTimeoutSeconds) { [weak self] in
+                self?.failIfStillPending(canonicalPath: canonicalPath)
+            }
         } catch {
             lock.lock()
             sessions.removeValue(forKey: canonicalPath)
@@ -238,12 +255,44 @@ final class SessionStore {
         }
     }
 
+    /// Fires `getPortTimeoutSeconds` after a worker was spawned — a no-op
+    /// if it already reported `Ready` (or already exited) by then. If it's
+    /// still sitting at `port == nil`, this worker is stuck (crashed
+    /// silently past the point that would call `remove`, or — the incident
+    /// this exists for — the whole coordinator's own accept path is
+    /// wedged and `Ready` can never reach `markReady` no matter how long
+    /// anyone waits): kill it and fail everyone still waiting on its port
+    /// with a clear reason instead of leaving them blocked forever. Only
+    /// clears `pendingPortRequests`, not the whole session — the worker's
+    /// own `terminationHandler` still runs once `terminate()` actually
+    /// takes effect and does the real `sessions` cleanup via `remove`,
+    /// same as any other worker that exits.
+    private func failIfStillPending(canonicalPath: String) {
+        lock.lock()
+        guard let session = sessions[canonicalPath], session.port == nil else {
+            lock.unlock()
+            return
+        }
+        let portRequests = session.pendingPortRequests
+        session.pendingPortRequests = []
+        lock.unlock()
+
+        session.process.terminate()
+        for completion in portRequests {
+            completion(.error(
+                "worker for \(canonicalPath) didn't report ready within \(Int(getPortTimeoutSeconds))s — killed it"
+            ))
+        }
+    }
+
     /// A session's worker is gone — normal exit (its own tabs all closed)
     /// or a crash before ever reporting `Ready`. Either way, nobody's
     /// waiting `getPort` on it should be left blocked forever
     /// (`UnixSocketServer.replyToGetPort`'s semaphore has no other way to
     /// wake up) — fail every still-pending request explicitly rather than
-    /// silently dropping them.
+    /// silently dropping them. Also reached (with an already-empty
+    /// `pendingPortRequests`) after `failIfStillPending` kills a stuck
+    /// worker, once its `terminationHandler` actually fires.
     private func remove(canonicalPath: String) {
         lock.lock()
         let portRequests = sessions[canonicalPath]?.pendingPortRequests ?? []

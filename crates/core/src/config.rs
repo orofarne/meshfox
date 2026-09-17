@@ -91,6 +91,114 @@ fn server_socket_from_table(table: &toml::Table) -> Option<PathBuf> {
     table.get("server_socket").and_then(|v| v.as_str()).map(PathBuf::from)
 }
 
+/// `[process_env]` in `.meshfox/config.toml` (local or global, same merge
+/// as every other setting here) — extra environment variables applied to
+/// every spawned block/interpreter process (`stream_exec::spawn_bash`/
+/// `spawn_process`/`spawn_interpreter`), on top of whatever that process
+/// already inherited. Named distinctly from `crate::shared_env`'s
+/// `[[env]]`/`vars=` (an unrelated, older feature — per-path-scoped
+/// *defaults for `meshfox:var` resolution*, only reaching a block that
+/// explicitly declares `env="NAME"` on its own fence) — this instead
+/// always applies, to every spawned process's real OS environment,
+/// regardless of anything a block declares. Exists specifically for the
+/// case where "whatever it inherited" is missing something a block
+/// actually needs — a `meshfox view`/`run` worker spawned by the macOS
+/// daemon inherits *launchd's* env, not a login shell's, so
+/// `npm`/`cargo`/anything installed under `~/.cargo/bin` or Homebrew is
+/// invisible to it even though it's on the user's own interactive `$PATH`.
+///
+/// A value may reference *any* variable's current value via `$NAME`/
+/// `${NAME}` (see `expand_env_refs`) — most usefully its own, to extend
+/// rather than replace it (blindly overwriting `PATH` would lose whatever
+/// the worker already had), but a plain shell-style export list referring
+/// to other variables too (`$HOME`, say) works exactly as it reads:
+///
+/// ```toml
+/// [process_env]
+/// PATH = "$HOME/.cargo/bin:$HOME/.local/bin:$PATH:$HOME/bin"
+/// ```
+///
+/// — the same left-to-right accumulation four separate
+/// `export PATH="...:$PATH"` lines in a `.zshrc` would produce, just
+/// collapsed into the one final value (`[process_env]` isn't itself
+/// sequential — there's only one `PATH` key — so a multi-line shell config
+/// extending `$PATH` several times over needs its author to fold those
+/// into one value by hand, same as it would if written as a single shell
+/// assignment).
+///
+/// Every key becomes a real env var unconditionally otherwise (no implicit
+/// `PATH`-only special-casing) — a plain `FOO = "bar"` just sets `FOO=bar`.
+/// Only string values are supported; anything else in the table is
+/// silently skipped, same as `flatten_to_env`'s own array/datetime skip —
+/// there's no established convention for what a non-string
+/// `[process_env]` entry would even mean.
+pub fn env_overrides(canvas_root: &Path) -> Vec<(String, String)> {
+    env_overrides_from_table(&load(canvas_root))
+}
+
+fn env_overrides_from_table(table: &toml::Table) -> Vec<(String, String)> {
+    let Some(toml::Value::Table(env_table)) = table.get("process_env") else {
+        return Vec::new();
+    };
+    env_table
+        .iter()
+        .filter_map(|(name, value)| Some((name.clone(), expand_env_refs(value.as_str()?))))
+        .collect()
+}
+
+/// Replaces every `$NAME`/`${NAME}` reference in `value` with that
+/// variable's current value in *this* process's own environment (empty
+/// string if unset) — the one substitution an `[process_env]` value gets, letting
+/// it read like an ordinary shell export (`PATH = "$HOME/bin:$PATH"`)
+/// instead of only ever being able to extend itself. `NAME` follows shell
+/// identifier rules (letters/digits/underscore, not starting with a
+/// digit); `${NAME}` needs a matching `}` and a valid identifier between
+/// the braces or it's left untouched, and the bare `$NAME` form only
+/// consumes the longest valid identifier that follows (so `$PATH2`
+/// resolves `PATH2`, not `PATH` followed by a literal `2` — same "whole
+/// token" reasoning `crate::exec::interpreter_var_refs` already applies
+/// elsewhere, just now bounded by where the identifier actually ends
+/// rather than by a single expected name). Deliberately not general shell
+/// expansion — no command substitution, no quoting rules, nothing else in
+/// `value` is touched.
+fn expand_env_refs(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let len = value.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0;
+    while i < len {
+        if bytes[i] == b'$' {
+            if i + 1 < len && bytes[i + 1] == b'{' {
+                if let Some(rel_close) = value[i + 2..].find('}') {
+                    let name = &value[i + 2..i + 2 + rel_close];
+                    if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                        out.push_str(&std::env::var(name).unwrap_or_default());
+                        i += 2 + rel_close + 1; // past the closing '}'
+                        continue;
+                    }
+                }
+            } else {
+                let name_start = i + 1;
+                let mut name_end = name_start;
+                while name_end < len && (bytes[name_end].is_ascii_alphanumeric() || bytes[name_end] == b'_') {
+                    name_end += 1;
+                }
+                let name = &value[name_start..name_end];
+                let starts_with_digit = name.as_bytes().first().is_some_and(u8::is_ascii_digit);
+                if !name.is_empty() && !starts_with_digit {
+                    out.push_str(&std::env::var(name).unwrap_or_default());
+                    i = name_end;
+                    continue;
+                }
+            }
+        }
+        let ch = value[i..].chars().next().expect("i < len");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 /// Flattens a config table into `MESHFOX_CONFIG_<PATH>` env-var pairs —
 /// `[interpreters.agent] provider = "codex"` becomes
 /// `MESHFOX_CONFIG_INTERPRETERS_AGENT_PROVIDER=codex`, dashes in a key
@@ -175,6 +283,74 @@ mod tests {
         assert_eq!(server_socket_from_table(&toml::Table::new()), None);
         let table: toml::Table = "server_socket = 4\n".parse().unwrap();
         assert_eq!(server_socket_from_table(&table), None);
+    }
+
+    #[test]
+    fn expand_env_refs_extends_an_existing_value_via_bare_dollar_name() {
+        std::env::set_var("MESHFOX_TEST_ENV_EXPAND_A", "/base");
+        let out = expand_env_refs("$MESHFOX_TEST_ENV_EXPAND_A:/extra");
+        std::env::remove_var("MESHFOX_TEST_ENV_EXPAND_A");
+        assert_eq!(out, "/base:/extra");
+    }
+
+    #[test]
+    fn expand_env_refs_extends_via_the_braced_form() {
+        std::env::set_var("MESHFOX_TEST_ENV_EXPAND_B", "/base");
+        let out = expand_env_refs("${MESHFOX_TEST_ENV_EXPAND_B}:/extra");
+        std::env::remove_var("MESHFOX_TEST_ENV_EXPAND_B");
+        assert_eq!(out, "/base:/extra");
+    }
+
+    #[test]
+    fn expand_env_refs_is_empty_string_when_the_variable_is_unset() {
+        std::env::remove_var("MESHFOX_TEST_ENV_EXPAND_UNSET_C");
+        let out = expand_env_refs("$MESHFOX_TEST_ENV_EXPAND_UNSET_C:/extra");
+        assert_eq!(out, ":/extra");
+    }
+
+    #[test]
+    fn expand_env_refs_consumes_the_longest_valid_identifier_not_a_fixed_name() {
+        std::env::set_var("MESHFOX_TEST_ENV_EXPAND_D", "short");
+        std::env::set_var("MESHFOX_TEST_ENV_EXPAND_D2", "long");
+        let out = expand_env_refs("$MESHFOX_TEST_ENV_EXPAND_D2/x");
+        std::env::remove_var("MESHFOX_TEST_ENV_EXPAND_D");
+        std::env::remove_var("MESHFOX_TEST_ENV_EXPAND_D2");
+        assert_eq!(out, "long/x");
+    }
+
+    /// The motivating real-world case: a `~/.zshrc` with several
+    /// `export PATH="...:$PATH"`-style lines collapsed into one `[process_env]`
+    /// value, referencing *other* variables (`$HOME`) as well as itself.
+    #[test]
+    fn expand_env_refs_resolves_multiple_distinct_variables_in_one_value() {
+        std::env::set_var("MESHFOX_TEST_ENV_EXPAND_HOME", "/Users/test");
+        std::env::set_var("MESHFOX_TEST_ENV_EXPAND_PATH", "/usr/bin");
+        let out = expand_env_refs(
+            "$MESHFOX_TEST_ENV_EXPAND_HOME/.cargo/bin:$MESHFOX_TEST_ENV_EXPAND_PATH:$MESHFOX_TEST_ENV_EXPAND_HOME/bin",
+        );
+        std::env::remove_var("MESHFOX_TEST_ENV_EXPAND_HOME");
+        std::env::remove_var("MESHFOX_TEST_ENV_EXPAND_PATH");
+        assert_eq!(out, "/Users/test/.cargo/bin:/usr/bin:/Users/test/bin");
+    }
+
+    #[test]
+    fn env_overrides_from_table_expands_and_skips_non_string_values() {
+        std::env::set_var("MESHFOX_TEST_ENV_EXPAND_E", "/base");
+        let table: toml::Table = "[process_env]\nMESHFOX_TEST_ENV_EXPAND_E = \"$MESHFOX_TEST_ENV_EXPAND_E:/extra\"\ncount = 3\n"
+            .parse()
+            .unwrap();
+        let overrides = env_overrides_from_table(&table);
+        std::env::remove_var("MESHFOX_TEST_ENV_EXPAND_E");
+        assert_eq!(
+            overrides,
+            vec![("MESHFOX_TEST_ENV_EXPAND_E".to_string(), "/base:/extra".to_string())]
+        );
+    }
+
+    #[test]
+    fn env_overrides_from_table_is_empty_without_an_env_table() {
+        let table: toml::Table = "server_socket = \"/tmp/x.sock\"\n".parse().unwrap();
+        assert!(env_overrides_from_table(&table).is_empty());
     }
 
     #[test]

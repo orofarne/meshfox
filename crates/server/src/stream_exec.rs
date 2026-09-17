@@ -123,7 +123,11 @@ pub fn supports(block: &meshfox_core::CodeBlock) -> bool {
 /// starts in — a node's own canvas file's directory (see
 /// `meshfox_core::canvas::Node::cwd`), not necessarily wherever the
 /// server process itself happens to be running from; `None` inherits the
-/// server's own cwd unchanged.
+/// server's own cwd unchanged. Also where `meshfox_core::config`'s
+/// `[process_env]` table (if any, resolved from `cwd`) gets merged in,
+/// *below* `envs` — see `config::env_overrides`'s own doc comment for why
+/// a worker's inherited environment (e.g. launchd's minimal one for a
+/// macOS-daemon-spawned worker) sometimes needs this at all.
 pub fn spawn_bash<I, K, V>(code: &str, envs: I, cwd: Option<&Path>) -> io::Result<SpawnedProcess>
 where
     I: IntoIterator<Item = (K, V)>,
@@ -135,7 +139,9 @@ where
     // `cp`/`mkdir`/`mv` failing partway through) would otherwise silently
     // continue past the failure and report whatever its last line's exit
     // code happens to be — usually success — instead of the real one.
-    command.arg("-e").arg("-c").arg(code).envs(envs);
+    command.arg("-e").arg("-c").arg(code);
+    command.envs(meshfox_core::config::env_overrides(cwd.unwrap_or_else(|| Path::new("."))));
+    command.envs(envs);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -159,10 +165,13 @@ where
 
 /// Spawns `program` (found via `PATH`, no shell involved) with `args`, as
 /// the leader of a fresh process group — same cancellable/streamed shape as
-/// `spawn_bash`, just without a shell or extra environment variables in
-/// between. Used to run a `file` node's `interpreter target` (see
-/// `meshfox_core::Node::is_runnable_file`), where `target` is a plain path
-/// string that has no business being interpreted by a shell.
+/// `spawn_bash`, just without a shell or caller-supplied environment
+/// variables in between (`meshfox_core::config`'s `[process_env]` table still
+/// applies, same as every other spawn function here — see
+/// `spawn_bash`'s own doc comment). Used to run a `file` node's
+/// `interpreter target` (see `meshfox_core::Node::is_runnable_file`),
+/// where `target` is a plain path string that has no business being
+/// interpreted by a shell.
 pub fn spawn_process<I, S>(program: &str, args: I, cwd: Option<&Path>) -> io::Result<SpawnedProcess>
 where
     I: IntoIterator<Item = S>,
@@ -170,6 +179,7 @@ where
 {
     let mut command = Command::new(program);
     command.args(args);
+    command.envs(meshfox_core::config::env_overrides(cwd.unwrap_or_else(|| Path::new("."))));
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -258,8 +268,18 @@ where
     ));
     std::fs::write(&path, code)?;
 
+    // Config's `[process_env]` (see `spawn_bash`'s own doc comment) goes in first —
+    // lowest precedence, overridable by both the caller's own `envs` and
+    // whatever `resolve_with_env` just added above.
+    let mut final_envs: Vec<(std::ffi::OsString, std::ffi::OsString)> =
+        meshfox_core::config::env_overrides(cwd.unwrap_or_else(|| Path::new(".")))
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect();
+    final_envs.extend(envs);
+
     let mut command = Command::new(&program);
-    command.args(&args).arg(&path).envs(envs);
+    command.args(&args).arg(&path).envs(final_envs);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -518,6 +538,74 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The concrete motivating case for `[process_env]`: a worker whose own
+    /// inherited `PATH` is missing something a block needs (a macOS-daemon-
+    /// spawned worker inherits launchd's minimal `PATH`, not a login
+    /// shell's — see `meshfox_core::config::env_overrides`'s own doc
+    /// comment) can extend it via a local `.meshfox/config.toml`, using
+    /// `$NAME` to splice in whatever this process already had rather than
+    /// clobbering it outright.
+    #[tokio::test]
+    async fn spawn_bash_extends_an_inherited_variable_via_local_env_config() {
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-env-override-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(dir.join(".meshfox")).unwrap();
+        std::fs::write(
+            dir.join(".meshfox").join("config.toml"),
+            "[process_env]\nMESHFOX_ENV_OVERRIDE_TEST = \"$MESHFOX_ENV_OVERRIDE_TEST:added\"\n",
+        )
+        .unwrap();
+
+        // `MESHFOX_ENV_OVERRIDE_TEST` is a name no other test or real code
+        // reads, so mutating it here can't race anything else in this test
+        // binary.
+        std::env::set_var("MESHFOX_ENV_OVERRIDE_TEST", "base");
+        let mut proc = spawn_bash("echo \"$MESHFOX_ENV_OVERRIDE_TEST\"", no_envs(), Some(&dir)).unwrap();
+        std::env::remove_var("MESHFOX_ENV_OVERRIDE_TEST");
+
+        let mut lines = Vec::new();
+        while let Some((_, line)) = proc.output_rx.recv().await {
+            lines.push(line);
+        }
+        let status = proc.child.wait().await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(lines, vec!["base:added"]);
+        assert_eq!(status.code(), Some(0));
+    }
+
+    /// A block's own explicit `envs` (resolved `meshfox:var`s) still wins
+    /// over a same-named `[process_env]` config entry — config is a base extension,
+    /// not something a block author has to fight around.
+    #[tokio::test]
+    async fn spawn_bash_lets_caller_envs_override_a_same_named_env_config_entry() {
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-env-override-precedence-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(dir.join(".meshfox")).unwrap();
+        std::fs::write(
+            dir.join(".meshfox").join("config.toml"),
+            "[process_env]\nFOO = \"from-config\"\n",
+        )
+        .unwrap();
+
+        let mut proc = spawn_bash("echo \"$FOO\"", [("FOO", "from-caller")], Some(&dir)).unwrap();
+        let mut lines = Vec::new();
+        while let Some((_, line)) = proc.output_rx.recv().await {
+            lines.push(line);
+        }
+        let status = proc.child.wait().await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(lines, vec!["from-caller"]);
+        assert_eq!(status.code(), Some(0));
     }
 
     #[tokio::test]

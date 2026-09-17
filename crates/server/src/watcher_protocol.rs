@@ -162,17 +162,57 @@ pub async fn request_open_file(socket_path: &Path, path: &Path) -> io::Result<()
     .await
 }
 
+/// How long [`request_port`] waits for a reply before giving up — a
+/// backstop for a coordinator that's wedged rather than just slow (a real
+/// worker spawn is fast; this is generous specifically so it never fires
+/// under normal load). Longer than the macOS daemon's own
+/// `SessionStore.getPortTimeoutSeconds` (15s, `SessionStore.swift`) so that
+/// side's own timeout-and-kill-the-worker path is what normally answers
+/// first — this is only reached if the coordinator itself never gets to
+/// run that logic at all (the launchd-socket-backlog incident this pair of
+/// timeouts was added for: a completely wedged accept loop, not merely a
+/// slow worker).
+const REQUEST_PORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// [`Message::GetPort`] — get-or-spawn a worker for `canvas_path` and learn
 /// its port, without opening a browser tab. Unlike every other function
 /// here, this one reads a reply back on the same connection before
 /// returning — see this module's own doc comment and [`PortResponse`]. A
 /// coordinator-reported `{"error": ...}` comes back as
 /// `io::ErrorKind::Other`; a connection failure or a malformed/missing
-/// reply as `io::ErrorKind::InvalidData`. Used by
+/// reply as `io::ErrorKind::InvalidData`; no reply at all within
+/// [`REQUEST_PORT_TIMEOUT`] as `io::ErrorKind::TimedOut` — a coordinator
+/// that's completely wedged (not just slow) shouldn't be able to hang
+/// every client that ever asks it for a port forever. Used by
 /// `crates/cli/src/coordinator.rs` whenever `server_socket` is configured —
 /// see that module for why every other core-launch operation (`tui`, `run`,
 /// `node <op>`, MCP) goes through this instead of `worker_lock`.
 pub async fn request_port(socket_path: &Path, canvas_path: &Path) -> io::Result<u16> {
+    request_port_with_timeout(socket_path, canvas_path, REQUEST_PORT_TIMEOUT).await
+}
+
+/// `request_port`'s own implementation, taking the timeout explicitly so a
+/// test can use a short one instead of waiting out the real
+/// [`REQUEST_PORT_TIMEOUT`].
+async fn request_port_with_timeout(
+    socket_path: &Path,
+    canvas_path: &Path,
+    timeout: std::time::Duration,
+) -> io::Result<u16> {
+    match tokio::time::timeout(timeout, request_port_inner(socket_path, canvas_path)).await {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "coordinator at {} didn't answer get_port within {}s",
+                socket_path.display(),
+                timeout.as_secs_f64()
+            ),
+        )),
+    }
+}
+
+async fn request_port_inner(socket_path: &Path, canvas_path: &Path) -> io::Result<u16> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     let mut stream = UnixStream::connect(socket_path).await?;
@@ -359,6 +399,36 @@ mod tests {
 
         let err = send_task.await.unwrap().unwrap_err();
         assert!(err.to_string().contains("couldn't spawn a worker"));
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// The client-side backstop from the launchd-socket-backlog incident:
+    /// a coordinator that accepts the connection but then never answers at
+    /// all (as opposed to replying with `{"error": ...}`) shouldn't hang
+    /// this forever — see `REQUEST_PORT_TIMEOUT`'s own doc comment for why
+    /// this exists *in addition to* the daemon's own timeout-and-kill path.
+    #[tokio::test]
+    async fn request_port_times_out_when_the_coordinator_never_replies() {
+        let socket_path = temp_socket_path("get-port-never-replies");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let canvas_path = PathBuf::from("/tmp/wedged.canvas.md");
+        let send_task = tokio::spawn({
+            let socket_path = socket_path.clone();
+            let canvas_path = canvas_path.clone();
+            async move {
+                request_port_with_timeout(&socket_path, &canvas_path, std::time::Duration::from_millis(200)).await
+            }
+        });
+
+        // Accept the connection (so the client's own `connect()` and
+        // `write_all` both succeed) and just hold it open, never writing a
+        // reply — exactly what a coordinator wedged before ever reaching
+        // its own reply logic looks like from a client's perspective.
+        let (_stream, _) = listener.accept().await.unwrap();
+
+        let err = send_task.await.unwrap().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         let _ = std::fs::remove_file(&socket_path);
     }
 

@@ -23,6 +23,28 @@ server_socket = "/Users/<you>/Library/Application Support/meshfox/daemon.sock"
 `server_socket` and `crates/cli/src/coordinator.rs` on the Rust side for
 what reads this).
 
+**A daemon-spawned worker inherits launchd's own minimal environment**, not
+your login shell's — `npm`/`cargo`/anything under `~/.cargo/bin` or
+Homebrew that only ever gets onto `$PATH` via `.zshrc`/`.zprofile` is
+invisible to it, even though it's on your normal interactive shell's
+`$PATH`. Fix this with `[env]` in the same `~/.meshfox/config.toml` (or a
+project-local `.meshfox/config.toml`) rather than trying to make launchd
+itself source your shell config — see `crates/core/src/config.rs`'s
+`env_overrides` for the full rationale:
+
+```toml
+[env]
+PATH = "$PATH:/opt/homebrew/bin:/Users/<you>/.cargo/bin"
+```
+
+`$NAME`/`${NAME}` in a value is replaced with that same variable's current
+value in the process actually spawning the block — so `PATH` above
+*extends* whatever the worker already had rather than replacing it
+outright. Applies to every spawned block/interpreter
+(`stream_exec::spawn_bash`/`spawn_process`/`spawn_interpreter`) regardless
+of what launched the worker, not just daemon-spawned ones — a block's own
+`env=` locals still win over a same-named `[env]` entry on conflict.
+
 Bundle id `net.orofarne.meshfox`; the app is named plainly "Meshfox"
 everywhere a user sees it (Finder, `/Applications`, the tray icon's own
 tooltip) even though the Swift package/source directory underneath keeps
@@ -109,6 +131,24 @@ poll until its socket comes up" retry logic on the client side (Rust *and*
 TypeScript) go away entirely — there's no "not started yet" state for a
 client to ever observe once this LaunchAgent is loaded.
 
+`rm -f "$SOCKET_PATH"` right after `bootout`, before re-registering: a real
+incident (2026-09-17) left launchd's own kernel-level socket holding an
+unread, permanently-stuck connection across multiple `bootstrap`/process
+restarts — every `getPort` waiting on that socket hung forever, even
+against a freshly-launched daemon process, until the socket *file* itself
+was deleted and the LaunchAgent bootstrapped fresh against a clean one.
+Root cause not fully pinned down (likely stale state surviving an earlier
+`bootstrap` that wasn't cleanly `bootout`'d first, from iterating on this
+exact feature) — this line makes re-running `build` always start from a
+known-clean socket regardless, rather than relying on that never
+recurring. Two independent, code-level backstops for the same failure
+mode now also exist so it fails loudly instead of hanging forever even if
+this happens again: `SessionStore.getPortTimeoutSeconds` (kills a worker
+that never reports ready and fails whoever's waiting on it),
+`watcher_protocol::REQUEST_PORT_TIMEOUT` on the Rust client side, and
+`StartupSelfTest.swift` (a round-trip `get_port` self-check a few hundred
+ms after every launch, logged to `daemon.log`).
+
 ```bash always
 set -euo pipefail
 
@@ -176,6 +216,7 @@ SOCKET_PATH="$HOME/Library/Application Support/meshfox/daemon.sock"
 mkdir -p "$HOME/Library/LaunchAgents" "$(dirname "$SOCKET_PATH")"
 
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+rm -f "$SOCKET_PATH"
 
 plutil -create xml1 "$AGENT_PLIST"
 "$PB" -c "Add :Label string $LABEL" "$AGENT_PLIST"
@@ -188,6 +229,10 @@ plutil -create xml1 "$AGENT_PLIST"
 "$PB" -c "Add :Sockets:Listener dict" "$AGENT_PLIST"
 "$PB" -c "Add :Sockets:Listener:SockPathName string $SOCKET_PATH" "$AGENT_PLIST"
 "$PB" -c "Add :Sockets:Listener:SockType string stream" "$AGENT_PLIST"
+LOG_DIR="$HOME/Library/Logs/Meshfox"
+mkdir -p "$LOG_DIR"
+"$PB" -c "Add :StandardOutPath string $LOG_DIR/daemon.log" "$AGENT_PLIST"
+"$PB" -c "Add :StandardErrorPath string $LOG_DIR/daemon.log" "$AGENT_PLIST"
 
 launchctl bootstrap "gui/$(id -u)" "$AGENT_PLIST"
 

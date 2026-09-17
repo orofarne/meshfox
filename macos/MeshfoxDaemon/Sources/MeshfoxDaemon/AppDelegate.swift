@@ -55,6 +55,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApplication.shared.terminate(nil)
             return
         }
+        StartupSelfTest.run(socketPath: socketPath)
 
         for path in pendingOpenPaths {
             store.openCanvas(path: path, fragment: nil)

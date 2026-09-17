@@ -130,9 +130,20 @@ final class UnixSocketServer {
                 }
             }
         }
-        guard rc == 0, count > 0, let fds = fdsOpt else { return nil }
+        guard rc == 0, count > 0, let fds = fdsOpt else {
+            FileHandle.standardError.write(
+                "meshfox-daemon: launch_activate_socket(\"\(launchSocketName)\") -> rc=\(rc) count=\(count)\n"
+                    .data(using: .utf8)!
+            )
+            return nil
+        }
         defer { free(fds) }
-        return fds[0]
+        let fd = fds[0]
+        FileHandle.standardError.write(
+            "meshfox-daemon: launch_activate_socket(\"\(launchSocketName)\") -> fd=\(fd) (count=\(count))\n"
+                .data(using: .utf8)!
+        )
+        return fd
     }
 
     private func startAcceptLoop() {
@@ -194,6 +205,9 @@ final class UnixSocketServer {
     }
 
     private func acceptLoop() {
+        FileHandle.standardError.write(
+            "meshfox-daemon: accept loop starting on fd=\(listenFD)\n".data(using: .utf8)!
+        )
         while true {
             let clientFD = accept(listenFD, nil, nil)
             if clientFD < 0 {
@@ -202,8 +216,15 @@ final class UnixSocketServer {
                 // the listening socket out from under this loop) means
                 // there's nothing left to accept.
                 if errno == EINTR { continue }
+                FileHandle.standardError.write(
+                    "meshfox-daemon: accept() failed on fd=\(listenFD), errno=\(errno) (\(Self.errnoString())) — accept loop exiting\n"
+                        .data(using: .utf8)!
+                )
                 break
             }
+            FileHandle.standardError.write(
+                "meshfox-daemon: accepted client fd=\(clientFD)\n".data(using: .utf8)!
+            )
             DispatchQueue.global(qos: .utility).async { [weak self] in
                 self?.handleClient(clientFD)
             }

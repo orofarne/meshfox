@@ -12,8 +12,9 @@
 use axum::{
     body::{Body, Bytes},
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
     http::{header, StatusCode, Uri},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, patch, post, put},
     Json, Router,
@@ -28,7 +29,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{broadcast, oneshot};
@@ -121,6 +122,19 @@ struct AppState {
     /// against `TabGuard` exiting the process before the auto-opened (or
     /// manually visited) tab has even had a chance to connect yet.
     ever_connected: AtomicBool,
+    /// Millis since `UNIX_EPOCH` of the most recent `/api/*` request this
+    /// worker has handled — `0` means "never". Entirely independent of
+    /// `open_tabs`/`ever_connected` above (which only ever see a browser
+    /// tab's own `/api/watch` connection): closes a real gap those two
+    /// alone leave open, where a worker whose only clients are non-browser
+    /// callers (`meshfox run` routed through `coordinator::resolve`,
+    /// `node <op>` worker routing, MCP `debug_*`, a bare integration-test
+    /// HTTP client) never opens `/api/watch` at all, so `ever_connected`
+    /// never flips and `TabGuard`'s tab-close-triggered check never even
+    /// runs, no matter how idle the worker has actually been. See
+    /// `spawn_api_idle_checker`, the periodic (not event-triggered) check
+    /// that actually reads this.
+    last_api_activity_millis: AtomicU64,
     /// Sequenced log of every `ServerEvent` (canvas changes, autorun
     /// triggers) — `watch_changes` forwards each one to its connected
     /// `/api/watch` client, plus enough backlog for a reconnecting client to
@@ -331,6 +345,128 @@ impl Drop for TabGuard {
             });
         }
     }
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Records that *some* `/api/*` request just happened — an
+/// `axum::middleware` layered onto every explicitly-declared route (via
+/// `Router::route_layer`, so it never wraps the static-asset `fallback`)
+/// in `build_app`. Not scoped to a caller who cares about the response —
+/// it fires on the way *in*, since even a request that ends up erroring
+/// still proves a real client is actively using this worker right now.
+async fn touch_api_activity(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
+    state.last_api_activity_millis.store(now_millis(), Ordering::Relaxed);
+    next.run(req).await
+}
+
+/// The periodic (as opposed to `TabGuard`'s event-triggered) half of
+/// auto-exit — spawned once per worker in `serve_as_worker`, alongside
+/// `spawn_file_watcher`. Exists specifically for the gap `TabGuard`/
+/// `ever_connected` leave open (see `AppState::last_api_activity_millis`'s
+/// own doc comment): a worker with `open_tabs` permanently at zero (no
+/// browser tab ever involved at all) still needs *something* to notice
+/// "nobody's used the API in a while" and exit, since nothing ever
+/// decrements `open_tabs` to trigger `TabGuard::drop`'s own check for such
+/// a worker. Polls rather than scheduling one sleep per request for the
+/// same reason a plain interval timer beats debouncing per-keystroke
+/// elsewhere: one lightweight timer, not a cascade of cancel-and-reschedule
+/// on every single API call.
+///
+/// Two independent conditions, checked every tick:
+///
+/// - **Used via the API before, now idle** (`last_api_activity_millis !=
+///   0`): exits once idle for `AUTO_EXIT_GRACE`, mirroring `TabGuard`'s own
+///   idle window on the tab side.
+/// - **Never used via the API *or* a tab at all** (`ever_connected` is
+///   also still false): rather than waiting forever for a first use that
+///   might never come (a `get_port` caller that fetched a port and then
+///   never actually called anything, an `Open` that never got followed by
+///   a browser actually loading), exits once `untouched_worker_timeout()`
+///   has passed since this worker started — a real incident (2026-09-17)
+///   where exactly this left a worker sitting in the macOS daemon's menu
+///   indefinitely. Deliberately a much longer bound than `AUTO_EXIT_GRACE`
+///   (5 minutes by default): unlike an idle *re*-check after real use,
+///   this has to stay generous enough that a slightly-slow `Open`→browser
+///   round trip, or a caller that reasonably calls `get_port` well before
+///   it's ready to act on it, never gets cut off.
+///
+/// A worker that's been used via the API before but *also* once had a tab
+/// connect and is now waiting on `TabGuard`'s own tab-close-triggered path
+/// (`ever_connected` true, `last_api_activity_millis` still `0`) is left
+/// alone by the second condition too — that path already owns exiting it.
+/// Both conditions back off for a running `service` block, same as
+/// `TabGuard`'s own check.
+fn spawn_api_idle_checker(state: Arc<AppState>) {
+    spawn_api_idle_checker_with_config(state, AUTO_EXIT_POLL_INTERVAL, AUTO_EXIT_GRACE, untouched_worker_timeout())
+}
+
+/// `spawn_api_idle_checker`'s own implementation, taking every duration
+/// explicitly so a test can shrink them — nothing here should ever wait
+/// out the real 5-minute default just to prove the timer fires at all.
+fn spawn_api_idle_checker_with_config(
+    state: Arc<AppState>,
+    poll_interval: Duration,
+    idle_grace: Duration,
+    untouched_timeout: Duration,
+) {
+    if !state.auto_exit {
+        return;
+    }
+    let started_at = std::time::Instant::now();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(poll_interval).await;
+            if state.open_tabs.load(Ordering::SeqCst) != 0 || has_running_services(&state) {
+                continue;
+            }
+            let last = state.last_api_activity_millis.load(Ordering::Relaxed);
+            if last != 0 {
+                let idle_for = Duration::from_millis(now_millis().saturating_sub(last));
+                if idle_for >= idle_grace {
+                    println!("meshfox: no API activity for {}s and no open tabs, exiting", idle_grace.as_secs());
+                    std::process::exit(0);
+                }
+                continue;
+            }
+            if state.ever_connected.load(Ordering::SeqCst) {
+                continue; // a tab's own TabGuard path already owns this worker
+            }
+            if started_at.elapsed() >= untouched_timeout {
+                println!(
+                    "meshfox: never used (no tab, no API request) after {}s, exiting",
+                    untouched_timeout.as_secs()
+                );
+                std::process::exit(0);
+            }
+        }
+    });
+}
+
+/// How often `spawn_api_idle_checker` wakes up to re-check — shorter than
+/// `AUTO_EXIT_GRACE` so the actual exit latency is dominated by the grace
+/// period itself, not by this poll granularity.
+const AUTO_EXIT_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long a worker that's *never* been touched at all (no browser tab
+/// ever connected, no `/api/*` request ever answered) waits before giving
+/// up and exiting anyway, instead of waiting forever for a first use that
+/// might never come — see `spawn_api_idle_checker`'s own doc comment.
+/// Overridable via `MESHFOX_TEST_UNTOUCHED_TIMEOUT_SECS`, test-only (same
+/// spirit as the macOS daemon's own `MESHFOX_BIN`): shrinks this so
+/// `crates/cli/tests/api_idle_auto_exit_cmd.rs`'s own coverage doesn't
+/// have to wait out the real 5 minutes to prove this actually fires.
+fn untouched_worker_timeout() -> Duration {
+    std::env::var("MESHFOX_TEST_UNTOUCHED_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(5 * 60))
 }
 
 /// Polls `canvas_path`'s mtime on a plain OS thread — simpler and more
@@ -6779,6 +6915,7 @@ async fn build_state(
         vars_cache: Mutex::new(vars_cache),
         open_tabs: AtomicUsize::new(0),
         ever_connected: AtomicBool::new(false),
+        last_api_activity_millis: AtomicU64::new(0),
         canvas_events: canvas_events::CanvasEventLog::new(),
         auto_exit,
         link_preview_cache: link_preview::PreviewCache::new(),
@@ -6840,6 +6977,10 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/include-asset", get(get_include_asset))
         .route("/api/syntax", get(get_syntax_list))
         .route("/api/syntax/:name", get(get_syntax_file))
+        // Only wraps the routes declared above, not `fallback` — see
+        // `touch_api_activity`'s own doc comment for why static-asset
+        // requests deliberately don't count as "activity" here.
+        .route_layer(middleware::from_fn_with_state(state.clone(), touch_api_activity))
         .fallback(serve_embedded)
         .with_state(state)
         .layer(CorsLayer::permissive())
@@ -6955,6 +7096,7 @@ pub async fn serve_as_worker(
     let state = build_state(canvas_path.clone(), auto_exit, watcher_socket.clone()).await?;
     spawn_file_watcher(Arc::clone(&state));
     spawn_shutdown_signal_handler(Arc::clone(&state));
+    spawn_api_idle_checker(Arc::clone(&state));
     let app = build_app(state);
 
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).await?;

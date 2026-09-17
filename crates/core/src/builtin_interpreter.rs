@@ -279,6 +279,48 @@ mod tests {
         assert!(!envs.iter().any(|(k, _)| k == "MESHFOX_VENV_DIR"));
     }
 
+    /// Regression test for a real bug: `agent.sh`'s `interpolate()` used
+    /// `for name in "${names[@]}"` after `IFS=',' read -ra names <<< ...`.
+    /// On bash 4+ that's fine even when `MESHFOX_ENV_NAMES` is unset/empty
+    /// (no `env=` vars on the fence — the common case), but bash 3.2 —
+    /// still what `#!/usr/bin/env bash` finds as a stock Mac's `/bin/bash`
+    /// unless a newer bash sits earlier in `$PATH` — treats a zero-element
+    /// array as unset under `set -u`, aborting the whole script with
+    /// "names[@]: unbound variable" before ever reaching a real
+    /// `claude`/`codex` invocation. Runs the materialized script with
+    /// `/bin/bash` explicitly (bypassing `$PATH`/the shebang, which is
+    /// exactly how this shipped unnoticed — dev shells here have a newer
+    /// bash ahead of `/bin/bash`) and a bogus provider to force a
+    /// deterministic, real-agent-free failure path.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn agent_sh_interpolate_survives_bash_3_2_with_no_env_names() {
+        let script = resolve_builtin_spec("@agent").unwrap().unwrap();
+        let prompt = std::env::temp_dir().join(format!("meshfox-agent-sh-test-{}.txt", std::process::id()));
+        std::fs::write(&prompt, "hello world").unwrap();
+
+        let output = std::process::Command::new("/bin/bash")
+            .arg(&script)
+            .arg(&prompt)
+            .env_remove("MESHFOX_ENV_NAMES")
+            .env("MESHFOX_CONFIG_INTERPRETERS_AGENT_PROVIDER", "bogus-provider")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+
+        std::fs::remove_file(&prompt).ok();
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("unbound variable"),
+            "agent.sh crashed on bash 3.2 with no MESHFOX_ENV_NAMES: {stderr}"
+        );
+        assert!(
+            stderr.contains("bogus-provider"),
+            "expected agent.sh's own unknown-provider message, got: {stderr}"
+        );
+    }
+
     #[test]
     fn resolve_with_env_sets_env_names_only_when_non_empty() {
         let (_, envs) = resolve_with_env("@agent", None, None, &[]).unwrap().unwrap();

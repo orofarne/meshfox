@@ -48,9 +48,17 @@ provider="${MESHFOX_CONFIG_INTERPRETERS_AGENT_PROVIDER:-claude}"
 interpolate() {
   local text=$1 name value out rest idx tail next
   local esc=$'\x01'
+  local -a names=()
   text=${text//\$\$/$esc}
   IFS=',' read -ra names <<< "${MESHFOX_ENV_NAMES:-}"
-  for name in "${names[@]}"; do
+  # bash 3.2 (macOS's shipped /bin/bash) treats a zero-element array as
+  # unset under `set -u`/nounset, so a bare `"${names[@]}"` aborts the
+  # whole script when MESHFOX_ENV_NAMES is empty (no env= vars declared)
+  # — bash 4.4+ fixed this, but 3.2 is still what `env bash` finds on a
+  # stock Mac. `${names[@]+"${names[@]}"}` is the standard portable
+  # workaround: expand to nothing at all when the array is unset/empty
+  # instead of erroring.
+  for name in ${names[@]+"${names[@]}"}; do
     [ -n "$name" ] || continue
     value=${!name-}
     text=${text//\$\{$name\}/$value}
