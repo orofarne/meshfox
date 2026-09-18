@@ -166,6 +166,34 @@ const AUTOFIT_TITLE_PORT = 4609;
 // read/write from the other's.
 const DRAG_REORDER_PORT = 4616;
 const DRAG_REORDER_FIREFOX_PORT = 4617;
+// Twenty-eighth server + port for external-edit.spec.ts — same reasoning
+// again, its own fixture (external-edit.canvas.md) and port, so its own
+// direct-filesystem write (bypassing the app, MCP, and the CLI entirely —
+// see that spec's own doc comment) never collides with any other suite's
+// server/canvas.
+//
+// Deliberately its own *fixed* directory, not a slice of `FIXTURES_DIR`
+// above: Playwright reloads this whole config file fresh in every worker
+// process, not just once in the root/orchestrator process — confirmed live
+// (each reload's own `fs.mkdtempSync` prints a different path). Every other
+// suite never notices, since their specs only ever reach their fixture over
+// HTTP (`/api/*`), never caring which physical copy answered. This spec is
+// the one exception — it needs to `fs.writeFileSync` the *exact* file the
+// already-running server for `EXTERNAL_EDIT_PORT` was actually pointed at,
+// so it needs a path stable across every reload, not `FIXTURES_DIR`'s own
+// fresh-random-dir-per-load. Fixed (not `mkdtempSync`) and rebuilt from the
+// checked-in fixture on every load — idempotent, and only the root
+// process's copy is ever live when a test actually runs (a worker loads
+// this config, and with it re-copies the fixture, once at its own startup,
+// strictly before any test in it executes).
+const EXTERNAL_EDIT_PORT = 4618;
+const EXTERNAL_EDIT_DIR = path.join(os.tmpdir(), "meshfox-e2e-external-edit-fixture");
+fs.mkdirSync(EXTERNAL_EDIT_DIR, { recursive: true });
+fs.copyFileSync(
+  path.join(import.meta.dirname, "e2e/fixtures/external-edit.canvas.md"),
+  path.join(EXTERNAL_EDIT_DIR, "external-edit.canvas.md"),
+);
+process.env.MESHFOX_E2E_EXTERNAL_EDIT_CANVAS_PATH = path.join(EXTERNAL_EDIT_DIR, "external-edit.canvas.md");
 
 // Taller than Playwright's 720px default — the app's own `minZoom` (0.5)
 // is a hard floor on how far "fit view" can zoom out, and deps.canvas.md's
@@ -346,6 +374,11 @@ export default defineConfig({
         baseURL: `http://127.0.0.1:${browser === "firefox" ? DRAG_REORDER_FIREFOX_PORT : DRAG_REORDER_PORT}`,
       },
     },
+    {
+      name: `${browser}-external-edit`,
+      testMatch: /(^|\/)external-edit\.spec\.ts$/,
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${EXTERNAL_EDIT_PORT}` },
+    },
   ]),
   webServer: [
     {
@@ -524,6 +557,12 @@ export default defineConfig({
     {
       command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/drag-reorder-firefox.canvas.md --port ${DRAG_REORDER_FIREFOX_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${DRAG_REORDER_FIREFOX_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${EXTERNAL_EDIT_DIR}/external-edit.canvas.md --port ${EXTERNAL_EDIT_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${EXTERNAL_EDIT_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },

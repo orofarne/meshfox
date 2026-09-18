@@ -28,6 +28,9 @@ anyhow = "1.0.104"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 scraper = "0.20"
 futures-util = "0.3.33"
+# "bundled" so the undo/redo session log (`undo_log.rs`) doesn't depend on a
+# system SQLite install being present/compatible.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
 tokio-tungstenite = "0.30.0"

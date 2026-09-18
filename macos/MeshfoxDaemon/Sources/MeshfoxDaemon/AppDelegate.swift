@@ -58,7 +58,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         StartupSelfTest.run(socketPath: socketPath)
 
         for path in pendingOpenPaths {
-            store.openCanvas(path: path, fragment: nil)
+            store.openCanvas(path: path, fragment: nil, completion: Self.logIfFailed)
         }
         pendingOpenPaths.removeAll()
 
@@ -76,7 +76,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         for url in urls {
-            store.openCanvas(path: url.path, fragment: nil)
+            store.openCanvas(path: url.path, fragment: nil, completion: Self.logIfFailed)
+        }
+    }
+
+    /// Nobody's waiting over the socket for these two call sites' own
+    /// `openCanvas` (Finder/startup opens, not a `watcher_protocol`
+    /// request) — but a failure (the exact case this whole ack mechanism
+    /// exists for — see `watcher_protocol.rs`'s own doc comment) shouldn't
+    /// just vanish silently for them either, so it still lands in
+    /// `daemon.log` where `UnixSocketServer`'s own failure logging already
+    /// goes.
+    private static func logIfFailed(_ reply: AckReply) {
+        if case .error(let message) = reply {
+            FileHandle.standardError.write("meshfox-daemon: couldn't open a Finder-requested file: \(message)\n".data(using: .utf8)!)
         }
     }
 

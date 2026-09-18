@@ -441,6 +441,35 @@ pub fn watch(port: u16) -> tokio::sync::mpsc::UnboundedReceiver<WatchEvent> {
     rx
 }
 
+/// Keeps a `/api/watch` connection open for as long as the returned
+/// `AbortHandle` isn't used to end it — no event this connection might
+/// receive is read for its own sake (everything off it is just discarded);
+/// this exists purely so the worker's own `AppState::open_tabs`/`TabGuard`
+/// sees *something* connected, the same liveness signal a real browser tab
+/// already gives it for free. For a caller with no tab of its own but that
+/// still wants the worker to stay up for as long as it's actively using it
+/// — `crate::mcp`'s own `DebugHandle::Remote`, specifically: a debug
+/// session can sit idle between `debug_send` calls for as long as whoever
+/// is driving it takes, and (unlike a `run`/`tty` step) has no registry of
+/// its own the worker could otherwise consult to know it's still wanted.
+/// Reconnects on drop (2s backoff), same as `watch` — best-effort, a
+/// connection failure here is never surfaced to the caller, since losing
+/// it degrades to "the worker might exit early" rather than breaking
+/// anything the caller's own operation depends on.
+pub fn hold_watch_connection(port: u16) -> tokio::task::AbortHandle {
+    let task = tokio::spawn(async move {
+        use futures_util::StreamExt;
+        loop {
+            let url = format!("ws://127.0.0.1:{port}/api/watch");
+            if let Ok((mut ws, _)) = tokio_tungstenite::connect_async(&url).await {
+                while ws.next().await.is_some() {}
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    });
+    task.abort_handle()
+}
+
 /// One line of `/api/run/subscribe`'s streamed NDJSON response — mirrors
 /// `crates/server/src/lib.rs`'s own `SubscribeEvent`: a much smaller
 /// vocabulary than `RunEvent` (no `StepStart`/chain concepts at all),

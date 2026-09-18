@@ -149,6 +149,17 @@ enum DebugHandle {
 struct MeshfoxMcp {
     canvas_path: PathBuf,
     sessions: Arc<Mutex<HashMap<String, DebugHandle>>>,
+    /// One `worker_client::hold_watch_connection` per `DebugHandle::Remote`
+    /// currently in `sessions`, keyed the same way — see that function's
+    /// own doc comment for why a remote debug session needs this at all
+    /// (it has no registry of its own the worker could otherwise consult
+    /// to know it's still wanted between `debug_send` calls, unlike a
+    /// `run`/`tty` step). Aborted (dropping the connection) wherever the
+    /// matching `sessions` entry is removed — `debug_stop`, or `debug_send`
+    /// noticing `session_ended`. Never populated for `DebugHandle::Local`
+    /// (an in-process session has no worker to keep alive in the first
+    /// place).
+    remote_keepalives: Arc<Mutex<HashMap<String, tokio::task::AbortHandle>>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -157,6 +168,7 @@ impl MeshfoxMcp {
         Self {
             canvas_path,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            remote_keepalives: Arc::new(Mutex::new(HashMap::new())),
             tool_router: Self::tool_router(),
         }
     }
@@ -204,6 +216,16 @@ impl MeshfoxMcp {
                 None,
             )
         })
+    }
+
+    /// Ends `session_id`'s own keep-alive connection, if it has one (a
+    /// no-op for a `DebugHandle::Local` session, which never gets an entry
+    /// here in the first place) — called wherever `sessions` itself loses
+    /// that entry, so the two maps never drift out of sync.
+    async fn stop_remote_keepalive(&self, session_id: &str) {
+        if let Some(handle) = self.remote_keepalives.lock().await.remove(session_id) {
+            handle.abort();
+        }
     }
 
     fn write_raw(&self, content: &str) -> Result<(), ErrorData> {
@@ -668,7 +690,10 @@ impl MeshfoxMcp {
     /// `coordinator::resolve` found a live worker — start the session there
     /// instead (`POST /api/debug/start`), tracked under `DebugHandle::
     /// Remote` keyed by the *worker's own* session id (no separate local id
-    /// needed on top of it).
+    /// needed on top of it). Also opens this session's own keep-alive
+    /// connection (`remote_keepalives`) right away — the worker otherwise
+    /// has no way to know this session is still wanted the moment this
+    /// call returns and no `debug_send` is yet in flight.
     async fn debug_start_remote(
         &self,
         port: u16,
@@ -686,6 +711,10 @@ impl MeshfoxMcp {
             session_id.clone(),
             DebugHandle::Remote { port, session_id: session_id.clone() },
         );
+        self.remote_keepalives
+            .lock()
+            .await
+            .insert(session_id.clone(), crate::worker_client::hold_watch_connection(port));
         Ok(CallToolResult::structured(json!({
             "session_id": session_id,
             "node_id": params.node_id,
@@ -736,6 +765,7 @@ impl MeshfoxMcp {
         };
         if session_ended {
             self.sessions.lock().await.remove(&params.session_id);
+            self.stop_remote_keepalive(&params.session_id).await;
         }
         Ok(CallToolResult::structured(json!({
             "stdout": stdout,
@@ -752,6 +782,7 @@ impl MeshfoxMcp {
         Parameters(params): Parameters<DebugStopParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let removed = self.sessions.lock().await.remove(&params.session_id);
+        self.stop_remote_keepalive(&params.session_id).await;
         match removed {
             Some(DebugHandle::Local(session)) => {
                 session.lock().await.stop().await;

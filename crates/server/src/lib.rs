@@ -61,6 +61,9 @@ mod seq_log;
 /// Sequenced broadcast log backing `/api/watch` — see its own module doc
 /// comment.
 mod canvas_events;
+/// Per-canvas undo/redo history — recording + rotation only so far, see its
+/// own module doc comment.
+mod undo_log;
 /// `pub` so `meshfox-cli` can reuse the same async spawn/kill primitives
 /// for `meshfox run`'s real-time output — see its `main.rs`.
 pub mod stream_exec;
@@ -141,6 +144,12 @@ struct AppState {
     /// tell "nothing missed" from "do a full resync" instead of just
     /// resuming blind. See `canvas_events`'s own module doc comment.
     canvas_events: canvas_events::CanvasEventLog,
+    /// Per-canvas undo/redo history — see `undo_log`'s own module doc
+    /// comment. `save_with_event` records every successful write here
+    /// (`record_undo`); `spawn_file_watcher` and `build_state`'s own
+    /// startup check record an external edit the same way whenever the
+    /// file changed without going through this `AppState` at all.
+    undo_log: undo_log::UndoLog,
     /// Whether the process should exit on its own once every `/api/watch`
     /// connection has gone (see `TabGuard`) — off for e.g. the e2e test
     /// server, which cycles through pages with brief all-tabs-closed gaps
@@ -239,10 +248,94 @@ impl AppState {
     /// exactly like `save` — `event` only changes what gets broadcast, not
     /// what gets persisted.
     fn save_with_event(&self, raw: &str, event: ServerEvent) -> std::io::Result<()> {
+        let old_raw = self.raw.lock().unwrap().clone();
         std::fs::write(&self.canvas_path, raw)?;
         *self.raw.lock().unwrap() = raw.to_string();
+        record_undo(self, &old_raw, raw, &event);
         self.canvas_events.push(event);
         Ok(())
+    }
+}
+
+/// Builds this write's own undo-history entry from `(old_raw, new_raw,
+/// event)` alone — no mutating handler above needs to hand over anything
+/// extra, since `event` already says which of the four shapes this write
+/// is (see `ServerEvent`'s own doc comment) and `old_raw` already has
+/// whatever "before" state that shape needs, a plain `mdcanvas::parse`
+/// away. See `undo_log`'s own module doc comment for the two payload
+/// shapes. Best-effort: a failure here is logged, never lets a successful
+/// save fail or roll back — the file write it's recording already
+/// succeeded by the time this runs.
+fn record_undo(state: &AppState, old_raw: &str, new_raw: &str, event: &ServerEvent) {
+    if old_raw == new_raw {
+        return;
+    }
+    let (op_kind, payload) = match event {
+        ServerEvent::NodeUpserted { node } => {
+            let before = mdcanvas::parse(old_raw)
+                .ok()
+                .and_then(|c| c.node(&node.id).cloned());
+            (
+                "node_upserted",
+                undo_log::Payload::Diff(serde_json::json!({
+                    "nodeId": node.id,
+                    "before": before,
+                    "after": node.as_ref(),
+                })),
+            )
+        }
+        ServerEvent::NodeRemoved { node_id, .. } => {
+            let old_canvas = mdcanvas::parse(old_raw).ok();
+            let parent_id = old_canvas
+                .as_ref()
+                .and_then(|c| c.node(node_id))
+                .and_then(|n| n.parent.clone());
+            let fragment = mdcanvas::node_subtree_fragment(old_raw, node_id);
+            (
+                "node_removed",
+                undo_log::Payload::Diff(serde_json::json!({
+                    "nodeId": node_id,
+                    "parentId": parent_id,
+                    "fragment": fragment,
+                })),
+            )
+        }
+        ServerEvent::NodesReordered { parent_id, child_ids } => {
+            let before: Vec<String> = mdcanvas::parse(old_raw)
+                .ok()
+                .map(|c| {
+                    c.nodes
+                        .iter()
+                        .filter(|n| n.parent.as_deref() == Some(parent_id.as_str()))
+                        .map(|n| n.id.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            (
+                "nodes_reordered",
+                undo_log::Payload::Diff(serde_json::json!({
+                    "parentId": parent_id,
+                    "before": before,
+                    "after": child_ids,
+                })),
+            )
+        }
+        // `Changed`, and any future variant this doesn't know about yet —
+        // the same "document-wide, rare, or not worth a bespoke shape"
+        // bucket as `rename_node_id`/`clear_node_id`/`remove_node?children=
+        // reparent`/raw `PUT /api/canvas/raw`, plus every endpoint that
+        // isn't one of the three node-scoped shapes above at all
+        // (`put_canvas`, `put_options`, `reorder_siblings`, `clear_layout`,
+        // the run-output cache save) — all of them already emit `Changed`
+        // today, so they land here automatically, with no call site of
+        // their own needing to know this exists.
+        _ => (
+            "raw_replace",
+            undo_log::Payload::Raw { before: old_raw },
+        ),
+    };
+    if let Err(e) = state.undo_log.push(op_kind, payload, new_raw) {
+        eprintln!("meshfox: failed to record undo history for {op_kind} ({e})");
     }
 }
 
@@ -328,6 +421,55 @@ fn has_running_services(state: &AppState) -> bool {
         .any(|s| matches!(s.status(), services::ServiceStatus::Running))
 }
 
+/// True if any run (plain, `tty`, or a `file`-node's own run — every one of
+/// `run_file_node_impl`/`run_block_impl`/`run_block_tty`) is currently
+/// mid-stream — consulted by both `TabGuard`'s auto-exit re-check and
+/// `spawn_api_idle_checker`, same reasoning `has_running_services` already
+/// gets both places for. `state.runs`'s own entry for a run lives from
+/// just before its `async_stream::stream!` generator is even constructed
+/// to `RunGuard`'s own `Drop`, "however it ends" (see that struct's own
+/// doc comment) — the run's *real* lifetime, not how long its handler
+/// function took to return, which for a streaming NDJSON/WebSocket body is
+/// almost immediate (the actual work happens later, as the stream is
+/// polled, entirely outside `touch_api_activity`'s own
+/// `next.run(req).await`, so `last_api_activity_millis` alone goes stale
+/// the instant a real run starts). Without this, a worker-routed `meshfox
+/// run` of anything slower than `AUTO_EXIT_GRACE` (10s) — confirmed live,
+/// a `cargo build --release` well past that — got its own worker killed by
+/// `spawn_api_idle_checker` mid-build the moment no browser tab was open
+/// to mask it (a bare CLI invocation never opens `/api/watch` at all),
+/// taking the build down with it and leaving its own `service_lock` file
+/// stale (the process holding it never reached its own release code) —
+/// exactly the "already running elsewhere" conflict a *later* run of the
+/// same block then hit against a pid that no longer existed.
+///
+/// Covers a `tty` step only for as long as *some* connection to it is still
+/// open (`state.runs`'s own entry is tied to one connection's own stream,
+/// dropped the moment that connection ends) — a `tty` session's whole
+/// point is to outlive that (see `tty_registry`'s own module doc comment:
+/// "closing one viewer's tab no longer ends the session"), so a session
+/// nobody's currently watching needs its own check —
+/// `has_running_tty_sessions`, right below.
+fn has_active_runs(state: &AppState) -> bool {
+    !state.runs.lock().unwrap().is_empty()
+}
+
+/// True if any `tty` session this process has ever spawned is still
+/// `Running` — same role `has_running_services` plays for `service`
+/// blocks, for the same reason: a `tty` session is deliberately designed
+/// to survive every viewer disconnecting (`tty_registry`'s own module doc
+/// comment — that's what makes a later `/api/run/tty/attach` reconnect
+/// meaningful at all), so unlike a plain run, its liveness can't be read
+/// off `state.runs` once the connection that started it is gone.
+fn has_running_tty_sessions(state: &AppState) -> bool {
+    state
+        .tty_registry
+        .lock()
+        .unwrap()
+        .values()
+        .any(|s| matches!(s.outcome(), tty_registry::RunOutcome::Running))
+}
+
 impl Drop for TabGuard {
     fn drop(&mut self) {
         let remaining = self.state.open_tabs.fetch_sub(1, Ordering::SeqCst) - 1;
@@ -338,7 +480,11 @@ impl Drop for TabGuard {
             let state = Arc::clone(&self.state);
             tokio::spawn(async move {
                 tokio::time::sleep(AUTO_EXIT_GRACE).await;
-                if state.open_tabs.load(Ordering::SeqCst) == 0 && !has_running_services(&state) {
+                if state.open_tabs.load(Ordering::SeqCst) == 0
+                    && !has_running_services(&state)
+                    && !has_active_runs(&state)
+                    && !has_running_tty_sessions(&state)
+                {
                     println!("meshfox: last open tab closed, exiting");
                     std::process::exit(0);
                 }
@@ -400,8 +546,12 @@ async fn touch_api_activity(State(state): State<Arc<AppState>>, req: Request, ne
 /// connect and is now waiting on `TabGuard`'s own tab-close-triggered path
 /// (`ever_connected` true, `last_api_activity_millis` still `0`) is left
 /// alone by the second condition too — that path already owns exiting it.
-/// Both conditions back off for a running `service` block, same as
-/// `TabGuard`'s own check.
+/// Both conditions back off for a running `service` block or any other
+/// in-flight run, same as `TabGuard`'s own check (see `has_active_runs`'s
+/// own doc comment for why this matters even more here: a worker-routed
+/// CLI run never opens `/api/watch` at all, so it has no tab to keep
+/// `open_tabs` nonzero while it runs — this check is the *only* thing that
+/// would otherwise stand between a slow run and this timer killing it).
 fn spawn_api_idle_checker(state: Arc<AppState>) {
     spawn_api_idle_checker_with_config(state, AUTO_EXIT_POLL_INTERVAL, AUTO_EXIT_GRACE, untouched_worker_timeout())
 }
@@ -422,7 +572,11 @@ fn spawn_api_idle_checker_with_config(
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(poll_interval).await;
-            if state.open_tabs.load(Ordering::SeqCst) != 0 || has_running_services(&state) {
+            if state.open_tabs.load(Ordering::SeqCst) != 0
+                || has_running_services(&state)
+                || has_active_runs(&state)
+                || has_running_tty_sessions(&state)
+            {
                 continue;
             }
             let last = state.last_api_activity_millis.load(Ordering::Relaxed);
@@ -499,8 +653,14 @@ fn spawn_file_watcher(state: Arc<AppState>) {
             };
             let mut raw = state.raw.lock().unwrap();
             if *raw != contents {
-                *raw = contents;
+                let old_raw = std::mem::replace(&mut *raw, contents.clone());
                 drop(raw);
+                if let Err(e) = state
+                    .undo_log
+                    .push("external_edit", undo_log::Payload::Raw { before: &old_raw }, &contents)
+                {
+                    eprintln!("meshfox: failed to record undo history for an external edit ({e})");
+                }
                 state.canvas_events.push(ServerEvent::Changed);
             }
         }
@@ -2900,19 +3060,19 @@ fn is_canvas_file(path: &std::path::Path) -> bool {
                 .is_ok_and(|contents| meshfox_core::mdcanvas::has_marker(&contents)))
 }
 
-/// Opens a `file` node's target — the web UI's "↗ open" button. Always
-/// `204`, fire-and-forget from the caller's own point of view (the client
-/// never gets a URL — or a success/failure of the open itself — back to
-/// act on any more, see `crate::watcher_protocol`'s own doc comment for
-/// why): both a plain file and a `.canvas.md` (or marker-carrying `.md`)
-/// target are handed to this worker's own coordinator
-/// (`watcher_protocol::request_open`/`request_open_file`) — get-or-spawn-
-/// and-show for a canvas, "open however this coordinator opens plain
-/// files" for anything else, entirely that coordinator's decision either
-/// way (the OS's default application for `crate::cli`'s own watcher and the
-/// macOS daemon, a fresh editor tab for the VS Code extension's). No
-/// coordinator reachable *is* the one thing this endpoint reports as a real
-/// error, since without one there's nobody left to open anything at all.
+/// Opens a `file` node's target — the web UI's "↗ open" button. `204` once
+/// the coordinator confirms it actually opened something (see
+/// `crate::watcher_protocol`'s own doc comment for why `Open`/`OpenFile`
+/// get a real reply now, not just a fire-and-forget request); both a plain
+/// file and a `.canvas.md` (or marker-carrying `.md`) target are handed to
+/// this worker's own coordinator (`watcher_protocol::request_open`/
+/// `request_open_file`) — get-or-spawn-and-show for a canvas, "open
+/// however this coordinator opens plain files" for anything else, entirely
+/// that coordinator's decision either way (the OS's default application
+/// for `crate::cli`'s own watcher and the macOS daemon, a fresh editor tab
+/// for the VS Code extension's). No coordinator reachable, or one that's
+/// reachable but failed to actually open anything (a malformed target
+/// canvas, say), both surface here as a real `500`.
 async fn open_node_file(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -6729,6 +6889,18 @@ async fn build_state(
 
     let vars_cache = VarCache::load(&canvas_path)?;
 
+    // Detect a file that changed while nothing was tracking it — another
+    // process's own worker, a text editor, or a worker-less CLI invocation
+    // (see `worker_client.rs`'s own doc comment for when CLI/MCP falls back
+    // to editing the file directly) — *before* this worker starts serving
+    // anything, so that edit lands in history instead of silently becoming
+    // this session's own new baseline. See `undo_log`'s own module doc
+    // comment.
+    let undo_log = undo_log::UndoLog::open(&canvas_path)?;
+    if let Err(e) = undo_log.reconcile_startup_drift(&raw) {
+        eprintln!("meshfox: failed to check {} for external edits at startup ({e})", canvas_path.display());
+    }
+
     Ok(Arc::new(AppState {
         canvas_path,
         raw: Mutex::new(raw),
@@ -6738,6 +6910,7 @@ async fn build_state(
         ever_connected: AtomicBool::new(false),
         last_api_activity_millis: AtomicU64::new(0),
         canvas_events: canvas_events::CanvasEventLog::new(),
+        undo_log,
         auto_exit,
         link_preview_cache: link_preview::PreviewCache::new(),
         session_runs: Mutex::new(HashMap::new()),
@@ -7406,6 +7579,217 @@ mod node_op_broadcast_tests {
             ServerEvent::Changed => {}
             other => panic!("expected a Changed fallback, got {other:?}"),
         }
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+}
+
+/// `crate::undo_log`'s own recording hook (`record_undo`, inside
+/// `AppState::save_with_event`) — one history row per mutation, in the
+/// right shape for its `ServerEvent` kind, plus the two external-edit
+/// paths (`spawn_file_watcher`'s live poll and `build_state`'s own startup
+/// check). Same direct-call-the-handler-and-inspect-afterward pattern
+/// `node_op_broadcast_tests` above uses, just asserting on
+/// `state.undo_log.history(...)` instead of the broadcast.
+#[cfg(test)]
+mod undo_log_recording_tests {
+    use super::*;
+
+    fn write_test_canvas(contents: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("meshfox-undo-log-test-{}.canvas.md", uuid::Uuid::new_v4()));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    const TWO_SIBLINGS: &str = concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "## A\n<!-- meshfox:node id=\"a\" -->\n\nbody a\n\n",
+        "## B\n<!-- meshfox:node id=\"b\" -->\n\nbody b\n",
+    );
+
+    #[tokio::test]
+    async fn create_node_records_a_node_upserted_diff_with_no_before() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None).await.expect("valid test canvas");
+
+        let req = CreateNodeRequest { parent_id: "root".to_string(), title: "New Child".to_string(), title_slug_id: false };
+        let _ = create_node(State(state.clone()), Json(req)).await.expect("create should succeed");
+
+        let history = state.undo_log.history(10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].op_kind, "node_upserted");
+        let diff: serde_json::Value = serde_json::from_str(history[0].diff_json.as_ref().unwrap()).unwrap();
+        assert!(diff["before"].is_null());
+        assert_eq!(diff["after"]["title"], "New Child");
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn update_node_records_a_node_upserted_diff_with_before_and_after() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None).await.expect("valid test canvas");
+
+        let req = UpdateNodeRequest {
+            title: None, node_type: None, color: None, target: None,
+            text: Some("new body a".to_string()), extra_parents: None,
+            display: None, lang: None, interpreter: None, preview: None,
+            tags: None, edge_label: None, fold: None,
+            x: None, y: None, width: None, height: None, created_at: None,
+        };
+        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req))
+            .await
+            .expect("update should succeed");
+
+        let history = state.undo_log.history(10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].op_kind, "node_upserted");
+        let diff: serde_json::Value = serde_json::from_str(history[0].diff_json.as_ref().unwrap()).unwrap();
+        assert_eq!(diff["before"]["text"], "body a");
+        assert_eq!(diff["after"]["text"], "new body a");
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn remove_node_records_the_deleted_subtrees_own_fragment() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None).await.expect("valid test canvas");
+
+        let _ = remove_node(State(state.clone()), Path("a".to_string()), Query(DeleteNodeQuery { children: None }))
+            .await
+            .expect("remove should succeed");
+
+        let history = state.undo_log.history(10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].op_kind, "node_removed");
+        let diff: serde_json::Value = serde_json::from_str(history[0].diff_json.as_ref().unwrap()).unwrap();
+        assert_eq!(diff["parentId"], "root");
+        assert!(diff["fragment"].as_str().unwrap().contains("body a"));
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn move_sibling_records_the_sibling_order_before_and_after() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None).await.expect("valid test canvas");
+
+        let req = MoveSiblingRequest { before: None, after: Some("b".to_string()) };
+        let _ = move_sibling(State(state.clone()), Path("a".to_string()), Json(req))
+            .await
+            .expect("move should succeed");
+
+        let history = state.undo_log.history(10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].op_kind, "nodes_reordered");
+        let diff: serde_json::Value = serde_json::from_str(history[0].diff_json.as_ref().unwrap()).unwrap();
+        assert_eq!(diff["before"], serde_json::json!(["a", "b"]));
+        assert_eq!(diff["after"], serde_json::json!(["b", "a"]));
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn rename_node_id_records_a_raw_replace() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None).await.expect("valid test canvas");
+
+        let req = RenameNodeIdRequest { new_id: "a-renamed".to_string() };
+        let _ = rename_node_id(State(state.clone()), Path("a".to_string()), Json(req))
+            .await
+            .expect("rename should succeed");
+
+        let history = state.undo_log.history(10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].op_kind, "raw_replace");
+        assert!(history[0].diff_json.is_none());
+        assert!(history[0].raw_before.as_ref().unwrap().contains("id=\"a\""));
+        assert!(history[0].raw_after.as_ref().unwrap().contains("id=\"a-renamed\""));
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn a_no_op_save_records_nothing() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None).await.expect("valid test canvas");
+
+        // Same content back — `save_with_event` should see old_raw == raw
+        // and skip recording entirely, not just skip broadcasting.
+        let raw = state.raw.lock().unwrap().clone();
+        state.save(&raw).unwrap();
+
+        assert!(state.undo_log.history(10).unwrap().is_empty());
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn an_external_edit_noticed_live_by_the_file_watcher_is_recorded() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None).await.expect("valid test canvas");
+        spawn_file_watcher(state.clone());
+        // Give the watcher's own OS thread a chance to actually start and
+        // capture its baseline mtime before the write below — otherwise
+        // this is a genuine race: if the thread hasn't run yet by the time
+        // the write below lands, it captures the *already-edited* mtime as
+        // its own starting point and never notices this specific edit at
+        // all (not a concern in production, where `spawn_file_watcher`
+        // always runs well before anything external could touch the file
+        // this soon after `build_state`).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Write different content directly, bypassing `AppState` entirely
+        // — the same way an unrelated editor or a worker-less CLI
+        // invocation would (the watcher diffs content, not mtime alone,
+        // see its own doc comment, so no need to fake a timestamp).
+        std::fs::write(&canvas_path, TWO_SIBLINGS.replace("body a", "body a EDITED EXTERNALLY")).unwrap();
+
+        // The watcher polls every 500ms; give it a few cycles.
+        let mut history = state.undo_log.history(10).unwrap();
+        for _ in 0..20 {
+            if !history.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            history = state.undo_log.history(10).unwrap();
+        }
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].op_kind, "external_edit");
+        assert!(history[0].raw_before.as_ref().unwrap().contains("body a\n"));
+        assert!(history[0].raw_after.as_ref().unwrap().contains("body a EDITED EXTERNALLY"));
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn a_file_edited_before_the_worker_ever_started_is_recorded_at_startup() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+
+        // First "session": build state once (seeds undo_meta.last_raw),
+        // then drop it — nothing else touches the sqlite file after this.
+        let _ = build_state(canvas_path.clone(), false, None).await.expect("valid test canvas");
+
+        // Simulate a worker-less CLI edit (or another program) touching
+        // the file directly while nothing was tracking it.
+        std::fs::write(
+            &canvas_path,
+            TWO_SIBLINGS.replace("body b", "body b EDITED WHILE NO WORKER RAN"),
+        )
+        .unwrap();
+
+        // Second "session" — `build_state`'s own startup check should
+        // catch the drift before returning.
+        let state = build_state(canvas_path.clone(), false, None).await.expect("valid test canvas");
+        let history = state.undo_log.history(10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].op_kind, "external_edit");
+        assert!(history[0]
+            .raw_after
+            .as_ref()
+            .unwrap()
+            .contains("body b EDITED WHILE NO WORKER RAN"));
 
         let _ = std::fs::remove_file(&canvas_path);
     }

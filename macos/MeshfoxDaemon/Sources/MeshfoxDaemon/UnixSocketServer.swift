@@ -39,6 +39,15 @@ final class UnixSocketServer {
     private let path: String
     private let onLine: (String) -> Void
     private let onGetPort: (String, @escaping (PortReply) -> Void) -> Void
+    /// `.open`'s own handler: canvas path, optional deep-link fragment,
+    /// completion. Like `onGetPort`, replies on the same connection instead
+    /// of falling through to `onLine` — see `watcher_protocol.rs`'s own
+    /// doc comment for why `Open` stopped being fire-and-forget.
+    private let onOpen: (String, String?, @escaping (AckReply) -> Void) -> Void
+    /// `.openFile`'s own handler — same reply-on-the-same-connection
+    /// treatment as `onOpen`, just with no fragment/spawn-and-wait
+    /// lifecycle to speak of.
+    private let onOpenFile: (String, @escaping (AckReply) -> Void) -> Void
     private var listenFD: Int32 = -1
     /// Whether `listenFD` is a socket this instance itself created (own
     /// `path` file, safe — and necessary — to `unlink` in `stop()`) versus
@@ -51,11 +60,15 @@ final class UnixSocketServer {
     init(
         path: String,
         onLine: @escaping (String) -> Void,
-        onGetPort: @escaping (String, @escaping (PortReply) -> Void) -> Void
+        onGetPort: @escaping (String, @escaping (PortReply) -> Void) -> Void,
+        onOpen: @escaping (String, String?, @escaping (AckReply) -> Void) -> Void,
+        onOpenFile: @escaping (String, @escaping (AckReply) -> Void) -> Void
     ) {
         self.path = path
         self.onLine = onLine
         self.onGetPort = onGetPort
+        self.onOpen = onOpen
+        self.onOpenFile = onOpenFile
     }
 
     enum ServerError: Error, CustomStringConvertible {
@@ -204,6 +217,23 @@ final class UnixSocketServer {
         startAcceptLoop()
     }
 
+    /// `errno`s from a failed `accept()` that mean "this one connection
+    /// attempt fell through, the listening socket itself is still fine" —
+    /// retry the call rather than tearing down the whole loop over it.
+    /// `EINTR` (a signal interrupted the call) is the textbook case;
+    /// `ECONNABORTED`/`EPROTO` are the same idea for a TCP-style abort
+    /// landing on a Unix domain socket — a client that reset the
+    /// connection between the kernel queuing it and this thread's own
+    /// `accept()` picking it up, nothing wrong with `listenFD` itself (see
+    /// Stevens' *UNIX Network Programming*, and confirmed live: this
+    /// daemon's own `errno=53` — `ECONNABORTED` — reliably killed the loop
+    /// after a single client turnover, taking every later `meshfox view`
+    /// down with it since nothing was left running `accept()` at all, with
+    /// no restart until the whole app was quit and reopened by hand).
+    private static func isRetryableAcceptError(_ e: Int32) -> Bool {
+        e == EINTR || e == ECONNABORTED || e == EPROTO
+    }
+
     private func acceptLoop() {
         FileHandle.standardError.write(
             "meshfox-daemon: accept loop starting on fd=\(listenFD)\n".data(using: .utf8)!
@@ -211,13 +241,19 @@ final class UnixSocketServer {
         while true {
             let clientFD = accept(listenFD, nil, nil)
             if clientFD < 0 {
-                // EINTR: a signal interrupted the call, just retry. Any
-                // other error (most likely EBADF, from `stop()` closing
+                let failedErrno = errno
+                if Self.isRetryableAcceptError(failedErrno) {
+                    FileHandle.standardError.write(
+                        "meshfox-daemon: accept() on fd=\(listenFD) hit a transient errno=\(failedErrno) (\(Self.errnoString())) — retrying\n"
+                            .data(using: .utf8)!
+                    )
+                    continue
+                }
+                // Anything else (most likely EBADF, from `stop()` closing
                 // the listening socket out from under this loop) means
-                // there's nothing left to accept.
-                if errno == EINTR { continue }
+                // there's genuinely nothing left to accept.
                 FileHandle.standardError.write(
-                    "meshfox-daemon: accept() failed on fd=\(listenFD), errno=\(errno) (\(Self.errnoString())) — accept loop exiting\n"
+                    "meshfox-daemon: accept() failed on fd=\(listenFD), errno=\(failedErrno) (\(Self.errnoString())) — accept loop exiting\n"
                         .data(using: .utf8)!
                 )
                 break
@@ -256,14 +292,24 @@ final class UnixSocketServer {
             if foundLine == nil, let newlineIndex = data.firstIndex(of: 0x0A) {
                 let lineData = data[data.startIndex..<newlineIndex]
                 foundLine = String(data: lineData, encoding: .utf8)
-                // `get_port` alone gets a reply, and its own client never
-                // shuts down its write half waiting for one — looping on
-                // for an EOF that's never coming would just hang this
-                // thread. Every other op still falls through to the
-                // EOF-then-`onLine` path below, unchanged.
-                if let line = foundLine, case let .getPort(canvasPath)? = WatcherMessage.parse(line: line) {
+                // `get_port`/`open`/`open_file` all get a reply, and none
+                // of their clients shut down their own write half waiting
+                // for one (`request_and_await_reply` on the Rust side keeps
+                // it open) — looping on for an EOF that's never coming
+                // would just hang this thread. `ready` alone still falls
+                // through to the EOF-then-`onLine` path below, unchanged.
+                switch foundLine.flatMap(WatcherMessage.parse(line:)) {
+                case .getPort(let canvasPath):
                     replyToGetPort(fd: fd, canvasPath: canvasPath)
                     return
+                case .open(let canvasPath, let fragment):
+                    replyToOpen(fd: fd, canvasPath: canvasPath, fragment: fragment)
+                    return
+                case .openFile(let path):
+                    replyToOpenFile(fd: fd, path: path)
+                    return
+                case .ready, nil:
+                    break
                 }
             }
         }
@@ -284,6 +330,39 @@ final class UnixSocketServer {
             semaphore.signal()
         }
         semaphore.wait()
+        writeReply(fd: fd, reply: reply)
+    }
+
+    /// Same shape as `replyToGetPort`, for `.open` — blocks on `onOpen`'s
+    /// own completion (`SessionStore.openCanvas`, which may itself wait on
+    /// a freshly-spawned worker's `Ready`, same as `getPort` does) before
+    /// replying.
+    private func replyToOpen(fd: Int32, canvasPath: String, fragment: String?) {
+        let semaphore = DispatchSemaphore(value: 0)
+        var reply: AckReply = .error("no response")
+        onOpen(canvasPath, fragment) { result in
+            reply = result
+            semaphore.signal()
+        }
+        semaphore.wait()
+        writeReply(fd: fd, reply: reply)
+    }
+
+    /// Same shape again, for `.open_file` — `onOpenFile` (`SessionStore.
+    /// openFile`) has no spawn-and-wait lifecycle, so this typically
+    /// returns almost immediately.
+    private func replyToOpenFile(fd: Int32, path: String) {
+        let semaphore = DispatchSemaphore(value: 0)
+        var reply: AckReply = .error("no response")
+        onOpenFile(path) { result in
+            reply = result
+            semaphore.signal()
+        }
+        semaphore.wait()
+        writeReply(fd: fd, reply: reply)
+    }
+
+    private func writeReply<T: Encodable>(fd: Int32, reply: T) {
         guard var replyData = try? JSONEncoder().encode(reply) else { return }
         replyData.append(0x0A)
         replyData.withUnsafeBytes { raw in

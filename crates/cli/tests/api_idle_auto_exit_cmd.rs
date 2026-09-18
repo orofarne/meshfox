@@ -178,6 +178,142 @@ fn a_worker_with_no_traffic_at_all_does_not_auto_exit() {
 /// actually calls anything, or an `Open` never gets followed by a browser
 /// actually loading. Shrinks `MESHFOX_TEST_UNTOUCHED_TIMEOUT_SECS` so this
 /// doesn't have to wait out the real 5-minute default.
+/// The bug this guards against, found live: `touch_api_activity`
+/// (`crates/server/src/lib.rs`) marks activity exactly once, at a run's own
+/// WebSocket-upgrade request — for a run whose real work happens *inside*
+/// its `async_stream::stream!` generator (see `has_active_runs`'s own doc
+/// comment), that single touch goes stale the instant the run itself takes
+/// longer than `AUTO_EXIT_GRACE` (10s), with no browser tab open to keep
+/// `open_tabs` nonzero (a bare worker-routed `meshfox run` never opens
+/// `/api/watch` at all). Before `has_active_runs` backed off this checker
+/// for an in-flight run, this exact test would have seen its own worker
+/// killed mid-`sleep`, taking the run (and, in the real incident, a
+/// `cargo build`'s own `service_lock` file) down with it.
+#[tokio::test]
+async fn a_worker_with_a_long_running_run_in_flight_does_not_auto_exit() {
+    use futures_util::StreamExt;
+
+    let dir = unique_dir();
+    let canvas_path = dir.join("base.canvas.md");
+    // 18s comfortably clears AUTO_EXIT_GRACE (10s) + AUTO_EXIT_POLL_INTERVAL
+    // (5s) — the old bug had time to fire well before this step's own
+    // stream would ever end.
+    std::fs::write(
+        &canvas_path,
+        concat!(
+            "<!-- meshfox:canvas -->\n# Base\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```bash name=\"slow\"\nsleep 18\necho done\n```\n",
+        ),
+    )
+    .unwrap();
+
+    let (mut worker, port) = spawn_worker(&dir, &canvas_path);
+
+    let url = format!("ws://127.0.0.1:{port}/api/run?block=slow");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+
+    // Drain events until the run's own terminal `Done` arrives — proves
+    // the worker survived the *whole* ~18s run, not just some arbitrary
+    // earlier instant. The per-message timeout has to clear the sleep
+    // itself (there's no output at all in between `step-start` and
+    // `step-end`/`done`), not just a normal "did anything arrive" check.
+    let mut saw_done = false;
+    while let Ok(Some(Ok(msg))) = tokio::time::timeout(Duration::from_secs(25), ws.next()).await {
+        if let Ok(text) = msg.into_text() {
+            if text.contains("\"type\":\"done\"") {
+                saw_done = true;
+                break;
+            }
+        }
+    }
+    let _ = ws.close(None).await;
+    assert!(saw_done, "the run should have completed with a Done event");
+
+    // The worker itself must still be alive right after — the whole point
+    // of this test. A brief grace window in case the process is still
+    // tearing down its own WebSocket connection.
+    let survived = !exited_within(&mut worker, Duration::from_secs(2));
+    kill(worker);
+    assert!(
+        survived,
+        "the worker should still have been running immediately after its own long run finished"
+    );
+}
+
+/// The sharper edge of the same bug, once `has_active_runs` alone fixed
+/// the plain-run case above: a `tty` session is deliberately designed to
+/// outlive the connection that started it (`tty_registry`'s own module doc
+/// comment — that's the whole point of `/api/run/tty/attach` letting a
+/// *different* connection reconnect to it later), so `state.runs`'s own
+/// entry — tied to one connection's own stream, not the session itself —
+/// disappears the instant this test's own WebSocket closes, well before
+/// the underlying pty process actually exits. Without `has_running_tty_
+/// sessions` also backing off the idle checker, that gap would let it kill
+/// the whole worker (and the still-running pty) the moment nobody happens
+/// to be watching, even though a later `/api/run/tty/attach` could have
+/// reconnected to it just fine.
+#[tokio::test]
+async fn a_worker_with_a_tty_session_outliving_its_own_connection_does_not_auto_exit() {
+    use futures_util::StreamExt;
+
+    let dir = unique_dir();
+    let canvas_path = dir.join("base.canvas.md");
+    // Long enough that it's still `Running` well past when this test's own
+    // connection closes and the idle checker gets a few chances to fire.
+    std::fs::write(
+        &canvas_path,
+        concat!(
+            "<!-- meshfox:canvas -->\n# Base\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```bash name=\"slow-tty\" tty\nsleep 18\necho done\n```\n",
+        ),
+    )
+    .unwrap();
+
+    let (mut worker, port) = spawn_worker(&dir, &canvas_path);
+
+    let url = format!("ws://127.0.0.1:{port}/api/run/tty?block=slow-tty&cols=80&rows=24");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+
+    // Wait for `tty-start` specifically — proof the session is actually
+    // registered in `tty_registry` (not just that the run itself started)
+    // before this test disconnects out from under it.
+    let mut saw_tty_start = false;
+    while let Ok(Some(Ok(msg))) = tokio::time::timeout(Duration::from_secs(10), ws.next()).await {
+        if let Ok(text) = msg.into_text() {
+            if text.contains("\"type\":\"tty-start\"") {
+                saw_tty_start = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_tty_start, "the tty session should have started");
+
+    // Simulate closing the tab: drop the connection entirely, well before
+    // the pty's own ~18s script finishes.
+    drop(ws);
+
+    // Past AUTO_EXIT_GRACE + AUTO_EXIT_POLL_INTERVAL at least twice over,
+    // with no connection of any kind open to this worker — exactly the
+    // window the old bug would have killed it in.
+    let survived = !exited_within(&mut worker, Duration::from_secs(16));
+    kill(worker);
+    assert!(
+        survived,
+        "the worker should still be running while its own tty session (nobody currently watching) is still active"
+    );
+}
+
+// `debug_send`'s own case (a plain, non-streaming handler that genuinely
+// blocks for its whole command) is deliberately *not* covered here: unlike
+// `run`/`tty`, whose liveness is a real fact this worker itself can check
+// (`state.runs`/`tty_registry`), a bare `POST /api/debug/send` has no such
+// registry of its own to consult — a caller resolving that gap by holding
+// its own connection open for as long as it's using the session (the same
+// signal a browser tab already gives via `/api/watch`) belongs in that
+// caller, not here. See `crate::mcp`'s own `DebugHandle::Remote` for where
+// that's actually done — `has_open_tabs`/`TabGuard` already covers it once
+// that connection exists, no separate check needed in this file.
+
 #[test]
 fn a_worker_with_no_traffic_at_all_still_exits_after_the_untouched_timeout() {
     let dir = unique_dir();

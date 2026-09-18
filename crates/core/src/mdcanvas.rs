@@ -1872,6 +1872,25 @@ pub fn delete_node(markdown: &str, node_id: &str) -> Option<String> {
     Some(result)
 }
 
+/// `node_id`'s own verbatim subtree span — its heading plus every
+/// descendant, exactly the byte range [`delete_node`] itself computes
+/// before splicing it out, exposed read-only for a caller that needs to
+/// remember what a deletion is about to remove (undo history) without
+/// re-deriving the same span-finding logic itself. `None` if `node_id`
+/// doesn't exist or `markdown` doesn't parse.
+pub fn node_subtree_fragment(markdown: &str, node_id: &str) -> Option<String> {
+    let segments = scan(markdown);
+    let ids = assign_ids(&segments).ok()?;
+    let parents = resolve_parent_ids(&segments, &ids).ok()?;
+    let idx = ids.iter().position(|id| id == node_id)?;
+
+    let start = segments[idx].heading_span.start;
+    let end = subtree_end_idx(&ids, &parents, idx)
+        .map(|j| segments[j].heading_span.start)
+        .unwrap_or(markdown.len());
+    Some(markdown[start..end].to_string())
+}
+
 /// Reorders every parent's direct (structural) children to match their
 /// canvas layout — sorted by `y`, then `x` among ties — without touching
 /// heading depth, any node's own content, or extra (`meshfox:edge`) parents,

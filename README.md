@@ -33,6 +33,20 @@ Status: **early bootstrap**.
 
 This document is itself a valid meshfox canvas — every `##` section here is a node, nested under this root. See [SPEC.md](./SPEC.md) for more details.
 
+## v1.0.0
+<!-- meshfox:node id="v1-0-0" -->
+
+Rough checklist for what's needed before a 1.0.0 release:
+
+- [ ] Linux server support
+- [ ] Persistent sessions (runs/services/tty survive a core restart)
+- [ ] Undo/redo
+- [ ] Full canvas-geometry support in the TUI
+- [ ] A unified interface for external renderers
+- [ ] LaTeX, Vega, Mermaid/PlantUML sub-render support
+- [ ] Conflict resolution for concurrent editing
+- [ ] Encryption for stored secrets
+
 ## Concept
 <!-- meshfox:node id="concept" -->
 

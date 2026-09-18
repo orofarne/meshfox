@@ -94,3 +94,30 @@ extension PortReply: Encodable {
         }
     }
 }
+
+/// The one JSON line written back after an `.open`/`.openFile` request —
+/// mirrors the Rust side's own `AckResponse`: `{}` on success,
+/// `{"error": "..."}` on failure. See `UnixSocketServer`'s own handling of
+/// those two cases for where this gets written, and
+/// `watcher_protocol.rs`'s own doc comment for why they get a reply at all
+/// now (they used to be fire-and-forget).
+enum AckReply {
+    case ok
+    case error(String)
+}
+
+extension AckReply: Encodable {
+    private enum CodingKeys: String, CodingKey {
+        case error
+    }
+
+    /// `.ok` encodes nothing into the keyed container at all — an empty
+    /// keyed container is exactly `{}` once `JSONEncoder` renders it,
+    /// matching the Rust side's own `AckResponse::Ok {}`.
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        if case .error(let message) = self {
+            try container.encode(message, forKey: .error)
+        }
+    }
+}

@@ -102,7 +102,14 @@ pub async fn resolve(canvas_path: &Path) -> io::Result<Resolved> {
 /// Returns `Ok(None)` if no `server_socket` is configured at all (the
 /// common case — caller should fall through to `view`'s own watcher/worker
 /// behavior unchanged), `Ok(Some(()))` once handed off successfully, `Err`
-/// for a configured-but-unreachable coordinator.
+/// otherwise — either the coordinator itself was unreachable (see the
+/// `io::ErrorKind::Other` check below for how that's told apart from the
+/// next case), or it *was* reached but failed to actually open anything —
+/// a real error from the worker it spawned (a malformed canvas file, most
+/// commonly), relayed back exactly as `request_open` received it rather
+/// than wrapped in a "can't reach it" message that would no longer be true
+/// (see `watcher_protocol.rs`'s own doc comment for why `Open` can fail
+/// this way at all now).
 pub async fn hand_off_to_configured_coordinator(
     canvas_path: &Path,
     fragment: Option<String>,
@@ -119,11 +126,20 @@ pub async fn hand_off_to_configured_coordinator(
         .await
         .map(Some)
         .map_err(|e| {
-            format!(
-                "couldn't reach the coordinator at {}: {e} — is its LaunchAgent installed? \
-                 see macos/app.canvas.md's \"Build & install\"",
-                socket.display()
-            )
+            // `parse_ack`'s own `io::Error::other(error)` is exactly (and
+            // only) how a *reached* coordinator's real `{"error": ...}"`
+            // reply surfaces here — every other failure (connection
+            // refused/not found, a malformed reply, a timeout) means the
+            // coordinator itself is the problem.
+            if e.kind() == io::ErrorKind::Other {
+                e.to_string()
+            } else {
+                format!(
+                    "couldn't reach the coordinator at {}: {e} — is its LaunchAgent installed? \
+                     see macos/app.canvas.md's \"Build & install\"",
+                    socket.display()
+                )
+            }
         })
 }
 

@@ -29,16 +29,16 @@
 //! macOS, eventually) is a deliberately separate thing — same wire
 //! protocol, entirely different lifecycle policy — not implemented here.
 
-use meshfox_server::watcher_protocol::Message;
+use meshfox_server::watcher_protocol::{AckResponse, Message};
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::{Child, Command};
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::{broadcast, oneshot, Notify};
 
 /// One tracked worker. `port` is `None` until its own `Ready` message
 /// arrives. `pending_open` is `Some(fragment)` the moment somebody (the
@@ -51,13 +51,20 @@ use tokio::sync::{broadcast, Notify};
 struct Entry {
     port: Option<u16>,
     pending_open: Option<Option<String>>,
+    /// Every still-unanswered `Open` request waiting on this worker's own
+    /// `Ready` (or its failure) — one per concurrent caller, each replied
+    /// to exactly once, by `mark_ready` on success or `remove` on failure.
+    /// Empty for a worker nobody's asked about over the socket (the
+    /// top-level invocation's own primary worker, spawned directly by
+    /// `run` rather than via an `Open` message).
+    waiters: Vec<oneshot::Sender<Result<(), String>>>,
 }
 
 /// Shared state the accept loop and every per-worker watch task touch.
-/// Never holds a `Child` — each worker's own task owns its `Child`
-/// exclusively (needed to both `.wait()` on it *and* `.start_kill()` it
-/// from the same place without fighting over `&mut` access) and only
-/// reports back here via `remove`.
+/// Never holds a `Child` — each worker's own task owns it exclusively
+/// (needed to both `.wait()` on it *and* `.start_kill()` it from the same
+/// place without fighting over `&mut` access) and only reports back here
+/// via `remove`.
 struct Registry {
     entries: Mutex<HashMap<PathBuf, Entry>>,
     /// Fired whenever `entries` transitions to empty — `wait_until_empty`
@@ -98,31 +105,64 @@ impl Registry {
         let _ = self.shutdown.send(());
     }
 
-    /// A worker's own `Ready` arrived — record its port, and return
-    /// whichever fragment a pending request wants a browser tab opened
-    /// with (`Some(None)` for "no fragment, just the root"), if anyone's
-    /// waiting on it. `path` is trusted as already the same canonical form
-    /// this registry spawned/keys by (it's echoed straight back from what
-    /// the watcher itself passed the worker as an argument). Deliberately a
-    /// pure state transition rather than calling `open_browser_tab` itself
-    /// — leaving that to the caller means this can't shell out to actually
-    /// open the user's browser just from being called in a test.
-    fn mark_ready(&self, path: &Path, port: u16) -> Option<Option<String>> {
-        let mut entries = self.entries.lock().unwrap();
-        let entry = entries.get_mut(path)?; // a Ready for something we're no longer tracking (already killed?) — ignore
-        entry.port = Some(port);
-        entry.pending_open.take()
+    /// A worker's own `Ready` arrived — record its port, open a browser tab
+    /// if anyone's waiting on that, and satisfy every `Open` caller
+    /// currently waiting on this same worker with `Ok(())`. `path` is
+    /// trusted as already the same canonical form this registry
+    /// spawned/keys by (it's echoed straight back from what the watcher
+    /// itself passed the worker as an argument).
+    fn mark_ready(&self, path: &Path, port: u16) {
+        let (pending_open, waiters) = {
+            let mut entries = self.entries.lock().unwrap();
+            // A `Ready` for something we're no longer tracking (already
+            // killed?) — ignore.
+            let Some(entry) = entries.get_mut(path) else {
+                return;
+            };
+            entry.port = Some(port);
+            (entry.pending_open.take(), std::mem::take(&mut entry.waiters))
+        };
+        if let Some(fragment) = pending_open {
+            open_browser_tab(port, fragment.as_deref());
+        }
+        for waiter in waiters {
+            let _ = waiter.send(Ok(()));
+        }
+    }
+
+    /// Registers `waiter` on `path`'s own entry (which must already exist —
+    /// callers create it via `spawn_worker` first) — for an `Open` request
+    /// that arrived while this worker is still spawning.
+    fn add_waiter(&self, path: &Path, waiter: oneshot::Sender<Result<(), String>>) {
+        if let Some(entry) = self.entries.lock().unwrap().get_mut(path) {
+            entry.waiters.push(waiter);
+        } else {
+            // The entry vanished between this being decided and now (the
+            // worker already failed and was removed) — fail immediately
+            // rather than leaving the caller waiting on a channel nothing
+            // will ever signal.
+            let _ = waiter.send(Err("worker exited before reporting ready".to_string()));
+        }
     }
 
     /// Removes `path`'s entry (its worker task is the sole caller, once
     /// its child has actually exited) and wakes `wait_until_empty` if that
-    /// was the last one.
-    fn remove(&self, path: &Path) {
-        let now_empty = {
+    /// was the last one. `failure_reason`, when the worker never reported
+    /// `Ready` at all, fails every still-waiting `Open` caller with it —
+    /// `None` for a worker that already had a port (nobody's left waiting;
+    /// `mark_ready` already satisfied everyone) or that never had any
+    /// waiters to begin with.
+    fn remove(&self, path: &Path, failure_reason: Option<String>) {
+        let (now_empty, waiters) = {
             let mut entries = self.entries.lock().unwrap();
-            entries.remove(path);
-            entries.is_empty()
+            let waiters = entries.remove(path).map(|e| e.waiters).unwrap_or_default();
+            (entries.is_empty(), waiters)
         };
+        if let Some(reason) = failure_reason {
+            for waiter in waiters {
+                let _ = waiter.send(Err(reason.clone()));
+            }
+        }
         if now_empty {
             self.empty.notify_waiters();
         }
@@ -148,27 +188,61 @@ fn open_browser_tab(port: u16, fragment: Option<&str>) {
 }
 
 /// A plain file, opened however this platform's default association says
-/// to (`open` on macOS, `xdg-open` on Linux, `start` on Windows) —
-/// this watcher's own answer to `Message::OpenFile`, the same "hand it to
-/// the OS" behavior `open_node_file` used to do itself before that moved
-/// up here. Best-effort, same reasoning as `open_browser_tab`; runs on a
-/// blocking thread for the same reason.
-fn open_plain_file(path: PathBuf) {
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = open::that(&path) {
-            eprintln!(
-                "meshfox: couldn't open {} automatically ({e})",
-                path.display()
-            );
-        }
-    });
+/// to (`open` on macOS, `xdg-open` on Linux, `start` on Windows) — this
+/// watcher's own answer to `Message::OpenFile`, the same "hand it to the
+/// OS" behavior `open_node_file` used to do itself before that moved up
+/// here. Awaited (unlike the fire-and-forget `open_browser_tab`) so its
+/// real success/failure can become this request's own `AckResponse` —
+/// still off the async runtime's own worker threads, on a blocking one,
+/// since `open::that` shells out synchronously.
+async fn open_plain_file(path: PathBuf) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || open::that(&path).map_err(|e| e.to_string()))
+        .await
+        .unwrap_or_else(|e| Err(format!("couldn't open the file: {e}")))
 }
+
+/// How long an `Open` request waits for the worker it's spawning (or
+/// already waiting on) to report `Ready` before giving up on *this
+/// specific caller* — the worker itself is left running regardless (it
+/// might still come up, and a later request for the same canvas benefits
+/// from that), unlike the macOS daemon's own `SessionStore` (which kills a
+/// worker that blows this same budget — see its own doc comment): that
+/// more aggressive policy was built around one specific incident (a wedged
+/// accept loop that made every worker look stuck), already fixed at its
+/// own root (`UnixSocketServer.swift`'s `accept()` retry) rather than
+/// worth re-defending against here too. Same value as `SessionStore`'s
+/// `getPortTimeoutSeconds`/`openTimeoutSeconds` regardless, so a caller
+/// waiting on either coordinator gives up on roughly the same schedule.
+const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// A crashed worker's own captured stderr almost always starts with
+/// `view_worker`'s own `eprintln!("meshfox view: {e}")` (`main.rs`) — a
+/// sensible prefix when that's the *only* thing printed to a real
+/// terminal, redundant once it's relayed as the reason inside an
+/// `AckResponse::Error`/`PortResponse::Error` that the ultimate caller
+/// (`view_or_hand_off`'s own `eprintln!("meshfox view: {e}")`) prefixes
+/// itself. Stripped so a caller doesn't see it doubled up.
+fn strip_meshfox_view_prefix(text: &str) -> &str {
+    text.strip_prefix("meshfox view: ").unwrap_or(text)
+}
+
+/// Caps how much of a failed worker's own stderr gets relayed back over
+/// the socket as an `AckResponse::Error` — enough for the one line that
+/// actually matters (`meshfox view: <reason>`, or a Rust panic's own
+/// message) without an unbounded/adversarial worker turning a JSON reply
+/// line into a multi-megabyte one.
+const CAPTURED_STDERR_LIMIT: usize = 4096;
 
 /// Spawns a worker for `canonical_path` (already canonicalized by the
 /// caller) and tracks it: inserts a `port: None` entry, then hands the
 /// `Child` to its own dedicated task, which owns it for the rest of its
 /// life — `.wait()`s for a natural exit, or kills it early on `shutdown`
-/// — and removes its own registry entry once it's actually gone.
+/// — and removes its own registry entry once it's actually gone. The
+/// child's own stderr is captured (and still echoed to this process's own,
+/// so a locally-run `meshfox view` doesn't lose that visibility) so a
+/// worker that dies before ever reporting `Ready` can fail any `Open`
+/// caller waiting on it with the worker's own real reason, not just "it
+/// exited" — see `watch_worker`.
 fn spawn_worker(
     registry: &Arc<Registry>,
     exe: &Path,
@@ -177,6 +251,7 @@ fn spawn_worker(
     port: u16,
     pending_open: Option<Option<String>>,
     auto_exit: bool,
+    initial_waiter: Option<oneshot::Sender<Result<(), String>>>,
 ) -> io::Result<()> {
     let mut command = Command::new(exe);
     command
@@ -189,16 +264,36 @@ fn spawn_worker(
     if !auto_exit {
         command.arg("--no-auto-exit");
     }
-    let child = command
+    let mut child = command
         .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()?;
+
+    let captured_stderr = Arc::new(Mutex::new(String::new()));
+    if let Some(stderr) = child.stderr.take() {
+        let captured_stderr = Arc::clone(&captured_stderr);
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                eprintln!("{line}");
+                let mut buf = captured_stderr.lock().unwrap();
+                if buf.len() < CAPTURED_STDERR_LIMIT {
+                    if !buf.is_empty() {
+                        buf.push('\n');
+                    }
+                    buf.push_str(&line);
+                }
+            }
+        });
+    }
 
     registry.entries.lock().unwrap().insert(
         canonical_path.clone(),
         Entry {
             port: None,
             pending_open,
+            waiters: initial_waiter.into_iter().collect(),
         },
     );
 
@@ -206,7 +301,24 @@ fn spawn_worker(
     let mut shutdown_rx = registry.shutdown.subscribe();
     tokio::spawn(async move {
         watch_worker(child, &mut shutdown_rx).await;
-        registry.remove(&canonical_path);
+        let had_port = registry
+            .entries
+            .lock()
+            .unwrap()
+            .get(&canonical_path)
+            .map(|e| e.port.is_some())
+            .unwrap_or(false);
+        let failure_reason = if had_port {
+            None
+        } else {
+            let captured = captured_stderr.lock().unwrap().clone();
+            Some(if captured.is_empty() {
+                "worker exited before reporting ready".to_string()
+            } else {
+                strip_meshfox_view_prefix(&captured).to_string()
+            })
+        };
+        registry.remove(&canonical_path, failure_reason);
     });
     Ok(())
 }
@@ -236,16 +348,29 @@ fn private_socket_path() -> PathBuf {
     std::env::temp_dir().join(format!("mfx-w-{}.sock", std::process::id()))
 }
 
+fn ack_json(result: &Result<(), String>) -> String {
+    let reply = match result {
+        Ok(()) => AckResponse::Ok {},
+        Err(error) => AckResponse::Error { error: error.clone() },
+    };
+    let mut line = serde_json::to_string(&reply).expect("AckResponse always serializes");
+    line.push('\n');
+    line
+}
+
 /// Handles one already-accepted connection: reads exactly one
-/// newline-delimited JSON `Message` (matches `watcher_protocol::send`'s
-/// own one-shot-then-shutdown write side) and acts on it. A malformed or
-/// empty read is just dropped — nothing meaningful to reply with over
-/// this one-way protocol, and a worker that fails to report in just
-/// leaves its own entry pending/never-ready rather than wedging anything
-/// else.
+/// newline-delimited JSON `Message` (matches `watcher_protocol::send`'s/
+/// `request_and_await_reply`'s own one-shot write side) and acts on it.
+/// `Ready` stays fire-and-forget (nothing meaningful to reply with, and
+/// nobody's waiting on a reply to it); `Open`/`OpenFile` now both write an
+/// `AckResponse` back on this same connection before returning — see
+/// `meshfox_server::watcher_protocol`'s own doc comment for why that
+/// stopped being optional. A malformed or empty read is just dropped, same
+/// as before.
 async fn handle_connection(stream: UnixStream, registry: Arc<Registry>, exe: PathBuf, socket_path: PathBuf) {
+    let (read_half, mut write_half) = stream.into_split();
     let mut line = String::new();
-    if BufReader::new(stream).read_line(&mut line).await.unwrap_or(0) == 0 {
+    if BufReader::new(read_half).read_line(&mut line).await.unwrap_or(0) == 0 {
         return;
     }
     let Ok(msg) = serde_json::from_str::<Message>(line.trim()) else {
@@ -253,23 +378,20 @@ async fn handle_connection(stream: UnixStream, registry: Arc<Registry>, exe: Pat
     };
     match msg {
         Message::Ready { canvas_path, port } => {
-            if let Some(fragment) = registry.mark_ready(&canvas_path, port) {
-                open_browser_tab(port, fragment.as_deref());
-            }
+            registry.mark_ready(&canvas_path, port);
         }
         Message::Open { canvas_path, fragment } => {
             let canonical = canvas_path.canonicalize().unwrap_or(canvas_path);
 
             // Three cases, matching exactly what was asked for: already
-            // open (a port is known) → show it now; already spawning
-            // (tracked, no port yet) → just flag it wanted (with this
-            // request's own fragment) — `mark_ready` opens it once the
-            // port lands; never seen at all → spawn it, wanted from the
-            // start. Resolved and dropped before `spawn_worker` (which
-            // takes the same lock itself, to insert its own entry).
+            // open (a port is known) → show it now, ack immediately;
+            // already spawning (tracked, no port yet) → flag it wanted
+            // (with this request's own fragment) and wait alongside
+            // whoever else is already waiting; never seen at all → spawn
+            // it, wanted from the start, and wait the same way.
             enum Action {
                 OpenNow(u16),
-                AlreadyPending,
+                Wait,
                 Spawn,
             }
             let action = {
@@ -279,38 +401,65 @@ async fn handle_connection(stream: UnixStream, registry: Arc<Registry>, exe: Pat
                         Some(port) => Action::OpenNow(port),
                         None => {
                             entry.pending_open = Some(fragment.clone());
-                            Action::AlreadyPending
+                            Action::Wait
                         }
                     },
                     None => Action::Spawn,
                 }
             };
-            match action {
-                Action::OpenNow(port) => open_browser_tab(port, fragment.as_deref()),
-                Action::AlreadyPending => {}
+            let result = match action {
+                Action::OpenNow(port) => {
+                    open_browser_tab(port, fragment.as_deref());
+                    Ok(())
+                }
+                Action::Wait => {
+                    let (tx, rx) = oneshot::channel();
+                    registry.add_waiter(&canonical, tx);
+                    await_ready(rx).await
+                }
                 Action::Spawn => {
                     // `port: 0` (let the OS pick) and `auto_exit: true`
                     // (exits on its own once its own tabs all close) —
                     // same defaults every navigated-to worker has always
                     // had.
-                    if let Err(e) =
-                        spawn_worker(&registry, &exe, &socket_path, canonical, 0, Some(fragment), true)
-                    {
-                        eprintln!("meshfox: couldn't spawn a worker for the requested canvas: {e}");
+                    let (tx, rx) = oneshot::channel();
+                    match spawn_worker(&registry, &exe, &socket_path, canonical, 0, Some(fragment), true, Some(tx)) {
+                        Ok(()) => await_ready(rx).await,
+                        Err(e) => Err(format!("couldn't spawn a worker for the requested canvas: {e}")),
                     }
                 }
-            }
+            };
+            let _ = write_half.write_all(ack_json(&result).as_bytes()).await;
         }
-        Message::OpenFile { path } => open_plain_file(path),
-        // Deliberately unsupported here: `GetPort` is the one message that
-        // needs a reply, but this function's own `stream` is already
-        // dropped by the time `match msg` runs (the `BufReader` reading
-        // `line` above owns it, and goes out of scope right after). A
-        // persistent, addressable coordinator (the macOS daemon, e.g.)
-        // implements this; this watcher is a private, per-`view`-invocation
-        // process nobody's `server_socket` has a reason to point at — see
-        // `crates/cli/src/coordinator.rs`'s own doc comment.
+        Message::OpenFile { path } => {
+            let result = open_plain_file(path).await;
+            let _ = write_half.write_all(ack_json(&result).as_bytes()).await;
+        }
+        // Deliberately unsupported here: `GetPort` is a request-reply
+        // message too, but this watcher is a private, per-`view`-invocation
+        // process nobody's `server_socket` has a reason to point at (a
+        // persistent, addressable coordinator — the macOS daemon, e.g. —
+        // implements it instead) — see `crates/cli/src/coordinator.rs`'s
+        // own doc comment. Closing without a reply here would leave a
+        // real `GetPort` caller waiting out its own timeout for nothing,
+        // but nothing in this codebase ever actually sends one here, so
+        // that's a non-issue in practice, not a gap worth closing.
         Message::GetPort { .. } => {}
+    }
+}
+
+/// Waits for `rx` to resolve (a worker this caller is waiting on either
+/// reported `Ready` or failed), or gives up after `WORKER_READY_TIMEOUT` —
+/// see that constant's own doc comment for why a timeout here doesn't also
+/// kill the worker, unlike the macOS daemon's equivalent.
+async fn await_ready(rx: oneshot::Receiver<Result<(), String>>) -> Result<(), String> {
+    match tokio::time::timeout(WORKER_READY_TIMEOUT, rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("worker's own tracking task ended without reporting an outcome".to_string()),
+        Err(_) => Err(format!(
+            "worker didn't report ready within {}s",
+            WORKER_READY_TIMEOUT.as_secs()
+        )),
     }
 }
 
@@ -321,8 +470,9 @@ async fn handle_connection(stream: UnixStream, registry: Arc<Registry>, exe: Pat
 /// which point every still-live worker is killed too (see `watch_worker`)
 /// before this returns. Never returns an `Err` for "a worker's own run
 /// failed" (that's the worker's own problem, reported on its own stdout/
-/// exit code) — only for something that stops the watcher itself from
-/// standing up at all (can't bind its socket, can't spawn the primary
+/// exit code, and relayed to any `Open`/`GetPort` caller waiting on it —
+/// see `spawn_worker`) — only for something that stops the watcher itself
+/// from standing up at all (can't bind its socket, can't spawn the primary
 /// worker).
 pub async fn run(
     exe: PathBuf,
@@ -341,7 +491,7 @@ pub async fn run(
 
     let registry = Arc::new(Registry::new());
     let initial_open = if open_browser { Some(None) } else { None };
-    spawn_worker(&registry, &exe, &socket_path, canonical, port, initial_open, auto_exit)?;
+    spawn_worker(&registry, &exe, &socket_path, canonical, port, initial_open, auto_exit, None)?;
 
     let accept_registry = Arc::clone(&registry);
     let accept_exe = exe.clone();
@@ -400,13 +550,18 @@ mod tests {
         std::env::current_exe().ok()
     }
 
+    fn empty_entry() -> Entry {
+        Entry { port: None, pending_open: None, waiters: Vec::new() }
+    }
+
     #[tokio::test]
     async fn registry_wait_until_empty_resolves_once_the_last_entry_is_removed() {
         let registry = Arc::new(Registry::new());
-        registry.entries.lock().unwrap().insert(
-            PathBuf::from("/tmp/a.canvas.md"),
-            Entry { port: Some(1), pending_open: None },
-        );
+        registry
+            .entries
+            .lock()
+            .unwrap()
+            .insert(PathBuf::from("/tmp/a.canvas.md"), Entry { port: Some(1), ..empty_entry() });
         assert!(!registry.is_empty());
 
         let wait_registry = Arc::clone(&registry);
@@ -415,7 +570,7 @@ mod tests {
         // Give the waiter a moment to actually start waiting before we
         // remove the only entry.
         tokio::time::sleep(Duration::from_millis(20)).await;
-        registry.remove(&PathBuf::from("/tmp/a.canvas.md"));
+        registry.remove(&PathBuf::from("/tmp/a.canvas.md"), None);
 
         tokio::time::timeout(Duration::from_secs(2), wait_task)
             .await
@@ -424,28 +579,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mark_ready_returns_the_pending_fragment_and_clears_it() {
+    async fn mark_ready_opens_the_pending_fragment_and_satisfies_waiters() {
         let registry = Registry::new();
+        let (tx, rx) = oneshot::channel();
         registry.entries.lock().unwrap().insert(
             PathBuf::from("/tmp/a.canvas.md"),
-            Entry { port: None, pending_open: Some(Some("some-node".to_string())) },
+            Entry {
+                pending_open: Some(Some("some-node".to_string())),
+                waiters: vec![tx],
+                ..empty_entry()
+            },
         );
 
-        let pending = registry.mark_ready(Path::new("/tmp/a.canvas.md"), 4242);
-        assert_eq!(pending, Some(Some("some-node".to_string())));
+        registry.mark_ready(Path::new("/tmp/a.canvas.md"), 4242);
 
         let entries = registry.entries.lock().unwrap();
         let entry = entries.get(Path::new("/tmp/a.canvas.md")).unwrap();
         assert_eq!(entry.port, Some(4242));
         assert_eq!(entry.pending_open, None);
+        assert!(entry.waiters.is_empty());
+        drop(entries);
+
+        assert_eq!(rx.await.unwrap(), Ok(()));
     }
 
     #[tokio::test]
     async fn mark_ready_for_an_untracked_path_is_a_harmless_no_op() {
         let registry = Registry::new();
-        let pending = registry.mark_ready(Path::new("/tmp/nope.canvas.md"), 4242);
-        assert_eq!(pending, None);
+        registry.mark_ready(Path::new("/tmp/nope.canvas.md"), 4242);
         assert!(registry.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_with_a_failure_reason_fails_every_waiter() {
+        let registry = Registry::new();
+        let (tx1, rx1) = oneshot::channel();
+        let (tx2, rx2) = oneshot::channel();
+        registry.entries.lock().unwrap().insert(
+            PathBuf::from("/tmp/a.canvas.md"),
+            Entry { waiters: vec![tx1, tx2], ..empty_entry() },
+        );
+
+        registry.remove(Path::new("/tmp/a.canvas.md"), Some("boom".to_string()));
+
+        assert_eq!(rx1.await.unwrap(), Err("boom".to_string()));
+        assert_eq!(rx2.await.unwrap(), Err("boom".to_string()));
+        assert!(registry.is_empty());
+    }
+
+    #[tokio::test]
+    async fn add_waiter_for_an_untracked_path_fails_immediately() {
+        let registry = Registry::new();
+        let (tx, rx) = oneshot::channel();
+        registry.add_waiter(Path::new("/tmp/gone.canvas.md"), tx);
+        assert!(rx.await.unwrap().is_err());
     }
 
     /// End-to-end: spawns this very test binary (standing in for `meshfox`
@@ -470,7 +657,7 @@ mod tests {
             .entries
             .lock()
             .unwrap()
-            .insert(canonical.clone(), Entry { port: None, pending_open: None });
+            .insert(canonical.clone(), empty_entry());
 
         let accept_registry = Arc::clone(&registry);
         let exe = PathBuf::from("/bin/true"); // never actually spawned in this test
@@ -487,6 +674,46 @@ mod tests {
 
         let entries = registry.entries.lock().unwrap();
         assert_eq!(entries.get(&canonical).unwrap().port, Some(9999));
+
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// The other end of the same real-socket path, now for `Open` itself:
+    /// spawns a real `meshfox` process (this test binary standing in for
+    /// it, same as above) is overkill here — this drives `handle_connection`
+    /// directly against an already-tracked, already-ready entry, confirming
+    /// the `OpenNow` branch acks immediately rather than waiting on
+    /// anything.
+    #[tokio::test]
+    async fn open_for_an_already_ready_worker_acks_immediately() {
+        let socket_path = std::env::temp_dir().join(format!("mfx-w-open-ready-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let registry = Arc::new(Registry::new());
+        let canvas_path = std::env::temp_dir().join("already-ready.canvas.md");
+        let canonical = canvas_path.canonicalize().unwrap_or_else(|_| canvas_path.clone());
+        registry
+            .entries
+            .lock()
+            .unwrap()
+            .insert(canonical.clone(), Entry { port: Some(7777), ..empty_entry() });
+
+        let accept_registry = Arc::clone(&registry);
+        let exe = PathBuf::from("/bin/true");
+        let socket_for_accept = socket_path.clone();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_connection(stream, accept_registry, exe, socket_for_accept).await;
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            meshfox_server::watcher_protocol::request_open(&socket_path, &canonical, None),
+        )
+        .await
+        .expect("should ack promptly, not hang");
+        assert!(result.is_ok());
 
         let _ = std::fs::remove_file(&socket_path);
     }

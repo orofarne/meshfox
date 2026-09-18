@@ -94,8 +94,9 @@ fn server_socket_from_table(table: &toml::Table) -> Option<PathBuf> {
 /// `[process_env]` in `.meshfox/config.toml` (local or global, same merge
 /// as every other setting here) — extra environment variables applied to
 /// every spawned block/interpreter process (`stream_exec::spawn_bash`/
-/// `spawn_process`/`spawn_interpreter`), on top of whatever that process
-/// already inherited. Named distinctly from `crate::shared_env`'s
+/// `spawn_process`/`spawn_interpreter`, and `pty_exec::spawn` for a `tty`
+/// block — every real spawn path this crate has, now), on top of whatever
+/// that process already inherited. Named distinctly from `crate::shared_env`'s
 /// `[[env]]`/`vars=` (an unrelated, older feature — per-path-scoped
 /// *defaults for `meshfox:var` resolution*, only reaching a block that
 /// explicitly declares `env="NAME"` on its own fence) — this instead

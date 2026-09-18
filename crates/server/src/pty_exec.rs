@@ -113,10 +113,18 @@ impl PtyProcess {
 /// by default, or under an explicit `interpreter=` command (see
 /// `meshfox_core::exec::resolve_command`) when the `tty` block carries one.
 /// `envs` is added on top of the inherited environment, same convention
-/// `stream_exec::spawn_bash` uses. `cwd`, when given, is the directory the
-/// child starts in — a node's own canvas file's directory (see
+/// `stream_exec::spawn_bash` uses — including `meshfox_core::config`'s own
+/// `[process_env]` table (resolved from `cwd`), merged in *below* `envs`/
+/// `resolved.extra_envs` exactly the way `spawn_bash`'s own doc comment
+/// describes; this used to be the one spawn path here that didn't apply it
+/// at all (confirmed live: a `tty` block invoking a Homebrew-installed
+/// binary — `tio`, specifically — came back `command not found` under the
+/// macOS daemon despite a `[process_env]` `PATH` override that already
+/// worked for every non-`tty` block). `cwd`, when given, is the directory
+/// the child starts in — a node's own canvas file's directory (see
 /// `meshfox_core::canvas::Node::cwd`); `None` inherits the server's own
-/// cwd unchanged. `canvas_path`, when given, is the canvas file this
+/// cwd unchanged, same fallback `env_overrides` itself uses when resolving
+/// `[process_env]`. `canvas_path`, when given, is the canvas file this
 /// step's fence actually lives in — only consulted for an `@name` builtin
 /// `interpreter` (see `meshfox_core::resolve_command`'s own doc comment).
 pub fn spawn<I, K, V>(
@@ -153,6 +161,9 @@ where
     let mut cmd = CommandBuilder::new(&resolved.program);
     for arg in &resolved.args {
         cmd.arg(arg);
+    }
+    for (k, v) in meshfox_core::config::env_overrides(cwd.unwrap_or_else(|| Path::new("."))) {
+        cmd.env(k, v);
     }
     for (k, v) in &envs {
         cmd.env(k, v);
@@ -373,5 +384,54 @@ mod tests {
             }
         }
         assert!(String::from_utf8_lossy(&collected).contains(&want));
+    }
+
+    /// The bug this test would have caught: a `tty` block used to be the
+    /// one spawn path in this crate that never applied `[process_env]` at
+    /// all (`stream_exec::spawn_bash`'s own equivalent test —
+    /// `spawn_bash_extends_an_inherited_variable_via_local_env_config` —
+    /// already covered every other one), so a `PATH` extension that fixed
+    /// every plain block still left a `tty` block unable to find a
+    /// Homebrew-installed binary under the macOS daemon's own minimal
+    /// inherited `PATH`.
+    #[tokio::test]
+    async fn spawn_extends_an_inherited_variable_via_local_env_config() {
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-pty-env-override-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(dir.join(".meshfox")).unwrap();
+        std::fs::write(
+            dir.join(".meshfox").join("config.toml"),
+            "[process_env]\nMESHFOX_PTY_ENV_OVERRIDE_TEST = \"$MESHFOX_PTY_ENV_OVERRIDE_TEST:added\"\n",
+        )
+        .unwrap();
+
+        // A name no other test or real code reads, so mutating it here
+        // can't race anything else in this test binary.
+        std::env::set_var("MESHFOX_PTY_ENV_OVERRIDE_TEST", "base");
+        let mut proc = spawn(
+            "echo \"$MESHFOX_PTY_ENV_OVERRIDE_TEST\"",
+            None,
+            no_envs(),
+            Some(&dir),
+            None,
+            80,
+            24,
+        )
+        .unwrap();
+        std::env::remove_var("MESHFOX_PTY_ENV_OVERRIDE_TEST");
+
+        let mut collected = Vec::new();
+        while let Some(chunk) = proc.output_rx.recv().await {
+            collected.extend_from_slice(&chunk);
+            if String::from_utf8_lossy(&collected).contains("base:added") {
+                break;
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(String::from_utf8_lossy(&collected).contains("base:added"));
     }
 }
