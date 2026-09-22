@@ -446,7 +446,7 @@ pub fn scan_runnable_blocks(node_id: &str, markdown: &str) -> Vec<CodeBlock> {
 /// here too, on top of `text` already not being a supported language —
 /// belt and suspenders against ever growing a spurious implicit block out
 /// of a node's own cached output.
-fn candidate_fences(markdown: &str) -> Vec<(RawFence, String, HashMap<String, String>)> {
+pub(crate) fn candidate_fences(markdown: &str) -> Vec<(RawFence, String, HashMap<String, String>)> {
     let output_ranges = crate::output::output_byte_ranges(markdown);
     scan_raw_fences(markdown)
         .into_iter()

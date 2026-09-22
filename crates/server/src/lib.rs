@@ -245,9 +245,14 @@ impl AppState {
     /// landed in the primary canvas file, so a client watching for those
     /// can apply it in place instead of reloading (see `ServerEvent`'s own
     /// doc comment). Still always updates `self.raw` and writes the file
-    /// exactly like `save` — `event` only changes what gets broadcast, not
-    /// what gets persisted.
+    /// like `save`. If output cleanup changes the document, broadcasts a
+    /// document-wide `Changed` and records a complete undo entry instead.
     fn save_with_event(&self, raw: &str, event: ServerEvent) -> std::io::Result<()> {
+        let cleaned = meshfox_core::output::strip_uncached_output(raw);
+        // Cleanup may change other nodes too. A document-wide event also makes
+        // undo record the complete pre-save document instead of a partial diff.
+        let event = if cleaned != raw { ServerEvent::Changed } else { event };
+        let raw = cleaned.as_str();
         let old_raw = self.raw.lock().unwrap().clone();
         std::fs::write(&self.canvas_path, raw)?;
         *self.raw.lock().unwrap() = raw.to_string();
@@ -1865,9 +1870,10 @@ async fn get_canvas_raw(
 }
 
 /// Overwrites the whole document (or, with `?include=<nodeId>`, an include
-/// target's own file — see `get_canvas_raw`) with `body`, verbatim — the
-/// Source-mode editor's Save button. Rejects (422, nothing written)
-/// anything that doesn't parse *as a canvas* — skipped for a plain-Markdown
+/// target's own file — see `get_canvas_raw`) with `body` — the Source-mode
+/// editor's Save button. Primary canvases receive the usual save-time output
+/// cleanup; plain-Markdown include targets are written verbatim. Rejects
+/// (422, nothing written) anything that doesn't parse *as a canvas* — skipped for a plain-Markdown
 /// include target (see `SourceFile`), which has no such requirement to
 /// begin with — same validate-before-commit guarantee every other
 /// mutating endpoint here gives for what it does validate.
@@ -2056,7 +2062,8 @@ async fn clear_layout(State(state): State<Arc<AppState>>) -> Result<Json<Canvas>
     state
         .save(&raw)
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    canvas_response(&raw, &state.canvas_path)
+    let saved = state.raw.lock().unwrap().clone();
+    canvas_response(&saved, &state.canvas_path)
 }
 
 /// Re-sorts every parent's own structural children by their real/auto-
@@ -2076,7 +2083,8 @@ async fn reorder_siblings(State(state): State<Arc<AppState>>) -> Result<Json<Can
     state
         .save(&updated)
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    canvas_response(&updated, &state.canvas_path)
+    let saved = state.raw.lock().unwrap().clone();
+    canvas_response(&saved, &state.canvas_path)
 }
 
 /// Clears node `id`'s own authored `x`/`y`/`w`/`h`, reverting it to
@@ -2233,7 +2241,8 @@ async fn put_options(
     state
         .save(&updated)
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    canvas_response(&updated, &state.canvas_path)
+    let saved = state.raw.lock().unwrap().clone();
+    canvas_response(&saved, &state.canvas_path)
 }
 
 #[derive(Debug, Deserialize)]
@@ -7607,6 +7616,63 @@ mod undo_log_recording_tests {
         "## A\n<!-- meshfox:node id=\"a\" -->\n\nbody a\n\n",
         "## B\n<!-- meshfox:node id=\"b\" -->\n\nbody b\n",
     );
+
+    #[tokio::test]
+    async fn raw_save_cleans_pandas_example_and_preserves_source() {
+        let original = include_str!("../../../examples/pandas-dataframe.canvas.md");
+        let canvas_path = write_test_canvas(original);
+        let state = build_state(canvas_path.clone(), false, None).await.unwrap();
+        let input = mdcanvas::set_fence_attrs(
+            original, "demo", "demo",
+            &mdcanvas::FenceAttrsPatch { cache: Some(false), ..Default::default() },
+        ).unwrap();
+        // Produce a stale region even if the checked-in example has no output.
+        let canvas = mdcanvas::parse(&input).unwrap();
+        let demo = canvas.node("demo").unwrap();
+        let body = meshfox_core::output::write_output(
+            &demo.text, "demo",
+            &meshfox_core::ExecOutput {
+                exit_code: 0,
+                output: "old table".into(),
+                stdout: "old table".into(),
+                stderr: String::new(),
+                duration_ms: 0,
+            },
+        ).unwrap();
+        let input = mdcanvas::set_node_body(&input, "demo", &body).unwrap();
+        let status = put_canvas_raw(
+            State(state.clone()), Query(SourceFileQuery { include: None }), input.clone(),
+        ).await.unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let saved = std::fs::read_to_string(&canvas_path).unwrap();
+        assert!(!saved.contains("<!-- meshfox:output"));
+        assert_eq!(saved, meshfox_core::output::strip_uncached_output(&input));
+        assert_eq!(*state.raw.lock().unwrap(), saved);
+        let _ = std::fs::remove_file(canvas_path);
+    }
+
+    #[tokio::test]
+    async fn saving_cleans_other_nodes_and_records_document_wide_change() {
+        let original = format!("{TWO_SIBLINGS}\n```bash name=\"old\"\necho hi\n```\n<!-- meshfox:output name=\"old\" -->\n```text\nhi\n```\n<!-- /meshfox:output -->\n");
+        let canvas_path = write_test_canvas(&original);
+        let state = build_state(canvas_path.clone(), false, None).await.unwrap();
+        assert_eq!(*state.raw.lock().unwrap(), original, "loading must not clean");
+        let (_, mut rx, _) = state.canvas_events.subscribe_from(0);
+        let Json(response) = clear_node_layout(State(state.clone()), Path("a".to_string())).await.unwrap();
+        let saved = std::fs::read_to_string(&canvas_path).unwrap();
+        assert!(!saved.contains("meshfox:output"));
+        assert_eq!(*state.raw.lock().unwrap(), saved);
+        assert!(!response.node("b").unwrap().text.contains("meshfox:output"));
+        assert!(matches!(rx.try_recv().unwrap().item, ServerEvent::Changed));
+        let history = state.undo_log.history(10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].op_kind, "raw_replace");
+        assert_eq!(history[0].raw_before.as_deref(), Some(original.as_str()));
+        assert_eq!(history[0].raw_after.as_deref(), Some(saved.as_str()));
+        state.save(&saved).unwrap();
+        assert_eq!(state.undo_log.history(10).unwrap().len(), 1);
+        let _ = std::fs::remove_file(canvas_path);
+    }
 
     #[tokio::test]
     async fn create_node_records_a_node_upserted_diff_with_no_before() {

@@ -2412,7 +2412,7 @@ impl App {
         let Some(se) = &self.source_editor else {
             return;
         };
-        let text = se.editor.lines.to_string();
+        let mut text = se.editor.lines.to_string();
         let is_canvas = se.is_canvas;
         let path = se.path.clone();
 
@@ -2426,7 +2426,16 @@ impl App {
         let is_primary = path == self.canvas_path;
         let write_result = if is_primary {
             if let Some(port) = self.worker_port {
-                crate::worker_client::put_canvas_raw(port, &text).await
+                match crate::worker_client::put_canvas_raw(port, &text).await {
+                    Ok(()) => match crate::worker_client::get_canvas_raw(port).await {
+                        Ok(saved) => {
+                            text = saved;
+                            Ok(())
+                        }
+                        Err(e) => Err(format!("saved, but failed to reload: {e}")),
+                    },
+                    Err(e) => Err(e),
+                }
             } else {
                 std::fs::write(&path, &text).map_err(|e| format!("failed to write {}: {e}", path.display()))
             }

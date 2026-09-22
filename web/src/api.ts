@@ -183,7 +183,8 @@ export async function fetchCanvasSource(includeNodeId?: string): Promise<string>
 
 /**
  * Overwrites the whole document (or, with `includeNodeId`, an include
- * target's own file — see `fetchCanvasSource`) with `text`, verbatim. The
+ * target's own file — see `fetchCanvasSource`) with `text`. The worker cleans
+ * uncached output from the primary canvas; callers reload after saving. The
  * server rejects (422, nothing written) anything that doesn't parse — the
  * thrown error's message is the parser's, suitable to show right next to
  * Source mode's Save button so an invalid edit is never silently lost or

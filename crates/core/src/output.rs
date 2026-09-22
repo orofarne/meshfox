@@ -247,6 +247,25 @@ pub(crate) fn output_byte_ranges(markdown: &str) -> Vec<Range<usize>> {
     ranges
 }
 
+/// Remove complete cached-output regions whose preceding source fence no longer
+/// enables `cache`. Uses the same structural regions as the canvas parser, so
+/// marker examples and fences printed inside output are never treated as source.
+/// Reading a document does not call this; workers apply it when saving.
+pub fn strip_uncached_output(markdown: &str) -> String {
+    let regions = output_byte_ranges(markdown);
+    let fences = crate::fence::candidate_fences(markdown);
+    let mut result = markdown.to_string();
+    for region in regions.iter().rev() {
+        let Some((_, _, attrs)) = fences.iter().find(|(fence, _, _)| fence.span.end + 1 == region.start) else {
+            continue;
+        };
+        if !attrs.get("cache").is_some_and(|value| value != "false") {
+            result.replace_range(region.clone(), "");
+        }
+    }
+    result
+}
+
 /// Insert or update the cached-output region for the code block named
 /// `block_name` in `markdown`. Returns `None` if no runnable block with
 /// that name exists. `block_name` doubles as the node-id fallback
@@ -343,6 +362,45 @@ mod tests {
             stdout: s.to_string(),
             stderr: String::new(),
         }
+    }
+
+    #[test]
+    fn strip_uncached_output_preserves_cached_blocks_and_surrounding_text() {
+        let region = "<!-- meshfox:output name=\"demo\" -->\n| a | b |\n<!-- /meshfox:output -->";
+        for flag in ["", " cache=false", " cache", " cache=true"] {
+            let input = format!("before\n```bash name=\"demo\"{flag}\necho 1\n```\n{region}\nafter\n");
+            let expected = if flag == "" || flag == " cache=false" {
+                input.replace(region, "")
+            } else {
+                input.clone()
+            };
+            let actual = strip_uncached_output(&input);
+            assert_eq!(actual, expected);
+            assert_eq!(strip_uncached_output(&actual), actual);
+        }
+    }
+
+    #[test]
+    fn strip_uncached_output_ignores_examples_and_incomplete_regions() {
+        let input = concat!(
+            "Mention <!-- meshfox:output name=\"x\" --> in prose.\n",
+            "````text\n```bash\necho hi\n```\n",
+            "<!-- meshfox:output name=\"x\" -->\nexample\n<!-- /meshfox:output -->\n````\n",
+            "```text\nnot runnable\n```\n",
+            "<!-- meshfox:output name=\"fake\" -->\nexample\n<!-- /meshfox:output -->\n",
+            "```bash name=\"broken\"\necho hi\n```\n",
+            "<!-- meshfox:output name=\"broken\" -->\nkeep the rest\n",
+        );
+        assert_eq!(strip_uncached_output(input), input);
+    }
+
+    #[test]
+    fn strip_uncached_output_handles_multiple_regions_and_nested_fences() {
+        let cached = "```bash name=\"keep\" cache\necho hi\n```\n<!-- meshfox:output name=\"keep\" -->\n```bash name=\"printed\"\necho fake\n```\n<!-- /meshfox:output -->\n";
+        let source = "```bash name=\"drop\"\necho hi\n```\n";
+        let output = "<!-- meshfox:output name=\"drop\" -->\n```text\nhi\n```\n<!-- /meshfox:output -->";
+        let input = format!("{source}{output}\n{cached}{source}{output}\n");
+        assert_eq!(strip_uncached_output(&input), format!("{source}\n{cached}{source}\n"));
     }
 
     #[test]

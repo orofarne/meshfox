@@ -116,7 +116,7 @@ consumes — it just leaves `data.csv` sitting in `$TMP_DIR` under a name both
 sides happen to agree on — so ordering it before this fence needs an actual
 explicit `deps="generate-data/generate-csv"`.
 
-```python name="demo" cache interpreter="$PYTHON -u" env="TMP_DIR" deps="generate-data/generate-csv" output="markdown"
+```python name="demo" interpreter="$PYTHON -u" env="TMP_DIR" deps="generate-data/generate-csv" output="markdown"
 import os
 import sys
 

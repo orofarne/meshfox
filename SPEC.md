@@ -1310,6 +1310,12 @@ source, wrapped in markers so re-runs replace just that region:
     ```
     <!-- /meshfox:output -->
 
+When the worker saves a canvas, it removes a complete output region immediately
+following a source fence without `cache` (also when `cache=false`). This applies
+to both text and Markdown output, across the entire saved document; no rerun is
+needed. Reading alone leaves the document unchanged. Incomplete output regions
+are left untouched. Output for fences with `cache` remains intact.
+
 The header line inside the `text` fence carries the exit code alongside how
 long the block's own process actually ran (`meshfox_core::format_duration_ms`
 — `"842ms"`/`"2.3s"`/`"1m 05s"`), so a re-opened canvas still shows the last
