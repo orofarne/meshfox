@@ -1872,11 +1872,9 @@ async fn get_canvas_raw(
 /// Overwrites the whole document (or, with `?include=<nodeId>`, an include
 /// target's own file — see `get_canvas_raw`) with `body` — the Source-mode
 /// editor's Save button. Primary canvases receive the usual save-time output
-/// cleanup; plain-Markdown include targets are written verbatim. Rejects
-/// (422, nothing written) anything that doesn't parse *as a canvas* — skipped for a plain-Markdown
-/// include target (see `SourceFile`), which has no such requirement to
-/// begin with — same validate-before-commit guarantee every other
-/// mutating endpoint here gives for what it does validate.
+/// cleanup. A canvas-valued include goes to that file's own worker; a plain
+/// Markdown include is written verbatim. Invalid canvas text is rejected
+/// before saving, as with the other canvas mutation endpoints.
 async fn put_canvas_raw(
     State(state): State<Arc<AppState>>,
     Query(query): Query<SourceFileQuery>,
@@ -1893,11 +1891,51 @@ async fn put_canvas_raw(
                 .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         }
         SourceFile::Include { path } => {
-            std::fs::write(&path, &body)
-                .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            let is_canvas = mdcanvas::is_canvas_path(&path)
+                || mdcanvas::has_marker(&body)
+                || std::fs::read_to_string(&path).is_ok_and(|raw| mdcanvas::has_marker(&raw));
+            if is_canvas {
+                let port = worker_port_for_include(&path).await.map_err(|e| {
+                    ApiError(StatusCode::SERVICE_UNAVAILABLE, format!("include worker: {e}"))
+                })?;
+                // The CLI installs this at process startup, but library
+                // embedders and direct handler tests may not have done so.
+                // Keep an existing provider if the host chose one already.
+                let _ = rustls::crypto::ring::default_provider().install_default();
+                let response = reqwest::Client::new()
+                    .put(format!("http://127.0.0.1:{port}/api/canvas/raw"))
+                    .body(body)
+                    .send()
+                    .await
+                    .map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let text = response.text().await.unwrap_or_default();
+                    return Err(ApiError(status, text));
+                }
+            } else {
+                std::fs::write(&path, &body)
+                    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            }
         }
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn worker_port_for_include(path: &std::path::Path) -> io::Result<u16> {
+    let canonical = path.canonicalize()?;
+    let root = canonical.parent().unwrap_or_else(|| std::path::Path::new("."));
+    if let Some(socket) = meshfox_core::config::server_socket(root) {
+        return watcher_protocol::request_port(&socket, &canonical).await;
+    }
+    match worker_lock::try_acquire(&canonical)? {
+        worker_lock::Acquired::Other { port } => Ok(port),
+        worker_lock::Acquired::Us(guard) => {
+            let (ready_tx, ready_rx) = oneshot::channel();
+            tokio::spawn(serve_as_worker(canonical, 0, false, None, true, guard, Some(ready_tx)));
+            ready_rx.await.map_err(|_| io::Error::other("failed to start include worker"))
+        }
+    }
 }
 
 /// One entry of `PutCanvasRequest::layout_hints` — a node's current
@@ -2313,6 +2351,8 @@ struct UpdateNodeRequest {
     y: Option<f64>,
     width: Option<f64>,
     height: Option<f64>,
+    #[serde(default)]
+    clear_position: bool,
     /// `None` leaves it untouched; explicit RFC3339 string (already
     /// validated CLI-side by `apply_node_meta` for the direct-file path,
     /// validated here too since this endpoint has its own callers now)
@@ -2511,6 +2551,14 @@ async fn update_node(
                 .to_string(),
         ));
     }
+    if req.clear_position
+        && (req.x.is_some() || req.y.is_some() || req.width.is_some() || req.height.is_some())
+    {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "clearPosition cannot be combined with x/y/width/height".to_string(),
+        ));
+    }
     if let Some(created_at) = &req.created_at {
         if !meshfox_core::timestamp::is_valid_rfc3339(created_at) {
             return Err(ApiError(
@@ -2534,6 +2582,7 @@ async fn update_node(
         || req.y.is_some()
         || req.width.is_some()
         || req.height.is_some()
+        || req.clear_position
         || req.created_at.is_some()
     {
         // This also has the side effect of pinning the node's `id=`
@@ -2575,11 +2624,14 @@ async fn update_node(
         let (final_width, final_height) = if final_type == NodeType::Group {
             (None, None)
         } else {
-            (req.width.or(width), req.height.or(height))
+            (
+                if req.clear_position { req.width } else { req.width.or(width) },
+                if req.clear_position { req.height } else { req.height.or(height) },
+            )
         };
         let meta = NodeMeta {
-            x: req.x.or(x),
-            y: req.y.or(y),
+            x: if req.clear_position { req.x } else { req.x.or(x) },
+            y: if req.clear_position { req.y } else { req.y.or(y) },
             width: final_width,
             height: final_height,
             color: req.color.clone().or(existing_color),
@@ -2624,6 +2676,23 @@ async fn update_node(
     commit_located(&state, &located, &raw, op)?;
     let response_raw = state.raw.lock().unwrap().clone();
     canvas_response(&response_raw, &state.canvas_path)
+}
+
+/// Append against the worker's current body in one request, without a
+/// client-side read/replace round trip.
+async fn append_node_body(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: String,
+) -> Result<StatusCode, ApiError> {
+    let primary_raw = state.raw.lock().unwrap().clone();
+    let located = locate_node(&primary_raw, &id)?;
+    let raw = mdcanvas::append_node_body(&located.raw, &located.local_id, &body)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}")))?;
+    parse_or_error(&raw)?;
+    let op = node_upserted_event(&raw, &state.canvas_path, &located.local_id);
+    commit_located(&state, &located, &raw, op)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Debug, Deserialize)]
@@ -6941,6 +7010,7 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/canvas/reorder-siblings", post(reorder_siblings))
         .route("/api/nodes", post(create_node))
         .route("/api/nodes/:id", patch(update_node).delete(remove_node))
+        .route("/api/nodes/:id/append", post(append_node_body))
         .route("/api/nodes/:id/reparent", post(reparent_node))
         .route("/api/nodes/:id/move", post(move_sibling))
         .route("/api/nodes/:id/block/:block_name", patch(update_block_attrs))
@@ -7036,7 +7106,7 @@ pub async fn run(
     quiet: bool,
 ) -> std::io::Result<()> {
     let lock_guard = match worker_lock::try_acquire(&canvas_path) {
-        Ok(worker_lock::Acquired::Us(guard)) => Some(guard),
+        Ok(worker_lock::Acquired::Us(guard)) => guard,
         Ok(worker_lock::Acquired::Other { port: existing_port }) => {
             if !quiet {
                 println!(
@@ -7057,15 +7127,7 @@ pub async fn run(
             }
             return Ok(());
         }
-        Err(e) => {
-            if !quiet {
-                eprintln!(
-                    "meshfox: couldn't acquire the worker lock for {} ({e}) — serving anyway, without cross-invocation dedup",
-                    canvas_path.display()
-                );
-            }
-            None
-        }
+        Err(e) => return Err(e),
     };
 
     serve_as_worker(canvas_path, port, auto_exit, watcher_socket, quiet, lock_guard, None).await
@@ -7074,11 +7136,8 @@ pub async fn run(
 /// Actually binds and serves `canvas_path`, given a `worker_lock` decision
 /// the caller already made (`run`'s own `try_acquire` match, above, or the
 /// TUI's identical one at startup — see `crates/cli/src/tui/mod.rs::run`).
-/// `lock_guard` is `Some` when the caller confirmed it's the one to serve
-/// this file (holding it keeps that true for as long as this future lives
-/// — see `worker_lock::LockGuard`'s own doc comment), `None` only for
-/// `run`'s own "the lock itself couldn't even be read — serve anyway,
-/// without cross-invocation dedup" degrade path.
+/// `lock_guard` proves that this caller owns the file. Holding it for this
+/// future's lifetime prevents a second worker from serving the same canvas.
 ///
 /// `ready_tx`, when given, is sent the actual bound port the moment it's
 /// known — for a caller that needs it synchronously to make its own HTTP
@@ -7093,7 +7152,7 @@ pub async fn serve_as_worker(
     auto_exit: bool,
     watcher_socket: Option<PathBuf>,
     quiet: bool,
-    mut lock_guard: Option<worker_lock::LockGuard>,
+    mut lock_guard: worker_lock::LockGuard,
     ready_tx: Option<tokio::sync::oneshot::Sender<u16>>,
 ) -> std::io::Result<()> {
     let state = build_state(canvas_path.clone(), auto_exit, watcher_socket.clone()).await?;
@@ -7111,13 +7170,7 @@ pub async fn serve_as_worker(
         );
     }
 
-    if let Some(guard) = &mut lock_guard {
-        if let Err(e) = guard.write_port(addr.port()) {
-            if !quiet {
-                eprintln!("meshfox: couldn't record this worker's port in its lock file ({e})");
-            }
-        }
-    }
+    lock_guard.write_port(addr.port())?;
 
     if let Some(tx) = ready_tx {
         let _ = tx.send(addr.port());
@@ -7453,6 +7506,7 @@ mod node_op_broadcast_tests {
         let (_backlog, mut rx, _gap) = state.canvas_events.subscribe_from(0);
 
         let req = UpdateNodeRequest {
+            clear_position: false,
             title: None,
             node_type: None,
             color: None,
@@ -7698,6 +7752,7 @@ mod undo_log_recording_tests {
         let state = build_state(canvas_path.clone(), false, None).await.expect("valid test canvas");
 
         let req = UpdateNodeRequest {
+            clear_position: false,
             title: None, node_type: None, color: None, target: None,
             text: Some("new body a".to_string()), extra_parents: None,
             display: None, lang: None, interpreter: None, preview: None,
@@ -8159,6 +8214,7 @@ mod include_edit_tests {
 
     fn blank_update_request() -> UpdateNodeRequest {
         UpdateNodeRequest {
+            clear_position: false,
             title: None,
             node_type: None,
             color: None,
@@ -8706,6 +8762,8 @@ mod include_edit_tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+
 }
 
 #[cfg(test)]

@@ -47,6 +47,7 @@ pub struct SourceEditorState {
     /// apart from "editing an include target" (`self.path == primary_path`)
     /// without a separate `Option` to keep in sync.
     primary_path: PathBuf,
+    primary_raw: String,
     pub path: PathBuf,
     /// Whether `path` needs to parse as a canvas before a save is allowed
     /// — always `true` for the primary document; for an include target,
@@ -143,13 +144,15 @@ impl SourceEditorState {
         cursor: Index2,
         files: Vec<IncludeInfo>,
         all_tags: Vec<String>,
+        primary_raw: String,
     ) -> std::io::Result<Self> {
-        let raw = std::fs::read_to_string(&path)?;
+        let raw = if path == primary_path { primary_raw.clone() } else { std::fs::read_to_string(&path)? };
         let mut editor = EditorState::new(Lines::from(raw.as_str()));
         editor.cursor = cursor;
         prime_viewport(&mut editor);
         Ok(SourceEditorState {
             primary_path,
+            primary_raw,
             path,
             is_canvas,
             editor,
@@ -181,6 +184,9 @@ impl SourceEditorState {
     /// immediately rather than comparing against stale content.
     pub fn mark_saved(&mut self) {
         self.original = self.editor.lines.to_string();
+        if self.path == self.primary_path {
+            self.primary_raw = self.original.clone();
+        }
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> SourceEditorOutcome {
@@ -304,7 +310,11 @@ impl SourceEditorState {
     }
 
     fn switch_to(&mut self, path: PathBuf, is_canvas: bool) {
-        let raw = match std::fs::read_to_string(&path) {
+        let raw = match if path == self.primary_path {
+            Ok(self.primary_raw.clone())
+        } else {
+            std::fs::read_to_string(&path)
+        } {
             Ok(s) => s,
             Err(e) => {
                 self.error = Some(format!("failed to read {}: {e}", path.display()));
@@ -758,6 +768,7 @@ mod tests {
             Index2::new(0, 0),
             Vec::new(),
             all_tags,
+            text.to_string(),
         )
         .unwrap();
         // Same requirement `prime_viewport`'s own test documents: a real

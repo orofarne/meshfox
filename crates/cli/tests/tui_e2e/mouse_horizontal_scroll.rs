@@ -6,6 +6,16 @@
 //! `ui.rs::render_output` slices the tail N *lines* and renders each one
 //! with no `Paragraph::wrap`, so a single output line wider than the pane
 //! is genuinely clipped with no way to see its tail today.
+//!
+//! A self-triggered run's own live stdout now also splices inline under
+//! its own block in the Document pane (`App::on_run_event`'s own
+//! `step_output` live splice, same posture the web UI already has) — and
+//! that pane wraps instead of clipping, so the wide line's own tail would
+//! show up there regardless of any Output-pane scrolling, defeating this
+//! test's whole premise. Fullscreening the Output pane right after
+//! opening it keeps the Document pane (and its own copy of the line) off
+//! screen for the rest of the test, so `screen_text()` only ever reflects
+//! the Output pane's own clip/scroll behavior.
 
 use std::time::Duration;
 
@@ -20,6 +30,17 @@ fn scrolling_right_over_the_output_pane_reveals_a_clipped_lines_tail() {
     session
         .wait_for("Root", Duration::from_secs(5))
         .expect("initial render");
+
+    // A single-block run (this fixture's own chain is just one step) never
+    // auto-expands the Output console (`App::begin_http_run`'s own "not
+    // worth losing screen space over" gate needs >= 2 steps) — click the
+    // collapsed strip open first, same as a real user would have to, so
+    // the run's real stdout actually lands somewhere visible. Then `f`
+    // fullscreens it (see the module doc comment above for why: keeps
+    // the Document pane's own inline copy of the line off screen).
+    let (out_row, out_col) = session.find("Output").expect("collapsed Output strip");
+    session.send_mouse_click(out_row, out_col);
+    session.send_keys("f");
 
     session.send_keys("r");
     session

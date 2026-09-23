@@ -14,7 +14,7 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 
 pub struct TuiSession {
     parser: Arc<Mutex<vt100::Parser>>,
-    writer: Box<dyn Write + Send>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Box<dyn Child + Send + Sync>,
     // Keeps the pty's master side alive for the session's whole lifetime —
     // dropping it would close the pty (and the reader thread's `read`
@@ -31,6 +31,32 @@ impl TuiSession {
     /// `fixture_dir` is removed on `Drop` — pass the directory `canvas_path`
     /// itself lives in (see `fixtures::write_fixture`).
     pub fn spawn(canvas_path: &Path, fixture_dir: PathBuf, rows: u16, cols: u16) -> Self {
+        // `cargo test`'s own `.cargo/config.toml` runner (`scripts/run-signed.sh`)
+        // only re-signs whatever cargo itself execs as *this* test binary — it
+        // never sees `CARGO_BIN_EXE_meshfox`, which we spawn ourselves, directly,
+        // through `portable_pty` below. That binary keeps ld64's flaky ad-hoc
+        // linker signature (silent `killed`, or a long AMFI/trustd validation
+        // hang — see the repo memory note "macos-codesign-kill", the same
+        // incident `scripts/run-signed.sh` was cut from) unless we re-sign it
+        // ourselves first, same as that script does for the runner case.
+        // Exactly once per test binary run, guarded by `Once` — every test in
+        // this suite calls `spawn`, `cargo test` runs them concurrently by
+        // default, and `codesign` rewriting the same shared
+        // `CARGO_BIN_EXE_meshfox` file from two threads at once corrupts it
+        // for whichever `spawn_command` loses the race ("object file format
+        // unrecognized", "No such file or directory" — confirmed live).
+        #[cfg(target_os = "macos")]
+        {
+            static SIGN_ONCE: std::sync::Once = std::sync::Once::new();
+            SIGN_ONCE.call_once(|| {
+                let status = std::process::Command::new("codesign")
+                    .args(["--force", "-s", "-", env!("CARGO_BIN_EXE_meshfox")])
+                    .status()
+                    .expect("run codesign");
+                assert!(status.success(), "codesign failed to re-sign the meshfox binary");
+            });
+        }
+
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -44,6 +70,20 @@ impl TuiSession {
         let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_meshfox"));
         cmd.arg("tui");
         cmd.arg(canvas_path);
+        // Isolates this process from whatever the *real* machine's
+        // `~/.meshfox/config.toml` happens to declare — `meshfox_core::config`
+        // reads `$HOME/.meshfox/config.toml` unconditionally, so a developer
+        // who has (say) `server_socket` set for their own daily use would
+        // otherwise have every `tui` spawned here silently handed off to
+        // *their* real external coordinator daemon instead of spawning the
+        // isolated embedded worker this suite means to test — same leak
+        // `crates/cli/tests/run_cmd.rs`'s own `meshfox()` helper already
+        // guards `Command`-based integration tests against, just never
+        // applied here since this harness builds its own `CommandBuilder`
+        // instead of going through that helper. `fixture_dir` already has no
+        // `.meshfox/config.toml` of its own, so pointing `HOME` there too
+        // gets both "no global config" and "no local config" for free.
+        cmd.env("HOME", &fixture_dir);
 
         let child = pair.slave.spawn_command(cmd).expect("spawn meshfox tui");
         // Only needed to spawn the child (which inherits it as its
@@ -53,16 +93,56 @@ impl TuiSession {
         drop(pair.slave);
 
         let mut reader = pair.master.try_clone_reader().expect("clone pty reader");
-        let writer = pair.master.take_writer().expect("pty writer");
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> =
+            Arc::new(Mutex::new(pair.master.take_writer().expect("pty writer")));
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
         let parser_for_thread = Arc::clone(&parser);
+        let writer_for_thread = Arc::clone(&writer);
         std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
+            // Tail of everything seen so far, just long enough to catch the
+            // query below even if it lands split across two `read`s — a
+            // real terminal answers on the wire, not through a parsed
+            // event, so watching raw bytes here (not `vt100::Parser`, which
+            // only tracks screen *state*, no per-terminal outgoing replies)
+            // is the only way to reply at all.
+            let mut tail = Vec::new();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => parser_for_thread.lock().unwrap().process(&buf[..n]),
+                    Ok(n) => {
+                        let chunk = &buf[..n];
+                        parser_for_thread.lock().unwrap().process(chunk);
+                        // `Picker::from_query_stdio` (see `App::new`'s own
+                        // startup, `crates/cli/src/tui/app.rs::build_picker`)
+                        // probes the real terminal for its image-protocol/
+                        // cell-size capabilities, ending every probe with a
+                        // Device Status Report (`ESC [ 5 n`) specifically
+                        // *because* every real terminal answers it — that
+                        // reply (`ESC [ 0 n`) is what tells the picker
+                        // "nothing more is coming, stop waiting" (see
+                        // `ratatui-image`'s own `cap_parser.rs`: "ensure
+                        // that there is some [...] response"). Nobody
+                        // emulates a terminal on this pty's other end, so
+                        // without an answer here the picker blocks on its
+                        // own multi-second read timeout on *every* startup
+                        // — slow enough to blow past this suite's `wait_for`
+                        // deadlines outright. We don't answer the other
+                        // probes (device attributes, cell size in pixels):
+                        // getting no reply to those is a perfectly normal,
+                        // fast "this terminal doesn't support that" result,
+                        // same as any real plain terminal.
+                        tail.extend_from_slice(chunk);
+                        if tail.len() > 4 {
+                            tail.drain(..tail.len() - 4);
+                        }
+                        if tail.ends_with(b"\x1b[5n") {
+                            let mut w = writer_for_thread.lock().unwrap();
+                            let _ = w.write_all(b"\x1b[0n");
+                            let _ = w.flush();
+                        }
+                    }
                 }
             }
         });
@@ -80,8 +160,9 @@ impl TuiSession {
     /// control bytes (`"\r"` for Enter, `"\x1b"` for Esc), or a raw escape
     /// sequence (arrow keys, mouse events — see `send_mouse_click`).
     pub fn send_keys(&mut self, s: &str) {
-        self.writer.write_all(s.as_bytes()).expect("write to pty");
-        self.writer.flush().expect("flush pty");
+        let mut w = self.writer.lock().unwrap();
+        w.write_all(s.as_bytes()).expect("write to pty");
+        w.flush().expect("flush pty");
     }
 
     /// A left-click at 0-indexed `(row, col)` — standard xterm SGR mouse

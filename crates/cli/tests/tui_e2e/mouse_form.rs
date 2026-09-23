@@ -25,8 +25,13 @@ fn filling_in_a_form_field_and_clicking_send_autoruns_the_dependent_block() {
         !session.screen_text().contains("field var"),
         "the form fence's raw source shouldn't show while not editing its own node's body"
     );
+    // Not a bare `"greeting is"` — the autorun block's own raw source
+    // (`echo "greeting is $GREETING"`, shown as-is in the Document pane
+    // right below the form) already contains that substring literally,
+    // with nothing having run at all. Only the *interpolated* value only
+    // real output could ever produce actually proves that.
     assert!(
-        !session.screen_text().contains("greeting is"),
+        !session.screen_text().contains("greeting is Hello"),
         "nothing should have run yet"
     );
 

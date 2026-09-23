@@ -34,6 +34,14 @@ fn running_a_service_block_streams_a_started_line_and_shows_live_glyphs_then_qui
         .wait_for("Root", Duration::from_secs(5))
         .expect("initial render");
 
+    // A single-block run (this fixture's own chain is just the service
+    // itself) never auto-expands the Output console (`App::begin_http_run`'s
+    // own >= 2-step gate) — click the collapsed strip open first, same as
+    // a real user would have to, so the "service started" line actually
+    // lands somewhere visible.
+    let (out_row, out_col) = session.find("Output").expect("collapsed Output strip");
+    session.send_mouse_click(out_row, out_col);
+
     // Root's own sole block is the service — already selected, no need to
     // move down first.
     session.send_keys("r");
@@ -92,9 +100,9 @@ fn running_a_service_block_streams_a_started_line_and_shows_live_glyphs_then_qui
     );
 }
 
-/// Pulls the pid out of "running · pid 1234" or "stopped · pid 1234" —
-/// whichever `render_services_view` currently shows for the one service
-/// this fixture has.
+/// Pulls the pid out of "running · pid 1234" (`render_services_view` never
+/// shows one for a stopped row — nothing live left to report — so
+/// `status_word` is only ever meaningfully "running" here).
 fn find_list_pid(screen: &str, status_word: &str) -> Option<u32> {
     let marker = format!("{status_word} · pid ");
     let start = screen.find(&marker)? + marker.len();
@@ -110,6 +118,13 @@ fn v_opens_the_services_view_and_s_r_stop_and_restart() {
     session
         .wait_for("Root", Duration::from_secs(5))
         .expect("initial render");
+
+    // A single-block run never auto-expands the Output console
+    // (`App::begin_http_run`'s own >= 2-step gate) — click the collapsed
+    // strip open first, same as a real user would have to, so the
+    // "service started" line actually lands somewhere visible.
+    let (out_row, out_col) = session.find("Output").expect("collapsed Output strip");
+    session.send_mouse_click(out_row, out_col);
 
     session.send_keys("r");
     session
@@ -132,7 +147,7 @@ fn v_opens_the_services_view_and_s_r_stop_and_restart() {
 
     session.send_keys("s");
     session
-        .wait_for("stopped · pid", Duration::from_secs(5))
+        .wait_for("stopped", Duration::from_secs(5))
         .expect("the list should flip to stopped after s");
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);

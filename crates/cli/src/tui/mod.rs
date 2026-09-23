@@ -88,14 +88,17 @@ pub async fn run(canvas_path: PathBuf, initial_node: Option<String>) -> io::Resu
                 false,
                 None,
                 true,
-                Some(guard),
+                guard,
                 Some(ready_tx),
             ));
-            // The embedded bind itself failing (distinct from `resolve`'s
-            // own error above) still degrades gracefully — `ready_rx`
-            // simply never fires, and `App::new` already has its own
-            // direct-file/local-process fallback for `worker_port: None`.
-            ready_rx.await.ok()
+            match ready_rx.await {
+                Ok(port) => Some(port),
+                Err(_) => {
+                    disable_raw_mode()?;
+                    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+                    return Err(io::Error::other("failed to start the worker"));
+                }
+            }
         }
         Ok(crate::coordinator::Resolved::Other(port)) => Some(port),
         Err(e) => {

@@ -26,6 +26,7 @@ anyhow = "1.0.104"
 # installing that as the process-wide default (meshfox-cli's `main`) covers
 # reqwest too, without compiling two crypto libraries into one binary.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 scraper = "0.20"
 futures-util = "0.3.33"
 # "bundled" so the undo/redo session log (`undo_log.rs`) doesn't depend on a

@@ -50,13 +50,23 @@ fn dragging_the_output_seam_resizes_the_output_pane() {
         .wait_for("Root", Duration::from_secs(5))
         .expect("initial render");
 
+    // Output starts collapsed to a fixed 1-row strip (`App::
+    // console_collapsed`'s own default) — `ui::compute_layout` pins a
+    // collapsed pane's own height to 1 regardless of `output_height`, so
+    // dragging its seam while collapsed silently updates `output_height`
+    // with no visible effect at all (nothing to actually grow). Expand it
+    // first, same as a real user would have to before resizing it.
+    let (strip_row, strip_col) = session.find("Output").expect("collapsed Output strip");
+    session.send_mouse_click(strip_row, strip_col);
+    std::thread::sleep(Duration::from_millis(150));
+
     // The Output pane's own title sits right on its top border row — one
     // row *above* it is the tree/document row's own bottom border, which
     // is the actual resize handle (Output's own top border/title row is
     // deliberately excluded — see `App::resize_handle_at`'s own doc
     // comment — so a click there keeps behaving as a plain focus click,
     // not a resize start).
-    let (title_row, col) = session.find("Output").expect("Output pane title");
+    let (title_row, col) = session.find("Output").expect("Output pane title, now expanded");
     let row = title_row - 1;
 
     // Drag the seam up — same column (a vertical drag) — growing the

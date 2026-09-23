@@ -73,6 +73,14 @@ fn scrolling_over_the_output_pane_scrolls_its_own_content() {
     session
         .wait_for("Root", Duration::from_secs(5))
         .expect("initial render");
+
+    // A single-block run never auto-expands the Output console
+    // (`App::begin_http_run`'s own >= 2-step gate) — click the collapsed
+    // strip open first, same as a real user would have to, so the run's
+    // real stdout actually lands somewhere visible.
+    let (out_row, out_col) = session.find("Output").expect("collapsed Output strip");
+    session.send_mouse_click(out_row, out_col);
+
     session.send_keys("r");
     session
         .wait_for("tui-e2e-line-40", Duration::from_secs(10))
@@ -104,7 +112,21 @@ fn double_clicking_the_output_title_expands_it_to_fullscreen_and_back() {
         "the tree is visible before expanding Output"
     );
 
-    let (row, col) = session.find("Output").expect("Output pane title");
+    // Output starts collapsed to a 1-row strip (`App::console_collapsed`'s
+    // own default) — a click anywhere on it always just expands it first
+    // (`App::on_mouse`'s collapsed-strip branch, same "click it to reopen"
+    // affordance the Tree pane's own collapsed handle has), regardless of
+    // single- or double-click; expanding grows the pane *upward*, so its
+    // own title row is no longer at the coordinate that was just clicked.
+    // A real double-click gesture here is genuinely two separate clicks
+    // (same "re-locate before the second click" reasoning the restore
+    // step below already uses) — expand first, then double-click the
+    // freshly-relocated title row to actually fullscreen it.
+    let (row, col) = session.find("Output").expect("collapsed Output strip");
+    session.send_mouse_click(row, col);
+    std::thread::sleep(Duration::from_millis(150));
+
+    let (row, col) = session.find("Output").expect("Output pane title, now expanded");
     session.send_mouse_double_click(row, col);
     std::thread::sleep(Duration::from_millis(100));
     assert!(

@@ -1,5 +1,6 @@
 <!-- meshfox:canvas -->
 # meshfox
+<!-- meshfox:node id="meshfox" -->
 
 ```
  /\_/\
@@ -760,6 +761,83 @@ Two independent syntax-highlighting engines, one shared grammar format (mostly):
 - **meshfox's own bundled grammar *pool*** (`grammars/README.md`) — complete, standalone language grammars for anything neither engine bundles by default that meshfox itself needs, currently just Starlark (for ` ```starlark constraint ` fences, SPEC.md's "Constraint fences" — neither `syntect` nor Shiki ships one). One canonical, unmodified file the web side loads directly; where that file doesn't load into `syntect` as-is, a hand-adapted copy lives in `grammars/tui/` instead (same `<dir>/tui/<name>` shape as the user-facing override below) — the *built-in* version of that same mechanism, for meshfox's own pool rather than a user-supplied grammar.
 - **User-loadable custom grammars**: drop a `.tmLanguage.json` or `.sublime-syntax` file into `.meshfox/syntax/` (next to the canvas) or `~/.meshfox/syntax/` (global, every project) — one shared repository both sides read from (`crate::syntax_registry` on the TUI side, `GET /api/syntax`/`GET /api/syntax/:name` for the browser — see "Terminal viewer" and "Browser UI" above for each side's own detail). Local wins over global on a same-named clash.
 - **TUI-only overrides**, `.meshfox/syntax/tui/` (and `~/.meshfox/syntax/tui/`): some real, unmodified upstream grammars simply can't load into `syntect` at all, override or not — a few (confirmed by grepping the actual upstream files, not guessed) use TextMate's `begin`/`while` construct, which `syntect`'s matching engine has no equivalent for (Markdown: 72 such rules; AsciiDoc: 244; YAML: 2 — plain programming-language grammars essentially never use it). A same-named file dropped in `tui/` overrides the plain one *for the TUI specifically*, hand-rewritten to use only constructs `syntect` supports (typically `include`-ing `syntect`'s own already-loaded default for that language, the way meshfox's own grammar does for Markdown) — the browser never sees this directory (`meshfox-server`'s own listing doesn't recurse into it), so it keeps using the original, unmodified file.
+
+### Component diagram
+<!-- meshfox:node id="component-diagram" type="group" -->
+
+#### Browser UI
+<!-- meshfox:node id="browser-ui" x=0 y=0 w=240 h=112 -->
+
+`web/`: React + React Flow SPA. Talks to the worker over `GET /api/canvas`, `PATCH /api/nodes/:id`, block-run/`tty` WebSockets. Built once (`npm run build`) into `web/dist`.
+
+#### TUI
+<!-- meshfox:node id="tui" x=280 y=0 w=240 h=112 -->
+
+`crates/cli/src/tui/`: `meshfox tui`, a real terminal frontend (ratatui). Never touches the canvas file itself — every read/mutation goes through `worker_client` to whichever worker owns the file.
+
+#### MCP root
+<!-- meshfox:node id="mcp-root" x=560 y=0 w=240 h=112 -->
+
+`meshfox mcp` with no leaf env var — the one server a host (Claude Code, ...) launches. `canvas_open` spawns/talks to one leaf child process per opened canvas over its own stdio.
+
+#### CLI one-shot ops
+<!-- meshfox:node id="cli-one-shot-ops" x=840 y=0 w=260 h=112 -->
+
+`meshfox node <op>` / `run` / `validate` / `check`: one-shot invocations from a shell. Node mutations always route through a worker too (no more direct-file-write fallback).
+
+#### MCP leaf
+<!-- meshfox:node id="mcp-leaf" x=560 y=152 w=240 h=92 -->
+<!-- meshfox:edge from="mcp-root" -->
+
+`MESHFOX_MCP_LEAF=1`, one process per open canvas. Wraps `worker_client`/`coordinator` — every tool call (`node_*`, `debug_*`) is a thin client of the file's own worker.
+
+#### coordinator::resolve
+<!-- meshfox:node id="coordinator-resolve" x=280 y=280 w=280 h=112 -->
+<!-- meshfox:edge from="tui" -->
+<!-- meshfox:edge from="mcp-leaf" -->
+<!-- meshfox:edge from="cli-one-shot-ops" -->
+
+`crates/cli/src/coordinator.rs`: the one function every frontend calls to decide "who is *the* worker for this file" — tried in order, a configured `server_socket` daemon, then the per-file `worker_lock`. `get_or_spawn` embeds a new worker (in-process, `tokio::spawn`) when this call wins the lock.
+
+#### worker_lock
+<!-- meshfox:node id="worker-lock" x=620 y=280 w=240 h=112 -->
+<!-- meshfox:edge from="coordinator-resolve" -->
+
+`meshfox-core::worker_lock`: one `flock`'d lock file per canvas path, holding the winning worker's bound port. A second `coordinator::resolve` for the same file reads that port instead of racing to also serve it.
+
+#### worker (axum HTTP server)
+<!-- meshfox:node id="worker-axum-http-server" x=260 y=452 w=340 h=132 -->
+<!-- meshfox:edge from="coordinator-resolve" -->
+<!-- meshfox:edge from="browser-ui" -->
+<!-- meshfox:edge from="tui" -->
+<!-- meshfox:edge from="mcp-leaf" -->
+<!-- meshfox:edge from="web-dist-bundle" -->
+
+`meshfox_server::serve_as_worker`: the one process (embedded in `cli`, `tui`, or `view`) that actually owns one canvas file — every read/mutation for that file funnels through here, serialized, closing the read-modify-write race a direct file edit would have.
+
+#### web/dist bundle
+<!-- meshfox:node id="web-dist-bundle" x=680 y=452 w=240 h=112 -->
+
+Built React app, embedded into the `meshfox` binary at compile time via `rust-embed` (`meshfox_server::WebAssets`). Not shipped or loaded separately at runtime.
+
+#### core (meshfox-core)
+<!-- meshfox:node id="core-meshfox-core" x=180 y=620 w=280 h=120 -->
+<!-- meshfox:edge from="worker-axum-http-server" -->
+<!-- meshfox:edge from="cli-one-shot-ops" -->
+
+Canvas model: `mdcanvas` parse/surgical-patch, tree derivation, fence scanning, output-block rewriting, auto-layout. The shared brain — no I/O of its own, no `[[bin]]`.
+
+#### stream_exec / debug_session
+<!-- meshfox:node id="stream-exec-debug-session" x=540 y=620 w=280 h=120 -->
+<!-- meshfox:edge from="worker-axum-http-server" -->
+
+`meshfox_server::stream_exec`/`debug_session`/`pty_exec`: spawns the real bash/interpreter subprocess for a runnable block, `tty` block, or MCP `debug_*` shell.
+
+#### canvas file (*.canvas.md)
+<!-- meshfox:node id="canvas-file-canvas-md" x=260 y=800 w=280 h=92 -->
+<!-- meshfox:edge from="worker-axum-http-server" -->
+
+The actual file on disk — a Markdown outline with `meshfox:*` HTML-comment bookkeeping. Read/written only by the worker that holds its `worker_lock`.
 
 ## Development
 <!-- meshfox:node id="development" -->

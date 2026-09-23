@@ -434,18 +434,39 @@ fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
     // below) rather than threading `&App.services` all the way into
     // `tree_row_words` — a node's live status, aggregated across every
     // service belonging to it (crashed wins over running, same "worst
-    // status shown" convention `ServiceBadge` uses in the webui).
-    // **Experimental**, see SPEC.md's "Service blocks (experimental)".
+    // status shown" convention `ServiceBadge` uses in the webui). Branches
+    // on `app.service_list` (worker mode) vs `app.services` (local mode)
+    // the same way `render_services_view` already does — this used to
+    // only ever read `app.services`, so a worker-routed session's tree
+    // rows never showed a running/crashed service glyph at all, always
+    // falling back to the idle `○service` regardless of real state, even
+    // though the footer aggregate (`App::refresh_services`) and the `v`
+    // services view were already worker-mode-aware. **Experimental**, see
+    // SPEC.md's "Service blocks (experimental)".
     let mut service_by_node: HashMap<String, ServiceRowState> = HashMap::new();
-    for ((node_id, _), handle) in &app.services {
-        let state = match handle.status() {
-            meshfox_server::services::ServiceStatus::Running => ServiceRowState::Running,
-            meshfox_server::services::ServiceStatus::Crashed { .. } => ServiceRowState::Crashed,
-            meshfox_server::services::ServiceStatus::Stopped => continue,
-        };
-        let entry = service_by_node.entry(node_id.clone()).or_insert(state);
-        if state == ServiceRowState::Crashed {
-            *entry = ServiceRowState::Crashed;
+    if app.worker_port.is_some() {
+        for dto in &app.service_list {
+            let state = match dto.status.as_str() {
+                "running" => ServiceRowState::Running,
+                "crashed" => ServiceRowState::Crashed,
+                _ => continue,
+            };
+            let entry = service_by_node.entry(dto.node_id.clone()).or_insert(state);
+            if state == ServiceRowState::Crashed {
+                *entry = ServiceRowState::Crashed;
+            }
+        }
+    } else {
+        for ((node_id, _), handle) in &app.services {
+            let state = match handle.status() {
+                meshfox_server::services::ServiceStatus::Running => ServiceRowState::Running,
+                meshfox_server::services::ServiceStatus::Crashed { .. } => ServiceRowState::Crashed,
+                meshfox_server::services::ServiceStatus::Stopped => continue,
+            };
+            let entry = service_by_node.entry(node_id.clone()).or_insert(state);
+            if state == ServiceRowState::Crashed {
+                *entry = ServiceRowState::Crashed;
+            }
         }
     }
 

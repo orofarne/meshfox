@@ -1,12 +1,7 @@
 //! Regression coverage for the data-race fix that routes `node
 //! add`/`meta`/`rename`/`set-id`/`edges`/`mv`/`move`/`reorder`/`block`
-//! through `crate::coordinator::discover` + `crate::worker_client` whenever
-//! a worker (a `view`/`tui`/`server_socket` daemon with the same file
-//! already open in its own in-memory `state.raw`) is already running for
-//! the canvas, instead of always doing a direct file read-modify-write that
-//! could silently clobber — or be clobbered by — that worker's own next
-//! save. Before this fix, only `node body`/`node rm` did this; every op
-//! covered here used to race the worker unconditionally.
+//! through `crate::coordinator::get_or_spawn` + `crate::worker_client`.
+//! A running worker is reused; otherwise the CLI starts one for the call.
 //!
 //! Each test spawns a bare worker via `--watcher-socket` (a fake,
 //! never-read path — the same convention `service_shutdown_cmd.rs`/
@@ -85,6 +80,48 @@ fn spawn_worker(dir: &Path, canvas_path: &Path) -> std::process::Child {
 fn kill(mut worker: std::process::Child) {
     let _ = worker.kill();
     let _ = worker.wait();
+}
+
+#[test]
+fn node_mutations_start_a_worker_when_none_is_running() {
+    let dir = unique_dir();
+    let canvas_path = dir.join("base.canvas.md");
+    std::fs::write(
+        &canvas_path,
+        concat!(
+            "<!-- meshfox:canvas -->\n# Base\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Child\n<!-- meshfox:node id=\"child\" x=5 y=7 width=100 height=40 -->\n\n",
+            "before\n\n",
+            "## Stale\n<!-- meshfox:node id=\"stale\" -->\n\n",
+            "```bash name=\"job\"\necho old\n```\n",
+            "<!-- meshfox:output name=\"job\" -->\n```text\nold\n```\n<!-- /meshfox:output -->\n",
+        ),
+    ).unwrap();
+
+    let mut append = meshfox().args(["node", "append", "--canvas"])
+        .arg(&canvas_path).arg("child")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn().unwrap();
+    use std::io::Write;
+    append.stdin.as_mut().unwrap().write_all(b"after\n").unwrap();
+    drop(append.stdin.take());
+    let output = append.wait_with_output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("via the worker"));
+
+    let output = meshfox().args(["node", "meta", "--canvas"])
+        .arg(&canvas_path).args(["child", "--clear-position"])
+        .output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let after = std::fs::read_to_string(&canvas_path).unwrap();
+    assert!(after.contains("before\n\nafter"), "{after}");
+    assert!(!after.contains(" x=5"), "{after}");
+    assert!(!after.contains(" y=7"), "{after}");
+    assert!(!after.contains("width=100"), "{after}");
+    assert!(!after.contains("meshfox:output"), "{after}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

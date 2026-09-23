@@ -13,9 +13,11 @@
 
 use clap::{Args, Parser, Subcommand};
 use meshfox_core::{
-    mdcanvas, Canvas, ExtraEdge, FenceAttrsPatch, FileDisplay, Node, NodeMeta, NodeType, VarCache,
+    mdcanvas, Canvas, ExtraEdge, FileDisplay, Node, NodeType, VarCache,
     VarDecl, VarType,
 };
+#[cfg(test)]
+use meshfox_core::{FenceAttrsPatch, NodeMeta};
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -1462,10 +1464,7 @@ fn shared_origin_note(origin: &meshfox_core::SharedOrigin) -> String {
 }
 
 fn configure(canvas_path: &PathBuf) {
-    let raw = std::fs::read_to_string(canvas_path).unwrap_or_else(|e| {
-        eprintln!("failed to read {}: {e}", canvas_path.display());
-        std::process::exit(1);
-    });
+    let raw = read_raw_or_exit(canvas_path);
     let decls = declared_vars_or_exit(canvas_path, &raw);
     // `secret` and `session` are both never cached -- `configure`'s whole
     // job is walking the cache, so neither has anything for it to do.
@@ -1570,10 +1569,7 @@ fn validate_canvas(raw: &str, canvas_path: &Path) -> Result<usize, String> {
 }
 
 fn validate(canvas_path: &PathBuf) {
-    let raw = std::fs::read_to_string(canvas_path).unwrap_or_else(|e| {
-        eprintln!("failed to read {}: {e}", canvas_path.display());
-        std::process::exit(1);
-    });
+    let raw = read_raw_or_exit(canvas_path);
     match validate_canvas(&raw, canvas_path) {
         Ok(n) => println!(
             "meshfox validate: {} ok ({n} node{})",
@@ -1619,10 +1615,7 @@ fn check_canvas(raw: &str, canvas_path: &Path) -> Result<Vec<meshfox_core::Const
 }
 
 fn check(canvas_path: &PathBuf) {
-    let raw = std::fs::read_to_string(canvas_path).unwrap_or_else(|e| {
-        eprintln!("failed to read {}: {e}", canvas_path.display());
-        std::process::exit(1);
-    });
+    let raw = read_raw_or_exit(canvas_path);
     let results = check_canvas(&raw, canvas_path).unwrap_or_else(|e| {
         eprintln!("meshfox check: {}: {e}", canvas_path.display());
         std::process::exit(1);
@@ -1693,7 +1686,13 @@ pub(crate) fn canvas_template_content(canvas_path: &Path) -> String {
 }
 
 fn write_canvas_template(canvas_path: &Path) {
-    std::fs::write(canvas_path, canvas_template_content(canvas_path)).unwrap_or_else(|e| {
+    use std::io::Write;
+    let result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(canvas_path)
+        .and_then(|mut file| file.write_all(canvas_template_content(canvas_path).as_bytes()));
+    result.unwrap_or_else(|e| {
         eprintln!("failed to write {}: {e}", canvas_path.display());
         std::process::exit(1);
     });
@@ -1999,8 +1998,12 @@ async fn run_async(
     let path: Vec<&str> = args.iter().map(String::as_str).collect();
     let block_names: Vec<&str> = block_arg.split(',').map(str::trim).collect();
 
-    let initial_raw = std::fs::read_to_string(canvas_path).unwrap_or_else(|e| {
-        eprintln!("failed to read {}: {e}", canvas_path.display());
+    let port = coordinator::get_or_spawn(canvas_path).await.unwrap_or_else(|e| {
+        eprintln!("failed to reach worker for {}: {e}", canvas_path.display());
+        std::process::exit(1);
+    });
+    let initial_raw = worker_client::get_canvas_raw(port).await.unwrap_or_else(|e| {
+        eprintln!("failed to read {} through worker: {e}", canvas_path.display());
         std::process::exit(1);
     });
 
@@ -2054,7 +2057,7 @@ async fn run_async(
                 false,
                 None,
                 true,
-                Some(guard),
+                guard,
                 Some(ready_tx),
             ));
             match ready_rx.await {
@@ -2686,10 +2689,7 @@ fn var_decl_from_status(status: &worker_client::VarStatus) -> VarDecl {
 }
 
 fn list(canvas_path: &PathBuf) {
-    let raw = std::fs::read_to_string(canvas_path).unwrap_or_else(|e| {
-        eprintln!("failed to read {}: {e}", canvas_path.display());
-        std::process::exit(1);
-    });
+    let raw = read_raw_or_exit(canvas_path);
     let canvas = Canvas::from_markdown(&raw).unwrap_or_else(|e| {
         eprintln!("failed to parse {}: {e}", canvas_path.display());
         std::process::exit(1);
@@ -2913,17 +2913,21 @@ fn run_command(path: &[String], name: &str, node_id: &str) -> String {
 }
 
 fn read_raw_or_exit(canvas_path: &Path) -> String {
-    std::fs::read_to_string(canvas_path).unwrap_or_else(|e| {
-        eprintln!("failed to read {}: {e}", canvas_path.display());
+    let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime");
+    let port = worker_port_or_exit(&runtime, canvas_path);
+    runtime.block_on(worker_client::get_canvas_raw(port)).unwrap_or_else(|e| {
+        eprintln!("failed to read {} through worker: {e}", canvas_path.display());
         std::process::exit(1);
     })
 }
 
-fn write_raw_or_exit(canvas_path: &Path, content: &str) {
-    std::fs::write(canvas_path, content).unwrap_or_else(|e| {
-        eprintln!("failed to write {}: {e}", canvas_path.display());
-        std::process::exit(1);
-    });
+fn worker_port_or_exit(runtime: &tokio::runtime::Runtime, canvas_path: &Path) -> u16 {
+    runtime
+        .block_on(coordinator::get_or_spawn(canvas_path))
+        .unwrap_or_else(|e| {
+            eprintln!("failed to start or reach the worker for {}: {e}", canvas_path.display());
+            std::process::exit(1);
+        })
 }
 
 fn node_add(
@@ -2938,55 +2942,39 @@ fn node_add(
         eprintln!("failed to start async runtime: {e}");
         std::process::exit(1);
     });
-    if let Some(port) = runtime.block_on(coordinator::discover(canvas_path)) {
-        // `title_slug_id: true` — `node add` has always produced a
-        // title-slug id (`mdcanvas::insert_child_node`), never the web
-        // UI's own random one; routing through a worker can't be allowed
-        // to change which scheme a caller gets back (see
-        // `crates/server/src/lib.rs`'s `CreateNodeRequest::title_slug_id`
-        // doc comment).
-        let new_id = match runtime.block_on(worker_client::create_node(port, parent_id, title, true)) {
-            Ok(id) => id,
+    let port = worker_port_or_exit(&runtime, canvas_path);
+    // `title_slug_id: true` — `node add` has always produced a
+    // title-slug id (`mdcanvas::insert_child_node`), never the web
+    // UI's own random one; routing through a worker can't be allowed
+    // to change which scheme a caller gets back (see
+    // `crates/server/src/lib.rs`'s `CreateNodeRequest::title_slug_id`
+    // doc comment).
+    let new_id = match runtime.block_on(worker_client::create_node(port, parent_id, title, true)) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("meshfox node add: {e} (worker on port {port})");
+            std::process::exit(1);
+        }
+    };
+    if body.is_some() || fields.is_set() {
+        let update = match node_update_from_fields(&fields, body.as_deref()) {
+            Ok(u) => u,
             Err(e) => {
-                eprintln!("meshfox node add: {e} (worker on port {port})");
+                eprintln!("meshfox node add: added {new_id:?}, but {e}");
                 std::process::exit(1);
             }
         };
-        if body.is_some() || fields.is_set() {
-            let update = match node_update_from_fields(&fields, body.as_deref()) {
-                Ok(u) => u,
-                Err(e) => {
-                    eprintln!("meshfox node add: added {new_id:?}, but {e}");
-                    std::process::exit(1);
-                }
-            };
-            if let Err(e) = runtime.block_on(worker_client::update_node(port, &new_id, &update)) {
-                eprintln!(
-                    "meshfox node add: added {new_id:?}, but failed to set its extra fields: {e} \
-                     (worker on port {port})"
-                );
-                std::process::exit(1);
-            }
-        }
-        println!(
-            "meshfox node add: added {new_id:?} under {parent_id:?} via the running worker on port {port}"
-        );
-        return;
-    }
-    let raw = read_raw_or_exit(canvas_path);
-    match apply_node_add_with_extras(&raw, parent_id, title, body.as_deref(), fields) {
-        Ok((updated, new_id)) => {
-            write_raw_or_exit(canvas_path, &updated);
-            println!(
-                "meshfox node add: added {new_id:?} under {parent_id:?} in {}",
-                canvas_path.display()
+        if let Err(e) = runtime.block_on(worker_client::update_node(port, &new_id, &update)) {
+            eprintln!(
+                "meshfox node add: added {new_id:?}, but failed to set its extra fields: {e} \
+                 (worker on port {port})"
             );
-        }
-        Err(e) => {
-            eprintln!("meshfox node add: {e} ({})", canvas_path.display());
             std::process::exit(1);
         }
     }
+    println!(
+        "meshfox node add: added {new_id:?} under {parent_id:?} via the running worker on port {port}"
+    );
 }
 
 /// Reads `--body-file`'s value: `path` itself, unless it's the literal `-`
@@ -3015,6 +3003,7 @@ fn read_body_source_or_exit(path: &Path) -> String {
 /// Pure logic behind `node add`: insert the child, then make sure the
 /// result still parses before handing it back to the caller to write.
 /// Returns `(updated document, new node's id)`.
+#[cfg(test)]
 fn apply_node_add(raw: &str, parent_id: &str, title: &str) -> Result<(String, String), String> {
     let (updated, new_id) = mdcanvas::insert_child_node(raw, parent_id, title)
         .ok_or_else(|| format!("no node {parent_id:?}"))?;
@@ -3030,6 +3019,7 @@ fn apply_node_add(raw: &str, parent_id: &str, title: &str) -> Result<(String, St
 /// least one of them was actually given (`NodeMetaFields::is_set`) — a
 /// plain `node add` with none of these flags behaves exactly as it always
 /// has, byte for byte.
+#[cfg(test)]
 fn apply_node_add_with_extras(
     raw: &str,
     parent_id: &str,
@@ -3069,39 +3059,20 @@ fn node_rm(canvas_path: &Path, node_id: &str, keep_children: bool) {
         eprintln!("failed to start async runtime: {e}");
         std::process::exit(1);
     });
-    if let Some(port) = runtime.block_on(coordinator::discover(canvas_path)) {
-        return match runtime.block_on(worker_client::remove_node(port, node_id, keep_children)) {
-            Ok(()) => println!(
-                "meshfox node rm: deleted {node_id:?}{} via the running worker on port {port}",
-                if keep_children { " (children promoted)" } else { "" }
-            ),
-            Err(e) => {
-                eprintln!("meshfox node rm: {e} (worker on port {port})");
-                std::process::exit(1);
-            }
-        };
-    }
-    let raw = read_raw_or_exit(canvas_path);
-    match apply_node_rm(&raw, node_id, keep_children) {
-        Ok(updated) => {
-            write_raw_or_exit(canvas_path, &updated);
-            println!(
-                "meshfox node rm: deleted {node_id:?}{} in {}",
-                if keep_children {
-                    " (children promoted)"
-                } else {
-                    ""
-                },
-                canvas_path.display()
-            );
-        }
+    let port = worker_port_or_exit(&runtime, canvas_path);
+    match runtime.block_on(worker_client::remove_node(port, node_id, keep_children)) {
+        Ok(()) => println!(
+            "meshfox node rm: deleted {node_id:?}{} via the running worker on port {port}",
+            if keep_children { " (children promoted)" } else { "" }
+        ),
         Err(e) => {
-            eprintln!("meshfox node rm: {e} ({})", canvas_path.display());
+            eprintln!("meshfox node rm: {e} (worker on port {port})");
             std::process::exit(1);
         }
     }
 }
 
+#[cfg(test)]
 fn apply_node_rm(raw: &str, node_id: &str, keep_children: bool) -> Result<String, String> {
     let canvas = Canvas::from_markdown(raw).map_err(|e| e.to_string())?;
     let node = canvas
@@ -3125,33 +3096,19 @@ fn node_mv(canvas_path: &Path, node_id: &str, new_parent_id: &str) {
         eprintln!("failed to start async runtime: {e}");
         std::process::exit(1);
     });
-    if let Some(port) = runtime.block_on(coordinator::discover(canvas_path)) {
-        return match runtime.block_on(node_mv_via_worker(port, canvas_path, node_id, new_parent_id)) {
-            Ok(()) => println!(
-                "meshfox node mv: moved {node_id:?} under {new_parent_id:?} via the running worker on port {port}"
-            ),
-            Err(e) => {
-                eprintln!("meshfox node mv: {e} (worker on port {port})");
-                std::process::exit(1);
-            }
-        };
-    }
-    let raw = read_raw_or_exit(canvas_path);
-    match apply_node_mv(&raw, node_id, new_parent_id) {
-        Ok(updated) => {
-            write_raw_or_exit(canvas_path, &updated);
-            println!(
-                "meshfox node mv: moved {node_id:?} under {new_parent_id:?} in {}",
-                canvas_path.display()
-            );
-        }
+    let port = worker_port_or_exit(&runtime, canvas_path);
+    match runtime.block_on(node_mv_via_worker(port, canvas_path, node_id, new_parent_id)) {
+        Ok(()) => println!(
+            "meshfox node mv: moved {node_id:?} under {new_parent_id:?} via the running worker on port {port}"
+        ),
         Err(e) => {
-            eprintln!("meshfox node mv: {e} ({})", canvas_path.display());
+            eprintln!("meshfox node mv: {e} (worker on port {port})");
             std::process::exit(1);
         }
     }
 }
 
+#[cfg(test)]
 fn apply_node_mv(raw: &str, node_id: &str, new_parent_id: &str) -> Result<String, String> {
     let canvas = Canvas::from_markdown(raw).map_err(|e| e.to_string())?;
     let node = canvas
@@ -3229,37 +3186,23 @@ fn node_rename(canvas_path: &Path, node_id: &str, title: &str) {
         eprintln!("failed to start async runtime: {e}");
         std::process::exit(1);
     });
-    if let Some(port) = runtime.block_on(coordinator::discover(canvas_path)) {
-        let update = worker_client::NodeUpdate {
-            title: Some(title.to_string()),
-            ..Default::default()
-        };
-        return match runtime.block_on(worker_client::update_node(port, node_id, &update)) {
-            Ok(()) => println!(
-                "meshfox node rename: renamed {node_id:?} via the running worker on port {port}"
-            ),
-            Err(e) => {
-                eprintln!("meshfox node rename: {e} (worker on port {port})");
-                std::process::exit(1);
-            }
-        };
-    }
-    let raw = read_raw_or_exit(canvas_path);
-    match apply_node_rename(&raw, node_id, title) {
-        Ok(updated) => {
-            write_raw_or_exit(canvas_path, &updated);
-            println!(
-                "meshfox node rename: renamed {node_id:?} in {}",
-                canvas_path.display()
-            );
-        }
+    let port = worker_port_or_exit(&runtime, canvas_path);
+    let update = worker_client::NodeUpdate {
+        title: Some(title.to_string()),
+        ..Default::default()
+    };
+    match runtime.block_on(worker_client::update_node(port, node_id, &update)) {
+        Ok(()) => println!(
+            "meshfox node rename: renamed {node_id:?} via the running worker on port {port}"
+        ),
         Err(e) => {
-            eprintln!("meshfox node rename: {e} ({})", canvas_path.display());
+            eprintln!("meshfox node rename: {e} (worker on port {port})");
             std::process::exit(1);
         }
     }
 }
 
+#[cfg(test)]
 fn apply_node_rename(raw: &str, node_id: &str, title: &str) -> Result<String, String> {
     let updated = mdcanvas::set_node_title(raw, node_id, title)
         .ok_or_else(|| format!("no node {node_id:?}"))?;
@@ -3272,61 +3215,32 @@ fn node_set_id(canvas_path: &Path, node_id: &str, new_id: &str) {
         eprintln!("failed to start async runtime: {e}");
         std::process::exit(1);
     });
-    if let Some(port) = runtime.block_on(coordinator::discover(canvas_path)) {
-        return match runtime.block_on(worker_client::rename_node_id(port, node_id, new_id)) {
-            Ok(()) => {
-                println!(
-                    "meshfox node set-id: renamed {node_id:?} to {new_id:?} via the running worker on port {port}"
-                );
-                // Same post-success `deps=` sanity check the direct-file
-                // path runs — the server's own `rename-id` endpoint
-                // doesn't do this itself, so it's replicated here against
-                // a fresh fetch rather than silently dropped.
-                if let Ok(raw) = runtime.block_on(worker_client::get_canvas_raw(port)) {
-                    if let Ok(canvas) = Canvas::from_markdown(&raw) {
-                        if let Err(e) = meshfox_core::deps::validate(&canvas) {
-                            eprintln!(
-                                "meshfox node set-id: warning: {e} (a deps= reference may need fixing by hand — \
-                                 see `meshfox validate`)"
-                            );
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("meshfox node set-id: {e} (worker on port {port})");
-                std::process::exit(1);
-            }
-        };
-    }
-    let raw = read_raw_or_exit(canvas_path);
-    match apply_node_set_id(&raw, node_id, new_id) {
-        Ok(updated) => {
-            write_raw_or_exit(canvas_path, &updated);
+    let port = worker_port_or_exit(&runtime, canvas_path);
+    match runtime.block_on(worker_client::rename_node_id(port, node_id, new_id)) {
+        Ok(()) => {
             println!(
-                "meshfox node set-id: renamed {node_id:?} to {new_id:?} in {}",
-                canvas_path.display()
+                "meshfox node set-id: renamed {node_id:?} to {new_id:?} via the running worker on port {port}"
             );
-            if let Ok(canvas) = Canvas::from_markdown(&updated) {
-                if let Err(e) = meshfox_core::deps::validate(&canvas) {
-                    eprintln!(
-                        "meshfox node set-id: warning: {e} (a deps= reference may need fixing by hand — \
-                         see `meshfox validate`)"
-                    );
+            // Same post-success `deps=` sanity check the direct-file
+            // path runs — the server's own `rename-id` endpoint
+            // doesn't do this itself, so it's replicated here against
+            // a fresh fetch rather than silently dropped.
+            if let Ok(raw) = runtime.block_on(worker_client::get_canvas_raw(port)) {
+                if let Ok(canvas) = Canvas::from_markdown(&raw) {
+                    if let Err(e) = meshfox_core::deps::validate(&canvas) {
+                        eprintln!(
+                            "meshfox node set-id: warning: {e} (a deps= reference may need fixing by hand — \
+                             see `meshfox validate`)"
+                        );
+                    }
                 }
             }
         }
         Err(e) => {
-            eprintln!("meshfox node set-id: {e} ({})", canvas_path.display());
+            eprintln!("meshfox node set-id: {e} (worker on port {port})");
             std::process::exit(1);
         }
     }
-}
-
-fn apply_node_set_id(raw: &str, node_id: &str, new_id: &str) -> Result<String, String> {
-    let updated = mdcanvas::rename_node_id(raw, node_id, new_id).map_err(|e| e.to_string())?;
-    validate_patch(&updated)?;
-    Ok(updated)
 }
 
 fn node_body(canvas_path: &Path, node_id: &str, file: Option<PathBuf>) {
@@ -3352,34 +3266,19 @@ fn node_body(canvas_path: &Path, node_id: &str, file: Option<PathBuf>) {
         eprintln!("failed to start async runtime: {e}");
         std::process::exit(1);
     });
-    if let Some(port) = runtime.block_on(coordinator::discover(canvas_path)) {
-        return match runtime.block_on(worker_client::update_node_body(port, node_id, &new_body)) {
-            Ok(()) => println!(
-                "meshfox node body: updated {node_id:?} via the running worker on port {port}"
-            ),
-            Err(e) => {
-                eprintln!("meshfox node body: {e} (worker on port {port})");
-                std::process::exit(1);
-            }
-        };
-    }
-
-    let raw = read_raw_or_exit(canvas_path);
-    match apply_node_body(&raw, node_id, &new_body) {
-        Ok(updated) => {
-            write_raw_or_exit(canvas_path, &updated);
-            println!(
-                "meshfox node body: updated {node_id:?} in {}",
-                canvas_path.display()
-            );
-        }
+    let port = worker_port_or_exit(&runtime, canvas_path);
+    match runtime.block_on(worker_client::update_node_body(port, node_id, &new_body)) {
+        Ok(()) => println!(
+            "meshfox node body: updated {node_id:?} via the running worker on port {port}"
+        ),
         Err(e) => {
-            eprintln!("meshfox node body: {e} ({})", canvas_path.display());
+            eprintln!("meshfox node body: {e} (worker on port {port})");
             std::process::exit(1);
         }
     }
 }
 
+#[cfg(test)]
 fn apply_node_body(raw: &str, node_id: &str, new_body: &str) -> Result<String, String> {
     let updated = mdcanvas::set_node_body(raw, node_id, new_body)
         .ok_or_else(|| format!("no node {node_id:?}"))?;
@@ -3388,7 +3287,6 @@ fn apply_node_body(raw: &str, node_id: &str, new_body: &str) -> Result<String, S
 }
 
 fn node_append(canvas_path: &Path, node_id: &str, file: Option<PathBuf>) {
-    let raw = read_raw_or_exit(canvas_path);
     let addition = match file {
         Some(path) => std::fs::read_to_string(&path).unwrap_or_else(|e| {
             eprintln!("failed to read {}: {e}", path.display());
@@ -3397,35 +3295,23 @@ fn node_append(canvas_path: &Path, node_id: &str, file: Option<PathBuf>) {
         None => {
             use std::io::Read;
             let mut buf = String::new();
-            std::io::stdin()
-                .read_to_string(&mut buf)
-                .unwrap_or_else(|e| {
-                    eprintln!("failed to read stdin: {e}");
-                    std::process::exit(1);
-                });
+            std::io::stdin().read_to_string(&mut buf).unwrap_or_else(|e| {
+                eprintln!("failed to read stdin: {e}");
+                std::process::exit(1);
+            });
             buf
         }
     };
-    match apply_node_append(&raw, node_id, &addition) {
-        Ok(updated) => {
-            write_raw_or_exit(canvas_path, &updated);
-            println!(
-                "meshfox node append: updated {node_id:?} in {}",
-                canvas_path.display()
-            );
-        }
-        Err(e) => {
-            eprintln!("meshfox node append: {e} ({})", canvas_path.display());
-            std::process::exit(1);
-        }
-    }
-}
-
-fn apply_node_append(raw: &str, node_id: &str, addition: &str) -> Result<String, String> {
-    let updated = mdcanvas::append_node_body(raw, node_id, addition)
-        .ok_or_else(|| format!("no node {node_id:?}"))?;
-    validate_patch(&updated)?;
-    Ok(updated)
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+        eprintln!("failed to start async runtime: {e}");
+        std::process::exit(1);
+    });
+    let port = worker_port_or_exit(&runtime, canvas_path);
+    runtime.block_on(worker_client::append_node_body(port, node_id, &addition)).unwrap_or_else(|e| {
+        eprintln!("meshfox node append: {e} (worker on port {port})");
+        std::process::exit(1);
+    });
+    println!("meshfox node append: updated {node_id:?} via the worker on port {port}");
 }
 
 /// Every `node block` flag except `canvas`/`node_id`/`block_name`
@@ -3466,35 +3352,20 @@ fn node_block(canvas_path: &Path, node_id: &str, block_name: &str, args: BlockAr
         eprintln!("failed to start async runtime: {e}");
         std::process::exit(1);
     });
-    if let Some(port) = runtime.block_on(coordinator::discover(canvas_path)) {
-        let update = match block_attrs_update_from_args(&args, code.as_deref()) {
-            Ok(u) => u,
-            Err(e) => {
-                eprintln!("meshfox node block: {e}");
-                std::process::exit(1);
-            }
-        };
-        return match runtime.block_on(worker_client::set_block_attrs(port, node_id, block_name, &update)) {
-            Ok(()) => println!(
-                "meshfox node block: updated {block_name:?} in {node_id:?} via the running worker on port {port}"
-            ),
-            Err(e) => {
-                eprintln!("meshfox node block: {e} (worker on port {port})");
-                std::process::exit(1);
-            }
-        };
-    }
-    let raw = read_raw_or_exit(canvas_path);
-    match apply_node_block(&raw, node_id, block_name, &args, code.as_deref()) {
-        Ok(updated) => {
-            write_raw_or_exit(canvas_path, &updated);
-            println!(
-                "meshfox node block: updated {block_name:?} in {node_id:?} in {}",
-                canvas_path.display()
-            );
-        }
+    let port = worker_port_or_exit(&runtime, canvas_path);
+    let update = match block_attrs_update_from_args(&args, code.as_deref()) {
+        Ok(u) => u,
         Err(e) => {
-            eprintln!("meshfox node block: {e} ({})", canvas_path.display());
+            eprintln!("meshfox node block: {e}");
+            std::process::exit(1);
+        }
+    };
+    match runtime.block_on(worker_client::set_block_attrs(port, node_id, block_name, &update)) {
+        Ok(()) => println!(
+            "meshfox node block: updated {block_name:?} in {node_id:?} via the running worker on port {port}"
+        ),
+        Err(e) => {
+            eprintln!("meshfox node block: {e} (worker on port {port})");
             std::process::exit(1);
         }
     }
@@ -3582,6 +3453,7 @@ fn block_attrs_update_from_args(
 /// validate the whole resulting document's `deps=` graph right away
 /// (`deps::validate`: dangling targets, cycles) rather than leaving that
 /// for a separate `meshfox validate`.
+#[cfg(test)]
 fn apply_node_block(
     raw: &str,
     node_id: &str,
@@ -3755,84 +3627,25 @@ fn node_meta(
     tags: Option<String>,
     created_at: Option<String>,
 ) {
-    // `--clear-position` has no worker-routed equivalent: `PATCH
-    // /api/nodes/:id` can only leave x/y/width/height untouched or set
-    // them to a new value, never explicitly clear one back to unset (no
-    // sentinel for that exists on this endpoint, unlike `fold`'s own
-    // "true"/"false"/"default" string) — falls through to the direct-file
-    // path unconditionally for this one case rather than silently
-    // dropping the clear, same "known gap, real fallback, not a silent
-    // no-op" posture `run`'s own `tty` exception already established.
-    if !clear_position {
-        let fields = NodeMetaFields {
-            x,
-            y,
-            width,
-            height,
-            color: color.clone(),
-            node_type: node_type.clone(),
-            display: display.clone(),
-            lang: lang.clone(),
-            interpreter: interpreter.clone(),
-            preview,
-            fold: fold.clone(),
-            tags: tags.clone(),
-            created_at: created_at.clone(),
-        };
-        let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
-            eprintln!("failed to start async runtime: {e}");
-            std::process::exit(1);
-        });
-        if let Some(port) = runtime.block_on(coordinator::discover(canvas_path)) {
-            let update = match node_update_from_fields(&fields, None) {
-                Ok(u) => u,
-                Err(e) => {
-                    eprintln!("meshfox node meta: {e}");
-                    std::process::exit(1);
-                }
-            };
-            return match runtime.block_on(worker_client::update_node(port, node_id, &update)) {
-                Ok(()) => println!(
-                    "meshfox node meta: updated {node_id:?} via the running worker on port {port}"
-                ),
-                Err(e) => {
-                    eprintln!("meshfox node meta: {e} (worker on port {port})");
-                    std::process::exit(1);
-                }
-            };
-        }
-    }
-    let raw = read_raw_or_exit(canvas_path);
-    match apply_node_meta(
-        &raw,
-        node_id,
-        x,
-        y,
-        width,
-        height,
-        clear_position,
-        color,
-        node_type,
-        display,
-        lang,
-        interpreter,
-        preview,
-        fold,
-        tags,
-        created_at,
-    ) {
-        Ok(updated) => {
-            write_raw_or_exit(canvas_path, &updated);
-            println!(
-                "meshfox node meta: updated {node_id:?} in {}",
-                canvas_path.display()
-            );
-        }
-        Err(e) => {
-            eprintln!("meshfox node meta: {e} ({})", canvas_path.display());
-            std::process::exit(1);
-        }
-    }
+    let fields = NodeMetaFields {
+        x, y, width, height, color, node_type, display, lang, interpreter,
+        preview, fold, tags, created_at,
+    };
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+        eprintln!("failed to start async runtime: {e}");
+        std::process::exit(1);
+    });
+    let port = worker_port_or_exit(&runtime, canvas_path);
+    let mut update = node_update_from_fields(&fields, None).unwrap_or_else(|e| {
+        eprintln!("meshfox node meta: {e}");
+        std::process::exit(1);
+    });
+    update.clear_position = clear_position;
+    runtime.block_on(worker_client::update_node(port, node_id, &update)).unwrap_or_else(|e| {
+        eprintln!("meshfox node meta: {e} (worker on port {port})");
+        std::process::exit(1);
+    });
+    println!("meshfox node meta: updated {node_id:?} via the running worker on port {port}");
 }
 
 /// Rejects a `--tags`/`tags` value carrying characters that were never a
@@ -3857,6 +3670,7 @@ fn validate_tags_input(s: &str) -> Result<(), String> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn apply_node_meta(
     raw: &str,
     node_id: &str,
@@ -3976,40 +3790,25 @@ fn node_edges(canvas_path: &Path, node_id: &str, from: Vec<String>, clear: bool)
         eprintln!("failed to start async runtime: {e}");
         std::process::exit(1);
     });
-    if let Some(port) = runtime.block_on(coordinator::discover(canvas_path)) {
-        let edges: Vec<ExtraEdge> = extra_parents.iter().map(|p| ExtraEdge::new(p.as_str())).collect();
-        let update = worker_client::NodeUpdate {
-            extra_parents: Some(edges),
-            ..Default::default()
-        };
-        return match runtime.block_on(worker_client::update_node(port, node_id, &update)) {
-            Ok(()) => println!(
-                "meshfox node edges: set {} extra parent(s) on {node_id:?} via the running worker on port {port}",
-                extra_parents.len()
-            ),
-            Err(e) => {
-                eprintln!("meshfox node edges: {e} (worker on port {port})");
-                std::process::exit(1);
-            }
-        };
-    }
-    let raw = read_raw_or_exit(canvas_path);
-    match apply_node_edges(&raw, node_id, &extra_parents) {
-        Ok(updated) => {
-            write_raw_or_exit(canvas_path, &updated);
-            println!(
-                "meshfox node edges: set {} extra parent(s) on {node_id:?} in {}",
-                extra_parents.len(),
-                canvas_path.display()
-            );
-        }
+    let port = worker_port_or_exit(&runtime, canvas_path);
+    let edges: Vec<ExtraEdge> = extra_parents.iter().map(|p| ExtraEdge::new(p.as_str())).collect();
+    let update = worker_client::NodeUpdate {
+        extra_parents: Some(edges),
+        ..Default::default()
+    };
+    match runtime.block_on(worker_client::update_node(port, node_id, &update)) {
+        Ok(()) => println!(
+            "meshfox node edges: set {} extra parent(s) on {node_id:?} via the running worker on port {port}",
+            extra_parents.len()
+        ),
         Err(e) => {
-            eprintln!("meshfox node edges: {e} ({})", canvas_path.display());
+            eprintln!("meshfox node edges: {e} (worker on port {port})");
             std::process::exit(1);
         }
     }
 }
 
+#[cfg(test)]
 fn apply_node_edges(raw: &str, node_id: &str, extra_parents: &[String]) -> Result<String, String> {
     let edges: Vec<ExtraEdge> = extra_parents
         .iter()
@@ -4026,46 +3825,32 @@ fn node_move(canvas_path: &Path, node_id: &str, before: Option<String>, after: O
         eprintln!("failed to start async runtime: {e}");
         std::process::exit(1);
     });
-    if let Some(port) = runtime.block_on(coordinator::discover(canvas_path)) {
-        let (target_id, is_before) = match (&before, &after) {
-            (Some(t), None) => (t.clone(), true),
-            (None, Some(t)) => (t.clone(), false),
-            (None, None) => {
-                eprintln!("meshfox node move: exactly one of --before/--after is required");
-                std::process::exit(1);
-            }
-            (Some(_), Some(_)) => {
-                eprintln!("meshfox node move: --before and --after are mutually exclusive");
-                std::process::exit(1);
-            }
-        };
-        return match runtime.block_on(worker_client::move_sibling(port, node_id, &target_id, is_before)) {
-            Ok(()) => println!(
-                "meshfox node move: moved {node_id:?} {} {target_id:?} via the running worker on port {port}",
-                if is_before { "before" } else { "after" }
-            ),
-            Err(e) => {
-                eprintln!("meshfox node move: {e} (worker on port {port})");
-                std::process::exit(1);
-            }
-        };
-    }
-    let raw = read_raw_or_exit(canvas_path);
-    match apply_node_move(&raw, node_id, before.as_deref(), after.as_deref()) {
-        Ok((updated, target_id, position)) => {
-            write_raw_or_exit(canvas_path, &updated);
-            println!(
-                "meshfox node move: moved {node_id:?} {position} {target_id:?} in {}",
-                canvas_path.display()
-            );
+    let port = worker_port_or_exit(&runtime, canvas_path);
+    let (target_id, is_before) = match (&before, &after) {
+        (Some(t), None) => (t.clone(), true),
+        (None, Some(t)) => (t.clone(), false),
+        (None, None) => {
+            eprintln!("meshfox node move: exactly one of --before/--after is required");
+            std::process::exit(1);
         }
+        (Some(_), Some(_)) => {
+            eprintln!("meshfox node move: --before and --after are mutually exclusive");
+            std::process::exit(1);
+        }
+    };
+    match runtime.block_on(worker_client::move_sibling(port, node_id, &target_id, is_before)) {
+        Ok(()) => println!(
+            "meshfox node move: moved {node_id:?} {} {target_id:?} via the running worker on port {port}",
+            if is_before { "before" } else { "after" }
+        ),
         Err(e) => {
-            eprintln!("meshfox node move: {e} ({})", canvas_path.display());
+            eprintln!("meshfox node move: {e} (worker on port {port})");
             std::process::exit(1);
         }
     }
 }
 
+#[cfg(test)]
 fn apply_node_move(
     raw: &str,
     node_id: &str,
@@ -4089,33 +3874,19 @@ fn node_reorder(canvas_path: &Path) {
         eprintln!("failed to start async runtime: {e}");
         std::process::exit(1);
     });
-    if let Some(port) = runtime.block_on(coordinator::discover(canvas_path)) {
-        return match runtime.block_on(worker_client::reorder_document(port)) {
-            Ok(()) => println!(
-                "meshfox node reorder: resynced sibling order via the running worker on port {port}"
-            ),
-            Err(e) => {
-                eprintln!("meshfox node reorder: {e} (worker on port {port})");
-                std::process::exit(1);
-            }
-        };
-    }
-    let raw = read_raw_or_exit(canvas_path);
-    match apply_node_reorder(&raw) {
-        Ok(updated) => {
-            write_raw_or_exit(canvas_path, &updated);
-            println!(
-                "meshfox node reorder: resynced sibling order in {}",
-                canvas_path.display()
-            );
-        }
+    let port = worker_port_or_exit(&runtime, canvas_path);
+    match runtime.block_on(worker_client::reorder_document(port)) {
+        Ok(()) => println!(
+            "meshfox node reorder: resynced sibling order via the running worker on port {port}"
+        ),
         Err(e) => {
-            eprintln!("meshfox node reorder: {e} ({})", canvas_path.display());
+            eprintln!("meshfox node reorder: {e} (worker on port {port})");
             std::process::exit(1);
         }
     }
 }
 
+#[cfg(test)]
 fn apply_node_reorder(raw: &str) -> Result<String, String> {
     // No client-side auto-layout to hint from here (a bare CLI/MCP call,
     // not the web UI's own drag) — same "unpositioned siblings sort last,
@@ -4834,6 +4605,7 @@ fn write_output_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     std::fs::write(path, bytes).map_err(|e| format!("failed to write {}: {e}", path.display()))
 }
 
+#[cfg(test)]
 fn validate_patch(updated: &str) -> Result<(), String> {
     Canvas::from_markdown(updated)
         .map(|_| ())

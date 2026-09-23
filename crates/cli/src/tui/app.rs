@@ -533,17 +533,8 @@ pub struct App {
     /// theme name — see `resolve_editor_theme`'s own doc comment.
     pub editor_theme: String,
     pub picker: Picker,
-    /// A real worker for this canvas was reachable at startup — this
-    /// process's own embedded one, or another process's (`mod.rs::run`'s
-    /// `worker_lock` dance). `Some(port)` keeps every HTTP-routed area
-    /// (canvas load, run, services, source-editor save, external-change
-    /// watch, `tty`) enabled for this whole session; `None` degrades all of
-    /// them to their original direct-file/local-process behavior. Never
-    /// flips from `Some` back to `None` after startup except for the one
-    /// area that hit a real error (each area degrades independently, same
-    /// "don't fail the whole session over one bad request" posture
-    /// `App::new`'s own canvas-load fallback already has) — this field
-    /// itself always reflects the *original* startup decision.
+    /// The canvas worker's port. Production startup requires `Some`;
+    /// `None` is used only by local TUI unit tests.
     pub worker_port: Option<u16>,
     /// Set only while a `VarFormState` opened by `start_run_via_worker` is
     /// waiting on an answer — see `PendingHttpRun`'s own doc comment.
@@ -964,38 +955,23 @@ fn var_form_from_statuses(missing: Vec<crate::worker_client::VarStatus>) -> VarF
 }
 
 impl App {
-    /// `worker_port`, when `Some`, means a real worker (this process's own
-    /// embedded one, or another process's) was confirmed reachable at
-    /// startup (`mod.rs::run`) — `App` then loads the canvas from it
-    /// (`GET /api/canvas`, already include-resolved server-side) instead of
-    /// reading/parsing the file itself, and every later HTTP-routed area
-    /// (run/services/save/watch/tty — see each one's own doc comment) stays
-    /// enabled for the rest of this session. `None` (lock unreadable, or
-    /// the embedded worker's own bind failed) degrades every one of those
-    /// areas to their original direct-file/local-process behavior instead
-    /// of failing this call outright — a locally-recoverable plumbing
-    /// hiccup shouldn't take down an interactive session someone's actively
-    /// working in.
+    /// Loads the primary canvas from its worker. A failed request is a
+    /// startup error; unit tests may pass `None` to exercise local UI code.
     pub async fn new(
         canvas_path: PathBuf,
         link_preview_tx: tokio::sync::mpsc::UnboundedSender<LinkPreviewMsg>,
         initial_node: Option<&str>,
         worker_port: Option<u16>,
     ) -> io::Result<App> {
-        let mut worker_port = worker_port;
         let raw = match worker_port {
             Some(port) => match crate::worker_client::get_canvas_raw(port).await {
                 Ok(raw) => raw,
-                Err(e) => {
-                    // Degrade for the rest of this session rather than
-                    // fail the whole launch over one bad request to a
-                    // worker that otherwise seemed reachable.
-                    worker_port = None;
-                    eprintln!("meshfox tui: couldn't load the canvas from the worker on port {port} ({e}) — continuing without it");
-                    std::fs::read_to_string(&canvas_path)?
-                }
+                Err(e) => return Err(io::Error::other(format!("failed to load canvas from worker on port {port}: {e}"))),
             },
+            #[cfg(test)]
             None => std::fs::read_to_string(&canvas_path)?,
+            #[cfg(not(test))]
+            None => return Err(io::Error::other("no worker for canvas")),
         };
         let canvas = Canvas::from_markdown(&raw).map_err(|e| io::Error::other(e.to_string()))?;
         let decls = declared_vars(&canvas).unwrap_or_default();
@@ -1788,21 +1764,18 @@ impl App {
                         self.set_focus(Focus::Tree);
                         self.expand_pane(Focus::Tree);
                     } else {
-                        let (toggled_fullscreen, hit_title_row) = self.toggle_fullscreen_on_title_click(
-                            Focus::Tree,
-                            layout.tree,
-                            &mouse,
-                            is_double_click,
-                        );
-                        // A plain click that hit the title row but wasn't
-                        // itself a fullscreen toggle — mirrors Output's own
-                        // "click the title bar to collapse" affordance (see
-                        // its own branch below for why: otherwise there'd
-                        // be no way back to the collapsed handle at all,
-                        // Tree having no auto-collapse timer of its own).
-                        if hit_title_row && !toggled_fullscreen && self.fullscreen != Some(Focus::Tree) {
-                            self.tree_collapsed = true;
-                        }
+                        // A plain click on the title row used to also
+                        // re-collapse the pane (mirroring Output's own
+                        // affordance below) — dropped: it raced a genuine
+                        // double-click-to-fullscreen gesture, since the
+                        // first of the pair's two `Down`s always landed as
+                        // a "plain click" on its own (nothing yet marks it
+                        // as the start of a double-click), collapsing the
+                        // pane before the second click could ever land on
+                        // its now-relocated/shrunk title row to complete
+                        // the fullscreen toggle. `z` (keyboard) is now the
+                        // only way to collapse Tree by hand.
+                        self.toggle_fullscreen_on_title_click(Focus::Tree, layout.tree, &mouse, is_double_click);
                         let inner_x = layout.tree.x + 1; // left border
                         let inner_y = layout.tree.y + 1; // top border
                         if mouse.row >= inner_y {
@@ -1851,22 +1824,16 @@ impl App {
                         self.set_focus(Focus::Output);
                         self.expand_pane(Focus::Output);
                     } else {
-                        let (toggled_fullscreen, hit_title_row) = self.toggle_fullscreen_on_title_click(
-                            Focus::Output,
-                            layout.output,
-                            &mouse,
-                            is_double_click,
-                        );
-                        // A plain click that hit the title row but wasn't
-                        // itself a fullscreen toggle (not on the `[+]`/`[-]`
-                        // icon, not a double-click) — mirrors the collapsed
-                        // strip's own "click it to reopen" affordance in
-                        // reverse, since otherwise the only way back to
-                        // that compact strip is waiting out
-                        // `CONSOLE_COLLAPSE_GRACE` after a run finishes.
-                        if hit_title_row && !toggled_fullscreen && self.fullscreen != Some(Focus::Output) {
-                            self.console_collapsed = true;
-                        }
+                        // A plain click on the title row used to also
+                        // re-collapse the console back down to its strip —
+                        // dropped: it raced a genuine double-click-to-
+                        // fullscreen gesture the same way Tree's own
+                        // (now-removed) version did (see that branch's own
+                        // comment above for the exact mechanism). `z`
+                        // (keyboard) or just waiting out
+                        // `CONSOLE_COLLAPSE_GRACE` after a run finishes are
+                        // now the only ways back to the collapsed strip.
+                        self.toggle_fullscreen_on_title_click(Focus::Output, layout.output, &mouse, is_double_click);
                     }
                 }
             }
@@ -2121,12 +2088,8 @@ impl App {
     /// flush against `rect`'s own top-right corner via
     /// `Line::right_aligned`) or was a double-click anywhere else on that
     /// same title row — toggles `fullscreen` for it, same as pressing `f`
-    /// while it's focused would. Returns `(toggled_fullscreen, hit_title_row)`
-    /// — the Output branch of `on_mouse` uses a plain (single, non-icon)
-    /// click that hit the title row but didn't itself toggle fullscreen
-    /// for its own "collapse back down" action (see that branch's own
-    /// comment).
-    fn toggle_fullscreen_on_title_click(&mut self, pane: Focus, rect: Rect, mouse: &MouseEvent, is_double_click: bool) -> (bool, bool) {
+    /// while it's focused would.
+    fn toggle_fullscreen_on_title_click(&mut self, pane: Focus, rect: Rect, mouse: &MouseEvent, is_double_click: bool) {
         self.set_focus(pane);
         let icon_start = rect
             .x
@@ -2140,7 +2103,6 @@ impl App {
         if toggled {
             self.fullscreen = if self.fullscreen == Some(pane) { None } else { Some(pane) };
         }
-        (toggled, hit_title_row)
     }
 
     fn toggle_expand(&mut self) {
@@ -2370,7 +2332,7 @@ impl App {
         // case.
         let cursor = local_id
             .as_deref()
-            .zip(std::fs::read_to_string(&path).ok())
+            .zip(if path == self.canvas_path { Some(self.raw.clone()) } else { std::fs::read_to_string(&path).ok() })
             .and_then(|(id, raw)| {
                 mdcanvas::node_body_offset(&raw, id)
                     .map(|off| source_editor::byte_offset_to_cursor(&raw, off))
@@ -2387,7 +2349,7 @@ impl App {
         all_tags.sort();
         all_tags.dedup();
 
-        match SourceEditorState::open(self.canvas_path.clone(), path, is_canvas, cursor, files, all_tags) {
+        match SourceEditorState::open(self.canvas_path.clone(), path, is_canvas, cursor, files, all_tags, self.raw.clone()) {
             Ok(state) => self.source_editor = Some(state),
             Err(e) => self.status = format!("failed to open source editor: {e}"),
         }
@@ -2401,19 +2363,18 @@ impl App {
     /// (and `raw`/`canvas`, if the primary document was what got saved)
     /// afterward, same as any other on-disk change here, so the tree/
     /// document panes reflect the edit the moment the editor closes.
-    /// Routes through the worker (`PUT /api/canvas/raw`) when this is the
-    /// primary canvas and one is reachable, instead of `std::fs::write` —
-    /// same lost-update-race reasoning `worker_client`'s other callers
-    /// already have. An `include` target file isn't addressable through
-    /// that endpoint the same way (it addresses an include by *node id* via
-    /// `?include=`, not by this editor's own path), so it always falls back
-    /// to a direct write, same as when no worker is reachable at all.
+    /// Canvas files, including canvas-valued include targets, save through
+    /// their own worker. Plain Markdown include targets remain file writes.
     async fn save_source_editor(&mut self) {
         let Some(se) = &self.source_editor else {
             return;
         };
         let mut text = se.editor.lines.to_string();
-        let is_canvas = se.is_canvas;
+        let is_canvas = se.is_canvas
+            || meshfox_core::mdcanvas::is_canvas_path(&se.path)
+            || meshfox_core::mdcanvas::has_marker(&text)
+            || std::fs::read_to_string(&se.path)
+                .is_ok_and(|raw| meshfox_core::mdcanvas::has_marker(&raw));
         let path = se.path.clone();
 
         if is_canvas {
@@ -2424,20 +2385,21 @@ impl App {
         }
 
         let is_primary = path == self.canvas_path;
-        let write_result = if is_primary {
-            if let Some(port) = self.worker_port {
-                match crate::worker_client::put_canvas_raw(port, &text).await {
+        let write_result = if is_canvas {
+            let port = if is_primary {
+                self.worker_port.ok_or_else(|| "no worker for primary canvas".to_string())
+            } else {
+                crate::coordinator::get_or_spawn(&path).await.map_err(|e| e.to_string())
+            };
+            match port {
+                Ok(port) => match crate::worker_client::put_canvas_raw(port, &text).await {
                     Ok(()) => match crate::worker_client::get_canvas_raw(port).await {
-                        Ok(saved) => {
-                            text = saved;
-                            Ok(())
-                        }
+                        Ok(saved) => { text = saved; Ok(()) }
                         Err(e) => Err(format!("saved, but failed to reload: {e}")),
                     },
                     Err(e) => Err(e),
-                }
-            } else {
-                std::fs::write(&path, &text).map_err(|e| format!("failed to write {}: {e}", path.display()))
+                },
+                Err(e) => Err(e),
             }
         } else {
             std::fs::write(&path, &text).map_err(|e| format!("failed to write {}: {e}", path.display()))
@@ -3175,25 +3137,71 @@ impl App {
             self.status = "meshfox: lost the worker's run stream".into();
             return;
         };
+        // Which address (if any) this event's own live-output splice
+        // touched — `on_external_run_event`'s own passive-watch path
+        // already refreshes `render_current_document`'s cached
+        // `doc_segments` on every line so a run it's only watching shows
+        // its output growing inline under its own block; a run *this*
+        // session started itself used to never do that at all (only the
+        // Output console ever saw it) — checked once, after the match
+        // below, so every arm that touches `step_output` shares the same
+        // "only redraw if this address's node is the one on screen"
+        // gate instead of repeating it per arm.
+        let mut touched: Option<BlockAddr> = None;
         match event {
             RunEvent::Started { .. } => {}
             RunEvent::StepStart { node_id, block } => {
-                run.chain.push(BlockAddr::new(node_id, block));
+                let addr = BlockAddr::new(node_id, block);
+                run.chain.push(addr.clone());
                 run.idx += 1;
                 run.stdout_only.clear();
                 run.stderr_only.clear();
                 run.step_started = std::time::Instant::now();
+                // Resolved fresh from `display_canvas` (never sent on the
+                // wire) the same way `on_external_run_event` already
+                // resolves it for a passively-watched run — previously
+                // left at `RunState`'s own default (`false`) for every
+                // worker-routed run, since nothing here ever set it.
+                run.output_markdown = self
+                    .display_canvas
+                    .node(&addr.node_id)
+                    .map(|n| meshfox_core::scan_runnable_blocks(&addr.node_id, &n.text))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()))
+                    .is_some_and(|b| b.attrs.get("output").map(String::as_str) == Some("markdown"));
+                // A fresh, in-flight entry right away — mirrors
+                // `on_external_run_event`'s own `Line` handling, so a
+                // self-triggered run's live stdout shows up inline under
+                // its own block in the Document pane the same way a
+                // passively-watched one already does (and the same way
+                // the web UI's own live view does), not just in the
+                // Output console.
+                self.step_output.insert(
+                    addr.clone(),
+                    StepOutput {
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        output_markdown: run.output_markdown,
+                        exit_code: 0,
+                        duration_ms: 0,
+                        running: true,
+                    },
+                );
+                touched = Some(addr);
             }
             RunEvent::StepSkipped { node_id, block, output, duration_ms } => {
                 run.lines.push(format!("==> {block} (skipped, already fresh this session)"));
                 run.lines.push(output.clone());
                 run.lines.push(format!("(skipped · {})", meshfox_core::format_duration_ms(duration_ms)));
+                let addr = BlockAddr::new(node_id, block);
                 self.step_output.insert(
-                    BlockAddr::new(node_id, block),
+                    addr.clone(),
                     StepOutput { stdout: output, stderr: String::new(), output_markdown: false, exit_code: 0, duration_ms, running: false },
                 );
+                touched = Some(addr);
             }
-            RunEvent::Output { node_id: _, block: _, stream, text } => {
+            RunEvent::Output { node_id, block, stream, text } => {
                 run.lines.push(text.clone());
                 run.full_output.push_str(&text);
                 run.full_output.push('\n');
@@ -3207,6 +3215,22 @@ impl App {
                         run.stderr_only.push('\n');
                     }
                 }
+                let addr = BlockAddr::new(node_id, block);
+                let entry = self.step_output.entry(addr.clone()).or_insert_with(|| StepOutput {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    output_markdown: run.output_markdown,
+                    exit_code: 0,
+                    duration_ms: 0,
+                    running: true,
+                });
+                let dest = match stream {
+                    meshfox_server::stream_exec::OutputStream::Stdout => &mut entry.stdout,
+                    meshfox_server::stream_exec::OutputStream::Stderr => &mut entry.stderr,
+                };
+                dest.push_str(&text);
+                dest.push('\n');
+                touched = Some(addr);
             }
             RunEvent::TtyStart { .. } => {}
             RunEvent::ServiceStarted { node_id: _, block, pid } => {
@@ -3217,8 +3241,9 @@ impl App {
                     "(exit {exit_code} · {})",
                     meshfox_core::format_duration_ms(duration_ms)
                 ));
+                let addr = BlockAddr::new(node_id, block);
                 self.step_output.insert(
-                    BlockAddr::new(node_id, block),
+                    addr.clone(),
                     StepOutput {
                         stdout: run.stdout_only.clone(),
                         stderr: run.stderr_only.clone(),
@@ -3231,6 +3256,7 @@ impl App {
                 if exit_code != 0 {
                     run.had_failure = true;
                 }
+                touched = Some(addr);
             }
             RunEvent::LockConflict { node_id, block, owner_pid, owner_desc } => {
                 // Only ever arrives as the very first event, handled
@@ -3258,8 +3284,9 @@ impl App {
                 // StepEnd" shape), so this is worker mode's own
                 // equivalent, needed for `ui::render_tree`'s failed-badge
                 // aggregation to see this address at all.
+                let addr = BlockAddr::new(node_id, block);
                 self.step_output.insert(
-                    BlockAddr::new(node_id, block),
+                    addr.clone(),
                     StepOutput {
                         stdout: run.stdout_only.clone(),
                         stderr: run.stderr_only.clone(),
@@ -3269,6 +3296,7 @@ impl App {
                         running: false,
                     },
                 );
+                touched = Some(addr);
             }
             RunEvent::Error { message } => {
                 run.had_failure = true;
@@ -3291,6 +3319,14 @@ impl App {
                         Box::pin(self.start_run_via_worker(addr.node_id, addr.block_name, true, port, None, HashMap::new())).await;
                     }
                 }
+            }
+        }
+        // Same trailing check `on_external_run_event` ends on — only
+        // worth rebuilding `doc_segments` when the address this event
+        // touched is actually the node on screen right now.
+        if let Some(addr) = touched {
+            if self.rows.get(self.selected).is_some_and(|row| row.node_id == addr.node_id) {
+                self.render_current_document();
             }
         }
     }
@@ -3385,9 +3421,13 @@ impl App {
                 .await;
             return;
         }
+        #[cfg(test)]
         self.start_run_local(node_id, block_name, with_deps).await;
+        #[cfg(not(test))]
+        { self.status = "no worker for canvas".into(); }
     }
 
+    #[cfg(test)]
     async fn start_run_local(&mut self, node_id: String, block_name: String, with_deps: bool) {
         let target = BlockAddr::new(node_id, block_name);
         // Include-resolved (not just `self.canvas`) so `target` can name a
@@ -3573,6 +3613,7 @@ impl App {
     /// resolve-then-project pair — kept separate from it (rather than
     /// having `advance_run` call this too) so a step that isn't skippable
     /// doesn't resolve `env=`/`interpreter=` twice.
+    #[cfg(test)]
     fn fingerprint_vars_for(
         &self,
         block: &meshfox_core::CodeBlock,
@@ -4252,7 +4293,6 @@ impl App {
                                         &updated,
                                     ) {
                                         self.raw = patched;
-                                        let _ = std::fs::write(&self.canvas_path, &self.raw);
                                         *self.known_raw.lock().unwrap() = self.raw.clone();
                                         if let Ok(reparsed) = Canvas::from_markdown(&self.raw) {
                                             self.canvas = reparsed;
@@ -4260,6 +4300,18 @@ impl App {
                                         self.rebuild_display_canvas();
                                         self.rebuild_rows();
                                         self.render_current_document();
+                                        // In-memory only, deliberately not pushed to
+                                        // the worker or written to disk — a local-exec
+                                        // run (this whole branch is test-only, see
+                                        // `start_run_local`) mirrors the same
+                                        // preview-first posture `worker_client::
+                                        // run_stream`'s own `persist: false` already
+                                        // establishes for a real TUI run: explicit
+                                        // "save to file" is its own separate action,
+                                        // not implied by every run, same as the web
+                                        // UI. Only `meshfox run`/`run_stream_persisted`
+                                        // (the CLI) actually writes a `cache` block's
+                                        // output back to the canvas file.
                                     }
                                 }
                             }

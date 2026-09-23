@@ -1,29 +1,6 @@
-//! Thin HTTP/WS client so any core-launch operation (`view`, `tui`, `run`,
-//! `node <op>`, MCP) can route through an already-running worker (see
-//! `crate::coordinator::resolve`, which decides *whether* one applies here)
-//! instead of touching the canvas file or running a block directly — closes
-//! the lost-update race between a worker's own in-memory state and an
-//! independent CLI/MCP read-modify-write (TODO.canvas.md's "Оптимистичная
-//! конкурентность при записи файла" / "MCP-редактирование файла (batch/
-//! транзакционно)"): when a worker already exists, there's no race to
-//! detect in the first place, since it's the only thing touching the file
-//! at all.
-//!
-//! Only wired into ops that map cleanly onto an existing `/api/nodes*`
-//! endpoint with identical semantics to their direct-file counterpart —
-//! `node body` (PATCH `text`) and `node rm` (DELETE) so far. Deliberately
-//! NOT `node add`/`node meta` yet: `POST /api/nodes` always assigns a
-//! random id (`mdcanvas::insert_child_node_random_id`), not the title-slug
-//! id CLI/MCP's own `node add` has always produced
-//! (`mdcanvas::insert_child_node`) — routing it through a worker as-is
-//! would make `node add`'s id scheme depend on whether a worker happens to
-//! be running, which is worse than the race it would close. `PATCH
-//! /api/nodes/:id` also has no way to set a node's position/size/
-//! `createdAt` at all (the web UI only ever moves a node by drag, never by
-//! absolute value through this endpoint), so `node meta`'s fields have no
-//! server-side equivalent to route through yet. Both logged as follow-ups
-//! in TODO.canvas.md rather than silently done differently than direct-file
-//! editing does them.
+//! Thin HTTP/WS client for CLI, MCP and TUI operations. Canvas mutations
+//! always reach the worker selected or started by `coordinator::get_or_spawn`;
+//! this module never writes the primary canvas directly.
 
 use meshfox_core::{ExtraEdge, FileDisplay, NodeType};
 use meshfox_server::stream_exec::OutputStream;
@@ -75,6 +52,7 @@ pub struct NodeUpdate {
     pub y: Option<f64>,
     pub width: Option<f64>,
     pub height: Option<f64>,
+    pub clear_position: bool,
     pub created_at: Option<String>,
 }
 
@@ -107,6 +85,20 @@ pub async fn update_node_body(port: u16, node_id: &str, body: &str) -> Result<()
         },
     )
     .await
+}
+
+pub async fn append_node_body(port: u16, node_id: &str, addition: &str) -> Result<(), String> {
+    let mut url = node_url(port, node_id)?;
+    url.path_segments_mut()
+        .map_err(|_| "couldn't build the worker's append URL".to_string())?
+        .push("append");
+    let res = reqwest::Client::new()
+        .post(url)
+        .body(addition.to_string())
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    into_result(res).await
 }
 
 /// DELETE `/api/nodes/:id[?children=reparent]` — the same
@@ -311,7 +303,7 @@ fn base_url(port: u16) -> String {
 
 // =======================================================================
 // TUI-as-client: canvas load, running, services, whole-file save. Shares
-// the `discover`/`node_url`/`into_result` primitives above with the
+// the `node_url`/`into_result` primitives above with the
 // CLI/MCP node-op routing already in this module — one client module for
 // every way a frontend here talks to a worker, not one per frontend.
 // =======================================================================
@@ -322,7 +314,7 @@ fn base_url(port: u16) -> String {
 /// already have. This is what `App::new` loads instead of
 /// `std::fs::read_to_string` when a worker is reachable; `display_canvas`
 /// (the include-resolved tree) is still built locally from it
-/// (`meshfox_core::include::resolve`), same as the no-worker fallback —
+/// (`meshfox_core::include::resolve`) —
 /// there's no separate "fetch the resolved tree" round trip, since local
 /// include-resolution is already needed either way (e.g. for edits that
 /// land in an `include` target file).
@@ -339,9 +331,8 @@ pub async fn get_canvas_raw(port: u16) -> Result<String, String> {
 }
 
 /// `PUT /api/canvas/raw` — whole-document replace, what the source
-/// editor's own `Ctrl-s` save routes through when the edited path is the
-/// worker's own primary canvas (an `include` target file isn't addressable
-/// through this endpoint — see `App::save_source_editor`'s own fallback).
+/// editor's own `Ctrl-s` save routes through for the primary canvas, or
+/// for a canvas-valued include target via that target's worker.
 /// A `422` (parse failure) comes back as plain text, same `ApiError`
 /// `IntoResponse` every other mutating endpoint here already uses.
 pub async fn put_canvas_raw(port: u16, text: &str) -> Result<(), String> {
@@ -1211,4 +1202,3 @@ pub async fn debug_stop(port: u16, session_id: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     into_result(res).await
 }
-

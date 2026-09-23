@@ -1,7 +1,7 @@
 //! Resolves "who is *the* worker for this canvas" for every core-launch
 //! operation (`view`, `tui`, `node <op>`, `run`, MCP `debug_*`) — one
 //! function every one of them calls instead of reaching for
-//! `meshfox_core::worker_lock`/`crate::worker_client::discover` directly.
+//! `meshfox_core::worker_lock` directly.
 //!
 //! Two independent sources feed the same decision, tried in order:
 //!
@@ -79,6 +79,29 @@ pub async fn resolve(canvas_path: &Path) -> io::Result<Resolved> {
     }
 }
 
+/// Return a worker that can own a short CLI or MCP operation. If this
+/// process wins the per-file lock, keep it in an embedded worker until the
+/// caller's Tokio runtime ends. A failed bind is an error, never permission
+/// to write the canvas directly.
+pub async fn get_or_spawn(canvas_path: &Path) -> io::Result<u16> {
+    match resolve(canvas_path).await? {
+        Resolved::Other(port) => Ok(port),
+        Resolved::Us(guard) => {
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(meshfox_server::serve_as_worker(
+                canvas_path.to_path_buf(),
+                0,
+                false,
+                None,
+                true,
+                guard,
+                Some(ready_tx),
+            ));
+            ready_rx.await.map_err(|_| io::Error::other("failed to start the worker"))
+        }
+    }
+}
+
 /// Hands `canvas_path` off to the `server_socket`-configured coordinator
 /// instead of `view` becoming its own watcher — the replacement for the
 /// now-removed `meshfox open` command, folded into `view`'s own top-level
@@ -141,25 +164,4 @@ pub async fn hand_off_to_configured_coordinator(
                 )
             }
         })
-}
-
-/// `resolve`'s own `Other(port)`-only view — the direct replacement for
-/// `crate::worker_client::discover`'s old signature/contract: `Some(port)`
-/// to route through, `None` (no live worker anywhere, *or* the lock itself
-/// couldn't be read) to fall back to direct-file editing. Drops a winning
-/// `Us` guard immediately, same non-blocking-peek posture `discover` always
-/// had — this never becomes the worker itself, even momentarily.
-///
-/// Unlike `resolve`, a configured-but-unreachable `server_socket` collapses
-/// to `None` here rather than propagating an error: every caller of this
-/// function already has a working direct-file fallback for "no worker"
-/// (that's the whole point of the ops it gates — `node body`/`node rm`),
-/// so silently taking that fallback is strictly better than hard-failing a
-/// plain file edit because a daemon happens to be down.
-pub async fn discover(canvas_path: &Path) -> Option<u16> {
-    match resolve(canvas_path).await {
-        Ok(Resolved::Other(port)) => Some(port),
-        Ok(Resolved::Us(_guard)) => None,
-        Err(_) => None,
-    }
 }

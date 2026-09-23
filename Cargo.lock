@@ -3194,6 +3194,7 @@ dependencies = [
  "reqwest",
  "rusqlite",
  "rust-embed",
+ "rustls",
  "scraper",
  "serde",
  "serde_json",

@@ -17,17 +17,12 @@
 //!   sees exactly one MCP server.
 //! - **Leaf** (`MESHFOX_MCP_LEAF=1` in the environment, canvas path in
 //!   [`LEAF_PATH_ENV_VAR`] — only `canvas_open` sets either, never a human):
-//!   [`MeshfoxMcp`], the original single-file server, unchanged.
-//!   `node_show`/`add`/`meta`/`body`/`block`/`rm`/`mv`/`rename`/`set_id`/
-//!   `edges`/`move`/`reorder`/`find` are thin wrappers around the same pure
-//!   `apply_node_*`/`find_node_ids` functions `node <op>` already uses;
+//!   [`MeshfoxMcp`], the single-file server. Read-only node tools inspect
+//!   the file; mutating node tools call that canvas's worker.
 //!   `debug_start`/`debug_send`/`debug_stop` run a persistent `bash` kept
 //!   alive in a node/block's own resolved cwd/env, so state between calls
 //!   (exported vars, files a snippet wrote) survives the way a one-shot
-//!   `meshfox run` never could. Each call is its own immediate
-//!   read-modify-write of the file on disk — no batching, no
-//!   optimistic-concurrency conflict detection against a concurrent editor
-//!   (see TODO.canvas.md's own still-open "MCP-редактирование файла" node).
+//!   `meshfox run` never could. Calls are immediate, without batching.
 //!
 //! `canvas_open` only ever resolves paths under the **root directory** — the
 //! canonicalized directory `meshfox mcp` was started in — rejecting anything
@@ -88,7 +83,6 @@ pub async fn run() -> Result<(), String> {
 
 async fn run_leaf(canvas_path: PathBuf) -> Result<(), String> {
     let server = MeshfoxMcp::new(canvas_path);
-    server.spawn_idle_sweep();
     let service = server
         .serve(rmcp::transport::stdio())
         .await
@@ -127,15 +121,8 @@ fn invalid_params(msg: impl Into<String>) -> ErrorData {
 // Leaf: one process, one canvas file — the original implementation.
 // =======================================================================
 
-/// One tracked debug session, from this MCP process's own point of view —
-/// either a `DebugSession` it spawned and owns directly (`coordinator::
-/// resolve` found no live worker), or just the address of a worker's own
-/// session it started remotely via `/api/debug/*` (see `crate::coordinator`'s
-/// own doc comment for why *every* call site here, not just this one,
-/// treats "a local worker" and "an externally-configured `server_socket`"
-/// as the same kind of "become a client instead" decision).
+/// Address of a debug session owned by the canvas worker.
 enum DebugHandle {
-    Local(Arc<Mutex<meshfox_server::debug_session::DebugSession>>),
     /// The worker's own session id (usually — but not necessarily, if a
     /// caller supplied its own — equal to this map's own key) and which
     /// port it lives on. `debug_send`/`debug_stop` must reach *this exact*
@@ -156,9 +143,7 @@ struct MeshfoxMcp {
     /// to know it's still wanted between `debug_send` calls, unlike a
     /// `run`/`tty` step). Aborted (dropping the connection) wherever the
     /// matching `sessions` entry is removed — `debug_stop`, or `debug_send`
-    /// noticing `session_ended`. Never populated for `DebugHandle::Local`
-    /// (an in-process session has no worker to keep alive in the first
-    /// place).
+    /// noticing `session_ended`.
     remote_keepalives: Arc<Mutex<HashMap<String, tokio::task::AbortHandle>>>,
     tool_router: ToolRouter<Self>,
 }
@@ -173,68 +158,24 @@ impl MeshfoxMcp {
         }
     }
 
-    /// Only ever sweeps `DebugHandle::Local` sessions — a `Remote` one
-    /// lives on the worker's own registry, which this MCP process is just
-    /// one possible client of among however many others (another CLI
-    /// invocation, a `tui`, a different MCP session) might be talking to
-    /// the same worker; idle-eviction for those has to be the worker's own
-    /// job to mean anything, and isn't implemented there yet (see
-    /// `crates/server/src/lib.rs`'s `debug_sessions` field/`/api/debug/*` —
-    /// a remote session currently only ever goes away via an explicit
-    /// `debug_stop`, `session_ended`, or the whole worker exiting).
-    fn spawn_idle_sweep(&self) {
-        let sessions = Arc::clone(&self.sessions);
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(SWEEP_INTERVAL).await;
-                let idle_ids: Vec<String> = {
-                    let map = sessions.lock().await;
-                    let mut idle = Vec::new();
-                    for (id, handle) in map.iter() {
-                        if let DebugHandle::Local(session) = handle {
-                            if session.lock().await.idle_for() > IDLE_TIMEOUT {
-                                idle.push(id.clone());
-                            }
-                        }
-                    }
-                    idle
-                };
-                for id in idle_ids {
-                    let removed = sessions.lock().await.remove(&id);
-                    if let Some(DebugHandle::Local(session)) = removed {
-                        session.lock().await.stop().await;
-                    }
-                }
-            }
-        });
+    async fn read_raw(&self) -> Result<String, ErrorData> {
+        let port = self.worker_port().await?;
+        crate::worker_client::get_canvas_raw(port)
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("worker read failed: {e}"), None))
     }
 
-    fn read_raw(&self) -> Result<String, ErrorData> {
-        std::fs::read_to_string(&self.canvas_path).map_err(|e| {
-            ErrorData::internal_error(
-                format!("failed to read {}: {e}", self.canvas_path.display()),
-                None,
-            )
-        })
+    async fn worker_port(&self) -> Result<u16, ErrorData> {
+        crate::coordinator::get_or_spawn(&self.canvas_path)
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("worker unavailable: {e}"), None))
     }
 
-    /// Ends `session_id`'s own keep-alive connection, if it has one (a
-    /// no-op for a `DebugHandle::Local` session, which never gets an entry
-    /// here in the first place) — called wherever `sessions` itself loses
-    /// that entry, so the two maps never drift out of sync.
+    /// Ends the keep-alive connection when a session is removed.
     async fn stop_remote_keepalive(&self, session_id: &str) {
         if let Some(handle) = self.remote_keepalives.lock().await.remove(session_id) {
             handle.abort();
         }
-    }
-
-    fn write_raw(&self, content: &str) -> Result<(), ErrorData> {
-        std::fs::write(&self.canvas_path, content).map_err(|e| {
-            ErrorData::internal_error(
-                format!("failed to write {}: {e}", self.canvas_path.display()),
-                None,
-            )
-        })
     }
 }
 
@@ -576,119 +517,11 @@ impl MeshfoxMcp {
         &self,
         Parameters(params): Parameters<DebugStartParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        match crate::coordinator::resolve(&self.canvas_path)
-            .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
-        {
-            crate::coordinator::Resolved::Us(_guard) => self.debug_start_local(params).await,
-            crate::coordinator::Resolved::Other(port) => self.debug_start_remote(port, params).await,
-        }
+        let port = self.worker_port().await?;
+        self.debug_start_remote(port, params).await
     }
 
-    /// Today's original in-process path: spawns a
-    /// `meshfox_server::debug_session::DebugSession` directly and tracks it
-    /// under `DebugHandle::Local`.
-    async fn debug_start_local(
-        &self,
-        params: DebugStartParams,
-    ) -> Result<CallToolResult, ErrorData> {
-        let raw = self.read_raw()?;
-        let canvas = Canvas::from_markdown(&raw).map_err(|e| invalid_params(e.to_string()))?;
-        let node = canvas
-            .node(&params.node_id)
-            .ok_or_else(|| invalid_params(format!("no node {:?}", params.node_id)))?;
-        let blocks = meshfox_core::scan_runnable_blocks(&params.node_id, &node.text);
-        let block = match &params.block_name {
-            Some(name) => blocks
-                .iter()
-                .find(|b| b.name.as_deref() == Some(name.as_str()))
-                .ok_or_else(|| {
-                    invalid_params(format!(
-                        "no runnable block named {name:?} in node {:?}",
-                        params.node_id
-                    ))
-                })?,
-            None => meshfox_core::fence::default_block(&params.node_id, &blocks)
-                .map_err(|names| {
-                    invalid_params(format!(
-                        "node {:?} has more than one default-eligible block ({}); pass block_name explicitly",
-                        params.node_id,
-                        names.join(", ")
-                    ))
-                })?
-                .ok_or_else(|| {
-                    invalid_params(format!(
-                        "node {:?} has no default block; pass block_name explicitly",
-                        params.node_id
-                    ))
-                })?,
-        };
-
-        let needed: std::collections::HashSet<String> =
-            block.env.iter().map(|r| r.var_name.clone()).collect();
-        let decls = meshfox_core::declared_vars(&canvas)
-            .map_err(|e| invalid_params(e.to_string()))?;
-        let relevant: Vec<_> = decls
-            .iter()
-            .filter(|d| needed.contains(&d.name))
-            .cloned()
-            .collect();
-        let mut cache = meshfox_core::VarCache::load(&self.canvas_path).map_err(|e| {
-            ErrorData::internal_error(format!("failed to load variable cache: {e}"), None)
-        })?;
-        for (name, value) in &params.vars {
-            if let Some(decl) = relevant.iter().find(|d| &d.name == name) {
-                meshfox_core::validate_value(decl, value).map_err(|e| {
-                    invalid_params(format!("vars.{name}={value:?} is invalid: {e}"))
-                })?;
-            }
-        }
-        let shared = meshfox_core::load_shared_env(crate::canvas_root_dir(&self.canvas_path));
-        let resolved = meshfox_core::resolve_with_shared(
-            &relevant,
-            &params.vars,
-            &cache,
-            &HashMap::new(),
-            &shared,
-        );
-        if !resolved.missing.is_empty() {
-            let names: Vec<&str> = resolved.missing.iter().map(|d| d.name.as_str()).collect();
-            return Err(invalid_params(format!(
-                "missing required variable(s): {} — pass them in `vars`",
-                names.join(", ")
-            )));
-        }
-        for (name, value) in &params.vars {
-            if relevant
-                .iter()
-                .any(|d| &d.name == name && !d.secret && !d.session)
-            {
-                let _ = cache.set(name, value);
-            }
-        }
-
-        let envs = meshfox_core::map_block_env(&block.env, &resolved.values);
-        let cwd = node.cwd(crate::canvas_root_dir(&self.canvas_path));
-
-        let session = meshfox_server::debug_session::DebugSession::spawn(&cwd, envs).map_err(|e| {
-            ErrorData::internal_error(format!("failed to start debug session: {e}"), None)
-        })?;
-        let session_id = uuid::Uuid::new_v4().to_string();
-        self.sessions
-            .lock()
-            .await
-            .insert(session_id.clone(), DebugHandle::Local(Arc::new(Mutex::new(session))));
-
-        Ok(CallToolResult::structured(json!({
-            "session_id": session_id,
-            "node_id": params.node_id,
-            "block_name": block.name,
-            "cwd": cwd.display().to_string(),
-        })))
-    }
-
-    /// `coordinator::resolve` found a live worker — start the session there
-    /// instead (`POST /api/debug/start`), tracked under `DebugHandle::
+    /// Starts the session at the worker (`POST /api/debug/start`), tracked under `DebugHandle::
     /// Remote` keyed by the *worker's own* session id (no separate local id
     /// needed on top of it). Also opens this session's own keep-alive
     /// connection (`remote_keepalives`) right away — the worker otherwise
@@ -730,39 +563,19 @@ impl MeshfoxMcp {
         &self,
         Parameters(params): Parameters<DebugSendParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let handle = {
+        let (port, session_id) = {
             let sessions = self.sessions.lock().await;
             match sessions.get(&params.session_id) {
-                Some(DebugHandle::Local(session)) => Some(DebugHandle::Local(Arc::clone(session))),
-                Some(DebugHandle::Remote { port, session_id }) => {
-                    Some(DebugHandle::Remote { port: *port, session_id: session_id.clone() })
-                }
-                None => None,
-            }
-        }
-        .ok_or_else(|| invalid_params(format!("no debug session {:?}", params.session_id)))?;
-
-        let timeout_ms = params.timeout_ms.unwrap_or(DEFAULT_SEND_TIMEOUT_MS);
-        let (stdout, stderr, exit_code, timed_out, session_ended) = match handle {
-            DebugHandle::Local(session) => {
-                let outcome = {
-                    let mut session = session.lock().await;
-                    session
-                        .send(&params.code, Duration::from_millis(timeout_ms))
-                        .await
-                        .map_err(|e| {
-                            ErrorData::internal_error(format!("debug session write/read failed: {e}"), None)
-                        })?
-                };
-                (outcome.stdout, outcome.stderr, outcome.exit_code, outcome.timed_out, outcome.session_ended)
-            }
-            DebugHandle::Remote { port, session_id } => {
-                let outcome = crate::worker_client::debug_send(port, &session_id, &params.code, timeout_ms)
-                    .await
-                    .map_err(invalid_params)?;
-                (outcome.stdout, outcome.stderr, outcome.exit_code, outcome.timed_out, outcome.session_ended)
+                Some(DebugHandle::Remote { port, session_id }) => (*port, session_id.clone()),
+                None => return Err(invalid_params(format!("no debug session {:?}", params.session_id))),
             }
         };
+        let timeout_ms = params.timeout_ms.unwrap_or(DEFAULT_SEND_TIMEOUT_MS);
+        let outcome = crate::worker_client::debug_send(port, &session_id, &params.code, timeout_ms)
+            .await
+            .map_err(invalid_params)?;
+        let (stdout, stderr, exit_code, timed_out, session_ended) =
+            (outcome.stdout, outcome.stderr, outcome.exit_code, outcome.timed_out, outcome.session_ended);
         if session_ended {
             self.sessions.lock().await.remove(&params.session_id);
             self.stop_remote_keepalive(&params.session_id).await;
@@ -784,10 +597,6 @@ impl MeshfoxMcp {
         let removed = self.sessions.lock().await.remove(&params.session_id);
         self.stop_remote_keepalive(&params.session_id).await;
         match removed {
-            Some(DebugHandle::Local(session)) => {
-                session.lock().await.stop().await;
-                Ok(CallToolResult::structured(json!({ "stopped": params.session_id })))
-            }
             Some(DebugHandle::Remote { port, session_id }) => {
                 crate::worker_client::debug_stop(port, &session_id)
                     .await
@@ -808,7 +617,7 @@ impl MeshfoxMcp {
         &self,
         Parameters(params): Parameters<NodeIdParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let raw = self.read_raw()?;
+        let raw = self.read_raw().await?;
         let canvas = Canvas::from_markdown(&raw).map_err(|e| invalid_params(e.to_string()))?;
         let node = canvas
             .node(&params.node_id)
@@ -827,30 +636,18 @@ impl MeshfoxMcp {
         &self,
         Parameters(params): Parameters<NodeAddParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Some(port) = crate::coordinator::discover(&self.canvas_path).await {
-            let new_id = crate::worker_client::create_node(port, &params.parent_id, &params.title, true)
+        let port = self.worker_port().await?;
+        let new_id = crate::worker_client::create_node(port, &params.parent_id, &params.title, true)
+            .await
+            .map_err(invalid_params)?;
+        let meta_fields = params.fields.into_node_meta_fields();
+        if params.body.is_some() || meta_fields.is_set() {
+            let update = crate::node_update_from_fields(&meta_fields, params.body.as_deref())
+                .map_err(invalid_params)?;
+            crate::worker_client::update_node(port, &new_id, &update)
                 .await
                 .map_err(invalid_params)?;
-            let meta_fields = params.fields.into_node_meta_fields();
-            if params.body.is_some() || meta_fields.is_set() {
-                let update = crate::node_update_from_fields(&meta_fields, params.body.as_deref())
-                    .map_err(invalid_params)?;
-                crate::worker_client::update_node(port, &new_id, &update)
-                    .await
-                    .map_err(invalid_params)?;
-            }
-            return Ok(CallToolResult::structured(json!({ "node_id": new_id })));
         }
-        let raw = self.read_raw()?;
-        let (updated, new_id) = crate::apply_node_add_with_extras(
-            &raw,
-            &params.parent_id,
-            &params.title,
-            params.body.as_deref(),
-            params.fields.into_node_meta_fields(),
-        )
-        .map_err(invalid_params)?;
-        self.write_raw(&updated)?;
         Ok(CallToolResult::structured(json!({ "node_id": new_id })))
     }
 
@@ -861,42 +658,14 @@ impl MeshfoxMcp {
         &self,
         Parameters(params): Parameters<NodeMetaParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        // `clear_position` has no worker-routed equivalent (see
-        // `NodeMetaFields`'s own doc comment in main.rs) — falls through
-        // to the direct-file path unconditionally for that one case.
-        if !params.clear_position {
-            if let Some(port) = crate::coordinator::discover(&self.canvas_path).await {
-                let meta_fields = params.fields.into_node_meta_fields();
-                let update = crate::node_update_from_fields(&meta_fields, None)
-                    .map_err(invalid_params)?;
-                crate::worker_client::update_node(port, &params.node_id, &update)
-                    .await
-                    .map_err(invalid_params)?;
-                return Ok(CallToolResult::structured(json!({ "updated": params.node_id })));
-            }
-        }
-        let raw = self.read_raw()?;
-        let f = params.fields;
-        let updated = crate::apply_node_meta(
-            &raw,
-            &params.node_id,
-            f.x,
-            f.y,
-            f.width,
-            f.height,
-            params.clear_position,
-            f.color,
-            f.node_type,
-            f.display,
-            f.lang,
-            f.interpreter,
-            f.preview,
-            f.fold,
-            f.tags,
-            f.created_at,
-        )
-        .map_err(invalid_params)?;
-        self.write_raw(&updated)?;
+        let port = self.worker_port().await?;
+        let meta_fields = params.fields.into_node_meta_fields();
+        let mut update = crate::node_update_from_fields(&meta_fields, None)
+            .map_err(invalid_params)?;
+        update.clear_position = params.clear_position;
+        crate::worker_client::update_node(port, &params.node_id, &update)
+            .await
+            .map_err(invalid_params)?;
         Ok(CallToolResult::structured(json!({ "updated": params.node_id })))
     }
 
@@ -905,16 +674,10 @@ impl MeshfoxMcp {
         &self,
         Parameters(params): Parameters<NodeBodyParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Some(port) = crate::coordinator::discover(&self.canvas_path).await {
-            crate::worker_client::update_node_body(port, &params.node_id, &params.body)
-                .await
-                .map_err(invalid_params)?;
-            return Ok(CallToolResult::structured(json!({ "updated": params.node_id })));
-        }
-        let raw = self.read_raw()?;
-        let updated = crate::apply_node_body(&raw, &params.node_id, &params.body)
+        let port = self.worker_port().await?;
+        crate::worker_client::update_node_body(port, &params.node_id, &params.body)
+            .await
             .map_err(invalid_params)?;
-        self.write_raw(&updated)?;
         Ok(CallToolResult::structured(json!({ "updated": params.node_id })))
     }
 
@@ -925,10 +688,10 @@ impl MeshfoxMcp {
         &self,
         Parameters(params): Parameters<NodeAppendParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let raw = self.read_raw()?;
-        let updated = crate::apply_node_append(&raw, &params.node_id, &params.addition)
+        let port = self.worker_port().await?;
+        crate::worker_client::append_node_body(port, &params.node_id, &params.addition)
+            .await
             .map_err(invalid_params)?;
-        self.write_raw(&updated)?;
         Ok(CallToolResult::structured(json!({ "updated": params.node_id })))
     }
 
@@ -968,27 +731,12 @@ impl MeshfoxMcp {
             clear_interpreter: params.clear_interpreter,
             code_file: None,
         };
-        if let Some(port) = crate::coordinator::discover(&self.canvas_path).await {
-            let update = crate::block_attrs_update_from_args(&args, params.code.as_deref())
-                .map_err(invalid_params)?;
-            crate::worker_client::set_block_attrs(port, &params.node_id, &params.block_name, &update)
-                .await
-                .map_err(invalid_params)?;
-            return Ok(CallToolResult::structured(json!({
-                "updated": params.node_id,
-                "block": params.block_name,
-            })));
-        }
-        let raw = self.read_raw()?;
-        let updated = crate::apply_node_block(
-            &raw,
-            &params.node_id,
-            &params.block_name,
-            &args,
-            params.code.as_deref(),
-        )
-        .map_err(invalid_params)?;
-        self.write_raw(&updated)?;
+        let port = self.worker_port().await?;
+        let update = crate::block_attrs_update_from_args(&args, params.code.as_deref())
+            .map_err(invalid_params)?;
+        crate::worker_client::set_block_attrs(port, &params.node_id, &params.block_name, &update)
+            .await
+            .map_err(invalid_params)?;
         Ok(CallToolResult::structured(json!({
             "updated": params.node_id,
             "block": params.block_name,
@@ -1002,18 +750,10 @@ impl MeshfoxMcp {
         &self,
         Parameters(params): Parameters<NodeRmParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Some(port) = crate::coordinator::discover(&self.canvas_path).await {
-            crate::worker_client::remove_node(port, &params.node_id, params.keep_children)
-                .await
-                .map_err(invalid_params)?;
-            return Ok(CallToolResult::structured(
-                json!({ "deleted": params.node_id, "keep_children": params.keep_children }),
-            ));
-        }
-        let raw = self.read_raw()?;
-        let updated = crate::apply_node_rm(&raw, &params.node_id, params.keep_children)
+        let port = self.worker_port().await?;
+        crate::worker_client::remove_node(port, &params.node_id, params.keep_children)
+            .await
             .map_err(invalid_params)?;
-        self.write_raw(&updated)?;
         Ok(CallToolResult::structured(
             json!({ "deleted": params.node_id, "keep_children": params.keep_children }),
         ))
@@ -1024,19 +764,10 @@ impl MeshfoxMcp {
         &self,
         Parameters(params): Parameters<NodeMvParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Some(port) = crate::coordinator::discover(&self.canvas_path).await {
-            crate::node_mv_via_worker(port, &self.canvas_path, &params.node_id, &params.new_parent_id)
-                .await
-                .map_err(invalid_params)?;
-            return Ok(CallToolResult::structured(json!({
-                "moved": params.node_id,
-                "new_parent_id": params.new_parent_id,
-            })));
-        }
-        let raw = self.read_raw()?;
-        let updated = crate::apply_node_mv(&raw, &params.node_id, &params.new_parent_id)
+        let port = self.worker_port().await?;
+        crate::node_mv_via_worker(port, &self.canvas_path, &params.node_id, &params.new_parent_id)
+            .await
             .map_err(invalid_params)?;
-        self.write_raw(&updated)?;
         Ok(CallToolResult::structured(json!({
             "moved": params.node_id,
             "new_parent_id": params.new_parent_id,
@@ -1050,23 +781,14 @@ impl MeshfoxMcp {
         &self,
         Parameters(params): Parameters<NodeRenameParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Some(port) = crate::coordinator::discover(&self.canvas_path).await {
-            let update = crate::worker_client::NodeUpdate {
-                title: Some(params.title.clone()),
-                ..Default::default()
-            };
-            crate::worker_client::update_node(port, &params.node_id, &update)
-                .await
-                .map_err(invalid_params)?;
-            return Ok(CallToolResult::structured(json!({
-                "renamed": params.node_id,
-                "title": params.title,
-            })));
-        }
-        let raw = self.read_raw()?;
-        let updated =
-            crate::apply_node_rename(&raw, &params.node_id, &params.title).map_err(invalid_params)?;
-        self.write_raw(&updated)?;
+        let port = self.worker_port().await?;
+        let update = crate::worker_client::NodeUpdate {
+            title: Some(params.title.clone()),
+            ..Default::default()
+        };
+        crate::worker_client::update_node(port, &params.node_id, &update)
+            .await
+            .map_err(invalid_params)?;
         Ok(CallToolResult::structured(json!({
             "renamed": params.node_id,
             "title": params.title,
@@ -1080,19 +802,10 @@ impl MeshfoxMcp {
         &self,
         Parameters(params): Parameters<NodeSetIdParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Some(port) = crate::coordinator::discover(&self.canvas_path).await {
-            crate::worker_client::rename_node_id(port, &params.node_id, &params.new_id)
-                .await
-                .map_err(invalid_params)?;
-            return Ok(CallToolResult::structured(json!({
-                "old_id": params.node_id,
-                "new_id": params.new_id,
-            })));
-        }
-        let raw = self.read_raw()?;
-        let updated = crate::apply_node_set_id(&raw, &params.node_id, &params.new_id)
+        let port = self.worker_port().await?;
+        crate::worker_client::rename_node_id(port, &params.node_id, &params.new_id)
+            .await
             .map_err(invalid_params)?;
-        self.write_raw(&updated)?;
         Ok(CallToolResult::structured(json!({
             "old_id": params.node_id,
             "new_id": params.new_id,
@@ -1106,28 +819,19 @@ impl MeshfoxMcp {
         &self,
         Parameters(params): Parameters<NodeEdgesParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Some(port) = crate::coordinator::discover(&self.canvas_path).await {
-            let edges: Vec<meshfox_core::ExtraEdge> = params
-                .from
-                .iter()
-                .map(|p| meshfox_core::ExtraEdge::new(p.as_str()))
-                .collect();
-            let update = crate::worker_client::NodeUpdate {
-                extra_parents: Some(edges),
-                ..Default::default()
-            };
-            crate::worker_client::update_node(port, &params.node_id, &update)
-                .await
-                .map_err(invalid_params)?;
-            return Ok(CallToolResult::structured(json!({
-                "updated": params.node_id,
-                "extra_parents": params.from,
-            })));
-        }
-        let raw = self.read_raw()?;
-        let updated =
-            crate::apply_node_edges(&raw, &params.node_id, &params.from).map_err(invalid_params)?;
-        self.write_raw(&updated)?;
+        let port = self.worker_port().await?;
+        let edges: Vec<meshfox_core::ExtraEdge> = params
+            .from
+            .iter()
+            .map(|p| meshfox_core::ExtraEdge::new(p.as_str()))
+            .collect();
+        let update = crate::worker_client::NodeUpdate {
+            extra_parents: Some(edges),
+            ..Default::default()
+        };
+        crate::worker_client::update_node(port, &params.node_id, &update)
+            .await
+            .map_err(invalid_params)?;
         Ok(CallToolResult::structured(json!({
             "updated": params.node_id,
             "extra_parents": params.from,
@@ -1141,42 +845,27 @@ impl MeshfoxMcp {
         &self,
         Parameters(params): Parameters<NodeMoveParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Some(port) = crate::coordinator::discover(&self.canvas_path).await {
-            let (target_id, is_before) = match (&params.before, &params.after) {
-                (Some(t), None) => (t.clone(), true),
-                (None, Some(t)) => (t.clone(), false),
-                (None, None) => {
-                    return Err(invalid_params(
-                        "exactly one of before/after is required".to_string(),
-                    ))
-                }
-                (Some(_), Some(_)) => {
-                    return Err(invalid_params(
-                        "before and after are mutually exclusive".to_string(),
-                    ))
-                }
-            };
-            crate::worker_client::move_sibling(port, &params.node_id, &target_id, is_before)
-                .await
-                .map_err(invalid_params)?;
-            return Ok(CallToolResult::structured(json!({
-                "moved": params.node_id,
-                "position": if is_before { "before" } else { "after" },
-                "target_id": target_id,
-            })));
-        }
-        let raw = self.read_raw()?;
-        let (updated, target_id, position) = crate::apply_node_move(
-            &raw,
-            &params.node_id,
-            params.before.as_deref(),
-            params.after.as_deref(),
-        )
-        .map_err(invalid_params)?;
-        self.write_raw(&updated)?;
+        let port = self.worker_port().await?;
+        let (target_id, is_before) = match (&params.before, &params.after) {
+            (Some(t), None) => (t.clone(), true),
+            (None, Some(t)) => (t.clone(), false),
+            (None, None) => {
+                return Err(invalid_params(
+                    "exactly one of before/after is required".to_string(),
+                ))
+            }
+            (Some(_), Some(_)) => {
+                return Err(invalid_params(
+                    "before and after are mutually exclusive".to_string(),
+                ))
+            }
+        };
+        crate::worker_client::move_sibling(port, &params.node_id, &target_id, is_before)
+            .await
+            .map_err(invalid_params)?;
         Ok(CallToolResult::structured(json!({
             "moved": params.node_id,
-            "position": position,
+            "position": if is_before { "before" } else { "after" },
             "target_id": target_id,
         })))
     }
@@ -1188,15 +877,10 @@ impl MeshfoxMcp {
         &self,
         Parameters(_params): Parameters<NodeReorderParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Some(port) = crate::coordinator::discover(&self.canvas_path).await {
-            crate::worker_client::reorder_document(port)
-                .await
-                .map_err(invalid_params)?;
-            return Ok(CallToolResult::structured(json!({ "reordered": true })));
-        }
-        let raw = self.read_raw()?;
-        let updated = crate::apply_node_reorder(&raw).map_err(invalid_params)?;
-        self.write_raw(&updated)?;
+        let port = self.worker_port().await?;
+        crate::worker_client::reorder_document(port)
+            .await
+            .map_err(invalid_params)?;
         Ok(CallToolResult::structured(json!({ "reordered": true })))
     }
 
@@ -1207,7 +891,7 @@ impl MeshfoxMcp {
         &self,
         Parameters(_params): Parameters<ValidateParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let raw = self.read_raw()?;
+        let raw = self.read_raw().await?;
         let node_count = crate::validate_canvas(&raw, &self.canvas_path).map_err(invalid_params)?;
         Ok(CallToolResult::structured(json!({
             "ok": true,
@@ -1219,7 +903,7 @@ impl MeshfoxMcp {
         description = "Runs every embedded `starlark constraint` fence's Starlark contract against the document (implies validate first, over the fully include-resolved tree) and reports pass/fail per fence. Unlike validate, one constraint failing isn't a tool error — it comes back as structured data (ok: false, with that fence's own fail() messages) so a caller can inspect what's wrong without try/catch. A parse/include failure (the document doesn't even reach a checkable state) is still a tool error, same as validate's."
     )]
     async fn check(&self, Parameters(_params): Parameters<CheckParams>) -> Result<CallToolResult, ErrorData> {
-        let raw = self.read_raw()?;
+        let raw = self.read_raw().await?;
         let results = crate::check_canvas(&raw, &self.canvas_path).map_err(invalid_params)?;
         let ok = results.iter().all(|r| r.ok);
         Ok(CallToolResult::structured(json!({
@@ -1235,7 +919,7 @@ impl MeshfoxMcp {
         &self,
         Parameters(params): Parameters<NodeFindParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let raw = self.read_raw()?;
+        let raw = self.read_raw().await?;
         let canvas = Canvas::from_markdown(&raw).map_err(|e| invalid_params(e.to_string()))?;
         let ids = crate::find_node_ids(&canvas, &params.selector).map_err(invalid_params)?;
         let ids = crate::filter_by_text(&canvas, ids, params.text.as_deref());
@@ -1317,8 +1001,8 @@ impl ServerHandler for MeshfoxMcp {
             "Tools for a meshfox canvas: a persistent debug shell (debug_start/debug_send/debug_stop) \
              running in a node/block's own resolved cwd and env, and thin structured wrappers around \
              the full `meshfox node <op>` surface (node_show/find/add/meta/body/block/rm/mv/rename/ \
-             set_id/edges/move/reorder). Each edit call is its own immediate read-modify-write of the \
-             file on disk — no batching, no conflict detection against a concurrent editor.",
+             set_id/edges/move/reorder). Each edit call is routed through the canvas worker, which owns the file. \
+             Calls are immediate; there is no batching.",
         )
     }
 }
@@ -1560,8 +1244,14 @@ impl MeshfoxMcpRoot {
         let (resolved, canvas_id) = if params.create {
             let (resolved, canvas_id) = self.resolve_under_root_for_create(&params.path)?;
             if !resolved.exists() {
+                use std::io::Write;
                 let content = crate::canvas_template_content(&resolved);
-                std::fs::write(&resolved, content).map_err(|e| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&resolved)
+                    .and_then(|mut file| file.write_all(content.as_bytes()))
+                    .map_err(|e| {
                     ErrorData::internal_error(
                         format!("failed to create {}: {e}", resolved.display()),
                         None,
