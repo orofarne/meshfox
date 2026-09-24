@@ -12,6 +12,7 @@ import {
 } from "@xyflow/react";
 import { NodeBodyContent, MeshNode, type MeshNodeData } from "./MeshNode";
 import { DeletableEdge } from "./DeletableEdge";
+import { withExtraRoutes } from "./edgeRouteLayout";
 import type { CanvasDoc } from "./types";
 import { subtreeIds } from "./tree";
 import type { ThemePreference } from "./theme";
@@ -121,6 +122,10 @@ export function NodeExpandPanel({
     () => edges.filter((e) => memberIds.has(e.source) && memberIds.has(e.target)),
     [edges, memberIds],
   );
+  const routedMemberEdges = useMemo(
+    () => withExtraRoutes(memberNodes, memberEdges),
+    [memberNodes, memberEdges],
+  );
 
   return createPortal(
     <div className="mesh-expand-backdrop" onClick={onClose}>
@@ -148,7 +153,7 @@ export function NodeExpandPanel({
             <ReactFlowProvider>
               <ReactFlow
                 nodes={memberNodes}
-                edges={memberEdges}
+                edges={routedMemberEdges}
                 onNodesChange={onNodesChange}
                 onEdgesChange={onEdgesChange}
                 nodeTypes={nodeTypes}

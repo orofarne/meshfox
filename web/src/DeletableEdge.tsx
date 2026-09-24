@@ -23,8 +23,8 @@ export interface DeletableEdgeData {
    * (see `DeletableEdge`'s own doc comment for why an on-canvas midpoint
    * button doesn't work well for this). */
   canDelete: boolean;
-  /** True only for an extra (`meshfox:edge`) edge — enables the curved
-   * bezier routing (see the "non-rectangular" requirement this exists for)
+  /** True only for an extra (`meshfox:edge`) edge — enables obstacle-avoiding
+   * routing with rounded corners (falling back to a bezier when blocked)
    * and the properties panel's full field set (color/line style/
    * arrowheads/tags, via `onUpdate`). A structural edge's panel only ever
    * has its own label to edit (via `onUpdateLabel`) — see SPEC.md, it has
@@ -40,8 +40,8 @@ export interface DeletableEdgeData {
    * suggestions by this edge's own `TagEditor` (see App.tsx's
    * `documentTags`). Extra-edge-only, like `tags` itself. */
   existingTags?: string[];
-  /** Perpendicular offset (flow-space px) from the straight source→target
-   * line — set only for an extra edge that shares its node pair with
+  /** Perpendicular offset (flow-space px) for the fallback bezier — set
+   * only for an extra edge that shares its node pair with
    * another (a mutual/multiple link — see App.tsx's `parallelOffsets`),
    * which would otherwise render two curves exactly on top of each other,
    * indistinguishable and unclickable for anything but whichever painted
@@ -52,6 +52,8 @@ export interface DeletableEdgeData {
    * routing handle. Computed with all edges on that side in App.tsx. */
   sourceOffset?: number;
   targetOffset?: number;
+  /** Derived from all visible extra edges for this render; never persisted. */
+  routedPath?: [string, number, number];
   /** Extra edge only: persists a full style patch. */
   onUpdate?: (patch: Partial<Omit<ExtraEdgeDto, "from">>) => void;
   /** Structural edge only: persists just its own label. */
@@ -87,8 +89,8 @@ function getParallelBezierPath(
 /**
  * Renders a plain `smoothstep` edge (structural `tree` edges — same
  * right-angle path shape the indented-tree layout expects) or, for an
- * extra (`meshfox:edge`) edge, a curved bezier instead — a deliberately
- * different, non-rectangular shape so it always reads as "an authored
+ * extra (`meshfox:edge`) edge, a rounded obstacle-avoiding path instead — a deliberately
+ * different shape so it always reads as "an authored
  * cross-reference", never as another nesting line.
  *
  * Neither kind has an on-canvas delete control anymore — both used to,
@@ -125,9 +127,9 @@ export function DeletableEdge({
   const tx = targetX + ((targetPosition === Position.Top || targetPosition === Position.Bottom) ? (edgeData?.targetOffset ?? 0) : 0);
   const ty = targetY + ((targetPosition === Position.Left || targetPosition === Position.Right) ? (edgeData?.targetOffset ?? 0) : 0);
   const [path, labelX, labelY] = curved
-    ? parallelOffset !== 0
+    ? edgeData?.routedPath ?? (parallelOffset !== 0
       ? getParallelBezierPath(sx, sy, tx, ty, parallelOffset)
-      : getBezierPath({ sourceX: sx, sourceY: sy, sourcePosition, targetX: tx, targetY: ty, targetPosition })
+      : getBezierPath({ sourceX: sx, sourceY: sy, sourcePosition, targetX: tx, targetY: ty, targetPosition }))
     : getSmoothStepPath({ sourceX: sx, sourceY: sy, sourcePosition, targetX: tx, targetY: ty, targetPosition });
 
   const [open, setOpen] = useState(false);

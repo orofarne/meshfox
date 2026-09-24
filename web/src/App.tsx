@@ -71,6 +71,7 @@ import { ResetSessionConfirmDialog } from "./ResetSessionConfirmDialog";
 import { ReparentChoiceDialog } from "./ReparentChoiceDialog";
 import { DeletableEdge } from "./DeletableEdge";
 import { distributeEdgePorts } from "./edgePorts";
+import { withExtraRoutes } from "./edgeRouteLayout";
 import { CanvasSourceEditor } from "./CanvasSourceEditor";
 import { ConsolePanel, type ConsoleLine } from "./ConsolePanel";
 import { getThemePreference, setThemePreference, type ThemePreference } from "./theme";
@@ -2163,7 +2164,10 @@ export default function App() {
       boxes,
       new Map(canvas.nodes.map((node) => [node.id, node.level])),
     );
-    // Two extra edges sharing the same *unordered* node pair — in
+    // Fallback-bezier separation for two extra edges sharing the same
+    // *unordered* node pair. The normal obstacle router in
+    // `DeletableEdge` uses separate side ports instead; this offset is
+    // only used when no safe corridor exists. Two edges sharing the same
     // practice always exactly a mutual link, `A->B` declared alongside
     // `B->A` (an `extraParents` entry can't repeat the same `from` twice
     // under one node, so that's the only way to actually get two here) —
@@ -2262,8 +2266,8 @@ export default function App() {
         // `ExtraEdgeDto`. Every field is optional; unset means "keep the
         // look this always had before these existed" (dashed, arrow only
         // at the end, no stroke override — see `dashArrayFor` below and
-        // DeletableEdge's own bezier routing, which is what actually makes
-        // this "non-rectangular" unlike a structural `tree` edge).
+        // DeletableEdge's rounded obstacle routing, unlike a structural
+        // `tree` edge).
         const strokeColor = e.color ? resolveNodeColor(e.color) : undefined;
         const dash = dashArrayFor(e.style);
         // `color` is only ever included on the marker object below when
@@ -3375,6 +3379,11 @@ export default function App() {
     ],
   );
 
+  const routedVisibleEdges = useMemo(
+    () => withExtraRoutes(focusedRenderNodes, visibleEdges),
+    [focusedRenderNodes, visibleEdges],
+  );
+
   if (serverGone) {
     return (
       <div className="server-gone">
@@ -3398,7 +3407,7 @@ export default function App() {
         ) : (
           <ReactFlow
             nodes={focusedRenderNodes}
-            edges={visibleEdges}
+            edges={routedVisibleEdges}
             onNodesChange={onNodesChangeAndMark}
             onEdgesChange={onEdgesChangeAndPersist}
             onConnect={handleConnect}
