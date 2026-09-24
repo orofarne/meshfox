@@ -65,8 +65,11 @@ async function edgeEndpointDistances(
         return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
       };
       const dist = (a: { x: number; y: number }, b: { x: number; y: number }) => Math.hypot(a.x - b.x, a.y - b.y);
+      const sourceHandle = handleCenter(sourceNodeId, sourceHandleId);
       return {
-        startToSourceHandle: dist(start, handleCenter(sourceNodeId, sourceHandleId)),
+        start,
+        sourceHandle,
+        startToSourceHandle: dist(start, sourceHandle),
         endToTargetHandle: dist(end, handleCenter(targetNodeId, targetHandleId)),
       };
     },
@@ -83,11 +86,12 @@ test.beforeEach(async ({ page }) => {
 test("root's own edges (level 1) exit from its Left handle, not the routing-only top/bottom pair", async ({
   page,
 }) => {
+  const starts: { x: number; y: number }[] = [];
   for (const [edgeId, targetId] of [
     ["root->child-a", "child-a"],
     ["root->child-b", "child-b"],
   ] as const) {
-    const { startToSourceHandle, endToTargetHandle } = await edgeEndpointDistances(
+    const { start, sourceHandle, endToTargetHandle } = await edgeEndpointDistances(
       page,
       edgeId,
       "root",
@@ -95,9 +99,11 @@ test("root's own edges (level 1) exit from its Left handle, not the routing-only
       targetId,
       "target-default",
     );
-    expect(startToSourceHandle, `${edgeId} start vs. root's source-default handle`).toBeLessThan(4);
+    starts.push(start);
+    expect(Math.abs(start.x - sourceHandle.x), `${edgeId} starts on root's left border`).toBeLessThan(4);
     expect(endToTargetHandle, `${edgeId} end vs. ${targetId}'s target-default handle`).toBeLessThan(4);
   }
+  expect(Math.hypot(starts[0].x - starts[1].x, starts[0].y - starts[1].y)).toBeGreaterThan(4);
 });
 
 test("a deeper node's own edges (level ≥ 2) exit from its Right handle", async ({ page }) => {

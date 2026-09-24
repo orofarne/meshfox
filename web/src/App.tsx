@@ -70,6 +70,7 @@ import { AutoLayoutConfirmDialog } from "./AutoLayoutConfirmDialog";
 import { ResetSessionConfirmDialog } from "./ResetSessionConfirmDialog";
 import { ReparentChoiceDialog } from "./ReparentChoiceDialog";
 import { DeletableEdge } from "./DeletableEdge";
+import { distributeEdgePorts } from "./edgePorts";
 import { CanvasSourceEditor } from "./CanvasSourceEditor";
 import { ConsolePanel, type ConsoleLine } from "./ConsolePanel";
 import { getThemePreference, setThemePreference, type ThemePreference } from "./theme";
@@ -2157,6 +2158,11 @@ export default function App() {
       });
     });
     const derivedEdges = deriveEdges(canvas);
+    const edgePorts = distributeEdgePorts(
+      derivedEdges,
+      boxes,
+      new Map(canvas.nodes.map((node) => [node.id, node.level])),
+    );
     // Two extra edges sharing the same *unordered* node pair — in
     // practice always exactly a mutual link, `A->B` declared alongside
     // `B->A` (an `extraParents` entry can't repeat the same `from` twice
@@ -2228,8 +2234,8 @@ export default function App() {
             // "no id given, just use whichever handle of that type it
             // finds first" fallback silently picking one of the new
             // ones instead.
-            sourceHandle: "source-default",
-            targetHandle: "target-default",
+            sourceHandle: edgePorts.get(e.id)?.sourceHandle ?? "source-default",
+            targetHandle: edgePorts.get(e.id)?.targetHandle ?? "target-default",
             // Right-angle "elbow" routing to match the indented-tree-view
             // layout (see layout.rs) — nodes grow rightward with depth,
             // so a classic step/elbow connector reads better here than a
@@ -2245,6 +2251,8 @@ export default function App() {
               canDelete: candidates.length > 0,
               title,
               label: e.label,
+              sourceOffset: edgePorts.get(e.id)?.sourceOffset ?? 0,
+              targetOffset: edgePorts.get(e.id)?.targetOffset ?? 0,
               onDelete: () => requestReparentEdge(e.target),
               onUpdateLabel: (label: string) => updateStructuralEdgeLabel(e.target, label),
             },
@@ -2315,26 +2323,13 @@ export default function App() {
         // given, just grab the first handle of that type" pitfall as the
         // structural edges above, now that every node has more than one
         // handle of each type.
-        const sourceBox = boxes.get(e.source);
-        const targetBox = boxes.get(e.target);
-        const handles: { sourceHandle: string; targetHandle: string } = (() => {
-          if (sourceBox && targetBox) {
-            const sourceBottom = sourceBox.y + sourceBox.height;
-            const targetBottom = targetBox.y + targetBox.height;
-            const yOverlaps = sourceBox.y < targetBottom && targetBox.y < sourceBottom;
-            if (!yOverlaps) {
-              return sourceBottom <= targetBox.y
-                ? { sourceHandle: "source-bottom", targetHandle: "target-top" }
-                : { sourceHandle: "source-top", targetHandle: "target-bottom" };
-            }
-          }
-          return { sourceHandle: "source-default", targetHandle: "target-default" };
-        })();
+        const handles = edgePorts.get(e.id);
         return {
           id: e.id,
           source: e.source,
           target: e.target,
-          ...handles,
+          sourceHandle: handles?.sourceHandle ?? "source-default",
+          targetHandle: handles?.targetHandle ?? "target-default",
           type: "extra",
           markerEnd,
           markerStart,
@@ -2355,6 +2350,8 @@ export default function App() {
             tags: e.tags,
             existingTags: documentTags,
             parallelOffset: parallelOffsets.get(e.id) ?? 0,
+            sourceOffset: handles?.sourceOffset ?? 0,
+            targetOffset: handles?.targetOffset ?? 0,
           },
         };
       }),

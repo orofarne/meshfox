@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { createPortal } from "react-dom";
-import { BaseEdge, EdgeLabelRenderer, getBezierPath, getSmoothStepPath, type EdgeProps } from "@xyflow/react";
+import { BaseEdge, EdgeLabelRenderer, Position, getBezierPath, getSmoothStepPath, type EdgeProps } from "@xyflow/react";
 import type { ExtraEdgeDto } from "./types";
 import { TagEditor } from "./TagEditor";
 
@@ -48,6 +48,10 @@ export interface DeletableEdgeData {
    * last. 0 (or absent, the common case) renders exactly as before this
    * existed — see `getParallelBezierPath`. */
   parallelOffset?: number;
+  /** Displacement along the source/target node's side from its centered
+   * routing handle. Computed with all edges on that side in App.tsx. */
+  sourceOffset?: number;
+  targetOffset?: number;
   /** Extra edge only: persists a full style patch. */
   onUpdate?: (patch: Partial<Omit<ExtraEdgeDto, "from">>) => void;
   /** Structural edge only: persists just its own label. */
@@ -116,11 +120,15 @@ export function DeletableEdge({
   const edgeData = data as DeletableEdgeData | undefined;
   const curved = !!edgeData?.editable;
   const parallelOffset = edgeData?.parallelOffset ?? 0;
+  const sx = sourceX + ((sourcePosition === Position.Top || sourcePosition === Position.Bottom) ? (edgeData?.sourceOffset ?? 0) : 0);
+  const sy = sourceY + ((sourcePosition === Position.Left || sourcePosition === Position.Right) ? (edgeData?.sourceOffset ?? 0) : 0);
+  const tx = targetX + ((targetPosition === Position.Top || targetPosition === Position.Bottom) ? (edgeData?.targetOffset ?? 0) : 0);
+  const ty = targetY + ((targetPosition === Position.Left || targetPosition === Position.Right) ? (edgeData?.targetOffset ?? 0) : 0);
   const [path, labelX, labelY] = curved
     ? parallelOffset !== 0
-      ? getParallelBezierPath(sourceX, sourceY, targetX, targetY, parallelOffset)
-      : getBezierPath({ sourceX, sourceY, sourcePosition, targetX, targetY, targetPosition })
-    : getSmoothStepPath({ sourceX, sourceY, sourcePosition, targetX, targetY, targetPosition });
+      ? getParallelBezierPath(sx, sy, tx, ty, parallelOffset)
+      : getBezierPath({ sourceX: sx, sourceY: sy, sourcePosition, targetX: tx, targetY: ty, targetPosition })
+    : getSmoothStepPath({ sourceX: sx, sourceY: sy, sourcePosition, targetX: tx, targetY: ty, targetPosition });
 
   const [open, setOpen] = useState(false);
   const canOpen = !!(edgeData?.editMode && (edgeData.editable ? edgeData.onUpdate : edgeData.onUpdateLabel));
