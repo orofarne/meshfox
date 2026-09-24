@@ -1,8 +1,11 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { BaseEdge, EdgeLabelRenderer, Position, getBezierPath, getSmoothStepPath, useReactFlow, useStore, useViewport, type EdgeProps } from "@xyflow/react";
+import { BaseEdge, Position, getBezierPath, getSmoothStepPath, useReactFlow, useStore, useViewport, type Edge, type EdgeProps, type Node } from "@xyflow/react";
 import type { ExtraEdgeDto } from "./types";
 import type { EdgeSide } from "./edgePorts";
+import type { MeshNodeData } from "./MeshNode";
+import { withEdgeRoutes } from "./edgeRouteLayout";
+import { draw } from "./edgeRouting";
 import { TagEditor } from "./TagEditor";
 
 /** Carried on a deletable edge's own `data` — everything `DeletableEdge`
@@ -29,6 +32,7 @@ export interface DeletableEdgeData {
    * has label and route controls, but no color/style/arrowhead attributes. */
   editable?: boolean;
   label?: string;
+  labelAt?: number;
   color?: string;
   style?: ExtraEdgeDto["style"];
   arrowStart?: ExtraEdgeDto["arrowStart"];
@@ -59,7 +63,7 @@ export interface DeletableEdgeData {
   targetSide?: ExtraEdgeDto["targetSide"];
   /** Extra edge only: persists a full style patch. */
   onUpdate?: (patch: Partial<Omit<ExtraEdgeDto, "from">>) => void;
-  onUpdateRoute?: (patch: { sourceSide?: "left" | "right" | "top" | "bottom" | "auto"; targetSide?: "left" | "right" | "top" | "bottom" | "auto"; via?: { x: number; y: number }[]; label?: string }) => void;
+  onUpdateRoute?: (patch: { sourceSide?: "left" | "right" | "top" | "bottom" | "auto"; targetSide?: "left" | "right" | "top" | "bottom" | "auto"; via?: { x: number; y: number }[]; label?: string; labelAt?: number }) => void;
   [key: string]: unknown;
 }
 
@@ -116,11 +120,19 @@ export function DeletableEdge({
   data,
 }: EdgeProps) {
   const edgeData = data as DeletableEdgeData | undefined;
-  const { screenToFlowPosition, flowToScreenPosition } = useReactFlow();
+  const { screenToFlowPosition, flowToScreenPosition, setEdges } = useReactFlow();
   const renderer = useStore((state) => state.domNode?.querySelector(".react-flow__renderer"));
+  const flowNodes = useStore((state) => state.nodes);
+  const flowEdges = useStore((state) => state.edges);
   useViewport(); // Reposition the portal controls when the canvas pans or zooms.
   const [draggingRoute, setDraggingRoute] = useState(false);
-  const [draggingEndpoint, setDraggingEndpoint] = useState<{ x: number; y: number } | null>(null);
+  const [draggingLabelAt, setDraggingLabelAt] = useState<number | null>(null);
+  const [draggingEndpoint, setDraggingEndpoint] = useState<{
+    end: "source" | "target";
+    point: { x: number; y: number };
+    side: EdgeSide | null;
+    port: { x: number; y: number } | null;
+  } | null>(null);
   const curved = !!edgeData?.editable;
   const parallelOffset = edgeData?.parallelOffset ?? 0;
   const sx = sourceX + ((sourcePosition === Position.Top || sourcePosition === Position.Bottom) ? (edgeData?.sourceOffset ?? 0) : 0);
@@ -135,11 +147,60 @@ export function DeletableEdge({
   const draftRef = useRef(draftVia);
   draftRef.current = draftVia;
   useEffect(() => { setDraftVia(fromStored(edgeData?.via ?? [])); }, [edgeData?.via, originX, originY]);
-  const [path, labelX, labelY] = curved
+  const [storedPath, storedLabelX, storedLabelY] = curved
     ? edgeData?.routedPath ?? (parallelOffset !== 0
       ? getParallelBezierPath(sx, sy, tx, ty, parallelOffset)
       : getBezierPath({ sourceX: sx, sourceY: sy, sourcePosition, targetX: tx, targetY: ty, targetPosition }))
     : edgeData?.routedPath ?? getSmoothStepPath({ sourceX: sx, sourceY: sy, sourcePosition, targetX: tx, targetY: ty, targetPosition });
+  const preview = useMemo(() => {
+    if (!draggingRoute && !draggingEndpoint) return null;
+    const candidate = draggingEndpoint?.side && draggingEndpoint.port ? draggingEndpoint : null;
+    if (draggingEndpoint && !candidate) {
+      const start = draggingEndpoint.end === "source" ? draggingEndpoint.point : { x: sx, y: sy };
+      const end = draggingEndpoint.end === "target" ? draggingEndpoint.point : { x: tx, y: ty };
+      const direct = draw([start, ...draftVia, end]);
+      return { path: [direct[0], direct[1], direct[2]] as [string, number, number], points: direct[3] };
+    }
+    const nextOrigin = candidate?.end === "source" ? candidate.port! : { x: originX, y: originY };
+    const routed = withEdgeRoutes(flowNodes as Node<MeshNodeData>[], flowEdges.map((edge) => edge.id === id
+      ? { ...edge,
+        sourceHandle: candidate?.end === "source" ? `source-${candidate.side}` : edge.sourceHandle,
+        targetHandle: candidate?.end === "target" ? `target-${candidate.side}` : edge.targetHandle,
+        data: { ...edge.data,
+          routedPath: undefined,
+          routedPoints: undefined,
+          routeFailed: undefined,
+          sourceOffset: candidate?.end === "source" ? 0 : edge.data?.sourceOffset,
+          targetOffset: candidate?.end === "target" ? 0 : edge.data?.targetOffset,
+          via: draftVia.map((point) => ({ x: Math.round(point.x - nextOrigin.x), y: Math.round(point.y - nextOrigin.y) })),
+        },
+      }
+      : edge,
+    ) as Edge[]).find((edge) => edge.id === id);
+    const result = routed?.data as DeletableEdgeData | undefined;
+    if (result?.routedPath && !result.routeFailed) return { path: result.routedPath, points: result.routedPoints };
+    // Even a blocked waypoint follows the pointer. This is a temporary
+    // drawing only; the canvas is still saved by pointerup below.
+    const fallback = draw([candidate?.end === "source" ? candidate.port! : { x: sx, y: sy },
+      ...draftVia, candidate?.end === "target" ? candidate.port! : { x: tx, y: ty }]);
+    return { path: [fallback[0], fallback[1], fallback[2]] as [string, number, number], points: fallback[3] };
+  }, [draggingRoute, draggingEndpoint, draftVia, flowNodes, flowEdges, id, originX, originY, sx, sy, tx, ty]);
+  const [path, labelX, labelY] = preview?.path ?? [storedPath, storedLabelX, storedLabelY];
+  const routePoints = preview?.points ?? edgeData?.routedPoints;
+  const hasBadge = !!(edgeData?.label || edgeData?.tags?.length);
+  const pathGeometry = useMemo(() => {
+    if (!hasBadge) return null;
+    const geometry = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    geometry.setAttribute("d", path);
+    return geometry;
+  }, [path, hasBadge]);
+  const labelAt = draggingLabelAt ?? edgeData?.labelAt ?? 500;
+  const labelPoint = useMemo(() => {
+    const length = pathGeometry?.getTotalLength() ?? 0;
+    if (!length) return { x: labelX, y: labelY };
+    const point = pathGeometry!.getPointAtLength(length * labelAt / 1000);
+    return { x: point.x, y: point.y };
+  }, [pathGeometry, labelAt, labelX, labelY]);
 
   const [open, setOpen] = useState(false);
   const canOpen = !!(edgeData?.editMode && (edgeData.editable ? edgeData.onUpdate : edgeData.onUpdateRoute));
@@ -151,8 +212,56 @@ export function DeletableEdge({
   };
   const toolbarAnchorY = Math.min(
     labelY,
-    ...(edgeData?.routedPoints?.map((point) => point.y) ?? [sy, ty]),
+    ...(routePoints?.map((point) => point.y) ?? [sy, ty]),
   );
+
+  const nearestLabelAt = (clientX: number, clientY: number): number => {
+    const pointer = screenToFlowPosition({ x: clientX, y: clientY });
+    const length = pathGeometry?.getTotalLength() ?? 0;
+    if (!length) return 500;
+    const distance = (at: number) => {
+      const point = pathGeometry!.getPointAtLength(length * at);
+      return Math.hypot(point.x - pointer.x, point.y - pointer.y);
+    };
+    const steps = Math.min(300, Math.max(40, Math.ceil(length / 6)));
+    let best = 0, bestDistance = Infinity;
+    for (let index = 0; index <= steps; index++) {
+      const d = distance(index / steps);
+      if (d < bestDistance) { best = index / steps; bestDistance = d; }
+    }
+    let span = 1 / steps;
+    for (let index = 0; index < 8; index++) {
+      const left = Math.max(0, best - span / 2), right = Math.min(1, best + span / 2);
+      if (distance(left) < distance(right)) best = left;
+      else best = right;
+      span /= 2;
+    }
+    return Math.round(best * 1000);
+  };
+
+  const dragLabel = (event: React.PointerEvent) => {
+    if (!canOpen) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setEdges((edges) => edges.map((edge) => ({ ...edge, selected: edge.id === id })));
+    const startX = event.clientX, startY = event.clientY;
+    let moved = false;
+    const move = (e: PointerEvent) => {
+      if (Math.hypot(e.clientX - startX, e.clientY - startY) < 4 && !moved) return;
+      moved = true;
+      setDraggingLabelAt(nearestLabelAt(e.clientX, e.clientY));
+    };
+    const up = (e: PointerEvent) => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      setDraggingLabelAt(null);
+      if (!moved) return;
+      const next = nearestLabelAt(e.clientX, e.clientY);
+      if (next !== (edgeData?.labelAt ?? 500)) edgeData?.onUpdateRoute?.({ labelAt: next });
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up, { once: true });
+  };
 
   const sideAt = (nodeId: string, clientX: number, clientY: number): EdgeSide | null => {
     const node = renderer?.querySelector(`.react-flow__node[data-id="${CSS.escape(nodeId)}"]`);
@@ -169,10 +278,25 @@ export function DeletableEdge({
     return distances.sort((a, b) => a[1] - b[1])[0][0];
   };
 
+  const portAt = (nodeId: string, side: EdgeSide) => {
+    const node = renderer?.querySelector(`.react-flow__node[data-id="${CSS.escape(nodeId)}"]`);
+    const box = node?.getBoundingClientRect();
+    if (!box) return null;
+    return screenToFlowPosition({
+      x: side === "left" ? box.left : side === "right" ? box.right : box.left + box.width / 2,
+      y: side === "top" ? box.top : side === "bottom" ? box.bottom : box.top + box.height / 2,
+    });
+  };
+
   const dragEndpoint = (end: "source" | "target", event: React.PointerEvent) => {
     event.preventDefault();
     event.stopPropagation();
-    const move = (e: PointerEvent) => setDraggingEndpoint(screenToFlowPosition({ x: e.clientX, y: e.clientY }));
+    const move = (e: PointerEvent) => {
+      const nodeId = end === "source" ? source : target;
+      const side = sideAt(nodeId, e.clientX, e.clientY);
+      setDraggingEndpoint({ end, point: screenToFlowPosition({ x: e.clientX, y: e.clientY }),
+        side, port: side ? portAt(nodeId, side) : null });
+    };
     const up = (e: PointerEvent) => {
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
@@ -185,14 +309,8 @@ export function DeletableEdge({
       }
       // Waypoints are stored relative to the source port. Keep them in the
       // same canvas positions when that port moves to a different side.
-      const node = renderer?.querySelector(`.react-flow__node[data-id="${CSS.escape(source)}"]`);
-      const box = node?.getBoundingClientRect();
-      if (!box) return;
-      const screenPort = {
-        x: side === "left" ? box.left : side === "right" ? box.right : box.left + box.width / 2,
-        y: side === "top" ? box.top : side === "bottom" ? box.bottom : box.top + box.height / 2,
-      };
-      const nextOrigin = screenToFlowPosition(screenPort);
+      const nextOrigin = portAt(source, side);
+      if (!nextOrigin) return;
       edgeData?.onUpdateRoute?.({
         sourceSide: side,
         via: draftRef.current.map((point) => ({ x: Math.round(point.x - nextOrigin.x), y: Math.round(point.y - nextOrigin.y) })),
@@ -253,9 +371,6 @@ export function DeletableEdge({
   return (
     <>
       <BaseEdge id={id} path={path} style={style} markerEnd={markerEnd} markerStart={markerStart} />
-      {draggingRoute && draftVia.length > 0 && <path
-        d={`M${sx},${sy} ${draftVia.map((p) => `L${p.x},${p.y}`).join(" ")} L${tx},${ty}`}
-        fill="none" stroke="var(--accent)" strokeWidth={2} strokeDasharray="4 4" pointerEvents="none" />}
       {canOpen && (
         // A wide, invisible click target on top of the (thin) visible path —
         // "click the arrow" to select it, without requiring pixel-
@@ -275,16 +390,18 @@ export function DeletableEdge({
           <div className="mesh-node-toolbar mesh-edge-toolbar nodrag nopan" data-testid="edge-toolbar"
             style={{ left: Math.max(72, Math.min(renderer.clientWidth - 72, localPoint({ x: labelX, y: labelY }).x)), top: Math.max(48, localPoint({ x: labelX, y: toolbarAnchorY }).y - 20) }}>
             <button type="button" className="mesh-node-icon-button" title="Arrow settings" aria-label="Arrow settings" onClick={() => setOpen(true)}>⚙</button>
-            <button type="button" className="mesh-node-icon-button" title="Reset route and attachment sides to automatic" aria-label="Reset arrow route" onClick={() => {
+            <button type="button" className="mesh-node-icon-button" title="Reset route, attachment sides, and label position to automatic" aria-label="Reset arrow route" onClick={() => {
               draftRef.current = [];
               setDraftVia([]);
-              edgeData.onUpdateRoute?.({ via: [], sourceSide: "auto", targetSide: "auto" });
+              edgeData.onUpdateRoute?.({ via: [], sourceSide: "auto", targetSide: "auto", labelAt: 500 });
             }}>↺</button>
             {edgeData.canDelete && <button type="button" className="mesh-node-icon-button mesh-node-delete-icon" title={edgeData.title} aria-label="Delete arrow" onClick={edgeData.onDelete}>🗑</button>}
             {edgeData.routeFailed && <span role="alert" title="A waypoint is blocked by a node">⚠</span>}
           </div>
           {(["source", "target"] as const).map((end) => {
-            const point = localPoint(end === "source" ? { x: sx, y: sy } : { x: tx, y: ty });
+            const point = localPoint(draggingEndpoint?.end === end
+              ? draggingEndpoint.port ?? draggingEndpoint.point
+              : end === "source" ? { x: sx, y: sy } : { x: tx, y: ty });
             return <button key={end} type="button" className={`mesh-edge-route-handle mesh-edge-endpoint mesh-edge-endpoint-${end} nodrag nopan`}
               aria-label={`Drag ${end} to a side of its node`} title={`Drag ${end} to a side of its node`}
               style={{ left: point.x, top: point.y }} onPointerDown={(event) => dragEndpoint(end, event)} />;
@@ -302,8 +419,8 @@ export function DeletableEdge({
                 edgeData.onUpdateRoute?.({ via: toStored(next) });
               }} />;
           })}
-          {edgeData.routedPoints?.slice(1).map((point, index) => {
-            const previous = edgeData.routedPoints![index];
+          {routePoints?.slice(1).map((point, index) => {
+            const previous = routePoints[index];
             if (Math.hypot(point.x - previous.x, point.y - previous.y) < 40) return null;
             const middle = { x: (point.x + previous.x) / 2, y: (point.y + previous.y) / 2 };
             const local = localPoint(middle);
@@ -311,19 +428,14 @@ export function DeletableEdge({
               aria-label={`Drag route segment ${index + 1}`} title="Drag to bend route"
               style={{ left: local.x, top: local.y }} onPointerDown={(event) => dragSegment(middle, event)} />;
           })}
-          {draggingEndpoint && <span className="mesh-edge-route-handle mesh-edge-endpoint mesh-edge-endpoint-preview" style={{ left: localPoint(draggingEndpoint).x, top: localPoint(draggingEndpoint).y }} />}
         </div>, renderer,
       )}
-      {(edgeData?.label || (edgeData?.tags && edgeData.tags.length > 0)) && (
-        <EdgeLabelRenderer>
-          <div
-            className="mesh-edge-label-badge"
-            style={{
-              position: "absolute",
-              pointerEvents: "none",
-              transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)`,
-            }}
-          >
+      {renderer && hasBadge && createPortal(
+        <div className="mesh-edge-label-layer">
+          <div className={`mesh-edge-label-badge nodrag nopan${canOpen ? " mesh-edge-label-draggable" : ""}`}
+            style={{ left: localPoint(labelPoint).x, top: localPoint(labelPoint).y }}
+            title={canOpen ? "Drag label along arrow" : undefined}
+            onPointerDown={dragLabel}>
             {edgeData!.label}
             {edgeData!.tags?.map((t) => (
               <span className="mesh-tag-chip" key={t}>
@@ -331,7 +443,7 @@ export function DeletableEdge({
               </span>
             ))}
           </div>
-        </EdgeLabelRenderer>
+        </div>, renderer,
       )}
       {open && canOpen && <EdgeEditorPanel data={edgeData!} onClose={() => setOpen(false)} />}
     </>

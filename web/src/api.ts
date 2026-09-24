@@ -251,6 +251,8 @@ export interface NodePatch {
    * no separate sentinel needed here since a caller only ever sends this
    * key at all when the label actually changed (see DeletableEdge.tsx). */
   edgeLabel?: string;
+  /** Thousandths of the structural edge's rendered path length; 500 resets to midpoint. */
+  edgeLabelAt?: number;
   edgeSourceSide?: "left" | "right" | "top" | "bottom" | "auto";
   edgeTargetSide?: "left" | "right" | "top" | "bottom" | "auto";
   edgeVia?: { x: number; y: number }[];

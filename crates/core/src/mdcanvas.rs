@@ -170,6 +170,7 @@ pub struct NodeMeta {
     /// Structural-edge label (see `Node::edge_label`). Same "omitted unless
     /// set" contract as `display`/`lang`/`interpreter`.
     pub edge_label: Option<String>,
+    pub edge_label_at: Option<u16>,
     pub edge_source_side: Option<crate::canvas::EdgeSide>,
     pub edge_target_side: Option<crate::canvas::EdgeSide>,
     pub edge_via: Vec<crate::canvas::RoutePoint>,
@@ -233,6 +234,7 @@ pub const NODE_ATTRS: &[&str] = &[
     "preview",
     "fold",
     "edgeLabel",
+    "edgeLabelAt",
     "edgeSourceSide",
     "edgeTargetSide",
     "edgeVia",
@@ -241,7 +243,7 @@ pub const NODE_ATTRS: &[&str] = &[
 ];
 /// `meshfox:edge`'s own attribute vocabulary — `from` is required, the
 /// rest optional styling (`canvas.rs`'s `ExtraEdge`/style enums).
-pub const EDGE_ATTRS: &[&str] = &["from", "label", "color", "style", "arrowStart", "arrowEnd", "tags", "sourceSide", "targetSide", "via"];
+pub const EDGE_ATTRS: &[&str] = &["from", "label", "labelAt", "color", "style", "arrowStart", "arrowEnd", "tags", "sourceSide", "targetSide", "via"];
 
 /// `meshfox validate`-only (see `attrs::UnknownAttrError`'s own doc
 /// comment for why this is a separate pass rather than part of `parse`
@@ -378,6 +380,7 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
             interpreter: seg.node_attrs.get("interpreter").cloned(),
             preview: seg.node_attrs.get("preview").map(|v| v == "true").unwrap_or(false),
             edge_label: seg.node_attrs.get("edgeLabel").cloned(),
+            edge_label_at: seg.node_attrs.get("edgeLabelAt").and_then(|raw| parse_label_at(raw)),
             edge_source_side: seg.node_attrs.get("edgeSourceSide").and_then(|v| crate::canvas::EdgeSide::parse(v)),
             edge_target_side: seg.node_attrs.get("edgeTargetSide").and_then(|v| crate::canvas::EdgeSide::parse(v)),
             edge_via: seg.node_attrs.get("edgeVia").map(|raw| parse_route_points(raw)).unwrap_or_default(),
@@ -427,6 +430,7 @@ fn extra_edge_from_attrs(attrs: &HashMap<String, String>, from_id: &str) -> Extr
         target_side: attrs.get("targetSide").and_then(|v| crate::canvas::EdgeSide::parse(v)),
         via: attrs.get("via").map(|raw| parse_route_points(raw)).unwrap_or_default(),
         label: attrs.get("label").cloned(),
+        label_at: attrs.get("labelAt").and_then(|raw| parse_label_at(raw)),
         color: attrs.get("color").cloned(),
         style: attrs.get("style").and_then(|v| EdgeLineStyle::parse(v)),
         arrow_start: attrs.get("arrowStart").and_then(|v| ArrowEnd::parse(v)),
@@ -440,6 +444,10 @@ fn parse_route_points(raw: &str) -> Vec<crate::canvas::RoutePoint> {
         let (x, y) = part.split_once(',')?;
         Some(crate::canvas::RoutePoint { x: x.parse().ok()?, y: y.parse().ok()? })
     }).collect()
+}
+
+fn parse_label_at(raw: &str) -> Option<u16> {
+    raw.parse::<u16>().ok().filter(|value| *value <= 1000)
 }
 
 /// Splits a `tags="a, b, c"` attribute value into its individual tags,
@@ -547,6 +555,7 @@ fn render_node_line(canvas: &Canvas, node: &Node) -> String {
     if let Some(l) = &node.edge_label {
         parts.push(format!("edgeLabel=\"{l}\""));
     }
+    if let Some(at) = node.edge_label_at { parts.push(format!("edgeLabelAt=\"{at}\"")); }
     if let Some(side) = node.edge_source_side { parts.push(format!("edgeSourceSide=\"{}\"", side.as_str())); }
     if let Some(side) = node.edge_target_side { parts.push(format!("edgeTargetSide=\"{}\"", side.as_str())); }
     if !node.edge_via.is_empty() { parts.push(format!("edgeVia=\"{}\"", render_route_points(&node.edge_via))); }
@@ -711,6 +720,7 @@ const NODE_LINE_RAW_ORDER: &[(&str, bool)] = &[
     ("interpreter", true),
     ("preview", true),
     ("edgeLabel", true),
+    ("edgeLabelAt", true),
     ("edgeSourceSide", true),
     ("edgeTargetSide", true),
     ("edgeVia", true),
@@ -800,6 +810,7 @@ pub fn set_node_meta(markdown: &str, node_id: &str, meta: &NodeMeta) -> Option<S
     if let Some(l) = &meta.edge_label {
         parts.push(format!("edgeLabel=\"{l}\""));
     }
+    if let Some(at) = meta.edge_label_at { parts.push(format!("edgeLabelAt=\"{at}\"")); }
     if let Some(side) = meta.edge_source_side { parts.push(format!("edgeSourceSide=\"{}\"", side.as_str())); }
     if let Some(side) = meta.edge_target_side { parts.push(format!("edgeTargetSide=\"{}\"", side.as_str())); }
     if !meta.edge_via.is_empty() { parts.push(format!("edgeVia=\"{}\"", render_route_points(&meta.edge_via))); }
@@ -1357,6 +1368,7 @@ fn render_edge_line(e: &ExtraEdge) -> String {
     if let Some(l) = &e.label {
         parts.push(format!("label=\"{l}\""));
     }
+    if let Some(at) = e.label_at { parts.push(format!("labelAt=\"{at}\"")); }
     if let Some(c) = &e.color {
         parts.push(format!("color=\"{c}\""));
     }
@@ -3190,6 +3202,7 @@ Reused from Tests as well.
             interpreter: None,
             preview: None,
             edge_label: None,
+            edge_label_at: None,
             edge_source_side: None,
             edge_target_side: None,
             edge_via: Vec::new(),
@@ -4648,12 +4661,13 @@ Reused from Tests as well.
 
     #[test]
     fn extra_edge_route_round_trips_through_markdown() {
-        let raw = "# Root\n<!-- meshfox:node id=\"root\" -->\n\n## Child\n<!-- meshfox:node id=\"child\" -->\n<!-- meshfox:edge from=\"root\" sourceSide=\"bottom\" targetSide=\"right\" via=\"10,20;30,-40\" -->\n";
+        let raw = "# Root\n<!-- meshfox:node id=\"root\" -->\n\n## Child\n<!-- meshfox:node id=\"child\" -->\n<!-- meshfox:edge from=\"root\" sourceSide=\"bottom\" targetSide=\"right\" via=\"10,20;30,-40\" label=\"Test\" labelAt=\"725\" -->\n";
         let parsed = parse(raw).unwrap();
         let edge = &parsed.node("child").unwrap().extra_parents[0];
         assert_eq!(edge.source_side, Some(crate::canvas::EdgeSide::Bottom));
         assert_eq!(edge.target_side, Some(crate::canvas::EdgeSide::Right));
         assert_eq!(edge.via, vec![crate::canvas::RoutePoint { x: 10, y: 20 }, crate::canvas::RoutePoint { x: 30, y: -40 }]);
+        assert_eq!(edge.label_at, Some(725));
         let rewritten = set_node_edges(raw, "child", std::slice::from_ref(edge)).unwrap();
         assert_eq!(parse(&rewritten).unwrap().node("child").unwrap().extra_parents[0], edge.clone());
         assert_eq!(unknown_node_edge_attr(&rewritten), None);
@@ -4661,21 +4675,24 @@ Reused from Tests as well.
 
     #[test]
     fn structural_edge_route_survives_unrelated_meta_edit() {
-        let raw = "# Root\n<!-- meshfox:node id=\"root\" -->\n\n## Child\n<!-- meshfox:node id=\"child\" edgeSourceSide=\"top\" edgeTargetSide=\"right\" edgeVia=\"12,34;-56,78\" -->\n";
+        let raw = "# Root\n<!-- meshfox:node id=\"root\" -->\n\n## Child\n<!-- meshfox:node id=\"child\" edgeLabel=\"Test\" edgeLabelAt=\"250\" edgeSourceSide=\"top\" edgeTargetSide=\"right\" edgeVia=\"12,34;-56,78\" -->\n";
         let parsed = parse(raw).unwrap();
         let node = parsed.node("child").unwrap();
         assert_eq!(node.edge_source_side, Some(crate::canvas::EdgeSide::Top));
         assert_eq!(node.edge_target_side, Some(crate::canvas::EdgeSide::Right));
         assert_eq!(node.edge_via.len(), 2);
+        assert_eq!(node.edge_label_at, Some(250));
         let updated = set_node_meta(raw, "child", &NodeMeta {
             color: Some("2".into()),
             edge_source_side: node.edge_source_side,
             edge_target_side: node.edge_target_side,
             edge_via: node.edge_via.clone(),
+            edge_label_at: node.edge_label_at,
             ..Default::default()
         }).unwrap();
         let after = parse(&updated).unwrap();
         assert_eq!(after.node("child").unwrap().edge_via, node.edge_via);
+        assert_eq!(after.node("child").unwrap().edge_label_at, Some(250));
         assert_eq!(unknown_node_edge_attr(&updated), None);
         let with_timestamps = updated.replacen(
             "<!-- meshfox:node id=\"root\" -->",

@@ -914,7 +914,6 @@ a {
 .mesh-edge-segment { width: 10px; height: 10px; background: var(--node-bg); border-color: var(--accent); z-index: 1; }
 .mesh-edge-waypoint { z-index: 2; }
 .mesh-edge-endpoint { width: 17px; height: 17px; z-index: 3; }
-.mesh-edge-endpoint-preview { opacity: 0.55; pointer-events: none; }
 
 /* The ▸/▾ subtree fold marker (see MeshNode.tsx's `FoldToggle`) — sits
  * ahead of the title text itself rather than among the trailing action
@@ -2220,14 +2219,19 @@ a {
   margin: 0 0 0.6rem;
 }
 
-/* An edge's own `label` (extra or structural — either kind can have one,
- * see DeletableEdge.tsx), shown at its midpoint. Purely decorative diagram
- * content, not an editing control — clicking it doesn't do anything on
- * its own (the invisible wide hit-path along the edge itself, also in
- * DeletableEdge.tsx, is the actual click target for opening its
- * properties panel), so this renders identically in read-only and edit
- * mode. */
+/* Labels share the renderer portal with the route controls, above edge SVGs
+ * and nodes. The wrapper lets the badge receive drags in edit mode without
+ * capturing pointer events anywhere else on the canvas. */
+.mesh-edge-label-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 90;
+  pointer-events: none;
+}
+
 .mesh-edge-label-badge {
+  position: absolute;
+  transform: translate(-50%, -50%);
   display: flex;
   align-items: center;
   flex-wrap: wrap;
@@ -2239,7 +2243,16 @@ a {
   border: 1px solid var(--node-border);
   color: var(--fg);
   max-width: 16rem;
+  pointer-events: none;
 }
+
+.mesh-edge-label-draggable {
+  pointer-events: all;
+  cursor: grab;
+  touch-action: none;
+}
+
+.mesh-edge-label-draggable:active { cursor: grabbing; }
 
 /* A tag chip nested inside the label badge (see DeletableEdge.tsx) needs
  * its own background to stand apart from the label text sharing the same

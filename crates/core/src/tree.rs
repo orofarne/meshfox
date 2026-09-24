@@ -150,6 +150,7 @@ mod tests {
             interpreter: None,
             preview: false,
             edge_label: None,
+            edge_label_at: None,
             edge_source_side: None,
             edge_target_side: None,
             edge_via: Vec::new(),

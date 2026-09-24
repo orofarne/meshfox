@@ -72,6 +72,7 @@ export interface DerivedEdge {
    * node, with no color/style/arrowheads. Extra (`extra: true`) edge: `ExtraEdgeDto`'s
    * own `label`, alongside every other styling field below. */
   label?: string;
+  labelAt?: number;
   color?: string;
   style?: "solid" | "dashed" | "dotted";
   arrowStart?: "none" | "arrow";
@@ -100,6 +101,7 @@ export function deriveEdges(canvas: CanvasDoc): DerivedEdge[] {
           target: n.id,
           extra: false,
           label: n.edgeLabel,
+          labelAt: n.edgeLabelAt,
           sourceSide: n.edgeSourceSide,
           targetSide: n.edgeTargetSide,
           via: n.edgeVia,
@@ -113,6 +115,7 @@ export function deriveEdges(canvas: CanvasDoc): DerivedEdge[] {
         target: n.id,
         extra: true,
         label: extra.label,
+        labelAt: extra.labelAt ?? undefined,
         color: extra.color,
         style: extra.style,
         arrowStart: extra.arrowStart,

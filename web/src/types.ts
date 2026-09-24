@@ -35,6 +35,8 @@ export interface ExtraEdgeDto {
   targetSide?: "left" | "right" | "top" | "bottom" | null;
   via?: { x: number; y: number }[];
   label?: string;
+  /** Thousandths of the rendered path length; absent means midpoint. */
+  labelAt?: number | null;
   color?: string;
   style?: "solid" | "dashed" | "dotted";
   arrowStart?: "none" | "arrow";
@@ -105,6 +107,7 @@ export interface CanvasNode {
    * structural edge has no color/style/arrowhead attributes to go with
    * it; its route attributes are stored separately on this node. */
   edgeLabel?: string;
+  edgeLabelAt?: number;
   edgeSourceSide?: "left" | "right" | "top" | "bottom";
   edgeTargetSide?: "left" | "right" | "top" | "bottom";
   edgeVia?: { x: number; y: number }[];

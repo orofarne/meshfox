@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { draw, routeAroundNodes } from "../src/edgeRouting.ts";
 import { distributeEdgePorts } from "../src/edgePorts.ts";
+import { withEdgeRoutes } from "../src/edgeRouteLayout.ts";
 
 // Sample the actual SVG path, including its rounded quadratic corners.
 // Checking just the orthogonal waypoints would miss a curve cutting into a box.
@@ -114,4 +115,19 @@ test("explicit sides select the matching routing handles", () => {
   const ports = distributeEdgePorts(edges, boxes, new Map([["root", 1], ["child", 2]])).get("root->child");
   assert.equal(ports.sourceHandle, "source-right");
   assert.equal(ports.targetHandle, "target-right");
+});
+
+test("the routed path uses explicit left and right handles", () => {
+  const nodes = [
+    { id: "root", type: "mesh", position: { x: 0, y: 0 }, width: 100, height: 60,
+      data: { level: 1, nodeType: "text" } },
+    { id: "child", type: "mesh", position: { x: 300, y: 0 }, width: 100, height: 60,
+      data: { level: 2, nodeType: "text" } },
+  ];
+  const edge = { id: "root->child", source: "root", target: "child", type: "extra",
+    sourceHandle: "source-right", targetHandle: "target-right", data: { sourceSide: "right", targetSide: "right" } };
+  const routed = withEdgeRoutes(nodes, [edge])[0].data.routedPoints;
+  assert.ok(routed);
+  assert.equal(routed[0].x, 102);
+  assert.equal(routed.at(-1).x, 402);
 });

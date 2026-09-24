@@ -2015,6 +2015,7 @@ async fn put_canvas(
             interpreter: node.interpreter.clone(),
             preview: Some(node.preview),
             edge_label: node.edge_label.clone(),
+            edge_label_at: node.edge_label_at,
             edge_source_side: node.edge_source_side,
             edge_target_side: node.edge_target_side,
             edge_via: node.edge_via.clone(),
@@ -2092,6 +2093,7 @@ async fn clear_layout(State(state): State<Arc<AppState>>) -> Result<Json<Canvas>
             interpreter: node.interpreter.clone(),
             preview: Some(node.preview),
             edge_label: node.edge_label.clone(),
+            edge_label_at: node.edge_label_at,
             edge_source_side: node.edge_source_side,
             edge_target_side: node.edge_target_side,
             edge_via: node.edge_via.clone(),
@@ -2160,6 +2162,7 @@ async fn clear_node_layout(
         interpreter: node.interpreter.clone(),
         preview: Some(node.preview),
         edge_label: node.edge_label.clone(),
+        edge_label_at: node.edge_label_at,
         edge_source_side: node.edge_source_side,
         edge_target_side: node.edge_target_side,
         edge_via: node.edge_via.clone(),
@@ -2333,6 +2336,8 @@ struct UpdateNodeRequest {
     /// clears it back to unset rather than writing a literal `edgeLabel=""`
     /// — see this field's own handling in `update_node`.
     edge_label: Option<String>,
+    /// 0..=1000 along the rendered path; 500 clears back to the midpoint.
+    edge_label_at: Option<u16>,
     /// "auto" clears an explicitly selected structural-edge side.
     edge_source_side: Option<String>,
     edge_target_side: Option<String>,
@@ -2466,6 +2471,9 @@ async fn update_node(
             edges
                 .iter()
                 .map(|e| {
+                    if e.label_at.is_some_and(|at| at > 1000) {
+                        return Err(ApiError(StatusCode::UNPROCESSABLE_ENTITY, "labelAt must be between 0 and 1000".to_string()));
+                    }
                     let from_located = locate_node(&primary_raw, &e.from)?;
                     Ok(ExtraEdge {
                         from: from_located.local_id,
@@ -2591,6 +2599,7 @@ async fn update_node(
         || req.tags.is_some()
         || req.fold.is_some()
         || req.edge_label.is_some()
+        || req.edge_label_at.is_some()
         || req.edge_source_side.is_some()
         || req.edge_target_side.is_some()
         || req.edge_via.is_some()
@@ -2657,6 +2666,12 @@ async fn update_node(
             interpreter,
             preview,
             edge_label,
+            edge_label_at: match req.edge_label_at {
+                None => initial_node.edge_label_at,
+                Some(500) => None,
+                Some(at @ 0..=1000) => Some(at),
+                Some(_) => return Err(ApiError(StatusCode::UNPROCESSABLE_ENTITY, "edgeLabelAt must be between 0 and 1000".to_string())),
+            },
             edge_source_side: match req.edge_source_side.as_deref() {
                 None => initial_node.edge_source_side,
                 Some("auto") => None,
@@ -3455,6 +3470,7 @@ async fn reparent_node(
                         interpreter: new_node.interpreter.clone(),
                         preview: Some(new_node.preview),
                         edge_label: new_node.edge_label.clone(),
+                        edge_label_at: new_node.edge_label_at,
                         edge_source_side: new_node.edge_source_side,
                         edge_target_side: new_node.edge_target_side,
                         edge_via: new_node.edge_via.clone(),
@@ -7549,6 +7565,7 @@ mod node_op_broadcast_tests {
             preview: None,
             tags: None,
             edge_label: None,
+            edge_label_at: None,
             edge_source_side: None,
             edge_target_side: None,
             edge_via: None,
@@ -7580,25 +7597,28 @@ mod node_op_broadcast_tests {
         let state = build_state(canvas_path.clone(), false, None).await.unwrap();
         let request: UpdateNodeRequest = serde_json::from_value(serde_json::json!({
             "edgeSourceSide": "bottom", "edgeTargetSide": "right",
-            "edgeVia": [{ "x": 12, "y": -34 }]
+            "edgeVia": [{ "x": 12, "y": -34 }], "edgeLabelAt": 725
         })).unwrap();
         let Json(canvas) = update_node(State(state.clone()), Path("a".to_string()), Json(request)).await.unwrap();
         let node = canvas.node("a").unwrap();
         assert_eq!(node.edge_source_side, Some(meshfox_core::canvas::EdgeSide::Bottom));
         assert_eq!(node.edge_target_side, Some(meshfox_core::canvas::EdgeSide::Right));
         assert_eq!(node.edge_via, vec![meshfox_core::canvas::RoutePoint { x: 12, y: -34 }]);
+        assert_eq!(node.edge_label_at, Some(725));
         let saved = std::fs::read_to_string(&canvas_path).unwrap();
         assert!(saved.contains("edgeSourceSide=\"bottom\""));
         assert!(saved.contains("edgeVia=\"12,-34\""));
+        assert!(saved.contains("edgeLabelAt=\"725\""));
 
         let reset: UpdateNodeRequest = serde_json::from_value(serde_json::json!({
-            "edgeSourceSide": "auto", "edgeTargetSide": "auto", "edgeVia": []
+            "edgeSourceSide": "auto", "edgeTargetSide": "auto", "edgeVia": [], "edgeLabelAt": 500
         })).unwrap();
         let Json(canvas) = update_node(State(state), Path("a".to_string()), Json(reset)).await.unwrap();
         let node = canvas.node("a").unwrap();
         assert_eq!(node.edge_source_side, None);
         assert_eq!(node.edge_target_side, None);
         assert!(node.edge_via.is_empty());
+        assert_eq!(node.edge_label_at, None);
         let _ = std::fs::remove_file(canvas_path);
     }
 
@@ -7817,7 +7837,7 @@ mod undo_log_recording_tests {
             title: None, node_type: None, color: None, target: None,
             text: Some("new body a".to_string()), extra_parents: None,
             display: None, lang: None, interpreter: None, preview: None,
-            tags: None, edge_label: None, edge_source_side: None,
+            tags: None, edge_label: None, edge_label_at: None, edge_source_side: None,
             edge_target_side: None, edge_via: None, fold: None,
             x: None, y: None, width: None, height: None, created_at: None,
         };
@@ -8289,6 +8309,7 @@ mod include_edit_tests {
             preview: None,
             tags: None,
             edge_label: None,
+            edge_label_at: None,
             edge_source_side: None,
             edge_target_side: None,
             edge_via: None,

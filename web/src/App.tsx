@@ -2244,18 +2244,20 @@ export default function App() {
               canDelete: candidates.length > 0,
               title,
               label: e.label,
+              labelAt: e.labelAt,
               sourceSide: e.sourceSide,
               targetSide: e.targetSide,
               via: e.via,
               sourceOffset: edgePorts.get(e.id)?.sourceOffset ?? 0,
               targetOffset: edgePorts.get(e.id)?.targetOffset ?? 0,
               onDelete: () => requestReparentEdge(e.target),
-              onUpdateRoute: (patch: { sourceSide?: string; targetSide?: string; via?: { x: number; y: number }[]; label?: string }) =>
+              onUpdateRoute: (patch: { sourceSide?: string; targetSide?: string; via?: { x: number; y: number }[]; label?: string; labelAt?: number }) =>
                 updateNode(e.target, {
                   ...(patch.sourceSide !== undefined ? { edgeSourceSide: patch.sourceSide as "auto" | "left" | "right" | "top" | "bottom" } : {}),
                   ...(patch.targetSide !== undefined ? { edgeTargetSide: patch.targetSide as "auto" | "left" | "right" | "top" | "bottom" } : {}),
                   ...(patch.via !== undefined ? { edgeVia: patch.via } : {}),
                   ...(patch.label !== undefined ? { edgeLabel: patch.label } : {}),
+                  ...(patch.labelAt !== undefined ? { edgeLabelAt: patch.labelAt } : {}),
                 }).then(setCanvas).catch((error) => setError(String(error))),
             },
           };
@@ -2344,13 +2346,15 @@ export default function App() {
             onDelete: () => removeExtraEdge(e.target, e.source),
             onUpdate: (patch: Partial<Omit<ExtraEdgeDto, "from">>) =>
               updateExtraEdgeStyle(e.target, e.source, patch),
-            onUpdateRoute: (patch: { sourceSide?: string; targetSide?: string; via?: { x: number; y: number }[] }) =>
+            onUpdateRoute: (patch: { sourceSide?: string; targetSide?: string; via?: { x: number; y: number }[]; labelAt?: number }) =>
               updateExtraEdgeStyle(e.target, e.source, {
                 ...(patch.sourceSide !== undefined ? { sourceSide: patch.sourceSide === "auto" ? null : patch.sourceSide as "left" | "right" | "top" | "bottom" } : {}),
                 ...(patch.targetSide !== undefined ? { targetSide: patch.targetSide === "auto" ? null : patch.targetSide as "left" | "right" | "top" | "bottom" } : {}),
                 ...(patch.via !== undefined ? { via: patch.via } : {}),
+                ...(patch.labelAt !== undefined ? { labelAt: patch.labelAt === 500 ? null : patch.labelAt } : {}),
               }),
             label: e.label,
+            labelAt: e.labelAt,
             color: e.color,
             style: e.style,
             arrowStart: e.arrowStart,

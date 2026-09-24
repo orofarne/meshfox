@@ -86,6 +86,10 @@ pub struct ExtraEdge {
     pub via: Vec<RoutePoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Position of the label along the rendered path, in thousandths of its length.
+    /// Absent means the midpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_at: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -301,6 +305,9 @@ pub struct Node {
     /// though its route can be adjusted below.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge_label: Option<String>,
+    /// `edgeLabelAt=` — thousandths of the structural edge's path length.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_label_at: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge_source_side: Option<EdgeSide>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

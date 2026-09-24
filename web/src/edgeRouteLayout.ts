@@ -2,9 +2,11 @@ import type { Edge, Node } from "@xyflow/react";
 import type { MeshNodeData } from "./MeshNode";
 import type { DeletableEdgeData } from "./DeletableEdge";
 import type { EdgeSide } from "./edgePorts";
-import { draw, routeAroundNodes, type Point, type Rect, type Segment } from "./edgeRouting";
+import { draw, routeAroundNodes, type Point, type Rect, type Segment } from "./edgeRouting.ts";
 
 function sideFor(handle: string | null | undefined, source: boolean, level: number): EdgeSide {
+  if (handle?.endsWith("-left")) return "left";
+  if (handle?.endsWith("-right")) return "right";
   if (handle?.endsWith("-top")) return "top";
   if (handle?.endsWith("-bottom")) return "bottom";
   return source ? (level === 1 ? "left" : "right") : "left";

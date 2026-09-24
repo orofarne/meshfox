@@ -21,7 +21,7 @@ of JSON, for readable diffs and hand-editability.
 - **`<!-- meshfox:node ... -->`** — right after a heading line. Turns the
   heading into a node and holds its bookkeeping as `key="value"` attributes:
   `id`, `type`, `x`, `y`, `w`, `h`, `color`, `tags`, `parent`, `fold`,
-  `edgeLabel`, `edgeSourceSide`, `edgeTargetSide`, `edgeVia`, `createdAt`,
+  `edgeLabel`, `edgeLabelAt`, `edgeSourceSide`, `edgeTargetSide`, `edgeVia`, `createdAt`,
   `updatedAt` (see "Timestamps" below). All optional; a
   bare `<!-- meshfox:node -->` is enough. `id` defaults to a slug of the
   heading text; only write it explicitly for a stable handle that survives
@@ -57,7 +57,9 @@ of JSON, for readable diffs and hand-editability.
   of its own. `edgeSourceSide`/`edgeTargetSide` choose the departure/arrival
   side (`left`, `right`, `top`, `bottom`), and `edgeVia="x,y;x,y"` stores ordered
   waypoints relative to the edge's departure point. Omitting these route attributes lets the web UI
-  route this edge automatically.
+  route this edge automatically. `edgeLabelAt="725"` places its label 72.5%
+  of the way along the rendered path; the range is 0–1000, and omission means
+  the midpoint.
 - **`<!-- meshfox:edge from="other-id" ... -->`** — one per line, right
   after a node's `meshfox:node` line. Declares an extra incoming edge from
   another node, for graphs that aren't a clean nesting tree. Any number
@@ -74,7 +76,8 @@ of JSON, for readable diffs and hand-editability.
   selection. `via="x,y;x,y"` stores ordered waypoints relative to the edge's departure point for
   a manually adjusted route. The web UI routes between those points while
   keeping the endpoints attached to their nodes; removing `via` restores
-  automatic routing.
+  automatic routing. `labelAt` uses the same 0–1000 position along the rendered
+  path as `edgeLabelAt`; omission places the label at the midpoint.
   All are omitted from the line unless explicitly set — a plain
   `from="other-id"` with nothing else is exactly the old, pre-styling form.
   These extra (`meshfox:edge`) edges use rounded orthogonal routing in the web
@@ -1498,10 +1501,10 @@ unrecognized key, for forward/backward compatibility across format versions
 (see "Options" above).
 
     node-attr      ::= 'id' | 'type' | 'x' | 'y' | 'w' | 'h' | 'color'
-                     | 'tags' | 'parent' | 'fold' | 'edgeLabel'
+                     | 'tags' | 'parent' | 'fold' | 'edgeLabel' | 'edgeLabelAt'
                      | 'edgeSourceSide' | 'edgeTargetSide' | 'edgeVia' | 'display'
                      | 'lang' | 'interpreter' | 'preview'
-    edge-attr      ::= 'from' | 'label' | 'color' | 'style' | 'arrowStart'
+    edge-attr      ::= 'from' | 'label' | 'labelAt' | 'color' | 'style' | 'arrowStart'
                      | 'arrowEnd' | 'tags' | 'sourceSide' | 'targetSide' | 'via'
     var-attr       ::= 'name' | 'type' | 'prompt' | 'default' | 'default_var'
                      | 'choices' | 'choices_var' | 'secret' | 'required'
