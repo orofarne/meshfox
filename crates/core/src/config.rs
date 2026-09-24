@@ -83,7 +83,18 @@ fn deep_merge(base: &mut toml::Table, overlay: toml::Table) {
 /// client of, instead of spawning/discovering a worker of its own. Unset
 /// (the default) changes nothing for any caller — see each call site's own
 /// doc comment for its fallback.
+///
+/// `MESHFOX_SERVER_SOCKET` overrides the config file when set, without
+/// touching `.meshfox/config.toml`: a path points at a different (or
+/// throwaway) daemon, an empty string forces this off even if the config
+/// file has a `server_socket` set. A debug-only escape hatch (same spirit
+/// as `MESHFOX_TEST_UNTOUCHED_TIMEOUT_SECS` in `meshfox_server`) — not a
+/// third config source alongside global/local, so it isn't merged or
+/// documented as a regular setting.
 pub fn server_socket(canvas_root: &Path) -> Option<PathBuf> {
+    if let Ok(over) = std::env::var("MESHFOX_SERVER_SOCKET") {
+        return if over.is_empty() { None } else { Some(PathBuf::from(over)) };
+    }
     server_socket_from_table(&load(canvas_root))
 }
 
@@ -284,6 +295,49 @@ mod tests {
         assert_eq!(server_socket_from_table(&toml::Table::new()), None);
         let table: toml::Table = "server_socket = 4\n".parse().unwrap();
         assert_eq!(server_socket_from_table(&table), None);
+    }
+
+    #[test]
+    fn server_socket_env_override_takes_a_path_over_the_config_file() {
+        let dir = tempfile_dir();
+        std::fs::create_dir_all(dir.join(".meshfox")).unwrap();
+        std::fs::write(
+            dir.join(".meshfox").join("config.toml"),
+            "server_socket = \"/tmp/from-config.sock\"\n",
+        )
+        .unwrap();
+        std::env::set_var("MESHFOX_SERVER_SOCKET", "/tmp/from-env.sock");
+        let result = server_socket(&dir);
+        std::env::remove_var("MESHFOX_SERVER_SOCKET");
+        assert_eq!(result, Some(PathBuf::from("/tmp/from-env.sock")));
+    }
+
+    #[test]
+    fn server_socket_env_override_empty_string_forces_it_off() {
+        let dir = tempfile_dir();
+        std::fs::create_dir_all(dir.join(".meshfox")).unwrap();
+        std::fs::write(
+            dir.join(".meshfox").join("config.toml"),
+            "server_socket = \"/tmp/from-config.sock\"\n",
+        )
+        .unwrap();
+        std::env::set_var("MESHFOX_SERVER_SOCKET", "");
+        let result = server_socket(&dir);
+        std::env::remove_var("MESHFOX_SERVER_SOCKET");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn server_socket_falls_back_to_config_file_when_env_unset() {
+        let dir = tempfile_dir();
+        std::fs::create_dir_all(dir.join(".meshfox")).unwrap();
+        std::fs::write(
+            dir.join(".meshfox").join("config.toml"),
+            "server_socket = \"/tmp/from-config.sock\"\n",
+        )
+        .unwrap();
+        std::env::remove_var("MESHFOX_SERVER_SOCKET");
+        assert_eq!(server_socket(&dir), Some(PathBuf::from("/tmp/from-config.sock")));
     }
 
     #[test]
