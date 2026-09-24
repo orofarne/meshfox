@@ -31,6 +31,9 @@ export interface ConstraintStatusDto {
  * which keeps the pre-existing dashed/arrow-end look for such an edge). */
 export interface ExtraEdgeDto {
   from: string;
+  sourceSide?: "left" | "right" | "top" | "bottom" | null;
+  targetSide?: "left" | "right" | "top" | "bottom" | null;
+  via?: { x: number; y: number }[];
   label?: string;
   color?: string;
   style?: "solid" | "dashed" | "dotted";
@@ -100,8 +103,11 @@ export interface CanvasNode {
    * `Node.edge_label`. Absent for the root and for any node that's never
    * had one set. Purely descriptive text; unlike `ExtraEdgeDto`, a
    * structural edge has no color/style/arrowhead attributes to go with
-   * it. */
+   * it; its route attributes are stored separately on this node. */
   edgeLabel?: string;
+  edgeSourceSide?: "left" | "right" | "top" | "bottom";
+  edgeTargetSide?: "left" | "right" | "top" | "bottom";
+  edgeVia?: { x: number; y: number }[];
   text: string;
   /** Results of every embedded ` ```starlark constraint ` fence in this
    * node's own body, in document order — see `ConstraintStatusDto`. Absent

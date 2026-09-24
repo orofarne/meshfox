@@ -71,7 +71,7 @@ import { ResetSessionConfirmDialog } from "./ResetSessionConfirmDialog";
 import { ReparentChoiceDialog } from "./ReparentChoiceDialog";
 import { DeletableEdge } from "./DeletableEdge";
 import { distributeEdgePorts } from "./edgePorts";
-import { withExtraRoutes } from "./edgeRouteLayout";
+import { withEdgeRoutes } from "./edgeRouteLayout";
 import { CanvasSourceEditor } from "./CanvasSourceEditor";
 import { ConsolePanel, type ConsoleLine } from "./ConsolePanel";
 import { getThemePreference, setThemePreference, type ThemePreference } from "./theme";
@@ -1911,18 +1911,6 @@ export default function App() {
     [canvas],
   );
 
-  // Sets (or, given `""`, clears) a structural edge's own label —
-  // `edgeLabel=` on the *child* node's `meshfox:node`, the only per-edge
-  // attribute a plain parent→child edge has (see CanvasNode.edgeLabel's
-  // own doc comment for why it lives there rather than on a dedicated
-  // edge object the way `ExtraEdgeDto`'s does) — the new structural-edge
-  // properties panel's "ok".
-  const updateStructuralEdgeLabel = useCallback((nodeId: string, label: string) => {
-    updateNode(nodeId, { edgeLabel: label })
-      .then(setCanvas)
-      .catch((e) => setError(String(e)));
-  }, []);
-
   // Dragging a new connection between two node handles (edit mode only,
   // see `nodesConnectable` on <ReactFlow>) adds an extra `meshfox:edge` —
   // the canvas-native way to create one, alongside NodeSettings' "add
@@ -2204,8 +2192,9 @@ export default function App() {
         for (const id of ids) parallelOffsets.set(id, PARALLEL_EDGE_OFFSET);
       }
     }
-    setEdges(
-      derivedEdges.map((e) => {
+    setEdges((previousEdges) => {
+      const selectedIds = new Set(previousEdges.filter((edge) => edge.selected).map((edge) => edge.id));
+      return derivedEdges.map((e) => {
         if (!e.extra) {
           // Deleting a structural (nesting) edge means reparenting the
           // node (moving its heading block) — only offered when there's
@@ -2255,10 +2244,19 @@ export default function App() {
               canDelete: candidates.length > 0,
               title,
               label: e.label,
+              sourceSide: e.sourceSide,
+              targetSide: e.targetSide,
+              via: e.via,
               sourceOffset: edgePorts.get(e.id)?.sourceOffset ?? 0,
               targetOffset: edgePorts.get(e.id)?.targetOffset ?? 0,
               onDelete: () => requestReparentEdge(e.target),
-              onUpdateLabel: (label: string) => updateStructuralEdgeLabel(e.target, label),
+              onUpdateRoute: (patch: { sourceSide?: string; targetSide?: string; via?: { x: number; y: number }[]; label?: string }) =>
+                updateNode(e.target, {
+                  ...(patch.sourceSide !== undefined ? { edgeSourceSide: patch.sourceSide as "auto" | "left" | "right" | "top" | "bottom" } : {}),
+                  ...(patch.targetSide !== undefined ? { edgeTargetSide: patch.targetSide as "auto" | "left" | "right" | "top" | "bottom" } : {}),
+                  ...(patch.via !== undefined ? { edgeVia: patch.via } : {}),
+                  ...(patch.label !== undefined ? { edgeLabel: patch.label } : {}),
+                }).then(setCanvas).catch((error) => setError(String(error))),
             },
           };
         }
@@ -2346,20 +2344,29 @@ export default function App() {
             onDelete: () => removeExtraEdge(e.target, e.source),
             onUpdate: (patch: Partial<Omit<ExtraEdgeDto, "from">>) =>
               updateExtraEdgeStyle(e.target, e.source, patch),
+            onUpdateRoute: (patch: { sourceSide?: string; targetSide?: string; via?: { x: number; y: number }[] }) =>
+              updateExtraEdgeStyle(e.target, e.source, {
+                ...(patch.sourceSide !== undefined ? { sourceSide: patch.sourceSide === "auto" ? null : patch.sourceSide as "left" | "right" | "top" | "bottom" } : {}),
+                ...(patch.targetSide !== undefined ? { targetSide: patch.targetSide === "auto" ? null : patch.targetSide as "left" | "right" | "top" | "bottom" } : {}),
+                ...(patch.via !== undefined ? { via: patch.via } : {}),
+              }),
             label: e.label,
             color: e.color,
             style: e.style,
             arrowStart: e.arrowStart,
             arrowEnd: e.arrowEnd,
             tags: e.tags,
+            sourceSide: e.sourceSide,
+            targetSide: e.targetSide,
+            via: e.via,
             existingTags: documentTags,
             parallelOffset: parallelOffsets.get(e.id) ?? 0,
             sourceOffset: handles?.sourceOffset ?? 0,
             targetOffset: handles?.targetOffset ?? 0,
           },
         };
-      }),
-    );
+      }).map((edge) => ({ ...edge, selected: selectedIds.has(edge.id) }));
+    });
     setDirty(false);
     // Deliberately excludes handleRun/handleKill/setNodes/setEdges: this effect should
     // only re-run when a fresh canvas doc arrives.
@@ -3380,7 +3387,7 @@ export default function App() {
   );
 
   const routedVisibleEdges = useMemo(
-    () => withExtraRoutes(focusedRenderNodes, visibleEdges),
+    () => withEdgeRoutes(focusedRenderNodes, visibleEdges),
     [focusedRenderNodes, visibleEdges],
   );
 

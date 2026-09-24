@@ -251,6 +251,9 @@ export interface NodePatch {
    * no separate sentinel needed here since a caller only ever sends this
    * key at all when the label actually changed (see DeletableEdge.tsx). */
   edgeLabel?: string;
+  edgeSourceSide?: "left" | "right" | "top" | "bottom" | "auto";
+  edgeTargetSide?: "left" | "right" | "top" | "bottom" | "auto";
+  edgeVia?: { x: number; y: number }[];
   /** Full replacement list of tags — omit to leave them untouched, pass
    * `[]` to clear them. */
   tags?: string[];

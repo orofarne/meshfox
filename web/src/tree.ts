@@ -68,9 +68,8 @@ export interface DerivedEdge {
   target: string;
   /** false for the implicit nesting edge, true for a `meshfox:edge` extra. */
   extra: boolean;
-  /** Structural (`extra: false`) edge: `CanvasNode.edgeLabel` off the
-   * *target* node — its only real per-edge attribute, no color/style/
-   * arrowheads to go with it. Extra (`extra: true`) edge: `ExtraEdgeDto`'s
+  /** Structural (`extra: false`) edge: label and routing off the *target*
+   * node, with no color/style/arrowheads. Extra (`extra: true`) edge: `ExtraEdgeDto`'s
    * own `label`, alongside every other styling field below. */
   label?: string;
   color?: string;
@@ -78,6 +77,9 @@ export interface DerivedEdge {
   arrowStart?: "none" | "arrow";
   arrowEnd?: "none" | "arrow";
   tags?: string[];
+  sourceSide?: "left" | "right" | "top" | "bottom" | null;
+  targetSide?: "left" | "right" | "top" | "bottom" | null;
+  via?: { x: number; y: number }[];
 }
 
 /** All edges implied by the tree (`parent`) plus `extraParents`, for rendering. */
@@ -98,6 +100,9 @@ export function deriveEdges(canvas: CanvasDoc): DerivedEdge[] {
           target: n.id,
           extra: false,
           label: n.edgeLabel,
+          sourceSide: n.edgeSourceSide,
+          targetSide: n.edgeTargetSide,
+          via: n.edgeVia,
         });
       }
     }
@@ -113,6 +118,9 @@ export function deriveEdges(canvas: CanvasDoc): DerivedEdge[] {
         arrowStart: extra.arrowStart,
         arrowEnd: extra.arrowEnd,
         tags: extra.tags,
+        sourceSide: extra.sourceSide,
+        targetSide: extra.targetSide,
+        via: extra.via,
       });
     }
   }

@@ -2015,6 +2015,9 @@ async fn put_canvas(
             interpreter: node.interpreter.clone(),
             preview: Some(node.preview),
             edge_label: node.edge_label.clone(),
+            edge_source_side: node.edge_source_side,
+            edge_target_side: node.edge_target_side,
+            edge_via: node.edge_via.clone(),
             fold: node.fold,
             tags: node.tags.clone(),
             created_at: node.created_at.clone(),
@@ -2089,6 +2092,9 @@ async fn clear_layout(State(state): State<Arc<AppState>>) -> Result<Json<Canvas>
             interpreter: node.interpreter.clone(),
             preview: Some(node.preview),
             edge_label: node.edge_label.clone(),
+            edge_source_side: node.edge_source_side,
+            edge_target_side: node.edge_target_side,
+            edge_via: node.edge_via.clone(),
             fold: node.fold,
             tags: node.tags.clone(),
             created_at: node.created_at.clone(),
@@ -2154,6 +2160,9 @@ async fn clear_node_layout(
         interpreter: node.interpreter.clone(),
         preview: Some(node.preview),
         edge_label: node.edge_label.clone(),
+        edge_source_side: node.edge_source_side,
+        edge_target_side: node.edge_target_side,
+        edge_via: node.edge_via.clone(),
         fold: node.fold,
         tags: node.tags.clone(),
         created_at: node.created_at.clone(),
@@ -2324,6 +2333,10 @@ struct UpdateNodeRequest {
     /// clears it back to unset rather than writing a literal `edgeLabel=""`
     /// — see this field's own handling in `update_node`.
     edge_label: Option<String>,
+    /// "auto" clears an explicitly selected structural-edge side.
+    edge_source_side: Option<String>,
+    edge_target_side: Option<String>,
+    edge_via: Option<Vec<meshfox_core::canvas::RoutePoint>>,
     /// Per-node fold-state override (see `meshfox_core::Node::fold`) —
     /// `None` (the field not sent at all) leaves it untouched, same
     /// convention as every other field here. Unlike those, though, this
@@ -2578,6 +2591,9 @@ async fn update_node(
         || req.tags.is_some()
         || req.fold.is_some()
         || req.edge_label.is_some()
+        || req.edge_source_side.is_some()
+        || req.edge_target_side.is_some()
+        || req.edge_via.is_some()
         || req.x.is_some()
         || req.y.is_some()
         || req.width.is_some()
@@ -2641,6 +2657,17 @@ async fn update_node(
             interpreter,
             preview,
             edge_label,
+            edge_source_side: match req.edge_source_side.as_deref() {
+                None => initial_node.edge_source_side,
+                Some("auto") => None,
+                Some(side) => Some(meshfox_core::canvas::EdgeSide::parse(side).ok_or_else(|| ApiError(StatusCode::UNPROCESSABLE_ENTITY, format!("invalid edgeSourceSide {side:?}")))?),
+            },
+            edge_target_side: match req.edge_target_side.as_deref() {
+                None => initial_node.edge_target_side,
+                Some("auto") => None,
+                Some(side) => Some(meshfox_core::canvas::EdgeSide::parse(side).ok_or_else(|| ApiError(StatusCode::UNPROCESSABLE_ENTITY, format!("invalid edgeTargetSide {side:?}")))?),
+            },
+            edge_via: req.edge_via.clone().unwrap_or_else(|| initial_node.edge_via.clone()),
             fold: resolve_fold_override(req.fold.as_deref(), existing_fold)?,
             tags: req.tags.clone().unwrap_or(existing_tags),
             created_at: req.created_at.clone().or(existing_created_at),
@@ -3428,6 +3455,9 @@ async fn reparent_node(
                         interpreter: new_node.interpreter.clone(),
                         preview: Some(new_node.preview),
                         edge_label: new_node.edge_label.clone(),
+                        edge_source_side: new_node.edge_source_side,
+                        edge_target_side: new_node.edge_target_side,
+                        edge_via: new_node.edge_via.clone(),
                         fold: new_node.fold,
                         tags: new_node.tags.clone(),
                         created_at: new_node.created_at.clone(),
@@ -7519,6 +7549,9 @@ mod node_op_broadcast_tests {
             preview: None,
             tags: None,
             edge_label: None,
+            edge_source_side: None,
+            edge_target_side: None,
+            edge_via: None,
             fold: None,
             x: None,
             y: None,
@@ -7539,6 +7572,34 @@ mod node_op_broadcast_tests {
         }
 
         let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn structural_edge_route_is_saved_and_can_be_reset() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None).await.unwrap();
+        let request: UpdateNodeRequest = serde_json::from_value(serde_json::json!({
+            "edgeSourceSide": "bottom", "edgeTargetSide": "right",
+            "edgeVia": [{ "x": 12, "y": -34 }]
+        })).unwrap();
+        let Json(canvas) = update_node(State(state.clone()), Path("a".to_string()), Json(request)).await.unwrap();
+        let node = canvas.node("a").unwrap();
+        assert_eq!(node.edge_source_side, Some(meshfox_core::canvas::EdgeSide::Bottom));
+        assert_eq!(node.edge_target_side, Some(meshfox_core::canvas::EdgeSide::Right));
+        assert_eq!(node.edge_via, vec![meshfox_core::canvas::RoutePoint { x: 12, y: -34 }]);
+        let saved = std::fs::read_to_string(&canvas_path).unwrap();
+        assert!(saved.contains("edgeSourceSide=\"bottom\""));
+        assert!(saved.contains("edgeVia=\"12,-34\""));
+
+        let reset: UpdateNodeRequest = serde_json::from_value(serde_json::json!({
+            "edgeSourceSide": "auto", "edgeTargetSide": "auto", "edgeVia": []
+        })).unwrap();
+        let Json(canvas) = update_node(State(state), Path("a".to_string()), Json(reset)).await.unwrap();
+        let node = canvas.node("a").unwrap();
+        assert_eq!(node.edge_source_side, None);
+        assert_eq!(node.edge_target_side, None);
+        assert!(node.edge_via.is_empty());
+        let _ = std::fs::remove_file(canvas_path);
     }
 
     #[tokio::test]
@@ -7756,7 +7817,8 @@ mod undo_log_recording_tests {
             title: None, node_type: None, color: None, target: None,
             text: Some("new body a".to_string()), extra_parents: None,
             display: None, lang: None, interpreter: None, preview: None,
-            tags: None, edge_label: None, fold: None,
+            tags: None, edge_label: None, edge_source_side: None,
+            edge_target_side: None, edge_via: None, fold: None,
             x: None, y: None, width: None, height: None, created_at: None,
         };
         let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req))
@@ -8227,6 +8289,9 @@ mod include_edit_tests {
             preview: None,
             tags: None,
             edge_label: None,
+            edge_source_side: None,
+            edge_target_side: None,
+            edge_via: None,
             fold: None,
             x: None,
             y: None,

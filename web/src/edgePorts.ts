@@ -32,8 +32,10 @@ export function distributeEdgePorts(
       sourceSide = source.y < target.y ? "bottom" : "top";
       targetSide = source.y < target.y ? "top" : "bottom";
     }
+    sourceSide = edge.sourceSide ?? sourceSide;
+    targetSide = edge.targetSide ?? targetSide;
     result.set(edge.id, {
-      sourceHandle: sourceSide === "left" || sourceSide === "right" ? "source-default" : `source-${sourceSide}`,
+      sourceHandle: edge.sourceSide ? `source-${sourceSide}` : sourceSide === "left" || sourceSide === "right" ? "source-default" : `source-${sourceSide}`,
       targetHandle: targetSide === "left" ? "target-default" : `target-${targetSide}`,
       sourceOffset: 0,
       targetOffset: 0,

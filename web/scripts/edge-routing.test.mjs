@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { routeAroundNodes } from "../src/edgeRouting.ts";
+import { draw, routeAroundNodes } from "../src/edgeRouting.ts";
+import { distributeEdgePorts } from "../src/edgePorts.ts";
 
 // Sample the actual SVG path, including its rounded quadratic corners.
 // Checking just the orthogonal waypoints would miss a curve cutting into a box.
@@ -87,4 +88,30 @@ test("a second edge uses a separate lane when one is available", () => {
   assert.notEqual(first[0], second[0]);
   assert.ok(first[3].some(point => point.x < -50));
   assert.ok(second[3].some(point => point.x > 50));
+});
+
+test("a saved waypoint and chosen sides survive rerouting around a moved obstacle", () => {
+  const source = { x: 0, y: 0, width: 100, height: 60 };
+  const target = { x: 300, y: 0, width: 100, height: 60 };
+  const via = { x: 200, y: 180 };
+  for (const blocker of [{ x: 150, y: 40, width: 80, height: 80 }, { x: 160, y: 65, width: 80, height: 80 }]) {
+    const first = routeAroundNodes({ x: 50, y: 60 }, "bottom", via, "left", [blocker], source, undefined, [], false, true);
+    const second = routeAroundNodes(via, "right", { x: 350, y: 60 }, "bottom", [blocker], undefined, target, [], true, false);
+    assert.ok(first && second);
+    const routed = draw([...first[3], ...second[3].slice(1)]);
+    assert.ok(routed[3].some(p => p.x === via.x && p.y === via.y));
+    assertOutside(routed[0], [blocker]);
+  }
+});
+
+test("explicit sides select the matching routing handles", () => {
+  const edges = [{ id: "root->child", source: "root", target: "child", extra: false,
+    sourceSide: "right", targetSide: "right" }];
+  const boxes = new Map([
+    ["root", { x: 0, y: 0, width: 100, height: 60 }],
+    ["child", { x: 200, y: 0, width: 100, height: 60 }],
+  ]);
+  const ports = distributeEdgePorts(edges, boxes, new Map([["root", 1], ["child", 2]])).get("root->child");
+  assert.equal(ports.sourceHandle, "source-right");
+  assert.equal(ports.targetHandle, "target-right");
 });

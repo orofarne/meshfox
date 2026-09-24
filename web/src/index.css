@@ -877,6 +877,45 @@ a {
   opacity: 1;
 }
 
+/* Edge controls are portaled into React Flow's renderer, the same layer as
+ * NodeToolbar. EdgeLabelRenderer lives behind nodes, so controls placed
+ * there disappear beneath a nearby node and cannot receive a drag. */
+.mesh-edge-controls-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 100;
+  pointer-events: none;
+}
+
+.mesh-edge-toolbar {
+  position: absolute;
+  transform: translate(-50%, -100%);
+  z-index: 10;
+  pointer-events: all;
+  white-space: nowrap;
+}
+
+.mesh-edge-route-handle {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  border: 2px solid var(--node-bg);
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+  transform: translate(-50%, -50%);
+  pointer-events: all;
+  cursor: grab;
+  touch-action: none;
+}
+
+.mesh-edge-route-handle:active { cursor: grabbing; }
+.mesh-edge-segment { width: 10px; height: 10px; background: var(--node-bg); border-color: var(--accent); z-index: 1; }
+.mesh-edge-waypoint { z-index: 2; }
+.mesh-edge-endpoint { width: 17px; height: 17px; z-index: 3; }
+.mesh-edge-endpoint-preview { opacity: 0.55; pointer-events: none; }
+
 /* The ▸/▾ subtree fold marker (see MeshNode.tsx's `FoldToggle`) — sits
  * ahead of the title text itself rather than among the trailing action
  * icons, mirroring where an outline/tree view conventionally puts its own
@@ -2214,17 +2253,12 @@ a {
  * DeletableEdge.tsx) reuses `.vars-modal`'s/`.vars-modal-field`'s
  * styling wholesale — same centered, ok/cancel-only-commits shape as
  * `NodeSettings` (see that panel's own doc comment for why this moved
- * off a `position: fixed`, edge-anchored popover). Only its color swatch
- * row and "Delete" button need their own rules, below. */
+ * off a `position: fixed`, edge-anchored popover). Its color swatch row
+ * has its own rule below. */
 .mesh-edge-editor-swatches {
   display: flex;
   gap: 0.3rem;
   margin-top: 0.25rem;
-}
-
-.mesh-edge-editor-delete {
-  margin-top: 0.5rem;
-  width: 100%;
 }
 
 /* Pre-run "configure missing variables" modal (see VarsForm.tsx) — the

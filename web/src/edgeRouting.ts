@@ -105,7 +105,7 @@ function simplify(points: Point[]): Point[] {
   return out;
 }
 
-function draw(points: Point[]): RoutedPath {
+export function draw(points: Point[]): RoutedPath {
   const lengths = points.slice(1).map((p, i) => Math.abs(p.x - points[i].x) + Math.abs(p.y - points[i].y));
   let half = lengths.reduce((a, b) => a + b, 0) / 2;
   let label = points[0];
@@ -164,6 +164,7 @@ function sharedLaneCost(a: Point, b: Point, occupied: Segment[]): number {
 export function routeAroundNodes(
   start: Point, startSide: EdgeSide, end: Point, endSide: EdgeSide,
   boxes: Rect[], sourceBox?: Rect, targetBox?: Rect, occupied: Segment[] = [],
+  noStartStub = false, noEndStub = false,
 ): RoutedPath | undefined {
   const bounds = {
     left: Math.min(start.x, end.x) - ROUTE_MARGIN, right: Math.max(start.x, end.x) + ROUTE_MARGIN,
@@ -178,8 +179,8 @@ export function routeAroundNodes(
   const targetObstacle = targetBox && expand(targetBox);
   if (sourceObstacle) obstacles.push(sourceObstacle);
   if (targetObstacle) obstacles.push(targetObstacle);
-  const startLength = stubLength(start, startSide, sourceObstacle, obstacles.filter((r) => r !== sourceObstacle));
-  const endLength = stubLength(end, endSide, targetObstacle, obstacles.filter((r) => r !== targetObstacle));
+  const startLength = noStartStub ? 0 : stubLength(start, startSide, sourceObstacle, obstacles.filter((r) => r !== sourceObstacle));
+  const endLength = noEndStub ? 0 : stubLength(end, endSide, targetObstacle, obstacles.filter((r) => r !== targetObstacle));
   if (startLength === undefined || endLength === undefined) return undefined;
   const from = outside(start, startSide, startLength);
   const to = outside(end, endSide, endLength);

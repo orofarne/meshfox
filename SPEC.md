@@ -21,7 +21,8 @@ of JSON, for readable diffs and hand-editability.
 - **`<!-- meshfox:node ... -->`** — right after a heading line. Turns the
   heading into a node and holds its bookkeeping as `key="value"` attributes:
   `id`, `type`, `x`, `y`, `w`, `h`, `color`, `tags`, `parent`, `fold`,
-  `edgeLabel`, `createdAt`, `updatedAt` (see "Timestamps" below). All optional; a
+  `edgeLabel`, `edgeSourceSide`, `edgeTargetSide`, `edgeVia`, `createdAt`,
+  `updatedAt` (see "Timestamps" below). All optional; a
   bare `<!-- meshfox:node -->` is enough. `id` defaults to a slug of the
   heading text; only write it explicitly for a stable handle that survives
   renames (e.g. because an edge references it). First write-back (running a
@@ -53,8 +54,10 @@ of JSON, for readable diffs and hand-editability.
   the way a `meshfox:edge` does (below), so it lives here instead, on the
   child end: "the label of the edge that points at me". Unlike a
   `meshfox:edge`, a structural edge has no color/style/arrowhead attributes
-  of its own — just this one piece of text. Omitted means no label, same as
-  every other optional attribute here.
+  of its own. `edgeSourceSide`/`edgeTargetSide` choose the departure/arrival
+  side (`left`, `right`, `top`, `bottom`), and `edgeVia="x,y;x,y"` stores ordered
+  waypoints relative to the edge's departure point. Omitting these route attributes lets the web UI
+  route this edge automatically.
 - **`<!-- meshfox:edge from="other-id" ... -->`** — one per line, right
   after a node's `meshfox:node` line. Declares an extra incoming edge from
   another node, for graphs that aren't a clean nesting tree. Any number
@@ -66,10 +69,16 @@ of JSON, for readable diffs and hand-editability.
   `"dotted"`), `arrowStart`/`arrowEnd` (`"none"` or `"arrow"` — an edge with
   neither set gets an arrowhead only at `arrowEnd`, matching the pre-styling
   default), and `tags` (comma-separated, same convention as a node's own).
+  `sourceSide` and `targetSide` optionally pin the corresponding endpoint to
+  `"left"`, `"right"`, `"top"`, or `"bottom"`; absent means automatic side
+  selection. `via="x,y;x,y"` stores ordered waypoints relative to the edge's departure point for
+  a manually adjusted route. The web UI routes between those points while
+  keeping the endpoints attached to their nodes; removing `via` restores
+  automatic routing.
   All are omitted from the line unless explicitly set — a plain
   `from="other-id"` with nothing else is exactly the old, pre-styling form.
-  These extra (`meshfox:edge`) edges render as a curved connector in the web
-  UI, distinct from the structural nesting tree's right-angle routing.
+  These extra (`meshfox:edge`) edges use rounded orthogonal routing in the web
+  UI, distinct from the structural nesting tree's simple right-angle routing.
 - **`<!-- meshfox:canvas -->`** — optional, first line of the file. Marks a
   plain `*.md` file as a canvas even though it isn't named `*.canvas.md`
   (used so this doubles as auto-discovery hint; not required for parsing —
@@ -1489,10 +1498,11 @@ unrecognized key, for forward/backward compatibility across format versions
 (see "Options" above).
 
     node-attr      ::= 'id' | 'type' | 'x' | 'y' | 'w' | 'h' | 'color'
-                     | 'tags' | 'parent' | 'fold' | 'edgeLabel' | 'display'
+                     | 'tags' | 'parent' | 'fold' | 'edgeLabel'
+                     | 'edgeSourceSide' | 'edgeTargetSide' | 'edgeVia' | 'display'
                      | 'lang' | 'interpreter' | 'preview'
     edge-attr      ::= 'from' | 'label' | 'color' | 'style' | 'arrowStart'
-                     | 'arrowEnd' | 'tags'
+                     | 'arrowEnd' | 'tags' | 'sourceSide' | 'targetSide' | 'via'
     var-attr       ::= 'name' | 'type' | 'prompt' | 'default' | 'default_var'
                      | 'choices' | 'choices_var' | 'secret' | 'required'
                      | 'session' | 'from'

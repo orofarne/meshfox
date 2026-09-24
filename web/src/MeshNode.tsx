@@ -2872,6 +2872,9 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
        * everything below (App.tsx's edge-building effect included) now
        * always passes an explicit id for exactly this reason. */}
       <Handle type="target" id="target-default" position={Position.Left} />
+      <Handle type="target" id="target-right" position={Position.Right} className="mesh-handle-routing" />
+      <Handle type="source" id="source-left" position={Position.Left} className="mesh-handle-routing" />
+      <Handle type="source" id="source-right" position={Position.Right} className="mesh-handle-routing" />
       {/* A `meshfox:edge` extra edge can connect any two nodes anywhere on
        * the canvas, including ones stacked mostly vertically rather than
        * side by side — routed through the plain Left/Right pair above,

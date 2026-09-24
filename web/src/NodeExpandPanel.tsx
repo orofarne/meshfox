@@ -12,7 +12,7 @@ import {
 } from "@xyflow/react";
 import { NodeBodyContent, MeshNode, type MeshNodeData } from "./MeshNode";
 import { DeletableEdge } from "./DeletableEdge";
-import { withExtraRoutes } from "./edgeRouteLayout";
+import { withEdgeRoutes } from "./edgeRouteLayout";
 import type { CanvasDoc } from "./types";
 import { subtreeIds } from "./tree";
 import type { ThemePreference } from "./theme";
@@ -123,7 +123,7 @@ export function NodeExpandPanel({
     [edges, memberIds],
   );
   const routedMemberEdges = useMemo(
-    () => withExtraRoutes(memberNodes, memberEdges),
+    () => withEdgeRoutes(memberNodes, memberEdges),
     [memberNodes, memberEdges],
   );
 

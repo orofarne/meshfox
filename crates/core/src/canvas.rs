@@ -67,8 +67,8 @@ impl NodeType {
 }
 
 /// An extra incoming edge (`meshfox:edge from="..."`), plus the optional
-/// per-edge styling attributes on that same comment line — label text,
-/// stroke color, line style, and arrowhead choice at each end. `None` on
+/// per-edge styling and route attributes on that same comment line — label text,
+/// stroke color, line style, arrowhead choice, endpoint sides and waypoints. `None` on
 /// any of these means "not written", not "explicitly cleared": `mdcanvas`
 /// omits the attribute entirely rather than writing e.g. `style="solid"`,
 /// and a client rendering an edge with `None` here is free to pick its own
@@ -78,6 +78,12 @@ impl NodeType {
 #[serde(rename_all = "camelCase")]
 pub struct ExtraEdge {
     pub from: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_side: Option<EdgeSide>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_side: Option<EdgeSide>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub via: Vec<RoutePoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -93,6 +99,22 @@ pub struct ExtraEdge {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
 }
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EdgeSide { Left, Right, Top, Bottom }
+
+impl EdgeSide {
+    pub fn as_str(self) -> &'static str {
+        match self { Self::Left => "left", Self::Right => "right", Self::Top => "top", Self::Bottom => "bottom" }
+    }
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw { "left" => Some(Self::Left), "right" => Some(Self::Right), "top" => Some(Self::Top), "bottom" => Some(Self::Bottom), _ => None }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoutePoint { pub x: i32, pub y: i32 }
 
 impl ExtraEdge {
     /// A bare edge with no styling — same shape a plain `meshfox:edge
@@ -275,9 +297,16 @@ pub struct Node {
     /// label of the edge that points at me". `None` for the root (no
     /// incoming edge to label) and for every node that's never had one set.
     /// Purely descriptive text — unlike `ExtraEdge`, a structural edge has
-    /// no color/style/arrowhead attributes to go with it (see SPEC.md).
+    /// no color/style/arrowhead attributes to go with it (see SPEC.md),
+    /// though its route can be adjusted below.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_source_side: Option<EdgeSide>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_target_side: Option<EdgeSide>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edge_via: Vec<RoutePoint>,
     /// Markdown body between this heading (and its meshfox comments) and
     /// the next heading. For `group`, always empty. For `file`/`link`,
     /// always exactly the one Markdown link `target` was parsed from.
