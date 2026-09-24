@@ -3,6 +3,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+// E2E servers must own their fixture workers, even on a developer machine
+// configured to hand `meshfox view` off to an external coordinator. Playwright
+// workers and any MCP processes they spawn inherit this setting too.
+process.env.MESHFOX_SERVER_SOCKET = "";
+
 // Drives the real `meshfox view` server (embedded UI + axum backend +
 // actual bash execution), not a mocked frontend — the two bugs this suite
 // exists to catch (a clipped dependency badge, a box-shadow eaten by
@@ -195,6 +200,22 @@ fs.copyFileSync(
 );
 process.env.MESHFOX_E2E_EXTERNAL_EDIT_CANVAS_PATH = path.join(EXTERNAL_EDIT_DIR, "external-edit.canvas.md");
 
+const MCP_LIVE_PORT = 4619;
+const MCP_LIVE_FIREFOX_PORT = 4620;
+const MCP_LIVE_DIRS = Object.fromEntries(
+  (["chrome", "firefox"] as const).map((browser) => {
+    const dir = path.join(os.tmpdir(), `meshfox-e2e-mcp-live-${browser}-fixture`);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.copyFileSync(
+      path.join(import.meta.dirname, "e2e/fixtures/mcp-live.canvas.md"),
+      path.join(dir, "mcp-live.canvas.md"),
+    );
+    return [browser, dir];
+  }),
+);
+process.env.MESHFOX_E2E_MCP_LIVE_CHROME_DIR = MCP_LIVE_DIRS.chrome;
+process.env.MESHFOX_E2E_MCP_LIVE_FIREFOX_DIR = MCP_LIVE_DIRS.firefox;
+
 // Taller than Playwright's 720px default — the app's own `minZoom` (0.5)
 // is a hard floor on how far "fit view" can zoom out, and deps.canvas.md's
 // content needs more room than a 720px-tall viewport gives it at that
@@ -379,15 +400,17 @@ export default defineConfig({
       testMatch: /(^|\/)external-edit\.spec\.ts$/,
       use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${EXTERNAL_EDIT_PORT}` },
     },
+    {
+      name: `${browser}-mcp-live`,
+      testMatch: /(^|\/)mcp-live\.spec\.ts$/,
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${browser === "firefox" ? MCP_LIVE_FIREFOX_PORT : MCP_LIVE_PORT}` },
+    },
   ]),
   webServer: [
     {
-      // `web/dist` must already be built (see the `pretest:e2e` npm script) —
-      // `cargo run` here only builds/starts the Rust side. Debug builds of
-      // meshfox-server read `web/dist` fresh off disk on every request
-      // (rust-embed's `debug-embed` feature is off — see its Cargo.toml),
-      // so no Rust rebuild is needed between a frontend change and the next
-      // test run, just `npm run build` again.
+      // `web/dist` is built by `pretest:e2e` before Cargo starts. The server
+      // embeds those assets at compile time; its build script watches the
+      // directory so `cargo run` rebuilds when the frontend bundle changes.
       // `--no-auto-exit`: `meshfox view` otherwise exits a few seconds after
       // its last connected tab closes (see README's roadmap) — Playwright
       // opens/closes a fresh page between tests against this one shared
@@ -563,6 +586,18 @@ export default defineConfig({
     {
       command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${EXTERNAL_EDIT_DIR}/external-edit.canvas.md --port ${EXTERNAL_EDIT_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${EXTERNAL_EDIT_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${MCP_LIVE_DIRS.chrome}/mcp-live.canvas.md --port ${MCP_LIVE_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${MCP_LIVE_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${MCP_LIVE_DIRS.firefox}/mcp-live.canvas.md --port ${MCP_LIVE_FIREFOX_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${MCP_LIVE_FIREFOX_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },

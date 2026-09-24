@@ -577,13 +577,14 @@ export async function runBlockStream(
   await openEventSocket(wsUrl(`/api/run?${params}`), onEvent);
 }
 
-/** Builds a `ws(s)://`-scheme URL for a path on this same origin — every
- * run-starting endpoint is a WebSocket now, not a plain `fetch()`, but
- * still lives at a relative `/api/...` path the same way the old HTTP
- * calls did, so this just swaps the scheme rather than hardcoding a host. */
+/** Builds a WebSocket URL against the worker serving this document.
+ * In VS Code, `window.location` is the webview origin, while the injected
+ * `<base>` points API requests at the worker. Plain browser tabs use their
+ * own URL as `document.baseURI`, so both hosts follow the same path. */
 function wsUrl(path: string): string {
-  const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${scheme}//${window.location.host}${path}`;
+  const url = new URL(path, document.baseURI);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  return url.toString();
 }
 
 /** Opens `url` as a WebSocket, calls `onEvent` for every JSON text frame it
@@ -990,9 +991,8 @@ export function watchChanges(
   window.addEventListener("pagehide", markLeaving);
 
   const socketUrl = () => {
-    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
     const since = lastSeq !== undefined ? `?since=${lastSeq}` : "";
-    return `${proto}//${window.location.host}/api/watch${since}`;
+    return wsUrl(`/api/watch${since}`);
   };
 
   const connectOnce = (onEstablished: () => void): Promise<void> =>

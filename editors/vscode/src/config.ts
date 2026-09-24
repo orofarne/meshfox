@@ -9,17 +9,23 @@ import * as path from "path";
  * exactly, but *not* its general deep-merge machinery: since this is the
  * only key any TypeScript code here reads, "merge" reduces to "prefer the
  * local file's value if it declares one, else the global file's" — there's
- * no second key that could ever need recursive merging. `readTopLevelString`
+ * no second key that could ever need recursive merging. An explicit empty
+ * local value disables the global socket for this workspace. `readTopLevelString`
  * below is a narrow, single-key reader for exactly this reason too — adding
  * a real TOML dependency (this extension has none at all today) for one
  * top-level string assignment isn't worth it; if a second config key ever
  * needs reading from here, that's the point to reconsider.
  */
 export function resolveServerSocket(canvasPath: string): string | undefined {
+  // Match meshfox_core::config::server_socket: an explicit empty override
+  // disables the configured daemon for this process (including e2e runs).
+  if (process.env.MESHFOX_SERVER_SOCKET !== undefined) {
+    return process.env.MESHFOX_SERVER_SOCKET || undefined;
+  }
   const canvasRoot = path.dirname(canvasPath);
   const local = readTopLevelString(path.join(canvasRoot, ".meshfox", "config.toml"), "server_socket");
   if (local !== undefined) {
-    return local;
+    return local || undefined;
   }
   return readTopLevelString(path.join(os.homedir(), ".meshfox", "config.toml"), "server_socket");
 }

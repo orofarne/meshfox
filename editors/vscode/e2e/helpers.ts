@@ -64,7 +64,7 @@ interface VSCodeSession {
  * `playwright.config.ts`'s own doc comment for why that's a prerequisite
  * this suite expects already built, not something it builds itself.
  */
-export async function launchVSCode(fixtureName: string): Promise<VSCodeSession> {
+export async function launchVSCode(fixtureName: string, envOverrides: NodeJS.ProcessEnv = {}): Promise<VSCodeSession> {
   const userDataDir = shortTempDir("mfx-e2e-ud-");
   const extensionsDir = shortTempDir("mfx-e2e-ext-");
   const workspaceDir = shortTempDir("mfx-e2e-ws-");
@@ -78,6 +78,7 @@ export async function launchVSCode(fixtureName: string): Promise<VSCodeSession> 
 
   const app = await electron.launch({
     executablePath: findVSCodeBinary(),
+    env: { ...process.env, ...envOverrides },
     args: [
       `--extensionDevelopmentPath=${join(__dirname, "..")}`,
       `--user-data-dir=${userDataDir}`,
@@ -125,7 +126,6 @@ export async function openMeshfoxCanvas(page: Page): Promise<Frame> {
   await page.keyboard.press("Enter");
   await page.waitForTimeout(600);
   await page.getByText("meshfox canvas", { exact: true }).first().click();
-  await page.waitForTimeout(4000);
 
   // VS Code's own generic webview *host* page (loaded at a
   // `vscode-webview://.../index.html` URL) is not this extension's
@@ -138,15 +138,15 @@ export async function openMeshfoxCanvas(page: Page): Promise<Frame> {
   // real text — is visibly rendered inside it; the swap isn't a normal
   // navigation). `childFrames()[0]` is that real content frame regardless
   // of what its own `.url()` still claims.
-  const hostFrame = page
-    .frames()
-    .find((f) => f.url().includes("vscode-webview://") && f.url().includes("index.html"));
-  if (!hostFrame) {
-    throw new Error(`No meshfox webview host frame found. Frames: ${page.frames().map((f) => f.url())}`);
+  for (let attempt = 0; attempt < 150; attempt++) {
+    const hostFrame = page
+      .frames()
+      .find((f) => f.url().includes("vscode-webview://") && f.url().includes("index.html"));
+    const contentFrame = hostFrame?.childFrames()[0];
+    if (contentFrame) return contentFrame;
+    await page.waitForTimeout(100);
   }
-  const contentFrame = hostFrame.childFrames()[0];
-  if (!contentFrame) throw new Error("Webview host frame has no content child frame.");
-  return contentFrame;
+  throw new Error(`No meshfox webview content frame found. Frames: ${page.frames().map((f) => f.url())}`);
 }
 
 /** Selects the root node and opens its own body editor (`NodeTextEditor`)

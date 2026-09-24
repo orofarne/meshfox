@@ -28,12 +28,10 @@ import { defineConfig } from "@playwright/test";
 //
 // Prerequisites this config does *not* build for you (unlike `web/e2e`'s
 // own `pretest:e2e`/`webServer`, which build everything they need):
-//   1. `cargo build -p meshfox-cli` at the repo root (`helpers.ts` points
-//      `meshfox.executablePath` at that debug binary directly, so a
-//      frontend-only change never needs a Rust rebuild between runs — see
-//      its own comment).
-//   2. `npm run build` in `web/` (the debug `meshfox` binary reads `web/dist`
-//      fresh off disk on every request, same as `web/e2e` already relies on).
+//   1. `npm run build` in `web/`.
+//   2. `cargo build -p meshfox-cli` at the repo root, *after* the web build:
+//      `rust-embed` bakes `web/dist` into the server crate at compile time,
+//      and the server build script watches it for changes.
 //   3. `npm run compile` in `editors/vscode` (compiles this extension's own
 //      `out/extension.js`, which `helpers.ts` loads via
 //      `--extensionDevelopmentPath`).

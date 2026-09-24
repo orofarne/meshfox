@@ -82,7 +82,8 @@ fn deep_merge(base: &mut toml::Table, overlay: toml::Table) {
 /// (`view`, `tui`, `node <op>`, `run`, MCP `debug_*`) should become a pure
 /// client of, instead of spawning/discovering a worker of its own. Unset
 /// (the default) changes nothing for any caller — see each call site's own
-/// doc comment for its fallback.
+/// doc comment for its fallback. An empty local value disables a global
+/// socket for that canvas root.
 ///
 /// `MESHFOX_SERVER_SOCKET` overrides the config file when set, without
 /// touching `.meshfox/config.toml`: a path points at a different (or
@@ -99,7 +100,7 @@ pub fn server_socket(canvas_root: &Path) -> Option<PathBuf> {
 }
 
 fn server_socket_from_table(table: &toml::Table) -> Option<PathBuf> {
-    table.get("server_socket").and_then(|v| v.as_str()).map(PathBuf::from)
+    table.get("server_socket").and_then(|v| v.as_str()).filter(|v| !v.is_empty()).map(PathBuf::from)
 }
 
 /// `[process_env]` in `.meshfox/config.toml` (local or global, same merge
@@ -294,6 +295,8 @@ mod tests {
     fn server_socket_from_table_is_none_when_unset_or_wrong_type() {
         assert_eq!(server_socket_from_table(&toml::Table::new()), None);
         let table: toml::Table = "server_socket = 4\n".parse().unwrap();
+        assert_eq!(server_socket_from_table(&table), None);
+        let table: toml::Table = "server_socket = \"\"\n".parse().unwrap();
         assert_eq!(server_socket_from_table(&table), None);
     }
 
