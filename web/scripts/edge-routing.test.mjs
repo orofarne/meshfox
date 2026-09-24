@@ -117,6 +117,22 @@ test("explicit sides select the matching routing handles", () => {
   assert.equal(ports.targetHandle, "target-right");
 });
 
+test("automatic outgoing arrows share the source center while pinned ones can spread", () => {
+  const boxes = new Map([
+    ["root", { x: 0, y: 0, width: 140, height: 100 }],
+    ["a", { x: 240, y: 0, width: 100, height: 60 }],
+    ["b", { x: 240, y: 180, width: 100, height: 60 }],
+    ["c", { x: 240, y: 360, width: 100, height: 60 }],
+  ]);
+  const edges = ["a", "b", "c"].map((target) => ({ id: `root->${target}`, source: "root", target, extra: false }));
+  const levels = new Map([["root", 1], ["a", 2], ["b", 2], ["c", 2]]);
+  const auto = distributeEdgePorts(edges, boxes, levels);
+  for (const edge of edges) assert.equal(auto.get(edge.id).sourceOffset, 0);
+
+  const pinned = distributeEdgePorts(edges.map((edge) => ({ ...edge, sourceSide: "left" })), boxes, levels);
+  assert.notEqual(pinned.get("root->a").sourceOffset, pinned.get("root->c").sourceOffset);
+});
+
 test("the routed path uses explicit left and right handles", () => {
   const nodes = [
     { id: "root", type: "mesh", position: { x: 0, y: 0 }, width: 100, height: 60,

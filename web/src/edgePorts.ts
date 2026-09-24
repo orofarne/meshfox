@@ -9,9 +9,9 @@ export interface EdgePorts {
   targetOffset: number;
 }
 
-/** Spread connections along each occupied side, in the order of their other
- * endpoints. Offsets are relative to the existing centered React Flow handle;
- * the visible path uses them without changing the connection UI. */
+/** Automatically placed outgoing edges share the centered source handle.
+ * Explicit source sides and incoming edges can still spread along an
+ * occupied side. Offsets are relative to the centered React Flow handle. */
 export function distributeEdgePorts(
   edges: DerivedEdge[],
   boxes: Map<string, LayoutBox>,
@@ -41,9 +41,9 @@ export function distributeEdgePorts(
       targetOffset: 0,
     });
     for (const [nodeId, side, end, other] of [
-      [edge.source, sourceSide, "source", target],
-      [edge.target, targetSide, "target", source],
-    ] as const) {
+      ...(edge.sourceSide ? [[edge.source, sourceSide, "source", target] as const] : []),
+      [edge.target, targetSide, "target", source] as const,
+    ]) {
       const key = `${nodeId}\0${side}`;
       const group = groups.get(key) ?? [];
       group.push({ edgeId: edge.id, end, order: center(other, side) });
