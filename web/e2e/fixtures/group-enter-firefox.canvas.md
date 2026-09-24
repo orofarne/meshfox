@@ -44,3 +44,16 @@ First member.
 <!-- meshfox:node id="outsider" -->
 
 A plain sibling of Frame, not one of its members.
+
+## Auto frame
+<!-- meshfox:node id="auto-frame" type="group" -->
+
+### At origin
+<!-- meshfox:node id="at-origin" x=0 y=0 w=200 h=100 -->
+
+A positioned member at the group's logical origin.
+
+## After auto frame
+<!-- meshfox:node id="after-auto-frame" -->
+
+An auto-placed sibling after the group.

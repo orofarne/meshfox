@@ -203,21 +203,11 @@ function resolveDefaultFold(canvas: CanvasDoc, rootId: string): Set<string> {
   return folded;
 }
 
-/** `n`'s React Flow `position` — relative to its group when it's a direct
- * `group` child (see SPEC.md and `autolayout.ts`'s own `groupOrigin`
- * threading), absolute otherwise. A real x/y is used as-is (it's already
- * in whichever frame it needs to be, per the file format); an auto-placed
- * node instead projects `computeAutoLayout`'s absolute `box` into the
- * parent's frame by subtracting the parent's own absolute box — the one
- * place a conversion is still needed, since `computeAutoLayout`'s internal
- * map stays absolute throughout. Shared by both the canvas-load node-build
- * effect and the measured-height reflow effect below, so a group member's
- * position is computed exactly the same way in either place — the reflow
- * effect used to skip this and write `box.x`/`box.y` straight back
- * (correct for every node *except* a group member, whose `position` needs
- * to stay parent-relative), which is what let `parentId`-composition
- * double-count the group's own offset the moment a member's height was
- * first measured. */
+/** React Flow positions direct group members relative to the group's
+ * visible frame. Canvas x/y instead use the group's logical anchor, which
+ * can lie inside that padded frame. `computeAutoLayout` resolves both to
+ * absolute boxes, so subtract the frame's origin for every member, whether
+ * its coordinates are authored or automatic. */
 function positionFor(
   n: CanvasNode,
   box: LayoutBox | undefined,
@@ -227,10 +217,8 @@ function positionFor(
   const groupParent = n.parent ? byId.get(n.parent) : undefined;
   const isGroupMember = groupParent?.type === "group";
   const parentBox = isGroupMember ? boxes.get(groupParent!.id) : undefined;
-  const x =
-    n.x !== undefined ? n.x : isGroupMember && box && parentBox ? box.x - parentBox.x : (box?.x ?? 0);
-  const y =
-    n.y !== undefined ? n.y : isGroupMember && box && parentBox ? box.y - parentBox.y : (box?.y ?? 0);
+  const x = isGroupMember && box && parentBox ? box.x - parentBox.x : (box?.x ?? n.x ?? 0);
+  const y = isGroupMember && box && parentBox ? box.y - parentBox.y : (box?.y ?? n.y ?? 0);
   return { x, y };
 }
 
@@ -3120,10 +3108,30 @@ export default function App() {
     // server-suggested position/size and that the user hasn't actually
     // touched — dragging one node shouldn't silently pin every other,
     // still-auto-placed node's suggested box into the file as if it were
-    // real authored data. A group *member*'s own `n.position` is already
-    // group-relative here (React Flow's own `parentId` semantics — see the
-    // node-building effect above), so it's persisted verbatim, no delta
-    // math needed.
+    // real authored data. React Flow positions group members relative to
+    // the visible frame, while saved x/y are relative to the group's
+    // logical anchor. A group's own saved x/y similarly refer to its
+    // anchor, not the padded frame's top-left corner.
+    const layoutBoxes = computeAutoLayout({
+      canvas,
+      viewportWidth: viewportWidthRef.current,
+      measuredHeight: (id) => measuredHeightsRef.current.get(id),
+      foldedNodeIds,
+    });
+    const canvasById = new Map(canvas.nodes.map((n) => [n.id, n]));
+    const canvasPosition = (n: Node<MeshNodeData>) => {
+      const ownBox = layoutBoxes.get(n.id);
+      const parent = canvasById.get(canvasById.get(n.id)?.parent ?? "");
+      const parentBox = parent?.type === "group" ? layoutBoxes.get(parent.id) : undefined;
+      const ownOffsetX = n.data.nodeType === "group" ? (ownBox?.anchorX ?? ownBox?.x ?? 0) - (ownBox?.x ?? 0) : 0;
+      const ownOffsetY = n.data.nodeType === "group" ? (ownBox?.anchorY ?? ownBox?.y ?? 0) - (ownBox?.y ?? 0) : 0;
+      const parentOffsetX = parentBox ? (parentBox.anchorX ?? parentBox.x) - parentBox.x : 0;
+      const parentOffsetY = parentBox ? (parentBox.anchorY ?? parentBox.y) - parentBox.y : 0;
+      return {
+        x: n.position.x + ownOffsetX - parentOffsetX,
+        y: n.position.y + ownOffsetY - parentOffsetY,
+      };
+    };
     const layout = new Map(
       nodes
         .filter((n) =>
@@ -3131,15 +3139,18 @@ export default function App() {
             ? touchedNodeIds.current.has(n.id)
             : !n.data.suggested || touchedNodeIds.current.has(n.id),
         )
-        .map((n) => [
-          n.id,
-          {
-            x: snapToGrid(n.position.x),
-            y: snapToGrid(n.position.y),
-            width: n.data.nodeType === "group" || n.width === undefined ? undefined : snapToGrid(n.width),
-            height: n.data.nodeType === "group" || n.height === undefined ? undefined : snapToGrid(n.height),
-          },
-        ]),
+        .map((n) => {
+          const position = canvasPosition(n);
+          return [
+            n.id,
+            {
+              x: snapToGrid(position.x),
+              y: snapToGrid(position.y),
+              width: n.data.nodeType === "group" || n.width === undefined ? undefined : snapToGrid(n.width),
+              height: n.data.nodeType === "group" || n.height === undefined ? undefined : snapToGrid(n.height),
+            },
+          ] as const;
+        }),
     );
     const updated: CanvasDoc = {
       ...canvas,
@@ -3163,7 +3174,7 @@ export default function App() {
     const layoutHints: Record<string, { x: number; y: number }> = {};
     for (const n of nodes) {
       if (layout.has(n.id)) continue;
-      layoutHints[n.id] = { x: n.position.x, y: n.position.y };
+      layoutHints[n.id] = canvasPosition(n);
     }
     try {
       await saveCanvas(updated, layoutHints);
@@ -3180,7 +3191,7 @@ export default function App() {
     } catch (e) {
       setError(String(e));
     }
-  }, [canvas, nodes]);
+  }, [canvas, nodes, foldedNodeIds]);
 
   // Auto-saves layout (position/size), but only once a drag/resize
   // actually *finishes* — not, e.g., 800ms after the last intermediate

@@ -70,6 +70,10 @@ export interface LayoutBox {
   y: number;
   width: number;
   height: number;
+  /** A group's coordinate origin. Its visible frame can start before this
+   * point to leave room for padding and the title. */
+  anchorX?: number;
+  anchorY?: number;
   /** Set only for an auto-placed (no real `height`) node at depth ≥2 — the
    * caller should apply this as a CSS `max-height` so the box still grows
    * with content up to the cap rather than always rendering at it. */
@@ -95,17 +99,6 @@ export interface AutoLayoutInput {
 
 function directChildren(canvas: CanvasDoc, id: string): CanvasNode[] {
   return canvas.nodes.filter((n) => n.parent === id);
-}
-
-function treeDepth(canvas: CanvasDoc, id: string): number {
-  const byId = new Map(canvas.nodes.map((n) => [n.id, n]));
-  let depth = 0;
-  let cur = byId.get(id);
-  while (cur?.parent) {
-    depth++;
-    cur = byId.get(cur.parent);
-  }
-  return depth;
 }
 
 function widthForDepth(depth: number, viewportWidth: number): number {
@@ -159,7 +152,10 @@ export function computeAutoLayout({
     yCursor += placeRightward(view, section, ROOT_CHILD_INDENT, yCursor, 1, null, sizeFor, boxes, folded);
   }
 
-  layoutGroups(view, boxes, sizeFor);
+  // `placeRightward` resolves group frames as it unwinds so each caller can
+  // reserve the frame's actual height before placing the next sibling. The
+  // root is normally a text node; handle a group root as well.
+  if (root.type === "group") layoutGroupBox(view, root, boxes);
   return boxes;
 }
 
@@ -211,31 +207,19 @@ function placeRightward(
     return size.height;
   }
 
-  // A `group`'s own rendered box is later overridden by `layoutGroups`
-  // (below) to a frame bounding its members, padded by `GROUP_PADDING` on
-  // every side plus `GROUP_TITLE_SPACE` above that for its own title row —
-  // space this pass has to reserve *before* stacking its children, not
-  // after: sibling spacing (both here, for a nested group's own children,
-  // and in `computeAutoLayout`'s root-children loop) is decided from this
-  // function's return value alone, before `layoutGroups` ever runs, so a
-  // *preceding* sibling's slot would otherwise get silently encroached on
-  // once that override actually padded the frame out above/below where
-  // this function had placed the group's children (confirmed directly: an
-  // unfolded group's frame overlapped the sibling row directly above it by
-  // exactly `GROUP_PADDING + GROUP_TITLE_SPACE`px — invisible before the
-  // group's frame extended left far enough to actually reach that sibling's
-  // own column, but always there).
+  // A group's frame wraps its members with padding and a title row. Start
+  // auto-placed members after that reserved space. Positioned members can
+  // start elsewhere, so measure the actual frame before placing siblings.
   const isGroup = node.type === "group";
   const topReserve = isGroup ? GROUP_PADDING + GROUP_TITLE_SPACE : 0;
   const bottomReserve = isGroup ? GROUP_PADDING : 0;
 
-  // A group's own frame directly wraps its members (`layoutGroups` below,
-  // now anchored at this node's own `x` too — see its own comment) — its
+  // A group's own frame directly wraps its members — its
   // children indent only `GROUP_PADDING` from that same left edge, not the
   // normal `size.width + H_GAP` column-jump every other parent/child pair
   // gets (each rendered as its own separate box, side by side, one tier
   // deeper). Using the normal jump here still positioned every member
-  // correctly (`layoutGroups`' own bounding box just follows wherever they
+  // correctly (the frame's bounding box just follows wherever they
   // landed) — it just left a wide dead gap between the frame's own
   // (correctly self-aligned) left edge and the far-off column its members
   // actually rendered in, since nothing here was previously reserving the
@@ -254,7 +238,7 @@ function placeRightward(
   });
   // A group's own `size.height` is deliberately left out of its `consumed`
   // — that figure is `measuredHeight(node.id)`, last render's real DOM
-  // height of whatever `layoutGroups` (below) set this same box to on the
+  // height of whatever `layoutGroupBox` set this same box to on the
   // *previous* pass, so feeding it back into this pass's own layout math
   // never converges (confirmed directly: an unfolded group's height blew
   // up to several thousand px within a couple of reflow passes before this
@@ -265,64 +249,68 @@ function placeRightward(
   // real y is the user's own, never shifted to "look centered". Skipped
   // for a group entirely (`nodeY = ny`, no centering): whenever this
   // branch runs at all, the group has ≥1 visible child, which means
-  // `layoutGroups` is about to override this box wholesale from its
+  // `layoutGroupBox` is about to override this box wholesale from its
   // members' own boxes anyway (see that function) — nothing stored here
   // survives, so centering against a stale `size.height` would just be
   // reintroducing that same feedback risk for a value nothing downstream
   // even reads.
   const nodeY = node.y !== undefined || isGroup ? ny : ny + (consumed - size.height) / 2;
   boxes.set(node.id, { x: nx, y: nodeY, ...size });
-  return consumed;
-}
+  if (!isGroup) return consumed;
 
-/** Overrides every group's box with the bounding box of its full subtree —
- * mirrors `layout.rs`'s `layout_groups`, deepest groups first so a
- * group-of-groups sees its nested group's already-resolved box. */
-function layoutGroups(
-  canvas: CanvasDoc,
-  boxes: Map<string, LayoutBox>,
-  sizeFor: (node: CanvasNode, depth: number) => { width: number; height: number; maxHeight?: number },
-) {
-  const groups = canvas.nodes
-    .filter((n) => n.type === "group")
-    .sort((a, b) => treeDepth(canvas, b.id) - treeDepth(canvas, a.id));
-
-  for (const group of groups) {
-    // `boxes` already holds an absolute position for every node, real or
-    // synthetic, group member or not — `placeRightward` above resolves a
-    // group member's own real x/y through `groupOrigin` rather than
-    // reading it as absolute directly, so there's nothing left to
-    // re-derive here (mirrors `layout.rs`'s own simplified `member_box`
-    // call site).
-    const memberBoxes = subtreeIds(canvas, group.id)
-      .map((id) => boxes.get(id))
-      .filter((b): b is LayoutBox => b !== undefined);
-    if (memberBoxes.length === 0) continue;
-    // Deliberately just the members here, not the group's own box too —
-    // `placeRightward` now indents a group's own children by exactly
-    // `GROUP_PADDING` from its own left edge (`childX`, above), rather
-    // than the normal full-column jump every other parent/child pair
-    // gets, specifically so this bounding box, once padded back out by
-    // that same `GROUP_PADDING` below, lands exactly on the group's own
-    // column again — `minX - GROUP_PADDING` here already equals the
-    // group's own `x` by construction, with no need to fold that `x` into
-    // the `Math.min` a second time. Doing that anyway (an earlier version
-    // of this fix did) double-subtracted the padding — `min(ownX, ownX +
-    // GROUP_PADDING) - GROUP_PADDING = ownX - GROUP_PADDING` — and landed
-    // the frame `GROUP_PADDING`px left of every sibling instead (confirmed
-    // directly against this same `Links` node: its frame's left edge sat
-    // 40px left of `Tests`/`Examples`'s own, once `childX` alone was
-    // already enough to align them exactly).
-    const minX = Math.min(...memberBoxes.map((b) => b.x));
-    const minY = Math.min(...memberBoxes.map((b) => b.y));
-    const maxX = Math.max(...memberBoxes.map((b) => b.x + b.width));
-    const maxY = Math.max(...memberBoxes.map((b) => b.y + b.height));
-    boxes.set(group.id, {
-      x: minX - GROUP_PADDING,
-      y: minY - GROUP_PADDING - GROUP_TITLE_SPACE,
-      width: maxX - minX + GROUP_PADDING * 2,
-      height: maxY - minY + GROUP_PADDING * 2 + GROUP_TITLE_SPACE,
-    });
+  let frame = layoutGroupBox(canvas, node, boxes);
+  if (!frame) return consumed;
+  // For an auto-placed group, the caller's (x, y) is the *frame* slot.
+  // Explicit member coordinates such as x=0/y=0 can otherwise pull the
+  // frame left/up out of that slot, even though the children were initially
+  // laid out with padding in mind. Move the whole subtree together, keeping
+  // the children's coordinates relative to the logical group anchor.
+  if (node.x === undefined || node.y === undefined) {
+    const dx = x - frame.x;
+    const dy = y - frame.y;
+    for (const id of [node.id, ...subtreeIds(canvas, node.id)]) {
+      const box = boxes.get(id);
+      if (!box) continue;
+      boxes.set(id, {
+        ...box,
+        x: box.x + dx,
+        y: box.y + dy,
+        anchorX: box.anchorX === undefined ? undefined : box.anchorX + dx,
+        anchorY: box.anchorY === undefined ? undefined : box.anchorY + dy,
+      });
+    }
+    frame = boxes.get(node.id)!;
   }
+  return Math.max(0, frame.y + frame.height - y);
 }
 
+/** Wraps a group's full subtree in a frame, preserving its logical anchor.
+ * Descendant groups have already been resolved by the recursive placement. */
+function layoutGroupBox(
+  canvas: CanvasDoc,
+  group: CanvasNode,
+  boxes: Map<string, LayoutBox>,
+): LayoutBox | undefined {
+  // Member boxes are absolute, including authored coordinates resolved
+  // through the group's logical anchor. That anchor is kept separately:
+  // the frame can extend above or left of it when a member has x=0/y=0.
+  const memberBoxes = subtreeIds(canvas, group.id)
+    .map((id) => boxes.get(id))
+    .filter((b): b is LayoutBox => b !== undefined);
+  if (memberBoxes.length === 0) return undefined;
+  const minX = Math.min(...memberBoxes.map((b) => b.x));
+  const minY = Math.min(...memberBoxes.map((b) => b.y));
+  const maxX = Math.max(...memberBoxes.map((b) => b.x + b.width));
+  const maxY = Math.max(...memberBoxes.map((b) => b.y + b.height));
+  const origin = boxes.get(group.id);
+  const frame: LayoutBox = {
+    x: minX - GROUP_PADDING,
+    y: minY - GROUP_PADDING - GROUP_TITLE_SPACE,
+    width: maxX - minX + GROUP_PADDING * 2,
+    height: maxY - minY + GROUP_PADDING * 2 + GROUP_TITLE_SPACE,
+    anchorX: origin?.anchorX ?? origin?.x,
+    anchorY: origin?.anchorY ?? origin?.y,
+  };
+  boxes.set(group.id, frame);
+  return frame;
+}

@@ -32,6 +32,61 @@ test.beforeEach(async ({ page }) => {
   await page.waitForSelector(".mesh-node");
 });
 
+async function nodeBox(page: Page, id: string) {
+  const result = await page.locator(`.react-flow__node[data-id="${id}"]`).boundingBox();
+  if (!result) throw new Error(`${id} has no box`);
+  return result;
+}
+
+test("a group's visible frame keeps its intended padding around positioned members", async ({ page }) => {
+  await expect.poll(async () => {
+    const frame = await nodeBox(page, "frame");
+    const first = await nodeBox(page, "member-two");
+    const last = await nodeBox(page, "member-one");
+    const left = first.x - frame.x;
+    const right = frame.x + frame.width - (last.x + last.width);
+    const top = first.y - frame.y;
+    const bottom = frame.y + frame.height - (last.y + last.height);
+    return left > 10 && bottom > 10 && Math.abs(left - right) < 3 && Math.abs(top - 2 * bottom) < 3;
+  }).toBe(true);
+});
+
+test("an auto group with a member at x=0/y=0 stays padded and clear of its siblings", async ({ page }) => {
+  await expect.poll(async () => {
+    const before = await nodeBox(page, "outsider");
+    const frame = await nodeBox(page, "auto-frame");
+    const member = await nodeBox(page, "at-origin");
+    const after = await nodeBox(page, "after-auto-frame");
+    const left = member.x - frame.x;
+    const top = member.y - frame.y;
+    const right = frame.x + frame.width - member.x - member.width;
+    const bottom = frame.y + frame.height - member.y - member.height;
+    return (
+      frame.y >= before.y + before.height &&
+      after.y >= frame.y + frame.height &&
+      left > 10 &&
+      Math.abs(left - right) < 3 &&
+      Math.abs(top - 2 * bottom) < 3
+    );
+  }).toBe(true);
+});
+
+test("unfolding an auto group reflows its following sibling below the full frame", async ({ page }) => {
+  const frame = page.locator('.react-flow__node[data-id="auto-frame"]');
+  const toggle = frame.locator(".mesh-node-fold-toggle");
+  await toggle.click();
+  await expect(page.locator('.react-flow__node[data-id="at-origin"]')).toHaveCount(0);
+  const foldedAfter = await nodeBox(page, "after-auto-frame");
+
+  await toggle.click();
+  await expect(page.locator('.react-flow__node[data-id="at-origin"]')).toBeVisible();
+  await expect.poll(async () => {
+    const fullFrame = await nodeBox(page, "auto-frame");
+    const after = await nodeBox(page, "after-auto-frame");
+    return after.y > foldedAfter.y && after.y >= fullFrame.y + fullFrame.height;
+  }).toBe(true);
+});
+
 test("a group's expand button opens a mini sub-canvas of exactly its own members", async ({ page }) => {
   const frame = page.locator('.react-flow__node[data-id="frame"]');
   await frame.locator(".mesh-node-expand-icon").click();
