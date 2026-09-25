@@ -43,7 +43,7 @@
 //! still need real endpoints from a browser and get drawn by a small JS pass
 //! instead; `SiteData.edges` carries only those (`build_edges`).
 //!
-//! Local-file references (`build`'s `canvas_dir`/`base_url` parameters) get
+//! Local-file references (`build`'s `canvas_dir`/`links_base_url` parameters) get
 //! three different treatments, matching how the web UI already resolves
 //! them (`crates/server/src/lib.rs`'s `serve_canvas_relative_file`/
 //! `get_node_file_content`) or, where a live server has no static
@@ -62,12 +62,16 @@
 //!     server route — see `render_file_code`).
 //!   - anything else relative (a plain Markdown link, or a `file`/`link`
 //!     node's own target when *not* `display="code"`) is left untouched
-//!     unless `base_url` is set, in which case it's prefixed with it —
+//!     unless `links_base_url` is set, in which case it's prefixed with it —
 //!     these were never resolved through the canvas's own directory to
 //!     begin with (an ordinary link can point anywhere, including outside
-//!     `canvas_dir`), so there's nothing here to copy; `base_url` is the
+//!     `canvas_dir`), so there's nothing here to copy; `links_base_url` is the
 //!     escape hatch for "this needs to resolve against wherever the source
-//!     repo/site actually lives" instead.
+//!     lives" instead — distinct from the site's own `base_url`
+//!     (`TemplateConfig::base_url`/`--sitemap`'s own `<loc>` prefix in
+//!     `crates/cli/src/main.rs`, which never reaches this module at all):
+//!     the two can differ, e.g. this repo's own canvases publish as plain
+//!     Markdown on GitHub, not alongside the static site built from them.
 
 use crate::canvas::{ArrowEnd, Canvas, FileDisplay, Node, NodeType};
 use serde::Serialize;
@@ -206,12 +210,32 @@ pub struct EdgeView {
 /// to enumerate these itself, only the CLI's own file-copy step does.
 #[derive(Debug, Clone)]
 pub struct Asset {
-    /// Absolute, canonicalized, `canvas_dir`-confined source path.
+    /// Absolute, canonicalized source path — confined to `canvas_dir` for
+    /// an ordinary node, or to that node's own `asset_base` for one spliced
+    /// in from an `include` target elsewhere on disk (see `include_asset`).
     pub source: PathBuf,
     /// Destination path relative to the site's output root, using forward
     /// slashes regardless of host OS — also what the rendered HTML's `src`
     /// now points to.
     pub dest_rel: String,
+    /// Set only when `source` doesn't live under `canvas_dir` at all — an
+    /// image referenced from inside an `include`-dumped body whose own
+    /// directory (`Node::asset_base`) lies outside the primary canvas's own
+    /// directory (`dest_rel` then carries a `_include-assets/`-namespaced
+    /// path instead of a plain canvas-relative one — see
+    /// `resolve_image_url`). `(dir, file)` is exactly the query-param pair
+    /// the worker's own confined `GET /api/include-asset?dir=&file=` route
+    /// expects (`crates/server/src/lib.rs::get_include_asset`) — the *only*
+    /// worker route that can serve it, since the ordinary canvas-relative
+    /// fallback route is confined to `canvas_dir` and 404s (well, falls
+    /// through to the embedded web UI's own SPA shell — a 200, not a 404,
+    /// so a worker-routed caller can't tell from the status code alone)
+    /// for anything outside it. `dir` is the node's own `asset_base`
+    /// string exactly as received, unmodified — the server's own `known`
+    /// check there is a plain string `==` against every node's
+    /// `asset_base`, so re-deriving/re-canonicalizing it client-side risks
+    /// a canonically-equal-but-not-byte-identical mismatch.
+    pub include_asset: Option<(String, String)>,
 }
 
 /// Builds a `SiteData` from `canvas` (its node tree, each node's body
@@ -220,13 +244,100 @@ pub struct Asset {
 ///
 /// `canvas_dir` is the directory the canvas file itself lives in — the same
 /// root a relative image/file reference resolves against, confined the same
-/// way the server confines it (see module docs). `base_url`, if set, is
+/// way the server confines it (see module docs). `links_base_url`, if set, is
 /// prefixed onto whatever relative reference is left over (see module
 /// docs) — pass `None` for a self-contained site meant to be opened as-is.
-pub fn build(canvas: &Canvas, canvas_dir: &Path, base_url: Option<&str>) -> (SiteData, Vec<Asset>) {
+pub fn build(canvas: &Canvas, canvas_dir: &Path, links_base_url: Option<&str>) -> (SiteData, Vec<Asset>) {
+    build_with_code_previews(canvas, canvas_dir, links_base_url, None)
+}
+
+/// Same as `build`, but every `display="code"` file-node's content is taken
+/// from `code_previews` (keyed by node id) instead of read off local disk —
+/// see `CodePreview`/`RenderCtx::code_previews`. Pass `None` for exactly
+/// `build`'s own behavior (local disk, `crate::file_read::preview`); pass
+/// `Some(map)` once every such node's content has already been fetched
+/// through a worker (`meshfox static`'s own worker-routed path) — a node
+/// with no entry in `map` renders the same fallback link `file_read::preview`
+/// returning `Err` produces locally, never a silent disk read.
+pub fn build_with_code_previews(
+    canvas: &Canvas,
+    canvas_dir: &Path,
+    links_base_url: Option<&str>,
+    code_previews: Option<&std::collections::HashMap<String, CodePreview>>,
+) -> (SiteData, Vec<Asset>) {
+    // `copy_files`/`recursive` both `false` means `root_canvas_path`/`""`
+    // (the root's own slot) are never actually consulted (no `file`-node
+    // target is ever treated as a possible canvas link at all — see
+    // `build_node_view`'s own branch on `ctx.copy_files`), so any value
+    // here is equally inert — `canvas_dir` itself is as good as any.
+    let root_canvas_path = canvas_dir.to_path_buf();
+    let (site, assets, _canvas_links) = build_for_static_export(
+        canvas,
+        canvas_dir,
+        &root_canvas_path,
+        "",
+        links_base_url,
+        code_previews,
+        false,
+        false,
+    )
+    .unwrap_or_else(|errors| {
+        unreachable!("copy_files=false never produces a CopyFilesTargetError, got {errors:?}")
+    });
+    (site, assets)
+}
+
+/// Same as `build_with_code_previews`, but also handles `--copy-files`
+/// (`copy_files: true`) and, on top of that, `--recursive` (`recursive:
+/// true`, meaningless unless `copy_files` is also `true` — enforced by the
+/// caller, not here):
+///
+/// - `copy_files: true` alone: a `file`-node's own `target` (never touched
+///   by `build`/`build_with_code_previews` — see the module doc comment's
+///   "Local-file references" section) is copied alongside the site the same
+///   way a Markdown image already is. A target that resolves to a
+///   `.canvas.md` file fails the whole build instead — every offending node
+///   collected into the returned `Err` (see `CopyFilesTargetError`) — since
+///   copying an inert canvas source file into `--out` wouldn't give a reader
+///   a rendered page.
+/// - `recursive: true` on top of that: a `.canvas.md` target is no longer an
+///   error — its link is rewritten to point at that canvas's own rendered
+///   page instead (a relative path computed from `current_slot`, this
+///   canvas's own position in the overall `--out` tree, to that target's own
+///   position — see `resolve_file_target_for_copy`/`canvas_link_subdir`),
+///   and the target itself is queued into the returned `Vec<CanvasLinkTarget>`
+///   for the caller to actually go build+render — this function only ever
+///   handles one canvas at a time, it doesn't recurse itself (no I/O here at
+///   all — see the module doc comment).
+///
+/// `root_canvas_path` is the *original* canvas the whole export started
+/// from (its file, not just its directory) — fixed for every call across a
+/// whole recursive export, distinct from `canvas_dir` (*this* call's own
+/// canvas's directory, which differs from the root's for every nested
+/// canvas). `current_slot` is this canvas's own position in the `--out`
+/// tree relative to its root (`""` for the root canvas itself, otherwise
+/// whatever `CanvasLinkTarget::subdir` the *caller* discovered this canvas
+/// under) — both only matter when `recursive` is `true`.
+///
+/// `copy_files: false` is exactly `build_with_code_previews` (an empty
+/// `Vec<CanvasLinkTarget>`, and can never itself produce an `Err`).
+#[allow(clippy::too_many_arguments)]
+pub fn build_for_static_export(
+    canvas: &Canvas,
+    canvas_dir: &Path,
+    root_canvas_path: &Path,
+    current_slot: &str,
+    links_base_url: Option<&str>,
+    code_previews: Option<&std::collections::HashMap<String, CodePreview>>,
+    copy_files: bool,
+    recursive: bool,
+) -> Result<(SiteData, Vec<Asset>, Vec<CanvasLinkTarget>), Vec<CopyFilesTargetError>> {
     let canvas_dir = canvas_dir
         .canonicalize()
         .unwrap_or_else(|_| canvas_dir.to_path_buf());
+    let root_canvas_path = root_canvas_path
+        .canonicalize()
+        .unwrap_or_else(|_| root_canvas_path.to_path_buf());
 
     let root_node = canvas
         .nodes
@@ -237,14 +348,32 @@ pub fn build(canvas: &Canvas, canvas_dir: &Path, base_url: Option<&str>) -> (Sit
     let tag_colors = crate::tag_colors::declared_tag_colors(canvas).unwrap_or_default();
     let ctx = RenderCtx {
         canvas_dir: &canvas_dir,
-        base_url,
+        root_canvas_path: &root_canvas_path,
+        current_slot,
+        links_base_url,
         folded_ids: &folded_ids,
         foldable_ids: &foldable_ids,
         tag_colors: &tag_colors,
+        code_previews,
+        copy_files,
+        recursive,
     };
 
     let mut assets: Vec<Asset> = Vec::new();
-    let root = build_node_view(canvas, root_node, 0, &ctx, &mut assets);
+    let mut errors: Vec<CopyFilesTargetError> = Vec::new();
+    let mut canvas_links: Vec<CanvasLinkTarget> = Vec::new();
+    let root = build_node_view(
+        canvas,
+        root_node,
+        0,
+        &ctx,
+        &mut assets,
+        &mut errors,
+        &mut canvas_links,
+    );
+    if !errors.is_empty() {
+        return Err(errors);
+    }
     let edges = build_edges(canvas);
     let title = root.title.clone();
 
@@ -253,7 +382,7 @@ pub fn build(canvas: &Canvas, canvas_dir: &Path, base_url: Option<&str>) -> (Sit
     let mut seen = std::collections::HashSet::new();
     assets.retain(|a| seen.insert(a.dest_rel.clone()));
 
-    (SiteData { title, root, edges }, assets)
+    Ok((SiteData { title, root, edges }, assets, canvas_links))
 }
 
 fn build_node_view(
@@ -262,7 +391,21 @@ fn build_node_view(
     depth: u32,
     ctx: &RenderCtx,
     assets: &mut Vec<Asset>,
+    errors: &mut Vec<CopyFilesTargetError>,
+    canvas_links: &mut Vec<CanvasLinkTarget>,
 ) -> NodeView {
+    // The directory this node's own relative references (Markdown images
+    // in its body, its caption) resolve against — `asset_base` when this
+    // node's body actually came from an `include` target living elsewhere
+    // on disk, `ctx.canvas_dir` otherwise. See `Node::cwd`'s own doc
+    // comment and this module's own doc comment's "Local-file references"
+    // section — a `file`-node's own `target` (the `display="code"` branch
+    // below) never has this problem: a `file` node can't itself live
+    // inside an `include`-dumped body (`crate::include::resolve` only ever
+    // produces plain `Text` nodes, never new addressable structure), so
+    // `node.asset_base` is always `None` there and `cwd` reduces to
+    // `ctx.canvas_dir` — nothing to thread through for `render_file_code`.
+    let base_dir = node.cwd(ctx.canvas_dir);
     let (html_body, target) = if node.node_type == NodeType::Group {
         (String::new(), None)
     } else if node.node_type == NodeType::File && node.display == Some(FileDisplay::Code) {
@@ -275,13 +418,64 @@ fn build_node_view(
         // as a heading/intro for the file content, not a footnote on it.
         let mut html = String::new();
         if let Some(caption) = &node.caption {
-            html.push_str(&render_markdown(caption, ctx, assets));
+            html.push_str(&render_markdown(
+                caption,
+                &base_dir,
+                node.asset_base.as_deref(),
+                ctx,
+                assets,
+                None,
+            ));
         }
-        html.push_str(&render_file_code(node, ctx.canvas_dir));
+        html.push_str(&render_file_code(node, ctx));
         (html, node.target.clone())
     } else {
-        let html_body = render_markdown(&node.text, ctx, assets);
-        let target = node.target.as_deref().map(|t| resolve_link_url(t, ctx));
+        // `--copy-files` only ever applies here, to a `file`-node whose
+        // rendered body still carries a plain link to its target (the
+        // `display="code"` branch above already inlined the content for
+        // anything else, nothing left to copy for) — never to a `link`
+        // node (an external/preview reference, not a local file the way a
+        // `file` node's target is treated) or a plain Markdown link inside
+        // `node.text` (`resolve_link_url`, unchanged — see the module doc
+        // comment's own reasoning for why those stay lighter-touch).
+        //
+        // Computed *before* `render_markdown` below, not after: SPEC.md's
+        // grammar guarantees a `file`/`link` node's body starts with
+        // exactly one Markdown link, so this resolved value is also the
+        // *visible* link a reader actually clicks (`html_body`'s own first
+        // `<a href>`) — `render_markdown`'s `first_link_override` is what
+        // wires the two together, rather than leaving `NodeView.target`
+        // correctly rewritten while the rendered page's own link still
+        // silently points at the old, unresolved target (a real bug this
+        // was caught by hand, rendering this repo's own `README.md` with
+        // `--copy-files --recursive`: every `--out` file existed, but
+        // nothing on the page actually linked to any of them).
+        let target = node.target.as_deref().map(|t| {
+            if ctx.copy_files && node.node_type == NodeType::File {
+                resolve_file_target_for_copy(
+                    &node.id,
+                    t,
+                    &base_dir,
+                    node.asset_base.as_deref(),
+                    ctx,
+                    assets,
+                    errors,
+                    canvas_links,
+                )
+            } else {
+                resolve_link_url(t, ctx)
+            }
+        });
+        let first_link_override =
+            (node.node_type == NodeType::File && ctx.copy_files).then_some(target.as_deref()).flatten();
+        let html_body = render_markdown(
+            &node.text,
+            &base_dir,
+            node.asset_base.as_deref(),
+            ctx,
+            assets,
+            first_link_override,
+        );
         (html_body, target)
     };
     // `canvas.resolve_absolute_position` is exactly `(node.x, node.y)` for
@@ -309,7 +503,7 @@ fn build_node_view(
     let children = canvas
         .children(&node.id)
         .into_iter()
-        .map(|c| build_node_view(canvas, c, depth + 1, ctx, assets))
+        .map(|c| build_node_view(canvas, c, depth + 1, ctx, assets, errors, canvas_links))
         .collect();
 
     NodeView {
@@ -418,7 +612,19 @@ fn build_edges(canvas: &Canvas) -> Vec<EdgeView> {
 /// docs.
 struct RenderCtx<'a> {
     canvas_dir: &'a Path,
-    base_url: Option<&'a str>,
+    /// The *original* canvas the whole export started from (its file, not
+    /// just its directory) — fixed across a whole recursive export, unlike
+    /// `canvas_dir` (this call's own canvas's directory). Only consulted
+    /// when `recursive` is `true` — see `canvas_link_subdir`/
+    /// `resolve_file_target_for_copy`.
+    root_canvas_path: &'a Path,
+    /// This canvas's own position in the `--out` tree, relative to the
+    /// root's — `""` for the root canvas itself, otherwise whatever
+    /// `CanvasLinkTarget::subdir` the *caller* (the CLI's own recursive
+    /// driver) discovered this canvas under. Only consulted when
+    /// `recursive` is `true`.
+    current_slot: &'a str,
+    links_base_url: Option<&'a str>,
     /// See `resolve_default_fold` — computed once in `build`, consulted per
     /// node by `build_node_view`.
     folded_ids: &'a std::collections::HashSet<String>,
@@ -430,6 +636,91 @@ struct RenderCtx<'a> {
     /// tag-derived color, same as if none were declared) — `meshfox
     /// validate` is what surfaces that loudly, not a site/PDF export.
     tag_colors: &'a std::collections::HashMap<String, String>,
+    /// Pre-fetched `display="code"` file-node content, keyed by node id —
+    /// see `CodePreview`/`build_with_code_previews`. `None` means "read the
+    /// target off local disk instead" (`build`'s own default, and what
+    /// `meshfox pdf` still uses); `Some(map)` means every `display="code"`
+    /// node's content was already fetched through a worker ahead of time,
+    /// and a missing entry means the fetch itself resulted in the same
+    /// "can't preview this" outcome `file_read::preview`'s `Err` does
+    /// locally — never a silent fall-through to a local disk read.
+    code_previews: Option<&'a std::collections::HashMap<String, CodePreview>>,
+    /// `--copy-files` (see `build_for_static_export`) — `false` for `build`/
+    /// `build_with_code_previews` (unchanged default behavior: a `file`-
+    /// node's own target is a plain link, never copied — see the module
+    /// doc comment's "Local-file references" section). `true` copies a
+    /// `file`-node's target alongside the site, same as a Markdown image
+    /// already is — see `build_node_view`'s own handling of it.
+    copy_files: bool,
+    /// `--recursive` (see `build_for_static_export`) — only meaningful when
+    /// `copy_files` is also `true` (enforced by the CLI, not here). `false`:
+    /// a `.canvas.md` target is a `CopyFilesTargetError`. `true`: it's
+    /// rewritten to a link at that canvas's own rendered page instead, and
+    /// queued into `CanvasLinkTarget` for the caller to actually render.
+    recursive: bool,
+}
+
+/// A `file`-node's target resolved to a `.canvas.md` file while
+/// `--copy-files` is on, with no `--recursive` to render it as a page
+/// instead (or `--recursive` without `--copy-files`, which the CLI refuses
+/// before ever reaching here) — copying a canvas source file verbatim into
+/// `--out` would sit there as inert Markdown, not the rendered page a
+/// reader following the link expects. `build_for_static_export` collects
+/// every one of these across the whole tree (not just the first) so a
+/// caller can report every offending node in one pass rather than
+/// fail-fix-refail once per node.
+#[derive(Debug, Clone)]
+pub struct CopyFilesTargetError {
+    pub node_id: String,
+    pub target: String,
+}
+
+impl std::fmt::Display for CopyFilesTargetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "node {:?}'s file target {:?} is a .canvas.md — --copy-files can't just copy it \
+             verbatim (that would sit in --out as inert Markdown source, not a rendered page); \
+             pass --recursive to render it as a page instead, or point this node somewhere else",
+            self.node_id, self.target
+        )
+    }
+}
+
+/// A `file`-node's target resolved to a `.canvas.md` file with `--recursive`
+/// on (see `build_for_static_export`) — this canvas's own build doesn't
+/// recurse into it itself (no I/O happens in this module at all — see its
+/// own doc comment), it only computes where the target's rendered page
+/// *will* live and queues it here for the caller (the CLI's own driver,
+/// which owns finding-or-spawning a worker for it, fetching its resolved
+/// canvas, and calling `build_for_static_export` on it in turn) to actually
+/// build. The corresponding `NodeView.target` is already rewritten to the
+/// right relative link by the time this is returned — the caller doesn't
+/// need to patch anything, just render what `subdir` names.
+#[derive(Debug, Clone)]
+pub struct CanvasLinkTarget {
+    /// Absolute, canonicalized path to the linked `.canvas.md` file.
+    pub resolved: PathBuf,
+    /// This target's own position in the `--out` tree, relative to the
+    /// root's (see `RenderCtx::current_slot`) — computed once, purely from
+    /// `resolved` and the root's own path (`canvas_link_subdir`), so every
+    /// node anywhere in the tree that links to the same target computes the
+    /// same `subdir` independently, with no shared registry needed: the
+    /// caller's own `visited`-style dedup (by `resolved`) is what makes sure
+    /// it only actually gets rendered once.
+    pub subdir: String,
+}
+
+/// A `display="code"` file-node's target content, fetched ahead of time by
+/// the caller (`build_with_code_previews`) instead of read from local disk
+/// during `build` itself — field-for-field what the worker's own
+/// `GET /api/nodes/:id/file-content` returns, and what
+/// `crate::file_read::FilePreview` holds for the local-disk case `render_file_code`
+/// otherwise falls back to.
+#[derive(Debug, Clone)]
+pub struct CodePreview {
+    pub content: String,
+    pub truncated: bool,
 }
 
 /// GFM-flavored Markdown -> HTML, with meshfox's own fence attributes
@@ -448,7 +739,23 @@ struct RenderCtx<'a> {
 /// natively (as `<blockquote class="markdown-alert-note">`, no marker
 /// text left behind); `site-template/style.css`'s own `.markdown-alert-*`
 /// rules are what actually style those, nothing more is needed here.
-fn render_markdown(text: &str, ctx: &RenderCtx, assets: &mut Vec<Asset>) -> String {
+fn render_markdown(
+    text: &str,
+    base_dir: &Path,
+    asset_base: Option<&str>,
+    ctx: &RenderCtx,
+    assets: &mut Vec<Asset>,
+    first_link_override: Option<&str>,
+) -> String {
+    // Taken (once) by the very first `Tag::Link` event below, if set —
+    // `--copy-files`'s own resolution for a `file`-node's own target (see
+    // `build_node_view`'s own caller). SPEC.md's grammar guarantees a
+    // `file`/`link` node's body starts with *exactly one* Markdown link, so
+    // "the first link in this text" and "this node's own target" are the
+    // same thing whenever this is `Some` — every link after that first one
+    // (there normally isn't one — the rest is a plain-text caption) still
+    // goes through the ordinary `resolve_link_url` below, unaffected.
+    let mut first_link_override = first_link_override.map(str::to_string);
     use pulldown_cmark::{html, Event, Options, Parser, Tag, TagEnd};
     let stripped = crate::fence::strip_fence_attrs(text);
     let options = Options::ENABLE_TABLES
@@ -481,7 +788,7 @@ fn render_markdown(text: &str, ctx: &RenderCtx, assets: &mut Vec<Asset>) -> Stri
                 title,
                 id,
             }) => {
-                let new_url = resolve_image_url(&dest_url, ctx, assets);
+                let new_url = resolve_image_url(&dest_url, base_dir, asset_base, ctx, assets);
                 let mut image_events = vec![Event::Start(Tag::Image {
                     link_type,
                     dest_url: new_url.into(),
@@ -522,7 +829,9 @@ fn render_markdown(text: &str, ctx: &RenderCtx, assets: &mut Vec<Asset>) -> Stri
                 title,
                 id,
             }) => {
-                let new_url = resolve_link_url(&dest_url, ctx);
+                let new_url = first_link_override
+                    .take()
+                    .unwrap_or_else(|| resolve_link_url(&dest_url, ctx));
                 events.push(Event::Start(Tag::Link {
                     link_type,
                     dest_url: new_url.into(),
@@ -663,17 +972,47 @@ fn resolve_canvas_relative(url: &str, canvas_dir: &Path) -> Option<PathBuf> {
     resolved.is_file().then_some(resolved)
 }
 
-/// `resolved`'s path relative to `canvas_dir`, using forward slashes
-/// regardless of host OS (so it's a valid URL path component, not just a
-/// valid local filesystem path) — always succeeds for a `resolved` that
-/// came out of `resolve_canvas_relative`, which already guarantees the
-/// `canvas_dir` prefix.
-fn dest_rel_for(resolved: &Path, canvas_dir: &Path) -> String {
-    resolved
-        .strip_prefix(canvas_dir)
-        .unwrap_or(resolved)
-        .to_string_lossy()
-        .replace('\\', "/")
+/// `resolved`'s output-relative path, using forward slashes regardless of
+/// host OS (so it's a valid URL path component, not just a valid local
+/// filesystem path), plus the `Asset::include_asset` pair a worker-routed
+/// copy step needs to actually fetch it when it's not under `canvas_dir`
+/// (see `Asset::include_asset`'s own doc comment for why the ordinary
+/// canvas-relative fallback route can't serve it).
+///
+/// Relative to `canvas_dir` when possible — the common case, and the only
+/// one before `asset_base` existed, so every existing `--out` layout is
+/// unchanged (and `include_asset` is `None`). When `resolved` isn't under
+/// `canvas_dir` at all — an image referenced from inside an `include`-
+/// dumped body whose own directory (`base_dir`, from `Node::cwd`) isn't
+/// nested under the primary canvas's directory (see
+/// `crate::include::resolve`'s `asset_base`) — falls back to a path
+/// relative to `base_dir` instead, namespaced under `_include-assets/` so
+/// it can never collide with a primary-canvas-relative asset that happens
+/// to share the same relative filename, and pairs it with `(asset_base,
+/// relative-path)` for `include_asset`. `resolved` is always under one of
+/// the two (it came out of `resolve_canvas_relative` confined to whichever
+/// of them was passed as its own `dir`), so the final `resolved` fallback
+/// only matters if a caller ever passes mismatched dirs — never valid
+/// output, but still a real (if ugly) path rather than a panic; `asset_base`
+/// being `None` there too (nothing to build an `include_asset` pair from)
+/// is deliberate for the same reason.
+fn dest_rel_for(
+    resolved: &Path,
+    canvas_dir: &Path,
+    base_dir: &Path,
+    asset_base: Option<&str>,
+) -> (String, Option<(String, String)>) {
+    if let Ok(rel) = resolved.strip_prefix(canvas_dir) {
+        return (rel.to_string_lossy().replace('\\', "/"), None);
+    }
+    if let (Ok(rel), Some(asset_base)) = (resolved.strip_prefix(base_dir), asset_base) {
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        return (
+            format!("_include-assets/{rel_str}"),
+            Some((asset_base.to_string(), rel_str)),
+        );
+    }
+    (resolved.to_string_lossy().replace('\\', "/"), None)
 }
 
 /// True for anything this module leaves untouched no matter what: an
@@ -690,20 +1029,48 @@ fn is_external_or_absolute(url: &str) -> bool {
 
 /// A Markdown image's `src`: copies the referenced local file (queuing an
 /// `Asset`) and points `src` at that copy, or — external/unresolvable —
-/// leaves the URL exactly as written (never `base_url`-prefixed: an image
-/// that couldn't be resolved under `canvas_dir` was never going to be
-/// bundled, and `base_url` is for the deliberately-left-alone case, not the
-/// failed-to-copy one).
-fn resolve_image_url(url: &str, ctx: &RenderCtx, assets: &mut Vec<Asset>) -> String {
+/// leaves the URL exactly as written (never `links_base_url`-prefixed: an image
+/// that couldn't be resolved under `base_dir` was never going to be
+/// bundled, and `links_base_url` is for the deliberately-left-alone case, not the
+/// failed-to-copy one). `base_dir` is the *owning node's* own directory
+/// (`Node::cwd(ctx.canvas_dir)` — `ctx.canvas_dir` itself for an ordinary
+/// node, an `include` target's own directory for a node spliced in from
+/// one), not always `ctx.canvas_dir`; `asset_base` is that same node's own
+/// raw `Node::asset_base` (`None` for an ordinary node) — see the module
+/// doc comment's "Local-file references" section and `dest_rel_for`.
+fn resolve_image_url(
+    url: &str,
+    base_dir: &Path,
+    asset_base: Option<&str>,
+    ctx: &RenderCtx,
+    assets: &mut Vec<Asset>,
+) -> String {
     if is_external_or_absolute(url) {
         return url.to_string();
     }
-    match resolve_canvas_relative(url, ctx.canvas_dir) {
+    match resolve_canvas_relative(url, base_dir) {
         Some(resolved) => {
-            let dest_rel = dest_rel_for(&resolved, ctx.canvas_dir);
+            // `resolved` came out of `confine`, which canonicalizes `dir`
+            // before comparing — `ctx.canvas_dir` was already canonicalized
+            // once, up front, in `build_with_code_previews`, but `base_dir`
+            // (an `include`'s own `asset_base`, when set) never has been.
+            // Comparing an uncanonicalized `base_dir` against a canonical
+            // `resolved` would spuriously miss the `strip_prefix` below on
+            // any platform where a temp/asset directory is itself a symlink
+            // (macOS: `/var` -> `/private/var`), always falling through to
+            // the last-resort absolute-path branch in `dest_rel_for`. Only
+            // for that comparison — `asset_base` itself (passed separately)
+            // stays exactly the raw string it came in as, for
+            // `Asset::include_asset`'s own reasons.
+            let canonical_base_dir = base_dir
+                .canonicalize()
+                .unwrap_or_else(|_| base_dir.to_path_buf());
+            let (dest_rel, include_asset) =
+                dest_rel_for(&resolved, ctx.canvas_dir, &canonical_base_dir, asset_base);
             assets.push(Asset {
                 source: resolved,
                 dest_rel: dest_rel.clone(),
+                include_asset,
             });
             dest_rel
         }
@@ -712,14 +1079,14 @@ fn resolve_image_url(url: &str, ctx: &RenderCtx, assets: &mut Vec<Asset>) -> Str
 }
 
 /// A plain link's `href` (Markdown or a `file`/`link` node's own target):
-/// left untouched unless it's relative and `base_url` is set, in which case
+/// left untouched unless it's relative and `links_base_url` is set, in which case
 /// it's prefixed with it. Never copies anything — see the module doc
 /// comment for why plain links get this lighter treatment than images.
 fn resolve_link_url(url: &str, ctx: &RenderCtx) -> String {
     if is_external_or_absolute(url) {
         return url.to_string();
     }
-    match ctx.base_url {
+    match ctx.links_base_url {
         Some(base) => format!(
             "{}/{}",
             base.trim_end_matches('/'),
@@ -729,15 +1096,199 @@ fn resolve_link_url(url: &str, ctx: &RenderCtx) -> String {
     }
 }
 
+/// This repo's own naming convention for a meshfox-structured document
+/// (`TODO.canvas.md`, `memory.canvas.md`, ...) — used by `resolve_file_
+/// target_for_copy` to tell a canvas target apart from an ordinary file. Not
+/// a strict guarantee the target actually parses as one (nothing here reads
+/// it to check), just the same suffix convention every canvas in this repo
+/// already follows.
+fn is_canvas_file(path: &Path) -> bool {
+    path.to_string_lossy().to_ascii_lowercase().ends_with(".canvas.md")
+}
+
+/// `resolved`'s position in the `--out` tree relative to the *root*
+/// canvas's own directory (`root_canvas_dir` — `RenderCtx::root_canvas_path`'s
+/// own parent), stripped of its `.canvas.md` suffix (`other.canvas.md`
+/// becomes `other`, a directory name — not `other.canvas.md`, which would
+/// look like the source file sitting there un-rendered). A pure function of
+/// `(resolved, root_canvas_dir)` alone, deliberately — every node anywhere
+/// in the whole tree that links to the same target canvas calls this with
+/// the same two inputs and must get the same answer back, with no shared
+/// mutable registry to keep them in sync (see `CanvasLinkTarget`'s own doc
+/// comment).
+///
+/// Nested under `root_canvas_dir` when possible — the common case (a
+/// self-contained set of canvases all under one directory tree), giving a
+/// readable path that mirrors the source layout. When `resolved` lives
+/// outside `root_canvas_dir` entirely, falls back to a hash of the full
+/// path instead — can't fall back to "relative to *this* node's own
+/// directory" the way `dest_rel_for`'s own `_include-assets/` fallback does
+/// (that only works there because an asset has one single owning include
+/// directory; a canvas link has no such single "owner" — it's whatever
+/// canvas happens to link to it, from wherever in the tree).
+fn canvas_link_subdir(resolved: &Path, root_canvas_dir: &Path) -> String {
+    let rel = match resolved.strip_prefix(root_canvas_dir) {
+        Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
+        Err(_) => {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(&resolved, &mut hasher);
+            format!("external-pages/{:016x}", std::hash::Hasher::finish(&hasher))
+        }
+    };
+    strip_canvas_md_suffix(&rel)
+}
+
+/// `rel` with a trailing `.canvas.md` (case-insensitive) removed — the
+/// `canvas_link_subdir`/`is_canvas_file` counterpart to `dest_rel_for`'s own
+/// plain pass-through for a non-canvas asset. Leaves `rel` untouched if it
+/// doesn't actually end that way (defensive; every real call site here only
+/// ever calls this after `is_canvas_file` already confirmed the suffix).
+fn strip_canvas_md_suffix(rel: &str) -> String {
+    const SUFFIX_LEN: usize = ".canvas.md".len();
+    if rel.len() > SUFFIX_LEN && rel.to_ascii_lowercase().ends_with(".canvas.md") {
+        rel[..rel.len() - SUFFIX_LEN].to_string()
+    } else {
+        rel.to_string()
+    }
+}
+
+/// The relative path (a sequence of `/`-joined directory names, no leading
+/// or trailing slash — `""` means "the same directory") from a page at
+/// `from_slot` to a page at `to_slot`, both themselves relative to the same
+/// `--out` root (`RenderCtx::current_slot`/`CanvasLinkTarget::subdir`) —
+/// ordinary `..`-counting path-diffing, computed purely from the two slot
+/// strings, no filesystem access. `from_slot`/`to_slot` `""` means the
+/// `--out` root itself (the root canvas's own page). Used to build an
+/// `<a href>` from *this* canvas's own rendered page to a linked canvas's
+/// one, wherever each of them actually ends up under `--out` — critical for
+/// a link back to an already-visited canvas (the root itself, most
+/// commonly, via a cycle) to still resolve to wherever that canvas *really*
+/// rendered, not to a location naively computed as if this were the first
+/// time anyone had linked to it.
+fn relative_slot_path(from_slot: &str, to_slot: &str) -> String {
+    let from_parts: Vec<&str> = from_slot.split('/').filter(|s| !s.is_empty()).collect();
+    let to_parts: Vec<&str> = to_slot.split('/').filter(|s| !s.is_empty()).collect();
+    let common = from_parts
+        .iter()
+        .zip(to_parts.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut parts: Vec<&str> = std::iter::repeat_n("..", from_parts.len() - common).collect();
+    parts.extend(&to_parts[common..]);
+    if parts.is_empty() {
+        ".".to_string()
+    } else {
+        parts.join("/")
+    }
+}
+
+/// `--copy-files`' own handling of a `file`-node's own `target` (never
+/// touched by `resolve_link_url`, which every other node's target still
+/// goes through) — copies the referenced local file alongside the site,
+/// the same treatment a Markdown image already gets (`resolve_image_url`),
+/// and points the rendered link at that copy instead of leaving it as a bare
+/// relative reference. `base_dir`/`asset_base` are this node's own (see
+/// `resolve_image_url`'s own doc comment) — a `file`-node can't itself live
+/// inside an `include`-dumped body (see `build_node_view`'s own comment on
+/// this), so `asset_base` is always `None` in practice here, but threaded
+/// through anyway rather than special-cased away, in case that invariant
+/// ever changes.
+///
+/// A target that resolves to a `.canvas.md` file, with `ctx.recursive`:
+/// rewritten to a relative link at that target's own rendered page (see
+/// `canvas_link_subdir`/`relative_slot_path`, and — for a
+/// `other.canvas.md#node-id`-style deep link — the fragment is carried over
+/// as `#node-<id>`, matching the bundled template's own per-node anchor
+/// convention, `site-template/_macros.html.tera`'s `id="node-{{ n.id }}"`),
+/// and queues the target into `canvas_links` for the caller to actually
+/// build+render. Without `ctx.recursive`, pushes a `CopyFilesTargetError`
+/// onto `errors` instead — see that type's own doc comment for why. A
+/// target that's external/absolute, or doesn't resolve locally at all
+/// (missing, a directory, outside confinement), falls back to
+/// `resolve_link_url`'s own plain-link handling — the same "leave it alone"
+/// outcome `resolve_image_url` already has for an unresolvable image, not a
+/// hard error: `--copy-files` copies what it can find, it doesn't require
+/// every `file`-node's target to resolve.
+#[allow(clippy::too_many_arguments)]
+fn resolve_file_target_for_copy(
+    node_id: &str,
+    url: &str,
+    base_dir: &Path,
+    asset_base: Option<&str>,
+    ctx: &RenderCtx,
+    assets: &mut Vec<Asset>,
+    errors: &mut Vec<CopyFilesTargetError>,
+    canvas_links: &mut Vec<CanvasLinkTarget>,
+) -> String {
+    if is_external_or_absolute(url) {
+        return resolve_link_url(url, ctx);
+    }
+    match resolve_canvas_relative(url, base_dir) {
+        Some(resolved) if is_canvas_file(&resolved) => {
+            if !ctx.recursive {
+                errors.push(CopyFilesTargetError {
+                    node_id: node_id.to_string(),
+                    target: url.to_string(),
+                });
+                // `errors` being non-empty fails the whole build in
+                // `build_for_static_export` before this ever reaches a
+                // template — what's returned here doesn't matter for
+                // correctness, only for not panicking on the way there.
+                return resolve_link_url(url, ctx);
+            }
+            let root_canvas_dir = ctx.root_canvas_path.parent().unwrap_or(ctx.root_canvas_path);
+            // The root canvas itself always renders at the `--out` root
+            // (`current_slot: ""`) by convention, not wherever
+            // `canvas_link_subdir` would naively place it by its own
+            // filename — a link back to it (directly, or via a longer
+            // cycle) needs to land there too, not at a nonexistent
+            // filename-derived subdirectory.
+            let target_slot = if resolved == ctx.root_canvas_path {
+                String::new()
+            } else {
+                canvas_link_subdir(&resolved, root_canvas_dir)
+            };
+            let href_dir = relative_slot_path(ctx.current_slot, &target_slot);
+            let fragment = url.split_once('#').map(|(_, f)| f);
+            let href = match fragment {
+                Some(f) if !f.is_empty() => format!("{href_dir}/index.html#node-{f}"),
+                _ => format!("{href_dir}/index.html"),
+            };
+            canvas_links.push(CanvasLinkTarget {
+                resolved,
+                subdir: target_slot,
+            });
+            href
+        }
+        Some(resolved) => {
+            let canonical_base_dir = base_dir
+                .canonicalize()
+                .unwrap_or_else(|_| base_dir.to_path_buf());
+            let (dest_rel, include_asset) =
+                dest_rel_for(&resolved, ctx.canvas_dir, &canonical_base_dir, asset_base);
+            assets.push(Asset {
+                source: resolved,
+                dest_rel: dest_rel.clone(),
+                include_asset,
+            });
+            dest_rel
+        }
+        None => resolve_link_url(url, ctx),
+    }
+}
+
 /// Inline `<pre><code>` replacement for a `file`-type node's `display="code"`
 /// preview (`web/src/MeshNode.tsx`'s `FileCodePreview`, backed there by a
 /// live `GET /api/nodes/:id/file-content` fetch — nothing to fetch from
-/// once static, so this reads the target once at build time instead, via
-/// `crate::file_read::preview` — same confinement/binary-sniff/size-cap as
-/// that route). Falls back to a plain link (same as the web UI falls back
-/// to an error message) when the target is missing, unreadable, outside
-/// `canvas_dir`, or looks binary.
-fn render_file_code(node: &Node, canvas_dir: &Path) -> String {
+/// once static). `ctx.code_previews`, when set, is consulted first (see its
+/// own doc comment) — the worker-routed path, content already fetched
+/// through that same `GET /api/nodes/:id/file-content` route ahead of time.
+/// `None` (or no entry for this node) falls back to reading the target once
+/// at build time instead, via `crate::file_read::preview` — same
+/// confinement/binary-sniff/size-cap as that route. Falls back to a plain
+/// link (same as the web UI falls back to an error message) when the target
+/// is missing, unreadable, outside `canvas_dir`, or looks binary.
+fn render_file_code(node: &Node, ctx: &RenderCtx) -> String {
     let Some(target) = node.target.as_deref() else {
         return "<p><em>no target</em></p>".to_string();
     };
@@ -748,11 +1299,20 @@ fn render_file_code(node: &Node, canvas_dir: &Path) -> String {
         )
     };
 
-    let Ok(preview) = crate::file_read::preview(canvas_dir, target) else {
-        return fallback_link();
+    let (content, truncated) = match ctx.code_previews {
+        Some(map) => {
+            let Some(preview) = map.get(&node.id) else {
+                return fallback_link();
+            };
+            (preview.content.clone(), preview.truncated)
+        }
+        None => {
+            let Ok(preview) = crate::file_read::preview(ctx.canvas_dir, target) else {
+                return fallback_link();
+            };
+            (preview.content, preview.truncated)
+        }
     };
-    let truncated = preview.truncated;
-    let content = preview.content;
     let lang = node.lang.clone().unwrap_or_else(|| guess_lang(target));
     let class_attr = if lang.is_empty() {
         String::new()
@@ -836,7 +1396,7 @@ mod tests {
     }
 
     /// `build` with no real `canvas_dir` (nothing to resolve images/
-    /// `display="code"` targets against) and no `base_url` — what every
+    /// `display="code"` targets against) and no `links_base_url` — what every
     /// test that isn't specifically about those two features wants.
     fn build_site(c: &Canvas) -> SiteData {
         build(c, Path::new("/nonexistent-meshfox-test-dir"), None).0
@@ -1348,6 +1908,470 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    // TODO.canvas.md: asset_base bug — `staticgen` used to always resolve a
+    // node's own Markdown images against `canvas_dir`, even for a node
+    // whose body actually came from an `include` target living in a
+    // different directory (`Node::asset_base`/`cwd`) — so an image
+    // referenced relative to *that* target's own directory either resolved
+    // to the wrong file (one that coincidentally exists at the same
+    // relative path under `canvas_dir`) or didn't resolve at all. Two
+    // sibling temp dirs, each with their own same-named file with different
+    // content, proves which directory actually got read.
+    #[test]
+    fn an_image_inside_an_include_dump_resolves_against_its_own_asset_base_not_canvas_dir() {
+        let canvas_dir = temp_dir("asset-base-canvas-dir");
+        let include_dir = temp_dir("asset-base-include-dir");
+        write(&canvas_dir, "shot.png", b"wrong file: lives next to the canvas");
+        write(&include_dir, "shot.png", b"right file: lives next to the include target");
+
+        let mut c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n![Screenshot](shot.png)\n");
+        c.nodes[0].asset_base = Some(include_dir.to_string_lossy().into_owned());
+
+        let (_site, assets) = build(&c, &canvas_dir, None);
+        assert_eq!(assets.len(), 1, "{assets:?}");
+        assert_eq!(
+            fs::read(&assets[0].source).unwrap(),
+            b"right file: lives next to the include target",
+            "resolved against canvas_dir instead of the node's own asset_base"
+        );
+
+        fs::remove_dir_all(&canvas_dir).ok();
+        fs::remove_dir_all(&include_dir).ok();
+    }
+
+    // Since the two temp dirs above are siblings (neither nested under the
+    // other), `dest_rel` can't just be "relative to canvas_dir" for the
+    // asset_base case — falls back to a `_include-assets/`-namespaced path
+    // relative to the include's own directory instead (see `dest_rel_for`).
+    #[test]
+    fn an_asset_base_image_outside_canvas_dir_gets_a_namespaced_dest_rel() {
+        let canvas_dir = temp_dir("asset-base-dest-rel-canvas-dir");
+        let include_dir = temp_dir("asset-base-dest-rel-include-dir");
+        write(&include_dir, "shot.png", b"bytes");
+
+        let mut c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n![Screenshot](shot.png)\n");
+        c.nodes[0].asset_base = Some(include_dir.to_string_lossy().into_owned());
+
+        let (_site, assets) = build(&c, &canvas_dir, None);
+        assert_eq!(assets.len(), 1, "{assets:?}");
+        assert_eq!(assets[0].dest_rel, "_include-assets/shot.png");
+        // The ordinary canvas-relative fallback route can't serve this (it's
+        // confined to `canvas_dir`, and this asset lives outside it) — a
+        // worker-routed copy step needs `include_asset` instead, exactly the
+        // `dir`/`file` pair `GET /api/include-asset` expects.
+        assert_eq!(
+            assets[0].include_asset,
+            Some((include_dir.to_string_lossy().into_owned(), "shot.png".to_string()))
+        );
+
+        fs::remove_dir_all(&canvas_dir).ok();
+        fs::remove_dir_all(&include_dir).ok();
+    }
+
+    // The common real-world shape (`README.md`/`SPEC.md` includes in this
+    // very repo): the include target lives in the *same* directory as the
+    // primary canvas, or a subdirectory of it — `asset_base` is set, but
+    // `dest_rel` should stay a plain canvas-relative path, unnamespaced,
+    // exactly as if `asset_base` had never been introduced.
+    #[test]
+    fn an_asset_base_image_nested_under_canvas_dir_gets_a_plain_dest_rel() {
+        let canvas_dir = temp_dir("asset-base-nested-canvas-dir");
+        let include_dir = canvas_dir.join("included");
+        fs::create_dir_all(&include_dir).unwrap();
+        write(&include_dir, "shot.png", b"bytes");
+
+        let mut c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n![Screenshot](shot.png)\n");
+        c.nodes[0].asset_base = Some(include_dir.to_string_lossy().into_owned());
+
+        let (_site, assets) = build(&c, &canvas_dir, None);
+        assert_eq!(assets.len(), 1, "{assets:?}");
+        assert_eq!(assets[0].dest_rel, "included/shot.png");
+        // Nested under canvas_dir — the ordinary fallback route can serve
+        // it directly, no `/api/include-asset` round trip needed.
+        assert_eq!(assets[0].include_asset, None);
+
+        fs::remove_dir_all(&canvas_dir).ok();
+    }
+
+    // TODO.canvas.md: "Опция: копировать file-таргет в dist; canvas-таргет
+    // — ошибка" — `--copy-files`'s own core support, via
+    // `build_for_static_export(..., copy_files: true)`.
+    #[test]
+    fn copy_files_queues_a_plain_file_nodes_target_as_an_asset() {
+        let dir = temp_dir("copy-files-plain");
+        write(&dir, "report.pdf", b"not a real pdf, just bytes");
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Report\n<!-- meshfox:node id=\"f\" type=\"file\" -->\n\n[report](report.pdf)\n",
+        ));
+
+        let (site, assets, canvas_links) =
+            build_for_static_export(&c, &dir, &dir, "", None, None, true, false).unwrap();
+        assert_eq!(
+            site.find("f").unwrap().target.as_deref(),
+            Some("report.pdf")
+        );
+        assert!(canvas_links.is_empty(), "{canvas_links:?}");
+        assert_eq!(assets.len(), 1, "{assets:?}");
+        assert_eq!(assets[0].dest_rel, "report.pdf");
+        assert_eq!(
+            fs::read(&assets[0].source).unwrap(),
+            b"not a real pdf, just bytes"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // Regression test for a real bug, caught by hand rendering this repo's
+    // own README.md with `--copy-files --recursive`: `NodeView.target` was
+    // correctly rewritten, every file actually landed in `--out` — but the
+    // bundled `site-template/` never reads `target` at all, only
+    // `html_body` (the node's own rendered Markdown) — which was still
+    // going through the *old* `resolve_link_url`/`links_base_url` path,
+    // completely unaware `--copy-files` existed. Every generated page
+    // existed; nothing on the site actually linked to any of them.
+    // `links_base_url` set here specifically so the two paths' outputs
+    // provably differ if the fix ever regresses.
+    #[test]
+    fn copy_files_rewrites_the_visible_link_not_just_node_view_target() {
+        let dir = temp_dir("copy-files-visible-link");
+        write(&dir, "report.pdf", b"bytes");
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Report\n<!-- meshfox:node id=\"f\" type=\"file\" -->\n\n[report](report.pdf)\n",
+        ));
+
+        let (site, _assets, _canvas_links) = build_for_static_export(
+            &c,
+            &dir,
+            &dir,
+            "",
+            Some("https://example.com/repo"),
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+        let f = site.find("f").unwrap();
+        assert_eq!(f.target.as_deref(), Some("report.pdf"));
+        assert!(
+            f.html_body.contains("href=\"report.pdf\""),
+            "the visible link must match NodeView.target, not links_base_url: {}",
+            f.html_body
+        );
+        assert!(
+            !f.html_body.contains("https://example.com/repo"),
+            "{}",
+            f.html_body
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // Same regression, `--recursive` case: the visible link must point at
+    // the rendered nested page, not the old links_base_url-prefixed target.
+    #[test]
+    fn recursive_rewrites_the_visible_link_not_just_node_view_target() {
+        let dir = temp_dir("recursive-visible-link");
+        write(&dir, "other.canvas.md", b"# Other\n<!-- meshfox:node id=\"root\" -->\n");
+        write(&dir, "doc.canvas.md", b"unused: build() is given `c` directly, not read from disk");
+        let root_path = dir.join("doc.canvas.md");
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Other\n<!-- meshfox:node id=\"f\" type=\"file\" -->\n\n[other](other.canvas.md)\n",
+        ));
+
+        let (site, _assets, _canvas_links) = build_for_static_export(
+            &c,
+            &dir,
+            &root_path,
+            "",
+            Some("https://example.com/repo"),
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+        let f = site.find("f").unwrap();
+        assert_eq!(f.target.as_deref(), Some("other/index.html"));
+        assert!(
+            f.html_body.contains("href=\"other/index.html\""),
+            "{}",
+            f.html_body
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // User's own clarification: a `display="code"` target is already
+    // inlined into the HTML — copying it alongside would just be dead
+    // weight, nobody follows that link.
+    #[test]
+    fn copy_files_never_copies_a_display_code_targets_content() {
+        let dir = temp_dir("copy-files-display-code");
+        write(&dir, "snippet.txt", b"inlined already");
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Snippet\n<!-- meshfox:node id=\"f\" type=\"file\" display=\"code\" -->\n\n",
+            "[snippet](snippet.txt)\n",
+        ));
+
+        let (_site, assets, _canvas_links) =
+            build_for_static_export(&c, &dir, &dir, "", None, None, true, false).unwrap();
+        assert!(assets.is_empty(), "{assets:?}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // `--copy-files` only ever applies to a `file`-node's own target — a
+    // `link`-type node (external/preview reference) is left exactly as
+    // `resolve_link_url` already handles it, same as without the flag.
+    #[test]
+    fn copy_files_never_touches_a_link_type_nodes_target() {
+        let dir = temp_dir("copy-files-link-node");
+        write(&dir, "sibling.md", b"# irrelevant");
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Ref\n<!-- meshfox:node id=\"l\" type=\"link\" -->\n\n[sibling](sibling.md)\n",
+        ));
+
+        let (site, assets, _canvas_links) =
+            build_for_static_export(&c, &dir, &dir, "", None, None, true, false).unwrap();
+        assert_eq!(
+            site.find("l").unwrap().target.as_deref(),
+            Some("sibling.md")
+        );
+        assert!(assets.is_empty(), "{assets:?}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn copy_files_errors_on_a_canvas_md_target_instead_of_copying_it() {
+        let dir = temp_dir("copy-files-canvas-target");
+        write(&dir, "other.canvas.md", b"# Other\n<!-- meshfox:node id=\"root\" -->\n");
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Other\n<!-- meshfox:node id=\"f\" type=\"file\" -->\n\n[other](other.canvas.md)\n",
+        ));
+
+        let errors =
+            build_for_static_export(&c, &dir, &dir, "", None, None, true, false).unwrap_err();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].node_id, "f");
+        assert_eq!(errors[0].target, "other.canvas.md");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // Without `--copy-files` (plain `build`), a `.canvas.md` target is just
+    // an ordinary, untouched link — exactly today's pre-`--copy-files`
+    // behavior, not a new error mode for anyone who never passes the flag.
+    #[test]
+    fn without_copy_files_a_canvas_md_target_is_left_as_a_plain_link() {
+        let dir = temp_dir("no-copy-files-canvas-target");
+        write(&dir, "other.canvas.md", b"# Other\n<!-- meshfox:node id=\"root\" -->\n");
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Other\n<!-- meshfox:node id=\"f\" type=\"file\" -->\n\n[other](other.canvas.md)\n",
+        ));
+
+        let (site, assets) = build(&c, &dir, None);
+        assert_eq!(
+            site.find("f").unwrap().target.as_deref(),
+            Some("other.canvas.md")
+        );
+        assert!(assets.is_empty(), "{assets:?}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // TODO.canvas.md: "Опция рекурсивного рендеринга canvas-таргетов" —
+    // `--recursive`'s own core support (`copy_files: true, recursive: true`).
+    #[test]
+    fn recursive_rewrites_a_sibling_canvas_target_to_its_own_rendered_page() {
+        let dir = temp_dir("recursive-sibling");
+        write(&dir, "other.canvas.md", b"# Other\n<!-- meshfox:node id=\"root\" -->\n");
+        // `root_canvas_path` must exist on disk to canonicalize — a
+        // non-canonical fallback here would desync from `resolved` (always
+        // canonical, via `confine`) and spuriously hit the
+        // `external-pages/` fallback (see `canvas_link_subdir`'s own doc
+        // comment) even though `other.canvas.md` genuinely lives right next
+        // to it.
+        write(&dir, "doc.canvas.md", b"unused: build() is given `c` directly, not read from disk");
+        let root_path = dir.join("doc.canvas.md");
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Other\n<!-- meshfox:node id=\"f\" type=\"file\" -->\n\n[other](other.canvas.md)\n",
+        ));
+
+        let (site, _assets, canvas_links) =
+            build_for_static_export(&c, &dir, &root_path, "", None, None, true, true).unwrap();
+        assert_eq!(
+            site.find("f").unwrap().target.as_deref(),
+            Some("other/index.html")
+        );
+        assert_eq!(canvas_links.len(), 1, "{canvas_links:?}");
+        assert_eq!(canvas_links[0].subdir, "other");
+        assert_eq!(
+            canvas_links[0].resolved,
+            dir.canonicalize().unwrap().join("other.canvas.md")
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // `other.canvas.md#some-node` deep-links to a specific node — carried
+    // over as `#node-some-node`, matching the bundled template's own
+    // per-node anchor convention (`site-template/_macros.html.tera`'s
+    // `id="node-{{ n.id }}"`), not just dropped.
+    #[test]
+    fn recursive_carries_a_deep_link_fragment_over_as_a_node_anchor() {
+        let dir = temp_dir("recursive-fragment");
+        write(&dir, "other.canvas.md", b"# Other\n<!-- meshfox:node id=\"root\" -->\n");
+        write(&dir, "doc.canvas.md", b"unused: build() is given `c` directly, not read from disk");
+        let root_path = dir.join("doc.canvas.md");
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Other\n<!-- meshfox:node id=\"f\" type=\"file\" -->\n\n",
+            "[other](other.canvas.md#some-node)\n",
+        ));
+
+        let (site, _assets, _canvas_links) =
+            build_for_static_export(&c, &dir, &root_path, "", None, None, true, true).unwrap();
+        assert_eq!(
+            site.find("f").unwrap().target.as_deref(),
+            Some("other/index.html#node-some-node")
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // A link back to the root canvas itself (directly, or as the closing
+    // edge of a longer cycle) must resolve to wherever the root *actually*
+    // renders (`--out`'s own top level, `current_slot: ""`) — not to a
+    // nonexistent filename-derived subdirectory `canvas_link_subdir` would
+    // naively compute for it like any other target.
+    #[test]
+    fn recursive_a_link_back_to_the_root_canvas_resolves_to_the_out_root() {
+        let dir = temp_dir("recursive-root-cycle");
+        let root_path = dir.join("doc.canvas.md");
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Self\n<!-- meshfox:node id=\"f\" type=\"file\" -->\n\n[self](doc.canvas.md)\n",
+        ));
+        write(&dir, "doc.canvas.md", b"unused: build() is given `c` directly, not read from disk");
+
+        let (site, _assets, canvas_links) =
+            build_for_static_export(&c, &dir, &root_path, "", None, None, true, true).unwrap();
+        assert_eq!(
+            site.find("f").unwrap().target.as_deref(),
+            Some("./index.html")
+        );
+        assert_eq!(canvas_links[0].subdir, "");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // The same link, followed from a canvas already nested one level deep
+    // (`current_slot: "other"`) — the relative path back to the root needs
+    // an extra `../` to still land on `--out`'s own top level, not on
+    // `other/index.html` (its own page) or `other/../index.html` written
+    // out literally.
+    #[test]
+    fn recursive_a_link_back_to_the_root_from_a_nested_canvas_climbs_out_correctly() {
+        let dir = temp_dir("recursive-root-cycle-nested");
+        write(&dir, "doc.canvas.md", b"unused: build() is given `c` directly, not read from disk");
+        let root_path = dir.join("doc.canvas.md");
+        let c = canvas(concat!(
+            "# Other\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Back\n<!-- meshfox:node id=\"f\" type=\"file\" -->\n\n[back](doc.canvas.md)\n",
+        ));
+
+        let (site, _assets, _canvas_links) = build_for_static_export(
+            &c, &dir, &root_path, "other", None, None, true, true,
+        )
+        .unwrap();
+        assert_eq!(
+            site.find("f").unwrap().target.as_deref(),
+            Some("../index.html")
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // A canvas link is confined to *its own linking node's* directory, same
+    // boundary an image/asset reference already has (`crate::file_read::
+    // confine`, via `resolve_canvas_relative`) — a `../other.canvas.md` that
+    // would have to climb out of the linking canvas's own directory doesn't
+    // resolve there either, `--recursive` or not, so it's left as a plain,
+    // untouched link (the `None` branch of `resolve_file_target_for_copy`'s
+    // own match, same "leave it alone" outcome an out-of-bounds image gets)
+    // rather than either an error or a silently-broken rewritten href.
+    #[test]
+    fn recursive_a_canvas_target_outside_the_linking_nodes_own_directory_is_left_untouched() {
+        let root_dir = temp_dir("recursive-confinement-root");
+        let nested_dir = root_dir.join("nested");
+        fs::create_dir_all(&nested_dir).unwrap();
+        write(&root_dir, "doc.canvas.md", b"unused: build() is given `c` directly, not read from disk");
+        write(&root_dir, "sibling.canvas.md", b"# Sibling\n<!-- meshfox:node id=\"root\" -->\n");
+        let root_path = root_dir.join("doc.canvas.md");
+        // `c` here stands in for `nested/b.canvas.md`'s own resolved
+        // content — `canvas_dir` (`nested_dir`) is what confinement is
+        // checked against, matching its real location on disk.
+        let c = canvas(concat!(
+            "# B\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Escape\n<!-- meshfox:node id=\"f\" type=\"file\" -->\n\n",
+            "[sibling](../sibling.canvas.md)\n",
+        ));
+
+        let (site, _assets, canvas_links) = build_for_static_export(
+            &c, &nested_dir, &root_path, "nested", None, None, true, true,
+        )
+        .unwrap();
+        assert_eq!(
+            site.find("f").unwrap().target.as_deref(),
+            Some("../sibling.canvas.md"),
+            "escaping the linking node's own directory must leave the link untouched, not rewrite or error"
+        );
+        assert!(canvas_links.is_empty(), "{canvas_links:?}");
+
+        fs::remove_dir_all(&root_dir).ok();
+    }
+
+    #[test]
+    fn relative_slot_path_from_root_to_a_nested_slot_is_just_the_slot() {
+        assert_eq!(relative_slot_path("", "sub/other"), "sub/other");
+    }
+
+    #[test]
+    fn relative_slot_path_between_sibling_nested_slots_climbs_out_once() {
+        assert_eq!(relative_slot_path("sub/b", "sub/other"), "../other");
+    }
+
+    #[test]
+    fn relative_slot_path_from_a_nested_slot_to_root_climbs_out_fully() {
+        assert_eq!(relative_slot_path("sub/b", ""), "../..");
+    }
+
+    #[test]
+    fn relative_slot_path_between_identical_slots_is_dot() {
+        assert_eq!(relative_slot_path("a/b", "a/b"), ".");
+    }
+
+    #[test]
+    fn canvas_link_subdir_outside_the_root_dir_is_still_deterministic() {
+        let root_dir = temp_dir("canvas-link-subdir-root");
+        let outside = temp_dir("canvas-link-subdir-outside").join("other.canvas.md");
+        let a = canvas_link_subdir(&outside, &root_dir);
+        let b = canvas_link_subdir(&outside, &root_dir);
+        assert_eq!(a, b, "same inputs must give the same subdir every time");
+        assert!(a.starts_with("external-pages/"), "{a}");
+
+        fs::remove_dir_all(&root_dir).ok();
+        fs::remove_dir_all(outside.parent().unwrap()).ok();
+    }
+
     #[test]
     fn external_image_url_is_never_queued_as_an_asset() {
         let dir = temp_dir("image-external");
@@ -1502,7 +2526,7 @@ mod tests {
     }
 
     #[test]
-    fn base_url_prefixes_a_relative_link_left_uncopied() {
+    fn links_base_url_prefixes_a_relative_link_left_uncopied() {
         let dir = temp_dir("base-url-link");
         let c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n[LICENSE](./LICENSE)\n");
 
@@ -1520,7 +2544,7 @@ mod tests {
     }
 
     #[test]
-    fn base_url_never_touches_a_copied_image() {
+    fn links_base_url_never_touches_a_copied_image() {
         let dir = temp_dir("base-url-image");
         write(&dir, "shot.png", b"bytes");
         let c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n![Screenshot](shot.png)\n");
@@ -1540,7 +2564,7 @@ mod tests {
     }
 
     #[test]
-    fn base_url_never_touches_an_external_link() {
+    fn links_base_url_never_touches_an_external_link() {
         let dir = temp_dir("base-url-external");
         let c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n[meshfox](https://github.com/example/meshfox)\n");
 
@@ -1558,7 +2582,7 @@ mod tests {
     }
 
     #[test]
-    fn base_url_prefixes_a_link_type_nodes_target_too() {
+    fn links_base_url_prefixes_a_link_type_nodes_target_too() {
         let dir = temp_dir("base-url-link-node");
         let c = canvas(
             "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\

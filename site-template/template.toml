@@ -2,6 +2,13 @@
 # path (`--template`'s own directory + "template.toml"), never rendered or
 # copied into --out itself. Both keys are optional; see `meshfox static -h`.
 
+# This export's own canonical, absolute URL — required by `--sitemap`
+# (sitemap.xml's own <loc> prefix), and distinct from links_base_url below
+# (see TemplateConfig::base_url's own doc comment for why the two aren't
+# the same thing: this is where *this site* lives, not a fallback for
+# content that lives somewhere else).
+base_url = "https://meshfox.orofarne.net"
+
 # Prefixed onto a relative link/target `static` doesn't already copy into
 # --out (a plain Markdown link, or a `file`/`link` node's own target when
 # not display="code"). This repo's own canvases (README.md, examples/) get
@@ -9,7 +16,7 @@
 # leftover relative link (e.g. a plain [LICENSE](./LICENSE) reference) needs
 # to resolve back against the real repo instead of a 404 on whatever host
 # is serving this template's own output.
-base_url = "https://github.com/orofarne/meshfox/blob/main/"
+links_base_url = "https://github.com/orofarne/meshfox/blob/main/"
 
 # Same favicon set web/public/ ships for the main interactive UI (see
 # web/index.html) — copied here verbatim (they're plain assets, not

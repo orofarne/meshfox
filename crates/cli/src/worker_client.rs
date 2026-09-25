@@ -2,7 +2,7 @@
 //! always reach the worker selected or started by `coordinator::get_or_spawn`;
 //! this module never writes the primary canvas directly.
 
-use meshfox_core::{ExtraEdge, FileDisplay, NodeType};
+use meshfox_core::{Canvas, ExtraEdge, FileDisplay, NodeType};
 use meshfox_server::stream_exec::OutputStream;
 use std::collections::{HashMap, HashSet};
 
@@ -343,6 +343,109 @@ pub async fn put_canvas_raw(port: u16, text: &str) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     into_result(res).await
+}
+
+/// `GET /api/canvas` — the worker's own `include`-resolved tree (same
+/// `meshfox_core::include::resolve` the server already runs before serving
+/// this, plus constraint-status annotation — see `canvas_response` in
+/// `crates/server/src/lib.rs`), unlike `get_canvas_raw`'s unresolved text.
+/// A mutating client (the TUI) deliberately avoids this and resolves
+/// includes locally instead (see `get_canvas_raw`'s own doc comment) so it
+/// still knows which file an edit inside an include target should land in —
+/// a read-only export has no such concern, so `meshfox static` uses this
+/// directly instead of re-deriving the same resolved tree itself from a raw
+/// fetch plus a local `include::resolve` call.
+pub async fn get_canvas(port: u16) -> Result<Canvas, String> {
+    let res = reqwest::get(format!("{}/api/canvas", base_url(port)))
+        .await
+        .map_err(|e| e.to_string())?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        return Err(if text.is_empty() { status.to_string() } else { text });
+    }
+    res.json().await.map_err(|e| e.to_string())
+}
+
+#[derive(serde::Deserialize)]
+struct FileContentResponse {
+    content: String,
+    truncated: bool,
+}
+
+/// `GET /api/nodes/:id/file-content` — a `file`-type node's `display="code"`
+/// target, read fresh off disk by the worker and confined to the canvas's
+/// own directory (`crates/server/src/lib.rs::get_node_file_content`). Same
+/// route the web UI's `FileCodePreview` already fetches live from; `meshfox
+/// static`'s worker-routed path calls this once per such node ahead of
+/// `staticgen::build_with_code_previews` instead of reading the target off
+/// local disk itself.
+pub async fn get_node_file_content(port: u16, node_id: &str) -> Result<(String, bool), String> {
+    let mut url = node_url(port, node_id)?;
+    url.path_segments_mut()
+        .map_err(|_| "couldn't build the worker's file-content URL".to_string())?
+        .push("file-content");
+    let res = reqwest::get(url).await.map_err(|e| e.to_string())?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        return Err(if text.is_empty() { status.to_string() } else { text });
+    }
+    let body: FileContentResponse = res.json().await.map_err(|e| e.to_string())?;
+    Ok((body.content, body.truncated))
+}
+
+/// A confined file's raw bytes, off the worker's own static-asset fallback
+/// route (`serve_canvas_relative_file`/`serve_embedded` in
+/// `crates/server/src/lib.rs`, wired as the router's catch-all `fallback`) —
+/// the same route a live `meshfox view` tab already resolves a relative
+/// Markdown image/`file`-node link against. `path` is relative to the
+/// canvas's own directory, forward-slash-separated (`staticgen::Asset::
+/// dest_rel`'s own shape) — each segment is percent-encoded individually via
+/// `path_segments_mut`, same as `node_url`, so a path component with
+/// spaces/non-ASCII round-trips correctly. `meshfox static`'s worker-routed
+/// asset-copy step calls this once per `Asset` instead of `std::fs::read`ing
+/// `Asset::source` itself.
+pub async fn get_relative_file(port: u16, path: &str) -> Result<Vec<u8>, String> {
+    let mut url =
+        reqwest::Url::parse(&base_url(port)).map_err(|e| e.to_string())?;
+    url.path_segments_mut()
+        .map_err(|_| "couldn't build the worker's asset URL".to_string())?
+        .clear()
+        .extend(path.split('/'));
+    let res = reqwest::get(url).await.map_err(|e| e.to_string())?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        return Err(if text.is_empty() { status.to_string() } else { text });
+    }
+    res.bytes().await.map(|b| b.to_vec()).map_err(|e| e.to_string())
+}
+
+/// A confined file's raw bytes, off the worker's own `GET /api/include-asset
+/// ?dir=&file=` route (`crates/server/src/lib.rs::get_include_asset`) — the
+/// *only* worker route that can serve an asset whose real path lives outside
+/// `canvas_dir` (an image referenced from inside an `include`-dumped body
+/// whose own directory isn't nested under the primary canvas's own
+/// directory), since `get_relative_file`'s plain fallback route is confined
+/// to `canvas_dir` and can't reach it. `dir` must be exactly some node's own
+/// `Node::asset_base` string, unmodified — the server re-derives the
+/// document's current resolved tree and only serves `dir`s that are still
+/// one of its nodes' actual `asset_base`s (see that route's own doc
+/// comment), so a stale or hand-crafted `dir` 404s rather than reading
+/// arbitrary files. `staticgen::Asset::include_asset`, when set, is exactly
+/// this `(dir, file)` pair.
+pub async fn get_include_asset(port: u16, dir: &str, file: &str) -> Result<Vec<u8>, String> {
+    let mut url = reqwest::Url::parse(&format!("{}/api/include-asset", base_url(port)))
+        .map_err(|e| e.to_string())?;
+    url.query_pairs_mut().append_pair("dir", dir).append_pair("file", file);
+    let res = reqwest::get(url).await.map_err(|e| e.to_string())?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        return Err(if text.is_empty() { status.to_string() } else { text });
+    }
+    res.bytes().await.map(|b| b.to_vec()).map_err(|e| e.to_string())
 }
 
 /// One notification off `GET /api/watch` — mirrors

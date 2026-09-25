@@ -18,7 +18,7 @@ use meshfox_core::{
 };
 #[cfg(test)]
 use meshfox_core::{FenceAttrsPatch, NodeMeta};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
@@ -317,14 +317,16 @@ enum Command {
     /// rendered standalone) is rendered and written to `--out` at the same
     /// relative path minus `.tera`; every other file is copied verbatim
     /// (CSS, fonts, ...) — except `template.toml` itself, the template's
-    /// own config file (optional; a template with none gets an empty
-    /// `base_url` and no `icons`), read from `--template`'s own directory
+    /// own config file (optional; a template with none gets no
+    /// `base_url`/`links_base_url` and no `icons`), read from `--template`'s own directory
     /// and never copied to `--out`. A local image referenced from a node's
     /// Markdown body is copied alongside the output automatically; a
     /// `file`-type node's `display="code"` target is read once and inlined
-    /// into the HTML directly (nothing left to fetch once static). See
-    /// `site-template/` in this repo for a working example, including its
-    /// own `template.toml`.
+    /// into the HTML directly (nothing left to fetch once static). A plain
+    /// `file`-node target (not `display="code"`) is left as an unresolved
+    /// link unless `--copy-files` is passed — see that flag's own help.
+    /// See `site-template/` in this repo for a working example, including
+    /// its own `template.toml`.
     Static {
         #[command(flatten)]
         canvas: CanvasOpt,
@@ -338,6 +340,53 @@ enum Command {
         /// Overwrite an existing, non-empty `--out` directory.
         #[arg(long)]
         force: bool,
+        /// Copy a `file`-node's own target alongside the site (same
+        /// treatment a Markdown image already gets), rewriting the link to
+        /// point at the copy, for every `file` node whose rendered body
+        /// still carries a plain link to its target (not `display="code"`
+        /// — that's inlined already, nothing left to copy). Off by
+        /// default: unresolved, as-authored links are today's behavior,
+        /// unchanged unless this is passed. A target that resolves to a
+        /// `.canvas.md` file is refused instead of copied, unless
+        /// `--recursive` is also passed — copying an inert canvas source
+        /// file into `--out` wouldn't give a reader following the link a
+        /// rendered page.
+        #[arg(long)]
+        copy_files: bool,
+        /// Requires `--copy-files`. A `file`-node target that resolves to a
+        /// `.canvas.md` file is rendered as its own page of this same site
+        /// (its own worker, own template pass, own nested `--out`
+        /// directory — named after its path relative to the canvas this
+        /// export started from) instead of being refused; the link is
+        /// rewritten to point at that page. Followed transitively — a page
+        /// rendered this way can itself link to further canvases — with
+        /// each distinct canvas (by its real path on disk) rendered at
+        /// most once even if several nodes, in this canvas or any other one
+        /// reached this way, link to it; a cycle (A links to B, B links
+        /// back to A) is graceful, not an error — the back-link just
+        /// resolves to A's own already-rendered page.
+        #[arg(long)]
+        recursive: bool,
+        /// Write a `sitemap.xml` at the root of `--out`, listing every
+        /// rendered page (the root canvas's own, plus — with `--recursive`
+        /// — every nested canvas's). Requires `template.toml`'s own
+        /// `base_url` to be set (see `TemplateConfig::base_url`) — a
+        /// sitemap's `<loc>` has to be an absolute URL, and `--sitemap`
+        /// refuses to guess one.
+        #[arg(long)]
+        sitemap: bool,
+        /// Requires `--sitemap`. Each `<url>`'s `<lastmod>` is the owning
+        /// canvas file's own last commit date in git (`git log -1
+        /// --format=%cI`, relative to the canvas's own directory — same
+        /// mechanism `canvas_commit`/`meshfox_version` already use for the
+        /// template context), rather than left unset. Off by default: not
+        /// every exported canvas is necessarily in a git repository (a
+        /// temp-directory/CI-checkout export, say), and a file's git date
+        /// isn't necessarily closer to "when the content last really
+        /// changed" than the moment of export for every author's workflow
+        /// either.
+        #[arg(long)]
+        sitemap_git_dates: bool,
     },
     /// Experimental: export a canvas as a PDF, via a real (headless)
     /// Chrome/Chromium — a system install is used if one can be found
@@ -1144,9 +1193,22 @@ fn main() {
             template,
             out,
             force,
+            copy_files,
+            recursive,
+            sitemap,
+            sitemap_git_dates,
         } => {
             let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
-            static_cmd(&canvas_path, &template, &out, force)
+            static_cmd(
+                &canvas_path,
+                &template,
+                &out,
+                force,
+                copy_files,
+                recursive,
+                sitemap,
+                sitemap_git_dates,
+            )
         }
         Command::Pdf {
             canvas,
@@ -4292,10 +4354,23 @@ const TEMPLATE_CONFIG_FILE: &str = "template.toml";
 /// checked into the template alongside its own `.tera`/CSS files instead of
 /// repeated on every command line that uses it. Both are optional — a
 /// template with no `template.toml` at all gets `Default::default()`
-/// (no `base_url`, no `icons`), same as today's behavior before this file
-/// existed.
+/// (no `base_url`/`links_base_url`, no `icons`), same as today's behavior
+/// before this file existed.
 #[derive(Debug, Default, serde::Deserialize)]
 struct TemplateConfig {
+    /// The site's own canonical, absolute URL (e.g.
+    /// `https://example.com`, no trailing content path) — `--sitemap`'s
+    /// own `<loc>` prefix (`sitemap_xml`), required whenever `--sitemap` is
+    /// passed. Distinct from `links_base_url` below: this is *this
+    /// export's own* address, not a fallback for content that lives
+    /// somewhere else — the two commonly differ (this repo's own
+    /// `site-template/template.toml` points `base_url` at
+    /// `meshfox.orofarne.net`, the site itself, while `links_base_url`
+    /// points at GitHub, where its canvases' own plain-Markdown source
+    /// actually lives). Left as-is (`None`) when the template doesn't set
+    /// one — fine for a template that never passes `--sitemap`.
+    #[serde(default)]
+    base_url: Option<String>,
     /// Prefixed onto a relative link/target `static` doesn't already copy
     /// into `--out` (a plain Markdown link, or a `file`/`link` node's own
     /// target when not `display="code"`) — a local image and a
@@ -4304,9 +4379,9 @@ struct TemplateConfig {
     /// where the site's own root isn't the canvas's own directory, so a
     /// leftover relative reference should resolve against e.g. the
     /// original repo instead. Left as-is (`None`) when the template
-    /// doesn't set one.
+    /// doesn't set one. See `base_url` above for how this differs from it.
     #[serde(default)]
-    base_url: Option<String>,
+    links_base_url: Option<String>,
     /// `<link>` tags for the page's own icons (favicon, apple-touch-icon,
     /// ...) — exposed to every template as the `icons` context key so
     /// `index.html.tera` (or any other page) can render them itself; see
@@ -4339,7 +4414,8 @@ struct IconLink {
 }
 
 /// Reads `template_dir`'s own `template.toml`, if it has one — a template
-/// with none gets `TemplateConfig::default()` (no `base_url`, no `icons`),
+/// with none gets `TemplateConfig::default()` (no `base_url`/`links_base_url`,
+/// no `icons`),
 /// exactly today's behavior before this file existed. A `template.toml`
 /// that exists but fails to parse is a hard error (same "fail loud, don't
 /// silently fall back" stance every other malformed-input path in this CLI
@@ -4382,22 +4458,153 @@ fn canvas_git_commit(canvas_dir: &Path) -> Option<String> {
     }
 }
 
+/// `canvas_path`'s own last commit date in git, strict ISO 8601
+/// (`git log`'s `%cI` — the committer date, same format `<lastmod>` in a
+/// sitemap wants, per the sitemaps.org spec's W3C Datetime requirement) —
+/// `--sitemap-git-dates`' own per-page date, in place of the moment of
+/// export. `None` on anything that isn't a clean "yes, here's a date":
+/// `canvas_path` outside a git working tree, `git` itself not installed, or
+/// the file never committed (a freshly-added, still-untracked canvas) —
+/// same "no silent guess" stance `canvas_git_commit` already takes for the
+/// template context's own `canvas_commit`.
+fn canvas_git_lastmod(canvas_path: &Path) -> Option<String> {
+    // Canonicalize first, then use the *same* absolute path for both `-C`
+    // and the `--` pathspec below — git resolves a relative pathspec
+    // against its own current process cwd, not against `-C`'s target
+    // directory, so pairing an already-relative `canvas_path` (as given on
+    // the command line, for the root canvas — a nested one from
+    // `--recursive` is always already absolute, see `staticgen::confine`)
+    // with `-C canvas_dir` silently looks for `canvas_dir`'s own relative
+    // path *again*, relative to itself, and finds nothing — no error, just
+    // a wrong, empty answer. Absolute-vs-absolute for both sidesteps that
+    // mismatch entirely.
+    let canonical = canvas_path.canonicalize().ok()?;
+    let dir = canonical.parent()?;
+    let output = std::process::Command::new("git")
+        .args(["-C", &dir.to_string_lossy(), "log", "-1", "--format=%cI", "--"])
+        .arg(&canonical)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let date = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if date.is_empty() {
+        None
+    } else {
+        Some(date)
+    }
+}
+
+/// One `<url>` entry `--sitemap` will write — collected as `render_canvas_
+/// site` renders each canvas's own non-partial template outputs, one entry
+/// per rendered page (not per canvas: a template with more than one
+/// non-partial `*.tera` file renders more than one real page per canvas,
+/// same as `static_cmd`'s own file count already reflects).
+struct SitemapEntry {
+    /// This page's own output path, relative to `--out` itself (forward
+    /// slashes) — `sitemap_xml` joins it onto `base_url` for `<loc>`.
+    out_rel: String,
+    /// The canvas file this page was rendered *from* — `--sitemap-git-
+    /// dates`' own per-page `git log` target. Deliberately the source
+    /// canvas, not the `.tera` template file that rendered it: a reader
+    /// cares when the *content* last changed, and the template's own git
+    /// history has nothing to do with that.
+    canvas_path: PathBuf,
+}
+
+/// Renders `entries` into a `sitemap.xml` document (sitemaps.org's
+/// `urlset`/`url`/`loc`/`lastmod` schema) — `base_url` is required by the
+/// caller before this is ever called (a `<loc>` has to be an absolute URL).
+/// `git_dates`: look up each entry's own `<lastmod>` via `canvas_git_
+/// lastmod`; a `None` result (not in a git repo, `git` missing, uncommitted)
+/// just omits that one entry's `<lastmod>`, not the whole entry.
+fn sitemap_xml(entries: &[SitemapEntry], base_url: &str, git_dates: bool) -> String {
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n",
+    );
+    for entry in entries {
+        let loc = format!(
+            "{}/{}",
+            base_url.trim_end_matches('/'),
+            entry.out_rel.trim_start_matches('/')
+        );
+        xml.push_str("  <url>\n");
+        xml.push_str(&format!("    <loc>{}</loc>\n", xml_escape(&loc)));
+        if git_dates {
+            if let Some(lastmod) = canvas_git_lastmod(&entry.canvas_path) {
+                xml.push_str(&format!("    <lastmod>{}</lastmod>\n", xml_escape(&lastmod)));
+            }
+        }
+        xml.push_str("  </url>\n");
+    }
+    xml.push_str("</urlset>\n");
+    xml
+}
+
+/// The handful of characters XML requires escaped in text/attribute
+/// content — a `<loc>`/`<lastmod>` here is always something this process
+/// itself built (a URL join, a `git log` date), never raw user text, but
+/// escaping it anyway costs nothing and means one less thing to reason
+/// about if that ever changes.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Every `file`-node with `display="code"` in `canvas`, fetched through the
+/// worker at `port` one at a time (`worker_client::get_node_file_content`,
+/// `GET /api/nodes/:id/file-content` — same route/confinement/binary-sniff
+/// the web UI's own live preview already uses) instead of read off local
+/// disk. A node whose fetch fails (missing/unreadable/binary target) is
+/// left out of the map entirely — `staticgen::render_file_code` treats a
+/// missing entry the same way it treats a local `file_read::preview` `Err`:
+/// a plain fallback link, never a silent local-disk retry.
+async fn fetch_code_previews(
+    port: u16,
+    canvas: &Canvas,
+) -> HashMap<String, meshfox_core::staticgen::CodePreview> {
+    let mut previews = HashMap::new();
+    for node in &canvas.nodes {
+        if node.node_type != NodeType::File || node.display != Some(FileDisplay::Code) {
+            continue;
+        }
+        if let Ok((content, truncated)) = worker_client::get_node_file_content(port, &node.id).await
+        {
+            previews.insert(
+                node.id.clone(),
+                meshfox_core::staticgen::CodePreview { content, truncated },
+            );
+        }
+    }
+    previews
+}
+
 /// Every `node` subcommand's last step before handing a patch back to be
 /// written: make sure it still parses — the same validate-before-commit
 /// shape every mutating `/api/nodes*` server handler uses.
-fn static_cmd(canvas_path: &Path, template_dir: &Path, out_dir: &Path, force: bool) {
-    let raw = read_raw_or_exit(canvas_path);
-    let canvas = Canvas::from_markdown(&raw).unwrap_or_else(|e| {
-        eprintln!("failed to parse {}: {e}", canvas_path.display());
+#[allow(clippy::too_many_arguments)]
+fn static_cmd(
+    canvas_path: &Path,
+    template_dir: &Path,
+    out_dir: &Path,
+    force: bool,
+    copy_files: bool,
+    recursive: bool,
+    sitemap: bool,
+    sitemap_git_dates: bool,
+) {
+    if recursive && !copy_files {
+        eprintln!("meshfox static: --recursive requires --copy-files");
         std::process::exit(1);
-    });
-    // Same as `validate`/`view`: splice in `include` nodes so the exported
-    // site shows the fully composed document, not the bare link `run`
-    // sees in the raw file.
-    let canvas = meshfox_core::include::resolve(&canvas, canvas_path).unwrap_or_else(|e| {
-        eprintln!("meshfox static: {}: {e}", canvas_path.display());
+    }
+    if sitemap_git_dates && !sitemap {
+        eprintln!("meshfox static: --sitemap-git-dates requires --sitemap");
         std::process::exit(1);
-    });
+    }
 
     if !template_dir.is_dir() {
         eprintln!(
@@ -4407,6 +4614,9 @@ fn static_cmd(canvas_path: &Path, template_dir: &Path, out_dir: &Path, force: bo
         std::process::exit(1);
     }
 
+    // Only `--out` itself (the root canvas's own output) is checked —
+    // everything `--recursive` renders below it is a brand-new path this
+    // very run creates, nothing pre-existing to clobber.
     let out_non_empty = out_dir.exists()
         && std::fs::read_dir(out_dir)
             .map(|mut d| d.next().is_some())
@@ -4420,33 +4630,21 @@ fn static_cmd(canvas_path: &Path, template_dir: &Path, out_dir: &Path, force: bo
     }
 
     let config = load_template_config(template_dir);
-
-    // Same "bare filename has an empty, not missing, parent" edge case
-    // `meshfox_server::get_node_file_content` handles — a canvas passed as
-    // just `README.md` (no directory component) resolves relative images/
-    // `display="code"` targets against the current directory.
-    let canvas_dir = canvas_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let (site, assets) =
-        meshfox_core::staticgen::build(&canvas, canvas_dir, config.base_url.as_deref());
-    let mut context = tera::Context::new();
-    context.insert("site", &site);
-    context.insert("icons", &config.icons);
-    // `meshfox_version` is always set (same string `--version` prints —
-    // whichever binary is running this export); `canvas_commit` is the
-    // canvas's own repo HEAD, short form, and `None` when `canvas_dir` isn't
-    // inside a git working tree — a template decides for itself whether to
-    // show either at all.
-    context.insert("meshfox_version", VERSION);
-    context.insert("canvas_commit", &canvas_git_commit(canvas_dir));
+    if sitemap && config.base_url.is_none() {
+        eprintln!(
+            "meshfox static: --sitemap needs an absolute base_url — set it in {}'s own template.toml",
+            template_dir.display()
+        );
+        std::process::exit(1);
+    }
 
     // A proper glob-registered `Tera` instance, not a one-off render per
     // file: a template needs cross-file `{% import %}` to define the
     // canvas tree's recursive rendering macro just once (see
     // `site-template/_macros.html.tera`) rather than duplicating it inline
-    // in every page.
+    // in every page. Loaded once and shared across every canvas
+    // `--recursive` renders — same template for the whole site, not
+    // reloaded per nested page.
     let glob = format!("{}/**/*.tera", template_dir.display());
     let tera = tera::Tera::new(&glob).unwrap_or_else(|e| {
         eprintln!(
@@ -4456,48 +4654,33 @@ fn static_cmd(canvas_path: &Path, template_dir: &Path, out_dir: &Path, force: bo
         std::process::exit(1);
     });
 
-    let mut count = 0;
-    for name in tera.get_template_names() {
-        // A `_`-prefixed basename is a partial — imported by another
-        // template (`{% import "_macros.html.tera" as macros %}`), never
-        // rendered as its own output page. Same convention Jekyll/
-        // Eleventy use for includes/partials.
-        let is_partial = Path::new(name)
-            .file_name()
-            .and_then(|f| f.to_str())
-            .is_some_and(|b| b.starts_with('_'));
-        if is_partial {
-            continue;
-        }
-        let rendered = tera.render(name, &context).unwrap_or_else(|e| {
-            eprintln!("meshfox static: failed to render {name}: {e}");
-            std::process::exit(1);
-        });
-        write_output_file(
-            &out_dir.join(Path::new(name).with_extension("")),
-            rendered.as_bytes(),
-        )
-        .unwrap_or_else(|e| {
-            eprintln!("meshfox static: {e}");
-            std::process::exit(1);
-        });
-        count += 1;
-    }
-
-    count += copy_template_assets(template_dir, template_dir, out_dir).unwrap_or_else(|e| {
-        eprintln!("meshfox static: {e}");
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+        eprintln!("meshfox static: failed to start a Tokio runtime: {e}");
         std::process::exit(1);
     });
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+    let mut sitemap_entries: Vec<SitemapEntry> = Vec::new();
+    let mut count = runtime.block_on(render_canvas_site(
+        canvas_path.to_path_buf(),
+        canvas_path.to_path_buf(),
+        out_dir.to_path_buf(),
+        String::new(),
+        template_dir,
+        &tera,
+        &config,
+        copy_files,
+        recursive,
+        &mut visited,
+        &mut sitemap_entries,
+    ));
 
-    for asset in &assets {
-        let bytes = std::fs::read(&asset.source).unwrap_or_else(|e| {
-            eprintln!(
-                "meshfox static: failed to read {}: {e}",
-                asset.source.display()
-            );
-            std::process::exit(1);
-        });
-        write_output_file(&out_dir.join(&asset.dest_rel), &bytes).unwrap_or_else(|e| {
+    if sitemap {
+        let base_url = config
+            .base_url
+            .as_deref()
+            .expect("checked non-None above");
+        let xml = sitemap_xml(&sitemap_entries, base_url, sitemap_git_dates);
+        write_output_file(&out_dir.join("sitemap.xml"), xml.as_bytes()).unwrap_or_else(|e| {
             eprintln!("meshfox static: {e}");
             std::process::exit(1);
         });
@@ -4508,6 +4691,219 @@ fn static_cmd(canvas_path: &Path, template_dir: &Path, out_dir: &Path, force: bo
         "meshfox static: wrote {count} file(s) to {}",
         out_dir.display()
     );
+}
+
+/// Renders one canvas's own `SiteData` (worker-routed — see
+/// `worker_client::get_canvas`'s own doc comment) into `out_dir`, then —
+/// with `--recursive` — does the same for every `.canvas.md` `file`-node
+/// target it discovered along the way, into a nested `out_dir` of its own
+/// (`top_out_dir.join(&link.subdir)` — `link.subdir` already computed by
+/// `staticgen::build_for_static_export` relative to the *root* canvas's own
+/// position, not this canvas's — see `staticgen::CanvasLinkTarget`'s own
+/// doc comment for why that has to be a global, not a per-parent, slot).
+/// `visited` is the one thing shared, by mutable reference, across the
+/// *whole* recursive export — canonicalized canvas paths already rendered
+/// (or in the middle of being rendered further up the call stack), so a
+/// cycle (A links to B, B links back to A) renders each canvas exactly
+/// once rather than looping forever; a target already in `visited` returns
+/// `0` immediately, doing no work (its link already points at wherever it
+/// really rendered — `staticgen` computed that independently of whether
+/// this call happens to be the first or the tenth to reach it).
+///
+/// Returns the number of files written (this canvas's own, plus every
+/// nested one's, recursively) — `static_cmd`'s own final count.
+///
+/// A boxed, manually-recursive `async fn` (no `async-recursion`-style macro
+/// in this workspace) rather than a loop/worklist: `--recursive` is a tree
+/// walk with real per-canvas state (its own worker, own `SiteData`, own
+/// `--out` subtree) that reads naturally as "render this, then render what
+/// it points to," and Rust's own recursive-`async fn` size restriction is
+/// the only reason this needs `Pin<Box<..>>` at all — the recursion itself
+/// isn't otherwise unusual.
+#[allow(clippy::too_many_arguments)]
+fn render_canvas_site<'a>(
+    canvas_path: PathBuf,
+    // Fixed for the whole recursive export — this call's own canvas's path
+    // for the top-level call, unchanged on every further recursive call
+    // (never re-derived from `canvas_path`, which *does* change per call —
+    // see `staticgen::CanvasLinkTarget`'s own doc comment for why every
+    // canvas needs the same, single root to compute its own `--out`
+    // position against, not whichever canvas happens to link to it).
+    root_canvas_path: PathBuf,
+    top_out_dir: PathBuf,
+    current_slot: String,
+    template_dir: &'a Path,
+    tera: &'a tera::Tera,
+    config: &'a TemplateConfig,
+    copy_files: bool,
+    recursive: bool,
+    visited: &'a mut HashSet<PathBuf>,
+    sitemap_entries: &'a mut Vec<SitemapEntry>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = usize> + 'a>> {
+    Box::pin(async move {
+        let canonical = canvas_path
+            .canonicalize()
+            .unwrap_or_else(|_| canvas_path.clone());
+        if !visited.insert(canonical) {
+            return 0;
+        }
+        let out_dir = if current_slot.is_empty() {
+            top_out_dir.clone()
+        } else {
+            top_out_dir.join(&current_slot)
+        };
+
+        let port = coordinator::get_or_spawn(&canvas_path).await.unwrap_or_else(|e| {
+            eprintln!(
+                "meshfox static: failed to start or reach the worker for {}: {e}",
+                canvas_path.display()
+            );
+            std::process::exit(1);
+        });
+        let canvas = worker_client::get_canvas(port).await.unwrap_or_else(|e| {
+            eprintln!(
+                "meshfox static: failed to read {} through the worker: {e}",
+                canvas_path.display()
+            );
+            std::process::exit(1);
+        });
+
+        // Same "bare filename has an empty, not missing, parent" edge case
+        // `meshfox_server::get_node_file_content` handles — a canvas passed
+        // as just `README.md` (no directory component) resolves relative
+        // images/`display="code"` targets against the current directory.
+        let canvas_dir = canvas_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let code_previews = fetch_code_previews(port, &canvas).await;
+        let (site, assets, canvas_links) = meshfox_core::staticgen::build_for_static_export(
+            &canvas,
+            canvas_dir,
+            &root_canvas_path,
+            &current_slot,
+            config.links_base_url.as_deref(),
+            Some(&code_previews),
+            copy_files,
+            recursive,
+        )
+        .unwrap_or_else(|errors| {
+            for e in &errors {
+                eprintln!("meshfox static: {e}");
+            }
+            std::process::exit(1);
+        });
+
+        let mut context = tera::Context::new();
+        context.insert("site", &site);
+        context.insert("icons", &config.icons);
+        // `meshfox_version` is always set (same string `--version` prints —
+        // whichever binary is running this export); `canvas_commit` is the
+        // canvas's own repo HEAD, short form, and `None` when `canvas_dir`
+        // isn't inside a git working tree — a template decides for itself
+        // whether to show either at all.
+        context.insert("meshfox_version", VERSION);
+        context.insert("canvas_commit", &canvas_git_commit(canvas_dir));
+
+        let mut count = 0;
+        for name in tera.get_template_names() {
+            // A `_`-prefixed basename is a partial — imported by another
+            // template (`{% import "_macros.html.tera" as macros %}`),
+            // never rendered as its own output page. Same convention
+            // Jekyll/Eleventy use for includes/partials.
+            let is_partial = Path::new(name)
+                .file_name()
+                .and_then(|f| f.to_str())
+                .is_some_and(|b| b.starts_with('_'));
+            if is_partial {
+                continue;
+            }
+            let rendered = tera.render(name, &context).unwrap_or_else(|e| {
+                eprintln!("meshfox static: failed to render {name}: {e}");
+                std::process::exit(1);
+            });
+            let page_rel = Path::new(name).with_extension("");
+            write_output_file(&out_dir.join(&page_rel), rendered.as_bytes()).unwrap_or_else(
+                |e| {
+                    eprintln!("meshfox static: {e}");
+                    std::process::exit(1);
+                },
+            );
+            count += 1;
+            let out_rel = if current_slot.is_empty() {
+                page_rel.to_string_lossy().replace('\\', "/")
+            } else {
+                format!("{current_slot}/{}", page_rel.to_string_lossy().replace('\\', "/"))
+            };
+            sitemap_entries.push(SitemapEntry {
+                out_rel,
+                canvas_path: canvas_path.clone(),
+            });
+        }
+
+        // Every nested canvas's own render gets its own full copy of the
+        // template's static assets, not a shared/relative-linked one —
+        // simplest correct thing regardless of nesting depth (a relative
+        // `./style.css`-style reference in a template stays correct from
+        // any nested `--out` subdirectory this way), at the cost of some
+        // duplicated bytes on disk for a deeply cross-linked set of
+        // canvases. `--recursive` is still experimental; worth revisiting
+        // if that turns out to matter in practice.
+        count += copy_template_assets(template_dir, template_dir, &out_dir).unwrap_or_else(|e| {
+            eprintln!("meshfox static: {e}");
+            std::process::exit(1);
+        });
+
+        for asset in &assets {
+            // Worker-routed, not `std::fs::read(&asset.source)`: the same
+            // bytes either way (the worker reads fresh off disk too, no
+            // in-memory staleness risk for file *content* the way there is
+            // for canvas *text* — see `worker_client::get_relative_file`'s
+            // own doc comment), but this way nothing in `meshfox static`
+            // reads the canvas directory directly at all any more.
+            // `include_asset`, when set, means `asset.source` lives outside
+            // `canvas_dir` entirely (an image from inside an `include`-
+            // dumped body — see `staticgen::Asset::include_asset`'s own doc
+            // comment) — the plain fallback route can't reach it at all
+            // (confined to `canvas_dir`), so this goes through
+            // `GET /api/include-asset` instead.
+            let result = match &asset.include_asset {
+                Some((dir, file)) => worker_client::get_include_asset(port, dir, file).await,
+                None => worker_client::get_relative_file(port, &asset.dest_rel).await,
+            };
+            let bytes = result.unwrap_or_else(|e| {
+                eprintln!(
+                    "meshfox static: failed to read {} through the worker: {e}",
+                    asset.dest_rel
+                );
+                std::process::exit(1);
+            });
+            write_output_file(&out_dir.join(&asset.dest_rel), &bytes).unwrap_or_else(|e| {
+                eprintln!("meshfox static: {e}");
+                std::process::exit(1);
+            });
+            count += 1;
+        }
+
+        for link in &canvas_links {
+            count += render_canvas_site(
+                link.resolved.clone(),
+                root_canvas_path.clone(),
+                top_out_dir.clone(),
+                link.subdir.clone(),
+                template_dir,
+                tera,
+                config,
+                copy_files,
+                recursive,
+                visited,
+                sitemap_entries,
+            )
+            .await;
+        }
+
+        count
+    })
 }
 
 /// `out`'s default (`--out` omitted): `canvas_path`'s own filename with its

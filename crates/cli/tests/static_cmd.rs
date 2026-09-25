@@ -134,7 +134,7 @@ fn recursive_macro_partial_is_imported_but_never_rendered_as_its_own_page() {
 }
 
 #[test]
-fn template_toml_supplies_base_url_and_icons_but_is_never_copied_to_out() {
+fn template_toml_supplies_links_base_url_and_icons_but_is_never_copied_to_out() {
     let template_dir = unique_dir("template-config");
     write_file(
         &template_dir.join("index.html.tera"),
@@ -142,7 +142,7 @@ fn template_toml_supplies_base_url_and_icons_but_is_never_copied_to_out() {
     );
     write_file(
         &template_dir.join("template.toml"),
-        "base_url = \"https://example.com/repo\"\n\n[[icons]]\nrel = \"icon\"\nhref = \"favicon.ico\"\n",
+        "links_base_url = \"https://example.com/repo\"\n\n[[icons]]\nrel = \"icon\"\nhref = \"favicon.ico\"\n",
     );
     // A real (if tiny) asset `icons` points at — proves `template.toml`
     // itself doesn't need to be the only new file in the template dir for
@@ -153,10 +153,11 @@ fn template_toml_supplies_base_url_and_icons_but_is_never_copied_to_out() {
     );
 
     let canvas_path = unique_dir("canvas-config").join("doc.canvas.md");
-    // A plain Markdown link in the root's own body — the kind `base_url`
-    // actually prefixes (see meshfox_core::staticgen's own doc comment); a
-    // literal `<a>` written directly in a template's own HTML never goes
-    // through that resolution at all, so it wouldn't exercise this.
+    // A plain Markdown link in the root's own body — the kind
+    // `links_base_url` actually prefixes (see meshfox_core::staticgen's own
+    // doc comment); a literal `<a>` written directly in a template's own
+    // HTML never goes through that resolution at all, so it wouldn't
+    // exercise this.
     write_file(&canvas_path, "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n[LICENSE](./LICENSE)\n");
 
     let out_dir = unique_dir("out-config");
@@ -177,7 +178,7 @@ fn template_toml_supplies_base_url_and_icons_but_is_never_copied_to_out() {
         index.contains(r#"<link rel="icon" href="favicon.ico">"#),
         "{index}"
     );
-    // base_url from template.toml, not a CLI flag (static no longer has one).
+    // links_base_url from template.toml, not a CLI flag (static has no such flag).
     assert!(
         index.contains(r#"href="https://example.com/repo/LICENSE""#),
         "{index}"
@@ -201,7 +202,7 @@ fn template_toml_supplies_base_url_and_icons_but_is_never_copied_to_out() {
 fn a_template_with_no_template_toml_gets_an_empty_config() {
     // Same as this file's other fixtures (no template.toml at all) — must
     // keep working exactly as before this file existed: empty `icons`,
-    // no `base_url` prefixing.
+    // no `links_base_url` prefixing.
     let template_dir = unique_dir("template-no-config");
     write_file(
         &template_dir.join("index.html.tera"),
@@ -274,5 +275,189 @@ fn refuses_to_clobber_a_non_empty_out_dir_without_force() {
 
     let _ = std::fs::remove_dir_all(&template_dir);
     let _ = std::fs::remove_dir_all(canvas_path.parent().unwrap());
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+// TODO.canvas.md: "Опция sitemap.xml (+ даты обновления из git)" —
+// `--sitemap`'s own end-to-end behavior (unit coverage lives in
+// `meshfox_core::staticgen` for everything upstream of the CLI; `sitemap.xml`
+// itself is generated entirely in `crates/cli/src/main.rs`, so it only has
+// a CLI-level test to exercise it at all).
+#[test]
+fn sitemap_lists_the_rendered_page_with_an_absolute_url() {
+    let template_dir = unique_dir("template-sitemap");
+    write_file(&template_dir.join("index.html.tera"), "{{ site.title }}");
+    write_file(
+        &template_dir.join("template.toml"),
+        "base_url = \"https://example.com/repo\"\n",
+    );
+
+    let canvas_path = unique_dir("canvas-sitemap").join("doc.canvas.md");
+    write_file(&canvas_path, FIXTURE_CANVAS);
+
+    let out_dir = unique_dir("out-sitemap");
+
+    let status = meshfox()
+        .arg("static")
+        .arg(&canvas_path)
+        .arg("--template")
+        .arg(&template_dir)
+        .arg("--out")
+        .arg(&out_dir)
+        .arg("--sitemap")
+        .status()
+        .expect("failed to run meshfox");
+    assert!(status.success());
+
+    let sitemap = std::fs::read_to_string(out_dir.join("sitemap.xml")).unwrap();
+    assert!(
+        sitemap.contains("<loc>https://example.com/repo/index.html</loc>"),
+        "{sitemap}"
+    );
+    assert!(
+        !sitemap.contains("<lastmod>"),
+        "no --sitemap-git-dates means no <lastmod> at all: {sitemap}"
+    );
+
+    let _ = std::fs::remove_dir_all(&template_dir);
+    let _ = std::fs::remove_dir_all(canvas_path.parent().unwrap());
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+#[test]
+fn sitemap_refuses_to_run_without_a_base_url() {
+    let template_dir = unique_dir("template-sitemap-no-base-url");
+    write_file(&template_dir.join("index.html.tera"), "{{ site.title }}");
+
+    let canvas_path = unique_dir("canvas-sitemap-no-base-url").join("doc.canvas.md");
+    write_file(&canvas_path, FIXTURE_CANVAS);
+
+    let out_dir = unique_dir("out-sitemap-no-base-url");
+
+    let status = meshfox()
+        .arg("static")
+        .arg(&canvas_path)
+        .arg("--template")
+        .arg(&template_dir)
+        .arg("--out")
+        .arg(&out_dir)
+        .arg("--sitemap")
+        .status()
+        .expect("failed to run meshfox");
+    assert!(!status.success());
+    assert!(
+        !out_dir.exists() || std::fs::read_dir(&out_dir).unwrap().next().is_none(),
+        "a refused run shouldn't have written anything"
+    );
+
+    let _ = std::fs::remove_dir_all(&template_dir);
+    let _ = std::fs::remove_dir_all(canvas_path.parent().unwrap());
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+#[test]
+fn sitemap_git_dates_refuses_to_run_without_sitemap() {
+    let template_dir = unique_dir("template-sitemap-git-dates-alone");
+    write_file(&template_dir.join("index.html.tera"), "{{ site.title }}");
+    write_file(
+        &template_dir.join("template.toml"),
+        "base_url = \"https://example.com/repo\"\n",
+    );
+
+    let canvas_path = unique_dir("canvas-sitemap-git-dates-alone").join("doc.canvas.md");
+    write_file(&canvas_path, FIXTURE_CANVAS);
+
+    let out_dir = unique_dir("out-sitemap-git-dates-alone");
+
+    let status = meshfox()
+        .arg("static")
+        .arg(&canvas_path)
+        .arg("--template")
+        .arg(&template_dir)
+        .arg("--out")
+        .arg(&out_dir)
+        .arg("--sitemap-git-dates")
+        .status()
+        .expect("failed to run meshfox");
+    assert!(!status.success());
+
+    let _ = std::fs::remove_dir_all(&template_dir);
+    let _ = std::fs::remove_dir_all(canvas_path.parent().unwrap());
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+#[test]
+fn sitemap_git_dates_sets_lastmod_from_the_canvass_own_commit_date() {
+    let template_dir = unique_dir("template-sitemap-git-dates");
+    write_file(&template_dir.join("index.html.tera"), "{{ site.title }}");
+    write_file(
+        &template_dir.join("template.toml"),
+        "base_url = \"https://example.com/repo\"\n",
+    );
+
+    // A throwaway git repo, committed once, so `git log` has exactly one,
+    // known commit date to check `<lastmod>` against — proves the fix for
+    // a real bug caught by hand (pairing `-C <dir>` with a pathspec that's
+    // relative to the *original* cwd, not to `<dir>`, silently finds no
+    // history at all rather than erroring — see `canvas_git_lastmod`'s own
+    // doc comment).
+    let repo_dir = unique_dir("canvas-sitemap-git-dates-repo");
+    let canvas_path = repo_dir.join("doc.canvas.md");
+    write_file(&canvas_path, FIXTURE_CANVAS);
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .current_dir(&repo_dir)
+            .args(args)
+            .status()
+            .expect("failed to run git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["add", "doc.canvas.md"]);
+    // `--date=` alone only sets the *author* date — `canvas_git_lastmod`
+    // reads `%cI`, the *committer* date, which `git commit` otherwise
+    // always stamps as "now" regardless of `--date`; `GIT_COMMITTER_DATE`
+    // is the only way to pin that one too.
+    let status = Command::new("git")
+        .current_dir(&repo_dir)
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "add doc.canvas.md",
+            "--date=2020-01-02T03:04:05+00:00",
+        ])
+        .env("GIT_COMMITTER_DATE", "2020-01-02T03:04:05+00:00")
+        .status()
+        .expect("failed to run git commit");
+    assert!(status.success(), "git commit failed");
+
+    let out_dir = unique_dir("out-sitemap-git-dates");
+
+    let status = meshfox()
+        .arg("static")
+        .arg(&canvas_path)
+        .arg("--template")
+        .arg(&template_dir)
+        .arg("--out")
+        .arg(&out_dir)
+        .arg("--sitemap")
+        .arg("--sitemap-git-dates")
+        .status()
+        .expect("failed to run meshfox");
+    assert!(status.success());
+
+    let sitemap = std::fs::read_to_string(out_dir.join("sitemap.xml")).unwrap();
+    assert!(
+        sitemap.contains("<lastmod>2020-01-02T03:04:05"),
+        "{sitemap}"
+    );
+
+    let _ = std::fs::remove_dir_all(&template_dir);
+    let _ = std::fs::remove_dir_all(&repo_dir);
     let _ = std::fs::remove_dir_all(&out_dir);
 }

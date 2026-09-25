@@ -622,16 +622,18 @@ On the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName
 
 Renders a canvas's node graph — boxes, tags, cached output, and every structural/`meshfox:edge` connection — as a plain static HTML/CSS/SVG site (no JS, no live server), through a user-supplied [Tera](https://keats.github.io/tera/) template: every `*.tera` file in `--template` is rendered with the canvas's data (context key `site`) and written to `--out` at the same relative path minus `.tera`; everything else in the template directory is copied verbatim (CSS, fonts, images, ...). [`site-template/`](./site-template) in this repo is a real, working template (used for the example below) that also happens to be a decent way to publish a canvas's README as a project page.
 
-A template's own settings live in an optional `template.toml` right in its own directory (see [`site-template/template.toml`](./site-template/template.toml)) rather than as `static` command-line flags — they're a property of *that template*, not something to repeat on every invocation: `base_url`, prefixed onto a relative link/target the command doesn't already copy into `--out`; and `icons`, a list of `<link rel="..." href="...">` tags (exposed to every template as the `icons` context key) for the page's own favicon/apple-touch-icon set. `template.toml` itself is read, never rendered or copied into `--out`. A template with none gets an empty config — no `base_url` prefixing, no icon tags — same as before this file existed.
+A template's own settings live in an optional `template.toml` right in its own directory (see [`site-template/template.toml`](./site-template/template.toml)) rather than as `static` command-line flags — they're a property of *that template*, not something to repeat on every invocation: `base_url`, this export's own canonical URL (`--sitemap`'s own `<loc>` prefix, below); `links_base_url`, prefixed onto a relative link/target the command doesn't already copy into `--out` (distinct from `base_url` — this repo's own [`site-template/template.toml`](./site-template/template.toml) points `base_url` at `meshfox.orofarne.net`, the site itself, and `links_base_url` at GitHub, where its canvases' own plain-Markdown source actually lives); and `icons`, a list of `<link rel="..." href="...">` tags (exposed to every template as the `icons` context key) for the page's own favicon/apple-touch-icon set. `template.toml` itself is read, never rendered or copied into `--out`. A template with none gets an empty config — no `base_url`/`links_base_url` prefixing, no icon tags — same as before this file existed.
+
+`--copy-files` copies a `file`-node's own target alongside the site instead of leaving it an unresolved link; `--recursive` (needs `--copy-files`) follows a `.canvas.md` target transitively, rendering it as its own page of the same site rather than refusing it; `--sitemap` (needs `template.toml`'s own `base_url`) writes a `sitemap.xml` listing every rendered page, and `--sitemap-git-dates` (needs `--sitemap`) sources each page's `<lastmod>` from its own canvas file's last commit date in git rather than leaving it unset. See each flag's own `-h` text below for the full story — this repo's own [`scripts/build-site.sh`](./scripts/build-site.sh) (the Cloudflare Pages build command for this same README, published at `meshfox.orofarne.net`) uses all four together.
 
 ```bash name="static-help" cache
 meshfox static -h
 ```
-<!-- meshfox:output name="static-help" -->
+<!-- meshfox:output name="static-help" hash="4bb2cc22" -->
 ```text
-exit code: 0
+exit code: 0 · 21ms
 
-Experimental: export a canvas as a static site. Resolves includes (same as `validate`/`view`), turns the canvas's node tree into a recursive `SiteData` (context key `site`) and hands it to a user-supplied Tera template. A node with no real, authored `x`/`y`/`width`/`height` gets no computed position at all — the template renders it as an ordinary nested HTML element and the *browser* lays it out and sizes it from its real content (no pre-computed/estimated pixels to get wrong); a node that does have all four real values keeps rendering at exactly that authored pixel position. A structural (parent/child) connector between two flow-positioned nodes is drawn in pure CSS (they're always DOM-adjacent); everything else — a `meshfox:edge` cross-reference, or a structural edge touching a real-positioned node — is left for a small non-interactive JS pass in the template to measure and draw. Every `*.tera` file in `--template` (except one whose basename starts with `_`, a partial meant to be `{% import %}`ed rather than rendered standalone) is rendered and written to `--out` at the same relative path minus `.tera`; every other file is copied verbatim (CSS, fonts, ...) — except `template.toml` itself, the template's own config file (optional; a template with none gets an empty `base_url` and no `icons`), read from `--template`'s own directory and never copied to `--out`. A local image referenced from a node's Markdown body is copied alongside the output automatically; a `file`-type node's `display="code"` target is read once and inlined into the HTML directly (nothing left to fetch once static). See `site-template/` in this repo for a working example, including its own `template.toml`
+Experimental: export a canvas as a static site. Resolves includes (same as `validate`/`view`), turns the canvas's node tree into a recursive `SiteData` (context key `site`) and hands it to a user-supplied Tera template. A node with no real, authored `x`/`y`/`width`/`height` gets no computed position at all — the template renders it as an ordinary nested HTML element and the *browser* lays it out and sizes it from its real content (no pre-computed/estimated pixels to get wrong); a node that does have all four real values keeps rendering at exactly that authored pixel position. A structural (parent/child) connector between two flow-positioned nodes is drawn in pure CSS (they're always DOM-adjacent); everything else — a `meshfox:edge` cross-reference, or a structural edge touching a real-positioned node — is left for a small non-interactive JS pass in the template to measure and draw. Every `*.tera` file in `--template` (except one whose basename starts with `_`, a partial meant to be `{% import %}`ed rather than rendered standalone) is rendered and written to `--out` at the same relative path minus `.tera`; every other file is copied verbatim (CSS, fonts, ...) — except `template.toml` itself, the template's own config file (optional; a template with none gets no `base_url`/`links_base_url` and no `icons`), read from `--template`'s own directory and never copied to `--out`. A local image referenced from a node's Markdown body is copied alongside the output automatically; a `file`-type node's `display="code"` target is read once and inlined into the HTML directly (nothing left to fetch once static). A plain `file`-node target (not `display="code"`) is left as an unresolved link unless `--copy-files` is passed — see that flag's own help. See `site-template/` in this repo for a working example, including its own `template.toml`
 
 Usage: meshfox static [OPTIONS] --template <TEMPLATE> [CANVAS]
 
@@ -643,6 +645,10 @@ Options:
   -t, --template <TEMPLATE>  Template directory
   -o, --out <OUT>            Output directory. Refused if it already exists and is non-empty, unless `--force` [default: site]
       --force                Overwrite an existing, non-empty `--out` directory
+      --copy-files           Copy a `file`-node's own target alongside the site (same treatment a Markdown image already gets), rewriting the link to point at the copy, for every `file` node whose rendered body still carries a plain link to its target (not `display="code"` — that's inlined already, nothing left to copy). Off by default: unresolved, as-authored links are today's behavior, unchanged unless this is passed. A target that resolves to a `.canvas.md` file is refused instead of copied, unless `--recursive` is also passed — copying an inert canvas source file into `--out` wouldn't give a reader following the link a rendered page
+      --recursive            Requires `--copy-files`. A `file`-node target that resolves to a `.canvas.md` file is rendered as its own page of this same site (its own worker, own template pass, own nested `--out` directory — named after its path relative to the canvas this export started from) instead of being refused; the link is rewritten to point at that page. Followed transitively — a page rendered this way can itself link to further canvases — with each distinct canvas (by its real path on disk) rendered at most once even if several nodes, in this canvas or any other one reached this way, link to it; a cycle (A links to B, B links back to A) is graceful, not an error — the back-link just resolves to A's own already-rendered page
+      --sitemap              Write a `sitemap.xml` at the root of `--out`, listing every rendered page (the root canvas's own, plus — with `--recursive` — every nested canvas's). Requires `template.toml`'s own `base_url` to be set (see `TemplateConfig::base_url`) — a sitemap's `<loc>` has to be an absolute URL, and `--sitemap` refuses to guess one
+      --sitemap-git-dates    Requires `--sitemap`. Each `<url>`'s `<lastmod>` is the owning canvas file's own last commit date in git (`git log -1 --format=%cI`, relative to the canvas's own directory — same mechanism `canvas_commit`/`meshfox_version` already use for the template context), rather than left unset. Off by default: not every exported canvas is necessarily in a git repository (a temp-directory/CI-checkout export, say), and a file's git date isn't necessarily closer to "when the content last really changed" than the moment of export for every author's workflow either
   -h, --help                 Print help
 ```
 <!-- /meshfox:output -->
@@ -654,11 +660,11 @@ meshfox static examples/hello.canvas.md --template site-template -o /tmp/meshfox
 ls /tmp/meshfox-static-demo
 rm -rf /tmp/meshfox-static-demo
 ```
-<!-- meshfox:output name="static-example" -->
+<!-- meshfox:output name="static-example" hash="b2417166" -->
 ```text
-exit code: 0
+exit code: 0 · 64ms
 
-meshfox static: wrote 24 file(s) to /tmp/meshfox-static-demo
+meshfox static: wrote 13 file(s) to /tmp/meshfox-static-demo
 apple-touch-icon.png
 favicon-16.png
 favicon-32.png
@@ -667,6 +673,7 @@ fonts
 icon-192.png
 index.html
 style.css
+tui-editor-themes.html
 ```
 <!-- /meshfox:output -->
 
