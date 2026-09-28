@@ -881,6 +881,55 @@ export async function clearLayout(): Promise<CanvasDoc> {
   return res.json();
 }
 
+/** `POST /api/undo`/`POST /api/redo`'s own response shape — the whole
+ * (already-updated) canvas, same as every other mutating endpoint here,
+ * plus `changed` (false for a harmless no-op — nothing left to undo/redo,
+ * never an error, see `crates/server/src/lib.rs`'s `api_undo`) and the
+ * resulting `canUndo`/`canRedo` so a caller doesn't need a second request
+ * just to know whether to grey out its own buttons. */
+export interface UndoRedoResult extends CanvasDoc {
+  changed: boolean;
+  canUndo: boolean;
+  canRedo: boolean;
+}
+
+/** Reverts the most recent still-undoable edit — any node/edge/reorder
+ * change, from any client (this tab, another tab, the CLI, an MCP-driven
+ * agent). A no-op (`changed: false`), not a thrown error, when there's
+ * nothing left to undo. */
+export async function undo(): Promise<UndoRedoResult> {
+  const res = await fetch("/api/undo", { method: "POST" });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `POST /api/undo: ${res.status}`);
+  }
+  return res.json();
+}
+
+/** The mirror image of {@link undo}. */
+export async function redo(): Promise<UndoRedoResult> {
+  const res = await fetch("/api/redo", { method: "POST" });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `POST /api/redo: ${res.status}`);
+  }
+  return res.json();
+}
+
+/** `GET /api/history?limit=0` — just the current `canUndo`/`canRedo`
+ * state, with no entries, for the toolbar's own buttons to initialize
+ * from on first load (later kept in sync live via `watchChanges`'s own
+ * `onUndoStateChanged`, see `crates/server/src/lib.rs`'s
+ * `ServerEvent::UndoStateChanged`). `limit: 0` still returns the *entire*
+ * current redo tail (never capped, see `UndoLog::history_around`'s own
+ * doc comment) — irrelevant here since only the two booleans are read,
+ * but worth knowing this isn't "no history at all". */
+export async function fetchUndoState(): Promise<{ canUndo: boolean; canRedo: boolean }> {
+  const res = await fetch("/api/history?limit=0");
+  if (!res.ok) throw new Error(`GET /api/history: ${res.status}`);
+  return res.json();
+}
+
 /**
  * Delays (ms) between reconnect attempts after `/api/watch` drops — see
  * `watchChanges` below. Cumulative sum (~9.6s) deliberately lands just under
@@ -976,6 +1025,16 @@ export function watchChanges(
    * comment describes for a client that doesn't know these event types
    * at all yet. */
   onNodeOp?: (op: NodeOpEvent) => void,
+  /** `"undo-state-changed"` — pushed after *any* successful save (this
+   * tab's own, another tab's, the CLI's, MCP's) and after `/api/undo`/
+   * `/api/redo` themselves, so the toolbar's own buttons stay accurate
+   * without polling — most importantly, so this tab notices its own
+   * `canRedo` getting cleared the moment *any* client makes a fresh edit
+   * on top of an undo, not just when this tab is the one doing it (see
+   * `crates/server/src/undo_log.rs`'s own redo-tail truncation). Optional
+   * — a caller that skips this just never updates its own undo/redo UI
+   * from a change made elsewhere. */
+  onUndoStateChanged?: (canUndo: boolean, canRedo: boolean) => void,
 ): () => void {
   let leaving = false;
   let stopped = false;
@@ -1011,6 +1070,8 @@ export function watchChanges(
           keepChildren?: boolean;
           parentId?: string;
           childIds?: string[];
+          canUndo?: boolean;
+          canRedo?: boolean;
         };
         if (event.seq !== undefined) lastSeq = event.seq;
         if (event.type === "changed" || (event.type === "connected" && event.resync) || event.type === "resync") {
@@ -1034,6 +1095,12 @@ export function watchChanges(
         ) {
           if (onNodeOp) onNodeOp({ type: "nodes-reordered", parentId: event.parentId, childIds: event.childIds });
           else onChanged();
+        } else if (
+          event.type === "undo-state-changed" &&
+          event.canUndo !== undefined &&
+          event.canRedo !== undefined
+        ) {
+          onUndoStateChanged?.(event.canUndo, event.canRedo);
         }
       };
       // The stream ending is itself a drop (the server never sends a

@@ -1938,6 +1938,217 @@ pub fn node_subtree_fragment(markdown: &str, node_id: &str) -> Option<String> {
     Some(markdown[start..end].to_string())
 }
 
+/// Moves `node_id`'s whole subtree to sit as the last child of
+/// `new_parent_id`, re-leveled to fit — the same subtree-splice mechanics
+/// [`reparent_node`] uses, minus its `meshfox:edge` bookkeeping and its
+/// precondition that `new_parent_id` already be one of `node_id`'s
+/// declared extra parents. Not exposed through any HTTP endpoint of its
+/// own: [`reparent_node`] is the only *user-facing* way to change a
+/// node's structural parent, precisely because skipping its edge
+/// bookkeeping would leave a promoted extra-parent edge dangling. The one
+/// caller that genuinely needs exactly this raw a primitive is
+/// `meshfox-server`'s own undo/redo (reverting/reapplying a
+/// `reparent_node` call's `NodeUpserted` diff), which already stores —
+/// and separately restores, via [`set_node_edges`] — the exact edge state
+/// on either side of that move, so redoing that bookkeeping here too
+/// would just be immediately undone again by that separate step.
+pub fn set_structural_parent(markdown: &str, node_id: &str, new_parent_id: &str) -> Option<String> {
+    if node_id == new_parent_id {
+        return None;
+    }
+    let canvas = parse(markdown).ok()?;
+    canvas.node(node_id)?.parent.as_ref()?;
+    canvas.node(new_parent_id)?;
+
+    // Cycle guard: same as `reparent_node`'s own.
+    let mut cur = canvas.node(new_parent_id)?.parent.clone();
+    while let Some(p) = cur {
+        if p == node_id {
+            return None;
+        }
+        cur = canvas.node(&p)?.parent.clone();
+    }
+
+    let segments = scan(markdown);
+    let ids = assign_ids(&segments).ok()?;
+    let parents = resolve_parent_ids(&segments, &ids).ok()?;
+    let idx = ids.iter().position(|id| id == node_id)?;
+
+    let start = segments[idx].heading_span.start;
+    let end = subtree_end_idx(&ids, &parents, idx)
+        .map(|j| segments[j].heading_span.start)
+        .unwrap_or(markdown.len());
+    let mut fragment = markdown[start..end].to_string();
+
+    let mut without_node = String::with_capacity(markdown.len() - (end - start));
+    without_node.push_str(&markdown[..start]);
+    without_node.push_str(&markdown[end..]);
+
+    let rescanned = scan(&without_node);
+    let rescanned_ids = assign_ids(&rescanned).ok()?;
+    let new_parent_idx = rescanned_ids.iter().position(|x| x == new_parent_id)?;
+    let new_parent_level = rescanned[new_parent_idx].level;
+    let old_level = segments[idx].level;
+    let new_level = (new_parent_level + 1).min(6);
+    let needs_explicit_parent = new_level <= new_parent_level;
+    let delta = new_level as i16 - old_level as i16;
+
+    fragment = set_node_parent_attr(
+        &fragment,
+        node_id,
+        needs_explicit_parent.then_some(new_parent_id),
+    )?;
+    if delta != 0 {
+        let flen = fragment.len();
+        fragment = shift_headings_range(&fragment, 0..flen, delta as i8);
+    }
+
+    let rescanned_parents = resolve_parent_ids(&rescanned, &rescanned_ids).ok()?;
+    let insert_at = subtree_end_idx(&rescanned_ids, &rescanned_parents, new_parent_idx)
+        .map(|j| rescanned[j].heading_span.start)
+        .unwrap_or(without_node.len());
+
+    let mut result = String::with_capacity(without_node.len() + fragment.len() + 2);
+    result.push_str(&without_node[..insert_at]);
+    if !result.ends_with("\n\n") {
+        if !result.ends_with('\n') {
+            result.push('\n');
+        }
+        result.push('\n');
+    }
+    result.push_str(&fragment);
+    if !result.ends_with('\n') {
+        result.push('\n');
+    }
+    result.push_str(&without_node[insert_at..]);
+
+    Some(result)
+}
+
+/// Splices a previously-captured subtree fragment (as returned by
+/// [`node_subtree_fragment`], taken right before deleting it) back in as
+/// the *last* child of `parent_id`, re-leveled to fit — the insertion
+/// half of [`set_structural_parent`]'s own mechanics, minus the "cut it
+/// out of the current document first" half, since the fragment isn't in
+/// `markdown` at all yet. `node_id` must be the fragment's own root
+/// node's id (used to rewrite its `parent=` attribute if the new depth
+/// needs one) and must not already exist in `markdown`. Used by
+/// `meshfox-server`'s own undo to reverse a `node_removed` event —
+/// restoring the node at the *end* of its former parent's children, not
+/// necessarily its exact former position among siblings, since that's all
+/// a `node_removed` undo entry ever records (see TODO.canvas.md's "Undo
+/// для правок канваса"). Returns `None` if `node_id` already exists,
+/// `parent_id` doesn't, or `fragment` is empty.
+pub fn insert_node_fragment(
+    markdown: &str,
+    parent_id: &str,
+    node_id: &str,
+    fragment: &str,
+) -> Option<String> {
+    let canvas = parse(markdown).ok()?;
+    if canvas.node(node_id).is_some() {
+        return None;
+    }
+    canvas.node(parent_id)?;
+
+    let frag_segments = scan(fragment);
+    let old_level = frag_segments.first()?.level;
+
+    let rescanned = scan(markdown);
+    let rescanned_ids = assign_ids(&rescanned).ok()?;
+    let rescanned_parents = resolve_parent_ids(&rescanned, &rescanned_ids).ok()?;
+    let parent_idx = rescanned_ids.iter().position(|x| x == parent_id)?;
+    let parent_level = rescanned[parent_idx].level;
+
+    let new_level = (parent_level + 1).min(6);
+    let needs_explicit_parent = new_level <= parent_level;
+    let delta = new_level as i16 - old_level as i16;
+
+    let mut frag = set_node_parent_attr(fragment, node_id, needs_explicit_parent.then_some(parent_id))?;
+    if delta != 0 {
+        let flen = frag.len();
+        frag = shift_headings_range(&frag, 0..flen, delta as i8);
+    }
+
+    let insert_at = subtree_end_idx(&rescanned_ids, &rescanned_parents, parent_idx)
+        .map(|j| rescanned[j].heading_span.start)
+        .unwrap_or(markdown.len());
+
+    let mut result = String::with_capacity(markdown.len() + frag.len() + 2);
+    result.push_str(&markdown[..insert_at]);
+    if !result.ends_with("\n\n") {
+        if !result.ends_with('\n') {
+            result.push('\n');
+        }
+        result.push('\n');
+    }
+    result.push_str(&frag);
+    if !result.ends_with('\n') {
+        result.push('\n');
+    }
+    result.push_str(&markdown[insert_at..]);
+    Some(result)
+}
+
+/// Inserts a fresh, empty-bodied node `node_id` as the last child of
+/// `parent_id` — the same placement mechanics [`insert_child_node_random_id`]
+/// uses, except the caller supplies the exact id to use instead of one
+/// being generated, and insertion is rejected outright if that id is
+/// already taken. Deliberately leaves everything else blank: its only
+/// caller (`meshfox-server`'s own undo/redo, redoing a `node_upserted`
+/// entry whose `before` was `null` — i.e. redoing a node's original
+/// creation after an earlier undo removed it outright) always follows
+/// this up with [`set_node_title`]/[`set_node_body`]/[`set_node_meta`]/
+/// [`set_node_edges`] to fill in the node's exact previously-recorded
+/// state, so duplicating any of that here would just be immediately
+/// overwritten.
+pub fn insert_node_with_id(markdown: &str, parent_id: &str, node_id: &str) -> Option<String> {
+    let canvas = parse(markdown).ok()?;
+    if canvas.node(node_id).is_some() {
+        return None;
+    }
+    canvas.node(parent_id)?;
+
+    let segments = scan(markdown);
+    let ids = assign_ids(&segments).ok()?;
+    let parents = resolve_parent_ids(&segments, &ids).ok()?;
+    let parent_idx = ids.iter().position(|id| id == parent_id)?;
+    let parent_level = segments[parent_idx].level;
+    let child_level = (parent_level + 1).min(6);
+    let needs_explicit_parent = child_level <= parent_level;
+
+    let insert_at = subtree_end_idx(&ids, &parents, parent_idx)
+        .map(|j| segments[j].heading_span.start)
+        .unwrap_or(markdown.len());
+
+    let mut node_parts = vec![format!("id=\"{node_id}\"")];
+    if needs_explicit_parent {
+        node_parts.push(format!("parent=\"{parent_id}\""));
+    }
+
+    let mut block = String::new();
+    block.push_str(&"#".repeat(child_level as usize));
+    block.push(' ');
+    // Placeholder title — always immediately overwritten by
+    // `set_node_title` in the caller's own follow-up pass.
+    block.push_str(node_id);
+    block.push('\n');
+    block.push_str(&format!("<!-- meshfox:node {} -->\n", node_parts.join(" ")));
+    block.push('\n');
+
+    let mut out = String::with_capacity(markdown.len() + block.len() + 1);
+    out.push_str(&markdown[..insert_at]);
+    if !out.ends_with("\n\n") {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    out.push_str(&block);
+    out.push_str(&markdown[insert_at..]);
+    Some(out)
+}
+
 /// Reorders every parent's direct (structural) children to match their
 /// canvas layout — sorted by `y`, then `x` among ties — without touching
 /// heading depth, any node's own content, or extra (`meshfox:edge`) parents,

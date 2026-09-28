@@ -433,6 +433,31 @@ struct NodeMoveParams {
 #[derive(Deserialize, Serialize, JsonSchema, Default)]
 struct NodeReorderParams {}
 
+#[derive(Deserialize, Serialize, JsonSchema, Default)]
+struct UndoParams {}
+
+#[derive(Deserialize, Serialize, JsonSchema, Default)]
+struct RedoParams {}
+
+fn default_history_limit() -> usize {
+    50
+}
+
+#[derive(Deserialize, Serialize, JsonSchema)]
+struct HistoryParams {
+    /// How many applied steps to list, most recent first. The current
+    /// redo tail (if any) is always listed in full regardless of this.
+    #[serde(default = "default_history_limit")]
+    limit: usize,
+}
+
+#[derive(Deserialize, Serialize, JsonSchema)]
+struct HistoryGotoParams {
+    /// The target step to jump to, as listed by `history`'s own `seq`
+    /// field — `0` means "undo everything".
+    seq: i64,
+}
+
 #[derive(Deserialize, Serialize, JsonSchema)]
 struct ValidateParams {}
 
@@ -882,6 +907,60 @@ impl MeshfoxMcp {
             .await
             .map_err(invalid_params)?;
         Ok(CallToolResult::structured(json!({ "reordered": true })))
+    }
+
+    #[tool(
+        description = "Reverts the most recent still-undoable edit to this canvas — any node/edge/reorder change, from any client (web UI, CLI, another MCP call), since undo history lives with the canvas's own worker, not with whoever made the edit. A no-op (changed: false), not an error, when there's nothing left to undo — safe to call speculatively."
+    )]
+    async fn undo(&self, Parameters(_params): Parameters<UndoParams>) -> Result<CallToolResult, ErrorData> {
+        let port = self.worker_port().await?;
+        let result = crate::worker_client::undo(port).await.map_err(invalid_params)?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(result).map_err(|e| ErrorData::internal_error(e.to_string(), None))?,
+        ))
+    }
+
+    #[tool(
+        description = "The mirror image of undo: reapplies the most recent still-redoable edit. A no-op (changed: false), not an error, when there's nothing left to redo — including right after any fresh edit, which always drops whatever redo history existed before it."
+    )]
+    async fn redo(&self, Parameters(_params): Parameters<RedoParams>) -> Result<CallToolResult, ErrorData> {
+        let port = self.worker_port().await?;
+        let result = crate::worker_client::redo(port).await.map_err(invalid_params)?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(result).map_err(|e| ErrorData::internal_error(e.to_string(), None))?,
+        ))
+    }
+
+    #[tool(
+        description = "Lists the last `limit` applied edits plus the entire current redo tail (never capped by `limit`), each with a human-readable summary and its own seq — pass that seq to history_goto to jump straight to it, forward or backward."
+    )]
+    async fn history(
+        &self,
+        Parameters(params): Parameters<HistoryParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let port = self.worker_port().await?;
+        let dto = crate::worker_client::history(port, Some(params.limit))
+            .await
+            .map_err(invalid_params)?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(dto).map_err(|e| ErrorData::internal_error(e.to_string(), None))?,
+        ))
+    }
+
+    #[tool(
+        description = "Jumps directly to a specific history step (a seq from history), in whichever direction that is from the current position — undoing or redoing as many steps as needed in one call. An unreachable or stale seq lands as far as it can rather than erroring (changed says whether anything actually moved)."
+    )]
+    async fn history_goto(
+        &self,
+        Parameters(params): Parameters<HistoryGotoParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let port = self.worker_port().await?;
+        let result = crate::worker_client::history_goto(port, params.seq)
+            .await
+            .map_err(invalid_params)?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(result).map_err(|e| ErrorData::internal_error(e.to_string(), None))?,
+        ))
     }
 
     #[tool(
@@ -1514,6 +1593,44 @@ impl MeshfoxMcpRoot {
         Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<NodeReorderParams>>,
     ) -> Result<CallToolResult, ErrorData> {
         self.forward(&canvas_id, "node_reorder", inner).await
+    }
+
+    #[tool(
+        description = "Same as undo, scoped to canvas_id (see canvas_open) — reverts the most recent still-undoable edit in that canvas."
+    )]
+    async fn undo(
+        &self,
+        Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<UndoParams>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.forward(&canvas_id, "undo", inner).await
+    }
+
+    #[tool(description = "Same as redo, scoped to canvas_id (see canvas_open).")]
+    async fn redo(
+        &self,
+        Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<RedoParams>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.forward(&canvas_id, "redo", inner).await
+    }
+
+    #[tool(
+        description = "Same as history, scoped to canvas_id (see canvas_open) — lists that canvas's own recent edits."
+    )]
+    async fn history(
+        &self,
+        Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<HistoryParams>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.forward(&canvas_id, "history", inner).await
+    }
+
+    #[tool(
+        description = "Same as history_goto, scoped to canvas_id (see canvas_open)."
+    )]
+    async fn history_goto(
+        &self,
+        Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<HistoryGotoParams>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.forward(&canvas_id, "history_goto", inner).await
     }
 
     #[tool(

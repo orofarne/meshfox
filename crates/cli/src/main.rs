@@ -289,6 +289,40 @@ enum Command {
         #[command(flatten)]
         canvas: CanvasOpt,
     },
+    /// Reverts the most recent still-undoable edit to the canvas — any
+    /// node/edge/reorder change, from any client (web UI, TUI, another CLI
+    /// invocation, MCP). Routes through the running worker for this
+    /// canvas (starting one if needed, same as `node <op>`), since undo
+    /// history lives in the worker's own session database
+    /// (`.meshfox/<canvas>.session.sqlite3`), not in this process. A
+    /// no-op, not an error, when there's nothing left to undo.
+    Undo {
+        #[command(flatten)]
+        canvas: CanvasOpt,
+    },
+    /// The mirror image of `undo`: reapplies the most recent
+    /// still-redoable edit. A no-op, not an error, when there's nothing
+    /// left to redo — including right after any fresh edit, which always
+    /// drops whatever redo history existed before it.
+    Redo {
+        #[command(flatten)]
+        canvas: CanvasOpt,
+    },
+    /// Lists the last `--limit` applied edits plus the entire current redo
+    /// tail (never capped by `--limit`), each with a human-readable
+    /// summary and its own seq — or, with `--goto`, jumps directly to a
+    /// specific one (a seq a plain `meshfox history` call just listed),
+    /// undoing or redoing as many steps as that takes in one call.
+    History {
+        #[command(flatten)]
+        canvas: CanvasOpt,
+        /// How many applied steps to list, most recent first.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Jump directly to this seq instead of listing.
+        #[arg(long)]
+        goto: Option<i64>,
+    },
     /// Print every runnable code block in the canvas as an indented tree,
     /// each with a ready-to-paste `meshfox run <path...> <name>` — so you
     /// don't have to go spelunking through the file to find out what's
@@ -1183,6 +1217,18 @@ fn main() {
         Command::Check { canvas } => {
             let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
             check(&canvas_path)
+        }
+        Command::Undo { canvas } => {
+            let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
+            undo_cmd(&canvas_path)
+        }
+        Command::Redo { canvas } => {
+            let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
+            redo_cmd(&canvas_path)
+        }
+        Command::History { canvas, limit, goto } => {
+            let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
+            history_cmd(&canvas_path, limit, goto)
         }
         Command::List { canvas } => {
             let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
@@ -3951,6 +3997,98 @@ fn node_reorder(canvas_path: &Path) {
         ),
         Err(e) => {
             eprintln!("meshfox node reorder: {e} (worker on port {port})");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn undo_cmd(canvas_path: &Path) {
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+        eprintln!("failed to start async runtime: {e}");
+        std::process::exit(1);
+    });
+    let port = worker_port_or_exit(&runtime, canvas_path);
+    match runtime.block_on(worker_client::undo(port)) {
+        Ok(result) if result.changed => println!(
+            "meshfox undo: reverted (can_undo={}, can_redo={})",
+            result.can_undo, result.can_redo
+        ),
+        Ok(_) => println!("meshfox undo: nothing to undo"),
+        Err(e) => {
+            eprintln!("meshfox undo: {e} (worker on port {port})");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn redo_cmd(canvas_path: &Path) {
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+        eprintln!("failed to start async runtime: {e}");
+        std::process::exit(1);
+    });
+    let port = worker_port_or_exit(&runtime, canvas_path);
+    match runtime.block_on(worker_client::redo(port)) {
+        Ok(result) if result.changed => println!(
+            "meshfox redo: reapplied (can_undo={}, can_redo={})",
+            result.can_undo, result.can_redo
+        ),
+        Ok(_) => println!("meshfox redo: nothing to redo"),
+        Err(e) => {
+            eprintln!("meshfox redo: {e} (worker on port {port})");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Either lists recent history (`goto: None`) or jumps straight to `goto`
+/// — `Command::History`'s own two modes collapsed into one function since
+/// they share the same worker-port setup and error handling, not because
+/// they're otherwise related.
+fn history_cmd(canvas_path: &Path, limit: usize, goto: Option<i64>) {
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+        eprintln!("failed to start async runtime: {e}");
+        std::process::exit(1);
+    });
+    let port = worker_port_or_exit(&runtime, canvas_path);
+
+    if let Some(seq) = goto {
+        match runtime.block_on(worker_client::history_goto(port, seq)) {
+            Ok(result) if result.changed => println!(
+                "meshfox history: jumped to seq {seq} (can_undo={}, can_redo={})",
+                result.can_undo, result.can_redo
+            ),
+            Ok(_) => println!("meshfox history: already there (or seq {seq} isn't reachable)"),
+            Err(e) => {
+                eprintln!("meshfox history: {e} (worker on port {port})");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    match runtime.block_on(worker_client::history(port, Some(limit))) {
+        Ok(dto) => {
+            if dto.entries.is_empty() {
+                println!("meshfox history: no recorded edits yet");
+                return;
+            }
+            for entry in &dto.entries {
+                let marker = if entry.seq == dto.cursor {
+                    "→"
+                } else if entry.applied {
+                    " "
+                } else {
+                    "·"
+                };
+                println!("{marker} {:>5}  {:<16}  {}", entry.seq, entry.op_kind, entry.summary);
+            }
+            println!(
+                "(cursor at seq {}, can_undo={}, can_redo={})",
+                dto.cursor, dto.can_undo, dto.can_redo
+            );
+        }
+        Err(e) => {
+            eprintln!("meshfox history: {e} (worker on port {port})");
             std::process::exit(1);
         }
     }

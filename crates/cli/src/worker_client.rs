@@ -281,6 +281,103 @@ pub async fn reorder_document(port: u16) -> Result<(), String> {
     into_result(res).await
 }
 
+/// One `/api/undo`/`/api/redo`/`/api/history/goto` response — deliberately
+/// narrower than the server's own `UndoRedoResponse` (no full `Canvas`):
+/// every caller here just reports the resulting undo/redo state, then
+/// re-fetches the canvas itself (`get_canvas_raw`) if it actually needs to
+/// show anything from it — an unrecognized `canvas`-shaped blob in the
+/// JSON is simply ignored by `#[derive(Deserialize)]`'s own default
+/// "unknown fields are dropped" behavior, same as `create_node`'s own
+/// narrower `Response` above.
+#[derive(serde::Deserialize, serde::Serialize, Debug, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+pub struct UndoRedoResult {
+    pub changed: bool,
+    pub can_undo: bool,
+    pub can_redo: bool,
+}
+
+async fn post_undo_redo(url: String) -> Result<UndoRedoResult, String> {
+    let res = reqwest::Client::new().post(url).send().await.map_err(|e| e.to_string())?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        return Err(if text.is_empty() { status.to_string() } else { text });
+    }
+    res.json().await.map_err(|e| e.to_string())
+}
+
+/// `POST /api/undo` — the worker-routed counterpart to `crates/server/
+/// src/lib.rs`'s `api_undo`. A no-op (`changed: false`), not an error,
+/// when there's nothing left to undo.
+pub async fn undo(port: u16) -> Result<UndoRedoResult, String> {
+    post_undo_redo(format!("{}/api/undo", base_url(port))).await
+}
+
+/// `POST /api/redo` — the mirror image of [`undo`].
+pub async fn redo(port: u16) -> Result<UndoRedoResult, String> {
+    post_undo_redo(format!("{}/api/redo", base_url(port))).await
+}
+
+/// `POST /api/history/goto` — jumps directly to `seq` (as listed by
+/// [`history`] below), in whichever direction that is from the current
+/// cursor — undoing or redoing as many steps as it takes in one call. An
+/// unreachable/stale `seq` lands as far as it can rather than erroring
+/// (`changed` says whether anything actually moved); see `crates/server/
+/// src/lib.rs`'s own `jump_to` for why.
+pub async fn history_goto(port: u16, seq: i64) -> Result<UndoRedoResult, String> {
+    let res = reqwest::Client::new()
+        .post(format!("{}/api/history/goto", base_url(port)))
+        .json(&serde_json::json!({ "seq": seq }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        return Err(if text.is_empty() { status.to_string() } else { text });
+    }
+    res.json().await.map_err(|e| e.to_string())
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryEntryDto {
+    pub seq: i64,
+    pub created_at: String,
+    pub op_kind: String,
+    /// `true` if this step is currently applied (an `undo` would revert
+    /// it), `false` if it's sitting in the redo tail (a `redo`, or a
+    /// `history_goto` naming this same `seq`, would reapply it).
+    pub applied: bool,
+    pub summary: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryDto {
+    pub cursor: i64,
+    pub can_undo: bool,
+    pub can_redo: bool,
+    pub entries: Vec<HistoryEntryDto>,
+}
+
+/// `GET /api/history?limit=N` — the worker-routed counterpart to
+/// `crates/server/src/lib.rs`'s `api_history`.
+pub async fn history(port: u16, limit: Option<usize>) -> Result<HistoryDto, String> {
+    let mut url = reqwest::Url::parse(&format!("{}/api/history", base_url(port))).map_err(|e| e.to_string())?;
+    if let Some(limit) = limit {
+        url.query_pairs_mut().append_pair("limit", &limit.to_string());
+    }
+    let res = reqwest::get(url).await.map_err(|e| e.to_string())?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        return Err(if text.is_empty() { status.to_string() } else { text });
+    }
+    res.json().await.map_err(|e| e.to_string())
+}
+
 /// A non-2xx response's body is already a plain-text error message on every
 /// mutating endpoint here (`ApiError`'s own `IntoResponse`) — surface it
 /// as-is rather than wrapping it in a generic "request failed".

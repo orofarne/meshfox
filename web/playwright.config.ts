@@ -202,6 +202,14 @@ process.env.MESHFOX_E2E_EXTERNAL_EDIT_CANVAS_PATH = path.join(EXTERNAL_EDIT_DIR,
 
 const MCP_LIVE_PORT = 4619;
 const MCP_LIVE_FIREFOX_PORT = 4620;
+// Server + port for undo-redo.spec.ts — same reasoning as CLEAR_NODE_LAYOUT_PORT
+// above, its own fixture (undo-redo.canvas.md, one plain text child) and
+// port; one port shared by both browsers, same as that suite — every test
+// here restores the fixture's own undo history back to "fully undone"
+// before finishing (see the spec file's own per-test cleanup), so chrome
+// and firefox never fight over genuinely divergent state even if a given
+// local run happens to interleave them.
+const UNDO_REDO_PORT = 4621;
 const MCP_LIVE_DIRS = Object.fromEntries(
   (["chrome", "firefox"] as const).map((browser) => {
     const dir = path.join(os.tmpdir(), `meshfox-e2e-mcp-live-${browser}-fixture`);
@@ -405,6 +413,11 @@ export default defineConfig({
       testMatch: /(^|\/)mcp-live\.spec\.ts$/,
       use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${browser === "firefox" ? MCP_LIVE_FIREFOX_PORT : MCP_LIVE_PORT}` },
     },
+    {
+      name: `${browser}-undo-redo`,
+      testMatch: /(^|\/)undo-redo\.spec\.ts$/,
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${UNDO_REDO_PORT}` },
+    },
   ]),
   webServer: [
     {
@@ -598,6 +611,12 @@ export default defineConfig({
     {
       command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${MCP_LIVE_DIRS.firefox}/mcp-live.canvas.md --port ${MCP_LIVE_FIREFOX_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${MCP_LIVE_FIREFOX_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/undo-redo.canvas.md --port ${UNDO_REDO_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${UNDO_REDO_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },

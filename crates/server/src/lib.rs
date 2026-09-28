@@ -239,6 +239,21 @@ impl AppState {
         self.save_with_event(raw, ServerEvent::Changed)
     }
 
+    /// Writes `raw` to disk and updates the in-memory cache to match, with
+    /// no undo-history side effects at all — the half of `save_with_event`
+    /// that `/api/undo`/`/api/redo` need on their own (see `api_undo`/
+    /// `api_redo`): they already compute the reverted/reapplied text from
+    /// `undo_log` itself and move its cursor via `UndoLog::commit_undo`/
+    /// `commit_redo` directly, so routing back through `save_with_event`
+    /// would incorrectly record *another* history step (and truncate the
+    /// very redo tail an undo just made reachable) for what's actually a
+    /// cursor move, not a new edit.
+    fn write_raw(&self, raw: &str) -> std::io::Result<()> {
+        std::fs::write(&self.canvas_path, raw)?;
+        *self.raw.lock().unwrap() = raw.to_string();
+        Ok(())
+    }
+
     /// Same as `save`, but broadcasts `event` instead of the generic
     /// `Changed` — `commit_located` uses this to push a precise
     /// `NodeUpserted`/`NodeRemoved`/`NodesReordered` for a mutation that
@@ -254,12 +269,27 @@ impl AppState {
         let event = if cleaned != raw { ServerEvent::Changed } else { event };
         let raw = cleaned.as_str();
         let old_raw = self.raw.lock().unwrap().clone();
-        std::fs::write(&self.canvas_path, raw)?;
-        *self.raw.lock().unwrap() = raw.to_string();
+        self.write_raw(raw)?;
         record_undo(self, &old_raw, raw, &event);
         self.canvas_events.push(event);
+        broadcast_undo_state(self);
         Ok(())
     }
+}
+
+/// Reads `state.undo_log`'s own current availability and pushes it as a
+/// fresh `ServerEvent::UndoStateChanged` — called after every successful
+/// `save_with_event` and after every `/api/undo`/`/api/redo` call. Cheap
+/// (two small `COUNT`/`MAX`-style queries, see `UndoLog::can_undo`/
+/// `can_redo`), so this doesn't try to detect whether availability
+/// actually *changed* first — an extra broadcast with the same booleans a
+/// client already had is harmless, unlike missing a real change would be.
+fn broadcast_undo_state(state: &AppState) {
+    let can_undo = state.undo_log.can_undo().unwrap_or(false);
+    let can_redo = state.undo_log.can_redo().unwrap_or(false);
+    state
+        .canvas_events
+        .push(ServerEvent::UndoStateChanged { can_undo, can_redo });
 }
 
 /// Builds this write's own undo-history entry from `(old_raw, new_raw,
@@ -342,6 +372,441 @@ fn record_undo(state: &AppState, old_raw: &str, new_raw: &str, event: &ServerEve
     if let Err(e) = state.undo_log.push(op_kind, payload, new_raw) {
         eprintln!("meshfox: failed to record undo history for {op_kind} ({e})");
     }
+}
+
+/// Reconstructs the document text one step in `direction` from `entry` —
+/// the shared core `api_undo`/`api_redo` both call, just flipping which
+/// side of each stored diff (`before`/`after`, or `raw_before`/
+/// `raw_after`) they aim for (`undo = true` for `api_undo`). `raw` must be
+/// the *current* document (the opposite side of whichever direction is
+/// requested) — the undo/redo cursor already guarantees that (nothing
+/// else can move it), so this never re-derives it itself. `None` if the
+/// stored diff can no longer be reconciled against `raw` at all — should
+/// only ever happen from a hand-edited session db, since normal use
+/// always undoes/redoes in strict last-in-first-out order, which the
+/// cursor itself already guarantees stays reconcilable — reported to the
+/// client as a plain 422 by `api_undo`/`api_redo`, never silently ignored
+/// or partially applied.
+fn apply_history_entry(raw: &str, entry: &undo_log::UndoEntry, undo: bool) -> Option<String> {
+    let Some(diff_json) = entry.diff_json.as_deref() else {
+        // `raw_replace`/`external_edit` — no structured diff, just the
+        // whole document, verbatim, either side.
+        return if undo {
+            entry.raw_before.clone()
+        } else {
+            entry.raw_after.clone()
+        };
+    };
+    let diff: serde_json::Value = serde_json::from_str(diff_json).ok()?;
+    match entry.op_kind.as_str() {
+        "node_upserted" => {
+            let node_id = diff.get("nodeId")?.as_str()?;
+            let target_value = if undo { diff.get("before")? } else { diff.get("after")? };
+            if target_value.is_null() {
+                // Undoing the node's own original creation — `after` is
+                // never null, so `redo` never takes this branch.
+                return mdcanvas::delete_node(raw, node_id);
+            }
+            let target: meshfox_core::Node = serde_json::from_value(target_value.clone()).ok()?;
+            let canvas = mdcanvas::parse(raw).ok()?;
+            let based_on = if canvas.node(&target.id).is_none() {
+                // Redoing the node's own original creation, after an
+                // earlier undo removed it outright — recreate a bare
+                // placeholder under its original parent first, then let
+                // `apply_node_state` below fill in its exact recorded
+                // state field by field.
+                mdcanvas::insert_node_with_id(raw, target.parent.as_deref()?, &target.id)?
+            } else {
+                raw.to_string()
+            };
+            apply_node_state(&based_on, &target)
+        }
+        "node_removed" => {
+            let node_id = diff.get("nodeId")?.as_str()?;
+            if undo {
+                let parent_id = diff.get("parentId")?.as_str()?;
+                let fragment = diff.get("fragment")?.as_str()?;
+                mdcanvas::insert_node_fragment(raw, parent_id, node_id, fragment)
+            } else {
+                mdcanvas::delete_node(raw, node_id)
+            }
+        }
+        "nodes_reordered" => {
+            let order_key = if undo { "before" } else { "after" };
+            let order: Vec<String> = serde_json::from_value(diff.get(order_key)?.clone()).ok()?;
+            apply_sibling_order(raw, &order)
+        }
+        _ => None,
+    }
+}
+
+/// Rewrites `raw` so node `target.id` ends up in exactly the state
+/// `target` describes — every field, not just whichever ones a specific
+/// live mutating endpoint happened to touch — since a `node_upserted`
+/// undo/redo entry always stores the node's *whole* state on either side
+/// (see `record_undo`'s own doc comment), not a per-field patch.
+/// Re-parses between each step rather than computing every patch off one
+/// initial parse, since some of these setters shift byte offsets
+/// elsewhere in the document (a structural-parent move most of all) — a
+/// small cost next to reusing the exact same setters every live mutating
+/// endpoint already calls (`update_node`, `reparent_node`), so undo/redo's
+/// own result is whatever a live equivalent edit would have produced, not
+/// a bespoke reconstruction. `None` if `target.id` doesn't exist in `raw`
+/// yet (the caller is responsible for inserting a bare placeholder first
+/// — see `mdcanvas::insert_node_with_id` — when this is actually a redo
+/// of the node's original creation) or if any step's own preconditions
+/// aren't met.
+fn apply_node_state(raw: &str, target: &meshfox_core::Node) -> Option<String> {
+    let mut result = raw.to_string();
+
+    let canvas = mdcanvas::parse(&result).ok()?;
+    let current_parent = canvas.node(&target.id)?.parent.clone();
+    if current_parent.as_deref() != target.parent.as_deref() {
+        let new_parent = target.parent.as_deref()?;
+        result = mdcanvas::set_structural_parent(&result, &target.id, new_parent)?;
+    }
+
+    let canvas = mdcanvas::parse(&result).ok()?;
+    if canvas.node(&target.id)?.title != target.title {
+        result = mdcanvas::set_node_title(&result, &target.id, &target.title)?;
+    }
+
+    let canvas = mdcanvas::parse(&result).ok()?;
+    if canvas.node(&target.id)?.text != target.text {
+        result = mdcanvas::set_node_body(&result, &target.id, &target.text)?;
+    }
+
+    let canvas = mdcanvas::parse(&result).ok()?;
+    if canvas.node(&target.id)?.extra_parents != target.extra_parents {
+        result = mdcanvas::set_node_edges(&result, &target.id, &target.extra_parents)?;
+    }
+
+    let meta = NodeMeta {
+        x: target.x,
+        y: target.y,
+        width: target.width,
+        height: target.height,
+        color: target.color.clone(),
+        node_type: Some(target.node_type),
+        display: target.display,
+        lang: target.lang.clone(),
+        interpreter: target.interpreter.clone(),
+        preview: Some(target.preview),
+        edge_label: target.edge_label.clone(),
+        edge_label_at: target.edge_label_at,
+        edge_source_side: target.edge_source_side,
+        edge_target_side: target.edge_target_side,
+        edge_via: target.edge_via.clone(),
+        fold: target.fold,
+        tags: target.tags.clone(),
+        created_at: target.created_at.clone(),
+    };
+    mdcanvas::set_node_meta(&result, &target.id, &meta)
+}
+
+/// Reconstructs a `parentId`'s children into exactly `order` — a
+/// `nodes_reordered` undo/redo entry stores the *whole* desired sibling
+/// order on either side (see `record_undo`'s own doc comment), not a
+/// single move, so this replays it as a chain of adjacent `move_sibling`
+/// calls (`order[1]` after `order[0]`, `order[2]` after `order[1]`, …)
+/// rather than needing its own bespoke "set the whole order" primitive in
+/// `mdcanvas`. `None` if any id in `order` no longer exists or the two
+/// have stopped being siblings since this entry was recorded.
+fn apply_sibling_order(raw: &str, order: &[String]) -> Option<String> {
+    let mut result = raw.to_string();
+    for pair in order.windows(2) {
+        result = mdcanvas::move_sibling(&result, &pair[1], &pair[0], mdcanvas::MoveSiblingPosition::After).ok()?;
+    }
+    Some(result)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UndoRedoResponse {
+    /// `false` when there was nothing left to undo/redo — a no-op, not an
+    /// error (see `api_undo`'s own doc comment for why a stale double-press
+    /// of an already-greyed-out button shouldn't be one).
+    changed: bool,
+    can_undo: bool,
+    can_redo: bool,
+    #[serde(flatten)]
+    canvas: Canvas,
+}
+
+fn undo_redo_response(state: &AppState, raw: &str, changed: bool) -> Result<Json<UndoRedoResponse>, ApiError> {
+    let can_undo = state
+        .undo_log
+        .can_undo()
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let can_redo = state
+        .undo_log
+        .can_redo()
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let Json(canvas) = canvas_response(raw, &state.canvas_path)?;
+    Ok(Json(UndoRedoResponse { changed, can_undo, can_redo, canvas }))
+}
+
+fn io_err(e: std::io::Error) -> ApiError {
+    ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+}
+
+/// The one place that actually moves `undo_log`'s own cursor and writes
+/// the resulting document — `api_undo`, `api_redo`, and `api_history_goto`
+/// all delegate to this rather than each re-implementing their own
+/// version of the same step-by-step walk: undo is `jump_to(state,
+/// target)` with `target` from `UndoLog::cursor_after_undoing` (see
+/// `api_undo`'s own doc comment for why that's not simply `cursor - 1`),
+/// redo is `jump_to(state, entry.seq)` for whatever `peek_redo` finds, and
+/// a history-panel jump is `jump_to(state, req.seq)` directly — the exact
+/// same primitive, just a different target. Steps one seq at a time — via
+/// the same `apply_history_entry`/`write_raw`/`commit_undo`/`commit_redo`
+/// sequence a single undo/redo already used — in whichever direction
+/// `target_seq` lies, stopping the moment there's nothing left to step
+/// with in that direction (`peek_undo`/`peek_redo` returns `None`), rather
+/// than erroring: that's how "nothing to undo/redo" and an out-of-range
+/// `target_seq` from a stale/bogus history-panel request end up with the
+/// exact same harmless "went as far as it could" behavior, with no
+/// special-casing needed anywhere for either.
+///
+/// `target_seq` must be `0` or an existing row's own `seq` — never a
+/// value synthesized by arithmetic (`cursor ± 1`) — or this can loop
+/// forever: found live, the hard way, when `api_undo`/`api_redo` used to
+/// pass exactly that arithmetic guess. A `target_seq` sitting in a gap
+/// between two real, reachable rows (left behind by a redo-tail
+/// truncation or `MAX_DEPTH` eviction — `seq` never gets reused) is never
+/// equal to *either* neighbor's own cursor value, so the `cursor ==
+/// target_seq` check above never fires; each step past one neighbor
+/// re-evaluates `cursor > target_seq` against the *other* neighbor and
+/// flips direction, walking back and forth between the two forever. The
+/// `MAX_STEPS` cap below is a backstop against exactly that (or any other
+/// still-undiscovered way to hand this an unreachable target) — every
+/// *correct* caller here already computes a target that's either `0` or a
+/// real row's own `seq`, which this can always reach in at most one step
+/// past `undo_log`'s own current depth, so a real walk should never come
+/// close to it.
+///
+/// A step whose own diff can no longer be reconciled against the document
+/// (should only happen from a hand-edited session db — see
+/// `apply_history_entry`'s own doc comment) still stops the walk with a
+/// real error, since that's an actual data problem, not just "nothing
+/// more this way." Broadcasts once for the whole walk, not once per step,
+/// so a multi-step history-panel jump doesn't flood `/api/watch` with
+/// intermediate events a client never asked to see individually. Returns
+/// the final document text and whether anything actually moved.
+fn jump_to(state: &AppState, target_seq: i64) -> Result<(String, bool), ApiError> {
+    const MAX_STEPS: u32 = 10_000;
+    let mut raw = state.raw.lock().unwrap().clone();
+    let mut steps = 0u32;
+    loop {
+        let cursor = state.undo_log.cursor().map_err(io_err)?;
+        if cursor == target_seq {
+            break;
+        }
+        if steps >= MAX_STEPS {
+            eprintln!(
+                "meshfox: jump_to gave up after {MAX_STEPS} steps trying to reach seq {target_seq} \
+                 (stuck oscillating around an unreachable target — this is a bug, not normal use)"
+            );
+            break;
+        }
+        let undo = cursor > target_seq;
+        let entry = if undo {
+            state.undo_log.peek_undo().map_err(io_err)?
+        } else {
+            state.undo_log.peek_redo().map_err(io_err)?
+        };
+        let Some(entry) = entry else {
+            // Nothing left in that direction — `target_seq` was never
+            // reachable (most likely out of range). Stop here rather than
+            // erroring; the caller's own response still reports exactly
+            // where this landed.
+            break;
+        };
+        let next = apply_history_entry(&raw, &entry, undo).ok_or_else(|| {
+            ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!(
+                    "can't reach seq {target_seq} — step {} ({:?}) no longer matches the document",
+                    entry.seq, entry.op_kind,
+                ),
+            )
+        })?;
+        state.write_raw(&next).map_err(io_err)?;
+        if undo {
+            state.undo_log.commit_undo(entry.seq, &next).map_err(io_err)?;
+        } else {
+            state.undo_log.commit_redo(entry.seq, &next).map_err(io_err)?;
+        }
+        raw = next;
+        steps += 1;
+    }
+    if steps > 0 {
+        state.canvas_events.push(ServerEvent::Changed);
+        broadcast_undo_state(state);
+    }
+    Ok((raw, steps > 0))
+}
+
+/// `POST /api/undo` — reverts the most recent still-undoable edit this
+/// canvas's own `undo_log` recorded (see that module's own doc comment),
+/// moving its cursor back by one step via `jump_to`. A no-op (`200`,
+/// `changed: false`) when there's nothing left to undo, never a `4xx` — a
+/// client's own "undo" button greying out already tells a user that, and a
+/// stale double-press from just before it did shouldn't surface as an
+/// error (see `jump_to`'s own doc comment for why that falls out of its
+/// own "stop, don't error, when a direction runs out" behavior with no
+/// special-casing needed here).
+async fn api_undo(State(state): State<Arc<AppState>>) -> Result<Json<UndoRedoResponse>, ApiError> {
+    // Not `cursor - 1` — see `UndoLog::cursor_after_undoing`'s own doc
+    // comment for why that arithmetic guess isn't always a real,
+    // reachable position, and what actually broke (an infinite loop in
+    // `jump_to`, not just a wrong number) using it as this call's target.
+    let target = match state.undo_log.peek_undo().map_err(io_err)? {
+        Some(entry) => state.undo_log.cursor_after_undoing(entry.seq).map_err(io_err)?,
+        None => state.undo_log.cursor().map_err(io_err)?,
+    };
+    let (raw, changed) = jump_to(&state, target)?;
+    undo_redo_response(&state, &raw, changed)
+}
+
+/// `POST /api/redo` — the mirror image of `api_undo`: same `jump_to`-based
+/// no-op (not error) contract when there's nothing left to redo.
+async fn api_redo(State(state): State<Arc<AppState>>) -> Result<Json<UndoRedoResponse>, ApiError> {
+    // Not `cursor + 1` — same reasoning as `api_undo`'s own target
+    // computation, just simpler here: `peek_redo`'s own entry, if any, is
+    // always an already-real, already-existing row (there's no gap-prone
+    // arithmetic step to get it wrong the way `cursor - 1` was), so its
+    // `seq` *is* the correct target directly.
+    let target = match state.undo_log.peek_redo().map_err(io_err)? {
+        Some(entry) => entry.seq,
+        None => state.undo_log.cursor().map_err(io_err)?,
+    };
+    let (raw, changed) = jump_to(&state, target)?;
+    undo_redo_response(&state, &raw, changed)
+}
+
+/// One entry as listed by `GET /api/history` — `undo_log::HistoryEntry`
+/// plus a human-readable one-line `summary` derived from its own
+/// `diffJson`, since that's domain knowledge (`meshfox_core::Node` shape,
+/// what a "before: null" `nodeUpserted` diff means) `undo_log` itself
+/// deliberately doesn't have (see that module's own doc comment).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoryEntryResponse {
+    seq: i64,
+    created_at: String,
+    op_kind: String,
+    /// `true` if this step is currently applied (`seq <= cursor` — an
+    /// `/api/undo` would revert it), `false` if it's sitting in the redo
+    /// tail (`seq > cursor` — an `/api/redo`, or `/api/history/goto` with
+    /// this same `seq`, would reapply it).
+    applied: bool,
+    summary: String,
+}
+
+/// A short, human-readable description of one `undo_log::UndoEntry` —
+/// "изменён «Setup»" rather than a raw diff dump, per TODO.canvas.md's own
+/// vision for a readable history panel. Best-effort: falls back to just
+/// the op kind if `diff_json` doesn't parse into the shape this expects
+/// (should never happen for a row this same server wrote).
+fn describe_history_entry(entry: &undo_log::UndoEntry) -> String {
+    let title_of = |v: &serde_json::Value| -> Option<String> {
+        v.get("title").and_then(|t| t.as_str()).map(str::to_string)
+    };
+    let Some(diff_json) = entry.diff_json.as_deref() else {
+        return match entry.op_kind.as_str() {
+            "external_edit" => "изменения вне интерфейса".to_string(),
+            _ => "изменение документа".to_string(),
+        };
+    };
+    let Ok(diff) = serde_json::from_str::<serde_json::Value>(diff_json) else {
+        return entry.op_kind.clone();
+    };
+    match entry.op_kind.as_str() {
+        "node_upserted" => {
+            let after_title = diff.get("after").and_then(title_of);
+            if diff.get("before").is_some_and(|b| b.is_null()) {
+                format!("создан «{}»", after_title.unwrap_or_default())
+            } else {
+                format!("изменён «{}»", after_title.unwrap_or_default())
+            }
+        }
+        "node_removed" => {
+            let id = diff.get("nodeId").and_then(|v| v.as_str()).unwrap_or_default();
+            format!("удалён «{id}»")
+        }
+        "nodes_reordered" => {
+            let parent_id = diff.get("parentId").and_then(|v| v.as_str()).unwrap_or_default();
+            format!("изменён порядок дочерних узлов «{parent_id}»")
+        }
+        other => other.to_string(),
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoryResponse {
+    cursor: i64,
+    can_undo: bool,
+    can_redo: bool,
+    entries: Vec<HistoryEntryResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoryQuery {
+    #[serde(default = "default_history_limit")]
+    limit: usize,
+}
+
+fn default_history_limit() -> usize {
+    50
+}
+
+/// `GET /api/history?limit=N` — the last `limit` applied steps plus the
+/// *entire* current redo tail (never separately capped — see
+/// `undo_log::UndoLog::history_around`'s own doc comment), most-recent-
+/// or-most-future first, each with a human `summary` and an `applied`
+/// flag so a history panel can grey out (or otherwise distinguish) the
+/// ones above the current cursor without the client having to compare
+/// `seq` against `cursor` itself.
+async fn api_history(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Json<HistoryResponse>, ApiError> {
+    let cursor = state.undo_log.cursor().map_err(io_err)?;
+    let can_undo = state.undo_log.can_undo().map_err(io_err)?;
+    let can_redo = state.undo_log.can_redo().map_err(io_err)?;
+    let entries = state
+        .undo_log
+        .history_around(query.limit)
+        .map_err(io_err)?
+        .into_iter()
+        .map(|h| HistoryEntryResponse {
+            seq: h.entry.seq,
+            created_at: h.entry.created_at.clone(),
+            op_kind: h.entry.op_kind.clone(),
+            applied: h.applied,
+            summary: describe_history_entry(&h.entry),
+        })
+        .collect();
+    Ok(Json(HistoryResponse { cursor, can_undo, can_redo, entries }))
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoryGotoRequest {
+    seq: i64,
+}
+
+/// `POST /api/history/goto` — jumps directly to `seq` (as listed by `GET
+/// /api/history`), whichever direction that is from the current cursor:
+/// exactly `jump_to(state, req.seq)`, the same primitive `api_undo`/
+/// `api_redo` use for a single step. `seq: 0` means "undo everything".
+async fn api_history_goto(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<HistoryGotoRequest>,
+) -> Result<Json<UndoRedoResponse>, ApiError> {
+    let (raw, changed) = jump_to(&state, req.seq)?;
+    undo_redo_response(&state, &raw, changed)
 }
 
 /// `session_vars` (a form's own Send, see `submit_form`) folded underneath
@@ -638,6 +1103,7 @@ fn untouched_worker_timeout() -> Duration {
 /// back to itself: by the time this notices the mtime bump from
 /// `AppState::save`, `state.raw` already matches what's now on disk, so
 /// nothing looks different and nothing is sent.
+///
 fn spawn_file_watcher(state: Arc<AppState>) {
     std::thread::spawn(move || {
         let mut last_mtime = std::fs::metadata(&state.canvas_path)
@@ -1514,6 +1980,16 @@ enum ServerEvent {
     /// order rather than a "moved X before/after Y" delta so a client
     /// never has to reconstruct one from the other.
     NodesReordered { parent_id: String, child_ids: Vec<String> },
+    /// Undo/redo *availability* changed — pushed after every successful
+    /// save (`AppState::save_with_event`) and after every `/api/undo`/
+    /// `/api/redo` call itself, so a client can grey/ungrey its own
+    /// buttons without polling. Carries the booleans directly rather than
+    /// expecting a client to infer them from whatever primary event came
+    /// with it, since a fresh edit landing on top of the redo stack always
+    /// clears `can_redo` too (see `undo_log::UndoLog::push`'s own redo-tail
+    /// truncation) — a client watching only the primary event has no way
+    /// to notice that on its own.
+    UndoStateChanged { can_undo: bool, can_redo: bool },
 }
 
 fn ndjson_line<T: Serialize>(event: &T) -> Bytes {
@@ -7054,6 +7530,10 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/includes", get(get_includes))
         .route("/api/canvas/clear-layout", post(clear_layout))
         .route("/api/canvas/reorder-siblings", post(reorder_siblings))
+        .route("/api/undo", post(api_undo))
+        .route("/api/redo", post(api_redo))
+        .route("/api/history", get(api_history))
+        .route("/api/history/goto", post(api_history_goto))
         .route("/api/nodes", post(create_node))
         .route("/api/nodes/:id", patch(update_node).delete(remove_node))
         .route("/api/nodes/:id/append", post(append_node_body))
@@ -7993,6 +8473,434 @@ mod undo_log_recording_tests {
             .as_ref()
             .unwrap()
             .contains("body b EDITED WHILE NO WORKER RAN"));
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+}
+
+/// `POST /api/undo`/`POST /api/redo` (`api_undo`/`api_redo`) — reverting
+/// and reapplying each of `undo_log_recording_tests`'s own op kinds via
+/// `apply_history_entry`/`apply_node_state`/`apply_sibling_order`, plus
+/// the no-op and redo-tail-truncation edges around them.
+#[cfg(test)]
+mod undo_redo_api_tests {
+    use super::*;
+
+    fn write_test_canvas(contents: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("meshfox-undo-redo-api-test-{}.canvas.md", uuid::Uuid::new_v4()));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    const TWO_SIBLINGS: &str = concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "## A\n<!-- meshfox:node id=\"a\" -->\n\nbody a\n\n",
+        "## B\n<!-- meshfox:node id=\"b\" -->\n\nbody b\n",
+    );
+
+    #[tokio::test]
+    async fn undo_with_nothing_to_undo_is_a_noop_not_an_error() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None).await.unwrap();
+
+        let Json(resp) = api_undo(State(state)).await.expect("a no-op undo should still be 200");
+        assert!(!resp.changed);
+        assert!(!resp.can_undo);
+        assert!(!resp.can_redo);
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn redo_with_nothing_to_redo_is_a_noop_not_an_error() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None).await.unwrap();
+
+        let Json(resp) = api_redo(State(state)).await.expect("a no-op redo should still be 200");
+        assert!(!resp.changed);
+        assert!(!resp.can_undo);
+        assert!(!resp.can_redo);
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn undo_reverts_a_text_edit_and_redo_reapplies_it() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None).await.unwrap();
+
+        let mut req: UpdateNodeRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        req.text = Some("edited body".to_string());
+        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req)).await.unwrap();
+        assert_eq!(state.raw.lock().unwrap().clone().contains("edited body"), true);
+
+        let Json(undone) = api_undo(State(state.clone())).await.expect("undo should succeed");
+        assert!(undone.changed);
+        assert!(!undone.can_undo);
+        assert!(undone.can_redo);
+        assert_eq!(undone.canvas.node("a").unwrap().text, "body a");
+        assert!(!state.raw.lock().unwrap().contains("edited body"));
+
+        let Json(redone) = api_redo(State(state.clone())).await.expect("redo should succeed");
+        assert!(redone.changed);
+        assert!(redone.can_undo);
+        assert!(!redone.can_redo);
+        assert_eq!(redone.canvas.node("a").unwrap().text, "edited body");
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn undo_a_freshly_created_node_removes_it_and_redo_recreates_it() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None).await.unwrap();
+
+        let req = CreateNodeRequest {
+            parent_id: "root".to_string(),
+            title: "New Child".to_string(),
+            title_slug_id: true,
+        };
+        let Json(created) =
+            create_node(State(state.clone()), Json(req)).await.expect("create should succeed");
+        let new_id = created.new_id.clone();
+        assert!(created.canvas.node(&new_id).is_some());
+
+        let Json(undone) = api_undo(State(state.clone())).await.expect("undo should succeed");
+        assert!(undone.canvas.node(&new_id).is_none());
+
+        let Json(redone) = api_redo(State(state.clone())).await.expect("redo should succeed");
+        let node = redone.canvas.node(&new_id).expect("recreated node should have its original id back");
+        assert_eq!(node.title, "New Child");
+        assert_eq!(node.parent.as_deref(), Some("root"));
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn undo_a_node_removal_reinserts_its_fragment_and_redo_deletes_it_again() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None).await.unwrap();
+
+        let _ = remove_node(State(state.clone()), Path("a".to_string()), Query(DeleteNodeQuery { children: None }))
+            .await
+            .expect("remove should succeed");
+        assert!(mdcanvas::parse(&state.raw.lock().unwrap().clone()).unwrap().node("a").is_none());
+
+        let Json(undone) = api_undo(State(state.clone())).await.expect("undo should succeed");
+        let node = undone.canvas.node("a").expect("removed node should be restored");
+        assert_eq!(node.text, "body a");
+        assert_eq!(node.parent.as_deref(), Some("root"));
+
+        let Json(redone) = api_redo(State(state.clone())).await.expect("redo should succeed");
+        assert!(redone.canvas.node("a").is_none());
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn undo_a_sibling_reorder_restores_the_previous_order() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None).await.unwrap();
+
+        let req = MoveSiblingRequest { before: None, after: Some("b".to_string()) };
+        let Json(moved) = move_sibling(State(state.clone()), Path("a".to_string()), Json(req))
+            .await
+            .expect("move should succeed");
+        let ids: Vec<&str> = moved.nodes.iter().filter(|n| n.parent.as_deref() == Some("root")).map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "a"]);
+
+        let Json(undone) = api_undo(State(state.clone())).await.expect("undo should succeed");
+        let ids: Vec<&str> = undone.canvas.nodes.iter().filter(|n| n.parent.as_deref() == Some("root")).map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b"]);
+
+        let Json(redone) = api_redo(State(state.clone())).await.expect("redo should succeed");
+        let ids: Vec<&str> = redone.canvas.nodes.iter().filter(|n| n.parent.as_deref() == Some("root")).map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "a"]);
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn undo_a_raw_replace_restores_the_previous_document_verbatim() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None).await.unwrap();
+
+        let req = RenameNodeIdRequest { new_id: "a-renamed".to_string() };
+        let _ = rename_node_id(State(state.clone()), Path("a".to_string()), Json(req))
+            .await
+            .expect("rename should succeed");
+        assert!(state.raw.lock().unwrap().contains("id=\"a-renamed\""));
+
+        let Json(undone) = api_undo(State(state.clone())).await.expect("undo should succeed");
+        assert!(undone.canvas.node("a").is_some());
+        assert!(undone.canvas.node("a-renamed").is_none());
+        assert_eq!(*state.raw.lock().unwrap(), TWO_SIBLINGS);
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_edit_after_undoing_drops_the_redo_tail() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None).await.unwrap();
+
+        let mut req: UpdateNodeRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        req.text = Some("edited body".to_string());
+        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req)).await.unwrap();
+        let Json(undone) = api_undo(State(state.clone())).await.unwrap();
+        assert!(undone.can_redo);
+
+        let mut req: UpdateNodeRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        req.text = Some("a completely different edit".to_string());
+        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req)).await.unwrap();
+
+        let Json(after_fresh_edit) = api_redo(State(state.clone())).await.expect("a no-op redo should still be 200");
+        assert!(!after_fresh_edit.changed, "the old redo tail should have been dropped, not reapplied");
+        assert!(!after_fresh_edit.can_redo);
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn undo_broadcasts_changed_and_then_undo_state_changed() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None).await.unwrap();
+
+        let mut req: UpdateNodeRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        req.text = Some("edited body".to_string());
+        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req)).await.unwrap();
+
+        let (_backlog, mut rx, _gap) = state.canvas_events.subscribe_from(0);
+        let _ = api_undo(State(state.clone())).await.expect("undo should succeed");
+
+        assert!(matches!(rx.try_recv().unwrap().item, ServerEvent::Changed));
+        match rx.try_recv().unwrap().item {
+            ServerEvent::UndoStateChanged { can_undo, can_redo } => {
+                assert!(!can_undo);
+                assert!(can_redo);
+            }
+            other => panic!("expected UndoStateChanged, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn undoing_twice_walks_back_two_independent_edits_in_order() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None).await.unwrap();
+
+        let mut req: UpdateNodeRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        req.text = Some("body a v2".to_string());
+        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req)).await.unwrap();
+        let mut req: UpdateNodeRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        req.text = Some("body b v2".to_string());
+        let _ = update_node(State(state.clone()), Path("b".to_string()), Json(req)).await.unwrap();
+
+        let Json(undo1) = api_undo(State(state.clone())).await.unwrap();
+        assert_eq!(undo1.canvas.node("b").unwrap().text, "body b");
+        assert_eq!(undo1.canvas.node("a").unwrap().text, "body a v2");
+        assert!(undo1.can_undo);
+
+        let Json(undo2) = api_undo(State(state.clone())).await.unwrap();
+        assert_eq!(undo2.canvas.node("a").unwrap().text, "body a");
+        assert!(!undo2.can_undo);
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    // Regression test for a real, serious bug (found live via the web e2e
+    // suite, before this fix): `api_undo`/`api_redo` used to compute their
+    // own target as plain arithmetic (`cursor - 1`/`cursor + 1`) before
+    // `jump_to` ever ran — a value that isn't always a real, reachable
+    // cursor position (see `UndoLog::cursor_after_undoing`'s own doc
+    // comment for exactly when `seq` develops a gap there). `jump_to`
+    // would then walk toward that unreachable target forever, flipping
+    // between undo and redo every step — an actual infinite loop (100% CPU
+    // on that request's own thread, never returning) hit by nothing more
+    // exotic than "undo one edit, make a different edit, undo that too" —
+    // ordinary use, not a contrived edge case. This reproduces the exact
+    // shape: edit, undo it (creates the gap once the next edit truncates
+    // the now-stale row), edit again, undo that. Finishing at all (this
+    // test has Rust's own default per-test behavior — a real hang would
+    // time out the whole `cargo test` run, not just this test) is most of
+    // what's being asserted here; the final state being correct confirms
+    // it didn't just get lucky.
+    #[tokio::test]
+    async fn undo_after_undo_then_a_fresh_edit_does_not_infinite_loop() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None).await.unwrap();
+
+        let mut req: UpdateNodeRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        req.text = Some("body a ONE".to_string());
+        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req)).await.unwrap();
+        let Json(undo1) = api_undo(State(state.clone())).await.unwrap();
+        assert_eq!(undo1.canvas.node("a").unwrap().text, "body a");
+
+        let mut req: UpdateNodeRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        req.text = Some("body a TWO".to_string());
+        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req)).await.unwrap();
+        let Json(undo2) = api_undo(State(state.clone())).await.unwrap();
+        assert_eq!(undo2.canvas.node("a").unwrap().text, "body a");
+        assert!(!undo2.can_undo);
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn api_history_lists_applied_steps_and_the_redo_tail_with_summaries() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None).await.unwrap();
+
+        let mut req: UpdateNodeRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        req.text = Some("edited body".to_string());
+        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req)).await.unwrap();
+        let _ = api_undo(State(state.clone())).await.unwrap();
+
+        let Json(resp) = api_history(State(state.clone()), Query(HistoryQuery { limit: 50 }))
+            .await
+            .expect("history should list");
+        assert_eq!(resp.entries.len(), 1);
+        assert_eq!(resp.cursor, 0);
+        assert!(!resp.can_undo);
+        assert!(resp.can_redo);
+        assert!(!resp.entries[0].applied);
+        assert_eq!(resp.entries[0].op_kind, "node_upserted");
+        assert!(resp.entries[0].summary.contains("изменён"));
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn api_history_limit_caps_only_the_applied_side_not_the_redo_tail() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None).await.unwrap();
+
+        for text in ["v1", "v2", "v3"] {
+            let mut req: UpdateNodeRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+            req.text = Some(text.to_string());
+            let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req)).await.unwrap();
+        }
+        let _ = api_undo(State(state.clone())).await.unwrap();
+        let _ = api_undo(State(state.clone())).await.unwrap();
+
+        let Json(resp) = api_history(State(state.clone()), Query(HistoryQuery { limit: 1 }))
+            .await
+            .expect("history should list");
+        // 2 redo-tail entries (never capped) + at most 1 applied entry.
+        assert_eq!(resp.entries.iter().filter(|e| !e.applied).count(), 2);
+        assert_eq!(resp.entries.iter().filter(|e| e.applied).count(), 1);
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn history_goto_jumps_backward_across_multiple_steps_with_one_broadcast() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None).await.unwrap();
+
+        for text in ["v1", "v2", "v3"] {
+            let mut req: UpdateNodeRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+            req.text = Some(text.to_string());
+            let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req)).await.unwrap();
+        }
+        assert_eq!(state.undo_log.cursor().unwrap(), 3);
+
+        let (_backlog, mut rx, _gap) = state.canvas_events.subscribe_from(0);
+        let Json(resp) = api_history_goto(State(state.clone()), Json(HistoryGotoRequest { seq: 0 }))
+            .await
+            .expect("goto should succeed");
+        assert!(resp.changed);
+        assert_eq!(resp.canvas.node("a").unwrap().text, "body a");
+        assert!(!resp.can_undo);
+        assert!(resp.can_redo);
+        assert_eq!(state.undo_log.cursor().unwrap(), 0);
+
+        // Exactly one Changed + one UndoStateChanged for the whole jump,
+        // not one pair per intermediate step.
+        assert!(matches!(rx.try_recv().unwrap().item, ServerEvent::Changed));
+        assert!(matches!(rx.try_recv().unwrap().item, ServerEvent::UndoStateChanged { .. }));
+        assert!(rx.try_recv().is_err(), "no further events for a single jump");
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn history_goto_jumps_forward_across_multiple_steps() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None).await.unwrap();
+
+        for text in ["v1", "v2", "v3"] {
+            let mut req: UpdateNodeRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+            req.text = Some(text.to_string());
+            let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req)).await.unwrap();
+        }
+        let _ = api_history_goto(State(state.clone()), Json(HistoryGotoRequest { seq: 0 })).await.unwrap();
+
+        let Json(resp) = api_history_goto(State(state.clone()), Json(HistoryGotoRequest { seq: 3 }))
+            .await
+            .expect("goto forward should succeed");
+        assert!(resp.changed);
+        assert_eq!(resp.canvas.node("a").unwrap().text, "v3");
+        assert!(resp.can_undo);
+        assert!(!resp.can_redo);
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn history_goto_to_the_current_seq_is_a_noop() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None).await.unwrap();
+
+        let mut req: UpdateNodeRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        req.text = Some("edited body".to_string());
+        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req)).await.unwrap();
+        let cursor = state.undo_log.cursor().unwrap();
+
+        let Json(resp) = api_history_goto(State(state.clone()), Json(HistoryGotoRequest { seq: cursor }))
+            .await
+            .expect("goto to the current seq should succeed");
+        assert!(!resp.changed);
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn history_goto_past_the_end_is_a_best_effort_noop_not_an_error() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None).await.unwrap();
+
+        let mut req: UpdateNodeRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        req.text = Some("edited body".to_string());
+        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req)).await.unwrap();
+
+        // Seq 999 doesn't exist — a stale/bogus history-panel request
+        // should land as far as it can (here: nowhere, since seq 1 is
+        // already the cursor) rather than erroring.
+        let Json(resp) = api_history_goto(State(state.clone()), Json(HistoryGotoRequest { seq: 999 }))
+            .await
+            .expect("an unreachable target should still be a clean response");
+        assert!(!resp.changed);
+        assert_eq!(state.undo_log.cursor().unwrap(), 1);
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn undo_and_redo_are_equivalent_to_a_goto_of_the_adjacent_seq() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None).await.unwrap();
+
+        let mut req: UpdateNodeRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        req.text = Some("edited body".to_string());
+        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req)).await.unwrap();
+
+        let Json(via_undo) = api_undo(State(state.clone())).await.unwrap();
+        let _ = api_history_goto(State(state.clone()), Json(HistoryGotoRequest { seq: 1 })).await.unwrap();
+        let Json(via_goto) = api_history_goto(State(state.clone()), Json(HistoryGotoRequest { seq: 0 })).await.unwrap();
+        assert_eq!(via_undo.canvas.node("a").unwrap().text, via_goto.canvas.node("a").unwrap().text);
 
         let _ = std::fs::remove_file(&canvas_path);
     }

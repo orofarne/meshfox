@@ -36,6 +36,9 @@ import {
   clearNodeLayout,
   watchChanges,
   clearLayout,
+  undo,
+  redo,
+  fetchUndoState,
   resetSession,
   fetchServices,
   fetchServiceLog,
@@ -519,6 +522,17 @@ export default function App() {
   // (or none at all) reports empty here, same as the TUI's own
   // `has_configurable_vars`.
   const [hasConfigurableVars, setHasConfigurableVars] = useState(false);
+  // Toolbar undo/redo buttons' own enabled state — reflects the *whole
+  // document's* history, not just this tab's own edits (see
+  // `crates/server/src/undo_log.rs`'s own doc comment: one shared linear
+  // stack per canvas, not per-writer). Initialized by `load()`'s own
+  // best-effort `fetchUndoState` call and kept live afterward by
+  // `watchChanges`'s `onUndoStateChanged` — see the `ServerEvent::
+  // UndoStateChanged` doc comment for why a *push* is needed here rather
+  // than just trusting whatever `handleUndo`/`handleRedo` last computed:
+  // another client's own edit can change this at any time.
+  const [canUndo, setCanUndo] = useState(false);
+  const [canRedo, setCanRedo] = useState(false);
   // The open "configure every declared variable" modal (see VarsForm,
   // `handleConfigure`) — the browser counterpart to `meshfox configure`/
   // the TUI's `c` key. Independent of `varsModal`: this isn't gating a
@@ -631,6 +645,18 @@ export default function App() {
       setHasConfigurableVars(vars.length > 0);
     } catch {
       setHasConfigurableVars(false);
+    }
+    // Best-effort, same "never surface as the page's own error" posture
+    // as `fetchConfigureVars` above — `watchChanges`'s own
+    // `onUndoStateChanged` is what actually keeps this current afterward;
+    // this is just so the buttons aren't wrongly disabled before that
+    // WebSocket has even connected.
+    try {
+      const { canUndo, canRedo } = await fetchUndoState();
+      setCanUndo(canUndo);
+      setCanRedo(canRedo);
+    } catch {
+      // Leave whatever was there before.
     }
   }, []);
 
@@ -1037,6 +1063,10 @@ export default function App() {
       () => setServerGone(true),
       (nodeId, block) => watchAutorunBlock(nodeId, block),
       handleNodeOp,
+      (nextCanUndo, nextCanRedo) => {
+        setCanUndo(nextCanUndo);
+        setCanRedo(nextCanRedo);
+      },
     );
     return stop;
   }, [load, watchAutorunBlock, handleNodeOp]);
@@ -1822,6 +1852,36 @@ export default function App() {
       const updated = await clearLayout();
       touchedNodeIds.current.clear();
       setCanvas(updated);
+    } catch (e) {
+      setError(String(e));
+    }
+  }, []);
+
+  // Toolbar "↶ undo"/keyboard shortcut — reverts the most recent
+  // still-undoable edit to the *whole document* (any client, not just
+  // this tab, see `canUndo`'s own doc comment). `changed: false` is a
+  // harmless no-op (nothing left to undo — shouldn't normally happen
+  // since the button is disabled then, but a stale keypress from just
+  // before `canUndo` flipped false is still possible), not an error, so
+  // it's simply ignored rather than surfaced via `setError`.
+  const handleUndo = useCallback(async () => {
+    try {
+      const result = await undo();
+      setCanUndo(result.canUndo);
+      setCanRedo(result.canRedo);
+      if (result.changed) setCanvas(result);
+    } catch (e) {
+      setError(String(e));
+    }
+  }, []);
+
+  // The mirror image of `handleUndo`.
+  const handleRedo = useCallback(async () => {
+    try {
+      const result = await redo();
+      setCanUndo(result.canUndo);
+      setCanRedo(result.canRedo);
+      if (result.changed) setCanvas(result);
     } catch (e) {
       setError(String(e));
     }
@@ -2855,6 +2915,19 @@ export default function App() {
         openSearch();
         return;
       }
+      // Standard cross-app convention (Docs/Figma/VS Code): Cmd/Ctrl-Z to
+      // undo, Cmd/Ctrl-Shift-Z to redo — `e.code` (physical key), not
+      // `e.key`, same layout-independence reasoning as j/k/h/l below. Always
+      // calls through regardless of `canUndo`/`canRedo` (no need to thread
+      // either into this effect's own dependency array): a stale keypress
+      // just before either flips false lands as `handleUndo`/`handleRedo`'s
+      // own harmless no-op, not a stale/wrong action.
+      if ((e.metaKey || e.ctrlKey) && e.code === "KeyZ") {
+        e.preventDefault();
+        if (e.shiftKey) handleRedo();
+        else handleUndo();
+        return;
+      }
       if (visibleOrder.length === 0) return;
 
       // `e.code` (the physical key position, e.g. "KeyJ" for whatever key
@@ -2944,6 +3017,8 @@ export default function App() {
     resetSessionConfirmOpen,
     searchOpen,
     openSearch,
+    handleUndo,
+    handleRedo,
   ]);
   // Trimmed once here, not read fresh off `searchQuery` state inside the
   // map below — `useMemo`'s own dependency array needs a primitive it can
@@ -3237,6 +3312,24 @@ export default function App() {
     () => (
       <div className="toolbar">
         <strong>meshfox</strong>
+        <button
+          type="button"
+          className="deps-toggle"
+          onClick={handleUndo}
+          disabled={!canUndo}
+          title="Undo the last edit to this document (Cmd/Ctrl-Z) — any client, not just this tab"
+        >
+          ↶ undo
+        </button>
+        <button
+          type="button"
+          className="deps-toggle"
+          onClick={handleRedo}
+          disabled={!canRedo}
+          title="Redo (Cmd/Ctrl-Shift-Z)"
+        >
+          ↷ redo
+        </button>
         {constraintStats && (
           <span
             className={
@@ -3387,6 +3480,10 @@ export default function App() {
       searchOpen,
       openSearch,
       closeSearch,
+      canUndo,
+      canRedo,
+      handleUndo,
+      handleRedo,
     ],
   );
 
