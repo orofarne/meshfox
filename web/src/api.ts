@@ -930,6 +930,57 @@ export async function fetchUndoState(): Promise<{ canUndo: boolean; canRedo: boo
   return res.json();
 }
 
+/** One entry in `GET /api/history`'s own `entries` list — see
+ * `crates/server/src/lib.rs`'s `HistoryEntryResponse`/
+ * `describe_history_entry`. `applied: true` means `seq <= cursor` (an
+ * `/api/undo` would revert it); `false` means it's sitting in the redo
+ * tail (an `/api/redo`, or a `historyGoto` to this same `seq`, would
+ * reapply it). */
+export interface HistoryEntry {
+  seq: number;
+  createdAt: string;
+  opKind: string;
+  applied: boolean;
+  summary: string;
+}
+
+/** `GET /api/history`'s own response shape — see {@link fetchHistory}. */
+export interface HistoryResponse {
+  cursor: number;
+  canUndo: boolean;
+  canRedo: boolean;
+  entries: HistoryEntry[];
+}
+
+/** Fetches the edit-history list for `HistoryPanel` — unlike
+ * {@link fetchUndoState} (which passes `limit=0` and reads only the two
+ * booleans), this reads the actual `entries`: the last `limit` applied
+ * steps plus the *entire* current redo tail (never separately capped, see
+ * `undo_log::UndoLog::history_around`'s own doc comment), most-future
+ * first. */
+export async function fetchHistory(limit: number): Promise<HistoryResponse> {
+  const res = await fetch(`/api/history?limit=${limit}`);
+  if (!res.ok) throw new Error(`GET /api/history: ${res.status}`);
+  return res.json();
+}
+
+/** `POST /api/history/goto` — jumps directly to a given history `seq` (as
+ * listed by {@link fetchHistory}), whichever direction that is from the
+ * current cursor, in one step rather than one `undo`/`redo` call per
+ * step. Same response shape as {@link undo}/{@link redo}. */
+export async function historyGoto(seq: number): Promise<UndoRedoResult> {
+  const res = await fetch("/api/history/goto", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ seq }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `POST /api/history/goto: ${res.status}`);
+  }
+  return res.json();
+}
+
 /**
  * Delays (ms) between reconnect attempts after `/api/watch` drops — see
  * `watchChanges` below. Cumulative sum (~9.6s) deliberately lands just under

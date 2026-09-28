@@ -18,6 +18,7 @@ editors/vscode/e2e/test-results/
 editors/vscode/e2e/playwright-report/
 editors/vscode/e2e/blob-report/
 .DS_Store
+*.swp
 # Project-local Python virtualenvs a canvas's own `@python_venv` builtin
 # interpreter creates (see examples/python-venv.canvas.md) — local machine
 # state. Colocated per-canvas under `.meshfox/<canvas filename>.venv`

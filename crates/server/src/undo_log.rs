@@ -21,11 +21,14 @@
 //! fresh write, so a real edit after some undoing always drops whatever
 //! redo history that undoing had left behind, same as any other editor.
 //!
-//! Two ways a row's own before/after state is stored, chosen by the caller
+//! Three ways a row's own before/after state is stored, chosen by the caller
 //! per op kind (see `crate::record_undo`): a small structured [`Payload::Diff`]
-//! for a single-node/single-parent op that's cheap to describe precisely, or
-//! the whole document's before/after text ([`Payload::Raw`]) for anything
-//! document-wide, rare, or otherwise not worth a bespoke shape.
+//! for a single-node/single-parent op that's cheap to describe precisely and
+//! replay directly; the whole document's before/after text ([`Payload::Raw`])
+//! for anything document-wide, rare, or otherwise not worth a bespoke replay
+//! shape; or both at once ([`Payload::RawWithDiff`]) for a document-wide op
+//! that's still cheap to *describe* specifically even though it isn't cheap
+//! to *replay* precisely.
 
 use rusqlite::{params, Connection, OptionalExtension};
 use std::io;
@@ -101,6 +104,16 @@ pub enum Payload<'a> {
     /// `push`'s own `full_after` argument, so callers only need to supply
     /// `before` here.
     Raw { before: &'a str },
+    /// Same replay data as `Raw` (`raw_before`/`raw_after` — `lib.rs`'s own
+    /// `apply_history_entry` always uses these two columns to reconstruct
+    /// this kind of step, dispatching by `op_kind` rather than by whether
+    /// `diff_json` happens to be set), plus a small `diff` stored
+    /// alongside purely for `describe_history_entry`'s own display text
+    /// (e.g. a rename's old/new id) — never consulted for replay itself.
+    /// Use this when the whole document is still the only reliable way to
+    /// reconstruct the step, but a specific summary is cheap to describe
+    /// anyway.
+    RawWithDiff { before: &'a str, diff: serde_json::Value },
 }
 
 pub struct UndoLog {
@@ -140,6 +153,9 @@ impl UndoLog {
             match payload {
                 Payload::Diff(v) => (Some(v.to_string()), None, None),
                 Payload::Raw { before } => (None, Some(before.to_string()), Some(full_after.to_string())),
+                Payload::RawWithDiff { before, diff } => {
+                    (Some(diff.to_string()), Some(before.to_string()), Some(full_after.to_string()))
+                }
             };
         let created_at = meshfox_core::timestamp::now_utc_rfc3339();
 

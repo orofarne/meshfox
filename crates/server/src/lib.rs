@@ -292,6 +292,89 @@ fn broadcast_undo_state(state: &AppState) {
         .push(ServerEvent::UndoStateChanged { can_undo, can_redo });
 }
 
+/// Whether `old_raw` → `new_raw` only touched some nodes' own `x`/`y`/
+/// `width`/`height` — the shape a canvas drag/resize produces once
+/// persisted, since `web/src/App.tsx`'s own `handleSaveLayout` saves via a
+/// single whole-document `PUT /api/canvas` (`ServerEvent::Changed`, no
+/// per-node `NodeUpserted`) rather than one `PATCH /api/nodes/:id` per
+/// moved node — which would otherwise always land in the generic
+/// `raw_replace`/"document changed" bucket alongside actual content edits,
+/// exactly the "moved" case `record_undo`'s caller wants told apart from
+/// the rest. `None` if anything else differs too (a node added/removed/
+/// reordered, or any other field on any node) — comparing full `Node`
+/// equality with the layout fields blanked out, rather than listing every
+/// other field by hand, so this keeps working if `Node` grows a field
+/// later. `Some` with an empty list never happens (that's `old_raw ==
+/// new_raw`, already short-circuited by this function's only caller).
+fn layout_only_change(old_raw: &str, new_raw: &str) -> Option<Vec<String>> {
+    let old = mdcanvas::parse(old_raw).ok()?;
+    let new = mdcanvas::parse(new_raw).ok()?;
+    if old.nodes.iter().map(|n| &n.id).ne(new.nodes.iter().map(|n| &n.id)) {
+        return None; // a node was added, removed, or reordered
+    }
+    let strip_layout = |n: &meshfox_core::Node| {
+        let mut n = n.clone();
+        n.x = None;
+        n.y = None;
+        n.width = None;
+        n.height = None;
+        n
+    };
+    let mut moved_ids = Vec::new();
+    for (old_node, new_node) in old.nodes.iter().zip(new.nodes.iter()) {
+        if strip_layout(old_node) != strip_layout(new_node) {
+            return None;
+        }
+        let layout_changed = old_node.x != new_node.x
+            || old_node.y != new_node.y
+            || old_node.width != new_node.width
+            || old_node.height != new_node.height;
+        if layout_changed {
+            moved_ids.push(old_node.id.clone());
+        }
+    }
+    if moved_ids.is_empty() { None } else { Some(moved_ids) }
+}
+
+#[cfg(test)]
+mod layout_only_change_tests {
+    use super::*;
+
+    const TWO_SIBLINGS: &str = concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "## A\n<!-- meshfox:node id=\"a\" x=\"0\" y=\"0\" -->\n\nbody a\n\n",
+        "## B\n<!-- meshfox:node id=\"b\" -->\n\nbody b\n",
+    );
+
+    #[test]
+    fn a_pure_position_drag_is_recognized() {
+        let moved = mdcanvas::set_node_meta(
+            TWO_SIBLINGS,
+            "a",
+            &NodeMeta { x: Some(50.0), y: Some(75.0), ..NodeMeta::default() },
+        )
+        .unwrap();
+        assert_eq!(layout_only_change(TWO_SIBLINGS, &moved), Some(vec!["a".to_string()]));
+    }
+
+    #[test]
+    fn a_title_change_is_not_layout_only() {
+        let renamed = mdcanvas::set_node_title(TWO_SIBLINGS, "a", "A renamed").unwrap();
+        assert_eq!(layout_only_change(TWO_SIBLINGS, &renamed), None);
+    }
+
+    #[test]
+    fn a_removed_node_is_not_layout_only() {
+        let removed = mdcanvas::delete_node(TWO_SIBLINGS, "b").unwrap();
+        assert_eq!(layout_only_change(TWO_SIBLINGS, &removed), None);
+    }
+
+    #[test]
+    fn no_actual_position_change_returns_none_not_an_empty_list() {
+        assert_eq!(layout_only_change(TWO_SIBLINGS, TWO_SIBLINGS), None);
+    }
+}
+
 /// Builds this write's own undo-history entry from `(old_raw, new_raw,
 /// event)` alone — no mutating handler above needs to hand over anything
 /// extra, since `event` already says which of the four shapes this write
@@ -355,19 +438,50 @@ fn record_undo(state: &AppState, old_raw: &str, new_raw: &str, event: &ServerEve
                 })),
             )
         }
+        ServerEvent::NodeIdRenamed { old_id, new_id } => (
+            "node_id_renamed",
+            undo_log::Payload::RawWithDiff {
+                before: old_raw,
+                diff: serde_json::json!({ "oldId": old_id, "newId": new_id }),
+            },
+        ),
+        ServerEvent::NodeIdCleared { old_id, new_id } => (
+            "node_id_cleared",
+            undo_log::Payload::RawWithDiff {
+                before: old_raw,
+                diff: serde_json::json!({ "oldId": old_id, "newId": new_id }),
+            },
+        ),
+        ServerEvent::OptionsChanged => ("options_changed", undo_log::Payload::Raw { before: old_raw }),
+        ServerEvent::AllChildrenReordered => {
+            ("siblings_reordered", undo_log::Payload::Raw { before: old_raw })
+        }
+        ServerEvent::LayoutCleared => ("layout_cleared", undo_log::Payload::Raw { before: old_raw }),
         // `Changed`, and any future variant this doesn't know about yet —
         // the same "document-wide, rare, or not worth a bespoke shape"
-        // bucket as `rename_node_id`/`clear_node_id`/`remove_node?children=
-        // reparent`/raw `PUT /api/canvas/raw`, plus every endpoint that
-        // isn't one of the three node-scoped shapes above at all
-        // (`put_canvas`, `put_options`, `reorder_siblings`, `clear_layout`,
-        // the run-output cache save) — all of them already emit `Changed`
-        // today, so they land here automatically, with no call site of
-        // their own needing to know this exists.
-        _ => (
-            "raw_replace",
-            undo_log::Payload::Raw { before: old_raw },
-        ),
+        // bucket as `remove_node?children=reparent`/raw `PUT
+        // /api/canvas/raw`/`put_canvas`/the run-output cache save — all of
+        // them already emit `Changed` today, so they land here
+        // automatically, with no call site of their own needing to know
+        // this exists. `layout_only_change` still gets a chance to pull
+        // the most common real case (a canvas drag/resize, saved as a
+        // whole-document `PUT /api/canvas` by `web/src/App.tsx`'s own
+        // `handleSaveLayout` — see that function's own doc comment) out of
+        // this bucket into something specific, same as every other arm
+        // above already does for its own call site.
+        _ => match layout_only_change(old_raw, new_raw) {
+            Some(moved_ids) => (
+                "nodes_repositioned",
+                undo_log::Payload::RawWithDiff {
+                    before: old_raw,
+                    diff: serde_json::json!({ "nodeIds": moved_ids }),
+                },
+            ),
+            None => (
+                "raw_replace",
+                undo_log::Payload::Raw { before: old_raw },
+            ),
+        },
     };
     if let Err(e) = state.undo_log.push(op_kind, payload, new_raw) {
         eprintln!("meshfox: failed to record undo history for {op_kind} ({e})");
@@ -388,15 +502,18 @@ fn record_undo(state: &AppState, old_raw: &str, new_raw: &str, event: &ServerEve
 /// client as a plain 422 by `api_undo`/`api_redo`, never silently ignored
 /// or partially applied.
 fn apply_history_entry(raw: &str, entry: &undo_log::UndoEntry, undo: bool) -> Option<String> {
-    let Some(diff_json) = entry.diff_json.as_deref() else {
-        // `raw_replace`/`external_edit` — no structured diff, just the
-        // whole document, verbatim, either side.
-        return if undo {
-            entry.raw_before.clone()
-        } else {
-            entry.raw_after.clone()
-        };
-    };
+    // Dispatches by `op_kind`, not by whether `diff_json` happens to be
+    // set — `node_upserted`/`node_removed`/`nodes_reordered` are the only
+    // kinds `record_undo` ever gives a *replayable* structured diff (a
+    // `Payload::Diff`); every other kind (`raw_replace`, `external_edit`,
+    // and anything recorded as `Payload::RawWithDiff` — a `diff_json` set
+    // purely for `describe_history_entry`'s own display text, e.g. a
+    // rename's old/new id) always replays via the whole-document
+    // `raw_before`/`raw_after` instead, regardless of `diff_json`.
+    if !matches!(entry.op_kind.as_str(), "node_upserted" | "node_removed" | "nodes_reordered") {
+        return if undo { entry.raw_before.clone() } else { entry.raw_after.clone() };
+    }
+    let diff_json = entry.diff_json.as_deref()?;
     let diff: serde_json::Value = serde_json::from_str(diff_json).ok()?;
     match entry.op_kind.as_str() {
         "node_upserted" => {
@@ -704,40 +821,220 @@ struct HistoryEntryResponse {
     summary: String,
 }
 
+/// The `from` id of every `extraParents` entry in a `node_upserted` diff's
+/// `before`/`after` Node JSON, as a set — used by `describe_node_upserted`
+/// to tell "an edge was added/removed" apart from "an existing edge's own
+/// style/route/label changed" without needing to compare each `ExtraEdge`
+/// field by field.
+fn extra_parent_from_ids(node: Option<&serde_json::Value>) -> std::collections::BTreeSet<String> {
+    node.and_then(|n| n.get("extraParents"))
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|edge| edge.get("from").and_then(|f| f.as_str()).map(str::to_string))
+        .collect()
+}
+
+/// `describe_history_entry`'s own `"node_upserted"` case, split out since
+/// it's the one op kind covering several genuinely different *kinds* of
+/// change under one shape (see `ServerEvent::NodeUpserted`'s own doc
+/// comment: create/title/body/meta/edges/parent all collapse into this
+/// same "whole node, before and after" diff) — without this, every one of
+/// them would read as the same generic "changed «X»", including a
+/// structural move (reparent) or an edge add/remove, which are worth
+/// calling out specifically. Checked in roughly most-to-least structurally
+/// significant order and stops at the first real difference found —
+/// intentionally *a* cause, not an exhaustive list of every field that
+/// changed, same "short one-liner, not a diff dump" scope as every other
+/// arm in `describe_history_entry`.
+fn describe_node_upserted(diff: &serde_json::Value) -> String {
+    let before = diff.get("before").filter(|b| !b.is_null());
+    let after = diff.get("after");
+    let after_title = after
+        .and_then(|a| a.get("title"))
+        .and_then(|t| t.as_str())
+        .unwrap_or_default();
+
+    let Some(before) = before else {
+        return format!("created «{after_title}»");
+    };
+    let field = |k: &str| (before.get(k).cloned().unwrap_or_default(), after.and_then(|a| a.get(k)).cloned().unwrap_or_default());
+
+    let (before_parent, after_parent) = field("parent");
+    if before_parent != after_parent {
+        let new_parent = after_parent.as_str().unwrap_or("(root)");
+        return format!("moved «{after_title}» under «{new_parent}»");
+    }
+
+    let before_edges = extra_parent_from_ids(Some(before));
+    let after_edges = extra_parent_from_ids(after);
+    if before_edges != after_edges {
+        let added: Vec<&str> = after_edges.difference(&before_edges).map(String::as_str).collect();
+        let removed: Vec<&str> = before_edges.difference(&after_edges).map(String::as_str).collect();
+        return match (added.is_empty(), removed.is_empty()) {
+            (false, true) => format!("added an edge from «{}» to «{after_title}»", added.join("», «")),
+            (true, false) => format!("removed the edge from «{}» to «{after_title}»", removed.join("», «")),
+            _ => format!("changed the edges on «{after_title}»"),
+        };
+    }
+    let (before_edge_style, after_edge_style) = field("extraParents");
+    if before_edge_style != after_edge_style {
+        return format!("restyled an edge on «{after_title}»");
+    }
+
+    let before_title = before.get("title").and_then(|t| t.as_str()).unwrap_or_default();
+    if before_title != after_title {
+        return format!("renamed «{before_title}» to «{after_title}»");
+    }
+
+    let (before_text, after_text) = field("text");
+    if before_text != after_text {
+        return format!("edited «{after_title}»");
+    }
+
+    if ["x", "y", "width", "height"].into_iter().any(|k| {
+        let (b, a) = field(k);
+        b != a
+    }) {
+        return format!("repositioned «{after_title}» on canvas");
+    }
+
+    format!("changed «{after_title}»")
+}
+
+#[cfg(test)]
+mod describe_node_upserted_tests {
+    use super::*;
+
+    #[test]
+    fn creation_is_created_not_changed() {
+        let diff = serde_json::json!({ "before": null, "after": { "title": "New" } });
+        assert_eq!(describe_node_upserted(&diff), "created «New»");
+    }
+
+    #[test]
+    fn a_parent_change_is_a_move_not_a_generic_change() {
+        let diff = serde_json::json!({
+            "before": { "title": "X", "parent": "a" },
+            "after": { "title": "X", "parent": "b" },
+        });
+        assert_eq!(describe_node_upserted(&diff), "moved «X» under «b»");
+    }
+
+    #[test]
+    fn a_new_extra_parent_is_an_added_edge() {
+        let diff = serde_json::json!({
+            "before": { "title": "X", "extraParents": [] },
+            "after": { "title": "X", "extraParents": [{ "from": "y" }] },
+        });
+        assert_eq!(describe_node_upserted(&diff), "added an edge from «y» to «X»");
+    }
+
+    #[test]
+    fn a_removed_extra_parent_is_a_removed_edge() {
+        let diff = serde_json::json!({
+            "before": { "title": "X", "extraParents": [{ "from": "y" }] },
+            "after": { "title": "X", "extraParents": [] },
+        });
+        assert_eq!(describe_node_upserted(&diff), "removed the edge from «y» to «X»");
+    }
+
+    #[test]
+    fn restyling_an_edge_without_changing_its_source_is_reported_as_a_restyle() {
+        let diff = serde_json::json!({
+            "before": { "title": "X", "extraParents": [{ "from": "y", "color": "red" }] },
+            "after": { "title": "X", "extraParents": [{ "from": "y", "color": "blue" }] },
+        });
+        assert_eq!(describe_node_upserted(&diff), "restyled an edge on «X»");
+    }
+
+    #[test]
+    fn a_title_change_is_a_rename() {
+        let diff = serde_json::json!({
+            "before": { "title": "Old" },
+            "after": { "title": "New" },
+        });
+        assert_eq!(describe_node_upserted(&diff), "renamed «Old» to «New»");
+    }
+
+    #[test]
+    fn a_text_change_is_an_edit() {
+        let diff = serde_json::json!({
+            "before": { "title": "X", "text": "a" },
+            "after": { "title": "X", "text": "b" },
+        });
+        assert_eq!(describe_node_upserted(&diff), "edited «X»");
+    }
+
+    #[test]
+    fn a_position_only_change_is_a_reposition() {
+        let diff = serde_json::json!({
+            "before": { "title": "X", "x": 0, "y": 0 },
+            "after": { "title": "X", "x": 10, "y": 0 },
+        });
+        assert_eq!(describe_node_upserted(&diff), "repositioned «X» on canvas");
+    }
+
+    #[test]
+    fn nothing_recognized_falls_back_to_generic_changed() {
+        let diff = serde_json::json!({
+            "before": { "title": "X", "color": "red" },
+            "after": { "title": "X", "color": "blue" },
+        });
+        assert_eq!(describe_node_upserted(&diff), "changed «X»");
+    }
+}
+
 /// A short, human-readable description of one `undo_log::UndoEntry` —
-/// "изменён «Setup»" rather than a raw diff dump, per TODO.canvas.md's own
+/// "changed «Setup»" rather than a raw diff dump, per TODO.canvas.md's own
 /// vision for a readable history panel. Best-effort: falls back to just
 /// the op kind if `diff_json` doesn't parse into the shape this expects
 /// (should never happen for a row this same server wrote).
 fn describe_history_entry(entry: &undo_log::UndoEntry) -> String {
-    let title_of = |v: &serde_json::Value| -> Option<String> {
-        v.get("title").and_then(|t| t.as_str()).map(str::to_string)
-    };
     let Some(diff_json) = entry.diff_json.as_deref() else {
         return match entry.op_kind.as_str() {
-            "external_edit" => "изменения вне интерфейса".to_string(),
-            _ => "изменение документа".to_string(),
+            "external_edit" => "edited outside the app".to_string(),
+            "options_changed" => "document options changed".to_string(),
+            "siblings_reordered" => "sibling order re-synced from layout".to_string(),
+            "layout_cleared" => "every node's layout was cleared".to_string(),
+            _ => "document changed".to_string(),
         };
     };
     let Ok(diff) = serde_json::from_str::<serde_json::Value>(diff_json) else {
         return entry.op_kind.clone();
     };
     match entry.op_kind.as_str() {
-        "node_upserted" => {
-            let after_title = diff.get("after").and_then(title_of);
-            if diff.get("before").is_some_and(|b| b.is_null()) {
-                format!("создан «{}»", after_title.unwrap_or_default())
-            } else {
-                format!("изменён «{}»", after_title.unwrap_or_default())
-            }
-        }
+        "node_upserted" => describe_node_upserted(&diff),
         "node_removed" => {
             let id = diff.get("nodeId").and_then(|v| v.as_str()).unwrap_or_default();
-            format!("удалён «{id}»")
+            format!("removed «{id}»")
         }
         "nodes_reordered" => {
             let parent_id = diff.get("parentId").and_then(|v| v.as_str()).unwrap_or_default();
-            format!("изменён порядок дочерних узлов «{parent_id}»")
+            format!("reordered children of «{parent_id}»")
+        }
+        "node_id_renamed" => {
+            let old_id = diff.get("oldId").and_then(|v| v.as_str()).unwrap_or_default();
+            let new_id = diff.get("newId").and_then(|v| v.as_str()).unwrap_or_default();
+            format!("renamed id «{old_id}» to «{new_id}»")
+        }
+        "node_id_cleared" => {
+            let old_id = diff.get("oldId").and_then(|v| v.as_str()).unwrap_or_default();
+            let new_id = diff.get("newId").and_then(|v| v.as_str()).unwrap_or_default();
+            format!("cleared id «{old_id}» (now «{new_id}»)")
+        }
+        "nodes_repositioned" => {
+            let ids: Vec<&str> = diff
+                .get("nodeIds")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str())
+                .collect();
+            match ids.as_slice() {
+                [id] => format!("repositioned «{id}» on canvas"),
+                _ => format!("repositioned {} nodes on canvas", ids.len()),
+            }
         }
         other => other.to_string(),
     }
@@ -1949,12 +2246,20 @@ enum RunEvent {
 /// these, from each mutating `/api/nodes*` handler, in *addition* to
 /// `Changed` still covering the cases these three don't (an edit landing
 /// in an `include` target file, or one that ripples across more nodes
-/// than a single op can cleanly describe — `rename_node_id`/`clear_node_id`,
-/// and `remove_node`'s own `?children=reparent` branch, still just push
-/// `Changed`, see their own call sites). A client that doesn't know these
-/// three yet can simply ignore them — they never replace `Changed` at the
-/// same seq, only accompany it, so an old client watching only `Changed`
-/// keeps working unmodified.
+/// than a single op can cleanly describe — `remove_node`'s own `?children=
+/// reparent` branch still just pushes `Changed`, see its own call site). A
+/// client that doesn't know these three yet can simply ignore them — they
+/// never replace `Changed` at the same seq, only accompany it, so an old
+/// client watching only `Changed` keeps working unmodified.
+///
+/// `NodeIdRenamed`/`NodeIdCleared`/`OptionsChanged`/`AllChildrenReordered`/
+/// `LayoutCleared` are narrower still — each still replays as a full
+/// document reload/undo (too document-wide to apply in place, same as
+/// `Changed`; see `apply_history_entry`'s own doc comment), but each names
+/// specifically *which* document-wide thing changed, so `record_undo` can
+/// give it (and `describe_history_entry` can show) a specific history
+/// summary instead of the generic `raw_replace`/"document changed" bucket
+/// every one of them used to fall into.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case", rename_all_fields = "camelCase")]
 enum ServerEvent {
@@ -1980,6 +2285,29 @@ enum ServerEvent {
     /// order rather than a "moved X before/after Y" delta so a client
     /// never has to reconstruct one from the other.
     NodesReordered { parent_id: String, child_ids: Vec<String> },
+    /// `rename_node_id` — `old_id` no longer exists, `new_id` is what
+    /// every reference to it was rewritten to. Ripples into every other
+    /// node's own `parent=`/`meshfox:edge from=` reference plus any
+    /// `deps=` fence text — too much for `NodeUpserted`'s single-node
+    /// shape, so this still replays as a full reload, same as `Changed`.
+    NodeIdRenamed { old_id: String, new_id: String },
+    /// `clear_node_id` — `old_id`'s own explicit `id="..."` attribute was
+    /// dropped, falling back to the parser's title-slug id, `new_id`
+    /// (usually equal to `old_id` already — see `ClearNodeIdResponse`'s
+    /// own doc comment for when it isn't). Same reload-replay reasoning as
+    /// `NodeIdRenamed`.
+    NodeIdCleared { old_id: String, new_id: String },
+    /// `put_options` — the document's declared `meshfox:option`s changed.
+    /// No payload: a client just re-reads `canvas.options`.
+    OptionsChanged,
+    /// `reorder_siblings` — every parent's own children were re-sorted by
+    /// position in one document-wide pass (`mdcanvas::reorder_by_position`)
+    /// — unlike `NodesReordered` (`move_sibling`'s own single-parent
+    /// shape), there's no one `parent_id` to name here.
+    AllChildrenReordered,
+    /// `clear_layout` — every node's own authored `x`/`y`/`w`/`h` was
+    /// cleared at once, reverting the whole document to auto-placed.
+    LayoutCleared,
     /// Undo/redo *availability* changed — pushed after every successful
     /// save (`AppState::save_with_event`) and after every `/api/undo`/
     /// `/api/redo` call itself, so a client can grey/ungrey its own
@@ -2582,7 +2910,7 @@ async fn clear_layout(State(state): State<Arc<AppState>>) -> Result<Json<Canvas>
         }
     }
     state
-        .save(&raw)
+        .save_with_event(&raw, ServerEvent::LayoutCleared)
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let saved = state.raw.lock().unwrap().clone();
     canvas_response(&saved, &state.canvas_path)
@@ -2603,7 +2931,7 @@ async fn reorder_siblings(State(state): State<Arc<AppState>>) -> Result<Json<Can
     let updated = mdcanvas::reorder_by_position(&raw, &HashMap::new())
         .ok_or_else(|| ApiError(StatusCode::UNPROCESSABLE_ENTITY, "failed to parse".to_string()))?;
     state
-        .save(&updated)
+        .save_with_event(&updated, ServerEvent::AllChildrenReordered)
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let saved = state.raw.lock().unwrap().clone();
     canvas_response(&saved, &state.canvas_path)
@@ -2765,7 +3093,7 @@ async fn put_options(
     })?;
     parse_or_error(&updated)?;
     state
-        .save(&updated)
+        .save_with_event(&updated, ServerEvent::OptionsChanged)
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let saved = state.raw.lock().unwrap().clone();
     canvas_response(&saved, &state.canvas_path)
@@ -4086,9 +4414,14 @@ async fn rename_node_id(
     // An id rename ripples into every other node's own `parent=`/
     // `meshfox:edge from=` reference plus any `deps=` fence text — too
     // much for `NodeUpserted`'s single-node shape to describe accurately;
-    // falls back to the generic `Changed` (a full reload), same as before
-    // this feature.
-    commit_located(&state, &located, &updated, ServerEvent::Changed)?;
+    // still replays as a full reload, same as `Changed`, just named
+    // specifically (see `ServerEvent::NodeIdRenamed`'s own doc comment).
+    commit_located(
+        &state,
+        &located,
+        &updated,
+        ServerEvent::NodeIdRenamed { old_id: located.local_id.clone(), new_id: req.new_id.clone() },
+    )?;
     let response_raw = state.raw.lock().unwrap().clone();
     canvas_response(&response_raw, &state.canvas_path)
 }
@@ -4122,8 +4455,15 @@ async fn clear_node_id(
         .map_err(|e| ApiError(StatusCode::NOT_FOUND, e.to_string()))?;
     parse_or_error(&updated)?;
     // Same reasoning as `rename_node_id`: an id change ripples too far for
-    // `NodeUpserted` — falls back to the generic `Changed`.
-    commit_located(&state, &located, &updated, ServerEvent::Changed)?;
+    // `NodeUpserted`, so this still replays as a full reload too — just
+    // named specifically (see `ServerEvent::NodeIdCleared`'s own doc
+    // comment).
+    commit_located(
+        &state,
+        &located,
+        &updated,
+        ServerEvent::NodeIdCleared { old_id: located.local_id.clone(), new_id: local_new_id.clone() },
+    )?;
     let response_raw = state.raw.lock().unwrap().clone();
     let Json(canvas) = canvas_response(&response_raw, &state.canvas_path)?;
     Ok(Json(ClearNodeIdResponse { id: local_new_id, canvas }))
@@ -8184,10 +8524,10 @@ mod node_op_broadcast_tests {
 
     // An id rename ripples into every other node's own `parent=`/`meshfox:
     // edge from=` reference — too much for `NodeUpserted`'s single-node
-    // shape, so it deliberately keeps the generic `Changed` (a full
-    // reload) instead of a precise op.
+    // shape, so it deliberately keeps a full-reload replay (like
+    // `Changed`) instead of a precise op, just under its own named variant.
     #[tokio::test]
-    async fn rename_node_id_falls_back_to_changed() {
+    async fn rename_node_id_broadcasts_node_id_renamed() {
         let canvas_path = write_test_canvas(TWO_SIBLINGS);
         let state = build_state(canvas_path.clone(), false, None)
             .await
@@ -8200,8 +8540,11 @@ mod node_op_broadcast_tests {
             .expect("rename should succeed");
 
         match recv_event(&mut rx) {
-            ServerEvent::Changed => {}
-            other => panic!("expected a Changed fallback, got {other:?}"),
+            ServerEvent::NodeIdRenamed { old_id, new_id } => {
+                assert_eq!(old_id, "a");
+                assert_eq!(new_id, "a-renamed");
+            }
+            other => panic!("expected NodeIdRenamed, got {other:?}"),
         }
 
         let _ = std::fs::remove_file(&canvas_path);
@@ -8375,7 +8718,7 @@ mod undo_log_recording_tests {
     }
 
     #[tokio::test]
-    async fn rename_node_id_records_a_raw_replace() {
+    async fn rename_node_id_records_a_raw_replay_with_a_specific_diff() {
         let canvas_path = write_test_canvas(TWO_SIBLINGS);
         let state = build_state(canvas_path.clone(), false, None).await.expect("valid test canvas");
 
@@ -8386,10 +8729,46 @@ mod undo_log_recording_tests {
 
         let history = state.undo_log.history(10).unwrap();
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].op_kind, "raw_replace");
-        assert!(history[0].diff_json.is_none());
+        assert_eq!(history[0].op_kind, "node_id_renamed");
+        // Still a whole-document replay under the hood (too much ripples
+        // into other nodes' own references to replay precisely) — the
+        // `diff_json` here is display-only, for `describe_history_entry`.
         assert!(history[0].raw_before.as_ref().unwrap().contains("id=\"a\""));
         assert!(history[0].raw_after.as_ref().unwrap().contains("id=\"a-renamed\""));
+        let diff: serde_json::Value = serde_json::from_str(history[0].diff_json.as_ref().unwrap()).unwrap();
+        assert_eq!(diff["oldId"], "a");
+        assert_eq!(diff["newId"], "a-renamed");
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    // `web/src/App.tsx`'s own `handleSaveLayout` persists a canvas drag via
+    // exactly this shape — a whole-document `PUT /api/canvas` with only
+    // some nodes' own `x`/`y` touched — rather than a per-node `PATCH
+    // /api/nodes/:id` (which `update_node_records_a_node_upserted_diff_
+    // with_before_and_after` above already covers). Without
+    // `layout_only_change`, this would fall into the generic `raw_replace`
+    // bucket like any other whole-document save.
+    #[tokio::test]
+    async fn a_layout_only_whole_canvas_save_is_recorded_as_nodes_repositioned() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None).await.expect("valid test canvas");
+
+        let Json(mut canvas) = get_canvas(State(state.clone())).await.expect("get should succeed");
+        for node in &mut canvas.nodes {
+            if node.id == "a" {
+                node.x = Some(123.0);
+                node.y = Some(456.0);
+            }
+        }
+        let req = PutCanvasRequest { canvas, layout_hints: HashMap::new() };
+        let _ = put_canvas(State(state.clone()), Json(req)).await.expect("save should succeed");
+
+        let history = state.undo_log.history(10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].op_kind, "nodes_repositioned");
+        let diff: serde_json::Value = serde_json::from_str(history[0].diff_json.as_ref().unwrap()).unwrap();
+        assert_eq!(diff["nodeIds"], serde_json::json!(["a"]));
 
         let _ = std::fs::remove_file(&canvas_path);
     }
@@ -8767,7 +9146,9 @@ mod undo_redo_api_tests {
         assert!(resp.can_redo);
         assert!(!resp.entries[0].applied);
         assert_eq!(resp.entries[0].op_kind, "node_upserted");
-        assert!(resp.entries[0].summary.contains("изменён"));
+        // A body-text-only change gets its own specific wording now (see
+        // `describe_node_upserted`), not the generic "changed".
+        assert!(resp.entries[0].summary.contains("edited"));
 
         let _ = std::fs::remove_file(&canvas_path);
     }

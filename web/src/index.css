@@ -2854,6 +2854,39 @@ a {
   padding: 0.25rem 0.6rem;
 }
 
+/* HistoryPanel.tsx — the shared undo/redo history list opened from the
+ * toolbar's "history" button. Same flat-list shape as `.tty-sessions-list`
+ * (own width instead of `.service-panel-list`'s fixed sidebar), but rows
+ * are `.service-panel-row` buttons (click-to-jump via `/api/history/goto`)
+ * rather than plain divs. */
+.history-panel-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  flex: 1;
+  min-width: 320px;
+  overflow-y: auto;
+}
+
+.history-panel-row {
+  width: 100%;
+}
+
+.history-panel-row-marker {
+  flex-shrink: 0;
+  width: 0.9rem;
+  color: var(--accent);
+}
+
+.history-panel-row-future {
+  opacity: 0.6;
+}
+
+.history-panel-divider {
+  margin: 0.3rem 0;
+  border-top: 1px dashed var(--node-border);
+}
+
 .service-panel-log {
   flex: 1;
   min-height: 0;

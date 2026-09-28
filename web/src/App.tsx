@@ -39,6 +39,8 @@ import {
   undo,
   redo,
   fetchUndoState,
+  fetchHistory,
+  historyGoto,
   resetSession,
   fetchServices,
   fetchServiceLog,
@@ -52,10 +54,12 @@ import {
   type NodePatch,
   type ActiveRunDto,
   type NodeOpEvent,
+  type HistoryEntry,
 } from "./api";
 import type { CanvasDoc, CanvasNode, ExtraEdgeDto, ServiceStatusDto, VarStatus } from "./types";
 import { ServicePanel } from "./ServicePanel";
 import { TtySessionsPanel } from "./TtySessionsPanel";
+import { HistoryPanel } from "./HistoryPanel";
 import { ServiceLockConflictDialog } from "./ServiceLockConflictDialog";
 import { pathTo, deriveEdges, findRoot, visibleNodeIds, subtreeIds } from "./tree";
 import { computeAutoLayout, FOLDED_HEIGHT, type LayoutBox } from "./autolayout";
@@ -696,6 +700,38 @@ export default function App() {
   // `TtySessionsPanel`'s list.
   const [liveTtySessions, setLiveTtySessions] = useState<ActiveRunDto[]>([]);
   const [ttySessionsPanelOpen, setTtySessionsPanelOpen] = useState(false);
+
+  // `HistoryPanel`'s own data — unlike `services`/`liveTtySessions`, not
+  // polled: fetched fresh whenever the panel opens and again after every
+  // `handleHistoryGoto`, since that's the only thing that can move the
+  // cursor while the panel is open (the panel itself is the only UI that
+  // calls `/api/history/goto`).
+  const [historyEntries, setHistoryEntries] = useState<HistoryEntry[]>([]);
+  const [historyCursor, setHistoryCursor] = useState(0);
+  const [historyPanelOpen, setHistoryPanelOpen] = useState(false);
+  const refreshHistory = useCallback(() => {
+    fetchHistory(50)
+      .then((r) => {
+        setHistoryEntries(r.entries);
+        setHistoryCursor(r.cursor);
+      })
+      .catch((e) => setError(String(e)));
+  }, []);
+  const handleHistoryGoto = useCallback(
+    async (seq: number) => {
+      try {
+        const result = await historyGoto(seq);
+        setCanUndo(result.canUndo);
+        setCanRedo(result.canRedo);
+        if (result.changed) setCanvas(result);
+        refreshHistory();
+      } catch (e) {
+        setError(String(e));
+      }
+    },
+    [refreshHistory],
+  );
+
   const refreshLiveTtySessions = useCallback(() => {
     return fetchActiveRuns()
       .then((runs) => {
@@ -2921,8 +2957,11 @@ export default function App() {
       // calls through regardless of `canUndo`/`canRedo` (no need to thread
       // either into this effect's own dependency array): a stale keypress
       // just before either flips false lands as `handleUndo`/`handleRedo`'s
-      // own harmless no-op, not a stale/wrong action.
-      if ((e.metaKey || e.ctrlKey) && e.code === "KeyZ") {
+      // own harmless no-op, not a stale/wrong action. Gated on `editMode`
+      // though, same as the toolbar buttons themselves — undoing/redoing
+      // still mutates the shared document, which read-only mode's own
+      // contract says a client can't do until "Edit" is clicked.
+      if (editMode && (e.metaKey || e.ctrlKey) && e.code === "KeyZ") {
         e.preventDefault();
         if (e.shiftKey) handleRedo();
         else handleUndo();
@@ -3019,6 +3058,7 @@ export default function App() {
     openSearch,
     handleUndo,
     handleRedo,
+    editMode,
   ]);
   // Trimmed once here, not read fresh off `searchQuery` state inside the
   // map below — `useMemo`'s own dependency array needs a primitive it can
@@ -3312,24 +3352,39 @@ export default function App() {
     () => (
       <div className="toolbar">
         <strong>meshfox</strong>
-        <button
-          type="button"
-          className="deps-toggle"
-          onClick={handleUndo}
-          disabled={!canUndo}
-          title="Undo the last edit to this document (Cmd/Ctrl-Z) — any client, not just this tab"
-        >
-          ↶ undo
-        </button>
-        <button
-          type="button"
-          className="deps-toggle"
-          onClick={handleRedo}
-          disabled={!canRedo}
-          title="Redo (Cmd/Ctrl-Shift-Z)"
-        >
-          ↷ redo
-        </button>
+        {editMode && (
+          <>
+            <button
+              type="button"
+              className="deps-toggle"
+              onClick={handleUndo}
+              disabled={!canUndo}
+              title="Undo the last edit to this document (Cmd/Ctrl-Z) — any client, not just this tab"
+            >
+              ↶ undo
+            </button>
+            <button
+              type="button"
+              className="deps-toggle"
+              onClick={handleRedo}
+              disabled={!canRedo}
+              title="Redo (Cmd/Ctrl-Shift-Z)"
+            >
+              ↷ redo
+            </button>
+            <button
+              type="button"
+              className="deps-toggle"
+              onClick={() => {
+                setHistoryPanelOpen(true);
+                refreshHistory();
+              }}
+              title="Show the edit history and jump to any past point"
+            >
+              🕘 history
+            </button>
+          </>
+        )}
         {constraintStats && (
           <span
             className={
@@ -3484,6 +3539,7 @@ export default function App() {
       canRedo,
       handleUndo,
       handleRedo,
+      refreshHistory,
     ],
   );
 
@@ -3664,6 +3720,14 @@ export default function App() {
               .then(() => refreshLiveTtySessions())
               .catch((e) => setError(String(e)));
           }}
+        />
+      )}
+      {historyPanelOpen && editMode && (
+        <HistoryPanel
+          entries={historyEntries}
+          cursor={historyCursor}
+          onClose={() => setHistoryPanelOpen(false)}
+          onGoto={handleHistoryGoto}
         />
       )}
       {expandedNode && (
