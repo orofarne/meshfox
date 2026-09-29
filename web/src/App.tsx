@@ -928,6 +928,11 @@ export default function App() {
   // actually mutating `liveBlocks`.
   const autorunWatchGeneration = useRef<Map<string, number>>(new Map());
 
+  // Addresses (`"<nodeId>::<block>"`) whose run this tab itself started via
+  // `executeRun` and is still streaming — `/api/watch`'s `"run-started"`
+  // for one of these must not spawn a second reader (see `executeRun`).
+  const selfInitiatedRuns = useRef<Set<string>>(new Set());
+
   // Claims `key` (an address, `"<nodeId>::<block>"`) as of *this* call —
   // bumps its generation and returns a checker any later event handler for
   // this same call should gate every state mutation on. Shared by
@@ -1097,7 +1102,10 @@ export default function App() {
         load();
       },
       () => setServerGone(true),
-      (nodeId, block) => watchAutorunBlock(nodeId, block),
+      (nodeId, block) => {
+        if (selfInitiatedRuns.current.has(`${nodeId}::${block}`)) return;
+        watchAutorunBlock(nodeId, block);
+      },
       handleNodeOp,
       (nextCanUndo, nextCanRedo) => {
         setCanUndo(nextCanUndo);
@@ -1225,6 +1233,13 @@ export default function App() {
         );
       };
 
+      // The server broadcasts `"run-started"` for *every* plain-block run,
+      // this tab's own included — without this, the `/api/watch` handler
+      // would start a second `watchAutorunBlock` reader on the very run
+      // this stream is already folding into `liveBlocks`, and both would
+      // append the same lines (doubled output).
+      const selfRunKey = `${nodeId}::${blockName}`;
+      selfInitiatedRuns.current.add(selfRunKey);
       try {
         // Running is always allowed; only Edit mode persists a cache'd
         // block's output to the file. When `withDeps`, the server
@@ -1360,6 +1375,8 @@ export default function App() {
       } catch (e) {
         blockStuckQueued();
         setError(String(e));
+      } finally {
+        selfInitiatedRuns.current.delete(selfRunKey);
       }
     },
     [canvas, editMode, load, blockGraph, setNodes, patchLiveBlock, appendConsoleLine],
