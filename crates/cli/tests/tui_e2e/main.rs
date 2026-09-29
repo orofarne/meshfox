@@ -24,6 +24,7 @@ mod baseline;
 mod fixtures;
 mod harness;
 mod history;
+mod markdown_output;
 mod mouse_deps_line;
 mod mouse_drag_dblclick;
 mod mouse_form;

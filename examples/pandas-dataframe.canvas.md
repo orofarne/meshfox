@@ -2,7 +2,8 @@
 # Pandas DataFrame Preview
 
 Renders a `pandas` `DataFrame` as an actual Markdown table in the canvas,
-instead of the usual preformatted-text output — via the `output="markdown"`
+(plus a chart drawn from the same data) instead of the usual
+preformatted-text output — via the `output="markdown"`
 fence attribute (SPEC.md's "Runnable code fences"/"Cached output"): a
 `cache`d block's captured stdout is normally wrapped in a passive ` ```text `
 fence and shown verbatim; with `output="markdown"` it's spliced in as real
@@ -40,15 +41,21 @@ satisfied" pip check, not a real reinstall. Uses meshfox's own built-in
 setup" for the pattern in isolation): the fence's body is a plain
 `requirements.txt` — `pandas` for the `DataFrame` itself, `tabulate` for
 `DataFrame.to_markdown()` (pandas shells out to it rather than implementing
-Markdown rendering itself) — and the builtin reports the venv's own
+Markdown rendering itself), `matplotlib` for the chart `demo` draws below
+its table. Deliberately unpinned: an exact `==` pin only has prebuilt wheels
+for the Python versions that existed when it was released, so on a newer (or
+older) `python3` pip would fall back to compiling from source and fail —
+unpinned, pip picks the newest release that has a wheel for *this* Python.
+The builtin reports the venv's own
 `python3` as the computed `PYTHON` variable via `$MESHFOX_VARS_OUT`
 (SPEC.md's "Computed variables"), so anything that needs the venv ready
 just references `$PYTHON` (see the root node's note above) rather than
 also declaring an explicit `deps=` on this block.
 
 ```text name="venv-setup" interpreter="@python_venv"
-pandas==2.2.3
-tabulate==0.9.0
+pandas
+tabulate
+matplotlib
 ```
 
 A second, unrelated setup step: a fresh scratch directory for `generate-csv`
@@ -100,6 +107,13 @@ what turns that printed pipe-table into an actually-rendered table in the
 canvas on the next run, instead of a passive `text` block — the only
 difference from an ordinary `cache`d fence.
 
+Right after the table it draws a small `matplotlib` bar chart of the same
+data and prints it as a Markdown image whose URL is a `data:image/png;base64,…`
+URI: stdout is Markdown, so an image is just `![alt](url)`, and inlining the
+PNG means there's no separate file to place next to the canvas (a
+temp-directory path wouldn't resolve in either the web UI or the TUI). The
+`Agg` backend renders straight to a buffer — no display or GUI toolkit needed.
+
 The script also logs a line to stderr (`sys.stderr`) — with `output="markdown"`,
 stderr is captured separately from stdout and shown as its own plain-text
 block, *before* the rendered table, regardless of where in the script it was
@@ -117,30 +131,33 @@ sides happen to agree on — so ordering it before this fence needs an actual
 explicit `deps="generate-data/generate-csv"`.
 
 ```python name="demo" interpreter="$PYTHON -u" env="TMP_DIR" deps="generate-data/generate-csv" output="markdown"
+import base64
+import io
 import os
 import sys
 
+import matplotlib
+
+matplotlib.use("Agg")  # render to a buffer; no display needed
+import matplotlib.pyplot as plt
 import pandas as pd
 
 path = os.path.join(os.environ["TMP_DIR"], "data.csv")
 df = pd.read_csv(path)
 print(f"loaded {len(df)} rows from {path}", file=sys.stderr)
 print(df.to_markdown(index=False))
+
+# A chart of the same data, inlined as a data: URI so it's part of the output.
+fig, (ax_temp, ax_hum) = plt.subplots(1, 2, figsize=(8, 3), sharey=False)
+ax_temp.bar(df["city"], df["temp_c"], color="#e56a6a")
+ax_temp.set_title("Temperature (°C)")
+ax_hum.bar(df["city"], df["humidity_pct"], color="#5b8def")
+ax_hum.set_title("Humidity (%)")
+for ax in (ax_temp, ax_hum):
+    ax.tick_params(axis="x", labelrotation=45)
+fig.tight_layout()
+buf = io.BytesIO()
+fig.savefig(buf, format="png", dpi=100)
+png = base64.b64encode(buf.getvalue()).decode("ascii")
+print(f"\n![Temperature and humidity by city](data:image/png;base64,{png})")
 ```
-<!-- meshfox:output name="demo" hash="9082ac1e" -->
-
-```text
-loaded 6 rows from /var/folders/y2/qq2wc6hd75b06jsjmcvpbmn80000gn/T/meshfox-demo-XXXXXX.h1ayRrg445/data.csv
-```
-
-| city       |   temp_c |   humidity_pct |
-|:-----------|---------:|---------------:|
-| Berlin     |       17 |             21 |
-| Tokyo      |       10 |             27 |
-| Lima       |        3 |             54 |
-| Nairobi    |       -2 |             78 |
-| Oslo       |       33 |             31 |
-| Wellington |       23 |             32 |
-
-<!-- /meshfox:output -->
-

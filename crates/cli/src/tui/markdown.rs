@@ -445,6 +445,12 @@ struct Renderer<'a> {
     /// Cleared on every other event so only a marker written with no gap
     /// right after the image counts.
     pending_image_attrs: bool,
+    /// `Some` between `Tag::Image` and its `TagEnd::Image`: the image's own
+    /// alt text (`![this part](url)`) arrives as ordinary `Text` events in
+    /// between, which belong to the image (its "failed to load" fallback,
+    /// `Segment::Image::alt`) — not to the paragraph text after it, where
+    /// they used to leak as a stray caption line under every image.
+    image_alt: Option<String>,
 }
 
 struct TableState {
@@ -478,6 +484,13 @@ struct OutputRegion {
     /// been pushed — opened lazily, right before the first segment that
     /// isn't the leading stderr fence (`push_segment`).
     markdown_frame_open: bool,
+    /// This block has live output (`Renderer::live_output`), which takes
+    /// over from the cached copy in the file — the web UI's `RunOutput`
+    /// shows one or the other, never both — so everything this region
+    /// would draw is dropped (`push_segment_plain`). Showing both put two
+    /// same-looking, different-data results (the fresh run's, and the
+    /// last-saved one's) under one block.
+    suppressed: bool,
 }
 
 impl<'a> Renderer<'a> {
@@ -521,6 +534,7 @@ impl<'a> Renderer<'a> {
             pending_heading_style: None,
             alert_stack: Vec::new(),
             pending_image_attrs: false,
+            image_alt: None,
         }
     }
 
@@ -583,6 +597,9 @@ impl<'a> Renderer<'a> {
     /// blank separator, computed fresh inside `push_segment_plain`, read
     /// as *inside* it and get the same `│ ` border `seg` itself does.
     fn push_segment(&mut self, seg: Segment) {
+        if matches!(&self.output_region, Some(r) if r.suppressed) {
+            return;
+        }
         let needs_frame = matches!(&self.output_region, Some(r) if !r.markdown_frame_open);
         if needs_frame {
             let name = self.output_region.as_ref().unwrap().name.clone();
@@ -611,6 +628,9 @@ impl<'a> Renderer<'a> {
     /// open at that point — its own separator comes out wrapped, closing
     /// the border cleanly down to the `└─` corner).
     fn push_segment_plain(&mut self, seg: Segment) {
+        if matches!(&self.output_region, Some(r) if r.suppressed) {
+            return;
+        }
         if !self.segments.is_empty() {
             let blank = self.wrap_in_output_border(Segment::Text(vec![Line::from("")]));
             self.segments.push(blank);
@@ -648,15 +668,13 @@ impl<'a> Renderer<'a> {
     /// on-disk `OutputRegion` splice uses for *cached* output, distinguished
     /// by a "· live" marker in the header, since the two can legitimately
     /// coexist (a fresh live run of a block whose last `cache`d result is
-    /// still sitting in the document). Deliberately simpler than
-    /// `OutputRegion`'s own handling: always plain text (no nested Markdown
-    /// re-render for `output="markdown"` blocks — that richer treatment
-    /// stays specific to the Output pane's own chain-wide view for now).
+    /// still sitting in the document). An `output="markdown"` block's stdout
+    /// is plain text while the run is still going and re-rendered as real
+    /// Markdown once it's done — same "raw while running, rendered once
+    /// done" the web UI's `LiveRunOutput` and the Output pane
+    /// (`ui::render_output`) give it; stderr always stays plain text.
     fn push_live_output(&mut self, block_name: &str, live: &super::app::StepOutput) {
         let border = Style::default().fg(super::theme::DEP);
-        // Flagged, not specially rendered — see this method's own doc
-        // comment on why `output="markdown"` doesn't get the Output pane's
-        // richer nested-Markdown treatment here (yet).
         let kind = if live.output_markdown { " · markdown" } else { "" };
         // `live.duration_ms`/`exit_code` are just placeholders until a run
         // discovered passively (`App::on_external_run_event`) reaches its
@@ -677,20 +695,86 @@ impl<'a> Renderer<'a> {
         };
         let mut framed: Vec<Line<'static>> = vec![Line::from(Span::styled(header, border))];
         let mut any_output = false;
-        for text in [&live.stdout, &live.stderr] {
-            for line in text.lines() {
-                any_output = true;
-                framed.push(Line::from(vec![
-                    Span::styled("│ ", border),
-                    Span::raw(line.to_string()),
-                ]));
+        // Only the first piece of this frame goes through `push_segment`
+        // (which adds the blank separator above it); every later piece is
+        // part of the same frame, so it is appended directly.
+        let mut first_piece = true;
+        let mut flush = |this: &mut Self, lines: Vec<Line<'static>>| {
+            if lines.is_empty() {
+                return;
+            }
+            if first_piece {
+                first_piece = false;
+                this.push_segment(Segment::Text(lines));
+            } else {
+                this.segments.push(Segment::Text(lines));
+            }
+        };
+
+        if live.output_markdown && !live.running && !live.stdout.trim().is_empty() {
+            any_output = true;
+            // stderr first, muted, then a rule — the web UI's
+            // `MarkdownOutput` does the same: stderr was never this block's
+            // Markdown, so it stays visibly apart from the rendered part
+            // instead of running straight into the last table row.
+            if !live.stderr.trim().is_empty() {
+                let muted = Style::default().fg(super::theme::BORDER);
+                for line in live.stderr.lines() {
+                    framed.push(Line::from(vec![
+                        Span::styled("│ ", border),
+                        Span::styled(line.to_string(), muted),
+                    ]));
+                }
+                framed.push(Line::from(Span::styled("│ ────", border)));
+            }
+            let (segs, _clicks) = render(
+                &live.stdout,
+                self.base_dir,
+                self.hl,
+                self.node_id,
+                &[],
+                &std::collections::HashMap::new(),
+                None,
+                &std::collections::HashMap::new(),
+            );
+            let mut first_seg = true;
+            for seg in segs {
+                match seg {
+                    Segment::Text(seg_lines) => {
+                        if !first_seg {
+                            framed.push(Line::from(Span::styled("│", border)));
+                        }
+                        for l in seg_lines {
+                            let mut spans = vec![Span::styled("│ ", border)];
+                            spans.extend(l.spans);
+                            framed.push(Line::from(spans));
+                        }
+                    }
+                    // A widget can't sit inside a text border: close off the
+                    // lines so far, let the image through as-is, continue.
+                    image @ Segment::Image { .. } => {
+                        flush(self, std::mem::take(&mut framed));
+                        self.segments.push(image);
+                    }
+                }
+                first_seg = false;
+            }
+        } else {
+            for text in [&live.stdout, &live.stderr] {
+                for line in text.lines() {
+                    any_output = true;
+                    framed.push(Line::from(vec![
+                        Span::styled("│ ", border),
+                        Span::raw(line.to_string()),
+                    ]));
+                }
             }
         }
         if !any_output {
             framed.push(Line::from(Span::styled("│ (no output)", border)));
         }
         framed.push(Line::from(Span::styled("└─", border)));
-        self.push_segment(Segment::Text(framed));
+        flush(self, framed);
     }
 
     /// Prefixes every line of `seg` with a purple `│ ` — the "markdown"
@@ -742,10 +826,12 @@ impl<'a> Renderer<'a> {
             // content, so an empty region (or one whose only content is
             // the leading stderr fence, handled separately) never leaves
             // a stray, contentless frame behind.
+            let suppressed = self.live_output.contains_key(name.as_str());
             self.output_region = Some(OutputRegion {
                 name,
                 first_segment_pending: true,
                 markdown_frame_open: false,
+                suppressed,
             });
         } else if trimmed == "<!-- /meshfox:output -->" {
             self.flush_paragraph();
@@ -792,6 +878,19 @@ impl<'a> Renderer<'a> {
     }
 
     fn event(&mut self, ev: Event, span_start: usize) {
+        if let Some(alt) = &mut self.image_alt {
+            match &ev {
+                Event::Text(t) | Event::Code(t) => {
+                    alt.push_str(t);
+                    return;
+                }
+                Event::SoftBreak | Event::HardBreak => {
+                    alt.push(' ');
+                    return;
+                }
+                _ => {}
+            }
+        }
         // `pending_image_attrs` (see its own doc comment) only ever
         // applies to the very next event, and only if that event is
         // `Text` — anything else (another tag, a line break, ...) means
@@ -991,6 +1090,10 @@ impl<'a> Renderer<'a> {
                 dest_url, title, ..
             } => {
                 self.flush_paragraph();
+                // The alt text itself isn't known yet (its `Text` events
+                // follow) — `TagEnd::Image` fills it in; the `title=` is
+                // only the fallback for an image with no alt text.
+                self.image_alt = Some(String::new());
                 let alt = title.to_string();
                 if dest_url.starts_with("http://") || dest_url.starts_with("https://") {
                     self.push_segment(Segment::Text(vec![Line::from(Span::styled(
@@ -1466,6 +1569,13 @@ impl<'a> Renderer<'a> {
             }
             TagEnd::Image => {
                 self.pending_image_attrs = true;
+                if let Some(text) = self.image_alt.take() {
+                    if !text.is_empty() {
+                        if let Some(Segment::Image { alt, .. }) = self.segments.last_mut() {
+                            *alt = text;
+                        }
+                    }
+                }
             }
             TagEnd::FootnoteDefinition => {
                 self.flush_paragraph();
@@ -1526,6 +1636,173 @@ fn render_table(t: &TableState) -> Vec<Line<'static>> {
 mod tests {
     use super::*;
 
+    // TODO.canvas.md: "TUI: инлайн live-вывод для output=\"markdown\" блоков
+    // ... как plain text" — a finished `output="markdown"` block's live
+    // stdout is rendered as real Markdown inside its frame; while still
+    // running (or for a non-markdown block) it stays raw text.
+    fn live_doc_text(live: super::super::app::StepOutput) -> String {
+        let hl = Highlighter::new();
+        let md = "```bash name=\"t\"\necho hi\n```\n";
+        let mut live_output = std::collections::HashMap::new();
+        live_output.insert("t".to_string(), live);
+        let (segments, _clicks) = render(
+            md,
+            Path::new("/nonexistent-base-dir"),
+            &hl,
+            "n",
+            &[],
+            &std::collections::HashMap::new(),
+            None,
+            &live_output,
+        );
+        let mut out = String::new();
+        for seg in segments {
+            if let Segment::Text(lines) = seg {
+                for line in lines {
+                    for span in line.spans {
+                        out.push_str(&span.content);
+                    }
+                    out.push('\n');
+                }
+            }
+        }
+        out
+    }
+
+    fn table_output(output_markdown: bool, running: bool) -> super::super::app::StepOutput {
+        super::super::app::StepOutput {
+            stdout: "| score | name |\n|---|---|\n| 1.0 | ZMARKERZ |\n".to_string(),
+            stderr: "some warning\n".to_string(),
+            output_markdown,
+            exit_code: 0,
+            duration_ms: 5,
+            running,
+        }
+    }
+
+    #[test]
+    fn finished_markdown_live_output_is_rendered_inside_its_frame() {
+        let text = live_doc_text(table_output(true, false));
+        assert!(text.contains("ZMARKERZ"), "cell text should show:\n{text}");
+        assert!(!text.contains("|---|---|"), "raw table syntax should be rendered, not literal:\n{text}");
+        assert!(text.contains("output: t · live · markdown · done"), "frame header:\n{text}");
+        let table_line = text.lines().find(|l| l.contains("ZMARKERZ")).unwrap();
+        assert!(table_line.starts_with("│ "), "rendered rows stay inside the frame border:\n{text}");
+        assert!(text.contains("│ some warning"), "stderr stays plain text in the frame:\n{text}");
+        // stderr sits above the rendered part, set off by a rule — not run
+        // together with the last table row.
+        let (warn, rule, table) = (
+            text.find("some warning").unwrap(),
+            text.find("│ ────").expect("a rule after stderr"),
+            text.find("ZMARKERZ").unwrap(),
+        );
+        assert!(warn < rule && rule < table, "stderr, rule, then the rendered markdown:\n{text}");
+        assert!(text.trim_end().ends_with("└─"), "frame is closed:\n{text}");
+    }
+
+    // The web UI's `RunOutput` shows live output *instead of* the cached
+    // copy in the file, never both — the TUI showed both (a fresh run's
+    // frame, then the last-saved one's right below it), which read as a
+    // duplicated, subtly different result.
+    #[test]
+    fn live_output_replaces_the_cached_output_region_of_the_same_block() {
+        let hl = Highlighter::new();
+        let md = concat!(
+            "```bash name=\"t\" cache output=\"markdown\"\necho hi\n```\n",
+            "<!-- meshfox:output name=\"t\" exit=\"0\" -->\n",
+            "CACHEDMARKER\n",
+            "<!-- /meshfox:output -->\n\n",
+            "```bash name=\"u\" cache\necho other\n```\n",
+            "<!-- meshfox:output name=\"u\" exit=\"0\" -->\n",
+            "```text\nOTHERCACHED\n```\n",
+            "<!-- /meshfox:output -->\n",
+        );
+        let mut live_output = std::collections::HashMap::new();
+        live_output.insert("t".to_string(), table_output(true, false));
+        let (segments, _clicks) = render(
+            md,
+            Path::new("/nonexistent-base-dir"),
+            &hl,
+            "n",
+            &[],
+            &std::collections::HashMap::new(),
+            None,
+            &live_output,
+        );
+        let mut text = String::new();
+        for seg in segments {
+            if let Segment::Text(lines) = seg {
+                for line in lines {
+                    for span in line.spans {
+                        text.push_str(&span.content);
+                    }
+                    text.push('\n');
+                }
+            }
+        }
+        assert!(text.contains("ZMARKERZ"), "the live frame shows:\n{text}");
+        assert!(!text.contains("CACHEDMARKER"), "the block's cached copy is superseded:\n{text}");
+        assert!(
+            text.contains("OTHERCACHED"),
+            "a block with no live output keeps its cached copy:\n{text}"
+        );
+    }
+
+    // examples/pandas-dataframe.canvas.md prints its chart as a
+    // `![..](data:image/png;base64,..)` in stdout — inside a live
+    // `output="markdown"` frame that must still become a real image segment
+    // (drawn by `app::load_image_protocol`), not literal text, with the
+    // frame's text on either side of it kept.
+    #[test]
+    fn an_image_in_finished_markdown_live_output_becomes_an_image_segment() {
+        let hl = Highlighter::new();
+        let md = "```bash name=\"t\"\necho hi\n```\n";
+        let mut live = table_output(true, false);
+        live.stdout.push_str("\n![chart](data:image/png;base64,iVBORw0KGgo=)\n");
+        let mut live_output = std::collections::HashMap::new();
+        live_output.insert("t".to_string(), live);
+        let (segments, _clicks) = render(
+            md,
+            Path::new("/nonexistent-base-dir"),
+            &hl,
+            "n",
+            &[],
+            &std::collections::HashMap::new(),
+            None,
+            &live_output,
+        );
+        let images: Vec<_> = segments
+            .iter()
+            .filter_map(|s| match s {
+                Segment::Image { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(images, vec![PathBuf::from("data:image/png;base64,iVBORw0KGgo=")]);
+        let last_text = segments.iter().rev().find_map(|s| match s {
+            Segment::Text(lines) => Some(lines.clone()),
+            _ => None,
+        });
+        let last_text: String = last_text
+            .unwrap()
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|sp| sp.content.to_string()))
+            .collect();
+        assert!(last_text.contains("└─"), "the frame still closes after the image: {last_text}");
+    }
+
+    #[test]
+    fn markdown_live_output_stays_raw_while_the_run_is_still_going() {
+        let text = live_doc_text(table_output(true, true));
+        assert!(text.contains("|---|---|"), "raw text while running:\n{text}");
+    }
+
+    #[test]
+    fn non_markdown_live_output_stays_raw() {
+        let text = live_doc_text(table_output(false, false));
+        assert!(text.contains("|---|---|"), "no output=\"markdown\", so no rendering:\n{text}");
+    }
+
     // TODO.canvas.md: "Base64 image" — a `data:` image URL becomes an
     // ordinary `Segment::Image`, same as a real local file, so
     // `app::load_image_protocol` can pick it up through the exact same
@@ -1546,7 +1823,9 @@ mod tests {
             unreachable!()
         };
         assert_eq!(path, PathBuf::from("data:image/png;base64,iVBORw0KGgo="));
-        assert_eq!(alt, "");
+        // The alt text belongs to the image (its load-failure fallback) —
+        // it must not also leak into the document as a caption line.
+        assert_eq!(alt, "a pixel");
     }
 
     // TUI complaint: an inline form's currently-focused field had no visible
@@ -1668,6 +1947,25 @@ mod tests {
             unreachable!()
         };
         assert_eq!(width_percent, None);
+    }
+
+    #[test]
+    fn an_images_alt_text_is_not_rendered_as_a_caption_under_it() {
+        let hl = Highlighter::new();
+        let md = "![Temperature and humidity](pic.png)\n\nafter\n";
+        let (segments, _clicks) =
+            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
+        let text = segment_text(&segments);
+        assert!(!text.contains("Temperature"), "no stray alt-text paragraph: {text:?}");
+        assert!(text.contains("after"), "the real paragraph after the image stays: {text:?}");
+        let alt = segments
+            .iter()
+            .find_map(|s| match s {
+                Segment::Image { alt, .. } => Some(alt.clone()),
+                _ => None,
+            })
+            .expect("an image segment");
+        assert_eq!(alt, "Temperature and humidity");
     }
 
     #[test]
