@@ -32,8 +32,9 @@
 
 use rusqlite::{params, Connection, OptionalExtension};
 use std::io;
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+use crate::session_db::sqlite_err;
 
 /// Kept well under any real editing session's own history without ever
 /// growing unbounded — TODO.canvas.md's "оценка масштаба" sized this at
@@ -55,29 +56,6 @@ const SCHEMA_SQL: &str = "
         last_raw  TEXT NOT NULL
     );
 ";
-
-fn sqlite_err(e: rusqlite::Error) -> io::Error {
-    io::Error::other(e)
-}
-
-/// Where a canvas's session database lives — same canonicalize-with-
-/// fallback and `.meshfox/<file name>.<suffix>` shape as
-/// `meshfox_core::worker_lock::lock_path`, just a different suffix.
-fn session_db_path(canvas_path: &Path) -> PathBuf {
-    let canvas_path = canvas_path
-        .canonicalize()
-        .unwrap_or_else(|_| canvas_path.to_path_buf());
-    let dir = match canvas_path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => PathBuf::from("."),
-    };
-    let file_name = canvas_path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    dir.join(".meshfox")
-        .join(format!("{file_name}.session.sqlite3"))
-}
 
 /// One recorded step of history, as read back by [`UndoLog::history`]/
 /// [`UndoLog::peek_undo`]/[`UndoLog::peek_redo`].
@@ -117,30 +95,27 @@ pub enum Payload<'a> {
 }
 
 pub struct UndoLog {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl UndoLog {
-    /// Opens (creating if needed) `canvas_path`'s own session database and
-    /// runs its schema — idempotent (`CREATE TABLE IF NOT EXISTS`), safe to
-    /// call every time a worker starts. Does *not* seed `undo_meta`'s
-    /// singleton row — see [`Self::reconcile_startup_drift`], which needs to
-    /// tell "never seeded" apart from "seeded and unchanged" itself.
-    pub fn open(canvas_path: &Path) -> io::Result<Self> {
-        let path = session_db_path(canvas_path);
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let conn = Connection::open(path).map_err(sqlite_err)?;
-        conn.execute_batch(SCHEMA_SQL).map_err(sqlite_err)?;
-        Ok(UndoLog { conn: Mutex::new(conn) })
+    /// Runs this module's schema against an already-open connection —
+    /// [`crate::session_db`] hands out one shared `Arc<Mutex<Connection>>`
+    /// per canvas so this module and [`crate::run_ledger`] don't each open
+    /// their own independent connection to the same sqlite file (see that
+    /// module's own doc comment for why that'd invite `SQLITE_BUSY`
+    /// contention). Runs this module's own schema, unconditionally —
+    /// harmless if `run_ledger` already ran its own on the same connection.
+    pub fn from_connection(conn: Arc<Mutex<Connection>>) -> io::Result<Self> {
+        conn.lock().unwrap().execute_batch(SCHEMA_SQL).map_err(sqlite_err)?;
+        Ok(UndoLog { conn })
     }
 
     #[cfg(test)]
     fn open_in_memory() -> io::Result<Self> {
         let conn = Connection::open_in_memory().map_err(sqlite_err)?;
         conn.execute_batch(SCHEMA_SQL).map_err(sqlite_err)?;
-        Ok(UndoLog { conn: Mutex::new(conn) })
+        Ok(UndoLog { conn: Arc::new(Mutex::new(conn)) })
     }
 
     /// Records one history step: truncates any redo tail past the current

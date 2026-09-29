@@ -57,7 +57,6 @@ pub use locate::{locate_node, LocateError, LocatedNode};
 pub use mdcanvas::{parse_fold_override, parse_tags, FenceAttrsPatch, NodeMeta, ParseError};
 pub use options::{declared_options, OptionsError};
 pub use output::{cached_output_hash, format_duration_ms, write_output, ExecOutput};
-pub use service_lock::{lock_path as service_lock_path, LockInfo as ServiceLockInfo, LockState as ServiceLockState};
 pub use shared_env::{load as load_shared_env, SharedEnv, SharedOrigin, SharedVar};
 pub use staticgen::{Asset, EdgeView, NodeView, Position, SiteData};
 pub use tag_colors::{

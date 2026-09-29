@@ -1,24 +1,26 @@
 //! Per-canvas discovery lock for a `meshfox view` worker — one small file
 //! next to the canvas (`.meshfox/<file>.worker.lock`, same colocation
-//! convention as `crate::service_lock`/`crate::varcache`), held via a real
-//! `flock` rather than a pid file + liveness check.
+//! convention as `crate::varcache`), held via a real `flock` rather than a
+//! pid file + liveness check.
 //!
-//! `crate::service_lock` records a pid and checks `kill(pid, 0)` to tell a
-//! live owner from a stale one — correct, but it needs a separate "is the
-//! recorded pid still alive" step, which is its own (harmless but avoidable)
-//! race when two callers notice the same stale lock at once. `flock`
-//! sidesteps that class of race entirely for this use case: holding the
-//! lock *is* being alive, full stop — the OS drops it automatically on any
-//! exit of the holding process, including `SIGKILL`, with no cooperation
-//! from that process required. So there's nothing here to distinguish
-//! "held but stale" from "held" — only "held" or "free".
+//! A pid-recorded lock (record a pid, `kill(pid, 0)` to tell a live owner
+//! from a stale one — the approach `crates/server/src/run_ledger.rs` uses
+//! for the unrelated per-`service`-block conflict-detection table) is
+//! correct, but needs a separate "is the recorded pid still alive" step,
+//! which is its own (harmless but avoidable) race when two callers notice
+//! the same stale lock at once. `flock` sidesteps that class of race
+//! entirely for this use case: holding the lock *is* being alive, full
+//! stop — the OS drops it automatically on any exit of the holding
+//! process, including `SIGKILL`, with no cooperation from that process
+//! required. So there's nothing here to distinguish "held but stale" from
+//! "held" — only "held" or "free".
 //!
 //! Used to let independent `meshfox view <path>` invocations (separate
-//! watcher processes — see `crate::service_lock`'s own module for the
-//! unrelated per-`service`-block lock, and `crates/cli/src/watcher.rs` for
-//! what a worker actually is) on the same canvas file discover and reuse
-//! whichever one of them is already serving it, instead of each spawning
-//! its own worker/server pair.
+//! watcher processes — see `crates/server/src/run_ledger.rs` for the
+//! unrelated per-`service`/`tty`/plain-run conflict-detection table, and
+//! `crates/cli/src/watcher.rs` for what a worker actually is) on the same
+//! canvas file discover and reuse whichever one of them is already serving
+//! it, instead of each spawning its own worker/server pair.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -30,9 +32,8 @@ use std::time::Duration;
 /// first so callers that reach the same file via different (relative,
 /// symlinked, differently-`cwd`'d) spellings still agree on one path; falls
 /// back to the path as given if canonicalization fails (e.g. the canvas
-/// doesn't exist yet), same graceful-degradation posture
-/// `service_lock::lock_path` doesn't need but this one does, since a worker
-/// lock can be checked before the canvas is known to exist.
+/// doesn't exist yet) — needed here since a worker lock can be checked
+/// before the canvas is known to exist.
 pub fn lock_path(canvas_path: &Path) -> PathBuf {
     let canvas_path = canvas_path
         .canonicalize()

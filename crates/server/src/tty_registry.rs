@@ -178,18 +178,18 @@ impl TtySessionHandle {
 /// returned handle into a registry keyed by address before anyone else can
 /// look it up.
 ///
-/// `lock_path`, if given, is released *by this background task itself*
-/// once the session actually exits or is killed — see
-/// `run_registry::track`'s identical parameter and its own doc comment for
-/// why: the whole point of this registry is that a session outlives
-/// whatever connection started it, so the lock's own lifetime has to
+/// `ledger_row`, if given, is resolved (`RunLedger::finish`) *by this
+/// background task itself* once the session actually exits or is killed —
+/// see `run_registry::track`'s identical parameter and its own doc comment
+/// for why: the whole point of this registry is that a session outlives
+/// whatever connection started it, so the ledger row's own lifetime has to
 /// track the session's real end, not whenever the originating connection
 /// happens to drop.
 pub fn track(
     node_id: String,
     block_name: String,
     mut pty: PtyProcess,
-    lock_path: Option<std::path::PathBuf>,
+    ledger_row: Option<(crate::run_ledger::RunLedger, i64)>,
 ) -> Arc<TtySessionHandle> {
     let (tx, _) = broadcast::channel(1024);
     let (kill_tx, mut kill_rx) = oneshot::channel();
@@ -233,9 +233,14 @@ pub fn track(
             }
         };
         *task_handle.outcome.lock().unwrap() = outcome.clone();
-        let _ = task_handle.tx.send(TtyEvent::Done(outcome));
-        if let Some(path) = lock_path {
-            let _ = meshfox_core::service_lock::release(&path);
+        let _ = task_handle.tx.send(TtyEvent::Done(outcome.clone()));
+        if let Some((ledger, id)) = ledger_row {
+            let finish_outcome = match outcome {
+                RunOutcome::Exited { exit_code } => crate::run_ledger::FinishOutcome::Exited(exit_code),
+                RunOutcome::Killed => crate::run_ledger::FinishOutcome::Killed,
+                RunOutcome::Running => unreachable!("the loop above only ever breaks with Exited/Killed"),
+            };
+            let _ = ledger.finish(id, finish_outcome);
         }
     });
 

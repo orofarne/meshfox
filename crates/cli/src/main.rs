@@ -19,7 +19,7 @@ use meshfox_core::{
 #[cfg(test)]
 use meshfox_core::{FenceAttrsPatch, NodeMeta};
 use std::collections::{HashMap, HashSet};
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 mod coordinator;
@@ -2250,11 +2250,9 @@ fn chain_contains_tty(
 /// pair — the plain `RunEvent`-only stream those two use has no
 /// binary-frame vocabulary for actual pty bytes at all.
 ///
-/// One remaining known gap against the in-process path, flagged inline
-/// below rather than silently papered over: a `service` block conflict
-/// (`RunEvent::LockConflict`) has no interactive kill-and-retry here the
-/// way the in-process path's `confirm_yn` does — `/api/run/force` exists
-/// server-side for this, just not wired up here.
+/// A `service` block conflict (`RunEvent::LockConflict`) gets the same
+/// interactive kill-and-retry `App::on_service_conflict_key` already does
+/// for the TUI — see `confirm_kill_and_retry`/`retry_after_lock_conflict`.
 async fn run_via_worker(
     port: u16,
     canvas_path: &Path,
@@ -2290,11 +2288,23 @@ async fn run_via_worker(
                 match resolve_worker_file_node(port, canvas_path, &path, name).await {
                     Some(node_id) => {
                         match worker_client::run_file_node_stream(port, &node_id).await {
-                            Ok(rx) => {
-                                if !drain_worker_run_events(rx, port, name, &mut started_services).await {
+                            Ok(rx) => match drain_worker_run_events(rx, port, name, &mut started_services).await {
+                                DrainResult::Ok => {}
+                                DrainResult::Failed => had_failure = true,
+                                // Unreachable in practice — `run_file_node_impl`
+                                // never takes a service lock (see
+                                // `DrainResult::Conflict`'s own doc comment) —
+                                // kept as a plain failure, not a retry, since
+                                // there's no `force`-capable endpoint for a
+                                // file node to retry through anyway.
+                                DrainResult::Conflict { block, owner_pid, owner_desc, .. } => {
+                                    eprintln!(
+                                        "error running {block:?}: already running elsewhere (pid {owner_pid}, \
+                                         started via {owner_desc})"
+                                    );
                                     had_failure = true;
                                 }
-                            }
+                            },
                             Err(e) => {
                                 eprintln!("error running {name:?}: {e} (worker on port {port})");
                                 had_failure = true;
@@ -2331,6 +2341,13 @@ async fn run_via_worker(
             }
         }
 
+        // Cloned before `vars` moves into the call below — only needed again
+        // if this name's own run comes back as a `LockConflict` and the user
+        // confirms a kill-and-retry (see `DrainResult::Conflict` below); the
+        // worker already re-resolves anything already-answered from its own
+        // var cache, so replaying the same values here is exactly as cheap
+        // and correct as the first attempt was.
+        let vars_for_retry = vars.clone();
         let rx = match worker_client::run_stream_persisted(
             port,
             &path,
@@ -2349,8 +2366,27 @@ async fn run_via_worker(
                 continue;
             }
         };
-        if !drain_worker_run_events(rx, port, name, &mut started_services).await {
-            had_failure = true;
+        match drain_worker_run_events(rx, port, name, &mut started_services).await {
+            DrainResult::Ok => {}
+            DrainResult::Failed => had_failure = true,
+            DrainResult::Conflict { node_id, block, owner_pid, owner_desc } => {
+                if !retry_after_lock_conflict(
+                    port,
+                    &path,
+                    name,
+                    no_deps,
+                    vars_for_retry,
+                    node_id,
+                    block,
+                    owner_pid,
+                    &owner_desc,
+                    &mut started_services,
+                )
+                .await
+                {
+                    had_failure = true;
+                }
+            }
         }
     }
 
@@ -2497,6 +2533,11 @@ async fn worker_did_you_mean_hint(canvas_path: &Path, port: u16, path: &[String]
 /// raw-mode enable/disable TUI's alt-screen already keeps on for its whole
 /// session, which a plain `run` invocation has to switch on/off itself
 /// around the call instead.
+///
+/// A `TtyConnectError::Conflict` gets the same interactive kill-and-retry
+/// `App::on_service_conflict_key`'s own `is_tty` branch does: confirm, then
+/// retry `tty_connect` with `force` set to the exact address the conflict
+/// named.
 async fn run_worker_tty(
     port: u16,
     path: &[String],
@@ -2514,21 +2555,46 @@ async fn run_worker_tty(
         path,
         name,
         no_deps,
-        vars,
+        vars.clone(),
         std::collections::HashSet::new(),
         cols,
         rows,
+        None,
     )
     .await
     {
         Ok(socket) => socket,
         Err(worker_client::TtyConnectError::Conflict(c)) => {
-            eprintln!(
-                "error running {name:?}: already running elsewhere (pid {}, started via {}) — \
-                 killing and retrying isn't wired up yet for a worker-routed tty run; stop it there first and rerun",
-                c.owner_pid, c.owner_desc
-            );
-            return false;
+            if !confirm_kill_and_retry(&c.block, c.owner_pid, &c.owner_desc) {
+                return false;
+            }
+            match worker_client::tty_connect(
+                port,
+                path,
+                name,
+                no_deps,
+                vars,
+                std::collections::HashSet::new(),
+                cols,
+                rows,
+                Some((c.node_id.clone(), c.block.clone())),
+            )
+            .await
+            {
+                Ok(socket) => socket,
+                Err(worker_client::TtyConnectError::Conflict(c)) => {
+                    eprintln!(
+                        "error running {name:?}: still locked after killing the previous owner (now pid {}, \
+                         started via {}) — giving up after one retry",
+                        c.owner_pid, c.owner_desc
+                    );
+                    return false;
+                }
+                Err(worker_client::TtyConnectError::Other(e)) => {
+                    eprintln!("error running {name:?}: {e} (worker on port {port})");
+                    return false;
+                }
+            }
         }
         Err(worker_client::TtyConnectError::Other(e)) => {
             eprintln!("error running {name:?}: {e} (worker on port {port})");
@@ -2585,22 +2651,36 @@ async fn node_mv_via_worker(
     worker_client::reparent_node(port, node_id, new_parent_id).await
 }
 
+/// What `drain_worker_run_events` found once its stream ended (or hit a
+/// `LockConflict`, which ends it early — see that arm below).
+enum DrainResult {
+    Ok,
+    Failed,
+    /// The stream's very first (and only) event was a `LockConflict` —
+    /// mirrors `App::begin_http_run`'s own "first event decides" framing
+    /// (see `worker_client::run_stream`'s own doc comment). Carried out
+    /// instead of handled inline so each call site can decide whether a
+    /// retry even makes sense for it (`run_via_worker`'s plain chain path
+    /// does; the file-node fallback below doesn't — `run_file_node_impl`
+    /// never takes a service lock at all, so this arm is unreachable there
+    /// in practice, kept only for exhaustiveness).
+    Conflict { node_id: String, block: String, owner_pid: u32, owner_desc: String },
+}
+
 /// Drains one requested name's own `RunEvent` stream to completion (a
 /// fenced-block chain from `run_stream_persisted`, or a single file node
 /// from `run_file_node_stream` — same event vocabulary either way, see
 /// `run_file_node`'s own doc comment server-side), printing the same
-/// console shape the in-process loop already does. Returns whether this
-/// name's own run was clean (`true`) or reported *some* failure (`false`)
-/// — never exits the process itself, so a single failing name in a
-/// multi-name `meshfox run a,b,c` doesn't stop the rest from being
-/// attempted, matching the in-process loop's own `had_failure`-without-
-/// early-exit posture.
+/// console shape the in-process loop already does. Never exits the process
+/// itself on an ordinary failure, so a single failing name in a multi-name
+/// `meshfox run a,b,c` doesn't stop the rest from being attempted, matching
+/// the in-process loop's own `had_failure`-without-early-exit posture.
 async fn drain_worker_run_events(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<worker_client::RunEvent>,
     port: u16,
     name: &str,
     started_services: &mut Vec<(String, String)>,
-) -> bool {
+) -> DrainResult {
     let mut had_failure = false;
     {
         // The address `StepStart` most recently named — who Ctrl-C below
@@ -2656,12 +2736,8 @@ async fn drain_worker_run_events(
                                 meshfox_core::format_duration_ms(duration_ms)
                             );
                         }
-                        worker_client::RunEvent::LockConflict { block, owner_pid, owner_desc, .. } => {
-                            eprintln!(
-                                "error running {block:?}: already running elsewhere (pid {owner_pid}, started via {owner_desc}) — \
-                                 killing and retrying isn't wired up yet for a worker-routed run; stop it there first and rerun"
-                            );
-                            had_failure = true;
+                        worker_client::RunEvent::LockConflict { node_id, block, owner_pid, owner_desc } => {
+                            return DrainResult::Conflict { node_id, block, owner_pid, owner_desc };
                         }
                         // Shouldn't actually happen: `run_via_worker`'s own
                         // per-name `chain_contains_tty` check routes a real
@@ -2709,7 +2785,91 @@ async fn drain_worker_run_events(
             }
         }
     }
-    !had_failure
+    if had_failure { DrainResult::Failed } else { DrainResult::Ok }
+}
+
+/// The interactive confirm `run_via_worker`'s `DrainResult::Conflict` arm
+/// shows before killing another process — same prompt shape as
+/// `App::on_service_conflict_key`'s own modal, just synchronous stdin/
+/// stdout instead of a TUI keypress. Refuses non-interactively (matching
+/// every other prompt in this file, e.g. `prompt::ask`'s own callers) so a
+/// piped/CI invocation fails fast instead of hanging on an answer that will
+/// never come.
+fn confirm_kill_and_retry(block: &str, owner_pid: u32, owner_desc: &str) -> bool {
+    if !prompt::stdin_is_tty() {
+        eprintln!(
+            "error running {block:?}: already running elsewhere (pid {owner_pid}, started via {owner_desc}) — \
+             not an interactive terminal, refusing to kill and retry (pass a different name, or stop it there first)"
+        );
+        return false;
+    }
+    print!(
+        "{block:?} is already running elsewhere (pid {owner_pid}, started via {owner_desc}) — kill it and retry? (y/n): "
+    );
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// `run_via_worker`'s own kill-and-retry, once its first attempt at `name`
+/// came back as `DrainResult::Conflict` — asks via `confirm_kill_and_retry`,
+/// and on `y` re-issues the exact same run with `force: Some((node_id,
+/// block))`, which `crates/server/src/lib.rs`'s own `force_run` resolves by
+/// killing the stale/foreign owner (plus any orphaned descendants) before
+/// re-running — same server-side mechanism the TUI's own
+/// `on_service_conflict_key` already drives via `/api/run/force`, just
+/// reached through `run_stream_persisted`'s `force` parameter instead of a
+/// second dedicated function. A second conflict on the retry itself (e.g. a
+/// fresh process grabbed the lock in between) is reported as an ordinary
+/// failure rather than prompting again, to keep this from turning into an
+/// unbounded loop.
+#[allow(clippy::too_many_arguments)]
+async fn retry_after_lock_conflict(
+    port: u16,
+    path: &[String],
+    name: &str,
+    no_deps: bool,
+    vars: HashMap<String, String>,
+    conflict_node_id: String,
+    conflict_block: String,
+    owner_pid: u32,
+    owner_desc: &str,
+    started_services: &mut Vec<(String, String)>,
+) -> bool {
+    if !confirm_kill_and_retry(&conflict_block, owner_pid, owner_desc) {
+        return false;
+    }
+    let rx = match worker_client::run_stream_persisted(
+        port,
+        path,
+        name,
+        no_deps,
+        vars,
+        std::collections::HashSet::new(),
+        Some((conflict_node_id, conflict_block)),
+    )
+    .await
+    {
+        Ok(rx) => rx,
+        Err(e) => {
+            eprintln!("error running {name:?}: {e} (worker on port {port})");
+            return false;
+        }
+    };
+    match drain_worker_run_events(rx, port, name, started_services).await {
+        DrainResult::Ok => true,
+        DrainResult::Failed => false,
+        DrainResult::Conflict { block, owner_pid, owner_desc, .. } => {
+            eprintln!(
+                "error running {block:?}: still locked after killing the previous owner (now pid {owner_pid}, \
+                 started via {owner_desc}) — giving up after one retry"
+            );
+            false
+        }
+    }
 }
 
 /// `run_via_worker`'s own var preflight — mirrors `preflight_chain_vars`'s

@@ -77,7 +77,7 @@ fn spinner_frame(tick: u32) -> char {
 /// This node's own live service state, as far as row rendering cares —
 /// aggregated across every service belonging to it (same row-level, not
 /// per-block, granularity `TreeRow::has_service` already uses). Computed
-/// once per `render_tree` call (not per row) from `App.services` — see
+/// once per `render_tree` call (not per row) from `App.service_list` — see
 /// that function's own comment. **Experimental**, see SPEC.md's "Service
 /// blocks (experimental)".
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -431,42 +431,21 @@ fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
     let content_width = area.width.saturating_sub(2) as usize;
 
     // Computed once per call (owned, no borrow conflict with `app.rows`
-    // below) rather than threading `&App.services` all the way into
+    // below) rather than threading `&App.service_list` all the way into
     // `tree_row_words` — a node's live status, aggregated across every
     // service belonging to it (crashed wins over running, same "worst
-    // status shown" convention `ServiceBadge` uses in the webui). Branches
-    // on `app.service_list` (worker mode) vs `app.services` (local mode)
-    // the same way `render_services_view` already does — this used to
-    // only ever read `app.services`, so a worker-routed session's tree
-    // rows never showed a running/crashed service glyph at all, always
-    // falling back to the idle `○service` regardless of real state, even
-    // though the footer aggregate (`App::refresh_services`) and the `v`
-    // services view were already worker-mode-aware. **Experimental**, see
-    // SPEC.md's "Service blocks (experimental)".
+    // status shown" convention `ServiceBadge` uses in the webui).
+    // **Experimental**, see SPEC.md's "Service blocks (experimental)".
     let mut service_by_node: HashMap<String, ServiceRowState> = HashMap::new();
-    if app.worker_port.is_some() {
-        for dto in &app.service_list {
-            let state = match dto.status.as_str() {
-                "running" => ServiceRowState::Running,
-                "crashed" => ServiceRowState::Crashed,
-                _ => continue,
-            };
-            let entry = service_by_node.entry(dto.node_id.clone()).or_insert(state);
-            if state == ServiceRowState::Crashed {
-                *entry = ServiceRowState::Crashed;
-            }
-        }
-    } else {
-        for ((node_id, _), handle) in &app.services {
-            let state = match handle.status() {
-                meshfox_server::services::ServiceStatus::Running => ServiceRowState::Running,
-                meshfox_server::services::ServiceStatus::Crashed { .. } => ServiceRowState::Crashed,
-                meshfox_server::services::ServiceStatus::Stopped => continue,
-            };
-            let entry = service_by_node.entry(node_id.clone()).or_insert(state);
-            if state == ServiceRowState::Crashed {
-                *entry = ServiceRowState::Crashed;
-            }
+    for dto in &app.service_list {
+        let state = match dto.status.as_str() {
+            "running" => ServiceRowState::Running,
+            "crashed" => ServiceRowState::Crashed,
+            _ => continue,
+        };
+        let entry = service_by_node.entry(dto.node_id.clone()).or_insert(state);
+        if state == ServiceRowState::Crashed {
+            *entry = ServiceRowState::Crashed;
         }
     }
 
@@ -1236,72 +1215,42 @@ fn render_service_conflict(f: &mut Frame, area: Rect, conflict: &ServiceConflict
 /// selected row stays put between frames. **Experimental**, see SPEC.md's
 /// "Service blocks (experimental)".
 /// One row's worth of pre-rendered display for `render_services_view` —
-/// built once, up front, from whichever of `app.services` (local mode) or
-/// `app.service_list` (worker mode, see that field's own doc comment) is
-/// actually live, so the rest of this function never needs to branch on
-/// `app.worker_port` again.
+/// built once, up front, from `app.service_list` (the worker-routed poll,
+/// see that field's own doc comment).
 struct ServiceRow {
-    node_id: String,
     block_name: String,
     line: Line<'static>,
 }
 
 fn render_services_view(f: &mut Frame, area: Rect, app: &App, sv: &ServicesViewState) {
-    let rows: Vec<ServiceRow> = if app.worker_port.is_some() {
-        let mut list: Vec<&crate::worker_client::ServiceDto> = app.service_list.iter().collect();
-        list.sort_by(|a, b| (&a.node_id, &a.block).cmp(&(&b.node_id, &b.block)));
-        list.into_iter()
-            .map(|dto| {
-                let line = match dto.status.as_str() {
-                    "running" => Line::from(vec![
-                        Span::raw(format!("{}  ", dto.block)),
-                        Span::styled(format!("running · pid {}", dto.pid), Style::default().fg(OK)),
-                        Span::styled(format!("  {}", dto.node_id), Style::default().fg(Color::DarkGray)),
-                    ]),
-                    "crashed" => Line::from(vec![
-                        Span::raw(format!("{}  ", dto.block)),
-                        Span::styled(
-                            format!("crashed (exit {})", dto.exit_code.unwrap_or(-1)),
-                            Style::default().fg(FAIL),
-                        ),
-                        Span::styled(format!("  {}", dto.node_id), Style::default().fg(Color::DarkGray)),
-                    ]),
-                    _ => Line::from(vec![
-                        Span::raw(format!("{}  ", dto.block)),
-                        Span::styled("stopped", Style::default().fg(Color::DarkGray)),
-                        Span::styled(format!("  {}", dto.node_id), Style::default().fg(Color::DarkGray)),
-                    ]),
-                };
-                ServiceRow { node_id: dto.node_id.clone(), block_name: dto.block.clone(), line }
-            })
-            .collect()
-    } else {
-        let mut keys: Vec<(&String, &String)> = app.services.keys().map(|(n, b)| (n, b)).collect();
-        keys.sort();
-        keys.into_iter()
-            .filter_map(|(node_id, block_name)| {
-                let handle = app.services.get(&(node_id.clone(), block_name.clone()))?;
-                let line = match handle.status() {
-                    meshfox_server::services::ServiceStatus::Running => Line::from(vec![
-                        Span::raw(format!("{block_name}  ")),
-                        Span::styled(format!("running · pid {}", handle.pid), Style::default().fg(OK)),
-                        Span::styled(format!("  {node_id}"), Style::default().fg(Color::DarkGray)),
-                    ]),
-                    meshfox_server::services::ServiceStatus::Crashed { exit_code } => Line::from(vec![
-                        Span::raw(format!("{block_name}  ")),
-                        Span::styled(format!("crashed (exit {exit_code})"), Style::default().fg(FAIL)),
-                        Span::styled(format!("  {node_id}"), Style::default().fg(Color::DarkGray)),
-                    ]),
-                    meshfox_server::services::ServiceStatus::Stopped => Line::from(vec![
-                        Span::raw(format!("{block_name}  ")),
-                        Span::styled("stopped", Style::default().fg(Color::DarkGray)),
-                        Span::styled(format!("  {node_id}"), Style::default().fg(Color::DarkGray)),
-                    ]),
-                };
-                Some(ServiceRow { node_id: node_id.clone(), block_name: block_name.clone(), line })
-            })
-            .collect()
-    };
+    let mut list: Vec<&crate::worker_client::ServiceDto> = app.service_list.iter().collect();
+    list.sort_by(|a, b| (&a.node_id, &a.block).cmp(&(&b.node_id, &b.block)));
+    let rows: Vec<ServiceRow> = list
+        .into_iter()
+        .map(|dto| {
+            let line = match dto.status.as_str() {
+                "running" => Line::from(vec![
+                    Span::raw(format!("{}  ", dto.block)),
+                    Span::styled(format!("running · pid {}", dto.pid), Style::default().fg(OK)),
+                    Span::styled(format!("  {}", dto.node_id), Style::default().fg(Color::DarkGray)),
+                ]),
+                "crashed" => Line::from(vec![
+                    Span::raw(format!("{}  ", dto.block)),
+                    Span::styled(
+                        format!("crashed (exit {})", dto.exit_code.unwrap_or(-1)),
+                        Style::default().fg(FAIL),
+                    ),
+                    Span::styled(format!("  {}", dto.node_id), Style::default().fg(Color::DarkGray)),
+                ]),
+                _ => Line::from(vec![
+                    Span::raw(format!("{}  ", dto.block)),
+                    Span::styled("stopped", Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("  {}", dto.node_id), Style::default().fg(Color::DarkGray)),
+                ]),
+            };
+            ServiceRow { block_name: dto.block.clone(), line }
+        })
+        .collect();
     let selected = sv.selected.min(rows.len().saturating_sub(1));
 
     // Large, near-fullscreen (not `block_picker_rect`'s content-sized
@@ -1345,15 +1294,12 @@ fn render_services_view(f: &mut Frame, area: Rect, app: &App, sv: &ServicesViewS
     let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     f.render_stateful_widget(list, list_area, &mut state);
 
-    // The selected service's own retained output — `ServiceHandle::
-    // log_snapshot()` directly in local mode (kept live by its own
-    // background drain task, see `meshfox_server::services`), or
-    // `app.service_log`'s last poll in worker mode (see that field's own
-    // doc comment — an async fetch has no place in a synchronous render
-    // function). Always the *tail* (whatever fits `log_area`'s own
-    // height), auto-following as more arrives — no manual scrollback yet,
-    // same "good enough for now" scope as everything else marked
-    // **experimental** here.
+    // The selected service's own retained output — `app.service_log`'s
+    // last poll (see that field's own doc comment — an async fetch has no
+    // place in a synchronous render function). Always the *tail* (whatever
+    // fits `log_area`'s own height), auto-following as more arrives — no
+    // manual scrollback yet, same "good enough for now" scope as everything
+    // else marked **experimental** here.
     if let Some(row) = rows.get(selected) {
         f.render_widget(
             Line::from(Span::styled(
@@ -1362,13 +1308,7 @@ fn render_services_view(f: &mut Frame, area: Rect, app: &App, sv: &ServicesViewS
             )),
             log_title_area,
         );
-        let log: Vec<(meshfox_server::stream_exec::OutputStream, String)> = if app.worker_port.is_some() {
-            app.service_log.clone()
-        } else if let Some(handle) = app.services.get(&(row.node_id.clone(), row.block_name.clone())) {
-            handle.log_snapshot()
-        } else {
-            Vec::new()
-        };
+        let log: Vec<(meshfox_server::stream_exec::OutputStream, String)> = app.service_log.clone();
         {
             let take = log_area.height as usize;
             let start = log.len().saturating_sub(take);
@@ -1903,7 +1843,6 @@ mod tests {
         app.run = Some(crate::tui::app::RunState {
             chain: vec![BlockAddr::new("root", "table")],
             idx: 1,
-            proc: None,
             http_rx: None,
             lines: vec!["==> table".to_string(), "(exit 0 · 5ms)".to_string()],
             full_output: String::new(),
@@ -1911,12 +1850,9 @@ mod tests {
             stderr_only: String::new(),
             output_markdown: true,
             step_started: std::time::Instant::now(),
-            current_node_text: String::new(),
             had_failure: false,
             killed: false,
             finished: true,
-            pending_vars_out: None,
-            forced_reruns: Default::default(),
         });
         // Bypasses `start_run` (which is what flips this in real use) since
         // this test builds `RunState` by hand — without it the console

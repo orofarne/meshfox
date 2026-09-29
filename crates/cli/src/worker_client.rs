@@ -1069,16 +1069,9 @@ pub enum TtyConnectError {
     /// just returned pre-upgrade as a plain HTTP response rather than a
     /// streamed event (`/api/run/tty` keeps its own older pre-upgrade-`409`
     /// shape — out of scope for the `/api/run` WS conversion, see
-    /// TODO.canvas.md). Unlike a plain run's conflict, there's no
-    /// `/api/run/tty/force` to retry
-    /// through (`TtyRunQuery` has no `force` field at all) — the confirm
-    /// flow instead kills the stale/foreign owner directly via
-    /// `meshfox_core::service_lock` against the same on-disk lock file the
-    /// worker itself would have written (computed locally via
-    /// `meshfox_core::locate_node`/`service_lock_path`, same as local-mode
-    /// conflict handling already does), then simply retries this exact
-    /// same `tty_connect` call — see `App::on_service_conflict_key`'s
-    /// `is_tty` branch.
+    /// TODO.canvas.md). Retried the same way a plain run's conflict is —
+    /// `tty_connect`'s own `force` parameter, set to the exact `(nodeId,
+    /// block)` this conflict names.
     Conflict(LockConflict),
     Other(String),
 }
@@ -1121,9 +1114,11 @@ fn tty_connect_error(err: tokio_tungstenite::tungstenite::Error) -> TtyConnectEr
 /// `run_stream`; `cols`/`rows` seed the pty's *initial* size (the real
 /// terminal's current size — later resizes go over this same socket as a
 /// `{"cols":..,"rows":..}` text frame, see `TtySocket`'s own doc comment).
-/// No `force` parameter — see `TtyConnectError::Conflict`'s own doc
-/// comment for why a conflict retries differently here than a plain run's
-/// does.
+/// `force`, when given, names the exact `(nodeId, block)` a prior
+/// `TtyConnectError::Conflict` reported — same `forceNodeId`/`forceBlock`
+/// pair `run_stream`'s own `force` sends to `/api/run/force`, just as query
+/// params on this same endpoint instead of a separate one (see
+/// `TtyRunQuery`'s own doc comment on the server side for why).
 #[allow(clippy::too_many_arguments)]
 pub async fn tty_connect(
     port: u16,
@@ -1134,23 +1129,26 @@ pub async fn tty_connect(
     save_secrets: HashSet<String>,
     cols: u16,
     rows: u16,
+    force: Option<(String, String)>,
 ) -> Result<TtySocket, TtyConnectError> {
     let vars_json = serde_json::to_string(&vars).map_err(|e| TtyConnectError::Other(e.to_string()))?;
     let secrets_json =
         serde_json::to_string(&save_secrets).map_err(|e| TtyConnectError::Other(e.to_string()))?;
-    let url = reqwest::Url::parse_with_params(
-        &format!("ws://127.0.0.1:{port}/api/run/tty"),
-        &[
-            ("path", path.join(",")),
-            ("block", block.to_string()),
-            ("noDeps", no_deps.to_string()),
-            ("vars", vars_json),
-            ("saveSecrets", secrets_json),
-            ("cols", cols.to_string()),
-            ("rows", rows.to_string()),
-        ],
-    )
-    .map_err(|e| TtyConnectError::Other(e.to_string()))?;
+    let mut params = vec![
+        ("path", path.join(",")),
+        ("block", block.to_string()),
+        ("noDeps", no_deps.to_string()),
+        ("vars", vars_json),
+        ("saveSecrets", secrets_json),
+        ("cols", cols.to_string()),
+        ("rows", rows.to_string()),
+    ];
+    if let Some((force_node_id, force_block)) = &force {
+        params.push(("forceNodeId", force_node_id.clone()));
+        params.push(("forceBlock", force_block.clone()));
+    }
+    let url = reqwest::Url::parse_with_params(&format!("ws://127.0.0.1:{port}/api/run/tty"), &params)
+        .map_err(|e| TtyConnectError::Other(e.to_string()))?;
     let (socket, _) = tokio_tungstenite::connect_async(url.as_str())
         .await
         .map_err(tty_connect_error)?;

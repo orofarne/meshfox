@@ -1,20 +1,19 @@
 //! Registry of live `service` blocks (see `meshfox_core::CodeBlock::service`
 //! and SPEC.md's "Service blocks (experimental)") — the persistent state a
 //! `run_block` step branches into instead of waiting for exit (see lib.rs),
-//! and what the new `/api/services*` endpoints and the TUI's own service
-//! view read/act on. Unlike `AppState::runs` (a per-HTTP-stream kill-switch,
-//! cleared the moment that stream closes), an entry here outlives any
-//! individual request — it holds the actual live process and a retained
-//! log, so a client can discover/observe/stop/restart a service across
-//! page reloads, not just within the request that started it.
+//! and what the `/api/services*` endpoints (and, through them, the TUI and
+//! CLI's own service views) read/act on. Unlike `AppState::runs` (a per-
+//! HTTP-stream kill-switch, cleared the moment that stream closes), an
+//! entry here outlives any individual request — it holds the actual live
+//! process and a retained log, so a client can discover/observe/stop/
+//! restart a service across page reloads, not just within the request that
+//! started it.
 //!
-//! The TUI links this crate as a library rather than talking to it over
-//! HTTP (see `stream_exec`'s own doc comment), so it holds its own
-//! `HashMap<(String, String), ServiceHandle>` built from these same
-//! functions — there's no cross-process sharing between a `meshfox view`
-//! server and a `meshfox tui` pointed at the same canvas, only the on-disk
-//! lock file (`meshfox_core::service_lock`) keeps the two honest about who
-//! owns what.
+//! Conflict detection against another core process for the same canvas
+//! (there's only ever one now — see `AppState::run_ledger`) goes through
+//! `crate::run_ledger` — `ServiceHandle` carries the ledger row its own
+//! address was claimed under, and resolves it (`finish`) whenever it stops,
+//! restarts, or crashes.
 
 use crate::stream_exec::{self, OutputStream, SpawnedProcess};
 use std::collections::{HashMap, VecDeque};
@@ -89,7 +88,8 @@ pub struct ServiceHandle {
     pub block_name: String,
     pub pid: u32,
     pub started_at: Instant,
-    pub lock_path: PathBuf,
+    ledger: crate::run_ledger::RunLedger,
+    ledger_row_id: i64,
     status: Arc<Mutex<ServiceStatus>>,
     log: Arc<Mutex<RingBuffer>>,
     respawn: RespawnRecipe,
@@ -111,7 +111,7 @@ impl ServiceHandle {
     /// `Crashed`.
     pub fn stop(&self) -> io::Result<()> {
         *self.status.lock().unwrap() = ServiceStatus::Stopped;
-        let _ = meshfox_core::service_lock::release(&self.lock_path);
+        let _ = self.ledger.finish(self.ledger_row_id, crate::run_ledger::FinishOutcome::Killed);
         let result = kill_process_group(self.pid);
         // Doesn't wait for `self.pid` to actually be gone first — a still-
         // running descendant that's already detached into its own group
@@ -126,18 +126,18 @@ impl ServiceHandle {
 /// Spawns `block` as a service and hands back a `ServiceHandle` whose
 /// `status`/log stay live in the background regardless of whether anything
 /// is watching them right now. **The caller must already hold this
-/// address's lock** (`meshfox_core::service_lock::acquire`, at the exact
-/// path `meshfox_core::service_lock_path(&canvas_path, &node_id,
-/// &block_name)` computes — this recomputes and trusts the same path,
-/// it doesn't acquire it) before calling this — this used to acquire it
-/// internally, but the caller now needs to have already claimed the lock
-/// as part of a possibly-larger, all-or-nothing batch (see the webui's own
+/// address's `run_ledger` row** (`crate::run_ledger::RunLedger::start`,
+/// `ledger_row_id`) before calling this — this used to acquire a file lock
+/// internally, but the caller now needs to have already claimed the row as
+/// part of a possibly-larger, all-or-nothing batch (see the webui's own
 /// up-front, whole-chain lock pass) before committing to spawning anything,
-/// so a second `acquire` in here would just conflict with the caller's own.
-/// Released by `ServiceHandle::stop` (explicit stop/restart) or by the
-/// background drain task itself the moment it notices the process exited
-/// on its own (`Crashed`) — either way, the lock's lifetime now exactly
-/// tracks the process's own, not any one caller's request.
+/// so a second claim in here would just conflict with the caller's own.
+/// Finished (`RunLedger::finish`) by `ServiceHandle::stop` (explicit stop/
+/// restart) or by the background drain task itself the moment it notices
+/// the process exited on its own (`Crashed`) — either way, the row's
+/// lifetime now exactly tracks the process's own, not any one caller's
+/// request.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     node_id: String,
     block_name: String,
@@ -146,27 +146,29 @@ pub fn spawn(
     cwd: PathBuf,
     canvas_path: PathBuf,
     owner: &str,
+    ledger: crate::run_ledger::RunLedger,
+    ledger_row_id: i64,
 ) -> io::Result<ServiceHandle> {
-    let lock_path = meshfox_core::service_lock_path(&canvas_path, &node_id, &block_name);
     let proc = stream_exec::spawn_block(&block, &env, Some(&cwd), Some(&canvas_path))?;
     let pid = proc.child.id().unwrap_or(0);
-    // The lock the caller already claimed was necessarily acquired with a
+    // The row the caller already claimed was necessarily started with a
     // placeholder pid (the real one doesn't exist until right *now*) — fix
-    // it up to the real child pid so a later `is_alive`/force-kill against
-    // this lock file actually targets the right process, not whatever
-    // acquired it originally.
-    let _ = meshfox_core::service_lock::update_owner_pid(&lock_path, pid);
+    // it up to the real child pid so a later force-take-over against this
+    // address actually targets the right process, not whatever placeholder
+    // claimed it originally.
+    let _ = ledger.update_pid(ledger_row_id, pid);
 
     let status = Arc::new(Mutex::new(ServiceStatus::Running));
     let log = Arc::new(Mutex::new(RingBuffer::new(LOG_CAPACITY)));
-    spawn_drain_task(proc, Arc::clone(&status), Arc::clone(&log), lock_path.clone());
+    spawn_drain_task(proc, Arc::clone(&status), Arc::clone(&log), ledger.clone(), ledger_row_id);
 
     Ok(ServiceHandle {
         node_id,
         block_name,
         pid,
         started_at: Instant::now(),
-        lock_path,
+        ledger,
+        ledger_row_id,
         status,
         log,
         respawn: RespawnRecipe { block, env, cwd, canvas_path, owner: owner.to_string() },
@@ -176,15 +178,30 @@ pub fn spawn(
 /// Stops `old` and spawns a fresh process with the exact parameters it was
 /// last started with (see `RespawnRecipe`'s own doc comment) — "local
 /// only" restart, per the product decision: this never touches, or even
-/// looks at, anything that depends on `old`. `old.stop()` already released
-/// `old`'s own lock, so this reacquires it itself before calling `spawn`
-/// (see that function's own doc comment on why it no longer does this
-/// internally) — nothing else can have taken it in between, since `stop`
-/// and this call happen back to back with no `.await` for anyone else to
-/// run in between.
+/// looks at, anything that depends on `old`. `old.stop()` already finished
+/// `old`'s own row, so this starts a fresh one itself before calling
+/// `spawn` (see that function's own doc comment on why it no longer does
+/// this internally) — nothing else can have taken this address in between,
+/// since `stop` and this call happen back to back with no `.await` for
+/// anyone else to run in between.
 pub fn restart(old: &ServiceHandle) -> io::Result<ServiceHandle> {
     old.stop()?;
-    meshfox_core::service_lock::acquire(&old.lock_path, std::process::id(), &old.respawn.owner)?;
+    let new_id = match old.ledger.start(
+        &old.node_id,
+        &old.block_name,
+        crate::run_ledger::RunKind::Service,
+        &old.respawn.owner,
+        std::process::id(),
+    ) {
+        Ok(id) => id,
+        Err(crate::run_ledger::StartError::Conflict(info)) => {
+            return Err(io::Error::other(format!(
+                "address still claimed immediately after stop (pid {}, {})",
+                info.pid, info.owner
+            )));
+        }
+        Err(crate::run_ledger::StartError::Io(e)) => return Err(e),
+    };
     spawn(
         old.node_id.clone(),
         old.block_name.clone(),
@@ -193,15 +210,17 @@ pub fn restart(old: &ServiceHandle) -> io::Result<ServiceHandle> {
         old.respawn.cwd.clone(),
         old.respawn.canvas_path.clone(),
         &old.respawn.owner,
+        old.ledger.clone(),
+        new_id,
     )
 }
 
 /// Drains `proc`'s output into `log` for as long as it runs, then reaps it
 /// and records whatever `ServiceStatus` that leaves it in — `Crashed` for
 /// an unexpected exit, left alone (already `Stopped`) if `ServiceHandle::
-/// stop` already flipped it first. Also releases `lock_path` on a `Crashed`
-/// exit — `stop` already releases it for a deliberate stop, but an
-/// unexpected exit used to leave the lock file behind forever (until the
+/// stop` already flipped it first. Also finishes `ledger_row_id` on a
+/// `Crashed` exit — `stop` already finishes it for a deliberate stop, but
+/// an unexpected exit used to leave the row `running` forever (until the
 /// whole process exited or someone explicitly stopped it), which meant a
 /// crashed service's own address stayed permanently "held by us" even
 /// though nothing was actually running under it — quietly wrong even
@@ -216,7 +235,8 @@ fn spawn_drain_task(
     mut proc: SpawnedProcess,
     status: Arc<Mutex<ServiceStatus>>,
     log: Arc<Mutex<RingBuffer>>,
-    lock_path: PathBuf,
+    ledger: crate::run_ledger::RunLedger,
+    ledger_row_id: i64,
 ) {
     tokio::spawn(async move {
         // Captured before `wait()` below — a `tokio::process::Child` can
@@ -267,7 +287,7 @@ fn spawn_drain_task(
         let mut current = status.lock().unwrap();
         if !matches!(*current, ServiceStatus::Stopped) {
             *current = ServiceStatus::Crashed { exit_code };
-            let _ = meshfox_core::service_lock::release(&lock_path);
+            let _ = ledger.finish(ledger_row_id, crate::run_ledger::FinishOutcome::Exited(exit_code));
         }
     });
 }
@@ -395,9 +415,11 @@ mod tests {
     }
 
     /// Test-only stand-in for what a real caller now must do itself before
-    /// calling `spawn` — acquire the address's lock first (see `spawn`'s
-    /// own doc comment on why it no longer does this internally).
+    /// calling `spawn` — claim the address's `run_ledger` row first (see
+    /// `spawn`'s own doc comment on why it no longer does this internally).
+    #[allow(clippy::too_many_arguments)]
     fn spawn_locked(
+        ledger: &crate::run_ledger::RunLedger,
         node_id: String,
         block_name: String,
         block: meshfox_core::CodeBlock,
@@ -406,16 +428,18 @@ mod tests {
         canvas_path: PathBuf,
         owner: &str,
     ) -> io::Result<ServiceHandle> {
-        let lock_path = meshfox_core::service_lock_path(&canvas_path, &node_id, &block_name);
-        meshfox_core::service_lock::acquire(&lock_path, std::process::id(), owner)
-            .map_err(io::Error::from)?;
-        spawn(node_id, block_name, block, env, cwd, canvas_path, owner)
+        let id = ledger
+            .start(&node_id, &block_name, crate::run_ledger::RunKind::Service, owner, std::process::id())
+            .map_err(io::Error::other)?;
+        spawn(node_id, block_name, block, env, cwd, canvas_path, owner, ledger.clone(), id)
     }
 
     #[tokio::test]
-    async fn spawn_acquires_the_lock_file_and_reports_running() {
+    async fn spawn_claims_the_ledger_row_and_reports_running() {
+        let ledger = crate::run_ledger::RunLedger::open_in_memory().unwrap();
         let canvas_path = tmp_canvas_path("spawn");
         let handle = spawn_locked(
+            &ledger,
             "root".to_string(),
             "srv".to_string(),
             test_block("sleep 30"),
@@ -427,23 +451,23 @@ mod tests {
         .unwrap();
 
         assert_eq!(handle.status(), ServiceStatus::Running);
-        let lock = meshfox_core::service_lock::check(&handle.lock_path).unwrap();
-        assert_eq!(
-            lock,
-            meshfox_core::ServiceLockState::Held {
-                info: meshfox_core::ServiceLockInfo { pid: handle.pid, owner: "cli".to_string() },
-                alive: true,
-            }
-        );
+        let active = ledger.active_running().unwrap();
+        assert_eq!(active.len(), 1, "active: {active:?}");
+        assert_eq!(active[0].node_id, "root");
+        assert_eq!(active[0].block, "srv");
+        assert_eq!(active[0].pid, handle.pid);
+        assert_eq!(active[0].owner, "cli");
 
         handle.stop().unwrap();
         std::fs::remove_dir_all(canvas_path.parent().unwrap()).ok();
     }
 
     #[tokio::test]
-    async fn stop_releases_the_lock_and_marks_stopped_not_crashed() {
+    async fn stop_finishes_the_ledger_row_and_marks_stopped_not_crashed() {
+        let ledger = crate::run_ledger::RunLedger::open_in_memory().unwrap();
         let canvas_path = tmp_canvas_path("stop");
         let handle = spawn_locked(
+            &ledger,
             "root".to_string(),
             "srv".to_string(),
             test_block("sleep 30"),
@@ -453,14 +477,10 @@ mod tests {
             "cli",
         )
         .unwrap();
-        let lock_path = handle.lock_path.clone();
 
         handle.stop().unwrap();
         assert_eq!(handle.status(), ServiceStatus::Stopped);
-        assert_eq!(
-            meshfox_core::service_lock::check(&lock_path).unwrap(),
-            meshfox_core::ServiceLockState::Free
-        );
+        assert!(ledger.active_running().unwrap().is_empty());
 
         // Give the background drain task a moment to actually notice the
         // process is gone and run its own status update — it must not
@@ -473,8 +493,10 @@ mod tests {
 
     #[tokio::test]
     async fn an_unexpected_exit_is_reported_as_crashed() {
+        let ledger = crate::run_ledger::RunLedger::open_in_memory().unwrap();
         let canvas_path = tmp_canvas_path("crash");
         let handle = spawn_locked(
+            &ledger,
             "root".to_string(),
             "srv".to_string(),
             test_block("exit 7"),
@@ -496,6 +518,10 @@ mod tests {
             status = handle.status();
         }
         assert_eq!(status, ServiceStatus::Crashed { exit_code: 7 });
+        assert!(
+            ledger.active_running().unwrap().is_empty(),
+            "the crashed row should have been finished too, not left running"
+        );
 
         std::fs::remove_dir_all(canvas_path.parent().unwrap()).ok();
     }
@@ -538,7 +564,9 @@ mod tests {
             "python3 <<'PYEOF'\nimport os, sys, time\npid = os.fork()\nif pid > 0:\n    time.sleep(1)\n    sys.exit(0)\nos.setsid()\ndevnull = os.open(os.devnull, os.O_RDWR)\nos.dup2(devnull, 0)\nos.dup2(devnull, 1)\nos.dup2(devnull, 2)\nwith open({marker:?}, 'w') as f:\n    f.write(str(os.getpid()))\ntime.sleep(30)\nPYEOF\n",
         );
 
+        let ledger = crate::run_ledger::RunLedger::open_in_memory().unwrap();
         let handle = spawn_locked(
+            &ledger,
             "root".to_string(),
             "srv".to_string(),
             test_block(&script),
@@ -601,8 +629,10 @@ mod tests {
 
     #[tokio::test]
     async fn log_snapshot_captures_output_lines() {
+        let ledger = crate::run_ledger::RunLedger::open_in_memory().unwrap();
         let canvas_path = tmp_canvas_path("log");
         let handle = spawn_locked(
+            &ledger,
             "root".to_string(),
             "srv".to_string(),
             test_block("echo one; echo two; sleep 30"),
@@ -635,8 +665,10 @@ mod tests {
 
     #[tokio::test]
     async fn restart_stops_the_old_process_and_starts_a_new_one_with_a_different_pid() {
+        let ledger = crate::run_ledger::RunLedger::open_in_memory().unwrap();
         let canvas_path = tmp_canvas_path("restart");
         let handle = spawn_locked(
+            &ledger,
             "root".to_string(),
             "srv".to_string(),
             test_block("sleep 30"),

@@ -19,7 +19,6 @@ mod tree;
 // hardcoding a second copy of it that could silently drift out of sync.
 pub(crate) mod ui;
 
-use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -307,15 +306,6 @@ fn spawn_run_subscriber(
     });
 }
 
-/// What `main_loop`'s combined `RunState`-polling `select!` arm actually
-/// got — `RunState::proc`'s local-mode output line, or
-/// `RunState::http_rx`'s worker-mode `RunEvent`. See that arm's own
-/// comment for why the two are folded into one future rather than two.
-enum RunPollOutcome {
-    Local(Option<(meshfox_server::stream_exec::OutputStream, String)>),
-    Http(Option<crate::worker_client::RunEvent>),
-}
-
 async fn main_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
@@ -329,24 +319,6 @@ async fn main_loop(
         terminal.draw(|f| ui::render(f, app))?;
         if app.should_quit {
             return Ok(());
-        }
-
-        if let Some(pending) = app.pending_tty.take() {
-            let exit_code = run_tty_handoff(
-                terminal,
-                input_paused,
-                input_rx,
-                &pending.block_name,
-                &pending.code,
-                pending.interpreter.as_deref(),
-                &pending.env,
-                &pending.cwd,
-                &pending.canvas_path,
-                pending.autoclose,
-            )
-            .await?;
-            app.resume_after_tty(exit_code).await;
-            continue;
         }
 
         if let Some(pending) = app.pending_http_tty.take() {
@@ -387,24 +359,12 @@ async fn main_loop(
             continue;
         }
 
-        let has_proc = app.run.as_ref().is_some_and(|r| r.proc.is_some());
         let has_http_run = app.run.as_ref().is_some_and(|r| r.http_rx.is_some());
         let has_file_proc = app.file_run.as_ref().is_some_and(|r| r.proc.is_some());
-        // Not draining any output here — each `ServiceHandle`'s own
-        // background task (`meshfox_server::services`) already keeps its
-        // `status()`/`log_snapshot()` live on its own; this just redraws
-        // the tree glyph/footer aggregate periodically while at least one
-        // service exists, gated the same way `has_proc`/`has_file_proc`
-        // are so it's a true no-op (no wakeups at all) once `services` is
-        // empty. **Experimental**, see SPEC.md's "Service blocks
-        // (experimental)".
-        let has_services = !app.services.is_empty();
-        // The worker-routed equivalent of `has_services`'s tick — polls
-        // `GET /api/services` (`App::refresh_services`) on the same ~3s
-        // cadence the web UI's own service panel already uses, unconditionally
-        // whenever a worker is reachable (unlike `has_services`, there's no
-        // cheap local check to gate this on — the whole point is finding out
-        // about services this process never itself spawned).
+        // Polls `GET /api/services` (`App::refresh_services`) on the same
+        // ~3s cadence the web UI's own service panel already uses,
+        // unconditionally whenever a worker is reachable — the whole point
+        // is finding out about services this process never itself spawned.
         let worker_reachable = app.worker_port.is_some();
         // While the services view is actually open in worker mode, also
         // keep the selected entry's own log fresh — see `service_log`'s own
@@ -412,9 +372,8 @@ async fn main_loop(
         let services_view_open_on_worker = worker_reachable && app.services_view.is_some();
         // Only scheduled while the console is actually expanded — once
         // `console_tick` re-collapses it (or it was never expanded this
-        // session), this branch simply isn't in the `select!` at all, same
-        // "true no-op, no wakeups" reasoning `has_services` above already
-        // has for its own tick.
+        // session), this branch simply isn't in the `select!` at all —
+        // a true no-op, no wakeups at all, while there's nothing to redraw.
         let console_pending_collapse = app.console_pending_collapse();
         // Keeps `ui::render_tree`'s running-spinner badge animating at a
         // steady rate regardless of whatever else is (or isn't) causing a
@@ -433,25 +392,10 @@ async fn main_loop(
                     None => return Ok(()),
                 }
             }
-            outcome = async {
-                // `proc`/`http_rx` are mutually exclusive on a given
-                // `RunState` (see its own doc comment) — both arms borrow
-                // `app.run` mutably, so they're combined into one future
-                // rather than two separate `select!` branches (which
-                // `tokio::select!` would otherwise construct at once, each
-                // borrowing `app.run` for itself, even though only one is
-                // ever actually polled).
-                let run = app.run.as_mut().unwrap();
-                if let Some(proc) = run.proc.as_mut() {
-                    RunPollOutcome::Local(proc.output_rx.recv().await)
-                } else {
-                    RunPollOutcome::Http(run.http_rx.as_mut().unwrap().recv().await)
-                }
-            }, if has_proc || has_http_run => {
-                match outcome {
-                    RunPollOutcome::Local(line) => app.on_output_line(line).await,
-                    RunPollOutcome::Http(event) => app.on_run_event(event).await,
-                }
+            event = async {
+                app.run.as_mut().unwrap().http_rx.as_mut().unwrap().recv().await
+            }, if has_http_run => {
+                app.on_run_event(event).await;
             }
             line = async {
                 app.file_run.as_mut().unwrap().proc.as_mut().unwrap().output_rx.recv().await
@@ -469,9 +413,6 @@ async fn main_loop(
                     BlockAddr::new(update.node_id, update.block),
                     update.event,
                 );
-            }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(300)), if has_services => {
-                app.tick_services();
             }
             _ = tokio::time::sleep(std::time::Duration::from_secs(3)), if worker_reachable => {
                 app.refresh_services().await;
@@ -559,133 +500,14 @@ async fn run_child_canvas_handoff(
     Ok(())
 }
 
-/// Leaves the TUI's screen entirely, runs `code` with its stdin/stdout/
-/// stderr connected directly to the real terminal (`Stdio::inherit()`, no
-/// pty of our own — same as `meshfox run`'s own `tty` handling in
-/// `crates/cli/src/main.rs`), and comes back once it exits. `input_paused`
-/// is set for the duration so the background input-reader thread (see
-/// `run` above) isn't calling `read()` on the same fd the child now owns.
-#[allow(clippy::too_many_arguments)]
-async fn run_tty_handoff(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    input_paused: &Arc<AtomicBool>,
-    input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
-    block_name: &str,
-    code: &str,
-    interpreter: Option<&str>,
-    env: &HashMap<String, String>,
-    cwd: &std::path::Path,
-    canvas_path: &std::path::Path,
-    autoclose: bool,
-) -> io::Result<i32> {
-    input_paused.store(true, Ordering::Release);
-    // Comfortably longer than the reader thread's own 50ms poll timeout,
-    // so it's guaranteed to have observed the flag and gone quiet before
-    // the terminal is actually handed to the child below.
-    tokio::time::sleep(Duration::from_millis(80)).await;
-
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    println!("==> {block_name}");
-
-    let exit_code = run_tty_block(code, interpreter, env, cwd, canvas_path).await;
-
-    // Without `autoclose`, the canvas doesn't come back on its own — the
-    // exit code (and whatever the process last printed, still on screen
-    // right above this) stays visible until a deliberate keypress, same
-    // as leaving a real shell open after a command finishes. `autoclose`
-    // skips straight to restoring the canvas, the only behavior this block
-    // had before the flag existed.
-    if !autoclose {
-        println!("\r\n(exited {exit_code} — press any key to return to the canvas)");
-        // Briefly un-paused so the background reader thread (paused above,
-        // for the child's own exclusive use of the terminal) forwards the
-        // next keypress here instead of it being silently dropped.
-        input_paused.store(false, Ordering::Release);
-        let _ = input_rx.recv().await;
-        input_paused.store(true, Ordering::Release);
-    }
-
-    enable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        EnterAlternateScreen,
-        EnableMouseCapture
-    )?;
-    // The alternate screen's own saved contents are stale after leaving
-    // and re-entering it — force a full repaint on the next `draw` rather
-    // than a diff against what's actually on screen now (the child's own
-    // last frame).
-    terminal.clear()?;
-
-    input_paused.store(false, Ordering::Release);
-    Ok(exit_code)
-}
-
-/// Mirrors `crates/cli/src/main.rs`'s own `run_tty_block`: `Ctrl+C` is
-/// swallowed and just keeps waiting — the child, as its own independent
-/// foreground process, decides for itself whether that signal ends it.
-async fn run_tty_block(
-    code: &str,
-    interpreter: Option<&str>,
-    envs: &HashMap<String, String>,
-    cwd: &std::path::Path,
-    canvas_path: &std::path::Path,
-) -> i32 {
-    let env_names: Vec<String> = envs.keys().cloned().collect();
-    let Ok(resolved) =
-        meshfox_core::resolve_command(code, interpreter, Some(cwd), Some(canvas_path), &env_names)
-    else {
-        return -1;
-    };
-    let spawned = tokio::process::Command::new(&resolved.program)
-        .args(&resolved.args)
-        .envs(envs)
-        .envs(resolved.extra_envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .current_dir(cwd)
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .spawn();
-
-    let mut child = match spawned {
-        Ok(child) => child,
-        Err(_) => {
-            if let Some(path) = &resolved.cleanup {
-                let _ = std::fs::remove_file(path);
-            }
-            return -1;
-        }
-    };
-
-    let exit_code = loop {
-        tokio::select! {
-            status = child.wait() => break status.ok().and_then(|s| s.code()).unwrap_or(-1),
-            _ = tokio::signal::ctrl_c() => continue,
-        }
-    };
-    if let Some(path) = &resolved.cleanup {
-        let _ = std::fs::remove_file(path);
-    }
-    exit_code
-}
-
 /// Leaves the alternate screen and relays an already-connected
 /// `/api/run/tty` socket (see `crate::worker_client::tty_connect`,
-/// `app::PendingHttpTty`) — the worker-routed counterpart to
-/// `run_tty_handoff` above. Unlike that one, raw mode is never disabled
-/// here: `run_tty_handoff` can safely leave it (the *child process* it
-/// spawns owns the real fds directly and manages its own terminal
-/// discipline once it does), but here *this* process is the one relaying
-/// bytes itself, so local echo/line-buffering/signal-generation have to
-/// stay off the whole time — same posture the rest of this TUI already
-/// runs under. `input_paused` still matters: it keeps the ordinary
-/// crossterm background reader (`run`, above) from racing
-/// `spawn_raw_stdin_reader`'s own direct reads of the same fd.
+/// `app::PendingHttpTty`). Raw mode is never disabled here — *this*
+/// process is the one relaying bytes itself, so local echo/line-buffering/
+/// signal-generation have to stay off the whole time, same posture the
+/// rest of this TUI already runs under. `input_paused` still matters: it
+/// keeps the ordinary crossterm background reader (`run`, above) from
+/// racing `spawn_raw_stdin_reader`'s own direct reads of the same fd.
 async fn run_http_tty_handoff(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     input_paused: &Arc<AtomicBool>,

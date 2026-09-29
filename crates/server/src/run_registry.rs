@@ -202,12 +202,16 @@ pub fn reserve(node_id: String, block_name: String) -> Arc<RunHandle> {
 /// practice (each handle's own chain step only ever calls this once), but
 /// safe rather than double-spawning a drain task over the same handle.
 ///
-/// `lock_path`, if given, is released *by this background task itself*
-/// once the process actually exits or is killed — see `track`'s own doc
-/// comment (still accurate here) for why that has to be tied to the
-/// process's own completion rather than whatever caller happened to start
-/// it.
-pub fn attach(handle: &Arc<RunHandle>, mut proc: SpawnedProcess, lock_path: Option<std::path::PathBuf>) {
+/// `ledger_row`, if given, is resolved (`RunLedger::finish`) *by this
+/// background task itself* once the process actually exits or is killed —
+/// see `track`'s own doc comment (still accurate here) for why that has to
+/// be tied to the process's own completion rather than whatever caller
+/// happened to start it.
+pub fn attach(
+    handle: &Arc<RunHandle>,
+    mut proc: SpawnedProcess,
+    ledger_row: Option<(crate::run_ledger::RunLedger, i64)>,
+) {
     if handle.attached.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -243,9 +247,14 @@ pub fn attach(handle: &Arc<RunHandle>, mut proc: SpawnedProcess, lock_path: Opti
             }
         };
         *task_handle.outcome.lock().unwrap() = outcome.clone();
-        let _ = task_handle.tx.send(RunEvent::Done(outcome));
-        if let Some(path) = lock_path {
-            let _ = meshfox_core::service_lock::release(&path);
+        let _ = task_handle.tx.send(RunEvent::Done(outcome.clone()));
+        if let Some((ledger, id)) = ledger_row {
+            let finish_outcome = match outcome {
+                RunOutcome::Exited { exit_code } => crate::run_ledger::FinishOutcome::Exited(exit_code),
+                RunOutcome::Killed => crate::run_ledger::FinishOutcome::Killed,
+                RunOutcome::Running => unreachable!("the loop above only ever breaks with Exited/Killed"),
+            };
+            let _ = ledger.finish(id, finish_outcome);
         }
     });
 }
@@ -257,10 +266,10 @@ pub fn track(
     node_id: String,
     block_name: String,
     proc: SpawnedProcess,
-    lock_path: Option<std::path::PathBuf>,
+    ledger_row: Option<(crate::run_ledger::RunLedger, i64)>,
 ) -> Arc<RunHandle> {
     let handle = reserve(node_id, block_name);
-    attach(&handle, proc, lock_path);
+    attach(&handle, proc, ledger_row);
     handle
 }
 
