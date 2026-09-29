@@ -226,6 +226,26 @@ impl TuiSession {
         self.parser.lock().unwrap().screen().contents()
     }
 
+    /// Whether the app currently has the terminal's alternate screen
+    /// switched on (`EnterAlternateScreen` seen, `LeaveAlternateScreen`
+    /// not yet) — what a TUI that exited without restoring the terminal
+    /// leaves behind.
+    pub fn in_alternate_screen(&self) -> bool {
+        self.parser.lock().unwrap().screen().alternate_screen()
+    }
+
+    /// The spawned `meshfox tui` process's own pid.
+    pub fn pid(&self) -> u32 {
+        self.child.process_id().expect("child pid")
+    }
+
+    /// Sends `signal` to the `meshfox tui` process itself — an *external*
+    /// kill, as opposed to the in-app `q`.
+    pub fn send_signal(&self, signal: i32) {
+        // SAFETY: plain `kill(2)` on our own child's pid.
+        unsafe { libc::kill(self.pid() as libc::pid_t, signal) };
+    }
+
     /// Polls `screen_text()` every 30ms until it contains `needle`, up to
     /// `timeout` — never a raw `sleep` in a test, which would either race
     /// a slow CI machine or waste time on a fast one.

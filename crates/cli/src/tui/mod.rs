@@ -73,8 +73,10 @@ pub async fn run(canvas_path: PathBuf, initial_node: Option<String>) -> io::Resu
     // couldn't be read) is a real, printed error, not a silent degrade to
     // today's direct-file/local-process behavior — matching every other
     // core-launch operation's own "no silent fallback" posture.
+    let mut embedded_worker = false;
     let worker_port = match crate::coordinator::resolve(&canvas_path).await {
         Ok(crate::coordinator::Resolved::Us(guard)) => {
+            embedded_worker = true;
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
             // `auto_exit: false` matters here specifically — with `true`, a
             // browser tab that peeked at this worker and then closed would
@@ -108,6 +110,8 @@ pub async fn run(canvas_path: PathBuf, initial_node: Option<String>) -> io::Resu
             std::process::exit(1);
         }
     };
+
+    spawn_signal_terminal_restore(embedded_worker);
 
     let result = match App::new(canvas_path, link_preview_tx, initial_node.as_deref(), worker_port).await {
         Ok(mut app) => {
@@ -186,6 +190,62 @@ pub async fn run(canvas_path: PathBuf, initial_node: Option<String>) -> io::Resu
     terminal.show_cursor()?;
 
     result
+}
+
+/// Gives the terminal back (raw mode off, main screen, mouse capture off,
+/// cursor shown) on an *external* `SIGTERM`/`SIGHUP`/`SIGINT` — a plain
+/// `kill <pid>`, a closing terminal — which the in-app `q` path (the
+/// restore at the end of [`run`]) never sees. Without it the process just
+/// died with the terminal still in the alternate screen, unusable until
+/// `reset`. (Ctrl-C typed *inside* the TUI is never a signal: raw mode
+/// hands it over as an ordinary key.)
+///
+/// Stopping what this session started is the worker's job, and who does it
+/// depends on `embedded_worker`:
+/// - `true`: this process *is* the worker, and its own shutdown handler
+///   (`meshfox_server`'s `spawn_shutdown_signal_handler`, listening for the
+///   same signals) stops every service/run/tty and then `exit`s ~200ms
+///   later. This handler only has to restore the terminal *before* that
+///   `exit` — it does so immediately, so it always wins the race — and
+///   exits itself after a grace period in case the worker's never does.
+/// - `false`: the worker belongs to someone else and outlives this TUI
+///   (its services are not ours to stop), so restoring and exiting is all
+///   there is to do.
+fn spawn_signal_terminal_restore(embedded_worker: bool) {
+    use tokio::signal::unix::{signal, SignalKind};
+    tokio::spawn(async move {
+        let (Ok(mut term), Ok(mut hup), Ok(mut int)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+            signal(SignalKind::interrupt()),
+        ) else {
+            return;
+        };
+        // Shell convention: 128 + signal number.
+        let code = tokio::select! {
+            _ = term.recv() => 143,
+            _ = hup.recv() => 129,
+            _ = int.recv() => 130,
+        };
+        restore_terminal_best_effort();
+        if embedded_worker {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        std::process::exit(code);
+    });
+}
+
+/// The terminal half of [`run`]'s own exit path, with every error ignored:
+/// this runs from a signal handler, possibly with the terminal already gone
+/// (`SIGHUP`), where there's nobody left to report a failure to.
+fn restore_terminal_best_effort() {
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        io::stdout(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        crossterm::cursor::Show
+    );
 }
 
 /// Polls `canvas_path`'s mtime every 500ms on its own OS thread — same

@@ -172,3 +172,92 @@ fn v_opens_the_services_view_and_s_r_stop_and_restart() {
         .wait_for("●service", Duration::from_secs(5))
         .expect("closing the view should reveal the running-service glyph on the row again");
 }
+
+/// An *external* `kill <pid>` (SIGTERM — what a closing terminal's SIGHUP or
+/// a plain `kill` delivers; Ctrl-C inside the TUI never becomes a signal, raw
+/// mode hands it over as a key) must behave like a quiet `q`: stop what this
+/// process's embedded worker started AND give the terminal back — the
+/// worker's own shutdown handler ends in `process::exit`, which used to skip
+/// the TUI's own restore (`disable_raw_mode`/`LeaveAlternateScreen`).
+fn external_signal_stops_services_and_restores_the_terminal(signal: i32, name: &str) {
+    let (canvas_path, dir) = fixtures::write_fixture(fixtures::SERVICE_RUNNABLE);
+    let mut session = TuiSession::spawn(&canvas_path, dir, 30, 100);
+    session.wait_for("Root", Duration::from_secs(5)).expect("initial render");
+    let (out_row, out_col) = session.find("Output").expect("collapsed Output strip");
+    session.send_mouse_click(out_row, out_col);
+    session.send_keys("r");
+    session
+        .wait_for("service started, pid", Duration::from_secs(10))
+        .expect("the service-started line should show up in the Output pane");
+    let pid = find_service_pid(&session.screen_text()).expect("parse the service's own pid");
+    assert!(is_alive(pid), "service should actually be running at this point");
+    assert!(session.in_alternate_screen(), "the TUI should own the alternate screen while running");
+
+    session.send_signal(signal);
+    assert!(
+        session.wait_for_exit(Duration::from_secs(5)),
+        "meshfox tui should exit on an external {name}"
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut still_alive = is_alive(pid);
+    while still_alive && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        still_alive = is_alive(pid);
+    }
+    assert!(!still_alive, "service pid {pid} survived an external {name} — it was orphaned");
+    // Give the pty reader thread a beat to drain the last bytes.
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        !session.in_alternate_screen(),
+        "an external {name} left the terminal stuck in the alternate screen"
+    );
+}
+
+#[test]
+#[ignore = "pty-based e2e — run via `cargo test --test tui_e2e -- --ignored`"]
+fn external_sigterm_stops_services_and_restores_the_terminal() {
+    external_signal_stops_services_and_restores_the_terminal(libc::SIGTERM, "SIGTERM");
+}
+
+#[test]
+#[ignore = "pty-based e2e — run via `cargo test --test tui_e2e -- --ignored`"]
+fn external_sighup_stops_services_and_restores_the_terminal() {
+    external_signal_stops_services_and_restores_the_terminal(libc::SIGHUP, "SIGHUP");
+}
+
+/// The other half: a TUI that merely *joined* someone else's worker
+/// (`Resolved::Other`) has no worker of its own to stop anything with — and
+/// its services aren't its to stop. An external SIGTERM must still hand the
+/// terminal back and exit, but leave the first TUI's service running.
+#[test]
+#[ignore = "pty-based e2e — run via `cargo test --test tui_e2e -- --ignored`"]
+fn external_sigterm_on_a_joined_tui_restores_the_terminal_and_leaves_the_others_service_running() {
+    let (canvas_path, dir) = fixtures::write_fixture(fixtures::SERVICE_RUNNABLE);
+    let mut owner = TuiSession::spawn(&canvas_path, dir.clone(), 30, 100);
+    owner.wait_for("Root", Duration::from_secs(5)).expect("owner initial render");
+    let (out_row, out_col) = owner.find("Output").expect("collapsed Output strip");
+    owner.send_mouse_click(out_row, out_col);
+    owner.send_keys("r");
+    owner
+        .wait_for("service started, pid", Duration::from_secs(10))
+        .expect("the owner's service should start");
+    let pid = find_service_pid(&owner.screen_text()).expect("parse the service's own pid");
+
+    let mut joined = TuiSession::spawn(&canvas_path, dir, 30, 100);
+    joined.wait_for("Root", Duration::from_secs(5)).expect("joined initial render");
+    assert!(joined.in_alternate_screen());
+
+    joined.send_signal(libc::SIGTERM);
+    assert!(
+        joined.wait_for_exit(Duration::from_secs(5)),
+        "the joined TUI should exit on an external SIGTERM"
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!joined.in_alternate_screen(), "the joined TUI left the terminal stuck in the alternate screen");
+    assert!(is_alive(pid), "another TUI's service must survive this TUI being killed");
+    assert!(owner.in_alternate_screen(), "the owning TUI must be untouched");
+    // `owner`'s Drop kills it; the service dies with it via the worker's own
+    // shutdown — not asserted here, `quit_stops_it` above already covers that.
+    let _ = owner.wait_for_exit(Duration::from_millis(1));
+}

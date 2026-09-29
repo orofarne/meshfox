@@ -4054,10 +4054,9 @@ impl App {
     /// A `service` block now always runs inside the shared worker, not this
     /// TUI process itself — stopping it on quit (or on any other TUI exit
     /// path) is the worker's own job, not this process's; see
-    /// `crates/server/src/lib.rs`'s `spawn_shutdown_signal_handler` and
-    /// TODO.canvas.md's "meshfox tui не ловит внешний kill" for the known,
-    /// separately-tracked gap in that story (deferred to its own TUI pass,
-    /// not this one).
+    /// `crates/server/src/lib.rs`'s `spawn_shutdown_signal_handler`. An
+    /// *external* kill takes a different path: see `mod.rs`'s
+    /// `spawn_signal_terminal_restore`.
     fn quit(&mut self) {
         self.should_quit = true;
     }
