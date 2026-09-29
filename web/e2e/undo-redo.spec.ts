@@ -165,3 +165,18 @@ test("Cmd/Ctrl-Z is swallowed by the node body editor instead of triggering docu
   await undoButton(page).click();
   await expect.poll(() => nodeAText(page)).toBe(before);
 });
+
+test("history panel's 'Start of history' row reverts the oldest step, which no real row can", async ({ page }) => {
+  const before = await nodeAText(page);
+  await editNodeABody(page);
+  expect(await nodeAText(page)).not.toBe(before);
+
+  await page.getByRole("button", { name: "🕘 history" }).click();
+  // Every real row jumps to the state right *after* its own step, so
+  // only this synthetic bottom row (goto seq 0) can undo the log's oldest step.
+  await page.locator(".history-panel-row", { hasText: /Start of history/ }).click();
+
+  await expect.poll(() => nodeAText(page)).toBe(before);
+  await expect(undoButton(page)).toBeDisabled();
+  await expect(redoButton(page)).toBeEnabled();
+});

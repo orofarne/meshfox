@@ -1,4 +1,4 @@
-import type { HistoryEntry } from "./api";
+import { HISTORY_FETCH_LIMIT, type HistoryEntry } from "./api";
 
 interface HistoryPanelProps {
   /** From `GET /api/history`, most-future first — see `fetchHistory`'s
@@ -21,6 +21,7 @@ interface HistoryPanelProps {
  * `Date.now()`, since the list only re-renders when refetched anyway
  * (on open, and after every `onGoto`). */
 function formatRelativeTime(iso: string): string {
+  if (!iso) return "";
   const ms = Date.now() - new Date(iso).getTime();
   if (!Number.isFinite(ms) || ms < 0) return "just now";
   const sec = Math.round(ms / 1000);
@@ -51,7 +52,22 @@ function formatRelativeTime(iso: string): string {
  * tail above the current position and applied history below it, mirroring
  * how `entries` itself is already split by `applied`.
  */
-export function HistoryPanel({ entries, cursor, onClose, onGoto }: HistoryPanelProps) {
+export function HistoryPanel({ entries: listed, cursor, onClose, onGoto }: HistoryPanelProps) {
+  // "Start of history": `goto` seq 0 undoes everything. No real row can
+  // undo the oldest step itself (each jumps to the state right *after* its
+  // own step), so without this that step could never be reverted. Only
+  // offered when the list holds the whole log — with more applied steps
+  // than the fetch limit, seq 0 would silently undo far more than the rows
+  // shown. (`oldest.seq - 1` isn't a safe target instead: seqs have gaps
+  // once a redo tail is dropped, so it may never be a cursor value.)
+  // Marked current when nothing real is applied.
+  const oldest = listed[listed.length - 1];
+  const wholeLogShown = listed.filter((e) => e.applied).length < HISTORY_FETCH_LIMIT;
+  const entries: HistoryEntry[] =
+    oldest && wholeLogShown
+      ? [...listed, { seq: 0, createdAt: "", opKind: "", applied: true, summary: "Start of history" }]
+      : listed;
+  const nothingApplied = !listed.some((e) => e.applied);
   return (
     <div className="vars-modal-backdrop" onClick={onClose}>
       <div className="service-panel" onClick={(e) => e.stopPropagation()}>
@@ -66,7 +82,10 @@ export function HistoryPanel({ entries, cursor, onClose, onGoto }: HistoryPanelP
             {entries.length === 0 && <p className="vars-modal-hint">No history yet.</p>}
             {entries.map((entry, i) => {
               const prev = entries[i - 1];
-              const isCurrent = entry.applied && entry.seq === cursor;
+              const isBeforeOldest = entry.seq === 0 && entry.opKind === "";
+              const isCurrent = isBeforeOldest
+                ? nothingApplied || cursor === 0
+                : entry.applied && entry.seq === cursor;
               const showDivider = i > 0 && prev.applied === false && entry.applied === true;
               return (
                 <div key={entry.seq}>
@@ -79,7 +98,7 @@ export function HistoryPanel({ entries, cursor, onClose, onGoto }: HistoryPanelP
                       (!entry.applied ? " history-panel-row-future" : "")
                     }
                     onClick={() => onGoto(entry.seq)}
-                    title={`#${entry.seq} — ${entry.opKind}`}
+                    title={isBeforeOldest ? entry.summary : `#${entry.seq} — ${entry.opKind}`}
                   >
                     <span className="history-panel-row-marker">{isCurrent ? "●" : ""}</span>
                     <span className="service-panel-row-block">{entry.summary}</span>

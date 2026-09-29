@@ -958,6 +958,8 @@ export interface HistoryResponse {
  * steps plus the *entire* current redo tail (never separately capped, see
  * `undo_log::UndoLog::history_around`'s own doc comment), most-future
  * first. */
+export const HISTORY_FETCH_LIMIT = 50;
+
 export async function fetchHistory(limit: number): Promise<HistoryResponse> {
   const res = await fetch(`/api/history?limit=${limit}`);
   if (!res.ok) throw new Error(`GET /api/history: ${res.status}`);

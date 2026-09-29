@@ -3967,18 +3967,21 @@ impl App {
                 // Already newest first (`UndoLog::history_around`), which is
                 // the order the view shows.
                 let mut entries = history.entries;
-                // The state *before* the oldest listed step — `goto` to the
-                // seq just below it undoes that step too, which no real row
-                // can (the same gap the web panel has). After log rotation
-                // it lands as far back as the log still reaches.
-                if let Some(oldest) = entries.last() {
-                    let oldest_seq = oldest.seq;
+                // "Start of history": `goto` seq 0 undoes everything. No real
+                // row can undo the oldest step itself (each jumps to the state
+                // right after its own step). Only offered when the list holds
+                // the whole log — past the fetch limit, seq 0 would undo far
+                // more than the rows shown. Not `oldest.seq - 1`: seqs have
+                // gaps once a redo tail is dropped, so that may never be a
+                // cursor value.
+                let applied = entries.iter().filter(|e| e.applied).count();
+                if !entries.is_empty() && applied < HISTORY_VIEW_LIMIT {
                     entries.push(crate::worker_client::HistoryEntryDto {
-                        seq: oldest_seq - 1,
+                        seq: 0,
                         created_at: String::new(),
                         op_kind: String::new(),
                         applied: true,
-                        summary: format!("(before #{oldest_seq})"),
+                        summary: "Start of history".to_string(),
                     });
                 }
                 // Preselect the newest *applied* step — the current state.

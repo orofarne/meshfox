@@ -40,6 +40,7 @@ import {
   redo,
   fetchUndoState,
   fetchHistory,
+  HISTORY_FETCH_LIMIT,
   historyGoto,
   resetSession,
   fetchServices,
@@ -710,7 +711,7 @@ export default function App() {
   const [historyCursor, setHistoryCursor] = useState(0);
   const [historyPanelOpen, setHistoryPanelOpen] = useState(false);
   const refreshHistory = useCallback(() => {
-    fetchHistory(50)
+    fetchHistory(HISTORY_FETCH_LIMIT)
       .then((r) => {
         setHistoryEntries(r.entries);
         setHistoryCursor(r.cursor);
