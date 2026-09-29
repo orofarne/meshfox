@@ -14,9 +14,10 @@ use syntect::parsing::SyntaxSet;
 use edtui::{EditorView, LineNumbers, SyntaxHighlighter};
 
 use super::app::{App, Focus, ServiceConflictState, ServicesViewState};
-use super::theme::{ACCENT, BORDER, FAIL, OK};
+use super::theme::{ACCENT, BORDER, FAIL, MAP_NODE_BG, MAP_NODE_FG, MAP_SELECTED_BG, OK};
 use super::markdown::Segment;
 use super::source_editor::SourceEditorState;
+use super::spatial;
 use super::tree::TreeRow;
 use crate::pdf::render::resolve_color_hex;
 use meshfox_core::{NodeType, VarType};
@@ -361,7 +362,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     let layout = compute_layout(
         area,
         app.fullscreen,
-        app.tree_width_pct,
+        app.navigation_width_pct(),
         app.output_height,
         app.console_collapsed,
         app.tree_collapsed,
@@ -410,6 +411,256 @@ fn type_marker(t: NodeType) -> &'static str {
     }
 }
 
+fn map_title_lines(title: &str, width: usize) -> Text<'static> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in title.split_whitespace() {
+        if !current.is_empty() && current.chars().count() + 1 + word.chars().count() > width {
+            lines.push(Line::raw(std::mem::take(&mut current)));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        if word.chars().count() <= width {
+            current.push_str(word);
+        } else {
+            for ch in word.chars() {
+                if current.chars().count() >= width {
+                    lines.push(Line::raw(std::mem::take(&mut current)));
+                }
+                current.push(ch);
+            }
+        }
+    }
+    if !current.is_empty() {
+        lines.push(Line::raw(current));
+    }
+    Text::from(lines.into_iter().take(2).collect::<Vec<_>>())
+}
+
+fn draw_map_arrow(grid: &mut [Vec<char>], from: Rect, to: Rect, area: Rect, obstacles: &[Rect]) -> Vec<(usize, usize)> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    let width = area.width as i32;
+    let height = area.height as i32;
+    if width == 0 || height == 0 { return Vec::new(); }
+    // Ports sit just outside the cards. An edge can bend around any other
+    // card, but it must never paint across one, even when it spans rows.
+    let vertical = from.y != to.y;
+    let (start, end, head, entrance) = if vertical {
+        let down = from.y < to.y;
+        let sx = from.x + from.width / 2;
+        let tx = to.x + to.width / 2;
+        let sy = if down { from.y + from.height } else { from.y.saturating_sub(1) };
+        let ty = if down { to.y.saturating_sub(1) } else { to.y + to.height };
+        ((sx, sy), (tx, ty), if down { '↓' } else { '↑' }, if down { 0 } else { 1 })
+    } else {
+        let right = from.x < to.x;
+        let sy = from.y + from.height / 2;
+        let ty = to.y + to.height / 2;
+        let sx = if right { from.x + from.width } else { from.x.saturating_sub(1) };
+        let tx = if right { to.x.saturating_sub(1) } else { to.x + to.width };
+        ((sx, sy), (tx, ty), if right { '→' } else { '←' }, if right { 2 } else { 3 })
+    };
+    let start = (start.0 as i32 - area.x as i32, start.1 as i32 - area.y as i32);
+    let end = (end.0 as i32 - area.x as i32, end.1 as i32 - area.y as i32);
+    let inside = |(x, y): (i32, i32)| x >= 0 && y >= 0 && x < width && y < height;
+    if !inside(start) || !inside(end) { return Vec::new(); }
+    let blocked = |(x, y): (i32, i32)| {
+        let x = x + area.x as i32;
+        let y = y + area.y as i32;
+        obstacles.iter().any(|r| x >= r.x as i32 && x < (r.x + r.width) as i32
+            && y >= r.y as i32 && y < (r.y + r.height) as i32)
+    };
+    let dirs = [(0, 1), (0, -1), (1, 0), (-1, 0)];
+    let index = |(x, y): (i32, i32), d: usize| ((y * width + x) as usize) * 4 + d;
+    let mut cost = vec![u32::MAX; (width * height * 4) as usize];
+    let mut previous = vec![None; cost.len()];
+    let mut queue = BinaryHeap::new();
+    let first = index(start, entrance);
+    cost[first] = 0;
+    queue.push(Reverse((0u32, start.0, start.1, entrance)));
+    let mut goal = None;
+    while let Some(Reverse((current, x, y, dir))) = queue.pop() {
+        let at = index((x, y), dir);
+        if current != cost[at] { continue; }
+        if (x, y) == end { goal = Some(at); break; }
+        for (next_dir, (dx, dy)) in dirs.iter().enumerate() {
+            let next = (x + dx, y + dy);
+            if !inside(next) || blocked(next) { continue; }
+            let crossing = grid[next.1 as usize][next.0 as usize] != ' ';
+            let next_cost = current + 10 + u32::from(next_dir != dir) * 18 + u32::from(crossing) * 80;
+            let at_next = index(next, next_dir);
+            if next_cost < cost[at_next] {
+                cost[at_next] = next_cost;
+                previous[at_next] = Some(at);
+                queue.push(Reverse((next_cost, next.0, next.1, next_dir)));
+            }
+        }
+    }
+    let Some(mut at) = goal else { return Vec::new(); };
+    let mut path = Vec::new();
+    loop {
+        let cell = at / 4;
+        path.push(((cell as i32 % width), (cell as i32 / width)));
+        if at == first { break; }
+        at = previous[at].expect("routed cell has a predecessor");
+    }
+    path.reverse();
+    for (i, &(x, y)) in path.iter().enumerate() {
+        let glyph = if i + 1 == path.len() { head } else {
+            let before = if i == 0 {
+                match entrance { 0 => (x, y - 1), 1 => (x, y + 1), 2 => (x - 1, y), _ => (x + 1, y) }
+            } else { path[i - 1] };
+            let after = path[i + 1];
+            let left = before.0 < x || after.0 < x;
+            let right = before.0 > x || after.0 > x;
+            let up = before.1 < y || after.1 < y;
+            let down = before.1 > y || after.1 > y;
+            match (left, right, up, down) {
+                (true, true, _, _) => '─',
+                (_, _, true, true) => '│',
+                (false, true, false, true) => '┌',
+                (true, false, false, true) => '┐',
+                (false, true, true, false) => '└',
+                (true, false, true, false) => '┘',
+                (true, false, false, false) | (false, true, false, false) => '─',
+                _ => '│',
+            }
+        };
+        grid[y as usize][x as usize] = glyph;
+    }
+    path.into_iter().map(|(x, y)| (x as usize, y as usize)).collect()
+}
+
+fn render_spatial_parent(f: &mut Frame, area: Rect, app: &mut App, group_id: &str) {
+    let title = app.display_canvas.node(group_id).map(|n| n.title.as_str()).unwrap_or("Group");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(pane_border(app.focus == Focus::Tree))
+        .title(format!(" {} ", title))
+        .title(fullscreen_icon_title(app, Focus::Tree));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height < 3 || inner.width < 8 {
+        return;
+    }
+    let map_area = Rect::new(inner.x, inner.y, inner.width, inner.height - 2);
+    let Some(selected) = app.rows.get(app.selected) else { return };
+    let selected_id = selected.node_id.clone();
+    let overview = selected_id == group_id;
+    let prior = app.spatial_viewports.get(group_id).copied().unwrap_or_default();
+    let projection = spatial::project(&app.display_canvas, group_id, map_area, &selected_id, prior);
+    app.spatial_viewports.insert(group_id.to_string(), projection.viewport);
+    let nodes = projection.visible;
+    let mut grid = vec![vec![' '; projection.virtual_area.width as usize]; projection.virtual_area.height as usize];
+    let mut selected_grid = grid.clone();
+    let rects: HashMap<&str, Rect> = projection.all.iter().map(|n| (n.id.as_str(), n.rect)).collect();
+    let obstacles: Vec<Rect> = projection.all.iter().map(|n| n.rect).collect();
+    let visible_ids: std::collections::HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+    let mut incoming = 0;
+    let mut outgoing = 0;
+    let mut offscreen = Vec::new();
+    let mut edge_details = Vec::new();
+    let mut visible_edges = Vec::new();
+    for child in app.display_canvas.children(group_id) {
+        for edge in &child.extra_parents {
+            let connected = edge.from == selected_id || child.id == selected_id;
+            if edge.from == selected_id { outgoing += 1; }
+            if child.id == selected_id { incoming += 1; }
+            if overview || connected {
+                if let Some(label) = &edge.label {
+                    let direction = if child.id == selected_id { "←" } else { "→" };
+                    let other = if child.id == selected_id {
+                        app.display_canvas.node(&edge.from).map(|n| n.title.as_str()).unwrap_or(&edge.from)
+                    } else {
+                        &child.title
+                    };
+                    let mut detail = format!("{direction} {other}: {label}");
+                    if edge.source_side.is_some() || edge.target_side.is_some() || !edge.via.is_empty() {
+                        let from = edge.source_side.map(|s| s.as_str()).unwrap_or("auto");
+                        let to = edge.target_side.map(|s| s.as_str()).unwrap_or("auto");
+                        detail.push_str(&format!(" [{from}→{to}, {} via]", edge.via.len()));
+                    }
+                    edge_details.push(detail);
+                }
+            }
+            if let (Some(&from), Some(&to)) = (rects.get(edge.from.as_str()), rects.get(child.id.as_str())) {
+                visible_edges.push((from, to, connected));
+            }
+            if child.id == selected_id && !visible_ids.contains(edge.from.as_str()) {
+                let title = app.display_canvas.node(&edge.from).map(|n| n.title.as_str()).unwrap_or(&edge.from);
+                offscreen.push(format!("← {title}"));
+            } else if edge.from == selected_id && !visible_ids.contains(child.id.as_str()) {
+                offscreen.push(format!("→ {}", child.title));
+            }
+        }
+    }
+    for &(from, to, connected) in &visible_edges {
+        let path = draw_map_arrow(&mut grid, from, to, projection.virtual_area, &obstacles);
+        if connected {
+            for (x, y) in path { selected_grid[y][x] = grid[y][x]; }
+        }
+    }
+    let lines: Vec<Line> = (0..map_area.height as usize).map(|screen_y| {
+        let mut spans = Vec::new();
+        let mut run = String::new();
+        let mut run_selected = false;
+        for screen_x in 0..map_area.width as usize {
+            let virtual_x = projection.offset_x + screen_x;
+            let virtual_y = projection.offset_y + screen_y;
+            let plain = if overview || app.show_all_map_edges {
+                grid.get(virtual_y).and_then(|row| row.get(virtual_x)).copied().unwrap_or(' ')
+            } else { ' ' };
+            let marked = selected_grid.get(virtual_y).and_then(|row| row.get(virtual_x)).copied().unwrap_or(' ');
+            let highlighted = marked != ' ';
+            if highlighted != run_selected && !run.is_empty() {
+                let color = if run_selected { ACCENT } else if app.show_all_map_edges && !overview { Color::DarkGray } else { BORDER };
+                spans.push(Span::styled(std::mem::take(&mut run), Style::default().fg(color)));
+            }
+            run_selected = highlighted;
+            run.push(if highlighted { marked } else { plain });
+        }
+        if !run.is_empty() {
+            let color = if run_selected { ACCENT } else if app.show_all_map_edges && !overview { Color::DarkGray } else { BORDER };
+            spans.push(Span::styled(run, Style::default().fg(color)));
+        }
+        Line::from(spans)
+    }).collect();
+    f.render_widget(Paragraph::new(Text::from(lines)), map_area);
+    let visible_count = nodes.len();
+    for node in nodes {
+        let selected_node = node.id == selected_id;
+        let color = app.display_canvas.node(&node.id)
+            .and_then(|n| tree_row_color(n.effective_color.as_deref()))
+            .unwrap_or(MAP_NODE_FG);
+        let bg = if selected_node { MAP_SELECTED_BG } else { MAP_NODE_BG };
+        let border = if selected_node { ACCENT } else { BORDER };
+        let text = map_title_lines(&node.title, node.rect.width.saturating_sub(2) as usize);
+        let card = Block::default().borders(Borders::ALL).border_style(Style::default().fg(border).bg(bg));
+        f.render_widget(Paragraph::new(text).style(Style::default().fg(color).bg(bg)).block(card), node.rect);
+    }
+    let total = app.display_canvas.children(group_id).len();
+    let hidden = if offscreen.is_empty() { String::new() } else { format!(" · beyond view: {}", offscreen.join(", ")) };
+    let mode = if overview {
+        "arrows/hjkl: move by position".to_string()
+    } else {
+        format!("a: {} arrows", if app.show_all_map_edges { "all" } else { "selected" })
+    };
+    let status = format!(" {visible_count}/{total} nodes · ←{incoming} →{outgoing}{hidden} · {mode} ");
+    f.render_widget(Paragraph::new(status).style(Style::default().fg(Color::DarkGray)),
+        Rect::new(inner.x, inner.y + inner.height - 2, inner.width, 1));
+    let details = if edge_details.is_empty() {
+        " arrows/hjkl move · Esc/⌫ fold group · Enter fold ".to_string()
+    } else {
+        format!(" labels: {} ", edge_details.join(" · "))
+    };
+    f.render_widget(Paragraph::new(details).style(Style::default().fg(Color::DarkGray)),
+        Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1));
+}
+
 fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
     if app.tree_collapsed {
         // A narrow, borderless handle — no room for a title the way
@@ -424,6 +675,11 @@ fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
         let line = format!("▸{}", " ".repeat(area.width.saturating_sub(1) as usize));
         let lines: Vec<Line> = (0..area.height).map(|_| Line::styled(line.clone(), style)).collect();
         f.render_widget(Paragraph::new(Text::from(lines)), area);
+        return;
+    }
+
+    if let Some(group_id) = spatial::active_spatial_parent(app) {
+        render_spatial_parent(f, area, app, &group_id);
         return;
     }
 
@@ -872,6 +1128,9 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     let mut hint = String::from(
         "tab focus · f fullscreen focused pane · z collapse focused pane · j/k move/scroll · enter expand · h/l collapse/expand · r run · R run (no deps) · K kill · e edit",
     );
+    if spatial::active_spatial_parent(app).is_some() {
+        hint.push_str(" · a all/selected arrows");
+    }
     if app.selected_is_open_target() {
         hint.push_str(" · o open");
     }
@@ -1384,10 +1643,12 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
     let mut items = vec![
         "tab             cycle focus: tree -> document -> output -> tree",
         "                (shift-tab: reverse)",
-        "j / k / ↑ / ↓   move selection (tree) or scroll (document/output)",
+        "arrows / hjkl   move in spatial view",
+        "esc / backspace fold spatial group",
+        "j / k           select tree / scroll panes",
+        "h / l           collapse / expand tree",
         "enter           expand/collapse node",
-        "l / →           expand node",
-        "h / ←           collapse node, or jump to parent",
+        "a               toggle all/selected arrows among positioned nodes",
         "r               run this node's block, with its deps chain",
         "R               run this node's block only (skip deps)",
         "  (a node with more than one block opens a picker first)",
@@ -1437,7 +1698,7 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         "PageUp/Down     scroll the focused pane (document or output)",
         "Ctrl-u / Ctrl-d scroll the focused pane (document or output)",
         "?               toggle this help (j/k/PageUp/Down scroll it while open)",
-        "q / esc         quit",
+        "q               quit (esc never quits)",
         "",
         "mouse: click a tree row to select it, or its ▾/▸ marker to",
         "expand/collapse; double-click a row to run its default block;",
@@ -1669,6 +1930,148 @@ fn render_source_file_picker(f: &mut Frame, area: Rect, se: &SourceEditorState) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arrows_have_source_stem_corners_and_target_stem_between_adjacent_cards() {
+        let mut grid = vec![vec![' '; 20]; 14];
+        draw_map_arrow(&mut grid, Rect::new(0, 8, 5, 4), Rect::new(10, 0, 5, 4), Rect::new(0, 0, 20, 14), &[]);
+        assert_eq!(grid[7][2], '│');
+        assert_eq!(grid[4][12], '↑');
+        assert!(grid.iter().any(|row| row.contains(&'─')));
+
+        let mut grid = vec![vec![' '; 20]; 14];
+        draw_map_arrow(&mut grid, Rect::new(0, 0, 5, 4), Rect::new(10, 8, 5, 4), Rect::new(0, 0, 20, 14), &[]);
+        assert_eq!(grid[4][2], '│');
+        assert_eq!(grid[7][12], '↓');
+    }
+
+    #[test]
+    fn aligned_nodes_keep_a_straight_connection() {
+        let mut grid = vec![vec![' '; 30]; 16];
+        let from = Rect::new(5, 0, 12, 4);
+        let to = Rect::new(5, 8, 12, 4);
+        draw_map_arrow(&mut grid, from, to, Rect::new(0, 0, 30, 16), &[from, to]);
+        assert_eq!(grid[4][11], '│');
+        assert_eq!(grid[5][11], '│');
+        assert_eq!(grid[6][11], '│');
+        assert_eq!(grid[7][11], '↓');
+    }
+
+    #[test]
+    fn long_connection_goes_around_intermediate_card() {
+        let mut grid = vec![vec![' '; 60]; 24];
+        let from = Rect::new(40, 0, 12, 4);
+        let middle = Rect::new(20, 8, 12, 4);
+        let to = Rect::new(4, 16, 12, 4);
+        let obstacles = [from, middle, to];
+        draw_map_arrow(&mut grid, from, to, Rect::new(0, 0, 60, 24), &obstacles);
+        assert_eq!(grid[15][10], '↓');
+        assert!(grid.iter().flatten().any(|&c| c == '─'));
+        for y in middle.y..middle.y + middle.height {
+            for x in middle.x..middle.x + middle.width {
+                assert_eq!(grid[y as usize][x as usize], ' ');
+            }
+        }
+    }
+
+    #[test]
+    fn readme_component_edges_do_not_cross_cards() {
+        let canvas = meshfox_core::Canvas::from_markdown(include_str!("../../../../README.md")).unwrap();
+        let area = Rect::new(0, 0, 128, 50);
+        let nodes = spatial::layout(&canvas, "component-diagram", area, "mcp-root");
+        let rect = |id: &str| nodes.iter().find(|node| node.id == id).unwrap().rect;
+        let obstacles: Vec<_> = nodes.iter().map(|node| node.rect).collect();
+        for (source, target) in [("mcp-root", "mcp-leaf"), ("cli-one-shot-ops", "coordinator-resolve")] {
+            let mut grid = vec![vec![' '; area.width as usize]; area.height as usize];
+            draw_map_arrow(&mut grid, rect(source), rect(target), area, &obstacles);
+            assert!(grid.iter().flatten().any(|&ch| matches!(ch, '↓' | '↑' | '←' | '→')));
+            for card in &obstacles {
+                for y in card.y..card.y + card.height {
+                    for x in card.x..card.x + card.width {
+                        assert_eq!(grid[y as usize][x as usize], ' ', "{source} → {target} crossed a card");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn all_edges_highlights_only_links_of_selected_node() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let dir = std::env::temp_dir().join(format!("meshfox-spatial-highlight-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.canvas.md");
+        std::fs::write(&path, concat!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
+            "## Diagram\n<!-- meshfox:node id=\"group\" -->\n",
+            "### A\n<!-- meshfox:node id=\"a\" x=0 y=0 w=100 h=80 -->\n",
+            "### B\n<!-- meshfox:node id=\"b\" x=200 y=0 w=100 h=80 -->\n<!-- meshfox:edge from=\"a\" -->\n",
+            "### C\n<!-- meshfox:node id=\"c\" x=400 y=0 w=100 h=80 -->\n",
+            "### D\n<!-- meshfox:node id=\"d\" x=600 y=0 w=100 h=80 -->\n<!-- meshfox:edge from=\"c\" -->\n",
+        )).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(path, tx, None, None).await.unwrap();
+        app.expanded.insert("group".to_string());
+        app.rows = crate::tui::tree::flatten(&app.display_canvas, &app.expanded);
+        app.selected = app.rows.iter().position(|row| row.node_id == "a").unwrap();
+        app.show_all_map_edges = true;
+        let mut terminal = Terminal::new(TestBackend::new(100, 15)).unwrap();
+        terminal.draw(|f| render_tree(f, Rect::new(0, 0, 100, 15), &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let arrow_colors: Vec<_> = (0..100).filter_map(|x| {
+            let cell = buf.cell((x, 3))?;
+            (cell.symbol() == "→").then_some(cell.fg)
+        }).collect();
+        assert!(arrow_colors.contains(&ACCENT), "selected edge should be highlighted");
+        assert!(arrow_colors.contains(&Color::DarkGray), "other edge should be subdued");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn positioned_regular_parent_renders_nodes_arrow_and_label() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let dir = std::env::temp_dir().join(format!("meshfox-spatial-render-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.canvas.md");
+        std::fs::write(&path, concat!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
+            "## Section\n<!-- meshfox:node id=\"group\" -->\n",
+            "### Long source title\n<!-- meshfox:node id=\"a\" x=0 y=0 w=240 h=112 -->\n",
+            "### Destination\n<!-- meshfox:node id=\"b\" x=280 y=0 w=240 h=112 -->\n",
+            "<!-- meshfox:edge from=\"a\" label=\"Test\" sourceSide=\"top\" targetSide=\"top\" -->\n",
+        )).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(path, tx, None, None).await.unwrap();
+        app.expanded.insert("group".to_string());
+        app.rows = crate::tui::tree::flatten(&app.display_canvas, &app.expanded);
+        app.selected = app.rows.iter().position(|r| r.node_id == "a").unwrap();
+
+        let mut terminal = Terminal::new(TestBackend::new(62, 15)).unwrap();
+        terminal.draw(|f| render_tree(f, Rect::new(0, 0, 62, 15), &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let screen: String = (0..15).map(|y| {
+            let row: String = (0..62).filter_map(|x| buf.cell((x, y))).map(|c| c.symbol()).collect();
+            format!("{row}\n")
+        }).collect();
+        assert!(screen.contains("Long source"), "{screen}");
+        assert!(screen.contains("Destination"), "{screen}");
+        assert!(screen.lines().take(4).any(|line| line.contains('→')), "{screen}");
+        assert!(screen.contains("Test"), "{screen}");
+        assert!(screen.contains("top→top"), "{screen}");
+        let map_area = Rect::new(1, 1, 60, 11);
+        let source = spatial::layout(&app.display_canvas, "group", map_area, "a")
+            .into_iter().find(|n| n.id == "a").unwrap();
+        let destination = spatial::layout(&app.display_canvas, "group", map_area, "a")
+            .into_iter().find(|n| n.id == "b").unwrap();
+        assert_eq!(buf.cell((source.rect.x + 1, source.rect.y + 1)).unwrap().bg, MAP_SELECTED_BG);
+        assert_eq!(buf.cell((destination.rect.x + 1, destination.rect.y + 1)).unwrap().bg, MAP_NODE_BG);
+        assert_eq!(spatial::hit_test(&app, map_area, destination.rect.x, destination.rect.y), Some("b".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     // A real bug, found live: the document pane used to size a
     // `Segment::Text`'s rect (and advance `y`) by its raw `lines.len()`

@@ -27,6 +27,7 @@ use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::Protocol;
 
 use super::ui;
+use super::spatial;
 
 use super::markdown::{self, ClickRegion, ClickTarget, Highlighter, Segment};
 use super::source_editor::{self, SourceEditorOutcome, SourceEditorState};
@@ -427,6 +428,15 @@ pub struct App {
     /// two panes (`resize_drag`/`on_resize_drag`); clamped to
     /// `MIN_TREE_WIDTH_PCT..=MAX_TREE_WIDTH_PCT`.
     pub tree_width_pct: u16,
+    /// Width chosen for positioned siblings, independent of the tree width.
+    /// Until the first seam drag a map starts wider to fit several columns.
+    pub spatial_width_pct: Option<u16>,
+    /// Last visible origin for each positioned sibling set. Navigation only
+    /// pans when the selected card would otherwise leave that window.
+    pub(super) spatial_viewports: HashMap<String, spatial::Viewport>,
+    /// Whether a positioned sibling set shows every extra edge or only edges of
+    /// the selected node. The latter is the readable default.
+    pub show_all_map_edges: bool,
     /// Whether the Tree pane is collapsed to a narrow, borderless handle
     /// (`ui::TREE_COLLAPSED_WIDTH` columns wide) instead of its usual
     /// `tree_width_pct` share of the tree/document row — the Tree pane's
@@ -904,6 +914,9 @@ impl App {
             fullscreen: None,
             last_click: None,
             tree_width_pct: ui::DEFAULT_TREE_WIDTH_PCT,
+            spatial_width_pct: None,
+            spatial_viewports: HashMap::new(),
+            show_all_map_edges: false,
             tree_collapsed: false,
             auto_expanded_pane: None,
             output_height: ui::DEFAULT_OUTPUT_HEIGHT,
@@ -1028,8 +1041,8 @@ impl App {
             KeyCode::Esc => {
                 if self.fullscreen.is_some() {
                     self.fullscreen = None;
-                } else {
-                    self.quit();
+                } else if self.focus == Focus::Tree {
+                    self.exit_spatial_parent();
                 }
             }
             // `show_help` is never true here — while it is, the early
@@ -1078,11 +1091,23 @@ impl App {
                 Focus::Output => self.scroll_output(1),
             },
             KeyCode::Enter if self.focus == Focus::Tree => self.toggle_expand(),
+            KeyCode::Backspace if self.focus == Focus::Tree => {
+                if !self.exit_spatial_parent() {
+                    self.collapse_or_to_parent();
+                }
+            }
             KeyCode::Left | KeyCode::Char('h') if self.focus == Focus::Tree => {
-                self.collapse_or_to_parent()
+                if !self.move_spatial_selection(spatial::Direction::Left) {
+                    self.collapse_or_to_parent();
+                }
             }
             KeyCode::Right | KeyCode::Char('l') if self.focus == Focus::Tree => {
-                self.expand_selected()
+                if !self.move_spatial_selection(spatial::Direction::Right) {
+                    self.expand_selected();
+                }
+            }
+            KeyCode::Char('a') if self.focus == Focus::Tree && spatial::active_spatial_parent(self).is_some() => {
+                self.show_all_map_edges = !self.show_all_map_edges;
             }
             KeyCode::Char('r') => self.trigger_run(true).await,
             KeyCode::Char('R') => self.trigger_run(false).await,
@@ -1611,7 +1636,7 @@ impl App {
         let layout = ui::compute_layout(
             area,
             self.fullscreen,
-            self.tree_width_pct,
+            self.navigation_width_pct(),
             self.output_height,
             self.console_collapsed,
             self.tree_collapsed,
@@ -1656,7 +1681,15 @@ impl App {
                         self.toggle_fullscreen_on_title_click(Focus::Tree, layout.tree, &mouse, is_double_click);
                         let inner_x = layout.tree.x + 1; // left border
                         let inner_y = layout.tree.y + 1; // top border
-                        if mouse.row >= inner_y {
+                        let map_area = Rect::new(inner_x, inner_y, layout.tree.width.saturating_sub(2), layout.tree.height.saturating_sub(4));
+                        if spatial::active_spatial_parent(self).is_some() {
+                            if let Some(id) = spatial::hit_test(self, map_area, mouse.column, mouse.row) {
+                                self.jump_to_node(&id);
+                                if is_double_click {
+                                    self.trigger_run(true).await;
+                                }
+                            }
+                        } else if mouse.row >= inner_y {
                             let clicked = self.list_state.offset() + (mouse.row - inner_y) as usize;
                             if let Some(row) = self.rows.get(clicked) {
                                 // "  " * depth (indent) then a 2-column-wide
@@ -1880,7 +1913,12 @@ impl App {
                     return;
                 }
                 let pct = (col.saturating_sub(area.x) as u32 * 100 / area.width as u32) as u16;
-                self.tree_width_pct = pct.clamp(MIN_TREE_WIDTH_PCT, MAX_TREE_WIDTH_PCT);
+                let pct = pct.clamp(MIN_TREE_WIDTH_PCT, MAX_TREE_WIDTH_PCT);
+                if spatial::active_spatial_parent(self).is_some() {
+                    self.spatial_width_pct = Some(pct);
+                } else {
+                    self.tree_width_pct = pct;
+                }
             }
             Some(ResizeDrag::Horizontal) => {
                 let content_height = area.height.saturating_sub(ui::FOOTER_HEIGHT);
@@ -1897,8 +1935,22 @@ impl App {
 
     // -- tree navigation --------------------------------------------------
 
+    /// Give positioned siblings a wider default without changing the ordinary
+    /// tree. Dragging the seam records a separate preferred map width.
+    pub(super) fn navigation_width_pct(&self) -> u16 {
+        if spatial::active_spatial_parent(self).is_some() {
+            self.spatial_width_pct.unwrap_or(65)
+        } else {
+            self.tree_width_pct
+        }
+    }
+
     fn move_selection(&mut self, delta: i32) {
         if self.rows.is_empty() {
+            return;
+        }
+        let direction = if delta < 0 { spatial::Direction::Up } else { spatial::Direction::Down };
+        if self.move_spatial_selection(direction) {
             return;
         }
         let len = self.rows.len() as i32;
@@ -1908,6 +1960,34 @@ impl App {
             self.doc_scroll = 0;
             self.render_current_document();
         }
+    }
+
+    /// Returns true whenever the spatial pane owns the key, including when
+    /// there is no card farther in that direction.
+    fn move_spatial_selection(&mut self, direction: spatial::Direction) -> bool {
+        let Some(parent_id) = spatial::active_spatial_parent(self) else { return false; };
+        let current = &self.rows[self.selected].node_id;
+        if let Some(id) = spatial::neighbor(&self.display_canvas, &parent_id, current, direction) {
+            if let Some(index) = self.rows.iter().position(|row| row.node_id == id) {
+                if index != self.selected {
+                    self.selected = index;
+                    self.doc_scroll = 0;
+                    self.render_current_document();
+                }
+            }
+        }
+        true
+    }
+
+    /// Leave this positioned sibling set from any card or its overview by
+    /// folding its parent. Keeping it expanded would expose the same cards
+    /// again as ordinary tree rows and make moving past the group tedious.
+    fn exit_spatial_parent(&mut self) -> bool {
+        let Some(group_id) = spatial::active_spatial_parent(self) else { return false; };
+        self.expanded.remove(&group_id);
+        self.rebuild_rows();
+        self.jump_to_node(&group_id);
+        true
     }
 
     fn scroll_document(&mut self, delta: i32) {
@@ -4285,6 +4365,64 @@ fn point_in(rect: Rect, x: u16, y: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn spatial_selection_uses_all_four_directions_instead_of_file_order() {
+        let dir = std::env::temp_dir().join(format!("meshfox-spatial-nav-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.canvas.md");
+        std::fs::write(&path, concat!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
+            "## Diagram\n<!-- meshfox:node id=\"group\" -->\n",
+            "### Bottom\n<!-- meshfox:node id=\"bottom\" x=0 y=200 w=100 h=80 -->\n",
+            "### Top right\n<!-- meshfox:node id=\"right\" x=200 y=0 w=100 h=80 -->\n",
+            "### Top left\n<!-- meshfox:node id=\"left\" x=0 y=0 w=100 h=80 -->\n",
+            "## After diagram\n<!-- meshfox:node id=\"after\" -->\n",
+        )).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(path, tx, None, None).await.unwrap();
+        app.jump_to_node("group");
+        app.expanded.insert("group".to_string());
+        app.rebuild_rows();
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).await;
+        assert_eq!(app.rows[app.selected].node_id, "left");
+        app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE)).await;
+        assert_eq!(app.rows[app.selected].node_id, "right");
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)).await;
+        assert_eq!(app.rows[app.selected].node_id, "bottom");
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)).await;
+        assert_eq!(app.rows[app.selected].node_id, "left");
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)).await;
+        assert_eq!(app.rows[app.selected].node_id, "right");
+        app.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)).await;
+        assert_eq!(app.rows[app.selected].node_id, "left");
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).await;
+        assert_eq!(app.rows[app.selected].node_id, "group");
+        assert!(!app.expanded.contains("group"));
+        assert!(spatial::active_spatial_parent(&app).is_none());
+        assert!(!app.rows.iter().any(|row| row.node_id == "left"));
+        app.move_selection(1);
+        assert_eq!(app.rows[app.selected].node_id, "after");
+        assert!(!app.should_quit);
+        app.jump_to_node("right");
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)).await;
+        assert_eq!(app.rows[app.selected].node_id, "group");
+        assert!(!app.expanded.contains("group"));
+        assert!(spatial::active_spatial_parent(&app).is_none());
+        assert!(!app.rows.iter().any(|row| row.node_id == "right"));
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).await;
+        assert!(!app.should_quit, "Esc in the ordinary tree must not quit");
+        app.focus = Focus::Document;
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).await;
+        assert!(!app.should_quit, "Esc in the document must not quit");
+        app.fullscreen = Some(Focus::Document);
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).await;
+        assert!(app.fullscreen.is_none());
+        assert!(!app.should_quit, "Esc leaving fullscreen must not quit");
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)).await;
+        assert!(app.should_quit, "q remains the explicit quit key");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     // TODO.canvas.md: "Base64 image" — `decode_data_url_image`/
     // `load_image_protocol`'s own `data:` branch. `Picker::halfblocks()`

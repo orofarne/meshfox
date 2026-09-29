@@ -35,3 +35,9 @@ pub const OK: Color = Color::Rgb(0x6f, 0xcf, 0x97);
 /// terminal background) — picked for terminal legibility first, brand hue
 /// second.
 pub const BORDER: Color = Color::Rgb(0x9a, 0x93, 0x8c);
+
+/// Filled cards in the compact spatial view. The canvas background is the
+/// terminal default; an opaque fill keeps arrow strokes behind each card.
+pub const MAP_NODE_BG: Color = Color::Rgb(0x25, 0x29, 0x30);
+pub const MAP_SELECTED_BG: Color = Color::Rgb(0x43, 0x30, 0x25);
+pub const MAP_NODE_FG: Color = Color::Rgb(0xee, 0xe9, 0xe2);
