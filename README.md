@@ -120,13 +120,13 @@ the file for what's runnable.
 <!-- meshfox:node id="a-canvas-s-own-python-environment" -->
 
 [examples/python-venv.canvas.md](./examples/python-venv.canvas.md) — a
-project-local `.venv/`, created once and reported as a computed
+canvas-local `.meshfox/<canvas filename>.venv/`, created once and reported as a computed
 `meshfox:var` (`PYTHON`) every other Python fence references via
 `interpreter="$PYTHON -u"`, so nothing hardcodes a path or depends on
 whatever Python happens to be on `$PATH`. The venv/install step itself is
-meshfox's own built-in `interpreter="@python_venv"` — the fence's body is
-just a plain `requirements.txt`, no shell script of your own to write or
-keep in sync.
+meshfox's own built-in `interpreter="@python_venv"`: a `text` fence supplies
+`requirements.txt`, while a `toml` fence supplies `pyproject.toml`, with no
+shell script of your own to keep in sync.
 
 #### Example
 <!-- meshfox:node id="example" type="file" -->

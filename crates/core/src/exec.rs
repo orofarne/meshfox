@@ -128,7 +128,7 @@ pub struct ResolvedCommand {
     pub extra_envs: Vec<(String, String)>,
 }
 
-/// `cwd`/`canvas_path`/`env_names` are only consulted for an `@name`
+/// `lang`/`cwd`/`canvas_path`/`env_names` are only consulted for an `@name`
 /// builtin spec (see `crate::builtin_interpreter::resolve_with_env`) —
 /// `cwd` as the local config root, `canvas_path` to key `@python_venv`'s
 /// own venv directory, `env_names` (the block's own `env=` locals) for
@@ -137,6 +137,7 @@ pub struct ResolvedCommand {
 pub fn resolve_command(
     code: &str,
     interpreter: Option<&str>,
+    lang: Option<&str>,
     cwd: Option<&std::path::Path>,
     canvas_path: Option<&std::path::Path>,
     env_names: &[String],
@@ -151,7 +152,7 @@ pub fn resolve_command(
         Some(spec) => {
             let resolved_spec;
             let extra_envs;
-            let spec = match crate::builtin_interpreter::resolve_with_env(spec, cwd, canvas_path, env_names)? {
+            let spec = match crate::builtin_interpreter::resolve_with_env(spec, lang, cwd, canvas_path, env_names)? {
                 Some((path, envs)) => {
                     resolved_spec = path;
                     extra_envs = envs;
@@ -376,7 +377,7 @@ mod tests {
 
     #[test]
     fn resolve_command_with_no_interpreter_is_implicit_bash() {
-        let resolved = resolve_command("echo hi", None, None, None, &[]).unwrap();
+        let resolved = resolve_command("echo hi", None, None, None, None, &[]).unwrap();
         assert_eq!(resolved.program, "bash");
         assert_eq!(resolved.args, vec!["-c".to_string(), "echo hi".to_string()]);
         assert!(resolved.cleanup.is_none());
@@ -384,7 +385,7 @@ mod tests {
 
     #[test]
     fn resolve_command_with_interpreter_writes_a_temp_file_and_appends_its_path() {
-        let resolved = resolve_command("print('hi')", Some("python3 -u"), None, None, &[]).unwrap();
+        let resolved = resolve_command("print('hi')", Some("python3 -u"), None, None, None, &[]).unwrap();
         assert_eq!(resolved.program, "python3");
         let cleanup = resolved.cleanup.clone().expect("interpreter spawn sets cleanup");
         assert_eq!(
@@ -397,12 +398,12 @@ mod tests {
 
     #[test]
     fn resolve_command_rejects_a_malformed_interpreter() {
-        assert!(resolve_command("code", Some(r#"unterminated ""#), None, None, &[]).is_err());
+        assert!(resolve_command("code", Some(r#"unterminated ""#), None, None, None, &[]).is_err());
     }
 
     #[test]
     fn resolve_command_resolves_an_at_builtin_interpreter_to_its_materialized_script() {
-        let resolved = resolve_command("a prompt", Some("@agent"), None, None, &[]).unwrap();
+        let resolved = resolve_command("a prompt", Some("@agent"), None, None, None, &[]).unwrap();
         assert!(resolved.program.ends_with(".sh"), "program: {}", resolved.program);
         assert!(std::path::Path::new(&resolved.program).exists());
         // No canvas_path given -> no MESHFOX_VENV_DIR, but @agent never
@@ -416,7 +417,7 @@ mod tests {
 
     #[test]
     fn resolve_command_rejects_an_unknown_at_builtin_name() {
-        assert!(resolve_command("code", Some("@nonexistent"), None, None, &[]).is_err());
+        assert!(resolve_command("code", Some("@nonexistent"), None, None, None, &[]).is_err());
     }
 
 }

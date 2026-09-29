@@ -86,9 +86,9 @@ pub type ResolvedInterpreter = (String, Vec<(String, String)>);
 /// Always includes the current config's `MESHFOX_CONFIG_*` flattening
 /// (`crate::config`, loaded from `cwd` as the local config root — `None`
 /// falls back to `.`, i.e. global config only). For `@python_venv`
-/// specifically, when `canvas_path` is given, also includes
-/// `MESHFOX_VENV_DIR` — a venv colocated at `.meshfox/<canvas
-/// filename>.venv`, keyed by the *canvas's own* path rather than shared
+/// specifically, includes `MESHFOX_BLOCK_LANG` when `lang` is given and,
+/// when `canvas_path` is given, `MESHFOX_VENV_DIR` — a venv colocated at
+/// `.meshfox/<canvas filename>.venv`, keyed by the *canvas's own* path rather than shared
 /// per-directory `.venv`, so two unrelated canvases in the same directory
 /// (e.g. this repo's own `examples/python-venv.canvas.md` and
 /// `examples/pandas-dataframe.canvas.md`) each get their own venv instead
@@ -98,6 +98,7 @@ pub type ResolvedInterpreter = (String, Vec<(String, String)>);
 /// behavior rather than erroring.
 pub fn resolve_with_env(
     spec: &str,
+    lang: Option<&str>,
     cwd: Option<&Path>,
     canvas_path: Option<&Path>,
     env_names: &[String],
@@ -109,6 +110,9 @@ pub fn resolve_with_env(
     let config = crate::config::load(cwd.unwrap_or_else(|| Path::new(".")));
     envs.extend(crate::config::flatten_to_env(&config));
     if spec == "@python_venv" {
+        if let Some(lang) = lang {
+            envs.push(("MESHFOX_BLOCK_LANG".to_string(), lang.to_string()));
+        }
         if let Some(canvas_path) = canvas_path {
             envs.push((
                 "MESHFOX_VENV_DIR".to_string(),
@@ -245,16 +249,17 @@ mod tests {
 
     #[test]
     fn resolve_with_env_is_none_for_a_non_builtin_spec() {
-        assert!(resolve_with_env("python3 -u", None, None, &[]).unwrap().is_none());
+        assert!(resolve_with_env("python3 -u", None, None, None, &[]).unwrap().is_none());
     }
 
     #[test]
     fn resolve_with_env_sets_venv_dir_only_for_python_venv_with_a_canvas_path() {
         let canvas_path = Path::new("examples/pandas-dataframe.canvas.md");
 
-        let (_, envs) = resolve_with_env("@python_venv", None, Some(canvas_path), &[])
+        let (_, envs) = resolve_with_env("@python_venv", Some("toml"), None, Some(canvas_path), &[])
             .unwrap()
             .unwrap();
+        assert!(envs.iter().any(|(k, v)| k == "MESHFOX_BLOCK_LANG" && v == "toml"));
         let venv_dir = envs
             .iter()
             .find(|(k, _)| k == "MESHFOX_VENV_DIR")
@@ -268,15 +273,16 @@ mod tests {
 
         // No canvas_path -> no MESHFOX_VENV_DIR at all (falls back to
         // python_venv.sh's own `.venv` default).
-        let (_, envs) = resolve_with_env("@python_venv", None, None, &[]).unwrap().unwrap();
+        let (_, envs) = resolve_with_env("@python_venv", None, None, None, &[]).unwrap().unwrap();
         assert!(!envs.iter().any(|(k, _)| k == "MESHFOX_VENV_DIR"));
 
         // @agent never gets MESHFOX_VENV_DIR, even with a canvas_path — it
         // has no use for one.
-        let (_, envs) = resolve_with_env("@agent", None, Some(canvas_path), &[])
+        let (_, envs) = resolve_with_env("@agent", None, None, Some(canvas_path), &[])
             .unwrap()
             .unwrap();
         assert!(!envs.iter().any(|(k, _)| k == "MESHFOX_VENV_DIR"));
+        assert!(!envs.iter().any(|(k, _)| k == "MESHFOX_BLOCK_LANG"));
     }
 
     /// Regression test for a real bug: `agent.sh`'s `interpolate()` used
@@ -323,14 +329,66 @@ mod tests {
 
     #[test]
     fn resolve_with_env_sets_env_names_only_when_non_empty() {
-        let (_, envs) = resolve_with_env("@agent", None, None, &[]).unwrap().unwrap();
+        let (_, envs) = resolve_with_env("@agent", None, None, None, &[]).unwrap().unwrap();
         assert!(!envs.iter().any(|(k, _)| k == "MESHFOX_ENV_NAMES"));
 
         let names = vec!["TOPIC".to_string(), "OTHER".to_string()];
-        let (_, envs) = resolve_with_env("@agent", None, None, &names).unwrap().unwrap();
+        let (_, envs) = resolve_with_env("@agent", None, None, None, &names).unwrap().unwrap();
         assert_eq!(
             envs.iter().find(|(k, _)| k == "MESHFOX_ENV_NAMES").map(|(_, v)| v.as_str()),
             Some("TOPIC,OTHER")
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn python_venv_dispatches_text_and_toml_to_pip() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-python-venv-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let bin = dir.join("venv/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let fake_python = bin.join("python3");
+        std::fs::write(&fake_python, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$PIP_CALLS\"\nfor arg do :; done\nif [ -d \"$arg\" ]; then cat \"$arg/pyproject.toml\" >> \"$PIP_CALLS\"; fi\n").unwrap();
+        std::fs::set_permissions(&fake_python, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let requirements = dir.join("requirements");
+        let project = dir.join("project");
+        let calls = dir.join("calls");
+        let vars = dir.join("vars");
+        std::fs::write(&requirements, "tabulate==0.9.0\n").unwrap();
+        std::fs::write(&project, "[project]\nname = \"example\"\nversion = \"0.1.0\"\n").unwrap();
+        let script = resolve_builtin_spec("@python_venv").unwrap().unwrap();
+        for (lang, input) in [("text", &requirements), ("toml", &project)] {
+            let output = std::process::Command::new("bash")
+                .arg(&script)
+                .arg(input)
+                .env("MESHFOX_BLOCK_LANG", lang)
+                .env("MESHFOX_VENV_DIR", dir.join("venv"))
+                .env("MESHFOX_VARS_OUT", &vars)
+                .env("PIP_CALLS", &calls)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        }
+        let calls_text = std::fs::read_to_string(&calls).unwrap();
+        assert!(calls_text.contains(&format!("-m pip install --disable-pip-version-check -r {}", requirements.display())));
+        assert!(calls_text.contains("[project]\nname = \"example\""));
+        assert!(calls_text.contains("-m pip install --disable-pip-version-check /"));
+        assert_eq!(std::fs::read_to_string(&vars).unwrap().lines().count(), 2);
+        let unsupported = std::process::Command::new("bash")
+            .arg(&script)
+            .arg(&project)
+            .env("MESHFOX_BLOCK_LANG", "yaml")
+            .env("MESHFOX_VENV_DIR", dir.join("venv"))
+            .env("MESHFOX_VARS_OUT", &vars)
+            .output()
+            .unwrap();
+        assert_eq!(unsupported.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&unsupported.stderr).contains("expected a text or toml block"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -2,13 +2,13 @@
 # Python Venv Demo
 <!-- meshfox:node id="root" -->
 
-A project-local virtualenv for Python, following the same `meshfox:var` `from=`
+A canvas-local virtualenv for Python, following the same `meshfox:var` `from=`
 pattern SPEC.md's "Computed variables" describes: the `venv-setup` block below
-creates `.venv/` (idempotent — a no-op once it already exists), installs this
+creates `.meshfox/python-venv.canvas.md.venv/` (idempotently), installs this
 demo's one dependency into it, and reports its own interpreter path as the
 computed `PYTHON` variable. Every other Python-running fence in this document
 references it via `interpreter="$PYTHON -u"` rather than a hardcoded
-`.venv/bin/python3` path or whatever Python happens to be on `$PATH` —
+virtualenv path or whatever Python happens to be on `$PATH` —
 useful since a system Python is often externally managed (Homebrew, PEP 668)
 and refuses a bare `pip install`.
 
@@ -26,11 +26,10 @@ and installed everything into it.
 
 `interpreter="@python_venv"` is meshfox's own built-in interpreter for
 exactly this — a small, fixed set of macro scripts meshfox carries with it.
-The fence's body below is a plain `requirements.txt`; the builtin creates
-`.venv/` (idempotent — a no-op once it already exists), installs it, and
-reports the venv's own `python3` as the computed `PYTHON` variable via
-`$MESHFOX_VARS_OUT`
-(SPEC.md's "Computed variables") — the same shell script this node used to
+A `text` fence is read as `requirements.txt`; the builtin creates
+its canvas-local virtualenv (idempotent once created), installs the
+requirements, and reports the venv's own `python3` as the computed `PYTHON`
+variable via `$MESHFOX_VARS_OUT` (SPEC.md's "Computed variables") — the same shell script this node used to
 spell out by hand, now shipped inside meshfox itself. Anything that needs
 the venv ready just references `$PYTHON` (see the root node's note above)
 rather than also declaring an explicit `deps=` on this block. Skipped on a
@@ -48,6 +47,25 @@ Requirement already satisfied: tabulate==0.9.0 in ./.meshfox/python-venv.canvas.
 venv ready: /Users/orofarne/sources/meshfox/examples/.meshfox/python-venv.canvas.md.venv/bin/python3
 ```
 <!-- /meshfox:output -->
+
+The same interpreter also accepts a `toml` fence as `pyproject.toml`. This
+alternative installs a temporary project into the same canvas-local venv;
+use either setup block for a given project. A build backend and project
+metadata are required because pip installs the project directory.
+
+```toml name="venv-pyproject" interpreter="@python_venv" cache
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meshfox-venv-example"
+version = "0.1.0"
+dependencies = ["tabulate==0.9.0"]
+
+[tool.setuptools]
+py-modules = []
+```
 
 ## Demo
 <!-- meshfox:node id="demo" -->

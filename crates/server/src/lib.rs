@@ -6209,6 +6209,7 @@ async fn run_tty_chain(
                 &mut socket,
                 &block.code,
                 resolved_block.interpreter.as_deref(),
+                Some(&block.lang),
                 &block_env,
                 Some(&cwd),
                 Some(canvas_path_for_step),
@@ -6520,6 +6521,7 @@ async fn relay_tty_step(
     socket: &mut WebSocket,
     code: &str,
     interpreter: Option<&str>,
+    lang: Option<&str>,
     envs: &HashMap<String, String>,
     cwd: Option<&std::path::Path>,
     canvas_path: Option<&std::path::Path>,
@@ -6528,7 +6530,7 @@ async fn relay_tty_step(
     kill_rx: &mut oneshot::Receiver<()>,
     ledger_row: Option<(run_ledger::RunLedger, i64)>,
 ) -> TtyStepOutcome {
-    let pty = match pty_exec::spawn(code, interpreter, envs, cwd, canvas_path, cols, rows) {
+    let pty = match pty_exec::spawn(code, interpreter, lang, envs, cwd, canvas_path, cols, rows) {
         Ok(p) => p,
         Err(e) => {
             if let Some((ledger, id)) = &ledger_row {

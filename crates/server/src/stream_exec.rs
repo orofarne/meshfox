@@ -213,8 +213,8 @@ where
 /// first — an `@name` builtin (see `meshfox_core::builtin_interpreter`)
 /// becomes its materialized script's real path before anything below ever
 /// sees it, with its `MESHFOX_*` env vars (config, and — for
-/// `@python_venv` specifically, when `canvas_path` is given —
-/// `MESHFOX_VENV_DIR`) merged into `envs`; a plain, non-`@` `interpreter=`
+/// `@python_venv` specifically — `MESHFOX_BLOCK_LANG` and, when
+/// `canvas_path` is given, `MESHFOX_VENV_DIR`) merged into `envs`; a plain, non-`@` `interpreter=`
 /// never pays for any of that at all. `canvas_path`, when given, is the
 /// canvas file this block's fence actually lives in — not necessarily
 /// derivable from `cwd` alone, since two unrelated canvases can share one
@@ -223,6 +223,7 @@ where
 pub fn spawn_interpreter<I, K, V>(
     interpreter: &str,
     code: &str,
+    lang: Option<&str>,
     envs: I,
     cwd: Option<&Path>,
     canvas_path: Option<&Path>,
@@ -245,7 +246,7 @@ where
         .collect();
 
     let resolved_interpreter;
-    let interpreter = match meshfox_core::resolve_with_env(interpreter, cwd, canvas_path, &env_names)? {
+    let interpreter = match meshfox_core::resolve_with_env(interpreter, lang, cwd, canvas_path, &env_names)? {
         Some((path, extra_envs)) => {
             envs.extend(extra_envs.into_iter().map(|(k, v)| (k.into(), v.into())));
             resolved_interpreter = path;
@@ -342,7 +343,7 @@ where
         return spawn_bash(":", envs, cwd);
     }
     match &block.interpreter {
-        Some(interpreter) => spawn_interpreter(interpreter, &block.code, envs, cwd, canvas_path),
+        Some(interpreter) => spawn_interpreter(interpreter, &block.code, Some(&block.lang), envs, cwd, canvas_path),
         None => spawn_bash(&block.code, envs, cwd),
     }
 }
@@ -473,7 +474,7 @@ mod tests {
     async fn spawn_interpreter_runs_code_via_the_named_program() {
         // `cat` as a stand-in "interpreter" — no assumption about python
         // being installed, just proves the temp-file-plus-args plumbing.
-        let mut proc = spawn_interpreter("cat", "hello from a temp file", no_envs(), None, None).unwrap();
+        let mut proc = spawn_interpreter("cat", "hello from a temp file", None, no_envs(), None, None).unwrap();
         let mut lines = Vec::new();
         while let Some((_, line)) = proc.output_rx.recv().await {
             lines.push(line);
@@ -488,7 +489,7 @@ mod tests {
         // `SpawnedProcess` (the `Ok` side) doesn't implement `Debug` — it
         // owns a live child process/channel, nothing worth debug-printing
         // — so this matches instead of `.unwrap_err()`.
-        match spawn_interpreter(r#"unterminated ""#, "code", no_envs(), None, None) {
+        match spawn_interpreter(r#"unterminated ""#, "code", None, no_envs(), None, None) {
             Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidInput),
             Ok(_) => panic!("expected an error for a malformed interpreter command"),
         }
@@ -525,7 +526,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut proc = spawn_interpreter("@agent", "an unused prompt", no_envs(), Some(&dir), None).unwrap();
+        let mut proc = spawn_interpreter("@agent", "an unused prompt", None, no_envs(), Some(&dir), None).unwrap();
         let mut lines = Vec::new();
         while let Some((_, line)) = proc.output_rx.recv().await {
             lines.push(line);
@@ -610,7 +611,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_interpreter_rejects_an_unknown_builtin_name() {
-        match spawn_interpreter("@nonexistent", "code", no_envs(), None, None) {
+        match spawn_interpreter("@nonexistent", "code", None, no_envs(), None, None) {
             Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidInput),
             Ok(_) => panic!("expected an error for an unknown @builtin name"),
         }
@@ -618,7 +619,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_interpreter_cleans_up_its_temp_file_on_drop() {
-        let mut proc = spawn_interpreter("cat", "temp contents", no_envs(), None, None).unwrap();
+        let mut proc = spawn_interpreter("cat", "temp contents", None, no_envs(), None, None).unwrap();
         let path = proc.cleanup.clone().expect("interpreter spawn sets cleanup");
         while proc.output_rx.recv().await.is_some() {}
         proc.child.wait().await.unwrap();
@@ -814,7 +815,7 @@ mod tests {
         // `pwd -P` — proves `cwd` reaches the actual spawned child, not
         // just whatever `bash -c` would've inherited.
         let dir = std::env::temp_dir();
-        let mut proc = spawn_interpreter("bash", "pwd -P", no_envs(), Some(&dir), None).unwrap();
+        let mut proc = spawn_interpreter("bash", "pwd -P", None, no_envs(), Some(&dir), None).unwrap();
         let mut lines = Vec::new();
         while let Some((_, line)) = proc.output_rx.recv().await {
             lines.push(line);
