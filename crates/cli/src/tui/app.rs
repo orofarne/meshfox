@@ -187,10 +187,18 @@ const HISTORY_VIEW_LIMIT: usize = 200;
 /// `App::on_history_view_key`, `ui::render_history_view`. Worker-only: the
 /// undo log lives in the worker (`/api/history`), same as the web UI's own
 /// history menu.
+#[derive(Default)]
 pub struct HistoryViewState {
     /// Newest first — the order `GET /api/history` returns them in.
     pub entries: Vec<crate::worker_client::HistoryEntryDto>,
     pub selected: usize,
+    /// Where the list was last drawn and how far it was scrolled
+    /// (`ui::render_history_view` writes both every frame): a mouse click
+    /// maps a screen row back to an entry from these, so the hit-test can't
+    /// drift from what's actually on screen — the scroll offset in
+    /// particular is ratatui's own decision, unknowable from here otherwise.
+    pub list_rect: std::cell::Cell<Rect>,
+    pub offset: std::cell::Cell<usize>,
 }
 
 /// A canvas-target `file`-node "open" waiting for `mod.rs`'s event loop to
@@ -1650,16 +1658,8 @@ impl App {
             se.on_mouse(mouse);
             return;
         }
-        if let Some(view) = &mut self.history_view {
-            // Modal: the wheel moves the selection, everything else is
-            // swallowed so a click never reaches the panes underneath.
-            match mouse.kind {
-                MouseEventKind::ScrollUp => view.selected = view.selected.saturating_sub(1),
-                MouseEventKind::ScrollDown => {
-                    view.selected = (view.selected + 1).min(view.entries.len().saturating_sub(1))
-                }
-                _ => {}
-            }
+        if self.history_view.is_some() {
+            self.on_history_view_mouse(mouse).await;
             return;
         }
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -3986,7 +3986,7 @@ impl App {
                 }
                 // Preselect the newest *applied* step — the current state.
                 let selected = entries.iter().position(|e| e.applied).unwrap_or(0);
-                self.history_view = Some(HistoryViewState { entries, selected });
+                self.history_view = Some(HistoryViewState { entries, selected, ..Default::default() });
             }
             Err(e) => self.status = format!("failed to load history: {e}"),
         }
@@ -4010,6 +4010,45 @@ impl App {
                 let Some(entry) = view.entries.get(view.selected).cloned() else { return };
                 self.history_view = None;
                 self.goto_history_step(entry).await;
+            }
+            _ => {}
+        }
+    }
+
+    /// The history view is modal: the wheel moves the selection, a click
+    /// selects the row under it, a double-click jumps there (same as
+    /// `Enter`), and everything else is swallowed so a click never reaches
+    /// the panes underneath.
+    async fn on_history_view_mouse(&mut self, mouse: MouseEvent) {
+        let Some(view) = &mut self.history_view else { return };
+        let last = view.entries.len().saturating_sub(1);
+        match mouse.kind {
+            MouseEventKind::ScrollUp => view.selected = view.selected.saturating_sub(1),
+            MouseEventKind::ScrollDown => view.selected = (view.selected + 1).min(last),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let rect = view.list_rect.get();
+                let inside = mouse.column >= rect.x
+                    && mouse.column < rect.x + rect.width
+                    && mouse.row >= rect.y
+                    && mouse.row < rect.y + rect.height;
+                let idx = view.offset.get() + (mouse.row.saturating_sub(rect.y)) as usize;
+                if !inside || idx >= view.entries.len() {
+                    return;
+                }
+                let is_double_click = matches!(
+                    self.last_click,
+                    Some((r, c, t))
+                        if r == mouse.row && c == mouse.column && t.elapsed() < DOUBLE_CLICK_WINDOW
+                );
+                view.selected = idx;
+                if is_double_click {
+                    self.last_click = None;
+                    let entry = view.entries[idx].clone();
+                    self.history_view = None;
+                    self.goto_history_step(entry).await;
+                } else {
+                    self.last_click = Some((mouse.row, mouse.column, std::time::Instant::now()));
+                }
             }
             _ => {}
         }
@@ -4682,7 +4721,8 @@ mod tests {
             applied: true,
             summary: String::new(),
         };
-        app.history_view = Some(HistoryViewState { entries: vec![entry(3), entry(2), entry(1)], selected: 0 });
+        app.history_view =
+            Some(HistoryViewState { entries: vec![entry(3), entry(2), entry(1)], selected: 0, ..Default::default() });
         app.on_key(key(KeyCode::Up)).await;
         assert_eq!(app.history_view.as_ref().unwrap().selected, 0);
         app.on_key(key(KeyCode::Char('j'))).await;
@@ -4690,6 +4730,49 @@ mod tests {
         assert_eq!(app.history_view.as_ref().unwrap().selected, 2);
         // The modal claims the keymap: `q` closes it rather than quitting.
         app.on_key(key(KeyCode::Char('q'))).await;
+        assert!(app.history_view.is_none());
+    }
+
+    #[tokio::test]
+    async fn history_view_click_selects_the_row_and_double_click_jumps() {
+        let dir = std::env::temp_dir().join(format!("meshfox-tui-history-mouse-test-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.md");
+        std::fs::write(&path, "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n").unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(path, tx, None, None).await.unwrap();
+        let entry = |seq| crate::worker_client::HistoryEntryDto {
+            seq,
+            created_at: String::new(),
+            op_kind: String::new(),
+            applied: true,
+            summary: String::new(),
+        };
+        let view = HistoryViewState { entries: (0..30).rev().map(entry).collect(), ..Default::default() };
+        // As if drawn at (10, 5), 40x10, scrolled down by 7 rows.
+        view.list_rect.set(Rect::new(10, 5, 40, 10));
+        view.offset.set(7);
+        app.history_view = Some(view);
+        let click = |row: u16, col: u16| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        // Third visible row -> entry 7 + 2.
+        app.on_mouse(click(7, 20)).await;
+        assert_eq!(app.history_view.as_ref().unwrap().selected, 9);
+        // Outside the list: ignored, and never reaches the panes below.
+        app.on_mouse(click(3, 20)).await;
+        app.on_mouse(click(7, 5)).await;
+        assert_eq!(app.history_view.as_ref().unwrap().selected, 9);
+        // A single click elsewhere is just a selection...
+        app.on_mouse(click(9, 20)).await;
+        assert_eq!(app.history_view.as_ref().unwrap().selected, 11);
+        // ...the same spot again, right away, is a double-click: it jumps
+        // (no worker here, so nothing to move) and closes the view.
+        app.on_mouse(click(9, 20)).await;
         assert!(app.history_view.is_none());
     }
 

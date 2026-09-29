@@ -54,3 +54,44 @@ fn history_view_jumps_the_canvas_back_to_an_earlier_step() {
         std::thread::sleep(Duration::from_millis(100));
     }
 }
+
+/// The mouse route to the same jump: a double-click on a row in the history
+/// view (`App::on_history_view_mouse`) does what `enter` does.
+#[test]
+#[ignore = "pty-based e2e — run via `cargo test --test tui_e2e -- --ignored`"]
+fn double_clicking_a_history_row_jumps_there() {
+    let (canvas_path, dir) = fixtures::write_fixture(fixtures::SIMPLE_RUNNABLE);
+    let mut session = TuiSession::spawn(&canvas_path, dir, 30, 100);
+    session.wait_for("Root", Duration::from_secs(5)).expect("the tree should render");
+
+    session.send_keys("e");
+    std::thread::sleep(Duration::from_millis(300));
+    session.send_keys("Go");
+    session.send_keys("HISTORYMARKER");
+    session.send_keys("\x1b");
+    session.send_keys("\x13"); // Ctrl-s
+    std::thread::sleep(Duration::from_millis(500));
+    session.send_keys("\x1b");
+    assert!(std::fs::read_to_string(&canvas_path).unwrap().contains("HISTORYMARKER"));
+
+    session.send_keys("H");
+    session
+        .wait_for("Start of history", Duration::from_secs(5))
+        .unwrap_or_else(|_| panic!("the history view should list the start row; screen:\n{}", session.screen_text()));
+
+    let (row, col) = session.find("Start of history").expect("the start-of-history row");
+    session.send_mouse_double_click(row, col);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if !std::fs::read_to_string(&canvas_path).unwrap().contains("HISTORYMARKER") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "double-clicking the row should have reverted the marker; screen:\n{}",
+            session.screen_text()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}

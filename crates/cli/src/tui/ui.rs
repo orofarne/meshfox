@@ -1703,14 +1703,17 @@ fn render_history_view(f: &mut Frame, area: Rect, hv: &super::app::HistoryViewSt
             ]))
         })
         .collect();
-    let mut state = ListState::default();
+    let mut state = ListState::default().with_offset(hv.offset.get());
     state.select(Some(hv.selected.min(hv.entries.len().saturating_sub(1))));
     let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     f.render_stateful_widget(list, list_area, &mut state);
+    // What `App::on_history_view_mouse` hit-tests clicks against.
+    hv.list_rect.set(list_area);
+    hv.offset.set(state.offset());
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "j/k select · enter jump here · dim = undone · q/esc close",
+            "j/k select · enter/double-click jump here · dim = undone · q/esc close",
             Style::default().fg(Color::DarkGray),
         ))),
         hint_area,
@@ -2439,6 +2442,27 @@ mod tests {
         assert_eq!(history_time(""), "");
     }
 
+    #[test]
+    fn render_history_view_records_where_the_list_was_drawn_and_how_far_it_scrolled() {
+        let entries = (0..40)
+            .rev()
+            .map(|seq| crate::worker_client::HistoryEntryDto {
+                seq,
+                created_at: String::new(),
+                op_kind: "node_body".into(),
+                applied: true,
+                summary: format!("step {seq}"),
+            })
+            .collect();
+        let hv = super::super::app::HistoryViewState { entries, selected: 35, ..Default::default() };
+        let area = Rect::new(0, 0, 90, 12);
+        let _ = render_to_screen(area, |f| render_history_view(f, area, &hv));
+        let rect = hv.list_rect.get();
+        assert!(rect.width > 0 && rect.height > 0, "list rect recorded: {rect:?}");
+        assert!(hv.offset.get() > 0, "a deep selection scrolls the list, and the offset is recorded");
+        assert!(hv.offset.get() <= 35 && 35 < hv.offset.get() + rect.height as usize, "selection is on screen");
+    }
+
     #[tokio::test]
     async fn render_history_view_marks_the_current_step_and_lists_newest_first() {
         use crate::worker_client::HistoryEntryDto;
@@ -2452,6 +2476,7 @@ mod tests {
         let hv = super::super::app::HistoryViewState {
             entries: vec![entry(3, false, "third undone"), entry(2, true, "second"), entry(1, true, "first")],
             selected: 1,
+            ..Default::default()
         };
         let area = Rect::new(0, 0, 90, 20);
         let screen = render_to_screen(area, |f| render_history_view(f, area, &hv));

@@ -39,7 +39,7 @@ fn running_a_service_block_streams_a_started_line_and_shows_live_glyphs_then_qui
     // own >= 2-step gate) — click the collapsed strip open first, same as
     // a real user would have to, so the "service started" line actually
     // lands somewhere visible.
-    let (out_row, out_col) = session.find("Output").expect("collapsed Output strip");
+    let (out_row, out_col) = session.find("Output").unwrap_or_else(|| panic!("collapsed Output strip; screen:\n{}", session.screen_text()));
     session.send_mouse_click(out_row, out_col);
 
     // Root's own sole block is the service — already selected, no need to
@@ -123,7 +123,7 @@ fn v_opens_the_services_view_and_s_r_stop_and_restart() {
     // (`App::begin_http_run`'s own >= 2-step gate) — click the collapsed
     // strip open first, same as a real user would have to, so the
     // "service started" line actually lands somewhere visible.
-    let (out_row, out_col) = session.find("Output").expect("collapsed Output strip");
+    let (out_row, out_col) = session.find("Output").unwrap_or_else(|| panic!("collapsed Output strip; screen:\n{}", session.screen_text()));
     session.send_mouse_click(out_row, out_col);
 
     session.send_keys("r");
@@ -183,7 +183,7 @@ fn external_signal_stops_services_and_restores_the_terminal(signal: i32, name: &
     let (canvas_path, dir) = fixtures::write_fixture(fixtures::SERVICE_RUNNABLE);
     let mut session = TuiSession::spawn(&canvas_path, dir, 30, 100);
     session.wait_for("Root", Duration::from_secs(5)).expect("initial render");
-    let (out_row, out_col) = session.find("Output").expect("collapsed Output strip");
+    let (out_row, out_col) = session.find("Output").unwrap_or_else(|| panic!("collapsed Output strip; screen:\n{}", session.screen_text()));
     session.send_mouse_click(out_row, out_col);
     session.send_keys("r");
     session
@@ -236,7 +236,7 @@ fn external_sigterm_on_a_joined_tui_restores_the_terminal_and_leaves_the_others_
     let (canvas_path, dir) = fixtures::write_fixture(fixtures::SERVICE_RUNNABLE);
     let mut owner = TuiSession::spawn(&canvas_path, dir.clone(), 30, 100);
     owner.wait_for("Root", Duration::from_secs(5)).expect("owner initial render");
-    let (out_row, out_col) = owner.find("Output").expect("collapsed Output strip");
+    let (out_row, out_col) = owner.find("Output").unwrap_or_else(|| panic!("collapsed Output strip; screen:\n{}", owner.screen_text()));
     owner.send_mouse_click(out_row, out_col);
     owner.send_keys("r");
     owner

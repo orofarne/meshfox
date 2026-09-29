@@ -933,6 +933,8 @@ npm test
 
 Every test in it is `#[ignore]`d — Cargo has no other way to exclude one integration-test target from `cargo test --workspace`'s default run, so this is what keeps it out of that gate (confirmed: `cargo test --workspace` reports this target's tests as `ignored`, not run, adding ~0s). The suite's `mouse_*.rs` tests each mirror one mouse-support checklist item in TODO.canvas.md's "Мышь в панелях TUI (tree/document/output)" — written first, failing on purpose, against a feature that didn't exist yet, with implementing the item and greening its test happening together, the same red-then-green shape as TDD; every item on that checklist is now implemented, so the whole suite is green. `baseline.rs` covers the keyboard-driven flows underneath all of it (start up and render, select a node and run its block, quit and actually exit), so a regression in the real event loop itself doesn't slip through unnoticed.
 
+At most six `meshfox tui` sessions are alive at once, whatever `--test-threads` says (`MAX_LIVE_SESSIONS` in `harness.rs`, a semaphore that `TuiSession::spawn` takes a permit from and `Drop` gives back): each one is a real process, a real embedded worker and a pty, and with every test running at once the machine gets loaded enough that tests which look for something on screen right after the first frame fail at random — a different one each run, each green on its own.
+
 ```sh name="tui-e2e-run"
 cargo test --test tui_e2e -- --ignored
 ```

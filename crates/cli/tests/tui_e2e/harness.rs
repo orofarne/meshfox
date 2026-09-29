@@ -12,6 +12,44 @@ use std::time::{Duration, Instant};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
+/// Most `meshfox tui` sessions alive at once across the whole suite,
+/// whatever `--test-threads` says. Each session is a real process plus a
+/// real embedded worker plus a pty; with every test running at once (the
+/// default is one thread per core, and the suite is bigger than that) the
+/// machine gets loaded enough that tests which look for something on
+/// screen right after the first frame start failing at random — a
+/// different one each run, every one of them green on its own or at six
+/// at a time.
+const MAX_LIVE_SESSIONS: usize = 6;
+
+/// Counting semaphore for [`MAX_LIVE_SESSIONS`]: `spawn` takes a permit and
+/// the `TuiSession` gives it back on `Drop`. (A test that holds two
+/// sessions takes two permits; only one test does, so the pool can never be
+/// all held by tests each waiting on a second one.)
+static LIVE_SESSIONS: (Mutex<usize>, std::sync::Condvar) = (Mutex::new(0), std::sync::Condvar::new());
+
+struct SessionPermit;
+
+impl SessionPermit {
+    fn acquire() -> Self {
+        let (lock, cvar) = &LIVE_SESSIONS;
+        let mut live = lock.lock().unwrap();
+        while *live >= MAX_LIVE_SESSIONS {
+            live = cvar.wait(live).unwrap();
+        }
+        *live += 1;
+        SessionPermit
+    }
+}
+
+impl Drop for SessionPermit {
+    fn drop(&mut self) {
+        let (lock, cvar) = &LIVE_SESSIONS;
+        *lock.lock().unwrap() -= 1;
+        cvar.notify_one();
+    }
+}
+
 pub struct TuiSession {
     parser: Arc<Mutex<vt100::Parser>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
@@ -21,6 +59,9 @@ pub struct TuiSession {
     // would just see EOF) well before the test is done with it.
     _master: Box<dyn MasterPty + Send>,
     fixture_dir: PathBuf,
+    // Declared last so it is released only after the child is killed and the
+    // fixture removed in `Drop`, i.e. once this session's load is really gone.
+    _permit: SessionPermit,
 }
 
 impl TuiSession {
@@ -31,6 +72,7 @@ impl TuiSession {
     /// `fixture_dir` is removed on `Drop` — pass the directory `canvas_path`
     /// itself lives in (see `fixtures::write_fixture`).
     pub fn spawn(canvas_path: &Path, fixture_dir: PathBuf, rows: u16, cols: u16) -> Self {
+        let permit = SessionPermit::acquire();
         // `cargo test`'s own `.cargo/config.toml` runner (`scripts/run-signed.sh`)
         // only re-signs whatever cargo itself execs as *this* test binary — it
         // never sees `CARGO_BIN_EXE_meshfox`, which we spawn ourselves, directly,
@@ -153,6 +195,7 @@ impl TuiSession {
             child,
             _master: pair.master,
             fixture_dir,
+            _permit: permit,
         }
     }
 
@@ -266,11 +309,30 @@ impl TuiSession {
     }
 
     /// 0-indexed `(row, col)` of the first cell where `needle` starts,
-    /// scanning the rendered screen row-major — `None` if it isn't
-    /// present. Lets a mouse test locate what it wants to click by the
-    /// text actually on screen instead of a hand-guessed, layout-fragile
-    /// coordinate.
+    /// scanning the rendered screen row-major — `None` if it still isn't
+    /// there after a few seconds. Lets a mouse test locate what it wants to
+    /// click by the text actually on screen instead of a hand-guessed,
+    /// layout-fragile coordinate.
+    ///
+    /// Waits rather than taking one snapshot: the pty stream reaches the
+    /// parser in chunks, so a test that has just seen some text (`"Root"`,
+    /// drawn mid-frame) can look at a frame whose last rows (the `Output`
+    /// strip, the footer) haven't arrived yet — a snapshot `find` right
+    /// then fails at random, more often the busier the machine.
     pub fn find(&self, needle: &str) -> Option<(u16, u16)> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(pos) = self.find_now(needle) {
+                return Some(pos);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+    }
+
+    fn find_now(&self, needle: &str) -> Option<(u16, u16)> {
         for (row, line) in self.screen_text().split('\n').enumerate() {
             if let Some(byte_idx) = line.find(needle) {
                 // Column count, not byte offset — a box-drawing glyph
