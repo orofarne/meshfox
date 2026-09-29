@@ -180,6 +180,19 @@ pub struct TtySessionsViewState {
     pub selected: usize,
 }
 
+/// How many undo-log steps the `H` view asks the worker for.
+const HISTORY_VIEW_LIMIT: usize = 200;
+
+/// The `H` history view — see `App::open_history_view`,
+/// `App::on_history_view_key`, `ui::render_history_view`. Worker-only: the
+/// undo log lives in the worker (`/api/history`), same as the web UI's own
+/// history menu.
+pub struct HistoryViewState {
+    /// Newest first — the order `GET /api/history` returns them in.
+    pub entries: Vec<crate::worker_client::HistoryEntryDto>,
+    pub selected: usize,
+}
+
 /// A canvas-target `file`-node "open" waiting for `mod.rs`'s event loop to
 /// hand the terminal to a nested child TUI — the terminal counterpart to
 /// `PendingHttpTty` above, and to the web UI's cross-canvas navigation (see
@@ -537,6 +550,8 @@ pub struct App {
     /// attach/kill (same "refetch, don't try to patch incrementally"
     /// posture `services_view`'s own worker-mode branch already has).
     pub tty_sessions_view: Option<TtySessionsViewState>,
+    /// The `H` history view, `None` while closed.
+    pub history_view: Option<HistoryViewState>,
     /// Last-fetched `GET /api/runs`, filtered to `kind == "tty" && status
     /// == "running"` — see `open_tty_sessions_view`. Empty (not `None`)
     /// when the view is closed; only meaningful while `tty_sessions_view`
@@ -936,6 +951,7 @@ impl App {
             pending_http_tty: None,
             pending_http_tty_attach: None,
             tty_sessions_view: None,
+            history_view: None,
             live_tty_sessions: Vec::new(),
             pending_child_canvas: None,
             block_picker: None,
@@ -1001,6 +1017,10 @@ impl App {
         }
         if self.tty_sessions_view.is_some() {
             self.on_tty_sessions_view_key(key).await;
+            return;
+        }
+        if self.history_view.is_some() {
+            self.on_history_view_key(key).await;
             return;
         }
         if self.reset_session_confirm {
@@ -1122,6 +1142,7 @@ impl App {
             // this TUI, another one, or a browser tab. See
             // `open_tty_sessions_view`'s own doc comment.
             KeyCode::Char('t') => self.open_tty_sessions_view().await,
+            KeyCode::Char('H') => self.open_history_view().await,
             KeyCode::Char('o') => self.trigger_open_file(),
             KeyCode::Char('c') => self.trigger_configure().await,
             KeyCode::Char('e') => self.open_source_editor(),
@@ -1161,12 +1182,14 @@ impl App {
             // hint/`?` help).
             KeyCode::Char('z') => self.toggle_collapse_focused(),
             KeyCode::PageDown => match self.focus {
+                Focus::Tree => self.page_selection(1),
                 Focus::Output => self.scroll_output(10),
-                _ => self.scroll_document(10),
+                Focus::Document => self.scroll_document(10),
             },
             KeyCode::PageUp => match self.focus {
+                Focus::Tree => self.page_selection(-1),
                 Focus::Output => self.scroll_output(-10),
-                _ => self.scroll_document(-10),
+                Focus::Document => self.scroll_document(-10),
             },
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => match self.focus
             {
@@ -1627,6 +1650,18 @@ impl App {
             se.on_mouse(mouse);
             return;
         }
+        if let Some(view) = &mut self.history_view {
+            // Modal: the wheel moves the selection, everything else is
+            // swallowed so a click never reaches the panes underneath.
+            match mouse.kind {
+                MouseEventKind::ScrollUp => view.selected = view.selected.saturating_sub(1),
+                MouseEventKind::ScrollDown => {
+                    view.selected = (view.selected + 1).min(view.entries.len().saturating_sub(1))
+                }
+                _ => {}
+            }
+            return;
+        }
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
         let area = Rect::new(0, 0, cols, rows);
         if self.var_form.is_some() || self.block_picker.is_some() {
@@ -1959,6 +1994,19 @@ impl App {
             self.selected = idx;
             self.doc_scroll = 0;
             self.render_current_document();
+        }
+    }
+
+    /// `PageUp`/`PageDown` in the tree pane: jump ten rows (clamped at
+    /// either end). In a spatial projection "ten rows" has no flat meaning,
+    /// so it steps ten cards along the compact grid instead.
+    fn page_selection(&mut self, sign: i32) {
+        if spatial::active_spatial_parent(self).is_some() {
+            for _ in 0..10 {
+                self.move_selection(sign);
+            }
+        } else {
+            self.move_selection(sign * 10);
         }
     }
 
@@ -3902,6 +3950,84 @@ impl App {
         }
     }
 
+    /// Opens the `H` history view — every undo-log step the worker knows
+    /// about (`GET /api/history`), newest first, with the current cursor
+    /// preselected. Worker-only, like `t`: the log lives in the worker.
+    async fn open_history_view(&mut self) {
+        let Some(port) = self.worker_port else {
+            self.status = "history needs a worker — none reachable".into();
+            return;
+        };
+        match crate::worker_client::history(port, Some(HISTORY_VIEW_LIMIT)).await {
+            Ok(history) => {
+                if history.entries.is_empty() {
+                    self.status = "no history yet".into();
+                    return;
+                }
+                // Already newest first (`UndoLog::history_around`), which is
+                // the order the view shows.
+                let mut entries = history.entries;
+                // The state *before* the oldest listed step — `goto` to the
+                // seq just below it undoes that step too, which no real row
+                // can (the same gap the web panel has). After log rotation
+                // it lands as far back as the log still reaches.
+                if let Some(oldest) = entries.last() {
+                    let oldest_seq = oldest.seq;
+                    entries.push(crate::worker_client::HistoryEntryDto {
+                        seq: oldest_seq - 1,
+                        created_at: String::new(),
+                        op_kind: String::new(),
+                        applied: true,
+                        summary: format!("(before #{oldest_seq})"),
+                    });
+                }
+                // Preselect the newest *applied* step — the current state.
+                let selected = entries.iter().position(|e| e.applied).unwrap_or(0);
+                self.history_view = Some(HistoryViewState { entries, selected });
+            }
+            Err(e) => self.status = format!("failed to load history: {e}"),
+        }
+    }
+
+    /// `j`/`k`/arrows/PageUp/PageDown navigate, `enter` jumps the canvas to
+    /// the state right after the selected step (`POST /api/history/goto` —
+    /// undoing or redoing as many steps as that takes), `q`/Esc closes.
+    async fn on_history_view_key(&mut self, key: KeyEvent) {
+        let Some(view) = &mut self.history_view else { return };
+        let last = view.entries.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.history_view = None,
+            KeyCode::Up | KeyCode::Char('k') => view.selected = view.selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => view.selected = (view.selected + 1).min(last),
+            KeyCode::PageUp => view.selected = view.selected.saturating_sub(10),
+            KeyCode::PageDown => view.selected = (view.selected + 10).min(last),
+            KeyCode::Home | KeyCode::Char('g') => view.selected = 0,
+            KeyCode::End | KeyCode::Char('G') => view.selected = last,
+            KeyCode::Enter => {
+                let Some(entry) = view.entries.get(view.selected).cloned() else { return };
+                self.history_view = None;
+                self.goto_history_step(entry).await;
+            }
+            _ => {}
+        }
+    }
+
+    async fn goto_history_step(&mut self, entry: crate::worker_client::HistoryEntryDto) {
+        let Some(port) = self.worker_port else { return };
+        match crate::worker_client::history_goto(port, entry.seq).await {
+            Ok(result) if !result.changed => self.status = "already at that step".into(),
+            Ok(_) => {
+                // Pull the rewritten canvas right away instead of waiting for
+                // the `/api/watch` push, so the tree is already current.
+                if let Ok(content) = crate::worker_client::get_canvas_raw(port).await {
+                    self.on_external_change(content);
+                }
+                self.status = format!("jumped to #{} · {}", entry.seq, entry.summary);
+            }
+            Err(e) => self.status = format!("history jump failed: {e}"),
+        }
+    }
+
     /// Connects `worker_client::tty_attach` and parks the result as
     /// `pending_http_tty_attach` for `mod.rs`'s event loop to hand the
     /// terminal to on its next iteration — the attach counterpart to
@@ -4530,6 +4656,63 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[tokio::test]
+    async fn history_view_navigates_clamps_and_closes_without_a_worker() {
+        let dir = std::env::temp_dir().join(format!("meshfox-tui-history-view-test-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.md");
+        std::fs::write(&path, "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n").unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(path, tx, None, None).await.unwrap();
+
+        // No worker: `H` reports it instead of opening anything.
+        app.worker_port = None;
+        app.on_key(key(KeyCode::Char('H'))).await;
+        assert!(app.history_view.is_none());
+        assert!(app.status.contains("worker"));
+
+        let entry = |seq| crate::worker_client::HistoryEntryDto {
+            seq,
+            created_at: "2026-09-29T12:00:00Z".into(),
+            op_kind: "node_body".into(),
+            applied: true,
+            summary: String::new(),
+        };
+        app.history_view = Some(HistoryViewState { entries: vec![entry(3), entry(2), entry(1)], selected: 0 });
+        app.on_key(key(KeyCode::Up)).await;
+        assert_eq!(app.history_view.as_ref().unwrap().selected, 0);
+        app.on_key(key(KeyCode::Char('j'))).await;
+        app.on_key(key(KeyCode::PageDown)).await;
+        assert_eq!(app.history_view.as_ref().unwrap().selected, 2);
+        // The modal claims the keymap: `q` closes it rather than quitting.
+        app.on_key(key(KeyCode::Char('q'))).await;
+        assert!(app.history_view.is_none());
+    }
+
+    #[tokio::test]
+    async fn page_keys_move_tree_selection_by_ten_rows_and_clamp() {
+        let dir = std::env::temp_dir().join(format!("meshfox-tui-tree-paging-test-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.md");
+        let mut src = String::from("<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n");
+        for i in 0..25 {
+            src.push_str(&format!("## Item {i}\n<!-- meshfox:node id=\"item-{i}\" -->\n"));
+        }
+        std::fs::write(&path, src).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(path, tx, None, None).await.unwrap();
+        app.focus = Focus::Tree;
+        app.selected = 0;
+
+        app.on_key(key(KeyCode::PageDown)).await;
+        assert_eq!(app.selected, 10);
+        app.on_key(key(KeyCode::PageDown)).await;
+        app.on_key(key(KeyCode::PageDown)).await;
+        assert_eq!(app.selected, app.rows.len() - 1);
+        app.on_key(key(KeyCode::PageUp)).await;
+        assert_eq!(app.selected, app.rows.len() - 11);
     }
 
     #[tokio::test]

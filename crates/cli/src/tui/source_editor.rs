@@ -330,12 +330,9 @@ impl SourceEditorState {
 
     /// TODO.canvas.md: "Саджесты и подсветка синтаксиса в TUI", item 3 —
     /// `Ctrl-n`. Turns the heading the cursor's currently on into a node:
-    /// appends a bare `<!-- meshfox:node -->` line right below it. Bare is
-    /// deliberate, not a shortcut: no `id=` means the parser derives one
-    /// from the heading's own title slug (see "Если не задан id в
-    /// meshfox:node, использовать заоголовок"), so this one line is
-    /// already a fully valid, addressable node — nothing further to fill
-    /// in unless the user wants to override something.
+    /// appends a `<!-- meshfox:node id="..." -->` line right below it, with
+    /// the same random base36 id the web UI assigns to a new node
+    /// (TODO.canvas.md: "Авто Id в TUI").
     fn insert_node_below_heading(&mut self) -> Result<(), &'static str> {
         let text = self.editor.lines.to_string();
         let row = self.editor.cursor.row;
@@ -353,8 +350,15 @@ impl SourceEditorState {
         // `AppendNewline` inserts right below `cursor.row` regardless of
         // `cursor.col` (it resets that to 0 itself) — no repositioning
         // needed first.
+        // Same random base36 id the web UI's "add child" button assigns,
+        // deduped against every id the document already has; an
+        // unparsable mid-edit document falls back to "no known ids".
+        let used: std::collections::HashSet<String> = meshfox_core::mdcanvas::parse(&text)
+            .map(|c| c.nodes.iter().map(|n| n.id.clone()).collect())
+            .unwrap_or_default();
+        let id = meshfox_core::mdcanvas::random_node_id(&used);
         self.editor.execute(AppendNewline(1));
-        type_str(&mut self.editor, "<!-- meshfox:node -->");
+        type_str(&mut self.editor, &format!("<!-- meshfox:node id=\"{id}\" -->"));
         Ok(())
     }
 
@@ -823,7 +827,11 @@ mod tests {
         let text = se.editor.lines.to_string();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[2], "## Section");
-        assert_eq!(lines[3], "<!-- meshfox:node -->");
+        let id = lines[3]
+            .strip_prefix("<!-- meshfox:node id=\"")
+            .and_then(|l| l.strip_suffix("\" -->"))
+            .expect("an id-bearing node comment");
+        assert!(!id.is_empty() && id.chars().all(|c| c.is_ascii_digit() || c.is_ascii_lowercase()));
         let _ = std::fs::remove_file(&se.path);
     }
 

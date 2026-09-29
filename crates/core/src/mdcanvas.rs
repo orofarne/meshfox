@@ -1517,12 +1517,19 @@ pub fn insert_child_node(markdown: &str, parent_id: &str, title: &str) -> Option
 /// the caller's title is the real, final one) is untouched — its
 /// human-readable, title-derived id is exactly the point there.
 pub fn insert_child_node_random_id(markdown: &str, parent_id: &str, title: &str) -> Option<(String, String)> {
-    insert_child_node_impl(markdown, parent_id, title, |used| loop {
+    insert_child_node_impl(markdown, parent_id, title, random_node_id)
+}
+
+/// A fresh random base36 node id not already in `used` — what the web UI's
+/// "add child" button assigns, exposed so other editors (the TUI's
+/// `Ctrl-n`) hand out the same style of id.
+pub fn random_node_id(used: &HashSet<String>) -> String {
+    loop {
         let candidate = random_base36_id();
         if !used.contains(&candidate) {
             return candidate;
         }
-    })
+    }
 }
 
 fn insert_child_node_impl(

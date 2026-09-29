@@ -392,6 +392,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
         render_services_view(f, area, &*app, sv);
     } else if let Some(tv) = &app.tty_sessions_view {
         render_tty_sessions_view(f, area, &*app, tv);
+    } else if let Some(hv) = &app.history_view {
+        render_history_view(f, area, hv);
     } else if app.show_help {
         render_help(f, area, &*app);
     }
@@ -1141,7 +1143,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         hint.push_str(" · v services");
     }
     if app.worker_port.is_some() {
-        hint.push_str(" · t live terminals");
+        hint.push_str(" · t live terminals · H history");
     }
     hint.push_str(" · ? help · q quit");
 
@@ -1639,6 +1641,82 @@ fn render_tty_sessions_view(f: &mut Frame, area: Rect, app: &App, tv: &super::ap
     );
 }
 
+/// `created_at` as a short relative label ("just now", "5m ago", "3h ago",
+/// "2d ago") — same as the web UI's history panel, and it sidesteps the
+/// log's UTC timestamps vs. the viewer's timezone altogether. Empty for the
+/// synthetic "before the first step" row (no timestamp) or an unparsable one.
+fn history_time(created_at: &str) -> String {
+    let Some(ts) = meshfox_core::timestamp::unix_timestamp(created_at) else {
+        return String::new();
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(ts);
+    let sec = (now - ts).max(0);
+    match sec {
+        0..=4 => "just now".to_string(),
+        5..=59 => format!("{sec}s ago"),
+        60..=3599 => format!("{}m ago", (sec + 30) / 60),
+        3600..=86399 => format!("{}h ago", (sec + 1800) / 3600),
+        _ => format!("{}d ago", (sec + 43200) / 86400),
+    }
+}
+
+/// The `H` history view: one row per undo-log step, newest first. Steps
+/// still applied read normally; the redo tail (undone, `applied == false`)
+/// is dimmed, and the newest applied step — the canvas's current state — is
+/// marked. `enter` jumps to the highlighted row.
+fn render_history_view(f: &mut Frame, area: Rect, hv: &super::app::HistoryViewState) {
+    let current = hv.entries.iter().position(|e| e.applied);
+    let rect = centered_rect(72, (hv.entries.len() as u16 + 4).min(area.height), area);
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .title(" history ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let (list_area, hint_area) = (layout[0], layout[1]);
+
+    let items: Vec<ListItem> = hv
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let marker = if Some(i) == current { "▶ " } else { "  " };
+            let style = if e.applied {
+                Style::default()
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let time = history_time(&e.created_at);
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{marker}#{:<4} {time:>8}  ", e.seq), style),
+                Span::styled(format!("{:<12} ", e.op_kind), Style::default().fg(OK)),
+                Span::styled(e.summary.clone(), style),
+            ]))
+        })
+        .collect();
+    let mut state = ListState::default();
+    state.select(Some(hv.selected.min(hv.entries.len().saturating_sub(1))));
+    let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    f.render_stateful_widget(list, list_area, &mut state);
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "j/k select · enter jump here · dim = undone · q/esc close",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        hint_area,
+    );
+}
+
 fn render_help(f: &mut Frame, area: Rect, app: &App) {
     let mut items = vec![
         "tab             cycle focus: tree -> document -> output -> tree",
@@ -1692,6 +1770,12 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         );
         items.push(
             "                enter attaches (joins as a viewer), K kills it",
+        );
+        items.push(
+            "H               history — every undo step, newest first; enter jumps",
+        );
+        items.push(
+            "                the canvas back (or forward) to the selected step",
         );
     }
     items.extend([
@@ -2344,6 +2428,42 @@ mod tests {
             screen.contains("esc close)"),
             "a long help line's own tail should still appear (wrapped), not be clipped off:\n{screen}"
         );
+    }
+
+    #[test]
+    fn history_time_is_relative_like_the_web_panel() {
+        let now = meshfox_core::timestamp::now_utc_rfc3339();
+        assert_eq!(history_time(&now), "just now");
+        assert_eq!(history_time("2020-01-15T12:00:00Z").chars().last(), Some('o'), "days/years ago");
+        assert!(history_time("2020-01-15T12:00:00Z").ends_with("d ago"));
+        assert_eq!(history_time(""), "");
+    }
+
+    #[tokio::test]
+    async fn render_history_view_marks_the_current_step_and_lists_newest_first() {
+        use crate::worker_client::HistoryEntryDto;
+        let entry = |seq, applied, summary: &str| HistoryEntryDto {
+            seq,
+            created_at: "2026-09-29T12:41:05Z".into(),
+            op_kind: "node_body".into(),
+            applied,
+            summary: summary.into(),
+        };
+        let hv = super::super::app::HistoryViewState {
+            entries: vec![entry(3, false, "third undone"), entry(2, true, "second"), entry(1, true, "first")],
+            selected: 1,
+        };
+        let area = Rect::new(0, 0, 90, 20);
+        let screen = render_to_screen(area, |f| render_history_view(f, area, &hv));
+        let (third, second, first) = (
+            screen.find("third undone").expect("redo-tail row"),
+            screen.find("second").expect("current row"),
+            screen.find("first").expect("oldest row"),
+        );
+        assert!(third < second && second < first, "newest first:\n{screen}");
+        assert!(screen.contains("▶ #2"), "current (newest applied) step is marked:\n{screen}");
+        assert!(screen.contains("ago"), "relative time shown:\n{screen}");
+        assert!(!screen.contains("2026-09-29T"), "not the raw timestamp:\n{screen}");
     }
 
     // On a terminal too short to fit every keybindings-help line at once,
