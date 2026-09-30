@@ -721,13 +721,15 @@ pub fn fingerprint(block: &CodeBlock) -> String {
 /// `fingerprint` plus the *resolved values* of the variables this block
 /// actually references — only its own `env=` list and any `$NAME` its
 /// `interpreter=` refers to (`crate::exec::interpreter_var_refs`), same
-/// scoping `resolve_block_env` already applies. Session-freshness
-/// bookkeeping (`AppState::session_runs`/TUI's `App::session_runs`, see
-/// TODO.canvas.md: "Переменные как часть состояния блока") uses this
-/// instead of plain `fingerprint` so a variable's *value* changing (not
-/// just which variables the block declares) invalidates the skip too — a
+/// scoping `resolve_block_env` already applies. So a variable's *value*
+/// changing (not just which variables the block declares) changes it too — a
 /// re-answered `meshfox:var` prompt, a changed `--set`/env override, or an
 /// upstream `from=` block now producing something different.
+///
+/// This is one block's own fingerprint. Anything that decides whether a
+/// *recorded result* is still valid (session freshness, stored runs) uses
+/// `crate::deps::closure_fingerprint`, which folds this together with the
+/// same fingerprint of everything the block depends on.
 ///
 /// Deliberately not part of `fingerprint` itself: that one also backs the
 /// on-disk `<!-- meshfox:output ... hash="..." -->` cache
@@ -750,6 +752,15 @@ pub fn session_fingerprint(block: &CodeBlock, resolved_vars: &HashMap<String, St
         parts.push(format!("{name}\u{0}{value}"));
     }
     format!("{:08x}", fnv1a(parts.join("\u{0}").as_bytes()))
+}
+
+/// Folds already-computed fingerprints into one — order-sensitive, same
+/// FNV-1a as [`fingerprint`]. For a caller that fingerprints a *set* of
+/// blocks together (see `crate::deps::closure_fingerprint`); not mirrored in
+/// the web UI, which never needs one.
+pub fn combine_fingerprints<I: IntoIterator<Item = String>>(parts: I) -> String {
+    let joined = parts.into_iter().collect::<Vec<_>>().join("\u{0}");
+    format!("{:08x}", fnv1a(joined.as_bytes()))
 }
 
 fn parse_info_string(info: &str) -> (String, HashMap<String, String>) {

@@ -103,6 +103,55 @@ fn server_socket_from_table(table: &toml::Table) -> Option<PathBuf> {
     table.get("server_socket").and_then(|v| v.as_str()).filter(|v| !v.is_empty()).map(PathBuf::from)
 }
 
+/// Default for [`session_max_output_bytes`] — 256 KiB per block, same
+/// figure `tty_registry::BYTE_CAPACITY` uses for a pty's own scrollback.
+pub const DEFAULT_SESSION_MAX_OUTPUT_BYTES: usize = 256 * 1024;
+
+/// Default for [`session_max_runs_per_block`].
+pub const DEFAULT_SESSION_MAX_RUNS_PER_BLOCK: usize = 10;
+
+/// `[session] max_runs_per_block = N` in `.meshfox/config.toml` (same merge
+/// as every other setting) — how many finished runs of one block the core
+/// keeps in the session database before the oldest are rotated out, run row
+/// and stored output together. At least `1`: a `0` (or a value that isn't a
+/// non-negative integer) is treated as `1` / the default respectively.
+pub fn session_max_runs_per_block(canvas_root: &Path) -> usize {
+    session_max_runs_per_block_from_table(&load(canvas_root))
+}
+
+fn session_max_runs_per_block_from_table(table: &toml::Table) -> usize {
+    table
+        .get("session")
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("max_runs_per_block"))
+        .and_then(|v| v.as_integer())
+        .and_then(|n| usize::try_from(n).ok())
+        .map(|n| n.max(1))
+        .unwrap_or(DEFAULT_SESSION_MAX_RUNS_PER_BLOCK)
+}
+
+/// `[session] max_output_bytes = N` in `.meshfox/config.toml` (local or
+/// global, same merge as every other setting here) — how many bytes of *each*
+/// finished plain run's output the core keeps in the session database
+/// (`.meshfox/<canvas>.session.sqlite3`) so it survives a core restart;
+/// past the limit the *oldest* lines are dropped, keeping the tail. How many
+/// runs per block are kept is [`session_max_runs_per_block`]. `0`
+/// turns persisting run output off entirely. Unset or not a non-negative
+/// integer falls back to [`DEFAULT_SESSION_MAX_OUTPUT_BYTES`].
+pub fn session_max_output_bytes(canvas_root: &Path) -> usize {
+    session_max_output_bytes_from_table(&load(canvas_root))
+}
+
+fn session_max_output_bytes_from_table(table: &toml::Table) -> usize {
+    table
+        .get("session")
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("max_output_bytes"))
+        .and_then(|v| v.as_integer())
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(DEFAULT_SESSION_MAX_OUTPUT_BYTES)
+}
+
 /// `[process_env]` in `.meshfox/config.toml` (local or global, same merge
 /// as every other setting here) — extra environment variables applied to
 /// every spawned block/interpreter process (`stream_exec::spawn_bash`/
@@ -289,6 +338,36 @@ mod tests {
             server_socket_from_table(&table),
             Some(PathBuf::from("/tmp/coordinator.sock"))
         );
+    }
+
+    #[test]
+    fn session_max_output_bytes_reads_override_and_defaults_otherwise() {
+        assert_eq!(
+            session_max_output_bytes_from_table(&toml::Table::new()),
+            DEFAULT_SESSION_MAX_OUTPUT_BYTES
+        );
+        let table: toml::Table = "[session]\nmax_output_bytes = 1024".parse().unwrap();
+        assert_eq!(session_max_output_bytes_from_table(&table), 1024);
+        let table: toml::Table = "[session]\nmax_output_bytes = 0".parse().unwrap();
+        assert_eq!(session_max_output_bytes_from_table(&table), 0);
+        for bad in ["[session]\nmax_output_bytes = -5", "[session]\nmax_output_bytes = \"big\""] {
+            let table: toml::Table = bad.parse().unwrap();
+            assert_eq!(session_max_output_bytes_from_table(&table), DEFAULT_SESSION_MAX_OUTPUT_BYTES);
+        }
+    }
+
+    #[test]
+    fn session_max_runs_per_block_reads_override_and_clamps_to_one() {
+        assert_eq!(
+            session_max_runs_per_block_from_table(&toml::Table::new()),
+            DEFAULT_SESSION_MAX_RUNS_PER_BLOCK
+        );
+        let table: toml::Table = "[session]\nmax_runs_per_block = 3".parse().unwrap();
+        assert_eq!(session_max_runs_per_block_from_table(&table), 3);
+        let table: toml::Table = "[session]\nmax_runs_per_block = 0".parse().unwrap();
+        assert_eq!(session_max_runs_per_block_from_table(&table), 1);
+        let table: toml::Table = "[session]\nmax_runs_per_block = -2".parse().unwrap();
+        assert_eq!(session_max_runs_per_block_from_table(&table), DEFAULT_SESSION_MAX_RUNS_PER_BLOCK);
     }
 
     #[test]

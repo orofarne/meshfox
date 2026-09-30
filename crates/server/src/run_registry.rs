@@ -118,9 +118,16 @@ pub struct RunHandle {
     /// right away, so it's always `true` for a handle nothing else ever
     /// needs to check it on.
     attached: AtomicBool,
+    /// The `run_ledger` row this run was tracked under, once `attach` knows
+    /// it — lets a reader tie the in-memory handle to its stored run.
+    run_id: Mutex<Option<i64>>,
 }
 
 impl RunHandle {
+    pub fn run_id(&self) -> Option<i64> {
+        *self.run_id.lock().unwrap()
+    }
+
     pub fn outcome(&self) -> RunOutcome {
         self.outcome.lock().unwrap().clone()
     }
@@ -192,6 +199,7 @@ pub fn reserve(node_id: String, block_name: String) -> Arc<RunHandle> {
         kill_tx: Mutex::new(None),
         started_at: std::time::Instant::now(),
         attached: AtomicBool::new(false),
+        run_id: Mutex::new(None),
     })
 }
 
@@ -217,6 +225,7 @@ pub fn attach(
     }
     let (kill_tx, mut kill_rx) = oneshot::channel();
     *handle.kill_tx.lock().unwrap() = Some(kill_tx);
+    *handle.run_id.lock().unwrap() = ledger_row.as_ref().map(|(_, id)| *id);
 
     let task_handle = Arc::clone(handle);
     tokio::spawn(async move {
@@ -246,8 +255,11 @@ pub fn attach(
                 }
             }
         };
-        *task_handle.outcome.lock().unwrap() = outcome.clone();
-        let _ = task_handle.tx.send(RunEvent::Done(outcome.clone()));
+        // Ledger first, *then* the outcome and `Done`: whoever sees this run
+        // as finished (`outcome()`, or `Done` on the channel) can rely on its
+        // row already being finished and its output already stored. Serving
+        // a finished run from the ledger instead of this handle
+        // (`subscribe_run`) depends on that.
         if let Some((ledger, id)) = ledger_row {
             let finish_outcome = match outcome {
                 RunOutcome::Exited { exit_code } => crate::run_ledger::FinishOutcome::Exited(exit_code),
@@ -255,7 +267,16 @@ pub fn attach(
                 RunOutcome::Running => unreachable!("the loop above only ever breaks with Exited/Killed"),
             };
             let _ = ledger.finish(id, finish_outcome);
+            // The restart-surviving copy of what `log` holds in memory — see
+            // `RunLedger::save_output`. Written at the run's own end (not
+            // per line), so a core that dies mid-run loses that run's
+            // output, same as it loses the process itself.
+            let lines: Vec<_> =
+                task_handle.log.lock().unwrap().since(0).into_iter().map(|l| (l.stream, l.text)).collect();
+            let _ = ledger.save_output(id, &lines);
         }
+        *task_handle.outcome.lock().unwrap() = outcome.clone();
+        let _ = task_handle.tx.send(RunEvent::Done(outcome));
     });
 }
 
@@ -319,6 +340,28 @@ mod tests {
             }
         }
         assert_eq!(lines, vec!["one".to_string(), "two".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_finished_run_is_in_the_ledger_before_it_is_reported_done() {
+        let ledger = crate::run_ledger::RunLedger::open_in_memory().unwrap();
+        let id = ledger.start("root", "saved", crate::run_ledger::RunKind::Plain, "test", 0).unwrap();
+        let proc = stream_exec::spawn_bash("echo one; echo two; exit 3", no_envs(), None).unwrap();
+        let handle = track("root".to_string(), "saved".to_string(), proc, Some((ledger.clone(), id)));
+        assert_eq!(handle.run_id(), Some(id));
+        ledger.set_fingerprint(id, "fp").unwrap();
+
+        let (_, mut rx) = handle.subscribe_from(0);
+        loop {
+            if let RunEvent::Done(_) = rx.recv().await.unwrap() {
+                break;
+            }
+        }
+        // No polling: `Done` is only sent once the ledger is up to date.
+        let run = ledger.latest_fresh_run("root", "saved", "fp").unwrap().expect("finished row");
+        assert_eq!((run.outcome.as_str(), run.exit_code), ("exited", Some(3)));
+        let lines = ledger.load_output(id).unwrap().expect("stored output");
+        assert_eq!(lines.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(), vec!["one", "two"]);
     }
 
     #[tokio::test]

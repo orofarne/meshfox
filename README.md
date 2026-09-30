@@ -258,6 +258,40 @@ a macro's own process as `MESHFOX_CONFIG_<PATH>` (e.g.
 
 [examples/agent-prompt.canvas.md](./examples/agent-prompt.canvas.md)
 
+## Configuration
+<!-- meshfox:node id="configuration" -->
+
+meshfox's own settings — facts about a machine or a project, as opposed to a document's `meshfox:var`s (see "Variables") — live in one optional TOML file, read in two places:
+
+- `<canvas dir>/.meshfox/config.toml` — local to the project, next to the canvas;
+- `~/.meshfox/config.toml` — global, every project.
+
+Local wins over global **key by key, at every nesting level**: a global `[session] max_output_bytes = 1048576` plus a local file containing only `[tui] editor_theme = "base16-mocha.dark"` ends up with both. A missing, unreadable or unparsable file counts as empty — this is optional configuration, never a required manifest. The files are re-read on every use, so an edit applies without restarting anything (except where a setting below says otherwise).
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `server_socket` | unset | Control socket of an external coordinator (the macOS menu-bar app, see "macOS menu-bar app"). When set, every core-launching command (`view`, `tui`, `run`, `node <op>`, MCP `debug_*`) becomes a client of that daemon instead of spawning its own worker; an empty local value turns a global one off for that project. `MESHFOX_SERVER_SOCKET` overrides it for one invocation (an empty value forces it off). |
+| `[process_env]` | empty | Extra environment variables for every process a block spawns (plain, `tty` and `@`-macro interpreters). A value may reference other variables — `PATH = "$HOME/.cargo/bin:$PATH"` extends rather than replaces — which is how a worker started by the macOS daemon (launchd's bare environment) finds `npm`/`cargo`. String values only. |
+| `[[env]]` | none | Shared defaults for `meshfox:var` resolution across canvases, optionally scoped with `path=`. Not a flat setting, so it isn't merged key by key; see SPEC.md's "Shared/global config (`[[env]]`)". |
+| `[interpreters.agent] provider` | `claude` | Which agent CLI the `@agent` macro calls (`claude` or `codex`) — see "Calling an AI agent from a block". Every scalar key in the file is also exported to a `@`-macro's process as `MESHFOX_CONFIG_<PATH>` (`MESHFOX_CONFIG_INTERPRETERS_AGENT_PROVIDER`), so a hand-written `interpreter=` script can read it too. |
+| `[tui] editor_theme` | `base16-ocean.dark` | `syntect` theme of the terminal viewer's editor and code panes — see "Terminal viewer". An unknown name falls back to the default. |
+| `[session] max_output_bytes` | `262144` (256 KiB) | How much of *each* finished run's output the core keeps in `.meshfox/<canvas>.session.sqlite3`; past the limit the oldest lines of that run are dropped, keeping the tail. `0` stores no output at all (runs, freshness and variables are still kept). Read once when the core starts, so restart it to apply a change. |
+| `[session] max_runs_per_block` | `10` | How many finished runs of one block the core keeps (run record and stored output together); when a run finishes, the oldest beyond this are rotated out. At most `max_runs_per_block × max_output_bytes` of output per block. Minimum `1`. Read once when the core starts. |
+
+#### What survives a core restart
+
+Alongside the undo history, the session database (`.meshfox/<canvas>.session.sqlite3`, covered by the repo's `.meshfox/` ignore) keeps what a restarted core needs to pick up where it left off:
+
+- **Run history**: the last `max_runs_per_block` finished runs of every block — exit code, start and end time, and output (each bounded by `max_output_bytes`). In the browser UI the clock button in a block's header (next to `‹/›`) opens the block's run history as a modal: every kept run with its start time, exit code, duration and a `stale` mark on the left, the selected run's output on the right (↑/↓ to move, Esc to close). A reloaded tab shows each block's latest current run again. The same data is behind `GET /api/run/history?nodeId=..&block=..` (the list) and `runId` on `/api/run/subscribe` (replay one run).
+- **Which blocks already ran** successfully this session and still look unchanged, so a later "run chain" doesn't redo a dependency it already ran.
+- **Values of variables** a `form` fence submitted.
+
+**`secret` variables are never written there** — neither a form's value for one, nor a `from=` block's output for one.
+
+A run counts as *stale* — kept in the history, flagged as such, never shown as the block's latest result — when it no longer describes the document: the block's own code, interpreter or `env=`/`deps=` changed, **or any block in its `deps=`/`from=` chain did**, or the value of a non-secret variable any of them references changed, or the session was reset (the "reset session" action). Undoing an edit makes the runs made before it current again. A `secret`'s value is not part of this check (only the fact that a block references it is), since it can't be reproduced later. Only a new run of that block replaces a stale one on screen; a run still in progress at the moment of a reset isn't marked. The freshness records and form values themselves are wiped by a reset, not just flagged.
+
+A run that was still in flight when the core died leaves no saved output, same as it leaves no process.
+
 ## Usage
 <!-- meshfox:node id="usage" -->
 

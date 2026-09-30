@@ -22,7 +22,9 @@ export function ResetSessionConfirmDialog({ onConfirm, onCancel }: ResetSessionC
         <h3>Reset session?</h3>
         <p className="vars-modal-hint">
           This forgets which blocks already ran successfully this session, so the next ⛓ run chain re-runs every
-          dependency instead of skipping unchanged ones. Doesn't touch the canvas file or any saved output.
+          dependency instead of skipping unchanged ones, and stops showing earlier runs' output as the latest
+          result. The runs stay in each block's history (marked stale). Doesn't touch the canvas file or any
+          output saved in it.
         </p>
         <div className="vars-modal-actions">
           <button type="button" onClick={onCancel}>

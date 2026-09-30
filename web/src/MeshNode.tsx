@@ -19,6 +19,8 @@ import {
 import { parseBlockRef, blockDomId } from "./deps";
 import { implicitDepsForBlock, interpreterVarRefsNaive, type ClientVarDecl } from "./vars";
 import { AnsiText } from "./AnsiText";
+import { formatDurationMs } from "./format";
+import { RunHistoryDialog } from "./RunHistoryDialog";
 import { NodeTextEditor } from "./NodeTextEditor";
 import {
   fetchNodeFileContent,
@@ -1432,6 +1434,7 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
   // either.
   const [expanded, setExpanded] = useState(true);
   const [sourceExpanded, setSourceExpanded] = useState(() => !seg.fold);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const live = data.liveBlocks[seg.name];
   const queued = live?.status === "queued";
   const running = live?.status === "running";
@@ -1533,6 +1536,39 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
             title={sourceExpanded ? "Hide the code (output stays visible)" : "Show the code"}
           >
             ‹/›
+          </button>
+        )}
+        {expanded && !seg.tty && !seg.service && (
+          <button
+            type="button"
+            className={
+              historyOpen
+                ? "mesh-code-source-toggle nodrag"
+                : "mesh-code-source-toggle mesh-code-source-toggle-collapsed nodrag"
+            }
+            onClick={() => setHistoryOpen((o) => !o)}
+            title={
+              historyOpen
+                ? "Hide this block's run history"
+                : "Show this block's run history — earlier runs' exit code, time and output, kept by the server across restarts"
+            }
+            aria-label="Run history"
+          >
+            <svg
+              className="mesh-history-icon"
+              viewBox="0 0 16 16"
+              width="1.15em"
+              height="1.15em"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <circle cx="8" cy="8" r="6" />
+              <path d="M8 4.6V8l2.3 1.5" />
+            </svg>
           </button>
         )}
         <span className="mesh-code-lang">
@@ -1685,6 +1721,14 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
            * together, same as it always has. */}
           {!seg.tty && <RunOutput seg={seg} live={live} assetBase={data.assetBase} />}
         </>
+      )}
+      {historyOpen && !seg.tty && !seg.service && (
+        <RunHistoryDialog
+          nodeId={nodeId}
+          blockName={seg.name}
+          liveStatus={live?.status}
+          onClose={() => setHistoryOpen(false)}
+        />
       )}
     </div>
   );
@@ -1845,17 +1889,6 @@ function FormBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData
       </button>
     </div>
   );
-}
-
-/** Mirrors `core::output::format_duration_ms` — kept in sync by hand (same
- * split this codebase already uses for every other Rust/TS syntax pair, see
- * SPEC.md's "Formal grammar" intro): `"842ms"` under a second, `"2.3s"`
- * under a minute, `"1m 05s"` beyond that. */
-function formatDurationMs(ms: number): string {
-  if (ms < 1000) return `${Math.round(ms)}ms`;
-  const totalSeconds = Math.round(ms / 1000);
-  if (totalSeconds < 60) return `${(ms / 1000).toFixed(1)}s`;
-  return `${Math.floor(totalSeconds / 60)}m ${String(totalSeconds % 60).padStart(2, "0")}s`;
 }
 
 /** A ticking elapsed-time counter for a still-`"running"` step — like

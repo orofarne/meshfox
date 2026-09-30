@@ -22,6 +22,7 @@ use std::io;
 use std::sync::{Arc, Mutex};
 
 use crate::session_db::sqlite_err;
+use crate::stream_exec::OutputStream;
 
 const SCHEMA_SQL: &str = "
     CREATE TABLE IF NOT EXISTS runs (
@@ -34,11 +35,29 @@ const SCHEMA_SQL: &str = "
         started_at  TEXT NOT NULL,
         ended_at    TEXT,
         outcome     TEXT NOT NULL,
-        exit_code   INTEGER
+        exit_code   INTEGER,
+        stale       INTEGER NOT NULL DEFAULT 0,
+        fingerprint TEXT
     );
     CREATE UNIQUE INDEX IF NOT EXISTS runs_one_running_per_address
         ON runs (node_id, block) WHERE outcome = 'running';
+    CREATE INDEX IF NOT EXISTS runs_by_address ON runs (node_id, block, id);
+    CREATE TABLE IF NOT EXISTS run_lines (
+        run_id INTEGER PRIMARY KEY,
+        lines  TEXT NOT NULL
+    );
 ";
+
+/// Columns added after `runs` first shipped — `CREATE TABLE IF NOT EXISTS`
+/// above leaves an older table as it was. Each fails with "duplicate column
+/// name" on an up-to-date one, which is the normal case and ignored. Then
+/// `run_output` (a one-row-per-address predecessor of `run_lines`, never
+/// released) is dropped.
+const MIGRATIONS_SQL: [&str; 3] = [
+    "ALTER TABLE runs ADD COLUMN stale INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE runs ADD COLUMN fingerprint TEXT",
+    "DROP TABLE IF EXISTS run_output",
+];
 
 /// Which kind of runnable this row tracks — mirrors the same three-way
 /// split `run_registry`/`tty_registry`/`services` already keep as three
@@ -137,6 +156,31 @@ impl std::error::Error for StartError {}
 #[derive(Clone)]
 pub struct RunLedger {
     conn: Arc<Mutex<Connection>>,
+    /// Byte budget for one run's stored output (see [`Self::save_output`]);
+    /// `0` disables storing it. Set once at startup from
+    /// `[session] max_output_bytes` (`meshfox_core::config`).
+    max_output_bytes: usize,
+    /// How many finished runs of one address [`Self::finish`] keeps — older
+    /// ones are rotated out, row and stored output together. Never below
+    /// `1`. From `[session] max_runs_per_block`.
+    max_runs_per_block: usize,
+}
+
+/// One finished run as [`RunLedger::latest_fresh_run`]/[`RunLedger::history`]
+/// read it back. `stale` is already resolved for the caller: the run was
+/// marked stale by a session reset, *or* its stored fingerprint no longer
+/// matches the current one it was compared against.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunSummary {
+    pub id: i64,
+    pub outcome: String,
+    pub exit_code: Option<i32>,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    /// Wall-clock length of the run, from `started_at` to `ended_at`.
+    pub duration_ms: Option<u64>,
+    pub stale: bool,
 }
 
 impl RunLedger {
@@ -144,8 +188,25 @@ impl RunLedger {
     /// see [`crate::session_db`] for why this takes a shared `Arc` rather
     /// than opening its own. Idempotent, safe to call every worker startup.
     pub fn from_connection(conn: Arc<Mutex<Connection>>) -> io::Result<Self> {
-        conn.lock().unwrap().execute_batch(SCHEMA_SQL).map_err(sqlite_err)?;
-        Ok(RunLedger { conn })
+        {
+            let conn = conn.lock().unwrap();
+            conn.execute_batch(SCHEMA_SQL).map_err(sqlite_err)?;
+            for migration in MIGRATIONS_SQL {
+                let _ = conn.execute(migration, []);
+            }
+        }
+        Ok(RunLedger {
+            conn,
+            max_output_bytes: meshfox_core::config::DEFAULT_SESSION_MAX_OUTPUT_BYTES,
+            max_runs_per_block: meshfox_core::config::DEFAULT_SESSION_MAX_RUNS_PER_BLOCK,
+        })
+    }
+
+    /// Overrides the per-address byte budget [`Self::save_output`] keeps —
+    /// see `meshfox_core::config::session_max_output_bytes`.
+    pub fn with_max_output_bytes(mut self, max_output_bytes: usize) -> Self {
+        self.max_output_bytes = max_output_bytes;
+        self
     }
 
     /// `pub(crate)` (not just `fn`, unlike most test-only helpers here) —
@@ -155,7 +216,176 @@ impl RunLedger {
     pub(crate) fn open_in_memory() -> io::Result<Self> {
         let conn = Connection::open_in_memory().map_err(sqlite_err)?;
         conn.execute_batch(SCHEMA_SQL).map_err(sqlite_err)?;
-        Ok(RunLedger { conn: Arc::new(Mutex::new(conn)) })
+        Ok(RunLedger {
+            conn: Arc::new(Mutex::new(conn)),
+            max_output_bytes: meshfox_core::config::DEFAULT_SESSION_MAX_OUTPUT_BYTES,
+            max_runs_per_block: meshfox_core::config::DEFAULT_SESSION_MAX_RUNS_PER_BLOCK,
+        })
+    }
+
+    /// Overrides how many finished runs of one address [`Self::finish`]
+    /// keeps — see `meshfox_core::config::session_max_runs_per_block`.
+    pub fn with_max_runs_per_block(mut self, max_runs_per_block: usize) -> Self {
+        self.max_runs_per_block = max_runs_per_block.max(1);
+        self
+    }
+
+    /// Stores `lines` as run `run_id`'s output. Keeps the *tail* that fits
+    /// in `max_output_bytes` (summed line text plus one newline each,
+    /// matching how the run's output is otherwise measured); older lines
+    /// are dropped, not the newest. A no-op when the budget is `0`. Rotated
+    /// out together with its run row by [`Self::finish`].
+    pub fn save_output(&self, run_id: i64, lines: &[(OutputStream, String)]) -> io::Result<()> {
+        if self.max_output_bytes == 0 {
+            return Ok(());
+        }
+        let mut used = 0usize;
+        let mut keep_from = lines.len();
+        for (i, (_, text)) in lines.iter().enumerate().rev() {
+            used += text.len() + 1;
+            if used > self.max_output_bytes {
+                break;
+            }
+            keep_from = i;
+        }
+        let json = serde_json::to_string(&lines[keep_from..]).map_err(io::Error::other)?;
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO run_lines (run_id, lines) VALUES (?1, ?2) \
+                 ON CONFLICT (run_id) DO UPDATE SET lines = excluded.lines",
+                params![run_id, json],
+            )
+            .map_err(sqlite_err)?;
+        Ok(())
+    }
+
+    /// The output [`Self::save_output`] stored for `run_id`, if any.
+    pub fn load_output(&self, run_id: i64) -> io::Result<Option<Vec<(OutputStream, String)>>> {
+        let json = self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT lines FROM run_lines WHERE run_id = ?1", params![run_id], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()
+            .map_err(sqlite_err)?;
+        json.map(|j| serde_json::from_str(&j).map_err(io::Error::other)).transpose()
+    }
+
+    /// Records what [`meshfox_core::closure_fingerprint`] said about the
+    /// document when run `id` started — what [`Self::latest_fresh_run`]
+    /// later compares against. A run that never gets one (a crash before
+    /// this call, a row from an older database) is never fresh.
+    pub fn set_fingerprint(&self, id: i64, fingerprint: &str) -> io::Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE runs SET fingerprint = ?1 WHERE id = ?2", params![fingerprint, id])
+            .map_err(sqlite_err)?;
+        Ok(())
+    }
+
+    /// Marks every finished run stale — a session reset says none of what
+    /// they did or printed (exit code, timing, output) describes the current
+    /// state. The rows stay as run history; [`Self::latest_fresh_run`] just
+    /// skips them. A run still `running` is left alone, and a later run of
+    /// the same address is stored fresh.
+    pub fn mark_finished_runs_stale(&self) -> io::Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE runs SET stale = 1 WHERE outcome != 'running'", [])
+            .map_err(sqlite_err)?;
+        Ok(())
+    }
+
+    /// Every plain-block address that has at least one finished run not
+    /// marked stale — the candidates whose latest *current* run
+    /// [`Self::latest_fresh_run`] may find (it also needs the fingerprint).
+    pub fn plain_addresses_with_runs(&self) -> io::Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT node_id, block FROM runs \
+                 WHERE kind = 'plain' AND outcome != 'running' AND stale = 0",
+            )
+            .map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(sqlite_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)
+    }
+
+    /// The newest finished run of `(node_id, block)` that is still current:
+    /// not marked stale by a reset, and stamped with exactly `fingerprint`
+    /// (the address's fingerprint *now*). Being newest matters — an edit
+    /// made and reverted makes an older run fresh again, and it is the
+    /// latest one that describes the document.
+    pub fn latest_fresh_run(
+        &self,
+        node_id: &str,
+        block: &str,
+        fingerprint: &str,
+    ) -> io::Result<Option<RunSummary>> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                &format!(
+                    "SELECT id, outcome, exit_code, started_at, ended_at, {DURATION_SQL} FROM runs \
+                     WHERE node_id = ?1 AND block = ?2 AND outcome != 'running' \
+                       AND stale = 0 AND fingerprint = ?3 \
+                     ORDER BY id DESC LIMIT 1"
+                ),
+                params![node_id, block, fingerprint],
+                |r| summary_row(r, false),
+            )
+            .optional()
+            .map_err(sqlite_err)
+    }
+
+    /// One finished run, by id, if it belongs to `(node_id, block)` — for a
+    /// caller that asks for a specific historical run. `current` is the
+    /// address's fingerprint now (`None` if it couldn't be computed), used
+    /// only to fill in [`RunSummary::stale`].
+    pub fn get_run(
+        &self,
+        id: i64,
+        node_id: &str,
+        block: &str,
+        current: Option<&str>,
+    ) -> io::Result<Option<RunSummary>> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                &format!(
+                    "SELECT id, outcome, exit_code, started_at, ended_at, stale, fingerprint, {DURATION_SQL} FROM runs \
+                     WHERE id = ?1 AND node_id = ?2 AND block = ?3 AND outcome != 'running'"
+                ),
+                params![id, node_id, block],
+                |r| summary_with_staleness(r, current),
+            )
+            .optional()
+            .map_err(sqlite_err)
+    }
+
+    /// Every finished run of `(node_id, block)` still kept, newest first.
+    pub fn history(&self, node_id: &str, block: &str, current: Option<&str>) -> io::Result<Vec<RunSummary>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT id, outcome, exit_code, started_at, ended_at, stale, fingerprint, {DURATION_SQL} FROM runs \
+                 WHERE node_id = ?1 AND block = ?2 AND outcome != 'running' ORDER BY id DESC"
+            ))
+            .map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map(params![node_id, block], |r| summary_with_staleness(r, current))
+            .map_err(sqlite_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)
     }
 
     /// Records a new `running` row for `(node_id, block)` — fails with
@@ -220,13 +450,24 @@ impl RunLedger {
     /// just recording how it ended instead of deleting the record.
     pub fn finish(&self, id: i64, outcome: FinishOutcome) -> io::Result<()> {
         let ended_at = meshfox_core::timestamp::now_utc_rfc3339();
-        self.conn
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE runs SET outcome = ?1, exit_code = ?2, ended_at = ?3 WHERE id = ?4",
-                params![outcome.outcome_str(), outcome.exit_code(), ended_at, id],
-            )
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE runs SET outcome = ?1, exit_code = ?2, ended_at = ?3 WHERE id = ?4",
+            params![outcome.outcome_str(), outcome.exit_code(), ended_at, id],
+        )
+        .map_err(sqlite_err)?;
+        // Rotation: everything past this address's newest
+        // `max_runs_per_block` finished runs goes, output included. Done
+        // here because a run finishing is the only moment the count grows.
+        let keep = self.max_runs_per_block as i64;
+        let old_ids = "SELECT id FROM runs WHERE outcome != 'running' \
+             AND (node_id, block) = (SELECT node_id, block FROM runs WHERE id = ?1) \
+             AND id NOT IN (SELECT id FROM runs WHERE outcome != 'running' \
+                 AND (node_id, block) = (SELECT node_id, block FROM runs WHERE id = ?1) \
+                 ORDER BY id DESC LIMIT ?2)";
+        conn.execute(&format!("DELETE FROM run_lines WHERE run_id IN ({old_ids})"), params![id, keep])
+            .map_err(sqlite_err)?;
+        conn.execute(&format!("DELETE FROM runs WHERE id IN ({old_ids})"), params![id, keep])
             .map_err(sqlite_err)?;
         Ok(())
     }
@@ -326,6 +567,33 @@ impl RunLedger {
     }
 }
 
+/// SQL expression for [`RunSummary::duration_ms`], selected `AS duration_ms`
+/// (`julianday` reads the RFC 3339 timestamps `start`/`finish` write).
+const DURATION_SQL: &str =
+    "CAST(ROUND((julianday(ended_at) - julianday(started_at)) * 86400000.0) AS INTEGER) AS duration_ms";
+
+fn summary_row(r: &rusqlite::Row<'_>, stale: bool) -> rusqlite::Result<RunSummary> {
+    Ok(RunSummary {
+        id: r.get(0)?,
+        outcome: r.get(1)?,
+        exit_code: r.get(2)?,
+        started_at: r.get(3)?,
+        ended_at: r.get(4)?,
+        duration_ms: r.get::<_, Option<i64>>("duration_ms")?.map(|ms| ms.max(0) as u64),
+        stale,
+    })
+}
+
+/// Columns 5 and 6 (`stale`, `fingerprint`) folded into [`RunSummary::stale`]
+/// against `current`: stale if flagged, or if there's no way to show the run
+/// is still current (no stored fingerprint, or `current` unknown/different).
+fn summary_with_staleness(r: &rusqlite::Row<'_>, current: Option<&str>) -> rusqlite::Result<RunSummary> {
+    let flagged: i64 = r.get(5)?;
+    let stored: Option<String> = r.get(6)?;
+    let fresh = flagged == 0 && stored.is_some() && stored.as_deref() == current;
+    summary_row(r, !fresh)
+}
+
 /// Same whole-process-group `SIGKILL` primitive `services.rs`'s own
 /// `kill_process_group` carries — duplicated, not shared, matching that
 /// function's own doc comment on why (`stream_exec`/`pty_exec` each already
@@ -361,6 +629,142 @@ mod tests {
             .process_group(0)
             .spawn()
             .expect("spawn dummy process")
+    }
+
+    fn out(lines: &[&str]) -> Vec<(OutputStream, String)> {
+        lines.iter().map(|l| (OutputStream::Stdout, l.to_string())).collect()
+    }
+
+    /// What `run_registry::attach` does for a real run of `("a", "b")`:
+    /// claim a row, stamp its fingerprint, finish it, store its output.
+    fn finished_run(ledger: &RunLedger, fp: &str, outcome: FinishOutcome, lines: &[(OutputStream, String)]) -> i64 {
+        let id = ledger.start("a", "b", RunKind::Plain, "test", 1).unwrap();
+        ledger.set_fingerprint(id, fp).unwrap();
+        ledger.finish(id, outcome).unwrap();
+        ledger.save_output(id, lines).unwrap();
+        id
+    }
+
+    #[test]
+    fn output_round_trips_per_run_and_history_keeps_every_run() {
+        let ledger = RunLedger::open_in_memory().unwrap();
+        let mixed = vec![(OutputStream::Stdout, "one".to_string()), (OutputStream::Stderr, "two".to_string())];
+        let first = finished_run(&ledger, "fp", FinishOutcome::Exited(3), &mixed);
+        let second = finished_run(&ledger, "fp", FinishOutcome::Killed, &out(&["x"]));
+        assert_eq!(ledger.load_output(first).unwrap().unwrap(), mixed);
+        assert_eq!(ledger.load_output(second).unwrap().unwrap(), out(&["x"]));
+
+        let latest = ledger.latest_fresh_run("a", "b", "fp").unwrap().unwrap();
+        assert_eq!((latest.id, latest.outcome.as_str(), latest.exit_code), (second, "killed", None));
+        let history = ledger.history("a", "b", Some("fp")).unwrap();
+        assert_eq!(history.iter().map(|r| r.id).collect::<Vec<_>>(), vec![second, first]);
+        assert_eq!(history[1].exit_code, Some(3));
+        assert!(history.iter().all(|r| !r.stale));
+        assert_eq!(ledger.latest_fresh_run("a", "other", "fp").unwrap(), None);
+    }
+
+    #[test]
+    fn a_changed_fingerprint_makes_runs_stale_and_a_reverted_one_fresh_again() {
+        let ledger = RunLedger::open_in_memory().unwrap();
+        let old = finished_run(&ledger, "v1", FinishOutcome::Exited(0), &out(&["v1"]));
+        assert_eq!(ledger.latest_fresh_run("a", "b", "v2").unwrap(), None);
+        let history = ledger.history("a", "b", Some("v2")).unwrap();
+        assert!(history[0].stale);
+        // The history is still all there; only what counts as current moved.
+        assert_eq!(ledger.load_output(old).unwrap().unwrap(), out(&["v1"]));
+
+        let newer = finished_run(&ledger, "v2", FinishOutcome::Exited(0), &out(&["v2"]));
+        assert_eq!(ledger.latest_fresh_run("a", "b", "v2").unwrap().unwrap().id, newer);
+        // Reverting the edit: the older run describes the document again,
+        // and it is now the newest one that does.
+        assert_eq!(ledger.latest_fresh_run("a", "b", "v1").unwrap().unwrap().id, old);
+    }
+
+    #[test]
+    fn a_finished_run_reports_its_duration() {
+        let ledger = RunLedger::open_in_memory().unwrap();
+        let id = ledger.start("a", "b", RunKind::Plain, "test", 1).unwrap();
+        ledger.set_fingerprint(id, "fp").unwrap();
+        ledger.conn.lock().unwrap().execute(
+            "UPDATE runs SET started_at = '2026-09-30T10:00:00Z' WHERE id = ?1",
+            params![id],
+        ).unwrap();
+        ledger.finish(id, FinishOutcome::Exited(0)).unwrap();
+        ledger.conn.lock().unwrap().execute(
+            "UPDATE runs SET ended_at = '2026-09-30T10:00:02.500Z' WHERE id = ?1",
+            params![id],
+        ).unwrap();
+        let run = ledger.latest_fresh_run("a", "b", "fp").unwrap().unwrap();
+        assert_eq!(run.duration_ms, Some(2500));
+        assert_eq!(ledger.plain_addresses_with_runs().unwrap(), vec![("a".to_string(), "b".to_string())]);
+    }
+
+    #[test]
+    fn a_run_without_a_fingerprint_is_never_fresh() {
+        let ledger = RunLedger::open_in_memory().unwrap();
+        let id = ledger.start("a", "b", RunKind::Plain, "test", 1).unwrap();
+        ledger.finish(id, FinishOutcome::Exited(0)).unwrap();
+        assert_eq!(ledger.latest_fresh_run("a", "b", "").unwrap(), None);
+        assert!(ledger.history("a", "b", Some("")).unwrap()[0].stale);
+    }
+
+    #[test]
+    fn a_reset_marks_finished_runs_stale_but_keeps_them_and_spares_a_running_one() {
+        let ledger = RunLedger::open_in_memory().unwrap();
+        let old = finished_run(&ledger, "fp", FinishOutcome::Exited(0), &out(&["old"]));
+        let running = ledger.start("a", "b", RunKind::Plain, "test", 1).unwrap();
+        ledger.set_fingerprint(running, "fp").unwrap();
+        ledger.mark_finished_runs_stale().unwrap();
+        assert_eq!(ledger.latest_fresh_run("a", "b", "fp").unwrap(), None);
+        assert!(ledger.get_run(old, "a", "b", Some("fp")).unwrap().unwrap().stale);
+        assert_eq!(ledger.load_output(old).unwrap().unwrap(), out(&["old"]));
+
+        ledger.finish(running, FinishOutcome::Exited(0)).unwrap();
+        ledger.save_output(running, &out(&["new"])).unwrap();
+        assert_eq!(ledger.latest_fresh_run("a", "b", "fp").unwrap().unwrap().id, running);
+    }
+
+    #[test]
+    fn rotation_keeps_only_the_newest_runs_per_address_and_drops_their_output() {
+        let ledger = RunLedger::open_in_memory().unwrap().with_max_runs_per_block(2);
+        let ids: Vec<i64> = (0..4)
+            .map(|i| finished_run(&ledger, "fp", FinishOutcome::Exited(i), &out(&["x"])))
+            .collect();
+        // Another address must not be affected by a and b's rotation.
+        let other = ledger.start("a", "other", RunKind::Plain, "test", 1).unwrap();
+        ledger.finish(other, FinishOutcome::Exited(0)).unwrap();
+
+        let kept: Vec<i64> = ledger.history("a", "b", Some("fp")).unwrap().iter().map(|r| r.id).collect();
+        assert_eq!(kept, vec![ids[3], ids[2]]);
+        assert_eq!(ledger.load_output(ids[0]).unwrap(), None);
+        assert_eq!(ledger.load_output(ids[3]).unwrap().unwrap(), out(&["x"]));
+        assert_eq!(ledger.history("a", "other", None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_running_row_never_counts_against_the_rotation_budget() {
+        let ledger = RunLedger::open_in_memory().unwrap().with_max_runs_per_block(1);
+        let done = finished_run(&ledger, "fp", FinishOutcome::Exited(0), &out(&["x"]));
+        let running = ledger.start("a", "b", RunKind::Plain, "test", 1).unwrap();
+        ledger.finish(done, FinishOutcome::Exited(0)).unwrap();
+        assert!(ledger.get_run(done, "a", "b", Some("fp")).unwrap().is_some());
+        assert_eq!(ledger.active_running().unwrap()[0].id, running);
+    }
+
+    #[test]
+    fn output_keeps_the_newest_lines_within_the_byte_budget() {
+        // Each "lineN" costs 6 bytes (5 + newline); a 13-byte budget fits two.
+        let ledger = RunLedger::open_in_memory().unwrap().with_max_output_bytes(13);
+        let id = finished_run(&ledger, "fp", FinishOutcome::Exited(0), &out(&["line1", "line2", "line3", "line4"]));
+        assert_eq!(ledger.load_output(id).unwrap().unwrap(), out(&["line3", "line4"]));
+    }
+
+    #[test]
+    fn a_zero_byte_budget_stores_no_output_but_keeps_the_run() {
+        let ledger = RunLedger::open_in_memory().unwrap().with_max_output_bytes(0);
+        let id = finished_run(&ledger, "fp", FinishOutcome::Exited(0), &out(&["x"]));
+        assert_eq!(ledger.load_output(id).unwrap(), None);
+        assert_eq!(ledger.latest_fresh_run("a", "b", "fp").unwrap().unwrap().id, id);
     }
 
     #[test]

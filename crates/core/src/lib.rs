@@ -39,7 +39,7 @@ pub mod worker_lock;
 pub use builtin_interpreter::{is_builtin, resolve_builtin_spec, resolve_with_env, ResolvedInterpreter};
 pub use canvas::{ArrowEnd, Canvas, EdgeLineStyle, ExtraEdge, FileDisplay, Node, NodeType};
 pub use constraint::{evaluate as evaluate_constraints, ConstraintResult, ConstraintStatus};
-pub use deps::{compute_forced_reruns, BlockAddr, DepsError};
+pub use deps::{closure_fingerprint, closure_fingerprint_with, compute_forced_reruns, BlockAddr, DepsError};
 pub use exec::{
     interpreter_var_refs, is_button, is_form, is_supported_lang, resolve_command,
     resolve_interpreter, split_interpreter, ResolvedCommand, BUTTON_LANG, FORM_LANG,
@@ -182,6 +182,16 @@ pub fn env_var_names_for_chain(
     // parse error is `meshfox validate`'s job to report, not this one's.
     let decls = vars::declared_vars(canvas).unwrap_or_default();
     vars::close_over_var_refs(&decls, needed.iter().map(String::as_str))
+}
+
+/// [`env_var_names_for_chain`] for `target`'s whole dependency chain — which
+/// variables' values feed [`closure_fingerprint`] of it.
+pub fn run_chain_var_names(
+    canvas: &Canvas,
+    target: &BlockAddr,
+) -> Result<std::collections::HashSet<String>, DepsError> {
+    let chain = deps::resolve_chain(canvas, target.clone())?;
+    Ok(env_var_names_for_chain(canvas, &chain))
 }
 
 /// Every declared-variable name `block` itself directly references, via

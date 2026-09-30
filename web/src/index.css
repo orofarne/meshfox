@@ -2991,3 +2991,141 @@ a {
   opacity: 0.6;
   font-style: italic;
 }
+
+/* Run history modal (RunHistoryDialog.tsx) — reuses `.vars-modal`'s
+ * backdrop/frame, widened, with a run list on the left and the selected
+ * run's output on the right. */
+.mesh-history-icon {
+  display: block;
+}
+
+.vars-modal.run-history-modal {
+  width: min(960px, 94vw);
+  height: min(640px, 80vh);
+  max-height: none;
+  overflow: hidden;
+  padding: 0;
+  gap: 0;
+}
+
+.run-history-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.6rem 0.9rem;
+  border-bottom: 1px solid var(--node-border);
+}
+
+.run-history-modal-block {
+  font-family: var(--mono-font, monospace);
+  font-weight: normal;
+  opacity: 0.7;
+  margin-left: 0.4rem;
+}
+
+.run-history-modal-close {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  opacity: 0.6;
+}
+
+.run-history-modal-close:hover {
+  opacity: 1;
+}
+
+.run-history-modal-body {
+  display: grid;
+  grid-template-columns: minmax(220px, 300px) 1fr;
+  flex: 1;
+  min-height: 0;
+}
+
+.run-history-list {
+  overflow: auto;
+  border-right: 1px solid var(--node-border);
+  font-size: 0.8rem;
+}
+
+.run-history-row {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.2rem 0.6rem;
+  width: 100%;
+  padding: 0.4rem 0.9rem;
+  border: 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--node-border) 50%, transparent);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.run-history-row:hover {
+  background: color-mix(in srgb, currentColor 6%, transparent);
+}
+
+.run-history-row[data-selected] {
+  background: color-mix(in srgb, currentColor 12%, transparent);
+}
+
+.run-history-row[data-exit="fail"] .run-history-exit,
+.run-history-row[data-exit="killed"] .run-history-exit,
+.run-history-detail-head[data-exit="fail"],
+.run-history-detail-head[data-exit="killed"] {
+  color: var(--fail);
+}
+
+.run-history-row[data-stale] .run-history-time,
+.run-history-row[data-stale] .run-history-exit,
+.run-history-row[data-stale] .run-history-duration {
+  opacity: 0.55;
+}
+
+.run-history-duration {
+  opacity: 0.65;
+}
+
+.run-history-stale {
+  margin-left: auto;
+  font-style: italic;
+  opacity: 0.8;
+}
+
+.run-history-detail {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+}
+
+.run-history-detail-head {
+  padding: 0.5rem 0.9rem;
+  font-size: 0.75rem;
+  border-bottom: 1px solid var(--node-border);
+}
+
+.run-history-stale-note {
+  font-style: italic;
+  opacity: 0.7;
+}
+
+.run-history-detail pre {
+  margin: 0;
+  padding: 0.6rem 0.9rem;
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.run-history-empty {
+  padding: 0.6rem 0.9rem;
+  opacity: 0.55;
+  font-style: italic;
+  font-size: 0.8rem;
+}

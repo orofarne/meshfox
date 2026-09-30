@@ -682,9 +682,37 @@ export async function subscribeRun(
   block: string,
   sinceSeq: number,
   onEvent: (event: SubscribeEvent) => void,
+  runId?: number,
 ): Promise<void> {
   const params = new URLSearchParams({ nodeId, block, sinceSeq: String(sinceSeq) });
+  if (runId !== undefined) params.set("runId", String(runId));
   await openEventSocket(wsUrl(`/api/run/subscribe?${params}`), onEvent);
+}
+
+/** One finished run of a block, as `GET /api/run/history` lists it (see
+ * `crates/server/src/run_ledger.rs`'s `RunSummary`). `stale` means it no
+ * longer describes the document — the block, something it depends on, or a
+ * variable value it used changed since, or the session was reset — not that
+ * the run failed. */
+export interface RunHistoryEntry {
+  id: number;
+  outcome: "exited" | "killed";
+  exitCode: number | null;
+  startedAt: string;
+  endedAt: string | null;
+  /** Wall-clock length of the run. */
+  durationMs: number | null;
+  stale: boolean;
+}
+
+/** The finished runs of one block the server still keeps (newest first —
+ * how many is the `[session] max_runs_per_block` setting). Pass an entry's
+ * `id` as `subscribeRun`'s `runId` to replay its output. */
+export async function fetchRunHistory(nodeId: string, block: string): Promise<RunHistoryEntry[]> {
+  const params = new URLSearchParams({ nodeId, block });
+  const res = await fetch(`/api/run/history?${params}`);
+  if (!res.ok) throw new Error(`GET /api/run/history: ${res.status}`);
+  return res.json();
 }
 
 /**
@@ -781,8 +809,12 @@ export interface ActiveRunDto {
 }
 
 /**
- * Every plain-block run and `tty` session this server process currently
- * knows about (running, or the most recent one for that address), whether
+ * Every plain-block run in flight, the latest *current* finished run of
+ * each plain block (from the server's session database, so it is still there
+ * after the core restarted — a run counts as current until the block, a
+ * dependency, a variable it used changes, or the session is reset; for a
+ * finished one `uptimeMs` is its duration), and every `tty` session this
+ * server process currently knows about, whether
  * or not any tab is currently watching it — what a freshly-loaded/
  * reloaded tab reconciles its own live state against on mount (see
  * `App.tsx`'s reconciliation effect) and what `TtySessionsPanel` lists to

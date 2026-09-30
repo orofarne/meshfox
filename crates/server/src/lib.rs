@@ -74,6 +74,9 @@ mod undo_log;
 /// execution — see its own module doc comment. `pub` for the same
 /// test-seeding reason `session_db` is.
 pub mod run_ledger;
+/// Restart-surviving copy of `AppState::session_runs`/`session_vars` — see
+/// its own module doc comment.
+mod session_state;
 /// `pub` so `meshfox-cli` can reuse the same async spawn/kill primitives
 /// for `meshfox run`'s real-time output — see its `main.rs`.
 pub mod stream_exec;
@@ -178,15 +181,18 @@ struct AppState {
     /// can skip re-running a dependency that's already run this session
     /// *and* hasn't changed since (see `SessionRun`, `TODO.canvas.md`:
     /// "Не перезапускать уже выполненные в этой сессии зависимости").
-    /// Never persisted anywhere and never touched by anything but this
-    /// process's own runs — restarting `meshfox view` starts fresh.
+    /// Written through to `session_store` (never a `secret` variable's
+    /// value) and reloaded at startup, so a core restart doesn't forget
+    /// what already ran; cleared by `reset_session`.
     session_runs: Mutex<HashMap<(String, String), SessionRun>>,
+    /// Write-through persistence for `session_runs`/`session_vars`, seeded
+    /// back from at startup — see `session_state`'s module doc comment.
+    session_store: session_state::SessionStore,
     /// Resolved values for a `form` fence's own `field var=` entries (see
     /// SPEC.md's "Form fences"), submitted via `POST /api/form/submit` —
-    /// same "never persisted, never touched by anything but this process's
-    /// own runs" lifetime as `session_runs` (cleared alongside it in
-    /// `reset_session`), since every variable a form targets is itself
-    /// implicitly `session`-scoped by its own `meshfox:var` declaration
+    /// same lifetime as `session_runs` (written through to `session_store`,
+    /// reloaded at startup, cleared alongside it in `reset_session`), since
+    /// every variable a form targets is itself implicitly `session`-scoped by its own `meshfox:var` declaration
     /// (node-scoped, per `meshfox_core::declared_vars`) — there'd be
     /// nothing for an on-disk cache entry to mean here. Folded into the
     /// `overrides` map at every variable-resolution call site, underneath
@@ -1168,6 +1174,125 @@ struct SessionRun {
     /// That same earlier run's own wall-clock duration, in milliseconds —
     /// mirrors `RunEvent::StepEnd`'s `duration_ms`.
     duration_ms: u64,
+}
+
+/// [`meshfox_core::closure_fingerprint`] of `addr`'s whole run as the
+/// document stands *now*, or `None` if it can't be worked out (the canvas
+/// doesn't resolve, `addr` is gone, a cycle).
+///
+/// Variable values come only from what outlives one request — a form's
+/// session values, the on-disk cache, the shared env, declared defaults —
+/// so a later call reproduces the same answer for an unchanged document. A
+/// one-shot `--set`/request override is deliberately absent (a value that
+/// can't be reproduced later would make every such run look stale the
+/// moment it ended), except that a non-secret one is written into the cache
+/// before the run starts, so it *is* seen here. `secret` values are left
+/// out for the same reason (the name is still part of the block's own
+/// fingerprint); `from=` values aren't known until a source block runs, but
+/// that block is itself part of the chain being fingerprinted.
+fn current_run_fingerprint(state: &AppState, addr: &meshfox_core::BlockAddr) -> Option<String> {
+    run_fingerprint_in(state, &RunFingerprintCtx::load(state)?, addr)
+}
+
+/// What [`current_run_fingerprint`] needs besides the address — the parsed
+/// canvas, its variable declarations and the shared env — loaded once so a
+/// caller fingerprinting many addresses (`get_active_runs`) doesn't repeat
+/// it per address.
+struct RunFingerprintCtx {
+    canvas: Canvas,
+    decls: Vec<meshfox_core::VarDecl>,
+    shared: meshfox_core::SharedEnv,
+}
+
+impl RunFingerprintCtx {
+    fn load(state: &AppState) -> Option<Self> {
+        let raw = state.raw.lock().unwrap().clone();
+        let canvas = resolved_canvas(&raw, &state.canvas_path).ok()?;
+        let decls = meshfox_core::declared_vars(&canvas).ok()?;
+        let shared = meshfox_core::load_shared_env(canvas_root_dir(&state.canvas_path));
+        Some(RunFingerprintCtx { canvas, decls, shared })
+    }
+}
+
+fn run_fingerprint_in(
+    state: &AppState,
+    ctx: &RunFingerprintCtx,
+    addr: &meshfox_core::BlockAddr,
+) -> Option<String> {
+    let needed = meshfox_core::run_chain_var_names(&ctx.canvas, addr).ok()?;
+    let relevant: Vec<_> = ctx.decls.iter().filter(|d| needed.contains(&d.name)).cloned().collect();
+    let overrides = effective_overrides(state, &HashMap::new());
+    let resolved = {
+        let cache = state.vars_cache.lock().unwrap();
+        meshfox_core::resolve_with_shared(&relevant, &overrides, &cache, &HashMap::new(), &ctx.shared)
+    };
+    let values: HashMap<String, String> = resolved
+        .values
+        .into_iter()
+        .filter(|(name, _)| !ctx.decls.iter().any(|d| d.secret && &d.name == name))
+        .collect();
+    meshfox_core::closure_fingerprint_with(&ctx.canvas, &ctx.decls, addr, &values).ok()
+}
+
+/// Stamps ledger row `id` (the run of `addr` that is about to start) with
+/// [`current_run_fingerprint`] — what `subscribe_run` later compares
+/// against to decide the run is still current. Best-effort: a row that
+/// can't be stamped is just never shown as a block's latest result.
+fn stamp_run_fingerprint(state: &AppState, addr: &meshfox_core::BlockAddr, id: i64) {
+    if let Some(fingerprint) = current_run_fingerprint(state, addr) {
+        if let Err(e) = state.run_ledger.set_fingerprint(id, &fingerprint) {
+            eprintln!("meshfox: failed to record run fingerprint for {}/{} ({e})", addr.node_id, addr.block_name);
+        }
+    }
+}
+
+/// The fingerprint a step's session-freshness record is stored and checked
+/// under (`AppState::session_runs`): [`meshfox_core::closure_fingerprint_with`]
+/// of `addr` against everything resolved for this run so far — so a change
+/// to the block, to anything it depends on, or to a variable value any of
+/// them reference, all make a recorded run stale. Falls back to the block's
+/// own [`meshfox_core::session_fingerprint`] if the closure can't be worked
+/// out (`canvas` is `None`, or the graph doesn't resolve) — the same answer
+/// every time for the same input, so a record still matches itself.
+fn step_fingerprint(
+    canvas: Option<&Canvas>,
+    decls: &[meshfox_core::VarDecl],
+    addr: &meshfox_core::BlockAddr,
+    block: &meshfox_core::CodeBlock,
+    resolved_vars: &HashMap<String, String>,
+) -> String {
+    canvas
+        .and_then(|c| meshfox_core::closure_fingerprint_with(c, decls, addr, resolved_vars).ok())
+        .unwrap_or_else(|| meshfox_core::session_fingerprint(block, resolved_vars))
+}
+
+/// Records `run` as `addr`'s latest successful run this session, in memory
+/// and (best-effort) in `session_store`. A `secret` variable's value never
+/// reaches the store — dropped from `produced_vars` here, since this is the
+/// one place that has the declarations to tell which names those are.
+fn remember_session_run(
+    state: &AppState,
+    addr: &meshfox_core::BlockAddr,
+    decls: &[meshfox_core::VarDecl],
+    run: SessionRun,
+) {
+    let stored = session_state::StoredRun {
+        node_id: addr.node_id.clone(),
+        block: addr.block_name.clone(),
+        fingerprint: run.fingerprint.clone(),
+        produced_vars: run
+            .produced_vars
+            .iter()
+            .filter(|(name, _)| !decls.iter().any(|d| d.secret && &d.name == *name))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        output: run.output.clone(),
+        duration_ms: run.duration_ms,
+    };
+    if let Err(e) = state.session_store.save_run(&stored) {
+        eprintln!("meshfox: failed to persist session run {}/{} ({e})", addr.node_id, addr.block_name);
+    }
+    state.session_runs.lock().unwrap().insert((addr.node_id.clone(), addr.block_name.clone()), run);
 }
 
 /// How long `TabGuard` waits, after the last `/api/watch` connection drops,
@@ -4956,7 +5081,7 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
             // above) adds a third way in: a `!` `deps=` edge whose
             // declaring block is itself running for real this pass.
             let is_requested_target = Some(addr) == chain.last();
-            let live_fingerprint = meshfox_core::session_fingerprint(&block, &resolved_vars);
+            let live_fingerprint = step_fingerprint(Some(&canvas), &decls, addr, &block, &resolved_vars);
             if !is_requested_target && !block.always && !forced_reruns.contains(addr) {
                 let already_fresh = state
                     .session_runs
@@ -5143,6 +5268,9 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
             let lock_path_for_run = held_locks
                 .remove(&(addr.node_id.clone(), addr.block_name.clone()))
                 .map(|id| (state.run_ledger.clone(), id));
+            if let Some((_, id)) = &lock_path_for_run {
+                stamp_run_fingerprint(&state, addr, *id);
+            }
             // The requested block's own step reuses the reservation made
             // before this stream even started (see `target_reservation`'s
             // own doc comment) — a subscriber that raced ahead of this
@@ -5317,8 +5445,10 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
                     .iter()
                     .filter_map(|decl| resolved_vars.get(&decl.name).map(|v| (decl.name.clone(), v.clone())))
                     .collect();
-                state.session_runs.lock().unwrap().insert(
-                    (addr.node_id.clone(), addr.block_name.clone()),
+                remember_session_run(
+                    &state,
+                    addr,
+                    &decls,
                     SessionRun { fingerprint: live_fingerprint, produced_vars, output: full_output, duration_ms },
                 );
             }
@@ -5706,6 +5836,11 @@ async fn submit_form(
             meshfox_core::validate_value(decl, value)
                 .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e))?;
             session_vars.insert(field.var.clone(), value.clone());
+            if !decl.secret {
+                if let Err(e) = state.session_store.save_var(&field.var, value) {
+                    eprintln!("meshfox: failed to persist session variable {} ({e})", field.var);
+                }
+            }
             changed.insert(field.var.clone());
             saved += 1;
         }
@@ -6057,6 +6192,11 @@ async fn run_tty_chain(
     let mut killed = false;
     // Same per-file tracking `run_block` uses — see its own doc comment.
     let mut file_raws: HashMap<Option<PathBuf>, String> = HashMap::new();
+    // Parsed once for every step's `step_fingerprint` below.
+    let fp_canvas = {
+        let raw = state.raw.lock().unwrap().clone();
+        resolved_canvas(&raw, &state.canvas_path).ok()
+    };
 
     for addr in &chain {
         if !send_event(
@@ -6134,7 +6274,7 @@ async fn run_tty_chain(
         // dependency regardless of whether it had already run successfully
         // this session, unlike the plain (non-`tty`) `/api/run` path.
         let is_requested_target = Some(addr) == chain.last();
-        let live_fingerprint = meshfox_core::session_fingerprint(&block, &resolved_vars);
+        let live_fingerprint = step_fingerprint(fp_canvas.as_ref(), &decls, addr, &block, &resolved_vars);
         if !is_requested_target && !block.always && !forced_reruns.contains(addr) {
             let already_fresh = state
                 .session_runs
@@ -6272,6 +6412,9 @@ async fn run_tty_chain(
                 .0
                 .remove(&(addr.node_id.clone(), addr.block_name.clone()))
                 .map(|id| (state.run_ledger.clone(), id));
+            if let Some((_, id)) = &lock_path_for_run {
+                stamp_run_fingerprint(&state, addr, *id);
+            }
             let run_handle =
                 run_registry::track(addr.node_id.clone(), addr.block_name.clone(), proc, lock_path_for_run);
             state.runs_registry.lock().unwrap().insert(
@@ -6449,8 +6592,10 @@ async fn run_tty_chain(
                 .iter()
                 .filter_map(|decl| resolved_vars.get(&decl.name).map(|v| (decl.name.clone(), v.clone())))
                 .collect();
-            state.session_runs.lock().unwrap().insert(
-                (addr.node_id.clone(), addr.block_name.clone()),
+            remember_session_run(
+                &state,
+                addr,
+                &decls,
                 SessionRun { fingerprint: live_fingerprint, produced_vars, output: full_output, duration_ms },
             );
         }
@@ -6895,20 +7040,49 @@ struct ActiveRunDto {
 /// the two other kinds of run this server now separately tracks.
 async fn get_active_runs(State(state): State<Arc<AppState>>) -> Json<Vec<ActiveRunDto>> {
     let mut out = Vec::new();
+    // A plain run still in flight comes from the in-memory registry (the
+    // only place its live output is). A *finished* one comes from the run
+    // ledger instead, and only if it still describes the document — so what
+    // a reloaded tab is offered is the latest current run of each block,
+    // whether the core has been up since it ran or was restarted after (see
+    // `serve_stored_run`, which is what a subscribe to it is served from).
     for handle in state.runs_registry.lock().unwrap().values() {
-        let (status, exit_code) = match handle.outcome() {
-            run_registry::RunOutcome::Running => ("running", None),
-            run_registry::RunOutcome::Exited { exit_code } => ("exited", Some(exit_code)),
-            run_registry::RunOutcome::Killed => ("killed", None),
-        };
-        out.push(ActiveRunDto {
-            node_id: handle.node_id.clone(),
-            block: handle.block_name.clone(),
-            kind: "plain",
-            status,
-            exit_code,
-            uptime_ms: handle.uptime_ms(),
-        });
+        if matches!(handle.outcome(), run_registry::RunOutcome::Running) {
+            out.push(ActiveRunDto {
+                node_id: handle.node_id.clone(),
+                block: handle.block_name.clone(),
+                kind: "plain",
+                status: "running",
+                exit_code: None,
+                uptime_ms: handle.uptime_ms(),
+            });
+        }
+    }
+    let running: std::collections::HashSet<(String, String)> =
+        out.iter().map(|r| (r.node_id.clone(), r.block.clone())).collect();
+    if let (Ok(addresses), Some(ctx)) =
+        (state.run_ledger.plain_addresses_with_runs(), RunFingerprintCtx::load(&state))
+    {
+        for (node_id, block) in addresses {
+            if running.contains(&(node_id.clone(), block.clone())) {
+                continue;
+            }
+            let addr = meshfox_core::BlockAddr::new(&node_id, &block);
+            let Some(fingerprint) = run_fingerprint_in(&state, &ctx, &addr) else { continue };
+            let Ok(Some(run)) = state.run_ledger.latest_fresh_run(&node_id, &block, &fingerprint) else {
+                continue;
+            };
+            out.push(ActiveRunDto {
+                node_id,
+                block,
+                kind: "plain",
+                status: if run.outcome == "killed" { "killed" } else { "exited" },
+                exit_code: run.exit_code,
+                // For a finished run this is its length, not the time since
+                // it started — what the client shows as its duration.
+                uptime_ms: run.duration_ms.unwrap_or(0),
+            });
+        }
     }
     for handle in state.tty_registry.lock().unwrap().values() {
         let (status, exit_code) = match handle.outcome() {
@@ -7396,6 +7570,10 @@ struct SubscribeRunQuery {
     /// last-seen `line` event carried, so it never sees a line twice.
     #[serde(default)]
     since_seq: u64,
+    /// A specific stored run (an `id` from `/api/run/history`) instead of
+    /// the address's latest current one — served even if stale.
+    #[serde(default)]
+    run_id: Option<i64>,
 }
 
 /// One line of `/api/run/subscribe`'s streamed NDJSON response — a much
@@ -7484,16 +7662,94 @@ async fn subscribe_run(
     })
 }
 
+/// `subscribe_run`'s answer for a run that isn't in flight: the requested
+/// stored run (`run_id`), or else the newest finished run of the address
+/// whose fingerprint still matches the document — so a run made stale by an
+/// edit to its block or a dependency, a changed variable value, or a session
+/// reset is never shown as the block's latest result. `404` if there is
+/// none. `finished` is the address's in-memory handle, if any, consulted
+/// only when nothing was stored for the run (output storing turned off).
+fn serve_stored_run(
+    state: &AppState,
+    query: &SubscribeRunQuery,
+    finished: Option<Arc<run_registry::RunHandle>>,
+) -> Result<Response, ApiError> {
+    let not_found =
+        || ApiError(StatusCode::NOT_FOUND, format!("no run for {:?}/{:?}", query.node_id, query.block));
+    let io_err = |e: io::Error| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    let addr = meshfox_core::BlockAddr::new(&query.node_id, &query.block);
+    let current = current_run_fingerprint(state, &addr);
+    let run = match (query.run_id, &current) {
+        (Some(id), _) => state.run_ledger.get_run(id, &query.node_id, &query.block, current.as_deref()),
+        (None, Some(fp)) => state.run_ledger.latest_fresh_run(&query.node_id, &query.block, fp),
+        (None, None) => Ok(None),
+    }
+    .map_err(io_err)?
+    .ok_or_else(not_found)?;
+
+    let stored = state.run_ledger.load_output(run.id).map_err(io_err)?;
+    let lines: Vec<(u64, stream_exec::OutputStream, String)> = match stored {
+        Some(lines) => lines.into_iter().enumerate().map(|(i, (s, t))| (i as u64, s, t)).collect(),
+        None => match finished.filter(|h| h.run_id() == Some(run.id)) {
+            Some(h) => h.subscribe_from(0).0.into_iter().map(|l| (l.seq, l.stream, l.text)).collect(),
+            None => Vec::new(),
+        },
+    };
+    let done = match run.outcome.as_str() {
+        "killed" => SubscribeEvent::Done { outcome: "killed", exit_code: None },
+        _ => SubscribeEvent::Done { outcome: "exited", exit_code: run.exit_code },
+    };
+    let mut chunks: Vec<io::Result<Bytes>> = lines
+        .into_iter()
+        .filter(|(seq, _, _)| *seq >= query.since_seq)
+        .map(|(seq, stream, text)| Ok(subscribe_ndjson_line(&SubscribeEvent::Line { seq, stream, text })))
+        .collect();
+    chunks.push(Ok(subscribe_ndjson_line(&done)));
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, "application/x-ndjson")
+        .body(Body::from_stream(futures_util::stream::iter(chunks)))
+        .unwrap())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunHistoryQuery {
+    node_id: String,
+    block: String,
+}
+
+/// `GET /api/run/history?nodeId=..&block=..` — the finished runs of one
+/// address the session database still holds (see `[session]
+/// max_runs_per_block`), newest first: id, outcome, exit code, start/end
+/// time, and whether each is `stale` (its block or a dependency, or a
+/// variable value it used, changed since; or the session was reset). Feed an
+/// `id` back as `runId` to `/api/run/subscribe` to replay that run's output.
+async fn get_run_history(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<RunHistoryQuery>,
+) -> Result<Json<Vec<run_ledger::RunSummary>>, ApiError> {
+    let addr = meshfox_core::BlockAddr::new(&query.node_id, &query.block);
+    let current = current_run_fingerprint(&state, &addr);
+    state
+        .run_ledger
+        .history(&query.node_id, &query.block, current.as_deref())
+        .map(Json)
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
 async fn subscribe_run_impl(
     state: Arc<AppState>,
     query: SubscribeRunQuery,
 ) -> Result<Response, ApiError> {
     let key = (query.node_id.clone(), query.block.clone());
-    let Some(handle) = state.runs_registry.lock().unwrap().get(&key).cloned() else {
-        return Err(ApiError(
-            StatusCode::NOT_FOUND,
-            format!("no run for {:?}/{:?}", query.node_id, query.block),
-        ));
+    let registered = state.runs_registry.lock().unwrap().get(&key).cloned();
+    // A run in flight is served live from its handle. Anything finished —
+    // a run from before a restart, or one that ended since — is served from
+    // the ledger instead, which is the one place that knows whether it is
+    // still current (see `serve_stored_run`).
+    let handle = match registered {
+        Some(h) if query.run_id.is_none() && matches!(h.outcome(), run_registry::RunOutcome::Running) => h,
+        finished => return serve_stored_run(&state, &query, finished),
     };
 
     let stream = async_stream::stream! {
@@ -7583,16 +7839,36 @@ async fn subscribe_run_impl(
 }
 
 /// Forgets every block's session-freshness record (`AppState::session_runs`)
-/// — the next "⛓ run chain" re-runs every pulled-in dependency for real
-/// instead of skipping whichever ones still look unchanged since their last
-/// run this session. Purely in-memory bookkeeping, so this never touches
-/// the canvas file itself or any persisted `<!-- meshfox:output ... -->`
-/// cache (`crate::output`/a block's own `cache` flag) — those are a
-/// separate, deliberately-persisted mechanism, not what "session" refers
-/// to here. See TODO.canvas.md: "Сброс сессии".
+/// and submitted `form` values — the next "⛓ run chain" re-runs every
+/// pulled-in dependency for real instead of skipping whichever ones still
+/// look unchanged since their last run. Both are wiped from the session
+/// database too. Finished runs are not deleted, only marked stale
+/// (`RunLedger::mark_finished_runs_stale` — the whole run: exit code, timing
+/// and output) and dropped from `runs_registry`, so `subscribe_run` stops
+/// serving them while they stay as run history. Never touches the canvas
+/// file itself or any persisted `<!-- meshfox:output ... -->` cache
+/// (`crate::output`/a block's own `cache` flag) — a separate,
+/// deliberately-persisted mechanism, not what "session" refers to here. See
+/// TODO.canvas.md: "Сброс сессии".
 async fn reset_session(State(state): State<Arc<AppState>>) -> StatusCode {
     state.session_runs.lock().unwrap().clear();
     state.session_vars.lock().unwrap().clear();
+    if let Err(e) = state.session_store.clear() {
+        eprintln!("meshfox: failed to clear the persisted session state ({e})");
+    }
+    // What finished runs did and printed no longer describes the current
+    // state: hide them from `subscribe_run` (the in-memory handle of a
+    // finished run and, after a restart, the stored copy), while the rows
+    // stay as run history. A run still in flight keeps its handle and is
+    // stored fresh when it ends.
+    state
+        .runs_registry
+        .lock()
+        .unwrap()
+        .retain(|_, h| matches!(h.outcome(), run_registry::RunOutcome::Running));
+    if let Err(e) = state.run_ledger.mark_finished_runs_stale() {
+        eprintln!("meshfox: failed to mark finished runs stale ({e})");
+    }
     StatusCode::NO_CONTENT
 }
 
@@ -7907,7 +8183,33 @@ async fn build_state(
     // own graceful-shutdown path (killed outright, or the host itself went
     // down); see `run_ledger::RunLedger::reconcile_startup`'s own doc
     // comment for why a live one is surfaced rather than silently resolved.
-    let run_ledger = run_ledger::RunLedger::from_connection(session_conn)?;
+    let config_root = canvas_path
+        .canonicalize()
+        .unwrap_or_else(|_| canvas_path.clone())
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let max_output_bytes = meshfox_core::config::session_max_output_bytes(&config_root);
+    let session_store = session_state::SessionStore::from_connection(Arc::clone(&session_conn), max_output_bytes)?;
+    let session_runs: HashMap<_, _> = session_store
+        .load_runs()?
+        .into_iter()
+        .map(|r| {
+            (
+                (r.node_id, r.block),
+                SessionRun {
+                    fingerprint: r.fingerprint,
+                    produced_vars: r.produced_vars,
+                    output: r.output,
+                    duration_ms: r.duration_ms,
+                },
+            )
+        })
+        .collect();
+    let session_vars = session_store.load_vars()?;
+    let run_ledger = run_ledger::RunLedger::from_connection(session_conn)?
+        .with_max_output_bytes(max_output_bytes)
+        .with_max_runs_per_block(meshfox_core::config::session_max_runs_per_block(&config_root));
     match run_ledger.reconcile_startup() {
         Ok(orphaned) if !orphaned.is_empty() => {
             eprintln!(
@@ -7941,8 +8243,9 @@ async fn build_state(
         run_ledger,
         auto_exit,
         link_preview_cache: link_preview::PreviewCache::new(),
-        session_runs: Mutex::new(HashMap::new()),
-        session_vars: Mutex::new(HashMap::new()),
+        session_runs: Mutex::new(session_runs),
+        session_store,
+        session_vars: Mutex::new(session_vars),
         services: Mutex::new(HashMap::new()),
         runs_registry: Mutex::new(HashMap::new()),
         tty_registry: Mutex::new(HashMap::new()),
@@ -7987,6 +8290,7 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/form/fields", get(get_form_fields))
         .route("/api/form/submit", post(submit_form))
         .route("/api/run/subscribe", get(subscribe_run))
+        .route("/api/run/history", get(get_run_history))
         .route("/api/run/tty", get(run_block_tty))
         .route("/api/run/tty/attach", get(attach_tty))
         .route("/api/kill", post(kill_run))
@@ -11231,6 +11535,98 @@ mod session_skip_tests {
             }
         }
         events
+    }
+
+    async fn ws_messages(url: String) -> Vec<serde_json::Value> {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+        let mut out = Vec::new();
+        while let Some(msg) = ws.next().await {
+            match msg.expect("no ws error") {
+                WsMessage::Text(t) => out.push(serde_json::from_str(&t).expect("valid JSON")),
+                WsMessage::Close(_) => break,
+                _ => continue,
+            }
+        }
+        out
+    }
+
+    async fn active_runs(addr: SocketAddr) -> Vec<serde_json::Value> {
+        let (status, body) = request(addr, "GET", "/api/runs", "application/json", "").await;
+        assert_eq!(status, 200);
+        serde_json::from_str(&body).expect("valid /api/runs JSON")
+    }
+
+    fn entry<'a>(runs: &'a [serde_json::Value], block: &str) -> Option<&'a serde_json::Value> {
+        runs.iter().find(|r| r["block"] == block)
+    }
+
+    #[tokio::test]
+    async fn a_restarted_core_still_skips_an_unchanged_dependency() {
+        let path = write_dep_chain_canvas("echo dep-ran");
+        let first_core = spawn_test_server(path.clone()).await;
+        assert!(really_ran(&run_target(first_core).await, "dep"));
+
+        // A second core on the same canvas file starts with empty memory —
+        // only the session database carries over.
+        let second_core = spawn_test_server(path.clone()).await;
+        let events = run_target(second_core).await;
+        assert!(skipped_for(&events, "dep"), "expected dep to stay fresh across a restart: {events:?}");
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_restarted_core_offers_the_last_runs_and_replays_their_output() {
+        let path = write_dep_chain_canvas("echo dep-ran");
+        let first_core = spawn_test_server(path.clone()).await;
+        run_target(first_core).await;
+
+        let restarted = spawn_test_server(path.clone()).await;
+        let runs = active_runs(restarted).await;
+        let target = entry(&runs, "target").unwrap_or_else(|| panic!("target missing from {runs:?}"));
+        assert_eq!((target["status"].as_str(), target["exitCode"].as_i64()), (Some("exited"), Some(0)));
+        assert!(entry(&runs, "dep").is_some(), "the dependency's run is current too: {runs:?}");
+
+        let events = ws_messages(format!("ws://{restarted}/api/run/subscribe?nodeId=root&block=target")).await;
+        assert!(
+            events.iter().any(|e| e["type"] == "line" && e["text"] == "target-ran"),
+            "expected the stored output to be replayed: {events:?}"
+        );
+        assert_eq!(events.last().map(|e| e["type"].clone()), Some(serde_json::json!("done")));
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn editing_a_dependency_hides_the_runs_that_depended_on_it() {
+        let path = write_dep_chain_canvas("echo dep-ran");
+        let first_core = spawn_test_server(path.clone()).await;
+        run_target(first_core).await;
+
+        // Same document, but the dependency's code changed (a `cache`
+        // block's own persisted output aside, which the run wrote back).
+        let edited = std::fs::read_to_string(&path).unwrap().replace("echo dep-ran", "echo dep-changed");
+        std::fs::write(&path, edited).unwrap();
+
+        let restarted = spawn_test_server(path.clone()).await;
+        let runs = active_runs(restarted).await;
+        assert!(entry(&runs, "dep").is_none(), "the edited block's own run is stale: {runs:?}");
+        assert!(
+            entry(&runs, "target").is_none(),
+            "a dependency changing must make the dependent's run stale too: {runs:?}"
+        );
+        // ...and its output isn't served as if it were current, but the run
+        // is still in the history, flagged.
+        let events = ws_messages(format!("ws://{restarted}/api/run/subscribe?nodeId=root&block=target")).await;
+        assert!(events.is_empty(), "a stale run must not be replayed as the latest one: {events:?}");
+        let (_, body) = request(restarted, "GET", "/api/run/history?nodeId=root&block=target", "application/json", "").await;
+        let history: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0]["stale"], true);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[tokio::test]

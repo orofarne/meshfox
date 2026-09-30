@@ -210,6 +210,10 @@ const MCP_LIVE_FIREFOX_PORT = 4620;
 // and firefox never fight over genuinely divergent state even if a given
 // local run happens to interleave them.
 const UNDO_REDO_PORT = 4621;
+// Server + port for run-history.spec.ts — same reasoning again, its own
+// fixture (run-history.canvas.md) and port, so its runs and its rewrite of
+// the block's code never collide with any other suite's server/canvas.
+const RUN_HISTORY_PORT = 4622;
 const MCP_LIVE_DIRS = Object.fromEntries(
   (["chrome", "firefox"] as const).map((browser) => {
     const dir = path.join(os.tmpdir(), `meshfox-e2e-mcp-live-${browser}-fixture`);
@@ -324,6 +328,11 @@ export default defineConfig({
       name: `${browser}-default-fold`,
       testMatch: /(^|\/)default-fold\.spec\.ts$/,
       use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${DEFAULT_FOLD_PORT}` },
+    },
+    {
+      name: `${browser}-run-history`,
+      testMatch: /(^|\/)run-history\.spec\.ts$/,
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${RUN_HISTORY_PORT}` },
     },
     {
       name: `${browser}-quick-run`,
@@ -503,6 +512,12 @@ export default defineConfig({
     {
       command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/quick-run.canvas.md --port ${QUICK_RUN_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${QUICK_RUN_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/run-history.canvas.md --port ${RUN_HISTORY_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${RUN_HISTORY_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },

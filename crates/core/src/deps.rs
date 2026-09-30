@@ -301,12 +301,16 @@ pub fn compute_forced_reruns(
         // Forward cascade: `chain` is topologically sorted (dependencies
         // before dependents), so every direct dependency has already been
         // decided by the time we reach `addr` — if any of them is forced,
-        // `addr` is too, regardless of its own fingerprint.
+        // `addr` is too, regardless of its own fingerprint. A dependency
+        // whose *content* changed no longer needs this to reach `addr`
+        // (the closure fingerprint below already differs); what only this
+        // covers is a rerun no fingerprint can see — an `always` dependency,
+        // a `!` edge, or the requested target itself running.
         let cascaded = direct_deps(&addr.node_id, &block, &decls)
             .iter()
             .any(|dep| forced.contains(dep));
         let live_fingerprint =
-            crate::fence::session_fingerprint(&block, &fingerprint_vars(&block, &sim_computed));
+            closure_fingerprint_with(canvas, &decls, addr, &fingerprint_vars(&block, &sim_computed))?;
         let cached = cached_run(addr);
         let run_for_real = Some(addr) == target
             || block.always
@@ -338,6 +342,82 @@ pub fn compute_forced_reruns(
     }
 
     Ok(forced)
+}
+
+/// Fingerprint of `target` *and everything it depends on* — the one
+/// fingerprint that answers "is a result recorded for this block still
+/// valid?", both for skipping an already-run dependency
+/// (`compute_forced_reruns`, the server's per-step check) and for deciding
+/// whether a stored run still describes the document (`meshfox-server`'s
+/// run history). Built from [`crate::fence::session_fingerprint`] of the
+/// block itself (its own code, interpreter, `env=`/`deps=` references, and
+/// the values in `values` of the variables it references) folded with the
+/// closure fingerprints of its direct dependencies (`deps=` plus implicit
+/// `from=` sources), recursively — so editing a dependency's code, or a
+/// variable value a dependency references, changes the fingerprint of every
+/// block above it, which a block's own fingerprint doesn't (it only names
+/// its `deps=`, not their content).
+///
+/// `values` is the map of variable values to fold in (only the names a
+/// block references are read). The caller decides which belong: the per-step
+/// skip check passes everything resolved for this run, secrets included; a
+/// stored run's fingerprint is better computed only from values that can be
+/// reproduced later, so it doesn't look stale the moment it ends.
+///
+/// `fingerprint`/`session_fingerprint` underneath stay as they are —
+/// `fingerprint` is mirrored byte-for-byte in the web UI and embedded in
+/// on-disk output markers. What *doesn't* fold in here is a rerun forced by
+/// something a fingerprint can't see (`always`, a `!` edge): that stays
+/// `compute_forced_reruns`'s cascade.
+pub fn closure_fingerprint(
+    canvas: &Canvas,
+    target: &BlockAddr,
+    values: &HashMap<String, String>,
+) -> Result<String, DepsError> {
+    let decls = crate::vars::declared_vars(canvas)?;
+    closure_fingerprint_with(canvas, &decls, target, values)
+}
+
+/// [`closure_fingerprint`] for a caller that already has the canvas's
+/// variable declarations (`crate::vars::declared_vars`).
+pub fn closure_fingerprint_with(
+    canvas: &Canvas,
+    decls: &[VarDecl],
+    target: &BlockAddr,
+    values: &HashMap<String, String>,
+) -> Result<String, DepsError> {
+    fn go(
+        canvas: &Canvas,
+        decls: &[VarDecl],
+        addr: &BlockAddr,
+        values: &HashMap<String, String>,
+        memo: &mut HashMap<String, String>,
+        stack: &mut Vec<BlockAddr>,
+    ) -> Result<String, DepsError> {
+        let key = addr.key();
+        if let Some(done) = memo.get(&key) {
+            return Ok(done.clone());
+        }
+        if let Some(pos) = stack.iter().position(|a| a.key() == key) {
+            let mut cycle = stack[pos..].to_vec();
+            cycle.push(addr.clone());
+            return Err(DepsError::Cycle(cycle));
+        }
+        let block = find_block(canvas, addr)?;
+        let mut deps = direct_deps(&addr.node_id, &block, decls);
+        deps.sort_by_key(BlockAddr::key);
+        deps.dedup();
+        stack.push(addr.clone());
+        let mut parts = vec![key.clone(), crate::fence::session_fingerprint(&block, values)];
+        for dep in &deps {
+            parts.push(go(canvas, decls, dep, values, memo, stack)?);
+        }
+        stack.pop();
+        let fp = crate::fence::combine_fingerprints(parts);
+        memo.insert(key, fp.clone());
+        Ok(fp)
+    }
+    go(canvas, decls, target, values, &mut HashMap::new(), &mut Vec::new())
 }
 
 /// Validates every `deps=` reference in the whole canvas resolves to a real
@@ -454,6 +534,25 @@ mod tests {
 
     fn canvas(md: &str) -> Canvas {
         Canvas::from_markdown(md).unwrap()
+    }
+
+    #[test]
+    fn closure_fingerprint_changes_when_a_dependency_or_a_referenced_value_does() {
+        let doc = |dep_code: &str| {
+            format!(
+                "# P\n\n## T\n<!-- meshfox:node id=\"t\" -->\n\n```bash name=\"build\"\n{dep_code}\n```\n\n```bash name=\"test\" deps=\"build\" env=\"$X\"\necho test\n```\n"
+            )
+        };
+        let addr = BlockAddr::new("t", "test");
+        let fp = |d: &str, x: &str| {
+            let canvas = Canvas::from_markdown(&doc(d)).unwrap();
+            let values = HashMap::from([("X".to_string(), x.to_string())]);
+            closure_fingerprint(&canvas, &addr, &values).unwrap()
+        };
+        let base = fp("echo a", "1");
+        assert_eq!(base, fp("echo a", "1"));
+        assert_ne!(base, fp("echo b", "1"), "a dependency's code must count");
+        assert_ne!(base, fp("echo a", "2"), "a referenced variable's value must count");
     }
 
     #[test]
@@ -973,8 +1072,7 @@ mod tests {
         let vars = HashMap::new();
         let mut cached: HashMap<BlockAddr, (String, HashMap<String, String>)> = HashMap::new();
         for addr in &chain {
-            let block = find_block(&c, addr).unwrap();
-            let fp = crate::fence::session_fingerprint(&block, &vars);
+            let fp = closure_fingerprint(&c, addr, &vars).unwrap();
             cached.insert(addr.clone(), (fp, HashMap::new()));
         }
         let forced = compute_forced_reruns(
@@ -1001,8 +1099,7 @@ mod tests {
         let chain = resolve_chain(&c, BlockAddr::new("root", "validate")).unwrap();
         let vars = HashMap::new();
         let migrate_addr = BlockAddr::new("root", "migrate");
-        let migrate_block = find_block(&c, &migrate_addr).unwrap();
-        let migrate_fp = crate::fence::session_fingerprint(&migrate_block, &vars);
+        let migrate_fp = closure_fingerprint(&c, &migrate_addr, &vars).unwrap();
         let mut cached: HashMap<BlockAddr, (String, HashMap<String, String>)> = HashMap::new();
         cached.insert(migrate_addr.clone(), (migrate_fp, HashMap::new()));
         // No entry for `load` at all — never run this session yet.
@@ -1042,8 +1139,7 @@ mod tests {
         let vars = HashMap::new();
         let mut cached: HashMap<BlockAddr, (String, HashMap<String, String>)> = HashMap::new();
         for addr in &chain {
-            let block = find_block(&c, addr).unwrap();
-            let fp = crate::fence::session_fingerprint(&block, &vars);
+            let fp = closure_fingerprint(&c, addr, &vars).unwrap();
             cached.insert(addr.clone(), (fp, HashMap::new()));
         }
         let forced = compute_forced_reruns(
@@ -1078,8 +1174,7 @@ mod tests {
         let vars = HashMap::new();
         let mut cached: HashMap<BlockAddr, (String, HashMap<String, String>)> = HashMap::new();
         for addr in &chain {
-            let block = find_block(&c, addr).unwrap();
-            let fp = crate::fence::session_fingerprint(&block, &vars);
+            let fp = closure_fingerprint(&c, addr, &vars).unwrap();
             cached.insert(addr.clone(), (fp, HashMap::new()));
         }
         let forced = compute_forced_reruns(
@@ -1116,8 +1211,7 @@ mod tests {
         vars.insert("X".to_string(), "abc".to_string());
         let mut cached: HashMap<BlockAddr, (String, HashMap<String, String>)> = HashMap::new();
         for addr in &chain {
-            let block = find_block(&c, addr).unwrap();
-            let fp = crate::fence::session_fingerprint(&block, &vars);
+            let fp = closure_fingerprint(&c, addr, &vars).unwrap();
             cached.insert(addr.clone(), (fp, HashMap::new()));
         }
         let forced = compute_forced_reruns(
