@@ -1521,14 +1521,35 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
                 Some(meshfox_core::SharedOrigin::Global { .. }) => " [global]",
                 None => "",
             };
+            // A `secret` field's "save" toggle (Ctrl-S), labelled by where
+            // it would go (`secret_store`), and — if the store couldn't be
+            // read — why the field is being asked for again.
+            let save_tag = if decl.secret {
+                let label = if vf.secret_store == "keychain" {
+                    "keychain"
+                } else {
+                    "plaintext"
+                };
+                format!(" [{}] save→{label}", if vf.save[i] { "x" } else { " " })
+            } else {
+                String::new()
+            };
+            let error_tag = vf.errors[i]
+                .as_ref()
+                .map(|e| format!(" ⚠ {e}"))
+                .unwrap_or_default();
             let prefix = format!("{}{origin_tag}: ", decl.prompt);
-            let value_budget = (inner.width as usize).saturating_sub(prefix.chars().count());
-            let value = tail_fit(&value, value_budget);
+            let value_budget = (inner.width as usize).saturating_sub(
+                prefix.chars().count() + save_tag.chars().count() + error_tag.chars().count(),
+            );
+            let value = tail_fit(&value, value_budget.max(8));
             ListItem::new(Line::from(vec![
                 Span::raw(decl.prompt.clone()),
                 Span::styled(origin_tag, Style::default().fg(Color::DarkGray)),
                 Span::raw(": "),
                 Span::styled(value, Style::default().fg(Color::LightGreen)),
+                Span::styled(save_tag, Style::default().fg(Color::DarkGray)),
+                Span::styled(error_tag, Style::default().fg(Color::Red)),
             ]))
         })
         .collect();
@@ -1539,9 +1560,9 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
     f.render_stateful_widget(list, rows[0], &mut state);
 
     let esc_hint = if vf.configuring {
-        "↑/↓/tab field · ←/→ toggle/cycle · enter save all · esc cancel configure"
+        "↑/↓/tab field · ←/→ toggle/cycle · ^s save secret · enter save all · esc cancel configure"
     } else {
-        "↑/↓/tab field · ←/→ toggle/cycle · enter confirm all · esc cancel run"
+        "↑/↓/tab field · ←/→ toggle/cycle · ^s save secret · enter confirm all · esc cancel run"
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -3074,6 +3095,23 @@ mod tests {
     fn strip_ansi_removes_color_codes_and_carriage_returns_but_keeps_text() {
         assert_eq!(strip_ansi("\u{1b}[1;32mok\u{1b}[0m done\r"), "ok done");
         assert_eq!(strip_ansi("plain"), "plain");
+    }
+
+    #[tokio::test]
+    async fn render_var_form_labels_the_secret_save_toggle_and_shows_a_store_error() {
+        let statuses: Vec<crate::worker_client::VarStatus> = serde_json::from_value(serde_json::json!([
+            {"name": "TOKEN", "type": "string", "prompt": "TOKEN", "secret": true, "resolved": false,
+             "secretStore": "keychain", "secretError": "keychain is locked"}
+        ]))
+        .unwrap();
+        let mut vf = super::super::app::var_form_from_statuses_for_test(statuses);
+        let area = Rect::new(0, 0, 100, 12);
+        let screen = render_to_screen(area, |f| render_var_form(f, area, &vf));
+        assert!(screen.contains("[ ] save→keychain"), "{screen}");
+        assert!(screen.contains("keychain is locked"), "{screen}");
+        vf.save[0] = true;
+        let screen = render_to_screen(area, |f| render_var_form(f, area, &vf));
+        assert!(screen.contains("[x] save→keychain"), "{screen}");
     }
 
     #[tokio::test]

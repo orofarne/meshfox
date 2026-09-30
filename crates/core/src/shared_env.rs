@@ -37,8 +37,35 @@ pub struct SharedVar {
     pub origin: SharedOrigin,
 }
 
-/// name -> resolved shared value, for one `canvas_root`.
-pub type SharedEnv = HashMap<String, SharedVar>;
+/// name -> resolved shared value, for one `canvas_root`, plus the reason any
+/// `secrets = [...]` entry couldn't be read from the secret store (locked
+/// keychain, access denied, ...). Derefs to the map, so `get`/`is_empty`
+/// work on it directly.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SharedEnv {
+    vars: HashMap<String, SharedVar>,
+    /// name -> error message, for a declared secret whose store read failed.
+    pub secret_errors: HashMap<String, String>,
+}
+
+impl SharedEnv {
+    pub fn new() -> SharedEnv {
+        SharedEnv::default()
+    }
+}
+
+impl std::ops::Deref for SharedEnv {
+    type Target = HashMap<String, SharedVar>;
+    fn deref(&self) -> &Self::Target {
+        &self.vars
+    }
+}
+
+impl std::ops::DerefMut for SharedEnv {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.vars
+    }
+}
 
 /// A section's own `path=` scoping, already resolved (see
 /// `resolve_scope_path`) — kept as three explicit states rather than a
@@ -69,6 +96,13 @@ struct EnvSection {
     raw_path: Option<String>,
     scope: Scope,
     vars: HashMap<String, String>,
+    /// Names listed in `secrets = [...]` — values live in the configured
+    /// secret store (`crate::secret_store`), never in the file. A `vars`
+    /// entry of the same name in the same section wins over the store.
+    secrets: Vec<String>,
+    /// Account scope for this section's secrets — see
+    /// `crate::secret_store::env_account`.
+    account_scope: String,
 }
 
 /// Loads and precedence-resolves global + local `[[env]]` sections for a
@@ -78,10 +112,14 @@ struct EnvSection {
 /// `~/.meshfox/config.toml` while a `meshfox tui`/`serve` is running takes
 /// effect on the very next resolution, no restart needed.
 pub fn load(canvas_root: &Path) -> SharedEnv {
-    load_from(
+    // A bad `secret_store` setting is reported loudly by `VarCache::load`;
+    // here it just means no store, i.e. `secrets = [...]` stay unset.
+    let backend = crate::secret_store::backend_for(canvas_root).ok().flatten();
+    load_from_with_store(
         crate::config::global_config_path().as_deref(),
         canvas_root,
         home_dir().as_deref(),
+        backend.as_deref(),
     )
 }
 
@@ -90,7 +128,17 @@ pub fn load(canvas_root: &Path) -> SharedEnv {
 /// itself — split out so a test can exercise a specific global-
 /// config/`$HOME` combination without depending on the developer's own
 /// machine (same reasoning as `config::load_from`'s own doc comment).
+#[cfg(test)]
 fn load_from(global_path: Option<&Path>, canvas_root: &Path, home: Option<&Path>) -> SharedEnv {
+    load_from_with_store(global_path, canvas_root, home, None)
+}
+
+fn load_from_with_store(
+    global_path: Option<&Path>,
+    canvas_root: &Path,
+    home: Option<&Path>,
+    store: Option<&dyn crate::secret_store::SecretBackend>,
+) -> SharedEnv {
     let global_table = global_path
         .map(crate::config::read_table)
         .unwrap_or_default();
@@ -99,23 +147,31 @@ fn load_from(global_path: Option<&Path>, canvas_root: &Path, home: Option<&Path>
     // The global tier's own relative (non-`~`) paths have no anchor other
     // than `$HOME` — there's no "directory the file lives in" to resolve
     // against the way the local tier has `canvas_root`.
-    let global_sections = parse_env_sections(&global_table, home, home);
-    let local_sections = parse_env_sections(&local_table, home, Some(canvas_root));
+    let global_sections = parse_env_sections(&global_table, home, home, None);
+    let local_sections = parse_env_sections(&local_table, home, Some(canvas_root), Some(canvas_root));
 
     let normalized_root = normalize(canvas_root);
 
-    let mut out: SharedEnv = HashMap::new();
+    let mut out = SharedEnv::new();
     // Global tier first — the local tier is applied second so it
     // unconditionally overlays the global result regardless of
     // specificity: a project's own config always wins over whatever's in
     // the user's global registry, the same "override" escape hatch the
     // per-document cache already provides on top of both.
-    apply_tier(&global_sections, &normalized_root, &mut out, |raw_path| {
-        SharedOrigin::Global { path: raw_path }
-    });
-    apply_tier(&local_sections, &normalized_root, &mut out, |_raw_path| {
-        SharedOrigin::Project
-    });
+    apply_tier(
+        &global_sections,
+        &normalized_root,
+        &mut out,
+        store,
+        |raw_path| SharedOrigin::Global { path: raw_path },
+    );
+    apply_tier(
+        &local_sections,
+        &normalized_root,
+        &mut out,
+        store,
+        |_raw_path| SharedOrigin::Project,
+    );
     out
 }
 
@@ -129,6 +185,7 @@ fn apply_tier(
     sections: &[EnvSection],
     normalized_root: &Path,
     out: &mut SharedEnv,
+    store: Option<&dyn crate::secret_store::SecretBackend>,
     origin_for: impl Fn(Option<String>) -> SharedOrigin,
 ) {
     // (specificity, section index) chosen so far, per variable name.
@@ -140,7 +197,7 @@ fn apply_tier(
         let Some(specificity) = matching_specificity(section, normalized_root) else {
             continue;
         };
-        for name in section.vars.keys() {
+        for name in section.vars.keys().chain(section.secrets.iter()) {
             let candidate = (specificity, idx);
             match winners.get(name.as_str()) {
                 Some(&current) if current >= candidate => {}
@@ -152,11 +209,25 @@ fn apply_tier(
     }
     for (name, (_, idx)) in winners {
         let section = &sections[idx];
-        if let Some(value) = section.vars.get(name) {
+        // An explicit `vars` value beats the secret store.
+        let value = match section.vars.get(name) {
+            Some(value) => Some(value.clone()),
+            None => store.and_then(|store| {
+                let account = crate::secret_store::env_account(&section.account_scope, name);
+                match store.get(&account) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        out.secret_errors.insert(name.to_string(), e.to_string());
+                        None
+                    }
+                }
+            }),
+        };
+        if let Some(value) = value {
             out.insert(
                 name.to_string(),
                 SharedVar {
-                    value: value.clone(),
+                    value,
                     origin: origin_for(section.raw_path.clone()),
                 },
             );
@@ -216,6 +287,22 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
+/// Account scope (see `crate::secret_store::env_account`) for `secrets`
+/// declared in `<canvas_root>/.meshfox/config.toml`.
+pub fn project_account_scope(canvas_root: &Path) -> String {
+    format!("project:{}", normalize(canvas_root).display())
+}
+
+/// Account scope for `secrets` declared in `~/.meshfox/config.toml`, in the
+/// section whose `path=` reads `raw_path` (exactly as written; `None` for
+/// an unscoped section).
+pub fn global_account_scope(raw_path: Option<&str>) -> String {
+    match raw_path {
+        Some(raw) => format!("global:{raw}"),
+        None => "global".to_string(),
+    }
+}
+
 /// Reads `table["env"]` as a list of `[[env]]` sections, resolving each
 /// one's `path=` (if any — a single string, or an array of strings, see
 /// `Scope::Paths`) against `home`/`relative_base` (see
@@ -232,6 +319,7 @@ fn parse_env_sections(
     table: &toml::Table,
     home: Option<&Path>,
     relative_base: Option<&Path>,
+    project_root: Option<&Path>,
 ) -> Vec<EnvSection> {
     let Some(toml::Value::Array(entries)) = table.get("env") else {
         return Vec::new();
@@ -248,10 +336,26 @@ fn parse_env_sections(
                 .and_then(|v| v.as_table())
                 .map(flatten_vars)
                 .unwrap_or_default();
+            let secrets = entry
+                .get("secrets")
+                .and_then(|v| v.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let account_scope = match project_root {
+                Some(root) => project_account_scope(root),
+                None => global_account_scope(raw_path.as_deref()),
+            };
             Some(EnvSection {
                 raw_path,
                 scope,
                 vars,
+                secrets,
+                account_scope,
             })
         })
         .collect()
@@ -584,5 +688,75 @@ mod tests {
             shared.get("DB_URL").map(|v| v.value.as_str()),
             Some("shared")
         );
+    }
+
+    #[test]
+    fn a_secrets_entry_is_read_from_the_store_under_its_sections_scope() {
+        use crate::secret_store::{env_account, MemoryBackend, SecretBackend};
+        let home = tempdir("home-secrets");
+        let root = tempdir("project-secrets");
+        let global = home.join(".meshfox").join("config.toml");
+        write(&global, "[[env]]\nvars = { DB_URL = \"u\" }\nsecrets = [\"DB_PASSWORD\", \"UNSET\"]\n");
+
+        let store = MemoryBackend::new();
+        store.set(&env_account("global", "DB_PASSWORD"), "hunter2").unwrap();
+
+        let shared = load_from_with_store(Some(&global), &root, Some(&home), Some(&store));
+        let pw = shared.get("DB_PASSWORD").expect("secret resolved");
+        assert_eq!(pw.value, "hunter2");
+        assert_eq!(pw.origin, SharedOrigin::Global { path: None });
+        assert_eq!(shared.get("UNSET"), None);
+        assert_eq!(shared.get("DB_URL").map(|v| v.value.as_str()), Some("u"));
+
+        // No store configured: the name is declared but stays unset.
+        let shared = load_from(Some(&global), &root, Some(&home));
+        assert_eq!(shared.get("DB_PASSWORD"), None);
+    }
+
+    #[test]
+    fn an_explicit_vars_value_beats_the_store_in_the_same_section() {
+        use crate::secret_store::{env_account, MemoryBackend, SecretBackend};
+        let home = tempdir("home-secrets-explicit");
+        let root = tempdir("project-secrets-explicit");
+        let global = home.join(".meshfox").join("config.toml");
+        write(&global, "[[env]]\nvars = { TOKEN = \"by-hand\" }\nsecrets = [\"TOKEN\"]\n");
+        let store = MemoryBackend::new();
+        store.set(&env_account("global", "TOKEN"), "from-store").unwrap();
+
+        let shared = load_from_with_store(Some(&global), &root, Some(&home), Some(&store));
+        assert_eq!(shared.get("TOKEN").map(|v| v.value.as_str()), Some("by-hand"));
+    }
+
+    #[test]
+    fn a_project_secret_is_scoped_to_its_canvas_root_and_beats_global() {
+        use crate::secret_store::{env_account, MemoryBackend, SecretBackend};
+        let home = tempdir("home-secrets-project");
+        let root = tempdir("project-secrets-project");
+        let global = home.join(".meshfox").join("config.toml");
+        write(&global, "[[env]]\nvars = { TOKEN = \"global\" }\n");
+        write(&root.join(".meshfox").join("config.toml"), "[[env]]\nsecrets = [\"TOKEN\"]\n");
+        let store = MemoryBackend::new();
+        let scope = project_account_scope(&root);
+        store.set(&env_account(&scope, "TOKEN"), "project-secret").unwrap();
+
+        let shared = load_from_with_store(Some(&global), &root, Some(&home), Some(&store));
+        let v = shared.get("TOKEN").unwrap();
+        assert_eq!(v.value, "project-secret");
+        assert_eq!(v.origin, SharedOrigin::Project);
+    }
+
+    #[test]
+    fn a_scoped_global_secret_uses_its_raw_path_in_the_account() {
+        use crate::secret_store::{env_account, MemoryBackend, SecretBackend};
+        let home = tempdir("home-secrets-scoped");
+        let project_a = home.join("work").join("projectA");
+        std::fs::create_dir_all(&project_a).unwrap();
+        let global = home.join(".meshfox").join("config.toml");
+        write(&global, "[[env]]\npath = \"~/work/projectA\"\nsecrets = [\"TOKEN\"]\n");
+        let store = MemoryBackend::new();
+        store.set(&env_account("global:~/work/projectA", "TOKEN"), "scoped").unwrap();
+
+        let shared = load_from_with_store(Some(&global), &project_a, Some(&home), Some(&store));
+        assert_eq!(shared.get("TOKEN").map(|v| v.value.as_str()), Some("scoped"));
     }
 }

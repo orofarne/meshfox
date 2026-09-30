@@ -888,6 +888,13 @@ pub struct VarStatus {
     pub value: Option<String>,
     #[serde(default)]
     pub inherited_from: Option<VarOrigin>,
+    /// `"plaintext"` or `"keychain"` for a `secret` field — where saving it
+    /// would put the value.
+    #[serde(default)]
+    pub secret_store: Option<String>,
+    /// Why the secret store couldn't be read for this field, if it failed.
+    #[serde(default)]
+    pub secret_error: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

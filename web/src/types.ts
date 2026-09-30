@@ -192,4 +192,10 @@ export interface VarStatus {
    * rather than entered for this document — the UI shows this as a badge
    * next to the field; typing a value still overrides it normally. */
   inheritedFrom?: VarOrigin;
+  /** For a `secret` field: where ticking "save" puts the value, per the
+   * `secret_store` setting — labels the checkbox. */
+  secretStore?: "plaintext" | "keychain";
+  /** Why the secret store couldn't be read for this field (locked keychain,
+   * access denied, ...) — it's asked for again; this says why. */
+  secretError?: string;
 }

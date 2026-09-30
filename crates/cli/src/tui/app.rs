@@ -93,6 +93,16 @@ pub struct VarFormState {
     /// to the document cache like any other answer, which is the override.
     pub origins: Vec<Option<meshfox_core::SharedOrigin>>,
     pub selected: usize,
+    /// Parallel to `decls` — which `secret` fields have "save" ticked
+    /// (`Ctrl-S`): the worker then persists that answer to the configured
+    /// secret store (or, for `plaintext`, the on-disk cache) instead of
+    /// asking again next time. Always `false` for a non-secret field.
+    pub save: Vec<bool>,
+    /// Parallel to `decls` — why the secret store couldn't be read for a
+    /// field (locked keychain, access denied, ...), shown next to it.
+    pub errors: Vec<Option<String>>,
+    /// `"plaintext"` or `"keychain"` — what "save" means here; labels it.
+    pub secret_store: String,
     /// `true` for a `c`-triggered walk of every declared (non-secret)
     /// variable (see `trigger_configure`), `false` for the ordinary
     /// "resolve whatever a run still needs" form (`advance_run`) — purely
@@ -905,7 +915,13 @@ fn var_form_from_statuses(missing: Vec<crate::worker_client::VarStatus>) -> VarF
     let mut decls = Vec::with_capacity(missing.len());
     let mut inputs = Vec::with_capacity(missing.len());
     let mut origins = Vec::with_capacity(missing.len());
+    let mut errors = Vec::with_capacity(missing.len());
+    let mut secret_store = "plaintext".to_string();
     for status in &missing {
+        errors.push(status.secret_error.clone());
+        if let Some(store) = &status.secret_store {
+            secret_store = store.clone();
+        }
         inputs.push(status.value.clone().unwrap_or_default());
         origins.push(status.inherited_from.clone().map(|o| match o {
             crate::worker_client::VarOrigin::Project => meshfox_core::SharedOrigin::Project,
@@ -916,12 +932,22 @@ fn var_form_from_statuses(missing: Vec<crate::worker_client::VarStatus>) -> VarF
         decls.push(var_decl_from_status(status));
     }
     VarFormState {
+        save: vec![false; decls.len()],
         decls,
         inputs,
         origins,
+        errors,
+        secret_store,
         selected: 0,
         configuring: false,
     }
+}
+
+#[cfg(test)]
+pub(super) fn var_form_from_statuses_for_test(
+    statuses: Vec<crate::worker_client::VarStatus>,
+) -> VarFormState {
+    var_form_from_statuses(statuses)
 }
 
 impl App {
@@ -1311,6 +1337,15 @@ impl App {
             }
             KeyCode::Left => self.cycle_var_form_field(-1),
             KeyCode::Right => self.cycle_var_form_field(1),
+            // Ctrl-S: toggle "save" on the focused `secret` field.
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(vf) = &mut self.var_form {
+                    let i = vf.selected;
+                    if vf.decls[i].secret {
+                        vf.save[i] = !vf.save[i];
+                    }
+                }
+            }
             KeyCode::Backspace => {
                 if let Some(vf) = &mut self.var_form {
                     let i = vf.selected;
@@ -3196,10 +3231,26 @@ impl App {
             }
         }
         if is_tty {
-            self.begin_http_tty_run(node_id, block_name, with_deps, port, extra_vars, force)
+            self.begin_http_tty_run(
+                node_id,
+                block_name,
+                with_deps,
+                port,
+                extra_vars,
+                std::collections::HashSet::new(),
+                force,
+            )
                 .await;
         } else {
-            self.begin_http_run(node_id, block_name, with_deps, port, extra_vars, force)
+            self.begin_http_run(
+                node_id,
+                block_name,
+                with_deps,
+                port,
+                extra_vars,
+                std::collections::HashSet::new(),
+                force,
+            )
                 .await;
         }
     }
@@ -3223,6 +3274,7 @@ impl App {
         with_deps: bool,
         port: u16,
         vars: HashMap<String, String>,
+        save_secrets: std::collections::HashSet<String>,
         force: Option<(String, String)>,
     ) {
         let path = self.path_to(&node_id);
@@ -3236,7 +3288,7 @@ impl App {
             &block_name,
             !with_deps,
             vars,
-            std::collections::HashSet::new(),
+            save_secrets,
             cols,
             rows,
             force,
@@ -3289,6 +3341,7 @@ impl App {
         with_deps: bool,
         port: u16,
         vars: HashMap<String, String>,
+        save_secrets: std::collections::HashSet<String>,
         force: Option<(String, String)>,
     ) {
         let path = self.path_to(&node_id);
@@ -3312,7 +3365,7 @@ impl App {
             &block_name,
             !with_deps,
             vars,
-            std::collections::HashSet::new(),
+            save_secrets,
             force,
         )
         .await
@@ -4122,6 +4175,7 @@ impl App {
                         retry.with_deps,
                         retry.port,
                         HashMap::new(),
+                        std::collections::HashSet::new(),
                         Some((retry.force_node_id, retry.force_block)),
                     ))
                     .await;
@@ -4132,6 +4186,7 @@ impl App {
                         retry.with_deps,
                         retry.port,
                         HashMap::new(),
+                        std::collections::HashSet::new(),
                         Some((retry.force_node_id, retry.force_block)),
                     ))
                     .await;
@@ -4827,6 +4882,13 @@ impl App {
                 .zip(vf.inputs.iter())
                 .map(|(d, v)| (d.name.clone(), v.clone()))
                 .collect();
+            let save_secrets: std::collections::HashSet<String> = vf
+                .decls
+                .iter()
+                .zip(vf.save.iter())
+                .filter(|(d, save)| d.secret && **save)
+                .map(|(d, _)| d.name.clone())
+                .collect();
             if pending.is_tty {
                 self.begin_http_tty_run(
                     pending.node_id,
@@ -4834,6 +4896,7 @@ impl App {
                     pending.with_deps,
                     pending.port,
                     vars,
+                    save_secrets,
                     pending.force,
                 )
                 .await;
@@ -4844,6 +4907,7 @@ impl App {
                     pending.with_deps,
                     pending.port,
                     vars,
+                    save_secrets,
                     pending.force,
                 )
                 .await;
@@ -4940,6 +5004,9 @@ impl App {
             .map(|d| initial_field_input(d, &self.var_cache, &shared))
             .unzip();
         self.var_form = Some(VarFormState {
+            save: vec![false; decls.len()],
+            errors: vec![None; decls.len()],
+            secret_store: self.var_cache.secret_store_kind().as_str().to_string(),
             decls,
             inputs,
             origins,
@@ -5341,6 +5408,52 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn secret_form_statuses() -> Vec<crate::worker_client::VarStatus> {
+        serde_json::from_value(serde_json::json!([
+            {"name": "USER", "type": "string", "prompt": "USER", "secret": false, "resolved": false},
+            {"name": "TOKEN", "type": "string", "prompt": "TOKEN", "secret": true, "resolved": false,
+             "secretStore": "keychain", "secretError": "keychain: locked"}
+        ]))
+        .unwrap()
+    }
+
+    #[test]
+    fn var_form_from_statuses_carries_the_store_label_and_read_errors() {
+        let vf = var_form_from_statuses(secret_form_statuses());
+        assert_eq!(vf.secret_store, "keychain");
+        assert_eq!(vf.errors, vec![None, Some("keychain: locked".to_string())]);
+        assert_eq!(vf.save, vec![false, false]);
+    }
+
+    #[tokio::test]
+    async fn ctrl_s_toggles_save_on_a_secret_field_only() {
+        let dir = std::env::temp_dir().join(format!("meshfox-tui-save-secret-test-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.md");
+        std::fs::write(
+            &path,
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
+        )
+        .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(path, tx, None, None).await.unwrap();
+        app.var_form = Some(var_form_from_statuses(secret_form_statuses()));
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+
+        // Field 0 (USER) isn't a secret: nothing to save, and the keypress
+        // isn't typed into it either.
+        app.on_var_form_key(ctrl_s).await;
+        let vf = app.var_form.as_ref().unwrap();
+        assert_eq!(vf.save, vec![false, false]);
+        assert_eq!(vf.inputs[0], "");
+
+        app.on_var_form_key(key(KeyCode::Down)).await;
+        app.on_var_form_key(ctrl_s).await;
+        assert_eq!(app.var_form.as_ref().unwrap().save, vec![false, true]);
+        app.on_var_form_key(ctrl_s).await;
+        assert_eq!(app.var_form.as_ref().unwrap().save, vec![false, false]);
     }
 
     #[tokio::test]

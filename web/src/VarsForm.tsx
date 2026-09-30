@@ -70,7 +70,7 @@ function initialValue(v: VarStatus): string {
  * submitted alongside the run request; the server persists whatever isn't
  * `secret` to the on-disk cache, so this only has to ask once per variable
  * (until the cache is cleared or a different value is needed) — a `secret`
- * field gets its own "save (plaintext)" checkbox instead (TODO.canvas.md:
+ * field gets its own "save (plaintext)" checkbox (or "save to keychain", per `secret_store`) instead (TODO.canvas.md:
  * "Галочка \"сохранить\" у secret"), off by default, for opting a specific
  * secret into that same on-disk persistence anyway; there's no encryption
  * yet, so checking it really does write the value out in plain text.
@@ -171,6 +171,11 @@ export function VarsForm({
               />
             )}
           </label>
+          {v.secretError && (
+            <p className="vars-modal-error" title={v.secretError}>
+              Couldn't read the saved value from the secret store: {v.secretError}
+            </p>
+          )}
           {v.secret && (
             <label className="vars-modal-secret-save">
               <input
@@ -178,9 +183,15 @@ export function VarsForm({
                 checked={saveSecret[v.name] ?? false}
                 onChange={(e) => setSaveSecret((prev) => ({ ...prev, [v.name]: e.target.checked }))}
               />
-              <span title="Not encrypted yet — written to the on-disk var cache in plain text.">
-                save (plaintext)
-              </span>
+              {v.secretStore === "keychain" ? (
+                <span title="Saved in the system keychain (secret_store = &quot;keychain&quot;).">
+                  save to keychain
+                </span>
+              ) : (
+                <span title="Not encrypted — written to the on-disk var cache in plain text.">
+                  save (plaintext)
+                </span>
+              )}
             </label>
           )}
           </div>

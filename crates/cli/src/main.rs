@@ -25,6 +25,7 @@ mod coordinator;
 mod mcp;
 mod pdf;
 mod prompt;
+mod secret_cmd;
 mod syntax_registry;
 mod tui;
 mod watcher;
@@ -136,6 +137,14 @@ enum Command {
     Configure {
         #[command(flatten)]
         canvas: CanvasOpt,
+    },
+    /// Manage values in the system secret store (`secret_store =
+    /// "keychain"` in `.meshfox/config.toml`; macOS only so far): `set`,
+    /// `show` (prints a value only with `--reveal`), `rm`. See SPEC.md's
+    /// "Secret store".
+    Secret {
+        #[command(subcommand)]
+        op: secret_cmd::SecretOp,
     },
     /// Create a new, empty canvas file: just the `meshfox:canvas` marker
     /// followed by a lone root heading (`#`) named after the file itself
@@ -1153,6 +1162,12 @@ fn main() {
             let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
             configure(&canvas_path)
         }
+        Command::Secret { op } => {
+            if let Err(e) = secret_cmd::run(op, find_canvas) {
+                eprintln!("meshfox secret: {e}");
+                std::process::exit(1);
+            }
+        }
         Command::Create {
             canvas,
             canvas_flag,
@@ -1493,6 +1508,24 @@ fn check_updates(yes: bool) {
     match result {
         Ok(self_update::Status::UpToDate(v)) => println!("meshfox: already up to date (v{v})"),
         Ok(self_update::Status::Updated(v)) => {
+            #[cfg(target_os = "macos")]
+            {
+                // Release tarballs can carry a linker-generated ad-hoc
+                // signature that AMFI rejects after replacing the executable.
+                // A fresh local signature makes the user's copy runnable.
+                let exe = std::env::current_exe().unwrap_or_else(|e| {
+                    eprintln!("meshfox check-updates: updated, but couldn't locate the binary to sign: {e}");
+                    std::process::exit(1);
+                });
+                let status = std::process::Command::new("codesign")
+                    .args(["--force", "-s", "-"])
+                    .arg(&exe)
+                    .status();
+                if !status.is_ok_and(|s| s.success()) {
+                    eprintln!("meshfox check-updates: updated, but re-signing {} failed", exe.display());
+                    std::process::exit(1);
+                }
+            }
             println!("meshfox: updated to v{v} — restart meshfox to use it")
         }
         Err(e) => {
@@ -3000,6 +3033,12 @@ async fn preflight_worker_vars(
         }
         if status.resolved {
             continue; // already resolvable server-side (cache/env/default) — nothing to override
+        }
+        if let Some(e) = &status.secret_error {
+            eprintln!(
+                "meshfox: couldn't read {} from the secret store: {e}",
+                status.name
+            );
         }
         if !prompt::stdin_is_tty() {
             missing.push(status.name.clone());

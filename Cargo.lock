@@ -3168,6 +3168,7 @@ dependencies = [
  "csv",
  "libc",
  "pulldown-cmark 0.12.2",
+ "security-framework",
  "serde",
  "serde_json",
  "serde_norway",

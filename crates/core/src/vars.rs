@@ -725,6 +725,11 @@ pub struct ResolvedVars {
     /// `default_var=`/`choices_var=` does not itself get an entry here —
     /// this tracks direct shared resolution only, not transitively.
     pub origins: HashMap<String, crate::shared_env::SharedOrigin>,
+    /// name -> why the secret store couldn't be read for a `secret` decl
+    /// that ended up without a value from any earlier tier (locked
+    /// keychain, access denied, ...). Resolution carries on as if there were
+    /// no stored value; this is so the caller can say why it's asking again.
+    pub secret_errors: HashMap<String, String>,
 }
 
 /// Resolves `decls` against, in priority order: `overrides` (explicit
@@ -808,6 +813,7 @@ pub fn resolve_with_shared(
     let mut missing = Vec::new();
     let mut unresolved_from = Vec::new();
     let mut origins = HashMap::new();
+    let mut secret_errors = HashMap::new();
     for decl in topo_order(decls) {
         if decl.from.is_some() {
             match computed.get(&decl.name) {
@@ -847,8 +853,19 @@ pub fn resolve_with_shared(
             // small, hand-editable dotenv file, see `crate::varcache`'s
             // own doc comment). Refusing to read it back here would make
             // that persistence a silent no-op.
+            //
+            // A hand-written cache value beats the secret store (the user's
+            // explicit choice), which in turn beats shared config.
             if let Some(v) = cache.get(&decl.name) {
                 Some(v.to_string())
+            } else if let Some(v) = decl.secret.then(|| cache.try_get_secret(&decl.name)).and_then(|r| match r {
+                Ok(v) => v,
+                Err(e) => {
+                    secret_errors.insert(decl.name.clone(), e.to_string());
+                    None
+                }
+            }) {
+                Some(v)
             } else if let Some(sv) = shared.get(&decl.name) {
                 shared_origin = Some(sv.origin.clone());
                 Some(sv.value.clone())
@@ -863,7 +880,13 @@ pub fn resolve_with_shared(
         } else {
             None
         };
+        if already_resolved.is_none() {
+            if let Some(e) = shared.secret_errors.get(&decl.name) {
+                secret_errors.insert(decl.name.clone(), e.clone());
+            }
+        }
         if let Some(v) = already_resolved {
+            secret_errors.remove(&decl.name);
             if let Some(origin) = shared_origin {
                 origins.insert(decl.name.clone(), origin);
             }
@@ -890,7 +913,11 @@ pub fn resolve_with_shared(
             None => decl.choices.clone(),
         };
 
-        if !decl.required {
+        // A secret whose store read failed is asked for again (with the
+        // error shown) rather than silently taking its `default` — the user
+        // would otherwise get the default with no hint that a stored value
+        // exists but couldn't be read.
+        if !decl.required && !secret_errors.contains_key(&decl.name) {
             if let Some(v) = effective_default.clone() {
                 values.insert(decl.name.clone(), v);
                 continue;
@@ -913,6 +940,7 @@ pub fn resolve_with_shared(
         missing,
         unresolved_from,
         origins,
+        secret_errors,
     }
 }
 
@@ -974,6 +1002,8 @@ pub struct BlockEnvResolution {
     /// Keyed by the declared variable's own name (not its block-local
     /// `env=` rename) — see `ResolvedVars::origins`.
     pub origins: HashMap<String, crate::shared_env::SharedOrigin>,
+    /// See `ResolvedVars::secret_errors`.
+    pub secret_errors: HashMap<String, String>,
 }
 
 /// Resolves *only* the declared variables a single block's own `env=`
@@ -1027,6 +1057,7 @@ pub fn resolve_block_env_with_shared(
         missing: resolved.missing,
         unresolved_from: resolved.unresolved_from,
         origins: resolved.origins,
+        secret_errors: resolved.secret_errors,
     }
 }
 
@@ -2259,5 +2290,86 @@ mod tests {
     fn unknown_var_attr_ignores_a_meshfox_var_comment_written_inside_a_fence() {
         let md = "```\n<!-- meshfox:var name=\"X\" defualt=\"1\" -->\n```\n";
         assert_eq!(unknown_var_attr(md), None);
+    }
+
+    #[test]
+    fn a_secret_saved_in_the_store_resolves_but_a_hand_written_cache_value_wins() {
+        use crate::secret_store::MemoryBackend;
+        let decl = |name: &str| decl(name, None, true);
+        let canvas = std::path::Path::new("/nonexistent/doc.canvas.md");
+        let mut cache = VarCache::in_memory()
+            .with_secret_backend(std::sync::Arc::new(MemoryBackend::new()), canvas);
+        cache.save_secret("TOKEN", "from-store").unwrap();
+        cache.save_secret("BOTH", "from-store").unwrap();
+        cache.set("BOTH", "by-hand").unwrap();
+
+        let r = resolve(
+            &[decl("TOKEN"), decl("BOTH"), decl("NONE")],
+            &HashMap::new(),
+            &cache,
+            &HashMap::new(),
+        );
+        assert_eq!(r.values.get("TOKEN").map(String::as_str), Some("from-store"));
+        assert_eq!(r.values.get("BOTH").map(String::as_str), Some("by-hand"));
+        assert_eq!(r.missing.len(), 1);
+        assert_eq!(r.missing[0].name, "NONE");
+    }
+
+    #[test]
+    fn a_failing_secret_store_is_reported_and_the_var_is_still_asked_for() {
+        #[derive(Debug)]
+        struct Locked;
+        impl crate::secret_store::SecretBackend for Locked {
+            fn get(&self, _: &str) -> std::io::Result<Option<String>> {
+                Err(std::io::Error::other("keychain is locked"))
+            }
+            fn set(&self, _: &str, _: &str) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn delete(&self, _: &str) -> std::io::Result<bool> {
+                Ok(false)
+            }
+        }
+        let canvas = std::path::Path::new("/nonexistent/doc.canvas.md");
+        let cache = VarCache::in_memory().with_secret_backend(std::sync::Arc::new(Locked), canvas);
+        let r = resolve(&[decl("TOKEN", None, true)], &HashMap::new(), &cache, &HashMap::new());
+        assert_eq!(r.missing.len(), 1);
+        assert!(r.secret_errors["TOKEN"].contains("locked"));
+
+        // A value from a higher tier makes the error moot.
+        let mut overrides = HashMap::new();
+        overrides.insert("TOKEN".to_string(), "x".to_string());
+        let r = resolve(&[decl("TOKEN", None, true)], &overrides, &cache, &HashMap::new());
+        assert!(r.secret_errors.is_empty());
+    }
+
+    #[test]
+    fn a_secret_with_a_default_is_not_silently_defaulted_when_the_store_cannot_be_read() {
+        #[derive(Debug)]
+        struct Locked;
+        impl crate::secret_store::SecretBackend for Locked {
+            fn get(&self, _: &str) -> std::io::Result<Option<String>> {
+                Err(std::io::Error::other("keychain is locked"))
+            }
+            fn set(&self, _: &str, _: &str) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn delete(&self, _: &str) -> std::io::Result<bool> {
+                Ok(false)
+            }
+        }
+        let canvas = std::path::Path::new("/nonexistent/doc.canvas.md");
+        let locked = VarCache::in_memory().with_secret_backend(std::sync::Arc::new(Locked), canvas);
+        let with_default = decl("TOKEN", Some("fallback"), true);
+
+        let r = resolve(std::slice::from_ref(&with_default), &HashMap::new(), &locked, &HashMap::new());
+        assert!(r.values.is_empty(), "must not take the default: {:?}", r.values);
+        assert_eq!(r.missing.len(), 1);
+        assert_eq!(r.missing[0].default.as_deref(), Some("fallback"), "still offered as the prefill");
+        assert!(r.secret_errors.contains_key("TOKEN"));
+
+        // A readable (empty) store, or no store at all, keeps the old behaviour.
+        let r = resolve(&[with_default], &HashMap::new(), &VarCache::in_memory(), &HashMap::new());
+        assert_eq!(r.values.get("TOKEN").map(String::as_str), Some("fallback"));
     }
 }

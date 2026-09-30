@@ -1998,6 +1998,31 @@ struct VarStatus {
     /// says *where* the value came from, never the value itself.
     #[serde(skip_serializing_if = "Option::is_none")]
     inherited_from: Option<VarOrigin>,
+    /// For a `secret` field only: where a "save" tick would put the value
+    /// (`"plaintext"` or `"keychain"`, from the `secret_store` setting) —
+    /// the UI just labels its checkbox with it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    secret_store: Option<&'static str>,
+    /// Why the secret store couldn't be read for this field (locked
+    /// keychain, access denied, ...) — the field is asked for again, and
+    /// the UI says why instead of leaving it a mystery.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    secret_error: Option<String>,
+}
+
+/// `" (secret store: NAME: reason; ...)"` for a "missing required
+/// variable(s)" error when a store read failed, otherwise empty.
+fn secret_error_suffix(resolved: &meshfox_core::ResolvedVars) -> String {
+    if resolved.secret_errors.is_empty() {
+        return String::new();
+    }
+    let mut parts: Vec<String> = resolved
+        .secret_errors
+        .iter()
+        .map(|(name, e)| format!("{name}: {e}"))
+        .collect();
+    parts.sort();
+    format!(" (secret store: {})", parts.join("; "))
 }
 
 /// The web-facing shape of `meshfox_core::SharedOrigin` — see
@@ -2115,7 +2140,7 @@ async fn get_vars(
                 .get(d.name.as_str())
                 .map(|m| (*m).clone())
                 .unwrap_or(d);
-            var_status(materialized, &resolved)
+            var_status(materialized, &resolved, cache.secret_store_kind())
         })
         .collect();
     Ok(Json(statuses))
@@ -2219,7 +2244,11 @@ async fn run_from_source_for_status(
 /// Builds one `VarStatus` from a declaration and the already-computed
 /// `ResolvedVars` for the whole batch — split out from `get_vars` so this
 /// (pure, `State`/`Query`-free) mapping is unit-testable on its own.
-fn var_status(d: meshfox_core::VarDecl, resolved: &meshfox_core::ResolvedVars) -> VarStatus {
+fn var_status(
+    d: meshfox_core::VarDecl,
+    resolved: &meshfox_core::ResolvedVars,
+    store: meshfox_core::secret_store::SecretStoreKind,
+) -> VarStatus {
     let resolved_value = resolved.values.get(&d.name).cloned();
     let is_resolved = resolved_value.is_some();
     // A `required` declaration with nothing else supplying it lands in
@@ -2228,6 +2257,7 @@ fn var_status(d: meshfox_core::VarDecl, resolved: &meshfox_core::ResolvedVars) -
     // still has something to pre-fill, without marking it `resolved`.
     let value = resolved_value.or_else(|| d.default.clone());
     let inherited_from = resolved.origins.get(&d.name).map(VarOrigin::from);
+    let secret_error = resolved.secret_errors.get(&d.name).cloned();
     VarStatus {
         name: d.name,
         var_type: d.var_type.as_str(),
@@ -2237,6 +2267,8 @@ fn var_status(d: meshfox_core::VarDecl, resolved: &meshfox_core::ResolvedVars) -
         resolved: is_resolved,
         value: if d.secret { None } else { value },
         inherited_from,
+        secret_store: d.secret.then(|| store.as_str()),
+        secret_error,
     }
 }
 
@@ -2323,7 +2355,7 @@ async fn get_configure_vars(
                 .get(d.name.as_str())
                 .map(|m| (*m).clone())
                 .unwrap_or(d);
-            var_status(materialized, &resolved)
+            var_status(materialized, &resolved, cache.secret_store_kind())
         })
         .collect();
     Ok(Json(statuses))
@@ -5161,14 +5193,30 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
             let names: Vec<&str> = resolved.missing.iter().map(|d| d.name.as_str()).collect();
             return Err(ApiError(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                format!("missing required variable(s): {}", names.join(", ")),
+                format!(
+                    "missing required variable(s): {}{}",
+                    names.join(", "),
+                    secret_error_suffix(&resolved)
+                ),
             ));
         }
         for (name, value) in &req.vars {
-            if relevant_decls.iter().any(|d| {
+            if let Some(d) = relevant_decls.iter().find(|d| {
                 &d.name == name && (!d.secret || req.save_secrets.contains(name)) && !d.session
             }) {
-                let _ = cache.set(name, value);
+                if d.secret {
+                    // The user explicitly asked to save this one: if the
+                    // store refuses, say so now instead of starting a run
+                    // that will ask for it again next time.
+                    cache.save_secret(name, value).map_err(|e| {
+                        ApiError(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("couldn't save {name} to the secret store: {e}"),
+                        )
+                    })?;
+                } else {
+                    let _ = cache.set(name, value);
+                }
             }
         }
         resolved.values
@@ -6073,7 +6121,7 @@ async fn get_form_fields(
                 .unwrap_or(d);
             FormFieldStatus {
                 label,
-                var: var_status(materialized, &resolved),
+                var: var_status(materialized, &resolved, cache.secret_store_kind()),
             }
         })
         .collect();
@@ -6338,14 +6386,30 @@ async fn run_block_tty(
             let names: Vec<&str> = resolved.missing.iter().map(|d| d.name.as_str()).collect();
             return Err(ApiError(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                format!("missing required variable(s): {}", names.join(", ")),
+                format!(
+                    "missing required variable(s): {}{}",
+                    names.join(", "),
+                    secret_error_suffix(&resolved)
+                ),
             ));
         }
         for (name, value) in &requested_vars {
-            if relevant_decls.iter().any(|d| {
+            if let Some(d) = relevant_decls.iter().find(|d| {
                 &d.name == name && (!d.secret || save_secrets.contains(name)) && !d.session
             }) {
-                let _ = cache.set(name, value);
+                if d.secret {
+                    // The user explicitly asked to save this one: if the
+                    // store refuses, say so now instead of starting a run
+                    // that will ask for it again next time.
+                    cache.save_secret(name, value).map_err(|e| {
+                        ApiError(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("couldn't save {name} to the secret store: {e}"),
+                        )
+                    })?;
+                } else {
+                    let _ = cache.set(name, value);
+                }
             }
         }
         resolved.values
@@ -7790,8 +7854,9 @@ async fn debug_start(
         return Err(ApiError(
             StatusCode::UNPROCESSABLE_ENTITY,
             format!(
-                "missing required variable(s): {} — pass them in `vars`",
-                names.join(", ")
+                "missing required variable(s): {} — pass them in `vars`{}",
+                names.join(", "),
+                secret_error_suffix(&resolved)
             ),
         ));
     }
@@ -12735,7 +12800,7 @@ mod var_status_tests {
             &VarCache::in_memory(),
             &HashMap::new(),
         );
-        let status = var_status(d, &resolved);
+        let status = var_status(d, &resolved, meshfox_core::secret_store::SecretStoreKind::Plaintext);
         assert!(!status.resolved);
         assert_eq!(status.value.as_deref(), Some("default-val"));
     }
@@ -12751,7 +12816,7 @@ mod var_status_tests {
             &cache,
             &HashMap::new(),
         );
-        let status = var_status(d, &resolved);
+        let status = var_status(d, &resolved, meshfox_core::secret_store::SecretStoreKind::Plaintext);
         assert!(status.resolved);
         assert_eq!(status.value.as_deref(), Some("confirmed-val"));
     }
@@ -12765,7 +12830,7 @@ mod var_status_tests {
             &VarCache::in_memory(),
             &HashMap::new(),
         );
-        let status = var_status(d, &resolved);
+        let status = var_status(d, &resolved, meshfox_core::secret_store::SecretStoreKind::Plaintext);
         assert!(status.resolved);
         assert_eq!(status.value.as_deref(), Some("default-val"));
     }
@@ -12779,7 +12844,7 @@ mod var_status_tests {
             &VarCache::in_memory(),
             &HashMap::new(),
         );
-        let status = var_status(d, &resolved);
+        let status = var_status(d, &resolved, meshfox_core::secret_store::SecretStoreKind::Plaintext);
         assert!(!status.resolved);
         assert_eq!(status.value, None);
     }
@@ -13130,6 +13195,59 @@ mod vars_endpoint_tests {
 
         let _ = std::fs::remove_file(&canvas_path);
         let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));
+    }
+
+    #[tokio::test]
+    async fn run_block_refuses_to_start_when_saving_a_secret_to_the_store_fails() {
+        #[derive(Debug)]
+        struct Refusing;
+        impl meshfox_core::secret_store::SecretBackend for Refusing {
+            fn get(&self, _: &str) -> std::io::Result<Option<String>> {
+                Ok(None)
+            }
+            fn set(&self, _: &str, _: &str) -> std::io::Result<()> {
+                Err(std::io::Error::other("keychain: access denied"))
+            }
+            fn delete(&self, _: &str) -> std::io::Result<bool> {
+                Ok(false)
+            }
+        }
+        let canvas_path = write_test_canvas(SECRET_ENV_CANVAS);
+        let state = build_state(canvas_path.clone(), false, None)
+            .await
+            .expect("valid test canvas");
+        *state.vars_cache.lock().unwrap() = VarCache::in_memory()
+            .with_secret_backend(std::sync::Arc::new(Refusing), &canvas_path);
+        let app = build_app(state);
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+
+        let url = format!(
+            "ws://{addr}/api/run?block=use-token&vars=%7B%22API_TOKEN%22%3A%22sk%22%7D&saveSecrets=%5B%22API_TOKEN%22%5D"
+        );
+        // A pre-stream failure arrives as a normal `error` event after the
+        // upgrade (see `pump_run_response_into_ws`), and nothing runs.
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+        let mut events: Vec<serde_json::Value> = Vec::new();
+        while let Some(msg) = ws.next().await {
+            match msg.expect("no ws error") {
+                WsMessage::Text(t) => events.push(serde_json::from_str(&t).unwrap()),
+                WsMessage::Close(_) => break,
+                _ => continue,
+            }
+        }
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["type"], "error", "{events:?}");
+        let message = events[0]["message"].as_str().unwrap();
+        assert!(message.contains("API_TOKEN") && message.contains("access denied"), "{message}");
+        let _ = std::fs::remove_file(&canvas_path);
     }
 
     // Regression: saving a secret via `saveSecrets` used to write it to the
