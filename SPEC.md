@@ -1084,8 +1084,64 @@ that one canvas from then on. A `required` variable satisfied only by
 shared config resolves silently, with no confirmation prompt — the same
 behavior a cached answer already has today.
 
-No encryption: both files are plain TOML, same caveat the per-document
-cache already carries.
+A section can also list names in `secrets = [...]` next to `vars` — see
+"Secret store" below. Values written in `vars` are plain TOML, same caveat
+the per-document cache already carries.
+
+### Secret store
+
+`secret_store` in `.meshfox/config.toml` (local or global; local wins) picks
+where `secret` variables are saved:
+
+```toml
+secret_store = "keychain"   # or "plaintext" (the default)
+```
+
+Explicit only — there is no auto mode, and an unknown value is an error
+rather than a silent fallback to plaintext. `keychain` is implemented for
+**macOS Keychain only** so far (service `meshfox`); elsewhere it fails loudly
+on first use. With it:
+
+- The web form's "save" checkbox on a `secret` field is labelled "save to
+  keychain" instead of "save (plaintext)" and writes there. It is still off
+  by default. Resolution reads the keychain back where it would read the
+  cache. The TUI's variable form has the same toggle on `Ctrl-S` (shown as
+  `[x] save→keychain`); a run started from it passes the ticked names on.
+- If the keychain can't be read (locked, access denied), the variable is
+  asked for again as if nothing were stored, and the reason is shown next to
+  the field (web, TUI), on stderr (`meshfox run`), and in a "missing required
+  variable(s)" error. That holds for a variable with a `default=` too: a
+  secret whose stored value couldn't be read is asked for (the default only
+  pre-fills the prompt), never silently replaced by its default.
+- Ticking "save" is a request, not a hint: if the store refuses the write,
+  the run doesn't start and says why.
+- A `[[env]]` section may declare `secrets = ["DB_PASSWORD"]` beside `vars`.
+  The names are in the file; the values are in the keychain, filed under the
+  section's scope (`global`, `global:<path= as written>` or
+  `project:<canvas_root>`). They take the same place in the precedence
+  chain as a `vars` entry and get the same "project"/"global" badge.
+- `meshfox secret set|show|rm NAME [--canvas F | --global [--path P] |
+  --project DIR]` manages values; `show` prints one only with `--reveal`.
+- The keychain can't be enumerated, so every save (checkbox or `secret set`)
+  is also noted — scope and name, never the value — in a local index,
+  `~/.meshfox/secrets.sqlite3`. `meshfox secret list [--json]` reads it and
+  gives each entry a status: `ok`; `orphan-decl` (the canvas no longer
+  declares the variable as `secret`, or the config no longer lists it in
+  `secrets`); `orphan-path` (the canvas file or project directory is gone —
+  a move or rename looks the same); `unknown` (a file that should say
+  couldn't be read or parsed — never treated as an orphan). `meshfox secret
+  prune` shows the orphans and, with `--yes`, deletes them from the keychain
+  and the index. The MCP server's `secret_list` returns the same list
+  (never values), limited to canvases and projects under its root plus
+  global entries. Secrets saved before the index existed, or by other
+  means, aren't in it.
+
+**A value written by hand always wins over the store**: a `vars` entry in the
+same section, or a line in the canvas's `.meshfox/<file>.env`. Turning the
+keychain on doesn't take away the plaintext option.
+
+Not implemented yet: other platforms, and managing secrets in the web UI/TUI
+screens — see TODO.canvas.md.
 
 ### Computed variables (`from=`)
 

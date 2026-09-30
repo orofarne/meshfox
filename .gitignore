@@ -35,6 +35,7 @@ ARTICLES.canvas.md
 .mcp.json
 memory.canvas.md
 /macos/MeshfoxDaemon/.build
+/macos/dist/
 # Codex stuff
 /AGENTS.md
 .codex
