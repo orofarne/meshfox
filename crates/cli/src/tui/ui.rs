@@ -394,6 +394,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
         render_tty_sessions_view(f, area, &*app, tv);
     } else if let Some(hv) = &app.history_view {
         render_history_view(f, area, hv);
+    } else if let Some(rv) = &app.run_history_view {
+        render_run_history_view(f, area, rv);
     } else if app.show_help {
         render_help(f, area, &*app);
     }
@@ -1143,7 +1145,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         hint.push_str(" · v services");
     }
     if app.worker_port.is_some() {
-        hint.push_str(" · t live terminals · H history");
+        hint.push_str(" · t live terminals · H history · L run history");
     }
     hint.push_str(" · ? help · q quit");
 
@@ -1351,7 +1353,9 @@ pub(super) fn block_picker_list_rect(area: Rect, block_count: usize) -> Rect {
 fn render_block_picker(f: &mut Frame, area: Rect, bp: &super::app::BlockPickerState) {
     let rect = block_picker_rect(area, bp.blocks.len());
     f.render_widget(Clear, rect);
-    let mode = if bp.with_deps {
+    let mode = if bp.history {
+        "run history"
+    } else if bp.with_deps {
         "run (with deps)"
     } else {
         "run (no deps)"
@@ -1720,6 +1724,138 @@ fn render_history_view(f: &mut Frame, area: Rect, hv: &super::app::HistoryViewSt
     );
 }
 
+/// `text` without ANSI CSI escape sequences (colors, cursor moves) — a
+/// stored run's output is raw process output, and a terminal escape in a
+/// ratatui cell would garble the screen instead of coloring it.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        } else if c != '\r' {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The `L` run-history view: the block's kept runs on the left (newest
+/// first, stale ones dimmed), the selected run's stored output on the right.
+/// The terminal counterpart of the web UI's `RunHistoryDialog`.
+fn render_run_history_view(f: &mut Frame, area: Rect, rv: &super::app::RunHistoryViewState) {
+    let rect = centered_rect(area.width * 9 / 10, area.height * 8 / 10, area);
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .title(format!(" run history — {}/{} ", rv.node_id, rv.block));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let (main, hint_area) = (rows[0], rows[1]);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length((main.width / 2).min(38)), Constraint::Min(1)])
+        .split(main);
+    let (list_area, detail_area) = (cols[0], cols[1]);
+
+    let run_label = |e: &crate::worker_client::RunHistoryEntryDto| {
+        if e.outcome == "killed" {
+            "killed".to_string()
+        } else {
+            format!("exit {}", e.exit_code.map_or("?".to_string(), |c| c.to_string()))
+        }
+    };
+    let items: Vec<ListItem> = rv
+        .entries
+        .iter()
+        .map(|e| {
+            let dim = if e.stale { Style::default().fg(Color::DarkGray) } else { Style::default() };
+            let exit_style = if e.stale {
+                dim
+            } else if e.outcome == "killed" || e.exit_code != Some(0) {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default().fg(OK)
+            };
+            let mut spans = vec![
+                Span::styled(format!(" {:<9}", history_time(&e.started_at)), dim),
+                Span::styled(format!("{:<8}", run_label(e)), exit_style),
+            ];
+            if let Some(ms) = e.duration_ms {
+                spans.push(Span::styled(format!("{:>7}", meshfox_core::format_duration_ms(ms)), dim));
+            }
+            if e.stale {
+                spans.push(Span::styled(" stale", Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let mut state = ListState::default().with_offset(rv.list_offset.get());
+    state.select(Some(rv.selected.min(rv.entries.len().saturating_sub(1))));
+    let list = List::new(items)
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .block(Block::default().borders(Borders::RIGHT));
+    f.render_stateful_widget(list, list_area, &mut state);
+    // The list's own rows sit inside its right border, one column narrower.
+    rv.list_rect.set(Rect { width: list_area.width.saturating_sub(1), ..list_area });
+    rv.list_offset.set(state.offset());
+
+    let detail = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(1)])
+        .split(detail_area);
+    if let Some(run) = rv.entries.get(rv.selected) {
+        let mut head = format!(" {} · {}", history_time(&run.started_at), run_label(run));
+        if let Some(ms) = run.duration_ms {
+            head.push_str(&format!(" · {}", meshfox_core::format_duration_ms(ms)));
+        }
+        let mut lines = vec![Line::from(Span::raw(head))];
+        if run.stale {
+            lines.push(Line::from(Span::styled(
+                " stale — the block, a dependency or a variable changed since (or the session was reset)",
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            )));
+        }
+        f.render_widget(Paragraph::new(lines), detail[0]);
+    }
+    let output_lines: Vec<Line> = match &rv.output {
+        None => vec![Line::from(Span::styled(" loading…", Style::default().fg(Color::DarkGray)))],
+        Some((_, lines)) if lines.is_empty() => {
+            vec![Line::from(Span::styled(" no output stored for this run", Style::default().fg(Color::DarkGray)))]
+        }
+        Some((_, lines)) => lines
+            .iter()
+            .map(|(stream, text)| {
+                let style = match stream {
+                    meshfox_server::stream_exec::OutputStream::Stdout => Style::default(),
+                    meshfox_server::stream_exec::OutputStream::Stderr => Style::default().fg(Color::Yellow),
+                };
+                Line::from(Span::styled(format!(" {}", strip_ansi(text)), style))
+            })
+            .collect(),
+    };
+    f.render_widget(Paragraph::new(output_lines).scroll((rv.output_scroll.min(u16::MAX as usize) as u16, 0)), detail[1]);
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "j/k select run · PgUp/PgDn (or K/J) scroll output · stderr in yellow · q/esc close",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        hint_area,
+    );
+}
+
 fn render_help(f: &mut Frame, area: Rect, app: &App) {
     let mut items = vec![
         "tab             cycle focus: tree -> document -> output -> tree",
@@ -1733,6 +1869,7 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         "r               run this node's block, with its deps chain",
         "R               run this node's block only (skip deps)",
         "  (a node with more than one block opens a picker first)",
+        "L               run history of this node's block (picker if several)",
         "K               kill the running block",
         "f               expand the focused pane to fill the screen, or",
         "                shrink it back (esc also shrinks it back)",
@@ -2425,7 +2562,7 @@ mod tests {
     async fn render_help_wraps_a_long_line_instead_of_clipping_it() {
         let mut app = test_app().await;
         app.show_help = true;
-        let area = Rect::new(0, 0, 40, 40);
+        let area = Rect::new(0, 0, 40, 60);
         let screen = render_to_screen(area, |f| render_help(f, area, &app));
         assert!(
             screen.contains("esc close)"),
@@ -2461,6 +2598,48 @@ mod tests {
         assert!(rect.width > 0 && rect.height > 0, "list rect recorded: {rect:?}");
         assert!(hv.offset.get() > 0, "a deep selection scrolls the list, and the offset is recorded");
         assert!(hv.offset.get() <= 35 && 35 < hv.offset.get() + rect.height as usize, "selection is on screen");
+    }
+
+    #[test]
+    fn render_run_history_view_lists_runs_marks_stale_ones_and_shows_the_selected_output() {
+        use crate::worker_client::RunHistoryEntryDto;
+        let run = |id, exit_code, stale| RunHistoryEntryDto {
+            id,
+            outcome: "exited".into(),
+            exit_code: Some(exit_code),
+            started_at: "2026-09-30T12:00:00Z".into(),
+            duration_ms: Some(2500),
+            stale,
+        };
+        let rv = super::super::app::RunHistoryViewState {
+            node_id: "leaf".into(),
+            block: "build".into(),
+            entries: vec![run(3, 0, false), run(2, 1, true)],
+            selected: 1,
+            output: Some((
+                2,
+                vec![
+                    (meshfox_server::stream_exec::OutputStream::Stdout, "\u{1b}[31mred text\u{1b}[0m".to_string()),
+                    (meshfox_server::stream_exec::OutputStream::Stderr, "boom".to_string()),
+                ],
+            )),
+            ..Default::default()
+        };
+        let area = Rect::new(0, 0, 100, 24);
+        let screen = render_to_screen(area, |f| render_run_history_view(f, area, &rv));
+        assert!(screen.contains("run history — leaf/build"), "titled with the block:\n{screen}");
+        assert!(screen.contains("exit 0") && screen.contains("exit 1"), "both runs listed:\n{screen}");
+        assert!(screen.contains("2.5s"), "duration shown:\n{screen}");
+        assert!(screen.contains("stale"), "the stale run is marked:\n{screen}");
+        assert!(screen.contains("red text") && !screen.contains("[31m"), "ANSI stripped:\n{screen}");
+        assert!(screen.contains("boom"), "stderr shown too:\n{screen}");
+        assert!(rv.list_rect.get().width > 0, "list position recorded for mouse hit-testing");
+    }
+
+    #[test]
+    fn strip_ansi_removes_color_codes_and_carriage_returns_but_keeps_text() {
+        assert_eq!(strip_ansi("\u{1b}[1;32mok\u{1b}[0m done\r"), "ok done");
+        assert_eq!(strip_ansi("plain"), "plain");
     }
 
     #[tokio::test]

@@ -144,6 +144,9 @@ pub struct BlockPickerState {
     pub blocks: Vec<BlockChoice>,
     pub selected: usize,
     pub with_deps: bool,
+    /// `true` when the choice opens the block's run history (`L`) instead of
+    /// running it (`r`/`R`) — same "which block?" question, different answer.
+    pub history: bool,
 }
 
 /// An *already-connected* `/api/run/tty` socket (see
@@ -199,6 +202,37 @@ pub struct HistoryViewState {
     /// particular is ratatui's own decision, unknowable from here otherwise.
     pub list_rect: std::cell::Cell<Rect>,
     pub offset: std::cell::Cell<usize>,
+}
+
+/// The `L` run-history view — see `App::open_run_history`,
+/// `App::on_run_history_key`, `ui::render_run_history_view`. Worker-only: the
+/// history lives in the worker's session database. The TUI counterpart of
+/// the web UI's `RunHistoryDialog`.
+#[derive(Default)]
+pub struct RunHistoryViewState {
+    pub node_id: String,
+    pub block: String,
+    /// Newest first — the order `GET /api/run/history` returns them in.
+    pub entries: Vec<crate::worker_client::RunHistoryEntryDto>,
+    pub selected: usize,
+    /// The selected run's stored output, tagged with which run it belongs to
+    /// so a slow load for an earlier selection never shows under a later one.
+    pub output: Option<(i64, Vec<(OutputStream, String)>)>,
+    /// First output line shown.
+    pub output_scroll: usize,
+    /// Where the run list was last drawn and how far it was scrolled
+    /// (`ui::render_run_history_view` writes both every frame) — what a
+    /// mouse click is hit-tested against.
+    pub list_rect: std::cell::Cell<Rect>,
+    pub list_offset: std::cell::Cell<usize>,
+}
+
+impl RunHistoryViewState {
+    /// Scrolls the output down by `by` lines, never past its last line.
+    pub fn scroll_output_down(&mut self, by: usize) {
+        let len = self.output.as_ref().map_or(0, |(_, lines)| lines.len());
+        self.output_scroll = (self.output_scroll + by).min(len.saturating_sub(1));
+    }
 }
 
 /// A canvas-target `file`-node "open" waiting for `mod.rs`'s event loop to
@@ -560,6 +594,8 @@ pub struct App {
     pub tty_sessions_view: Option<TtySessionsViewState>,
     /// The `H` history view, `None` while closed.
     pub history_view: Option<HistoryViewState>,
+    /// The `L` run-history view, when open.
+    pub run_history_view: Option<RunHistoryViewState>,
     /// Last-fetched `GET /api/runs`, filtered to `kind == "tty" && status
     /// == "running"` — see `open_tty_sessions_view`. Empty (not `None`)
     /// when the view is closed; only meaningful while `tty_sessions_view`
@@ -960,6 +996,7 @@ impl App {
             pending_http_tty_attach: None,
             tty_sessions_view: None,
             history_view: None,
+            run_history_view: None,
             live_tty_sessions: Vec::new(),
             pending_child_canvas: None,
             block_picker: None,
@@ -1029,6 +1066,10 @@ impl App {
         }
         if self.history_view.is_some() {
             self.on_history_view_key(key).await;
+            return;
+        }
+        if self.run_history_view.is_some() {
+            self.on_run_history_key(key).await;
             return;
         }
         if self.reset_session_confirm {
@@ -1151,6 +1192,7 @@ impl App {
             // `open_tty_sessions_view`'s own doc comment.
             KeyCode::Char('t') => self.open_tty_sessions_view().await,
             KeyCode::Char('H') => self.open_history_view().await,
+            KeyCode::Char('L') => self.open_run_history().await,
             KeyCode::Char('o') => self.trigger_open_file(),
             KeyCode::Char('c') => self.trigger_configure().await,
             KeyCode::Char('e') => self.open_source_editor(),
@@ -1614,7 +1656,11 @@ impl App {
                     return;
                 };
                 let name = bp.blocks[bp.selected].name.clone();
-                self.start_run(bp.node_id, name, bp.with_deps).await;
+                if bp.history {
+                    self.open_run_history_for(bp.node_id, name).await;
+                } else {
+                    self.start_run(bp.node_id, name, bp.with_deps).await;
+                }
             }
             KeyCode::Esc => self.block_picker = None,
             _ => {}
@@ -1660,6 +1706,10 @@ impl App {
         }
         if self.history_view.is_some() {
             self.on_history_view_mouse(mouse).await;
+            return;
+        }
+        if self.run_history_view.is_some() {
+            self.on_run_history_mouse(mouse).await;
             return;
         }
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -2798,6 +2848,7 @@ impl App {
             blocks: choices,
             selected: 0,
             with_deps,
+            history: false,
         });
     }
 
@@ -3325,6 +3376,43 @@ impl App {
         }
     }
 
+    /// Whether `addr`'s block declares `output="markdown"` — looked up fresh
+    /// from `display_canvas`, best-effort `false` if the block can't be found
+    /// (already gone from a since-edited canvas, say).
+    fn block_output_markdown(&self, addr: &BlockAddr) -> bool {
+        self.display_canvas
+            .node(&addr.node_id)
+            .map(|n| meshfox_core::scan_runnable_blocks(&addr.node_id, &n.text))
+            .unwrap_or_default()
+            .into_iter()
+            .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()))
+            .is_some_and(|b| b.attrs.get("output").map(String::as_str) == Some("markdown"))
+    }
+
+    /// [`Self::on_external_run_event`] for a run found at startup
+    /// (`mod.rs`'s `reconcile_runs`) rather than announced by
+    /// `WatchEvent::RunStarted`: the worker already knows how long a finished
+    /// run took, and replaying it takes no time at all, so its terminal event
+    /// carries that known `duration_ms` instead of the near-zero replay time
+    /// `on_external_run_event` would measure.
+    pub fn on_reconciled_run_event(
+        &mut self,
+        addr: BlockAddr,
+        event: crate::worker_client::SubscribeEvent,
+        duration_ms: Option<u64>,
+    ) {
+        let done = matches!(event, crate::worker_client::SubscribeEvent::Done { .. });
+        self.on_external_run_event(addr.clone(), event);
+        if let (true, Some(ms)) = (done, duration_ms) {
+            if let Some(entry) = self.step_output.get_mut(&addr) {
+                entry.duration_ms = ms;
+            }
+            if self.rows.get(self.selected).is_some_and(|row| row.node_id == addr.node_id) {
+                self.render_current_document();
+            }
+        }
+    }
+
     /// Folds one `worker_client::SubscribeEvent` for `addr` into
     /// `step_output`/`external_running` — the passive-watch counterpart to
     /// `on_run_event`, for a run this TUI session never itself started
@@ -3365,17 +3453,11 @@ impl App {
                     self.step_output.remove(&addr);
                 }
                 self.external_running.entry(addr.clone()).or_insert_with(std::time::Instant::now);
+                let output_markdown = self.block_output_markdown(&addr);
                 let entry = self.step_output.entry(addr.clone()).or_insert_with(|| StepOutput {
                     stdout: String::new(),
                     stderr: String::new(),
-                    output_markdown: self
-                        .display_canvas
-                        .node(&addr.node_id)
-                        .map(|n| meshfox_core::scan_runnable_blocks(&addr.node_id, &n.text))
-                        .unwrap_or_default()
-                        .into_iter()
-                        .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()))
-                        .is_some_and(|b| b.attrs.get("output").map(String::as_str) == Some("markdown")),
+                    output_markdown,
                     exit_code: 0,
                     duration_ms: 0,
                     running: true,
@@ -3390,12 +3472,21 @@ impl App {
             }
             SubscribeEvent::Done { exit_code } => {
                 let started = self.external_running.remove(&addr);
-                if let Some(entry) = self.step_output.get_mut(&addr) {
-                    entry.exit_code = exit_code.unwrap_or(-1);
-                    entry.running = false;
-                    if let Some(started) = started {
-                        entry.duration_ms = started.elapsed().as_millis() as u64;
-                    }
+                // A run that printed nothing never got an entry from a
+                // `Line` — make one, so its exit code still shows.
+                let output_markdown = self.block_output_markdown(&addr);
+                let entry = self.step_output.entry(addr.clone()).or_insert_with(|| StepOutput {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    output_markdown,
+                    exit_code: 0,
+                    duration_ms: 0,
+                    running: false,
+                });
+                entry.exit_code = exit_code.unwrap_or(-1);
+                entry.running = false;
+                if let Some(started) = started {
+                    entry.duration_ms = started.elapsed().as_millis() as u64;
                 }
             }
         }
@@ -4048,6 +4139,153 @@ impl App {
                     self.goto_history_step(entry).await;
                 } else {
                     self.last_click = Some((mouse.row, mouse.column, std::time::Instant::now()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `L` — opens the run history of the selected node's block, with the
+    /// same "which block?" logic `r`/`R` use: a node with one block that has a
+    /// history goes straight to it, one with several opens the picker first.
+    /// Only plain blocks have a history — a `tty`, `service`, `button` or
+    /// `form` block never leaves a run record with output behind, so those
+    /// aren't offered (and a node with none says so).
+    async fn open_run_history(&mut self) {
+        if self.worker_port.is_none() {
+            self.status = "run history needs a worker — none reachable".into();
+            return;
+        }
+        let Some(row) = self.rows.get(self.selected) else { return };
+        let node_id = row.node_id.clone();
+        let Some(node) = self.display_canvas.node(&node_id) else {
+            self.status = format!("node {node_id:?} not found");
+            return;
+        };
+        if node.is_runnable_file() {
+            self.status = "a runnable file node keeps no run history".into();
+            return;
+        }
+        let blocks: Vec<_> = scan_runnable_blocks(&node_id, &node.text)
+            .into_iter()
+            .filter(|b| !b.tty && !b.service && !meshfox_core::is_button(&b.lang) && !meshfox_core::is_form(&b.lang))
+            .collect();
+        match blocks.len() {
+            0 => self.status = "no block in this node keeps a run history".into(),
+            1 => {
+                let name = blocks[0].name.clone().expect("scan_runnable_blocks always names its blocks");
+                self.open_run_history_for(node_id, name).await;
+            }
+            _ => {
+                let default_name = fence::default_block(&node_id, &blocks)
+                    .ok()
+                    .flatten()
+                    .and_then(|b| b.name.clone());
+                let choices: Vec<BlockChoice> = blocks
+                    .iter()
+                    .map(|b| {
+                        let name = b.name.clone().expect("scan_runnable_blocks always names its blocks");
+                        BlockChoice {
+                            is_default: Some(&name) == default_name.as_ref(),
+                            name,
+                            cache: b.cache,
+                            tty: false,
+                            is_button: false,
+                        }
+                    })
+                    .collect();
+                let selected = choices.iter().position(|c| c.is_default).unwrap_or(0);
+                self.block_picker = Some(BlockPickerState {
+                    node_id,
+                    blocks: choices,
+                    selected,
+                    with_deps: false,
+                    history: true,
+                });
+            }
+        }
+    }
+
+    /// Fetches `block`'s run history and opens the view on its newest run.
+    async fn open_run_history_for(&mut self, node_id: String, block: String) {
+        let Some(port) = self.worker_port else {
+            self.status = "run history needs a worker — none reachable".into();
+            return;
+        };
+        match crate::worker_client::run_history(port, &node_id, &block).await {
+            Ok(entries) if entries.is_empty() => self.status = format!("no earlier runs of {block}"),
+            Ok(entries) => {
+                self.run_history_view =
+                    Some(RunHistoryViewState { node_id, block, entries, ..Default::default() });
+                self.load_run_history_output().await;
+            }
+            Err(e) => self.status = format!("failed to load run history: {e}"),
+        }
+    }
+
+    /// Loads the selected run's stored output into the view.
+    async fn load_run_history_output(&mut self) {
+        let Some(port) = self.worker_port else { return };
+        let Some(view) = &self.run_history_view else { return };
+        let Some(run) = view.entries.get(view.selected) else { return };
+        let (id, node_id, block) = (run.id, view.node_id.clone(), view.block.clone());
+        // A load that fails shows why in place of the output, rather than
+        // passing for "this run printed nothing".
+        let lines = crate::worker_client::run_output(port, &node_id, &block, id)
+            .await
+            .unwrap_or_else(|e| vec![(OutputStream::Stderr, format!("couldn't load this run's output: {e}"))]);
+        if let Some(view) = &mut self.run_history_view {
+            // Only if the selection hasn't moved on while this was loading.
+            if view.entries.get(view.selected).is_some_and(|r| r.id == id) {
+                view.output = Some((id, lines));
+                view.output_scroll = 0;
+            }
+        }
+    }
+
+    /// `j`/`k`/arrows/`g`/`G` pick a run, `PageUp`/`PageDown` (or `J`/`K`)
+    /// scroll its output, `q`/Esc closes.
+    async fn on_run_history_key(&mut self, key: KeyEvent) {
+        let Some(view) = &mut self.run_history_view else { return };
+        let last = view.entries.len().saturating_sub(1);
+        let before = view.selected;
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.run_history_view = None;
+                return;
+            }
+            KeyCode::Up | KeyCode::Char('k') => view.selected = view.selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => view.selected = (view.selected + 1).min(last),
+            KeyCode::Home | KeyCode::Char('g') => view.selected = 0,
+            KeyCode::End | KeyCode::Char('G') => view.selected = last,
+            KeyCode::PageUp | KeyCode::Char('K') => view.output_scroll = view.output_scroll.saturating_sub(10),
+            KeyCode::PageDown | KeyCode::Char('J') => view.scroll_output_down(10),
+            _ => {}
+        }
+        if view.selected != before {
+            view.output = None;
+            self.load_run_history_output().await;
+        }
+    }
+
+    /// The run-history view is modal: the wheel scrolls the output, a click
+    /// on a run selects it, everything else is swallowed.
+    async fn on_run_history_mouse(&mut self, mouse: MouseEvent) {
+        let Some(view) = &mut self.run_history_view else { return };
+        match mouse.kind {
+            MouseEventKind::ScrollUp => view.output_scroll = view.output_scroll.saturating_sub(3),
+            MouseEventKind::ScrollDown => view.scroll_output_down(3),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let rect = view.list_rect.get();
+                let inside = mouse.column >= rect.x
+                    && mouse.column < rect.x + rect.width
+                    && mouse.row >= rect.y
+                    && mouse.row < rect.y + rect.height;
+                let idx = view.list_offset.get() + (mouse.row.saturating_sub(rect.y)) as usize;
+                if inside && idx < view.entries.len() && idx != view.selected {
+                    view.selected = idx;
+                    view.output = None;
+                    self.load_run_history_output().await;
                 }
             }
             _ => {}
@@ -4731,6 +4969,139 @@ mod tests {
         // The modal claims the keymap: `q` closes it rather than quitting.
         app.on_key(key(KeyCode::Char('q'))).await;
         assert!(app.history_view.is_none());
+    }
+
+    fn run_entry(id: i64, exit_code: i32, stale: bool) -> crate::worker_client::RunHistoryEntryDto {
+        crate::worker_client::RunHistoryEntryDto {
+            id,
+            outcome: "exited".into(),
+            exit_code: Some(exit_code),
+            started_at: "2026-09-30T12:00:00Z".into(),
+            duration_ms: Some(120),
+            stale,
+        }
+    }
+
+    async fn app_with_blocks(name: &str, node_body: &str) -> App {
+        let dir = std::env::temp_dir().join(format!("meshfox-tui-run-history-{name}-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.md");
+        std::fs::write(
+            &path,
+            format!("<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n{node_body}"),
+        )
+        .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(path, tx, None, None).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_run_found_at_startup_shows_its_output_exit_code_and_known_duration() {
+        use crate::worker_client::SubscribeEvent;
+        let mut app = app_with_blocks("reconcile", "```bash name=\"a\"\necho a\n```\n").await;
+        let addr = BlockAddr::new("root", "a");
+        let out = meshfox_server::stream_exec::OutputStream::Stdout;
+        let err = meshfox_server::stream_exec::OutputStream::Stderr;
+        app.on_reconciled_run_event(addr.clone(), SubscribeEvent::Line { stream: out, text: "hello".into() }, Some(1234));
+        assert!(app.step_output[&addr].running, "still replaying");
+        app.on_reconciled_run_event(addr.clone(), SubscribeEvent::Line { stream: err, text: "oops".into() }, Some(1234));
+        app.on_reconciled_run_event(addr.clone(), SubscribeEvent::Done { exit_code: Some(3) }, Some(1234));
+        let entry = &app.step_output[&addr];
+        assert_eq!((entry.stdout.as_str(), entry.stderr.as_str()), ("hello\n", "oops\n"));
+        assert_eq!((entry.exit_code, entry.duration_ms, entry.running), (3, 1234, false));
+        assert!(!app.external_running.contains_key(&addr), "no longer counted as running");
+    }
+
+    #[tokio::test]
+    async fn a_finished_run_that_printed_nothing_still_gets_an_entry_with_its_exit_code() {
+        use crate::worker_client::SubscribeEvent;
+        let mut app = app_with_blocks("silent", "```bash name=\"a\"\ntrue\n```\n").await;
+        let addr = BlockAddr::new("root", "a");
+        app.on_reconciled_run_event(addr.clone(), SubscribeEvent::Done { exit_code: Some(0) }, Some(40));
+        let entry = &app.step_output[&addr];
+        assert_eq!((entry.exit_code, entry.duration_ms, entry.running), (0, 40, false));
+        assert!(entry.stdout.is_empty() && entry.stderr.is_empty());
+    }
+
+    #[tokio::test]
+    async fn l_without_a_worker_reports_it_instead_of_opening_anything() {
+        let mut app = app_with_blocks("noworker", "```bash name=\"a\"\necho a\n```\n").await;
+        app.worker_port = None;
+        app.on_key(key(KeyCode::Char('L'))).await;
+        assert!(app.run_history_view.is_none() && app.block_picker.is_none());
+        assert!(app.status.contains("worker"), "status: {}", app.status);
+    }
+
+    #[tokio::test]
+    async fn l_on_a_node_with_several_blocks_opens_a_picker_of_only_the_ones_with_a_history() {
+        let mut app = app_with_blocks(
+            "picker",
+            concat!(
+                "```bash name=\"a\"\necho a\n```\n\n",
+                "```bash name=\"b\" default\necho b\n```\n\n",
+                "```bash name=\"term\" tty\nsh\n```\n\n",
+                "```bash name=\"srv\" service\nsleep 1\n```\n",
+            ),
+        )
+        .await;
+        // An unreachable port: choosing a block is what would hit the
+        // network, and this only gets as far as the picker.
+        app.worker_port = Some(1);
+        app.on_key(key(KeyCode::Char('L'))).await;
+        let bp = app.block_picker.as_ref().expect("several blocks open the picker first");
+        assert!(bp.history, "the picker is for the history, not a run");
+        let names: Vec<_> = bp.blocks.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b"], "tty and service blocks keep no history");
+        assert_eq!(bp.selected, 1, "the default block is preselected");
+        assert!(app.run_history_view.is_none());
+    }
+
+    #[tokio::test]
+    async fn l_on_a_node_without_any_history_keeping_block_says_so() {
+        // (A single history-keeping block skips the picker and fetches
+        // straight away — that path needs a worker, so it's covered by the
+        // pty suite's `run_history.rs`.)
+        let mut app = app_with_blocks("tty-only", "```bash name=\"term\" tty\nsh\n```\n").await;
+        app.worker_port = Some(1);
+        app.on_key(key(KeyCode::Char('L'))).await;
+        assert!(app.block_picker.is_none() && app.run_history_view.is_none());
+        assert!(app.status.contains("no block"), "status: {}", app.status);
+    }
+
+    #[tokio::test]
+    async fn run_history_view_navigates_scrolls_within_the_output_and_closes() {
+        let mut app = app_with_blocks("nav", "```bash name=\"a\"\necho a\n```\n").await;
+        app.worker_port = Some(1);
+        app.run_history_view = Some(RunHistoryViewState {
+            node_id: "root".into(),
+            block: "a".into(),
+            entries: vec![run_entry(3, 0, false), run_entry(2, 1, false), run_entry(1, 0, true)],
+            output: Some((3, (0..30).map(|i| (OutputStream::Stdout, format!("line {i}"))).collect())),
+            ..Default::default()
+        });
+        app.on_key(key(KeyCode::Up)).await;
+        assert_eq!(app.run_history_view.as_ref().unwrap().selected, 0);
+        app.on_key(key(KeyCode::Char('G'))).await;
+        assert_eq!(app.run_history_view.as_ref().unwrap().selected, 2);
+        // Moving to another run replaces the previous run's output rather
+        // than leaving it under the wrong heading — here the reload fails
+        // (no worker on port 1), and says so instead of showing nothing.
+        let (shown_for, lines) = app.run_history_view.as_ref().unwrap().output.clone().expect("reloaded");
+        assert_eq!(shown_for, 1);
+        assert!(lines[0].1.contains("couldn't load"), "{lines:?}");
+
+        let view = app.run_history_view.as_mut().unwrap();
+        view.output = Some((1, (0..30).map(|i| (OutputStream::Stdout, format!("line {i}"))).collect()));
+        app.on_key(key(KeyCode::PageDown)).await;
+        assert_eq!(app.run_history_view.as_ref().unwrap().output_scroll, 10);
+        for _ in 0..10 {
+            app.on_key(key(KeyCode::PageDown)).await;
+        }
+        assert_eq!(app.run_history_view.as_ref().unwrap().output_scroll, 29, "never past the last line");
+
+        // The modal claims the keymap: `q` closes it rather than quitting.
+        app.on_key(key(KeyCode::Char('q'))).await;
+        assert!(app.run_history_view.is_none());
     }
 
     #[tokio::test]

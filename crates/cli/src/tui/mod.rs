@@ -306,6 +306,9 @@ fn spawn_worker_watcher(
     tokio::spawn(async move {
         use crate::worker_client::WatchEvent;
         let mut changes = crate::worker_client::watch(port);
+        // After `watch` is up, so a run starting in the gap is announced
+        // rather than missed (at worst both paths see it — harmless).
+        reconcile_runs(port, &external_run_tx).await;
         while let Some(event) = changes.recv().await {
             match event {
                 WatchEvent::Changed => {
@@ -322,7 +325,7 @@ fn spawn_worker_watcher(
                     }
                 }
                 WatchEvent::RunStarted { node_id, block } => {
-                    spawn_run_subscriber(port, node_id, block, external_run_tx.clone());
+                    spawn_run_subscriber(port, node_id, block, None, external_run_tx.clone());
                 }
             }
         }
@@ -335,6 +338,10 @@ struct ExternalRunUpdate {
     node_id: String,
     block: String,
     event: crate::worker_client::SubscribeEvent,
+    /// `Some` for a finished run found at startup (`reconcile_runs`) — its
+    /// real duration, which the replay itself can't measure. See
+    /// `App::on_reconciled_run_event`.
+    known_duration_ms: Option<u64>,
 }
 
 /// Reacts to one `WatchEvent::RunStarted` by opening a passive
@@ -352,19 +359,38 @@ fn spawn_run_subscriber(
     port: u16,
     node_id: String,
     block: String,
+    known_duration_ms: Option<u64>,
     tx: tokio::sync::mpsc::UnboundedSender<ExternalRunUpdate>,
 ) {
     tokio::spawn(async move {
         let mut events = crate::worker_client::subscribe_run(port, node_id.clone(), block.clone());
         while let Some(event) = events.recv().await {
-            if tx
-                .send(ExternalRunUpdate { node_id: node_id.clone(), block: block.clone(), event })
-                .is_err()
-            {
+            let update =
+                ExternalRunUpdate { node_id: node_id.clone(), block: block.clone(), event, known_duration_ms };
+            if tx.send(update).is_err() {
                 return;
             }
         }
     });
+}
+
+/// Once, at startup: every plain block the worker has a run for — one still
+/// in flight, or the latest *current* finished one (from the worker's
+/// session database, so also after the worker was restarted; a run the
+/// document has since outgrown isn't offered, see `GET /api/runs`) — gets
+/// the same passive subscription a `WatchEvent::RunStarted` would open, which
+/// replays its output into the Document pane. The counterpart of the web
+/// UI's reconcile-on-load effect. Best-effort: a worker that can't list its
+/// runs just means an empty start, as before.
+async fn reconcile_runs(port: u16, tx: &tokio::sync::mpsc::UnboundedSender<ExternalRunUpdate>) {
+    let Ok(runs) = crate::worker_client::list_active_runs(port).await else { return };
+    for run in runs.into_iter().filter(|r| r.kind == "plain") {
+        // For a finished run `uptime_ms` is its duration (see the server's
+        // `get_active_runs`); for a running one it's the time so far, which
+        // the live stream's own terminal event will measure itself.
+        let known = (run.status != "running").then_some(run.uptime_ms);
+        spawn_run_subscriber(port, run.node_id, run.block, known, tx.clone());
+    }
 }
 
 async fn main_loop(
@@ -470,9 +496,10 @@ async fn main_loop(
                 app.on_link_preview_msg(msg);
             }
             Some(update) = external_run_rx.recv() => {
-                app.on_external_run_event(
+                app.on_reconciled_run_event(
                     BlockAddr::new(update.node_id, update.block),
                     update.event,
+                    update.known_duration_ms,
                 );
             }
             _ = tokio::time::sleep(std::time::Duration::from_secs(3)), if worker_reachable => {

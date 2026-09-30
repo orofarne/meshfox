@@ -711,6 +711,71 @@ pub fn subscribe_run(port: u16, node_id: String, block: String) -> tokio::sync::
     rx
 }
 
+/// One finished run of a block, as `GET /api/run/history` lists it — mirrors
+/// `crates/server/src/run_ledger.rs`'s `RunSummary`. `stale` means the run no
+/// longer describes the document (its block, something it depends on, or a
+/// variable it used changed since, or the session was reset), not that it
+/// failed.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunHistoryEntryDto {
+    pub id: i64,
+    /// `"exited"` or `"killed"`.
+    pub outcome: String,
+    pub exit_code: Option<i32>,
+    pub started_at: String,
+    pub duration_ms: Option<u64>,
+    pub stale: bool,
+}
+
+/// `GET /api/run/history?nodeId=..&block=..` — the finished runs of one
+/// block the worker's session database still keeps (`[session]
+/// max_runs_per_block`), newest first.
+pub async fn run_history(port: u16, node_id: &str, block: &str) -> Result<Vec<RunHistoryEntryDto>, String> {
+    let url = reqwest::Url::parse_with_params(
+        &format!("{}/api/run/history", base_url(port)),
+        &[("nodeId", node_id), ("block", block)],
+    )
+    .map_err(|e| e.to_string())?;
+    let res = reqwest::get(url).await.map_err(|e| e.to_string())?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        return Err(if text.is_empty() { status.to_string() } else { text });
+    }
+    res.json().await.map_err(|e| e.to_string())
+}
+
+/// The stored output of one historical run — `/api/run/subscribe` with a
+/// `runId`, read to its end. A finished run replays its lines and closes, so
+/// this simply collects them; a run the worker no longer has (rotated out
+/// since the list was fetched) closes without a message and comes back as an
+/// empty output.
+pub async fn run_output(
+    port: u16,
+    node_id: &str,
+    block: &str,
+    run_id: i64,
+) -> Result<Vec<(OutputStream, String)>, String> {
+    use futures_util::StreamExt;
+    let url = reqwest::Url::parse_with_params(
+        &format!("ws://127.0.0.1:{port}/api/run/subscribe"),
+        &[("nodeId", node_id), ("block", block), ("runId", &run_id.to_string())],
+    )
+    .map_err(|e| e.to_string())?;
+    let (mut ws, _) = tokio_tungstenite::connect_async(url.as_str()).await.map_err(|e| e.to_string())?;
+    let mut lines = Vec::new();
+    while let Some(msg) = ws.next().await {
+        let Ok(tokio_tungstenite::tungstenite::Message::Text(text)) = msg else { continue };
+        match serde_json::from_str::<SubscribeEvent>(&text) {
+            Ok(SubscribeEvent::Line { stream, text }) => lines.push((stream, text)),
+            Ok(SubscribeEvent::Done { .. }) => break,
+            Err(_) => {}
+        }
+    }
+    Ok(lines)
+}
+
 /// One declared `meshfox:var`'s current status — mirrors
 /// `crates/server/src/lib.rs`'s own `VarStatus`/`VarOrigin` wire shape
 /// (`GET /api/vars`), the same pre-run gate the web UI's `handleRun`

@@ -32,5 +32,6 @@ mod mouse_horizontal_scroll;
 mod mouse_modals;
 mod mouse_output_pane;
 mod mouse_resize;
+mod run_history;
 mod mouse_run_buttons;
 mod services;
