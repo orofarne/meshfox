@@ -24,6 +24,7 @@ pub mod mdcanvas;
 pub mod options;
 pub mod output;
 pub mod service_lock;
+pub mod secret_index;
 pub mod secret_store;
 pub mod shared_env;
 pub mod staticgen;

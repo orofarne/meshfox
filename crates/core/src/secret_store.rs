@@ -90,12 +90,23 @@ pub fn system_backend() -> Arc<dyn SecretBackend> {
 /// is canonicalized when possible, so different spellings of the same file
 /// agree.
 pub fn doc_account(canvas_path: &Path, name: &str) -> String {
-    format!("{}/{name}", doc_scope(canvas_path))
+    account_for(&doc_scope(canvas_path), name)
 }
 
-pub(crate) fn doc_scope(canvas_path: &Path) -> String {
+pub fn doc_scope(canvas_path: &Path) -> String {
     let canonical = std::fs::canonicalize(canvas_path).unwrap_or_else(|_| canvas_path.to_path_buf());
     format!("doc:{}", canonical.display())
+}
+
+/// Account for `name` under a scope as the index stores it: `doc:<path>`
+/// scopes are a document's saved answers, anything else an `[[env]]`
+/// section's `secrets`.
+pub fn account_for(scope: &str, name: &str) -> String {
+    if scope.starts_with("doc:") {
+        format!("{scope}/{name}")
+    } else {
+        env_account(scope, name)
+    }
 }
 
 /// Account for a `secrets = [...]` entry of an `[[env]]` section. `scope`

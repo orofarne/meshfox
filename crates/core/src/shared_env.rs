@@ -287,6 +287,27 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
+/// Every `(account scope, name)` a config table's `[[env]]` sections list in
+/// `secrets = [...]` — for `crate::secret_index` to tell a live secret from
+/// an orphan. `project_root` is `Some` for `<root>/.meshfox/config.toml`,
+/// `None` for the global file.
+pub fn declared_secrets(
+    table: &toml::Table,
+    home: Option<&Path>,
+    project_root: Option<&Path>,
+) -> std::collections::HashSet<(String, String)> {
+    parse_env_sections(table, home, project_root.or(home), project_root)
+        .into_iter()
+        .flat_map(|section| {
+            let scope = section.account_scope;
+            section
+                .secrets
+                .into_iter()
+                .map(move |name| (scope.clone(), name))
+        })
+        .collect()
+}
+
 /// Account scope (see `crate::secret_store::env_account`) for `secrets`
 /// declared in `<canvas_root>/.meshfox/config.toml`.
 pub fn project_account_scope(canvas_root: &Path) -> String {

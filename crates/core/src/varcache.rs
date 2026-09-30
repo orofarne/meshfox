@@ -12,6 +12,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::secret_index::SecretIndex;
 use crate::secret_store::{self, SecretBackend, SecretStoreKind};
 
 /// Where the var cache for `canvas_path` lives: a sibling `.meshfox/`
@@ -53,6 +54,9 @@ pub struct VarCache {
 struct SecretBinding {
     backend: Arc<dyn SecretBackend>,
     canvas_path: PathBuf,
+    /// Where a save is noted (see `crate::secret_index`); `None` for tests
+    /// and when there's no `$HOME`.
+    index: Option<SecretIndex>,
 }
 
 impl VarCache {
@@ -74,6 +78,7 @@ impl VarCache {
             .map(|backend| SecretBinding {
                 backend,
                 canvas_path: canvas_path.to_path_buf(),
+                index: SecretIndex::default_location(),
             });
         Ok(VarCache {
             path: Some(path),
@@ -101,7 +106,16 @@ impl VarCache {
         self.secrets = Some(SecretBinding {
             backend,
             canvas_path: canvas_path.to_path_buf(),
+            index: None,
         });
+        self
+    }
+
+    /// Records saves in `index` — for tests of the index wiring.
+    pub fn with_secret_index(mut self, index: SecretIndex) -> VarCache {
+        if let Some(binding) = &mut self.secrets {
+            binding.index = Some(index);
+        }
         self
     }
 
@@ -131,7 +145,15 @@ impl VarCache {
         match &self.secrets {
             Some(binding) => {
                 let account = secret_store::doc_account(&binding.canvas_path, name);
-                binding.backend.set(&account, value)
+                binding.backend.set(&account, value)?;
+                if let Some(index) = &binding.index {
+                    index
+                        .record(&secret_store::doc_scope(&binding.canvas_path), name)
+                        .map_err(|e| {
+                            io::Error::other(format!("saved, but couldn't note it in the index: {e}"))
+                        })?;
+                }
+                Ok(())
             }
             None => self.set(name, value),
         }
@@ -227,6 +249,23 @@ mod tests {
         assert_eq!(cache.try_get_secret("TOKEN").unwrap().as_deref(), Some("s3cret"));
         assert_eq!(cache.get("TOKEN"), None);
         assert_eq!(cache.secret_store_kind(), SecretStoreKind::Keychain);
+    }
+
+    #[test]
+    fn save_secret_notes_the_save_in_the_index() {
+        let dir = std::env::temp_dir().join(format!("meshfox-varcache-index-{}", uid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let index = SecretIndex::at(dir.join("secrets.sqlite3"));
+        let canvas = dir.join("doc.canvas.md");
+        let mut cache = VarCache::in_memory()
+            .with_secret_backend(Arc::new(secret_store::MemoryBackend::new()), &canvas)
+            .with_secret_index(index.clone());
+        cache.save_secret("TOKEN", "v").unwrap();
+        let entries = index.entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "TOKEN");
+        assert_eq!(entries[0].scope, secret_store::doc_scope(&canvas));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

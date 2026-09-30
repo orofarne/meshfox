@@ -5215,7 +5215,12 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
                         )
                     })?;
                 } else {
-                    let _ = cache.set(name, value);
+                    cache.set(name, value).map_err(|e| {
+                        ApiError(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("couldn't save {name} to the variable cache: {e}"),
+                        )
+                    })?;
                 }
             }
         }
@@ -6408,7 +6413,12 @@ async fn run_block_tty(
                         )
                     })?;
                 } else {
-                    let _ = cache.set(name, value);
+                    cache.set(name, value).map_err(|e| {
+                        ApiError(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("couldn't save {name} to the variable cache: {e}"),
+                        )
+                    })?;
                 }
             }
         }
@@ -7865,7 +7875,12 @@ async fn debug_start(
             .iter()
             .any(|d| &d.name == name && !d.secret && !d.session)
         {
-            let _ = cache.set(name, value);
+            cache.set(name, value).map_err(|e| {
+                        ApiError(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("couldn't save {name} to the variable cache: {e}"),
+                        )
+                    })?;
         }
     }
     drop(cache);
@@ -13195,6 +13210,31 @@ mod vars_endpoint_tests {
 
         let _ = std::fs::remove_file(&canvas_path);
         let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));
+    }
+
+    #[tokio::test]
+    async fn run_block_refuses_to_start_when_a_plain_answer_cannot_be_saved_to_the_cache() {
+        let canvas_path = write_test_canvas(concat!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "<!-- meshfox:var name=\"GREETING\" -->\n\n",
+            "```bash name=\"hi\" env=\"$GREETING\"\necho \"$GREETING\"\n```\n",
+        ));
+        // A read-only cache file: loading it works, writing an answer doesn't.
+        let cache_file = meshfox_core::varcache::cache_path(&canvas_path);
+        std::fs::create_dir_all(cache_file.parent().unwrap()).unwrap();
+        std::fs::write(&cache_file, "").unwrap();
+        let mut perms = std::fs::metadata(&cache_file).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o444);
+        std::fs::set_permissions(&cache_file, perms).unwrap();
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let events = run_ws_events(addr, &[("block", "hi"), ("vars", r#"{"GREETING":"hello"}"#)]).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["type"], "error", "{events:?}");
+        let message = events[0]["message"].as_str().unwrap();
+        assert!(message.contains("GREETING") && message.contains("variable cache"), "{message}");
+        let _ = std::fs::remove_file(&cache_file);
+        let _ = std::fs::remove_file(&canvas_path);
     }
 
     #[tokio::test]

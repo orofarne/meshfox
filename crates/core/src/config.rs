@@ -62,6 +62,19 @@ pub(crate) fn read_table(path: &Path) -> toml::Table {
         .unwrap_or_default()
 }
 
+/// Like `read_table`, but tells "no such file" (fine: empty) apart from a
+/// file that exists and can't be read or parsed (an `Err` with the reason) —
+/// for callers that must not treat a typo as "declares nothing".
+pub(crate) fn read_table_strict(path: &Path) -> Result<toml::Table, String> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => s
+            .parse::<toml::Table>()
+            .map_err(|e| format!("{}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(toml::Table::new()),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
 fn deep_merge(base: &mut toml::Table, overlay: toml::Table) {
     for (key, overlay_value) in overlay {
         match (base.get_mut(&key), overlay_value) {

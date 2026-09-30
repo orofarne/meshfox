@@ -1,10 +1,12 @@
-//! `meshfox secret set|show|rm` — manage values in the system secret store
-//! (`secret_store = "keychain"`, see `meshfox_core::secret_store`). Values
-//! are only ever printed by `show --reveal`.
+//! `meshfox secret set|show|rm|list|prune` — manage values in the system
+//! secret store (`secret_store = "keychain"`, see `meshfox_core::secret_store`)
+//! and the local index of what's in it (`meshfox_core::secret_index`).
+//! Values are only ever printed by `show --reveal`.
 
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 
+use meshfox_core::secret_index::{self, SecretIndex, SecretReport, SecretStatus};
 use meshfox_core::secret_store::{self, SecretBackend};
 use meshfox_core::shared_env;
 
@@ -45,20 +47,41 @@ pub enum SecretOp {
         #[command(flatten)]
         scope: SecretScope,
     },
-    /// Delete a stored value.
+    /// Delete a stored value (and its index entry).
     Rm {
         name: String,
         #[command(flatten)]
         scope: SecretScope,
+    },
+    /// List what meshfox has stored, from the local index
+    /// (`~/.meshfox/secrets.sqlite3`) — names and status only, never
+    /// values. Status: `ok`; `orphan-decl` (the file no longer declares
+    /// it); `orphan-path` (the canvas/project directory is gone — or was
+    /// moved or renamed); `unknown` (a file that should say couldn't be
+    /// read).
+    List {
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete every orphaned secret (`orphan-decl` and `orphan-path`) from
+    /// the keychain and the index. Only shows what it would delete unless
+    /// `--yes` is given. `unknown` entries are never touched.
+    Prune {
+        #[arg(long)]
+        yes: bool,
     },
 }
 
 pub fn run(op: SecretOp, find_canvas: impl FnOnce() -> PathBuf) -> Result<(), String> {
     match op {
         SecretOp::Set { name, scope } => {
-            let (backend, account) = resolve(&scope, &name, find_canvas)?;
+            let t = resolve(&scope, &name, find_canvas)?;
             let value = read_value(&name)?;
-            backend.set(&account, &value).map_err(|e| e.to_string())?;
+            t.backend.set(&t.account(), &value).map_err(|e| e.to_string())?;
+            index()?.record(&t.scope, &name).map_err(|e| {
+                format!("stored, but couldn't note {name} in the index: {e}")
+            })?;
             println!("stored {name}");
         }
         SecretOp::Show {
@@ -66,39 +89,142 @@ pub fn run(op: SecretOp, find_canvas: impl FnOnce() -> PathBuf) -> Result<(), St
             reveal,
             scope,
         } => {
-            let (backend, account) = resolve(&scope, &name, find_canvas)?;
-            match backend.get(&account).map_err(|e| e.to_string())? {
+            let t = resolve(&scope, &name, find_canvas)?;
+            match t.backend.get(&t.account()).map_err(|e| e.to_string())? {
                 Some(v) if reveal => println!("{v}"),
                 Some(_) => println!("{name}: set"),
                 None => println!("{name}: unset"),
             }
         }
         SecretOp::Rm { name, scope } => {
-            let (backend, account) = resolve(&scope, &name, find_canvas)?;
-            if backend.delete(&account).map_err(|e| e.to_string())? {
+            let t = resolve(&scope, &name, find_canvas)?;
+            let removed = secret_index::remove(&index()?, t.backend.as_ref(), &t.scope, &name)
+                .map_err(|e| e.to_string())?;
+            if removed {
                 println!("removed {name}");
             } else {
                 println!("{name}: nothing stored");
             }
         }
+        SecretOp::List { json } => {
+            let reports = secret_index::report(&index()?).map_err(|e| e.to_string())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&reports_json(&reports)).unwrap());
+            } else if reports.is_empty() {
+                println!("no secrets recorded");
+            } else {
+                for r in &reports {
+                    println!(
+                        "{:<12} {:<20} {}  ({})",
+                        r.status.as_str(),
+                        r.entry.name,
+                        r.entry.scope,
+                        r.entry.created_at
+                    );
+                    if let SecretStatus::Unknown(why) = &r.status {
+                        println!("             {why}");
+                    }
+                }
+            }
+        }
+        SecretOp::Prune { yes } => prune(yes)?,
     }
     Ok(())
 }
 
-/// The configured backend plus the account for `name` in `scope`. Errors
-/// (rather than doing nothing) when `secret_store` isn't `keychain`.
+pub fn reports_json(reports: &[SecretReport]) -> serde_json::Value {
+    serde_json::Value::Array(
+        reports
+            .iter()
+            .map(|r| {
+                let mut v = serde_json::json!({
+                    "scope": r.entry.scope,
+                    "name": r.entry.name,
+                    "createdAt": r.entry.created_at,
+                    "status": r.status.as_str(),
+                });
+                if let SecretStatus::Unknown(why) = &r.status {
+                    v["reason"] = serde_json::Value::String(why.clone());
+                }
+                v
+            })
+            .collect(),
+    )
+}
+
+fn index() -> Result<SecretIndex, String> {
+    SecretIndex::default_location().ok_or_else(|| "HOME isn't set — nowhere to keep the index".to_string())
+}
+
+fn prune(yes: bool) -> Result<(), String> {
+    let index = index()?;
+    let reports = secret_index::report(&index).map_err(|e| e.to_string())?;
+    let (by_path, by_decl): (Vec<_>, Vec<_>) = reports
+        .iter()
+        .filter(|r| r.status.is_orphan())
+        .partition(|r| r.status == SecretStatus::OrphanPath);
+    if by_path.is_empty() && by_decl.is_empty() {
+        println!("nothing to prune");
+        return Ok(());
+    }
+    let describe = |title: &str, group: &[&SecretReport]| {
+        if !group.is_empty() {
+            println!("{title}:");
+            for r in group {
+                println!("  {}  {}", r.entry.name, r.entry.scope);
+            }
+        }
+    };
+    describe("no longer declared", &by_decl);
+    describe(
+        "file or directory not found (deleted — or moved/renamed, which looks the same)",
+        &by_path,
+    );
+    if !yes {
+        println!("dry run — pass --yes to delete these from the keychain and the index");
+        return Ok(());
+    }
+    let backend = secret_store::system_backend();
+    let mut failed = 0;
+    for r in by_decl.iter().chain(by_path.iter()) {
+        match secret_index::remove(&index, backend.as_ref(), &r.entry.scope, &r.entry.name) {
+            Ok(_) => println!("deleted {}  {}", r.entry.name, r.entry.scope),
+            Err(e) => {
+                failed += 1;
+                eprintln!("couldn't delete {}  {}: {e}", r.entry.name, r.entry.scope);
+            }
+        }
+    }
+    if failed > 0 {
+        return Err(format!("{failed} secret(s) could not be deleted"));
+    }
+    Ok(())
+}
+
+struct Target {
+    backend: std::sync::Arc<dyn SecretBackend>,
+    scope: String,
+    name: String,
+}
+
+impl Target {
+    fn account(&self) -> String {
+        secret_store::account_for(&self.scope, &self.name)
+    }
+}
+
+/// The configured backend plus the index scope for `name`. Errors (rather
+/// than doing nothing) when `secret_store` isn't `keychain`.
 fn resolve(
     scope: &SecretScope,
     name: &str,
     find_canvas: impl FnOnce() -> PathBuf,
-) -> Result<(std::sync::Arc<dyn SecretBackend>, String), String> {
-    let (config_root, account): (PathBuf, String) = if scope.global {
+) -> Result<Target, String> {
+    let (config_root, index_scope): (PathBuf, String) = if scope.global {
         let root = std::env::current_dir().map_err(|e| e.to_string())?;
-        let s = shared_env::global_account_scope(scope.path.as_deref());
-        (root, secret_store::env_account(&s, name))
+        (root, shared_env::global_account_scope(scope.path.as_deref()))
     } else if let Some(dir) = &scope.project {
-        let s = shared_env::project_account_scope(dir);
-        (dir.clone(), secret_store::env_account(&s, name))
+        (dir.clone(), shared_env::project_account_scope(dir))
     } else {
         let canvas = scope.canvas.clone().unwrap_or_else(find_canvas);
         let root = canvas
@@ -106,14 +232,17 @@ fn resolve(
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."))
             .to_path_buf();
-        let account = secret_store::doc_account(&canvas, name);
-        (root, account)
+        (root, secret_store::doc_scope(&canvas))
     };
     let backend = secret_store::backend_for(&config_root)?.ok_or_else(|| {
         "secret_store is not set to \"keychain\" in .meshfox/config.toml — nothing to manage"
             .to_string()
     })?;
-    Ok((backend, account))
+    Ok(Target {
+        backend,
+        scope: index_scope,
+        name: name.to_string(),
+    })
 }
 
 fn read_value(name: &str) -> Result<String, String> {

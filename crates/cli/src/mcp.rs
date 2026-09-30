@@ -1481,6 +1481,26 @@ impl MeshfoxMcpRoot {
     }
 
     #[tool(
+        description = "Lists the secrets meshfox has stored in the system secret store, from its local index: scope, name, created-at and status (ok, orphan-decl, orphan-path, unknown). Never returns values. Only entries for canvases and projects under this server's root directory are listed, plus global ones."
+    )]
+    async fn secret_list(
+        &self,
+        Parameters(_params): Parameters<EmptyParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let index = meshfox_core::secret_index::SecretIndex::default_location()
+            .ok_or_else(|| ErrorData::internal_error("HOME isn't set", None))?;
+        let reports = meshfox_core::secret_index::report(&index)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let visible: Vec<_> = reports
+            .into_iter()
+            .filter(|r| secret_visible_under(&r.entry.scope, &self.root))
+            .collect();
+        Ok(CallToolResult::structured(
+            json!({ "secrets": crate::secret_cmd::reports_json(&visible) }),
+        ))
+    }
+
+    #[tool(
         description = "Same as debug_start, scoped to canvas_id (see canvas_open) — starts a persistent debug shell in that canvas."
     )]
     async fn debug_start(
@@ -1707,6 +1727,17 @@ impl MeshfoxMcpRoot {
     }
 }
 
+/// Whether an index scope may be shown to an MCP client rooted at `root`:
+/// a `doc:`/`project:` scope only when its path is under `root`, so an agent
+/// working in one tree can't enumerate the rest of the machine; `global`
+/// scopes always.
+fn secret_visible_under(scope: &str, root: &std::path::Path) -> bool {
+    match meshfox_core::secret_index::scope_path(scope) {
+        Some(path) => path.starts_with(root),
+        None => true,
+    }
+}
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for MeshfoxMcpRoot {
     fn get_info(&self) -> ServerInfo {
@@ -1730,12 +1761,24 @@ impl ServerHandler for MeshfoxMcpRoot {
 
 #[cfg(test)]
 mod tests {
-    use super::{node_json, MeshfoxMcpRoot};
+    use super::{node_json, secret_visible_under, MeshfoxMcpRoot};
     use meshfox_core::Canvas;
     use meshfox_server::debug_session::DebugSession;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn secret_list_only_shows_scopes_under_the_root_plus_global() {
+        let root = std::path::Path::new("/work/proj");
+        assert!(secret_visible_under("doc:/work/proj/a.canvas.md", root));
+        assert!(secret_visible_under("project:/work/proj/sub", root));
+        assert!(secret_visible_under("global", root));
+        assert!(secret_visible_under("global:~/work", root));
+        assert!(!secret_visible_under("doc:/work/other/a.canvas.md", root));
+        assert!(!secret_visible_under("doc:/work/project2/a.canvas.md", root));
+        assert!(!secret_visible_under("project:/elsewhere", root));
+    }
 
     #[tokio::test]
     async fn debug_session_has_no_controlling_terminal() {
