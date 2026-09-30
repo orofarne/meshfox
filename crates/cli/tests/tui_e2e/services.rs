@@ -21,7 +21,10 @@ fn is_alive(pid: u32) -> bool {
 fn find_service_pid(screen: &str) -> Option<u32> {
     let marker = "service started, pid ";
     let start = screen.find(marker)? + marker.len();
-    let digits: String = screen[start..].chars().take_while(|c| c.is_ascii_digit()).collect();
+    let digits: String = screen[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
     digits.parse().ok()
 }
 
@@ -39,7 +42,9 @@ fn running_a_service_block_streams_a_started_line_and_shows_live_glyphs_then_qui
     // own >= 2-step gate) — click the collapsed strip open first, same as
     // a real user would have to, so the "service started" line actually
     // lands somewhere visible.
-    let (out_row, out_col) = session.find("Output").unwrap_or_else(|| panic!("collapsed Output strip; screen:\n{}", session.screen_text()));
+    let (out_row, out_col) = session
+        .find("Output")
+        .unwrap_or_else(|| panic!("collapsed Output strip; screen:\n{}", session.screen_text()));
     session.send_mouse_click(out_row, out_col);
 
     // Root's own sole block is the service — already selected, no need to
@@ -53,7 +58,10 @@ fn running_a_service_block_streams_a_started_line_and_shows_live_glyphs_then_qui
     // view (below) covers/scrolls other panes, so this line isn't
     // guaranteed to still be readable verbatim afterward.
     let pid = find_service_pid(&session.screen_text()).expect("parse the service's own pid");
-    assert!(is_alive(pid), "service should actually be running at this point");
+    assert!(
+        is_alive(pid),
+        "service should actually be running at this point"
+    );
 
     // `v` — the services view is how you actually see a daemon's own log
     // in the TUI (`ui::render_services_view`'s log pane, below the list).
@@ -106,7 +114,10 @@ fn running_a_service_block_streams_a_started_line_and_shows_live_glyphs_then_qui
 fn find_list_pid(screen: &str, status_word: &str) -> Option<u32> {
     let marker = format!("{status_word} · pid ");
     let start = screen.find(&marker)? + marker.len();
-    let digits: String = screen[start..].chars().take_while(|c| c.is_ascii_digit()).collect();
+    let digits: String = screen[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
     digits.parse().ok()
 }
 
@@ -123,7 +134,9 @@ fn v_opens_the_services_view_and_s_r_stop_and_restart() {
     // (`App::begin_http_run`'s own >= 2-step gate) — click the collapsed
     // strip open first, same as a real user would have to, so the
     // "service started" line actually lands somewhere visible.
-    let (out_row, out_col) = session.find("Output").unwrap_or_else(|| panic!("collapsed Output strip; screen:\n{}", session.screen_text()));
+    let (out_row, out_col) = session
+        .find("Output")
+        .unwrap_or_else(|| panic!("collapsed Output strip; screen:\n{}", session.screen_text()));
     session.send_mouse_click(out_row, out_col);
 
     session.send_keys("r");
@@ -156,15 +169,22 @@ fn v_opens_the_services_view_and_s_r_stop_and_restart() {
         std::thread::sleep(Duration::from_millis(50));
         still_alive = is_alive(pid);
     }
-    assert!(!still_alive, "pid {pid} should be dead after stopping via s");
+    assert!(
+        !still_alive,
+        "pid {pid} should be dead after stopping via s"
+    );
 
     session.send_keys("r");
     session
         .wait_for("running · pid", Duration::from_secs(5))
         .expect("the list should flip back to running after r");
-    let restarted_pid = find_list_pid(&session.screen_text(), "running").expect("parse the restarted pid");
+    let restarted_pid =
+        find_list_pid(&session.screen_text(), "running").expect("parse the restarted pid");
     assert_ne!(restarted_pid, pid, "restart should give it a fresh pid");
-    assert!(is_alive(restarted_pid), "restarted service should actually be running");
+    assert!(
+        is_alive(restarted_pid),
+        "restarted service should actually be running"
+    );
 
     // Closing the view uncovers the tree again, glyph and all.
     session.send_keys("q");
@@ -182,16 +202,26 @@ fn v_opens_the_services_view_and_s_r_stop_and_restart() {
 fn external_signal_stops_services_and_restores_the_terminal(signal: i32, name: &str) {
     let (canvas_path, dir) = fixtures::write_fixture(fixtures::SERVICE_RUNNABLE);
     let mut session = TuiSession::spawn(&canvas_path, dir, 30, 100);
-    session.wait_for("Root", Duration::from_secs(5)).expect("initial render");
-    let (out_row, out_col) = session.find("Output").unwrap_or_else(|| panic!("collapsed Output strip; screen:\n{}", session.screen_text()));
+    session
+        .wait_for("Root", Duration::from_secs(5))
+        .expect("initial render");
+    let (out_row, out_col) = session
+        .find("Output")
+        .unwrap_or_else(|| panic!("collapsed Output strip; screen:\n{}", session.screen_text()));
     session.send_mouse_click(out_row, out_col);
     session.send_keys("r");
     session
         .wait_for("service started, pid", Duration::from_secs(10))
         .expect("the service-started line should show up in the Output pane");
     let pid = find_service_pid(&session.screen_text()).expect("parse the service's own pid");
-    assert!(is_alive(pid), "service should actually be running at this point");
-    assert!(session.in_alternate_screen(), "the TUI should own the alternate screen while running");
+    assert!(
+        is_alive(pid),
+        "service should actually be running at this point"
+    );
+    assert!(
+        session.in_alternate_screen(),
+        "the TUI should own the alternate screen while running"
+    );
 
     session.send_signal(signal);
     assert!(
@@ -205,7 +235,10 @@ fn external_signal_stops_services_and_restores_the_terminal(signal: i32, name: &
         std::thread::sleep(Duration::from_millis(50));
         still_alive = is_alive(pid);
     }
-    assert!(!still_alive, "service pid {pid} survived an external {name} — it was orphaned");
+    assert!(
+        !still_alive,
+        "service pid {pid} survived an external {name} — it was orphaned"
+    );
     // Give the pty reader thread a beat to drain the last bytes.
     std::thread::sleep(Duration::from_millis(200));
     assert!(
@@ -235,8 +268,12 @@ fn external_sighup_stops_services_and_restores_the_terminal() {
 fn external_sigterm_on_a_joined_tui_restores_the_terminal_and_leaves_the_others_service_running() {
     let (canvas_path, dir) = fixtures::write_fixture(fixtures::SERVICE_RUNNABLE);
     let mut owner = TuiSession::spawn(&canvas_path, dir.clone(), 30, 100);
-    owner.wait_for("Root", Duration::from_secs(5)).expect("owner initial render");
-    let (out_row, out_col) = owner.find("Output").unwrap_or_else(|| panic!("collapsed Output strip; screen:\n{}", owner.screen_text()));
+    owner
+        .wait_for("Root", Duration::from_secs(5))
+        .expect("owner initial render");
+    let (out_row, out_col) = owner
+        .find("Output")
+        .unwrap_or_else(|| panic!("collapsed Output strip; screen:\n{}", owner.screen_text()));
     owner.send_mouse_click(out_row, out_col);
     owner.send_keys("r");
     owner
@@ -245,7 +282,9 @@ fn external_sigterm_on_a_joined_tui_restores_the_terminal_and_leaves_the_others_
     let pid = find_service_pid(&owner.screen_text()).expect("parse the service's own pid");
 
     let mut joined = TuiSession::spawn(&canvas_path, dir, 30, 100);
-    joined.wait_for("Root", Duration::from_secs(5)).expect("joined initial render");
+    joined
+        .wait_for("Root", Duration::from_secs(5))
+        .expect("joined initial render");
     assert!(joined.in_alternate_screen());
 
     joined.send_signal(libc::SIGTERM);
@@ -254,9 +293,18 @@ fn external_sigterm_on_a_joined_tui_restores_the_terminal_and_leaves_the_others_
         "the joined TUI should exit on an external SIGTERM"
     );
     std::thread::sleep(Duration::from_millis(200));
-    assert!(!joined.in_alternate_screen(), "the joined TUI left the terminal stuck in the alternate screen");
-    assert!(is_alive(pid), "another TUI's service must survive this TUI being killed");
-    assert!(owner.in_alternate_screen(), "the owning TUI must be untouched");
+    assert!(
+        !joined.in_alternate_screen(),
+        "the joined TUI left the terminal stuck in the alternate screen"
+    );
+    assert!(
+        is_alive(pid),
+        "another TUI's service must survive this TUI being killed"
+    );
+    assert!(
+        owner.in_alternate_screen(),
+        "the owning TUI must be untouched"
+    );
     // `owner`'s Drop kills it; the service dies with it via the worker's own
     // shutdown — not asserted here, `quit_stops_it` above already covers that.
     let _ = owner.wait_for_exit(Duration::from_millis(1));

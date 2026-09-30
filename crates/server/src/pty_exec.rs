@@ -147,7 +147,8 @@ where
         .map(|(k, v)| (k.as_ref().to_string(), v.as_ref().to_string()))
         .collect();
     let env_names: Vec<String> = envs.iter().map(|(k, _)| k.clone()).collect();
-    let resolved = meshfox_core::resolve_command(code, interpreter, lang, cwd, canvas_path, &env_names)?;
+    let resolved =
+        meshfox_core::resolve_command(code, interpreter, lang, cwd, canvas_path, &env_names)?;
 
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -296,7 +297,17 @@ mod tests {
 
     #[tokio::test]
     async fn stdin_is_writable() {
-        let mut proc = spawn("read line; echo \"got: $line\"", None, None, no_envs(), None, None, 80, 24).unwrap();
+        let mut proc = spawn(
+            "read line; echo \"got: $line\"",
+            None,
+            None,
+            no_envs(),
+            None,
+            None,
+            80,
+            24,
+        )
+        .unwrap();
         proc.write(b"hi there\n".to_vec());
         let mut collected = Vec::new();
         while let Some(chunk) = proc.output_rx.recv().await {
@@ -347,8 +358,17 @@ mod tests {
         // `cat` as a stand-in "interpreter" — no assumption about python
         // being installed, just proves a `tty` block's own `interpreter=`
         // actually reaches the pty instead of always running under `bash`.
-        let mut proc = spawn("hello from a tty interpreter", Some("cat"), None, no_envs(), None, None, 80, 24)
-            .unwrap();
+        let mut proc = spawn(
+            "hello from a tty interpreter",
+            Some("cat"),
+            None,
+            no_envs(),
+            None,
+            None,
+            80,
+            24,
+        )
+        .unwrap();
         let mut collected = Vec::new();
         while let Some(chunk) = proc.output_rx.recv().await {
             collected.extend_from_slice(&chunk);
@@ -361,8 +381,21 @@ mod tests {
 
     #[tokio::test]
     async fn interpreter_temp_file_is_removed_once_the_child_exits() {
-        let mut proc = spawn("temp contents", Some("cat"), None, no_envs(), None, None, 80, 24).unwrap();
-        let path = proc.cleanup.clone().expect("interpreter spawn sets cleanup");
+        let mut proc = spawn(
+            "temp contents",
+            Some("cat"),
+            None,
+            no_envs(),
+            None,
+            None,
+            80,
+            24,
+        )
+        .unwrap();
+        let path = proc
+            .cleanup
+            .clone()
+            .expect("interpreter spawn sets cleanup");
         assert!(path.exists());
         while let Some(chunk) = proc.output_rx.recv().await {
             if String::from_utf8_lossy(&chunk).contains("temp contents") {

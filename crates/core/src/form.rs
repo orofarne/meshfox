@@ -126,7 +126,10 @@ mod tests {
         assert_eq!(
             form.fields,
             vec![
-                FormField { var: "INSTALL_PATH".to_string(), label: None },
+                FormField {
+                    var: "INSTALL_PATH".to_string(),
+                    label: None
+                },
                 FormField {
                     var: "REGION".to_string(),
                     label: Some("AWS Region".to_string())

@@ -270,7 +270,13 @@ pub async fn request_open(
     canvas_path: &Path,
     fragment: Option<String>,
 ) -> io::Result<()> {
-    request_open_with_timeout(socket_path, canvas_path, fragment, COORDINATOR_REQUEST_TIMEOUT).await
+    request_open_with_timeout(
+        socket_path,
+        canvas_path,
+        fragment,
+        COORDINATOR_REQUEST_TIMEOUT,
+    )
+    .await
 }
 
 async fn request_open_with_timeout(
@@ -361,7 +367,10 @@ mod tests {
 
         let msg: Message = serde_json::from_str(buf.trim()).unwrap();
         match msg {
-            Message::Ready { canvas_path: p, port } => {
+            Message::Ready {
+                canvas_path: p,
+                port,
+            } => {
                 assert_eq!(p, canvas_path);
                 assert_eq!(port, 4242);
             }
@@ -402,7 +411,10 @@ mod tests {
         send_task.await.unwrap().unwrap();
 
         match msg {
-            Message::Open { canvas_path: p, fragment } => {
+            Message::Open {
+                canvas_path: p,
+                fragment,
+            } => {
                 assert_eq!(p, canvas_path);
                 assert_eq!(fragment.as_deref(), Some("some-node"));
             }
@@ -509,7 +521,12 @@ mod tests {
             let socket_path = socket_path.clone();
             let canvas_path = canvas_path.clone();
             async move {
-                request_port_with_timeout(&socket_path, &canvas_path, std::time::Duration::from_millis(200)).await
+                request_port_with_timeout(
+                    &socket_path,
+                    &canvas_path,
+                    std::time::Duration::from_millis(200),
+                )
+                .await
             }
         });
 
@@ -536,8 +553,13 @@ mod tests {
             let socket_path = socket_path.clone();
             let canvas_path = canvas_path.clone();
             async move {
-                request_open_with_timeout(&socket_path, &canvas_path, None, std::time::Duration::from_millis(200))
-                    .await
+                request_open_with_timeout(
+                    &socket_path,
+                    &canvas_path,
+                    None,
+                    std::time::Duration::from_millis(200),
+                )
+                .await
             }
         });
 

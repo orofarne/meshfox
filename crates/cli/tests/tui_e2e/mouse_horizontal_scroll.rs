@@ -51,7 +51,9 @@ fn scrolling_right_over_the_output_pane_reveals_a_clipped_lines_tail() {
         "the line's own tail shouldn't fit in a 100-column Output pane"
     );
 
-    let (row, col) = session.find("line-start-marker").expect("the wide output line");
+    let (row, col) = session
+        .find("line-start-marker")
+        .expect("the wide output line");
     for _ in 0..20 {
         session.send_mouse_scroll_horizontal(row, col, true); // true = right
     }

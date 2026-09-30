@@ -64,7 +64,12 @@ impl<T: Clone> RingBuffer<T> {
     /// case).
     fn since(&self, since: u64) -> (Vec<SeqItem<T>>, bool) {
         let gap = matches!(self.items.front(), Some(oldest) if since < oldest.seq);
-        let backlog = self.items.iter().filter(|i| i.seq >= since).cloned().collect();
+        let backlog = self
+            .items
+            .iter()
+            .filter(|i| i.seq >= since)
+            .cloned()
+            .collect();
         (backlog, gap)
     }
 }
@@ -78,7 +83,11 @@ impl<T: Clone> SeqLog<T> {
     pub fn new(cap: usize) -> Self {
         let (tx, _) = broadcast::channel(1024);
         SeqLog {
-            log: Mutex::new(RingBuffer { cap, next_seq: 0, items: VecDeque::new() }),
+            log: Mutex::new(RingBuffer {
+                cap,
+                next_seq: 0,
+                items: VecDeque::new(),
+            }),
             tx,
         }
     }
@@ -99,7 +108,10 @@ impl<T: Clone> SeqLog<T> {
     /// The trailing `bool` is `true` when `since` predates everything still
     /// in the buffer — the caller should treat that as "do a full resync",
     /// not trust the (possibly incomplete) backlog alone.
-    pub fn subscribe_from(&self, since: u64) -> (Vec<SeqItem<T>>, broadcast::Receiver<SeqItem<T>>, bool) {
+    pub fn subscribe_from(
+        &self,
+        since: u64,
+    ) -> (Vec<SeqItem<T>>, broadcast::Receiver<SeqItem<T>>, bool) {
         let log = self.log.lock().unwrap();
         let rx = self.tx.subscribe();
         let (backlog, gap) = log.since(since);

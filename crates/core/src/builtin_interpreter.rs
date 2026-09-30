@@ -163,7 +163,8 @@ fn venv_dir(canvas_path: &Path) -> PathBuf {
 /// for a caller that wants to check without also materializing a script to
 /// disk (e.g. deciding whether to bother loading config at all).
 pub fn is_builtin(spec: &str) -> bool {
-    spec.strip_prefix('@').is_some_and(|name| lookup(name).is_some())
+    spec.strip_prefix('@')
+        .is_some_and(|name| lookup(name).is_some())
 }
 
 /// Writes `builtin.script` to a stable, content-addressed path under the
@@ -178,7 +179,11 @@ pub fn is_builtin(spec: &str) -> bool {
 fn materialize(builtin: &Builtin) -> io::Result<PathBuf> {
     let dir = std::env::temp_dir().join("meshfox-builtins");
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{}-{:08x}.sh", builtin.name, fnv1a(builtin.script.as_bytes())));
+    let path = dir.join(format!(
+        "{}-{:08x}.sh",
+        builtin.name,
+        fnv1a(builtin.script.as_bytes())
+    ));
     if !path.exists() {
         std::fs::write(&path, builtin.script)?;
         #[cfg(unix)]
@@ -249,17 +254,22 @@ mod tests {
 
     #[test]
     fn resolve_with_env_is_none_for_a_non_builtin_spec() {
-        assert!(resolve_with_env("python3 -u", None, None, None, &[]).unwrap().is_none());
+        assert!(resolve_with_env("python3 -u", None, None, None, &[])
+            .unwrap()
+            .is_none());
     }
 
     #[test]
     fn resolve_with_env_sets_venv_dir_only_for_python_venv_with_a_canvas_path() {
         let canvas_path = Path::new("examples/pandas-dataframe.canvas.md");
 
-        let (_, envs) = resolve_with_env("@python_venv", Some("toml"), None, Some(canvas_path), &[])
-            .unwrap()
-            .unwrap();
-        assert!(envs.iter().any(|(k, v)| k == "MESHFOX_BLOCK_LANG" && v == "toml"));
+        let (_, envs) =
+            resolve_with_env("@python_venv", Some("toml"), None, Some(canvas_path), &[])
+                .unwrap()
+                .unwrap();
+        assert!(envs
+            .iter()
+            .any(|(k, v)| k == "MESHFOX_BLOCK_LANG" && v == "toml"));
         let venv_dir = envs
             .iter()
             .find(|(k, _)| k == "MESHFOX_VENV_DIR")
@@ -273,7 +283,9 @@ mod tests {
 
         // No canvas_path -> no MESHFOX_VENV_DIR at all (falls back to
         // python_venv.sh's own `.venv` default).
-        let (_, envs) = resolve_with_env("@python_venv", None, None, None, &[]).unwrap().unwrap();
+        let (_, envs) = resolve_with_env("@python_venv", None, None, None, &[])
+            .unwrap()
+            .unwrap();
         assert!(!envs.iter().any(|(k, _)| k == "MESHFOX_VENV_DIR"));
 
         // @agent never gets MESHFOX_VENV_DIR, even with a canvas_path — it
@@ -302,14 +314,18 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn agent_sh_interpolate_survives_bash_3_2_with_no_env_names() {
         let script = resolve_builtin_spec("@agent").unwrap().unwrap();
-        let prompt = std::env::temp_dir().join(format!("meshfox-agent-sh-test-{}.txt", std::process::id()));
+        let prompt =
+            std::env::temp_dir().join(format!("meshfox-agent-sh-test-{}.txt", std::process::id()));
         std::fs::write(&prompt, "hello world").unwrap();
 
         let output = std::process::Command::new("/bin/bash")
             .arg(&script)
             .arg(&prompt)
             .env_remove("MESHFOX_ENV_NAMES")
-            .env("MESHFOX_CONFIG_INTERPRETERS_AGENT_PROVIDER", "bogus-provider")
+            .env(
+                "MESHFOX_CONFIG_INTERPRETERS_AGENT_PROVIDER",
+                "bogus-provider",
+            )
             .stdin(std::process::Stdio::null())
             .output()
             .unwrap();
@@ -329,13 +345,19 @@ mod tests {
 
     #[test]
     fn resolve_with_env_sets_env_names_only_when_non_empty() {
-        let (_, envs) = resolve_with_env("@agent", None, None, None, &[]).unwrap().unwrap();
+        let (_, envs) = resolve_with_env("@agent", None, None, None, &[])
+            .unwrap()
+            .unwrap();
         assert!(!envs.iter().any(|(k, _)| k == "MESHFOX_ENV_NAMES"));
 
         let names = vec!["TOPIC".to_string(), "OTHER".to_string()];
-        let (_, envs) = resolve_with_env("@agent", None, None, None, &names).unwrap().unwrap();
+        let (_, envs) = resolve_with_env("@agent", None, None, None, &names)
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            envs.iter().find(|(k, _)| k == "MESHFOX_ENV_NAMES").map(|(_, v)| v.as_str()),
+            envs.iter()
+                .find(|(k, _)| k == "MESHFOX_ENV_NAMES")
+                .map(|(_, v)| v.as_str()),
             Some("TOPIC,OTHER")
         );
     }
@@ -348,7 +370,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "meshfox-python-venv-test-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let bin = dir.join("venv/bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -360,7 +385,11 @@ mod tests {
         let calls = dir.join("calls");
         let vars = dir.join("vars");
         std::fs::write(&requirements, "tabulate==0.9.0\n").unwrap();
-        std::fs::write(&project, "[project]\nname = \"example\"\nversion = \"0.1.0\"\n").unwrap();
+        std::fs::write(
+            &project,
+            "[project]\nname = \"example\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
         let script = resolve_builtin_spec("@python_venv").unwrap().unwrap();
         for (lang, input) in [("text", &requirements), ("toml", &project)] {
             let output = std::process::Command::new("bash")
@@ -372,10 +401,17 @@ mod tests {
                 .env("PIP_CALLS", &calls)
                 .output()
                 .unwrap();
-            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
         let calls_text = std::fs::read_to_string(&calls).unwrap();
-        assert!(calls_text.contains(&format!("-m pip install --disable-pip-version-check -r {}", requirements.display())));
+        assert!(calls_text.contains(&format!(
+            "-m pip install --disable-pip-version-check -r {}",
+            requirements.display()
+        )));
         assert!(calls_text.contains("[project]\nname = \"example\""));
         assert!(calls_text.contains("-m pip install --disable-pip-version-check /"));
         assert_eq!(std::fs::read_to_string(&vars).unwrap().lines().count(), 2);
@@ -388,7 +424,9 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(unsupported.status.code(), Some(2));
-        assert!(String::from_utf8_lossy(&unsupported.stderr).contains("expected a text or toml block"));
+        assert!(
+            String::from_utf8_lossy(&unsupported.stderr).contains("expected a text or toml block")
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

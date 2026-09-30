@@ -60,7 +60,10 @@ fn spawn_worker(dir: &Path, canvas_path: &Path) -> std::process::Child {
         .spawn()
         .unwrap();
 
-    let lock_name = format!("{}.worker.lock", canvas_path.file_name().unwrap().to_string_lossy());
+    let lock_name = format!(
+        "{}.worker.lock",
+        canvas_path.file_name().unwrap().to_string_lossy()
+    );
     let lock_path = dir.join(".meshfox").join(lock_name);
     let mut discovered = false;
     for _ in 0..100 {
@@ -96,25 +99,45 @@ fn node_mutations_start_a_worker_when_none_is_running() {
             "```bash name=\"job\"\necho old\n```\n",
             "<!-- meshfox:output name=\"job\" -->\n```text\nold\n```\n<!-- /meshfox:output -->\n",
         ),
-    ).unwrap();
+    )
+    .unwrap();
 
-    let mut append = meshfox().args(["node", "append", "--canvas"])
-        .arg(&canvas_path).arg("child")
+    let mut append = meshfox()
+        .args(["node", "append", "--canvas"])
+        .arg(&canvas_path)
+        .arg("child")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .spawn().unwrap();
+        .spawn()
+        .unwrap();
     use std::io::Write;
-    append.stdin.as_mut().unwrap().write_all(b"after\n").unwrap();
+    append
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"after\n")
+        .unwrap();
     drop(append.stdin.take());
     let output = append.wait_with_output().unwrap();
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(String::from_utf8_lossy(&output.stdout).contains("via the worker"));
 
-    let output = meshfox().args(["node", "meta", "--canvas"])
-        .arg(&canvas_path).args(["child", "--clear-position"])
-        .output().unwrap();
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let output = meshfox()
+        .args(["node", "meta", "--canvas"])
+        .arg(&canvas_path)
+        .args(["child", "--clear-position"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let after = std::fs::read_to_string(&canvas_path).unwrap();
     assert!(after.contains("before\n\nafter"), "{after}");
     assert!(!after.contains(" x=5"), "{after}");
@@ -351,10 +374,7 @@ fn node_edges_routes_through_a_running_worker() {
     );
 
     let after = std::fs::read_to_string(&canvas_path).unwrap();
-    assert!(
-        after.contains("meshfox:edge from=\"a\""),
-        "after: {after}"
-    );
+    assert!(after.contains("meshfox:edge from=\"a\""), "after: {after}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

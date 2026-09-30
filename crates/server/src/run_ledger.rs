@@ -137,7 +137,11 @@ impl std::fmt::Display for StartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StartError::Conflict(info) => {
-                write!(f, "already running elsewhere (pid {}, {})", info.pid, info.owner)
+                write!(
+                    f,
+                    "already running elsewhere (pid {}, {})",
+                    info.pid, info.owner
+                )
             }
             StartError::Io(e) => write!(f, "{e}"),
         }
@@ -267,12 +271,15 @@ impl RunLedger {
             .conn
             .lock()
             .unwrap()
-            .query_row("SELECT lines FROM run_lines WHERE run_id = ?1", params![run_id], |r| {
-                r.get::<_, String>(0)
-            })
+            .query_row(
+                "SELECT lines FROM run_lines WHERE run_id = ?1",
+                params![run_id],
+                |r| r.get::<_, String>(0),
+            )
             .optional()
             .map_err(sqlite_err)?;
-        json.map(|j| serde_json::from_str(&j).map_err(io::Error::other)).transpose()
+        json.map(|j| serde_json::from_str(&j).map_err(io::Error::other))
+            .transpose()
     }
 
     /// Records what [`meshfox_core::closure_fingerprint`] said about the
@@ -283,7 +290,10 @@ impl RunLedger {
         self.conn
             .lock()
             .unwrap()
-            .execute("UPDATE runs SET fingerprint = ?1 WHERE id = ?2", params![fingerprint, id])
+            .execute(
+                "UPDATE runs SET fingerprint = ?1 WHERE id = ?2",
+                params![fingerprint, id],
+            )
             .map_err(sqlite_err)?;
         Ok(())
     }
@@ -374,7 +384,12 @@ impl RunLedger {
     }
 
     /// Every finished run of `(node_id, block)` still kept, newest first.
-    pub fn history(&self, node_id: &str, block: &str, current: Option<&str>) -> io::Result<Vec<RunSummary>> {
+    pub fn history(
+        &self,
+        node_id: &str,
+        block: &str,
+        current: Option<&str>,
+    ) -> io::Result<Vec<RunSummary>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(&format!(
@@ -383,7 +398,9 @@ impl RunLedger {
             ))
             .map_err(sqlite_err)?;
         let rows = stmt
-            .query_map(params![node_id, block], |r| summary_with_staleness(r, current))
+            .query_map(params![node_id, block], |r| {
+                summary_with_staleness(r, current)
+            })
             .map_err(sqlite_err)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)
     }
@@ -413,7 +430,9 @@ impl RunLedger {
         );
         match result {
             Ok(_) => Ok(conn.last_insert_rowid()),
-            Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == ErrorCode::ConstraintViolation => {
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == ErrorCode::ConstraintViolation =>
+            {
                 let info = conn
                     .query_row(
                         "SELECT pid, owner, kind, started_at FROM runs \
@@ -465,10 +484,16 @@ impl RunLedger {
              AND id NOT IN (SELECT id FROM runs WHERE outcome != 'running' \
                  AND (node_id, block) = (SELECT node_id, block FROM runs WHERE id = ?1) \
                  ORDER BY id DESC LIMIT ?2)";
-        conn.execute(&format!("DELETE FROM run_lines WHERE run_id IN ({old_ids})"), params![id, keep])
-            .map_err(sqlite_err)?;
-        conn.execute(&format!("DELETE FROM runs WHERE id IN ({old_ids})"), params![id, keep])
-            .map_err(sqlite_err)?;
+        conn.execute(
+            &format!("DELETE FROM run_lines WHERE run_id IN ({old_ids})"),
+            params![id, keep],
+        )
+        .map_err(sqlite_err)?;
+        conn.execute(
+            &format!("DELETE FROM runs WHERE id IN ({old_ids})"),
+            params![id, keep],
+        )
+        .map_err(sqlite_err)?;
         Ok(())
     }
 
@@ -492,7 +517,9 @@ impl RunLedger {
             .optional()
             .map_err(sqlite_err)?
         };
-        let Some((stale_id, stale_pid)) = stale else { return Ok(()) };
+        let Some((stale_id, stale_pid)) = stale else {
+            return Ok(());
+        };
         // Snapshot descendants before *and* after the group kill — same
         // "while it's still alive" reasoning `force_run_kill_prep`'s own
         // doc comment gives for calling this twice (crates/server/src/
@@ -579,7 +606,9 @@ fn summary_row(r: &rusqlite::Row<'_>, stale: bool) -> rusqlite::Result<RunSummar
         exit_code: r.get(2)?,
         started_at: r.get(3)?,
         ended_at: r.get(4)?,
-        duration_ms: r.get::<_, Option<i64>>("duration_ms")?.map(|ms| ms.max(0) as u64),
+        duration_ms: r
+            .get::<_, Option<i64>>("duration_ms")?
+            .map(|ms| ms.max(0) as u64),
         stale,
     })
 }
@@ -587,7 +616,10 @@ fn summary_row(r: &rusqlite::Row<'_>, stale: bool) -> rusqlite::Result<RunSummar
 /// Columns 5 and 6 (`stale`, `fingerprint`) folded into [`RunSummary::stale`]
 /// against `current`: stale if flagged, or if there's no way to show the run
 /// is still current (no stored fingerprint, or `current` unknown/different).
-fn summary_with_staleness(r: &rusqlite::Row<'_>, current: Option<&str>) -> rusqlite::Result<RunSummary> {
+fn summary_with_staleness(
+    r: &rusqlite::Row<'_>,
+    current: Option<&str>,
+) -> rusqlite::Result<RunSummary> {
     let flagged: i64 = r.get(5)?;
     let stored: Option<String> = r.get(6)?;
     let fresh = flagged == 0 && stored.is_some() && stored.as_deref() == current;
@@ -632,12 +664,20 @@ mod tests {
     }
 
     fn out(lines: &[&str]) -> Vec<(OutputStream, String)> {
-        lines.iter().map(|l| (OutputStream::Stdout, l.to_string())).collect()
+        lines
+            .iter()
+            .map(|l| (OutputStream::Stdout, l.to_string()))
+            .collect()
     }
 
     /// What `run_registry::attach` does for a real run of `("a", "b")`:
     /// claim a row, stamp its fingerprint, finish it, store its output.
-    fn finished_run(ledger: &RunLedger, fp: &str, outcome: FinishOutcome, lines: &[(OutputStream, String)]) -> i64 {
+    fn finished_run(
+        ledger: &RunLedger,
+        fp: &str,
+        outcome: FinishOutcome,
+        lines: &[(OutputStream, String)],
+    ) -> i64 {
         let id = ledger.start("a", "b", RunKind::Plain, "test", 1).unwrap();
         ledger.set_fingerprint(id, fp).unwrap();
         ledger.finish(id, outcome).unwrap();
@@ -648,16 +688,25 @@ mod tests {
     #[test]
     fn output_round_trips_per_run_and_history_keeps_every_run() {
         let ledger = RunLedger::open_in_memory().unwrap();
-        let mixed = vec![(OutputStream::Stdout, "one".to_string()), (OutputStream::Stderr, "two".to_string())];
+        let mixed = vec![
+            (OutputStream::Stdout, "one".to_string()),
+            (OutputStream::Stderr, "two".to_string()),
+        ];
         let first = finished_run(&ledger, "fp", FinishOutcome::Exited(3), &mixed);
         let second = finished_run(&ledger, "fp", FinishOutcome::Killed, &out(&["x"]));
         assert_eq!(ledger.load_output(first).unwrap().unwrap(), mixed);
         assert_eq!(ledger.load_output(second).unwrap().unwrap(), out(&["x"]));
 
         let latest = ledger.latest_fresh_run("a", "b", "fp").unwrap().unwrap();
-        assert_eq!((latest.id, latest.outcome.as_str(), latest.exit_code), (second, "killed", None));
+        assert_eq!(
+            (latest.id, latest.outcome.as_str(), latest.exit_code),
+            (second, "killed", None)
+        );
         let history = ledger.history("a", "b", Some("fp")).unwrap();
-        assert_eq!(history.iter().map(|r| r.id).collect::<Vec<_>>(), vec![second, first]);
+        assert_eq!(
+            history.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![second, first]
+        );
         assert_eq!(history[1].exit_code, Some(3));
         assert!(history.iter().all(|r| !r.stale));
         assert_eq!(ledger.latest_fresh_run("a", "other", "fp").unwrap(), None);
@@ -674,10 +723,16 @@ mod tests {
         assert_eq!(ledger.load_output(old).unwrap().unwrap(), out(&["v1"]));
 
         let newer = finished_run(&ledger, "v2", FinishOutcome::Exited(0), &out(&["v2"]));
-        assert_eq!(ledger.latest_fresh_run("a", "b", "v2").unwrap().unwrap().id, newer);
+        assert_eq!(
+            ledger.latest_fresh_run("a", "b", "v2").unwrap().unwrap().id,
+            newer
+        );
         // Reverting the edit: the older run describes the document again,
         // and it is now the newest one that does.
-        assert_eq!(ledger.latest_fresh_run("a", "b", "v1").unwrap().unwrap().id, old);
+        assert_eq!(
+            ledger.latest_fresh_run("a", "b", "v1").unwrap().unwrap().id,
+            old
+        );
     }
 
     #[test]
@@ -685,18 +740,31 @@ mod tests {
         let ledger = RunLedger::open_in_memory().unwrap();
         let id = ledger.start("a", "b", RunKind::Plain, "test", 1).unwrap();
         ledger.set_fingerprint(id, "fp").unwrap();
-        ledger.conn.lock().unwrap().execute(
-            "UPDATE runs SET started_at = '2026-09-30T10:00:00Z' WHERE id = ?1",
-            params![id],
-        ).unwrap();
+        ledger
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE runs SET started_at = '2026-09-30T10:00:00Z' WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
         ledger.finish(id, FinishOutcome::Exited(0)).unwrap();
-        ledger.conn.lock().unwrap().execute(
-            "UPDATE runs SET ended_at = '2026-09-30T10:00:02.500Z' WHERE id = ?1",
-            params![id],
-        ).unwrap();
+        ledger
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE runs SET ended_at = '2026-09-30T10:00:02.500Z' WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
         let run = ledger.latest_fresh_run("a", "b", "fp").unwrap().unwrap();
         assert_eq!(run.duration_ms, Some(2500));
-        assert_eq!(ledger.plain_addresses_with_runs().unwrap(), vec![("a".to_string(), "b".to_string())]);
+        assert_eq!(
+            ledger.plain_addresses_with_runs().unwrap(),
+            vec![("a".to_string(), "b".to_string())]
+        );
     }
 
     #[test]
@@ -716,25 +784,43 @@ mod tests {
         ledger.set_fingerprint(running, "fp").unwrap();
         ledger.mark_finished_runs_stale().unwrap();
         assert_eq!(ledger.latest_fresh_run("a", "b", "fp").unwrap(), None);
-        assert!(ledger.get_run(old, "a", "b", Some("fp")).unwrap().unwrap().stale);
+        assert!(
+            ledger
+                .get_run(old, "a", "b", Some("fp"))
+                .unwrap()
+                .unwrap()
+                .stale
+        );
         assert_eq!(ledger.load_output(old).unwrap().unwrap(), out(&["old"]));
 
         ledger.finish(running, FinishOutcome::Exited(0)).unwrap();
         ledger.save_output(running, &out(&["new"])).unwrap();
-        assert_eq!(ledger.latest_fresh_run("a", "b", "fp").unwrap().unwrap().id, running);
+        assert_eq!(
+            ledger.latest_fresh_run("a", "b", "fp").unwrap().unwrap().id,
+            running
+        );
     }
 
     #[test]
     fn rotation_keeps_only_the_newest_runs_per_address_and_drops_their_output() {
-        let ledger = RunLedger::open_in_memory().unwrap().with_max_runs_per_block(2);
+        let ledger = RunLedger::open_in_memory()
+            .unwrap()
+            .with_max_runs_per_block(2);
         let ids: Vec<i64> = (0..4)
             .map(|i| finished_run(&ledger, "fp", FinishOutcome::Exited(i), &out(&["x"])))
             .collect();
         // Another address must not be affected by a and b's rotation.
-        let other = ledger.start("a", "other", RunKind::Plain, "test", 1).unwrap();
+        let other = ledger
+            .start("a", "other", RunKind::Plain, "test", 1)
+            .unwrap();
         ledger.finish(other, FinishOutcome::Exited(0)).unwrap();
 
-        let kept: Vec<i64> = ledger.history("a", "b", Some("fp")).unwrap().iter().map(|r| r.id).collect();
+        let kept: Vec<i64> = ledger
+            .history("a", "b", Some("fp"))
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect();
         assert_eq!(kept, vec![ids[3], ids[2]]);
         assert_eq!(ledger.load_output(ids[0]).unwrap(), None);
         assert_eq!(ledger.load_output(ids[3]).unwrap().unwrap(), out(&["x"]));
@@ -743,42 +829,68 @@ mod tests {
 
     #[test]
     fn a_running_row_never_counts_against_the_rotation_budget() {
-        let ledger = RunLedger::open_in_memory().unwrap().with_max_runs_per_block(1);
+        let ledger = RunLedger::open_in_memory()
+            .unwrap()
+            .with_max_runs_per_block(1);
         let done = finished_run(&ledger, "fp", FinishOutcome::Exited(0), &out(&["x"]));
         let running = ledger.start("a", "b", RunKind::Plain, "test", 1).unwrap();
         ledger.finish(done, FinishOutcome::Exited(0)).unwrap();
-        assert!(ledger.get_run(done, "a", "b", Some("fp")).unwrap().is_some());
+        assert!(ledger
+            .get_run(done, "a", "b", Some("fp"))
+            .unwrap()
+            .is_some());
         assert_eq!(ledger.active_running().unwrap()[0].id, running);
     }
 
     #[test]
     fn output_keeps_the_newest_lines_within_the_byte_budget() {
         // Each "lineN" costs 6 bytes (5 + newline); a 13-byte budget fits two.
-        let ledger = RunLedger::open_in_memory().unwrap().with_max_output_bytes(13);
-        let id = finished_run(&ledger, "fp", FinishOutcome::Exited(0), &out(&["line1", "line2", "line3", "line4"]));
-        assert_eq!(ledger.load_output(id).unwrap().unwrap(), out(&["line3", "line4"]));
+        let ledger = RunLedger::open_in_memory()
+            .unwrap()
+            .with_max_output_bytes(13);
+        let id = finished_run(
+            &ledger,
+            "fp",
+            FinishOutcome::Exited(0),
+            &out(&["line1", "line2", "line3", "line4"]),
+        );
+        assert_eq!(
+            ledger.load_output(id).unwrap().unwrap(),
+            out(&["line3", "line4"])
+        );
     }
 
     #[test]
     fn a_zero_byte_budget_stores_no_output_but_keeps_the_run() {
-        let ledger = RunLedger::open_in_memory().unwrap().with_max_output_bytes(0);
+        let ledger = RunLedger::open_in_memory()
+            .unwrap()
+            .with_max_output_bytes(0);
         let id = finished_run(&ledger, "fp", FinishOutcome::Exited(0), &out(&["x"]));
         assert_eq!(ledger.load_output(id).unwrap(), None);
-        assert_eq!(ledger.latest_fresh_run("a", "b", "fp").unwrap().unwrap().id, id);
+        assert_eq!(
+            ledger.latest_fresh_run("a", "b", "fp").unwrap().unwrap().id,
+            id
+        );
     }
 
     #[test]
     fn start_on_a_free_address_succeeds_and_returns_an_id() {
         let ledger = RunLedger::open_in_memory().unwrap();
-        let id = ledger.start("a", "block", RunKind::Plain, "cli", 1234).unwrap();
+        let id = ledger
+            .start("a", "block", RunKind::Plain, "cli", 1234)
+            .unwrap();
         assert!(id > 0);
     }
 
     #[test]
     fn a_second_start_on_the_same_running_address_conflicts() {
         let ledger = RunLedger::open_in_memory().unwrap();
-        ledger.start("a", "block", RunKind::Service, "cli", 1234).unwrap();
-        let err = ledger.start("a", "block", RunKind::Service, "tui", 5678).unwrap_err();
+        ledger
+            .start("a", "block", RunKind::Service, "cli", 1234)
+            .unwrap();
+        let err = ledger
+            .start("a", "block", RunKind::Service, "tui", 5678)
+            .unwrap_err();
         match err {
             StartError::Conflict(info) => {
                 assert_eq!(info.pid, 1234);
@@ -792,7 +904,9 @@ mod tests {
     #[test]
     fn finishing_a_row_frees_the_address_for_a_fresh_start() {
         let ledger = RunLedger::open_in_memory().unwrap();
-        let id = ledger.start("a", "block", RunKind::Plain, "cli", 1234).unwrap();
+        let id = ledger
+            .start("a", "block", RunKind::Plain, "cli", 1234)
+            .unwrap();
         ledger.finish(id, FinishOutcome::Exited(0)).unwrap();
         // No longer conflicts — the address's only row is no longer `running`.
         let second = ledger.start("a", "block", RunKind::Plain, "cli", 5678);
@@ -802,9 +916,13 @@ mod tests {
     #[test]
     fn update_pid_corrects_a_placeholder_without_disturbing_the_conflict_check() {
         let ledger = RunLedger::open_in_memory().unwrap();
-        let id = ledger.start("a", "block", RunKind::Service, "cli", 0).unwrap();
+        let id = ledger
+            .start("a", "block", RunKind::Service, "cli", 0)
+            .unwrap();
         ledger.update_pid(id, 4321).unwrap();
-        let err = ledger.start("a", "block", RunKind::Service, "tui", 1).unwrap_err();
+        let err = ledger
+            .start("a", "block", RunKind::Service, "tui", 1)
+            .unwrap_err();
         match err {
             StartError::Conflict(info) => assert_eq!(info.pid, 4321),
             StartError::Io(e) => panic!("expected a conflict, got an io error: {e}"),
@@ -816,9 +934,13 @@ mod tests {
         let ledger = RunLedger::open_in_memory().unwrap();
         let mut dummy = spawn_dummy();
         let dummy_pid = dummy.id();
-        let stale_id = ledger.start("a", "block", RunKind::Service, "cli", dummy_pid).unwrap();
+        let stale_id = ledger
+            .start("a", "block", RunKind::Service, "cli", dummy_pid)
+            .unwrap();
 
-        let new_id = ledger.force_take_over("a", "block", RunKind::Service, "webui", 999).unwrap();
+        let new_id = ledger
+            .force_take_over("a", "block", RunKind::Service, "webui", 999)
+            .unwrap();
         assert_ne!(new_id, stale_id);
 
         // `try_wait` (not a raw `kill(pid, 0)` probe) — SIGKILL leaves a
@@ -842,7 +964,9 @@ mod tests {
 
         // A second force-take-over succeeds again (kills the new row's own
         // fake pid 999 — a no-op signal, ESRCH-tolerant — then re-claims).
-        let third_id = ledger.force_take_over("a", "block", RunKind::Service, "cli", 1).unwrap();
+        let third_id = ledger
+            .force_take_over("a", "block", RunKind::Service, "cli", 1)
+            .unwrap();
         assert_ne!(third_id, new_id);
     }
 
@@ -851,7 +975,9 @@ mod tests {
         let ledger = RunLedger::open_in_memory().unwrap();
         let mut dummy = spawn_dummy();
         let dummy_pid = dummy.id();
-        let live_id = ledger.start("a", "block", RunKind::Service, "cli", dummy_pid).unwrap();
+        let live_id = ledger
+            .start("a", "block", RunKind::Service, "cli", dummy_pid)
+            .unwrap();
 
         // A pid essentially guaranteed dead: implausibly large, well past
         // any real OS pid_max (Linux's own absolute ceiling is 2^22), but
@@ -863,7 +989,9 @@ mod tests {
         // then-reaping a real child and hoping its now-free pid isn't
         // reused before this asserts on it (a real, if unlikely, race).
         let dead_pid: u32 = 999_999_999;
-        let dead_id = ledger.start("b", "block", RunKind::Plain, "cli", dead_pid).unwrap();
+        let dead_id = ledger
+            .start("b", "block", RunKind::Plain, "cli", dead_pid)
+            .unwrap();
 
         let orphaned = ledger.reconcile_startup().unwrap();
         assert_eq!(orphaned.len(), 1, "orphaned: {orphaned:?}");

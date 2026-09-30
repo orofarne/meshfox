@@ -208,7 +208,11 @@ fn run_runs_a_file_node_in_the_primary_document() {
 #[test]
 fn run_via_an_already_running_worker_still_runs_a_file_node() {
     let dir = unique_dir();
-    std::fs::write(dir.join("seed.sh"), "#!/bin/sh\necho hi from worker-routed seed\n").unwrap();
+    std::fs::write(
+        dir.join("seed.sh"),
+        "#!/bin/sh\necho hi from worker-routed seed\n",
+    )
+    .unwrap();
     let canvas_path = dir.join("base.canvas.md");
     std::fs::write(
         &canvas_path,

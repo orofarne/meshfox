@@ -34,7 +34,9 @@ pub enum ServiceStatus {
     Running,
     /// Exited on its own, unexpectedly — `exit_code` is whatever its own
     /// process reported (`-1` if that couldn't be determined).
-    Crashed { exit_code: i32 },
+    Crashed {
+        exit_code: i32,
+    },
     /// Exited because something here (`ServiceHandle::stop`, or a restart)
     /// killed it on purpose — distinguished from `Crashed` so the UI shows
     /// "stopped" rather than a false crash after a deliberate Stop click.
@@ -52,7 +54,10 @@ struct RingBuffer {
 
 impl RingBuffer {
     fn new(cap: usize) -> Self {
-        RingBuffer { cap, lines: VecDeque::new() }
+        RingBuffer {
+            cap,
+            lines: VecDeque::new(),
+        }
     }
 
     fn push(&mut self, stream: OutputStream, line: String) {
@@ -111,7 +116,9 @@ impl ServiceHandle {
     /// `Crashed`.
     pub fn stop(&self) -> io::Result<()> {
         *self.status.lock().unwrap() = ServiceStatus::Stopped;
-        let _ = self.ledger.finish(self.ledger_row_id, crate::run_ledger::FinishOutcome::Killed);
+        let _ = self
+            .ledger
+            .finish(self.ledger_row_id, crate::run_ledger::FinishOutcome::Killed);
         let result = kill_process_group(self.pid);
         // Doesn't wait for `self.pid` to actually be gone first — a still-
         // running descendant that's already detached into its own group
@@ -160,7 +167,13 @@ pub fn spawn(
 
     let status = Arc::new(Mutex::new(ServiceStatus::Running));
     let log = Arc::new(Mutex::new(RingBuffer::new(LOG_CAPACITY)));
-    spawn_drain_task(proc, Arc::clone(&status), Arc::clone(&log), ledger.clone(), ledger_row_id);
+    spawn_drain_task(
+        proc,
+        Arc::clone(&status),
+        Arc::clone(&log),
+        ledger.clone(),
+        ledger_row_id,
+    );
 
     Ok(ServiceHandle {
         node_id,
@@ -171,7 +184,13 @@ pub fn spawn(
         ledger_row_id,
         status,
         log,
-        respawn: RespawnRecipe { block, env, cwd, canvas_path, owner: owner.to_string() },
+        respawn: RespawnRecipe {
+            block,
+            env,
+            cwd,
+            canvas_path,
+            owner: owner.to_string(),
+        },
     })
 }
 
@@ -272,7 +291,13 @@ fn spawn_drain_task(
                 }
             }
         }
-        let exit_code = proc.child.wait().await.ok().and_then(|s| s.code()).unwrap_or(-1);
+        let exit_code = proc
+            .child
+            .wait()
+            .await
+            .ok()
+            .and_then(|s| s.code())
+            .unwrap_or(-1);
         // One last scan too — belt and suspenders alongside the
         // accumulated history above, for whatever's still reachable this
         // way (a descendant that hasn't been reparented away yet, say).
@@ -287,7 +312,10 @@ fn spawn_drain_task(
         let mut current = status.lock().unwrap();
         if !matches!(*current, ServiceStatus::Stopped) {
             *current = ServiceStatus::Crashed { exit_code };
-            let _ = ledger.finish(ledger_row_id, crate::run_ledger::FinishOutcome::Exited(exit_code));
+            let _ = ledger.finish(
+                ledger_row_id,
+                crate::run_ledger::FinishOutcome::Exited(exit_code),
+            );
         }
     });
 }
@@ -409,7 +437,10 @@ mod tests {
     }
 
     fn tmp_canvas_path(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("meshfox-services-test-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-services-test-{name}-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("doc.canvas.md")
     }
@@ -429,9 +460,25 @@ mod tests {
         owner: &str,
     ) -> io::Result<ServiceHandle> {
         let id = ledger
-            .start(&node_id, &block_name, crate::run_ledger::RunKind::Service, owner, std::process::id())
+            .start(
+                &node_id,
+                &block_name,
+                crate::run_ledger::RunKind::Service,
+                owner,
+                std::process::id(),
+            )
             .map_err(io::Error::other)?;
-        spawn(node_id, block_name, block, env, cwd, canvas_path, owner, ledger.clone(), id)
+        spawn(
+            node_id,
+            block_name,
+            block,
+            env,
+            cwd,
+            canvas_path,
+            owner,
+            ledger.clone(),
+            id,
+        )
     }
 
     #[tokio::test]

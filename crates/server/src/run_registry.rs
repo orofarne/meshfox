@@ -54,7 +54,11 @@ struct RingBuffer {
 
 impl RingBuffer {
     fn new(cap: usize) -> Self {
-        RingBuffer { cap, next_seq: 0, lines: VecDeque::new() }
+        RingBuffer {
+            cap,
+            next_seq: 0,
+            lines: VecDeque::new(),
+        }
     }
 
     fn push(&mut self, stream: OutputStream, text: String) -> SeqLine {
@@ -72,7 +76,11 @@ impl RingBuffer {
     /// still in the buffer, the closest equivalent to `services::
     /// RingBuffer::snapshot`'s own full-snapshot behavior.
     fn since(&self, seq: u64) -> Vec<SeqLine> {
-        self.lines.iter().filter(|l| l.seq >= seq).cloned().collect()
+        self.lines
+            .iter()
+            .filter(|l| l.seq >= seq)
+            .cloned()
+            .collect()
     }
 }
 
@@ -154,7 +162,12 @@ impl RunHandle {
     /// watcher) sees the same `RunEvent::Done(Killed)` once the drain task
     /// actually notices, regardless of who called this.
     pub fn kill(&self) -> bool {
-        self.kill_tx.lock().unwrap().take().map(|tx| tx.send(())).is_some()
+        self.kill_tx
+            .lock()
+            .unwrap()
+            .take()
+            .map(|tx| tx.send(()))
+            .is_some()
     }
 
     /// Resolves this handle as `outcome` — but only if `attach` was never
@@ -262,17 +275,27 @@ pub fn attach(
         // (`subscribe_run`) depends on that.
         if let Some((ledger, id)) = ledger_row {
             let finish_outcome = match outcome {
-                RunOutcome::Exited { exit_code } => crate::run_ledger::FinishOutcome::Exited(exit_code),
+                RunOutcome::Exited { exit_code } => {
+                    crate::run_ledger::FinishOutcome::Exited(exit_code)
+                }
                 RunOutcome::Killed => crate::run_ledger::FinishOutcome::Killed,
-                RunOutcome::Running => unreachable!("the loop above only ever breaks with Exited/Killed"),
+                RunOutcome::Running => {
+                    unreachable!("the loop above only ever breaks with Exited/Killed")
+                }
             };
             let _ = ledger.finish(id, finish_outcome);
             // The restart-surviving copy of what `log` holds in memory — see
             // `RunLedger::save_output`. Written at the run's own end (not
             // per line), so a core that dies mid-run loses that run's
             // output, same as it loses the process itself.
-            let lines: Vec<_> =
-                task_handle.log.lock().unwrap().since(0).into_iter().map(|l| (l.stream, l.text)).collect();
+            let lines: Vec<_> = task_handle
+                .log
+                .lock()
+                .unwrap()
+                .since(0)
+                .into_iter()
+                .map(|l| (l.stream, l.text))
+                .collect();
             let _ = ledger.save_output(id, &lines);
         }
         *task_handle.outcome.lock().unwrap() = outcome.clone();
@@ -305,7 +328,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_late_subscriber_gets_the_backlog_then_the_live_tail() {
-        let proc = stream_exec::spawn_bash("echo one; sleep 0.3; echo two", no_envs(), None).unwrap();
+        let proc =
+            stream_exec::spawn_bash("echo one; sleep 0.3; echo two", no_envs(), None).unwrap();
         let handle = track("root".to_string(), "slow".to_string(), proc, None);
 
         // Poll briefly for the drain task to actually push "one" before
@@ -345,9 +369,22 @@ mod tests {
     #[tokio::test]
     async fn a_finished_run_is_in_the_ledger_before_it_is_reported_done() {
         let ledger = crate::run_ledger::RunLedger::open_in_memory().unwrap();
-        let id = ledger.start("root", "saved", crate::run_ledger::RunKind::Plain, "test", 0).unwrap();
+        let id = ledger
+            .start(
+                "root",
+                "saved",
+                crate::run_ledger::RunKind::Plain,
+                "test",
+                0,
+            )
+            .unwrap();
         let proc = stream_exec::spawn_bash("echo one; echo two; exit 3", no_envs(), None).unwrap();
-        let handle = track("root".to_string(), "saved".to_string(), proc, Some((ledger.clone(), id)));
+        let handle = track(
+            "root".to_string(),
+            "saved".to_string(),
+            proc,
+            Some((ledger.clone(), id)),
+        );
         assert_eq!(handle.run_id(), Some(id));
         ledger.set_fingerprint(id, "fp").unwrap();
 
@@ -358,15 +395,22 @@ mod tests {
             }
         }
         // No polling: `Done` is only sent once the ledger is up to date.
-        let run = ledger.latest_fresh_run("root", "saved", "fp").unwrap().expect("finished row");
+        let run = ledger
+            .latest_fresh_run("root", "saved", "fp")
+            .unwrap()
+            .expect("finished row");
         assert_eq!((run.outcome.as_str(), run.exit_code), ("exited", Some(3)));
         let lines = ledger.load_output(id).unwrap().expect("stored output");
-        assert_eq!(lines.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(), vec!["one", "two"]);
+        assert_eq!(
+            lines.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(),
+            vec!["one", "two"]
+        );
     }
 
     #[tokio::test]
     async fn subscribing_from_a_later_seq_skips_earlier_backlog() {
-        let proc = stream_exec::spawn_bash("echo one; echo two; echo three", no_envs(), None).unwrap();
+        let proc =
+            stream_exec::spawn_bash("echo one; echo two; echo three", no_envs(), None).unwrap();
         let handle = track("root".to_string(), "x".to_string(), proc, None);
 
         // Poll until the whole run has actually finished (three lines
@@ -378,7 +422,10 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         let (backlog, _rx) = handle.subscribe_from(2);
-        assert_eq!(backlog.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), vec!["three"]);
+        assert_eq!(
+            backlog.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(),
+            vec!["three"]
+        );
     }
 
     #[tokio::test]

@@ -327,11 +327,19 @@ fn build_prelude(canvas: &Canvas, base_dir: Option<&Path>) -> String {
             Some(v) => star_str(v),
             None => "None".to_string(),
         };
-        let created_at_ts = match n.created_at.as_deref().and_then(crate::timestamp::unix_timestamp) {
+        let created_at_ts = match n
+            .created_at
+            .as_deref()
+            .and_then(crate::timestamp::unix_timestamp)
+        {
             Some(ts) => ts.to_string(),
             None => "None".to_string(),
         };
-        let updated_at_ts = match n.updated_at.as_deref().and_then(crate::timestamp::unix_timestamp) {
+        let updated_at_ts = match n
+            .updated_at
+            .as_deref()
+            .and_then(crate::timestamp::unix_timestamp)
+        {
             Some(ts) => ts.to_string(),
             None => "None".to_string(),
         };

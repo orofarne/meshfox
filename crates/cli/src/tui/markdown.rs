@@ -107,7 +107,10 @@ impl Highlighter {
     /// outside tests, so this is `cfg(test)` rather than plain `pub`.
     #[cfg(test)]
     pub fn new() -> Self {
-        Self::with_syntax_set(SyntaxSet::load_defaults_newlines(), crate::tui::ui::SOURCE_EDITOR_THEME)
+        Self::with_syntax_set(
+            SyntaxSet::load_defaults_newlines(),
+            crate::tui::ui::SOURCE_EDITOR_THEME,
+        )
     }
 
     /// Same as `new`, but the `SyntaxSet` also includes whatever custom
@@ -120,7 +123,10 @@ impl Highlighter {
     /// so this read-only preview pane and that editor read as one product,
     /// not two independently-themed surfaces.
     pub fn with_extra_syntaxes(canvas_root: &Path, theme_name: &str) -> Self {
-        Self::with_syntax_set(crate::syntax_registry::build_syntax_set(canvas_root), theme_name)
+        Self::with_syntax_set(
+            crate::syntax_registry::build_syntax_set(canvas_root),
+            theme_name,
+        )
     }
 
     fn with_syntax_set(syntax_set: SyntaxSet, theme_name: &str) -> Self {
@@ -328,7 +334,16 @@ pub fn render(
     // doc comment) — by matching its byte span, rather than re-deriving
     // that same implicit-naming rule a second time here.
     let runnable = meshfox_core::fence::scan_runnable_blocks(node_id, md);
-    let mut renderer = Renderer::new(base_dir, hl, node_id, decls, &runnable, form_values, form_focus, live_output);
+    let mut renderer = Renderer::new(
+        base_dir,
+        hl,
+        node_id,
+        decls,
+        &runnable,
+        form_values,
+        form_focus,
+        live_output,
+    );
     // `ENABLE_GFM` is what makes `pulldown-cmark` recognize `> [!NOTE]`/...
     // alert blockquotes (`Tag::BlockQuote(Some(kind))`, marker line
     // already stripped) — see `start`'s own `Tag::BlockQuote` arm below.
@@ -675,7 +690,11 @@ impl<'a> Renderer<'a> {
     /// (`ui::render_output`) give it; stderr always stays plain text.
     fn push_live_output(&mut self, block_name: &str, live: &super::app::StepOutput) {
         let border = Style::default().fg(super::theme::DEP);
-        let kind = if live.output_markdown { " · markdown" } else { "" };
+        let kind = if live.output_markdown {
+            " · markdown"
+        } else {
+            ""
+        };
         // `live.duration_ms`/`exit_code` are just placeholders until a run
         // discovered passively (`App::on_external_run_event`) reaches its
         // own terminal event — showing "done · 0ms" the moment its first
@@ -687,7 +706,11 @@ impl<'a> Renderer<'a> {
         let header = if live.running {
             format!("┌─ output: {block_name} · live{kind} · running ──")
         } else {
-            let status = if live.exit_code == 0 { "done" } else { "failed" };
+            let status = if live.exit_code == 0 {
+                "done"
+            } else {
+                "failed"
+            };
             format!(
                 "┌─ output: {block_name} · live{kind} · {status} · {} ──",
                 meshfox_core::format_duration_ms(live.duration_ms)
@@ -904,7 +927,10 @@ impl<'a> Renderer<'a> {
                     self.apply_pending_image_attrs(&attrs);
                     let rest = t[consumed..].to_string();
                     if !rest.is_empty() {
-                        self.push_text(&meshfox_core::subsup::render_unicode(&rest), Style::default());
+                        self.push_text(
+                            &meshfox_core::subsup::render_unicode(&rest),
+                            Style::default(),
+                        );
                     }
                     return;
                 }
@@ -1026,7 +1052,9 @@ impl<'a> Renderer<'a> {
                 self.flush_paragraph();
                 self.lines.push(Line::from(Span::styled(
                     format!("[{label}]"),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 )));
             }
             Tag::CodeBlock(kind) => {
@@ -1179,7 +1207,9 @@ impl<'a> Renderer<'a> {
             })
             .collect();
 
-        let env_refs = env_raw.map(meshfox_core::fence::parse_env_list).unwrap_or_default();
+        let env_refs = env_raw
+            .map(meshfox_core::fence::parse_env_list)
+            .unwrap_or_default();
         let interp_refs: Vec<String> = interpreter
             .map(meshfox_core::interpreter_var_refs)
             .unwrap_or_default();
@@ -1309,7 +1339,8 @@ impl<'a> Renderer<'a> {
                     // fallback for `form_name`, used only for the parse
                     // error this renderer then discards).
                     let form_name = name.clone().unwrap_or_default();
-                    let fields = meshfox_core::parse_form_body(&form_name, &code).unwrap_or_default();
+                    let fields =
+                        meshfox_core::parse_form_body(&form_name, &code).unwrap_or_default();
                     let send_caption = send_raw.unwrap_or_else(|| "Send".to_string());
                     let label_style = Style::default().fg(super::theme::DEP);
                     let value_style = Style::default()
@@ -1325,7 +1356,9 @@ impl<'a> Renderer<'a> {
                     // elsewhere in the same node. See `render`'s own
                     // `form_focus` doc comment.
                     let focused_index = match (self.form_focus, click_name.as_deref()) {
-                        (Some((focus_block, idx)), Some(this_block)) if focus_block == this_block => {
+                        (Some((focus_block, idx)), Some(this_block))
+                            if focus_block == this_block =>
+                        {
                             Some(idx)
                         }
                         _ => None,
@@ -1336,9 +1369,14 @@ impl<'a> Renderer<'a> {
                     for (i, field) in fields.iter().enumerate() {
                         let focused = focused_index == Some(i);
                         let label = field.label.clone().unwrap_or_else(|| field.var.clone());
-                        let value = self.form_values.get(&field.var).cloned().unwrap_or_default();
+                        let value = self
+                            .form_values
+                            .get(&field.var)
+                            .cloned()
+                            .unwrap_or_default();
                         let prefix = format!("{label}: ");
-                        let col_end = (prefix.chars().count() + value.chars().count().max(1)) as u16;
+                        let col_end =
+                            (prefix.chars().count() + value.chars().count().max(1)) as u16;
                         // A blinking `_` text cursor on the focused row's
                         // own value, same convention `render_var_form`
                         // (`ui.rs`) already uses for its own text fields —
@@ -1348,28 +1386,36 @@ impl<'a> Renderer<'a> {
                         // undeclared/unknown var — `None` here — defaults
                         // to showing one anyway, same as a plain text field
                         // would, rather than silently showing none).
-                        let var_type = self.decls.iter().find(|d| d.name == field.var).map(|d| d.var_type);
+                        let var_type = self
+                            .decls
+                            .iter()
+                            .find(|d| d.name == field.var)
+                            .map(|d| d.var_type);
                         let cursor = focused
                             && !matches!(
                                 var_type,
                                 Some(meshfox_core::vars::VarType::Bool)
                                     | Some(meshfox_core::vars::VarType::Select)
                             );
-                        let mut shown = if value.is_empty() { " ".to_string() } else { value };
+                        let mut shown = if value.is_empty() {
+                            " ".to_string()
+                        } else {
+                            value
+                        };
                         if cursor {
                             shown.push('_');
                         }
                         let mut value_span = Span::styled(shown, value_style);
                         let mut label_span = Span::styled(prefix, label_style);
                         if focused {
-                            label_span = label_span.patch_style(Style::default().add_modifier(Modifier::REVERSED));
-                            value_span = value_span.patch_style(
-                                Style::default().add_modifier(if cursor {
+                            label_span = label_span
+                                .patch_style(Style::default().add_modifier(Modifier::REVERSED));
+                            value_span =
+                                value_span.patch_style(Style::default().add_modifier(if cursor {
                                     Modifier::REVERSED | Modifier::SLOW_BLINK
                                 } else {
                                     Modifier::REVERSED
-                                }),
-                            );
+                                }));
                         }
                         lines.push(Line::from(vec![label_span, value_span]));
                         col_ends.push(col_end);
@@ -1378,7 +1424,8 @@ impl<'a> Renderer<'a> {
                     let send_col_end = send_line.chars().count() as u16;
                     let mut send_span = Span::styled(send_line, marker_style);
                     if focused_index == Some(fields.len()) {
-                        send_span = send_span.patch_style(Style::default().add_modifier(Modifier::REVERSED));
+                        send_span = send_span
+                            .patch_style(Style::default().add_modifier(Modifier::REVERSED));
                     }
                     lines.push(Line::from(send_span));
 
@@ -1490,9 +1537,11 @@ impl<'a> Renderer<'a> {
                 // actually pushed as a segment below — only then is
                 // `segment_index` known.
                 let mut dep_clicks: DepClicks = Vec::new();
-                if let Some((dep_line, clicks)) =
-                    self.dep_line(deps_raw.as_deref(), env_raw.as_deref(), interpreter.as_deref())
-                {
+                if let Some((dep_line, clicks)) = self.dep_line(
+                    deps_raw.as_deref(),
+                    env_raw.as_deref(),
+                    interpreter.as_deref(),
+                ) {
                     framed.push(dep_line);
                     dep_clicks = clicks;
                 }
@@ -1684,11 +1733,23 @@ mod tests {
     fn finished_markdown_live_output_is_rendered_inside_its_frame() {
         let text = live_doc_text(table_output(true, false));
         assert!(text.contains("ZMARKERZ"), "cell text should show:\n{text}");
-        assert!(!text.contains("|---|---|"), "raw table syntax should be rendered, not literal:\n{text}");
-        assert!(text.contains("output: t · live · markdown · done"), "frame header:\n{text}");
+        assert!(
+            !text.contains("|---|---|"),
+            "raw table syntax should be rendered, not literal:\n{text}"
+        );
+        assert!(
+            text.contains("output: t · live · markdown · done"),
+            "frame header:\n{text}"
+        );
         let table_line = text.lines().find(|l| l.contains("ZMARKERZ")).unwrap();
-        assert!(table_line.starts_with("│ "), "rendered rows stay inside the frame border:\n{text}");
-        assert!(text.contains("│ some warning"), "stderr stays plain text in the frame:\n{text}");
+        assert!(
+            table_line.starts_with("│ "),
+            "rendered rows stay inside the frame border:\n{text}"
+        );
+        assert!(
+            text.contains("│ some warning"),
+            "stderr stays plain text in the frame:\n{text}"
+        );
         // stderr sits above the rendered part, set off by a rule — not run
         // together with the last table row.
         let (warn, rule, table) = (
@@ -1696,7 +1757,10 @@ mod tests {
             text.find("│ ────").expect("a rule after stderr"),
             text.find("ZMARKERZ").unwrap(),
         );
-        assert!(warn < rule && rule < table, "stderr, rule, then the rendered markdown:\n{text}");
+        assert!(
+            warn < rule && rule < table,
+            "stderr, rule, then the rendered markdown:\n{text}"
+        );
         assert!(text.trim_end().ends_with("└─"), "frame is closed:\n{text}");
     }
 
@@ -1741,7 +1805,10 @@ mod tests {
             }
         }
         assert!(text.contains("ZMARKERZ"), "the live frame shows:\n{text}");
-        assert!(!text.contains("CACHEDMARKER"), "the block's cached copy is superseded:\n{text}");
+        assert!(
+            !text.contains("CACHEDMARKER"),
+            "the block's cached copy is superseded:\n{text}"
+        );
         assert!(
             text.contains("OTHERCACHED"),
             "a block with no live output keeps its cached copy:\n{text}"
@@ -1758,7 +1825,8 @@ mod tests {
         let hl = Highlighter::new();
         let md = "```bash name=\"t\"\necho hi\n```\n";
         let mut live = table_output(true, false);
-        live.stdout.push_str("\n![chart](data:image/png;base64,iVBORw0KGgo=)\n");
+        live.stdout
+            .push_str("\n![chart](data:image/png;base64,iVBORw0KGgo=)\n");
         let mut live_output = std::collections::HashMap::new();
         live_output.insert("t".to_string(), live);
         let (segments, _clicks) = render(
@@ -1778,7 +1846,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(images, vec![PathBuf::from("data:image/png;base64,iVBORw0KGgo=")]);
+        assert_eq!(
+            images,
+            vec![PathBuf::from("data:image/png;base64,iVBORw0KGgo=")]
+        );
         let last_text = segments.iter().rev().find_map(|s| match s {
             Segment::Text(lines) => Some(lines.clone()),
             _ => None,
@@ -1788,19 +1859,28 @@ mod tests {
             .iter()
             .flat_map(|l| l.spans.iter().map(|sp| sp.content.to_string()))
             .collect();
-        assert!(last_text.contains("└─"), "the frame still closes after the image: {last_text}");
+        assert!(
+            last_text.contains("└─"),
+            "the frame still closes after the image: {last_text}"
+        );
     }
 
     #[test]
     fn markdown_live_output_stays_raw_while_the_run_is_still_going() {
         let text = live_doc_text(table_output(true, true));
-        assert!(text.contains("|---|---|"), "raw text while running:\n{text}");
+        assert!(
+            text.contains("|---|---|"),
+            "raw text while running:\n{text}"
+        );
     }
 
     #[test]
     fn non_markdown_live_output_stays_raw() {
         let text = live_doc_text(table_output(false, false));
-        assert!(text.contains("|---|---|"), "no output=\"markdown\", so no rendering:\n{text}");
+        assert!(
+            text.contains("|---|---|"),
+            "no output=\"markdown\", so no rendering:\n{text}"
+        );
     }
 
     // TODO.canvas.md: "Base64 image" — a `data:` image URL becomes an
@@ -1813,8 +1893,16 @@ mod tests {
     fn a_data_url_image_becomes_a_segment_image_keyed_by_the_url_itself() {
         let hl = Highlighter::new();
         let md = "![a pixel](data:image/png;base64,iVBORw0KGgo=)\n";
-        let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
+        let (segments, _clicks) = render(
+            md,
+            Path::new("/nonexistent-base-dir"),
+            &hl,
+            "n",
+            &[],
+            &std::collections::HashMap::new(),
+            None,
+            &std::collections::HashMap::new(),
+        );
         let Segment::Image { path, alt, .. } = segments
             .into_iter()
             .find(|s| matches!(s, Segment::Image { .. }))
@@ -1854,8 +1942,26 @@ mod tests {
         let mut values = std::collections::HashMap::new();
         values.insert("NAME".to_string(), "abc".to_string());
 
-        let (unfocused, _) = render(md, Path::new("/x"), &hl, "n", &decls, &values, None, &std::collections::HashMap::new());
-        let (focused, _) = render(md, Path::new("/x"), &hl, "n", &decls, &values, Some(("f", 0)), &std::collections::HashMap::new());
+        let (unfocused, _) = render(
+            md,
+            Path::new("/x"),
+            &hl,
+            "n",
+            &decls,
+            &values,
+            None,
+            &std::collections::HashMap::new(),
+        );
+        let (focused, _) = render(
+            md,
+            Path::new("/x"),
+            &hl,
+            "n",
+            &decls,
+            &values,
+            Some(("f", 0)),
+            &std::collections::HashMap::new(),
+        );
 
         let value_span = |segs: &[Segment]| -> Span<'static> {
             let Segment::Text(lines) = segs.iter().find(|s| matches!(s, Segment::Text(_))).unwrap()
@@ -1869,7 +1975,10 @@ mod tests {
 
         assert_eq!(unfocused_value.content.as_ref(), "abc");
         assert!(
-            !unfocused_value.style.add_modifier.contains(Modifier::REVERSED),
+            !unfocused_value
+                .style
+                .add_modifier
+                .contains(Modifier::REVERSED),
             "an unfocused field row shouldn't be reversed"
         );
         assert_eq!(
@@ -1878,7 +1987,10 @@ mod tests {
             "the focused field's own value should carry a trailing text cursor"
         );
         assert!(
-            focused_value.style.add_modifier.contains(Modifier::REVERSED),
+            focused_value
+                .style
+                .add_modifier
+                .contains(Modifier::REVERSED),
             "the focused field's row should be reversed so it's visibly the one in focus"
         );
     }
@@ -1887,8 +1999,16 @@ mod tests {
     fn an_http_image_is_still_inert_text_not_a_segment_image() {
         let hl = Highlighter::new();
         let md = "![x](https://example.com/pic.png)\n";
-        let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
+        let (segments, _clicks) = render(
+            md,
+            Path::new("/nonexistent-base-dir"),
+            &hl,
+            "n",
+            &[],
+            &std::collections::HashMap::new(),
+            None,
+            &std::collections::HashMap::new(),
+        );
         assert!(!segments.iter().any(|s| matches!(s, Segment::Image { .. })));
     }
 
@@ -1916,8 +2036,16 @@ mod tests {
     fn image_percent_attrs_become_a_sizing_hint() {
         let hl = Highlighter::new();
         let md = "![alt](pic.png){width=50% height=25%}\n";
-        let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
+        let (segments, _clicks) = render(
+            md,
+            Path::new("/nonexistent-base-dir"),
+            &hl,
+            "n",
+            &[],
+            &std::collections::HashMap::new(),
+            None,
+            &std::collections::HashMap::new(),
+        );
         let Segment::Image {
             width_percent,
             height_percent,
@@ -1937,8 +2065,16 @@ mod tests {
     fn image_absolute_attrs_are_parsed_but_have_no_tui_effect() {
         let hl = Highlighter::new();
         let md = "![alt](pic.png){width=300}\n";
-        let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
+        let (segments, _clicks) = render(
+            md,
+            Path::new("/nonexistent-base-dir"),
+            &hl,
+            "n",
+            &[],
+            &std::collections::HashMap::new(),
+            None,
+            &std::collections::HashMap::new(),
+        );
         let Segment::Image { width_percent, .. } = segments
             .into_iter()
             .find(|s| matches!(s, Segment::Image { .. }))
@@ -1953,11 +2089,25 @@ mod tests {
     fn an_images_alt_text_is_not_rendered_as_a_caption_under_it() {
         let hl = Highlighter::new();
         let md = "![Temperature and humidity](pic.png)\n\nafter\n";
-        let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
+        let (segments, _clicks) = render(
+            md,
+            Path::new("/nonexistent-base-dir"),
+            &hl,
+            "n",
+            &[],
+            &std::collections::HashMap::new(),
+            None,
+            &std::collections::HashMap::new(),
+        );
         let text = segment_text(&segments);
-        assert!(!text.contains("Temperature"), "no stray alt-text paragraph: {text:?}");
-        assert!(text.contains("after"), "the real paragraph after the image stays: {text:?}");
+        assert!(
+            !text.contains("Temperature"),
+            "no stray alt-text paragraph: {text:?}"
+        );
+        assert!(
+            text.contains("after"),
+            "the real paragraph after the image stays: {text:?}"
+        );
         let alt = segments
             .iter()
             .find_map(|s| match s {
@@ -1972,8 +2122,16 @@ mod tests {
     fn text_right_after_an_image_with_no_attrs_marker_is_rendered_normally() {
         let hl = Highlighter::new();
         let md = "![alt](pic.png) just text\n";
-        let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
+        let (segments, _clicks) = render(
+            md,
+            Path::new("/nonexistent-base-dir"),
+            &hl,
+            "n",
+            &[],
+            &std::collections::HashMap::new(),
+            None,
+            &std::collections::HashMap::new(),
+        );
         assert!(segment_text(&segments).contains("just text"));
     }
 
@@ -1982,8 +2140,16 @@ mod tests {
     fn subscript_and_superscript_render_as_unicode_small_forms() {
         let hl = Highlighter::new();
         let md = "H~2~O and x^n^\n";
-        let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
+        let (segments, _clicks) = render(
+            md,
+            Path::new("/nonexistent-base-dir"),
+            &hl,
+            "n",
+            &[],
+            &std::collections::HashMap::new(),
+            None,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(segment_text(&segments), "H₂O and xⁿ");
     }
 
@@ -1991,8 +2157,16 @@ mod tests {
     fn subsup_falls_back_to_literal_when_not_fully_mapped_to_unicode() {
         let hl = Highlighter::new();
         let md = "x~query~\n";
-        let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
+        let (segments, _clicks) = render(
+            md,
+            Path::new("/nonexistent-base-dir"),
+            &hl,
+            "n",
+            &[],
+            &std::collections::HashMap::new(),
+            None,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(segment_text(&segments), "x~query~");
     }
 
@@ -2000,8 +2174,16 @@ mod tests {
     fn subsup_never_applies_inside_a_code_block() {
         let hl = Highlighter::new();
         let md = "```text\nx~2~\n```\n";
-        let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
+        let (segments, _clicks) = render(
+            md,
+            Path::new("/nonexistent-base-dir"),
+            &hl,
+            "n",
+            &[],
+            &std::collections::HashMap::new(),
+            None,
+            &std::collections::HashMap::new(),
+        );
         assert!(segment_text(&segments).contains("x~2~"));
     }
 
@@ -2011,8 +2193,16 @@ mod tests {
     fn a_gfm_alert_blockquote_gets_a_styled_title_line() {
         let hl = Highlighter::new();
         let md = "> [!WARNING]\n> be careful\n";
-        let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
+        let (segments, _clicks) = render(
+            md,
+            Path::new("/nonexistent-base-dir"),
+            &hl,
+            "n",
+            &[],
+            &std::collections::HashMap::new(),
+            None,
+            &std::collections::HashMap::new(),
+        );
         let text = segment_text(&segments);
         assert!(text.contains("Warning"), "{text}");
         assert!(text.contains("be careful"), "{text}");
@@ -2023,8 +2213,16 @@ mod tests {
     fn an_ordinary_blockquote_gets_no_title_line() {
         let hl = Highlighter::new();
         let md = "> just a quote\n";
-        let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
+        let (segments, _clicks) = render(
+            md,
+            Path::new("/nonexistent-base-dir"),
+            &hl,
+            "n",
+            &[],
+            &std::collections::HashMap::new(),
+            None,
+            &std::collections::HashMap::new(),
+        );
         let text = segment_text(&segments);
         assert!(text.contains("just a quote"), "{text}");
         assert!(!text.contains("Note"), "{text}");
@@ -2040,8 +2238,16 @@ mod tests {
     fn task_list_items_show_a_checkbox_after_their_bullet() {
         let hl = Highlighter::new();
         let md = "- [ ] todo\n- [x] done\n";
-        let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
+        let (segments, _clicks) = render(
+            md,
+            Path::new("/nonexistent-base-dir"),
+            &hl,
+            "n",
+            &[],
+            &std::collections::HashMap::new(),
+            None,
+            &std::collections::HashMap::new(),
+        );
         let text = segment_text(&segments);
         assert!(text.contains("[ ] todo"), "{text}");
         assert!(text.contains("[x] done"), "{text}");
@@ -2051,8 +2257,16 @@ mod tests {
     fn a_numeric_footnote_reference_renders_as_unicode_superscript() {
         let hl = Highlighter::new();
         let md = "See[^1].\n\n[^1]: A note.\n";
-        let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
+        let (segments, _clicks) = render(
+            md,
+            Path::new("/nonexistent-base-dir"),
+            &hl,
+            "n",
+            &[],
+            &std::collections::HashMap::new(),
+            None,
+            &std::collections::HashMap::new(),
+        );
         let text = segment_text(&segments);
         assert!(text.contains("See¹."), "{text}");
         assert!(!text.contains("[^1]"), "{text}");
@@ -2062,8 +2276,16 @@ mod tests {
     fn a_footnote_definition_gets_a_bracketed_label_and_its_body() {
         let hl = Highlighter::new();
         let md = "See[^1].\n\n[^1]: A note.\n";
-        let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
+        let (segments, _clicks) = render(
+            md,
+            Path::new("/nonexistent-base-dir"),
+            &hl,
+            "n",
+            &[],
+            &std::collections::HashMap::new(),
+            None,
+            &std::collections::HashMap::new(),
+        );
         let text = segment_text(&segments);
         assert!(text.contains("[1]"), "{text}");
         assert!(text.contains("A note."), "{text}");
@@ -2075,8 +2297,16 @@ mod tests {
         // 'q' has no superscript Unicode glyph, so "note" (which does map
         // fully) is deliberately not used here — want the fallback path.
         let md = "See[^query].\n\n[^query]: A note.\n";
-        let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
+        let (segments, _clicks) = render(
+            md,
+            Path::new("/nonexistent-base-dir"),
+            &hl,
+            "n",
+            &[],
+            &std::collections::HashMap::new(),
+            None,
+            &std::collections::HashMap::new(),
+        );
         let text = segment_text(&segments);
         assert!(text.contains("See[query]."), "{text}");
     }
@@ -2085,8 +2315,16 @@ mod tests {
     fn a_fences_own_interpreter_attr_shows_up_as_a_shebang_suffix_on_its_header() {
         let hl = Highlighter::new();
         let md = "```python name=\"seed\" interpreter=\"python3 -u\"\nprint(1)\n```\n";
-        let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
+        let (segments, _clicks) = render(
+            md,
+            Path::new("/nonexistent-base-dir"),
+            &hl,
+            "n",
+            &[],
+            &std::collections::HashMap::new(),
+            None,
+            &std::collections::HashMap::new(),
+        );
         let text = segment_text(&segments);
         // Exactly as written in the attribute — no case-folding — mirrors
         // the web UI's own `mesh-code-interpreter` suffix.
@@ -2097,8 +2335,16 @@ mod tests {
     fn a_fence_with_no_interpreter_attr_has_no_shebang_suffix() {
         let hl = Highlighter::new();
         let md = "```bash name=\"build\" cache\necho hi\n```\n";
-        let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
+        let (segments, _clicks) = render(
+            md,
+            Path::new("/nonexistent-base-dir"),
+            &hl,
+            "n",
+            &[],
+            &std::collections::HashMap::new(),
+            None,
+            &std::collections::HashMap::new(),
+        );
         let text = segment_text(&segments);
         assert!(!text.contains("#!"), "{text}");
     }
@@ -2107,8 +2353,16 @@ mod tests {
     fn a_button_fence_renders_its_body_as_the_caption_with_a_run_hint() {
         let hl = Highlighter::new();
         let md = "```button name=\"full-import\" deps=\"build\"\n🚀 Run everything\n```\n";
-        let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
+        let (segments, _clicks) = render(
+            md,
+            Path::new("/nonexistent-base-dir"),
+            &hl,
+            "n",
+            &[],
+            &std::collections::HashMap::new(),
+            None,
+            &std::collections::HashMap::new(),
+        );
         let text = segment_text(&segments);
         assert!(text.contains("🚀 Run everything"), "{text}");
         assert!(text.contains("(r to run)"), "{text}");
@@ -2121,8 +2375,16 @@ mod tests {
     fn a_button_fence_falls_back_to_its_name_when_the_body_is_blank() {
         let hl = Highlighter::new();
         let md = "```button name=\"full-import\" deps=\"build\"\n```\n";
-        let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
+        let (segments, _clicks) = render(
+            md,
+            Path::new("/nonexistent-base-dir"),
+            &hl,
+            "n",
+            &[],
+            &std::collections::HashMap::new(),
+            None,
+            &std::collections::HashMap::new(),
+        );
         let text = segment_text(&segments);
         assert!(text.contains("full-import"), "{text}");
     }
@@ -2131,8 +2393,16 @@ mod tests {
     fn a_button_fences_caption_is_rendered_as_a_bold_accent_marker() {
         let hl = Highlighter::new();
         let md = "```button name=\"full-import\" deps=\"build\"\nRun everything\n```\n";
-        let (segments, _clicks) =
-            render(md, Path::new("/nonexistent-base-dir"), &hl, "n", &[], &std::collections::HashMap::new(), None, &std::collections::HashMap::new());
+        let (segments, _clicks) = render(
+            md,
+            Path::new("/nonexistent-base-dir"),
+            &hl,
+            "n",
+            &[],
+            &std::collections::HashMap::new(),
+            None,
+            &std::collections::HashMap::new(),
+        );
         let Segment::Text(lines) = &segments[0] else {
             panic!("expected a text segment");
         };
@@ -2141,7 +2411,10 @@ mod tests {
             .iter()
             .find(|s| s.content.contains("Run everything"))
             .expect("caption span");
-        assert_eq!(caption_span.style.bg, None, "no fill — see design choice above");
+        assert_eq!(
+            caption_span.style.bg, None,
+            "no fill — see design choice above"
+        );
         assert_eq!(caption_span.style.fg, Some(crate::tui::theme::ACCENT));
         assert!(caption_span.style.add_modifier.contains(Modifier::BOLD));
 

@@ -105,10 +105,16 @@ pub fn declared_tag_colors(canvas: &Canvas) -> Result<HashMap<String, String>, T
 /// has a default for. `None` when neither applies — same "no explicit
 /// color, no inherited style" fallback every consumer already gives an
 /// uncolored node.
-pub fn effective_color<'a>(node: &'a Node, tag_colors: &'a HashMap<String, String>) -> Option<&'a str> {
-    node.color
-        .as_deref()
-        .or_else(|| node.tags.iter().find_map(|t| tag_colors.get(t)).map(String::as_str))
+pub fn effective_color<'a>(
+    node: &'a Node,
+    tag_colors: &'a HashMap<String, String>,
+) -> Option<&'a str> {
+    node.color.as_deref().or_else(|| {
+        node.tags
+            .iter()
+            .find_map(|t| tag_colors.get(t))
+            .map(String::as_str)
+    })
 }
 
 /// `meshfox validate`-only: the first `meshfox:tag-color` comment
@@ -139,7 +145,10 @@ pub fn unknown_tag_color_attr(markdown: &str) -> Option<crate::attrs::UnknownAtt
         }
         if let Some(attrs) = parse_tag_color_comment(line) {
             if let Some(attr) = crate::attrs::first_unknown(&attrs, TAG_COLOR_ATTRS) {
-                let tag = attrs.get("tag").cloned().unwrap_or_else(|| "<untagged>".to_string());
+                let tag = attrs
+                    .get("tag")
+                    .cloned()
+                    .unwrap_or_else(|| "<untagged>".to_string());
                 return Some(crate::attrs::UnknownAttrError {
                     context: format!("the meshfox:tag-color comment for {tag:?}"),
                     attr: attr.to_string(),
@@ -177,7 +186,8 @@ mod tests {
 
     #[test]
     fn scans_a_simple_declaration() {
-        let decls = scan_tag_color_decls("<!-- meshfox:tag-color tag=\"bug\" color=\"1\" -->\n").unwrap();
+        let decls =
+            scan_tag_color_decls("<!-- meshfox:tag-color tag=\"bug\" color=\"1\" -->\n").unwrap();
         assert_eq!(decls, vec![("bug".to_string(), "1".to_string())]);
     }
 
@@ -209,7 +219,8 @@ mod tests {
     #[test]
     fn ignores_a_declaration_written_as_an_indented_code_block() {
         let decls =
-            scan_tag_color_decls("    <!-- meshfox:tag-color tag=\"bug\" color=\"1\" -->\n").unwrap();
+            scan_tag_color_decls("    <!-- meshfox:tag-color tag=\"bug\" color=\"1\" -->\n")
+                .unwrap();
         assert!(decls.is_empty());
     }
 
@@ -268,7 +279,8 @@ mod tests {
 
     #[test]
     fn effective_color_falls_back_to_the_first_matching_tag_in_the_nodes_own_order() {
-        let doc = "# Root\n<!-- meshfox:node id=\"root\" tags=\"untagged,bug,feature\" -->\n\nbody\n";
+        let doc =
+            "# Root\n<!-- meshfox:node id=\"root\" tags=\"untagged,bug,feature\" -->\n\nbody\n";
         let c = canvas(doc);
         let mut tag_colors = HashMap::new();
         tag_colors.insert("bug".to_string(), "1".to_string());
@@ -290,7 +302,10 @@ mod tests {
         let doc = "# Root\n<!-- meshfox:node id=\"root\" -->\n<!-- meshfox:tag-color tag=\"bug\" color=\"1\" -->\n\nbody\n\n## Child\n<!-- meshfox:node id=\"child\" tags=\"bug\" -->\n\nbody\n";
         let mut c = canvas(doc);
         annotate_effective_colors(&mut c);
-        assert_eq!(c.node("child").unwrap().effective_color.as_deref(), Some("1"));
+        assert_eq!(
+            c.node("child").unwrap().effective_color.as_deref(),
+            Some("1")
+        );
         assert_eq!(c.node("root").unwrap().effective_color, None);
     }
 

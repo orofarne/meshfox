@@ -126,7 +126,9 @@ fn double_clicking_the_output_title_expands_it_to_fullscreen_and_back() {
     session.send_mouse_click(row, col);
     std::thread::sleep(Duration::from_millis(150));
 
-    let (row, col) = session.find("Output").expect("Output pane title, now expanded");
+    let (row, col) = session
+        .find("Output")
+        .expect("Output pane title, now expanded");
     session.send_mouse_double_click(row, col);
     std::thread::sleep(Duration::from_millis(100));
     assert!(
@@ -137,7 +139,9 @@ fn double_clicking_the_output_title_expands_it_to_fullscreen_and_back() {
     // The title moved (fullscreen Output starts at row 0) — re-locate it
     // rather than reusing the pre-fullscreen coordinate, same as a real
     // user would have to click wherever it actually is now.
-    let (row, col) = session.find("Output").expect("Output pane title, now fullscreen");
+    let (row, col) = session
+        .find("Output")
+        .expect("Output pane title, now fullscreen");
     session.send_mouse_double_click(row, col);
     std::thread::sleep(Duration::from_millis(100));
     assert!(

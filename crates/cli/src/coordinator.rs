@@ -97,7 +97,9 @@ pub async fn get_or_spawn(canvas_path: &Path) -> io::Result<u16> {
                 guard,
                 Some(ready_tx),
             ));
-            ready_rx.await.map_err(|_| io::Error::other("failed to start the worker"))
+            ready_rx
+                .await
+                .map_err(|_| io::Error::other("failed to start the worker"))
         }
     }
 }

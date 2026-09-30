@@ -79,7 +79,10 @@ fn spawn_worker_with_untouched_timeout_secs(
     }
     let worker = cmd.spawn().unwrap();
 
-    let lock_name = format!("{}.worker.lock", canvas_path.file_name().unwrap().to_string_lossy());
+    let lock_name = format!(
+        "{}.worker.lock",
+        canvas_path.file_name().unwrap().to_string_lossy()
+    );
     let lock_path = dir.join(".meshfox").join(lock_name);
     let mut port = None;
     for _ in 0..100 {
@@ -93,7 +96,10 @@ fn spawn_worker_with_untouched_timeout_secs(
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    (worker, port.expect("worker never reported a port within 5s"))
+    (
+        worker,
+        port.expect("worker never reported a port within 5s"),
+    )
 }
 
 fn kill(mut worker: std::process::Child) {
@@ -106,7 +112,11 @@ fn kill(mut worker: std::process::Child) {
 /// parsing its response.
 fn http_get(port: u16, path: &str) {
     let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-    write!(stream, "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
     let mut buf = Vec::new();
     let _ = stream.read_to_end(&mut buf);
 }
@@ -170,7 +180,10 @@ fn a_worker_with_no_traffic_at_all_does_not_auto_exit() {
 
     let exited = exited_within(&mut worker, Duration::from_secs(20));
     kill(worker);
-    assert!(!exited, "an untouched worker (no tab, no API call) must not auto-exit");
+    assert!(
+        !exited,
+        "an untouched worker (no tab, no API call) must not auto-exit"
+    );
 }
 
 /// A worker nobody ever touches at all shouldn't wait *forever* either —
@@ -210,7 +223,9 @@ async fn a_worker_with_a_long_running_run_in_flight_does_not_auto_exit() {
     let (mut worker, port) = spawn_worker(&dir, &canvas_path);
 
     let url = format!("ws://127.0.0.1:{port}/api/run?block=slow");
-    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("connect");
 
     // Drain events until the run's own terminal `Done` arrives — proves
     // the worker survived the *whole* ~18s run, not just some arbitrary
@@ -272,7 +287,9 @@ async fn a_worker_with_a_tty_session_outliving_its_own_connection_does_not_auto_
     let (mut worker, port) = spawn_worker(&dir, &canvas_path);
 
     let url = format!("ws://127.0.0.1:{port}/api/run/tty?block=slow-tty&cols=80&rows=24");
-    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("connect");
 
     // Wait for `tty-start` specifically — proof the session is actually
     // registered in `tty_registry` (not just that the run itself started)
@@ -326,5 +343,8 @@ fn a_worker_with_no_traffic_at_all_still_exits_after_the_untouched_timeout() {
     if !exited {
         kill(worker);
     }
-    assert!(exited, "a completely untouched worker should still exit after the untouched timeout");
+    assert!(
+        exited,
+        "a completely untouched worker should still exit after the untouched timeout"
+    );
 }

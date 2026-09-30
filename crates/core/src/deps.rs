@@ -98,7 +98,15 @@ pub fn resolve_chain(canvas: &Canvas, target: BlockAddr) -> Result<Vec<BlockAddr
     let mut order = Vec::new();
     let mut visited = std::collections::HashSet::new();
     let mut stack: Vec<BlockAddr> = Vec::new();
-    visit(canvas, target, &decls, true, &mut order, &mut visited, &mut stack)?;
+    visit(
+        canvas,
+        target,
+        &decls,
+        true,
+        &mut order,
+        &mut visited,
+        &mut stack,
+    )?;
     Ok(order)
 }
 
@@ -114,7 +122,15 @@ pub fn resolve_from_chain(canvas: &Canvas, target: BlockAddr) -> Result<Vec<Bloc
     let mut order = Vec::new();
     let mut visited = std::collections::HashSet::new();
     let mut stack: Vec<BlockAddr> = Vec::new();
-    visit(canvas, target, &decls, false, &mut order, &mut visited, &mut stack)?;
+    visit(
+        canvas,
+        target,
+        &decls,
+        false,
+        &mut order,
+        &mut visited,
+        &mut stack,
+    )?;
     Ok(order)
 }
 
@@ -178,8 +194,13 @@ fn implicit_from_deps(
 /// exists — unlike `visit`'s own `follow_deps`, which exists to let a
 /// caller opt out of `deps=` entirely (`resolve_from_chain`), not to
 /// distinguish a plain `deps=` entry from a `!` one.
-fn direct_deps(node_id: &str, block: &crate::fence::CodeBlock, decls: &[VarDecl]) -> Vec<BlockAddr> {
-    let mut dep_addrs: Vec<BlockAddr> = block.deps.iter().map(|d| resolve_ref(node_id, d)).collect();
+fn direct_deps(
+    node_id: &str,
+    block: &crate::fence::CodeBlock,
+    decls: &[VarDecl],
+) -> Vec<BlockAddr> {
+    let mut dep_addrs: Vec<BlockAddr> =
+        block.deps.iter().map(|d| resolve_ref(node_id, d)).collect();
     dep_addrs.extend(implicit_from_deps(node_id, block, decls));
     dep_addrs
 }
@@ -288,7 +309,10 @@ fn visit(
 pub fn compute_forced_reruns(
     canvas: &Canvas,
     chain: &[BlockAddr],
-    mut fingerprint_vars: impl FnMut(&crate::fence::CodeBlock, &HashMap<String, String>) -> HashMap<String, String>,
+    mut fingerprint_vars: impl FnMut(
+        &crate::fence::CodeBlock,
+        &HashMap<String, String>,
+    ) -> HashMap<String, String>,
     cached_run: impl Fn(&BlockAddr) -> Option<(String, HashMap<String, String>)>,
 ) -> Result<HashSet<BlockAddr>, DepsError> {
     let decls = crate::vars::declared_vars(canvas)?;
@@ -309,8 +333,12 @@ pub fn compute_forced_reruns(
         let cascaded = direct_deps(&addr.node_id, &block, &decls)
             .iter()
             .any(|dep| forced.contains(dep));
-        let live_fingerprint =
-            closure_fingerprint_with(canvas, &decls, addr, &fingerprint_vars(&block, &sim_computed))?;
+        let live_fingerprint = closure_fingerprint_with(
+            canvas,
+            &decls,
+            addr,
+            &fingerprint_vars(&block, &sim_computed),
+        )?;
         let cached = cached_run(addr);
         let run_for_real = Some(addr) == target
             || block.always
@@ -408,7 +436,10 @@ pub fn closure_fingerprint_with(
         deps.sort_by_key(BlockAddr::key);
         deps.dedup();
         stack.push(addr.clone());
-        let mut parts = vec![key.clone(), crate::fence::session_fingerprint(&block, values)];
+        let mut parts = vec![
+            key.clone(),
+            crate::fence::session_fingerprint(&block, values),
+        ];
         for dep in &deps {
             parts.push(go(canvas, decls, dep, values, memo, stack)?);
         }
@@ -417,7 +448,14 @@ pub fn closure_fingerprint_with(
         memo.insert(key, fp.clone());
         Ok(fp)
     }
-    go(canvas, decls, target, values, &mut HashMap::new(), &mut Vec::new())
+    go(
+        canvas,
+        decls,
+        target,
+        values,
+        &mut HashMap::new(),
+        &mut Vec::new(),
+    )
 }
 
 /// Validates every `deps=` reference in the whole canvas resolves to a real
@@ -436,13 +474,19 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
                 return Err(DepsError::CacheTtyConflict(node.id.clone(), name.clone()));
             }
             if block.autoclose && !block.tty {
-                return Err(DepsError::AutocloseWithoutTty(node.id.clone(), name.clone()));
+                return Err(DepsError::AutocloseWithoutTty(
+                    node.id.clone(),
+                    name.clone(),
+                ));
             }
             if block.service && block.tty {
                 return Err(DepsError::ServiceTtyConflict(node.id.clone(), name.clone()));
             }
             if block.service && block.cache {
-                return Err(DepsError::ServiceCacheConflict(node.id.clone(), name.clone()));
+                return Err(DepsError::ServiceCacheConflict(
+                    node.id.clone(),
+                    name.clone(),
+                ));
             }
             if block.autorun && block.tty {
                 return Err(DepsError::AutorunTtyConflict(node.id.clone(), name.clone()));
@@ -552,7 +596,11 @@ mod tests {
         let base = fp("echo a", "1");
         assert_eq!(base, fp("echo a", "1"));
         assert_ne!(base, fp("echo b", "1"), "a dependency's code must count");
-        assert_ne!(base, fp("echo a", "2"), "a referenced variable's value must count");
+        assert_ne!(
+            base,
+            fp("echo a", "2"),
+            "a referenced variable's value must count"
+        );
     }
 
     #[test]
@@ -877,7 +925,10 @@ mod tests {
         let chain = resolve_chain(&c, BlockAddr::new("root", "build")).unwrap();
         assert_eq!(
             chain,
-            vec![BlockAddr::new("root", "shell"), BlockAddr::new("root", "build")]
+            vec![
+                BlockAddr::new("root", "shell"),
+                BlockAddr::new("root", "build")
+            ]
         );
     }
 
@@ -938,7 +989,10 @@ mod tests {
         let chain = resolve_chain(&c, BlockAddr::new("root", "run")).unwrap();
         assert_eq!(
             chain,
-            vec![BlockAddr::new("root", "setup"), BlockAddr::new("root", "run"),]
+            vec![
+                BlockAddr::new("root", "setup"),
+                BlockAddr::new("root", "run"),
+            ]
         );
     }
 

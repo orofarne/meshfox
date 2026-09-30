@@ -35,6 +35,9 @@ use std::time::Duration;
 use tokio::sync::{broadcast, oneshot};
 use tower_http::cors::CorsLayer;
 
+/// Sequenced broadcast log backing `/api/watch` — see its own module doc
+/// comment.
+mod canvas_events;
 /// `pub` so `meshfox-cli`'s TUI can reuse the same SSRF-safe fetch +
 /// OpenGraph parsing + cache in-process (see its own `App` struct) rather
 /// than duplicating it — the TUI doesn't talk to `meshfox serve` over
@@ -42,44 +45,41 @@ use tower_http::cors::CorsLayer;
 pub mod debug_session;
 pub mod link_preview;
 mod pty_exec;
-/// `pub` so `meshfox-cli`'s TUI can share the exact same live-service
-/// registry primitives (spawn/stop/restart/resource-sampling) the webui
-/// server uses — see its own module doc comment for why the TUI links this
-/// crate as a library rather than talking to it over HTTP.
-pub mod services;
+/// Persistent audit log + startup reconciliation for every run/service/tty
+/// execution — see its own module doc comment. `pub` for the same
+/// test-seeding reason `session_db` is.
+pub mod run_ledger;
 /// Webui-only (not shared with the CLI/TUI, unlike `services` — see this
 /// module's own doc comment for why a plain block's reconnect-safe output
 /// is specifically a multi-tab-webui concern) registry for a plain
 /// block's own most recent run.
 mod run_registry;
-/// Webui-only multi-viewer registry for a `tty` block's own live pty
-/// session — see its own module doc comment.
-mod tty_registry;
 /// Generic seq + ring-buffer + `subscribe_from` primitive — see its own
 /// module doc comment.
 mod seq_log;
-/// Sequenced broadcast log backing `/api/watch` — see its own module doc
-/// comment.
-mod canvas_events;
+/// `pub` so `meshfox-cli`'s TUI can share the exact same live-service
+/// registry primitives (spawn/stop/restart/resource-sampling) the webui
+/// server uses — see its own module doc comment for why the TUI links this
+/// crate as a library rather than talking to it over HTTP.
+pub mod services;
 /// The one shared SQLite connection `undo_log`/`run_ledger` are both built
 /// on — see its own module doc comment. `pub` so `meshfox-cli`'s own tests
 /// can seed a `run_ledger` row directly against the real connection/schema
 /// (`crates/cli/tests/service_run_cmd.rs`), the same way they already write
 /// the real on-disk format directly instead of duplicating it by hand.
 pub mod session_db;
-/// Per-canvas undo/redo history — recording + rotation only so far, see its
-/// own module doc comment.
-mod undo_log;
-/// Persistent audit log + startup reconciliation for every run/service/tty
-/// execution — see its own module doc comment. `pub` for the same
-/// test-seeding reason `session_db` is.
-pub mod run_ledger;
 /// Restart-surviving copy of `AppState::session_runs`/`session_vars` — see
 /// its own module doc comment.
 mod session_state;
 /// `pub` so `meshfox-cli` can reuse the same async spawn/kill primitives
 /// for `meshfox run`'s real-time output — see its `main.rs`.
 pub mod stream_exec;
+/// Webui-only multi-viewer registry for a `tty` block's own live pty
+/// session — see its own module doc comment.
+mod tty_registry;
+/// Per-canvas undo/redo history — recording + rotation only so far, see its
+/// own module doc comment.
+mod undo_log;
 /// `pub` so `meshfox-cli`'s watcher (the coordinator this crate's own
 /// workers talk to — see `open_node_file`/`run`) can speak the exact same
 /// wire types without duplicating them.
@@ -286,7 +286,11 @@ impl AppState {
         let cleaned = meshfox_core::output::strip_uncached_output(raw);
         // Cleanup may change other nodes too. A document-wide event also makes
         // undo record the complete pre-save document instead of a partial diff.
-        let event = if cleaned != raw { ServerEvent::Changed } else { event };
+        let event = if cleaned != raw {
+            ServerEvent::Changed
+        } else {
+            event
+        };
         let raw = cleaned.as_str();
         let old_raw = self.raw.lock().unwrap().clone();
         self.write_raw(raw)?;
@@ -329,7 +333,12 @@ fn broadcast_undo_state(state: &AppState) {
 fn layout_only_change(old_raw: &str, new_raw: &str) -> Option<Vec<String>> {
     let old = mdcanvas::parse(old_raw).ok()?;
     let new = mdcanvas::parse(new_raw).ok()?;
-    if old.nodes.iter().map(|n| &n.id).ne(new.nodes.iter().map(|n| &n.id)) {
+    if old
+        .nodes
+        .iter()
+        .map(|n| &n.id)
+        .ne(new.nodes.iter().map(|n| &n.id))
+    {
         return None; // a node was added, removed, or reordered
     }
     let strip_layout = |n: &meshfox_core::Node| {
@@ -353,7 +362,11 @@ fn layout_only_change(old_raw: &str, new_raw: &str) -> Option<Vec<String>> {
             moved_ids.push(old_node.id.clone());
         }
     }
-    if moved_ids.is_empty() { None } else { Some(moved_ids) }
+    if moved_ids.is_empty() {
+        None
+    } else {
+        Some(moved_ids)
+    }
 }
 
 #[cfg(test)]
@@ -371,10 +384,17 @@ mod layout_only_change_tests {
         let moved = mdcanvas::set_node_meta(
             TWO_SIBLINGS,
             "a",
-            &NodeMeta { x: Some(50.0), y: Some(75.0), ..NodeMeta::default() },
+            &NodeMeta {
+                x: Some(50.0),
+                y: Some(75.0),
+                ..NodeMeta::default()
+            },
         )
         .unwrap();
-        assert_eq!(layout_only_change(TWO_SIBLINGS, &moved), Some(vec!["a".to_string()]));
+        assert_eq!(
+            layout_only_change(TWO_SIBLINGS, &moved),
+            Some(vec!["a".to_string()])
+        );
     }
 
     #[test]
@@ -438,7 +458,10 @@ fn record_undo(state: &AppState, old_raw: &str, new_raw: &str, event: &ServerEve
                 })),
             )
         }
-        ServerEvent::NodesReordered { parent_id, child_ids } => {
+        ServerEvent::NodesReordered {
+            parent_id,
+            child_ids,
+        } => {
             let before: Vec<String> = mdcanvas::parse(old_raw)
                 .ok()
                 .map(|c| {
@@ -472,11 +495,17 @@ fn record_undo(state: &AppState, old_raw: &str, new_raw: &str, event: &ServerEve
                 diff: serde_json::json!({ "oldId": old_id, "newId": new_id }),
             },
         ),
-        ServerEvent::OptionsChanged => ("options_changed", undo_log::Payload::Raw { before: old_raw }),
-        ServerEvent::AllChildrenReordered => {
-            ("siblings_reordered", undo_log::Payload::Raw { before: old_raw })
+        ServerEvent::OptionsChanged => (
+            "options_changed",
+            undo_log::Payload::Raw { before: old_raw },
+        ),
+        ServerEvent::AllChildrenReordered => (
+            "siblings_reordered",
+            undo_log::Payload::Raw { before: old_raw },
+        ),
+        ServerEvent::LayoutCleared => {
+            ("layout_cleared", undo_log::Payload::Raw { before: old_raw })
         }
-        ServerEvent::LayoutCleared => ("layout_cleared", undo_log::Payload::Raw { before: old_raw }),
         // `Changed`, and any future variant this doesn't know about yet —
         // the same "document-wide, rare, or not worth a bespoke shape"
         // bucket as `remove_node?children=reparent`/raw `PUT
@@ -497,10 +526,7 @@ fn record_undo(state: &AppState, old_raw: &str, new_raw: &str, event: &ServerEve
                     diff: serde_json::json!({ "nodeIds": moved_ids }),
                 },
             ),
-            None => (
-                "raw_replace",
-                undo_log::Payload::Raw { before: old_raw },
-            ),
+            None => ("raw_replace", undo_log::Payload::Raw { before: old_raw }),
         },
     };
     if let Err(e) = state.undo_log.push(op_kind, payload, new_raw) {
@@ -530,15 +556,26 @@ fn apply_history_entry(raw: &str, entry: &undo_log::UndoEntry, undo: bool) -> Op
     // purely for `describe_history_entry`'s own display text, e.g. a
     // rename's old/new id) always replays via the whole-document
     // `raw_before`/`raw_after` instead, regardless of `diff_json`.
-    if !matches!(entry.op_kind.as_str(), "node_upserted" | "node_removed" | "nodes_reordered") {
-        return if undo { entry.raw_before.clone() } else { entry.raw_after.clone() };
+    if !matches!(
+        entry.op_kind.as_str(),
+        "node_upserted" | "node_removed" | "nodes_reordered"
+    ) {
+        return if undo {
+            entry.raw_before.clone()
+        } else {
+            entry.raw_after.clone()
+        };
     }
     let diff_json = entry.diff_json.as_deref()?;
     let diff: serde_json::Value = serde_json::from_str(diff_json).ok()?;
     match entry.op_kind.as_str() {
         "node_upserted" => {
             let node_id = diff.get("nodeId")?.as_str()?;
-            let target_value = if undo { diff.get("before")? } else { diff.get("after")? };
+            let target_value = if undo {
+                diff.get("before")?
+            } else {
+                diff.get("after")?
+            };
             if target_value.is_null() {
                 // Undoing the node's own original creation — `after` is
                 // never null, so `redo` never takes this branch.
@@ -652,7 +689,13 @@ fn apply_node_state(raw: &str, target: &meshfox_core::Node) -> Option<String> {
 fn apply_sibling_order(raw: &str, order: &[String]) -> Option<String> {
     let mut result = raw.to_string();
     for pair in order.windows(2) {
-        result = mdcanvas::move_sibling(&result, &pair[1], &pair[0], mdcanvas::MoveSiblingPosition::After).ok()?;
+        result = mdcanvas::move_sibling(
+            &result,
+            &pair[1],
+            &pair[0],
+            mdcanvas::MoveSiblingPosition::After,
+        )
+        .ok()?;
     }
     Some(result)
 }
@@ -670,7 +713,11 @@ struct UndoRedoResponse {
     canvas: Canvas,
 }
 
-fn undo_redo_response(state: &AppState, raw: &str, changed: bool) -> Result<Json<UndoRedoResponse>, ApiError> {
+fn undo_redo_response(
+    state: &AppState,
+    raw: &str,
+    changed: bool,
+) -> Result<Json<UndoRedoResponse>, ApiError> {
     let can_undo = state
         .undo_log
         .can_undo()
@@ -680,7 +727,12 @@ fn undo_redo_response(state: &AppState, raw: &str, changed: bool) -> Result<Json
         .can_redo()
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let Json(canvas) = canvas_response(raw, &state.canvas_path)?;
-    Ok(Json(UndoRedoResponse { changed, can_undo, can_redo, canvas }))
+    Ok(Json(UndoRedoResponse {
+        changed,
+        can_undo,
+        can_redo,
+        canvas,
+    }))
 }
 
 fn io_err(e: std::io::Error) -> ApiError {
@@ -770,9 +822,15 @@ fn jump_to(state: &AppState, target_seq: i64) -> Result<(String, bool), ApiError
         })?;
         state.write_raw(&next).map_err(io_err)?;
         if undo {
-            state.undo_log.commit_undo(entry.seq, &next).map_err(io_err)?;
+            state
+                .undo_log
+                .commit_undo(entry.seq, &next)
+                .map_err(io_err)?;
         } else {
-            state.undo_log.commit_redo(entry.seq, &next).map_err(io_err)?;
+            state
+                .undo_log
+                .commit_redo(entry.seq, &next)
+                .map_err(io_err)?;
         }
         raw = next;
         steps += 1;
@@ -799,7 +857,10 @@ async fn api_undo(State(state): State<Arc<AppState>>) -> Result<Json<UndoRedoRes
     // reachable position, and what actually broke (an infinite loop in
     // `jump_to`, not just a wrong number) using it as this call's target.
     let target = match state.undo_log.peek_undo().map_err(io_err)? {
-        Some(entry) => state.undo_log.cursor_after_undoing(entry.seq).map_err(io_err)?,
+        Some(entry) => state
+            .undo_log
+            .cursor_after_undoing(entry.seq)
+            .map_err(io_err)?,
         None => state.undo_log.cursor().map_err(io_err)?,
     };
     let (raw, changed) = jump_to(&state, target)?;
@@ -851,7 +912,11 @@ fn extra_parent_from_ids(node: Option<&serde_json::Value>) -> std::collections::
         .and_then(|v| v.as_array())
         .into_iter()
         .flatten()
-        .filter_map(|edge| edge.get("from").and_then(|f| f.as_str()).map(str::to_string))
+        .filter_map(|edge| {
+            edge.get("from")
+                .and_then(|f| f.as_str())
+                .map(str::to_string)
+        })
         .collect()
 }
 
@@ -878,7 +943,12 @@ fn describe_node_upserted(diff: &serde_json::Value) -> String {
     let Some(before) = before else {
         return format!("created «{after_title}»");
     };
-    let field = |k: &str| (before.get(k).cloned().unwrap_or_default(), after.and_then(|a| a.get(k)).cloned().unwrap_or_default());
+    let field = |k: &str| {
+        (
+            before.get(k).cloned().unwrap_or_default(),
+            after.and_then(|a| a.get(k)).cloned().unwrap_or_default(),
+        )
+    };
 
     let (before_parent, after_parent) = field("parent");
     if before_parent != after_parent {
@@ -889,11 +959,23 @@ fn describe_node_upserted(diff: &serde_json::Value) -> String {
     let before_edges = extra_parent_from_ids(Some(before));
     let after_edges = extra_parent_from_ids(after);
     if before_edges != after_edges {
-        let added: Vec<&str> = after_edges.difference(&before_edges).map(String::as_str).collect();
-        let removed: Vec<&str> = before_edges.difference(&after_edges).map(String::as_str).collect();
+        let added: Vec<&str> = after_edges
+            .difference(&before_edges)
+            .map(String::as_str)
+            .collect();
+        let removed: Vec<&str> = before_edges
+            .difference(&after_edges)
+            .map(String::as_str)
+            .collect();
         return match (added.is_empty(), removed.is_empty()) {
-            (false, true) => format!("added an edge from «{}» to «{after_title}»", added.join("», «")),
-            (true, false) => format!("removed the edge from «{}» to «{after_title}»", removed.join("», «")),
+            (false, true) => format!(
+                "added an edge from «{}» to «{after_title}»",
+                added.join("», «")
+            ),
+            (true, false) => format!(
+                "removed the edge from «{}» to «{after_title}»",
+                removed.join("», «")
+            ),
             _ => format!("changed the edges on «{after_title}»"),
         };
     }
@@ -902,7 +984,10 @@ fn describe_node_upserted(diff: &serde_json::Value) -> String {
         return format!("restyled an edge on «{after_title}»");
     }
 
-    let before_title = before.get("title").and_then(|t| t.as_str()).unwrap_or_default();
+    let before_title = before
+        .get("title")
+        .and_then(|t| t.as_str())
+        .unwrap_or_default();
     if before_title != after_title {
         return format!("renamed «{before_title}» to «{after_title}»");
     }
@@ -947,7 +1032,10 @@ mod describe_node_upserted_tests {
             "before": { "title": "X", "extraParents": [] },
             "after": { "title": "X", "extraParents": [{ "from": "y" }] },
         });
-        assert_eq!(describe_node_upserted(&diff), "added an edge from «y» to «X»");
+        assert_eq!(
+            describe_node_upserted(&diff),
+            "added an edge from «y» to «X»"
+        );
     }
 
     #[test]
@@ -956,7 +1044,10 @@ mod describe_node_upserted_tests {
             "before": { "title": "X", "extraParents": [{ "from": "y" }] },
             "after": { "title": "X", "extraParents": [] },
         });
-        assert_eq!(describe_node_upserted(&diff), "removed the edge from «y» to «X»");
+        assert_eq!(
+            describe_node_upserted(&diff),
+            "removed the edge from «y» to «X»"
+        );
     }
 
     #[test]
@@ -1026,21 +1117,39 @@ fn describe_history_entry(entry: &undo_log::UndoEntry) -> String {
     match entry.op_kind.as_str() {
         "node_upserted" => describe_node_upserted(&diff),
         "node_removed" => {
-            let id = diff.get("nodeId").and_then(|v| v.as_str()).unwrap_or_default();
+            let id = diff
+                .get("nodeId")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             format!("removed «{id}»")
         }
         "nodes_reordered" => {
-            let parent_id = diff.get("parentId").and_then(|v| v.as_str()).unwrap_or_default();
+            let parent_id = diff
+                .get("parentId")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             format!("reordered children of «{parent_id}»")
         }
         "node_id_renamed" => {
-            let old_id = diff.get("oldId").and_then(|v| v.as_str()).unwrap_or_default();
-            let new_id = diff.get("newId").and_then(|v| v.as_str()).unwrap_or_default();
+            let old_id = diff
+                .get("oldId")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let new_id = diff
+                .get("newId")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             format!("renamed id «{old_id}» to «{new_id}»")
         }
         "node_id_cleared" => {
-            let old_id = diff.get("oldId").and_then(|v| v.as_str()).unwrap_or_default();
-            let new_id = diff.get("newId").and_then(|v| v.as_str()).unwrap_or_default();
+            let old_id = diff
+                .get("oldId")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let new_id = diff
+                .get("newId")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             format!("cleared id «{old_id}» (now «{new_id}»)")
         }
         "nodes_repositioned" => {
@@ -1106,7 +1215,12 @@ async fn api_history(
             summary: describe_history_entry(&h.entry),
         })
         .collect();
-    Ok(Json(HistoryResponse { cursor, can_undo, can_redo, entries }))
+    Ok(Json(HistoryResponse {
+        cursor,
+        can_undo,
+        can_redo,
+        entries,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1210,7 +1324,11 @@ impl RunFingerprintCtx {
         let canvas = resolved_canvas(&raw, &state.canvas_path).ok()?;
         let decls = meshfox_core::declared_vars(&canvas).ok()?;
         let shared = meshfox_core::load_shared_env(canvas_root_dir(&state.canvas_path));
-        Some(RunFingerprintCtx { canvas, decls, shared })
+        Some(RunFingerprintCtx {
+            canvas,
+            decls,
+            shared,
+        })
     }
 }
 
@@ -1220,11 +1338,22 @@ fn run_fingerprint_in(
     addr: &meshfox_core::BlockAddr,
 ) -> Option<String> {
     let needed = meshfox_core::run_chain_var_names(&ctx.canvas, addr).ok()?;
-    let relevant: Vec<_> = ctx.decls.iter().filter(|d| needed.contains(&d.name)).cloned().collect();
+    let relevant: Vec<_> = ctx
+        .decls
+        .iter()
+        .filter(|d| needed.contains(&d.name))
+        .cloned()
+        .collect();
     let overrides = effective_overrides(state, &HashMap::new());
     let resolved = {
         let cache = state.vars_cache.lock().unwrap();
-        meshfox_core::resolve_with_shared(&relevant, &overrides, &cache, &HashMap::new(), &ctx.shared)
+        meshfox_core::resolve_with_shared(
+            &relevant,
+            &overrides,
+            &cache,
+            &HashMap::new(),
+            &ctx.shared,
+        )
     };
     let values: HashMap<String, String> = resolved
         .values
@@ -1241,7 +1370,10 @@ fn run_fingerprint_in(
 fn stamp_run_fingerprint(state: &AppState, addr: &meshfox_core::BlockAddr, id: i64) {
     if let Some(fingerprint) = current_run_fingerprint(state, addr) {
         if let Err(e) = state.run_ledger.set_fingerprint(id, &fingerprint) {
-            eprintln!("meshfox: failed to record run fingerprint for {}/{} ({e})", addr.node_id, addr.block_name);
+            eprintln!(
+                "meshfox: failed to record run fingerprint for {}/{} ({e})",
+                addr.node_id, addr.block_name
+            );
         }
     }
 }
@@ -1290,9 +1422,16 @@ fn remember_session_run(
         duration_ms: run.duration_ms,
     };
     if let Err(e) = state.session_store.save_run(&stored) {
-        eprintln!("meshfox: failed to persist session run {}/{} ({e})", addr.node_id, addr.block_name);
+        eprintln!(
+            "meshfox: failed to persist session run {}/{} ({e})",
+            addr.node_id, addr.block_name
+        );
     }
-    state.session_runs.lock().unwrap().insert((addr.node_id.clone(), addr.block_name.clone()), run);
+    state
+        .session_runs
+        .lock()
+        .unwrap()
+        .insert((addr.node_id.clone(), addr.block_name.clone()), run);
 }
 
 /// How long `TabGuard` waits, after the last `/api/watch` connection drops,
@@ -1412,8 +1551,14 @@ fn now_millis() -> u64 {
 /// in `build_app`. Not scoped to a caller who cares about the response —
 /// it fires on the way *in*, since even a request that ends up erroring
 /// still proves a real client is actively using this worker right now.
-async fn touch_api_activity(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
-    state.last_api_activity_millis.store(now_millis(), Ordering::Relaxed);
+async fn touch_api_activity(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    state
+        .last_api_activity_millis
+        .store(now_millis(), Ordering::Relaxed);
     next.run(req).await
 }
 
@@ -1459,7 +1604,12 @@ async fn touch_api_activity(State(state): State<Arc<AppState>>, req: Request, ne
 /// `open_tabs` nonzero while it runs — this check is the *only* thing that
 /// would otherwise stand between a slow run and this timer killing it).
 fn spawn_api_idle_checker(state: Arc<AppState>) {
-    spawn_api_idle_checker_with_config(state, AUTO_EXIT_POLL_INTERVAL, AUTO_EXIT_GRACE, untouched_worker_timeout())
+    spawn_api_idle_checker_with_config(
+        state,
+        AUTO_EXIT_POLL_INTERVAL,
+        AUTO_EXIT_GRACE,
+        untouched_worker_timeout(),
+    )
 }
 
 /// `spawn_api_idle_checker`'s own implementation, taking every duration
@@ -1489,7 +1639,10 @@ fn spawn_api_idle_checker_with_config(
             if last != 0 {
                 let idle_for = Duration::from_millis(now_millis().saturating_sub(last));
                 if idle_for >= idle_grace {
-                    println!("meshfox: no API activity for {}s and no open tabs, exiting", idle_grace.as_secs());
+                    println!(
+                        "meshfox: no API activity for {}s and no open tabs, exiting",
+                        idle_grace.as_secs()
+                    );
                     std::process::exit(0);
                 }
                 continue;
@@ -1562,10 +1715,11 @@ fn spawn_file_watcher(state: Arc<AppState>) {
             if *raw != contents {
                 let old_raw = std::mem::replace(&mut *raw, contents.clone());
                 drop(raw);
-                if let Err(e) = state
-                    .undo_log
-                    .push("external_edit", undo_log::Payload::Raw { before: &old_raw }, &contents)
-                {
+                if let Err(e) = state.undo_log.push(
+                    "external_edit",
+                    undo_log::Payload::Raw { before: &old_raw },
+                    &contents,
+                ) {
                     eprintln!("meshfox: failed to record undo history for an external edit ({e})");
                 }
                 state.canvas_events.push(ServerEvent::Changed);
@@ -1692,7 +1846,11 @@ fn steps_needing_a_lock(
         else {
             continue;
         };
-        let kind = if block.service { run_ledger::RunKind::Service } else { run_ledger::RunKind::Plain };
+        let kind = if block.service {
+            run_ledger::RunKind::Service
+        } else {
+            run_ledger::RunKind::Plain
+        };
         out.push((addr.clone(), kind));
     }
     out
@@ -1737,7 +1895,13 @@ fn acquire_chain_locks(
 ) -> Result<HashMap<(String, String), i64>, ChainLockError> {
     let mut acquired: HashMap<(String, String), i64> = HashMap::new();
     for (addr, kind) in targets {
-        match ledger.start(&addr.node_id, &addr.block_name, *kind, owner, std::process::id()) {
+        match ledger.start(
+            &addr.node_id,
+            &addr.block_name,
+            *kind,
+            owner,
+            std::process::id(),
+        ) {
             Ok(id) => {
                 acquired.insert((addr.node_id.clone(), addr.block_name.clone()), id);
             }
@@ -1939,8 +2103,11 @@ async fn get_vars(
     // default/choices (substituted from `default_var`/`choices_var`) in
     // `resolved.missing`, not the raw `relevant` copy — see
     // `vars::resolve`'s own doc comment.
-    let missing_by_name: HashMap<&str, &meshfox_core::VarDecl> =
-        resolved.missing.iter().map(|d| (d.name.as_str(), d)).collect();
+    let missing_by_name: HashMap<&str, &meshfox_core::VarDecl> = resolved
+        .missing
+        .iter()
+        .map(|d| (d.name.as_str(), d))
+        .collect();
     let statuses = relevant
         .into_iter()
         .map(|d| {
@@ -2144,8 +2311,11 @@ async fn get_configure_vars(
         &computed,
         &shared,
     );
-    let missing_by_name: HashMap<&str, &meshfox_core::VarDecl> =
-        resolved.missing.iter().map(|d| (d.name.as_str(), d)).collect();
+    let missing_by_name: HashMap<&str, &meshfox_core::VarDecl> = resolved
+        .missing
+        .iter()
+        .map(|d| (d.name.as_str(), d))
+        .collect();
     let statuses = configurable
         .into_iter()
         .map(|d| {
@@ -2413,10 +2583,17 @@ enum RunEvent {
 /// summary instead of the generic `raw_replace`/"document changed" bucket
 /// every one of them used to fall into.
 #[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", rename_all = "kebab-case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
 enum ServerEvent {
     Changed,
-    RunStarted { node_id: String, block: String },
+    RunStarted {
+        node_id: String,
+        block: String,
+    },
     /// A node was created, or an existing one's own fields (title/body/
     /// meta/edges/parent) changed — `node.parent` already says where it
     /// belongs, so a fresh id a client hasn't seen is exactly "insert
@@ -2424,31 +2601,45 @@ enum ServerEvent {
     /// Covers `create_node`, `update_node`, `clear_node_layout`, and
     /// `reparent_node` (a structural-parent change is just a `parent`
     /// field change from this shape's point of view).
-    NodeUpserted { node: Box<meshfox_core::Node> },
+    NodeUpserted {
+        node: Box<meshfox_core::Node>,
+    },
     /// `node_id`'s own subtree was deleted outright (`keep_children:
     /// false` — `mdcanvas::delete_node`) — never sent for the `?children=
     /// reparent` branch (`mdcanvas::delete_node_reparent_children`), which
     /// changes every direct child's own `parent` too and just pushes
     /// `Changed` instead rather than also emitting one `NodeUpserted` per
     /// promoted child.
-    NodeRemoved { node_id: String, keep_children: bool },
+    NodeRemoved {
+        node_id: String,
+        keep_children: bool,
+    },
     /// `parent_id`'s direct children are now ordered exactly as
     /// `child_ids` lists them (`move_sibling`) — sent as the *whole* new
     /// order rather than a "moved X before/after Y" delta so a client
     /// never has to reconstruct one from the other.
-    NodesReordered { parent_id: String, child_ids: Vec<String> },
+    NodesReordered {
+        parent_id: String,
+        child_ids: Vec<String>,
+    },
     /// `rename_node_id` — `old_id` no longer exists, `new_id` is what
     /// every reference to it was rewritten to. Ripples into every other
     /// node's own `parent=`/`meshfox:edge from=` reference plus any
     /// `deps=` fence text — too much for `NodeUpserted`'s single-node
     /// shape, so this still replays as a full reload, same as `Changed`.
-    NodeIdRenamed { old_id: String, new_id: String },
+    NodeIdRenamed {
+        old_id: String,
+        new_id: String,
+    },
     /// `clear_node_id` — `old_id`'s own explicit `id="..."` attribute was
     /// dropped, falling back to the parser's title-slug id, `new_id`
     /// (usually equal to `old_id` already — see `ClearNodeIdResponse`'s
     /// own doc comment for when it isn't). Same reload-replay reasoning as
     /// `NodeIdRenamed`.
-    NodeIdCleared { old_id: String, new_id: String },
+    NodeIdCleared {
+        old_id: String,
+        new_id: String,
+    },
     /// `put_options` — the document's declared `meshfox:option`s changed.
     /// No payload: a client just re-reads `canvas.options`.
     OptionsChanged,
@@ -2469,7 +2660,10 @@ enum ServerEvent {
     /// clears `can_redo` too (see `undo_log::UndoLog::push`'s own redo-tail
     /// truncation) — a client watching only the primary event has no way
     /// to notice that on its own.
-    UndoStateChanged { can_undo: bool, can_redo: bool },
+    UndoStateChanged {
+        can_undo: bool,
+        can_redo: bool,
+    },
 }
 
 fn ndjson_line<T: Serialize>(event: &T) -> Bytes {
@@ -2518,7 +2712,11 @@ async fn pump_run_response_into_ws(mut socket: WebSocket, result: Result<Respons
             // not a re-parsed wire transfer, so items are never split/merged
             // the way reading a real HTTP connection byte-by-byte could.
             let text = String::from_utf8_lossy(&bytes);
-            if socket.send(Message::Text(text.trim_end().to_string())).await.is_err() {
+            if socket
+                .send(Message::Text(text.trim_end().to_string()))
+                .await
+                .is_err()
+            {
                 return;
             }
         }
@@ -2540,10 +2738,14 @@ async fn pump_run_response_into_ws(mut socket: WebSocket, result: Result<Respons
                 owner_pid: c.owner_pid,
                 owner_desc: c.owner_desc,
             },
-            Err(e) => RunEvent::Error { message: e.to_string() },
+            Err(e) => RunEvent::Error {
+                message: e.to_string(),
+            },
         }
     } else {
-        RunEvent::Error { message: String::from_utf8_lossy(&body_bytes).into_owned() }
+        RunEvent::Error {
+            message: String::from_utf8_lossy(&body_bytes).into_owned(),
+        }
     };
     let _ = socket.send(run_event_msg(&event)).await;
     let _ = socket.close().await;
@@ -2695,7 +2897,12 @@ fn locate_node(primary_raw: &str, id: &str) -> Result<LocatedNode, ApiError> {
 /// doc comment) — so a client watching for it can apply it in place.
 /// `located` isn't consulted here (there's only ever one file to write to)
 /// — kept as a parameter so every existing call site stays untouched.
-fn commit_located(state: &AppState, _located: &LocatedNode, raw: &str, op: ServerEvent) -> Result<(), ApiError> {
+fn commit_located(
+    state: &AppState,
+    _located: &LocatedNode,
+    raw: &str,
+    op: ServerEvent,
+) -> Result<(), ApiError> {
     state
         .save_with_event(raw, op)
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -2731,7 +2938,9 @@ fn node_upserted_event(raw: &str, canvas_path: &std::path::Path, local_id: &str)
     meshfox_core::constraint::annotate_status(&mut canvas, Some(canvas_root_dir(canvas_path)));
     meshfox_core::annotate_effective_colors(&mut canvas);
     match canvas.node(local_id).cloned() {
-        Some(node) => ServerEvent::NodeUpserted { node: Box::new(node) },
+        Some(node) => ServerEvent::NodeUpserted {
+            node: Box::new(node),
+        },
         None => ServerEvent::Changed,
     }
 }
@@ -2852,7 +3061,10 @@ async fn put_canvas_raw(
                 || std::fs::read_to_string(&path).is_ok_and(|raw| mdcanvas::has_marker(&raw));
             if is_canvas {
                 let port = worker_port_for_include(&path).await.map_err(|e| {
-                    ApiError(StatusCode::SERVICE_UNAVAILABLE, format!("include worker: {e}"))
+                    ApiError(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("include worker: {e}"),
+                    )
                 })?;
                 // The CLI installs this at process startup, but library
                 // embedders and direct handler tests may not have done so.
@@ -2880,7 +3092,9 @@ async fn put_canvas_raw(
 
 async fn worker_port_for_include(path: &std::path::Path) -> io::Result<u16> {
     let canonical = path.canonicalize()?;
-    let root = canonical.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let root = canonical
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
     if let Some(socket) = meshfox_core::config::server_socket(root) {
         return watcher_protocol::request_port(&socket, &canonical).await;
     }
@@ -2888,8 +3102,18 @@ async fn worker_port_for_include(path: &std::path::Path) -> io::Result<u16> {
         worker_lock::Acquired::Other { port } => Ok(port),
         worker_lock::Acquired::Us(guard) => {
             let (ready_tx, ready_rx) = oneshot::channel();
-            tokio::spawn(serve_as_worker(canonical, 0, false, None, true, guard, Some(ready_tx)));
-            ready_rx.await.map_err(|_| io::Error::other("failed to start include worker"))
+            tokio::spawn(serve_as_worker(
+                canonical,
+                0,
+                false,
+                None,
+                true,
+                guard,
+                Some(ready_tx),
+            ));
+            ready_rx
+                .await
+                .map_err(|_| io::Error::other("failed to start include worker"))
         }
     }
 }
@@ -3080,8 +3304,12 @@ async fn clear_layout(State(state): State<Arc<AppState>>) -> Result<Json<Canvas>
 /// a separate file, untouched by this.
 async fn reorder_siblings(State(state): State<Arc<AppState>>) -> Result<Json<Canvas>, ApiError> {
     let raw = state.raw.lock().unwrap().clone();
-    let updated = mdcanvas::reorder_by_position(&raw, &HashMap::new())
-        .ok_or_else(|| ApiError(StatusCode::UNPROCESSABLE_ENTITY, "failed to parse".to_string()))?;
+    let updated = mdcanvas::reorder_by_position(&raw, &HashMap::new()).ok_or_else(|| {
+        ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "failed to parse".to_string(),
+        )
+    })?;
     state
         .save_with_event(&updated, ServerEvent::AllChildrenReordered)
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -3199,12 +3427,13 @@ async fn create_node(
     } else {
         mdcanvas::insert_child_node_random_id
     };
-    let (updated, new_id) = insert(&located.raw, &located.local_id, &req.title).ok_or_else(|| {
-        ApiError(
-            StatusCode::NOT_FOUND,
-            format!("no node {:?}", req.parent_id),
-        )
-    })?;
+    let (updated, new_id) =
+        insert(&located.raw, &located.local_id, &req.title).ok_or_else(|| {
+            ApiError(
+                StatusCode::NOT_FOUND,
+                format!("no node {:?}", req.parent_id),
+            )
+        })?;
     // Insertion can't actually break parsing, but validate anyway — same
     // validate-before-commit shape every other mutating endpoint here uses.
     parse_or_error(&updated)?;
@@ -3428,7 +3657,10 @@ async fn update_node(
                 .iter()
                 .map(|e| {
                     if e.label_at.is_some_and(|at| at > 1000) {
-                        return Err(ApiError(StatusCode::UNPROCESSABLE_ENTITY, "labelAt must be between 0 and 1000".to_string()));
+                        return Err(ApiError(
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            "labelAt must be between 0 and 1000".to_string(),
+                        ));
                     }
                     let from_located = locate_node(&primary_raw, &e.from)?;
                     Ok(ExtraEdge {
@@ -3606,13 +3838,29 @@ async fn update_node(
             (None, None)
         } else {
             (
-                if req.clear_position { req.width } else { req.width.or(width) },
-                if req.clear_position { req.height } else { req.height.or(height) },
+                if req.clear_position {
+                    req.width
+                } else {
+                    req.width.or(width)
+                },
+                if req.clear_position {
+                    req.height
+                } else {
+                    req.height.or(height)
+                },
             )
         };
         let meta = NodeMeta {
-            x: if req.clear_position { req.x } else { req.x.or(x) },
-            y: if req.clear_position { req.y } else { req.y.or(y) },
+            x: if req.clear_position {
+                req.x
+            } else {
+                req.x.or(x)
+            },
+            y: if req.clear_position {
+                req.y
+            } else {
+                req.y.or(y)
+            },
             width: final_width,
             height: final_height,
             color: req.color.clone().or(existing_color),
@@ -3626,19 +3874,41 @@ async fn update_node(
                 None => initial_node.edge_label_at,
                 Some(500) => None,
                 Some(at @ 0..=1000) => Some(at),
-                Some(_) => return Err(ApiError(StatusCode::UNPROCESSABLE_ENTITY, "edgeLabelAt must be between 0 and 1000".to_string())),
+                Some(_) => {
+                    return Err(ApiError(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "edgeLabelAt must be between 0 and 1000".to_string(),
+                    ))
+                }
             },
             edge_source_side: match req.edge_source_side.as_deref() {
                 None => initial_node.edge_source_side,
                 Some("auto") => None,
-                Some(side) => Some(meshfox_core::canvas::EdgeSide::parse(side).ok_or_else(|| ApiError(StatusCode::UNPROCESSABLE_ENTITY, format!("invalid edgeSourceSide {side:?}")))?),
+                Some(side) => {
+                    Some(meshfox_core::canvas::EdgeSide::parse(side).ok_or_else(|| {
+                        ApiError(
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            format!("invalid edgeSourceSide {side:?}"),
+                        )
+                    })?)
+                }
             },
             edge_target_side: match req.edge_target_side.as_deref() {
                 None => initial_node.edge_target_side,
                 Some("auto") => None,
-                Some(side) => Some(meshfox_core::canvas::EdgeSide::parse(side).ok_or_else(|| ApiError(StatusCode::UNPROCESSABLE_ENTITY, format!("invalid edgeTargetSide {side:?}")))?),
+                Some(side) => {
+                    Some(meshfox_core::canvas::EdgeSide::parse(side).ok_or_else(|| {
+                        ApiError(
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            format!("invalid edgeTargetSide {side:?}"),
+                        )
+                    })?)
+                }
             },
-            edge_via: req.edge_via.clone().unwrap_or_else(|| initial_node.edge_via.clone()),
+            edge_via: req
+                .edge_via
+                .clone()
+                .unwrap_or_else(|| initial_node.edge_via.clone()),
             fold: resolve_fold_override(req.fold.as_deref(), existing_fold)?,
             tags: req.tags.clone().unwrap_or(existing_tags),
             created_at: req.created_at.clone().or(existing_created_at),
@@ -3753,14 +4023,8 @@ async fn update_block_attrs(
     } else {
         req.interpreter.clone().map(Some)
     };
-    let deps = req
-        .deps
-        .as_deref()
-        .map(meshfox_core::parse_deps_list);
-    let env = req
-        .env
-        .as_deref()
-        .map(meshfox_core::parse_env_list);
+    let deps = req.deps.as_deref().map(meshfox_core::parse_deps_list);
+    let env = req.env.as_deref().map(meshfox_core::parse_env_list);
 
     let primary_raw = state.raw.lock().unwrap().clone();
     let located = locate_node(&primary_raw, &id)?;
@@ -3949,7 +4213,8 @@ fn list_grammar_files(dir: &std::path::Path) -> Vec<String> {
         .flatten()
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
-            (name.ends_with(".tmLanguage.json") || name.ends_with(".sublime-syntax")).then_some(name)
+            (name.ends_with(".tmLanguage.json") || name.ends_with(".sublime-syntax"))
+                .then_some(name)
         })
         .collect()
 }
@@ -3990,9 +4255,12 @@ async fn get_syntax_file(
 ) -> Result<String, ApiError> {
     let canvas_dir = canvas_root_dir(&state.canvas_path);
     let local_dir = meshfox_core::syntax_dirs::local_syntax_dir(canvas_dir);
-    for dir in [Some(local_dir), meshfox_core::syntax_dirs::global_syntax_dir()]
-        .into_iter()
-        .flatten()
+    for dir in [
+        Some(local_dir),
+        meshfox_core::syntax_dirs::global_syntax_dir(),
+    ]
+    .into_iter()
+    .flatten()
     {
         if list_grammar_files(&dir).contains(&name) {
             return std::fs::read_to_string(dir.join(&name))
@@ -4047,11 +4315,13 @@ async fn run_file_node_impl(state: Arc<AppState>, id: String) -> Result<Response
         .interpreter
         .clone()
         .expect("checked by is_runnable_file");
-    let (interpreter_program, interpreter_args) =
-        meshfox_core::split_interpreter(&interpreter).ok_or_else(|| {
+    let (interpreter_program, interpreter_args) = meshfox_core::split_interpreter(&interpreter)
+        .ok_or_else(|| {
             ApiError(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                format!("node {id:?}'s interpreter={interpreter:?} isn't a valid shell-word command"),
+                format!(
+                    "node {id:?}'s interpreter={interpreter:?} isn't a valid shell-word command"
+                ),
             )
         })?;
     let target = node.target.as_deref().expect("checked by is_runnable_file");
@@ -4318,7 +4588,10 @@ async fn remove_node(
     let op = if reparent {
         ServerEvent::Changed
     } else {
-        ServerEvent::NodeRemoved { node_id: local_id.clone(), keep_children: false }
+        ServerEvent::NodeRemoved {
+            node_id: local_id.clone(),
+            keep_children: false,
+        }
     };
     commit_located(&state, &located, &updated, op)?;
     let response_raw = state.raw.lock().unwrap().clone();
@@ -4494,9 +4767,8 @@ async fn move_sibling(
     .map_err(|e| {
         let status = match e {
             mdcanvas::MoveSiblingError::NotFound(_) => StatusCode::NOT_FOUND,
-            mdcanvas::MoveSiblingError::NotSiblings(_, _) | mdcanvas::MoveSiblingError::SameNode => {
-                StatusCode::UNPROCESSABLE_ENTITY
-            }
+            mdcanvas::MoveSiblingError::NotSiblings(_, _)
+            | mdcanvas::MoveSiblingError::SameNode => StatusCode::UNPROCESSABLE_ENTITY,
         };
         ApiError(status, e.to_string())
     })?;
@@ -4507,7 +4779,10 @@ async fn move_sibling(
     // order, so this is just "every node whose `parent` matches, in the
     // order they already come back in" — no separate sort needed.
     let new_canvas = parse_or_error(&updated)?;
-    let op = match new_canvas.node(&located.local_id).and_then(|n| n.parent.clone()) {
+    let op = match new_canvas
+        .node(&located.local_id)
+        .and_then(|n| n.parent.clone())
+    {
         Some(parent_id) => {
             let child_ids: Vec<String> = new_canvas
                 .nodes
@@ -4515,7 +4790,10 @@ async fn move_sibling(
                 .filter(|n| n.parent.as_deref() == Some(parent_id.as_str()))
                 .map(|n| n.id.clone())
                 .collect();
-            ServerEvent::NodesReordered { parent_id, child_ids }
+            ServerEvent::NodesReordered {
+                parent_id,
+                child_ids,
+            }
         }
         // No parent (the root) — `move_sibling` requires two siblings
         // under a common parent, so this can't actually happen; falls
@@ -4572,7 +4850,10 @@ async fn rename_node_id(
         &state,
         &located,
         &updated,
-        ServerEvent::NodeIdRenamed { old_id: located.local_id.clone(), new_id: req.new_id.clone() },
+        ServerEvent::NodeIdRenamed {
+            old_id: located.local_id.clone(),
+            new_id: req.new_id.clone(),
+        },
     )?;
     let response_raw = state.raw.lock().unwrap().clone();
     canvas_response(&response_raw, &state.canvas_path)
@@ -4614,11 +4895,17 @@ async fn clear_node_id(
         &state,
         &located,
         &updated,
-        ServerEvent::NodeIdCleared { old_id: located.local_id.clone(), new_id: local_new_id.clone() },
+        ServerEvent::NodeIdCleared {
+            old_id: located.local_id.clone(),
+            new_id: local_new_id.clone(),
+        },
     )?;
     let response_raw = state.raw.lock().unwrap().clone();
     let Json(canvas) = canvas_response(&response_raw, &state.canvas_path)?;
-    Ok(Json(ClearNodeIdResponse { id: local_new_id, canvas }))
+    Ok(Json(ClearNodeIdResponse {
+        id: local_new_id,
+        canvas,
+    }))
 }
 
 /// Query params for `run_block`'s own `GET /api/run` WebSocket upgrade —
@@ -4672,10 +4959,21 @@ fn parse_run_request(
     let save_secrets: std::collections::HashSet<String> = if save_secrets.is_empty() {
         std::collections::HashSet::new()
     } else {
-        serde_json::from_str(save_secrets)
-            .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("invalid `saveSecrets`: {e}")))?
+        serde_json::from_str(save_secrets).map_err(|e| {
+            ApiError(
+                StatusCode::BAD_REQUEST,
+                format!("invalid `saveSecrets`: {e}"),
+            )
+        })?
     };
-    Ok(RunRequest { path, block, persist, no_deps, vars, save_secrets })
+    Ok(RunRequest {
+        path,
+        block,
+        persist,
+        no_deps,
+        vars,
+        save_secrets,
+    })
 }
 
 /// `GET /api/run` — runs the requested block plus — automatically, same as
@@ -4773,7 +5071,10 @@ async fn force_run(
     Query(query): Query<ForceRunWsQuery>,
 ) -> Response {
     ws.on_upgrade(move |socket| async move {
-        let force = ForceTarget { node_id: query.force_node_id, block: query.force_block };
+        let force = ForceTarget {
+            node_id: query.force_node_id,
+            block: query.force_block,
+        };
         let result: Result<Response, ApiError> = async {
             force_run_kill_prep(&state, &force).await?;
             let req = parse_run_request(
@@ -4864,10 +5165,9 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
             ));
         }
         for (name, value) in &req.vars {
-            if relevant_decls
-                .iter()
-                .any(|d| &d.name == name && (!d.secret || req.save_secrets.contains(name)) && !d.session)
-            {
+            if relevant_decls.iter().any(|d| {
+                &d.name == name && (!d.secret || req.save_secrets.contains(name)) && !d.session
+            }) {
                 let _ = cache.set(name, value);
             }
         }
@@ -4947,11 +5247,10 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
     // hanging on a `Running` outcome forever.
     let target_reservation = chain.last().map(|target| {
         let reserved = run_registry::reserve(target.node_id.clone(), target.block_name.clone());
-        state
-            .runs_registry
-            .lock()
-            .unwrap()
-            .insert((target.node_id.clone(), target.block_name.clone()), Arc::clone(&reserved));
+        state.runs_registry.lock().unwrap().insert(
+            (target.node_id.clone(), target.block_name.clone()),
+            Arc::clone(&reserved),
+        );
         // Broadcast right after reservation, not before — same
         // race-freedom reasoning as the reservation itself: a passive
         // watcher (`GET /api/watch`) that reacts to this by immediately
@@ -5692,7 +5991,10 @@ async fn get_form_fields(
     let raw = state.raw.lock().unwrap().clone();
     let canvas = resolved_canvas(&raw, &state.canvas_path)?;
     let node = canvas.node(&query.node_id).ok_or_else(|| {
-        ApiError(StatusCode::NOT_FOUND, format!("no node {:?}", query.node_id))
+        ApiError(
+            StatusCode::NOT_FOUND,
+            format!("no node {:?}", query.node_id),
+        )
     })?;
     let block = meshfox_core::scan_runnable_blocks(&node.id, &node.text)
         .into_iter()
@@ -5756,8 +6058,11 @@ async fn get_form_fields(
         &computed,
         &shared,
     );
-    let missing_by_name: HashMap<&str, &meshfox_core::VarDecl> =
-        resolved.missing.iter().map(|d| (d.name.as_str(), d)).collect();
+    let missing_by_name: HashMap<&str, &meshfox_core::VarDecl> = resolved
+        .missing
+        .iter()
+        .map(|d| (d.name.as_str(), d))
+        .collect();
     let fields = field_decls
         .into_iter()
         .zip(labels)
@@ -5838,7 +6143,10 @@ async fn submit_form(
             session_vars.insert(field.var.clone(), value.clone());
             if !decl.secret {
                 if let Err(e) = state.session_store.save_var(&field.var, value) {
-                    eprintln!("meshfox: failed to persist session variable {} ({e})", field.var);
+                    eprintln!(
+                        "meshfox: failed to persist session variable {} ({e})",
+                        field.var
+                    );
                 }
             }
             changed.insert(field.var.clone());
@@ -5992,8 +6300,12 @@ async fn run_block_tty(
     let save_secrets: std::collections::HashSet<String> = if query.save_secrets.is_empty() {
         std::collections::HashSet::new()
     } else {
-        serde_json::from_str(&query.save_secrets)
-            .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("invalid `saveSecrets`: {e}")))?
+        serde_json::from_str(&query.save_secrets).map_err(|e| {
+            ApiError(
+                StatusCode::BAD_REQUEST,
+                format!("invalid `saveSecrets`: {e}"),
+            )
+        })?
     };
 
     // Same resolution this chain's `env=` needs as `run_block` does — see
@@ -6030,10 +6342,9 @@ async fn run_block_tty(
             ));
         }
         for (name, value) in &requested_vars {
-            if relevant_decls
-                .iter()
-                .any(|d| &d.name == name && (!d.secret || save_secrets.contains(name)) && !d.session)
-            {
+            if relevant_decls.iter().any(|d| {
+                &d.name == name && (!d.secret || save_secrets.contains(name)) && !d.session
+            }) {
                 let _ = cache.set(name, value);
             }
         }
@@ -6274,7 +6585,8 @@ async fn run_tty_chain(
         // dependency regardless of whether it had already run successfully
         // this session, unlike the plain (non-`tty`) `/api/run` path.
         let is_requested_target = Some(addr) == chain.last();
-        let live_fingerprint = step_fingerprint(fp_canvas.as_ref(), &decls, addr, &block, &resolved_vars);
+        let live_fingerprint =
+            step_fingerprint(fp_canvas.as_ref(), &decls, addr, &block, &resolved_vars);
         if !is_requested_target && !block.always && !forced_reruns.contains(addr) {
             let already_fresh = state
                 .session_runs
@@ -6327,7 +6639,8 @@ async fn run_tty_chain(
         // see its own comment on the equivalent line.
         let mut resolved_block = block.clone();
         if let Some(spec) = &block.interpreter {
-            resolved_block.interpreter = Some(meshfox_core::resolve_interpreter(spec, &resolved_vars));
+            resolved_block.interpreter =
+                Some(meshfox_core::resolve_interpreter(spec, &resolved_vars));
         }
 
         let exit_code = if block.tty {
@@ -6386,8 +6699,13 @@ async fn run_tty_chain(
             ) {
                 Ok(p) => p,
                 Err(e) => {
-                    if let Some(id) = held_locks.0.remove(&(addr.node_id.clone(), addr.block_name.clone())) {
-                        let _ = state.run_ledger.finish(id, run_ledger::FinishOutcome::Killed);
+                    if let Some(id) = held_locks
+                        .0
+                        .remove(&(addr.node_id.clone(), addr.block_name.clone()))
+                    {
+                        let _ = state
+                            .run_ledger
+                            .finish(id, run_ledger::FinishOutcome::Killed);
                     }
                     send_event(
                         &mut socket,
@@ -6399,8 +6717,13 @@ async fn run_tty_chain(
                     break;
                 }
             };
-            if let Some(id) = held_locks.0.get(&(addr.node_id.clone(), addr.block_name.clone())) {
-                let _ = state.run_ledger.update_pid(*id, proc.child.id().unwrap_or(0));
+            if let Some(id) = held_locks
+                .0
+                .get(&(addr.node_id.clone(), addr.block_name.clone()))
+            {
+                let _ = state
+                    .run_ledger
+                    .update_pid(*id, proc.child.id().unwrap_or(0));
             }
             // Same registry-backed detachment `run_block_impl` uses for
             // its own plain steps — see its own doc comment, including on
@@ -6415,8 +6738,12 @@ async fn run_tty_chain(
             if let Some((_, id)) = &lock_path_for_run {
                 stamp_run_fingerprint(&state, addr, *id);
             }
-            let run_handle =
-                run_registry::track(addr.node_id.clone(), addr.block_name.clone(), proc, lock_path_for_run);
+            let run_handle = run_registry::track(
+                addr.node_id.clone(),
+                addr.block_name.clone(),
+                proc,
+                lock_path_for_run,
+            );
             state.runs_registry.lock().unwrap().insert(
                 (addr.node_id.clone(), addr.block_name.clone()),
                 Arc::clone(&run_handle),
@@ -6581,7 +6908,9 @@ async fn run_tty_chain(
             };
             if let Some(updated) = meshfox_core::write_output(&node_text, &addr.block_name, &result)
             {
-                if let Some(patched) = mdcanvas::set_node_body(&located.raw, &located.local_id, &updated) {
+                if let Some(patched) =
+                    mdcanvas::set_node_body(&located.raw, &located.local_id, &updated)
+                {
                     file_raws.insert(None, patched);
                 }
             }
@@ -6590,13 +6919,22 @@ async fn run_tty_chain(
         if exit_code == 0 && !from_value_error {
             let produced_vars = from_decls
                 .iter()
-                .filter_map(|decl| resolved_vars.get(&decl.name).map(|v| (decl.name.clone(), v.clone())))
+                .filter_map(|decl| {
+                    resolved_vars
+                        .get(&decl.name)
+                        .map(|v| (decl.name.clone(), v.clone()))
+                })
                 .collect();
             remember_session_run(
                 &state,
                 addr,
                 &decls,
-                SessionRun { fingerprint: live_fingerprint, produced_vars, output: full_output, duration_ms },
+                SessionRun {
+                    fingerprint: live_fingerprint,
+                    produced_vars,
+                    output: full_output,
+                    duration_ms,
+                },
             );
         }
 
@@ -6704,7 +7042,11 @@ async fn relay_tty_step(
     // doc comment on why: this session outlives whatever connection
     // started it, so its row has to too).
     let handle = tty_registry::track(node_id.clone(), block_name.clone(), pty, ledger_row);
-    state.tty_registry.lock().unwrap().insert((node_id, block_name), Arc::clone(&handle));
+    state
+        .tty_registry
+        .lock()
+        .unwrap()
+        .insert((node_id, block_name), Arc::clone(&handle));
 
     let (backlog, mut rx) = handle.attach();
     if !backlog.is_empty() && socket.send(Message::Binary(backlog)).await.is_err() {
@@ -7058,25 +7400,37 @@ async fn get_active_runs(State(state): State<Arc<AppState>>) -> Json<Vec<ActiveR
             });
         }
     }
-    let running: std::collections::HashSet<(String, String)> =
-        out.iter().map(|r| (r.node_id.clone(), r.block.clone())).collect();
-    if let (Ok(addresses), Some(ctx)) =
-        (state.run_ledger.plain_addresses_with_runs(), RunFingerprintCtx::load(&state))
-    {
+    let running: std::collections::HashSet<(String, String)> = out
+        .iter()
+        .map(|r| (r.node_id.clone(), r.block.clone()))
+        .collect();
+    if let (Ok(addresses), Some(ctx)) = (
+        state.run_ledger.plain_addresses_with_runs(),
+        RunFingerprintCtx::load(&state),
+    ) {
         for (node_id, block) in addresses {
             if running.contains(&(node_id.clone(), block.clone())) {
                 continue;
             }
             let addr = meshfox_core::BlockAddr::new(&node_id, &block);
-            let Some(fingerprint) = run_fingerprint_in(&state, &ctx, &addr) else { continue };
-            let Ok(Some(run)) = state.run_ledger.latest_fresh_run(&node_id, &block, &fingerprint) else {
+            let Some(fingerprint) = run_fingerprint_in(&state, &ctx, &addr) else {
+                continue;
+            };
+            let Ok(Some(run)) = state
+                .run_ledger
+                .latest_fresh_run(&node_id, &block, &fingerprint)
+            else {
                 continue;
             };
             out.push(ActiveRunDto {
                 node_id,
                 block,
                 kind: "plain",
-                status: if run.outcome == "killed" { "killed" } else { "exited" },
+                status: if run.outcome == "killed" {
+                    "killed"
+                } else {
+                    "exited"
+                },
                 exit_code: run.exit_code,
                 // For a finished run this is its length, not the time since
                 // it started — what the client shows as its duration.
@@ -7125,9 +7479,14 @@ async fn get_service_log(
     Query(q): Query<ServiceKeyQuery>,
 ) -> Result<Json<Vec<ServiceLogLine>>, ApiError> {
     let services = state.services.lock().unwrap();
-    let handle = services.get(&(q.node_id.clone(), q.block.clone())).ok_or_else(|| {
-        ApiError(StatusCode::NOT_FOUND, format!("no service {:?}/{:?}", q.node_id, q.block))
-    })?;
+    let handle = services
+        .get(&(q.node_id.clone(), q.block.clone()))
+        .ok_or_else(|| {
+            ApiError(
+                StatusCode::NOT_FOUND,
+                format!("no service {:?}/{:?}", q.node_id, q.block),
+            )
+        })?;
     Ok(Json(
         handle
             .log_snapshot()
@@ -7153,9 +7512,14 @@ async fn stop_service(
     Json(req): Json<ServiceKeyRequest>,
 ) -> Result<StatusCode, ApiError> {
     let services = state.services.lock().unwrap();
-    let handle = services.get(&(req.node_id.clone(), req.block.clone())).ok_or_else(|| {
-        ApiError(StatusCode::NOT_FOUND, format!("no service {:?}/{:?}", req.node_id, req.block))
-    })?;
+    let handle = services
+        .get(&(req.node_id.clone(), req.block.clone()))
+        .ok_or_else(|| {
+            ApiError(
+                StatusCode::NOT_FOUND,
+                format!("no service {:?}/{:?}", req.node_id, req.block),
+            )
+        })?;
     handle
         .stop()
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -7179,10 +7543,13 @@ async fn restart_service(
     let mut services = state.services.lock().unwrap();
     let key = (req.node_id.clone(), req.block.clone());
     let old = services.get(&key).ok_or_else(|| {
-        ApiError(StatusCode::NOT_FOUND, format!("no service {:?}/{:?}", req.node_id, req.block))
+        ApiError(
+            StatusCode::NOT_FOUND,
+            format!("no service {:?}/{:?}", req.node_id, req.block),
+        )
     })?;
-    let restarted =
-        services::restart(old).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let restarted = services::restart(old)
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let pid = restarted.pid;
     services.insert(key, restarted);
     Ok(Json(ServiceActionResponse { pid }))
@@ -7223,7 +7590,11 @@ async fn force_start_service(
     let needed = meshfox_core::env_var_names_for_chain(&canvas, &chain);
     let decls = meshfox_core::declared_vars(&canvas)
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
-    let relevant_decls: Vec<_> = decls.iter().filter(|d| needed.contains(&d.name)).cloned().collect();
+    let relevant_decls: Vec<_> = decls
+        .iter()
+        .filter(|d| needed.contains(&d.name))
+        .cloned()
+        .collect();
     validate_var_overrides(&relevant_decls, &req.vars)?;
     let resolved_vars = {
         let cache = state.vars_cache.lock().unwrap();
@@ -7251,9 +7622,12 @@ async fn force_start_service(
 
     let located = locate_node(&raw_snapshot, &target.node_id)?;
     let step_canvas = resolved_canvas(&located.raw, &state.canvas_path)?;
-    let step_node = step_canvas
-        .node(&target.node_id)
-        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("node {:?} not found", target.node_id)))?;
+    let step_node = step_canvas.node(&target.node_id).ok_or_else(|| {
+        ApiError(
+            StatusCode::NOT_FOUND,
+            format!("node {:?} not found", target.node_id),
+        )
+    })?;
     let node_text = step_node.text.clone();
     let cwd = step_node.cwd(canvas_root_dir(&state.canvas_path));
     let block = meshfox_core::scan_runnable_blocks(&target.node_id, &node_text)
@@ -7262,7 +7636,10 @@ async fn force_start_service(
         .ok_or_else(|| {
             ApiError(
                 StatusCode::NOT_FOUND,
-                format!("no runnable block named {:?} in node {:?}", target.block_name, target.node_id),
+                format!(
+                    "no runnable block named {:?} in node {:?}",
+                    target.block_name, target.node_id
+                ),
             )
         })?;
     if !block.service {
@@ -7309,7 +7686,11 @@ async fn force_start_service(
     )
     .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let pid = handle.pid;
-    state.services.lock().unwrap().insert((target.node_id, target.block_name), handle);
+    state
+        .services
+        .lock()
+        .unwrap()
+        .insert((target.node_id, target.block_name), handle);
     Ok(Json(ServiceActionResponse { pid }))
 }
 
@@ -7393,7 +7774,11 @@ async fn debug_start(
         block.env.iter().map(|r| r.var_name.clone()).collect();
     let decls = meshfox_core::declared_vars(&canvas)
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
-    let relevant: Vec<_> = decls.iter().filter(|d| needed.contains(&d.name)).cloned().collect();
+    let relevant: Vec<_> = decls
+        .iter()
+        .filter(|d| needed.contains(&d.name))
+        .cloned()
+        .collect();
     validate_var_overrides(&relevant, &req.vars)?;
 
     let mut cache = state.vars_cache.lock().unwrap();
@@ -7404,11 +7789,17 @@ async fn debug_start(
         let names: Vec<&str> = resolved.missing.iter().map(|d| d.name.as_str()).collect();
         return Err(ApiError(
             StatusCode::UNPROCESSABLE_ENTITY,
-            format!("missing required variable(s): {} — pass them in `vars`", names.join(", ")),
+            format!(
+                "missing required variable(s): {} — pass them in `vars`",
+                names.join(", ")
+            ),
         ));
     }
     for (name, value) in &req.vars {
-        if relevant.iter().any(|d| &d.name == name && !d.secret && !d.session) {
+        if relevant
+            .iter()
+            .any(|d| &d.name == name && !d.secret && !d.session)
+        {
             let _ = cache.set(name, value);
         }
     }
@@ -7417,14 +7808,17 @@ async fn debug_start(
     let envs = meshfox_core::map_block_env(&block.env, &resolved.values);
     let cwd = node.cwd(canvas_root_dir(&state.canvas_path));
 
-    let session = debug_session::DebugSession::spawn(&cwd, envs)
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to start debug session: {e}")))?;
+    let session = debug_session::DebugSession::spawn(&cwd, envs).map_err(|e| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to start debug session: {e}"),
+        )
+    })?;
     let session_id = uuid::Uuid::new_v4().to_string();
-    state
-        .debug_sessions
-        .lock()
-        .unwrap()
-        .insert(session_id.clone(), Arc::new(tokio::sync::Mutex::new(session)));
+    state.debug_sessions.lock().unwrap().insert(
+        session_id.clone(),
+        Arc::new(tokio::sync::Mutex::new(session)),
+    );
 
     Ok(Json(DebugStartResponse {
         session_id,
@@ -7469,14 +7863,21 @@ async fn debug_send(
         .unwrap()
         .get(&req.session_id)
         .cloned()
-        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no debug session {:?}", req.session_id)))?;
+        .ok_or_else(|| {
+            ApiError(
+                StatusCode::NOT_FOUND,
+                format!("no debug session {:?}", req.session_id),
+            )
+        })?;
     let timeout = Duration::from_millis(req.timeout_ms.unwrap_or(DEFAULT_DEBUG_SEND_TIMEOUT_MS));
     let outcome = {
         let mut session = session.lock().await;
-        session
-            .send(&req.code, timeout)
-            .await
-            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("debug session write/read failed: {e}")))?
+        session.send(&req.code, timeout).await.map_err(|e| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("debug session write/read failed: {e}"),
+            )
+        })?
     };
     if outcome.session_ended {
         state.debug_sessions.lock().unwrap().remove(&req.session_id);
@@ -7508,7 +7909,10 @@ async fn debug_stop(
             session.lock().await.stop().await;
             Ok(StatusCode::NO_CONTENT)
         }
-        None => Err(ApiError(StatusCode::NOT_FOUND, format!("no debug session {:?}", req.session_id))),
+        None => Err(ApiError(
+            StatusCode::NOT_FOUND,
+            format!("no debug session {:?}", req.session_id),
+        )),
     }
 }
 
@@ -7590,7 +7994,11 @@ struct SubscribeRunQuery {
 // from a genuinely missing value, which is exactly what let a
 // *successful* reconciled run get treated as failed (`undefined !== 0`).
 #[derive(Debug, Serialize)]
-#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 enum SubscribeEvent {
     Line {
         seq: u64,
@@ -7609,15 +8017,22 @@ enum SubscribeEvent {
 
 fn done_event(outcome: &run_registry::RunOutcome) -> SubscribeEvent {
     match outcome {
-        run_registry::RunOutcome::Exited { exit_code } => {
-            SubscribeEvent::Done { outcome: "exited", exit_code: Some(*exit_code) }
-        }
-        run_registry::RunOutcome::Killed => SubscribeEvent::Done { outcome: "killed", exit_code: None },
+        run_registry::RunOutcome::Exited { exit_code } => SubscribeEvent::Done {
+            outcome: "exited",
+            exit_code: Some(*exit_code),
+        },
+        run_registry::RunOutcome::Killed => SubscribeEvent::Done {
+            outcome: "killed",
+            exit_code: None,
+        },
         // Never actually reached from `subscribe_run` below (only called
         // once `outcome()` has already been checked to not be `Running`)
         // — `"exited"`-with-no-code is a harmless, honest fallback rather
         // than a silent lie about the process having actually exited.
-        run_registry::RunOutcome::Running => SubscribeEvent::Done { outcome: "exited", exit_code: None },
+        run_registry::RunOutcome::Running => SubscribeEvent::Done {
+            outcome: "exited",
+            exit_code: None,
+        },
     }
 }
 
@@ -7674,14 +8089,24 @@ fn serve_stored_run(
     query: &SubscribeRunQuery,
     finished: Option<Arc<run_registry::RunHandle>>,
 ) -> Result<Response, ApiError> {
-    let not_found =
-        || ApiError(StatusCode::NOT_FOUND, format!("no run for {:?}/{:?}", query.node_id, query.block));
+    let not_found = || {
+        ApiError(
+            StatusCode::NOT_FOUND,
+            format!("no run for {:?}/{:?}", query.node_id, query.block),
+        )
+    };
     let io_err = |e: io::Error| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     let addr = meshfox_core::BlockAddr::new(&query.node_id, &query.block);
     let current = current_run_fingerprint(state, &addr);
     let run = match (query.run_id, &current) {
-        (Some(id), _) => state.run_ledger.get_run(id, &query.node_id, &query.block, current.as_deref()),
-        (None, Some(fp)) => state.run_ledger.latest_fresh_run(&query.node_id, &query.block, fp),
+        (Some(id), _) => {
+            state
+                .run_ledger
+                .get_run(id, &query.node_id, &query.block, current.as_deref())
+        }
+        (None, Some(fp)) => state
+            .run_ledger
+            .latest_fresh_run(&query.node_id, &query.block, fp),
         (None, None) => Ok(None),
     }
     .map_err(io_err)?
@@ -7689,20 +8114,41 @@ fn serve_stored_run(
 
     let stored = state.run_ledger.load_output(run.id).map_err(io_err)?;
     let lines: Vec<(u64, stream_exec::OutputStream, String)> = match stored {
-        Some(lines) => lines.into_iter().enumerate().map(|(i, (s, t))| (i as u64, s, t)).collect(),
+        Some(lines) => lines
+            .into_iter()
+            .enumerate()
+            .map(|(i, (s, t))| (i as u64, s, t))
+            .collect(),
         None => match finished.filter(|h| h.run_id() == Some(run.id)) {
-            Some(h) => h.subscribe_from(0).0.into_iter().map(|l| (l.seq, l.stream, l.text)).collect(),
+            Some(h) => h
+                .subscribe_from(0)
+                .0
+                .into_iter()
+                .map(|l| (l.seq, l.stream, l.text))
+                .collect(),
             None => Vec::new(),
         },
     };
     let done = match run.outcome.as_str() {
-        "killed" => SubscribeEvent::Done { outcome: "killed", exit_code: None },
-        _ => SubscribeEvent::Done { outcome: "exited", exit_code: run.exit_code },
+        "killed" => SubscribeEvent::Done {
+            outcome: "killed",
+            exit_code: None,
+        },
+        _ => SubscribeEvent::Done {
+            outcome: "exited",
+            exit_code: run.exit_code,
+        },
     };
     let mut chunks: Vec<io::Result<Bytes>> = lines
         .into_iter()
         .filter(|(seq, _, _)| *seq >= query.since_seq)
-        .map(|(seq, stream, text)| Ok(subscribe_ndjson_line(&SubscribeEvent::Line { seq, stream, text })))
+        .map(|(seq, stream, text)| {
+            Ok(subscribe_ndjson_line(&SubscribeEvent::Line {
+                seq,
+                stream,
+                text,
+            }))
+        })
         .collect();
     chunks.push(Ok(subscribe_ndjson_line(&done)));
     Ok(Response::builder()
@@ -7748,7 +8194,12 @@ async fn subscribe_run_impl(
     // the ledger instead, which is the one place that knows whether it is
     // still current (see `serve_stored_run`).
     let handle = match registered {
-        Some(h) if query.run_id.is_none() && matches!(h.outcome(), run_registry::RunOutcome::Running) => h,
+        Some(h)
+            if query.run_id.is_none()
+                && matches!(h.outcome(), run_registry::RunOutcome::Running) =>
+        {
+            h
+        }
         finished => return serve_stored_run(&state, &query, finished),
     };
 
@@ -7894,9 +8345,7 @@ fn default_watch_since() -> u64 {
 /// trusted as complete: the client should do a full canvas refetch right
 /// away rather than wait for a future event to prompt it.
 fn watch_connected_msg(resync: bool) -> Message {
-    Message::Text(
-        serde_json::json!({"type": "connected", "resync": resync}).to_string(),
-    )
+    Message::Text(serde_json::json!({"type": "connected", "resync": resync}).to_string())
 }
 
 /// One `ServerEvent` off `canvas_events`, still exactly the same
@@ -7944,7 +8393,9 @@ async fn watch_changes(
 async fn relay_canvas_events(state: Arc<AppState>, mut socket: WebSocket, since: u64) {
     // Dropped when this task ends (i.e. the client disconnects) — see
     // `TabGuard`'s own doc comment.
-    let _guard = TabGuard { state: Arc::clone(&state) };
+    let _guard = TabGuard {
+        state: Arc::clone(&state),
+    };
     let (backlog, mut rx, gap) = state.canvas_events.subscribe_from(since);
 
     if socket.send(watch_connected_msg(gap)).await.is_err() {
@@ -8174,7 +8625,10 @@ async fn build_state(
     // comment.
     let undo_log = undo_log::UndoLog::from_connection(Arc::clone(&session_conn))?;
     if let Err(e) = undo_log.reconcile_startup_drift(&raw) {
-        eprintln!("meshfox: failed to check {} for external edits at startup ({e})", canvas_path.display());
+        eprintln!(
+            "meshfox: failed to check {} for external edits at startup ({e})",
+            canvas_path.display()
+        );
     }
 
     // Same startup-reconciliation spirit as the undo-drift check above, for
@@ -8190,7 +8644,8 @@ async fn build_state(
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
     let max_output_bytes = meshfox_core::config::session_max_output_bytes(&config_root);
-    let session_store = session_state::SessionStore::from_connection(Arc::clone(&session_conn), max_output_bytes)?;
+    let session_store =
+        session_state::SessionStore::from_connection(Arc::clone(&session_conn), max_output_bytes)?;
     let session_runs: HashMap<_, _> = session_store
         .load_runs()?
         .into_iter()
@@ -8209,7 +8664,9 @@ async fn build_state(
     let session_vars = session_store.load_vars()?;
     let run_ledger = run_ledger::RunLedger::from_connection(session_conn)?
         .with_max_output_bytes(max_output_bytes)
-        .with_max_runs_per_block(meshfox_core::config::session_max_runs_per_block(&config_root));
+        .with_max_runs_per_block(meshfox_core::config::session_max_runs_per_block(
+            &config_root,
+        ));
     match run_ledger.reconcile_startup() {
         Ok(orphaned) if !orphaned.is_empty() => {
             eprintln!(
@@ -8222,11 +8679,16 @@ async fn build_state(
                     row.node_id, row.block, row.kind, row.pid, row.started_at, row.owner
                 );
             }
-            eprintln!("  stop them manually, or force-restart the same block/service to take over.");
+            eprintln!(
+                "  stop them manually, or force-restart the same block/service to take over."
+            );
         }
         Ok(_) => {}
         Err(e) => {
-            eprintln!("meshfox: failed to reconcile {} run history at startup ({e})", canvas_path.display());
+            eprintln!(
+                "meshfox: failed to reconcile {} run history at startup ({e})",
+                canvas_path.display()
+            );
         }
     }
 
@@ -8270,7 +8732,10 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/nodes/:id/append", post(append_node_body))
         .route("/api/nodes/:id/reparent", post(reparent_node))
         .route("/api/nodes/:id/move", post(move_sibling))
-        .route("/api/nodes/:id/block/:block_name", patch(update_block_attrs))
+        .route(
+            "/api/nodes/:id/block/:block_name",
+            patch(update_block_attrs),
+        )
         .route("/api/nodes/:id/clear-layout", post(clear_node_layout))
         .route("/api/nodes/:id/rename-id", post(rename_node_id))
         .route("/api/nodes/:id/clear-id", post(clear_node_id))
@@ -8311,7 +8776,10 @@ fn build_app(state: Arc<AppState>) -> Router {
         // Only wraps the routes declared above, not `fallback` — see
         // `touch_api_activity`'s own doc comment for why static-asset
         // requests deliberately don't count as "activity" here.
-        .route_layer(middleware::from_fn_with_state(state.clone(), touch_api_activity))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            touch_api_activity,
+        ))
         .fallback(serve_embedded)
         .with_state(state)
         .layer(CorsLayer::permissive())
@@ -8365,7 +8833,9 @@ pub async fn run(
 ) -> std::io::Result<()> {
     let lock_guard = match worker_lock::try_acquire(&canvas_path) {
         Ok(worker_lock::Acquired::Us(guard)) => guard,
-        Ok(worker_lock::Acquired::Other { port: existing_port }) => {
+        Ok(worker_lock::Acquired::Other {
+            port: existing_port,
+        }) => {
             if !quiet {
                 println!(
                     "meshfox: {} is already served on port {existing_port} — reusing that worker instead of starting a new one",
@@ -8388,7 +8858,16 @@ pub async fn run(
         Err(e) => return Err(e),
     };
 
-    serve_as_worker(canvas_path, port, auto_exit, watcher_socket, quiet, lock_guard, None).await
+    serve_as_worker(
+        canvas_path,
+        port,
+        auto_exit,
+        watcher_socket,
+        quiet,
+        lock_guard,
+        None,
+    )
+    .await
 }
 
 /// Actually binds and serves `canvas_path`, given a `worker_lock` decision
@@ -8479,7 +8958,8 @@ pub async fn serve_as_worker(
 /// one termination path nothing can stop from orphaning any of these.
 fn spawn_shutdown_signal_handler(state: Arc<AppState>) {
     tokio::spawn(async move {
-        let Ok(mut sigterm) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        let Ok(mut sigterm) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         else {
             return;
         };
@@ -8492,15 +8972,33 @@ fn spawn_shutdown_signal_handler(state: Arc<AppState>) {
             _ = sighup.recv() => {}
             _ = tokio::signal::ctrl_c() => {}
         }
-        let service_handles: Vec<_> = state.services.lock().unwrap().drain().map(|(_, h)| h).collect();
+        let service_handles: Vec<_> = state
+            .services
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, h)| h)
+            .collect();
         for handle in service_handles {
             let _ = handle.stop();
         }
-        let run_handles: Vec<_> = state.runs_registry.lock().unwrap().drain().map(|(_, h)| h).collect();
+        let run_handles: Vec<_> = state
+            .runs_registry
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, h)| h)
+            .collect();
         for handle in run_handles {
             handle.kill();
         }
-        let tty_handles: Vec<_> = state.tty_registry.lock().unwrap().drain().map(|(_, h)| h).collect();
+        let tty_handles: Vec<_> = state
+            .tty_registry
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, h)| h)
+            .collect();
         for handle in tty_handles {
             handle.kill();
         }
@@ -8721,7 +9219,9 @@ mod node_op_broadcast_tests {
     /// checks, just also handing the event back for the caller's own
     /// variant/payload assertion.
     fn recv_event(rx: &mut broadcast::Receiver<canvas_events::SeqEvent>) -> ServerEvent {
-        rx.try_recv().expect("mutation should have broadcast an event").item
+        rx.try_recv()
+            .expect("mutation should have broadcast an event")
+            .item
     }
 
     #[tokio::test]
@@ -8737,8 +9237,9 @@ mod node_op_broadcast_tests {
             title: "New Child".to_string(),
             title_slug_id: false,
         };
-        let Json(CreateNodeResponse { canvas, .. }) =
-            create_node(State(state), Json(req)).await.expect("create should succeed");
+        let Json(CreateNodeResponse { canvas, .. }) = create_node(State(state), Json(req))
+            .await
+            .expect("create should succeed");
 
         match recv_event(&mut rx) {
             ServerEvent::NodeUpserted { node } => {
@@ -8810,12 +9311,24 @@ mod node_op_broadcast_tests {
         let request: UpdateNodeRequest = serde_json::from_value(serde_json::json!({
             "edgeSourceSide": "bottom", "edgeTargetSide": "right",
             "edgeVia": [{ "x": 12, "y": -34 }], "edgeLabelAt": 725
-        })).unwrap();
-        let Json(canvas) = update_node(State(state.clone()), Path("a".to_string()), Json(request)).await.unwrap();
+        }))
+        .unwrap();
+        let Json(canvas) = update_node(State(state.clone()), Path("a".to_string()), Json(request))
+            .await
+            .unwrap();
         let node = canvas.node("a").unwrap();
-        assert_eq!(node.edge_source_side, Some(meshfox_core::canvas::EdgeSide::Bottom));
-        assert_eq!(node.edge_target_side, Some(meshfox_core::canvas::EdgeSide::Right));
-        assert_eq!(node.edge_via, vec![meshfox_core::canvas::RoutePoint { x: 12, y: -34 }]);
+        assert_eq!(
+            node.edge_source_side,
+            Some(meshfox_core::canvas::EdgeSide::Bottom)
+        );
+        assert_eq!(
+            node.edge_target_side,
+            Some(meshfox_core::canvas::EdgeSide::Right)
+        );
+        assert_eq!(
+            node.edge_via,
+            vec![meshfox_core::canvas::RoutePoint { x: 12, y: -34 }]
+        );
         assert_eq!(node.edge_label_at, Some(725));
         let saved = std::fs::read_to_string(&canvas_path).unwrap();
         assert!(saved.contains("edgeSourceSide=\"bottom\""));
@@ -8824,8 +9337,11 @@ mod node_op_broadcast_tests {
 
         let reset: UpdateNodeRequest = serde_json::from_value(serde_json::json!({
             "edgeSourceSide": "auto", "edgeTargetSide": "auto", "edgeVia": [], "edgeLabelAt": 500
-        })).unwrap();
-        let Json(canvas) = update_node(State(state), Path("a".to_string()), Json(reset)).await.unwrap();
+        }))
+        .unwrap();
+        let Json(canvas) = update_node(State(state), Path("a".to_string()), Json(reset))
+            .await
+            .unwrap();
         let node = canvas.node("a").unwrap();
         assert_eq!(node.edge_source_side, None);
         assert_eq!(node.edge_target_side, None);
@@ -8842,12 +9358,19 @@ mod node_op_broadcast_tests {
             .expect("valid test canvas");
         let (_backlog, mut rx, _gap) = state.canvas_events.subscribe_from(0);
 
-        let _ = remove_node(State(state), Path("a".to_string()), Query(DeleteNodeQuery { children: None }))
-            .await
-            .expect("remove should succeed");
+        let _ = remove_node(
+            State(state),
+            Path("a".to_string()),
+            Query(DeleteNodeQuery { children: None }),
+        )
+        .await
+        .expect("remove should succeed");
 
         match recv_event(&mut rx) {
-            ServerEvent::NodeRemoved { node_id, keep_children } => {
+            ServerEvent::NodeRemoved {
+                node_id,
+                keep_children,
+            } => {
                 assert_eq!(node_id, "a");
                 assert!(!keep_children);
             }
@@ -8876,7 +9399,9 @@ mod node_op_broadcast_tests {
         let _ = remove_node(
             State(state),
             Path("a".to_string()),
-            Query(DeleteNodeQuery { children: Some("reparent".to_string()) }),
+            Query(DeleteNodeQuery {
+                children: Some("reparent".to_string()),
+            }),
         )
         .await
         .expect("remove should succeed");
@@ -8898,13 +9423,19 @@ mod node_op_broadcast_tests {
         let (_backlog, mut rx, _gap) = state.canvas_events.subscribe_from(0);
 
         // "a" starts before "b" — move it to sit after "b" instead.
-        let req = MoveSiblingRequest { before: None, after: Some("b".to_string()) };
+        let req = MoveSiblingRequest {
+            before: None,
+            after: Some("b".to_string()),
+        };
         let _ = move_sibling(State(state), Path("a".to_string()), Json(req))
             .await
             .expect("move should succeed");
 
         match recv_event(&mut rx) {
-            ServerEvent::NodesReordered { parent_id, child_ids } => {
+            ServerEvent::NodesReordered {
+                parent_id,
+                child_ids,
+            } => {
                 assert_eq!(parent_id, "root");
                 assert_eq!(child_ids, vec!["b".to_string(), "a".to_string()]);
             }
@@ -8926,7 +9457,9 @@ mod node_op_broadcast_tests {
             .expect("valid test canvas");
         let (_backlog, mut rx, _gap) = state.canvas_events.subscribe_from(0);
 
-        let req = RenameNodeIdRequest { new_id: "a-renamed".to_string() };
+        let req = RenameNodeIdRequest {
+            new_id: "a-renamed".to_string(),
+        };
         let _ = rename_node_id(State(state), Path("a".to_string()), Json(req))
             .await
             .expect("rename should succeed");
@@ -8956,7 +9489,10 @@ mod undo_log_recording_tests {
 
     fn write_test_canvas(contents: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
-        path.push(format!("meshfox-undo-log-test-{}.canvas.md", uuid::Uuid::new_v4()));
+        path.push(format!(
+            "meshfox-undo-log-test-{}.canvas.md",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::write(&path, contents).unwrap();
         path
     }
@@ -8973,14 +9509,21 @@ mod undo_log_recording_tests {
         let canvas_path = write_test_canvas(original);
         let state = build_state(canvas_path.clone(), false, None).await.unwrap();
         let input = mdcanvas::set_fence_attrs(
-            original, "demo", "demo",
-            &mdcanvas::FenceAttrsPatch { cache: Some(false), ..Default::default() },
-        ).unwrap();
+            original,
+            "demo",
+            "demo",
+            &mdcanvas::FenceAttrsPatch {
+                cache: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         // Produce a stale region even if the checked-in example has no output.
         let canvas = mdcanvas::parse(&input).unwrap();
         let demo = canvas.node("demo").unwrap();
         let body = meshfox_core::output::write_output(
-            &demo.text, "demo",
+            &demo.text,
+            "demo",
             &meshfox_core::ExecOutput {
                 exit_code: 0,
                 output: "old table".into(),
@@ -8988,11 +9531,16 @@ mod undo_log_recording_tests {
                 stderr: String::new(),
                 duration_ms: 0,
             },
-        ).unwrap();
+        )
+        .unwrap();
         let input = mdcanvas::set_node_body(&input, "demo", &body).unwrap();
         let status = put_canvas_raw(
-            State(state.clone()), Query(SourceFileQuery { include: None }), input.clone(),
-        ).await.unwrap();
+            State(state.clone()),
+            Query(SourceFileQuery { include: None }),
+            input.clone(),
+        )
+        .await
+        .unwrap();
         assert_eq!(status, StatusCode::NO_CONTENT);
         let saved = std::fs::read_to_string(&canvas_path).unwrap();
         assert!(!saved.contains("<!-- meshfox:output"));
@@ -9006,9 +9554,15 @@ mod undo_log_recording_tests {
         let original = format!("{TWO_SIBLINGS}\n```bash name=\"old\"\necho hi\n```\n<!-- meshfox:output name=\"old\" -->\n```text\nhi\n```\n<!-- /meshfox:output -->\n");
         let canvas_path = write_test_canvas(&original);
         let state = build_state(canvas_path.clone(), false, None).await.unwrap();
-        assert_eq!(*state.raw.lock().unwrap(), original, "loading must not clean");
+        assert_eq!(
+            *state.raw.lock().unwrap(),
+            original,
+            "loading must not clean"
+        );
         let (_, mut rx, _) = state.canvas_events.subscribe_from(0);
-        let Json(response) = clear_node_layout(State(state.clone()), Path("a".to_string())).await.unwrap();
+        let Json(response) = clear_node_layout(State(state.clone()), Path("a".to_string()))
+            .await
+            .unwrap();
         let saved = std::fs::read_to_string(&canvas_path).unwrap();
         assert!(!saved.contains("meshfox:output"));
         assert_eq!(*state.raw.lock().unwrap(), saved);
@@ -9027,15 +9581,24 @@ mod undo_log_recording_tests {
     #[tokio::test]
     async fn create_node_records_a_node_upserted_diff_with_no_before() {
         let canvas_path = write_test_canvas(TWO_SIBLINGS);
-        let state = build_state(canvas_path.clone(), false, None).await.expect("valid test canvas");
+        let state = build_state(canvas_path.clone(), false, None)
+            .await
+            .expect("valid test canvas");
 
-        let req = CreateNodeRequest { parent_id: "root".to_string(), title: "New Child".to_string(), title_slug_id: false };
-        let _ = create_node(State(state.clone()), Json(req)).await.expect("create should succeed");
+        let req = CreateNodeRequest {
+            parent_id: "root".to_string(),
+            title: "New Child".to_string(),
+            title_slug_id: false,
+        };
+        let _ = create_node(State(state.clone()), Json(req))
+            .await
+            .expect("create should succeed");
 
         let history = state.undo_log.history(10).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].op_kind, "node_upserted");
-        let diff: serde_json::Value = serde_json::from_str(history[0].diff_json.as_ref().unwrap()).unwrap();
+        let diff: serde_json::Value =
+            serde_json::from_str(history[0].diff_json.as_ref().unwrap()).unwrap();
         assert!(diff["before"].is_null());
         assert_eq!(diff["after"]["title"], "New Child");
 
@@ -9045,16 +9608,34 @@ mod undo_log_recording_tests {
     #[tokio::test]
     async fn update_node_records_a_node_upserted_diff_with_before_and_after() {
         let canvas_path = write_test_canvas(TWO_SIBLINGS);
-        let state = build_state(canvas_path.clone(), false, None).await.expect("valid test canvas");
+        let state = build_state(canvas_path.clone(), false, None)
+            .await
+            .expect("valid test canvas");
 
         let req = UpdateNodeRequest {
             clear_position: false,
-            title: None, node_type: None, color: None, target: None,
-            text: Some("new body a".to_string()), extra_parents: None,
-            display: None, lang: None, interpreter: None, preview: None,
-            tags: None, edge_label: None, edge_label_at: None, edge_source_side: None,
-            edge_target_side: None, edge_via: None, fold: None,
-            x: None, y: None, width: None, height: None, created_at: None,
+            title: None,
+            node_type: None,
+            color: None,
+            target: None,
+            text: Some("new body a".to_string()),
+            extra_parents: None,
+            display: None,
+            lang: None,
+            interpreter: None,
+            preview: None,
+            tags: None,
+            edge_label: None,
+            edge_label_at: None,
+            edge_source_side: None,
+            edge_target_side: None,
+            edge_via: None,
+            fold: None,
+            x: None,
+            y: None,
+            width: None,
+            height: None,
+            created_at: None,
         };
         let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req))
             .await
@@ -9063,7 +9644,8 @@ mod undo_log_recording_tests {
         let history = state.undo_log.history(10).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].op_kind, "node_upserted");
-        let diff: serde_json::Value = serde_json::from_str(history[0].diff_json.as_ref().unwrap()).unwrap();
+        let diff: serde_json::Value =
+            serde_json::from_str(history[0].diff_json.as_ref().unwrap()).unwrap();
         assert_eq!(diff["before"]["text"], "body a");
         assert_eq!(diff["after"]["text"], "new body a");
 
@@ -9073,16 +9655,23 @@ mod undo_log_recording_tests {
     #[tokio::test]
     async fn remove_node_records_the_deleted_subtrees_own_fragment() {
         let canvas_path = write_test_canvas(TWO_SIBLINGS);
-        let state = build_state(canvas_path.clone(), false, None).await.expect("valid test canvas");
-
-        let _ = remove_node(State(state.clone()), Path("a".to_string()), Query(DeleteNodeQuery { children: None }))
+        let state = build_state(canvas_path.clone(), false, None)
             .await
-            .expect("remove should succeed");
+            .expect("valid test canvas");
+
+        let _ = remove_node(
+            State(state.clone()),
+            Path("a".to_string()),
+            Query(DeleteNodeQuery { children: None }),
+        )
+        .await
+        .expect("remove should succeed");
 
         let history = state.undo_log.history(10).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].op_kind, "node_removed");
-        let diff: serde_json::Value = serde_json::from_str(history[0].diff_json.as_ref().unwrap()).unwrap();
+        let diff: serde_json::Value =
+            serde_json::from_str(history[0].diff_json.as_ref().unwrap()).unwrap();
         assert_eq!(diff["parentId"], "root");
         assert!(diff["fragment"].as_str().unwrap().contains("body a"));
 
@@ -9092,9 +9681,14 @@ mod undo_log_recording_tests {
     #[tokio::test]
     async fn move_sibling_records_the_sibling_order_before_and_after() {
         let canvas_path = write_test_canvas(TWO_SIBLINGS);
-        let state = build_state(canvas_path.clone(), false, None).await.expect("valid test canvas");
+        let state = build_state(canvas_path.clone(), false, None)
+            .await
+            .expect("valid test canvas");
 
-        let req = MoveSiblingRequest { before: None, after: Some("b".to_string()) };
+        let req = MoveSiblingRequest {
+            before: None,
+            after: Some("b".to_string()),
+        };
         let _ = move_sibling(State(state.clone()), Path("a".to_string()), Json(req))
             .await
             .expect("move should succeed");
@@ -9102,7 +9696,8 @@ mod undo_log_recording_tests {
         let history = state.undo_log.history(10).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].op_kind, "nodes_reordered");
-        let diff: serde_json::Value = serde_json::from_str(history[0].diff_json.as_ref().unwrap()).unwrap();
+        let diff: serde_json::Value =
+            serde_json::from_str(history[0].diff_json.as_ref().unwrap()).unwrap();
         assert_eq!(diff["before"], serde_json::json!(["a", "b"]));
         assert_eq!(diff["after"], serde_json::json!(["b", "a"]));
 
@@ -9112,9 +9707,13 @@ mod undo_log_recording_tests {
     #[tokio::test]
     async fn rename_node_id_records_a_raw_replay_with_a_specific_diff() {
         let canvas_path = write_test_canvas(TWO_SIBLINGS);
-        let state = build_state(canvas_path.clone(), false, None).await.expect("valid test canvas");
+        let state = build_state(canvas_path.clone(), false, None)
+            .await
+            .expect("valid test canvas");
 
-        let req = RenameNodeIdRequest { new_id: "a-renamed".to_string() };
+        let req = RenameNodeIdRequest {
+            new_id: "a-renamed".to_string(),
+        };
         let _ = rename_node_id(State(state.clone()), Path("a".to_string()), Json(req))
             .await
             .expect("rename should succeed");
@@ -9126,8 +9725,13 @@ mod undo_log_recording_tests {
         // into other nodes' own references to replay precisely) — the
         // `diff_json` here is display-only, for `describe_history_entry`.
         assert!(history[0].raw_before.as_ref().unwrap().contains("id=\"a\""));
-        assert!(history[0].raw_after.as_ref().unwrap().contains("id=\"a-renamed\""));
-        let diff: serde_json::Value = serde_json::from_str(history[0].diff_json.as_ref().unwrap()).unwrap();
+        assert!(history[0]
+            .raw_after
+            .as_ref()
+            .unwrap()
+            .contains("id=\"a-renamed\""));
+        let diff: serde_json::Value =
+            serde_json::from_str(history[0].diff_json.as_ref().unwrap()).unwrap();
         assert_eq!(diff["oldId"], "a");
         assert_eq!(diff["newId"], "a-renamed");
 
@@ -9144,22 +9748,32 @@ mod undo_log_recording_tests {
     #[tokio::test]
     async fn a_layout_only_whole_canvas_save_is_recorded_as_nodes_repositioned() {
         let canvas_path = write_test_canvas(TWO_SIBLINGS);
-        let state = build_state(canvas_path.clone(), false, None).await.expect("valid test canvas");
+        let state = build_state(canvas_path.clone(), false, None)
+            .await
+            .expect("valid test canvas");
 
-        let Json(mut canvas) = get_canvas(State(state.clone())).await.expect("get should succeed");
+        let Json(mut canvas) = get_canvas(State(state.clone()))
+            .await
+            .expect("get should succeed");
         for node in &mut canvas.nodes {
             if node.id == "a" {
                 node.x = Some(123.0);
                 node.y = Some(456.0);
             }
         }
-        let req = PutCanvasRequest { canvas, layout_hints: HashMap::new() };
-        let _ = put_canvas(State(state.clone()), Json(req)).await.expect("save should succeed");
+        let req = PutCanvasRequest {
+            canvas,
+            layout_hints: HashMap::new(),
+        };
+        let _ = put_canvas(State(state.clone()), Json(req))
+            .await
+            .expect("save should succeed");
 
         let history = state.undo_log.history(10).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].op_kind, "nodes_repositioned");
-        let diff: serde_json::Value = serde_json::from_str(history[0].diff_json.as_ref().unwrap()).unwrap();
+        let diff: serde_json::Value =
+            serde_json::from_str(history[0].diff_json.as_ref().unwrap()).unwrap();
         assert_eq!(diff["nodeIds"], serde_json::json!(["a"]));
 
         let _ = std::fs::remove_file(&canvas_path);
@@ -9168,7 +9782,9 @@ mod undo_log_recording_tests {
     #[tokio::test]
     async fn a_no_op_save_records_nothing() {
         let canvas_path = write_test_canvas(TWO_SIBLINGS);
-        let state = build_state(canvas_path.clone(), false, None).await.expect("valid test canvas");
+        let state = build_state(canvas_path.clone(), false, None)
+            .await
+            .expect("valid test canvas");
 
         // Same content back — `save_with_event` should see old_raw == raw
         // and skip recording entirely, not just skip broadcasting.
@@ -9182,7 +9798,9 @@ mod undo_log_recording_tests {
     #[tokio::test]
     async fn an_external_edit_noticed_live_by_the_file_watcher_is_recorded() {
         let canvas_path = write_test_canvas(TWO_SIBLINGS);
-        let state = build_state(canvas_path.clone(), false, None).await.expect("valid test canvas");
+        let state = build_state(canvas_path.clone(), false, None)
+            .await
+            .expect("valid test canvas");
         spawn_file_watcher(state.clone());
         // Give the watcher's own OS thread a chance to actually start and
         // capture its baseline mtime before the write below — otherwise
@@ -9198,7 +9816,11 @@ mod undo_log_recording_tests {
         // — the same way an unrelated editor or a worker-less CLI
         // invocation would (the watcher diffs content, not mtime alone,
         // see its own doc comment, so no need to fake a timestamp).
-        std::fs::write(&canvas_path, TWO_SIBLINGS.replace("body a", "body a EDITED EXTERNALLY")).unwrap();
+        std::fs::write(
+            &canvas_path,
+            TWO_SIBLINGS.replace("body a", "body a EDITED EXTERNALLY"),
+        )
+        .unwrap();
 
         // The watcher polls every 500ms; give it a few cycles.
         let mut history = state.undo_log.history(10).unwrap();
@@ -9212,7 +9834,11 @@ mod undo_log_recording_tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].op_kind, "external_edit");
         assert!(history[0].raw_before.as_ref().unwrap().contains("body a\n"));
-        assert!(history[0].raw_after.as_ref().unwrap().contains("body a EDITED EXTERNALLY"));
+        assert!(history[0]
+            .raw_after
+            .as_ref()
+            .unwrap()
+            .contains("body a EDITED EXTERNALLY"));
 
         let _ = std::fs::remove_file(&canvas_path);
     }
@@ -9223,7 +9849,9 @@ mod undo_log_recording_tests {
 
         // First "session": build state once (seeds undo_meta.last_raw),
         // then drop it — nothing else touches the sqlite file after this.
-        let _ = build_state(canvas_path.clone(), false, None).await.expect("valid test canvas");
+        let _ = build_state(canvas_path.clone(), false, None)
+            .await
+            .expect("valid test canvas");
 
         // Simulate a worker-less CLI edit (or another program) touching
         // the file directly while nothing was tracking it.
@@ -9235,7 +9863,9 @@ mod undo_log_recording_tests {
 
         // Second "session" — `build_state`'s own startup check should
         // catch the drift before returning.
-        let state = build_state(canvas_path.clone(), false, None).await.expect("valid test canvas");
+        let state = build_state(canvas_path.clone(), false, None)
+            .await
+            .expect("valid test canvas");
         let history = state.undo_log.history(10).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].op_kind, "external_edit");
@@ -9259,7 +9889,10 @@ mod undo_redo_api_tests {
 
     fn write_test_canvas(contents: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
-        path.push(format!("meshfox-undo-redo-api-test-{}.canvas.md", uuid::Uuid::new_v4()));
+        path.push(format!(
+            "meshfox-undo-redo-api-test-{}.canvas.md",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::write(&path, contents).unwrap();
         path
     }
@@ -9275,7 +9908,9 @@ mod undo_redo_api_tests {
         let canvas_path = write_test_canvas(TWO_SIBLINGS);
         let state = build_state(canvas_path.clone(), false, None).await.unwrap();
 
-        let Json(resp) = api_undo(State(state)).await.expect("a no-op undo should still be 200");
+        let Json(resp) = api_undo(State(state))
+            .await
+            .expect("a no-op undo should still be 200");
         assert!(!resp.changed);
         assert!(!resp.can_undo);
         assert!(!resp.can_redo);
@@ -9288,7 +9923,9 @@ mod undo_redo_api_tests {
         let canvas_path = write_test_canvas(TWO_SIBLINGS);
         let state = build_state(canvas_path.clone(), false, None).await.unwrap();
 
-        let Json(resp) = api_redo(State(state)).await.expect("a no-op redo should still be 200");
+        let Json(resp) = api_redo(State(state))
+            .await
+            .expect("a no-op redo should still be 200");
         assert!(!resp.changed);
         assert!(!resp.can_undo);
         assert!(!resp.can_redo);
@@ -9303,17 +9940,26 @@ mod undo_redo_api_tests {
 
         let mut req: UpdateNodeRequest = serde_json::from_value(serde_json::json!({})).unwrap();
         req.text = Some("edited body".to_string());
-        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req)).await.unwrap();
-        assert_eq!(state.raw.lock().unwrap().clone().contains("edited body"), true);
+        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req))
+            .await
+            .unwrap();
+        assert_eq!(
+            state.raw.lock().unwrap().clone().contains("edited body"),
+            true
+        );
 
-        let Json(undone) = api_undo(State(state.clone())).await.expect("undo should succeed");
+        let Json(undone) = api_undo(State(state.clone()))
+            .await
+            .expect("undo should succeed");
         assert!(undone.changed);
         assert!(!undone.can_undo);
         assert!(undone.can_redo);
         assert_eq!(undone.canvas.node("a").unwrap().text, "body a");
         assert!(!state.raw.lock().unwrap().contains("edited body"));
 
-        let Json(redone) = api_redo(State(state.clone())).await.expect("redo should succeed");
+        let Json(redone) = api_redo(State(state.clone()))
+            .await
+            .expect("redo should succeed");
         assert!(redone.changed);
         assert!(redone.can_undo);
         assert!(!redone.can_redo);
@@ -9332,16 +9978,24 @@ mod undo_redo_api_tests {
             title: "New Child".to_string(),
             title_slug_id: true,
         };
-        let Json(created) =
-            create_node(State(state.clone()), Json(req)).await.expect("create should succeed");
+        let Json(created) = create_node(State(state.clone()), Json(req))
+            .await
+            .expect("create should succeed");
         let new_id = created.new_id.clone();
         assert!(created.canvas.node(&new_id).is_some());
 
-        let Json(undone) = api_undo(State(state.clone())).await.expect("undo should succeed");
+        let Json(undone) = api_undo(State(state.clone()))
+            .await
+            .expect("undo should succeed");
         assert!(undone.canvas.node(&new_id).is_none());
 
-        let Json(redone) = api_redo(State(state.clone())).await.expect("redo should succeed");
-        let node = redone.canvas.node(&new_id).expect("recreated node should have its original id back");
+        let Json(redone) = api_redo(State(state.clone()))
+            .await
+            .expect("redo should succeed");
+        let node = redone
+            .canvas
+            .node(&new_id)
+            .expect("recreated node should have its original id back");
         assert_eq!(node.title, "New Child");
         assert_eq!(node.parent.as_deref(), Some("root"));
 
@@ -9353,17 +10007,31 @@ mod undo_redo_api_tests {
         let canvas_path = write_test_canvas(TWO_SIBLINGS);
         let state = build_state(canvas_path.clone(), false, None).await.unwrap();
 
-        let _ = remove_node(State(state.clone()), Path("a".to_string()), Query(DeleteNodeQuery { children: None }))
-            .await
-            .expect("remove should succeed");
-        assert!(mdcanvas::parse(&state.raw.lock().unwrap().clone()).unwrap().node("a").is_none());
+        let _ = remove_node(
+            State(state.clone()),
+            Path("a".to_string()),
+            Query(DeleteNodeQuery { children: None }),
+        )
+        .await
+        .expect("remove should succeed");
+        assert!(mdcanvas::parse(&state.raw.lock().unwrap().clone())
+            .unwrap()
+            .node("a")
+            .is_none());
 
-        let Json(undone) = api_undo(State(state.clone())).await.expect("undo should succeed");
-        let node = undone.canvas.node("a").expect("removed node should be restored");
+        let Json(undone) = api_undo(State(state.clone()))
+            .await
+            .expect("undo should succeed");
+        let node = undone
+            .canvas
+            .node("a")
+            .expect("removed node should be restored");
         assert_eq!(node.text, "body a");
         assert_eq!(node.parent.as_deref(), Some("root"));
 
-        let Json(redone) = api_redo(State(state.clone())).await.expect("redo should succeed");
+        let Json(redone) = api_redo(State(state.clone()))
+            .await
+            .expect("redo should succeed");
         assert!(redone.canvas.node("a").is_none());
 
         let _ = std::fs::remove_file(&canvas_path);
@@ -9374,19 +10042,43 @@ mod undo_redo_api_tests {
         let canvas_path = write_test_canvas(TWO_SIBLINGS);
         let state = build_state(canvas_path.clone(), false, None).await.unwrap();
 
-        let req = MoveSiblingRequest { before: None, after: Some("b".to_string()) };
+        let req = MoveSiblingRequest {
+            before: None,
+            after: Some("b".to_string()),
+        };
         let Json(moved) = move_sibling(State(state.clone()), Path("a".to_string()), Json(req))
             .await
             .expect("move should succeed");
-        let ids: Vec<&str> = moved.nodes.iter().filter(|n| n.parent.as_deref() == Some("root")).map(|n| n.id.as_str()).collect();
+        let ids: Vec<&str> = moved
+            .nodes
+            .iter()
+            .filter(|n| n.parent.as_deref() == Some("root"))
+            .map(|n| n.id.as_str())
+            .collect();
         assert_eq!(ids, vec!["b", "a"]);
 
-        let Json(undone) = api_undo(State(state.clone())).await.expect("undo should succeed");
-        let ids: Vec<&str> = undone.canvas.nodes.iter().filter(|n| n.parent.as_deref() == Some("root")).map(|n| n.id.as_str()).collect();
+        let Json(undone) = api_undo(State(state.clone()))
+            .await
+            .expect("undo should succeed");
+        let ids: Vec<&str> = undone
+            .canvas
+            .nodes
+            .iter()
+            .filter(|n| n.parent.as_deref() == Some("root"))
+            .map(|n| n.id.as_str())
+            .collect();
         assert_eq!(ids, vec!["a", "b"]);
 
-        let Json(redone) = api_redo(State(state.clone())).await.expect("redo should succeed");
-        let ids: Vec<&str> = redone.canvas.nodes.iter().filter(|n| n.parent.as_deref() == Some("root")).map(|n| n.id.as_str()).collect();
+        let Json(redone) = api_redo(State(state.clone()))
+            .await
+            .expect("redo should succeed");
+        let ids: Vec<&str> = redone
+            .canvas
+            .nodes
+            .iter()
+            .filter(|n| n.parent.as_deref() == Some("root"))
+            .map(|n| n.id.as_str())
+            .collect();
         assert_eq!(ids, vec!["b", "a"]);
 
         let _ = std::fs::remove_file(&canvas_path);
@@ -9397,13 +10089,17 @@ mod undo_redo_api_tests {
         let canvas_path = write_test_canvas(TWO_SIBLINGS);
         let state = build_state(canvas_path.clone(), false, None).await.unwrap();
 
-        let req = RenameNodeIdRequest { new_id: "a-renamed".to_string() };
+        let req = RenameNodeIdRequest {
+            new_id: "a-renamed".to_string(),
+        };
         let _ = rename_node_id(State(state.clone()), Path("a".to_string()), Json(req))
             .await
             .expect("rename should succeed");
         assert!(state.raw.lock().unwrap().contains("id=\"a-renamed\""));
 
-        let Json(undone) = api_undo(State(state.clone())).await.expect("undo should succeed");
+        let Json(undone) = api_undo(State(state.clone()))
+            .await
+            .expect("undo should succeed");
         assert!(undone.canvas.node("a").is_some());
         assert!(undone.canvas.node("a-renamed").is_none());
         assert_eq!(*state.raw.lock().unwrap(), TWO_SIBLINGS);
@@ -9418,16 +10114,25 @@ mod undo_redo_api_tests {
 
         let mut req: UpdateNodeRequest = serde_json::from_value(serde_json::json!({})).unwrap();
         req.text = Some("edited body".to_string());
-        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req)).await.unwrap();
+        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req))
+            .await
+            .unwrap();
         let Json(undone) = api_undo(State(state.clone())).await.unwrap();
         assert!(undone.can_redo);
 
         let mut req: UpdateNodeRequest = serde_json::from_value(serde_json::json!({})).unwrap();
         req.text = Some("a completely different edit".to_string());
-        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req)).await.unwrap();
+        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req))
+            .await
+            .unwrap();
 
-        let Json(after_fresh_edit) = api_redo(State(state.clone())).await.expect("a no-op redo should still be 200");
-        assert!(!after_fresh_edit.changed, "the old redo tail should have been dropped, not reapplied");
+        let Json(after_fresh_edit) = api_redo(State(state.clone()))
+            .await
+            .expect("a no-op redo should still be 200");
+        assert!(
+            !after_fresh_edit.changed,
+            "the old redo tail should have been dropped, not reapplied"
+        );
         assert!(!after_fresh_edit.can_redo);
 
         let _ = std::fs::remove_file(&canvas_path);
@@ -9440,10 +10145,14 @@ mod undo_redo_api_tests {
 
         let mut req: UpdateNodeRequest = serde_json::from_value(serde_json::json!({})).unwrap();
         req.text = Some("edited body".to_string());
-        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req)).await.unwrap();
+        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req))
+            .await
+            .unwrap();
 
         let (_backlog, mut rx, _gap) = state.canvas_events.subscribe_from(0);
-        let _ = api_undo(State(state.clone())).await.expect("undo should succeed");
+        let _ = api_undo(State(state.clone()))
+            .await
+            .expect("undo should succeed");
 
         assert!(matches!(rx.try_recv().unwrap().item, ServerEvent::Changed));
         match rx.try_recv().unwrap().item {
@@ -9464,10 +10173,14 @@ mod undo_redo_api_tests {
 
         let mut req: UpdateNodeRequest = serde_json::from_value(serde_json::json!({})).unwrap();
         req.text = Some("body a v2".to_string());
-        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req)).await.unwrap();
+        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req))
+            .await
+            .unwrap();
         let mut req: UpdateNodeRequest = serde_json::from_value(serde_json::json!({})).unwrap();
         req.text = Some("body b v2".to_string());
-        let _ = update_node(State(state.clone()), Path("b".to_string()), Json(req)).await.unwrap();
+        let _ = update_node(State(state.clone()), Path("b".to_string()), Json(req))
+            .await
+            .unwrap();
 
         let Json(undo1) = api_undo(State(state.clone())).await.unwrap();
         assert_eq!(undo1.canvas.node("b").unwrap().text, "body b");
@@ -9505,13 +10218,17 @@ mod undo_redo_api_tests {
 
         let mut req: UpdateNodeRequest = serde_json::from_value(serde_json::json!({})).unwrap();
         req.text = Some("body a ONE".to_string());
-        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req)).await.unwrap();
+        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req))
+            .await
+            .unwrap();
         let Json(undo1) = api_undo(State(state.clone())).await.unwrap();
         assert_eq!(undo1.canvas.node("a").unwrap().text, "body a");
 
         let mut req: UpdateNodeRequest = serde_json::from_value(serde_json::json!({})).unwrap();
         req.text = Some("body a TWO".to_string());
-        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req)).await.unwrap();
+        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req))
+            .await
+            .unwrap();
         let Json(undo2) = api_undo(State(state.clone())).await.unwrap();
         assert_eq!(undo2.canvas.node("a").unwrap().text, "body a");
         assert!(!undo2.can_undo);
@@ -9526,7 +10243,9 @@ mod undo_redo_api_tests {
 
         let mut req: UpdateNodeRequest = serde_json::from_value(serde_json::json!({})).unwrap();
         req.text = Some("edited body".to_string());
-        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req)).await.unwrap();
+        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req))
+            .await
+            .unwrap();
         let _ = api_undo(State(state.clone())).await.unwrap();
 
         let Json(resp) = api_history(State(state.clone()), Query(HistoryQuery { limit: 50 }))
@@ -9553,7 +10272,9 @@ mod undo_redo_api_tests {
         for text in ["v1", "v2", "v3"] {
             let mut req: UpdateNodeRequest = serde_json::from_value(serde_json::json!({})).unwrap();
             req.text = Some(text.to_string());
-            let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req)).await.unwrap();
+            let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req))
+                .await
+                .unwrap();
         }
         let _ = api_undo(State(state.clone())).await.unwrap();
         let _ = api_undo(State(state.clone())).await.unwrap();
@@ -9576,14 +10297,17 @@ mod undo_redo_api_tests {
         for text in ["v1", "v2", "v3"] {
             let mut req: UpdateNodeRequest = serde_json::from_value(serde_json::json!({})).unwrap();
             req.text = Some(text.to_string());
-            let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req)).await.unwrap();
+            let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req))
+                .await
+                .unwrap();
         }
         assert_eq!(state.undo_log.cursor().unwrap(), 3);
 
         let (_backlog, mut rx, _gap) = state.canvas_events.subscribe_from(0);
-        let Json(resp) = api_history_goto(State(state.clone()), Json(HistoryGotoRequest { seq: 0 }))
-            .await
-            .expect("goto should succeed");
+        let Json(resp) =
+            api_history_goto(State(state.clone()), Json(HistoryGotoRequest { seq: 0 }))
+                .await
+                .expect("goto should succeed");
         assert!(resp.changed);
         assert_eq!(resp.canvas.node("a").unwrap().text, "body a");
         assert!(!resp.can_undo);
@@ -9593,8 +10317,14 @@ mod undo_redo_api_tests {
         // Exactly one Changed + one UndoStateChanged for the whole jump,
         // not one pair per intermediate step.
         assert!(matches!(rx.try_recv().unwrap().item, ServerEvent::Changed));
-        assert!(matches!(rx.try_recv().unwrap().item, ServerEvent::UndoStateChanged { .. }));
-        assert!(rx.try_recv().is_err(), "no further events for a single jump");
+        assert!(matches!(
+            rx.try_recv().unwrap().item,
+            ServerEvent::UndoStateChanged { .. }
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "no further events for a single jump"
+        );
 
         let _ = std::fs::remove_file(&canvas_path);
     }
@@ -9607,13 +10337,18 @@ mod undo_redo_api_tests {
         for text in ["v1", "v2", "v3"] {
             let mut req: UpdateNodeRequest = serde_json::from_value(serde_json::json!({})).unwrap();
             req.text = Some(text.to_string());
-            let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req)).await.unwrap();
+            let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req))
+                .await
+                .unwrap();
         }
-        let _ = api_history_goto(State(state.clone()), Json(HistoryGotoRequest { seq: 0 })).await.unwrap();
-
-        let Json(resp) = api_history_goto(State(state.clone()), Json(HistoryGotoRequest { seq: 3 }))
+        let _ = api_history_goto(State(state.clone()), Json(HistoryGotoRequest { seq: 0 }))
             .await
-            .expect("goto forward should succeed");
+            .unwrap();
+
+        let Json(resp) =
+            api_history_goto(State(state.clone()), Json(HistoryGotoRequest { seq: 3 }))
+                .await
+                .expect("goto forward should succeed");
         assert!(resp.changed);
         assert_eq!(resp.canvas.node("a").unwrap().text, "v3");
         assert!(resp.can_undo);
@@ -9629,12 +10364,17 @@ mod undo_redo_api_tests {
 
         let mut req: UpdateNodeRequest = serde_json::from_value(serde_json::json!({})).unwrap();
         req.text = Some("edited body".to_string());
-        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req)).await.unwrap();
+        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req))
+            .await
+            .unwrap();
         let cursor = state.undo_log.cursor().unwrap();
 
-        let Json(resp) = api_history_goto(State(state.clone()), Json(HistoryGotoRequest { seq: cursor }))
-            .await
-            .expect("goto to the current seq should succeed");
+        let Json(resp) = api_history_goto(
+            State(state.clone()),
+            Json(HistoryGotoRequest { seq: cursor }),
+        )
+        .await
+        .expect("goto to the current seq should succeed");
         assert!(!resp.changed);
 
         let _ = std::fs::remove_file(&canvas_path);
@@ -9647,14 +10387,17 @@ mod undo_redo_api_tests {
 
         let mut req: UpdateNodeRequest = serde_json::from_value(serde_json::json!({})).unwrap();
         req.text = Some("edited body".to_string());
-        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req)).await.unwrap();
+        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req))
+            .await
+            .unwrap();
 
         // Seq 999 doesn't exist — a stale/bogus history-panel request
         // should land as far as it can (here: nowhere, since seq 1 is
         // already the cursor) rather than erroring.
-        let Json(resp) = api_history_goto(State(state.clone()), Json(HistoryGotoRequest { seq: 999 }))
-            .await
-            .expect("an unreachable target should still be a clean response");
+        let Json(resp) =
+            api_history_goto(State(state.clone()), Json(HistoryGotoRequest { seq: 999 }))
+                .await
+                .expect("an unreachable target should still be a clean response");
         assert!(!resp.changed);
         assert_eq!(state.undo_log.cursor().unwrap(), 1);
 
@@ -9668,12 +10411,22 @@ mod undo_redo_api_tests {
 
         let mut req: UpdateNodeRequest = serde_json::from_value(serde_json::json!({})).unwrap();
         req.text = Some("edited body".to_string());
-        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req)).await.unwrap();
+        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req))
+            .await
+            .unwrap();
 
         let Json(via_undo) = api_undo(State(state.clone())).await.unwrap();
-        let _ = api_history_goto(State(state.clone()), Json(HistoryGotoRequest { seq: 1 })).await.unwrap();
-        let Json(via_goto) = api_history_goto(State(state.clone()), Json(HistoryGotoRequest { seq: 0 })).await.unwrap();
-        assert_eq!(via_undo.canvas.node("a").unwrap().text, via_goto.canvas.node("a").unwrap().text);
+        let _ = api_history_goto(State(state.clone()), Json(HistoryGotoRequest { seq: 1 }))
+            .await
+            .unwrap();
+        let Json(via_goto) =
+            api_history_goto(State(state.clone()), Json(HistoryGotoRequest { seq: 0 }))
+                .await
+                .unwrap();
+        assert_eq!(
+            via_undo.canvas.node("a").unwrap().text,
+            via_goto.canvas.node("a").unwrap().text
+        );
 
         let _ = std::fs::remove_file(&canvas_path);
     }
@@ -9696,16 +10449,25 @@ mod undo_redo_api_tests {
         let canvas_path = write_test_canvas(TWO_SIBLINGS);
         let state = build_state(canvas_path.clone(), false, None).await.unwrap();
 
-        let req = RenameNodeIdRequest { new_id: "a-renamed".to_string() };
+        let req = RenameNodeIdRequest {
+            new_id: "a-renamed".to_string(),
+        };
         let _ = rename_node_id(State(state.clone()), Path("a".to_string()), Json(req))
             .await
             .expect("rename should succeed");
-        let Json(undone) = api_undo(State(state.clone())).await.expect("undo should succeed");
+        let Json(undone) = api_undo(State(state.clone()))
+            .await
+            .expect("undo should succeed");
         assert!(undone.canvas.node("a").is_some());
         assert!(undone.can_redo);
 
-        let Json(redone) = api_redo(State(state.clone())).await.expect("redo should succeed");
-        assert!(redone.canvas.node("a").is_none(), "the rename should be back in effect");
+        let Json(redone) = api_redo(State(state.clone()))
+            .await
+            .expect("redo should succeed");
+        assert!(
+            redone.canvas.node("a").is_none(),
+            "the rename should be back in effect"
+        );
         assert!(redone.canvas.node("a-renamed").is_some());
         assert!(!redone.can_redo);
 
@@ -9733,13 +10495,23 @@ mod undo_redo_api_tests {
         assert!(body.canvas.node("a").is_some());
         assert!(body.canvas.node("custom-a").is_none());
 
-        let Json(undone) = api_undo(State(state.clone())).await.expect("undo should succeed");
-        assert!(undone.canvas.node("custom-a").is_some(), "the explicit id should be back");
+        let Json(undone) = api_undo(State(state.clone()))
+            .await
+            .expect("undo should succeed");
+        assert!(
+            undone.canvas.node("custom-a").is_some(),
+            "the explicit id should be back"
+        );
         assert!(undone.canvas.node("a").is_none());
         assert_eq!(*state.raw.lock().unwrap(), DIVERGED_ID);
 
-        let Json(redone) = api_redo(State(state.clone())).await.expect("redo should succeed");
-        assert!(redone.canvas.node("a").is_some(), "the clear should be back in effect");
+        let Json(redone) = api_redo(State(state.clone()))
+            .await
+            .expect("redo should succeed");
+        assert!(
+            redone.canvas.node("a").is_some(),
+            "the clear should be back in effect"
+        );
         assert!(redone.canvas.node("custom-a").is_none());
 
         let _ = std::fs::remove_file(&canvas_path);
@@ -9760,7 +10532,9 @@ mod undo_redo_api_tests {
         let removed = remove_node(
             State(state.clone()),
             Path("a".to_string()),
-            Query(DeleteNodeQuery { children: Some("reparent".to_string()) }),
+            Query(DeleteNodeQuery {
+                children: Some("reparent".to_string()),
+            }),
         )
         .await
         .expect("remove should succeed")
@@ -9769,16 +10543,38 @@ mod undo_redo_api_tests {
         assert_eq!(removed.node("a1").unwrap().parent.as_deref(), Some("root"));
         assert_eq!(removed.node("a2").unwrap().parent.as_deref(), Some("root"));
 
-        let Json(undone) = api_undo(State(state.clone())).await.expect("undo should succeed");
-        assert!(undone.canvas.node("a").is_some(), "the deleted parent should be restored");
-        assert_eq!(undone.canvas.node("a1").unwrap().parent.as_deref(), Some("a"));
-        assert_eq!(undone.canvas.node("a2").unwrap().parent.as_deref(), Some("a"));
+        let Json(undone) = api_undo(State(state.clone()))
+            .await
+            .expect("undo should succeed");
+        assert!(
+            undone.canvas.node("a").is_some(),
+            "the deleted parent should be restored"
+        );
+        assert_eq!(
+            undone.canvas.node("a1").unwrap().parent.as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            undone.canvas.node("a2").unwrap().parent.as_deref(),
+            Some("a")
+        );
         assert_eq!(*state.raw.lock().unwrap(), PARENT_WITH_CHILDREN);
 
-        let Json(redone) = api_redo(State(state.clone())).await.expect("redo should succeed");
-        assert!(redone.canvas.node("a").is_none(), "the reparenting delete should be back in effect");
-        assert_eq!(redone.canvas.node("a1").unwrap().parent.as_deref(), Some("root"));
-        assert_eq!(redone.canvas.node("a2").unwrap().parent.as_deref(), Some("root"));
+        let Json(redone) = api_redo(State(state.clone()))
+            .await
+            .expect("redo should succeed");
+        assert!(
+            redone.canvas.node("a").is_none(),
+            "the reparenting delete should be back in effect"
+        );
+        assert_eq!(
+            redone.canvas.node("a1").unwrap().parent.as_deref(),
+            Some("root")
+        );
+        assert_eq!(
+            redone.canvas.node("a2").unwrap().parent.as_deref(),
+            Some("root")
+        );
 
         let _ = std::fs::remove_file(&canvas_path);
     }
@@ -9788,24 +10584,36 @@ mod undo_redo_api_tests {
         let canvas_path = write_test_canvas(TWO_SIBLINGS);
         let state = build_state(canvas_path.clone(), false, None).await.unwrap();
 
-        let req = RenameNodeIdRequest { new_id: "a-renamed".to_string() };
+        let req = RenameNodeIdRequest {
+            new_id: "a-renamed".to_string(),
+        };
         let _ = rename_node_id(State(state.clone()), Path("a".to_string()), Json(req))
             .await
             .expect("rename should succeed");
-        let Json(undone) = api_undo(State(state.clone())).await.expect("undo should succeed");
+        let Json(undone) = api_undo(State(state.clone()))
+            .await
+            .expect("undo should succeed");
         assert!(undone.can_redo);
 
         let mut req: UpdateNodeRequest = serde_json::from_value(serde_json::json!({})).unwrap();
         req.text = Some("a completely different edit".to_string());
-        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req)).await.unwrap();
+        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(req))
+            .await
+            .unwrap();
 
-        let Json(after_fresh_edit) = api_redo(State(state.clone())).await.expect("a no-op redo should still be 200");
+        let Json(after_fresh_edit) = api_redo(State(state.clone()))
+            .await
+            .expect("a no-op redo should still be 200");
         assert!(
             !after_fresh_edit.changed,
             "the rename's own redo tail should have been dropped, not reapplied"
         );
         assert!(!after_fresh_edit.can_redo);
-        assert!(state.raw.lock().unwrap().contains("a completely different edit"));
+        assert!(state
+            .raw
+            .lock()
+            .unwrap()
+            .contains("a completely different edit"));
         assert!(!state.raw.lock().unwrap().contains("id=\"a-renamed\""));
 
         let _ = std::fs::remove_file(&canvas_path);
@@ -10243,7 +11051,8 @@ mod include_edit_tests {
             .await,
         );
 
-        let body = expect_ok_clear(clear_node_id(State(state), Path("custom-id".to_string())).await);
+        let body =
+            expect_ok_clear(clear_node_id(State(state), Path("custom-id".to_string())).await);
 
         assert_eq!(body.id, "a");
         assert!(body.canvas.node("a").is_some());
@@ -10293,7 +11102,8 @@ mod include_edit_tests {
 
         let mut req = blank_update_request();
         req.text = Some("updated via a spaced id".to_string());
-        let updated = expect_ok(update_node(State(state), Path("has space".to_string()), Json(req)).await);
+        let updated =
+            expect_ok(update_node(State(state), Path("has space".to_string()), Json(req)).await);
         assert_eq!(
             updated.node("has space").unwrap().text,
             "updated via a spaced id"
@@ -10494,7 +11304,10 @@ mod include_edit_tests {
     #[tokio::test]
     async fn put_canvas_uses_layout_hints_to_place_a_positioned_node_among_auto_siblings() {
         let mut canvas_path = std::env::temp_dir();
-        canvas_path.push(format!("meshfox-layout-hints-test-{}.canvas.md", uuid::Uuid::new_v4()));
+        canvas_path.push(format!(
+            "meshfox-layout-hints-test-{}.canvas.md",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::write(
             &canvas_path,
             concat!(
@@ -10510,8 +11323,8 @@ mod include_edit_tests {
             .expect("valid test canvas");
 
         let primary_raw = state.raw.lock().unwrap().clone();
-        let mut canvas =
-            resolved_canvas(&primary_raw, &state.canvas_path).unwrap_or_else(|e| panic!("resolve failed: {}", e.1));
+        let mut canvas = resolved_canvas(&primary_raw, &state.canvas_path)
+            .unwrap_or_else(|e| panic!("resolve failed: {}", e.1));
         // The client's own auto-layout rendered `one` at y=0 and `two` at
         // y=100 — `target`'s own newly-authored y=50 should land between
         // them, not before both.
@@ -10522,9 +11335,15 @@ mod include_edit_tests {
             ("two".to_string(), LayoutHint { x: 0.0, y: 100.0 }),
         ]);
 
-        let status = put_canvas(State(state), Json(PutCanvasRequest { canvas, layout_hints }))
-            .await
-            .unwrap_or_else(|e| panic!("put_canvas failed: {}", e.1));
+        let status = put_canvas(
+            State(state),
+            Json(PutCanvasRequest {
+                canvas,
+                layout_hints,
+            }),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("put_canvas failed: {}", e.1));
         assert_eq!(status, StatusCode::NO_CONTENT);
 
         let after = std::fs::read_to_string(&canvas_path).unwrap();
@@ -10662,8 +11481,6 @@ mod include_edit_tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
-
-
 }
 
 #[cfg(test)]
@@ -10807,7 +11624,9 @@ mod ws_tests {
         let addr = spawn_test_server(canvas_path.clone()).await;
         let url = format!("ws://{addr}/api/run/tty?path=&block=target&cols=80&rows=24");
 
-        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.expect("connect");
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("connect");
         next_event(&mut ws).await; // started
         let step_start = next_event(&mut ws).await;
         assert_eq!(step_start["type"], "step-start");
@@ -10821,17 +11640,21 @@ mod ws_tests {
         next_event(&mut ws).await; // step-start for target
         next_event(&mut ws).await; // tty-start
         read_until(&mut ws, "ready").await;
-        ws.send(WsMessage::Binary(b"\n".to_vec().into())).await.expect("send input");
+        ws.send(WsMessage::Binary(b"\n".to_vec().into()))
+            .await
+            .expect("send input");
         next_event(&mut ws).await; // step-end for target
         drop(ws);
 
-        let (mut ws2, _) = tokio_tungstenite::connect_async(&url).await.expect("connect");
+        let (mut ws2, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("connect");
         next_event(&mut ws2).await; // started
-        // `step-start` is sent unconditionally for every chain step, even
-        // one about to be skipped a moment later (same "brief flash" the
-        // plain `/api/run` path already has — see `RunEvent::StepSkipped`'s
-        // own doc comment) — the real signal is the `step-skipped` right
-        // after it, not the absence of `step-start`.
+                                    // `step-start` is sent unconditionally for every chain step, even
+                                    // one about to be skipped a moment later (same "brief flash" the
+                                    // plain `/api/run` path already has — see `RunEvent::StepSkipped`'s
+                                    // own doc comment) — the real signal is the `step-skipped` right
+                                    // after it, not the absence of `step-start`.
         let dep_step_start = next_event(&mut ws2).await;
         assert_eq!(dep_step_start["type"], "step-start");
         assert_eq!(dep_step_start["block"], "dep");
@@ -10844,7 +11667,9 @@ mod ws_tests {
         next_event(&mut ws2).await; // step-start for target
         next_event(&mut ws2).await; // tty-start
         read_until(&mut ws2, "ready").await;
-        ws2.send(WsMessage::Binary(b"\n".to_vec().into())).await.expect("send input");
+        ws2.send(WsMessage::Binary(b"\n".to_vec().into()))
+            .await
+            .expect("send input");
         next_event(&mut ws2).await; // step-end for target
 
         let _ = std::fs::remove_file(&canvas_path);
@@ -10900,7 +11725,9 @@ mod ws_tests {
         let canvas_path = write_test_canvas(TTY_CANVAS);
         let addr = spawn_test_server(canvas_path.clone()).await;
         let url = format!("ws://{addr}/api/run/tty?path=shell&block=interactive&cols=80&rows=24");
-        let (mut ws1, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+        let (mut ws1, _) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("connect");
 
         next_event(&mut ws1).await; // started
         next_event(&mut ws1).await; // step-start
@@ -10909,9 +11736,12 @@ mod ws_tests {
 
         // A second viewer attaches to the *same* address — no chain
         // resolution, no spawning, just joining what's already running.
-        let attach_url =
-            format!("ws://{addr}/api/run/tty/attach?nodeId=shell&block=interactive&cols=80&rows=24");
-        let (mut ws2, _) = tokio_tungstenite::connect_async(attach_url).await.expect("attach");
+        let attach_url = format!(
+            "ws://{addr}/api/run/tty/attach?nodeId=shell&block=interactive&cols=80&rows=24"
+        );
+        let (mut ws2, _) = tokio_tungstenite::connect_async(attach_url)
+            .await
+            .expect("attach");
         // The attacher gets the already-buffered "ready" as backlog,
         // without the process ever having to print it again.
         read_until(&mut ws2, "ready").await;
@@ -10939,15 +11769,20 @@ mod ws_tests {
         ));
         let addr = spawn_test_server(canvas_path.clone()).await;
         let url = format!("ws://{addr}/api/run/tty?path=shell&block=interactive&cols=80&rows=24");
-        let (mut ws1, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+        let (mut ws1, _) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("connect");
         next_event(&mut ws1).await; // started
         next_event(&mut ws1).await; // step-start
         next_event(&mut ws1).await; // tty-start
         read_until(&mut ws1, "ready").await;
 
-        let attach_url =
-            format!("ws://{addr}/api/run/tty/attach?nodeId=shell&block=interactive&cols=80&rows=24");
-        let (mut ws2, _) = tokio_tungstenite::connect_async(attach_url).await.expect("attach");
+        let attach_url = format!(
+            "ws://{addr}/api/run/tty/attach?nodeId=shell&block=interactive&cols=80&rows=24"
+        );
+        let (mut ws2, _) = tokio_tungstenite::connect_async(attach_url)
+            .await
+            .expect("attach");
         read_until(&mut ws2, "ready").await;
 
         // Kill by address alone — this test never even looks at `runId`,
@@ -10963,7 +11798,10 @@ mod ws_tests {
         stream.write_all(request.as_bytes()).await.expect("write");
         let mut response = String::new();
         stream.read_to_string(&mut response).await.expect("read");
-        assert!(response.starts_with("HTTP/1.1 204"), "unexpected response: {response}");
+        assert!(
+            response.starts_with("HTTP/1.1 204"),
+            "unexpected response: {response}"
+        );
 
         // The attached viewer sees the session end too, even though it
         // never held any kill switch of its own — either a close frame or
@@ -11005,15 +11843,20 @@ mod ws_tests {
         ));
         let addr = spawn_test_server(canvas_path.clone()).await;
         let url = format!("ws://{addr}/api/run/tty?path=shell&block=interactive&cols=80&rows=24");
-        let (mut ws1, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+        let (mut ws1, _) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("connect");
         next_event(&mut ws1).await; // started
         next_event(&mut ws1).await; // step-start
         next_event(&mut ws1).await; // tty-start
         read_until(&mut ws1, "ready").await;
 
-        let attach_url =
-            format!("ws://{addr}/api/run/tty/attach?nodeId=shell&block=interactive&cols=80&rows=24");
-        let (mut ws2, _) = tokio_tungstenite::connect_async(attach_url).await.expect("attach");
+        let attach_url = format!(
+            "ws://{addr}/api/run/tty/attach?nodeId=shell&block=interactive&cols=80&rows=24"
+        );
+        let (mut ws2, _) = tokio_tungstenite::connect_async(attach_url)
+            .await
+            .expect("attach");
         // Give `relay_tty_viewer` a moment to actually reach `handle.
         // attach()` (subscribing) before the burst below starts — a WS
         // client's own `connect_async` returning doesn't itself guarantee
@@ -11026,7 +11869,9 @@ mod ws_tests {
         // fills, which stalls that task's own `rx.recv()` loop for the
         // whole burst — guaranteeing it falls behind, rather than merely
         // *risking* it under an ordinary timing race.
-        ws1.send(WsMessage::Binary(b"\n".to_vec().into())).await.expect("unblock read");
+        ws1.send(WsMessage::Binary(b"\n".to_vec().into()))
+            .await
+            .expect("unblock read");
         // Draining `ws1` (the *originating* connection, read continuously
         // throughout) confirms the several-MB burst has fully landed
         // server-side before `ws2` ever looks at it.
@@ -11037,7 +11882,9 @@ mod ws_tests {
         // the socket having shown nothing at all; after it, it resyncs via
         // a fresh `attach()` snapshot and keeps going.
         read_until(&mut ws2, "BURST-DONE").await;
-        ws2.send(WsMessage::Binary(b"hello\n".to_vec().into())).await.expect("send input");
+        ws2.send(WsMessage::Binary(b"hello\n".to_vec().into()))
+            .await
+            .expect("send input");
         read_until(&mut ws2, "got: hello").await;
 
         let _ = std::fs::remove_file(&canvas_path);
@@ -11052,7 +11899,9 @@ mod ws_tests {
         ));
         let addr = spawn_test_server(canvas_path.clone()).await;
         let url = format!("ws://{addr}/api/run/tty?path=shell&block=interactive&cols=80&rows=24");
-        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("connect");
         next_event(&mut ws).await; // started
         next_event(&mut ws).await; // step-start
         next_event(&mut ws).await; // tty-start
@@ -11066,7 +11915,9 @@ mod ws_tests {
             .unwrap()
             .iter()
             .find(|r| r["nodeId"] == "shell" && r["block"] == "interactive")
-            .unwrap_or_else(|| panic!("expected an active-runs entry for shell/interactive, got: {body}"));
+            .unwrap_or_else(|| {
+                panic!("expected an active-runs entry for shell/interactive, got: {body}")
+            });
         assert_eq!(entry["kind"], "tty");
         assert_eq!(entry["status"], "running");
 
@@ -11208,7 +12059,9 @@ mod run_file_tests {
         use futures_util::StreamExt;
         use tokio_tungstenite::tungstenite::Message as WsMessage;
         let url = format!("ws://{addr}{path}");
-        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("connect");
         let mut events = Vec::new();
         while let Some(msg) = ws.next().await {
             match msg.expect("no ws error") {
@@ -11245,9 +12098,9 @@ mod run_file_tests {
         assert_eq!(events[1]["nodeId"], "seed");
         assert_eq!(events[1]["block"], "seed");
         assert!(
-            events
-                .iter()
-                .any(|e| e["type"] == "output" && e["text"] == "hi from seed" && e["stream"] == "stdout"),
+            events.iter().any(|e| e["type"] == "output"
+                && e["text"] == "hi from seed"
+                && e["stream"] == "stdout"),
             "expected a stdout-tagged output event with the script's own stdout, got: {events:?}"
         );
         let step_end = events
@@ -11318,7 +12171,6 @@ mod run_file_tests {
         assert_eq!(status, 404);
         let _ = std::fs::remove_file(&canvas_path);
     }
-
 }
 
 #[cfg(test)]
@@ -11332,7 +12184,9 @@ mod run_block_ws_tests {
         use futures_util::StreamExt;
         use tokio_tungstenite::tungstenite::Message as WsMessage;
         let url = format!("ws://{addr}/api/run?{query}");
-        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("connect");
         let mut events = Vec::new();
         while let Some(msg) = ws.next().await {
             match msg.expect("no ws error") {
@@ -11377,7 +12231,10 @@ mod run_block_ws_tests {
             .collect();
         assert_eq!(
             output_events,
-            vec![(Some("stdout"), Some("out1")), (Some("stderr"), Some("err1"))],
+            vec![
+                (Some("stdout"), Some("out1")),
+                (Some("stderr"), Some("err1"))
+            ],
             "events: {events:?}"
         );
 
@@ -11454,7 +12311,13 @@ mod session_skip_tests {
     // Same request/dechunk/ndjson-parsing shape as `run_block_include_tests`
     // above (kept local rather than shared — that module is itself
     // `#[cfg(test)]`-private, nothing to import from).
-    async fn request(addr: SocketAddr, method: &str, path: &str, content_type: &str, body: &str) -> (u16, String) {
+    async fn request(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        content_type: &str,
+        body: &str,
+    ) -> (u16, String) {
         let request = format!(
             "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
@@ -11472,11 +12335,16 @@ mod session_skip_tests {
             .and_then(|l| l.split_whitespace().nth(1))
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        let body = if head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+        let body = if head
+            .to_ascii_lowercase()
+            .contains("transfer-encoding: chunked")
+        {
             let mut out = String::new();
             let mut rest = raw_body;
             while let Some(nl) = rest.find("\r\n") {
-                let Ok(size) = usize::from_str_radix(rest[..nl].trim(), 16) else { break };
+                let Ok(size) = usize::from_str_radix(rest[..nl].trim(), 16) else {
+                    break;
+                };
                 rest = &rest[nl + 2..];
                 if size == 0 || size > rest.len() {
                     break;
@@ -11496,15 +12364,22 @@ mod session_skip_tests {
     // on `RunEvent::StepSkipped`) -- "actually ran" means it reached a real
     // `step-end`, not just a `step-start`.
     fn really_ran(events: &[serde_json::Value], block: &str) -> bool {
-        events.iter().any(|e| e["type"] == "step-end" && e["block"] == block)
+        events
+            .iter()
+            .any(|e| e["type"] == "step-end" && e["block"] == block)
     }
 
     fn skipped_for(events: &[serde_json::Value], block: &str) -> bool {
-        events.iter().any(|e| e["type"] == "step-skipped" && e["block"] == block)
+        events
+            .iter()
+            .any(|e| e["type"] == "step-skipped" && e["block"] == block)
     }
 
     fn write_dep_chain_canvas(dep_code: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("meshfox-session-skip-test-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-session-skip-test-{}",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("canvas.md");
         std::fs::write(
@@ -11523,7 +12398,9 @@ mod session_skip_tests {
         use futures_util::StreamExt;
         use tokio_tungstenite::tungstenite::Message as WsMessage;
         let url = format!("ws://{addr}/api/run?block=target&persist=true");
-        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("connect");
         let mut events = Vec::new();
         while let Some(msg) = ws.next().await {
             match msg.expect("no ws error") {
@@ -11540,7 +12417,9 @@ mod session_skip_tests {
     async fn ws_messages(url: String) -> Vec<serde_json::Value> {
         use futures_util::StreamExt;
         use tokio_tungstenite::tungstenite::Message as WsMessage;
-        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("connect");
         let mut out = Vec::new();
         while let Some(msg) = ws.next().await {
             match msg.expect("no ws error") {
@@ -11572,7 +12451,10 @@ mod session_skip_tests {
         // only the session database carries over.
         let second_core = spawn_test_server(path.clone()).await;
         let events = run_target(second_core).await;
-        assert!(skipped_for(&events, "dep"), "expected dep to stay fresh across a restart: {events:?}");
+        assert!(
+            skipped_for(&events, "dep"),
+            "expected dep to stay fresh across a restart: {events:?}"
+        );
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
@@ -11585,16 +12467,31 @@ mod session_skip_tests {
 
         let restarted = spawn_test_server(path.clone()).await;
         let runs = active_runs(restarted).await;
-        let target = entry(&runs, "target").unwrap_or_else(|| panic!("target missing from {runs:?}"));
-        assert_eq!((target["status"].as_str(), target["exitCode"].as_i64()), (Some("exited"), Some(0)));
-        assert!(entry(&runs, "dep").is_some(), "the dependency's run is current too: {runs:?}");
-
-        let events = ws_messages(format!("ws://{restarted}/api/run/subscribe?nodeId=root&block=target")).await;
+        let target =
+            entry(&runs, "target").unwrap_or_else(|| panic!("target missing from {runs:?}"));
+        assert_eq!(
+            (target["status"].as_str(), target["exitCode"].as_i64()),
+            (Some("exited"), Some(0))
+        );
         assert!(
-            events.iter().any(|e| e["type"] == "line" && e["text"] == "target-ran"),
+            entry(&runs, "dep").is_some(),
+            "the dependency's run is current too: {runs:?}"
+        );
+
+        let events = ws_messages(format!(
+            "ws://{restarted}/api/run/subscribe?nodeId=root&block=target"
+        ))
+        .await;
+        assert!(
+            events
+                .iter()
+                .any(|e| e["type"] == "line" && e["text"] == "target-ran"),
             "expected the stored output to be replayed: {events:?}"
         );
-        assert_eq!(events.last().map(|e| e["type"].clone()), Some(serde_json::json!("done")));
+        assert_eq!(
+            events.last().map(|e| e["type"].clone()),
+            Some(serde_json::json!("done"))
+        );
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
@@ -11607,21 +12504,39 @@ mod session_skip_tests {
 
         // Same document, but the dependency's code changed (a `cache`
         // block's own persisted output aside, which the run wrote back).
-        let edited = std::fs::read_to_string(&path).unwrap().replace("echo dep-ran", "echo dep-changed");
+        let edited = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("echo dep-ran", "echo dep-changed");
         std::fs::write(&path, edited).unwrap();
 
         let restarted = spawn_test_server(path.clone()).await;
         let runs = active_runs(restarted).await;
-        assert!(entry(&runs, "dep").is_none(), "the edited block's own run is stale: {runs:?}");
+        assert!(
+            entry(&runs, "dep").is_none(),
+            "the edited block's own run is stale: {runs:?}"
+        );
         assert!(
             entry(&runs, "target").is_none(),
             "a dependency changing must make the dependent's run stale too: {runs:?}"
         );
         // ...and its output isn't served as if it were current, but the run
         // is still in the history, flagged.
-        let events = ws_messages(format!("ws://{restarted}/api/run/subscribe?nodeId=root&block=target")).await;
-        assert!(events.is_empty(), "a stale run must not be replayed as the latest one: {events:?}");
-        let (_, body) = request(restarted, "GET", "/api/run/history?nodeId=root&block=target", "application/json", "").await;
+        let events = ws_messages(format!(
+            "ws://{restarted}/api/run/subscribe?nodeId=root&block=target"
+        ))
+        .await;
+        assert!(
+            events.is_empty(),
+            "a stale run must not be replayed as the latest one: {events:?}"
+        );
+        let (_, body) = request(
+            restarted,
+            "GET",
+            "/api/run/history?nodeId=root&block=target",
+            "application/json",
+            "",
+        )
+        .await;
         let history: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0]["stale"], true);
@@ -11635,14 +12550,26 @@ mod session_skip_tests {
         let addr = spawn_test_server(path.clone()).await;
 
         let first = run_target(addr).await;
-        assert!(really_ran(&first, "dep"), "expected dep to actually run the first time: {first:?}");
-        assert!(!skipped_for(&first, "dep"), "dep shouldn't be skipped before it's ever run: {first:?}");
+        assert!(
+            really_ran(&first, "dep"),
+            "expected dep to actually run the first time: {first:?}"
+        );
+        assert!(
+            !skipped_for(&first, "dep"),
+            "dep shouldn't be skipped before it's ever run: {first:?}"
+        );
         // The target itself always runs for real, first time and every time.
         assert!(really_ran(&first, "target"));
 
         let second = run_target(addr).await;
-        assert!(skipped_for(&second, "dep"), "expected dep to be skipped the second time: {second:?}");
-        assert!(!really_ran(&second, "dep"), "a skipped dep must not also get a real step-start: {second:?}");
+        assert!(
+            skipped_for(&second, "dep"),
+            "expected dep to be skipped the second time: {second:?}"
+        );
+        assert!(
+            !really_ran(&second, "dep"),
+            "a skipped dep must not also get a real step-start: {second:?}"
+        );
         assert!(
             really_ran(&second, "target"),
             "the requested block itself must never be skipped, even when unchanged: {second:?}"
@@ -11688,8 +12615,13 @@ mod session_skip_tests {
         // wrote, so its fence's fingerprint (see `meshfox_core::fingerprint`)
         // changes — the same mechanism `crate::output`'s cached-output
         // staleness uses, here driving "already ran this session" instead.
-        let edited = std::fs::read_to_string(&path).unwrap().replacen("echo dep-ran", "echo dep-ran-again", 1);
-        let (put_status, put_body) = request(addr, "PUT", "/api/canvas/raw", "text/plain", &edited).await;
+        let edited = std::fs::read_to_string(&path).unwrap().replacen(
+            "echo dep-ran",
+            "echo dep-ran-again",
+            1,
+        );
+        let (put_status, put_body) =
+            request(addr, "PUT", "/api/canvas/raw", "text/plain", &edited).await;
         assert_eq!(put_status, 204, "unexpected body: {put_body}");
 
         let second = run_target(addr).await;
@@ -11708,7 +12640,10 @@ mod session_skip_tests {
         // — a migration-style step whose side effect (here: writing a
         // marker file) needs to happen on every chain run regardless of
         // whether its own code looks unchanged.
-        let dir = std::env::temp_dir().join(format!("meshfox-session-skip-always-test-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-session-skip-always-test-{}",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("canvas.md");
         std::fs::write(
@@ -11750,7 +12685,8 @@ mod session_skip_tests {
             "expected dep to be skipped before any reset: {second:?}"
         );
 
-        let (status, body) = request(addr, "POST", "/api/session/reset", "application/json", "").await;
+        let (status, body) =
+            request(addr, "POST", "/api/session/reset", "application/json", "").await;
         assert_eq!(status, 204, "unexpected body: {body}");
 
         let third = run_target(addr).await;
@@ -12154,7 +13090,10 @@ mod vars_endpoint_tests {
             ],
         )
         .await;
-        assert_eq!(events[0]["type"], "started", "unexpected events: {events:?}");
+        assert_eq!(
+            events[0]["type"], "started",
+            "unexpected events: {events:?}"
+        );
 
         let cache = VarCache::load(&canvas_path).expect("load cache");
         assert_eq!(cache.get("API_TOKEN"), None);
@@ -12177,7 +13116,10 @@ mod vars_endpoint_tests {
             ],
         )
         .await;
-        assert_eq!(events[0]["type"], "started", "unexpected events: {events:?}");
+        assert_eq!(
+            events[0]["type"], "started",
+            "unexpected events: {events:?}"
+        );
 
         let cache = VarCache::load(&canvas_path).expect("load cache");
         assert_eq!(
@@ -12213,14 +13155,18 @@ mod vars_endpoint_tests {
             ],
         )
         .await;
-        assert_eq!(events[0]["type"], "started", "unexpected events: {events:?}");
+        assert_eq!(
+            events[0]["type"], "started",
+            "unexpected events: {events:?}"
+        );
 
         // `GET /api/vars` (what the pre-run form checks before ever
         // opening) now sees it as resolved — so the browser wouldn't even
         // ask again — and still never puts the actual value on the wire.
         let (status, body) = get(addr, "/api/vars?block=use-token").await;
         assert_eq!(status, 200);
-        let statuses: Vec<serde_json::Value> = serde_json::from_str(&body).expect("valid VarStatus JSON");
+        let statuses: Vec<serde_json::Value> =
+            serde_json::from_str(&body).expect("valid VarStatus JSON");
         assert_eq!(statuses[0]["name"], "API_TOKEN");
         assert_eq!(
             statuses[0]["resolved"], true,
@@ -12236,7 +13182,10 @@ mod vars_endpoint_tests {
         // saved value back from the cache, not fail with "missing required
         // variable(s)".
         let events = run_ws_events(addr, &[("block", "use-token")]).await;
-        assert_eq!(events[0]["type"], "started", "unexpected events: {events:?}");
+        assert_eq!(
+            events[0]["type"], "started",
+            "unexpected events: {events:?}"
+        );
 
         let _ = std::fs::remove_file(&canvas_path);
         let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));
@@ -12319,7 +13268,6 @@ mod vars_endpoint_tests {
         let _ = std::fs::remove_file(&canvas_path);
         let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));
     }
-
 }
 
 #[cfg(test)]
@@ -12411,7 +13359,9 @@ mod form_endpoint_tests {
         use futures_util::StreamExt;
         use tokio_tungstenite::tungstenite::Message as WsMessage;
         let url = format!("ws://{addr}{path}");
-        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("connect");
         let mut body = String::new();
         while let Some(msg) = ws.next().await {
             match msg.expect("no ws error") {
@@ -12467,8 +13417,7 @@ mod form_endpoint_tests {
         let canvas_path = write_test_canvas(FORM_CANVAS);
         let addr = spawn_test_server(canvas_path.clone()).await;
 
-        let (status, body) =
-            get(addr, "/api/form/fields?nodeId=config&block=pick-region").await;
+        let (status, body) = get(addr, "/api/form/fields?nodeId=config&block=pick-region").await;
         assert_eq!(status, 200, "unexpected body: {body}");
         let resp: serde_json::Value = serde_json::from_str(&body).expect("valid response JSON");
         assert_eq!(resp["send"], "Apply");
@@ -12558,7 +13507,10 @@ mod form_endpoint_tests {
         // A node-scoped var is implicitly `session` -- `submit_form` must
         // never persist it the way `POST /api/vars/configure` would.
         let cache_path = meshfox_core::varcache::cache_path(&canvas_path);
-        assert!(!cache_path.exists(), "REGION should never reach the on-disk cache");
+        assert!(
+            !cache_path.exists(),
+            "REGION should never reach the on-disk cache"
+        );
 
         let _ = std::fs::remove_file(&canvas_path);
     }
@@ -12674,7 +13626,10 @@ mod form_endpoint_tests {
         // value — a real completed run already sitting in the registry
         // before the form is ever touched, same as the bug report.
         let events = run_ws_events(addr, &[("path", "config"), ("block", "table")]).await;
-        assert_eq!(events[0]["type"], "started", "unexpected events: {events:?}");
+        assert_eq!(
+            events[0]["type"], "started",
+            "unexpected events: {events:?}"
+        );
 
         // Submit a *new* value, then subscribe immediately — no delay —
         // so this reliably races `table`'s own slow `wait` dependency,
@@ -12687,9 +13642,11 @@ mod form_endpoint_tests {
         .await;
         assert_eq!(status, 200, "unexpected body: {body}");
 
-        let sub_body =
-            subscribe_ws_body(addr, "/api/run/subscribe?nodeId=config&block=table&sinceSeq=0")
-                .await;
+        let sub_body = subscribe_ws_body(
+            addr,
+            "/api/run/subscribe?nodeId=config&block=table&sinceSeq=0",
+        )
+        .await;
         assert!(
             sub_body.contains(r#""text":"value is new""#),
             "a subscriber that raced the slow dependency should still see the fresh run's own output: {sub_body}"
@@ -12896,7 +13853,10 @@ mod syntax_endpoint_tests {
     /// otherwise race on (and pollute each other's view of) the same
     /// `.meshfox/syntax/` folder under parallel test execution.
     fn write_test_canvas(contents: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("meshfox-syntax-endpoint-test-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-syntax-endpoint-test-{}",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("root.canvas.md");
         std::fs::write(&path, contents).unwrap();
@@ -12922,7 +13882,8 @@ mod syntax_endpoint_tests {
     }
 
     const CANVAS: &str = "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n";
-    const TINY_TMLANGUAGE: &str = r#"{"scopeName": "source.meshfox-endpoint-test", "name": "Meshfox Endpoint Test"}"#;
+    const TINY_TMLANGUAGE: &str =
+        r#"{"scopeName": "source.meshfox-endpoint-test", "name": "Meshfox Endpoint Test"}"#;
 
     /// Only exercises the *local* `.meshfox/syntax/` directory — the
     /// global `~/.meshfox/syntax/` one shares the exact same
@@ -12997,7 +13958,8 @@ mod service_endpoint_tests {
         // session database out from under it (a real, observed source of
         // cross-test flakiness once more than a couple of tests here
         // started exercising locks concurrently).
-        let dir = std::env::temp_dir().join(format!("meshfox-services-test-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("meshfox-services-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("doc.canvas.md");
         std::fs::write(&path, contents).unwrap();
@@ -13034,11 +13996,23 @@ mod service_endpoint_tests {
     /// the real server for this canvas starts (same "any conflict is shown,
     /// never silently resolved" principle the old file-lock mechanism
     /// already established, now automated instead of manual).
-    fn seed_stale_service_row(canvas_path: &std::path::Path, node_id: &str, block: &str, pid: u32, owner: &str) {
+    fn seed_stale_service_row(
+        canvas_path: &std::path::Path,
+        node_id: &str,
+        block: &str,
+        pid: u32,
+        owner: &str,
+    ) {
         let conn = crate::session_db::open(canvas_path).unwrap();
         let ledger = crate::run_ledger::RunLedger::from_connection(conn).unwrap();
         ledger
-            .start(node_id, block, crate::run_ledger::RunKind::Service, owner, pid)
+            .start(
+                node_id,
+                block,
+                crate::run_ledger::RunKind::Service,
+                owner,
+                pid,
+            )
             .unwrap();
     }
 
@@ -13155,18 +14129,28 @@ mod service_endpoint_tests {
         let addr = spawn_test_server(canvas_path.clone()).await;
 
         let events1 = run_ws_events(addr, &[("block", "srv")]).await;
-        assert_eq!(events1[0]["type"], "started", "unexpected events: {events1:?}");
+        assert_eq!(
+            events1[0]["type"], "started",
+            "unexpected events: {events1:?}"
+        );
         let (_, list1) = get(addr, "/api/services").await;
         let pid1 = serde_json::from_str::<Vec<serde_json::Value>>(&list1).unwrap()[0]["pid"]
             .as_u64()
             .unwrap();
 
         let events2 = run_ws_events(addr, &[("block", "srv")]).await;
-        assert_eq!(events2[0]["type"], "started", "unexpected events: {events2:?}");
+        assert_eq!(
+            events2[0]["type"], "started",
+            "unexpected events: {events2:?}"
+        );
         let (_, list2) = get(addr, "/api/services").await;
         let services2: Vec<serde_json::Value> = serde_json::from_str(&list2).unwrap();
         assert_eq!(services2.len(), 1, "must not spawn a duplicate instance");
-        assert_eq!(services2[0]["pid"].as_u64().unwrap(), pid1, "same pid, not restarted");
+        assert_eq!(
+            services2[0]["pid"].as_u64().unwrap(),
+            pid1,
+            "same pid, not restarted"
+        );
 
         let _ = post_json(
             addr,
@@ -13283,7 +14267,10 @@ mod service_endpoint_tests {
         // claimed *before* any step actually runs — the socket still
         // opens (a browser `WebSocket` can't read a pre-upgrade status),
         // but the very first message is a `lock-conflict`, not `started`.
-        assert_eq!(events[0]["type"], "lock-conflict", "unexpected events: {events:?}");
+        assert_eq!(
+            events[0]["type"], "lock-conflict",
+            "unexpected events: {events:?}"
+        );
         assert_eq!(events[0]["nodeId"], "root");
         assert_eq!(events[0]["block"], "srv");
         assert_eq!(events[0]["ownerPid"], dummy.id());
@@ -13333,7 +14320,10 @@ mod service_endpoint_tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         let _ = dummy.wait();
-        assert!(reaped, "force-start should have killed the stale dummy owner (pid {dummy_pid})");
+        assert!(
+            reaped,
+            "force-start should have killed the stale dummy owner (pid {dummy_pid})"
+        );
 
         let _ = post_json(
             addr,
@@ -13352,7 +14342,10 @@ mod debug_endpoint_tests {
     use tokio::net::TcpStream;
 
     fn write_test_canvas(contents: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("meshfox-debug-endpoint-test-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-debug-endpoint-test-{}",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("doc.canvas.md");
         std::fs::write(&path, contents).unwrap();
@@ -13463,12 +14456,8 @@ mod debug_endpoint_tests {
         let canvas_path = write_test_canvas(DEBUG_CANVAS);
         let addr = spawn_test_server(canvas_path.clone()).await;
 
-        let (status, _) = post_json(
-            addr,
-            "/api/debug/start",
-            r#"{"nodeId":"nope","vars":{}}"#,
-        )
-        .await;
+        let (status, _) =
+            post_json(addr, "/api/debug/start", r#"{"nodeId":"nope","vars":{}}"#).await;
         assert_eq!(status, 404);
 
         cleanup(&canvas_path);
@@ -13497,7 +14486,9 @@ mod run_lock_tests {
     /// than just collecting everything to the end.
     async fn connect_run_ws(addr: SocketAddr, query: &str) -> TestSocket {
         let url = format!("ws://{addr}/api/run?{query}");
-        let (ws, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+        let (ws, _) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("connect");
         ws
     }
 
@@ -13528,7 +14519,9 @@ mod run_lock_tests {
     /// `SubscribeEvent` text frame until the socket closes.
     async fn subscribe_ws_events(addr: SocketAddr, query: &str) -> Vec<serde_json::Value> {
         let url = format!("ws://{addr}{query}");
-        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("connect");
         let mut events = Vec::new();
         while let Some(msg) = ws.next().await {
             match msg.expect("no ws error") {
@@ -13549,7 +14542,8 @@ mod run_lock_tests {
         // running tests is a real cross-test-flakiness hazard once more
         // than a couple of tests touch locks at once (this whole module's
         // entire point).
-        let dir = std::env::temp_dir().join(format!("meshfox-run-lock-test-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("meshfox-run-lock-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("doc.canvas.md");
         std::fs::write(&path, contents).unwrap();
@@ -13576,11 +14570,23 @@ mod run_lock_tests {
 
     /// See `service_endpoint_tests::seed_stale_service_row` — identical,
     /// just duplicated per this module's own existing convention.
-    fn seed_stale_service_row(canvas_path: &std::path::Path, node_id: &str, block: &str, pid: u32, owner: &str) {
+    fn seed_stale_service_row(
+        canvas_path: &std::path::Path,
+        node_id: &str,
+        block: &str,
+        pid: u32,
+        owner: &str,
+    ) {
         let conn = crate::session_db::open(canvas_path).unwrap();
         let ledger = crate::run_ledger::RunLedger::from_connection(conn).unwrap();
         ledger
-            .start(node_id, block, crate::run_ledger::RunKind::Service, owner, pid)
+            .start(
+                node_id,
+                block,
+                crate::run_ledger::RunKind::Service,
+                owner,
+                pid,
+            )
             .unwrap();
     }
 
@@ -13725,7 +14731,10 @@ mod run_lock_tests {
 
         let addr = spawn_test_server(canvas_path.clone()).await;
         let events = run_ws_events(addr, "block=slow").await;
-        assert_eq!(events[0]["type"], "lock-conflict", "unexpected events: {events:?}");
+        assert_eq!(
+            events[0]["type"], "lock-conflict",
+            "unexpected events: {events:?}"
+        );
         assert_eq!(events[0]["nodeId"], "root");
         assert_eq!(events[0]["block"], "slow");
         assert_eq!(events[0]["ownerPid"], std::process::id());
@@ -13751,14 +14760,20 @@ mod run_lock_tests {
         let addr = spawn_test_server(canvas_path.clone()).await;
 
         let events = run_ws_events(addr, "block=slow").await;
-        assert_eq!(events[0]["type"], "started", "unexpected events: {events:?}");
+        assert_eq!(
+            events[0]["type"], "started",
+            "unexpected events: {events:?}"
+        );
 
         // The first run has already fully completed (`run_ws_events` only
         // returns once the socket closes, i.e. after `Done`) — its own
         // execution-scoped lock must already be released, so a fresh run
         // right after succeeds rather than conflicting with itself.
         let events = run_ws_events(addr, "block=slow").await;
-        assert_eq!(events[0]["type"], "started", "unexpected events: {events:?}");
+        assert_eq!(
+            events[0]["type"], "started",
+            "unexpected events: {events:?}"
+        );
         assert!(events.iter().any(|e| e["type"] == "done"));
 
         cleanup(&canvas_path);
@@ -13777,7 +14792,10 @@ mod run_lock_tests {
 
         let addr = spawn_test_server(canvas_path.clone()).await;
         let events = run_ws_events(addr, "block=slow").await;
-        assert_eq!(events[0]["type"], "lock-conflict", "unexpected events: {events:?}");
+        assert_eq!(
+            events[0]["type"], "lock-conflict",
+            "unexpected events: {events:?}"
+        );
         assert_eq!(events[0]["ownerPid"], dummy_pid);
 
         let url = reqwest::Url::parse_with_params(
@@ -13796,7 +14814,9 @@ mod run_lock_tests {
         while let Some(msg) = ws.next().await {
             match msg.expect("no ws error") {
                 WsMessage::Text(t) => {
-                    events.push(serde_json::from_str::<serde_json::Value>(&t).expect("valid RunEvent JSON"));
+                    events.push(
+                        serde_json::from_str::<serde_json::Value>(&t).expect("valid RunEvent JSON"),
+                    );
                 }
                 WsMessage::Close(_) => break,
                 _ => continue,
@@ -13838,7 +14858,8 @@ mod run_lock_tests {
         };
         assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
         let body = resp.body().clone().unwrap_or_default();
-        let conflict: serde_json::Value = serde_json::from_slice(&body).expect("valid LockConflict JSON");
+        let conflict: serde_json::Value =
+            serde_json::from_slice(&body).expect("valid LockConflict JSON");
         assert_eq!(conflict["ownerPid"], dummy_pid);
 
         let force_url = reqwest::Url::parse_with_params(
@@ -13875,8 +14896,7 @@ mod run_lock_tests {
         // upgrades (a browser `WebSocket` can't read a pre-upgrade
         // status), but closes immediately with zero messages.
         let events =
-            subscribe_ws_events(addr, "/api/run/subscribe?nodeId=root&block=slow&sinceSeq=0")
-                .await;
+            subscribe_ws_events(addr, "/api/run/subscribe?nodeId=root&block=slow&sinceSeq=0").await;
         assert!(events.is_empty(), "expected no events, got: {events:?}");
 
         cleanup(&canvas_path);
@@ -13895,10 +14915,11 @@ mod run_lock_tests {
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;
 
         let sub_events =
-            subscribe_ws_events(addr, "/api/run/subscribe?nodeId=root&block=slow&sinceSeq=0")
-                .await;
+            subscribe_ws_events(addr, "/api/run/subscribe?nodeId=root&block=slow&sinceSeq=0").await;
         assert!(
-            sub_events.iter().any(|e| e["type"] == "line" && e["text"] == "done"),
+            sub_events
+                .iter()
+                .any(|e| e["type"] == "line" && e["text"] == "done"),
             "expected the block's own output line replayed/tailed, got: {sub_events:?}"
         );
         assert!(
@@ -13929,14 +14950,13 @@ mod run_lock_tests {
         // the socket closes, i.e. after `done`) — its `RunHandle` should
         // still be sitting in the registry with its buffered log intact.
         let sub_events =
-            subscribe_ws_events(addr, "/api/run/subscribe?nodeId=root&block=slow&sinceSeq=0")
-                .await;
-        assert!(sub_events.iter().any(|e| e["type"] == "line" && e["text"] == "done"));
-        assert!(
-            sub_events
-                .iter()
-                .any(|e| e["type"] == "done" && e["outcome"] == "exited")
-        );
+            subscribe_ws_events(addr, "/api/run/subscribe?nodeId=root&block=slow&sinceSeq=0").await;
+        assert!(sub_events
+            .iter()
+            .any(|e| e["type"] == "line" && e["text"] == "done"));
+        assert!(sub_events
+            .iter()
+            .any(|e| e["type"] == "done" && e["outcome"] == "exited"));
         // Regression test: `SubscribeEvent` used to derive `rename_all =
         // "camelCase"` alone, which (unlike `RunEvent`'s own combo further
         // up this file) only renames the *variant* tag on an enum, not the
@@ -13970,12 +14990,8 @@ mod run_lock_tests {
         let run = tokio::spawn(async move { run_ws_events(addr, "block=slow").await });
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;
 
-        let (kill_status, _) = post_json(
-            addr,
-            "/api/kill",
-            r#"{"nodeId":"root","block":"slow"}"#,
-        )
-        .await;
+        let (kill_status, _) =
+            post_json(addr, "/api/kill", r#"{"nodeId":"root","block":"slow"}"#).await;
         assert_eq!(kill_status, 204);
 
         let run_events = run.await.unwrap();
@@ -14094,7 +15110,10 @@ mod node_block_and_reorder_endpoint_tests {
         .expect("update should succeed");
         let node = updated.node("root").unwrap();
         let blocks = meshfox_core::scan_runnable_blocks("root", &node.text);
-        let block = blocks.iter().find(|b| b.name.as_deref() == Some("hi")).unwrap();
+        let block = blocks
+            .iter()
+            .find(|b| b.name.as_deref() == Some("hi"))
+            .unwrap();
         assert!(block.cache);
 
         let _ = std::fs::remove_file(&canvas_path);
@@ -14122,7 +15141,10 @@ mod node_block_and_reorder_endpoint_tests {
         .expect("update should succeed");
         let node = updated.node("root").unwrap();
         let blocks = meshfox_core::scan_runnable_blocks("root", &node.text);
-        let block_b = blocks.iter().find(|b| b.name.as_deref() == Some("b")).unwrap();
+        let block_b = blocks
+            .iter()
+            .find(|b| b.name.as_deref() == Some("b"))
+            .unwrap();
         assert_eq!(block_b.deps.len(), 1);
         assert_eq!(block_b.deps[0].block_name, "a");
 
@@ -14137,7 +15159,10 @@ mod node_block_and_reorder_endpoint_tests {
         .expect("clear should succeed");
         let node = cleared.node("root").unwrap();
         let blocks = meshfox_core::scan_runnable_blocks("root", &node.text);
-        let block_b = blocks.iter().find(|b| b.name.as_deref() == Some("b")).unwrap();
+        let block_b = blocks
+            .iter()
+            .find(|b| b.name.as_deref() == Some("b"))
+            .unwrap();
         assert!(block_b.deps.is_empty());
 
         let _ = std::fs::remove_file(&canvas_path);
@@ -14202,7 +15227,10 @@ mod node_block_and_reorder_endpoint_tests {
         let ids: Vec<&str> = updated.nodes.iter().map(|n| n.id.as_str()).collect();
         let pos_a = ids.iter().position(|&id| id == "a").unwrap();
         let pos_b = ids.iter().position(|&id| id == "b").unwrap();
-        assert!(pos_a < pos_b, "expected a (y=-100) before b (y=0), got {ids:?}");
+        assert!(
+            pos_a < pos_b,
+            "expected a (y=-100) before b (y=0), got {ids:?}"
+        );
 
         let _ = std::fs::remove_file(&canvas_path);
     }

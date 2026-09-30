@@ -26,8 +26,8 @@ use ratatui_image::picker::cap_parser::QueryStdioOptions;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::Protocol;
 
-use super::ui;
 use super::spatial;
+use super::ui;
 
 use super::markdown::{self, ClickRegion, ClickTarget, Highlighter, Segment};
 use super::source_editor::{self, SourceEditorOutcome, SourceEditorState};
@@ -788,8 +788,14 @@ pub struct InlineFormState {
 /// existing `reload_rx`/output-line channels) — never sent at all on
 /// failure, see `App::link_preview_requested`'s own doc comment.
 pub enum LinkPreviewMsg {
-    Meta { url: String, meta: PreviewMeta },
-    Image { url: String, image: image::DynamicImage },
+    Meta {
+        url: String,
+        meta: PreviewMeta,
+    },
+    Image {
+        url: String,
+        image: image::DynamicImage,
+    },
 }
 
 /// A non-secret declaration's currently-resolved value with no overrides
@@ -852,7 +858,11 @@ fn initial_field_input(
     // suggestion unchanged -- a `select` falling back to its first choice,
     // or a `bool` coerced from something that isn't literally "true"/
     // "false", isn't really showing the shared value at all.
-    let origin = if suggestion.as_deref() == Some(value.as_str()) { origin } else { None };
+    let origin = if suggestion.as_deref() == Some(value.as_str()) {
+        origin
+    } else {
+        None
+    };
     (value, origin)
 }
 
@@ -899,11 +909,19 @@ fn var_form_from_statuses(missing: Vec<crate::worker_client::VarStatus>) -> VarF
         inputs.push(status.value.clone().unwrap_or_default());
         origins.push(status.inherited_from.clone().map(|o| match o {
             crate::worker_client::VarOrigin::Project => meshfox_core::SharedOrigin::Project,
-            crate::worker_client::VarOrigin::Global { path } => meshfox_core::SharedOrigin::Global { path },
+            crate::worker_client::VarOrigin::Global { path } => {
+                meshfox_core::SharedOrigin::Global { path }
+            }
         }));
         decls.push(var_decl_from_status(status));
     }
-    VarFormState { decls, inputs, origins, selected: 0, configuring: false }
+    VarFormState {
+        decls,
+        inputs,
+        origins,
+        selected: 0,
+        configuring: false,
+    }
 }
 
 impl App {
@@ -918,7 +936,11 @@ impl App {
         let raw = match worker_port {
             Some(port) => match crate::worker_client::get_canvas_raw(port).await {
                 Ok(raw) => raw,
-                Err(e) => return Err(io::Error::other(format!("failed to load canvas from worker on port {port}: {e}"))),
+                Err(e) => {
+                    return Err(io::Error::other(format!(
+                        "failed to load canvas from worker on port {port}: {e}"
+                    )))
+                }
             },
             #[cfg(test)]
             None => std::fs::read_to_string(&canvas_path)?,
@@ -1026,7 +1048,11 @@ impl App {
             pending_autoruns: std::collections::VecDeque::new(),
         };
         if let Some(target) = initial_node {
-            if let Some(idx) = app.rows.iter().position(|r| r.node_id == target) {
+            if let Some(idx) = app
+                .rows
+                .iter()
+                .position(|r| r.reference.is_none() && r.node_id == target)
+            {
                 app.selected = idx;
             }
         }
@@ -1175,7 +1201,9 @@ impl App {
                     self.expand_selected();
                 }
             }
-            KeyCode::Char('a') if self.focus == Focus::Tree && spatial::active_spatial_parent(self).is_some() => {
+            KeyCode::Char('a')
+                if self.focus == Focus::Tree && spatial::active_spatial_parent(self).is_some() =>
+            {
                 self.show_all_map_edges = !self.show_all_map_edges;
             }
             KeyCode::Char('r') => self.trigger_run(true).await,
@@ -1379,9 +1407,11 @@ impl App {
             let Some(decl) = self.decls.iter().find(|d| d.name == field.var) else {
                 continue;
             };
-            let input = self.session_vars.get(&field.var).cloned().unwrap_or_else(|| {
-                initial_field_input(decl, &self.var_cache, &shared).0
-            });
+            let input = self
+                .session_vars
+                .get(&field.var)
+                .cloned()
+                .unwrap_or_else(|| initial_field_input(decl, &self.var_cache, &shared).0);
             fields.push(field);
             decls.push(decl.clone());
             inputs.push(input);
@@ -1429,8 +1459,7 @@ impl App {
                 }
             }
             _ => {
-                self.status =
-                    "more than one form in this node — click the one you want".into();
+                self.status = "more than one form in this node — click the one you want".into();
             }
         }
     }
@@ -1441,7 +1470,9 @@ impl App {
     /// once, and with an extra virtual "Send" position
     /// (`selected == fields.len()`) `Tab`/arrows can land on.
     async fn on_inline_form_key(&mut self, key: KeyEvent) {
-        let Some(form) = &self.active_inline_form else { return };
+        let Some(form) = &self.active_inline_form else {
+            return;
+        };
         let send_idx = form.fields.len();
         match key.code {
             KeyCode::Enter => self.submit_inline_form().await,
@@ -1510,7 +1541,9 @@ impl App {
     /// A no-op when the virtual "Send" row (`selected == fields.len()`) is
     /// focused — nothing to cycle there.
     fn cycle_inline_form_field(&mut self, dir: i32) {
-        let Some(form) = &mut self.active_inline_form else { return };
+        let Some(form) = &mut self.active_inline_form else {
+            return;
+        };
         let i = form.selected;
         if i >= form.decls.len() {
             return;
@@ -1557,7 +1590,9 @@ impl App {
     /// the rest.
     async fn submit_inline_form(&mut self) {
         {
-            let Some(form) = &self.active_inline_form else { return };
+            let Some(form) = &self.active_inline_form else {
+                return;
+            };
             if let Some((i, e)) = form
                 .decls
                 .iter()
@@ -1571,7 +1606,9 @@ impl App {
                 return;
             }
         }
-        let Some(form) = &self.active_inline_form else { return };
+        let Some(form) = &self.active_inline_form else {
+            return;
+        };
         let mut changed = HashSet::new();
         let mut values = HashMap::new();
         for (field, value) in form.fields.iter().zip(form.inputs.iter()) {
@@ -1600,12 +1637,17 @@ impl App {
         // a *second* time, against a canvas snapshot that never actually
         // saw the new value.
         if let Some(port) = self.worker_port {
-            match crate::worker_client::submit_form(port, &form_node_id, &form_block_name, values).await {
+            match crate::worker_client::submit_form(port, &form_node_id, &form_block_name, values)
+                .await
+            {
                 Ok(triggered) => {
                     self.status = if triggered.is_empty() {
                         "meshfox: form submitted".into()
                     } else {
-                        format!("meshfox: form submitted — {} autorun block(s) started", triggered.len())
+                        format!(
+                            "meshfox: form submitted — {} autorun block(s) started",
+                            triggered.len()
+                        )
                     };
                     // Nothing further to do here: `spawn_worker_watcher`/
                     // `on_external_run_event` (already built to show any
@@ -1622,7 +1664,8 @@ impl App {
             return;
         }
 
-        let triggered = meshfox_core::autorun_blocks_for_changed_vars(&self.display_canvas, &changed);
+        let triggered =
+            meshfox_core::autorun_blocks_for_changed_vars(&self.display_canvas, &changed);
         let count = triggered.len();
         self.pending_autoruns.extend(triggered);
         self.status = if count == 0 {
@@ -1763,12 +1806,24 @@ impl App {
                         // its now-relocated/shrunk title row to complete
                         // the fullscreen toggle. `z` (keyboard) is now the
                         // only way to collapse Tree by hand.
-                        self.toggle_fullscreen_on_title_click(Focus::Tree, layout.tree, &mouse, is_double_click);
+                        self.toggle_fullscreen_on_title_click(
+                            Focus::Tree,
+                            layout.tree,
+                            &mouse,
+                            is_double_click,
+                        );
                         let inner_x = layout.tree.x + 1; // left border
                         let inner_y = layout.tree.y + 1; // top border
-                        let map_area = Rect::new(inner_x, inner_y, layout.tree.width.saturating_sub(2), layout.tree.height.saturating_sub(4));
+                        let map_area = Rect::new(
+                            inner_x,
+                            inner_y,
+                            layout.tree.width.saturating_sub(2),
+                            layout.tree.height.saturating_sub(4),
+                        );
                         if spatial::active_spatial_parent(self).is_some() {
-                            if let Some(id) = spatial::hit_test(self, map_area, mouse.column, mouse.row) {
+                            if let Some(id) =
+                                spatial::hit_test(self, map_area, mouse.column, mouse.row)
+                            {
                                 self.jump_to_node(&id);
                                 if is_double_click {
                                     self.trigger_run(true).await;
@@ -1794,13 +1849,23 @@ impl App {
                                 if on_disclosure {
                                     self.toggle_expand();
                                 } else if is_double_click {
-                                    self.trigger_run(true).await;
+                                    if self.rows[self.selected].reference.is_some() {
+                                        let target = self.rows[self.selected].node_id.clone();
+                                        self.jump_to_node(&target);
+                                    } else {
+                                        self.trigger_run(true).await;
+                                    }
                                 }
                             }
                         }
                     }
                 } else if point_in(layout.document, mouse.column, mouse.row) {
-                    self.toggle_fullscreen_on_title_click(Focus::Document, layout.document, &mouse, is_double_click);
+                    self.toggle_fullscreen_on_title_click(
+                        Focus::Document,
+                        layout.document,
+                        &mouse,
+                        is_double_click,
+                    );
                     let target = self
                         .doc_click_targets
                         .iter()
@@ -1829,7 +1894,12 @@ impl App {
                         // (keyboard) or just waiting out
                         // `CONSOLE_COLLAPSE_GRACE` after a run finishes are
                         // now the only ways back to the collapsed strip.
-                        self.toggle_fullscreen_on_title_click(Focus::Output, layout.output, &mouse, is_double_click);
+                        self.toggle_fullscreen_on_title_click(
+                            Focus::Output,
+                            layout.output,
+                            &mouse,
+                            is_double_click,
+                        );
                     }
                 }
             }
@@ -1877,7 +1947,10 @@ impl App {
     /// own exact block already).
     async fn activate_click_target(&mut self, target: ClickTarget) {
         match target {
-            ClickTarget::RunBlock { node_id, block_name } => {
+            ClickTarget::RunBlock {
+                node_id,
+                block_name,
+            } => {
                 if self.run.as_ref().is_some_and(|r| !r.finished)
                     || self.file_run.as_ref().is_some_and(|r| !r.finished)
                 {
@@ -1887,7 +1960,11 @@ impl App {
                 self.start_run(node_id, block_name, true).await;
             }
             ClickTarget::JumpToNode { node_id } => self.jump_to_node(&node_id),
-            ClickTarget::FormField { node_id, block_name, field_index } => {
+            ClickTarget::FormField {
+                node_id,
+                block_name,
+                field_index,
+            } => {
                 self.ensure_inline_form_open(&node_id, &block_name);
                 if let Some(form) = &mut self.active_inline_form {
                     if field_index < form.fields.len() {
@@ -1897,7 +1974,10 @@ impl App {
                 }
                 self.render_current_document();
             }
-            ClickTarget::FormSend { node_id, block_name } => {
+            ClickTarget::FormSend {
+                node_id,
+                block_name,
+            } => {
                 self.ensure_inline_form_open(&node_id, &block_name);
                 self.submit_inline_form().await;
             }
@@ -1973,7 +2053,8 @@ impl App {
         if self.fullscreen.is_some() {
             return None;
         }
-        let in_tree_document_rows = row >= layout.tree.y && row < layout.tree.y + layout.tree.height;
+        let in_tree_document_rows =
+            row >= layout.tree.y && row < layout.tree.y + layout.tree.height;
         if in_tree_document_rows && (col == layout.document.x || col + 1 == layout.document.x) {
             return Some(ResizeDrag::Vertical);
         }
@@ -2034,7 +2115,11 @@ impl App {
         if self.rows.is_empty() {
             return;
         }
-        let direction = if delta < 0 { spatial::Direction::Up } else { spatial::Direction::Down };
+        let direction = if delta < 0 {
+            spatial::Direction::Up
+        } else {
+            spatial::Direction::Down
+        };
         if self.move_spatial_selection(direction) {
             return;
         }
@@ -2063,10 +2148,16 @@ impl App {
     /// Returns true whenever the spatial pane owns the key, including when
     /// there is no card farther in that direction.
     fn move_spatial_selection(&mut self, direction: spatial::Direction) -> bool {
-        let Some(parent_id) = spatial::active_spatial_parent(self) else { return false; };
+        let Some(parent_id) = spatial::active_spatial_parent(self) else {
+            return false;
+        };
         let current = &self.rows[self.selected].node_id;
         if let Some(id) = spatial::neighbor(&self.display_canvas, &parent_id, current, direction) {
-            if let Some(index) = self.rows.iter().position(|row| row.node_id == id) {
+            if let Some(index) = self
+                .rows
+                .iter()
+                .position(|row| row.reference.is_none() && row.node_id == id)
+            {
                 if index != self.selected {
                     self.selected = index;
                     self.doc_scroll = 0;
@@ -2081,7 +2172,9 @@ impl App {
     /// folding its parent. Keeping it expanded would expose the same cards
     /// again as ordinary tree rows and make moving past the group tedious.
     fn exit_spatial_parent(&mut self) -> bool {
-        let Some(group_id) = spatial::active_spatial_parent(self) else { return false; };
+        let Some(group_id) = spatial::active_spatial_parent(self) else {
+            return false;
+        };
         self.expanded.remove(&group_id);
         self.rebuild_rows();
         self.jump_to_node(&group_id);
@@ -2119,7 +2212,10 @@ impl App {
     /// `ClickTarget::JumpToNode`'s own doc comment.
     fn jump_to_node(&mut self, node_id: &str) {
         let mut expanded_any = false;
-        let mut current = self.display_canvas.node(node_id).and_then(|n| n.parent.clone());
+        let mut current = self
+            .display_canvas
+            .node(node_id)
+            .and_then(|n| n.parent.clone());
         while let Some(id) = current {
             current = self.display_canvas.node(&id).and_then(|n| n.parent.clone());
             if self.expanded.insert(id) {
@@ -2129,7 +2225,11 @@ impl App {
         if expanded_any {
             self.rebuild_rows();
         }
-        if let Some(idx) = self.rows.iter().position(|r| r.node_id == node_id) {
+        if let Some(idx) = self
+            .rows
+            .iter()
+            .position(|r| r.reference.is_none() && r.node_id == node_id)
+        {
             if idx != self.selected {
                 self.selected = idx;
                 self.doc_scroll = 0;
@@ -2145,7 +2245,13 @@ impl App {
     /// `Line::right_aligned`) or was a double-click anywhere else on that
     /// same title row — toggles `fullscreen` for it, same as pressing `f`
     /// while it's focused would.
-    fn toggle_fullscreen_on_title_click(&mut self, pane: Focus, rect: Rect, mouse: &MouseEvent, is_double_click: bool) {
+    fn toggle_fullscreen_on_title_click(
+        &mut self,
+        pane: Focus,
+        rect: Rect,
+        mouse: &MouseEvent,
+        is_double_click: bool,
+    ) {
         self.set_focus(pane);
         let icon_start = rect
             .x
@@ -2157,7 +2263,11 @@ impl App {
             && mouse.column < icon_start + ui::FULLSCREEN_ICON_WIDTH;
         let toggled = on_icon || (is_double_click && hit_title_row);
         if toggled {
-            self.fullscreen = if self.fullscreen == Some(pane) { None } else { Some(pane) };
+            self.fullscreen = if self.fullscreen == Some(pane) {
+                None
+            } else {
+                Some(pane)
+            };
         }
     }
 
@@ -2165,6 +2275,11 @@ impl App {
         let Some(row) = self.rows.get(self.selected) else {
             return;
         };
+        if row.reference.is_some() {
+            let target = row.node_id.clone();
+            self.jump_to_node(&target);
+            return;
+        }
         if !row.has_children {
             return;
         }
@@ -2180,6 +2295,11 @@ impl App {
         let Some(row) = self.rows.get(self.selected) else {
             return;
         };
+        if row.reference.is_some() {
+            let target = row.node_id.clone();
+            self.jump_to_node(&target);
+            return;
+        }
         if row.has_children && !row.expanded {
             self.expanded.insert(row.node_id.clone());
             self.rebuild_rows();
@@ -2209,9 +2329,27 @@ impl App {
     }
 
     fn rebuild_rows(&mut self) {
-        let current_id = self.rows.get(self.selected).map(|r| r.node_id.clone());
+        let current = self.rows.get(self.selected).map(|row| {
+            (
+                row.node_id.clone(),
+                row.reference
+                    .as_ref()
+                    .map(|reference| (reference.source_id.clone(), reference.edge_index)),
+            )
+        });
         self.rows = tree::flatten(&self.display_canvas, &self.expanded);
-        match current_id.and_then(|id| self.rows.iter().position(|r| r.node_id == id)) {
+        match current.and_then(|(id, reference)| {
+            self.rows.iter().position(|row| {
+                row.node_id == id
+                    && match (&row.reference, &reference) {
+                        (None, None) => true,
+                        (Some(found), Some((source, index))) => {
+                            found.source_id == *source && found.edge_index == *index
+                        }
+                        _ => false,
+                    }
+            })
+        }) {
             Some(pos) => self.selected = pos,
             None => self.selected = self.selected.min(self.rows.len().saturating_sub(1)),
         }
@@ -2388,7 +2526,11 @@ impl App {
         // case.
         let cursor = local_id
             .as_deref()
-            .zip(if path == self.canvas_path { Some(self.raw.clone()) } else { std::fs::read_to_string(&path).ok() })
+            .zip(if path == self.canvas_path {
+                Some(self.raw.clone())
+            } else {
+                std::fs::read_to_string(&path).ok()
+            })
             .and_then(|(id, raw)| {
                 mdcanvas::node_body_offset(&raw, id)
                     .map(|off| source_editor::byte_offset_to_cursor(&raw, off))
@@ -2399,13 +2541,25 @@ impl App {
             .display_canvas
             .nodes
             .iter()
-            .flat_map(|n| n.tags.iter().chain(n.extra_parents.iter().flat_map(|e| e.tags.iter())))
+            .flat_map(|n| {
+                n.tags
+                    .iter()
+                    .chain(n.extra_parents.iter().flat_map(|e| e.tags.iter()))
+            })
             .cloned()
             .collect();
         all_tags.sort();
         all_tags.dedup();
 
-        match SourceEditorState::open(self.canvas_path.clone(), path, is_canvas, cursor, files, all_tags, self.raw.clone()) {
+        match SourceEditorState::open(
+            self.canvas_path.clone(),
+            path,
+            is_canvas,
+            cursor,
+            files,
+            all_tags,
+            self.raw.clone(),
+        ) {
             Ok(state) => self.source_editor = Some(state),
             Err(e) => self.status = format!("failed to open source editor: {e}"),
         }
@@ -2443,14 +2597,20 @@ impl App {
         let is_primary = path == self.canvas_path;
         let write_result = if is_canvas {
             let port = if is_primary {
-                self.worker_port.ok_or_else(|| "no worker for primary canvas".to_string())
+                self.worker_port
+                    .ok_or_else(|| "no worker for primary canvas".to_string())
             } else {
-                crate::coordinator::get_or_spawn(&path).await.map_err(|e| e.to_string())
+                crate::coordinator::get_or_spawn(&path)
+                    .await
+                    .map_err(|e| e.to_string())
             };
             match port {
                 Ok(port) => match crate::worker_client::put_canvas_raw(port, &text).await {
                     Ok(()) => match crate::worker_client::get_canvas_raw(port).await {
-                        Ok(saved) => { text = saved; Ok(()) }
+                        Ok(saved) => {
+                            text = saved;
+                            Ok(())
+                        }
                         Err(e) => Err(format!("saved, but failed to reload: {e}")),
                     },
                     Err(e) => Err(e),
@@ -2458,7 +2618,8 @@ impl App {
                 Err(e) => Err(e),
             }
         } else {
-            std::fs::write(&path, &text).map_err(|e| format!("failed to write {}: {e}", path.display()))
+            std::fs::write(&path, &text)
+                .map_err(|e| format!("failed to write {}: {e}", path.display()))
         };
         if let Err(e) = write_result {
             self.source_editor.as_mut().unwrap().error = Some(e);
@@ -2499,6 +2660,24 @@ impl App {
         let Some(node) = self.display_canvas.node(&row.node_id) else {
             return;
         };
+        let mut heading = Vec::new();
+        if let Some(color) = ui::tree_row_color(node.color.as_deref()) {
+            heading.push(Span::styled("● ", Style::default().fg(color)));
+        }
+        heading.push(Span::styled(
+            node.title.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        for tag in &node.tags {
+            heading.push(Span::styled(
+                format!("  #{tag}"),
+                Style::default().fg(Color::Cyan),
+            ));
+        }
+        // Keep the heading in the document's segment stream so it wraps
+        // and scrolls with the body, including file-content previews.
+        self.doc_segments
+            .push(Segment::Text(vec![Line::from(heading), Line::from("")]));
         let base_dir = self
             .canvas_path
             .parent()
@@ -2580,7 +2759,6 @@ impl App {
                 // which gets its caption for free below the link by
                 // rendering `node.text` whole) — it reads as a heading/
                 // intro for the file content, not a footnote on it.
-                self.doc_segments = Vec::new();
                 if let Some(caption) = &node.caption {
                     let (segs, regions) = markdown::render(
                         caption,
@@ -2598,13 +2776,13 @@ impl App {
                     // still point at the right entry once folded into the
                     // shared `doc_segments`/`doc_click_regions`.
                     let offset = self.doc_segments.len();
-                    self.doc_click_regions.extend(regions.into_iter().map(|mut r| {
-                        r.segment_index += offset;
-                        r
-                    }));
+                    self.doc_click_regions
+                        .extend(regions.into_iter().map(|mut r| {
+                            r.segment_index += offset;
+                            r
+                        }));
                     self.doc_segments.extend(segs);
-                    self.doc_segments
-                        .push(Segment::Text(vec![Line::from("")]));
+                    self.doc_segments.push(Segment::Text(vec![Line::from("")]));
                 }
                 self.doc_segments.extend(preview);
                 return;
@@ -2621,8 +2799,15 @@ impl App {
             form_focus,
             &live_output,
         );
-        self.doc_segments = segs;
-        self.doc_click_regions = regions;
+        let offset = self.doc_segments.len();
+        self.doc_segments.extend(segs);
+        self.doc_click_regions = regions
+            .into_iter()
+            .map(|mut r| {
+                r.segment_index += offset;
+                r
+            })
+            .collect();
 
         let images: Vec<(PathBuf, Option<u32>, Option<u32>)> = self
             .doc_segments
@@ -2861,13 +3046,27 @@ impl App {
     /// chain, same as `App::new`'s deep-link ancestor expansion already
     /// does.
     fn path_to(&self, node_id: &str) -> Vec<String> {
-        if self.display_canvas.node(node_id).and_then(|n| n.parent.clone()).is_none() {
+        if self
+            .display_canvas
+            .node(node_id)
+            .and_then(|n| n.parent.clone())
+            .is_none()
+        {
             return Vec::new();
         }
         let mut chain = vec![node_id.to_string()];
         let mut current = node_id.to_string();
-        while let Some(parent) = self.display_canvas.node(&current).and_then(|n| n.parent.clone()) {
-            if self.display_canvas.node(&parent).and_then(|n| n.parent.clone()).is_none() {
+        while let Some(parent) = self
+            .display_canvas
+            .node(&current)
+            .and_then(|n| n.parent.clone())
+        {
+            if self
+                .display_canvas
+                .node(&parent)
+                .and_then(|n| n.parent.clone())
+                .is_none()
+            {
                 break;
             }
             chain.push(parent.clone());
@@ -2894,7 +3093,12 @@ impl App {
     /// if none are `tty` at all) — a chain can touch more than one `tty`
     /// step, and the last one is the one whose own flag actually governs
     /// whether the handoff pauses at the end (see `PendingHttpTty::autoclose`).
-    fn target_chain_tty_autoclose(&self, node_id: &str, block_name: &str, with_deps: bool) -> Option<bool> {
+    fn target_chain_tty_autoclose(
+        &self,
+        node_id: &str,
+        block_name: &str,
+        with_deps: bool,
+    ) -> Option<bool> {
         let target = BlockAddr::new(node_id.to_string(), block_name.to_string());
         let chain_result = if with_deps {
             meshfox_core::deps::resolve_chain(&self.display_canvas, target)
@@ -2965,7 +3169,9 @@ impl App {
         extra_vars: HashMap<String, String>,
     ) {
         let path = self.path_to(&node_id);
-        let is_tty = self.target_chain_tty_autoclose(&node_id, &block_name, with_deps).is_some();
+        let is_tty = self
+            .target_chain_tty_autoclose(&node_id, &block_name, with_deps)
+            .is_some();
         if force.is_none() {
             match crate::worker_client::get_vars(port, &path, &block_name, !with_deps).await {
                 Ok(statuses) => {
@@ -2990,9 +3196,11 @@ impl App {
             }
         }
         if is_tty {
-            self.begin_http_tty_run(node_id, block_name, with_deps, port, extra_vars, force).await;
+            self.begin_http_tty_run(node_id, block_name, with_deps, port, extra_vars, force)
+                .await;
         } else {
-            self.begin_http_run(node_id, block_name, with_deps, port, extra_vars, force).await;
+            self.begin_http_run(node_id, block_name, with_deps, port, extra_vars, force)
+                .await;
         }
     }
 
@@ -3118,7 +3326,12 @@ impl App {
                 // peek at it here, before a `RunState` even exists, same
                 // as the old connect-time `Err` branch used to.
                 match http_rx.recv().await {
-                    Some(RunEvent::LockConflict { node_id: conflict_node, block: conflict_block, owner_pid, owner_desc }) => {
+                    Some(RunEvent::LockConflict {
+                        node_id: conflict_node,
+                        block: conflict_block,
+                        owner_pid,
+                        owner_desc,
+                    }) => {
                         self.status = format!(
                             "meshfox: {conflict_node:?}/{conflict_block:?} is locked by pid {owner_pid} ({owner_desc}) — y to kill and retry, n to cancel"
                         );
@@ -3235,18 +3448,39 @@ impl App {
                 );
                 touched = Some(addr);
             }
-            RunEvent::StepSkipped { node_id, block, output, duration_ms } => {
-                run.lines.push(format!("==> {block} (skipped, already fresh this session)"));
+            RunEvent::StepSkipped {
+                node_id,
+                block,
+                output,
+                duration_ms,
+            } => {
+                run.lines
+                    .push(format!("==> {block} (skipped, already fresh this session)"));
                 run.lines.push(output.clone());
-                run.lines.push(format!("(skipped · {})", meshfox_core::format_duration_ms(duration_ms)));
+                run.lines.push(format!(
+                    "(skipped · {})",
+                    meshfox_core::format_duration_ms(duration_ms)
+                ));
                 let addr = BlockAddr::new(node_id, block);
                 self.step_output.insert(
                     addr.clone(),
-                    StepOutput { stdout: output, stderr: String::new(), output_markdown: false, exit_code: 0, duration_ms, running: false },
+                    StepOutput {
+                        stdout: output,
+                        stderr: String::new(),
+                        output_markdown: false,
+                        exit_code: 0,
+                        duration_ms,
+                        running: false,
+                    },
                 );
                 touched = Some(addr);
             }
-            RunEvent::Output { node_id, block, stream, text } => {
+            RunEvent::Output {
+                node_id,
+                block,
+                stream,
+                text,
+            } => {
                 run.lines.push(text.clone());
                 run.full_output.push_str(&text);
                 run.full_output.push('\n');
@@ -3261,14 +3495,17 @@ impl App {
                     }
                 }
                 let addr = BlockAddr::new(node_id, block);
-                let entry = self.step_output.entry(addr.clone()).or_insert_with(|| StepOutput {
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    output_markdown: run.output_markdown,
-                    exit_code: 0,
-                    duration_ms: 0,
-                    running: true,
-                });
+                let entry = self
+                    .step_output
+                    .entry(addr.clone())
+                    .or_insert_with(|| StepOutput {
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        output_markdown: run.output_markdown,
+                        exit_code: 0,
+                        duration_ms: 0,
+                        running: true,
+                    });
                 let dest = match stream {
                     meshfox_server::stream_exec::OutputStream::Stdout => &mut entry.stdout,
                     meshfox_server::stream_exec::OutputStream::Stderr => &mut entry.stderr,
@@ -3278,10 +3515,20 @@ impl App {
                 touched = Some(addr);
             }
             RunEvent::TtyStart { .. } => {}
-            RunEvent::ServiceStarted { node_id: _, block, pid } => {
-                run.lines.push(format!("==> {block} (service started, pid {pid})"));
+            RunEvent::ServiceStarted {
+                node_id: _,
+                block,
+                pid,
+            } => {
+                run.lines
+                    .push(format!("==> {block} (service started, pid {pid})"));
             }
-            RunEvent::StepEnd { node_id, block, exit_code, duration_ms } => {
+            RunEvent::StepEnd {
+                node_id,
+                block,
+                exit_code,
+                duration_ms,
+            } => {
                 run.lines.push(format!(
                     "(exit {exit_code} · {})",
                     meshfox_core::format_duration_ms(duration_ms)
@@ -3303,7 +3550,12 @@ impl App {
                 }
                 touched = Some(addr);
             }
-            RunEvent::LockConflict { node_id, block, owner_pid, owner_desc } => {
+            RunEvent::LockConflict {
+                node_id,
+                block,
+                owner_pid,
+                owner_desc,
+            } => {
                 // Only ever arrives as the very first event, handled
                 // directly by `begin_http_run` before a `RunState` even
                 // exists — reaching here is defensive-only (shouldn't
@@ -3361,7 +3613,15 @@ impl App {
                 };
                 if let Some(addr) = self.pending_autoruns.pop_front() {
                     if let Some(port) = self.worker_port {
-                        Box::pin(self.start_run_via_worker(addr.node_id, addr.block_name, true, port, None, HashMap::new())).await;
+                        Box::pin(self.start_run_via_worker(
+                            addr.node_id,
+                            addr.block_name,
+                            true,
+                            port,
+                            None,
+                            HashMap::new(),
+                        ))
+                        .await;
                     }
                 }
             }
@@ -3370,7 +3630,11 @@ impl App {
         // worth rebuilding `doc_segments` when the address this event
         // touched is actually the node on screen right now.
         if let Some(addr) = touched {
-            if self.rows.get(self.selected).is_some_and(|row| row.node_id == addr.node_id) {
+            if self
+                .rows
+                .get(self.selected)
+                .is_some_and(|row| row.node_id == addr.node_id)
+            {
                 self.render_current_document();
             }
         }
@@ -3407,7 +3671,11 @@ impl App {
             if let Some(entry) = self.step_output.get_mut(&addr) {
                 entry.duration_ms = ms;
             }
-            if self.rows.get(self.selected).is_some_and(|row| row.node_id == addr.node_id) {
+            if self
+                .rows
+                .get(self.selected)
+                .is_some_and(|row| row.node_id == addr.node_id)
+            {
                 self.render_current_document();
             }
         }
@@ -3432,7 +3700,11 @@ impl App {
     /// (this TUI never resolved this block's own attributes for a run it
     /// didn't start) — best-effort `false` if the block can't be found
     /// (already gone from a since-edited canvas, say).
-    pub fn on_external_run_event(&mut self, addr: BlockAddr, event: crate::worker_client::SubscribeEvent) {
+    pub fn on_external_run_event(
+        &mut self,
+        addr: BlockAddr,
+        event: crate::worker_client::SubscribeEvent,
+    ) {
         use crate::worker_client::SubscribeEvent;
         if self.run.as_ref().is_some_and(|r| r.chain.contains(&addr)) {
             return;
@@ -3452,16 +3724,21 @@ impl App {
                 if !self.external_running.contains_key(&addr) {
                     self.step_output.remove(&addr);
                 }
-                self.external_running.entry(addr.clone()).or_insert_with(std::time::Instant::now);
+                self.external_running
+                    .entry(addr.clone())
+                    .or_insert_with(std::time::Instant::now);
                 let output_markdown = self.block_output_markdown(&addr);
-                let entry = self.step_output.entry(addr.clone()).or_insert_with(|| StepOutput {
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    output_markdown,
-                    exit_code: 0,
-                    duration_ms: 0,
-                    running: true,
-                });
+                let entry = self
+                    .step_output
+                    .entry(addr.clone())
+                    .or_insert_with(|| StepOutput {
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        output_markdown,
+                        exit_code: 0,
+                        duration_ms: 0,
+                        running: true,
+                    });
                 entry.running = true;
                 let line = match stream {
                     meshfox_server::stream_exec::OutputStream::Stdout => &mut entry.stdout,
@@ -3475,14 +3752,17 @@ impl App {
                 // A run that printed nothing never got an entry from a
                 // `Line` — make one, so its exit code still shows.
                 let output_markdown = self.block_output_markdown(&addr);
-                let entry = self.step_output.entry(addr.clone()).or_insert_with(|| StepOutput {
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    output_markdown,
-                    exit_code: 0,
-                    duration_ms: 0,
-                    running: false,
-                });
+                let entry = self
+                    .step_output
+                    .entry(addr.clone())
+                    .or_insert_with(|| StepOutput {
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        output_markdown,
+                        exit_code: 0,
+                        duration_ms: 0,
+                        running: false,
+                    });
                 entry.exit_code = exit_code.unwrap_or(-1);
                 entry.running = false;
                 if let Some(started) = started {
@@ -3490,7 +3770,11 @@ impl App {
                 }
             }
         }
-        if self.rows.get(self.selected).is_some_and(|row| row.node_id == addr.node_id) {
+        if self
+            .rows
+            .get(self.selected)
+            .is_some_and(|row| row.node_id == addr.node_id)
+        {
             self.render_current_document();
         }
     }
@@ -3570,12 +3854,17 @@ impl App {
     /// mirrors `on_output_line`, minus everything that only applies to a
     /// fenced block (no `cache`, no `meshfox:var`, no chain to advance).
     pub async fn on_file_output_line(&mut self, line: Option<(OutputStream, String)>) {
-        let Some(run) = &mut self.file_run else { return };
+        let Some(run) = &mut self.file_run else {
+            return;
+        };
         self.console_last_activity = Some(std::time::Instant::now());
         match line {
             Some((_, text)) => run.lines.push(text),
             None => {
-                let mut proc = run.proc.take().expect("output channel closed without a process");
+                let mut proc = run
+                    .proc
+                    .take()
+                    .expect("output channel closed without a process");
                 let status = proc.child.wait().await;
                 let exit_code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
                 let run = self.file_run.as_mut().unwrap();
@@ -3779,7 +4068,11 @@ impl App {
                 _ => {}
             }
         }
-        self.service_stats = if list.is_empty() { None } else { Some((running, crashed)) };
+        self.service_stats = if list.is_empty() {
+            None
+        } else {
+            Some((running, crashed))
+        };
         self.service_list = list;
     }
 
@@ -3805,7 +4098,9 @@ impl App {
     /// errors out" outcome `meshfox run`'s own declined prompt has. See
     /// `ServiceConflictState`'s own doc comment.
     async fn on_service_conflict_key(&mut self, key: KeyEvent) {
-        let Some(conflict) = self.service_conflict.take() else { return };
+        let Some(conflict) = self.service_conflict.take() else {
+            return;
+        };
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                 // `http_retry` is always `Some` in practice now — a
@@ -3813,8 +4108,13 @@ impl App {
                 // raised (see `ServiceConflictState::http_retry`'s own doc
                 // comment); a bare `None` here would mean the conflict got
                 // parked some other way, which nothing does.
-                let Some(retry) = conflict.http_retry else { return };
-                self.status = format!("killed pid {} — restarting {:?}", conflict.owner_pid, conflict.block_name);
+                let Some(retry) = conflict.http_retry else {
+                    return;
+                };
+                self.status = format!(
+                    "killed pid {} — restarting {:?}",
+                    conflict.owner_pid, conflict.block_name
+                );
                 if retry.is_tty {
                     Box::pin(self.begin_http_tty_run(
                         retry.node_id,
@@ -3883,8 +4183,11 @@ impl App {
     /// `service_list`'s own last-poll response order, to stay put between
     /// frames/keypresses.
     pub(super) fn sorted_service_keys(&self) -> Vec<(String, String)> {
-        let mut keys: Vec<(String, String)> =
-            self.service_list.iter().map(|d| (d.node_id.clone(), d.block.clone())).collect();
+        let mut keys: Vec<(String, String)> = self
+            .service_list
+            .iter()
+            .map(|d| (d.node_id.clone(), d.block.clone()))
+            .collect();
         keys.sort();
         keys
     }
@@ -3963,8 +4266,10 @@ impl App {
         };
         match crate::worker_client::list_active_runs(port).await {
             Ok(runs) => {
-                self.live_tty_sessions =
-                    runs.into_iter().filter(|r| r.kind == "tty" && r.status == "running").collect();
+                self.live_tty_sessions = runs
+                    .into_iter()
+                    .filter(|r| r.kind == "tty" && r.status == "running")
+                    .collect();
             }
             Err(e) => {
                 self.status = format!("failed to list live terminals: {e}");
@@ -4014,7 +4319,8 @@ impl App {
             KeyCode::Enter => {
                 let session = self.live_tty_sessions[selected].clone();
                 self.tty_sessions_view = None;
-                self.attach_tty_session(port, session.node_id, session.block).await;
+                self.attach_tty_session(port, session.node_id, session.block)
+                    .await;
             }
             KeyCode::Char('K') => {
                 let session = self.live_tty_sessions[selected].clone();
@@ -4077,7 +4383,11 @@ impl App {
                 }
                 // Preselect the newest *applied* step — the current state.
                 let selected = entries.iter().position(|e| e.applied).unwrap_or(0);
-                self.history_view = Some(HistoryViewState { entries, selected, ..Default::default() });
+                self.history_view = Some(HistoryViewState {
+                    entries,
+                    selected,
+                    ..Default::default()
+                });
             }
             Err(e) => self.status = format!("failed to load history: {e}"),
         }
@@ -4087,7 +4397,9 @@ impl App {
     /// the state right after the selected step (`POST /api/history/goto` —
     /// undoing or redoing as many steps as that takes), `q`/Esc closes.
     async fn on_history_view_key(&mut self, key: KeyEvent) {
-        let Some(view) = &mut self.history_view else { return };
+        let Some(view) = &mut self.history_view else {
+            return;
+        };
         let last = view.entries.len().saturating_sub(1);
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.history_view = None,
@@ -4098,7 +4410,9 @@ impl App {
             KeyCode::Home | KeyCode::Char('g') => view.selected = 0,
             KeyCode::End | KeyCode::Char('G') => view.selected = last,
             KeyCode::Enter => {
-                let Some(entry) = view.entries.get(view.selected).cloned() else { return };
+                let Some(entry) = view.entries.get(view.selected).cloned() else {
+                    return;
+                };
                 self.history_view = None;
                 self.goto_history_step(entry).await;
             }
@@ -4111,7 +4425,9 @@ impl App {
     /// `Enter`), and everything else is swallowed so a click never reaches
     /// the panes underneath.
     async fn on_history_view_mouse(&mut self, mouse: MouseEvent) {
-        let Some(view) = &mut self.history_view else { return };
+        let Some(view) = &mut self.history_view else {
+            return;
+        };
         let last = view.entries.len().saturating_sub(1);
         match mouse.kind {
             MouseEventKind::ScrollUp => view.selected = view.selected.saturating_sub(1),
@@ -4156,7 +4472,9 @@ impl App {
             self.status = "run history needs a worker — none reachable".into();
             return;
         }
-        let Some(row) = self.rows.get(self.selected) else { return };
+        let Some(row) = self.rows.get(self.selected) else {
+            return;
+        };
         let node_id = row.node_id.clone();
         let Some(node) = self.display_canvas.node(&node_id) else {
             self.status = format!("node {node_id:?} not found");
@@ -4168,12 +4486,20 @@ impl App {
         }
         let blocks: Vec<_> = scan_runnable_blocks(&node_id, &node.text)
             .into_iter()
-            .filter(|b| !b.tty && !b.service && !meshfox_core::is_button(&b.lang) && !meshfox_core::is_form(&b.lang))
+            .filter(|b| {
+                !b.tty
+                    && !b.service
+                    && !meshfox_core::is_button(&b.lang)
+                    && !meshfox_core::is_form(&b.lang)
+            })
             .collect();
         match blocks.len() {
             0 => self.status = "no block in this node keeps a run history".into(),
             1 => {
-                let name = blocks[0].name.clone().expect("scan_runnable_blocks always names its blocks");
+                let name = blocks[0]
+                    .name
+                    .clone()
+                    .expect("scan_runnable_blocks always names its blocks");
                 self.open_run_history_for(node_id, name).await;
             }
             _ => {
@@ -4184,7 +4510,10 @@ impl App {
                 let choices: Vec<BlockChoice> = blocks
                     .iter()
                     .map(|b| {
-                        let name = b.name.clone().expect("scan_runnable_blocks always names its blocks");
+                        let name = b
+                            .name
+                            .clone()
+                            .expect("scan_runnable_blocks always names its blocks");
                         BlockChoice {
                             is_default: Some(&name) == default_name.as_ref(),
                             name,
@@ -4213,10 +4542,16 @@ impl App {
             return;
         };
         match crate::worker_client::run_history(port, &node_id, &block).await {
-            Ok(entries) if entries.is_empty() => self.status = format!("no earlier runs of {block}"),
+            Ok(entries) if entries.is_empty() => {
+                self.status = format!("no earlier runs of {block}")
+            }
             Ok(entries) => {
-                self.run_history_view =
-                    Some(RunHistoryViewState { node_id, block, entries, ..Default::default() });
+                self.run_history_view = Some(RunHistoryViewState {
+                    node_id,
+                    block,
+                    entries,
+                    ..Default::default()
+                });
                 self.load_run_history_output().await;
             }
             Err(e) => self.status = format!("failed to load run history: {e}"),
@@ -4226,14 +4561,23 @@ impl App {
     /// Loads the selected run's stored output into the view.
     async fn load_run_history_output(&mut self) {
         let Some(port) = self.worker_port else { return };
-        let Some(view) = &self.run_history_view else { return };
-        let Some(run) = view.entries.get(view.selected) else { return };
+        let Some(view) = &self.run_history_view else {
+            return;
+        };
+        let Some(run) = view.entries.get(view.selected) else {
+            return;
+        };
         let (id, node_id, block) = (run.id, view.node_id.clone(), view.block.clone());
         // A load that fails shows why in place of the output, rather than
         // passing for "this run printed nothing".
         let lines = crate::worker_client::run_output(port, &node_id, &block, id)
             .await
-            .unwrap_or_else(|e| vec![(OutputStream::Stderr, format!("couldn't load this run's output: {e}"))]);
+            .unwrap_or_else(|e| {
+                vec![(
+                    OutputStream::Stderr,
+                    format!("couldn't load this run's output: {e}"),
+                )]
+            });
         if let Some(view) = &mut self.run_history_view {
             // Only if the selection hasn't moved on while this was loading.
             if view.entries.get(view.selected).is_some_and(|r| r.id == id) {
@@ -4246,7 +4590,9 @@ impl App {
     /// `j`/`k`/arrows/`g`/`G` pick a run, `PageUp`/`PageDown` (or `J`/`K`)
     /// scroll its output, `q`/Esc closes.
     async fn on_run_history_key(&mut self, key: KeyEvent) {
-        let Some(view) = &mut self.run_history_view else { return };
+        let Some(view) = &mut self.run_history_view else {
+            return;
+        };
         let last = view.entries.len().saturating_sub(1);
         let before = view.selected;
         match key.code {
@@ -4258,7 +4604,9 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => view.selected = (view.selected + 1).min(last),
             KeyCode::Home | KeyCode::Char('g') => view.selected = 0,
             KeyCode::End | KeyCode::Char('G') => view.selected = last,
-            KeyCode::PageUp | KeyCode::Char('K') => view.output_scroll = view.output_scroll.saturating_sub(10),
+            KeyCode::PageUp | KeyCode::Char('K') => {
+                view.output_scroll = view.output_scroll.saturating_sub(10)
+            }
             KeyCode::PageDown | KeyCode::Char('J') => view.scroll_output_down(10),
             _ => {}
         }
@@ -4271,7 +4619,9 @@ impl App {
     /// The run-history view is modal: the wheel scrolls the output, a click
     /// on a run selects it, everything else is swallowed.
     async fn on_run_history_mouse(&mut self, mouse: MouseEvent) {
-        let Some(view) = &mut self.run_history_view else { return };
+        let Some(view) = &mut self.run_history_view else {
+            return;
+        };
         match mouse.kind {
             MouseEventKind::ScrollUp => view.output_scroll = view.output_scroll.saturating_sub(3),
             MouseEventKind::ScrollDown => view.scroll_output_down(3),
@@ -4320,7 +4670,10 @@ impl App {
         match crate::worker_client::tty_attach(port, &node_id, &block, cols, rows).await {
             Ok(socket) => {
                 self.status.clear();
-                self.pending_http_tty_attach = Some(PendingHttpTtyAttach { socket, block_name: block });
+                self.pending_http_tty_attach = Some(PendingHttpTtyAttach {
+                    socket,
+                    block_name: block,
+                });
             }
             Err(e) => {
                 self.status = format!("failed to attach to {block:?}: {e}");
@@ -4772,36 +5125,82 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn extra_edge_row_follows_the_real_target_on_enter() {
+        let dir = std::env::temp_dir().join(format!("meshfox-tui-link-row-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.canvas.md");
+        std::fs::write(
+            &path,
+            concat!(
+                "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
+                "## Source\n<!-- meshfox:node id=\"source\" -->\n",
+                "## Target\n<!-- meshfox:node id=\"target\" -->\n",
+                "<!-- meshfox:edge from=\"source\" label=\"uses worker\" -->\n",
+                "Target body.\n",
+            ),
+        )
+        .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(path, tx, None, None).await.unwrap();
+        app.jump_to_node("source");
+        app.toggle_expand();
+        let reference_index = app
+            .rows
+            .iter()
+            .position(|row| row.reference.is_some())
+            .unwrap();
+        app.selected = reference_index;
+        app.rebuild_rows();
+        assert_eq!(app.selected, reference_index); // reload preserves the link row
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await;
+        assert_eq!(app.rows[app.selected].node_id, "target");
+        assert!(app.rows[app.selected].reference.is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn spatial_selection_uses_all_four_directions_instead_of_file_order() {
         let dir = std::env::temp_dir().join(format!("meshfox-spatial-nav-{}", uuid_like()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("canvas.canvas.md");
-        std::fs::write(&path, concat!(
-            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
-            "## Diagram\n<!-- meshfox:node id=\"group\" -->\n",
-            "### Bottom\n<!-- meshfox:node id=\"bottom\" x=0 y=200 w=100 h=80 -->\n",
-            "### Top right\n<!-- meshfox:node id=\"right\" x=200 y=0 w=100 h=80 -->\n",
-            "### Top left\n<!-- meshfox:node id=\"left\" x=0 y=0 w=100 h=80 -->\n",
-            "## After diagram\n<!-- meshfox:node id=\"after\" -->\n",
-        )).unwrap();
+        std::fs::write(
+            &path,
+            concat!(
+                "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
+                "## Diagram\n<!-- meshfox:node id=\"group\" -->\n",
+                "### Bottom\n<!-- meshfox:node id=\"bottom\" x=0 y=200 w=100 h=80 -->\n",
+                "### Top right\n<!-- meshfox:node id=\"right\" x=200 y=0 w=100 h=80 -->\n",
+                "### Top left\n<!-- meshfox:node id=\"left\" x=0 y=0 w=100 h=80 -->\n",
+                "## After diagram\n<!-- meshfox:node id=\"after\" -->\n",
+            ),
+        )
+        .unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(path, tx, None, None).await.unwrap();
         app.jump_to_node("group");
         app.expanded.insert("group".to_string());
         app.rebuild_rows();
-        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).await;
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await;
         assert_eq!(app.rows[app.selected].node_id, "left");
-        app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE)).await;
+        app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+            .await;
         assert_eq!(app.rows[app.selected].node_id, "right");
-        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)).await;
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .await;
         assert_eq!(app.rows[app.selected].node_id, "bottom");
-        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)).await;
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+            .await;
         assert_eq!(app.rows[app.selected].node_id, "left");
-        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)).await;
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+            .await;
         assert_eq!(app.rows[app.selected].node_id, "right");
-        app.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)).await;
+        app.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+            .await;
         assert_eq!(app.rows[app.selected].node_id, "left");
-        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).await;
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await;
         assert_eq!(app.rows[app.selected].node_id, "group");
         assert!(!app.expanded.contains("group"));
         assert!(spatial::active_spatial_parent(&app).is_none());
@@ -4810,21 +5209,26 @@ mod tests {
         assert_eq!(app.rows[app.selected].node_id, "after");
         assert!(!app.should_quit);
         app.jump_to_node("right");
-        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)).await;
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+            .await;
         assert_eq!(app.rows[app.selected].node_id, "group");
         assert!(!app.expanded.contains("group"));
         assert!(spatial::active_spatial_parent(&app).is_none());
         assert!(!app.rows.iter().any(|row| row.node_id == "right"));
-        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).await;
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await;
         assert!(!app.should_quit, "Esc in the ordinary tree must not quit");
         app.focus = Focus::Document;
-        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).await;
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await;
         assert!(!app.should_quit, "Esc in the document must not quit");
         app.fullscreen = Some(Focus::Document);
-        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).await;
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await;
         assert!(app.fullscreen.is_none());
         assert!(!app.should_quit, "Esc leaving fullscreen must not quit");
-        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)).await;
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .await;
         assert!(app.should_quit, "q remains the explicit quit key");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -4911,7 +5315,8 @@ mod tests {
 
     #[tokio::test]
     async fn reset_session_clears_every_submitted_form_value() {
-        let dir = std::env::temp_dir().join(format!("meshfox-tui-reset-session-test-{}", uuid_like()));
+        let dir =
+            std::env::temp_dir().join(format!("meshfox-tui-reset-session-test-{}", uuid_like()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("canvas.md");
         std::fs::write(
@@ -4922,7 +5327,8 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(path, tx, None, None).await.unwrap();
 
-        app.session_vars.insert("greeting".to_string(), "hi".to_string());
+        app.session_vars
+            .insert("greeting".to_string(), "hi".to_string());
         assert!(!app.session_vars.is_empty());
 
         app.reset_session();
@@ -4939,10 +5345,15 @@ mod tests {
 
     #[tokio::test]
     async fn history_view_navigates_clamps_and_closes_without_a_worker() {
-        let dir = std::env::temp_dir().join(format!("meshfox-tui-history-view-test-{}", uuid_like()));
+        let dir =
+            std::env::temp_dir().join(format!("meshfox-tui-history-view-test-{}", uuid_like()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("canvas.md");
-        std::fs::write(&path, "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n").unwrap();
+        std::fs::write(
+            &path,
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
+        )
+        .unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(path, tx, None, None).await.unwrap();
 
@@ -4959,8 +5370,11 @@ mod tests {
             applied: true,
             summary: String::new(),
         };
-        app.history_view =
-            Some(HistoryViewState { entries: vec![entry(3), entry(2), entry(1)], selected: 0, ..Default::default() });
+        app.history_view = Some(HistoryViewState {
+            entries: vec![entry(3), entry(2), entry(1)],
+            selected: 0,
+            ..Default::default()
+        });
         app.on_key(key(KeyCode::Up)).await;
         assert_eq!(app.history_view.as_ref().unwrap().selected, 0);
         app.on_key(key(KeyCode::Char('j'))).await;
@@ -4983,12 +5397,15 @@ mod tests {
     }
 
     async fn app_with_blocks(name: &str, node_body: &str) -> App {
-        let dir = std::env::temp_dir().join(format!("meshfox-tui-run-history-{name}-{}", uuid_like()));
+        let dir =
+            std::env::temp_dir().join(format!("meshfox-tui-run-history-{name}-{}", uuid_like()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("canvas.md");
         std::fs::write(
             &path,
-            format!("<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n{node_body}"),
+            format!(
+                "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n{node_body}"
+            ),
         )
         .unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -5002,14 +5419,41 @@ mod tests {
         let addr = BlockAddr::new("root", "a");
         let out = meshfox_server::stream_exec::OutputStream::Stdout;
         let err = meshfox_server::stream_exec::OutputStream::Stderr;
-        app.on_reconciled_run_event(addr.clone(), SubscribeEvent::Line { stream: out, text: "hello".into() }, Some(1234));
+        app.on_reconciled_run_event(
+            addr.clone(),
+            SubscribeEvent::Line {
+                stream: out,
+                text: "hello".into(),
+            },
+            Some(1234),
+        );
         assert!(app.step_output[&addr].running, "still replaying");
-        app.on_reconciled_run_event(addr.clone(), SubscribeEvent::Line { stream: err, text: "oops".into() }, Some(1234));
-        app.on_reconciled_run_event(addr.clone(), SubscribeEvent::Done { exit_code: Some(3) }, Some(1234));
+        app.on_reconciled_run_event(
+            addr.clone(),
+            SubscribeEvent::Line {
+                stream: err,
+                text: "oops".into(),
+            },
+            Some(1234),
+        );
+        app.on_reconciled_run_event(
+            addr.clone(),
+            SubscribeEvent::Done { exit_code: Some(3) },
+            Some(1234),
+        );
         let entry = &app.step_output[&addr];
-        assert_eq!((entry.stdout.as_str(), entry.stderr.as_str()), ("hello\n", "oops\n"));
-        assert_eq!((entry.exit_code, entry.duration_ms, entry.running), (3, 1234, false));
-        assert!(!app.external_running.contains_key(&addr), "no longer counted as running");
+        assert_eq!(
+            (entry.stdout.as_str(), entry.stderr.as_str()),
+            ("hello\n", "oops\n")
+        );
+        assert_eq!(
+            (entry.exit_code, entry.duration_ms, entry.running),
+            (3, 1234, false)
+        );
+        assert!(
+            !app.external_running.contains_key(&addr),
+            "no longer counted as running"
+        );
     }
 
     #[tokio::test]
@@ -5017,9 +5461,16 @@ mod tests {
         use crate::worker_client::SubscribeEvent;
         let mut app = app_with_blocks("silent", "```bash name=\"a\"\ntrue\n```\n").await;
         let addr = BlockAddr::new("root", "a");
-        app.on_reconciled_run_event(addr.clone(), SubscribeEvent::Done { exit_code: Some(0) }, Some(40));
+        app.on_reconciled_run_event(
+            addr.clone(),
+            SubscribeEvent::Done { exit_code: Some(0) },
+            Some(40),
+        );
         let entry = &app.step_output[&addr];
-        assert_eq!((entry.exit_code, entry.duration_ms, entry.running), (0, 40, false));
+        assert_eq!(
+            (entry.exit_code, entry.duration_ms, entry.running),
+            (0, 40, false)
+        );
         assert!(entry.stdout.is_empty() && entry.stderr.is_empty());
     }
 
@@ -5048,10 +5499,17 @@ mod tests {
         // network, and this only gets as far as the picker.
         app.worker_port = Some(1);
         app.on_key(key(KeyCode::Char('L'))).await;
-        let bp = app.block_picker.as_ref().expect("several blocks open the picker first");
+        let bp = app
+            .block_picker
+            .as_ref()
+            .expect("several blocks open the picker first");
         assert!(bp.history, "the picker is for the history, not a run");
         let names: Vec<_> = bp.blocks.iter().map(|b| b.name.as_str()).collect();
-        assert_eq!(names, vec!["a", "b"], "tty and service blocks keep no history");
+        assert_eq!(
+            names,
+            vec!["a", "b"],
+            "tty and service blocks keep no history"
+        );
         assert_eq!(bp.selected, 1, "the default block is preselected");
         assert!(app.run_history_view.is_none());
     }
@@ -5075,8 +5533,17 @@ mod tests {
         app.run_history_view = Some(RunHistoryViewState {
             node_id: "root".into(),
             block: "a".into(),
-            entries: vec![run_entry(3, 0, false), run_entry(2, 1, false), run_entry(1, 0, true)],
-            output: Some((3, (0..30).map(|i| (OutputStream::Stdout, format!("line {i}"))).collect())),
+            entries: vec![
+                run_entry(3, 0, false),
+                run_entry(2, 1, false),
+                run_entry(1, 0, true),
+            ],
+            output: Some((
+                3,
+                (0..30)
+                    .map(|i| (OutputStream::Stdout, format!("line {i}")))
+                    .collect(),
+            )),
             ..Default::default()
         });
         app.on_key(key(KeyCode::Up)).await;
@@ -5086,18 +5553,33 @@ mod tests {
         // Moving to another run replaces the previous run's output rather
         // than leaving it under the wrong heading — here the reload fails
         // (no worker on port 1), and says so instead of showing nothing.
-        let (shown_for, lines) = app.run_history_view.as_ref().unwrap().output.clone().expect("reloaded");
+        let (shown_for, lines) = app
+            .run_history_view
+            .as_ref()
+            .unwrap()
+            .output
+            .clone()
+            .expect("reloaded");
         assert_eq!(shown_for, 1);
         assert!(lines[0].1.contains("couldn't load"), "{lines:?}");
 
         let view = app.run_history_view.as_mut().unwrap();
-        view.output = Some((1, (0..30).map(|i| (OutputStream::Stdout, format!("line {i}"))).collect()));
+        view.output = Some((
+            1,
+            (0..30)
+                .map(|i| (OutputStream::Stdout, format!("line {i}")))
+                .collect(),
+        ));
         app.on_key(key(KeyCode::PageDown)).await;
         assert_eq!(app.run_history_view.as_ref().unwrap().output_scroll, 10);
         for _ in 0..10 {
             app.on_key(key(KeyCode::PageDown)).await;
         }
-        assert_eq!(app.run_history_view.as_ref().unwrap().output_scroll, 29, "never past the last line");
+        assert_eq!(
+            app.run_history_view.as_ref().unwrap().output_scroll,
+            29,
+            "never past the last line"
+        );
 
         // The modal claims the keymap: `q` closes it rather than quitting.
         app.on_key(key(KeyCode::Char('q'))).await;
@@ -5106,10 +5588,15 @@ mod tests {
 
     #[tokio::test]
     async fn history_view_click_selects_the_row_and_double_click_jumps() {
-        let dir = std::env::temp_dir().join(format!("meshfox-tui-history-mouse-test-{}", uuid_like()));
+        let dir =
+            std::env::temp_dir().join(format!("meshfox-tui-history-mouse-test-{}", uuid_like()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("canvas.md");
-        std::fs::write(&path, "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n").unwrap();
+        std::fs::write(
+            &path,
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
+        )
+        .unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(path, tx, None, None).await.unwrap();
         let entry = |seq| crate::worker_client::HistoryEntryDto {
@@ -5119,7 +5606,10 @@ mod tests {
             applied: true,
             summary: String::new(),
         };
-        let view = HistoryViewState { entries: (0..30).rev().map(entry).collect(), ..Default::default() };
+        let view = HistoryViewState {
+            entries: (0..30).rev().map(entry).collect(),
+            ..Default::default()
+        };
         // As if drawn at (10, 5), 40x10, scrolled down by 7 rows.
         view.list_rect.set(Rect::new(10, 5, 40, 10));
         view.offset.set(7);
@@ -5149,12 +5639,16 @@ mod tests {
 
     #[tokio::test]
     async fn page_keys_move_tree_selection_by_ten_rows_and_clamp() {
-        let dir = std::env::temp_dir().join(format!("meshfox-tui-tree-paging-test-{}", uuid_like()));
+        let dir =
+            std::env::temp_dir().join(format!("meshfox-tui-tree-paging-test-{}", uuid_like()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("canvas.md");
-        let mut src = String::from("<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n");
+        let mut src =
+            String::from("<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n");
         for i in 0..25 {
-            src.push_str(&format!("## Item {i}\n<!-- meshfox:node id=\"item-{i}\" -->\n"));
+            src.push_str(&format!(
+                "## Item {i}\n<!-- meshfox:node id=\"item-{i}\" -->\n"
+            ));
         }
         std::fs::write(&path, src).unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -5173,7 +5667,10 @@ mod tests {
 
     #[tokio::test]
     async fn s_key_only_resets_the_session_after_confirming() {
-        let dir = std::env::temp_dir().join(format!("meshfox-tui-reset-session-confirm-test-{}", uuid_like()));
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-tui-reset-session-confirm-test-{}",
+            uuid_like()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("canvas.md");
         std::fs::write(
@@ -5183,7 +5680,8 @@ mod tests {
         .unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(path, tx, None, None).await.unwrap();
-        app.session_vars.insert("greeting".to_string(), "hi".to_string());
+        app.session_vars
+            .insert("greeting".to_string(), "hi".to_string());
 
         // `S` alone opens the prompt — doesn't clear anything yet.
         app.on_key(key(KeyCode::Char('S'))).await;
@@ -5245,7 +5743,10 @@ mod tests {
         app.trigger_configure().await;
         let form = app.var_form.as_ref().expect("configure should open a form");
         assert_eq!(
-            form.decls.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            form.decls
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["NORMAL"],
             "COMPUTED (from=) must not show up as a configurable field"
         );

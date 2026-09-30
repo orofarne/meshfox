@@ -82,8 +82,10 @@ const NUSHELL_GRAMMAR: &str = include_str!("../../../grammars/nushell.tmLanguage
 const PUPPET_GRAMMAR: &str = include_str!("../../../grammars/puppet.tmLanguage.json");
 const TSV_GRAMMAR: &str = include_str!("../../../grammars/tsv.tmLanguage.json");
 const INI_GRAMMAR_TUI: &str = include_str!("../../../grammars/tui/ini.tmLanguage.json");
-const POWERSHELL_GRAMMAR_TUI: &str = include_str!("../../../grammars/tui/powershell.tmLanguage.json");
-const TYPESCRIPT_GRAMMAR_TUI: &str = include_str!("../../../grammars/tui/typescript.tmLanguage.json");
+const POWERSHELL_GRAMMAR_TUI: &str =
+    include_str!("../../../grammars/tui/powershell.tmLanguage.json");
+const TYPESCRIPT_GRAMMAR_TUI: &str =
+    include_str!("../../../grammars/tui/typescript.tmLanguage.json");
 const TSX_GRAMMAR_TUI: &str = include_str!("../../../grammars/tui/tsx.tmLanguage.json");
 const JSX_GRAMMAR_TUI: &str = include_str!("../../../grammars/tui/jsx.tmLanguage.json");
 
@@ -131,8 +133,8 @@ const BUNDLED_POOL_ADDITIONS: &[(&str, &str)] = &[
 /// highlighting.
 pub fn build_syntax_set(canvas_root: &Path) -> SyntaxSet {
     let mut builder = SyntaxSet::load_defaults_newlines().into_builder();
-    let meshfox_def =
-        syntect_tmlanguage::load(MESHFOX_GRAMMAR).expect("meshfox's own bundled grammar must parse");
+    let meshfox_def = syntect_tmlanguage::load(MESHFOX_GRAMMAR)
+        .expect("meshfox's own bundled grammar must parse");
     builder.add(meshfox_def);
     let starlark_def = syntect_tmlanguage::load(STARLARK_GRAMMAR_TUI)
         .expect("meshfox's own bundled Starlark grammar must parse");
@@ -179,7 +181,9 @@ pub fn build_syntax_set(canvas_root: &Path) -> SyntaxSet {
 /// happens to default unmatched scopes to — confirmed directly (a
 /// throwaway scratch test comparing `HighlightLines` output before/after
 /// this call, on a real `<!-- meshfox:node ... -->` line).
-pub fn with_meshfox_scope_colors(mut theme: syntect::highlighting::Theme) -> syntect::highlighting::Theme {
+pub fn with_meshfox_scope_colors(
+    mut theme: syntect::highlighting::Theme,
+) -> syntect::highlighting::Theme {
     use syntect::highlighting::{Color, FontStyle, StyleModifier, ThemeItem};
 
     // Standard relative-luminance-ish weighting (ITU-R BT.601), same
@@ -193,8 +197,7 @@ pub fn with_meshfox_scope_colors(mut theme: syntect::highlighting::Theme) -> syn
         .settings
         .background
         .map(|bg| {
-            let luminance =
-                0.299 * bg.r as f32 + 0.587 * bg.g as f32 + 0.114 * bg.b as f32;
+            let luminance = 0.299 * bg.r as f32 + 0.587 * bg.g as f32 + 0.114 * bg.b as f32;
             luminance > 128.0
         })
         .unwrap_or(false);
@@ -203,20 +206,60 @@ pub fn with_meshfox_scope_colors(mut theme: syntect::highlighting::Theme) -> syn
         // `web/src/index.css`'s own light-mode `--fg`/`--accent`/
         // `--syntax-attr`/`--syntax-value`.
         (
-            Color { r: 0x20, g: 0x1a, b: 0x14, a: 0xff },
-            Color { r: 0xea, g: 0x58, b: 0x0c, a: 0xff },
-            Color { r: 0x96, g: 0x66, b: 0x0a, a: 0xff },
-            Color { r: 0x1b, g: 0x7a, b: 0x43, a: 0xff },
+            Color {
+                r: 0x20,
+                g: 0x1a,
+                b: 0x14,
+                a: 0xff,
+            },
+            Color {
+                r: 0xea,
+                g: 0x58,
+                b: 0x0c,
+                a: 0xff,
+            },
+            Color {
+                r: 0x96,
+                g: 0x66,
+                b: 0x0a,
+                a: 0xff,
+            },
+            Color {
+                r: 0x1b,
+                g: 0x7a,
+                b: 0x43,
+                a: 0xff,
+            },
         )
     } else {
         // `web/src/index.css`'s own dark-mode set — this file's original
         // pins, unchanged for every dark bundled theme (`ui::
         // SOURCE_EDITOR_THEME`'s default included).
         (
-            Color { r: 0xf8, g: 0xf8, b: 0xf2, a: 0xff },
-            Color { r: 0xff, g: 0x6e, b: 0x15, a: 0xff },
-            Color { r: 0xd8, g: 0xb6, b: 0x56, a: 0xff },
-            Color { r: 0x6f, g: 0xcf, b: 0x97, a: 0xff },
+            Color {
+                r: 0xf8,
+                g: 0xf8,
+                b: 0xf2,
+                a: 0xff,
+            },
+            Color {
+                r: 0xff,
+                g: 0x6e,
+                b: 0x15,
+                a: 0xff,
+            },
+            Color {
+                r: 0xd8,
+                g: 0xb6,
+                b: 0x56,
+                a: 0xff,
+            },
+            Color {
+                r: 0x6f,
+                g: 0xcf,
+                b: 0x97,
+                a: 0xff,
+            },
         )
     };
 
@@ -239,15 +282,27 @@ pub fn with_meshfox_scope_colors(mut theme: syntect::highlighting::Theme) -> syn
     theme.settings.foreground = Some(foreground);
     theme.scopes.push(ThemeItem {
         scope: "keyword.other.meshfox".parse().unwrap(),
-        style: StyleModifier { foreground: Some(accent), background: None, font_style: Some(FontStyle::BOLD) },
+        style: StyleModifier {
+            foreground: Some(accent),
+            background: None,
+            font_style: Some(FontStyle::BOLD),
+        },
     });
     theme.scopes.push(ThemeItem {
         scope: "entity.other.attribute-name.meshfox".parse().unwrap(),
-        style: StyleModifier { foreground: Some(attr), background: None, font_style: None },
+        style: StyleModifier {
+            foreground: Some(attr),
+            background: None,
+            font_style: None,
+        },
     });
     theme.scopes.push(ThemeItem {
         scope: "string.unquoted.meshfox".parse().unwrap(),
-        style: StyleModifier { foreground: Some(value), background: None, font_style: None },
+        style: StyleModifier {
+            foreground: Some(value),
+            background: None,
+            font_style: None,
+        },
     });
     theme
 }
@@ -277,7 +332,13 @@ pub fn resolve_editor_theme(canvas_root: &Path) -> String {
         .and_then(|v| v.as_str())
         .map(str::to_string);
     match configured {
-        Some(name) if syntect::highlighting::ThemeSet::load_defaults().themes.contains_key(&name) => name,
+        Some(name)
+            if syntect::highlighting::ThemeSet::load_defaults()
+                .themes
+                .contains_key(&name) =>
+        {
+            name
+        }
         _ => crate::tui::ui::SOURCE_EDITOR_THEME.to_string(),
     }
 }
@@ -348,7 +409,11 @@ mod tests {
         let root = scratch_dir();
         let syntax_dir = root.join(".meshfox").join("syntax");
         std::fs::create_dir_all(&syntax_dir).unwrap();
-        std::fs::write(syntax_dir.join("test-lang.tmLanguage.json"), TINY_TMLANGUAGE).unwrap();
+        std::fs::write(
+            syntax_dir.join("test-lang.tmLanguage.json"),
+            TINY_TMLANGUAGE,
+        )
+        .unwrap();
 
         let ss = build_syntax_set(&root);
         assert!(
@@ -389,7 +454,11 @@ mod tests {
         let root = scratch_dir();
         let syntax_dir = root.join(".meshfox").join("syntax");
         std::fs::create_dir_all(&syntax_dir).unwrap();
-        std::fs::write(syntax_dir.join("broken.tmLanguage.json"), "{ not valid json").unwrap();
+        std::fs::write(
+            syntax_dir.join("broken.tmLanguage.json"),
+            "{ not valid json",
+        )
+        .unwrap();
 
         // Must not panic, and defaults must still be there.
         let ss = build_syntax_set(&root);
@@ -428,7 +497,11 @@ mod tests {
             .expect("meshfox's own bundled Starlark grammar should always be present");
 
         let ts = syntect::highlighting::ThemeSet::load_defaults();
-        let theme = ts.themes.values().next().expect("syntect ships at least one theme");
+        let theme = ts
+            .themes
+            .values()
+            .next()
+            .expect("syntect ships at least one theme");
         let mut hl = syntect::easy::HighlightLines::new(syntax, theme);
         let ranges = hl
             .highlight_line("for n in self.descendants():\n", &ss)
@@ -440,7 +513,10 @@ mod tests {
             .expect("expected a highlighted range containing \"for\"")
             .0
             .foreground;
-        assert_ne!(for_color, plain_default, "the `for` keyword should not render as plain text");
+        assert_ne!(
+            for_color, plain_default,
+            "the `for` keyword should not render as plain text"
+        );
     }
 
     /// The original motivating case (TODO.canvas.md's "Единая база языков
@@ -457,7 +533,11 @@ mod tests {
             .expect("meshfox's own bundled Elixir grammar should always be present");
 
         let ts = syntect::highlighting::ThemeSet::load_defaults();
-        let theme = ts.themes.values().next().expect("syntect ships at least one theme");
+        let theme = ts
+            .themes
+            .values()
+            .next()
+            .expect("syntect ships at least one theme");
         let mut hl = syntect::easy::HighlightLines::new(syntax, theme);
         let ranges = hl.highlight_line("defmodule Foo do\n", &ss).unwrap();
         let plain_default = theme.settings.foreground.unwrap();
@@ -467,7 +547,10 @@ mod tests {
             .expect("expected a highlighted range containing \"defmodule\"")
             .0
             .foreground;
-        assert_ne!(keyword_color, plain_default, "the `defmodule` keyword should not render as plain text");
+        assert_ne!(
+            keyword_color, plain_default,
+            "the `defmodule` keyword should not render as plain text"
+        );
     }
 
     /// TODO.canvas.md's 2026-08-24 audit + the follow-up batch it led to —
@@ -478,8 +561,9 @@ mod tests {
         let root = scratch_dir(); // never created on disk — no user grammars involved
         let ss = build_syntax_set(&root);
         for (label, _) in BUNDLED_POOL_ADDITIONS {
-            ss.find_syntax_by_name(label)
-                .unwrap_or_else(|| panic!("bundled pool addition {label:?} should always be present"));
+            ss.find_syntax_by_name(label).unwrap_or_else(|| {
+                panic!("bundled pool addition {label:?} should always be present")
+            });
         }
     }
 
@@ -492,18 +576,36 @@ mod tests {
         let root = scratch_dir(); // never created on disk — no user grammars involved
         let ss = build_syntax_set(&root);
         let ts = syntect::highlighting::ThemeSet::load_defaults();
-        let theme = ts.themes.values().next().expect("syntect ships at least one theme");
+        let theme = ts
+            .themes
+            .values()
+            .next()
+            .expect("syntect ships at least one theme");
         let plain_default = theme.settings.foreground.unwrap();
 
         let cases: &[(&str, &str, &str)] = &[
             ("ini", "[section]\nkey = value\n# a comment\n", "comment"),
             ("powershell", "function Foo {\n    $x = 1\n}\n", "function"),
-            ("typescript", "function greet(name: string): void {}\n", "function"),
-            ("tsx", "const el = <div className=\"a\">hi</div>;\n", "className"),
-            ("jsx", "const el = <div className=\"a\">hi</div>;\n", "className"),
+            (
+                "typescript",
+                "function greet(name: string): void {}\n",
+                "function",
+            ),
+            (
+                "tsx",
+                "const el = <div className=\"a\">hi</div>;\n",
+                "className",
+            ),
+            (
+                "jsx",
+                "const el = <div className=\"a\">hi</div>;\n",
+                "className",
+            ),
         ];
         for (name, snippet, needle) in cases {
-            let syntax = ss.find_syntax_by_name(name).unwrap_or_else(|| panic!("{name} should be present"));
+            let syntax = ss
+                .find_syntax_by_name(name)
+                .unwrap_or_else(|| panic!("{name} should be present"));
             let mut hl = syntect::easy::HighlightLines::new(syntax, theme);
             let ranges = hl.highlight_line(snippet, &ss).unwrap();
             let color = ranges
@@ -512,7 +614,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name}: expected a range containing {needle:?}"))
                 .0
                 .foreground;
-            assert_ne!(color, plain_default, "{name}: {needle:?} should not render as plain text");
+            assert_ne!(
+                color, plain_default,
+                "{name}: {needle:?} should not render as plain text"
+            );
         }
     }
 
@@ -623,7 +728,12 @@ mod meshfox_grammar_tests {
             .expect("the bundled meshfox-markdown grammar should always be present");
 
         let ts = syntect::highlighting::ThemeSet::load_defaults();
-        let base_theme = ts.themes.values().next().expect("syntect ships at least one theme").clone();
+        let base_theme = ts
+            .themes
+            .values()
+            .next()
+            .expect("syntect ships at least one theme")
+            .clone();
         let theme = with_meshfox_scope_colors(base_theme);
 
         let mut hl = syntect::easy::HighlightLines::new(syntax, &theme);
@@ -645,11 +755,26 @@ mod meshfox_grammar_tests {
         let attr_value_color = color_of("\"root\"");
         let plain_default = theme.settings.foreground.unwrap();
 
-        assert_ne!(keyword_color, plain_default, "the meshfox:node keyword should not render as plain text");
-        assert_ne!(attr_name_color, plain_default, "the id attribute name should not render as plain text");
-        assert_ne!(attr_value_color, plain_default, "the \"root\" attribute value should not render as plain text");
-        assert_ne!(keyword_color, attr_name_color, "keyword and attribute-name should be distinctly colored");
-        assert_ne!(attr_name_color, attr_value_color, "attribute-name and attribute-value should be distinctly colored");
+        assert_ne!(
+            keyword_color, plain_default,
+            "the meshfox:node keyword should not render as plain text"
+        );
+        assert_ne!(
+            attr_name_color, plain_default,
+            "the id attribute name should not render as plain text"
+        );
+        assert_ne!(
+            attr_value_color, plain_default,
+            "the \"root\" attribute value should not render as plain text"
+        );
+        assert_ne!(
+            keyword_color, attr_name_color,
+            "keyword and attribute-name should be distinctly colored"
+        );
+        assert_ne!(
+            attr_name_color, attr_value_color,
+            "attribute-name and attribute-value should be distinctly colored"
+        );
     }
 
     /// `edtui`'s own `SyntaxHighlighter` colors *every* span (plain text
@@ -680,14 +805,26 @@ mod meshfox_grammar_tests {
         let base_theme = ts
             .themes
             .get(crate::tui::ui::SOURCE_EDITOR_THEME)
-            .unwrap_or_else(|| panic!("{:?} should be a real bundled syntect theme", crate::tui::ui::SOURCE_EDITOR_THEME))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{:?} should be a real bundled syntect theme",
+                    crate::tui::ui::SOURCE_EDITOR_THEME
+                )
+            })
             .clone();
         let theme = with_meshfox_scope_colors(base_theme);
 
         let mut hl = syntect::easy::HighlightLines::new(syntax, &theme);
-        let ranges = hl.highlight_line("just plain prose, no markup at all\n", &ss).unwrap();
+        let ranges = hl
+            .highlight_line("just plain prose, no markup at all\n", &ss)
+            .unwrap();
 
-        let pinned_foreground = syntect::highlighting::Color { r: 0xf8, g: 0xf8, b: 0xf2, a: 0xff };
+        let pinned_foreground = syntect::highlighting::Color {
+            r: 0xf8,
+            g: 0xf8,
+            b: 0xf2,
+            a: 0xff,
+        };
         for (style, text) in &ranges {
             if text.trim().is_empty() {
                 continue;
@@ -728,9 +865,16 @@ mod meshfox_grammar_tests {
         let theme = with_meshfox_scope_colors(base_theme);
 
         let mut hl = syntect::easy::HighlightLines::new(syntax, &theme);
-        let ranges = hl.highlight_line("just plain prose, no markup at all\n", &ss).unwrap();
+        let ranges = hl
+            .highlight_line("just plain prose, no markup at all\n", &ss)
+            .unwrap();
 
-        let dark_mode_pin = syntect::highlighting::Color { r: 0xf8, g: 0xf8, b: 0xf2, a: 0xff };
+        let dark_mode_pin = syntect::highlighting::Color {
+            r: 0xf8,
+            g: 0xf8,
+            b: 0xf2,
+            a: 0xff,
+        };
         for (style, text) in &ranges {
             if text.trim().is_empty() {
                 continue;

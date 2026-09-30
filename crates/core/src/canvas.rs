@@ -106,19 +106,38 @@ pub struct ExtraEdge {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum EdgeSide { Left, Right, Top, Bottom }
+pub enum EdgeSide {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
 
 impl EdgeSide {
     pub fn as_str(self) -> &'static str {
-        match self { Self::Left => "left", Self::Right => "right", Self::Top => "top", Self::Bottom => "bottom" }
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+            Self::Top => "top",
+            Self::Bottom => "bottom",
+        }
     }
     pub fn parse(raw: &str) -> Option<Self> {
-        match raw { "left" => Some(Self::Left), "right" => Some(Self::Right), "top" => Some(Self::Top), "bottom" => Some(Self::Bottom), _ => None }
+        match raw {
+            "left" => Some(Self::Left),
+            "right" => Some(Self::Right),
+            "top" => Some(Self::Top),
+            "bottom" => Some(Self::Bottom),
+            _ => None,
+        }
     }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RoutePoint { pub x: i32, pub y: i32 }
+pub struct RoutePoint {
+    pub x: i32,
+    pub y: i32,
+}
 
 impl ExtraEdge {
     /// A bare edge with no styling — same shape a plain `meshfox:edge
@@ -516,7 +535,10 @@ mod tests {
         let doc = "# Root\n\n## Section\n<!-- meshfox:node -->\n\nbody\n";
         let mut node = parse(doc).unwrap().node("section").unwrap().clone();
         node.asset_base = Some("/included/dir".to_string());
-        assert_eq!(node.cwd(Path::new("/canvas/dir")), Path::new("/included/dir"));
+        assert_eq!(
+            node.cwd(Path::new("/canvas/dir")),
+            Path::new("/included/dir")
+        );
     }
 
     #[test]

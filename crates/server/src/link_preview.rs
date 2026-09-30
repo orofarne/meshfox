@@ -162,7 +162,9 @@ async fn safe_get(
             return Err(PreviewError::Blocked);
         }
         let host = parsed.host_str().ok_or(PreviewError::Blocked)?;
-        let port = parsed.port_or_known_default().ok_or(PreviewError::Blocked)?;
+        let port = parsed
+            .port_or_known_default()
+            .ok_or(PreviewError::Blocked)?;
         let addr = resolve_validated(host, port).await?;
 
         let client = reqwest::Client::builder()
@@ -200,7 +202,10 @@ async fn safe_get(
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
-        if require_html && !content_type.as_deref().is_some_and(|ct| ct.starts_with("text/html"))
+        if require_html
+            && !content_type
+                .as_deref()
+                .is_some_and(|ct| ct.starts_with("text/html"))
         {
             return Err(PreviewError::NotHtml);
         }
@@ -321,9 +326,9 @@ mod tests {
 
     #[test]
     fn allows_ordinary_public_v6() {
-        assert!(!is_blocked_ip("2606:2800:220:1:248:1893:25c8:1946"
-            .parse()
-            .unwrap()));
+        assert!(!is_blocked_ip(
+            "2606:2800:220:1:248:1893:25c8:1946".parse().unwrap()
+        ));
     }
 
     #[test]

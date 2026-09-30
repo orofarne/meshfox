@@ -91,7 +91,9 @@ pub fn load(canvas_root: &Path) -> SharedEnv {
 /// config/`$HOME` combination without depending on the developer's own
 /// machine (same reasoning as `config::load_from`'s own doc comment).
 fn load_from(global_path: Option<&Path>, canvas_root: &Path, home: Option<&Path>) -> SharedEnv {
-    let global_table = global_path.map(crate::config::read_table).unwrap_or_default();
+    let global_table = global_path
+        .map(crate::config::read_table)
+        .unwrap_or_default();
     let local_table = crate::config::read_table(&crate::config::local_config_path(canvas_root));
 
     // The global tier's own relative (non-`~`) paths have no anchor other
@@ -108,10 +110,12 @@ fn load_from(global_path: Option<&Path>, canvas_root: &Path, home: Option<&Path>
     // specificity: a project's own config always wins over whatever's in
     // the user's global registry, the same "override" escape hatch the
     // per-document cache already provides on top of both.
-    apply_tier(&global_sections, &normalized_root, &mut out, |raw_path| SharedOrigin::Global {
-        path: raw_path,
+    apply_tier(&global_sections, &normalized_root, &mut out, |raw_path| {
+        SharedOrigin::Global { path: raw_path }
     });
-    apply_tier(&local_sections, &normalized_root, &mut out, |_raw_path| SharedOrigin::Project);
+    apply_tier(&local_sections, &normalized_root, &mut out, |_raw_path| {
+        SharedOrigin::Project
+    });
     out
 }
 
@@ -151,7 +155,10 @@ fn apply_tier(
         if let Some(value) = section.vars.get(name) {
             out.insert(
                 name.to_string(),
-                SharedVar { value: value.clone(), origin: origin_for(section.raw_path.clone()) },
+                SharedVar {
+                    value: value.clone(),
+                    origin: origin_for(section.raw_path.clone()),
+                },
             );
         }
     }
@@ -232,14 +239,20 @@ fn parse_env_sections(
     entries
         .iter()
         .filter_map(|entry| {
-            let toml::Value::Table(entry) = entry else { return None };
+            let toml::Value::Table(entry) = entry else {
+                return None;
+            };
             let (raw_path, scope) = parse_path_scope(entry.get("path"), home, relative_base);
             let vars = entry
                 .get("vars")
                 .and_then(|v| v.as_table())
                 .map(flatten_vars)
                 .unwrap_or_default();
-            Some(EnvSection { raw_path, scope, vars })
+            Some(EnvSection {
+                raw_path,
+                scope,
+                vars,
+            })
         })
         .collect()
 }
@@ -261,9 +274,10 @@ fn parse_path_scope(
     let raw_strings: Vec<String> = match path_value {
         None => return (None, Scope::Unscoped),
         Some(toml::Value::String(s)) => vec![s.clone()],
-        Some(toml::Value::Array(items)) => {
-            items.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()
-        }
+        Some(toml::Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
         Some(_) => Vec::new(),
     };
     let raw_path = (!raw_strings.is_empty()).then(|| raw_strings.join(", "));
@@ -271,12 +285,19 @@ fn parse_path_scope(
         .iter()
         .filter_map(|s| resolve_scope_path(s, home, relative_base))
         .collect();
-    let scope = if resolved.is_empty() { Scope::Unresolvable } else { Scope::Paths(resolved) };
+    let scope = if resolved.is_empty() {
+        Scope::Unresolvable
+    } else {
+        Scope::Paths(resolved)
+    };
     (raw_path, scope)
 }
 
 fn flatten_vars(table: &toml::Table) -> HashMap<String, String> {
-    table.iter().filter_map(|(k, v)| scalar_to_string(v).map(|s| (k.clone(), s))).collect()
+    table
+        .iter()
+        .filter_map(|(k, v)| scalar_to_string(v).map(|s| (k.clone(), s)))
+        .collect()
 }
 
 fn scalar_to_string(value: &toml::Value) -> Option<String> {
@@ -295,7 +316,11 @@ fn scalar_to_string(value: &toml::Value) -> Option<String> {
 /// (the global tier passes its own `home` as the base too — there's no
 /// other natural anchor for a user-wide file; the local tier passes
 /// `canvas_root`); an already-absolute path is used as-is.
-fn resolve_scope_path(raw: &str, home: Option<&Path>, relative_base: Option<&Path>) -> Option<PathBuf> {
+fn resolve_scope_path(
+    raw: &str,
+    home: Option<&Path>,
+    relative_base: Option<&Path>,
+) -> Option<PathBuf> {
     if raw == "~" {
         return home.map(Path::to_path_buf);
     }
@@ -317,7 +342,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "meshfox-shared-env-test-{label}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -342,8 +370,14 @@ mod tests {
         let root = tempdir("project-unscoped");
 
         let shared = load_from(Some(&global), &root, Some(&home));
-        assert_eq!(shared.get("DB_USER").map(|v| v.value.as_str()), Some("alice"));
-        assert_eq!(shared.get("DB_USER").unwrap().origin, SharedOrigin::Global { path: None });
+        assert_eq!(
+            shared.get("DB_USER").map(|v| v.value.as_str()),
+            Some("alice")
+        );
+        assert_eq!(
+            shared.get("DB_USER").unwrap().origin,
+            SharedOrigin::Global { path: None }
+        );
     }
 
     #[test]
@@ -364,7 +398,10 @@ mod tests {
         );
 
         let matching = load_from(Some(&global), &project_a, Some(&home));
-        assert_eq!(matching.get("DB_URL").map(|v| v.value.as_str()), Some("projA"));
+        assert_eq!(
+            matching.get("DB_URL").map(|v| v.value.as_str()),
+            Some("projA")
+        );
 
         // A sibling directory whose name merely starts with the same
         // string must NOT match -- this is exactly why matching has to be
@@ -397,7 +434,10 @@ mod tests {
         assert_eq!(shared.get("DB_URL").map(|v| v.value.as_str()), Some("sub"));
 
         let shared_parent = load_from(Some(&global), &project_a, Some(&home));
-        assert_eq!(shared_parent.get("DB_URL").map(|v| v.value.as_str()), Some("projA"));
+        assert_eq!(
+            shared_parent.get("DB_URL").map(|v| v.value.as_str()),
+            Some("projA")
+        );
     }
 
     #[test]
@@ -413,10 +453,16 @@ mod tests {
                 root.to_string_lossy()
             ),
         );
-        write(&root.join(".meshfox").join("config.toml"), "[[env]]\nvars = { DB_URL = \"local\" }\n");
+        write(
+            &root.join(".meshfox").join("config.toml"),
+            "[[env]]\nvars = { DB_URL = \"local\" }\n",
+        );
 
         let shared = load_from(Some(&global), &root, Some(&home));
-        assert_eq!(shared.get("DB_URL").map(|v| v.value.as_str()), Some("local"));
+        assert_eq!(
+            shared.get("DB_URL").map(|v| v.value.as_str()),
+            Some("local")
+        );
         assert_eq!(shared.get("DB_URL").unwrap().origin, SharedOrigin::Project);
     }
 
@@ -427,10 +473,16 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
 
         let global = home.join(".meshfox").join("config.toml");
-        write(&global, "[[env]]\npath = \"~/work/projectA\"\nvars = { DB_URL = \"projA\" }\n");
+        write(
+            &global,
+            "[[env]]\npath = \"~/work/projectA\"\nvars = { DB_URL = \"projA\" }\n",
+        );
 
         let shared = load_from(Some(&global), &project, Some(&home));
-        assert_eq!(shared.get("DB_URL").map(|v| v.value.as_str()), Some("projA"));
+        assert_eq!(
+            shared.get("DB_URL").map(|v| v.value.as_str()),
+            Some("projA")
+        );
     }
 
     #[test]
@@ -438,7 +490,10 @@ mod tests {
         let home = tempdir("home-tie");
         let root = tempdir("project-tie");
         let global = home.join(".meshfox").join("config.toml");
-        write(&global, "[[env]]\nvars = { X = \"first\" }\n\n[[env]]\nvars = { X = \"second\" }\n");
+        write(
+            &global,
+            "[[env]]\nvars = { X = \"first\" }\n\n[[env]]\nvars = { X = \"second\" }\n",
+        );
 
         let shared = load_from(Some(&global), &root, Some(&home));
         assert_eq!(shared.get("X").map(|v| v.value.as_str()), Some("second"));
@@ -460,7 +515,11 @@ mod tests {
         let shared = load_from(Some(&global), &root, Some(&home));
         assert_eq!(shared.get("LIST"), None, "non-scalar vars leaf is dropped");
         assert_eq!(shared.get("OK").map(|v| v.value.as_str()), Some("kept"));
-        assert_eq!(shared.get("LEAKED"), None, "a non-string path= must not fall back to unscoped");
+        assert_eq!(
+            shared.get("LEAKED"),
+            None,
+            "a non-string path= must not fall back to unscoped"
+        );
     }
 
     #[test]
@@ -485,7 +544,10 @@ mod tests {
 
         for matching in [&project_a, &project_b] {
             let shared = load_from(Some(&global), matching, Some(&home));
-            assert_eq!(shared.get("DB_URL").map(|v| v.value.as_str()), Some("shared"));
+            assert_eq!(
+                shared.get("DB_URL").map(|v| v.value.as_str()),
+                Some("shared")
+            );
         }
         let shared = load_from(Some(&global), &unrelated, Some(&home));
         assert_eq!(shared.get("DB_URL"), None);
@@ -518,6 +580,9 @@ mod tests {
         );
 
         let shared = load_from(Some(&global), &project_a, Some(&home));
-        assert_eq!(shared.get("DB_URL").map(|v| v.value.as_str()), Some("shared"));
+        assert_eq!(
+            shared.get("DB_URL").map(|v| v.value.as_str()),
+            Some("shared")
+        );
     }
 }

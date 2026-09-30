@@ -46,7 +46,8 @@ pub fn lock_path(canvas_path: &Path) -> PathBuf {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    dir.join(".meshfox").join(format!("{file_name}.worker.lock"))
+    dir.join(".meshfox")
+        .join(format!("{file_name}.worker.lock"))
 }
 
 /// Held for as long as this process wants to be *the* worker for a canvas —
@@ -111,7 +112,9 @@ pub fn try_acquire(canvas_path: &Path) -> io::Result<Acquired> {
     if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
         return Err(err);
     }
-    Ok(Acquired::Other { port: read_port_with_retry(&path)? })
+    Ok(Acquired::Other {
+        port: read_port_with_retry(&path)?,
+    })
 }
 
 /// The current holder acquired the lock and then, a moment later, writes its
@@ -164,12 +167,21 @@ mod tests {
 
     #[test]
     fn lock_path_is_a_sibling_meshfox_dir() {
-        let dir = std::env::temp_dir().join(format!("meshfox-worker-lock-test-path-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-worker-lock-test-path-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("doc.canvas.md");
         std::fs::write(&path, "# Doc\n").unwrap();
         let locked = lock_path(&path);
-        assert_eq!(locked, dir.canonicalize().unwrap().join(".meshfox").join("doc.canvas.md.worker.lock"));
+        assert_eq!(
+            locked,
+            dir.canonicalize()
+                .unwrap()
+                .join(".meshfox")
+                .join("doc.canvas.md.worker.lock")
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -247,7 +247,11 @@ pub struct Asset {
 /// way the server confines it (see module docs). `links_base_url`, if set, is
 /// prefixed onto whatever relative reference is left over (see module
 /// docs) — pass `None` for a self-contained site meant to be opened as-is.
-pub fn build(canvas: &Canvas, canvas_dir: &Path, links_base_url: Option<&str>) -> (SiteData, Vec<Asset>) {
+pub fn build(
+    canvas: &Canvas,
+    canvas_dir: &Path,
+    links_base_url: Option<&str>,
+) -> (SiteData, Vec<Asset>) {
     build_with_code_previews(canvas, canvas_dir, links_base_url, None)
 }
 
@@ -466,8 +470,9 @@ fn build_node_view(
                 resolve_link_url(t, ctx)
             }
         });
-        let first_link_override =
-            (node.node_type == NodeType::File && ctx.copy_files).then_some(target.as_deref()).flatten();
+        let first_link_override = (node.node_type == NodeType::File && ctx.copy_files)
+            .then_some(target.as_deref())
+            .flatten();
         let html_body = render_markdown(
             &node.text,
             &base_dir,
@@ -1103,7 +1108,9 @@ fn resolve_link_url(url: &str, ctx: &RenderCtx) -> String {
 /// it to check), just the same suffix convention every canvas in this repo
 /// already follows.
 fn is_canvas_file(path: &Path) -> bool {
-    path.to_string_lossy().to_ascii_lowercase().ends_with(".canvas.md")
+    path.to_string_lossy()
+        .to_ascii_lowercase()
+        .ends_with(".canvas.md")
 }
 
 /// `resolved`'s position in the `--out` tree relative to the *root*
@@ -1236,7 +1243,10 @@ fn resolve_file_target_for_copy(
                 // correctness, only for not panicking on the way there.
                 return resolve_link_url(url, ctx);
             }
-            let root_canvas_dir = ctx.root_canvas_path.parent().unwrap_or(ctx.root_canvas_path);
+            let root_canvas_dir = ctx
+                .root_canvas_path
+                .parent()
+                .unwrap_or(ctx.root_canvas_path);
             // The root canvas itself always renders at the `--out` root
             // (`current_slot: ""`) by convention, not wherever
             // `canvas_link_subdir` would naively place it by its own
@@ -1532,7 +1542,9 @@ mod tests {
     // `<img>` tag.
     #[test]
     fn image_size_attrs_become_html_width_height() {
-        let c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n![alt](pic.png){width=300 height=50%}\n");
+        let c = canvas(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n![alt](pic.png){width=300 height=50%}\n",
+        );
         let (site, _assets) = build(&c, Path::new("/nonexistent-meshfox-test-dir"), None);
         let body = &site.find("root").unwrap().html_body;
         assert!(
@@ -1552,7 +1564,9 @@ mod tests {
 
     #[test]
     fn leftover_text_after_a_partial_image_attrs_match_still_renders() {
-        let c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n![alt](pic.png){width=300} tail\n");
+        let c = canvas(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n![alt](pic.png){width=300} tail\n",
+        );
         let (site, _assets) = build(&c, Path::new("/nonexistent-meshfox-test-dir"), None);
         let body = &site.find("root").unwrap().html_body;
         assert!(body.contains(r#"width="300""#), "{body}");
@@ -1921,10 +1935,19 @@ mod tests {
     fn an_image_inside_an_include_dump_resolves_against_its_own_asset_base_not_canvas_dir() {
         let canvas_dir = temp_dir("asset-base-canvas-dir");
         let include_dir = temp_dir("asset-base-include-dir");
-        write(&canvas_dir, "shot.png", b"wrong file: lives next to the canvas");
-        write(&include_dir, "shot.png", b"right file: lives next to the include target");
+        write(
+            &canvas_dir,
+            "shot.png",
+            b"wrong file: lives next to the canvas",
+        );
+        write(
+            &include_dir,
+            "shot.png",
+            b"right file: lives next to the include target",
+        );
 
-        let mut c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n![Screenshot](shot.png)\n");
+        let mut c =
+            canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n![Screenshot](shot.png)\n");
         c.nodes[0].asset_base = Some(include_dir.to_string_lossy().into_owned());
 
         let (_site, assets) = build(&c, &canvas_dir, None);
@@ -1949,7 +1972,8 @@ mod tests {
         let include_dir = temp_dir("asset-base-dest-rel-include-dir");
         write(&include_dir, "shot.png", b"bytes");
 
-        let mut c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n![Screenshot](shot.png)\n");
+        let mut c =
+            canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n![Screenshot](shot.png)\n");
         c.nodes[0].asset_base = Some(include_dir.to_string_lossy().into_owned());
 
         let (_site, assets) = build(&c, &canvas_dir, None);
@@ -1961,7 +1985,10 @@ mod tests {
         // `dir`/`file` pair `GET /api/include-asset` expects.
         assert_eq!(
             assets[0].include_asset,
-            Some((include_dir.to_string_lossy().into_owned(), "shot.png".to_string()))
+            Some((
+                include_dir.to_string_lossy().into_owned(),
+                "shot.png".to_string()
+            ))
         );
 
         fs::remove_dir_all(&canvas_dir).ok();
@@ -1980,7 +2007,8 @@ mod tests {
         fs::create_dir_all(&include_dir).unwrap();
         write(&include_dir, "shot.png", b"bytes");
 
-        let mut c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n![Screenshot](shot.png)\n");
+        let mut c =
+            canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n![Screenshot](shot.png)\n");
         c.nodes[0].asset_base = Some(include_dir.to_string_lossy().into_owned());
 
         let (_site, assets) = build(&c, &canvas_dir, None);
@@ -2073,8 +2101,16 @@ mod tests {
     #[test]
     fn recursive_rewrites_the_visible_link_not_just_node_view_target() {
         let dir = temp_dir("recursive-visible-link");
-        write(&dir, "other.canvas.md", b"# Other\n<!-- meshfox:node id=\"root\" -->\n");
-        write(&dir, "doc.canvas.md", b"unused: build() is given `c` directly, not read from disk");
+        write(
+            &dir,
+            "other.canvas.md",
+            b"# Other\n<!-- meshfox:node id=\"root\" -->\n",
+        );
+        write(
+            &dir,
+            "doc.canvas.md",
+            b"unused: build() is given `c` directly, not read from disk",
+        );
         let root_path = dir.join("doc.canvas.md");
         let c = canvas(concat!(
             "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
@@ -2149,7 +2185,11 @@ mod tests {
     #[test]
     fn copy_files_errors_on_a_canvas_md_target_instead_of_copying_it() {
         let dir = temp_dir("copy-files-canvas-target");
-        write(&dir, "other.canvas.md", b"# Other\n<!-- meshfox:node id=\"root\" -->\n");
+        write(
+            &dir,
+            "other.canvas.md",
+            b"# Other\n<!-- meshfox:node id=\"root\" -->\n",
+        );
         let c = canvas(concat!(
             "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
             "## Other\n<!-- meshfox:node id=\"f\" type=\"file\" -->\n\n[other](other.canvas.md)\n",
@@ -2170,7 +2210,11 @@ mod tests {
     #[test]
     fn without_copy_files_a_canvas_md_target_is_left_as_a_plain_link() {
         let dir = temp_dir("no-copy-files-canvas-target");
-        write(&dir, "other.canvas.md", b"# Other\n<!-- meshfox:node id=\"root\" -->\n");
+        write(
+            &dir,
+            "other.canvas.md",
+            b"# Other\n<!-- meshfox:node id=\"root\" -->\n",
+        );
         let c = canvas(concat!(
             "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
             "## Other\n<!-- meshfox:node id=\"f\" type=\"file\" -->\n\n[other](other.canvas.md)\n",
@@ -2191,14 +2235,22 @@ mod tests {
     #[test]
     fn recursive_rewrites_a_sibling_canvas_target_to_its_own_rendered_page() {
         let dir = temp_dir("recursive-sibling");
-        write(&dir, "other.canvas.md", b"# Other\n<!-- meshfox:node id=\"root\" -->\n");
+        write(
+            &dir,
+            "other.canvas.md",
+            b"# Other\n<!-- meshfox:node id=\"root\" -->\n",
+        );
         // `root_canvas_path` must exist on disk to canonicalize — a
         // non-canonical fallback here would desync from `resolved` (always
         // canonical, via `confine`) and spuriously hit the
         // `external-pages/` fallback (see `canvas_link_subdir`'s own doc
         // comment) even though `other.canvas.md` genuinely lives right next
         // to it.
-        write(&dir, "doc.canvas.md", b"unused: build() is given `c` directly, not read from disk");
+        write(
+            &dir,
+            "doc.canvas.md",
+            b"unused: build() is given `c` directly, not read from disk",
+        );
         let root_path = dir.join("doc.canvas.md");
         let c = canvas(concat!(
             "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
@@ -2228,8 +2280,16 @@ mod tests {
     #[test]
     fn recursive_carries_a_deep_link_fragment_over_as_a_node_anchor() {
         let dir = temp_dir("recursive-fragment");
-        write(&dir, "other.canvas.md", b"# Other\n<!-- meshfox:node id=\"root\" -->\n");
-        write(&dir, "doc.canvas.md", b"unused: build() is given `c` directly, not read from disk");
+        write(
+            &dir,
+            "other.canvas.md",
+            b"# Other\n<!-- meshfox:node id=\"root\" -->\n",
+        );
+        write(
+            &dir,
+            "doc.canvas.md",
+            b"unused: build() is given `c` directly, not read from disk",
+        );
         let root_path = dir.join("doc.canvas.md");
         let c = canvas(concat!(
             "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
@@ -2260,7 +2320,11 @@ mod tests {
             "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
             "## Self\n<!-- meshfox:node id=\"f\" type=\"file\" -->\n\n[self](doc.canvas.md)\n",
         ));
-        write(&dir, "doc.canvas.md", b"unused: build() is given `c` directly, not read from disk");
+        write(
+            &dir,
+            "doc.canvas.md",
+            b"unused: build() is given `c` directly, not read from disk",
+        );
 
         let (site, _assets, canvas_links) =
             build_for_static_export(&c, &dir, &root_path, "", None, None, true, true).unwrap();
@@ -2281,17 +2345,19 @@ mod tests {
     #[test]
     fn recursive_a_link_back_to_the_root_from_a_nested_canvas_climbs_out_correctly() {
         let dir = temp_dir("recursive-root-cycle-nested");
-        write(&dir, "doc.canvas.md", b"unused: build() is given `c` directly, not read from disk");
+        write(
+            &dir,
+            "doc.canvas.md",
+            b"unused: build() is given `c` directly, not read from disk",
+        );
         let root_path = dir.join("doc.canvas.md");
         let c = canvas(concat!(
             "# Other\n<!-- meshfox:node id=\"root\" -->\n\n",
             "## Back\n<!-- meshfox:node id=\"f\" type=\"file\" -->\n\n[back](doc.canvas.md)\n",
         ));
 
-        let (site, _assets, _canvas_links) = build_for_static_export(
-            &c, &dir, &root_path, "other", None, None, true, true,
-        )
-        .unwrap();
+        let (site, _assets, _canvas_links) =
+            build_for_static_export(&c, &dir, &root_path, "other", None, None, true, true).unwrap();
         assert_eq!(
             site.find("f").unwrap().target.as_deref(),
             Some("../index.html")
@@ -2313,8 +2379,16 @@ mod tests {
         let root_dir = temp_dir("recursive-confinement-root");
         let nested_dir = root_dir.join("nested");
         fs::create_dir_all(&nested_dir).unwrap();
-        write(&root_dir, "doc.canvas.md", b"unused: build() is given `c` directly, not read from disk");
-        write(&root_dir, "sibling.canvas.md", b"# Sibling\n<!-- meshfox:node id=\"root\" -->\n");
+        write(
+            &root_dir,
+            "doc.canvas.md",
+            b"unused: build() is given `c` directly, not read from disk",
+        );
+        write(
+            &root_dir,
+            "sibling.canvas.md",
+            b"# Sibling\n<!-- meshfox:node id=\"root\" -->\n",
+        );
         let root_path = root_dir.join("doc.canvas.md");
         // `c` here stands in for `nested/b.canvas.md`'s own resolved
         // content — `canvas_dir` (`nested_dir`) is what confinement is
@@ -2326,7 +2400,14 @@ mod tests {
         ));
 
         let (site, _assets, canvas_links) = build_for_static_export(
-            &c, &nested_dir, &root_path, "nested", None, None, true, true,
+            &c,
+            &nested_dir,
+            &root_path,
+            "nested",
+            None,
+            None,
+            true,
+            true,
         )
         .unwrap();
         assert_eq!(
@@ -2457,7 +2538,11 @@ mod tests {
         let site = build_site(&c);
         let post = site.find("post").unwrap();
         assert!(post.html_body.contains("example.com"), "{}", post.html_body);
-        assert!(post.html_body.contains("A short note."), "{}", post.html_body);
+        assert!(
+            post.html_body.contains("A short note."),
+            "{}",
+            post.html_body
+        );
     }
 
     #[test]

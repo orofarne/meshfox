@@ -85,7 +85,10 @@ mod tests {
 
     #[test]
     fn strips_a_region_including_its_own_markers() {
-        assert_eq!(strip("before <!-- meshfox:comment -->hidden<!-- /meshfox:comment --> after"), "before  after");
+        assert_eq!(
+            strip("before <!-- meshfox:comment -->hidden<!-- /meshfox:comment --> after"),
+            "before  after"
+        );
     }
 
     #[test]
@@ -96,7 +99,10 @@ mod tests {
 
     #[test]
     fn leaves_plain_text_with_no_markers_untouched() {
-        assert_eq!(strip("just some text\n\nmore text\n"), "just some text\n\nmore text\n");
+        assert_eq!(
+            strip("just some text\n\nmore text\n"),
+            "just some text\n\nmore text\n"
+        );
     }
 
     #[test]
@@ -116,7 +122,8 @@ mod tests {
 
     #[test]
     fn a_region_can_span_a_fence_that_sits_entirely_inside_it() {
-        let md = "<!-- meshfox:comment -->before\n```\ncode\n```\nafter<!-- /meshfox:comment -->kept";
+        let md =
+            "<!-- meshfox:comment -->before\n```\ncode\n```\nafter<!-- /meshfox:comment -->kept";
         assert_eq!(strip(md), "kept");
     }
 

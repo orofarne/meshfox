@@ -40,7 +40,10 @@ pub fn resolve(canvas: &Canvas, base_path: &Path) -> Result<Canvas, IncludeError
         .unwrap_or_default();
     let mut nodes = canvas.nodes.clone();
 
-    for node in nodes.iter_mut().filter(|n| n.node_type == NodeType::Include) {
+    for node in nodes
+        .iter_mut()
+        .filter(|n| n.node_type == NodeType::Include)
+    {
         let target = node
             .target
             .clone()
@@ -168,10 +171,8 @@ mod tests {
 
     #[test]
     fn includes_a_canvas_target_as_plain_dumped_text_too() {
-        let tmp = std::env::temp_dir().join(format!(
-            "meshfox-include-test-{}",
-            std::process::id() + 1
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("meshfox-include-test-{}", std::process::id() + 1));
         fs::create_dir_all(&tmp).unwrap();
         write(
             &tmp,
@@ -202,10 +203,8 @@ mod tests {
 
     #[test]
     fn missing_include_target_is_a_clear_error() {
-        let tmp = std::env::temp_dir().join(format!(
-            "meshfox-include-test-{}",
-            std::process::id() + 2
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("meshfox-include-test-{}", std::process::id() + 2));
         fs::create_dir_all(&tmp).unwrap();
         let base = write(
             &tmp,
@@ -223,10 +222,8 @@ mod tests {
 
     #[test]
     fn list_includes_reports_a_top_level_include_without_reading_its_target() {
-        let tmp = std::env::temp_dir().join(format!(
-            "meshfox-list-includes-test-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("meshfox-list-includes-test-{}", std::process::id()));
         fs::create_dir_all(&tmp).unwrap();
         write(&tmp, "child.md", "# Child\n\nbody\n");
         let base = write(

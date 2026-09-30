@@ -97,7 +97,11 @@ pub async fn run(canvas_path: PathBuf, initial_node: Option<String>) -> io::Resu
                 Ok(port) => Some(port),
                 Err(_) => {
                     disable_raw_mode()?;
-                    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+                    execute!(
+                        terminal.backend_mut(),
+                        LeaveAlternateScreen,
+                        DisableMouseCapture
+                    )?;
                     return Err(io::Error::other("failed to start the worker"));
                 }
             }
@@ -105,7 +109,11 @@ pub async fn run(canvas_path: PathBuf, initial_node: Option<String>) -> io::Resu
         Ok(crate::coordinator::Resolved::Other(port)) => Some(port),
         Err(e) => {
             disable_raw_mode()?;
-            execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+            execute!(
+                terminal.backend_mut(),
+                LeaveAlternateScreen,
+                DisableMouseCapture
+            )?;
             eprintln!("meshfox tui: couldn't reach a worker for this canvas: {e}");
             std::process::exit(1);
         }
@@ -113,7 +121,14 @@ pub async fn run(canvas_path: PathBuf, initial_node: Option<String>) -> io::Resu
 
     spawn_signal_terminal_restore(embedded_worker);
 
-    let result = match App::new(canvas_path, link_preview_tx, initial_node.as_deref(), worker_port).await {
+    let result = match App::new(
+        canvas_path,
+        link_preview_tx,
+        initial_node.as_deref(),
+        worker_port,
+    )
+    .await
+    {
         Ok(mut app) => {
             // `crossterm::event::read()` is blocking, so reading happens on
             // its own OS thread — the main loop stays async and can
@@ -163,8 +178,17 @@ pub async fn run(canvas_path: PathBuf, initial_node: Option<String>) -> io::Resu
             // such thing to discover, so `external_run_rx` just never
             // receives anything then.
             match app.worker_port {
-                Some(port) => spawn_worker_watcher(port, Arc::clone(&app.known_raw), reload_tx, external_run_tx),
-                None => spawn_file_watcher(app.canvas_path.clone(), Arc::clone(&app.known_raw), reload_tx),
+                Some(port) => spawn_worker_watcher(
+                    port,
+                    Arc::clone(&app.known_raw),
+                    reload_tx,
+                    external_run_tx,
+                ),
+                None => spawn_file_watcher(
+                    app.canvas_path.clone(),
+                    Arc::clone(&app.known_raw),
+                    reload_tx,
+                ),
             }
 
             main_loop(
@@ -365,8 +389,12 @@ fn spawn_run_subscriber(
     tokio::spawn(async move {
         let mut events = crate::worker_client::subscribe_run(port, node_id.clone(), block.clone());
         while let Some(event) = events.recv().await {
-            let update =
-                ExternalRunUpdate { node_id: node_id.clone(), block: block.clone(), event, known_duration_ms };
+            let update = ExternalRunUpdate {
+                node_id: node_id.clone(),
+                block: block.clone(),
+                event,
+                known_duration_ms,
+            };
             if tx.send(update).is_err() {
                 return;
             }
@@ -383,7 +411,9 @@ fn spawn_run_subscriber(
 /// UI's reconcile-on-load effect. Best-effort: a worker that can't list its
 /// runs just means an empty start, as before.
 async fn reconcile_runs(port: u16, tx: &tokio::sync::mpsc::UnboundedSender<ExternalRunUpdate>) {
-    let Ok(runs) = crate::worker_client::list_active_runs(port).await else { return };
+    let Ok(runs) = crate::worker_client::list_active_runs(port).await else {
+        return;
+    };
     for run in runs.into_iter().filter(|r| r.kind == "plain") {
         // For a finished run `uptime_ms` is its duration (see the server's
         // `get_active_runs`); for a running one it's the time so far, which
@@ -720,7 +750,12 @@ fn write_all_retrying(stdout: &mut std::io::Stdout, mut bytes: &[u8]) -> io::Res
     use std::io::Write;
     while !bytes.is_empty() {
         match stdout.write(bytes) {
-            Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "stdout wrote 0 bytes")),
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "stdout wrote 0 bytes",
+                ))
+            }
             Ok(n) => bytes = &bytes[n..],
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -752,7 +787,11 @@ fn write_all_retrying(stdout: &mut std::io::Stdout, mut bytes: &[u8]) -> io::Res
 fn stdin_has_input_within(timeout: Duration) -> bool {
     use std::os::unix::io::AsRawFd;
     let fd = std::io::stdin().as_raw_fd();
-    let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
     let ready = unsafe { libc::poll(&mut pfd, 1, timeout.as_millis() as libc::c_int) };
     ready > 0 && pfd.revents & libc::POLLIN != 0
 }
@@ -774,7 +813,10 @@ fn stdin_has_input_within(timeout: Duration) -> bool {
 /// not just tidiness).
 fn spawn_raw_stdin_reader(
     stop: Arc<AtomicBool>,
-) -> (tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>, std::thread::JoinHandle<()>) {
+) -> (
+    tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    std::thread::JoinHandle<()>,
+) {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let handle = std::thread::spawn(move || {
         use std::io::Read;
@@ -830,7 +872,12 @@ fn print_tty_transcript_event(event: crate::worker_client::RunEvent) -> TtyPrelu
             print!("==> {block}\r\n");
             TtyPreludeOutcome::Continue
         }
-        RunEvent::StepSkipped { block, output, duration_ms, .. } => {
+        RunEvent::StepSkipped {
+            block,
+            output,
+            duration_ms,
+            ..
+        } => {
             print!(
                 "==> {block} (skipped, already fresh this session)\r\n{output}\r\n(skipped · {})\r\n",
                 meshfox_core::format_duration_ms(duration_ms)
@@ -841,8 +888,15 @@ fn print_tty_transcript_event(event: crate::worker_client::RunEvent) -> TtyPrelu
             print!("{text}\r\n");
             TtyPreludeOutcome::Continue
         }
-        RunEvent::StepEnd { exit_code, duration_ms, .. } => {
-            print!("(exit {exit_code} · {})\r\n", meshfox_core::format_duration_ms(duration_ms));
+        RunEvent::StepEnd {
+            exit_code,
+            duration_ms,
+            ..
+        } => {
+            print!(
+                "(exit {exit_code} · {})\r\n",
+                meshfox_core::format_duration_ms(duration_ms)
+            );
             TtyPreludeOutcome::Continue
         }
         RunEvent::Killed { .. } => TtyPreludeOutcome::Done(-1),
@@ -854,7 +908,12 @@ fn print_tty_transcript_event(event: crate::worker_client::RunEvent) -> TtyPrelu
         // (`TtyConnectError::Conflict`), not a streamed event — this arm
         // exists only for exhaustiveness against the shared `RunEvent`
         // enum and should never actually be reached here.
-        RunEvent::LockConflict { node_id, block, owner_pid, owner_desc } => {
+        RunEvent::LockConflict {
+            node_id,
+            block,
+            owner_pid,
+            owner_desc,
+        } => {
             print!("{node_id:?}/{block:?} is locked by pid {owner_pid} ({owner_desc})\r\n");
             TtyPreludeOutcome::Done(-1)
         }
@@ -904,7 +963,8 @@ pub(crate) async fn bridge_http_tty(socket: &mut crate::worker_client::TtySocket
     loop {
         match socket.next().await {
             Some(Ok(Message::Text(text))) => {
-                let Ok(event) = serde_json::from_str::<crate::worker_client::RunEvent>(&text) else {
+                let Ok(event) = serde_json::from_str::<crate::worker_client::RunEvent>(&text)
+                else {
                     continue;
                 };
                 match print_tty_transcript_event(event) {

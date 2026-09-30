@@ -13,8 +13,7 @@
 
 use clap::{Args, Parser, Subcommand};
 use meshfox_core::{
-    mdcanvas, Canvas, ExtraEdge, FileDisplay, Node, NodeType, VarCache,
-    VarDecl, VarType,
+    mdcanvas, Canvas, ExtraEdge, FileDisplay, Node, NodeType, VarCache, VarDecl, VarType,
 };
 #[cfg(test)]
 use meshfox_core::{FenceAttrsPatch, NodeMeta};
@@ -475,7 +474,9 @@ enum Command {
     Spec,
     /// Check github.com/orofarne/meshfox's releases for a newer version
     /// than this binary and, if one exists, offer to download and install
-    /// it in place (replacing the running executable). A no-op if this
+    /// it in place (replacing the running executable). A CLI bundled in
+    /// Meshfox.app is updated with the whole app via Meshfox.pkg instead.
+    /// A no-op if this
     /// build wasn't made from a release tag (e.g. a local/dev build) —
     /// there's no version to compare against a release with, so it just
     /// says so and exits.
@@ -1226,7 +1227,11 @@ fn main() {
             let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
             redo_cmd(&canvas_path)
         }
-        Command::History { canvas, limit, goto } => {
+        Command::History {
+            canvas,
+            limit,
+            goto,
+        } => {
             let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
             history_cmd(&canvas_path, limit, goto)
         }
@@ -1400,12 +1405,7 @@ fn main() {
                 node_id,
                 before,
                 after,
-            } => node_move(
-                &canvas.unwrap_or_else(find_canvas),
-                &node_id,
-                before,
-                after,
-            ),
+            } => node_move(&canvas.unwrap_or_else(find_canvas), &node_id, before, after),
             NodeCommand::Reorder { canvas } => node_reorder(&canvas.unwrap_or_else(find_canvas)),
             NodeCommand::Show { canvas, node_id } => {
                 node_show(&canvas.unwrap_or_else(find_canvas), &node_id)
@@ -1444,6 +1444,21 @@ fn main() {
 /// release, so that's what distinguishes the two here rather than trying
 /// to parse `commit ...` as a non-version and fall through.
 fn check_updates(yes: bool) {
+    // A package-managed macOS app must be updated as a whole. Replacing just
+    // its embedded CLI would either fail on /Applications permissions or
+    // invalidate the bundle's code signature.
+    if let Ok(exe) = std::env::current_exe().and_then(std::fs::canonicalize) {
+        let macos_dir = exe.parent();
+        let contents_dir = macos_dir.and_then(Path::parent);
+        let app_dir = contents_dir.and_then(Path::parent);
+        if macos_dir.and_then(Path::file_name).and_then(|s| s.to_str()) == Some("MacOS")
+            && contents_dir.and_then(Path::file_name).and_then(|s| s.to_str()) == Some("Contents")
+            && app_dir.is_some_and(|p| p.extension().is_some_and(|s| s == "app"))
+        {
+            println!("meshfox check-updates: this CLI belongs to a macOS app bundle; install a newer Meshfox.pkg to update the app and CLI together.");
+            return;
+        }
+    }
     let label = env!("MESHFOX_VERSION_LABEL");
     let is_release_tag =
         label.starts_with('v') && label[1..].starts_with(|c: char| c.is_ascii_digit());
@@ -1713,7 +1728,10 @@ fn validate(canvas_path: &PathBuf) {
 /// empty match list rather than erroring: the caller (CLI `check` below,
 /// or the MCP `check` tool) decides what to do with per-constraint
 /// failures.
-fn check_canvas(raw: &str, canvas_path: &Path) -> Result<Vec<meshfox_core::ConstraintResult>, String> {
+fn check_canvas(
+    raw: &str,
+    canvas_path: &Path,
+) -> Result<Vec<meshfox_core::ConstraintResult>, String> {
     let canvas = Canvas::from_markdown(raw).map_err(|e| e.to_string())?;
     let canvas = meshfox_core::include::resolve(&canvas, canvas_path).map_err(|e| e.to_string())?;
     Ok(meshfox_core::evaluate_constraints(
@@ -1829,7 +1847,13 @@ fn view_worker(canvas_path: PathBuf, port: u16, auto_exit: bool, watcher_socket:
         eprintln!("failed to start async runtime: {e}");
         std::process::exit(1);
     });
-    if let Err(e) = runtime.block_on(meshfox_server::run(canvas_path, port, auto_exit, Some(watcher_socket), false)) {
+    if let Err(e) = runtime.block_on(meshfox_server::run(
+        canvas_path,
+        port,
+        auto_exit,
+        Some(watcher_socket),
+        false,
+    )) {
         eprintln!("meshfox view: {e}");
         std::process::exit(1);
     }
@@ -1848,7 +1872,13 @@ fn view_watcher(canvas_path: PathBuf, port: u16, open_browser: bool, auto_exit: 
         eprintln!("meshfox view: couldn't resolve this binary's own path: {e}");
         std::process::exit(1);
     });
-    if let Err(e) = runtime.block_on(watcher::run(exe, canvas_path, port, open_browser, auto_exit)) {
+    if let Err(e) = runtime.block_on(watcher::run(
+        exe,
+        canvas_path,
+        port,
+        open_browser,
+        auto_exit,
+    )) {
         eprintln!("meshfox view: {e}");
         std::process::exit(1);
     }
@@ -1865,7 +1895,10 @@ fn view_or_hand_off(canvas_path: PathBuf, port: u16, no_open: bool, no_auto_exit
         std::process::exit(1);
     });
     let fragment = None; // `view`'s own path argument has no `#node-id` deep-link syntax.
-    match runtime.block_on(coordinator::hand_off_to_configured_coordinator(&canvas_path, fragment)) {
+    match runtime.block_on(coordinator::hand_off_to_configured_coordinator(
+        &canvas_path,
+        fragment,
+    )) {
         Ok(Some(())) => {
             println!(
                 "meshfox view: handed {} off to the configured coordinator",
@@ -1938,7 +1971,12 @@ fn find_canvas() -> PathBuf {
         many => {
             let names: Vec<String> = many
                 .iter()
-                .map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned())
+                .map(|p| {
+                    p.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                })
                 .collect();
             eprintln!(
                 "multiple canvas files found: {} — pass one explicitly",
@@ -2106,14 +2144,21 @@ async fn run_async(
     let path: Vec<&str> = args.iter().map(String::as_str).collect();
     let block_names: Vec<&str> = block_arg.split(',').map(str::trim).collect();
 
-    let port = coordinator::get_or_spawn(canvas_path).await.unwrap_or_else(|e| {
-        eprintln!("failed to reach worker for {}: {e}", canvas_path.display());
-        std::process::exit(1);
-    });
-    let initial_raw = worker_client::get_canvas_raw(port).await.unwrap_or_else(|e| {
-        eprintln!("failed to read {} through worker: {e}", canvas_path.display());
-        std::process::exit(1);
-    });
+    let port = coordinator::get_or_spawn(canvas_path)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("failed to reach worker for {}: {e}", canvas_path.display());
+            std::process::exit(1);
+        });
+    let initial_raw = worker_client::get_canvas_raw(port)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "failed to read {} through worker: {e}",
+                canvas_path.display()
+            );
+            std::process::exit(1);
+        });
 
     // `meshfox:var` only ever lives in the root node, which is always in
     // the primary document — never affected by an `include`.
@@ -2170,8 +2215,15 @@ async fn run_async(
             ));
             match ready_rx.await {
                 Ok(port) => {
-                    return run_via_worker(port, canvas_path, &path, &block_names, no_deps, overrides)
-                        .await;
+                    return run_via_worker(
+                        port,
+                        canvas_path,
+                        &path,
+                        &block_names,
+                        no_deps,
+                        overrides,
+                    )
+                    .await;
                 }
                 Err(_) => {
                     eprintln!("meshfox run: failed to start the core for this file");
@@ -2180,7 +2232,8 @@ async fn run_async(
             }
         }
         Ok(coordinator::Resolved::Other(port)) => {
-            return run_via_worker(port, canvas_path, &path, &block_names, no_deps, overrides).await;
+            return run_via_worker(port, canvas_path, &path, &block_names, no_deps, overrides)
+                .await;
         }
         Err(e) => {
             eprintln!("meshfox run: {e}");
@@ -2288,23 +2341,32 @@ async fn run_via_worker(
                 match resolve_worker_file_node(port, canvas_path, &path, name).await {
                     Some(node_id) => {
                         match worker_client::run_file_node_stream(port, &node_id).await {
-                            Ok(rx) => match drain_worker_run_events(rx, port, name, &mut started_services).await {
-                                DrainResult::Ok => {}
-                                DrainResult::Failed => had_failure = true,
-                                // Unreachable in practice — `run_file_node_impl`
-                                // never takes a service lock (see
-                                // `DrainResult::Conflict`'s own doc comment) —
-                                // kept as a plain failure, not a retry, since
-                                // there's no `force`-capable endpoint for a
-                                // file node to retry through anyway.
-                                DrainResult::Conflict { block, owner_pid, owner_desc, .. } => {
-                                    eprintln!(
+                            Ok(rx) => {
+                                match drain_worker_run_events(rx, port, name, &mut started_services)
+                                    .await
+                                {
+                                    DrainResult::Ok => {}
+                                    DrainResult::Failed => had_failure = true,
+                                    // Unreachable in practice — `run_file_node_impl`
+                                    // never takes a service lock (see
+                                    // `DrainResult::Conflict`'s own doc comment) —
+                                    // kept as a plain failure, not a retry, since
+                                    // there's no `force`-capable endpoint for a
+                                    // file node to retry through anyway.
+                                    DrainResult::Conflict {
+                                        block,
+                                        owner_pid,
+                                        owner_desc,
+                                        ..
+                                    } => {
+                                        eprintln!(
                                         "error running {block:?}: already running elsewhere (pid {owner_pid}, \
                                          started via {owner_desc})"
                                     );
-                                    had_failure = true;
+                                        had_failure = true;
+                                    }
                                 }
-                            },
+                            }
                             Err(e) => {
                                 eprintln!("error running {name:?}: {e} (worker on port {port})");
                                 had_failure = true;
@@ -2369,7 +2431,12 @@ async fn run_via_worker(
         match drain_worker_run_events(rx, port, name, &mut started_services).await {
             DrainResult::Ok => {}
             DrainResult::Failed => had_failure = true,
-            DrainResult::Conflict { node_id, block, owner_pid, owner_desc } => {
+            DrainResult::Conflict {
+                node_id,
+                block,
+                owner_pid,
+                owner_desc,
+            } => {
                 if !retry_after_lock_conflict(
                     port,
                     &path,
@@ -2486,7 +2553,11 @@ async fn resolve_worker_file_node(
     let raw = worker_client::get_canvas_raw(port).await.ok()?;
     let primary = Canvas::from_markdown(&raw).ok()?;
     let canvas = meshfox_core::include::resolve(&primary, canvas_path).ok()?;
-    let full_path: Vec<&str> = path.iter().map(String::as_str).chain(std::iter::once(name)).collect();
+    let full_path: Vec<&str> = path
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once(name))
+        .collect();
     let node = canvas.resolve_path(&full_path).ok()?;
     node.is_runnable_file().then(|| node.id.clone())
 }
@@ -2502,7 +2573,12 @@ async fn resolve_worker_file_node(
 /// unresolvable node-id-path segment, or that fails to even re-fetch/parse
 /// — same "nothing worth suggesting" posture `closest_node_path` already
 /// has.
-async fn worker_did_you_mean_hint(canvas_path: &Path, port: u16, path: &[String], name: &str) -> String {
+async fn worker_did_you_mean_hint(
+    canvas_path: &Path,
+    port: u16,
+    path: &[String],
+    name: &str,
+) -> String {
     let Ok(raw) = worker_client::get_canvas_raw(port).await else {
         return String::new();
     };
@@ -2546,7 +2622,9 @@ async fn run_worker_tty(
     vars: HashMap<String, String>,
 ) -> bool {
     if !prompt::stdin_is_tty() || !std::io::stdout().is_terminal() {
-        eprintln!("error running {name:?}: requires an interactive terminal (stdin/stdout isn't one)");
+        eprintln!(
+            "error running {name:?}: requires an interactive terminal (stdin/stdout isn't one)"
+        );
         return false;
     }
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -2627,9 +2705,12 @@ async fn node_mv_via_worker(
     node_id: &str,
     new_parent_id: &str,
 ) -> Result<(), String> {
-    let raw = worker_client::get_canvas_raw(port).await.map_err(|e| e.to_string())?;
+    let raw = worker_client::get_canvas_raw(port)
+        .await
+        .map_err(|e| e.to_string())?;
     let primary = Canvas::from_markdown(&raw).map_err(|e| e.to_string())?;
-    let canvas = meshfox_core::include::resolve(&primary, canvas_path).map_err(|e| e.to_string())?;
+    let canvas =
+        meshfox_core::include::resolve(&primary, canvas_path).map_err(|e| e.to_string())?;
     let node = canvas
         .node(node_id)
         .ok_or_else(|| format!("no node {node_id:?}"))?;
@@ -2664,7 +2745,12 @@ enum DrainResult {
     /// does; the file-node fallback below doesn't — `run_file_node_impl`
     /// never takes a service lock at all, so this arm is unreachable there
     /// in practice, kept only for exhaustiveness).
-    Conflict { node_id: String, block: String, owner_pid: u32, owner_desc: String },
+    Conflict {
+        node_id: String,
+        block: String,
+        owner_pid: u32,
+        owner_desc: String,
+    },
 }
 
 /// Drains one requested name's own `RunEvent` stream to completion (a
@@ -2785,7 +2871,11 @@ async fn drain_worker_run_events(
             }
         }
     }
-    if had_failure { DrainResult::Failed } else { DrainResult::Ok }
+    if had_failure {
+        DrainResult::Failed
+    } else {
+        DrainResult::Ok
+    }
 }
 
 /// The interactive confirm `run_via_worker`'s `DrainResult::Conflict` arm
@@ -2862,7 +2952,12 @@ async fn retry_after_lock_conflict(
     match drain_worker_run_events(rx, port, name, started_services).await {
         DrainResult::Ok => true,
         DrainResult::Failed => false,
-        DrainResult::Conflict { block, owner_pid, owner_desc, .. } => {
+        DrainResult::Conflict {
+            block,
+            owner_pid,
+            owner_desc,
+            ..
+        } => {
             eprintln!(
                 "error running {block:?}: still locked after killing the previous owner (now pid {owner_pid}, \
                  started via {owner_desc}) — giving up after one retry"
@@ -3183,17 +3278,25 @@ fn run_command(path: &[String], name: &str, node_id: &str) -> String {
 fn read_raw_or_exit(canvas_path: &Path) -> String {
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime");
     let port = worker_port_or_exit(&runtime, canvas_path);
-    runtime.block_on(worker_client::get_canvas_raw(port)).unwrap_or_else(|e| {
-        eprintln!("failed to read {} through worker: {e}", canvas_path.display());
-        std::process::exit(1);
-    })
+    runtime
+        .block_on(worker_client::get_canvas_raw(port))
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "failed to read {} through worker: {e}",
+                canvas_path.display()
+            );
+            std::process::exit(1);
+        })
 }
 
 fn worker_port_or_exit(runtime: &tokio::runtime::Runtime, canvas_path: &Path) -> u16 {
     runtime
         .block_on(coordinator::get_or_spawn(canvas_path))
         .unwrap_or_else(|e| {
-            eprintln!("failed to start or reach the worker for {}: {e}", canvas_path.display());
+            eprintln!(
+                "failed to start or reach the worker for {}: {e}",
+                canvas_path.display()
+            );
             std::process::exit(1);
         })
 }
@@ -3255,10 +3358,12 @@ fn read_body_source_or_exit(path: &Path) -> String {
     if path == Path::new("-") {
         use std::io::Read;
         let mut buf = String::new();
-        std::io::stdin().read_to_string(&mut buf).unwrap_or_else(|e| {
-            eprintln!("failed to read stdin: {e}");
-            std::process::exit(1);
-        });
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .unwrap_or_else(|e| {
+                eprintln!("failed to read stdin: {e}");
+                std::process::exit(1);
+            });
         buf
     } else {
         std::fs::read_to_string(path).unwrap_or_else(|e| {
@@ -3331,7 +3436,11 @@ fn node_rm(canvas_path: &Path, node_id: &str, keep_children: bool) {
     match runtime.block_on(worker_client::remove_node(port, node_id, keep_children)) {
         Ok(()) => println!(
             "meshfox node rm: deleted {node_id:?}{} via the running worker on port {port}",
-            if keep_children { " (children promoted)" } else { "" }
+            if keep_children {
+                " (children promoted)"
+            } else {
+                ""
+            }
         ),
         Err(e) => {
             eprintln!("meshfox node rm: {e} (worker on port {port})");
@@ -3540,9 +3649,9 @@ fn node_body(canvas_path: &Path, node_id: &str, file: Option<PathBuf>) {
     });
     let port = worker_port_or_exit(&runtime, canvas_path);
     match runtime.block_on(worker_client::update_node_body(port, node_id, &new_body)) {
-        Ok(()) => println!(
-            "meshfox node body: updated {node_id:?} via the running worker on port {port}"
-        ),
+        Ok(()) => {
+            println!("meshfox node body: updated {node_id:?} via the running worker on port {port}")
+        }
         Err(e) => {
             eprintln!("meshfox node body: {e} (worker on port {port})");
             std::process::exit(1);
@@ -3567,10 +3676,12 @@ fn node_append(canvas_path: &Path, node_id: &str, file: Option<PathBuf>) {
         None => {
             use std::io::Read;
             let mut buf = String::new();
-            std::io::stdin().read_to_string(&mut buf).unwrap_or_else(|e| {
-                eprintln!("failed to read stdin: {e}");
-                std::process::exit(1);
-            });
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .unwrap_or_else(|e| {
+                    eprintln!("failed to read stdin: {e}");
+                    std::process::exit(1);
+                });
             buf
         }
     };
@@ -3579,10 +3690,12 @@ fn node_append(canvas_path: &Path, node_id: &str, file: Option<PathBuf>) {
         std::process::exit(1);
     });
     let port = worker_port_or_exit(&runtime, canvas_path);
-    runtime.block_on(worker_client::append_node_body(port, node_id, &addition)).unwrap_or_else(|e| {
-        eprintln!("meshfox node append: {e} (worker on port {port})");
-        std::process::exit(1);
-    });
+    runtime
+        .block_on(worker_client::append_node_body(port, node_id, &addition))
+        .unwrap_or_else(|e| {
+            eprintln!("meshfox node append: {e} (worker on port {port})");
+            std::process::exit(1);
+        });
     println!("meshfox node append: updated {node_id:?} via the worker on port {port}");
 }
 
@@ -3646,7 +3759,12 @@ fn node_block(canvas_path: &Path, node_id: &str, block_name: &str, args: BlockAr
 /// Resolves one `--x`/`--no-x` pair to `Some(true)`/`Some(false)`/`None`
 /// ("not touched") — rejects both being set in the same call, the one
 /// shape that would otherwise silently pick a winner.
-fn resolve_bool_pair(on: bool, off: bool, on_flag: &str, off_flag: &str) -> Result<Option<bool>, String> {
+fn resolve_bool_pair(
+    on: bool,
+    off: bool,
+    on_flag: &str,
+    off_flag: &str,
+) -> Result<Option<bool>, String> {
     match (on, off) {
         (true, true) => Err(format!("{on_flag} is mutually exclusive with {off_flag}")),
         (true, false) => Ok(Some(true)),
@@ -3852,7 +3970,11 @@ fn node_update_from_fields(
     fields: &NodeMetaFields,
     body: Option<&str>,
 ) -> Result<worker_client::NodeUpdate, String> {
-    let node_type = fields.node_type.as_deref().map(parse_node_type).transpose()?;
+    let node_type = fields
+        .node_type
+        .as_deref()
+        .map(parse_node_type)
+        .transpose()?;
     let display = fields.display.as_deref().map(parse_display).transpose()?;
     let tags = match &fields.tags {
         None => None,
@@ -3900,8 +4022,19 @@ fn node_meta(
     created_at: Option<String>,
 ) {
     let fields = NodeMetaFields {
-        x, y, width, height, color, node_type, display, lang, interpreter,
-        preview, fold, tags, created_at,
+        x,
+        y,
+        width,
+        height,
+        color,
+        node_type,
+        display,
+        lang,
+        interpreter,
+        preview,
+        fold,
+        tags,
+        created_at,
     };
     let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
         eprintln!("failed to start async runtime: {e}");
@@ -3913,10 +4046,12 @@ fn node_meta(
         std::process::exit(1);
     });
     update.clear_position = clear_position;
-    runtime.block_on(worker_client::update_node(port, node_id, &update)).unwrap_or_else(|e| {
-        eprintln!("meshfox node meta: {e} (worker on port {port})");
-        std::process::exit(1);
-    });
+    runtime
+        .block_on(worker_client::update_node(port, node_id, &update))
+        .unwrap_or_else(|e| {
+            eprintln!("meshfox node meta: {e} (worker on port {port})");
+            std::process::exit(1);
+        });
     println!("meshfox node meta: updated {node_id:?} via the running worker on port {port}");
 }
 
@@ -3933,7 +4068,10 @@ fn validate_tags_input(s: &str) -> Result<(), String> {
             "--tags contains a control character ({c:?}) — expected plain comma-separated tags, e.g. \"foo,bar\", not a JSON-encoded list"
         ));
     }
-    if let Some(c) = s.chars().find(|c| matches!(c, '"' | '\'' | '[' | ']' | '{' | '}')) {
+    if let Some(c) = s
+        .chars()
+        .find(|c| matches!(c, '"' | '\'' | '[' | ']' | '{' | '}'))
+    {
         return Err(format!(
             "--tags contains {c:?}, which looks like accidental JSON — expected plain comma-separated tags, e.g. \"foo,bar\""
         ));
@@ -3974,9 +4112,7 @@ fn apply_node_meta(
     }
 
     if clear_position && (x.is_some() || y.is_some() || width.is_some() || height.is_some()) {
-        return Err(
-            "--clear-position is mutually exclusive with --x/--y/--w/--h".to_string(),
-        );
+        return Err("--clear-position is mutually exclusive with --x/--y/--w/--h".to_string());
     }
 
     let parsed_type = node_type.as_deref().map(parse_node_type).transpose()?;
@@ -4067,7 +4203,10 @@ fn node_edges(canvas_path: &Path, node_id: &str, from: Vec<String>, clear: bool)
         std::process::exit(1);
     });
     let port = worker_port_or_exit(&runtime, canvas_path);
-    let edges: Vec<ExtraEdge> = extra_parents.iter().map(|p| ExtraEdge::new(p.as_str())).collect();
+    let edges: Vec<ExtraEdge> = extra_parents
+        .iter()
+        .map(|p| ExtraEdge::new(p.as_str()))
+        .collect();
     let update = worker_client::NodeUpdate {
         extra_parents: Some(edges),
         ..Default::default()
@@ -4240,7 +4379,10 @@ fn history_cmd(canvas_path: &Path, limit: usize, goto: Option<i64>) {
                 } else {
                     "·"
                 };
-                println!("{marker} {:>5}  {:<16}  {}", entry.seq, entry.op_kind, entry.summary);
+                println!(
+                    "{marker} {:>5}  {:<16}  {}",
+                    entry.seq, entry.op_kind, entry.summary
+                );
             }
             println!(
                 "(cursor at seq {}, can_undo={}, can_redo={})",
@@ -4534,8 +4676,7 @@ fn filter_by_dates(
                 }
             }
             if let Some(x) = since {
-                let touched =
-                    c_ts.is_some_and(|t| t >= x) || u_ts.is_some_and(|t| t >= x);
+                let touched = c_ts.is_some_and(|t| t >= x) || u_ts.is_some_and(|t| t >= x);
                 if !touched {
                     return false;
                 }
@@ -4779,7 +4920,14 @@ fn canvas_git_lastmod(canvas_path: &Path) -> Option<String> {
     let canonical = canvas_path.canonicalize().ok()?;
     let dir = canonical.parent()?;
     let output = std::process::Command::new("git")
-        .args(["-C", &dir.to_string_lossy(), "log", "-1", "--format=%cI", "--"])
+        .args([
+            "-C",
+            &dir.to_string_lossy(),
+            "log",
+            "-1",
+            "--format=%cI",
+            "--",
+        ])
         .arg(&canonical)
         .output()
         .ok()?;
@@ -4832,7 +4980,10 @@ fn sitemap_xml(entries: &[SitemapEntry], base_url: &str, git_dates: bool) -> Str
         xml.push_str(&format!("    <loc>{}</loc>\n", xml_escape(&loc)));
         if git_dates {
             if let Some(lastmod) = canvas_git_lastmod(&entry.canvas_path) {
-                xml.push_str(&format!("    <lastmod>{}</lastmod>\n", xml_escape(&lastmod)));
+                xml.push_str(&format!(
+                    "    <lastmod>{}</lastmod>\n",
+                    xml_escape(&lastmod)
+                ));
             }
         }
         xml.push_str("  </url>\n");
@@ -4973,10 +5124,7 @@ fn static_cmd(
     ));
 
     if sitemap {
-        let base_url = config
-            .base_url
-            .as_deref()
-            .expect("checked non-None above");
+        let base_url = config.base_url.as_deref().expect("checked non-None above");
         let xml = sitemap_xml(&sitemap_entries, base_url, sitemap_git_dates);
         write_output_file(&out_dir.join("sitemap.xml"), xml.as_bytes()).unwrap_or_else(|e| {
             eprintln!("meshfox static: {e}");
@@ -5051,13 +5199,15 @@ fn render_canvas_site<'a>(
             top_out_dir.join(&current_slot)
         };
 
-        let port = coordinator::get_or_spawn(&canvas_path).await.unwrap_or_else(|e| {
-            eprintln!(
-                "meshfox static: failed to start or reach the worker for {}: {e}",
-                canvas_path.display()
-            );
-            std::process::exit(1);
-        });
+        let port = coordinator::get_or_spawn(&canvas_path)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!(
+                    "meshfox static: failed to start or reach the worker for {}: {e}",
+                    canvas_path.display()
+                );
+                std::process::exit(1);
+            });
         let canvas = worker_client::get_canvas(port).await.unwrap_or_else(|e| {
             eprintln!(
                 "meshfox static: failed to read {} through the worker: {e}",
@@ -5121,17 +5271,18 @@ fn render_canvas_site<'a>(
                 std::process::exit(1);
             });
             let page_rel = Path::new(name).with_extension("");
-            write_output_file(&out_dir.join(&page_rel), rendered.as_bytes()).unwrap_or_else(
-                |e| {
-                    eprintln!("meshfox static: {e}");
-                    std::process::exit(1);
-                },
-            );
+            write_output_file(&out_dir.join(&page_rel), rendered.as_bytes()).unwrap_or_else(|e| {
+                eprintln!("meshfox static: {e}");
+                std::process::exit(1);
+            });
             count += 1;
             let out_rel = if current_slot.is_empty() {
                 page_rel.to_string_lossy().replace('\\', "/")
             } else {
-                format!("{current_slot}/{}", page_rel.to_string_lossy().replace('\\', "/"))
+                format!(
+                    "{current_slot}/{}",
+                    page_rel.to_string_lossy().replace('\\', "/")
+                )
             };
             sitemap_entries.push(SitemapEntry {
                 out_rel,
@@ -5385,9 +5536,14 @@ Shared body.
 
     #[test]
     fn add_with_extras_matches_plain_add_when_nothing_extra_is_given() {
-        let (with_extras, id_a) =
-            apply_node_add_with_extras(TEST_DOC, "tests", "New Check", None, NodeMetaFields::default())
-                .unwrap();
+        let (with_extras, id_a) = apply_node_add_with_extras(
+            TEST_DOC,
+            "tests",
+            "New Check",
+            None,
+            NodeMetaFields::default(),
+        )
+        .unwrap();
         let (plain, id_b) = apply_node_add(TEST_DOC, "tests", "New Check").unwrap();
         assert_eq!(id_a, id_b);
         // Byte-for-byte equality no longer holds now that every `node add`
@@ -5563,7 +5719,12 @@ Shared body.
             None,
         )
         .unwrap();
-        assert!(Canvas::from_markdown(&updated).unwrap().node("smoke-test").unwrap().tags.is_empty());
+        assert!(Canvas::from_markdown(&updated)
+            .unwrap()
+            .node("smoke-test")
+            .unwrap()
+            .tags
+            .is_empty());
 
         // Given, replaces the whole list outright — trimmed/split the same
         // way the file's own `tags="a, b"` attribute is.
@@ -5587,12 +5748,21 @@ Shared body.
         )
         .unwrap();
         assert_eq!(
-            Canvas::from_markdown(&updated).unwrap().node("smoke-test").unwrap().tags,
+            Canvas::from_markdown(&updated)
+                .unwrap()
+                .node("smoke-test")
+                .unwrap()
+                .tags,
             vec!["bag".to_string(), "fixed".to_string()],
         );
         // Untouched fields (here, color) still keep their prior value.
         assert_eq!(
-            Canvas::from_markdown(&updated).unwrap().node("smoke-test").unwrap().color.as_deref(),
+            Canvas::from_markdown(&updated)
+                .unwrap()
+                .node("smoke-test")
+                .unwrap()
+                .color
+                .as_deref(),
             Some("1")
         );
 
@@ -5616,7 +5786,12 @@ Shared body.
             None,
         )
         .unwrap();
-        assert!(Canvas::from_markdown(&cleared).unwrap().node("smoke-test").unwrap().tags.is_empty());
+        assert!(Canvas::from_markdown(&cleared)
+            .unwrap()
+            .node("smoke-test")
+            .unwrap()
+            .tags
+            .is_empty());
         assert!(!cleared.contains("tags="));
     }
 
@@ -5933,8 +6108,10 @@ Shared body.
             .map(|n| n.id.clone())
             .collect();
         assert_eq!(order[1], "examples");
-        assert!(order.iter().position(|i| i == "examples").unwrap()
-            < order.iter().position(|i| i == "tests").unwrap());
+        assert!(
+            order.iter().position(|i| i == "examples").unwrap()
+                < order.iter().position(|i| i == "tests").unwrap()
+        );
     }
 
     #[test]
@@ -5946,8 +6123,10 @@ Shared body.
             .iter()
             .map(|n| n.id.clone())
             .collect();
-        assert!(order.iter().position(|i| i == "examples").unwrap()
-            < order.iter().position(|i| i == "tests").unwrap());
+        assert!(
+            order.iter().position(|i| i == "examples").unwrap()
+                < order.iter().position(|i| i == "tests").unwrap()
+        );
     }
 
     #[test]
@@ -5956,7 +6135,10 @@ Shared body.
         assert!(err.contains("exactly one"), "unexpected error: {err}");
 
         let err = apply_node_move(TEST_DOC, "examples", Some("tests"), Some("root")).unwrap_err();
-        assert!(err.contains("mutually exclusive"), "unexpected error: {err}");
+        assert!(
+            err.contains("mutually exclusive"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -6059,7 +6241,10 @@ Shared body.
             .unwrap();
         assert!(block.always);
         assert!(block.cache, "untouched cache flag should survive");
-        assert!(updated.contains("echo untouched"), "sibling block untouched");
+        assert!(
+            updated.contains("echo untouched"),
+            "sibling block untouched"
+        );
     }
 
     #[test]
@@ -6076,7 +6261,10 @@ Shared body.
             None,
         )
         .unwrap_err();
-        assert!(err.contains("mutually exclusive"), "unexpected error: {err}");
+        assert!(
+            err.contains("mutually exclusive"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -6166,9 +6354,14 @@ Shared body.
 
     #[test]
     fn block_replaces_the_code() {
-        let updated =
-            apply_node_block(BLOCK_DOC, "root", "build", &BlockArgs::default(), Some("echo new"))
-                .unwrap();
+        let updated = apply_node_block(
+            BLOCK_DOC,
+            "root",
+            "build",
+            &BlockArgs::default(),
+            Some("echo new"),
+        )
+        .unwrap();
         assert!(updated.contains("echo new"));
         assert!(!updated.contains("echo hi"));
     }
@@ -6202,7 +6395,10 @@ Shared body.
     #[test]
     fn find_direct_child_combinator_excludes_deeper_descendants() {
         let canvas = Canvas::from_markdown(FIND_DOC).unwrap();
-        assert_eq!(find_node_ids(&canvas, "#todo > .bag").unwrap(), vec!["fixed-bug"]);
+        assert_eq!(
+            find_node_ids(&canvas, "#todo > .bag").unwrap(),
+            vec!["fixed-bug"]
+        );
         // Plain descendant combinator (space) reaches any depth.
         assert_eq!(
             find_node_ids(&canvas, "#todo .bag").unwrap(),
@@ -6213,28 +6409,46 @@ Shared body.
     #[test]
     fn find_matches_type_and_color_attributes() {
         let canvas = Canvas::from_markdown(FIND_DOC).unwrap();
-        assert_eq!(find_node_ids(&canvas, "[type=\"group\"]").unwrap(), vec!["other"]);
-        assert_eq!(find_node_ids(&canvas, "[color=\"4\"]").unwrap(), vec!["other"]);
+        assert_eq!(
+            find_node_ids(&canvas, "[type=\"group\"]").unwrap(),
+            vec!["other"]
+        );
+        assert_eq!(
+            find_node_ids(&canvas, "[color=\"4\"]").unwrap(),
+            vec!["other"]
+        );
     }
 
     #[test]
     fn find_combines_multiple_tags_and_id_selectors() {
         let canvas = Canvas::from_markdown(FIND_DOC).unwrap();
-        assert_eq!(find_node_ids(&canvas, ".bag.fixed").unwrap(), vec!["fixed-bug"]);
-        assert_eq!(find_node_ids(&canvas, "#fixed-bug").unwrap(), vec!["fixed-bug"]);
+        assert_eq!(
+            find_node_ids(&canvas, ".bag.fixed").unwrap(),
+            vec!["fixed-bug"]
+        );
+        assert_eq!(
+            find_node_ids(&canvas, "#fixed-bug").unwrap(),
+            vec!["fixed-bug"]
+        );
     }
 
     #[test]
     fn find_returns_empty_not_an_error_for_no_matches() {
         let canvas = Canvas::from_markdown(FIND_DOC).unwrap();
-        assert_eq!(find_node_ids(&canvas, ".nonexistent").unwrap(), Vec::<String>::new());
+        assert_eq!(
+            find_node_ids(&canvas, ".nonexistent").unwrap(),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
     fn find_rejects_an_invalid_selector() {
         let canvas = Canvas::from_markdown(FIND_DOC).unwrap();
         let err = find_node_ids(&canvas, "###bad").unwrap_err();
-        assert!(err.contains("invalid CSS selector"), "unexpected error: {err}");
+        assert!(
+            err.contains("invalid CSS selector"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

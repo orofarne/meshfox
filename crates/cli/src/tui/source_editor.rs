@@ -146,7 +146,11 @@ impl SourceEditorState {
         all_tags: Vec<String>,
         primary_raw: String,
     ) -> std::io::Result<Self> {
-        let raw = if path == primary_path { primary_raw.clone() } else { std::fs::read_to_string(&path)? };
+        let raw = if path == primary_path {
+            primary_raw.clone()
+        } else {
+            std::fs::read_to_string(&path)?
+        };
         let mut editor = EditorState::new(Lines::from(raw.as_str()));
         editor.cursor = cursor;
         prime_viewport(&mut editor);
@@ -358,7 +362,10 @@ impl SourceEditorState {
             .unwrap_or_default();
         let id = meshfox_core::mdcanvas::random_node_id(&used);
         self.editor.execute(AppendNewline(1));
-        type_str(&mut self.editor, &format!("<!-- meshfox:node id=\"{id}\" -->"));
+        type_str(
+            &mut self.editor,
+            &format!("<!-- meshfox:node id=\"{id}\" -->"),
+        );
         Ok(())
     }
 
@@ -413,9 +420,16 @@ impl SourceEditorState {
     /// `tags="..."` value spanning `[value_start, value_end)` (char
     /// columns) on `line`.
     fn open_tag_suggest(&mut self, line: &str, value_start: usize, value_end: usize) {
-        let value: String = line.chars().skip(value_start).take(value_end - value_start).collect();
-        let present: std::collections::HashSet<&str> =
-            value.split(',').map(str::trim).filter(|t| !t.is_empty()).collect();
+        let value: String = line
+            .chars()
+            .skip(value_start)
+            .take(value_end - value_start)
+            .collect();
+        let present: std::collections::HashSet<&str> = value
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .collect();
         let candidates: Vec<String> = self
             .all_tags
             .iter()
@@ -444,7 +458,11 @@ impl SourceEditorState {
             KeyCode::Esc => self.tag_suggest_open = false,
             KeyCode::Enter => {
                 self.tag_suggest_open = false;
-                if let Some(tag) = self.tag_suggest_candidates.get(self.tag_suggest_selected).cloned() {
+                if let Some(tag) = self
+                    .tag_suggest_candidates
+                    .get(self.tag_suggest_selected)
+                    .cloned()
+                {
                     self.insert_tag_candidate(&tag);
                 }
             }
@@ -606,12 +624,18 @@ fn attr_candidates(kind: AttrKind, line: &str) -> Vec<AttrCandidate> {
     value_attrs
         .iter()
         .filter(|n| !value_present(n))
-        .map(|&name| AttrCandidate { name, is_flag: false })
+        .map(|&name| AttrCandidate {
+            name,
+            is_flag: false,
+        })
         .chain(
             flag_attrs
                 .iter()
                 .filter(|n| !flag_present(n))
-                .map(|&name| AttrCandidate { name, is_flag: true }),
+                .map(|&name| AttrCandidate {
+                    name,
+                    is_flag: true,
+                }),
         )
         .collect()
 }
@@ -731,7 +755,9 @@ mod tests {
         // the source editor's own header/footer rows.
         let area = Rect::new(0, 0, 80, 22);
         let mut buf = Buffer::empty(area);
-        EditorView::new(&mut editor).wrap(true).render(area, &mut buf);
+        EditorView::new(&mut editor)
+            .wrap(true)
+            .render(area, &mut buf);
 
         assert!(
             editor.cursor_screen_position().is_some(),
@@ -780,7 +806,9 @@ mod tests {
         // coordinate mapping needs.
         let area = Rect::new(0, 0, 80, 22);
         let mut buf = Buffer::empty(area);
-        EditorView::new(&mut se.editor).wrap(true).render(area, &mut buf);
+        EditorView::new(&mut se.editor)
+            .wrap(true)
+            .render(area, &mut buf);
         se
     }
 
@@ -831,7 +859,12 @@ mod tests {
             .strip_prefix("<!-- meshfox:node id=\"")
             .and_then(|l| l.strip_suffix("\" -->"))
             .expect("an id-bearing node comment");
-        assert!(!id.is_empty() && id.chars().all(|c| c.is_ascii_digit() || c.is_ascii_lowercase()));
+        assert!(
+            !id.is_empty()
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase())
+        );
         let _ = std::fs::remove_file(&se.path);
     }
 
@@ -869,16 +902,20 @@ mod tests {
             detect_attr_context("<!-- meshfox:edge from=\"root\" -->"),
             Some(AttrKind::Edge)
         );
-        assert_eq!(detect_attr_context("```bash name=\"build\""), Some(AttrKind::Fence));
+        assert_eq!(
+            detect_attr_context("```bash name=\"build\""),
+            Some(AttrKind::Fence)
+        );
         assert_eq!(detect_attr_context("just a body line"), None);
     }
 
     #[test]
     fn attr_candidates_excludes_attributes_already_on_the_line() {
-        let names: Vec<&str> = attr_candidates(AttrKind::Node, "<!-- meshfox:node id=\"root\" x=0 -->")
-            .iter()
-            .map(|c| c.name)
-            .collect();
+        let names: Vec<&str> =
+            attr_candidates(AttrKind::Node, "<!-- meshfox:node id=\"root\" x=0 -->")
+                .iter()
+                .map(|c| c.name)
+                .collect();
         assert!(!names.contains(&"id"));
         assert!(!names.contains(&"x")); // bare-numeric form is still detected
         assert!(names.contains(&"color"));
@@ -893,7 +930,10 @@ mod tests {
             .find(|c| c.name == "cache")
             .expect("cache offered");
         assert!(cache.is_flag);
-        let name = candidates.iter().find(|c| c.name == "name").expect("name offered");
+        let name = candidates
+            .iter()
+            .find(|c| c.name == "name")
+            .expect("name offered");
         assert!(!name.is_flag);
     }
 
@@ -943,7 +983,10 @@ mod tests {
     #[test]
     fn insert_attr_candidate_gives_x_y_w_h_a_bare_numeric_default() {
         let mut se = open_test_editor("<!-- meshfox:node id=\"root\" -->\n");
-        se.insert_attr_candidate(AttrCandidate { name: "x", is_flag: false });
+        se.insert_attr_candidate(AttrCandidate {
+            name: "x",
+            is_flag: false,
+        });
 
         assert_eq!(
             se.editor.lines.to_string(),
@@ -973,7 +1016,11 @@ mod tests {
         let line = "<!-- meshfox:node id=\"root\" tags=\"bag\" -->\n";
         let mut se = open_test_editor_with_tags(
             line,
-            vec!["bag".to_string(), "improvement".to_string(), "docs".to_string()],
+            vec![
+                "bag".to_string(),
+                "improvement".to_string(),
+                "docs".to_string(),
+            ],
         );
         let (start, end) = tags_value_range(line.trim_end()).unwrap();
         se.editor.cursor = Index2::new(0, (start + end) / 2);
@@ -983,7 +1030,9 @@ mod tests {
         assert!(se.tag_suggest_open);
         assert!(!se.attr_suggest_open);
         assert!(!se.tag_suggest_candidates.contains(&"bag".to_string())); // already on this node
-        assert!(se.tag_suggest_candidates.contains(&"improvement".to_string()));
+        assert!(se
+            .tag_suggest_candidates
+            .contains(&"improvement".to_string()));
         assert!(se.tag_suggest_candidates.contains(&"docs".to_string()));
         let _ = std::fs::remove_file(&se.path);
     }

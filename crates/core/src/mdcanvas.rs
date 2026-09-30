@@ -243,7 +243,19 @@ pub const NODE_ATTRS: &[&str] = &[
 ];
 /// `meshfox:edge`'s own attribute vocabulary — `from` is required, the
 /// rest optional styling (`canvas.rs`'s `ExtraEdge`/style enums).
-pub const EDGE_ATTRS: &[&str] = &["from", "label", "labelAt", "color", "style", "arrowStart", "arrowEnd", "tags", "sourceSide", "targetSide", "via"];
+pub const EDGE_ATTRS: &[&str] = &[
+    "from",
+    "label",
+    "labelAt",
+    "color",
+    "style",
+    "arrowStart",
+    "arrowEnd",
+    "tags",
+    "sourceSide",
+    "targetSide",
+    "via",
+];
 
 /// `meshfox validate`-only (see `attrs::UnknownAttrError`'s own doc
 /// comment for why this is a separate pass rather than part of `parse`
@@ -378,12 +390,29 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
                 }),
             lang: seg.node_attrs.get("lang").cloned(),
             interpreter: seg.node_attrs.get("interpreter").cloned(),
-            preview: seg.node_attrs.get("preview").map(|v| v == "true").unwrap_or(false),
+            preview: seg
+                .node_attrs
+                .get("preview")
+                .map(|v| v == "true")
+                .unwrap_or(false),
             edge_label: seg.node_attrs.get("edgeLabel").cloned(),
-            edge_label_at: seg.node_attrs.get("edgeLabelAt").and_then(|raw| parse_label_at(raw)),
-            edge_source_side: seg.node_attrs.get("edgeSourceSide").and_then(|v| crate::canvas::EdgeSide::parse(v)),
-            edge_target_side: seg.node_attrs.get("edgeTargetSide").and_then(|v| crate::canvas::EdgeSide::parse(v)),
-            edge_via: seg.node_attrs.get("edgeVia").map(|raw| parse_route_points(raw)).unwrap_or_default(),
+            edge_label_at: seg
+                .node_attrs
+                .get("edgeLabelAt")
+                .and_then(|raw| parse_label_at(raw)),
+            edge_source_side: seg
+                .node_attrs
+                .get("edgeSourceSide")
+                .and_then(|v| crate::canvas::EdgeSide::parse(v)),
+            edge_target_side: seg
+                .node_attrs
+                .get("edgeTargetSide")
+                .and_then(|v| crate::canvas::EdgeSide::parse(v)),
+            edge_via: seg
+                .node_attrs
+                .get("edgeVia")
+                .map(|raw| parse_route_points(raw))
+                .unwrap_or_default(),
             text: body,
             created_at,
             updated_at,
@@ -426,9 +455,16 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
 fn extra_edge_from_attrs(attrs: &HashMap<String, String>, from_id: &str) -> ExtraEdge {
     ExtraEdge {
         from: from_id.to_string(),
-        source_side: attrs.get("sourceSide").and_then(|v| crate::canvas::EdgeSide::parse(v)),
-        target_side: attrs.get("targetSide").and_then(|v| crate::canvas::EdgeSide::parse(v)),
-        via: attrs.get("via").map(|raw| parse_route_points(raw)).unwrap_or_default(),
+        source_side: attrs
+            .get("sourceSide")
+            .and_then(|v| crate::canvas::EdgeSide::parse(v)),
+        target_side: attrs
+            .get("targetSide")
+            .and_then(|v| crate::canvas::EdgeSide::parse(v)),
+        via: attrs
+            .get("via")
+            .map(|raw| parse_route_points(raw))
+            .unwrap_or_default(),
         label: attrs.get("label").cloned(),
         label_at: attrs.get("labelAt").and_then(|raw| parse_label_at(raw)),
         color: attrs.get("color").cloned(),
@@ -440,10 +476,15 @@ fn extra_edge_from_attrs(attrs: &HashMap<String, String>, from_id: &str) -> Extr
 }
 
 fn parse_route_points(raw: &str) -> Vec<crate::canvas::RoutePoint> {
-    raw.split(';').filter_map(|part| {
-        let (x, y) = part.split_once(',')?;
-        Some(crate::canvas::RoutePoint { x: x.parse().ok()?, y: y.parse().ok()? })
-    }).collect()
+    raw.split(';')
+        .filter_map(|part| {
+            let (x, y) = part.split_once(',')?;
+            Some(crate::canvas::RoutePoint {
+                x: x.parse().ok()?,
+                y: y.parse().ok()?,
+            })
+        })
+        .collect()
 }
 
 fn parse_label_at(raw: &str) -> Option<u16> {
@@ -555,10 +596,21 @@ fn render_node_line(canvas: &Canvas, node: &Node) -> String {
     if let Some(l) = &node.edge_label {
         parts.push(format!("edgeLabel=\"{l}\""));
     }
-    if let Some(at) = node.edge_label_at { parts.push(format!("edgeLabelAt=\"{at}\"")); }
-    if let Some(side) = node.edge_source_side { parts.push(format!("edgeSourceSide=\"{}\"", side.as_str())); }
-    if let Some(side) = node.edge_target_side { parts.push(format!("edgeTargetSide=\"{}\"", side.as_str())); }
-    if !node.edge_via.is_empty() { parts.push(format!("edgeVia=\"{}\"", render_route_points(&node.edge_via))); }
+    if let Some(at) = node.edge_label_at {
+        parts.push(format!("edgeLabelAt=\"{at}\""));
+    }
+    if let Some(side) = node.edge_source_side {
+        parts.push(format!("edgeSourceSide=\"{}\"", side.as_str()));
+    }
+    if let Some(side) = node.edge_target_side {
+        parts.push(format!("edgeTargetSide=\"{}\"", side.as_str()));
+    }
+    if !node.edge_via.is_empty() {
+        parts.push(format!(
+            "edgeVia=\"{}\"",
+            render_route_points(&node.edge_via)
+        ));
+    }
     if let Some(c) = &node.created_at {
         parts.push(format!("createdAt=\"{c}\""));
     }
@@ -637,10 +689,7 @@ pub fn set_node_body(markdown: &str, node_id: &str, new_body: &str) -> Option<St
         return Some(out);
     };
     let mut attrs = seg.node_attrs.clone();
-    attrs.insert(
-        "updatedAt".to_string(),
-        crate::timestamp::now_utc_rfc3339(),
-    );
+    attrs.insert("updatedAt".to_string(), crate::timestamp::now_utc_rfc3339());
     let new_line = rebuild_node_line_from_raw_attrs(node_id, &attrs);
     // `line_span` was measured against the original `markdown`, but nothing
     // between it and `seg.body_span.start` (where the edit above starts)
@@ -810,10 +859,21 @@ pub fn set_node_meta(markdown: &str, node_id: &str, meta: &NodeMeta) -> Option<S
     if let Some(l) = &meta.edge_label {
         parts.push(format!("edgeLabel=\"{l}\""));
     }
-    if let Some(at) = meta.edge_label_at { parts.push(format!("edgeLabelAt=\"{at}\"")); }
-    if let Some(side) = meta.edge_source_side { parts.push(format!("edgeSourceSide=\"{}\"", side.as_str())); }
-    if let Some(side) = meta.edge_target_side { parts.push(format!("edgeTargetSide=\"{}\"", side.as_str())); }
-    if !meta.edge_via.is_empty() { parts.push(format!("edgeVia=\"{}\"", render_route_points(&meta.edge_via))); }
+    if let Some(at) = meta.edge_label_at {
+        parts.push(format!("edgeLabelAt=\"{at}\""));
+    }
+    if let Some(side) = meta.edge_source_side {
+        parts.push(format!("edgeSourceSide=\"{}\"", side.as_str()));
+    }
+    if let Some(side) = meta.edge_target_side {
+        parts.push(format!("edgeTargetSide=\"{}\"", side.as_str()));
+    }
+    if !meta.edge_via.is_empty() {
+        parts.push(format!(
+            "edgeVia=\"{}\"",
+            render_route_points(&meta.edge_via)
+        ));
+    }
     if let Some(f) = meta.fold {
         parts.push(format!("fold=\"{f}\""));
     }
@@ -911,7 +971,9 @@ pub fn set_fence_attrs(
     let body = &markdown[seg.body_span.clone()];
 
     let blocks = scan_runnable_blocks(node_id, body);
-    let block = blocks.iter().find(|b| b.name.as_deref() == Some(block_name))?;
+    let block = blocks
+        .iter()
+        .find(|b| b.name.as_deref() == Some(block_name))?;
 
     let abs_start = seg.body_span.start + block.span.start;
     let abs_end = seg.body_span.start + block.span.end;
@@ -1003,7 +1065,15 @@ pub fn set_fence_attrs(
     // fields) — carry it over verbatim instead of silently dropping it
     // just because `FenceAttrsPatch` doesn't know its name yet.
     const KNOWN_ATTRS: &[&str] = &[
-        "name", "deps", "env", "cache", "tty", "autoclose", "service", "always", "default",
+        "name",
+        "deps",
+        "env",
+        "cache",
+        "tty",
+        "autoclose",
+        "service",
+        "always",
+        "default",
         "interpreter",
     ];
     let mut extra: Vec<(&str, &str)> = block
@@ -1213,13 +1283,12 @@ pub fn clear_node_id(markdown: &str, id: &str) -> Result<(String, String), Clear
     let renamed = if derived_id == id {
         markdown.to_string()
     } else {
-        rename_node_id(markdown, id, &derived_id).map_err(|_| ClearIdError::NotFound(id.to_string()))?
+        rename_node_id(markdown, id, &derived_id)
+            .map_err(|_| ClearIdError::NotFound(id.to_string()))?
     };
 
     if let Some(candidate) = set_node_id_attr(&renamed, &derived_id, None) {
-        if Canvas::from_markdown(&candidate)
-            .is_ok_and(|c| c.node(&derived_id).is_some())
-        {
+        if Canvas::from_markdown(&candidate).is_ok_and(|c| c.node(&derived_id).is_some()) {
             return Ok((candidate, derived_id));
         }
     }
@@ -1362,13 +1431,21 @@ fn rewrite_deps_node_id(markdown: &str, old_id: &str, new_id: &str) -> String {
 /// by `render_node` and `set_node_edges`.
 fn render_edge_line(e: &ExtraEdge) -> String {
     let mut parts = vec![format!("from=\"{}\"", e.from)];
-    if let Some(side) = e.source_side { parts.push(format!("sourceSide=\"{}\"", side.as_str())); }
-    if let Some(side) = e.target_side { parts.push(format!("targetSide=\"{}\"", side.as_str())); }
-    if !e.via.is_empty() { parts.push(format!("via=\"{}\"", render_route_points(&e.via))); }
+    if let Some(side) = e.source_side {
+        parts.push(format!("sourceSide=\"{}\"", side.as_str()));
+    }
+    if let Some(side) = e.target_side {
+        parts.push(format!("targetSide=\"{}\"", side.as_str()));
+    }
+    if !e.via.is_empty() {
+        parts.push(format!("via=\"{}\"", render_route_points(&e.via)));
+    }
     if let Some(l) = &e.label {
         parts.push(format!("label=\"{l}\""));
     }
-    if let Some(at) = e.label_at { parts.push(format!("labelAt=\"{at}\"")); }
+    if let Some(at) = e.label_at {
+        parts.push(format!("labelAt=\"{at}\""));
+    }
     if let Some(c) = &e.color {
         parts.push(format!("color=\"{c}\""));
     }
@@ -1388,7 +1465,11 @@ fn render_edge_line(e: &ExtraEdge) -> String {
 }
 
 fn render_route_points(points: &[crate::canvas::RoutePoint]) -> String {
-    points.iter().map(|p| format!("{},{}", p.x, p.y)).collect::<Vec<_>>().join(";")
+    points
+        .iter()
+        .map(|p| format!("{},{}", p.x, p.y))
+        .collect::<Vec<_>>()
+        .join(";")
 }
 
 /// Replaces node `node_id`'s whole set of extra incoming edges
@@ -1516,7 +1597,11 @@ pub fn insert_child_node(markdown: &str, parent_id: &str, title: &str) -> Option
 /// по умолчанию"). `insert_child_node` itself (CLI/MCP `node add`, where
 /// the caller's title is the real, final one) is untouched — its
 /// human-readable, title-derived id is exactly the point there.
-pub fn insert_child_node_random_id(markdown: &str, parent_id: &str, title: &str) -> Option<(String, String)> {
+pub fn insert_child_node_random_id(
+    markdown: &str,
+    parent_id: &str,
+    title: &str,
+) -> Option<(String, String)> {
     insert_child_node_impl(markdown, parent_id, title, random_node_id)
 }
 
@@ -2071,7 +2156,11 @@ pub fn insert_node_fragment(
     let needs_explicit_parent = new_level <= parent_level;
     let delta = new_level as i16 - old_level as i16;
 
-    let mut frag = set_node_parent_attr(fragment, node_id, needs_explicit_parent.then_some(parent_id))?;
+    let mut frag = set_node_parent_attr(
+        fragment,
+        node_id,
+        needs_explicit_parent.then_some(parent_id),
+    )?;
     if delta != 0 {
         let flen = frag.len();
         frag = shift_headings_range(&frag, 0..flen, delta as i8);
@@ -2213,8 +2302,12 @@ pub fn reorder_by_position(markdown: &str, hints: &HashMap<String, (f64, f64)>) 
     fn sort_pos(node: &Node, id: &str, hints: &HashMap<String, (f64, f64)>) -> (f64, f64) {
         let hint = hints.get(id);
         (
-            node.y.or_else(|| hint.map(|h| h.1)).unwrap_or(f64::INFINITY),
-            node.x.or_else(|| hint.map(|h| h.0)).unwrap_or(f64::INFINITY),
+            node.y
+                .or_else(|| hint.map(|h| h.1))
+                .unwrap_or(f64::INFINITY),
+            node.x
+                .or_else(|| hint.map(|h| h.0))
+                .unwrap_or(f64::INFINITY),
         )
     }
 
@@ -2317,8 +2410,8 @@ pub fn move_sibling(
     }
     let segments = scan(markdown);
     let ids = assign_ids(&segments).map_err(|_| MoveSiblingError::NotFound(id.to_string()))?;
-    let parents =
-        resolve_parent_ids(&segments, &ids).map_err(|_| MoveSiblingError::NotFound(id.to_string()))?;
+    let parents = resolve_parent_ids(&segments, &ids)
+        .map_err(|_| MoveSiblingError::NotFound(id.to_string()))?;
 
     let idx = ids
         .iter()
@@ -2987,11 +3080,13 @@ Reused from Tests as well.
             },
         )
         .unwrap();
-        let block =
-            scan_runnable_blocks("root", &parse(&replaced).unwrap().node("root").unwrap().text)
-                .into_iter()
-                .find(|b| b.name.as_deref() == Some("b"))
-                .unwrap();
+        let block = scan_runnable_blocks(
+            "root",
+            &parse(&replaced).unwrap().node("root").unwrap().text,
+        )
+        .into_iter()
+        .find(|b| b.name.as_deref() == Some("b"))
+        .unwrap();
         assert_eq!(block.deps.len(), 2);
         assert_eq!(block.deps[0].block_name, "x");
         assert_eq!(block.deps[1].node_id.as_deref(), Some("y"));
@@ -3017,7 +3112,8 @@ Reused from Tests as well.
 
     #[test]
     fn set_fence_attrs_sets_and_clears_interpreter() {
-        let doc = "# Root\n<!-- meshfox:node id=\"root\" -->\n\n```bash name=\"b\"\nprint(1)\n```\n";
+        let doc =
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n```bash name=\"b\"\nprint(1)\n```\n";
         let set = set_fence_attrs(
             doc,
             "root",
@@ -3045,7 +3141,8 @@ Reused from Tests as well.
 
     #[test]
     fn set_fence_attrs_replaces_the_code_and_can_combine_with_attrs_in_one_call() {
-        let doc = "# Root\n<!-- meshfox:node id=\"root\" -->\n\n```bash name=\"b\"\necho old\n```\n";
+        let doc =
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n```bash name=\"b\"\necho old\n```\n";
         let updated = set_fence_attrs(
             doc,
             "root",
@@ -3072,7 +3169,8 @@ Reused from Tests as well.
         // Four backticks — needed here because the code itself contains a
         // literal fenced block written as plain text (a common reason to
         // need one at all: quoting example Markdown inside a real fence).
-        let doc = "# Root\n<!-- meshfox:node id=\"root\" -->\n\n````bash name=\"b\"\necho '```'\n````\n";
+        let doc =
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n````bash name=\"b\"\necho '```'\n````\n";
         let updated = set_fence_attrs(
             doc,
             "root",
@@ -3156,7 +3254,8 @@ Reused from Tests as well.
         // `slugify("---")` is empty, so `unique_slug` substitutes "node" —
         // two such headings must still dedupe against each other instead
         // of silently colliding into the same id.
-        let doc = "# Root\n\n## ---\n<!-- meshfox:node -->\n\na\n\n## !!!\n<!-- meshfox:node -->\n\nb\n";
+        let doc =
+            "# Root\n\n## ---\n<!-- meshfox:node -->\n\na\n\n## !!!\n<!-- meshfox:node -->\n\nb\n";
         let c = parse(doc).unwrap();
         assert_eq!(c.node("node").unwrap().text.trim(), "a");
         assert_eq!(c.node("node-2").unwrap().text.trim(), "b");
@@ -3498,7 +3597,10 @@ Reused from Tests as well.
         let c = parse(doc).unwrap();
         let n = c.node("linkedin").unwrap();
         assert_eq!(n.target.as_deref(), Some("https://lnkd.in/p/dXe_v6GH"));
-        assert_eq!(n.caption.as_deref(), Some("Опубликовано: см. дату в самом посте."));
+        assert_eq!(
+            n.caption.as_deref(),
+            Some("Опубликовано: см. дату в самом посте.")
+        );
     }
 
     #[test]
@@ -3516,27 +3618,39 @@ Reused from Tests as well.
     fn link_node_caption_rejects_a_heading() {
         let doc =
             "# Root\n\n## LinkedIn\n<!-- meshfox:node type=\"link\" -->\n\n[post](https://example.com)\n\n### Not allowed\n";
-        assert_eq!(parse(doc), Err(ParseError::InvalidLinkBody("linkedin".to_string(), "link")));
+        assert_eq!(
+            parse(doc),
+            Err(ParseError::InvalidLinkBody("linkedin".to_string(), "link"))
+        );
     }
 
     #[test]
     fn link_node_caption_rejects_a_list() {
         let doc = "# Root\n\n## LinkedIn\n<!-- meshfox:node type=\"link\" -->\n\n[post](https://example.com)\n\n- one\n- two\n";
-        assert_eq!(parse(doc), Err(ParseError::InvalidLinkBody("linkedin".to_string(), "link")));
+        assert_eq!(
+            parse(doc),
+            Err(ParseError::InvalidLinkBody("linkedin".to_string(), "link"))
+        );
     }
 
     #[test]
     fn file_node_caption_rejects_an_image() {
         let doc = "# Root\n\n## Diagram\n<!-- meshfox:node type=\"file\" -->\n\n[architecture](./architecture.png)\n\n\
                     ![alt](./other.png)\n";
-        assert_eq!(parse(doc), Err(ParseError::InvalidLinkBody("diagram".to_string(), "file")));
+        assert_eq!(
+            parse(doc),
+            Err(ParseError::InvalidLinkBody("diagram".to_string(), "file"))
+        );
     }
 
     #[test]
     fn file_node_caption_rejects_a_code_fence() {
         let doc = "# Root\n\n## Diagram\n<!-- meshfox:node type=\"file\" -->\n\n[architecture](./architecture.png)\n\n\
                     ```\ncode\n```\n";
-        assert_eq!(parse(doc), Err(ParseError::InvalidLinkBody("diagram".to_string(), "file")));
+        assert_eq!(
+            parse(doc),
+            Err(ParseError::InvalidLinkBody("diagram".to_string(), "file"))
+        );
     }
 
     #[test]
@@ -3545,7 +3659,10 @@ Reused from Tests as well.
         // text right after the closing `)` stays rejected, exactly as any
         // trailing text did before captions existed at all.
         let doc = "# Root\n\n## LinkedIn\n<!-- meshfox:node type=\"link\" -->\n\n[post](https://example.com) extra\n";
-        assert_eq!(parse(doc), Err(ParseError::InvalidLinkBody("linkedin".to_string(), "link")));
+        assert_eq!(
+            parse(doc),
+            Err(ParseError::InvalidLinkBody("linkedin".to_string(), "link"))
+        );
     }
 
     #[test]
@@ -3686,8 +3803,7 @@ Reused from Tests as well.
             ParseError::PreviewRequiresLinkType("diagram".to_string())
         );
 
-        let text_doc =
-            "# Root\n\n## Notes\n<!-- meshfox:node preview=\"true\" -->\n\nsome text\n";
+        let text_doc = "# Root\n\n## Notes\n<!-- meshfox:node preview=\"true\" -->\n\nsome text\n";
         assert_eq!(
             parse(text_doc).unwrap_err(),
             ParseError::PreviewRequiresLinkType("notes".to_string())
@@ -4020,7 +4136,10 @@ Reused from Tests as well.
         let (updated, new_id) = insert_child_node(doc, "root", "New Check").unwrap();
         let c = parse(&updated).unwrap();
         let n = c.node(&new_id).unwrap();
-        assert!(n.created_at.as_deref().is_some_and(crate::timestamp::is_valid_rfc3339));
+        assert!(n
+            .created_at
+            .as_deref()
+            .is_some_and(crate::timestamp::is_valid_rfc3339));
         assert_eq!(n.created_at, n.updated_at);
     }
 
@@ -4037,7 +4156,10 @@ Reused from Tests as well.
         let updated = set_node_body(doc, "child", "new body").unwrap();
         let c = parse(&updated).unwrap();
         let n = c.node("child").unwrap();
-        assert!(n.updated_at.as_deref().is_some_and(crate::timestamp::is_valid_rfc3339));
+        assert!(n
+            .updated_at
+            .as_deref()
+            .is_some_and(crate::timestamp::is_valid_rfc3339));
 
         // re-applying the *same* body still doesn't touch updatedAt again —
         // the byte-unchanged skip applies independently of the option.
@@ -4061,8 +4183,11 @@ Reused from Tests as well.
     fn insert_child_node_random_id_ignores_the_title_slug() {
         let (updated, first_id) = insert_child_node_random_id(DOC, "root", "New Node").unwrap();
         assert_ne!(first_id, "new-node");
-        assert!(first_id.chars().all(|c| c.is_ascii_digit() || c.is_ascii_lowercase()));
-        let (updated, second_id) = insert_child_node_random_id(&updated, "root", "New Node").unwrap();
+        assert!(first_id
+            .chars()
+            .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase()));
+        let (updated, second_id) =
+            insert_child_node_random_id(&updated, "root", "New Node").unwrap();
         assert_ne!(second_id, "new-node-2");
         assert_ne!(first_id, second_id);
         let c = parse(&updated).unwrap();
@@ -4390,7 +4515,10 @@ Reused from Tests as well.
 
     #[test]
     fn reorder_by_position_missing_root_is_none() {
-        assert_eq!(reorder_by_position("not a heading at all", &HashMap::new()), None);
+        assert_eq!(
+            reorder_by_position("not a heading at all", &HashMap::new()),
+            None
+        );
     }
 
     fn abc_doc() -> &'static str {
@@ -4474,11 +4602,21 @@ Reused from Tests as well.
     #[test]
     fn move_sibling_rejects_missing_nodes() {
         assert_eq!(
-            move_sibling(abc_doc(), "does-not-exist", "a", MoveSiblingPosition::Before),
+            move_sibling(
+                abc_doc(),
+                "does-not-exist",
+                "a",
+                MoveSiblingPosition::Before
+            ),
             Err(MoveSiblingError::NotFound("does-not-exist".to_string()))
         );
         assert_eq!(
-            move_sibling(abc_doc(), "a", "does-not-exist", MoveSiblingPosition::Before),
+            move_sibling(
+                abc_doc(),
+                "a",
+                "does-not-exist",
+                MoveSiblingPosition::Before
+            ),
             Err(MoveSiblingError::NotFound("does-not-exist".to_string()))
         );
     }
@@ -4884,10 +5022,23 @@ Reused from Tests as well.
         let edge = &parsed.node("child").unwrap().extra_parents[0];
         assert_eq!(edge.source_side, Some(crate::canvas::EdgeSide::Bottom));
         assert_eq!(edge.target_side, Some(crate::canvas::EdgeSide::Right));
-        assert_eq!(edge.via, vec![crate::canvas::RoutePoint { x: 10, y: 20 }, crate::canvas::RoutePoint { x: 30, y: -40 }]);
+        assert_eq!(
+            edge.via,
+            vec![
+                crate::canvas::RoutePoint { x: 10, y: 20 },
+                crate::canvas::RoutePoint { x: 30, y: -40 }
+            ]
+        );
         assert_eq!(edge.label_at, Some(725));
         let rewritten = set_node_edges(raw, "child", std::slice::from_ref(edge)).unwrap();
-        assert_eq!(parse(&rewritten).unwrap().node("child").unwrap().extra_parents[0], edge.clone());
+        assert_eq!(
+            parse(&rewritten)
+                .unwrap()
+                .node("child")
+                .unwrap()
+                .extra_parents[0],
+            edge.clone()
+        );
         assert_eq!(unknown_node_edge_attr(&rewritten), None);
     }
 
@@ -4900,14 +5051,19 @@ Reused from Tests as well.
         assert_eq!(node.edge_target_side, Some(crate::canvas::EdgeSide::Right));
         assert_eq!(node.edge_via.len(), 2);
         assert_eq!(node.edge_label_at, Some(250));
-        let updated = set_node_meta(raw, "child", &NodeMeta {
-            color: Some("2".into()),
-            edge_source_side: node.edge_source_side,
-            edge_target_side: node.edge_target_side,
-            edge_via: node.edge_via.clone(),
-            edge_label_at: node.edge_label_at,
-            ..Default::default()
-        }).unwrap();
+        let updated = set_node_meta(
+            raw,
+            "child",
+            &NodeMeta {
+                color: Some("2".into()),
+                edge_source_side: node.edge_source_side,
+                edge_target_side: node.edge_target_side,
+                edge_via: node.edge_via.clone(),
+                edge_label_at: node.edge_label_at,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let after = parse(&updated).unwrap();
         assert_eq!(after.node("child").unwrap().edge_via, node.edge_via);
         assert_eq!(after.node("child").unwrap().edge_label_at, Some(250));
@@ -4918,7 +5074,14 @@ Reused from Tests as well.
             1,
         );
         let body_changed = set_node_body(&with_timestamps, "child", "new body").unwrap();
-        assert_eq!(parse(&body_changed).unwrap().node("child").unwrap().edge_via, node.edge_via);
+        assert_eq!(
+            parse(&body_changed)
+                .unwrap()
+                .node("child")
+                .unwrap()
+                .edge_via,
+            node.edge_via
+        );
     }
 
     #[test]

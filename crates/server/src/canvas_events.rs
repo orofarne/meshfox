@@ -27,7 +27,10 @@ impl CanvasEventLog {
         self.0.push(event);
     }
 
-    pub fn subscribe_from(&self, since: u64) -> (Vec<SeqEvent>, broadcast::Receiver<SeqEvent>, bool) {
+    pub fn subscribe_from(
+        &self,
+        since: u64,
+    ) -> (Vec<SeqEvent>, broadcast::Receiver<SeqEvent>, bool) {
         self.0.subscribe_from(since)
     }
 }
@@ -46,7 +49,10 @@ mod tests {
     fn a_late_subscriber_gets_the_backlog_with_no_gap() {
         let log = CanvasEventLog::new();
         log.push(ServerEvent::Changed);
-        log.push(ServerEvent::RunStarted { node_id: "n".into(), block: "b".into() });
+        log.push(ServerEvent::RunStarted {
+            node_id: "n".into(),
+            block: "b".into(),
+        });
 
         let (backlog, _rx, gap) = log.subscribe_from(0);
         assert_eq!(backlog.len(), 2);

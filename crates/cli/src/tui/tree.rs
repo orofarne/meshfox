@@ -1,7 +1,7 @@
 //! Flattening the canvas's node tree into visible rows for the TUI's left
 //! pane, respecting which nodes are currently collapsed.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use meshfox_core::{scan_runnable_blocks, Canvas, NodeType};
 
@@ -43,12 +43,34 @@ pub struct TreeRow {
     pub color: Option<String>,
     /// The node's own `tags` attribute, verbatim — empty means none.
     pub tags: Vec<String>,
+    /// A one-hop extra-edge link shown below its source. `node_id` points
+    /// to the real target, but this row never recursively visits it.
+    pub reference: Option<ReferenceRow>,
 }
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ReferenceRow {
+    pub source_id: String,
+    pub edge_index: usize,
+    pub label: Option<String>,
+}
+
+type OutgoingLinks = HashMap<String, Vec<(String, usize, Option<String>)>>;
 
 pub fn flatten(canvas: &Canvas, expanded: &HashSet<String>) -> Vec<TreeRow> {
     let mut rows = Vec::new();
+    let mut outgoing: OutgoingLinks = HashMap::new();
+    for target in &canvas.nodes {
+        for (edge_index, edge) in target.extra_parents.iter().enumerate() {
+            outgoing.entry(edge.from.clone()).or_default().push((
+                target.id.clone(),
+                edge_index,
+                edge.label.clone(),
+            ));
+        }
+    }
     if let Ok(root) = canvas.root() {
-        visit(canvas, root, 0, expanded, &mut rows);
+        visit(canvas, root, 0, expanded, &outgoing, &mut rows);
     }
     rows
 }
@@ -58,10 +80,12 @@ fn visit(
     node: &meshfox_core::Node,
     depth: usize,
     expanded: &HashSet<String>,
+    outgoing: &OutgoingLinks,
     rows: &mut Vec<TreeRow>,
 ) {
     let children = canvas.children(&node.id);
-    let has_children = !children.is_empty();
+    let links = outgoing.get(&node.id);
+    let has_children = !children.is_empty() || links.is_some_and(|links| !links.is_empty());
     let is_expanded = depth == 0 || expanded.contains(&node.id);
     let blocks = scan_runnable_blocks(&node.id, &node.text);
     let constraint_ok = if node.constraint_results.is_empty() {
@@ -84,11 +108,39 @@ fn visit(
         constraint_ok,
         color: node.effective_color.clone(),
         tags: node.tags.clone(),
+        reference: None,
     });
 
     if has_children && is_expanded {
         for child in children {
-            visit(canvas, child, depth + 1, expanded, rows);
+            visit(canvas, child, depth + 1, expanded, outgoing, rows);
+        }
+        if let Some(links) = links {
+            for (target_id, edge_index, label) in links {
+                let Some(target) = canvas.node(target_id) else {
+                    continue;
+                };
+                rows.push(TreeRow {
+                    node_id: target.id.clone(),
+                    title: target.title.clone(),
+                    depth: depth + 1,
+                    node_type: target.node_type,
+                    has_children: false,
+                    expanded: false,
+                    runnable_count: 0,
+                    has_cache: false,
+                    has_tty: false,
+                    has_service: false,
+                    constraint_ok: None,
+                    color: None,
+                    tags: Vec::new(),
+                    reference: Some(ReferenceRow {
+                        source_id: node.id.clone(),
+                        edge_index: *edge_index,
+                        label: label.clone(),
+                    }),
+                });
+            }
         }
     }
 }
@@ -114,5 +166,46 @@ mod tests {
         let rows = flatten(&canvas, &HashSet::new());
         let child = rows.iter().find(|r| r.node_id == "child").unwrap();
         assert_eq!(child.color.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn extra_edges_follow_real_children_and_never_duplicate_subtrees() {
+        let canvas = Canvas::from_markdown(concat!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
+            "## Source\n<!-- meshfox:node id=\"source\" -->\n",
+            "<!-- meshfox:edge from=\"target\" label=\"returns\" -->\n",
+            "### Child\n<!-- meshfox:node id=\"child\" -->\n",
+            "## Target\n<!-- meshfox:node id=\"target\" -->\n",
+            "<!-- meshfox:edge from=\"source\" label=\"uses worker\" -->\n",
+        ))
+        .unwrap();
+        let collapsed = flatten(&canvas, &HashSet::new());
+        assert_eq!(
+            collapsed
+                .iter()
+                .map(|r| r.node_id.as_str())
+                .collect::<Vec<_>>(),
+            ["root", "source", "target"]
+        );
+        assert!(collapsed[1].has_children);
+        assert!(collapsed[2].has_children); // its outgoing reference is foldable
+
+        let expanded = HashSet::from(["source".to_string(), "target".to_string()]);
+        let rows = flatten(&canvas, &expanded);
+        assert_eq!(
+            rows.iter().map(|r| r.node_id.as_str()).collect::<Vec<_>>(),
+            ["root", "source", "child", "target", "target", "source"]
+        );
+        assert!(rows[3].reference.is_some());
+        assert_eq!(
+            rows[3].reference.as_ref().unwrap().label.as_deref(),
+            Some("uses worker")
+        );
+        assert!(rows[4].reference.is_none());
+        assert_eq!(
+            rows[5].reference.as_ref().unwrap().label.as_deref(),
+            Some("returns")
+        );
+        assert_eq!(rows.len(), 6); // the two-way cycle does not recurse
     }
 }

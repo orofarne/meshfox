@@ -91,7 +91,10 @@ pub enum Payload<'a> {
     /// Use this when the whole document is still the only reliable way to
     /// reconstruct the step, but a specific summary is cheap to describe
     /// anyway.
-    RawWithDiff { before: &'a str, diff: serde_json::Value },
+    RawWithDiff {
+        before: &'a str,
+        diff: serde_json::Value,
+    },
 }
 
 pub struct UndoLog {
@@ -107,7 +110,10 @@ impl UndoLog {
     /// contention). Runs this module's own schema, unconditionally —
     /// harmless if `run_ledger` already ran its own on the same connection.
     pub fn from_connection(conn: Arc<Mutex<Connection>>) -> io::Result<Self> {
-        conn.lock().unwrap().execute_batch(SCHEMA_SQL).map_err(sqlite_err)?;
+        conn.lock()
+            .unwrap()
+            .execute_batch(SCHEMA_SQL)
+            .map_err(sqlite_err)?;
         Ok(UndoLog { conn })
     }
 
@@ -115,7 +121,9 @@ impl UndoLog {
     fn open_in_memory() -> io::Result<Self> {
         let conn = Connection::open_in_memory().map_err(sqlite_err)?;
         conn.execute_batch(SCHEMA_SQL).map_err(sqlite_err)?;
-        Ok(UndoLog { conn: Arc::new(Mutex::new(conn)) })
+        Ok(UndoLog {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
     /// Records one history step: truncates any redo tail past the current
@@ -127,10 +135,14 @@ impl UndoLog {
         let (diff_json, raw_before, raw_after): (Option<String>, Option<String>, Option<String>) =
             match payload {
                 Payload::Diff(v) => (Some(v.to_string()), None, None),
-                Payload::Raw { before } => (None, Some(before.to_string()), Some(full_after.to_string())),
-                Payload::RawWithDiff { before, diff } => {
-                    (Some(diff.to_string()), Some(before.to_string()), Some(full_after.to_string()))
+                Payload::Raw { before } => {
+                    (None, Some(before.to_string()), Some(full_after.to_string()))
                 }
+                Payload::RawWithDiff { before, diff } => (
+                    Some(diff.to_string()),
+                    Some(before.to_string()),
+                    Some(full_after.to_string()),
+                ),
             };
         let created_at = meshfox_core::timestamp::now_utc_rfc3339();
 
@@ -142,7 +154,9 @@ impl UndoLog {
         )
         .map_err(sqlite_err)?;
         let cursor: i64 = tx
-            .query_row("SELECT cursor FROM undo_meta WHERE id = 1", [], |r| r.get(0))
+            .query_row("SELECT cursor FROM undo_meta WHERE id = 1", [], |r| {
+                r.get(0)
+            })
             .map_err(sqlite_err)?;
         tx.execute("DELETE FROM undo_log WHERE seq > ?1", params![cursor])
             .map_err(sqlite_err)?;
@@ -180,9 +194,11 @@ impl UndoLog {
     pub fn reconcile_startup_drift(&self, current_raw: &str) -> io::Result<bool> {
         let existing_last_raw: Option<String> = {
             let conn = self.conn.lock().unwrap();
-            conn.query_row("SELECT last_raw FROM undo_meta WHERE id = 1", [], |r| r.get(0))
-                .optional()
-                .map_err(sqlite_err)?
+            conn.query_row("SELECT last_raw FROM undo_meta WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .optional()
+            .map_err(sqlite_err)?
         };
         match existing_last_raw {
             None => {
@@ -196,7 +212,11 @@ impl UndoLog {
             }
             Some(last_raw) if last_raw == current_raw => Ok(false),
             Some(last_raw) => {
-                self.push("external_edit", Payload::Raw { before: &last_raw }, current_raw)?;
+                self.push(
+                    "external_edit",
+                    Payload::Raw { before: &last_raw },
+                    current_raw,
+                )?;
                 Ok(true)
             }
         }
@@ -228,7 +248,9 @@ impl UndoLog {
         let cursor = self.cursor()?;
         let conn = self.conn.lock().unwrap();
         let max_seq: i64 = conn
-            .query_row("SELECT COALESCE(MAX(seq), 0) FROM undo_log", [], |r| r.get(0))
+            .query_row("SELECT COALESCE(MAX(seq), 0) FROM undo_log", [], |r| {
+                r.get(0)
+            })
             .map_err(sqlite_err)?;
         Ok(max_seq > cursor)
     }
@@ -402,9 +424,7 @@ impl UndoLog {
         rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)
     }
 
-    fn row_mapper(
-        r: &rusqlite::Row,
-    ) -> rusqlite::Result<UndoEntry> {
+    fn row_mapper(r: &rusqlite::Row) -> rusqlite::Result<UndoEntry> {
         Ok(UndoEntry {
             seq: r.get(0)?,
             created_at: r.get(1)?,
@@ -436,7 +456,9 @@ impl UndoLog {
                      FROM undo_log WHERE seq > ?1 ORDER BY seq DESC",
                 )
                 .map_err(sqlite_err)?;
-            let rows = stmt.query_map(params![cursor], Self::row_mapper).map_err(sqlite_err)?;
+            let rows = stmt
+                .query_map(params![cursor], Self::row_mapper)
+                .map_err(sqlite_err)?;
             rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)?
         };
         let applied: Vec<UndoEntry> = {
@@ -453,8 +475,14 @@ impl UndoLog {
         };
         Ok(redo_tail
             .into_iter()
-            .map(|entry| HistoryEntry { entry, applied: false })
-            .chain(applied.into_iter().map(|entry| HistoryEntry { entry, applied: true }))
+            .map(|entry| HistoryEntry {
+                entry,
+                applied: false,
+            })
+            .chain(applied.into_iter().map(|entry| HistoryEntry {
+                entry,
+                applied: true,
+            }))
             .collect())
     }
 }
@@ -481,8 +509,10 @@ mod tests {
     #[test]
     fn push_assigns_increasing_seq() {
         let log = UndoLog::open_in_memory().unwrap();
-        log.push("node_upserted", Payload::Diff(json!({"a": 1})), "doc-v1").unwrap();
-        log.push("node_upserted", Payload::Diff(json!({"a": 2})), "doc-v2").unwrap();
+        log.push("node_upserted", Payload::Diff(json!({"a": 1})), "doc-v1")
+            .unwrap();
+        log.push("node_upserted", Payload::Diff(json!({"a": 2})), "doc-v2")
+            .unwrap();
 
         let history = log.history(10).unwrap();
         assert_eq!(history.len(), 2);
@@ -494,11 +524,16 @@ mod tests {
     #[test]
     fn diff_payload_rows_have_null_raw_columns_and_vice_versa() {
         let log = UndoLog::open_in_memory().unwrap();
-        log.push("node_upserted", Payload::Diff(json!({"a": 1})), "doc-v1").unwrap();
-        log.push("raw_replace", Payload::Raw { before: "old" }, "new").unwrap();
+        log.push("node_upserted", Payload::Diff(json!({"a": 1})), "doc-v1")
+            .unwrap();
+        log.push("raw_replace", Payload::Raw { before: "old" }, "new")
+            .unwrap();
 
         let history = log.history(10).unwrap();
-        let diff_row = history.iter().find(|e| e.op_kind == "node_upserted").unwrap();
+        let diff_row = history
+            .iter()
+            .find(|e| e.op_kind == "node_upserted")
+            .unwrap();
         assert!(diff_row.diff_json.is_some());
         assert!(diff_row.raw_before.is_none());
         assert!(diff_row.raw_after.is_none());
@@ -513,7 +548,8 @@ mod tests {
     fn depth_cap_keeps_only_the_most_recent_max_depth_rows() {
         let log = UndoLog::open_in_memory().unwrap();
         for i in 0..(MAX_DEPTH + 5) {
-            log.push("node_upserted", Payload::Diff(json!({"i": i})), "doc").unwrap();
+            log.push("node_upserted", Payload::Diff(json!({"i": i})), "doc")
+                .unwrap();
         }
         let history = log.history(10_000).unwrap();
         assert_eq!(history.len() as i64, MAX_DEPTH);
@@ -572,8 +608,10 @@ mod tests {
     #[test]
     fn peek_undo_returns_the_row_at_the_cursor_without_moving_it() {
         let log = UndoLog::open_in_memory().unwrap();
-        log.push("node_upserted", Payload::Diff(json!({"a": 1})), "doc-v1").unwrap();
-        log.push("node_upserted", Payload::Diff(json!({"a": 2})), "doc-v2").unwrap();
+        log.push("node_upserted", Payload::Diff(json!({"a": 1})), "doc-v1")
+            .unwrap();
+        log.push("node_upserted", Payload::Diff(json!({"a": 2})), "doc-v2")
+            .unwrap();
 
         assert!(log.can_undo().unwrap());
         assert!(!log.can_redo().unwrap());
@@ -586,8 +624,10 @@ mod tests {
     #[test]
     fn commit_undo_moves_the_cursor_back_one_step_and_leaves_the_row_in_place() {
         let log = UndoLog::open_in_memory().unwrap();
-        log.push("node_upserted", Payload::Diff(json!({"a": 1})), "doc-v1").unwrap();
-        log.push("node_upserted", Payload::Diff(json!({"a": 2})), "doc-v2").unwrap();
+        log.push("node_upserted", Payload::Diff(json!({"a": 1})), "doc-v1")
+            .unwrap();
+        log.push("node_upserted", Payload::Diff(json!({"a": 2})), "doc-v2")
+            .unwrap();
 
         let entry = log.peek_undo().unwrap().unwrap();
         assert_eq!(entry.seq, 2);
@@ -605,7 +645,8 @@ mod tests {
     fn commit_undo_updates_last_raw_so_a_later_reconcile_sees_no_drift() {
         let log = UndoLog::open_in_memory().unwrap();
         log.reconcile_startup_drift("doc-v0").unwrap();
-        log.push("node_upserted", Payload::Diff(json!({"a": 1})), "doc-v1").unwrap();
+        log.push("node_upserted", Payload::Diff(json!({"a": 1})), "doc-v1")
+            .unwrap();
 
         let entry = log.peek_undo().unwrap().unwrap();
         log.commit_undo(entry.seq, "doc-v0").unwrap();
@@ -616,8 +657,10 @@ mod tests {
     #[test]
     fn commit_redo_moves_the_cursor_forward_and_updates_last_raw() {
         let log = UndoLog::open_in_memory().unwrap();
-        log.push("node_upserted", Payload::Diff(json!({"a": 1})), "doc-v1").unwrap();
-        log.push("node_upserted", Payload::Diff(json!({"a": 2})), "doc-v2").unwrap();
+        log.push("node_upserted", Payload::Diff(json!({"a": 1})), "doc-v1")
+            .unwrap();
+        log.push("node_upserted", Payload::Diff(json!({"a": 2})), "doc-v2")
+            .unwrap();
         let entry = log.peek_undo().unwrap().unwrap();
         log.commit_undo(entry.seq, "doc-v1").unwrap();
 
@@ -633,8 +676,10 @@ mod tests {
     #[test]
     fn a_fresh_push_after_undoing_drops_the_redo_tail() {
         let log = UndoLog::open_in_memory().unwrap();
-        log.push("node_upserted", Payload::Diff(json!({"a": 1})), "doc-v1").unwrap();
-        log.push("node_upserted", Payload::Diff(json!({"a": 2})), "doc-v2").unwrap();
+        log.push("node_upserted", Payload::Diff(json!({"a": 1})), "doc-v1")
+            .unwrap();
+        log.push("node_upserted", Payload::Diff(json!({"a": 2})), "doc-v2")
+            .unwrap();
         let entry = log.peek_undo().unwrap().unwrap();
         log.commit_undo(entry.seq, "doc-v1").unwrap();
         assert!(log.can_redo().unwrap());
@@ -642,12 +687,16 @@ mod tests {
         // A brand-new edit lands on top of the undone cursor instead of
         // being redone — same as any other editor, this discards the redo
         // tail rather than branching history.
-        log.push("node_upserted", Payload::Diff(json!({"a": 3})), "doc-v3").unwrap();
+        log.push("node_upserted", Payload::Diff(json!({"a": 3})), "doc-v3")
+            .unwrap();
 
         assert!(!log.can_redo().unwrap());
         let history = log.history(10).unwrap();
         assert_eq!(history.len(), 2);
-        assert_eq!(history[0].diff_json.as_deref(), Some(json!({"a": 3}).to_string().as_str()));
+        assert_eq!(
+            history[0].diff_json.as_deref(),
+            Some(json!({"a": 3}).to_string().as_str())
+        );
     }
 
     // Regression test for a real bug (found while designing the web e2e
@@ -664,11 +713,13 @@ mod tests {
     #[test]
     fn undo_after_undo_then_a_fresh_edit_does_not_leave_can_undo_disagreeing_with_peek_undo() {
         let log = UndoLog::open_in_memory().unwrap();
-        log.push("node_upserted", Payload::Diff(json!({"a": 1})), "doc-v1").unwrap();
+        log.push("node_upserted", Payload::Diff(json!({"a": 1})), "doc-v1")
+            .unwrap();
         let first = log.peek_undo().unwrap().unwrap();
         log.commit_undo(first.seq, "doc-v0").unwrap();
 
-        log.push("node_upserted", Payload::Diff(json!({"a": 2})), "doc-v2").unwrap();
+        log.push("node_upserted", Payload::Diff(json!({"a": 2})), "doc-v2")
+            .unwrap();
         let second = log.peek_undo().unwrap().unwrap();
         log.commit_undo(second.seq, "doc-v0-again").unwrap();
 
@@ -687,26 +738,34 @@ mod tests {
     #[test]
     fn redo_after_undo_then_a_fresh_edit_then_undo_reaches_the_surviving_row_past_the_gap() {
         let log = UndoLog::open_in_memory().unwrap();
-        log.push("node_upserted", Payload::Diff(json!({"a": 1})), "doc-v1").unwrap();
+        log.push("node_upserted", Payload::Diff(json!({"a": 1})), "doc-v1")
+            .unwrap();
         let first = log.peek_undo().unwrap().unwrap();
         log.commit_undo(first.seq, "doc-v0").unwrap();
 
-        log.push("node_upserted", Payload::Diff(json!({"a": 2})), "doc-v2").unwrap();
+        log.push("node_upserted", Payload::Diff(json!({"a": 2})), "doc-v2")
+            .unwrap();
         let second = log.peek_undo().unwrap().unwrap();
         log.commit_undo(second.seq, "doc-v0-again").unwrap();
 
         assert!(log.can_redo().unwrap());
         let redoable = log.peek_redo().unwrap();
-        assert!(redoable.is_some(), "can_redo said true but peek_redo found nothing");
+        assert!(
+            redoable.is_some(),
+            "can_redo said true but peek_redo found nothing"
+        );
         assert_eq!(redoable.unwrap().seq, second.seq);
     }
 
     #[test]
     fn history_around_marks_applied_vs_redo_tail_on_either_side_of_the_cursor() {
         let log = UndoLog::open_in_memory().unwrap();
-        log.push("node_upserted", Payload::Diff(json!({"a": 1})), "doc-v1").unwrap();
-        log.push("node_upserted", Payload::Diff(json!({"a": 2})), "doc-v2").unwrap();
-        log.push("node_upserted", Payload::Diff(json!({"a": 3})), "doc-v3").unwrap();
+        log.push("node_upserted", Payload::Diff(json!({"a": 1})), "doc-v1")
+            .unwrap();
+        log.push("node_upserted", Payload::Diff(json!({"a": 2})), "doc-v2")
+            .unwrap();
+        log.push("node_upserted", Payload::Diff(json!({"a": 3})), "doc-v3")
+            .unwrap();
         // Undo the most recent one, so seq 3 sits in the redo tail and 1/2
         // stay applied.
         let entry = log.peek_undo().unwrap().unwrap();
@@ -714,7 +773,8 @@ mod tests {
         log.commit_undo(entry.seq, "doc-v2").unwrap();
 
         let listed = log.history_around(10).unwrap();
-        let seqs_and_applied: Vec<(i64, bool)> = listed.iter().map(|h| (h.entry.seq, h.applied)).collect();
+        let seqs_and_applied: Vec<(i64, bool)> =
+            listed.iter().map(|h| (h.entry.seq, h.applied)).collect();
         // Most-recent/most-future first throughout: the redo tail (seq 3),
         // then the applied steps in descending order (seq 2, seq 1).
         assert_eq!(seqs_and_applied, vec![(3, false), (2, true), (1, true)]);
@@ -724,7 +784,8 @@ mod tests {
     fn history_around_caps_only_the_applied_side_never_the_redo_tail() {
         let log = UndoLog::open_in_memory().unwrap();
         for i in 0..5 {
-            log.push("node_upserted", Payload::Diff(json!({"i": i})), "doc").unwrap();
+            log.push("node_upserted", Payload::Diff(json!({"i": i})), "doc")
+                .unwrap();
         }
         // Undo three of the five, so seqs 3/4/5 sit in the redo tail.
         for _ in 0..3 {
@@ -736,7 +797,11 @@ mod tests {
         // A `limit` smaller than the redo tail's own size still returns
         // every redo-tail row — only the applied side is capped.
         let listed = log.history_around(1).unwrap();
-        let seqs_and_applied: Vec<(i64, bool)> = listed.iter().map(|h| (h.entry.seq, h.applied)).collect();
-        assert_eq!(seqs_and_applied, vec![(5, false), (4, false), (3, false), (2, true)]);
+        let seqs_and_applied: Vec<(i64, bool)> =
+            listed.iter().map(|h| (h.entry.seq, h.applied)).collect();
+        assert_eq!(
+            seqs_and_applied,
+            vec![(5, false), (4, false), (3, false), (2, true)]
+        );
     }
 }

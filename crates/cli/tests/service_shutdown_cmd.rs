@@ -104,7 +104,9 @@ fn run_ws_events(port: u16, query: &str) -> String {
         .block_on(async {
             use futures_util::StreamExt;
             let url = format!("ws://127.0.0.1:{port}/api/run?{query}");
-            let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+            let (mut ws, _) = tokio_tungstenite::connect_async(url)
+                .await
+                .expect("connect");
             let mut body = String::new();
             while let Some(msg) = ws.next().await {
                 match msg.expect("no ws error") {
@@ -163,7 +165,10 @@ fn killing_the_worker_stops_a_running_service_instead_of_orphaning_it() {
     assert_eq!(services.len(), 1);
     assert_eq!(services[0]["status"], "running");
     let service_pid = services[0]["pid"].as_u64().unwrap() as u32;
-    assert!(is_alive(service_pid), "service should be running before the kill");
+    assert!(
+        is_alive(service_pid),
+        "service should be running before the kill"
+    );
 
     // The exact signal `editors/vscode/src/coordinator.ts`'s `killWorker`/
     // `dispose` send (Node's default `ChildProcess.kill()`).
@@ -203,7 +208,9 @@ fn killing_the_worker_stops_a_running_service_instead_of_orphaning_it() {
 
 /// Counts the lines in `path`, or 0 if it doesn't exist yet.
 fn tick_count(path: &std::path::Path) -> usize {
-    std::fs::read_to_string(path).map(|s| s.lines().count()).unwrap_or(0)
+    std::fs::read_to_string(path)
+        .map(|s| s.lines().count())
+        .unwrap_or(0)
 }
 
 /// Same proof as `killing_the_worker_stops_a_running_service_instead_of_
@@ -316,7 +323,10 @@ fn killing_the_worker_stops_a_currently_running_plain_block_instead_of_orphaning
     while !run_thread.is_finished() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(run_thread.is_finished(), "the run's own HTTP connection never closed after the worker died");
+    assert!(
+        run_thread.is_finished(),
+        "the run's own HTTP connection never closed after the worker died"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }

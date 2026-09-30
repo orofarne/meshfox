@@ -66,7 +66,9 @@ fn dragging_the_output_seam_resizes_the_output_pane() {
     // deliberately excluded — see `App::resize_handle_at`'s own doc
     // comment — so a click there keeps behaving as a plain focus click,
     // not a resize start).
-    let (title_row, col) = session.find("Output").expect("Output pane title, now expanded");
+    let (title_row, col) = session
+        .find("Output")
+        .expect("Output pane title, now expanded");
     let row = title_row - 1;
 
     // Drag the seam up — same column (a vertical drag) — growing the
@@ -74,7 +76,9 @@ fn dragging_the_output_seam_resizes_the_output_pane() {
     session.send_mouse_drag(row, col, row.saturating_sub(5), col);
     std::thread::sleep(Duration::from_millis(100));
 
-    let (new_title_row, _) = session.find("Output").expect("Output pane title, now moved");
+    let (new_title_row, _) = session
+        .find("Output")
+        .expect("Output pane title, now moved");
     assert!(
         new_title_row + 3 <= title_row,
         "dragging the seam up should grow the Output pane, moving its title row up — was at row {title_row}, now at {new_title_row}"

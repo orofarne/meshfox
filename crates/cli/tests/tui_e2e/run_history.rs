@@ -13,10 +13,14 @@ use crate::harness::TuiSession;
 fn l_shows_the_finished_run_with_its_exit_code_and_output() {
     let (canvas_path, dir) = fixtures::write_fixture(fixtures::SIMPLE_RUNNABLE);
     let mut session = TuiSession::spawn(&canvas_path, dir, 30, 110);
-    session.wait_for("Root", Duration::from_secs(5)).expect("the tree should render");
+    session
+        .wait_for("Root", Duration::from_secs(5))
+        .expect("the tree should render");
 
     session.send_keys("j");
-    session.wait_for("Leaf", Duration::from_secs(2)).expect("tree still renders");
+    session
+        .wait_for("Leaf", Duration::from_secs(2))
+        .expect("tree still renders");
     session.send_keys("R");
     session
         .wait_for("tui-e2e-marker-output", Duration::from_secs(10))
@@ -28,15 +32,30 @@ fn l_shows_the_finished_run_with_its_exit_code_and_output() {
     session.send_keys("L");
     session
         .wait_for("run history", Duration::from_secs(5))
-        .unwrap_or_else(|_| panic!("L should open the run-history view; screen:\n{}", session.screen_text()));
+        .unwrap_or_else(|_| {
+            panic!(
+                "L should open the run-history view; screen:\n{}",
+                session.screen_text()
+            )
+        });
     let screen = session.screen_text();
-    assert!(screen.contains("exit 0"), "the run's exit code is listed:\n{screen}");
-    assert!(screen.contains("leaf/leaf"), "the block is named in the title:\n{screen}");
+    assert!(
+        screen.contains("exit 0"),
+        "the run's exit code is listed:\n{screen}"
+    );
+    assert!(
+        screen.contains("leaf/leaf"),
+        "the block is named in the title:\n{screen}"
+    );
 
     session.send_keys("q");
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     while session.screen_text().contains("run history") {
-        assert!(std::time::Instant::now() < deadline, "q should close the view:\n{}", session.screen_text());
+        assert!(
+            std::time::Instant::now() < deadline,
+            "q should close the view:\n{}",
+            session.screen_text()
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -46,9 +65,13 @@ fn l_shows_the_finished_run_with_its_exit_code_and_output() {
 fn l_on_a_block_that_never_ran_says_so_instead_of_opening_an_empty_view() {
     let (canvas_path, dir) = fixtures::write_fixture(fixtures::SIMPLE_RUNNABLE);
     let mut session = TuiSession::spawn(&canvas_path, dir, 30, 110);
-    session.wait_for("Root", Duration::from_secs(5)).expect("the tree should render");
+    session
+        .wait_for("Root", Duration::from_secs(5))
+        .expect("the tree should render");
     session.send_keys("j");
-    session.wait_for("Leaf", Duration::from_secs(2)).expect("tree still renders");
+    session
+        .wait_for("Leaf", Duration::from_secs(2))
+        .expect("tree still renders");
     // The status line lives in the Output pane, collapsed at startup:
     // click its handle open before asking.
     let (row, col) = session.find("Output").expect("the collapsed Output handle");
@@ -57,7 +80,12 @@ fn l_on_a_block_that_never_ran_says_so_instead_of_opening_an_empty_view() {
     session.send_keys("L");
     session
         .wait_for("no earlier runs", Duration::from_secs(5))
-        .unwrap_or_else(|_| panic!("expected the status message; screen:\n{}", session.screen_text()));
+        .unwrap_or_else(|_| {
+            panic!(
+                "expected the status message; screen:\n{}",
+                session.screen_text()
+            )
+        });
 }
 
 /// Copies `from` (a fixture directory, `.meshfox` session database included)
@@ -89,9 +117,13 @@ fn a_restarted_tui_shows_the_last_runs_output_without_running_anything() {
     ));
     let file_name = canvas_path.file_name().unwrap().to_owned();
     let mut first = TuiSession::spawn(&canvas_path, dir.clone(), 30, 110);
-    first.wait_for("Root", Duration::from_secs(5)).expect("the tree should render");
+    first
+        .wait_for("Root", Duration::from_secs(5))
+        .expect("the tree should render");
     first.send_keys("j");
-    first.wait_for("Leaf", Duration::from_secs(2)).expect("tree still renders");
+    first
+        .wait_for("Leaf", Duration::from_secs(2))
+        .expect("tree still renders");
     first.send_keys("R");
     first
         .wait_for("persisted-42", Duration::from_secs(10))
@@ -102,7 +134,10 @@ fn a_restarted_tui_shows_the_last_runs_output_without_running_anything() {
     // session database — over to a directory the first session's `Drop`
     // won't delete.
     first.send_keys("q");
-    assert!(first.wait_for_exit(Duration::from_secs(5)), "q should exit the TUI");
+    assert!(
+        first.wait_for_exit(Duration::from_secs(5)),
+        "q should exit the TUI"
+    );
     let carried = dir.with_file_name(format!(
         "{}-carried",
         dir.file_name().unwrap().to_string_lossy()
@@ -112,12 +147,19 @@ fn a_restarted_tui_shows_the_last_runs_output_without_running_anything() {
 
     let carried_canvas = carried.join(file_name);
     let mut second = TuiSession::spawn(&carried_canvas, carried, 30, 110);
-    second.wait_for("Root", Duration::from_secs(5)).expect("the tree should render");
+    second
+        .wait_for("Root", Duration::from_secs(5))
+        .expect("the tree should render");
     second.send_keys("j");
-    second.wait_for("Leaf", Duration::from_secs(2)).expect("tree still renders");
+    second
+        .wait_for("Leaf", Duration::from_secs(2))
+        .expect("tree still renders");
     second
         .wait_for("persisted-42", Duration::from_secs(10))
         .unwrap_or_else(|_| {
-            panic!("the last run's output should be back without running; screen:\n{}", second.screen_text())
+            panic!(
+                "the last run's output should be back without running; screen:\n{}",
+                second.screen_text()
+            )
         });
 }

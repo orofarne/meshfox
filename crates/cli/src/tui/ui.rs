@@ -14,10 +14,10 @@ use syntect::parsing::SyntaxSet;
 use edtui::{EditorView, LineNumbers, SyntaxHighlighter};
 
 use super::app::{App, Focus, ServiceConflictState, ServicesViewState};
-use super::theme::{ACCENT, BORDER, FAIL, MAP_NODE_BG, MAP_NODE_FG, MAP_SELECTED_BG, OK};
 use super::markdown::Segment;
 use super::source_editor::SourceEditorState;
 use super::spatial;
+use super::theme::{ACCENT, BORDER, DEP, FAIL, MAP_NODE_BG, MAP_NODE_FG, MAP_SELECTED_BG, OK};
 use super::tree::TreeRow;
 use crate::pdf::render::resolve_color_hex;
 use meshfox_core::{NodeType, VarType};
@@ -29,7 +29,7 @@ use meshfox_core::{NodeType, VarType};
 /// that isn't a valid color — same "malformed input just renders with no
 /// explicit color" fallback `resolve_color_hex`'s own callers already rely
 /// on, rather than erroring.
-fn tree_row_color(color: Option<&str>) -> Option<Color> {
+pub(super) fn tree_row_color(color: Option<&str>) -> Option<Color> {
     let hex = resolve_color_hex(color?)?;
     let hex = hex.strip_prefix('#')?;
     let r = u8::from_str_radix(hex.get(0..2)?, 16).ok()?;
@@ -94,6 +94,19 @@ fn tree_row_words(
     run_status: Option<RunRowState>,
     spinner_tick: u32,
 ) -> Vec<(String, Style)> {
+    if let Some(reference) = &row.reference {
+        let mut words = Vec::new();
+        if let Some(label) = reference.label.as_deref().filter(|label| !label.is_empty()) {
+            words.push((format!("[{label}]"), Style::default().fg(ACCENT)));
+        }
+        words.extend(row.title.split_whitespace().map(|word| {
+            (
+                word.to_string(),
+                Style::default().fg(DEP).add_modifier(Modifier::ITALIC),
+            )
+        }));
+        return words;
+    }
     let mut words: Vec<(String, Style)> = row
         .title
         .split_whitespace()
@@ -101,7 +114,10 @@ fn tree_row_words(
         .collect();
     match run_status {
         Some(RunRowState::Running) => {
-            words.push((spinner_frame(spinner_tick).to_string(), Style::default().fg(ACCENT)));
+            words.push((
+                spinner_frame(spinner_tick).to_string(),
+                Style::default().fg(ACCENT),
+            ));
         }
         Some(RunRowState::Failed) => {
             words.push(("✗".to_string(), Style::default().fg(FAIL)));
@@ -135,10 +151,7 @@ fn tree_row_words(
         flags.push("tty");
     }
     if !flags.is_empty() {
-        words.push((
-            format!("[{}]", flags.join(",")),
-            Style::default().fg(OK),
-        ));
+        words.push((format!("[{}]", flags.join(",")), Style::default().fg(OK)));
     }
     words
 }
@@ -151,7 +164,11 @@ fn tree_row_words(
 /// than its own row's budget still gets a whole row to itself rather than
 /// being split mid-word — same "don't break tokens" choice `ratatui`'s own
 /// `WordWrapper` defaults to, and what keeps e.g. a lone long tag legible.
-fn wrap_word_indices(word_widths: &[usize], first_width: usize, cont_width: usize) -> Vec<Vec<usize>> {
+fn wrap_word_indices(
+    word_widths: &[usize],
+    first_width: usize,
+    cont_width: usize,
+) -> Vec<Vec<usize>> {
     if word_widths.is_empty() {
         return vec![Vec::new()];
     }
@@ -443,13 +460,21 @@ fn map_title_lines(title: &str, width: usize) -> Text<'static> {
     Text::from(lines.into_iter().take(2).collect::<Vec<_>>())
 }
 
-fn draw_map_arrow(grid: &mut [Vec<char>], from: Rect, to: Rect, area: Rect, obstacles: &[Rect]) -> Vec<(usize, usize)> {
+fn draw_map_arrow(
+    grid: &mut [Vec<char>],
+    from: Rect,
+    to: Rect,
+    area: Rect,
+    obstacles: &[Rect],
+) -> Vec<(usize, usize)> {
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
 
     let width = area.width as i32;
     let height = area.height as i32;
-    if width == 0 || height == 0 { return Vec::new(); }
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
     // Ports sit just outside the cards. An edge can bend around any other
     // card, but it must never paint across one, even when it spans rows.
     let vertical = from.y != to.y;
@@ -457,26 +482,61 @@ fn draw_map_arrow(grid: &mut [Vec<char>], from: Rect, to: Rect, area: Rect, obst
         let down = from.y < to.y;
         let sx = from.x + from.width / 2;
         let tx = to.x + to.width / 2;
-        let sy = if down { from.y + from.height } else { from.y.saturating_sub(1) };
-        let ty = if down { to.y.saturating_sub(1) } else { to.y + to.height };
-        ((sx, sy), (tx, ty), if down { '↓' } else { '↑' }, if down { 0 } else { 1 })
+        let sy = if down {
+            from.y + from.height
+        } else {
+            from.y.saturating_sub(1)
+        };
+        let ty = if down {
+            to.y.saturating_sub(1)
+        } else {
+            to.y + to.height
+        };
+        (
+            (sx, sy),
+            (tx, ty),
+            if down { '↓' } else { '↑' },
+            if down { 0 } else { 1 },
+        )
     } else {
         let right = from.x < to.x;
         let sy = from.y + from.height / 2;
         let ty = to.y + to.height / 2;
-        let sx = if right { from.x + from.width } else { from.x.saturating_sub(1) };
-        let tx = if right { to.x.saturating_sub(1) } else { to.x + to.width };
-        ((sx, sy), (tx, ty), if right { '→' } else { '←' }, if right { 2 } else { 3 })
+        let sx = if right {
+            from.x + from.width
+        } else {
+            from.x.saturating_sub(1)
+        };
+        let tx = if right {
+            to.x.saturating_sub(1)
+        } else {
+            to.x + to.width
+        };
+        (
+            (sx, sy),
+            (tx, ty),
+            if right { '→' } else { '←' },
+            if right { 2 } else { 3 },
+        )
     };
-    let start = (start.0 as i32 - area.x as i32, start.1 as i32 - area.y as i32);
+    let start = (
+        start.0 as i32 - area.x as i32,
+        start.1 as i32 - area.y as i32,
+    );
     let end = (end.0 as i32 - area.x as i32, end.1 as i32 - area.y as i32);
     let inside = |(x, y): (i32, i32)| x >= 0 && y >= 0 && x < width && y < height;
-    if !inside(start) || !inside(end) { return Vec::new(); }
+    if !inside(start) || !inside(end) {
+        return Vec::new();
+    }
     let blocked = |(x, y): (i32, i32)| {
         let x = x + area.x as i32;
         let y = y + area.y as i32;
-        obstacles.iter().any(|r| x >= r.x as i32 && x < (r.x + r.width) as i32
-            && y >= r.y as i32 && y < (r.y + r.height) as i32)
+        obstacles.iter().any(|r| {
+            x >= r.x as i32
+                && x < (r.x + r.width) as i32
+                && y >= r.y as i32
+                && y < (r.y + r.height) as i32
+        })
     };
     let dirs = [(0, 1), (0, -1), (1, 0), (-1, 0)];
     let index = |(x, y): (i32, i32), d: usize| ((y * width + x) as usize) * 4 + d;
@@ -489,13 +549,21 @@ fn draw_map_arrow(grid: &mut [Vec<char>], from: Rect, to: Rect, area: Rect, obst
     let mut goal = None;
     while let Some(Reverse((current, x, y, dir))) = queue.pop() {
         let at = index((x, y), dir);
-        if current != cost[at] { continue; }
-        if (x, y) == end { goal = Some(at); break; }
+        if current != cost[at] {
+            continue;
+        }
+        if (x, y) == end {
+            goal = Some(at);
+            break;
+        }
         for (next_dir, (dx, dy)) in dirs.iter().enumerate() {
             let next = (x + dx, y + dy);
-            if !inside(next) || blocked(next) { continue; }
+            if !inside(next) || blocked(next) {
+                continue;
+            }
             let crossing = grid[next.1 as usize][next.0 as usize] != ' ';
-            let next_cost = current + 10 + u32::from(next_dir != dir) * 18 + u32::from(crossing) * 80;
+            let next_cost =
+                current + 10 + u32::from(next_dir != dir) * 18 + u32::from(crossing) * 80;
             let at_next = index(next, next_dir);
             if next_cost < cost[at_next] {
                 cost[at_next] = next_cost;
@@ -504,20 +572,33 @@ fn draw_map_arrow(grid: &mut [Vec<char>], from: Rect, to: Rect, area: Rect, obst
             }
         }
     }
-    let Some(mut at) = goal else { return Vec::new(); };
+    let Some(mut at) = goal else {
+        return Vec::new();
+    };
     let mut path = Vec::new();
     loop {
         let cell = at / 4;
         path.push(((cell as i32 % width), (cell as i32 / width)));
-        if at == first { break; }
+        if at == first {
+            break;
+        }
         at = previous[at].expect("routed cell has a predecessor");
     }
     path.reverse();
     for (i, &(x, y)) in path.iter().enumerate() {
-        let glyph = if i + 1 == path.len() { head } else {
+        let glyph = if i + 1 == path.len() {
+            head
+        } else {
             let before = if i == 0 {
-                match entrance { 0 => (x, y - 1), 1 => (x, y + 1), 2 => (x - 1, y), _ => (x + 1, y) }
-            } else { path[i - 1] };
+                match entrance {
+                    0 => (x, y - 1),
+                    1 => (x, y + 1),
+                    2 => (x - 1, y),
+                    _ => (x + 1, y),
+                }
+            } else {
+                path[i - 1]
+            };
             let after = path[i + 1];
             let left = before.0 < x || after.0 < x;
             let right = before.0 > x || after.0 > x;
@@ -536,11 +617,17 @@ fn draw_map_arrow(grid: &mut [Vec<char>], from: Rect, to: Rect, area: Rect, obst
         };
         grid[y as usize][x as usize] = glyph;
     }
-    path.into_iter().map(|(x, y)| (x as usize, y as usize)).collect()
+    path.into_iter()
+        .map(|(x, y)| (x as usize, y as usize))
+        .collect()
 }
 
 fn render_spatial_parent(f: &mut Frame, area: Rect, app: &mut App, group_id: &str) {
-    let title = app.display_canvas.node(group_id).map(|n| n.title.as_str()).unwrap_or("Group");
+    let title = app
+        .display_canvas
+        .node(group_id)
+        .map(|n| n.title.as_str())
+        .unwrap_or("Group");
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(pane_border(app.focus == Focus::Tree))
@@ -552,18 +639,33 @@ fn render_spatial_parent(f: &mut Frame, area: Rect, app: &mut App, group_id: &st
         return;
     }
     let map_area = Rect::new(inner.x, inner.y, inner.width, inner.height - 2);
-    let Some(selected) = app.rows.get(app.selected) else { return };
+    let Some(selected) = app.rows.get(app.selected) else {
+        return;
+    };
     let selected_id = selected.node_id.clone();
     let overview = selected_id == group_id;
-    let prior = app.spatial_viewports.get(group_id).copied().unwrap_or_default();
+    let prior = app
+        .spatial_viewports
+        .get(group_id)
+        .copied()
+        .unwrap_or_default();
     let projection = spatial::project(&app.display_canvas, group_id, map_area, &selected_id, prior);
-    app.spatial_viewports.insert(group_id.to_string(), projection.viewport);
+    app.spatial_viewports
+        .insert(group_id.to_string(), projection.viewport);
     let nodes = projection.visible;
-    let mut grid = vec![vec![' '; projection.virtual_area.width as usize]; projection.virtual_area.height as usize];
+    let mut grid = vec![
+        vec![' '; projection.virtual_area.width as usize];
+        projection.virtual_area.height as usize
+    ];
     let mut selected_grid = grid.clone();
-    let rects: HashMap<&str, Rect> = projection.all.iter().map(|n| (n.id.as_str(), n.rect)).collect();
+    let rects: HashMap<&str, Rect> = projection
+        .all
+        .iter()
+        .map(|n| (n.id.as_str(), n.rect))
+        .collect();
     let obstacles: Vec<Rect> = projection.all.iter().map(|n| n.rect).collect();
-    let visible_ids: std::collections::HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+    let visible_ids: std::collections::HashSet<&str> =
+        nodes.iter().map(|n| n.id.as_str()).collect();
     let mut incoming = 0;
     let mut outgoing = 0;
     let mut offscreen = Vec::new();
@@ -572,18 +674,32 @@ fn render_spatial_parent(f: &mut Frame, area: Rect, app: &mut App, group_id: &st
     for child in app.display_canvas.children(group_id) {
         for edge in &child.extra_parents {
             let connected = edge.from == selected_id || child.id == selected_id;
-            if edge.from == selected_id { outgoing += 1; }
-            if child.id == selected_id { incoming += 1; }
+            if edge.from == selected_id {
+                outgoing += 1;
+            }
+            if child.id == selected_id {
+                incoming += 1;
+            }
             if overview || connected {
                 if let Some(label) = &edge.label {
-                    let direction = if child.id == selected_id { "←" } else { "→" };
+                    let direction = if child.id == selected_id {
+                        "←"
+                    } else {
+                        "→"
+                    };
                     let other = if child.id == selected_id {
-                        app.display_canvas.node(&edge.from).map(|n| n.title.as_str()).unwrap_or(&edge.from)
+                        app.display_canvas
+                            .node(&edge.from)
+                            .map(|n| n.title.as_str())
+                            .unwrap_or(&edge.from)
                     } else {
                         &child.title
                     };
                     let mut detail = format!("{direction} {other}: {label}");
-                    if edge.source_side.is_some() || edge.target_side.is_some() || !edge.via.is_empty() {
+                    if edge.source_side.is_some()
+                        || edge.target_side.is_some()
+                        || !edge.via.is_empty()
+                    {
                         let from = edge.source_side.map(|s| s.as_str()).unwrap_or("auto");
                         let to = edge.target_side.map(|s| s.as_str()).unwrap_or("auto");
                         detail.push_str(&format!(" [{from}→{to}, {} via]", edge.via.len()));
@@ -591,11 +707,17 @@ fn render_spatial_parent(f: &mut Frame, area: Rect, app: &mut App, group_id: &st
                     edge_details.push(detail);
                 }
             }
-            if let (Some(&from), Some(&to)) = (rects.get(edge.from.as_str()), rects.get(child.id.as_str())) {
+            if let (Some(&from), Some(&to)) =
+                (rects.get(edge.from.as_str()), rects.get(child.id.as_str()))
+            {
                 visible_edges.push((from, to, connected));
             }
             if child.id == selected_id && !visible_ids.contains(edge.from.as_str()) {
-                let title = app.display_canvas.node(&edge.from).map(|n| n.title.as_str()).unwrap_or(&edge.from);
+                let title = app
+                    .display_canvas
+                    .node(&edge.from)
+                    .map(|n| n.title.as_str())
+                    .unwrap_or(&edge.from);
                 offscreen.push(format!("← {title}"));
             } else if edge.from == selected_id && !visible_ids.contains(child.id.as_str()) {
                 offscreen.push(format!("→ {}", child.title));
@@ -605,64 +727,121 @@ fn render_spatial_parent(f: &mut Frame, area: Rect, app: &mut App, group_id: &st
     for &(from, to, connected) in &visible_edges {
         let path = draw_map_arrow(&mut grid, from, to, projection.virtual_area, &obstacles);
         if connected {
-            for (x, y) in path { selected_grid[y][x] = grid[y][x]; }
+            for (x, y) in path {
+                selected_grid[y][x] = grid[y][x];
+            }
         }
     }
-    let lines: Vec<Line> = (0..map_area.height as usize).map(|screen_y| {
-        let mut spans = Vec::new();
-        let mut run = String::new();
-        let mut run_selected = false;
-        for screen_x in 0..map_area.width as usize {
-            let virtual_x = projection.offset_x + screen_x;
-            let virtual_y = projection.offset_y + screen_y;
-            let plain = if overview || app.show_all_map_edges {
-                grid.get(virtual_y).and_then(|row| row.get(virtual_x)).copied().unwrap_or(' ')
-            } else { ' ' };
-            let marked = selected_grid.get(virtual_y).and_then(|row| row.get(virtual_x)).copied().unwrap_or(' ');
-            let highlighted = marked != ' ';
-            if highlighted != run_selected && !run.is_empty() {
-                let color = if run_selected { ACCENT } else if app.show_all_map_edges && !overview { Color::DarkGray } else { BORDER };
-                spans.push(Span::styled(std::mem::take(&mut run), Style::default().fg(color)));
+    let lines: Vec<Line> = (0..map_area.height as usize)
+        .map(|screen_y| {
+            let mut spans = Vec::new();
+            let mut run = String::new();
+            let mut run_selected = false;
+            for screen_x in 0..map_area.width as usize {
+                let virtual_x = projection.offset_x + screen_x;
+                let virtual_y = projection.offset_y + screen_y;
+                let plain = if overview || app.show_all_map_edges {
+                    grid.get(virtual_y)
+                        .and_then(|row| row.get(virtual_x))
+                        .copied()
+                        .unwrap_or(' ')
+                } else {
+                    ' '
+                };
+                let marked = selected_grid
+                    .get(virtual_y)
+                    .and_then(|row| row.get(virtual_x))
+                    .copied()
+                    .unwrap_or(' ');
+                let highlighted = marked != ' ';
+                if highlighted != run_selected && !run.is_empty() {
+                    let color = if run_selected {
+                        ACCENT
+                    } else if app.show_all_map_edges && !overview {
+                        Color::DarkGray
+                    } else {
+                        BORDER
+                    };
+                    spans.push(Span::styled(
+                        std::mem::take(&mut run),
+                        Style::default().fg(color),
+                    ));
+                }
+                run_selected = highlighted;
+                run.push(if highlighted { marked } else { plain });
             }
-            run_selected = highlighted;
-            run.push(if highlighted { marked } else { plain });
-        }
-        if !run.is_empty() {
-            let color = if run_selected { ACCENT } else if app.show_all_map_edges && !overview { Color::DarkGray } else { BORDER };
-            spans.push(Span::styled(run, Style::default().fg(color)));
-        }
-        Line::from(spans)
-    }).collect();
+            if !run.is_empty() {
+                let color = if run_selected {
+                    ACCENT
+                } else if app.show_all_map_edges && !overview {
+                    Color::DarkGray
+                } else {
+                    BORDER
+                };
+                spans.push(Span::styled(run, Style::default().fg(color)));
+            }
+            Line::from(spans)
+        })
+        .collect();
     f.render_widget(Paragraph::new(Text::from(lines)), map_area);
     let visible_count = nodes.len();
     for node in nodes {
         let selected_node = node.id == selected_id;
-        let color = app.display_canvas.node(&node.id)
+        let color = app
+            .display_canvas
+            .node(&node.id)
             .and_then(|n| tree_row_color(n.effective_color.as_deref()))
             .unwrap_or(MAP_NODE_FG);
-        let bg = if selected_node { MAP_SELECTED_BG } else { MAP_NODE_BG };
+        let bg = if selected_node {
+            MAP_SELECTED_BG
+        } else {
+            MAP_NODE_BG
+        };
         let border = if selected_node { ACCENT } else { BORDER };
         let text = map_title_lines(&node.title, node.rect.width.saturating_sub(2) as usize);
-        let card = Block::default().borders(Borders::ALL).border_style(Style::default().fg(border).bg(bg));
-        f.render_widget(Paragraph::new(text).style(Style::default().fg(color).bg(bg)).block(card), node.rect);
+        let card = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border).bg(bg));
+        f.render_widget(
+            Paragraph::new(text)
+                .style(Style::default().fg(color).bg(bg))
+                .block(card),
+            node.rect,
+        );
     }
     let total = app.display_canvas.children(group_id).len();
-    let hidden = if offscreen.is_empty() { String::new() } else { format!(" · beyond view: {}", offscreen.join(", ")) };
+    let hidden = if offscreen.is_empty() {
+        String::new()
+    } else {
+        format!(" · beyond view: {}", offscreen.join(", "))
+    };
     let mode = if overview {
         "arrows/hjkl: move by position".to_string()
     } else {
-        format!("a: {} arrows", if app.show_all_map_edges { "all" } else { "selected" })
+        format!(
+            "a: {} arrows",
+            if app.show_all_map_edges {
+                "all"
+            } else {
+                "selected"
+            }
+        )
     };
-    let status = format!(" {visible_count}/{total} nodes · ←{incoming} →{outgoing}{hidden} · {mode} ");
-    f.render_widget(Paragraph::new(status).style(Style::default().fg(Color::DarkGray)),
-        Rect::new(inner.x, inner.y + inner.height - 2, inner.width, 1));
+    let status =
+        format!(" {visible_count}/{total} nodes · ←{incoming} →{outgoing}{hidden} · {mode} ");
+    f.render_widget(
+        Paragraph::new(status).style(Style::default().fg(Color::DarkGray)),
+        Rect::new(inner.x, inner.y + inner.height - 2, inner.width, 1),
+    );
     let details = if edge_details.is_empty() {
         " arrows/hjkl move · Esc/⌫ fold group · Enter fold ".to_string()
     } else {
         format!(" labels: {} ", edge_details.join(" · "))
     };
-    f.render_widget(Paragraph::new(details).style(Style::default().fg(Color::DarkGray)),
-        Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1));
+    f.render_widget(
+        Paragraph::new(details).style(Style::default().fg(Color::DarkGray)),
+        Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1),
+    );
 }
 
 fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
@@ -677,7 +856,9 @@ fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
         // regardless of which row a click actually lands on.
         let style = pane_border(app.focus == Focus::Tree);
         let line = format!("▸{}", " ".repeat(area.width.saturating_sub(1) as usize));
-        let lines: Vec<Line> = (0..area.height).map(|_| Line::styled(line.clone(), style)).collect();
+        let lines: Vec<Line> = (0..area.height)
+            .map(|_| Line::styled(line.clone(), style))
+            .collect();
         f.render_widget(Paragraph::new(Text::from(lines)), area);
         return;
     }
@@ -719,7 +900,11 @@ fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
     // — see `App::on_run_event`'s own `Killed` arm — since a local-mode
     // kill already gets one for free once its process's exit status
     // resolves, non-zero or not), plus a `file` node's own last failed run.
-    let mut running_nodes: std::collections::HashSet<&str> = app.external_running.keys().map(|addr| addr.node_id.as_str()).collect();
+    let mut running_nodes: std::collections::HashSet<&str> = app
+        .external_running
+        .keys()
+        .map(|addr| addr.node_id.as_str())
+        .collect();
     running_nodes.extend(
         app.run
             .as_ref()
@@ -753,13 +938,19 @@ fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
             } else {
                 "▸ "
             };
-            let type_mark = type_marker(row.node_type);
+            let type_mark = if row.reference.is_some() {
+                "→ "
+            } else {
+                type_marker(row.node_type)
+            };
             let title_style = match tree_row_color(row.color.as_deref()) {
                 Some(c) => Style::default().fg(c),
                 None => Style::default(),
             };
 
-            let run_status = if running_nodes.contains(row.node_id.as_str()) {
+            let run_status = if row.reference.is_some() {
+                None
+            } else if running_nodes.contains(row.node_id.as_str()) {
                 Some(RunRowState::Running)
             } else if failed_nodes.contains(row.node_id.as_str()) {
                 Some(RunRowState::Failed)
@@ -777,9 +968,11 @@ fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
             // Row 0 also carries the indent + disclosure marker + type
             // marker; continuation rows only re-indent by the disclosure
             // marker's own width, so wrapped text still lines up under it.
-            let first_width = content_width
-                .saturating_sub(indent.chars().count() + disclosure.chars().count() + type_mark.chars().count());
-            let cont_width = content_width.saturating_sub(indent.chars().count() + disclosure.chars().count());
+            let first_width = content_width.saturating_sub(
+                indent.chars().count() + disclosure.chars().count() + type_mark.chars().count(),
+            );
+            let cont_width =
+                content_width.saturating_sub(indent.chars().count() + disclosure.chars().count());
             let wrapped = wrap_word_indices(&word_widths, first_width, cont_width);
 
             let lines: Vec<Line> = wrapped
@@ -789,10 +982,23 @@ fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
                     let mut spans = Vec::new();
                     if row_i == 0 {
                         spans.push(Span::raw(indent.clone()));
-                        spans.push(Span::styled(disclosure, Style::default().fg(Color::DarkGray)));
-                        spans.push(Span::styled(type_mark, Style::default().fg(Color::DarkGray)));
+                        spans.push(Span::styled(
+                            disclosure,
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                        spans.push(Span::styled(
+                            type_mark,
+                            Style::default().fg(if row.reference.is_some() {
+                                DEP
+                            } else {
+                                Color::DarkGray
+                            }),
+                        ));
                     } else {
-                        spans.push(Span::raw(format!("{indent}{}", " ".repeat(disclosure.chars().count()))));
+                        spans.push(Span::raw(format!(
+                            "{indent}{}",
+                            " ".repeat(disclosure.chars().count())
+                        )));
                     }
                     for (i, &wi) in word_indices.iter().enumerate() {
                         if i > 0 {
@@ -858,15 +1064,10 @@ fn wrapped_text_layout(total: u16, skip: u16, available: u16) -> Option<TextLayo
 }
 
 fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
-    let title = app
-        .rows
-        .get(app.selected)
-        .map(|r| r.title.as_str())
-        .unwrap_or("");
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(pane_border(app.focus == Focus::Document))
-        .title(format!(" {title} "))
+        .title(" Document ")
         .title(fullscreen_icon_title(app, Focus::Document));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -911,7 +1112,8 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
                 // partial skip can now land *inside* one long logical line
                 // — not just before/after one, like it always could when
                 // "line" and "row" were still the same thing.
-                let paragraph = Paragraph::new(Text::from(lines.clone())).wrap(Wrap { trim: false });
+                let paragraph =
+                    Paragraph::new(Text::from(lines.clone())).wrap(Wrap { trim: false });
                 let total = paragraph.line_count(inner.width) as u16;
                 let layout = match wrapped_text_layout(total, skip, bottom - y) {
                     None => {
@@ -934,7 +1136,11 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
                 // against these, not `doc_click_regions` directly, so it
                 // never has to redo this segment's own wrap/scroll math
                 // itself.
-                if app.doc_click_regions.iter().any(|r| r.segment_index == seg_idx) {
+                if app
+                    .doc_click_regions
+                    .iter()
+                    .any(|r| r.segment_index == seg_idx)
+                {
                     // Each line's own wrapped-row start within the
                     // segment, found by wrapping it alone rather than
                     // re-deriving an offset from `total` above — wrapping
@@ -947,11 +1153,15 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
                     let mut acc = 0u16;
                     for line in lines {
                         line_row_starts.push(acc);
-                        let single =
-                            Paragraph::new(Text::from(vec![line.clone()])).wrap(Wrap { trim: false });
+                        let single = Paragraph::new(Text::from(vec![line.clone()]))
+                            .wrap(Wrap { trim: false });
                         acc += single.line_count(inner.width) as u16;
                     }
-                    for region in app.doc_click_regions.iter().filter(|r| r.segment_index == seg_idx) {
+                    for region in app
+                        .doc_click_regions
+                        .iter()
+                        .filter(|r| r.segment_index == seg_idx)
+                    {
                         let Some(&line_start) = line_row_starts.get(region.line_index) else {
                             continue;
                         };
@@ -1039,7 +1249,10 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
         // A 1-row strip (see `compute_layout`) — no border (there's no room
         // for one plus content), just the same title text a click here
         // expands back into the full pane.
-        let line = Line::styled(format!("▸{}", title.trim()), pane_border(app.focus == Focus::Output));
+        let line = Line::styled(
+            format!("▸{}", title.trim()),
+            pane_border(app.focus == Focus::Output),
+        );
         f.render_widget(Paragraph::new(line), area);
         return;
     }
@@ -1063,10 +1276,14 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
     // into the Document pane) had nowhere it would *ever* render as
     // anything but raw text.
     let content: Option<Vec<Line<'static>>> = if let Some(run) = &app.run {
-        let mut lines: Vec<Line<'static>> = run.lines.iter().map(|l| Line::from(l.clone())).collect();
+        let mut lines: Vec<Line<'static>> =
+            run.lines.iter().map(|l| Line::from(l.clone())).collect();
         if run.finished && run.output_markdown && !run.stdout_only.trim().is_empty() {
             lines.push(Line::from(""));
-            lines.push(Line::styled("── rendered markdown ──", Style::default().fg(super::theme::DEP)));
+            lines.push(Line::styled(
+                "── rendered markdown ──",
+                Style::default().fg(super::theme::DEP),
+            ));
             let base_dir = app
                 .canvas_path
                 .parent()
@@ -1130,7 +1347,7 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
 
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     let mut hint = String::from(
-        "tab focus · f fullscreen focused pane · z collapse focused pane · j/k move/scroll · enter expand · h/l collapse/expand · r run · R run (no deps) · K kill · e edit",
+        "tab focus · f fullscreen focused pane · z collapse focused pane · j/k move/scroll · enter expand/follow link · h/l collapse/expand · r run · R run (no deps) · K kill · e edit",
     );
     if spatial::active_spatial_parent(app).is_some() {
         hint.push_str(" · a all/selected arrows");
@@ -1496,8 +1713,14 @@ fn render_services_view(f: &mut Frame, area: Rect, app: &App, sv: &ServicesViewS
             let line = match dto.status.as_str() {
                 "running" => Line::from(vec![
                     Span::raw(format!("{}  ", dto.block)),
-                    Span::styled(format!("running · pid {}", dto.pid), Style::default().fg(OK)),
-                    Span::styled(format!("  {}", dto.node_id), Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("running · pid {}", dto.pid),
+                        Style::default().fg(OK),
+                    ),
+                    Span::styled(
+                        format!("  {}", dto.node_id),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                 ]),
                 "crashed" => Line::from(vec![
                     Span::raw(format!("{}  ", dto.block)),
@@ -1505,15 +1728,24 @@ fn render_services_view(f: &mut Frame, area: Rect, app: &App, sv: &ServicesViewS
                         format!("crashed (exit {})", dto.exit_code.unwrap_or(-1)),
                         Style::default().fg(FAIL),
                     ),
-                    Span::styled(format!("  {}", dto.node_id), Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("  {}", dto.node_id),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                 ]),
                 _ => Line::from(vec![
                     Span::raw(format!("{}  ", dto.block)),
                     Span::styled("stopped", Style::default().fg(Color::DarkGray)),
-                    Span::styled(format!("  {}", dto.node_id), Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("  {}", dto.node_id),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                 ]),
             };
-            ServiceRow { block_name: dto.block.clone(), line }
+            ServiceRow {
+                block_name: dto.block.clone(),
+                line,
+            }
         })
         .collect();
     let selected = sv.selected.min(rows.len().saturating_sub(1));
@@ -1542,7 +1774,8 @@ fn render_services_view(f: &mut Frame, area: Rect, app: &App, sv: &ServicesViewS
             Constraint::Length(1),
         ])
         .split(inner);
-    let (list_area, log_title_area, log_area, hint_area) = (layout[0], layout[1], layout[2], layout[3]);
+    let (list_area, log_title_area, log_area, hint_area) =
+        (layout[0], layout[1], layout[2], layout[3]);
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -1581,7 +1814,9 @@ fn render_services_view(f: &mut Frame, area: Rect, app: &App, sv: &ServicesViewS
                 .iter()
                 .map(|(stream, text)| {
                     let style = match stream {
-                        meshfox_server::stream_exec::OutputStream::Stderr => Style::default().fg(FAIL),
+                        meshfox_server::stream_exec::OutputStream::Stderr => {
+                            Style::default().fg(FAIL)
+                        }
                         meshfox_server::stream_exec::OutputStream::Stdout => Style::default(),
                     };
                     Line::from(Span::styled(text.as_str(), style))
@@ -1599,7 +1834,12 @@ fn render_services_view(f: &mut Frame, area: Rect, app: &App, sv: &ServicesViewS
 /// session's own live bytes are the point, only visible once actually
 /// attached) — same "closer to a plain picker than a full panel" shape
 /// the web UI's own `TtySessionsPanel` has.
-fn render_tty_sessions_view(f: &mut Frame, area: Rect, app: &App, tv: &super::app::TtySessionsViewState) {
+fn render_tty_sessions_view(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    tv: &super::app::TtySessionsViewState,
+) {
     let sessions = &app.live_tty_sessions;
     let selected = tv.selected.min(sessions.len().saturating_sub(1));
 
@@ -1624,10 +1864,16 @@ fn render_tty_sessions_view(f: &mut Frame, area: Rect, app: &App, tv: &super::ap
             ListItem::new(Line::from(vec![
                 Span::raw(format!("{}  ", s.block)),
                 Span::styled(
-                    format!("running · {}", meshfox_core::format_duration_ms(s.uptime_ms)),
+                    format!(
+                        "running · {}",
+                        meshfox_core::format_duration_ms(s.uptime_ms)
+                    ),
                     Style::default().fg(OK),
                 ),
-                Span::styled(format!("  {}", s.node_id), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("  {}", s.node_id),
+                    Style::default().fg(Color::DarkGray),
+                ),
             ]))
         })
         .collect();
@@ -1765,7 +2011,10 @@ fn render_run_history_view(f: &mut Frame, area: Rect, rv: &super::app::RunHistor
     let (main, hint_area) = (rows[0], rows[1]);
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length((main.width / 2).min(38)), Constraint::Min(1)])
+        .constraints([
+            Constraint::Length((main.width / 2).min(38)),
+            Constraint::Min(1),
+        ])
         .split(main);
     let (list_area, detail_area) = (cols[0], cols[1]);
 
@@ -1773,14 +2022,21 @@ fn render_run_history_view(f: &mut Frame, area: Rect, rv: &super::app::RunHistor
         if e.outcome == "killed" {
             "killed".to_string()
         } else {
-            format!("exit {}", e.exit_code.map_or("?".to_string(), |c| c.to_string()))
+            format!(
+                "exit {}",
+                e.exit_code.map_or("?".to_string(), |c| c.to_string())
+            )
         }
     };
     let items: Vec<ListItem> = rv
         .entries
         .iter()
         .map(|e| {
-            let dim = if e.stale { Style::default().fg(Color::DarkGray) } else { Style::default() };
+            let dim = if e.stale {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default()
+            };
             let exit_style = if e.stale {
                 dim
             } else if e.outcome == "killed" || e.exit_code != Some(0) {
@@ -1793,10 +2049,18 @@ fn render_run_history_view(f: &mut Frame, area: Rect, rv: &super::app::RunHistor
                 Span::styled(format!("{:<8}", run_label(e)), exit_style),
             ];
             if let Some(ms) = e.duration_ms {
-                spans.push(Span::styled(format!("{:>7}", meshfox_core::format_duration_ms(ms)), dim));
+                spans.push(Span::styled(
+                    format!("{:>7}", meshfox_core::format_duration_ms(ms)),
+                    dim,
+                ));
             }
             if e.stale {
-                spans.push(Span::styled(" stale", Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)));
+                spans.push(Span::styled(
+                    " stale",
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
+                ));
             }
             ListItem::new(Line::from(spans))
         })
@@ -1808,7 +2072,10 @@ fn render_run_history_view(f: &mut Frame, area: Rect, rv: &super::app::RunHistor
         .block(Block::default().borders(Borders::RIGHT));
     f.render_stateful_widget(list, list_area, &mut state);
     // The list's own rows sit inside its right border, one column narrower.
-    rv.list_rect.set(Rect { width: list_area.width.saturating_sub(1), ..list_area });
+    rv.list_rect.set(Rect {
+        width: list_area.width.saturating_sub(1),
+        ..list_area
+    });
     rv.list_offset.set(state.offset());
 
     let detail = Layout::default()
@@ -1830,22 +2097,33 @@ fn render_run_history_view(f: &mut Frame, area: Rect, rv: &super::app::RunHistor
         f.render_widget(Paragraph::new(lines), detail[0]);
     }
     let output_lines: Vec<Line> = match &rv.output {
-        None => vec![Line::from(Span::styled(" loading…", Style::default().fg(Color::DarkGray)))],
+        None => vec![Line::from(Span::styled(
+            " loading…",
+            Style::default().fg(Color::DarkGray),
+        ))],
         Some((_, lines)) if lines.is_empty() => {
-            vec![Line::from(Span::styled(" no output stored for this run", Style::default().fg(Color::DarkGray)))]
+            vec![Line::from(Span::styled(
+                " no output stored for this run",
+                Style::default().fg(Color::DarkGray),
+            ))]
         }
         Some((_, lines)) => lines
             .iter()
             .map(|(stream, text)| {
                 let style = match stream {
                     meshfox_server::stream_exec::OutputStream::Stdout => Style::default(),
-                    meshfox_server::stream_exec::OutputStream::Stderr => Style::default().fg(Color::Yellow),
+                    meshfox_server::stream_exec::OutputStream::Stderr => {
+                        Style::default().fg(Color::Yellow)
+                    }
                 };
                 Line::from(Span::styled(format!(" {}", strip_ansi(text)), style))
             })
             .collect(),
     };
-    f.render_widget(Paragraph::new(output_lines).scroll((rv.output_scroll.min(u16::MAX as usize) as u16, 0)), detail[1]);
+    f.render_widget(
+        Paragraph::new(output_lines).scroll((rv.output_scroll.min(u16::MAX as usize) as u16, 0)),
+        detail[1],
+    );
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -1864,7 +2142,7 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         "esc / backspace fold spatial group",
         "j / k           select tree / scroll panes",
         "h / l           collapse / expand tree",
-        "enter           expand/collapse node",
+        "enter           expand/collapse node or follow → link",
         "a               toggle all/selected arrows among positioned nodes",
         "r               run this node's block, with its deps chain",
         "R               run this node's block only (skip deps)",
@@ -1894,29 +2172,15 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         );
     }
     if app.service_stats.is_some() {
-        items.push(
-            "v               open the services list (stop/restart any of them) —",
-        );
-        items.push(
-            "                experimental, see SPEC.md's \"Service blocks (experimental)\"",
-        );
+        items.push("v               open the services list (stop/restart any of them) —");
+        items.push("                experimental, see SPEC.md's \"Service blocks (experimental)\"");
     }
     if app.worker_port.is_some() {
-        items.push(
-            "t               live terminals — every tty session the shared worker",
-        );
-        items.push(
-            "                knows about, started here, another TUI, or a browser tab;",
-        );
-        items.push(
-            "                enter attaches (joins as a viewer), K kills it",
-        );
-        items.push(
-            "H               history — every undo step, newest first; enter jumps",
-        );
-        items.push(
-            "                the canvas back (or forward) to the selected step",
-        );
+        items.push("t               live terminals — every tty session the shared worker");
+        items.push("                knows about, started here, another TUI, or a browser tab;");
+        items.push("                enter attaches (joins as a viewer), K kills it");
+        items.push("H               history — every undo step, newest first; enter jumps");
+        items.push("                the canvas back (or forward) to the selected step");
     }
     items.extend([
         "PageUp/Down     scroll the focused pane (document or output)",
@@ -1925,7 +2189,8 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         "q               quit (esc never quits)",
         "",
         "mouse: click a tree row to select it, or its ▾/▸ marker to",
-        "expand/collapse; double-click a row to run its default block;",
+        "expand/collapse; double-click a node to run its default block;",
+        "double-click a → link to jump to its target;",
         "click a button fence's own ▶ marker, or a block name in a",
         "deps line, to run/jump to it; click a var-form/block-picker",
         "row to select it; scroll wheel over any of the three panes",
@@ -1976,7 +2241,9 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(block, rect);
 
     f.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((scroll, 0)),
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
         inner,
     );
 }
@@ -2036,7 +2303,12 @@ fn render_source_editor(
             // marker's keyword/attribute-name/attribute-value would all
             // render in one plain color, same as any other comment text.
             let theme = crate::syntax_registry::with_meshfox_scope_colors(theme);
-            SyntaxHighlighter::with_sets(theme, Arc::new(theme_set), syntax_ref, Arc::clone(syntax_set))
+            SyntaxHighlighter::with_sets(
+                theme,
+                Arc::new(theme_set),
+                syntax_ref,
+                Arc::clone(syntax_set),
+            )
         });
     let view = EditorView::new(&mut se.editor)
         .line_numbers(LineNumbers::Absolute)
@@ -2141,9 +2413,11 @@ fn render_source_file_picker(f: &mut Frame, area: Rect, se: &SourceEditorState) 
     f.render_widget(block, rect);
 
     let mut items = vec![ListItem::new(Line::from("this document"))];
-    items.extend(se.files.iter().map(|inc| {
-        ListItem::new(Line::from(format!("↳ {} ({})", inc.title, inc.target)))
-    }));
+    items.extend(
+        se.files
+            .iter()
+            .map(|inc| ListItem::new(Line::from(format!("↳ {} ({})", inc.title, inc.target)))),
+    );
 
     let mut state = ListState::default();
     state.select(Some(se.file_picker_selected));
@@ -2155,16 +2429,77 @@ fn render_source_file_picker(f: &mut Frame, area: Rect, se: &SourceEditorState) 
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn extra_edge_row_shows_bracketed_label_before_italic_target() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let dir =
+            std::env::temp_dir().join(format!("meshfox-tui-link-render-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.canvas.md");
+        std::fs::write(
+            &path,
+            concat!(
+                "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
+                "## Source\n<!-- meshfox:node id=\"source\" -->\n",
+                "## Target\n<!-- meshfox:node id=\"target\" -->\n",
+                "<!-- meshfox:edge from=\"source\" label=\"uses worker\" -->\n",
+                "<!-- meshfox:edge from=\"source\" -->\n",
+            ),
+        )
+        .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(path, tx, None, None).await.unwrap();
+        app.expanded.insert("source".to_string());
+        app.rows = crate::tui::tree::flatten(&app.display_canvas, &app.expanded);
+        let mut terminal = Terminal::new(TestBackend::new(70, 12)).unwrap();
+        terminal
+            .draw(|f| render_tree(f, Rect::new(0, 0, 70, 12), &mut app))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let row: String = (0..70)
+            .map(|x| buf.cell((x, 3)).unwrap().symbol())
+            .collect();
+        assert!(row.contains("→ [uses worker] Target"), "{row}");
+        let label_x = row.find('[').unwrap() as u16;
+        let target_x = row.find("Target").unwrap() as u16;
+        assert_eq!(buf.cell((label_x, 3)).unwrap().fg, ACCENT);
+        assert!(buf
+            .cell((target_x, 3))
+            .unwrap()
+            .modifier
+            .contains(Modifier::ITALIC));
+        let plain_row: String = (0..70)
+            .map(|x| buf.cell((x, 4)).unwrap().symbol())
+            .collect();
+        assert!(plain_row.contains("→ Target"), "{plain_row}");
+        assert!(!plain_row.contains("[]"), "{plain_row}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn arrows_have_source_stem_corners_and_target_stem_between_adjacent_cards() {
         let mut grid = vec![vec![' '; 20]; 14];
-        draw_map_arrow(&mut grid, Rect::new(0, 8, 5, 4), Rect::new(10, 0, 5, 4), Rect::new(0, 0, 20, 14), &[]);
+        draw_map_arrow(
+            &mut grid,
+            Rect::new(0, 8, 5, 4),
+            Rect::new(10, 0, 5, 4),
+            Rect::new(0, 0, 20, 14),
+            &[],
+        );
         assert_eq!(grid[7][2], '│');
         assert_eq!(grid[4][12], '↑');
         assert!(grid.iter().any(|row| row.contains(&'─')));
 
         let mut grid = vec![vec![' '; 20]; 14];
-        draw_map_arrow(&mut grid, Rect::new(0, 0, 5, 4), Rect::new(10, 8, 5, 4), Rect::new(0, 0, 20, 14), &[]);
+        draw_map_arrow(
+            &mut grid,
+            Rect::new(0, 0, 5, 4),
+            Rect::new(10, 8, 5, 4),
+            Rect::new(0, 0, 20, 14),
+            &[],
+        );
         assert_eq!(grid[4][2], '│');
         assert_eq!(grid[7][12], '↓');
     }
@@ -2200,19 +2535,29 @@ mod tests {
 
     #[test]
     fn readme_component_edges_do_not_cross_cards() {
-        let canvas = meshfox_core::Canvas::from_markdown(include_str!("../../../../README.md")).unwrap();
+        let canvas =
+            meshfox_core::Canvas::from_markdown(include_str!("../../../../README.md")).unwrap();
         let area = Rect::new(0, 0, 128, 50);
         let nodes = spatial::layout(&canvas, "component-diagram", area, "mcp-root");
         let rect = |id: &str| nodes.iter().find(|node| node.id == id).unwrap().rect;
         let obstacles: Vec<_> = nodes.iter().map(|node| node.rect).collect();
-        for (source, target) in [("mcp-root", "mcp-leaf"), ("cli-one-shot-ops", "coordinator-resolve")] {
+        for (source, target) in [
+            ("mcp-root", "mcp-leaf"),
+            ("cli-one-shot-ops", "coordinator-resolve"),
+        ] {
             let mut grid = vec![vec![' '; area.width as usize]; area.height as usize];
             draw_map_arrow(&mut grid, rect(source), rect(target), area, &obstacles);
-            assert!(grid.iter().flatten().any(|&ch| matches!(ch, '↓' | '↑' | '←' | '→')));
+            assert!(grid
+                .iter()
+                .flatten()
+                .any(|&ch| matches!(ch, '↓' | '↑' | '←' | '→')));
             for card in &obstacles {
                 for y in card.y..card.y + card.height {
                     for x in card.x..card.x + card.width {
-                        assert_eq!(grid[y as usize][x as usize], ' ', "{source} → {target} crossed a card");
+                        assert_eq!(
+                            grid[y as usize][x as usize], ' ',
+                            "{source} → {target} crossed a card"
+                        );
                     }
                 }
             }
@@ -2224,7 +2569,8 @@ mod tests {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
-        let dir = std::env::temp_dir().join(format!("meshfox-spatial-highlight-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("meshfox-spatial-highlight-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("canvas.canvas.md");
         std::fs::write(&path, concat!(
@@ -2242,14 +2588,24 @@ mod tests {
         app.selected = app.rows.iter().position(|row| row.node_id == "a").unwrap();
         app.show_all_map_edges = true;
         let mut terminal = Terminal::new(TestBackend::new(100, 15)).unwrap();
-        terminal.draw(|f| render_tree(f, Rect::new(0, 0, 100, 15), &mut app)).unwrap();
+        terminal
+            .draw(|f| render_tree(f, Rect::new(0, 0, 100, 15), &mut app))
+            .unwrap();
         let buf = terminal.backend().buffer();
-        let arrow_colors: Vec<_> = (0..100).filter_map(|x| {
-            let cell = buf.cell((x, 3))?;
-            (cell.symbol() == "→").then_some(cell.fg)
-        }).collect();
-        assert!(arrow_colors.contains(&ACCENT), "selected edge should be highlighted");
-        assert!(arrow_colors.contains(&Color::DarkGray), "other edge should be subdued");
+        let arrow_colors: Vec<_> = (0..100)
+            .filter_map(|x| {
+                let cell = buf.cell((x, 3))?;
+                (cell.symbol() == "→").then_some(cell.fg)
+            })
+            .collect();
+        assert!(
+            arrow_colors.contains(&ACCENT),
+            "selected edge should be highlighted"
+        );
+        assert!(
+            arrow_colors.contains(&Color::DarkGray),
+            "other edge should be subdued"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2258,7 +2614,8 @@ mod tests {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
-        let dir = std::env::temp_dir().join(format!("meshfox-spatial-render-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("meshfox-spatial-render-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("canvas.canvas.md");
         std::fs::write(&path, concat!(
@@ -2275,25 +2632,50 @@ mod tests {
         app.selected = app.rows.iter().position(|r| r.node_id == "a").unwrap();
 
         let mut terminal = Terminal::new(TestBackend::new(62, 15)).unwrap();
-        terminal.draw(|f| render_tree(f, Rect::new(0, 0, 62, 15), &mut app)).unwrap();
+        terminal
+            .draw(|f| render_tree(f, Rect::new(0, 0, 62, 15), &mut app))
+            .unwrap();
         let buf = terminal.backend().buffer();
-        let screen: String = (0..15).map(|y| {
-            let row: String = (0..62).filter_map(|x| buf.cell((x, y))).map(|c| c.symbol()).collect();
-            format!("{row}\n")
-        }).collect();
+        let screen: String = (0..15)
+            .map(|y| {
+                let row: String = (0..62)
+                    .filter_map(|x| buf.cell((x, y)))
+                    .map(|c| c.symbol())
+                    .collect();
+                format!("{row}\n")
+            })
+            .collect();
         assert!(screen.contains("Long source"), "{screen}");
         assert!(screen.contains("Destination"), "{screen}");
-        assert!(screen.lines().take(4).any(|line| line.contains('→')), "{screen}");
+        assert!(
+            screen.lines().take(4).any(|line| line.contains('→')),
+            "{screen}"
+        );
         assert!(screen.contains("Test"), "{screen}");
         assert!(screen.contains("top→top"), "{screen}");
         let map_area = Rect::new(1, 1, 60, 11);
         let source = spatial::layout(&app.display_canvas, "group", map_area, "a")
-            .into_iter().find(|n| n.id == "a").unwrap();
+            .into_iter()
+            .find(|n| n.id == "a")
+            .unwrap();
         let destination = spatial::layout(&app.display_canvas, "group", map_area, "a")
-            .into_iter().find(|n| n.id == "b").unwrap();
-        assert_eq!(buf.cell((source.rect.x + 1, source.rect.y + 1)).unwrap().bg, MAP_SELECTED_BG);
-        assert_eq!(buf.cell((destination.rect.x + 1, destination.rect.y + 1)).unwrap().bg, MAP_NODE_BG);
-        assert_eq!(spatial::hit_test(&app, map_area, destination.rect.x, destination.rect.y), Some("b".to_string()));
+            .into_iter()
+            .find(|n| n.id == "b")
+            .unwrap();
+        assert_eq!(
+            buf.cell((source.rect.x + 1, source.rect.y + 1)).unwrap().bg,
+            MAP_SELECTED_BG
+        );
+        assert_eq!(
+            buf.cell((destination.rect.x + 1, destination.rect.y + 1))
+                .unwrap()
+                .bg,
+            MAP_NODE_BG
+        );
+        assert_eq!(
+            spatial::hit_test(&app, map_area, destination.rect.x, destination.rect.y),
+            Some("b".to_string())
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2342,9 +2724,8 @@ mod tests {
         use ratatui::widgets::Widget;
 
         let long_line = "word ".repeat(40); // wraps to several rows at width 20
-        let paragraph =
-            Paragraph::new(Text::from(vec![Line::from(long_line.trim().to_string())]))
-                .wrap(Wrap { trim: false });
+        let paragraph = Paragraph::new(Text::from(vec![Line::from(long_line.trim().to_string())]))
+            .wrap(Wrap { trim: false });
         let width = 20u16;
         let total = paragraph.line_count(width) as u16;
         assert!(total > 1, "this line should need more than one wrapped row");
@@ -2396,7 +2777,10 @@ mod tests {
         // if every repetition past the first got clipped, since it's a
         // substring of the *first* one too; numbered tokens can't lie
         // about which repetitions actually survived.
-        let long_line: String = (1..=8).map(|n| format!("TOKEN{n:02}")).collect::<Vec<_>>().join(" ");
+        let long_line: String = (1..=8)
+            .map(|n| format!("TOKEN{n:02}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         std::fs::write(
             &path,
             format!(
@@ -2406,12 +2790,16 @@ mod tests {
         .unwrap();
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(path, tx, None, None).await.expect("valid test canvas");
+        let mut app = App::new(path, tx, None, None)
+            .await
+            .expect("valid test canvas");
 
         let backend = TestBackend::new(20, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         let area = Rect::new(0, 0, 20, 20);
-        terminal.draw(|f| render_document(f, area, &mut app)).unwrap();
+        terminal
+            .draw(|f| render_document(f, area, &mut app))
+            .unwrap();
 
         let buf = terminal.backend().buffer();
         let mut screen = String::new();
@@ -2445,9 +2833,9 @@ mod tests {
     // `output="markdown"` step finishes.
     #[tokio::test]
     async fn render_output_shows_a_finished_output_markdown_steps_stdout_as_a_real_table() {
+        use meshfox_core::deps::BlockAddr;
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
-        use meshfox_core::deps::BlockAddr;
 
         let dir = std::env::temp_dir().join(format!(
             "meshfox-render-output-markdown-test-{}",
@@ -2466,7 +2854,9 @@ mod tests {
         .unwrap();
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(path.clone(), tx, None, None).await.expect("valid test canvas");
+        let mut app = App::new(path.clone(), tx, None, None)
+            .await
+            .expect("valid test canvas");
         app.run = Some(crate::tui::app::RunState {
             chain: vec![BlockAddr::new("root", "table")],
             idx: 1,
@@ -2528,9 +2918,15 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("canvas.canvas.md");
-        std::fs::write(&path, "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n").unwrap();
+        std::fs::write(
+            &path,
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
+        )
+        .unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        App::new(path, tx, None, None).await.expect("valid test canvas")
+        App::new(path, tx, None, None)
+            .await
+            .expect("valid test canvas")
     }
 
     fn render_to_screen(area: Rect, mut draw: impl FnMut(&mut ratatui::Frame)) -> String {
@@ -2574,7 +2970,11 @@ mod tests {
     fn history_time_is_relative_like_the_web_panel() {
         let now = meshfox_core::timestamp::now_utc_rfc3339();
         assert_eq!(history_time(&now), "just now");
-        assert_eq!(history_time("2020-01-15T12:00:00Z").chars().last(), Some('o'), "days/years ago");
+        assert_eq!(
+            history_time("2020-01-15T12:00:00Z").chars().last(),
+            Some('o'),
+            "days/years ago"
+        );
         assert!(history_time("2020-01-15T12:00:00Z").ends_with("d ago"));
         assert_eq!(history_time(""), "");
     }
@@ -2591,13 +2991,26 @@ mod tests {
                 summary: format!("step {seq}"),
             })
             .collect();
-        let hv = super::super::app::HistoryViewState { entries, selected: 35, ..Default::default() };
+        let hv = super::super::app::HistoryViewState {
+            entries,
+            selected: 35,
+            ..Default::default()
+        };
         let area = Rect::new(0, 0, 90, 12);
         let _ = render_to_screen(area, |f| render_history_view(f, area, &hv));
         let rect = hv.list_rect.get();
-        assert!(rect.width > 0 && rect.height > 0, "list rect recorded: {rect:?}");
-        assert!(hv.offset.get() > 0, "a deep selection scrolls the list, and the offset is recorded");
-        assert!(hv.offset.get() <= 35 && 35 < hv.offset.get() + rect.height as usize, "selection is on screen");
+        assert!(
+            rect.width > 0 && rect.height > 0,
+            "list rect recorded: {rect:?}"
+        );
+        assert!(
+            hv.offset.get() > 0,
+            "a deep selection scrolls the list, and the offset is recorded"
+        );
+        assert!(
+            hv.offset.get() <= 35 && 35 < hv.offset.get() + rect.height as usize,
+            "selection is on screen"
+        );
     }
 
     #[test]
@@ -2619,21 +3032,42 @@ mod tests {
             output: Some((
                 2,
                 vec![
-                    (meshfox_server::stream_exec::OutputStream::Stdout, "\u{1b}[31mred text\u{1b}[0m".to_string()),
-                    (meshfox_server::stream_exec::OutputStream::Stderr, "boom".to_string()),
+                    (
+                        meshfox_server::stream_exec::OutputStream::Stdout,
+                        "\u{1b}[31mred text\u{1b}[0m".to_string(),
+                    ),
+                    (
+                        meshfox_server::stream_exec::OutputStream::Stderr,
+                        "boom".to_string(),
+                    ),
                 ],
             )),
             ..Default::default()
         };
         let area = Rect::new(0, 0, 100, 24);
         let screen = render_to_screen(area, |f| render_run_history_view(f, area, &rv));
-        assert!(screen.contains("run history — leaf/build"), "titled with the block:\n{screen}");
-        assert!(screen.contains("exit 0") && screen.contains("exit 1"), "both runs listed:\n{screen}");
+        assert!(
+            screen.contains("run history — leaf/build"),
+            "titled with the block:\n{screen}"
+        );
+        assert!(
+            screen.contains("exit 0") && screen.contains("exit 1"),
+            "both runs listed:\n{screen}"
+        );
         assert!(screen.contains("2.5s"), "duration shown:\n{screen}");
-        assert!(screen.contains("stale"), "the stale run is marked:\n{screen}");
-        assert!(screen.contains("red text") && !screen.contains("[31m"), "ANSI stripped:\n{screen}");
+        assert!(
+            screen.contains("stale"),
+            "the stale run is marked:\n{screen}"
+        );
+        assert!(
+            screen.contains("red text") && !screen.contains("[31m"),
+            "ANSI stripped:\n{screen}"
+        );
         assert!(screen.contains("boom"), "stderr shown too:\n{screen}");
-        assert!(rv.list_rect.get().width > 0, "list position recorded for mouse hit-testing");
+        assert!(
+            rv.list_rect.get().width > 0,
+            "list position recorded for mouse hit-testing"
+        );
     }
 
     #[test]
@@ -2653,7 +3087,11 @@ mod tests {
             summary: summary.into(),
         };
         let hv = super::super::app::HistoryViewState {
-            entries: vec![entry(3, false, "third undone"), entry(2, true, "second"), entry(1, true, "first")],
+            entries: vec![
+                entry(3, false, "third undone"),
+                entry(2, true, "second"),
+                entry(1, true, "first"),
+            ],
             selected: 1,
             ..Default::default()
         };
@@ -2665,9 +3103,15 @@ mod tests {
             screen.find("first").expect("oldest row"),
         );
         assert!(third < second && second < first, "newest first:\n{screen}");
-        assert!(screen.contains("▶ #2"), "current (newest applied) step is marked:\n{screen}");
+        assert!(
+            screen.contains("▶ #2"),
+            "current (newest applied) step is marked:\n{screen}"
+        );
         assert!(screen.contains("ago"), "relative time shown:\n{screen}");
-        assert!(!screen.contains("2026-09-29T"), "not the raw timestamp:\n{screen}");
+        assert!(
+            !screen.contains("2026-09-29T"),
+            "not the raw timestamp:\n{screen}"
+        );
     }
 
     // On a terminal too short to fit every keybindings-help line at once,
@@ -2722,7 +3166,9 @@ mod tests {
         .unwrap();
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(path, tx, None, None).await.expect("valid test canvas");
+        let mut app = App::new(path, tx, None, None)
+            .await
+            .expect("valid test canvas");
 
         let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2745,6 +3191,53 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn document_heading_shows_color_title_and_tags_and_scrolls_with_body() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let dir =
+            std::env::temp_dir().join(format!("meshfox-document-heading-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.canvas.md");
+        std::fs::write(&path, "<!-- meshfox:canvas -->\n# A long node title\n<!-- meshfox:node id=\"root\" color=\"4\" tags=\"bag,improvement\" -->\n\nBody text here.\n").unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(path, tx, None, None).await.unwrap();
+        let area = Rect::new(0, 0, 24, 7);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|f| render_document(f, area, &mut app))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let screen: String = (0..area.height)
+            .map(|y| {
+                let row: String = (0..area.width)
+                    .map(|x| buf.cell((x, y)).unwrap().symbol())
+                    .collect();
+                format!("{row}\n")
+            })
+            .collect();
+        assert!(screen.contains("Document"), "{screen}");
+        assert!(screen.contains("● A long node title"), "{screen}");
+        assert!(screen.contains("#bag"), "{screen}");
+        assert!(screen.contains("#improvement"), "{screen}");
+        assert_eq!(buf.cell((1, 1)).unwrap().fg, Color::Rgb(0x3d, 0x9e, 0x4f));
+
+        app.doc_scroll = 3;
+        terminal
+            .draw(|f| render_document(f, area, &mut app))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let scrolled: String = (1..area.height - 1)
+            .flat_map(|y| {
+                (1..area.width - 1).map(move |x| buf.cell((x, y)).unwrap().symbol().to_string())
+            })
+            .collect();
+        assert!(!scrolled.contains("A long node title"), "{scrolled}");
+        assert!(scrolled.contains("Body text here."), "{scrolled}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     // TODO.canvas.md: "Переносы строк в дереве нод в TUI" — end to end
@@ -2781,7 +3274,9 @@ mod tests {
         .unwrap();
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(path, tx, None, None).await.expect("valid test canvas");
+        let mut app = App::new(path, tx, None, None)
+            .await
+            .expect("valid test canvas");
 
         // Narrow enough that "ALFA BRAVO CHARLIE DELTA ECHO  #bag #improvement  [run,cache]"
         // (73+ chars) cannot possibly fit on one row.
@@ -2816,13 +3311,22 @@ mod tests {
     // use (`resolve_color_hex`).
     #[test]
     fn tree_row_color_resolves_a_numbered_preset() {
-        assert_eq!(tree_row_color(Some("1")), Some(Color::Rgb(0xc2, 0x2b, 0x2b)));
-        assert_eq!(tree_row_color(Some("4")), Some(Color::Rgb(0x3d, 0x9e, 0x4f)));
+        assert_eq!(
+            tree_row_color(Some("1")),
+            Some(Color::Rgb(0xc2, 0x2b, 0x2b))
+        );
+        assert_eq!(
+            tree_row_color(Some("4")),
+            Some(Color::Rgb(0x3d, 0x9e, 0x4f))
+        );
     }
 
     #[test]
     fn tree_row_color_resolves_a_literal_hex_string() {
-        assert_eq!(tree_row_color(Some("#a05dd1")), Some(Color::Rgb(0xa0, 0x5d, 0xd1)));
+        assert_eq!(
+            tree_row_color(Some("#a05dd1")),
+            Some(Color::Rgb(0xa0, 0x5d, 0xd1))
+        );
     }
 
     #[test]

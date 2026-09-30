@@ -120,7 +120,10 @@ impl Registry {
                 return;
             };
             entry.port = Some(port);
-            (entry.pending_open.take(), std::mem::take(&mut entry.waiters))
+            (
+                entry.pending_open.take(),
+                std::mem::take(&mut entry.waiters),
+            )
         };
         if let Some(fragment) = pending_open {
             open_browser_tab(port, fragment.as_deref());
@@ -351,7 +354,9 @@ fn private_socket_path() -> PathBuf {
 fn ack_json(result: &Result<(), String>) -> String {
     let reply = match result {
         Ok(()) => AckResponse::Ok {},
-        Err(error) => AckResponse::Error { error: error.clone() },
+        Err(error) => AckResponse::Error {
+            error: error.clone(),
+        },
     };
     let mut line = serde_json::to_string(&reply).expect("AckResponse always serializes");
     line.push('\n');
@@ -367,10 +372,20 @@ fn ack_json(result: &Result<(), String>) -> String {
 /// `meshfox_server::watcher_protocol`'s own doc comment for why that
 /// stopped being optional. A malformed or empty read is just dropped, same
 /// as before.
-async fn handle_connection(stream: UnixStream, registry: Arc<Registry>, exe: PathBuf, socket_path: PathBuf) {
+async fn handle_connection(
+    stream: UnixStream,
+    registry: Arc<Registry>,
+    exe: PathBuf,
+    socket_path: PathBuf,
+) {
     let (read_half, mut write_half) = stream.into_split();
     let mut line = String::new();
-    if BufReader::new(read_half).read_line(&mut line).await.unwrap_or(0) == 0 {
+    if BufReader::new(read_half)
+        .read_line(&mut line)
+        .await
+        .unwrap_or(0)
+        == 0
+    {
         return;
     }
     let Ok(msg) = serde_json::from_str::<Message>(line.trim()) else {
@@ -380,7 +395,10 @@ async fn handle_connection(stream: UnixStream, registry: Arc<Registry>, exe: Pat
         Message::Ready { canvas_path, port } => {
             registry.mark_ready(&canvas_path, port);
         }
-        Message::Open { canvas_path, fragment } => {
+        Message::Open {
+            canvas_path,
+            fragment,
+        } => {
             let canonical = canvas_path.canonicalize().unwrap_or(canvas_path);
 
             // Three cases, matching exactly what was asked for: already
@@ -423,9 +441,20 @@ async fn handle_connection(stream: UnixStream, registry: Arc<Registry>, exe: Pat
                     // same defaults every navigated-to worker has always
                     // had.
                     let (tx, rx) = oneshot::channel();
-                    match spawn_worker(&registry, &exe, &socket_path, canonical, 0, Some(fragment), true, Some(tx)) {
+                    match spawn_worker(
+                        &registry,
+                        &exe,
+                        &socket_path,
+                        canonical,
+                        0,
+                        Some(fragment),
+                        true,
+                        Some(tx),
+                    ) {
                         Ok(()) => await_ready(rx).await,
-                        Err(e) => Err(format!("couldn't spawn a worker for the requested canvas: {e}")),
+                        Err(e) => Err(format!(
+                            "couldn't spawn a worker for the requested canvas: {e}"
+                        )),
                     }
                 }
             };
@@ -455,7 +484,9 @@ async fn handle_connection(stream: UnixStream, registry: Arc<Registry>, exe: Pat
 async fn await_ready(rx: oneshot::Receiver<Result<(), String>>) -> Result<(), String> {
     match tokio::time::timeout(WORKER_READY_TIMEOUT, rx).await {
         Ok(Ok(result)) => result,
-        Ok(Err(_)) => Err("worker's own tracking task ended without reporting an outcome".to_string()),
+        Ok(Err(_)) => {
+            Err("worker's own tracking task ended without reporting an outcome".to_string())
+        }
         Err(_) => Err(format!(
             "worker didn't report ready within {}s",
             WORKER_READY_TIMEOUT.as_secs()
@@ -491,7 +522,16 @@ pub async fn run(
 
     let registry = Arc::new(Registry::new());
     let initial_open = if open_browser { Some(None) } else { None };
-    spawn_worker(&registry, &exe, &socket_path, canonical, port, initial_open, auto_exit, None)?;
+    spawn_worker(
+        &registry,
+        &exe,
+        &socket_path,
+        canonical,
+        port,
+        initial_open,
+        auto_exit,
+        None,
+    )?;
 
     let accept_registry = Arc::clone(&registry);
     let accept_exe = exe.clone();
@@ -551,17 +591,23 @@ mod tests {
     }
 
     fn empty_entry() -> Entry {
-        Entry { port: None, pending_open: None, waiters: Vec::new() }
+        Entry {
+            port: None,
+            pending_open: None,
+            waiters: Vec::new(),
+        }
     }
 
     #[tokio::test]
     async fn registry_wait_until_empty_resolves_once_the_last_entry_is_removed() {
         let registry = Arc::new(Registry::new());
-        registry
-            .entries
-            .lock()
-            .unwrap()
-            .insert(PathBuf::from("/tmp/a.canvas.md"), Entry { port: Some(1), ..empty_entry() });
+        registry.entries.lock().unwrap().insert(
+            PathBuf::from("/tmp/a.canvas.md"),
+            Entry {
+                port: Some(1),
+                ..empty_entry()
+            },
+        );
         assert!(!registry.is_empty());
 
         let wait_registry = Arc::clone(&registry);
@@ -617,7 +663,10 @@ mod tests {
         let (tx2, rx2) = oneshot::channel();
         registry.entries.lock().unwrap().insert(
             PathBuf::from("/tmp/a.canvas.md"),
-            Entry { waiters: vec![tx1, tx2], ..empty_entry() },
+            Entry {
+                waiters: vec![tx1, tx2],
+                ..empty_entry()
+            },
         );
 
         registry.remove(Path::new("/tmp/a.canvas.md"), Some("boom".to_string()));
@@ -647,7 +696,8 @@ mod tests {
         let Some(_exe) = current_exe_or_skip() else {
             return;
         };
-        let socket_path = std::env::temp_dir().join(format!("mfx-w-test-{}.sock", std::process::id()));
+        let socket_path =
+            std::env::temp_dir().join(format!("mfx-w-test-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&socket_path);
         let listener = UnixListener::bind(&socket_path).unwrap();
 
@@ -670,7 +720,10 @@ mod tests {
         meshfox_server::watcher_protocol::notify_ready(&socket_path, &canonical, 9999)
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), accept_task).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), accept_task)
+            .await
+            .unwrap()
+            .unwrap();
 
         let entries = registry.entries.lock().unwrap();
         assert_eq!(entries.get(&canonical).unwrap().port, Some(9999));
@@ -686,18 +739,23 @@ mod tests {
     /// anything.
     #[tokio::test]
     async fn open_for_an_already_ready_worker_acks_immediately() {
-        let socket_path = std::env::temp_dir().join(format!("mfx-w-open-ready-{}.sock", std::process::id()));
+        let socket_path =
+            std::env::temp_dir().join(format!("mfx-w-open-ready-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&socket_path);
         let listener = UnixListener::bind(&socket_path).unwrap();
 
         let registry = Arc::new(Registry::new());
         let canvas_path = std::env::temp_dir().join("already-ready.canvas.md");
-        let canonical = canvas_path.canonicalize().unwrap_or_else(|_| canvas_path.clone());
-        registry
-            .entries
-            .lock()
-            .unwrap()
-            .insert(canonical.clone(), Entry { port: Some(7777), ..empty_entry() });
+        let canonical = canvas_path
+            .canonicalize()
+            .unwrap_or_else(|_| canvas_path.clone());
+        registry.entries.lock().unwrap().insert(
+            canonical.clone(),
+            Entry {
+                port: Some(7777),
+                ..empty_entry()
+            },
+        );
 
         let accept_registry = Arc::clone(&registry);
         let exe = PathBuf::from("/bin/true");

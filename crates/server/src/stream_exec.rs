@@ -140,7 +140,9 @@ where
     // continue past the failure and report whatever its last line's exit
     // code happens to be — usually success — instead of the real one.
     command.arg("-e").arg("-c").arg(code);
-    command.envs(meshfox_core::config::env_overrides(cwd.unwrap_or_else(|| Path::new("."))));
+    command.envs(meshfox_core::config::env_overrides(
+        cwd.unwrap_or_else(|| Path::new(".")),
+    ));
     command.envs(envs);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
@@ -153,8 +155,16 @@ where
         .spawn()?;
 
     let (tx, output_rx) = mpsc::unbounded_channel();
-    spawn_line_reader(child.stdout.take().expect("piped stdout"), OutputStream::Stdout, tx.clone());
-    spawn_line_reader(child.stderr.take().expect("piped stderr"), OutputStream::Stderr, tx);
+    spawn_line_reader(
+        child.stdout.take().expect("piped stdout"),
+        OutputStream::Stdout,
+        tx.clone(),
+    );
+    spawn_line_reader(
+        child.stderr.take().expect("piped stderr"),
+        OutputStream::Stderr,
+        tx,
+    );
 
     Ok(SpawnedProcess {
         child,
@@ -179,7 +189,9 @@ where
 {
     let mut command = Command::new(program);
     command.args(args);
-    command.envs(meshfox_core::config::env_overrides(cwd.unwrap_or_else(|| Path::new("."))));
+    command.envs(meshfox_core::config::env_overrides(
+        cwd.unwrap_or_else(|| Path::new(".")),
+    ));
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -191,8 +203,16 @@ where
         .spawn()?;
 
     let (tx, output_rx) = mpsc::unbounded_channel();
-    spawn_line_reader(child.stdout.take().expect("piped stdout"), OutputStream::Stdout, tx.clone());
-    spawn_line_reader(child.stderr.take().expect("piped stderr"), OutputStream::Stderr, tx);
+    spawn_line_reader(
+        child.stdout.take().expect("piped stdout"),
+        OutputStream::Stdout,
+        tx.clone(),
+    );
+    spawn_line_reader(
+        child.stderr.take().expect("piped stderr"),
+        OutputStream::Stderr,
+        tx,
+    );
 
     Ok(SpawnedProcess {
         child,
@@ -246,14 +266,15 @@ where
         .collect();
 
     let resolved_interpreter;
-    let interpreter = match meshfox_core::resolve_with_env(interpreter, lang, cwd, canvas_path, &env_names)? {
-        Some((path, extra_envs)) => {
-            envs.extend(extra_envs.into_iter().map(|(k, v)| (k.into(), v.into())));
-            resolved_interpreter = path;
-            resolved_interpreter.as_str()
-        }
-        None => interpreter,
-    };
+    let interpreter =
+        match meshfox_core::resolve_with_env(interpreter, lang, cwd, canvas_path, &env_names)? {
+            Some((path, extra_envs)) => {
+                envs.extend(extra_envs.into_iter().map(|(k, v)| (k.into(), v.into())));
+                resolved_interpreter = path;
+                resolved_interpreter.as_str()
+            }
+            None => interpreter,
+        };
 
     let (program, args) = meshfox_core::split_interpreter(interpreter).ok_or_else(|| {
         io::Error::new(
@@ -300,8 +321,16 @@ where
     };
 
     let (tx, output_rx) = mpsc::unbounded_channel();
-    spawn_line_reader(child.stdout.take().expect("piped stdout"), OutputStream::Stdout, tx.clone());
-    spawn_line_reader(child.stderr.take().expect("piped stderr"), OutputStream::Stderr, tx);
+    spawn_line_reader(
+        child.stdout.take().expect("piped stdout"),
+        OutputStream::Stdout,
+        tx.clone(),
+    );
+    spawn_line_reader(
+        child.stderr.take().expect("piped stderr"),
+        OutputStream::Stderr,
+        tx,
+    );
 
     Ok(SpawnedProcess {
         child,
@@ -343,13 +372,23 @@ where
         return spawn_bash(":", envs, cwd);
     }
     match &block.interpreter {
-        Some(interpreter) => spawn_interpreter(interpreter, &block.code, Some(&block.lang), envs, cwd, canvas_path),
+        Some(interpreter) => spawn_interpreter(
+            interpreter,
+            &block.code,
+            Some(&block.lang),
+            envs,
+            cwd,
+            canvas_path,
+        ),
         None => spawn_bash(&block.code, envs, cwd),
     }
 }
 
-fn spawn_line_reader<R>(reader: R, stream: OutputStream, tx: mpsc::UnboundedSender<(OutputStream, String)>)
-where
+fn spawn_line_reader<R>(
+    reader: R,
+    stream: OutputStream,
+    tx: mpsc::UnboundedSender<(OutputStream, String)>,
+) where
     R: AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
@@ -474,7 +513,9 @@ mod tests {
     async fn spawn_interpreter_runs_code_via_the_named_program() {
         // `cat` as a stand-in "interpreter" — no assumption about python
         // being installed, just proves the temp-file-plus-args plumbing.
-        let mut proc = spawn_interpreter("cat", "hello from a temp file", None, no_envs(), None, None).unwrap();
+        let mut proc =
+            spawn_interpreter("cat", "hello from a temp file", None, no_envs(), None, None)
+                .unwrap();
         let mut lines = Vec::new();
         while let Some((_, line)) = proc.output_rx.recv().await {
             lines.push(line);
@@ -526,7 +567,15 @@ mod tests {
         )
         .unwrap();
 
-        let mut proc = spawn_interpreter("@agent", "an unused prompt", None, no_envs(), Some(&dir), None).unwrap();
+        let mut proc = spawn_interpreter(
+            "@agent",
+            "an unused prompt",
+            None,
+            no_envs(),
+            Some(&dir),
+            None,
+        )
+        .unwrap();
         let mut lines = Vec::new();
         while let Some((_, line)) = proc.output_rx.recv().await {
             lines.push(line);
@@ -566,7 +615,8 @@ mod tests {
         // reads, so mutating it here can't race anything else in this test
         // binary.
         std::env::set_var("MESHFOX_ENV_OVERRIDE_TEST", "base");
-        let mut proc = spawn_bash("echo \"$MESHFOX_ENV_OVERRIDE_TEST\"", no_envs(), Some(&dir)).unwrap();
+        let mut proc =
+            spawn_bash("echo \"$MESHFOX_ENV_OVERRIDE_TEST\"", no_envs(), Some(&dir)).unwrap();
         std::env::remove_var("MESHFOX_ENV_OVERRIDE_TEST");
 
         let mut lines = Vec::new();
@@ -619,8 +669,12 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_interpreter_cleans_up_its_temp_file_on_drop() {
-        let mut proc = spawn_interpreter("cat", "temp contents", None, no_envs(), None, None).unwrap();
-        let path = proc.cleanup.clone().expect("interpreter spawn sets cleanup");
+        let mut proc =
+            spawn_interpreter("cat", "temp contents", None, no_envs(), None, None).unwrap();
+        let path = proc
+            .cleanup
+            .clone()
+            .expect("interpreter spawn sets cleanup");
         while proc.output_rx.recv().await.is_some() {}
         proc.child.wait().await.unwrap();
         drop(proc);
@@ -682,8 +736,12 @@ mod tests {
 
     #[tokio::test]
     async fn injects_extra_env_vars_on_top_of_the_inherited_ones() {
-        let mut proc =
-            spawn_bash("echo \"$INSTALL_PATH\"", [("INSTALL_PATH", "/opt/meshfox")], None).unwrap();
+        let mut proc = spawn_bash(
+            "echo \"$INSTALL_PATH\"",
+            [("INSTALL_PATH", "/opt/meshfox")],
+            None,
+        )
+        .unwrap();
         let mut lines = Vec::new();
         while let Some((_, line)) = proc.output_rx.recv().await {
             lines.push(line);
@@ -815,7 +873,8 @@ mod tests {
         // `pwd -P` — proves `cwd` reaches the actual spawned child, not
         // just whatever `bash -c` would've inherited.
         let dir = std::env::temp_dir();
-        let mut proc = spawn_interpreter("bash", "pwd -P", None, no_envs(), Some(&dir), None).unwrap();
+        let mut proc =
+            spawn_interpreter("bash", "pwd -P", None, no_envs(), Some(&dir), None).unwrap();
         let mut lines = Vec::new();
         while let Some((_, line)) = proc.output_rx.recv().await {
             lines.push(line);

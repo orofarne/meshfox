@@ -22,7 +22,9 @@ const MARKDOWN_TABLE: &str = concat!(
 fn a_finished_markdown_block_renders_its_output_inline_under_the_block() {
     let (canvas_path, dir) = fixtures::write_fixture(MARKDOWN_TABLE);
     let mut session = TuiSession::spawn(&canvas_path, dir, 40, 100);
-    session.wait_for("Root", Duration::from_secs(5)).expect("initial render");
+    session
+        .wait_for("Root", Duration::from_secs(5))
+        .expect("initial render");
 
     session.send_keys("r");
     session

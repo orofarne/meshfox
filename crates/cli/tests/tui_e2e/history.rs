@@ -14,7 +14,9 @@ use crate::harness::TuiSession;
 fn history_view_jumps_the_canvas_back_to_an_earlier_step() {
     let (canvas_path, dir) = fixtures::write_fixture(fixtures::SIMPLE_RUNNABLE);
     let mut session = TuiSession::spawn(&canvas_path, dir, 30, 100);
-    session.wait_for("Root", Duration::from_secs(5)).expect("the tree should render");
+    session
+        .wait_for("Root", Duration::from_secs(5))
+        .expect("the tree should render");
 
     // Edit: open the editor, append a marker line at the end of the file,
     // save, leave. (edtui's vim keys: `G` last line, `o` open line below.)
@@ -27,14 +29,21 @@ fn history_view_jumps_the_canvas_back_to_an_earlier_step() {
     std::thread::sleep(Duration::from_millis(500));
     session.send_keys("\x1b"); // leave the editor
     assert!(
-        std::fs::read_to_string(&canvas_path).unwrap().contains("HISTORYMARKER"),
+        std::fs::read_to_string(&canvas_path)
+            .unwrap()
+            .contains("HISTORYMARKER"),
         "the edit should have been saved to disk"
     );
 
     session.send_keys("H");
     session
         .wait_for("jump here", Duration::from_secs(5))
-        .unwrap_or_else(|_| panic!("H should open the history view; screen:\n{}", session.screen_text()));
+        .unwrap_or_else(|_| {
+            panic!(
+                "H should open the history view; screen:\n{}",
+                session.screen_text()
+            )
+        });
 
     // Newest step first and preselected (the current state) — one `j` moves
     // to the step before it, i.e. the state without the marker.
@@ -43,7 +52,10 @@ fn history_view_jumps_the_canvas_back_to_an_earlier_step() {
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        if !std::fs::read_to_string(&canvas_path).unwrap().contains("HISTORYMARKER") {
+        if !std::fs::read_to_string(&canvas_path)
+            .unwrap()
+            .contains("HISTORYMARKER")
+        {
             break;
         }
         assert!(
@@ -62,7 +74,9 @@ fn history_view_jumps_the_canvas_back_to_an_earlier_step() {
 fn double_clicking_a_history_row_jumps_there() {
     let (canvas_path, dir) = fixtures::write_fixture(fixtures::SIMPLE_RUNNABLE);
     let mut session = TuiSession::spawn(&canvas_path, dir, 30, 100);
-    session.wait_for("Root", Duration::from_secs(5)).expect("the tree should render");
+    session
+        .wait_for("Root", Duration::from_secs(5))
+        .expect("the tree should render");
 
     session.send_keys("e");
     std::thread::sleep(Duration::from_millis(300));
@@ -72,19 +86,31 @@ fn double_clicking_a_history_row_jumps_there() {
     session.send_keys("\x13"); // Ctrl-s
     std::thread::sleep(Duration::from_millis(500));
     session.send_keys("\x1b");
-    assert!(std::fs::read_to_string(&canvas_path).unwrap().contains("HISTORYMARKER"));
+    assert!(std::fs::read_to_string(&canvas_path)
+        .unwrap()
+        .contains("HISTORYMARKER"));
 
     session.send_keys("H");
     session
         .wait_for("Start of history", Duration::from_secs(5))
-        .unwrap_or_else(|_| panic!("the history view should list the start row; screen:\n{}", session.screen_text()));
+        .unwrap_or_else(|_| {
+            panic!(
+                "the history view should list the start row; screen:\n{}",
+                session.screen_text()
+            )
+        });
 
-    let (row, col) = session.find("Start of history").expect("the start-of-history row");
+    let (row, col) = session
+        .find("Start of history")
+        .expect("the start-of-history row");
     session.send_mouse_double_click(row, col);
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        if !std::fs::read_to_string(&canvas_path).unwrap().contains("HISTORYMARKER") {
+        if !std::fs::read_to_string(&canvas_path)
+            .unwrap()
+            .contains("HISTORYMARKER")
+        {
             break;
         }
         assert!(

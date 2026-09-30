@@ -50,7 +50,10 @@ struct ByteRing {
 
 impl ByteRing {
     fn new(cap: usize) -> Self {
-        ByteRing { cap, buf: VecDeque::new() }
+        ByteRing {
+            cap,
+            buf: VecDeque::new(),
+        }
     }
 
     fn push(&mut self, bytes: &[u8]) {
@@ -149,12 +152,14 @@ impl TtySessionHandle {
 
     fn recompute_size(&self) {
         let sizes = self.viewer_sizes.lock().unwrap();
-        let min = sizes.values().fold(None, |acc: Option<(u16, u16)>, &(c, r)| {
-            Some(match acc {
-                None => (c, r),
-                Some((mc, mr)) => (mc.min(c), mr.min(r)),
-            })
-        });
+        let min = sizes
+            .values()
+            .fold(None, |acc: Option<(u16, u16)>, &(c, r)| {
+                Some(match acc {
+                    None => (c, r),
+                    Some((mc, mr)) => (mc.min(c), mr.min(r)),
+                })
+            });
         // No viewers left at all — leave the pty at whatever size it last
         // had rather than resizing to nothing.
         if let Some((cols, rows)) = min {
@@ -168,7 +173,12 @@ impl TtySessionHandle {
     /// `TtyEvent::Done(Killed)` once the drain task actually notices,
     /// regardless of who called this.
     pub fn kill(&self) -> bool {
-        self.kill_tx.lock().unwrap().take().map(|tx| tx.send(())).is_some()
+        self.kill_tx
+            .lock()
+            .unwrap()
+            .take()
+            .map(|tx| tx.send(()))
+            .is_some()
     }
 }
 
@@ -236,9 +246,13 @@ pub fn track(
         let _ = task_handle.tx.send(TtyEvent::Done(outcome.clone()));
         if let Some((ledger, id)) = ledger_row {
             let finish_outcome = match outcome {
-                RunOutcome::Exited { exit_code } => crate::run_ledger::FinishOutcome::Exited(exit_code),
+                RunOutcome::Exited { exit_code } => {
+                    crate::run_ledger::FinishOutcome::Exited(exit_code)
+                }
                 RunOutcome::Killed => crate::run_ledger::FinishOutcome::Killed,
-                RunOutcome::Running => unreachable!("the loop above only ever breaks with Exited/Killed"),
+                RunOutcome::Running => {
+                    unreachable!("the loop above only ever breaks with Exited/Killed")
+                }
             };
             let _ = ledger.finish(id, finish_outcome);
         }
@@ -304,8 +318,14 @@ mod tests {
         // size` doesn't panic and that removing the smaller viewer lets a
         // later resize widen again, via the size-tracking map itself
         // rather than the pty's own internals.
-        assert_eq!(*handle.viewer_sizes.lock().unwrap().get(&a).unwrap(), (100, 40));
-        assert_eq!(*handle.viewer_sizes.lock().unwrap().get(&b).unwrap(), (80, 24));
+        assert_eq!(
+            *handle.viewer_sizes.lock().unwrap().get(&a).unwrap(),
+            (100, 40)
+        );
+        assert_eq!(
+            *handle.viewer_sizes.lock().unwrap().get(&b).unwrap(),
+            (80, 24)
+        );
 
         handle.forget_viewer(b);
         assert!(!handle.viewer_sizes.lock().unwrap().contains_key(&b));

@@ -451,7 +451,9 @@ pub(crate) fn candidate_fences(markdown: &str) -> Vec<(RawFence, String, HashMap
     scan_raw_fences(markdown)
         .into_iter()
         .filter(|f| {
-            f.delim_char == '`' && !f.info.is_empty() && !in_output_region(&output_ranges, f.span.start)
+            f.delim_char == '`'
+                && !f.info.is_empty()
+                && !in_output_region(&output_ranges, f.span.start)
         })
         .map(|f| {
             let (lang, attrs) = parse_info_string(&f.info);
@@ -526,7 +528,10 @@ pub const RENDER_KINDS: &[&str] = &["form"];
 pub fn unknown_fence_attr(markdown: &str) -> Option<crate::attrs::UnknownAttrError> {
     for (_, _, attrs) in candidate_fences(markdown) {
         if let Some(attr) = crate::attrs::first_unknown(&attrs, FENCE_ATTRS) {
-            let label = attrs.get("name").cloned().unwrap_or_else(|| "<unnamed>".to_string());
+            let label = attrs
+                .get("name")
+                .cloned()
+                .unwrap_or_else(|| "<unnamed>".to_string());
             return Some(crate::attrs::UnknownAttrError {
                 context: format!("the runnable fence {label:?}"),
                 attr: attr.to_string(),
@@ -545,7 +550,10 @@ fn build_code_block(
     let cache = attrs.get("cache").map(|v| v != "false").unwrap_or(false);
     let default = attrs.get("default").map(|v| v != "false").unwrap_or(false);
     let tty = attrs.get("tty").map(|v| v != "false").unwrap_or(false);
-    let autoclose = attrs.get("autoclose").map(|v| v != "false").unwrap_or(false);
+    let autoclose = attrs
+        .get("autoclose")
+        .map(|v| v != "false")
+        .unwrap_or(false);
     let service = attrs.get("service").map(|v| v != "false").unwrap_or(false);
     let always = attrs.get("always").map(|v| v != "false").unwrap_or(false);
     let autorun = attrs.get("autorun").map(|v| v != "false").unwrap_or(false);
@@ -638,8 +646,7 @@ pub fn strip_fence_attrs(markdown: &str) -> String {
     for fence in &fences {
         out.push_str(&markdown[cursor..fence.span.start]);
         let (lang, _attrs) = parse_info_string(&fence.info);
-        let delim: String = std::iter::repeat_n(fence.delim_char, fence.delim_len)
-            .collect();
+        let delim: String = std::iter::repeat_n(fence.delim_char, fence.delim_len).collect();
         out.push_str(&delim);
         out.push_str(&lang);
         out.push('\n');
@@ -980,8 +987,7 @@ mod tests {
 
     #[test]
     fn deps_parses_trailing_bang_as_sync_on_bare_and_qualified_names() {
-        let md =
-            "```bash name=\"deploy\" deps=\"build!,other-node/test!\"\necho hi\n```\n";
+        let md = "```bash name=\"deploy\" deps=\"build!,other-node/test!\"\necho hi\n```\n";
         let deps = &scan_code_blocks(md)[0].deps;
         assert_eq!(
             deps,
@@ -1418,7 +1424,8 @@ mod tests {
     #[test]
     fn fingerprint_changes_when_interpreter_changes() {
         let a = &scan_code_blocks("```python name=\"x\" interpreter=\"python3\"\npass\n```\n")[0];
-        let b = &scan_code_blocks("```python name=\"x\" interpreter=\"python3.11\"\npass\n```\n")[0];
+        let b =
+            &scan_code_blocks("```python name=\"x\" interpreter=\"python3.11\"\npass\n```\n")[0];
         assert_ne!(fingerprint(a), fingerprint(b));
     }
 
@@ -1429,7 +1436,10 @@ mod tests {
         a.insert("A".to_string(), "1".to_string());
         let mut b = HashMap::new();
         b.insert("A".to_string(), "2".to_string());
-        assert_ne!(session_fingerprint(block, &a), session_fingerprint(block, &b));
+        assert_ne!(
+            session_fingerprint(block, &a),
+            session_fingerprint(block, &b)
+        );
     }
 
     #[test]
@@ -1441,7 +1451,10 @@ mod tests {
         let mut b = HashMap::new();
         b.insert("A".to_string(), "1".to_string());
         b.insert("UNRELATED".to_string(), "2".to_string());
-        assert_eq!(session_fingerprint(block, &a), session_fingerprint(block, &b));
+        assert_eq!(
+            session_fingerprint(block, &a),
+            session_fingerprint(block, &b)
+        );
     }
 
     #[test]
@@ -1452,13 +1465,19 @@ mod tests {
         a.insert("PYTHON".to_string(), "python3".to_string());
         let mut b = HashMap::new();
         b.insert("PYTHON".to_string(), "python3.11".to_string());
-        assert_ne!(session_fingerprint(block, &a), session_fingerprint(block, &b));
+        assert_ne!(
+            session_fingerprint(block, &a),
+            session_fingerprint(block, &b)
+        );
     }
 
     #[test]
     fn session_fingerprint_matches_plain_fingerprint_for_a_block_with_no_vars() {
         let block = &scan_code_blocks("```bash name=\"x\"\necho hi\n```\n")[0];
-        assert_eq!(session_fingerprint(block, &HashMap::new()), fingerprint(block));
+        assert_eq!(
+            session_fingerprint(block, &HashMap::new()),
+            fingerprint(block)
+        );
     }
 
     #[test]

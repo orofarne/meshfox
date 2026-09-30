@@ -36,10 +36,14 @@ pub mod varout;
 pub mod vars;
 pub mod worker_lock;
 
-pub use builtin_interpreter::{is_builtin, resolve_builtin_spec, resolve_with_env, ResolvedInterpreter};
+pub use builtin_interpreter::{
+    is_builtin, resolve_builtin_spec, resolve_with_env, ResolvedInterpreter,
+};
 pub use canvas::{ArrowEnd, Canvas, EdgeLineStyle, ExtraEdge, FileDisplay, Node, NodeType};
 pub use constraint::{evaluate as evaluate_constraints, ConstraintResult, ConstraintStatus};
-pub use deps::{closure_fingerprint, closure_fingerprint_with, compute_forced_reruns, BlockAddr, DepsError};
+pub use deps::{
+    closure_fingerprint, closure_fingerprint_with, compute_forced_reruns, BlockAddr, DepsError,
+};
 pub use exec::{
     interpreter_var_refs, is_button, is_form, is_supported_lang, resolve_command,
     resolve_interpreter, split_interpreter, ResolvedCommand, BUTTON_LANG, FORM_LANG,
@@ -69,10 +73,10 @@ pub use varout::{
     read_and_cleanup as read_and_cleanup_vars_out, VARS_OUT_ENV,
 };
 pub use vars::{
-    close_over_var_refs, declared_vars, map_block_env, resolve as resolve_vars,
-    resolve_block_env, resolve_block_env_with_shared, resolve_with_shared, validate_env_refs,
-    validate_value, validate_var_refs, validate_var_scope, BlockEnvResolution, ResolvedVars,
-    VarDecl, VarType, VarsError,
+    close_over_var_refs, declared_vars, map_block_env, resolve as resolve_vars, resolve_block_env,
+    resolve_block_env_with_shared, resolve_with_shared, validate_env_refs, validate_value,
+    validate_var_refs, validate_var_scope, BlockEnvResolution, ResolvedVars, VarDecl, VarType,
+    VarsError,
 };
 
 pub use attrs::UnknownAttrError;
@@ -528,8 +532,7 @@ mod tests {
 
     #[test]
     fn validate_known_attrs_catches_an_unknown_fence_attribute() {
-        let doc =
-            "# Project\n\nbody\n\n```bash name=\"build\" cach\ncargo build\n```\n";
+        let doc = "# Project\n\nbody\n\n```bash name=\"build\" cach\ncargo build\n```\n";
         let err = validate_known_attrs(doc).unwrap_err();
         assert_eq!(err.attr, "cach");
     }

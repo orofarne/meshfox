@@ -56,14 +56,28 @@ pub struct SessionStore {
 }
 
 impl SessionStore {
-    pub fn from_connection(conn: Arc<Mutex<Connection>>, max_output_bytes: usize) -> io::Result<Self> {
-        conn.lock().unwrap().execute_batch(SCHEMA_SQL).map_err(sqlite_err)?;
-        Ok(SessionStore { conn, max_output_bytes })
+    pub fn from_connection(
+        conn: Arc<Mutex<Connection>>,
+        max_output_bytes: usize,
+    ) -> io::Result<Self> {
+        conn.lock()
+            .unwrap()
+            .execute_batch(SCHEMA_SQL)
+            .map_err(sqlite_err)?;
+        Ok(SessionStore {
+            conn,
+            max_output_bytes,
+        })
     }
 
     #[cfg(test)]
     fn open_in_memory(max_output_bytes: usize) -> io::Result<Self> {
-        Self::from_connection(Arc::new(Mutex::new(Connection::open_in_memory().map_err(sqlite_err)?)), max_output_bytes)
+        Self::from_connection(
+            Arc::new(Mutex::new(
+                Connection::open_in_memory().map_err(sqlite_err)?,
+            )),
+            max_output_bytes,
+        )
     }
 
     /// Upserts one block's fresh-run record. `produced_vars` must already
@@ -106,11 +120,21 @@ impl SessionStore {
             .map_err(sqlite_err)?;
         let mut runs = Vec::new();
         for row in rows {
-            let (node_id, block, fingerprint, vars, output, duration_ms) = row.map_err(sqlite_err)?;
+            let (node_id, block, fingerprint, vars, output, duration_ms) =
+                row.map_err(sqlite_err)?;
             // A row whose JSON no longer parses is dropped rather than
             // failing startup — worst case that block just re-runs.
-            let Ok(produced_vars) = serde_json::from_str(&vars) else { continue };
-            runs.push(StoredRun { node_id, block, fingerprint, produced_vars, output, duration_ms: duration_ms as u64 });
+            let Ok(produced_vars) = serde_json::from_str(&vars) else {
+                continue;
+            };
+            runs.push(StoredRun {
+                node_id,
+                block,
+                fingerprint,
+                produced_vars,
+                output,
+                duration_ms: duration_ms as u64,
+            });
         }
         Ok(runs)
     }
@@ -131,11 +155,14 @@ impl SessionStore {
 
     pub fn load_vars(&self) -> io::Result<HashMap<String, String>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT name, value FROM session_vars").map_err(sqlite_err)?;
+        let mut stmt = conn
+            .prepare("SELECT name, value FROM session_vars")
+            .map_err(sqlite_err)?;
         let rows = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
             .map_err(sqlite_err)?;
-        rows.collect::<Result<HashMap<_, _>, _>>().map_err(sqlite_err)
+        rows.collect::<Result<HashMap<_, _>, _>>()
+            .map_err(sqlite_err)
     }
 
     /// Forgets everything stored — `reset_session`'s persistent half.
@@ -202,7 +229,10 @@ mod tests {
         store.save_var("A", "1").unwrap();
         store.save_var("A", "2").unwrap();
         store.save_run(&run("x")).unwrap();
-        assert_eq!(store.load_vars().unwrap(), HashMap::from([("A".to_string(), "2".to_string())]));
+        assert_eq!(
+            store.load_vars().unwrap(),
+            HashMap::from([("A".to_string(), "2".to_string())])
+        );
         store.clear().unwrap();
         assert!(store.load_vars().unwrap().is_empty());
         assert!(store.load_runs().unwrap().is_empty());

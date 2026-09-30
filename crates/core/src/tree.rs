@@ -198,7 +198,11 @@ mod tests {
         let c = sample();
         assert_eq!(
             c.id_path_to("test1"),
-            Some(vec!["tests".to_string(), "examples".to_string(), "test1".to_string()])
+            Some(vec![
+                "tests".to_string(),
+                "examples".to_string(),
+                "test1".to_string()
+            ])
         );
         // Round-trips back through resolve_path.
         let path = c.id_path_to("test1").unwrap();

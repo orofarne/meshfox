@@ -31,7 +31,9 @@ pub fn split_interpreter(spec: &str) -> Option<(String, Vec<String>)> {
 fn whole_token_var_name(word: &str) -> Option<&str> {
     let name = word.strip_prefix('$')?;
     let mut chars = name.chars();
-    let first_ok = chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+    let first_ok = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
     if !first_ok || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return None;
     }
@@ -89,7 +91,10 @@ pub fn interpreter_var_refs(spec: &str) -> Vec<String> {
 /// resolution already has) — degrades by leaving that one token literal
 /// (`$NAME`) rather than panicking, the same "don't crash on an
 /// unrecognized/unresolved case" fallback used throughout this format.
-pub fn resolve_interpreter(spec: &str, resolved_vars: &std::collections::HashMap<String, String>) -> String {
+pub fn resolve_interpreter(
+    spec: &str,
+    resolved_vars: &std::collections::HashMap<String, String>,
+) -> String {
     let Some(words) = shlex::split(spec) else {
         return spec.to_string();
     };
@@ -152,7 +157,13 @@ pub fn resolve_command(
         Some(spec) => {
             let resolved_spec;
             let extra_envs;
-            let spec = match crate::builtin_interpreter::resolve_with_env(spec, lang, cwd, canvas_path, env_names)? {
+            let spec = match crate::builtin_interpreter::resolve_with_env(
+                spec,
+                lang,
+                cwd,
+                canvas_path,
+                env_names,
+            )? {
                 Some((path, envs)) => {
                     resolved_spec = path;
                     extra_envs = envs;
@@ -305,7 +316,10 @@ mod tests {
 
     #[test]
     fn interpreter_var_refs_finds_a_whole_token_reference() {
-        assert_eq!(interpreter_var_refs("$PYTHON -u"), vec!["PYTHON".to_string()]);
+        assert_eq!(
+            interpreter_var_refs("$PYTHON -u"),
+            vec!["PYTHON".to_string()]
+        );
     }
 
     #[test]
@@ -336,7 +350,10 @@ mod tests {
     fn resolve_interpreter_substitutes_a_whole_token_reference() {
         let mut vars = std::collections::HashMap::new();
         vars.insert("PYTHON".to_string(), ".venv/bin/python3".to_string());
-        assert_eq!(resolve_interpreter("$PYTHON -u", &vars), ".venv/bin/python3 -u");
+        assert_eq!(
+            resolve_interpreter("$PYTHON -u", &vars),
+            ".venv/bin/python3 -u"
+        );
     }
 
     #[test]
@@ -348,7 +365,10 @@ mod tests {
     #[test]
     fn resolve_interpreter_keeps_a_value_containing_spaces_as_one_argument() {
         let mut vars = std::collections::HashMap::new();
-        vars.insert("PYTHON".to_string(), "/opt/my python/bin/python3".to_string());
+        vars.insert(
+            "PYTHON".to_string(),
+            "/opt/my python/bin/python3".to_string(),
+        );
         let resolved = resolve_interpreter("$PYTHON -u", &vars);
         assert_eq!(
             split_interpreter(&resolved),
@@ -385,9 +405,13 @@ mod tests {
 
     #[test]
     fn resolve_command_with_interpreter_writes_a_temp_file_and_appends_its_path() {
-        let resolved = resolve_command("print('hi')", Some("python3 -u"), None, None, None, &[]).unwrap();
+        let resolved =
+            resolve_command("print('hi')", Some("python3 -u"), None, None, None, &[]).unwrap();
         assert_eq!(resolved.program, "python3");
-        let cleanup = resolved.cleanup.clone().expect("interpreter spawn sets cleanup");
+        let cleanup = resolved
+            .cleanup
+            .clone()
+            .expect("interpreter spawn sets cleanup");
         assert_eq!(
             resolved.args,
             vec!["-u".to_string(), cleanup.display().to_string()]
@@ -404,13 +428,20 @@ mod tests {
     #[test]
     fn resolve_command_resolves_an_at_builtin_interpreter_to_its_materialized_script() {
         let resolved = resolve_command("a prompt", Some("@agent"), None, None, None, &[]).unwrap();
-        assert!(resolved.program.ends_with(".sh"), "program: {}", resolved.program);
+        assert!(
+            resolved.program.ends_with(".sh"),
+            "program: {}",
+            resolved.program
+        );
         assert!(std::path::Path::new(&resolved.program).exists());
         // No canvas_path given -> no MESHFOX_VENV_DIR, but @agent never
         // sets that anyway (only @python_venv does) — this just confirms
         // resolve_command's own config-env plumbing ran at all, same as
         // stream_exec's spawn_interpreter test covers for the non-tty path.
-        let cleanup = resolved.cleanup.clone().expect("interpreter spawn sets cleanup");
+        let cleanup = resolved
+            .cleanup
+            .clone()
+            .expect("interpreter spawn sets cleanup");
         assert_eq!(std::fs::read_to_string(&cleanup).unwrap(), "a prompt");
         std::fs::remove_file(&cleanup).unwrap();
     }
@@ -419,5 +450,4 @@ mod tests {
     fn resolve_command_rejects_an_unknown_at_builtin_name() {
         assert!(resolve_command("code", Some("@nonexistent"), None, None, None, &[]).is_err());
     }
-
 }

@@ -128,7 +128,9 @@ pub enum VarsError {
     VarOutOfScope(String, String, String, String, &'static str),
     #[error("meshfox:var {0:?} has an empty from= target")]
     EmptyFrom(String),
-    #[error("meshfox:var {0:?} combines from= with {1}=, which isn't allowed for a computed variable")]
+    #[error(
+        "meshfox:var {0:?} combines from= with {1}=, which isn't allowed for a computed variable"
+    )]
     FromConflict(String, &'static str),
     #[error("meshfox:var {0:?} combines default= with default_var=, only one may be given")]
     DefaultConflict(String),
@@ -378,7 +380,10 @@ pub fn unknown_var_attr(markdown: &str) -> Option<crate::attrs::UnknownAttrError
         }
         if let Some(attrs) = parse_var_comment(line) {
             if let Some(attr) = crate::attrs::first_unknown(&attrs, VAR_ATTRS) {
-                let name = attrs.get("name").cloned().unwrap_or_else(|| "<unnamed>".to_string());
+                let name = attrs
+                    .get("name")
+                    .cloned()
+                    .unwrap_or_else(|| "<unnamed>".to_string());
                 return Some(crate::attrs::UnknownAttrError {
                     context: format!("the meshfox:var comment for {name:?}"),
                     attr: attr.to_string(),
@@ -488,15 +493,21 @@ pub fn validate_var_scope(canvas: &Canvas) -> Result<(), VarsError> {
         .iter()
         .map(|s| (s.decl.name.as_str(), s.owner_node.as_str()))
         .collect();
-    let decls_by_name: HashMap<&str, &VarDecl> =
-        scanned.iter().map(|s| (s.decl.name.as_str(), &s.decl)).collect();
+    let decls_by_name: HashMap<&str, &VarDecl> = scanned
+        .iter()
+        .map(|s| (s.decl.name.as_str(), &s.decl))
+        .collect();
     for node in &canvas.nodes {
         for block in crate::fence::scan_runnable_blocks(&node.id, &node.text) {
             let mut refs: Vec<(String, &'static str)> = block
                 .env
                 .iter()
                 .map(|e| (e.var_name.clone(), "env"))
-                .chain(interpreter_refs(&block).into_iter().map(|n| (n, "interpreter")))
+                .chain(
+                    interpreter_refs(&block)
+                        .into_iter()
+                        .map(|n| (n, "interpreter")),
+                )
                 .collect();
             // A `form` fence's own `field var=` is just as much a
             // reference to a declared variable as `env=`/`interpreter=`
@@ -570,7 +581,11 @@ pub fn validate_env_refs(canvas: &Canvas) -> Result<(), VarsError> {
                 .env
                 .iter()
                 .map(|e| (e.var_name.clone(), "env"))
-                .chain(interpreter_refs(&block).into_iter().map(|n| (n, "interpreter")))
+                .chain(
+                    interpreter_refs(&block)
+                        .into_iter()
+                        .map(|n| (n, "interpreter")),
+                )
                 .collect();
             for (var_name, via) in refs {
                 if !declared.contains(var_name.as_str()) {
@@ -764,7 +779,13 @@ pub fn resolve(
     cache: &crate::varcache::VarCache,
     computed: &HashMap<String, String>,
 ) -> ResolvedVars {
-    resolve_with_shared(decls, overrides, cache, computed, &crate::shared_env::SharedEnv::new())
+    resolve_with_shared(
+        decls,
+        overrides,
+        cache,
+        computed,
+        &crate::shared_env::SharedEnv::new(),
+    )
 }
 
 /// Same as `resolve`, but additionally consults `shared` (see
@@ -1116,7 +1137,8 @@ mod tests {
     }
 
     #[test]
-    fn a_node_scoped_declaration_does_not_collide_with_an_indented_documentation_example_elsewhere() {
+    fn a_node_scoped_declaration_does_not_collide_with_an_indented_documentation_example_elsewhere()
+    {
         let doc = concat!(
             "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
             "<!-- meshfox:var name=\"INSTALL_PATH\" default=\"/usr/local/bin\" -->\n\n",
@@ -1220,7 +1242,10 @@ mod tests {
             "<!-- meshfox:var name=\"X\" from=\"create\" -->\n",
         );
         let decls = declared_vars(&canvas(doc)).unwrap();
-        assert_eq!(decls[0].from.as_ref().unwrap().node_id.as_deref(), Some("install"));
+        assert_eq!(
+            decls[0].from.as_ref().unwrap().node_id.as_deref(),
+            Some("install")
+        );
     }
 
     #[test]
@@ -1513,7 +1538,10 @@ mod tests {
             .values_mut_for_test()
             .insert("TOKEN".to_string(), "saved-secret".to_string());
         let resolved = resolve(&decls, &HashMap::new(), &cache, &HashMap::new());
-        assert_eq!(resolved.values.get("TOKEN").map(String::as_str), Some("saved-secret"));
+        assert_eq!(
+            resolved.values.get("TOKEN").map(String::as_str),
+            Some("saved-secret")
+        );
         assert!(resolved.missing.is_empty());
     }
 
@@ -1649,7 +1677,8 @@ mod tests {
             var_name: "INSTALL_PATH".to_string(),
         }];
         let cache = VarCache::in_memory();
-        let resolution = resolve_block_env(&env_refs, &decls, &HashMap::new(), &cache, &HashMap::new());
+        let resolution =
+            resolve_block_env(&env_refs, &decls, &HashMap::new(), &cache, &HashMap::new());
         assert_eq!(
             resolution.env.get("INSTALL_PATH").map(String::as_str),
             Some("/usr/local/bin")
@@ -1667,7 +1696,8 @@ mod tests {
             var_name: "INSTALL_PATH".to_string(),
         }];
         let cache = VarCache::in_memory();
-        let resolution = resolve_block_env(&env_refs, &decls, &HashMap::new(), &cache, &HashMap::new());
+        let resolution =
+            resolve_block_env(&env_refs, &decls, &HashMap::new(), &cache, &HashMap::new());
         assert_eq!(
             resolution.env.get("PREFIX").map(String::as_str),
             Some("/opt")
@@ -1683,7 +1713,8 @@ mod tests {
             var_name: "INSTALL_PATH".to_string(),
         }];
         let cache = VarCache::in_memory();
-        let resolution = resolve_block_env(&env_refs, &decls, &HashMap::new(), &cache, &HashMap::new());
+        let resolution =
+            resolve_block_env(&env_refs, &decls, &HashMap::new(), &cache, &HashMap::new());
         assert!(resolution.env.is_empty());
         assert_eq!(resolution.missing, vec![decls[0].clone()]);
     }
@@ -1701,7 +1732,8 @@ mod tests {
             var_name: "INSTALL_PATH".to_string(),
         }];
         let cache = VarCache::in_memory();
-        let resolution = resolve_block_env(&env_refs, &decls, &HashMap::new(), &cache, &HashMap::new());
+        let resolution =
+            resolve_block_env(&env_refs, &decls, &HashMap::new(), &cache, &HashMap::new());
         assert!(resolution.env.is_empty());
         assert_eq!(resolution.missing, vec![decls[0].clone()]);
         assert_eq!(
@@ -1753,9 +1785,18 @@ mod tests {
     #[test]
     fn from_conflicts_with_default_required_and_secret() {
         let cases = [
-            ("<!-- meshfox:var name=\"X\" from=\"a\" default=\"1\" -->\n", "default"),
-            ("<!-- meshfox:var name=\"X\" from=\"a\" required -->\n", "required"),
-            ("<!-- meshfox:var name=\"X\" from=\"a\" secret -->\n", "secret"),
+            (
+                "<!-- meshfox:var name=\"X\" from=\"a\" default=\"1\" -->\n",
+                "default",
+            ),
+            (
+                "<!-- meshfox:var name=\"X\" from=\"a\" required -->\n",
+                "required",
+            ),
+            (
+                "<!-- meshfox:var name=\"X\" from=\"a\" secret -->\n",
+                "secret",
+            ),
         ];
         for (md, attr) in cases {
             assert_eq!(
@@ -1791,7 +1832,10 @@ mod tests {
         );
         let c = canvas(doc);
         let decls = declared_vars(&c).unwrap();
-        assert_eq!(decls[0].from.as_ref().unwrap().node_id.as_deref(), Some("other-node"));
+        assert_eq!(
+            decls[0].from.as_ref().unwrap().node_id.as_deref(),
+            Some("other-node")
+        );
     }
 
     #[test]
@@ -2177,11 +2221,7 @@ mod tests {
         );
         assert_eq!(
             validate_var_refs(&canvas(doc)).unwrap_err(),
-            VarsError::UndeclaredVarRef(
-                "X".to_string(),
-                "NOPE".to_string(),
-                "default_var"
-            )
+            VarsError::UndeclaredVarRef("X".to_string(), "NOPE".to_string(), "default_var")
         );
     }
 

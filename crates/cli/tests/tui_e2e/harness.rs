@@ -26,7 +26,8 @@ const MAX_LIVE_SESSIONS: usize = 6;
 /// the `TuiSession` gives it back on `Drop`. (A test that holds two
 /// sessions takes two permits; only one test does, so the pool can never be
 /// all held by tests each waiting on a second one.)
-static LIVE_SESSIONS: (Mutex<usize>, std::sync::Condvar) = (Mutex::new(0), std::sync::Condvar::new());
+static LIVE_SESSIONS: (Mutex<usize>, std::sync::Condvar) =
+    (Mutex::new(0), std::sync::Condvar::new());
 
 struct SessionPermit;
 
@@ -95,7 +96,10 @@ impl TuiSession {
                     .args(["--force", "-s", "-", env!("CARGO_BIN_EXE_meshfox")])
                     .status()
                     .expect("run codesign");
-                assert!(status.success(), "codesign failed to re-sign the meshfox binary");
+                assert!(
+                    status.success(),
+                    "codesign failed to re-sign the meshfox binary"
+                );
             });
         }
 

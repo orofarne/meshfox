@@ -151,9 +151,16 @@ pub async fn create_node(
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
-        return Err(if text.is_empty() { status.to_string() } else { text });
+        return Err(if text.is_empty() {
+            status.to_string()
+        } else {
+            text
+        });
     }
-    res.json::<Response>().await.map(|r| r.new_id).map_err(|e| e.to_string())
+    res.json::<Response>()
+        .await
+        .map(|r| r.new_id)
+        .map_err(|e| e.to_string())
 }
 
 /// POST `/api/nodes/:id/reparent` — the same `mdcanvas::reparent_node`
@@ -298,11 +305,19 @@ pub struct UndoRedoResult {
 }
 
 async fn post_undo_redo(url: String) -> Result<UndoRedoResult, String> {
-    let res = reqwest::Client::new().post(url).send().await.map_err(|e| e.to_string())?;
+    let res = reqwest::Client::new()
+        .post(url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
-        return Err(if text.is_empty() { status.to_string() } else { text });
+        return Err(if text.is_empty() {
+            status.to_string()
+        } else {
+            text
+        });
     }
     res.json().await.map_err(|e| e.to_string())
 }
@@ -335,7 +350,11 @@ pub async fn history_goto(port: u16, seq: i64) -> Result<UndoRedoResult, String>
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
-        return Err(if text.is_empty() { status.to_string() } else { text });
+        return Err(if text.is_empty() {
+            status.to_string()
+        } else {
+            text
+        });
     }
     res.json().await.map_err(|e| e.to_string())
 }
@@ -365,15 +384,21 @@ pub struct HistoryDto {
 /// `GET /api/history?limit=N` — the worker-routed counterpart to
 /// `crates/server/src/lib.rs`'s `api_history`.
 pub async fn history(port: u16, limit: Option<usize>) -> Result<HistoryDto, String> {
-    let mut url = reqwest::Url::parse(&format!("{}/api/history", base_url(port))).map_err(|e| e.to_string())?;
+    let mut url = reqwest::Url::parse(&format!("{}/api/history", base_url(port)))
+        .map_err(|e| e.to_string())?;
     if let Some(limit) = limit {
-        url.query_pairs_mut().append_pair("limit", &limit.to_string());
+        url.query_pairs_mut()
+            .append_pair("limit", &limit.to_string());
     }
     let res = reqwest::get(url).await.map_err(|e| e.to_string())?;
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
-        return Err(if text.is_empty() { status.to_string() } else { text });
+        return Err(if text.is_empty() {
+            status.to_string()
+        } else {
+            text
+        });
     }
     res.json().await.map_err(|e| e.to_string())
 }
@@ -422,7 +447,11 @@ pub async fn get_canvas_raw(port: u16) -> Result<String, String> {
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
-        return Err(if text.is_empty() { status.to_string() } else { text });
+        return Err(if text.is_empty() {
+            status.to_string()
+        } else {
+            text
+        });
     }
     res.text().await.map_err(|e| e.to_string())
 }
@@ -459,7 +488,11 @@ pub async fn get_canvas(port: u16) -> Result<Canvas, String> {
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
-        return Err(if text.is_empty() { status.to_string() } else { text });
+        return Err(if text.is_empty() {
+            status.to_string()
+        } else {
+            text
+        });
     }
     res.json().await.map_err(|e| e.to_string())
 }
@@ -486,7 +519,11 @@ pub async fn get_node_file_content(port: u16, node_id: &str) -> Result<(String, 
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
-        return Err(if text.is_empty() { status.to_string() } else { text });
+        return Err(if text.is_empty() {
+            status.to_string()
+        } else {
+            text
+        });
     }
     let body: FileContentResponse = res.json().await.map_err(|e| e.to_string())?;
     Ok((body.content, body.truncated))
@@ -504,8 +541,7 @@ pub async fn get_node_file_content(port: u16, node_id: &str) -> Result<(String, 
 /// asset-copy step calls this once per `Asset` instead of `std::fs::read`ing
 /// `Asset::source` itself.
 pub async fn get_relative_file(port: u16, path: &str) -> Result<Vec<u8>, String> {
-    let mut url =
-        reqwest::Url::parse(&base_url(port)).map_err(|e| e.to_string())?;
+    let mut url = reqwest::Url::parse(&base_url(port)).map_err(|e| e.to_string())?;
     url.path_segments_mut()
         .map_err(|_| "couldn't build the worker's asset URL".to_string())?
         .clear()
@@ -514,9 +550,16 @@ pub async fn get_relative_file(port: u16, path: &str) -> Result<Vec<u8>, String>
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
-        return Err(if text.is_empty() { status.to_string() } else { text });
+        return Err(if text.is_empty() {
+            status.to_string()
+        } else {
+            text
+        });
     }
-    res.bytes().await.map(|b| b.to_vec()).map_err(|e| e.to_string())
+    res.bytes()
+        .await
+        .map(|b| b.to_vec())
+        .map_err(|e| e.to_string())
 }
 
 /// A confined file's raw bytes, off the worker's own `GET /api/include-asset
@@ -535,14 +578,23 @@ pub async fn get_relative_file(port: u16, path: &str) -> Result<Vec<u8>, String>
 pub async fn get_include_asset(port: u16, dir: &str, file: &str) -> Result<Vec<u8>, String> {
     let mut url = reqwest::Url::parse(&format!("{}/api/include-asset", base_url(port)))
         .map_err(|e| e.to_string())?;
-    url.query_pairs_mut().append_pair("dir", dir).append_pair("file", file);
+    url.query_pairs_mut()
+        .append_pair("dir", dir)
+        .append_pair("file", file);
     let res = reqwest::get(url).await.map_err(|e| e.to_string())?;
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
-        return Err(if text.is_empty() { status.to_string() } else { text });
+        return Err(if text.is_empty() {
+            status.to_string()
+        } else {
+            text
+        });
     }
-    res.bytes().await.map(|b| b.to_vec()).map_err(|e| e.to_string())
+    res.bytes()
+        .await
+        .map(|b| b.to_vec())
+        .map_err(|e| e.to_string())
 }
 
 /// One notification off `GET /api/watch` — mirrors
@@ -591,12 +643,19 @@ pub fn watch(port: u16) -> tokio::sync::mpsc::UnboundedReceiver<WatchEvent> {
     tokio::spawn(async move {
         use futures_util::StreamExt;
         #[derive(serde::Deserialize)]
-        #[serde(tag = "type", rename_all = "kebab-case", rename_all_fields = "camelCase")]
+        #[serde(
+            tag = "type",
+            rename_all = "kebab-case",
+            rename_all_fields = "camelCase"
+        )]
         enum WatchMsg {
             Connected,
             Changed,
             Resync,
-            RunStarted { node_id: String, block: String },
+            RunStarted {
+                node_id: String,
+                block: String,
+            },
             NodeUpserted,
             NodeRemoved,
             NodesReordered,
@@ -610,8 +669,12 @@ pub fn watch(port: u16) -> tokio::sync::mpsc::UnboundedReceiver<WatchEvent> {
                 continue;
             };
             while let Some(Ok(msg)) = ws.next().await {
-                let tokio_tungstenite::tungstenite::Message::Text(text) = msg else { continue };
-                let Ok(parsed) = serde_json::from_str::<WatchMsg>(&text) else { continue };
+                let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
+                    continue;
+                };
+                let Ok(parsed) = serde_json::from_str::<WatchMsg>(&text) else {
+                    continue;
+                };
                 let event = match parsed {
                     WatchMsg::Connected => continue,
                     WatchMsg::Changed
@@ -620,7 +683,9 @@ pub fn watch(port: u16) -> tokio::sync::mpsc::UnboundedReceiver<WatchEvent> {
                     | WatchMsg::NodeRemoved
                     | WatchMsg::NodesReordered
                     | WatchMsg::Other => WatchEvent::Changed,
-                    WatchMsg::RunStarted { node_id, block } => WatchEvent::RunStarted { node_id, block },
+                    WatchMsg::RunStarted { node_id, block } => {
+                        WatchEvent::RunStarted { node_id, block }
+                    }
                 };
                 if tx.send(event).is_err() {
                     return;
@@ -667,7 +732,11 @@ pub fn hold_watch_connection(port: u16) -> tokio::task::AbortHandle {
 /// since this watches exactly one address's own run independent of
 /// whatever request originally started it.
 #[derive(Debug, Clone, serde::Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum SubscribeEvent {
     Line { stream: OutputStream, text: String },
     Done { exit_code: Option<i32> },
@@ -688,7 +757,11 @@ pub enum SubscribeEvent {
 /// messages) — indistinguishable here from a connect failure, and handled
 /// the same way: just an empty channel, best-effort, same as the web UI's
 /// own `.catch()` on this call.
-pub fn subscribe_run(port: u16, node_id: String, block: String) -> tokio::sync::mpsc::UnboundedReceiver<SubscribeEvent> {
+pub fn subscribe_run(
+    port: u16,
+    node_id: String,
+    block: String,
+) -> tokio::sync::mpsc::UnboundedReceiver<SubscribeEvent> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
         use futures_util::StreamExt;
@@ -701,8 +774,12 @@ pub fn subscribe_run(port: u16, node_id: String, block: String) -> tokio::sync::
             return;
         };
         while let Some(Ok(msg)) = ws.next().await {
-            let tokio_tungstenite::tungstenite::Message::Text(text) = msg else { continue };
-            let Ok(event) = serde_json::from_str::<SubscribeEvent>(&text) else { continue };
+            let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
+                continue;
+            };
+            let Ok(event) = serde_json::from_str::<SubscribeEvent>(&text) else {
+                continue;
+            };
             if tx.send(event).is_err() {
                 return;
             }
@@ -731,7 +808,11 @@ pub struct RunHistoryEntryDto {
 /// `GET /api/run/history?nodeId=..&block=..` — the finished runs of one
 /// block the worker's session database still keeps (`[session]
 /// max_runs_per_block`), newest first.
-pub async fn run_history(port: u16, node_id: &str, block: &str) -> Result<Vec<RunHistoryEntryDto>, String> {
+pub async fn run_history(
+    port: u16,
+    node_id: &str,
+    block: &str,
+) -> Result<Vec<RunHistoryEntryDto>, String> {
     let url = reqwest::Url::parse_with_params(
         &format!("{}/api/run/history", base_url(port)),
         &[("nodeId", node_id), ("block", block)],
@@ -741,7 +822,11 @@ pub async fn run_history(port: u16, node_id: &str, block: &str) -> Result<Vec<Ru
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
-        return Err(if text.is_empty() { status.to_string() } else { text });
+        return Err(if text.is_empty() {
+            status.to_string()
+        } else {
+            text
+        });
     }
     res.json().await.map_err(|e| e.to_string())
 }
@@ -760,13 +845,21 @@ pub async fn run_output(
     use futures_util::StreamExt;
     let url = reqwest::Url::parse_with_params(
         &format!("ws://127.0.0.1:{port}/api/run/subscribe"),
-        &[("nodeId", node_id), ("block", block), ("runId", &run_id.to_string())],
+        &[
+            ("nodeId", node_id),
+            ("block", block),
+            ("runId", &run_id.to_string()),
+        ],
     )
     .map_err(|e| e.to_string())?;
-    let (mut ws, _) = tokio_tungstenite::connect_async(url.as_str()).await.map_err(|e| e.to_string())?;
+    let (mut ws, _) = tokio_tungstenite::connect_async(url.as_str())
+        .await
+        .map_err(|e| e.to_string())?;
     let mut lines = Vec::new();
     while let Some(msg) = ws.next().await {
-        let Ok(tokio_tungstenite::tungstenite::Message::Text(text)) = msg else { continue };
+        let Ok(tokio_tungstenite::tungstenite::Message::Text(text)) = msg else {
+            continue;
+        };
         match serde_json::from_str::<SubscribeEvent>(&text) {
             Ok(SubscribeEvent::Line { stream, text }) => lines.push((stream, text)),
             Ok(SubscribeEvent::Done { .. }) => break,
@@ -807,7 +900,12 @@ pub enum VarOrigin {
 /// `GET /api/vars?path=..&block=..&noDeps=..` — `path` is the node-id path
 /// joined with commas, empty for a root-level block (matches
 /// `VarsQuery::path`'s own "comma-joined" convention server-side).
-pub async fn get_vars(port: u16, path: &[String], block: &str, no_deps: bool) -> Result<Vec<VarStatus>, String> {
+pub async fn get_vars(
+    port: u16,
+    path: &[String],
+    block: &str,
+    no_deps: bool,
+) -> Result<Vec<VarStatus>, String> {
     let url = reqwest::Url::parse_with_params(
         &format!("{}/api/vars", base_url(port)),
         &[
@@ -821,7 +919,11 @@ pub async fn get_vars(port: u16, path: &[String], block: &str, no_deps: bool) ->
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
-        return Err(if text.is_empty() { status.to_string() } else { text });
+        return Err(if text.is_empty() {
+            status.to_string()
+        } else {
+            text
+        });
     }
     res.json().await.map_err(|e| e.to_string())
 }
@@ -838,7 +940,11 @@ pub async fn get_configure_vars(port: u16) -> Result<Vec<VarStatus>, String> {
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
-        return Err(if text.is_empty() { status.to_string() } else { text });
+        return Err(if text.is_empty() {
+            status.to_string()
+        } else {
+            text
+        });
     }
     res.json().await.map_err(|e| e.to_string())
 }
@@ -850,7 +956,10 @@ pub async fn get_configure_vars(port: u16) -> Result<Vec<VarStatus>, String> {
 /// worker mode. Doesn't run anything. A `422` (an invalid value for its
 /// declared type) comes back as plain text, same `ApiError` posture every
 /// other mutating endpoint here already has.
-pub async fn post_configure_vars(port: u16, vars: HashMap<String, String>) -> Result<usize, String> {
+pub async fn post_configure_vars(
+    port: u16,
+    vars: HashMap<String, String>,
+) -> Result<usize, String> {
     let res = reqwest::Client::new()
         .post(format!("{}/api/vars/configure", base_url(port)))
         .json(&serde_json::json!({ "vars": vars }))
@@ -860,7 +969,11 @@ pub async fn post_configure_vars(port: u16, vars: HashMap<String, String>) -> Re
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
-        return Err(if text.is_empty() { status.to_string() } else { text });
+        return Err(if text.is_empty() {
+            status.to_string()
+        } else {
+            text
+        });
     }
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -902,7 +1015,11 @@ pub async fn submit_form(
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
-        return Err(if text.is_empty() { status.to_string() } else { text });
+        return Err(if text.is_empty() {
+            status.to_string()
+        } else {
+            text
+        });
     }
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -916,7 +1033,11 @@ pub async fn submit_form(
         autorun_triggered: Vec<Triggered>,
     }
     let response: Response = res.json().await.map_err(|e| e.to_string())?;
-    Ok(response.autorun_triggered.into_iter().map(|t| (t.node_id, t.block)).collect())
+    Ok(response
+        .autorun_triggered
+        .into_iter()
+        .map(|t| (t.node_id, t.block))
+        .collect())
 }
 
 /// Mirrors `crates/server/src/lib.rs`'s own `RunEvent` — the WebSocket
@@ -935,19 +1056,62 @@ pub async fn submit_form(
 /// error.
 #[allow(dead_code)]
 #[derive(Debug, Clone, serde::Deserialize)]
-#[serde(tag = "type", rename_all = "kebab-case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
 pub enum RunEvent {
-    Started { run_id: String },
-    StepStart { node_id: String, block: String },
-    StepSkipped { node_id: String, block: String, output: String, duration_ms: u64 },
-    Output { node_id: String, block: String, stream: OutputStream, text: String },
-    TtyStart { node_id: String, block: String },
-    ServiceStarted { node_id: String, block: String, pid: u32 },
-    LockConflict { node_id: String, block: String, owner_pid: u32, owner_desc: String },
-    StepEnd { node_id: String, block: String, exit_code: i32, duration_ms: u64 },
-    Killed { node_id: String, block: String },
-    Error { message: String },
-    Done { exit_code: i32 },
+    Started {
+        run_id: String,
+    },
+    StepStart {
+        node_id: String,
+        block: String,
+    },
+    StepSkipped {
+        node_id: String,
+        block: String,
+        output: String,
+        duration_ms: u64,
+    },
+    Output {
+        node_id: String,
+        block: String,
+        stream: OutputStream,
+        text: String,
+    },
+    TtyStart {
+        node_id: String,
+        block: String,
+    },
+    ServiceStarted {
+        node_id: String,
+        block: String,
+        pid: u32,
+    },
+    LockConflict {
+        node_id: String,
+        block: String,
+        owner_pid: u32,
+        owner_desc: String,
+    },
+    StepEnd {
+        node_id: String,
+        block: String,
+        exit_code: i32,
+        duration_ms: u64,
+    },
+    Killed {
+        node_id: String,
+        block: String,
+    },
+    Error {
+        message: String,
+    },
+    Done {
+        exit_code: i32,
+    },
 }
 
 /// A `409` from `POST /api/run/tty`/`force-start` — mirrors
@@ -1036,7 +1200,11 @@ async fn run_stream_inner(
 ) -> Result<tokio::sync::mpsc::UnboundedReceiver<RunEvent>, String> {
     let vars_json = serde_json::to_string(&vars).map_err(|e| e.to_string())?;
     let secrets_json = serde_json::to_string(&save_secrets).map_err(|e| e.to_string())?;
-    let route = if force.is_some() { "/api/run/force" } else { "/api/run" };
+    let route = if force.is_some() {
+        "/api/run/force"
+    } else {
+        "/api/run"
+    };
     let mut params = vec![
         ("path", path.join(",")),
         ("block", block.to_string()),
@@ -1059,8 +1227,12 @@ async fn run_stream_inner(
     tokio::spawn(async move {
         use futures_util::StreamExt;
         while let Some(Ok(msg)) = ws.next().await {
-            let tokio_tungstenite::tungstenite::Message::Text(text) = msg else { continue };
-            let Ok(event) = serde_json::from_str::<RunEvent>(&text) else { continue };
+            let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
+                continue;
+            };
+            let Ok(event) = serde_json::from_str::<RunEvent>(&text) else {
+                continue;
+            };
             if tx.send(event).is_err() {
                 return;
             }
@@ -1097,8 +1269,12 @@ pub async fn run_file_node_stream(
     tokio::spawn(async move {
         use futures_util::StreamExt;
         while let Some(Ok(msg)) = ws.next().await {
-            let tokio_tungstenite::tungstenite::Message::Text(text) = msg else { continue };
-            let Ok(event) = serde_json::from_str::<RunEvent>(&text) else { continue };
+            let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
+                continue;
+            };
+            let Ok(event) = serde_json::from_str::<RunEvent>(&text) else {
+                continue;
+            };
             if tx.send(event).is_err() {
                 return;
             }
@@ -1126,7 +1302,8 @@ pub async fn kill_run(port: u16, node_id: &str, block: &str) -> Result<(), Strin
 /// `{"cols":..,"rows":..}` resize (client to server, only meaningful once
 /// `RunEvent::TtyStart` has arrived). See `crate::tui::mod`'s own
 /// `bridge_http_tty` for the actual byte-relay loop this feeds.
-pub type TtySocket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+pub type TtySocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 #[derive(Debug)]
 pub enum TtyConnectError {
@@ -1170,7 +1347,11 @@ fn tty_connect_error(err: tokio_tungstenite::tungstenite::Error) -> TtyConnectEr
         }
     }
     let text = String::from_utf8_lossy(&body).into_owned();
-    TtyConnectError::Other(if text.is_empty() { resp.status().to_string() } else { text })
+    TtyConnectError::Other(if text.is_empty() {
+        resp.status().to_string()
+    } else {
+        text
+    })
 }
 
 /// `GET /api/run/tty` — the WS client that starts (and, for the duration of
@@ -1196,7 +1377,8 @@ pub async fn tty_connect(
     rows: u16,
     force: Option<(String, String)>,
 ) -> Result<TtySocket, TtyConnectError> {
-    let vars_json = serde_json::to_string(&vars).map_err(|e| TtyConnectError::Other(e.to_string()))?;
+    let vars_json =
+        serde_json::to_string(&vars).map_err(|e| TtyConnectError::Other(e.to_string()))?;
     let secrets_json =
         serde_json::to_string(&save_secrets).map_err(|e| TtyConnectError::Other(e.to_string()))?;
     let mut params = vec![
@@ -1212,8 +1394,9 @@ pub async fn tty_connect(
         params.push(("forceNodeId", force_node_id.clone()));
         params.push(("forceBlock", force_block.clone()));
     }
-    let url = reqwest::Url::parse_with_params(&format!("ws://127.0.0.1:{port}/api/run/tty"), &params)
-        .map_err(|e| TtyConnectError::Other(e.to_string()))?;
+    let url =
+        reqwest::Url::parse_with_params(&format!("ws://127.0.0.1:{port}/api/run/tty"), &params)
+            .map_err(|e| TtyConnectError::Other(e.to_string()))?;
     let (socket, _) = tokio_tungstenite::connect_async(url.as_str())
         .await
         .map_err(tty_connect_error)?;
@@ -1286,7 +1469,11 @@ pub async fn list_active_runs(port: u16) -> Result<Vec<ActiveRunDto>, String> {
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
-        return Err(if text.is_empty() { status.to_string() } else { text });
+        return Err(if text.is_empty() {
+            status.to_string()
+        } else {
+            text
+        });
     }
     res.json().await.map_err(|e| e.to_string())
 }
@@ -1322,7 +1509,11 @@ pub async fn list_services(port: u16) -> Result<Vec<ServiceDto>, String> {
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
-        return Err(if text.is_empty() { status.to_string() } else { text });
+        return Err(if text.is_empty() {
+            status.to_string()
+        } else {
+            text
+        });
     }
     res.json().await.map_err(|e| e.to_string())
 }
@@ -1332,7 +1523,11 @@ pub async fn list_services(port: u16) -> Result<Vec<ServiceDto>, String> {
 /// `App::refresh_service_log`) rather than streamed, same as the server's
 /// own doc comment on `get_service_log` explains for why the web UI does
 /// the same.
-pub async fn get_service_log(port: u16, node_id: &str, block: &str) -> Result<Vec<(OutputStream, String)>, String> {
+pub async fn get_service_log(
+    port: u16,
+    node_id: &str,
+    block: &str,
+) -> Result<Vec<(OutputStream, String)>, String> {
     let url = reqwest::Url::parse_with_params(
         &format!("{}/api/services/log", base_url(port)),
         &[("nodeId", node_id), ("block", block)],
@@ -1342,7 +1537,11 @@ pub async fn get_service_log(port: u16, node_id: &str, block: &str) -> Result<Ve
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
-        return Err(if text.is_empty() { status.to_string() } else { text });
+        return Err(if text.is_empty() {
+            status.to_string()
+        } else {
+            text
+        });
     }
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -1375,13 +1574,20 @@ pub async fn restart_service(port: u16, node_id: &str, block: &str) -> Result<u3
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
-        return Err(if text.is_empty() { status.to_string() } else { text });
+        return Err(if text.is_empty() {
+            status.to_string()
+        } else {
+            text
+        });
     }
     #[derive(serde::Deserialize)]
     struct Resp {
         pid: u32,
     }
-    res.json::<Resp>().await.map(|r| r.pid).map_err(|e| e.to_string())
+    res.json::<Resp>()
+        .await
+        .map(|r| r.pid)
+        .map_err(|e| e.to_string())
 }
 
 // =======================================================================
@@ -1417,7 +1623,11 @@ pub async fn debug_start(
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
-        return Err(if text.is_empty() { status.to_string() } else { text });
+        return Err(if text.is_empty() {
+            status.to_string()
+        } else {
+            text
+        });
     }
     let response: Response = res.json().await.map_err(|e| e.to_string())?;
     Ok((response.session_id, response.block_name, response.cwd))
@@ -1443,14 +1653,20 @@ pub async fn debug_send(
 ) -> Result<DebugSendOutcome, String> {
     let res = reqwest::Client::new()
         .post(format!("{}/api/debug/send", base_url(port)))
-        .json(&serde_json::json!({ "sessionId": session_id, "code": code, "timeoutMs": timeout_ms }))
+        .json(
+            &serde_json::json!({ "sessionId": session_id, "code": code, "timeoutMs": timeout_ms }),
+        )
         .send()
         .await
         .map_err(|e| e.to_string())?;
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
-        return Err(if text.is_empty() { status.to_string() } else { text });
+        return Err(if text.is_empty() {
+            status.to_string()
+        } else {
+            text
+        });
     }
     res.json().await.map_err(|e| e.to_string())
 }

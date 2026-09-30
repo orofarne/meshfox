@@ -34,17 +34,23 @@ fn clicking_the_block_name_in_a_deps_line_selects_its_owning_node() {
     // border title (the currently-selected node's title, rendered above
     // the tree pane's row-major position on screen) — the `[run,cache]`
     // badge suffix only the tree's own row carries disambiguates it.
-    let (consumer_row, consumer_col) = session.find("Consumer [run").expect("Consumer's own tree row");
+    let (consumer_row, consumer_col) = session
+        .find("Consumer [run")
+        .expect("Consumer's own tree row");
     assert!(
         session.inverse_at(consumer_row, consumer_col),
         "Consumer's tree row should be the selected (reverse-video) one right now"
     );
 
-    let (row, col) = session.find("producer/make").expect("deps-line block-name text");
+    let (row, col) = session
+        .find("producer/make")
+        .expect("deps-line block-name text");
     session.send_mouse_click(row, col);
     std::thread::sleep(Duration::from_millis(100));
 
-    let (producer_row, producer_col) = session.find("Producer [run").expect("Producer's own tree row");
+    let (producer_row, producer_col) = session
+        .find("Producer [run")
+        .expect("Producer's own tree row");
     assert!(
         session.inverse_at(producer_row, producer_col),
         "clicking the deps-line's block name should move the tree's own selection to Producer"

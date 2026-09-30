@@ -94,13 +94,21 @@ fn deep_merge(base: &mut toml::Table, overlay: toml::Table) {
 /// documented as a regular setting.
 pub fn server_socket(canvas_root: &Path) -> Option<PathBuf> {
     if let Ok(over) = std::env::var("MESHFOX_SERVER_SOCKET") {
-        return if over.is_empty() { None } else { Some(PathBuf::from(over)) };
+        return if over.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(over))
+        };
     }
     server_socket_from_table(&load(canvas_root))
 }
 
 fn server_socket_from_table(table: &toml::Table) -> Option<PathBuf> {
-    table.get("server_socket").and_then(|v| v.as_str()).filter(|v| !v.is_empty()).map(PathBuf::from)
+    table
+        .get("server_socket")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 /// Default for [`session_max_output_bytes`] — 256 KiB per block, same
@@ -233,7 +241,9 @@ fn expand_env_refs(value: &str) -> String {
             if i + 1 < len && bytes[i + 1] == b'{' {
                 if let Some(rel_close) = value[i + 2..].find('}') {
                     let name = &value[i + 2..i + 2 + rel_close];
-                    if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                    if !name.is_empty()
+                        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                    {
                         out.push_str(&std::env::var(name).unwrap_or_default());
                         i += 2 + rel_close + 1; // past the closing '}'
                         continue;
@@ -242,7 +252,9 @@ fn expand_env_refs(value: &str) -> String {
             } else {
                 let name_start = i + 1;
                 let mut name_end = name_start;
-                while name_end < len && (bytes[name_end].is_ascii_alphanumeric() || bytes[name_end] == b'_') {
+                while name_end < len
+                    && (bytes[name_end].is_ascii_alphanumeric() || bytes[name_end] == b'_')
+                {
                     name_end += 1;
                 }
                 let name = &value[name_start..name_end];
@@ -333,7 +345,9 @@ mod tests {
 
     #[test]
     fn server_socket_from_table_reads_the_top_level_string_key() {
-        let table: toml::Table = "server_socket = \"/tmp/coordinator.sock\"\n".parse().unwrap();
+        let table: toml::Table = "server_socket = \"/tmp/coordinator.sock\"\n"
+            .parse()
+            .unwrap();
         assert_eq!(
             server_socket_from_table(&table),
             Some(PathBuf::from("/tmp/coordinator.sock"))
@@ -350,9 +364,15 @@ mod tests {
         assert_eq!(session_max_output_bytes_from_table(&table), 1024);
         let table: toml::Table = "[session]\nmax_output_bytes = 0".parse().unwrap();
         assert_eq!(session_max_output_bytes_from_table(&table), 0);
-        for bad in ["[session]\nmax_output_bytes = -5", "[session]\nmax_output_bytes = \"big\""] {
+        for bad in [
+            "[session]\nmax_output_bytes = -5",
+            "[session]\nmax_output_bytes = \"big\"",
+        ] {
             let table: toml::Table = bad.parse().unwrap();
-            assert_eq!(session_max_output_bytes_from_table(&table), DEFAULT_SESSION_MAX_OUTPUT_BYTES);
+            assert_eq!(
+                session_max_output_bytes_from_table(&table),
+                DEFAULT_SESSION_MAX_OUTPUT_BYTES
+            );
         }
     }
 
@@ -367,7 +387,10 @@ mod tests {
         let table: toml::Table = "[session]\nmax_runs_per_block = 0".parse().unwrap();
         assert_eq!(session_max_runs_per_block_from_table(&table), 1);
         let table: toml::Table = "[session]\nmax_runs_per_block = -2".parse().unwrap();
-        assert_eq!(session_max_runs_per_block_from_table(&table), DEFAULT_SESSION_MAX_RUNS_PER_BLOCK);
+        assert_eq!(
+            session_max_runs_per_block_from_table(&table),
+            DEFAULT_SESSION_MAX_RUNS_PER_BLOCK
+        );
     }
 
     #[test]
@@ -419,7 +442,10 @@ mod tests {
         )
         .unwrap();
         std::env::remove_var("MESHFOX_SERVER_SOCKET");
-        assert_eq!(server_socket(&dir), Some(PathBuf::from("/tmp/from-config.sock")));
+        assert_eq!(
+            server_socket(&dir),
+            Some(PathBuf::from("/tmp/from-config.sock"))
+        );
     }
 
     #[test]
@@ -480,7 +506,10 @@ mod tests {
         std::env::remove_var("MESHFOX_TEST_ENV_EXPAND_E");
         assert_eq!(
             overrides,
-            vec![("MESHFOX_TEST_ENV_EXPAND_E".to_string(), "/base:/extra".to_string())]
+            vec![(
+                "MESHFOX_TEST_ENV_EXPAND_E".to_string(),
+                "/base:/extra".to_string()
+            )]
         );
     }
 

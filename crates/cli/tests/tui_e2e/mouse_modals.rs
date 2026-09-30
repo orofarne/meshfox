@@ -27,13 +27,17 @@ fn clicking_a_row_in_the_block_picker_selects_it() {
     // `┌─ bash · alpha ──` fence headers, which sit above the picker in
     // row-major scan order — the `  [cache]` badge suffix disambiguates
     // the picker's own row text from that.
-    let (alpha_row, alpha_col) = session.find("alpha  [cache]").expect("alpha row in the picker");
+    let (alpha_row, alpha_col) = session
+        .find("alpha  [cache]")
+        .expect("alpha row in the picker");
     assert!(
         session.inverse_at(alpha_row, alpha_col),
         "alpha (the first/default row) should start out selected"
     );
 
-    let (beta_row, beta_col) = session.find("beta  [cache]").expect("beta row in the picker");
+    let (beta_row, beta_col) = session
+        .find("beta  [cache]")
+        .expect("beta row in the picker");
     session.send_mouse_click(beta_row, beta_col);
     std::thread::sleep(Duration::from_millis(100));
     assert!(

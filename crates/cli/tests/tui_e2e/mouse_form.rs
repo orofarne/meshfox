@@ -45,8 +45,10 @@ fn filling_in_a_form_field_and_clicking_send_autoruns_the_dependent_block() {
     let (row, col) = session.find("[Send]").expect("the form's own Send marker");
     session.send_mouse_click(row, col);
 
-    session.wait_for("greeting is Hello", Duration::from_secs(10)).expect(
-        "clicking Send should commit the field and automatically start the autorun block \
+    session
+        .wait_for("greeting is Hello", Duration::from_secs(10))
+        .expect(
+            "clicking Send should commit the field and automatically start the autorun block \
          that references it, with no r press",
-    );
+        );
 }

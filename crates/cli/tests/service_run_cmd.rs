@@ -62,7 +62,13 @@ fn seed_stale_service_lock(canvas_path: &std::path::Path, node_id: &str, block: 
     let conn = meshfox_server::session_db::open(canvas_path).unwrap();
     let ledger = meshfox_server::run_ledger::RunLedger::from_connection(conn).unwrap();
     ledger
-        .start(node_id, block, meshfox_server::run_ledger::RunKind::Service, "cli", pid)
+        .start(
+            node_id,
+            block,
+            meshfox_server::run_ledger::RunKind::Service,
+            "cli",
+            pid,
+        )
         .unwrap();
 }
 
@@ -138,13 +144,19 @@ fn run_stays_attached_streams_output_and_ctrl_c_stops_the_service() {
         }
     }
     assert!(saw_started, "never saw the 'service started' line");
-    assert!(saw_output, "never saw the service's own streamed output line");
+    assert!(
+        saw_output,
+        "never saw the service's own streamed output line"
+    );
     assert!(
         saw_streaming_banner,
         "never saw the 'staying attached' banner — run exited instead of watching the service"
     );
     let service_pid = service_pid.expect("service pid parsed from the started line");
-    assert!(is_alive(service_pid), "service should be running at this point");
+    assert!(
+        is_alive(service_pid),
+        "service should be running at this point"
+    );
 
     // `meshfox run` should still be alive and blocked here, not exited —
     // the whole point of "staying attached".
@@ -227,7 +239,10 @@ fn lock_conflict_on_worker_routed_run_refuses_non_interactively() {
         stderr.contains("not an interactive terminal, refusing to kill and retry"),
         "stderr: {stderr}"
     );
-    assert!(!run.status.success(), "the run should report failure, not silently succeed");
+    assert!(
+        !run.status.success(),
+        "the run should report failure, not silently succeed"
+    );
     assert!(
         is_alive(dummy_pid),
         "the seeded owner process should be untouched by a refused retry"
@@ -258,7 +273,10 @@ fn lock_conflict_on_worker_routed_run_kills_and_retries_when_confirmed() {
                 .args(["--force", "-s", "-", env!("CARGO_BIN_EXE_meshfox")])
                 .status()
                 .expect("run codesign");
-            assert!(status.success(), "codesign failed to re-sign the meshfox binary");
+            assert!(
+                status.success(),
+                "codesign failed to re-sign the meshfox binary"
+            );
         });
     }
 
@@ -279,7 +297,12 @@ fn lock_conflict_on_worker_routed_run_kills_and_retries_when_confirmed() {
 
     let pty_system = native_pty_system();
     let pair = pty_system
-        .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
         .expect("openpty");
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_meshfox"));
     cmd.arg("run");
@@ -287,7 +310,10 @@ fn lock_conflict_on_worker_routed_run_kills_and_retries_when_confirmed() {
     cmd.arg(&canvas_path);
     cmd.arg("srv");
     cmd.env("HOME", unique_dir());
-    let mut child = pair.slave.spawn_command(cmd).expect("spawn meshfox run in pty");
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("spawn meshfox run in pty");
     drop(pair.slave);
 
     let mut reader = pair.master.try_clone_reader().expect("clone pty reader");
@@ -313,7 +339,10 @@ fn lock_conflict_on_worker_routed_run_kills_and_retries_when_confirmed() {
         }
     }
 
-    assert!(sent_confirm, "never saw the kill-and-retry prompt — output so far:\n{output}");
+    assert!(
+        sent_confirm,
+        "never saw the kill-and-retry prompt — output so far:\n{output}"
+    );
     assert!(
         output.contains("service started, pid"),
         "never saw 'service started' after confirming — output so far:\n{output}"
