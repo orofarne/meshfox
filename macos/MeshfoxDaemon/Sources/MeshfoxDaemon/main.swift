@@ -2,11 +2,8 @@ import AppKit
 import Foundation
 
 /// Same lookup `macos/src/launcher.applescript`'s own `resolveMeshfox`
-/// already uses, and for the same reason: resolved fresh on every launch
-/// (not baked in at build time) so a `meshfox` installed/upgraded after
-/// this daemon was last built is still found, and `~/.local/bin` is
-/// checked explicitly first since that's where meshfox's own install
-/// script puts it — not on a fresh Mac's `PATH` by default.
+/// already uses. Each account has an independently updatable CLI in
+/// ~/.local/bin; the bundled CLI is only a first-install source and fallback.
 ///
 /// `MESHFOX_BIN`, if set, wins over both — not meant for a normal launch,
 /// just for developing/testing this daemon against a `target/debug`
@@ -20,6 +17,10 @@ func resolveMeshfoxPath() -> String? {
     let localBin = NSHomeDirectory() + "/.local/bin/meshfox"
     if FileManager.default.isExecutableFile(atPath: localBin) {
         return localBin
+    }
+    let bundledBin = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/meshfox").path
+    if FileManager.default.isExecutableFile(atPath: bundledBin) {
+        return bundledBin
     }
     let pathEnv = ProcessInfo.processInfo.environment["PATH"] ?? ""
     for dir in pathEnv.split(separator: ":") {

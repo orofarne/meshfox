@@ -7,15 +7,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let meshfoxPath: String
     private let socketPath: String
 
-    /// The `meshfox` CLI binary's own version — distinct from
-    /// `Self.daemonVersion` (this app's own). Shown right underneath it in
-    /// the menu specifically because "Check for Updates" updates the CLI,
-    /// not this app itself (see `checkForUpdates`'s own doc comment) — a
-    /// menu that only ever showed the daemon's version would leave that
-    /// update invisible. Re-read at launch and again once a
-    /// `checkForUpdates` run finishes, not on every menu rebuild: it can
-    /// only change from those two events, so there's no reason to shell out
-    /// more often than that.
+    /// The user's CLI version, which can advance independently of the app.
     private var cliVersion: String = "…"
 
     /// Finder's own "open documents" Apple Event (double-click/drag-onto-
@@ -63,6 +55,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pendingOpenPaths.removeAll()
 
         rebuildMenu()
+        offerSocketConfigurationIfNeeded()
     }
 
     /// Finder's "open documents" Apple Event — a double-click, drag onto
@@ -128,6 +121,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
+        let configureItem = NSMenuItem(title: "Connect CLI to Daemon…", action: #selector(configureCLI), keyEquivalent: "")
+        configureItem.target = self
+        menu.addItem(configureItem)
+
         let versionItem = NSMenuItem(title: "Meshfox Daemon \(Self.daemonVersion)", action: nil, keyEquivalent: "")
         versionItem.isEnabled = false
         menu.addItem(versionItem)
@@ -136,7 +133,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         cliVersionItem.isEnabled = false
         menu.addItem(cliVersionItem)
 
-        let updateItem = NSMenuItem(title: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: "")
+        let updateItem = NSMenuItem(title: "Check CLI Updates…", action: #selector(checkForUpdates), keyEquivalent: "")
         updateItem.target = self
         menu.addItem(updateItem)
 
@@ -163,46 +160,95 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         store.kill(canvasPath: path)
     }
 
-    /// Shells out to the CLI's own already-built, already-tested update
-    /// mechanism (`meshfox check-updates`, `self_update` against GitHub
-    /// releases — `crates/cli/src/main.rs`) rather than reimplementing any
-    /// of that here. `--yes`: this process has no TTY for the CLI's own
-    /// interactive confirmation prompt to work against.
-    @objc private func checkForUpdates() {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: meshfoxPath)
-        process.arguments = ["check-updates", "--yes"]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-        process.terminationHandler = { [weak self] _ in
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-            DispatchQueue.main.async {
-                self?.refreshCliVersion()
-                self?.rebuildMenu()
-                let alert = NSAlert()
-                alert.messageText = "Meshfox update check"
-                alert.informativeText = (output?.isEmpty ?? true) ? "(no output)" : output!
-                alert.runModal()
-            }
-        }
+    private func offerSocketConfigurationIfNeeded() {
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: "didOfferSocketConfiguration") else { return }
         do {
-            try process.run()
+            guard try !SocketConfiguration.hasServerSocket() else { return }
         } catch {
-            let alert = NSAlert()
-            alert.alertStyle = .warning
-            alert.messageText = "Couldn't run meshfox check-updates"
-            alert.informativeText = "\(error)"
-            alert.runModal()
+            FileHandle.standardError.write("meshfox-daemon: couldn't inspect CLI configuration: \(error)\n".data(using: .utf8)!)
+            return
+        }
+        defaults.set(true, forKey: "didOfferSocketConfiguration")
+        DispatchQueue.main.async { [weak self] in self?.configureCLI() }
+    }
+
+    @objc private func configureCLI() {
+        do {
+            if try SocketConfiguration.hasServerSocket() {
+                let alert = NSAlert()
+                alert.messageText = "Meshfox CLI is already configured"
+                alert.informativeText = "A server_socket setting exists in ~/.meshfox/config.toml. Meshfox left it unchanged."
+                alert.runModal()
+                return
+            }
+        } catch {
+            showConfigurationError(error)
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "Connect Meshfox CLI to this daemon?"
+        alert.informativeText = "Add server_socket to ~/.meshfox/config.toml for this account? CLI commands will use this daemon's socket at \(socketPath). Existing settings will be kept."
+        alert.addButton(withTitle: "Connect")
+        alert.addButton(withTitle: "Not Now")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        do {
+            try SocketConfiguration.configure(socketPath: socketPath)
+        } catch {
+            showConfigurationError(error)
+        }
+    }
+
+    private func showConfigurationError(_ error: Error) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Couldn't configure Meshfox CLI"
+        alert.informativeText = "\(error)\n\nYou can add server_socket to ~/.meshfox/config.toml manually."
+        alert.runModal()
+    }
+
+    /// The CLI lives in the user's home, so its existing self-update
+    /// mechanism can replace it without touching the signed app bundle.
+    @objc private func checkForUpdates() {
+        let path = meshfoxPath
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: path)
+            process.arguments = ["check-updates", "--yes"]
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = pipe
+            do {
+                try process.run()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                DispatchQueue.main.async {
+                    self?.refreshCliVersion()
+                    self?.rebuildMenu()
+                    let alert = NSAlert()
+                    alert.messageText = process.terminationStatus == 0 ? "Meshfox CLI update" : "Meshfox CLI update failed"
+                    alert.informativeText = (output.isEmpty ? "(no output)" : output)
+                        + "\n\nNew workers use the updated CLI. Restart existing canvas sessions to switch them over."
+                    alert.runModal()
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    let alert = NSAlert()
+                    alert.alertStyle = .warning
+                    alert.messageText = "Couldn't run meshfox check-updates"
+                    alert.informativeText = "\(error)"
+                    alert.runModal()
+                }
+            }
         }
     }
 
     /// Runs `meshfox --version` and stores the trimmed output in
     /// `cliVersion`. Synchronous (`waitUntilExit`) — always called from
     /// somewhere that's already fine blocking briefly on a fast local
-    /// binary (launch, or a `checkForUpdates` completion already hopped
-    /// onto `DispatchQueue.main`), never from `acceptLoop`'s background
+    /// binary (at launch or after an update), never from `acceptLoop`'s background
     /// thread directly.
     private func refreshCliVersion() {
         let process = Process()
