@@ -168,6 +168,12 @@ pub struct RunLedger {
     /// ones are rotated out, row and stored output together. Never below
     /// `1`. From `[session] max_runs_per_block`.
     max_runs_per_block: usize,
+    /// Called after a row is started or finished (or every finished run is
+    /// marked stale) — set once by `build_state` to broadcast `runs-changed`
+    /// on `/api/watch`, so other frontends refetch `GET /api/runs`. A
+    /// `OnceLock` shared by every clone, so setting it after the ledger has
+    /// already been handed around still reaches all of them.
+    notifier: Arc<std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 /// One finished run as [`RunLedger::latest_fresh_run`]/[`RunLedger::history`]
@@ -203,6 +209,7 @@ impl RunLedger {
             conn,
             max_output_bytes: meshfox_core::config::DEFAULT_SESSION_MAX_OUTPUT_BYTES,
             max_runs_per_block: meshfox_core::config::DEFAULT_SESSION_MAX_RUNS_PER_BLOCK,
+            notifier: Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -224,11 +231,24 @@ impl RunLedger {
             conn: Arc::new(Mutex::new(conn)),
             max_output_bytes: meshfox_core::config::DEFAULT_SESSION_MAX_OUTPUT_BYTES,
             max_runs_per_block: meshfox_core::config::DEFAULT_SESSION_MAX_RUNS_PER_BLOCK,
+            notifier: Arc::new(std::sync::OnceLock::new()),
         })
     }
 
     /// Overrides how many finished runs of one address [`Self::finish`]
     /// keeps — see `meshfox_core::config::session_max_runs_per_block`.
+    /// Registers the callback run after a row starts or finishes (only the
+    /// first call takes effect).
+    pub fn set_notifier(&self, notifier: Arc<dyn Fn() + Send + Sync>) {
+        let _ = self.notifier.set(notifier);
+    }
+
+    fn notify(&self) {
+        if let Some(notifier) = self.notifier.get() {
+            notifier();
+        }
+    }
+
     pub fn with_max_runs_per_block(mut self, max_runs_per_block: usize) -> Self {
         self.max_runs_per_block = max_runs_per_block.max(1);
         self
@@ -309,31 +329,37 @@ impl RunLedger {
             .unwrap()
             .execute("UPDATE runs SET stale = 1 WHERE outcome != 'running'", [])
             .map_err(sqlite_err)?;
+        self.notify();
         Ok(())
     }
 
-    /// Every plain-block address that has at least one finished run not
-    /// marked stale — the candidates whose latest *current* run
-    /// [`Self::latest_fresh_run`] may find (it also needs the fingerprint).
-    pub fn plain_addresses_with_runs(&self) -> io::Result<Vec<(String, String)>> {
+    /// Every plain-block or `tty` address that has at least one finished run
+    /// not marked stale, with its kind (`"plain"`/`"tty"`) — the candidates
+    /// whose latest *current* run [`Self::latest_fresh_run`] may find (it
+    /// also needs the fingerprint). A `service` is left out: it's tracked
+    /// live by `crate::services`. A `tty` run has no stored output (only
+    /// its outcome and timing), so there's nothing to replay for it.
+    pub fn addresses_with_runs(&self) -> io::Result<Vec<(String, String, String)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT DISTINCT node_id, block FROM runs \
-                 WHERE kind = 'plain' AND outcome != 'running' AND stale = 0",
+                "SELECT node_id, block, kind FROM runs \
+                 WHERE kind IN ('plain', 'tty') AND outcome != 'running' AND stale = 0 \
+                 GROUP BY node_id, block ORDER BY MAX(id)",
             )
             .map_err(sqlite_err)?;
         let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
             .map_err(sqlite_err)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)
     }
 
-    /// The newest finished run of `(node_id, block)` that is still current:
-    /// not marked stale by a reset, and stamped with exactly `fingerprint`
-    /// (the address's fingerprint *now*). Being newest matters — an edit
-    /// made and reverted makes an older run fresh again, and it is the
-    /// latest one that describes the document.
     pub fn latest_fresh_run(
         &self,
         node_id: &str,
@@ -421,6 +447,19 @@ impl RunLedger {
         owner: &str,
         pid: u32,
     ) -> Result<i64, StartError> {
+        let id = self.start_row(node_id, block, kind, owner, pid)?;
+        self.notify();
+        Ok(id)
+    }
+
+    fn start_row(
+        &self,
+        node_id: &str,
+        block: &str,
+        kind: RunKind,
+        owner: &str,
+        pid: u32,
+    ) -> Result<i64, StartError> {
         let started_at = meshfox_core::timestamp::now_utc_rfc3339();
         let conn = self.conn.lock().unwrap();
         let result = conn.execute(
@@ -468,6 +507,12 @@ impl RunLedger {
     /// Marks row `id` resolved — the equivalent of `service_lock::release`,
     /// just recording how it ended instead of deleting the record.
     pub fn finish(&self, id: i64, outcome: FinishOutcome) -> io::Result<()> {
+        self.finish_row(id, outcome)?;
+        self.notify();
+        Ok(())
+    }
+
+    fn finish_row(&self, id: i64, outcome: FinishOutcome) -> io::Result<()> {
         let ended_at = meshfox_core::timestamp::now_utc_rfc3339();
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -762,8 +807,8 @@ mod tests {
         let run = ledger.latest_fresh_run("a", "b", "fp").unwrap().unwrap();
         assert_eq!(run.duration_ms, Some(2500));
         assert_eq!(
-            ledger.plain_addresses_with_runs().unwrap(),
-            vec![("a".to_string(), "b".to_string())]
+            ledger.addresses_with_runs().unwrap(),
+            vec![("a".to_string(), "b".to_string(), "plain".to_string())]
         );
     }
 

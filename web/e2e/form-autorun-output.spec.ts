@@ -77,7 +77,7 @@ test("the table's own source can still be expanded independently — its output 
   // never also hide the output it just produced — SPEC.md's "Runnable
   // code fences" `fold` attribute exists precisely to decouple the two.
   await expect(table.locator(".mesh-code-block-source")).toBeVisible();
-  await table.locator(".mesh-code-source-toggle").click();
+  await table.getByRole("button", { name: "‹/›" }).click();
   await expect(table.locator(".mesh-code-block-source")).toBeHidden();
   await expect(table.locator(".mesh-code-output")).toBeVisible();
   await expect(table.locator(".mesh-code-output")).toContainText("Ada");

@@ -895,11 +895,9 @@ fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
     // `RunRowState`'s own doc comment. `running_node` is whichever single
     // node currently owns the in-flight block/file run (there's only ever
     // one foreground run at a time, see `App::advance_run`'s own doc
-    // comment); `failed_nodes` folds in every address `App.step_output`
-    // last recorded a non-zero exit for (a worker-mode kill writes one too
-    // — see `App::on_run_event`'s own `Killed` arm — since a local-mode
-    // kill already gets one for free once its process's exit status
-    // resolves, non-zero or not), plus a `file` node's own last failed run.
+    // comment); `failed_nodes` is every node with a block whose latest
+    // current run the worker recorded as failed or killed (`App::
+    // failed_node_ids`), plus a `file` node's own last failed run.
     let mut running_nodes: std::collections::HashSet<&str> = app
         .external_running
         .keys()
@@ -914,12 +912,7 @@ fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
     if let Some(file_run) = app.file_run.as_ref().filter(|f| f.proc.is_some()) {
         running_nodes.insert(file_run.node_id.as_str());
     }
-    let mut failed_nodes: std::collections::HashSet<&str> = app
-        .step_output
-        .iter()
-        .filter(|(_, so)| so.exit_code != 0)
-        .map(|(addr, _)| addr.node_id.as_str())
-        .collect();
+    let mut failed_nodes: std::collections::HashSet<&str> = app.failed_node_ids();
     if let Some(file_run) = &app.file_run {
         if file_run.had_failure {
             failed_nodes.insert(file_run.node_id.as_str());
@@ -2124,7 +2117,11 @@ fn render_run_history_view(f: &mut Frame, area: Rect, rv: &super::app::RunHistor
         ))],
         Some((_, lines)) if lines.is_empty() => {
             vec![Line::from(Span::styled(
-                " no output stored for this run",
+                if rv.tty {
+                    " a tty session's output isn't stored"
+                } else {
+                    " no output stored for this run"
+                },
                 Style::default().fg(Color::DarkGray),
             ))]
         }
@@ -3032,6 +3029,30 @@ mod tests {
             hv.offset.get() <= 35 && 35 < hv.offset.get() + rect.height as usize,
             "selection is on screen"
         );
+    }
+
+    #[test]
+    fn render_run_history_view_says_a_tty_runs_output_is_not_stored() {
+        use crate::worker_client::RunHistoryEntryDto;
+        let rv = super::super::app::RunHistoryViewState {
+            node_id: "shell".into(),
+            block: "interactive".into(),
+            tty: true,
+            entries: vec![RunHistoryEntryDto {
+                id: 1,
+                outcome: "exited".into(),
+                exit_code: Some(0),
+                started_at: "2026-09-30T12:00:00Z".into(),
+                duration_ms: Some(4200),
+                stale: false,
+            }],
+            output: Some((1, Vec::new())),
+            ..Default::default()
+        };
+        let area = Rect::new(0, 0, 100, 24);
+        let screen = render_to_screen(area, |f| render_run_history_view(f, area, &rv));
+        assert!(screen.contains("exit 0"), "{screen}");
+        assert!(screen.contains("a tty session's output isn't stored"), "{screen}");
     }
 
     #[test]

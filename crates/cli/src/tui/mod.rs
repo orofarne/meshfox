@@ -165,7 +165,7 @@ pub async fn run(canvas_path: PathBuf, initial_node: Option<String>) -> io::Resu
 
             let (reload_tx, mut reload_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
             let (external_run_tx, mut external_run_rx) =
-                tokio::sync::mpsc::unbounded_channel::<ExternalRunUpdate>();
+                tokio::sync::mpsc::unbounded_channel::<ExternalMsg>();
             // `app.worker_port` (not the outer `worker_port` this function
             // resolved before constructing `App`) is the authoritative
             // answer — `App::new`'s own canvas-load fallback can still turn
@@ -325,7 +325,7 @@ fn spawn_worker_watcher(
     port: u16,
     known_raw: Arc<std::sync::Mutex<String>>,
     reload_tx: tokio::sync::mpsc::UnboundedSender<String>,
-    external_run_tx: tokio::sync::mpsc::UnboundedSender<ExternalRunUpdate>,
+    external_run_tx: tokio::sync::mpsc::UnboundedSender<ExternalMsg>,
 ) {
     tokio::spawn(async move {
         use crate::worker_client::WatchEvent;
@@ -351,9 +351,23 @@ fn spawn_worker_watcher(
                 WatchEvent::RunStarted { node_id, block } => {
                     spawn_run_subscriber(port, node_id, block, None, external_run_tx.clone());
                 }
+                WatchEvent::RunsChanged => {
+                    if external_run_tx.send(ExternalMsg::RunsChanged).is_err() {
+                        return;
+                    }
+                }
             }
         }
     });
+}
+
+/// What the worker watcher tells the main loop.
+enum ExternalMsg {
+    /// An incremental update for a run this session never started.
+    Run(ExternalRunUpdate),
+    /// Some run started or ended somewhere (another frontend, a terminal
+    /// session): the worker's `GET /api/runs` has changed, refetch it.
+    RunsChanged,
 }
 
 /// One incremental update for a run this TUI session never itself started
@@ -384,7 +398,7 @@ fn spawn_run_subscriber(
     node_id: String,
     block: String,
     known_duration_ms: Option<u64>,
-    tx: tokio::sync::mpsc::UnboundedSender<ExternalRunUpdate>,
+    tx: tokio::sync::mpsc::UnboundedSender<ExternalMsg>,
 ) {
     tokio::spawn(async move {
         let mut events = crate::worker_client::subscribe_run(port, node_id.clone(), block.clone());
@@ -395,7 +409,7 @@ fn spawn_run_subscriber(
                 event,
                 known_duration_ms,
             };
-            if tx.send(update).is_err() {
+            if tx.send(ExternalMsg::Run(update)).is_err() {
                 return;
             }
         }
@@ -410,7 +424,7 @@ fn spawn_run_subscriber(
 /// replays its output into the Document pane. The counterpart of the web
 /// UI's reconcile-on-load effect. Best-effort: a worker that can't list its
 /// runs just means an empty start, as before.
-async fn reconcile_runs(port: u16, tx: &tokio::sync::mpsc::UnboundedSender<ExternalRunUpdate>) {
+async fn reconcile_runs(port: u16, tx: &tokio::sync::mpsc::UnboundedSender<ExternalMsg>) {
     let Ok(runs) = crate::worker_client::list_active_runs(port).await else {
         return;
     };
@@ -430,12 +444,19 @@ async fn main_loop(
     input_paused: &Arc<AtomicBool>,
     reload_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
     link_preview_rx: &mut tokio::sync::mpsc::UnboundedReceiver<LinkPreviewMsg>,
-    external_run_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExternalRunUpdate>,
+    external_run_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExternalMsg>,
 ) -> io::Result<()> {
     loop {
         terminal.draw(|f| ui::render(f, app))?;
         if app.should_quit {
             return Ok(());
+        }
+
+        // A run just ended (or the TUI just started): pick up the worker's
+        // record of it now, then redraw, instead of waiting for the tick.
+        if app.refresh_runs_soon {
+            app.refresh_block_runs().await;
+            continue;
         }
 
         if let Some(pending) = app.pending_http_tty.take() {
@@ -525,15 +546,17 @@ async fn main_loop(
             Some(msg) = link_preview_rx.recv() => {
                 app.on_link_preview_msg(msg);
             }
-            Some(update) = external_run_rx.recv() => {
-                app.on_reconciled_run_event(
+            Some(msg) = external_run_rx.recv() => match msg {
+                ExternalMsg::Run(update) => app.on_reconciled_run_event(
                     BlockAddr::new(update.node_id, update.block),
                     update.event,
                     update.known_duration_ms,
-                );
-            }
+                ),
+                ExternalMsg::RunsChanged => app.refresh_runs_soon = true,
+            },
             _ = tokio::time::sleep(std::time::Duration::from_secs(3)), if worker_reachable => {
                 app.refresh_services().await;
+                app.refresh_block_runs().await;
             }
             _ = tokio::time::sleep(std::time::Duration::from_secs(1)), if services_view_open_on_worker => {
                 if let Some(view) = &app.services_view {

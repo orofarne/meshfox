@@ -412,6 +412,10 @@ export default function App() {
       .catch((e) => setError(String(e)));
   }, []);
   const [nodes, setNodes, onNodesChange] = useNodesState<Node<MeshNodeData>>([]);
+  // The latest `nodes`, for callbacks that must compare against what's on screen
+  // right now without being re-created on every change.
+  const nodesRef = useRef(nodes);
+  nodesRef.current = nodes;
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   // Set via `onInit` below — needed to call `setCenter` imperatively once
   // the canvas has actually loaded (see the initial-view effect further
@@ -733,10 +737,17 @@ export default function App() {
     [refreshHistory],
   );
 
+  // Filled in below, once `patchLiveBlock` exists: sets each `tty` block's
+  // node badge from what the server reports for it.
+  const applyTtyRunsRef = useRef<(runs: ActiveRunDto[]) => void>(() => {});
+  // Likewise for plain blocks run elsewhere — see `syncPlainRuns`.
+  const syncPlainRunsRef = useRef<(runs: ActiveRunDto[]) => void>(() => {});
   const refreshLiveTtySessions = useCallback(() => {
     return fetchActiveRuns()
       .then((runs) => {
         setLiveTtySessions(runs.filter((r) => r.kind === "tty" && r.status === "running"));
+        applyTtyRunsRef.current(runs);
+        syncPlainRunsRef.current(runs);
       })
       .catch(() => {
         // Best-effort — a transient fetch failure just leaves the last
@@ -908,6 +919,52 @@ export default function App() {
     },
     [setNodes],
   );
+
+  // A `tty` block has no output to replay (it's a live terminal — a running
+  // one is reattached from `TtySessionsPanel`), but the server's record of
+  // it still sets the node's status: running (spinner), or its latest
+  // finished run's outcome (failed badge). Runs on load, on every
+  // `"runs-changed"`, and on the periodic tick — so a terminal session
+  // started or ended from another tab or the TUI shows up without a reload.
+  const applyTtyRuns = useCallback(
+    (runs: ActiveRunDto[]) => {
+      const tty = runs.filter((r) => r.kind === "tty");
+      if (tty.length === 0) return;
+      setNodes((nds) => {
+        let changed = false;
+        const next = nds.map((n) => {
+          let liveBlocks = n.data.liveBlocks;
+          for (const run of tty) {
+            if (run.nodeId !== n.id) continue;
+            const status: LiveBlockState["status"] =
+              run.status === "running" ? "running" : run.status === "killed" ? "killed" : "done";
+            const prev = liveBlocks[run.block];
+            // Already showing exactly this (this tab's own terminal events
+            // got there first, or an earlier tick did): leave it alone, so
+            // the periodic refresh doesn't churn every node every 3s.
+            if (prev && prev.status === status && prev.exitCode === run.exitCode) continue;
+            liveBlocks = {
+              ...liveBlocks,
+              [run.block]: {
+                ...(prev ?? { status, text: "" }),
+                status,
+                text: "",
+                exitCode: run.exitCode,
+                startedAt: status === "running" ? Date.now() - run.uptimeMs : undefined,
+                durationMs: status === "done" ? run.uptimeMs : undefined,
+              },
+            };
+          }
+          if (liveBlocks === n.data.liveBlocks) return n;
+          changed = true;
+          return { ...n, data: { ...n.data, liveBlocks } };
+        });
+        return changed ? next : nds;
+      });
+    },
+    [setNodes],
+  );
+  applyTtyRunsRef.current = applyTtyRuns;
 
   // One `subscribeRun` watch per address can end up started twice for the
   // exact same triggered run: `handleSubmitForm` starts one straight from
@@ -1112,9 +1169,12 @@ export default function App() {
         setCanUndo(nextCanUndo);
         setCanRedo(nextCanRedo);
       },
+      () => {
+        refreshLiveTtySessions();
+      },
     );
     return stop;
-  }, [load, watchAutorunBlock, handleNodeOp]);
+  }, [load, watchAutorunBlock, handleNodeOp, refreshLiveTtySessions]);
 
   // A `form`-lang fence's own Send button (see SPEC.md's "Form fences") —
   // commits `values` server-side and immediately starts watching every
@@ -1383,6 +1443,99 @@ export default function App() {
     [canvas, editMode, load, blockGraph, setNodes, patchLiveBlock, appendConsoleLine],
   );
 
+  // Adopts one plain-block run the server reports (`GET /api/runs`) into this
+  // tab's `liveBlocks` — status now, output replayed by `subscribeRun` (a
+  // running one then keeps streaming). Used by the on-load reconcile below
+  // and by `syncPlainRuns`.
+  const adoptPlainRun = useCallback(
+    (run: ActiveRunDto) => {
+      // Claims this address the same way `watchAutorunBlock` does
+      // (same shared generation counter, `beginAddressWatch`) — this
+      // effect and that one independently decide, for the very same
+      // address, "subscribe and fold the backlog into `liveBlocks`";
+      // without sharing one counter between them, whichever call
+      // loses the race would keep mutating state after the other
+      // (correctly) took over — confirmed directly: a fresh page
+      // load racing an in-flight `autorun` trigger for the same
+      // block could show a stale, already-superseded run's own
+      // leftover output instead of (or mixed with) the real current
+      // one.
+      const isCurrent = beginAddressWatch(`${run.nodeId}::${run.block}`);
+      patchLiveBlock(run.nodeId, run.block, {
+        status: run.status === "killed" ? "killed" : run.status === "exited" ? "done" : "running",
+        text: "",
+        stdoutText: undefined,
+        stderrText: undefined,
+        exitCode: run.exitCode,
+        runId: undefined,
+        // Backdated so `LiveElapsed` (`Date.now() - startedAt`) shows
+        // the real elapsed time immediately instead of restarting its
+        // own clock from the moment this tab happened to notice.
+        startedAt: run.status === "running" ? Date.now() - run.uptimeMs : undefined,
+        durationMs: run.status === "exited" ? run.uptimeMs : undefined,
+      });
+      subscribeRun(run.nodeId, run.block, 0, (event) => {
+        if (!isCurrent()) return;
+        switch (event.type) {
+          case "line":
+            appendConsoleLine(run.nodeId, run.block, event);
+            setNodes((nds) =>
+              nds.map((n) => {
+                if (n.id !== run.nodeId) return n;
+                const prev = n.data.liveBlocks[run.block] ?? { status: "running", text: "" };
+                return {
+                  ...n,
+                  data: {
+                    ...n.data,
+                    liveBlocks: { ...n.data.liveBlocks, [run.block]: appendOutputLine(prev, event) },
+                  },
+                };
+              }),
+            );
+            break;
+          case "done":
+            patchLiveBlock(run.nodeId, run.block, {
+              status: event.outcome === "killed" ? "killed" : "done",
+              exitCode: event.exitCode,
+              runId: undefined,
+            });
+            break;
+        }
+      }).catch(() => {
+        // Best-effort — if the subscribe stream itself fails partway
+        // through, just leave whatever was already shown; nothing
+        // meaningful to retry automatically here.
+      });
+    },
+    [beginAddressWatch, patchLiveBlock, setNodes, appendConsoleLine],
+  );
+
+  // Runs that started or ended elsewhere (another tab, the TUI, a chain's
+  // dependency — `"run-started"` is only broadcast for a chain's target, so
+  // only `"runs-changed"` tells us about those): adopts any plain run this
+  // tab isn't already showing the outcome of. A block this tab is running
+  // or watching right now, or shows as skipped/blocked/queued in a chain of
+  // its own, is left alone.
+  const syncPlainRuns = useCallback(
+    (runs: ActiveRunDto[]) => {
+      for (const run of runs) {
+        if (run.kind !== "plain") continue;
+        if (selfInitiatedRuns.current.has(`${run.nodeId}::${run.block}`)) continue;
+        const local = nodesRef.current.find((n) => n.id === run.nodeId)?.data.liveBlocks[run.block];
+        if (run.status === "running") {
+          if (local?.status === "running") continue;
+        } else {
+          const status = run.status === "killed" ? "killed" : "done";
+          if (local && local.status !== "done" && local.status !== "killed") continue;
+          if (local && local.status === status && local.exitCode === run.exitCode) continue;
+        }
+        adoptPlainRun(run);
+      }
+    },
+    [adoptPlainRun],
+  );
+  syncPlainRunsRef.current = syncPlainRuns;
+
   // Reconciles this tab's own `liveBlocks` against the server's registry
   // of still-running (or just-finished) plain-block runs (`GET
   // /api/runs`) — once, right after the canvas first loads. Without this,
@@ -1395,80 +1548,28 @@ export default function App() {
   // to the canvas's own identity) — not on every later reload `/api/watch`
   // triggers for an unrelated edit, since re-subscribing to something
   // already being watched would just race with itself. `tty` sessions are
-  // handled by `TtySessionsPanel`/reattach instead of `liveBlocks` — see
-  // this effect's own `kind` filter.
+  // handled by `TtySessionsPanel`/reattach instead of `liveBlocks` — a
+  // still-running one isn't touched here, a finished one only sets the
+  // node's status badge.
   const reconciledActiveRunsRef = useRef(false);
   useEffect(() => {
     if (!canvas || reconciledActiveRunsRef.current) return;
     reconciledActiveRunsRef.current = true;
     fetchActiveRuns()
       .then((runs) => {
+        applyTtyRuns(runs);
         for (const run of runs) {
+          // `tty` blocks are handled by `applyTtyRuns` below.
+          if (run.kind === "tty") continue;
           if (run.kind !== "plain") continue;
-          // Claims this address the same way `watchAutorunBlock` does
-          // (same shared generation counter, `beginAddressWatch`) — this
-          // effect and that one independently decide, for the very same
-          // address, "subscribe and fold the backlog into `liveBlocks`";
-          // without sharing one counter between them, whichever call
-          // loses the race would keep mutating state after the other
-          // (correctly) took over — confirmed directly: a fresh page
-          // load racing an in-flight `autorun` trigger for the same
-          // block could show a stale, already-superseded run's own
-          // leftover output instead of (or mixed with) the real current
-          // one.
-          const isCurrent = beginAddressWatch(`${run.nodeId}::${run.block}`);
-          patchLiveBlock(run.nodeId, run.block, {
-            status: run.status === "killed" ? "killed" : run.status === "exited" ? "done" : "running",
-            text: "",
-            stdoutText: undefined,
-            stderrText: undefined,
-            exitCode: run.exitCode,
-            runId: undefined,
-            // Backdated so `LiveElapsed` (`Date.now() - startedAt`) shows
-            // the real elapsed time immediately instead of restarting its
-            // own clock from the moment this tab happened to notice.
-            startedAt: run.status === "running" ? Date.now() - run.uptimeMs : undefined,
-            durationMs: run.status === "exited" ? run.uptimeMs : undefined,
-          });
-          subscribeRun(run.nodeId, run.block, 0, (event) => {
-            if (!isCurrent()) return;
-            switch (event.type) {
-              case "line":
-                appendConsoleLine(run.nodeId, run.block, event);
-                setNodes((nds) =>
-                  nds.map((n) => {
-                    if (n.id !== run.nodeId) return n;
-                    const prev = n.data.liveBlocks[run.block] ?? { status: "running", text: "" };
-                    return {
-                      ...n,
-                      data: {
-                        ...n.data,
-                        liveBlocks: { ...n.data.liveBlocks, [run.block]: appendOutputLine(prev, event) },
-                      },
-                    };
-                  }),
-                );
-                break;
-              case "done":
-                patchLiveBlock(run.nodeId, run.block, {
-                  status: event.outcome === "killed" ? "killed" : "done",
-                  exitCode: event.exitCode,
-                  runId: undefined,
-                });
-                break;
-            }
-          }).catch(() => {
-            // Best-effort — if the subscribe stream itself fails partway
-            // through, just leave whatever was already shown; nothing
-            // meaningful to retry automatically here.
-          });
+          adoptPlainRun(run);
         }
       })
       .catch(() => {
         // No active runs to reconcile, or the endpoint failed — either
         // way, not worth surfacing as a page-level error.
       });
-  }, [canvas, beginAddressWatch, patchLiveBlock, setNodes, appendConsoleLine]);
+  }, [canvas, adoptPlainRun, applyTtyRuns]);
 
   // Runs a runnable `file` node's `interpreter target` (see
   // `api.ts`'s `runFileStream`) — the file-node counterpart to
@@ -3721,6 +3822,17 @@ export default function App() {
           saveSecrets={ttySession.saveSecrets}
           autoclose={ttySession.autoclose}
           attachTo={ttySession.attachTo}
+          onStepState={(nodeId, block, state) =>
+            patchLiveBlock(
+              nodeId,
+              block,
+              state.status === "running"
+                ? { status: "running", text: "", exitCode: undefined, startedAt: Date.now(), durationMs: undefined }
+                : state.status === "killed"
+                  ? { status: "killed" }
+                  : { status: "done", exitCode: state.exitCode },
+            )
+          }
           onClose={() => setTtySession(null)}
         />
       )}

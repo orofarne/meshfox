@@ -50,11 +50,15 @@ const STALE_HINT =
 export function RunHistoryDialog({
   nodeId,
   blockName,
+  tty,
   liveStatus,
   onClose,
 }: {
   nodeId: string;
   blockName: string;
+  /** A `tty` block: its runs are listed with outcome and timing, but no
+   * output is stored for them. */
+  tty?: boolean;
   liveStatus?: string;
   onClose: () => void;
 }) {
@@ -195,7 +199,9 @@ export function RunHistoryDialog({
                   </code>
                 </pre>
               ) : (
-                <div className="run-history-empty">no output stored for this run</div>
+                <div className="run-history-empty">
+                  {tty ? "a tty session's output isn't stored" : "no output stored for this run"}
+                </div>
               )
             ) : (
               !current && runs && runs.length > 0 && <div className="run-history-empty">select a run</div>

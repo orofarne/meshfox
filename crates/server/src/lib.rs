@@ -1802,12 +1802,14 @@ fn lock_conflict_response(conflict: &LockConflict) -> Response {
 /// `AppState.services`). Deliberately built from `forced_reruns` alone
 /// (already computed by `compute_forced_reruns` before this is ever called)
 /// rather than re-resolving each block's own kind/fingerprint a second
-/// time: neither `service` nor `tty` ever populates `session_runs` (see
-/// `SessionRun`'s own doc comment), so `compute_forced_reruns` already
-/// treats every such address as "no skip mechanism, always forced" on its
-/// own — exactly the set this needs, service-liveness aside. Resolves each
-/// address's own block (not just `locate_node`) to know whether it's
-/// `RunKind::Service` or `RunKind::Plain` for the row's own `kind` column —
+/// time: a `service` never populates `session_runs` (see `SessionRun`'s own
+/// doc comment), so `compute_forced_reruns` already treats it as "no skip
+/// mechanism, always forced" on its own — exactly the set this needs,
+/// service-liveness aside (a `tty` step does populate it, once it exits 0,
+/// so a fresh one is skipped like a plain step). Resolves each address's
+/// own block (not just `locate_node`) to know whether it's
+/// `RunKind::Service`, `RunKind::Tty` or `RunKind::Plain` for the row's own
+/// `kind` column —
 /// a bad node/block reference just gets skipped here, left for the real
 /// per-step loop to report as a normal `RunEvent::Error`.
 fn steps_needing_a_lock(
@@ -1848,6 +1850,8 @@ fn steps_needing_a_lock(
         };
         let kind = if block.service {
             run_ledger::RunKind::Service
+        } else if block.tty {
+            run_ledger::RunKind::Tty
         } else {
             run_ledger::RunKind::Plain
         };
@@ -2622,6 +2626,13 @@ enum RunEvent {
 )]
 enum ServerEvent {
     Changed,
+    /// Some plain or `tty` run started or finished, or every finished run
+    /// was marked stale (session reset) — the set of runs `GET /api/runs`
+    /// reports may differ from what a client last fetched, so it should
+    /// refetch. Carries nothing on purpose: the list is the source of truth.
+    /// Pushed by the `run_ledger` (see `RunLedger::set_notifier`), so it
+    /// covers every kind of run and every way one can end.
+    RunsChanged,
     RunStarted {
         node_id: String,
         block: String,
@@ -7108,6 +7119,14 @@ async fn relay_tty_step(
     // before this pty existed.
     if let Some((ledger, id)) = &ledger_row {
         let _ = ledger.update_pid(*id, pty.pid() as u32);
+        // Same fingerprint a plain run gets when it spawns, so this session
+        // counts as the block's current run (and goes stale like any other
+        // when the document changes) — after a restart too.
+        stamp_run_fingerprint(
+            state,
+            &meshfox_core::BlockAddr::new(&node_id, &block_name),
+            *id,
+        );
     }
 
     // `ledger_row` (if any) is handed to `track` below by value — its
@@ -7462,6 +7481,9 @@ async fn get_active_runs(State(state): State<Arc<AppState>>) -> Json<Vec<ActiveR
     // a reloaded tab is offered is the latest current run of each block,
     // whether the core has been up since it ran or was restarted after (see
     // `serve_stored_run`, which is what a subscribe to it is served from).
+    // A finished `tty` run is listed too, from the ledger, once the process
+    // that ran it has no in-memory session left — its outcome only, since
+    // a `tty` run stores no output.
     for handle in state.runs_registry.lock().unwrap().values() {
         if matches!(handle.outcome(), run_registry::RunOutcome::Running) {
             out.push(ActiveRunDto {
@@ -7479,11 +7501,24 @@ async fn get_active_runs(State(state): State<Arc<AppState>>) -> Json<Vec<ActiveR
         .map(|r| (r.node_id.clone(), r.block.clone()))
         .collect();
     if let (Ok(addresses), Some(ctx)) = (
-        state.run_ledger.plain_addresses_with_runs(),
+        state.run_ledger.addresses_with_runs(),
         RunFingerprintCtx::load(&state),
     ) {
-        for (node_id, block) in addresses {
+        for (node_id, block, kind) in addresses {
             if running.contains(&(node_id.clone(), block.clone())) {
+                continue;
+            }
+            // A `tty` session this process still has in memory is reported
+            // below, with its live state; only one left over from before a
+            // restart is served from the ledger (outcome and timing only —
+            // there's no stored output to attach to).
+            if kind == "tty"
+                && state
+                    .tty_registry
+                    .lock()
+                    .unwrap()
+                    .contains_key(&(node_id.clone(), block.clone()))
+            {
                 continue;
             }
             let addr = meshfox_core::BlockAddr::new(&node_id, &block);
@@ -7499,7 +7534,7 @@ async fn get_active_runs(State(state): State<Arc<AppState>>) -> Json<Vec<ActiveR
             out.push(ActiveRunDto {
                 node_id,
                 block,
-                kind: "plain",
+                kind: if kind == "tty" { "tty" } else { "plain" },
                 status: if run.outcome == "killed" {
                     "killed"
                 } else {
@@ -8772,7 +8807,7 @@ async fn build_state(
         }
     }
 
-    Ok(Arc::new(AppState {
+    let state = Arc::new(AppState {
         canvas_path,
         raw: Mutex::new(raw),
         runs: Mutex::new(HashMap::new()),
@@ -8793,7 +8828,15 @@ async fn build_state(
         tty_registry: Mutex::new(HashMap::new()),
         debug_sessions: Mutex::new(HashMap::new()),
         watcher_socket,
-    }))
+    });
+    // A weak handle: the ledger lives inside the state it reports to.
+    let weak = Arc::downgrade(&state);
+    state.run_ledger.set_notifier(Arc::new(move || {
+        if let Some(state) = weak.upgrade() {
+            state.canvas_events.push(ServerEvent::RunsChanged);
+        }
+    }));
+    Ok(state)
 }
 
 fn build_app(state: Arc<AppState>) -> Router {
@@ -15042,6 +15085,120 @@ mod run_lock_tests {
 
         let _ = dummy.kill();
         let _ = dummy.wait();
+        cleanup(&canvas_path);
+    }
+
+    /// Another client watching `/api/watch` hears about a `tty` run
+    /// starting and ending — `run-started` is only broadcast for plain
+    /// blocks, so `runs-changed` (from the run ledger) is how a tab or TUI
+    /// learns a terminal session ran elsewhere.
+    #[tokio::test]
+    async fn a_watcher_is_told_when_a_tty_run_starts_and_ends() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+        let canvas_path = write_test_canvas(TTY_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (mut watch, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/watch"))
+            .await
+            .expect("watch");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            while let Some(Ok(WsMessage::Text(t))) = watch.next().await {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) {
+                    if let Some(kind) = v["type"].as_str() {
+                        let _ = tx.send(kind.to_string());
+                    }
+                }
+            }
+        });
+
+        let url = format!("ws://{addr}/api/run/tty?block=interactive&cols=80&rows=24");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("upgrade");
+        let events = tty_ws_run_to_completion(&mut ws).await;
+        assert!(events.iter().any(|e| e["type"] == "done"), "{events:?}");
+
+        let mut runs_changed = 0;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while runs_changed < 2 {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(kind)) if kind == "runs-changed" => runs_changed += 1,
+                Ok(Some(_)) => {}
+                _ => break,
+            }
+        }
+        assert!(runs_changed >= 2, "expected a start and an end, saw {runs_changed}");
+        cleanup(&canvas_path);
+    }
+
+    /// A finished `tty` run is recorded as a `tty` run with the block's
+    /// current fingerprint, so a core started afterwards still reports it
+    /// (outcome only — a `tty` run stores no output).
+    #[tokio::test]
+    async fn a_finished_tty_run_is_reported_again_after_a_restart() {
+        let canvas_path = write_test_canvas(TTY_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let url = format!("ws://{addr}/api/run/tty?block=interactive&cols=80&rows=24");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("upgrade");
+        let events = tty_ws_run_to_completion(&mut ws).await;
+        assert!(events.iter().any(|e| e["type"] == "done"), "{events:?}");
+
+        // Wait for the session's own task to close its ledger row.
+        async fn runs(addr: SocketAddr) -> serde_json::Value {
+            let (status, body) = get(addr, "/api/runs").await;
+            assert_eq!(status, 200, "{body}");
+            serde_json::from_str(&body).unwrap()
+        }
+        let mut first = serde_json::Value::Null;
+        for _ in 0..50 {
+            first = runs(addr).await;
+            if first[0]["status"] == "exited" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
+        assert_eq!(first[0]["kind"], "tty", "{first}");
+        assert_eq!(first[0]["status"], "exited", "{first}");
+
+        // "Restart": a second core over the same canvas has no in-memory
+        // registry, only the ledger.
+        let restarted = spawn_test_server(canvas_path.clone()).await;
+        let after = runs(restarted).await;
+        assert_eq!(after.as_array().unwrap().len(), 1, "{after}");
+        assert_eq!(after[0]["kind"], "tty", "{after}");
+        assert_eq!(after[0]["status"], "exited", "{after}");
+        assert_eq!(after[0]["exitCode"], 0, "{after}");
+
+        // Its history is served like a plain block's: one finished run,
+        // current, with an exit code — and replaying it yields no output.
+        let (status, body) = get(
+            restarted,
+            "/api/run/history?nodeId=root&block=interactive",
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let history: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(history.as_array().unwrap().len(), 1, "{history}");
+        assert_eq!(history[0]["exitCode"], 0, "{history}");
+        assert_eq!(history[0]["stale"], false, "{history}");
+        let run_id = history[0]["id"].as_i64().unwrap();
+        let events = subscribe_ws_events(
+            restarted,
+            &format!("/api/run/subscribe?nodeId=root&block=interactive&runId={run_id}"),
+        )
+        .await;
+        assert!(
+            events.iter().all(|e| e["type"] != "line"),
+            "no output stored for a tty run: {events:?}"
+        );
+
+        // Editing the block makes that run stale, like a plain one.
+        let raw = std::fs::read_to_string(&canvas_path).unwrap();
+        std::fs::write(&canvas_path, raw.replace("echo ready", "echo changed")).unwrap();
+        let edited = spawn_test_server(canvas_path.clone()).await;
+        let stale = runs(edited).await;
+        assert!(stale.as_array().unwrap().is_empty(), "{stale}");
+
         cleanup(&canvas_path);
     }
 

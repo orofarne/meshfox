@@ -68,8 +68,15 @@ interface TtyPanelProps {
    * (`{nodeId, block}`) rather than a `runId`, since an attach-only
    * connection never has one. */
   attachTo?: { nodeId: string; block: string };
+  /** Reports each step's state as this run's events arrive (a fresh run
+   * only — an attach has none), so the canvas node can show it the same way
+   * it does for a plain block's run: started, finished with an exit code,
+   * or killed. */
+  onStepState?: (nodeId: string, block: string, state: TtyStepState) => void;
   onClose: () => void;
 }
+
+export type TtyStepState = { status: "running" } | { status: "done"; exitCode: number } | { status: "killed" };
 
 function statusLabel(status: Status, exitCode: number | undefined, errorMsg: string | undefined): string {
   switch (status) {
@@ -123,6 +130,7 @@ export function TtyPanel({
   saveSecrets,
   autoclose,
   attachTo,
+  onStepState,
   onClose,
 }: TtyPanelProps) {
   const dark = usePrefersDark();
@@ -131,6 +139,10 @@ export function TtyPanel({
   const wsRef = useRef<WebSocket | null>(null);
   const runIdRef = useRef<string | undefined>(undefined);
   const ttyActiveRef = useRef(false);
+  // Read through a ref: the socket handlers below are set up once per
+  // mount, and must call whatever callback the parent passes *now*.
+  const onStepStateRef = useRef(onStepState);
+  onStepStateRef.current = onStepState;
 
   const [status, setStatus] = useState<Status>("connecting");
   const [exitCode, setExitCode] = useState<number | undefined>(undefined);
@@ -218,6 +230,7 @@ export function TtyPanel({
             setCanKill(true);
             break;
           case "step-start":
+            onStepStateRef.current?.(event.nodeId, event.block, { status: "running" });
             setActiveBlock(event.block);
             setStatus("running");
             term.write(`\x1b[2m── ${event.block} ──\x1b[0m\r\n`);
@@ -239,6 +252,7 @@ export function TtyPanel({
             term.write(event.text.replace(/\n/g, "\r\n") + "\r\n");
             break;
           case "step-end":
+            onStepStateRef.current?.(event.nodeId, event.block, { status: "done", exitCode: event.exitCode });
             if (ttyActiveRef.current) {
               ttyActiveRef.current = false;
               setCanKill(false);
@@ -249,6 +263,7 @@ export function TtyPanel({
             }
             break;
           case "killed":
+            onStepStateRef.current?.(event.nodeId, event.block, { status: "killed" });
             ttyActiveRef.current = false;
             setCanKill(false);
             setStatus("killed");

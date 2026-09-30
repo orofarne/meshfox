@@ -1538,7 +1538,7 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
             ‹/›
           </button>
         )}
-        {expanded && !seg.tty && !seg.service && (
+        {expanded && !seg.service && (
           <button
             type="button"
             className={
@@ -1550,7 +1550,7 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
             title={
               historyOpen
                 ? "Hide this block's run history"
-                : "Show this block's run history — earlier runs' exit code, time and output, kept by the server across restarts"
+                : "Show this block's run history — earlier runs' exit code, time and (except for a tty block) output, kept by the server across restarts"
             }
             aria-label="Run history"
           >
@@ -1719,13 +1719,18 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
            * "Runnable code fences", the `fold` attribute this decoupling
            * exists for); collapsing the *whole* block still hides both
            * together, same as it always has. */}
-          {!seg.tty && <RunOutput seg={seg} live={live} assetBase={data.assetBase} />}
+          {seg.tty ? (
+            <TtyRunStatus live={live} />
+          ) : (
+            <RunOutput seg={seg} live={live} assetBase={data.assetBase} />
+          )}
         </>
       )}
-      {historyOpen && !seg.tty && !seg.service && (
+      {historyOpen && !seg.service && (
         <RunHistoryDialog
           nodeId={nodeId}
           blockName={seg.name}
+          tty={seg.tty}
           liveStatus={live?.status}
           onClose={() => setHistoryOpen(false)}
         />
@@ -2084,6 +2089,35 @@ function LiveRunOutput({
           <code><AnsiText text={live.text} /></code>
         </pre>
       )}
+    </div>
+  );
+}
+
+/** A `tty` block's last run, as a one-line status under it — a terminal
+ * session's output isn't stored, so there is nothing else to show, but its
+ * outcome and time are (and a successful run is otherwise invisible: the node's
+ * failed badge only ever appears for a failure). Same look as a plain block's
+ * output header. */
+function TtyRunStatus({ live }: { live?: LiveBlockState }) {
+  if (!live || (live.status !== "running" && live.status !== "done" && live.status !== "killed")) return null;
+  const duration = live.durationMs !== undefined ? ` · ${formatDurationMs(live.durationMs)}` : "";
+  const exitState =
+    live.status === "running" ? "running" : live.status === "killed" ? "killed" : live.exitCode === 0 ? "ok" : "fail";
+  return (
+    <div className="mesh-code-output mesh-tty-status" data-exit={exitState}>
+      <div className="mesh-code-output-head">
+        {live.status === "running" ? (
+          <>running… {live.startedAt !== undefined && <LiveElapsed startedAt={live.startedAt} />}</>
+        ) : live.status === "killed" ? (
+          <>terminal · killed{duration}</>
+        ) : (
+          <>
+            terminal · exit {live.exitCode}
+            {duration}
+          </>
+        )}
+        <span className="mesh-code-output-transient"> · output isn't stored</span>
+      </div>
     </div>
   );
 }

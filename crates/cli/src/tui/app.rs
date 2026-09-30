@@ -222,6 +222,8 @@ pub struct HistoryViewState {
 pub struct RunHistoryViewState {
     pub node_id: String,
     pub block: String,
+    /// A `tty` block: its runs keep an outcome and timing but no output.
+    pub tty: bool,
     /// Newest first — the order `GET /api/run/history` returns them in.
     pub entries: Vec<crate::worker_client::RunHistoryEntryDto>,
     pub selected: usize,
@@ -611,6 +613,16 @@ pub struct App {
     /// when the view is closed; only meaningful while `tty_sessions_view`
     /// is `Some`.
     pub live_tty_sessions: Vec<crate::worker_client::ActiveRunDto>,
+    /// Last-fetched `GET /api/runs` in full: for each plain or `tty` block,
+    /// the latest run that still describes the document (running, or
+    /// finished with its exit code) — the source of the tree's failed
+    /// badge, so it reflects each block's *latest* run rather than any
+    /// failure this session happened to see. `None` until the first
+    /// successful fetch (or with no worker, where nothing can run anyway).
+    pub block_runs: Option<Vec<crate::worker_client::ActiveRunDto>>,
+    /// Set when a run just ended, so `mod.rs` refetches `block_runs` right
+    /// away instead of waiting for the periodic tick.
+    pub refresh_runs_soon: bool,
     pub pending_child_canvas: Option<PendingChildCanvas>,
     pub block_picker: Option<BlockPickerState>,
     pub var_form: Option<VarFormState>,
@@ -1046,6 +1058,8 @@ impl App {
             history_view: None,
             run_history_view: None,
             live_tty_sessions: Vec::new(),
+            block_runs: None,
+            refresh_runs_soon: true,
             pending_child_canvas: None,
             block_picker: None,
             var_form: None,
@@ -3267,6 +3281,7 @@ impl App {
     /// right way (see `TtyConnectError::Conflict`'s own doc comment).
     /// `force`, when given, names the address a prior conflict on this same
     /// chain reported — mirrors `begin_http_run`'s own `force` parameter.
+    #[allow(clippy::too_many_arguments)]
     async fn begin_http_tty_run(
         &mut self,
         node_id: String,
@@ -3334,6 +3349,7 @@ impl App {
     /// rendering code (`ui.rs`/`markdown.rs`'s live-output splice) already
     /// reads regardless of which mode populated it — see
     /// `App::on_run_event` for the folding itself.
+    #[allow(clippy::too_many_arguments)]
     async fn begin_http_run(
         &mut self,
         node_id: String,
@@ -3437,6 +3453,12 @@ impl App {
     pub async fn on_run_event(&mut self, event: Option<crate::worker_client::RunEvent>) {
         use crate::worker_client::RunEvent;
         self.console_last_activity = Some(std::time::Instant::now());
+        if matches!(
+            event,
+            Some(RunEvent::Done { .. } | RunEvent::Killed { .. } | RunEvent::Error { .. })
+        ) {
+            self.refresh_runs_soon = true;
+        }
         let Some(run) = &mut self.run else { return };
         let Some(event) = event else {
             // The channel closed without a terminal event (the worker died
@@ -3937,6 +3959,7 @@ impl App {
     /// place. Only draining `pending_autoruns` (same "one foreground run
     /// slot" reasoning a chain-exhausted run has) carries over.
     pub async fn resume_after_http_tty(&mut self, exit_code: i32) {
+        self.refresh_block_runs().await;
         self.status = if exit_code == 0 {
             "run finished".into()
         } else {
@@ -4127,6 +4150,104 @@ impl App {
             Some((running, crashed))
         };
         self.service_list = list;
+    }
+
+    /// Refetches `block_runs` (`GET /api/runs`). A failed request keeps the
+    /// last list, like `refresh_services` does.
+    pub async fn refresh_block_runs(&mut self) {
+        self.refresh_runs_soon = false;
+        let Some(port) = self.worker_port else { return };
+        if let Ok(runs) = crate::worker_client::list_active_runs(port).await {
+            self.block_runs = Some(runs);
+            self.sync_tty_results();
+        }
+    }
+
+    /// Shows each `tty` block's latest finished run under it in the Document
+    /// pane — the same `output: <block> · live · done|failed · <time>` frame a
+    /// plain block gets, just with no output (a terminal session's isn't
+    /// stored). Plain blocks get theirs by replaying their stored run
+    /// (`mod.rs`'s `reconcile_runs` / `on_external_run_event`); a `tty` block
+    /// has nothing to replay, so its outcome comes straight from
+    /// `block_runs`. An entry whose run is gone from the list (the block was
+    /// edited, or the session reset) is dropped again. Only touches `tty`
+    /// blocks' entries.
+    fn sync_tty_results(&mut self) {
+        let Some(runs) = &self.block_runs else { return };
+        let finished: HashMap<BlockAddr, (i32, u64)> = runs
+            .iter()
+            .filter(|r| r.kind == "tty" && r.status != "running")
+            .map(|r| {
+                let code = if r.status == "killed" {
+                    -1
+                } else {
+                    r.exit_code.unwrap_or(-1)
+                };
+                (BlockAddr::new(&r.node_id, &r.block), (code, r.uptime_ms))
+            })
+            .collect();
+        let mut changed_nodes: Vec<String> = Vec::new();
+        for (addr, (code, duration_ms)) in &finished {
+            let same = self.step_output.get(addr).is_some_and(|so| {
+                !so.running && so.exit_code == *code && so.duration_ms == *duration_ms
+            });
+            if same {
+                continue;
+            }
+            self.step_output.insert(
+                addr.clone(),
+                StepOutput {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    output_markdown: false,
+                    exit_code: *code,
+                    duration_ms: *duration_ms,
+                    running: false,
+                },
+            );
+            changed_nodes.push(addr.node_id.clone());
+        }
+        let gone: Vec<BlockAddr> = self
+            .step_output
+            .keys()
+            .filter(|addr| !finished.contains_key(*addr) && self.is_tty_block(addr))
+            .cloned()
+            .collect();
+        for addr in gone {
+            self.step_output.remove(&addr);
+            changed_nodes.push(addr.node_id);
+        }
+        if self
+            .rows
+            .get(self.selected)
+            .is_some_and(|row| changed_nodes.contains(&row.node_id))
+        {
+            self.render_current_document();
+        }
+    }
+
+    fn is_tty_block(&self, addr: &BlockAddr) -> bool {
+        self.display_canvas
+            .node(&addr.node_id)
+            .map(|n| meshfox_core::scan_runnable_blocks(&addr.node_id, &n.text))
+            .unwrap_or_default()
+            .into_iter()
+            .any(|b| b.tty && b.name.as_deref() == Some(addr.block_name.as_str()))
+    }
+
+    /// Nodes whose blocks' latest current run failed or was killed, per the
+    /// worker's own record (`block_runs`) — so a block that failed and later
+    /// succeeded, or whose run no longer describes the document after an
+    /// edit or a session reset, isn't flagged. Empty until the first fetch;
+    /// with no worker there is nothing to show either (the TUI can't start
+    /// a run without one), and if the worker goes away the last list stays.
+    pub fn failed_node_ids(&self) -> std::collections::HashSet<&str> {
+        self.block_runs
+            .iter()
+            .flatten()
+            .filter(|r| r.status == "killed" || (r.status == "exited" && r.exit_code != Some(0)))
+            .map(|r| r.node_id.as_str())
+            .collect()
     }
 
     /// Refreshes `service_log` for one service — the worker-routed
@@ -4519,9 +4640,10 @@ impl App {
     /// `L` — opens the run history of the selected node's block, with the
     /// same "which block?" logic `r`/`R` use: a node with one block that has a
     /// history goes straight to it, one with several opens the picker first.
-    /// Only plain blocks have a history — a `tty`, `service`, `button` or
-    /// `form` block never leaves a run record with output behind, so those
-    /// aren't offered (and a node with none says so).
+    /// Plain and `tty` blocks have a history (a `tty` run keeps its outcome
+    /// and timing, not its output); a `service`, `button` or `form` block
+    /// never leaves a run record behind, so those aren't offered (and a node
+    /// with none says so).
     async fn open_run_history(&mut self) {
         if self.worker_port.is_none() {
             self.status = "run history needs a worker — none reachable".into();
@@ -4542,8 +4664,7 @@ impl App {
         let blocks: Vec<_> = scan_runnable_blocks(&node_id, &node.text)
             .into_iter()
             .filter(|b| {
-                !b.tty
-                    && !b.service
+                !b.service
                     && !meshfox_core::is_button(&b.lang)
                     && !meshfox_core::is_form(&b.lang)
             })
@@ -4601,9 +4722,15 @@ impl App {
                 self.status = format!("no earlier runs of {block}")
             }
             Ok(entries) => {
+                let tty = self.display_canvas.node(&node_id).is_some_and(|n| {
+                    scan_runnable_blocks(&node_id, &n.text)
+                        .iter()
+                        .any(|b| b.tty && b.name.as_deref() == Some(block.as_str()))
+                });
                 self.run_history_view = Some(RunHistoryViewState {
                     node_id,
                     block,
+                    tty,
                     entries,
                     ..Default::default()
                 });
@@ -5457,6 +5584,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_finished_tty_run_is_shown_under_its_block_and_dropped_when_it_goes_stale() {
+        let mut app = app_with_blocks(
+            "root",
+            concat!(
+                "```bash name=\"term\" tty\nsh\n```\n\n",
+                "```bash name=\"plain\"\necho hi\n```\n",
+            ),
+        )
+        .await;
+        let run = |block: &str, kind: &str, status: &str, code: Option<i32>| {
+            crate::worker_client::ActiveRunDto {
+                node_id: "root".into(),
+                block: block.into(),
+                kind: kind.into(),
+                status: status.into(),
+                exit_code: code,
+                uptime_ms: 2800,
+            }
+        };
+        let addr = BlockAddr::new("root", "term");
+
+        app.block_runs = Some(vec![run("term", "tty", "exited", Some(0))]);
+        app.sync_tty_results();
+        let entry = &app.step_output[&addr];
+        assert_eq!((entry.exit_code, entry.duration_ms, entry.running), (0, 2800, false));
+        assert!(entry.stdout.is_empty() && entry.stderr.is_empty());
+        // ...and the Document pane actually draws it under the block.
+        app.selected = app.rows.iter().position(|r| r.node_id == "root").unwrap();
+        app.render_current_document();
+        let drawn = |app: &App| -> String {
+            app.doc_segments
+                .iter()
+                .filter_map(|seg| match seg {
+                    Segment::Text(lines) => Some(lines),
+                    _ => None,
+                })
+                .flatten()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let text = drawn(&app);
+        assert!(text.contains("output: term · live · done · 2.8s"), "{text}");
+
+        // A newer failing run replaces it.
+        app.block_runs = Some(vec![run("term", "tty", "exited", Some(3))]);
+        app.sync_tty_results();
+        assert_eq!(app.step_output[&addr].exit_code, 3);
+        assert!(drawn(&app).contains("output: term · live · failed"), "{}", drawn(&app));
+
+        // A plain block's entry is never touched, and a tty one whose run is
+        // no longer current (edited / session reset) disappears.
+        app.step_output.insert(
+            BlockAddr::new("root", "plain"),
+            StepOutput {
+                stdout: "hi\n".into(),
+                stderr: String::new(),
+                output_markdown: false,
+                exit_code: 0,
+                duration_ms: 1,
+                running: false,
+            },
+        );
+        app.block_runs = Some(Vec::new());
+        app.sync_tty_results();
+        assert!(!app.step_output.contains_key(&addr));
+        assert!(app.step_output.contains_key(&BlockAddr::new("root", "plain")));
+    }
+
+    #[tokio::test]
+    async fn the_failed_badge_follows_the_workers_latest_current_run_per_block() {
+        let dir = std::env::temp_dir().join(format!("meshfox-tui-failed-badge-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.md");
+        std::fs::write(
+            &path,
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
+        )
+        .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(path, tx, None, None).await.unwrap();
+        let run = |node: &str, kind: &str, status: &str, exit_code: Option<i32>| {
+            crate::worker_client::ActiveRunDto {
+                node_id: node.into(),
+                block: "b".into(),
+                kind: kind.into(),
+                status: status.into(),
+                exit_code,
+                uptime_ms: 1,
+            }
+        };
+
+        // Nothing is flagged before the first fetch, whatever this session saw.
+        app.step_output.insert(
+            BlockAddr::new("session-only", "b"),
+            StepOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                output_markdown: false,
+                exit_code: 1,
+                duration_ms: 0,
+                running: false,
+            },
+        );
+        assert!(app.failed_node_ids().is_empty());
+
+        // After it, only the worker's latest current runs count: an old
+        // failure that isn't listed any more (fixed, edited or reset) is gone,
+        // and this session's own `step_output` no longer matters.
+        app.block_runs = Some(vec![
+            run("plain-failed", "plain", "exited", Some(2)),
+            run("plain-ok", "plain", "exited", Some(0)),
+            run("tty-failed", "tty", "exited", Some(1)),
+            run("tty-killed", "tty", "killed", None),
+            run("running", "plain", "running", None),
+        ]);
+        let failed = app.failed_node_ids();
+        assert_eq!(
+            failed,
+            ["plain-failed", "tty-failed", "tty-killed"].into_iter().collect()
+        );
+    }
+
+    #[tokio::test]
     async fn history_view_navigates_clamps_and_closes_without_a_worker() {
         let dir =
             std::env::temp_dir().join(format!("meshfox-tui-history-view-test-{}", uuid_like()));
@@ -5620,8 +5871,8 @@ mod tests {
         let names: Vec<_> = bp.blocks.iter().map(|b| b.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["a", "b"],
-            "tty and service blocks keep no history"
+            vec!["a", "b", "term"],
+            "a tty block keeps a history (outcome and timing); a service block doesn't"
         );
         assert_eq!(bp.selected, 1, "the default block is preselected");
         assert!(app.run_history_view.is_none());
@@ -5632,7 +5883,8 @@ mod tests {
         // (A single history-keeping block skips the picker and fetches
         // straight away — that path needs a worker, so it's covered by the
         // pty suite's `run_history.rs`.)
-        let mut app = app_with_blocks("tty-only", "```bash name=\"term\" tty\nsh\n```\n").await;
+        let mut app =
+            app_with_blocks("service-only", "```bash name=\"srv\" service\nsleep 1\n```\n").await;
         app.worker_port = Some(1);
         app.on_key(key(KeyCode::Char('L'))).await;
         assert!(app.block_picker.is_none() && app.run_history_view.is_none());

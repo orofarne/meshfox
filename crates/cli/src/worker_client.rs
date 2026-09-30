@@ -612,6 +612,9 @@ pub enum WatchEvent {
     /// a run I didn't start" flow the web UI's `watchAutorunBlock` already
     /// has.
     RunStarted { node_id: String, block: String },
+    /// A run (plain or `tty`) started or ended somewhere, or the session was
+    /// reset: refetch `GET /api/runs`.
+    RunsChanged,
 }
 
 /// `GET /api/watch` — the WS client for canvas-change notifications, the
@@ -656,6 +659,7 @@ pub fn watch(port: u16) -> tokio::sync::mpsc::UnboundedReceiver<WatchEvent> {
                 node_id: String,
                 block: String,
             },
+            RunsChanged,
             NodeUpserted,
             NodeRemoved,
             NodesReordered,
@@ -686,6 +690,7 @@ pub fn watch(port: u16) -> tokio::sync::mpsc::UnboundedReceiver<WatchEvent> {
                     WatchMsg::RunStarted { node_id, block } => {
                         WatchEvent::RunStarted { node_id, block }
                     }
+                    WatchMsg::RunsChanged => WatchEvent::RunsChanged,
                 };
                 if tx.send(event).is_err() {
                     return;

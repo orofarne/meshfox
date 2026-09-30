@@ -810,10 +810,11 @@ export interface ActiveRunDto {
 
 /**
  * Every plain-block run in flight, the latest *current* finished run of
- * each plain block (from the server's session database, so it is still there
+ * each plain or `tty` block (from the server's session database, so it is still there
  * after the core restarted — a run counts as current until the block, a
  * dependency, a variable it used changes, or the session is reset; for a
- * finished one `uptimeMs` is its duration), and every `tty` session this
+ * finished one `uptimeMs` is its duration; a finished `tty` one has no
+ * output to attach to, only its outcome), and every `tty` session this
  * server process currently knows about, whether
  * or not any tab is currently watching it — what a freshly-loaded/
  * reloaded tab reconciles its own live state against on mount (see
@@ -1120,6 +1121,11 @@ export function watchChanges(
    * — a caller that skips this just never updates its own undo/redo UI
    * from a change made elsewhere. */
   onUndoStateChanged?: (canUndo: boolean, canRedo: boolean) => void,
+  /** `"runs-changed"` — a plain or `tty` run started or ended somewhere
+   * (this tab, another tab, the TUI, a terminal session), or the session was
+   * reset: `GET /api/runs` may differ from what was last fetched, so refetch
+   * it. Optional — a caller that skips this just relies on its own polling. */
+  onRunsChanged?: () => void,
 ): () => void {
   let leaving = false;
   let stopped = false;
@@ -1161,6 +1167,8 @@ export function watchChanges(
         if (event.seq !== undefined) lastSeq = event.seq;
         if (event.type === "changed" || (event.type === "connected" && event.resync) || event.type === "resync") {
           onChanged();
+        } else if (event.type === "runs-changed") {
+          onRunsChanged?.();
         } else if (event.type === "run-started" && event.nodeId !== undefined && event.block !== undefined) {
           onRunStarted?.(event.nodeId, event.block);
         } else if (event.type === "node-upserted" && event.node !== undefined) {
