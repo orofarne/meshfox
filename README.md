@@ -185,8 +185,8 @@ matching row in that file's license tables — the same mechanism
 
 See "Usage" below → "Static export" for the real `meshfox static`
 invocation against [examples/hello.canvas.md](./examples/hello.canvas.md)
-and [site-template/](./site-template/). This README's own repo builds and
-publishes itself that way (`scripts/build-site.sh`, see `.gitignore`'s
+and [site-template/](./site-template/) as a standalone example. This README's own repo builds and
+publishes itself with [site-template-archive/](./site-template-archive/) (`scripts/build-site.sh`, see `.gitignore`'s
 `/site-dist` entry) — the live result is
 [meshfox.orofarne.net](https://meshfox.orofarne.net/).
 
@@ -547,7 +547,7 @@ No *structural* editing beyond that in this first cut (`meshfox node ...`, or th
 
 Both the document pane's own highlighting and `e`'s full-screen editor share one `syntect` grammar set (`crate::syntax_registry`, not two independently-loaded copies) — [`syntect`](https://github.com/trishume/syntect)'s own bundled defaults, extended with any `.tmLanguage.json` (via [`syntect-tmlanguage`](https://crates.io/crates/syntect-tmlanguage)) or `.sublime-syntax` grammar file dropped into `.meshfox/syntax/` next to the canvas (the same `.meshfox/` directory `meshfox:var` answers are cached in, see "Variables" above) or `~/.meshfox/syntax/` (global, every project — local wins on a name clash). A grammar that fails to parse is skipped with a warning on stderr rather than stopping the TUI from starting. The same directory (and a `.tmLanguage.json` dropped into it) also works for the browser UI's own syntax highlighting — see "Browser UI (`view`)" above.
 
-Which of `syntect`'s own bundled themes both panes use (`InspiredGitHub`, `Solarized (dark)`/`(light)`, `base16-eighties.dark`, `base16-mocha.dark`, `base16-ocean.dark` — the default — or `base16-ocean.light`) is also a `.meshfox/config.toml` setting, same file/precedence as `interpreters.agent.provider` above: `[tui] editor_theme = "base16-mocha.dark"`, local (next to the canvas) or global (`~/.meshfox/config.toml`). A name that isn't one of those bundled themes is ignored and the default is used instead, rather than erroring. [Live theme preview](https://meshfox.orofarne.net/tui-editor-themes.html) renders every bundled theme's actual colors side by side to help pick one — the page itself lives in `site-template/` (see "Publishing a canvas as a static site" above) so it's built and published alongside this README's own self-hosted site, not committed as a standalone repo file GitHub would only show as raw source.
+Which of `syntect`'s own bundled themes both panes use (`InspiredGitHub`, `Solarized (dark)`/`(light)`, `base16-eighties.dark`, `base16-mocha.dark`, `base16-ocean.dark` — the default — or `base16-ocean.light`) is also a `.meshfox/config.toml` setting, same file/precedence as `interpreters.agent.provider` above: `[tui] editor_theme = "base16-mocha.dark"`, local (next to the canvas) or global (`~/.meshfox/config.toml`). A name that isn't one of those bundled themes is ignored and the default is used instead, rather than erroring. [Live theme preview](https://meshfox.orofarne.net/tui-editor-themes.html) renders every bundled theme's actual colors side by side to help pick one — the page itself is included in `site-template-archive/` (see "Publishing a canvas as a static site" above) so it's built and published alongside this README's own self-hosted site, not committed as a standalone repo file GitHub would only show as raw source.
 
 ```bash name="tui-help" cache
 meshfox tui -h
@@ -659,9 +659,11 @@ On the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName
 ### Static export (experimental)
 <!-- meshfox:node id="usage-static" -->
 
-Renders a canvas's node graph — boxes, tags, cached output, and every structural/`meshfox:edge` connection — as a plain static HTML/CSS/SVG site (no JS, no live server), through a user-supplied [Tera](https://keats.github.io/tera/) template: every `*.tera` file in `--template` is rendered with the canvas's data (context key `site`) and written to `--out` at the same relative path minus `.tera`; everything else in the template directory is copied verbatim (CSS, fonts, images, ...). [`site-template/`](./site-template) in this repo is a real, working template (used for the example below) that also happens to be a decent way to publish a canvas's README as a project page.
+Renders a canvas's node graph — boxes, tags, cached output, and every structural/`meshfox:edge` connection — as a static HTML/CSS/SVG site (no live server), through a user-supplied [Tera](https://keats.github.io/tera/) template: every `*.tera` file in `--template` is rendered with the canvas's data (context key `site`) and written to `--out` at the same relative path minus `.tera`; everything else in the template directory is copied verbatim (CSS, fonts, images, ...). [`site-template/`](./site-template) is the project-page example used below. [`site-template-archive/`](./site-template-archive) is the investigation-board template used by this repo's published site. Both templates use a small browser script to place SVG arrows after layout, including authored waypoints and labels.
 
-A template's own settings live in an optional `template.toml` right in its own directory (see [`site-template/template.toml`](./site-template/template.toml)) rather than as `static` command-line flags — they're a property of *that template*, not something to repeat on every invocation: `base_url`, this export's own canonical URL (`--sitemap`'s own `<loc>` prefix, below); `links_base_url`, prefixed onto a relative link/target the command doesn't already copy into `--out` (distinct from `base_url` — this repo's own [`site-template/template.toml`](./site-template/template.toml) points `base_url` at `meshfox.orofarne.net`, the site itself, and `links_base_url` at GitHub, where its canvases' own plain-Markdown source actually lives); and `icons`, a list of `<link rel="..." href="...">` tags (exposed to every template as the `icons` context key) for the page's own favicon/apple-touch-icon set. `template.toml` itself is read, never rendered or copied into `--out`. A template with none gets an empty config — no `base_url`/`links_base_url` prefixing, no icon tags — same as before this file existed.
+To try the archive with this README: `meshfox static README.md --template site-template-archive -o /tmp/meshfox-archive --force --copy-files --recursive`.
+
+A template's own settings live in an optional `template.toml` right in its own directory (see [`site-template/template.toml`](./site-template/template.toml)) rather than as `static` command-line flags — they're a property of *that template*, not something to repeat on every invocation: `base_url`, this export's own canonical URL (`--sitemap`'s own `<loc>` prefix, below); `links_base_url`, prefixed onto a relative link/target the command doesn't already copy into `--out` (distinct from `base_url` — this repo's own [`site-template-archive/template.toml`](./site-template-archive/template.toml) points `base_url` at `meshfox.orofarne.net`, the site itself, and `links_base_url` at GitHub, where its canvases' own plain-Markdown source actually lives); and `icons`, a list of `<link rel="..." href="...">` tags (exposed to every template as the `icons` context key) for the page's own favicon/apple-touch-icon set. `template.toml` itself is read, never rendered or copied into `--out`. A template with none gets an empty config — no `base_url`/`links_base_url` prefixing, no icon tags — same as before this file existed.
 
 `--copy-files` copies a `file`-node's own target alongside the site instead of leaving it an unresolved link; `--recursive` (needs `--copy-files`) follows a `.canvas.md` target transitively, rendering it as its own page of the same site rather than refusing it; `--sitemap` (needs `template.toml`'s own `base_url`) writes a `sitemap.xml` listing every rendered page, and `--sitemap-git-dates` (needs `--sitemap`) sources each page's `<lastmod>` from its own canvas file's last commit date in git rather than leaving it unset. See each flag's own `-h` text below for the full story — this repo's own [`scripts/build-site.sh`](./scripts/build-site.sh) (the Cloudflare Pages build command for this same README, published at `meshfox.orofarne.net`) uses all four together.
 
@@ -812,33 +814,33 @@ Two independent syntax-highlighting engines, one shared grammar format (mostly):
 <!-- meshfox:node id="component-diagram" type="group" -->
 
 #### Browser UI
-<!-- meshfox:node id="browser-ui" x=0 y=0 w=240 h=112 -->
+<!-- meshfox:node id="browser-ui" x=0 y=0 w=380 h=210 -->
 
 `web/`: React + React Flow SPA. Talks to the worker over `GET /api/canvas`, `PATCH /api/nodes/:id`, block-run/`tty` WebSockets. Built once (`npm run build`) into `web/dist`.
 
 #### TUI
-<!-- meshfox:node id="tui" x=280 y=0 w=240 h=112 -->
+<!-- meshfox:node id="tui" x=430 y=0 w=380 h=230 -->
 
 `crates/cli/src/tui/`: `meshfox tui`, a real terminal frontend (ratatui). Never touches the canvas file itself — every read/mutation goes through `worker_client` to whichever worker owns the file.
 
 #### MCP root
-<!-- meshfox:node id="mcp-root" x=560 y=0 w=240 h=112 -->
+<!-- meshfox:node id="mcp-root" x=860 y=0 w=380 h=210 -->
 
 `meshfox mcp` with no leaf env var — the one server a host (Claude Code, ...) launches. `canvas_open` spawns/talks to one leaf child process per opened canvas over its own stdio.
 
 #### CLI one-shot ops
-<!-- meshfox:node id="cli-one-shot-ops" x=840 y=0 w=260 h=112 -->
+<!-- meshfox:node id="cli-one-shot-ops" x=1290 y=0 w=380 h=210 -->
 
 `meshfox node <op>` / `run` / `validate` / `check`: one-shot invocations from a shell. Node mutations always route through a worker too (no more direct-file-write fallback).
 
 #### MCP leaf
-<!-- meshfox:node id="mcp-leaf" x=560 y=152 w=240 h=92 -->
+<!-- meshfox:node id="mcp-leaf" x=860 y=285 w=380 h=230 -->
 <!-- meshfox:edge from="mcp-root" -->
 
 `MESHFOX_MCP_LEAF=1`, one process per open canvas. Wraps `worker_client`/`coordinator` — every tool call (`node_*`, `debug_*`) is a thin client of the file's own worker.
 
 #### coordinator::resolve
-<!-- meshfox:node id="coordinator-resolve" x=280 y=280 w=280 h=112 -->
+<!-- meshfox:node id="coordinator-resolve" x=430 y=585 w=380 h=280 -->
 <!-- meshfox:edge from="tui" -->
 <!-- meshfox:edge from="mcp-leaf" -->
 <!-- meshfox:edge from="cli-one-shot-ops" -->
@@ -846,13 +848,13 @@ Two independent syntax-highlighting engines, one shared grammar format (mostly):
 `crates/cli/src/coordinator.rs`: the one function every frontend calls to decide "who is *the* worker for this file" — tried in order, a configured `server_socket` daemon, then the per-file `worker_lock`. `get_or_spawn` embeds a new worker (in-process, `tokio::spawn`) when this call wins the lock.
 
 #### worker_lock
-<!-- meshfox:node id="worker-lock" x=620 y=280 w=240 h=112 -->
+<!-- meshfox:node id="worker-lock" x=900 y=585 w=380 h=230 -->
 <!-- meshfox:edge from="coordinator-resolve" -->
 
 `meshfox-core::worker_lock`: one `flock`'d lock file per canvas path, holding the winning worker's bound port. A second `coordinator::resolve` for the same file reads that port instead of racing to also serve it.
 
 #### worker (axum HTTP server)
-<!-- meshfox:node id="worker-axum-http-server" x=260 y=452 w=340 h=132 -->
+<!-- meshfox:node id="worker-axum-http-server" x=430 y=950 w=380 h=255 -->
 <!-- meshfox:edge from="coordinator-resolve" -->
 <!-- meshfox:edge from="browser-ui" -->
 <!-- meshfox:edge from="tui" -->
@@ -862,25 +864,25 @@ Two independent syntax-highlighting engines, one shared grammar format (mostly):
 `meshfox_server::serve_as_worker`: the one process (embedded in `cli`, `tui`, or `view`) that actually owns one canvas file — every read/mutation for that file funnels through here, serialized, closing the read-modify-write race a direct file edit would have.
 
 #### web/dist bundle
-<!-- meshfox:node id="web-dist-bundle" x=680 y=452 w=240 h=112 -->
+<!-- meshfox:node id="web-dist-bundle" x=1290 y=950 w=380 h=210 -->
 
 Built React app, embedded into the `meshfox` binary at compile time via `rust-embed` (`meshfox_server::WebAssets`). Not shipped or loaded separately at runtime.
 
 #### core (meshfox-core)
-<!-- meshfox:node id="core-meshfox-core" x=180 y=620 w=280 h=120 -->
+<!-- meshfox:node id="core-meshfox-core" x=215 y=1290 w=380 h=210 -->
 <!-- meshfox:edge from="worker-axum-http-server" -->
 <!-- meshfox:edge from="cli-one-shot-ops" -->
 
 Canvas model: `mdcanvas` parse/surgical-patch, tree derivation, fence scanning, output-block rewriting, auto-layout. The shared brain — no I/O of its own, no `[[bin]]`.
 
 #### stream_exec / debug_session
-<!-- meshfox:node id="stream-exec-debug-session" x=540 y=620 w=280 h=120 -->
+<!-- meshfox:node id="stream-exec-debug-session" x=860 y=1290 w=380 h=210 -->
 <!-- meshfox:edge from="worker-axum-http-server" -->
 
 `meshfox_server::stream_exec`/`debug_session`/`pty_exec`: spawns the real bash/interpreter subprocess for a runnable block, `tty` block, or MCP `debug_*` shell.
 
 #### canvas file (*.canvas.md)
-<!-- meshfox:node id="canvas-file-canvas-md" x=260 y=800 w=280 h=92 -->
+<!-- meshfox:node id="canvas-file-canvas-md" x=430 y=1580 w=380 h=210 -->
 <!-- meshfox:edge from="worker-axum-http-server" -->
 
 The actual file on disk — a Markdown outline with `meshfox:*` HTML-comment bookkeeping. Read/written only by the worker that holds its `worker_lock`.

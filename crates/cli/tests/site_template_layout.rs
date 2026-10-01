@@ -59,6 +59,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+fn meshfox() -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_meshfox"));
+    // Isolates this process from the real machine's own
+    // `~/.meshfox/config.toml` — a developer with `server_socket` set for
+    // daily use would otherwise have this command routed through *their*
+    // external coordinator (see `validate_cmd.rs`'s `meshfox()` for the
+    // full rationale). The directory doesn't need to exist.
+    cmd.env("HOME", unique_dir("home"));
+    cmd
+}
+
 fn unique_dir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -106,7 +117,7 @@ fn build_and_inspect(
     write_file(&canvas_path, canvas_md);
     let out_dir = unique_dir(&format!("out-{tag}"));
 
-    let status = Command::new(env!("CARGO_BIN_EXE_meshfox"))
+    let status = meshfox()
         .arg("static")
         .arg(&canvas_path)
         .arg("--template")
@@ -775,7 +786,7 @@ fn edge_overlay_stays_glued_to_nodes_when_the_canvas_scrolls() {
     write_file(&canvas_path, EXTRA_EDGE_FIXTURE_CANVAS);
     let out_dir = unique_dir("out-scroll");
 
-    let status = Command::new(env!("CARGO_BIN_EXE_meshfox"))
+    let status = meshfox()
         .arg("static")
         .arg(&canvas_path)
         .arg("--template")

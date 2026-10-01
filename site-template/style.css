@@ -592,3 +592,7 @@ summary.node-title::before {
   font-size: 0.8rem;
   border-top: 1px solid var(--border);
 }
+
+.node-children > .node-row.edge-overridden::before, .node-children > .node-row.edge-overridden::after { display: none; }
+.mesh-edge-label { font: 600 12px "Fira Code", sans-serif; fill: var(--fg); paint-order: stroke; stroke: var(--panel); stroke-width: 5px; stroke-linejoin: round; }
+.mesh-edge-label-overlay { position:absolute; inset:0; overflow:visible; pointer-events:none; z-index:5; }

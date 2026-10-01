@@ -1,0 +1,82 @@
+/* Self-hosted fonts (woff2 from the @fontsource npm packages, latin subset;
+   licenses next to them in fonts/): Special Elite (Apache-2.0) is the
+   typewriter display face for the title, stamp and node titles; IBM Plex
+   Serif (OFL-1.1) is the body text; IBM Plex Mono (OFL-1.1) is code, tags,
+   labels. Special Elite ships a single weight, so every use of it pins
+   font-weight to 400 rather than letting the browser fake a bold. */
+@font-face { font-family:"Special Elite"; font-style:normal; font-weight:400; font-display:swap; src:url(fonts/special-elite-latin-400-normal.woff2) format("woff2"); }
+@font-face { font-family:"IBM Plex Serif"; font-style:normal; font-weight:400; font-display:swap; src:url(fonts/ibm-plex-serif-latin-400-normal.woff2) format("woff2"); }
+@font-face { font-family:"IBM Plex Serif"; font-style:italic; font-weight:400; font-display:swap; src:url(fonts/ibm-plex-serif-latin-400-italic.woff2) format("woff2"); }
+@font-face { font-family:"IBM Plex Serif"; font-style:normal; font-weight:700; font-display:swap; src:url(fonts/ibm-plex-serif-latin-700-normal.woff2) format("woff2"); }
+@font-face { font-family:"IBM Plex Mono"; font-style:normal; font-weight:400; font-display:swap; src:url(fonts/ibm-plex-mono-latin-400-normal.woff2) format("woff2"); }
+@font-face { font-family:"IBM Plex Mono"; font-style:normal; font-weight:700; font-display:swap; src:url(fonts/ibm-plex-mono-latin-700-normal.woff2) format("woff2"); }
+:root {
+  --accent-default:#aa4339; --ink:#2d2926; --paper-light:#fff8e8;
+  --board:#352c27; --pin:#ba503e;
+  --display:"Special Elite","Courier New",monospace;
+  --serif:"IBM Plex Serif",Georgia,serif;
+  --mono:"IBM Plex Mono",ui-monospace,monospace;
+}
+* { box-sizing:border-box; }
+body { margin:0; color:var(--ink); background:#241f1b; font:15px/1.55 var(--serif); }
+a { color:#8e392f; }
+.archive-header { background:#e4d7bb; border-bottom:8px solid #1b1918; padding:.7rem clamp(1rem,4vw,4rem); display:flex; align-items:center; flex-wrap:wrap; gap:.5rem 1.4rem; box-shadow:0 6px 20px #0007; position:relative; z-index:3; }
+.archive-header h1 { font:400 clamp(1.5rem,3vw,2.7rem)/1 var(--display); margin:0; }
+.stamp,.archive-footer { font:700 .69rem/1.5 var(--mono); letter-spacing:.17em; }
+.stamp { font:400 .8rem/1.5 var(--display); }
+.stamp { margin-left:auto; color:#9b3a31; border:2px solid currentColor; padding:.25rem .55rem; transform:rotate(-3deg); }
+.board-wrap { overflow:auto; min-height:70vh; padding:clamp(1rem,3vw,3rem); background-color:var(--board); background-image:radial-gradient(#9d806646 1px,transparent 1px),radial-gradient(#130e0c50 1px,transparent 1px),linear-gradient(135deg,#44372f,#312822); background-size:5px 5px,7px 7px,auto; }
+.tree { position:relative; min-width:100%; width:max-content; padding:1.5rem; }
+/* One column of siblings at every depth. The sibling column is always to
+   the right of its parent, so unfolding grows the subtree down and right. */
+.node-row { display:flex; align-items:flex-start; gap:2.8rem; margin-bottom:1.5rem; }
+.node-children { display:flex; flex-direction:column; gap:1.5rem; margin:0; flex-shrink:0; }
+.node-children > .node-row:last-child { margin-bottom:0; }
+.node-row.authored-item { position:absolute; margin:0; }
+.node { --accent:var(--accent-default); display:block; position:relative; z-index:2; flex-shrink:0; width:clamp(280px,30vw,480px); max-width:100%; padding:1.2rem 1.35rem 1.4rem; background:var(--paper-light); border:1px solid #bbad93; box-shadow:2px 3px 0 #b6a280,7px 12px 18px #0008; transform:rotate(.35deg); overflow:visible; }
+.node-row:nth-child(3n+2) > .node:not(.group-sheet) { transform:rotate(-.7deg); background:#f0e4cb; }
+.node-row:nth-child(4n+3) > .node:not(.group-sheet) { transform:rotate(.8deg); }
+.tree > .node-row > .node { width:500px; background:#ddcfac; transform:rotate(-.4deg); }
+/* Scroll only the root's long prose. Its paper and pin remain unclipped. */
+.tree > .node-row > .node > .node-body { max-height:62vh; overflow:auto; padding-right:.25rem; }
+.node[open] > .node-body { max-height:70vh; overflow:auto; }
+.node::before { content:""; position:absolute; left:calc(50% - 7px); top:-8px; width:14px; height:14px; border-radius:50%; background:radial-gradient(circle at 35% 30%,#f8bd9a,var(--pin) 55%,#642d28 85%); box-shadow:1px 3px 3px #0007; z-index:2; }
+.node::after { content:""; position:absolute; top:4px; left:calc(50% + 2px); width:9px; height:10px; background:#0003; border-radius:50%; filter:blur(3px); }
+.node-row.authored-item > .node { max-width:none; overflow:visible; }
+.node-row.authored-item > .node > .node-body,
+.group-canvas > .node-row.spatial-item > .node > .node-body { overflow:auto; }
+.node-title { display:block; border-bottom:2px solid color-mix(in srgb,var(--accent) 60%,#b7a68c); padding-bottom:.55rem; margin-bottom:.8rem; font:400 1.15rem/1.35 var(--display); overflow-wrap:anywhere; }
+summary.node-title { cursor:pointer; list-style:none; }
+summary.node-title::before { content:"▾ "; color:var(--accent); }
+.node:not([open]) > summary.node-title::before { content:"▸ "; }
+.node-row > .node:not([open]) ~ .node-children { display:none; }
+.node-tags { display:flex; gap:.35rem; flex-wrap:wrap; margin:.5rem 0; }
+.tag { background:#d9c9a9; color:#6e493b; padding:.1rem .45rem; font:700 .67rem var(--mono); text-transform:uppercase; }
+.node-body { overflow-wrap:anywhere; }
+.node-body > :first-child { margin-top:0; }
+.node-body > :last-child { margin-bottom:0; }
+.node-body img { max-width:100%; height:auto; }
+.node-body pre { overflow:auto; padding:.8rem; background:#342e2a; color:#f6e9d4; font:12px/1.5 var(--mono); }
+.node-body :not(pre) > code { background:#dfd1b4; padding:.1em .25em; }
+.node-body table { display:block; overflow:auto; border-collapse:collapse; }
+.node-body th,.node-body td { border:1px solid #bdae94; padding:.3rem .5rem; }
+.node-body blockquote { margin:1rem 0; padding:.2rem .8rem; border-left:3px solid var(--accent); background:#eadfc7; }
+/* Ordinary groups look like folder covers. A group whose direct children
+   all have authored boxes carries a local cork board instead. */
+.node.group-sheet { background:#dfd0b1; border:2px dashed #aa8967; transform:none; z-index:4; }
+.group-sheet .node-title { color:#5e3e31; text-transform:uppercase; letter-spacing:.08em; font-size:.9rem; }
+.node.group-sheet.spatial-group { width:max-content; max-width:none; min-width:420px; padding:.9rem; }
+.group-canvas { position:relative; min-width:360px; min-height:180px; background-color:#3b3029; background-image:radial-gradient(#b4956d3d 1px,transparent 1px); background-size:6px 6px; border:4px solid #80664d; box-shadow:inset 0 3px 12px #0009; }
+.group-canvas > .node-row.spatial-item { position:absolute; margin:0; display:block; }
+.group-canvas > .node-row.spatial-item > .node { transform:none; max-width:none; overflow:visible; }
+/* Straight threads sit behind the paper; labels stay above it. */
+.mesh-edge-overlay,.mesh-edge-label-overlay { position:absolute; inset:0; overflow:visible; pointer-events:none; }
+.mesh-edge-overlay { z-index:1; }
+.mesh-edge-overlay path { opacity:.7; filter:drop-shadow(1px 1px 1px #0009); }
+.mesh-edge-label-overlay { z-index:5; }
+.mesh-edge-label { font:700 12px var(--mono); fill:#352820; paint-order:stroke; stroke:#f5ead2; stroke-width:6px; stroke-linejoin:round; }
+.archive-footer { color:#b7a184; padding:1rem 3rem; }
+@media(max-width:760px) {
+  .node { width:min(75vw,480px); }
+  .tree > .node-row > .node { width:min(78vw,500px); }
+}

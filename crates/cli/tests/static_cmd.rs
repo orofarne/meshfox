@@ -30,7 +30,16 @@ fn write_file(path: &Path, contents: &str) {
 }
 
 fn meshfox() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_meshfox"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_meshfox"));
+    // Isolates this process from the real machine's own
+    // `~/.meshfox/config.toml` — a developer with `server_socket` set for
+    // daily use would otherwise have this command routed through *their*
+    // external coordinator instead of a worker of its own (see
+    // `validate_cmd.rs`'s `meshfox()` for the full rationale). The
+    // directory doesn't need to exist: a missing global config is read as
+    // "none".
+    cmd.env("HOME", unique_dir("home"));
+    cmd
 }
 
 const FIXTURE_CANVAS: &str = concat!(

@@ -35,13 +35,11 @@
 //! template's CSS tell root/depth-1 (stacked below, small nudge) apart from
 //! depth ≥2 (branches right of its own real parent).
 //!
-//! Every structural (`parent`→child) connector is drawn by that same CSS
-//! (a border-based "twig and spine" pair of pseudo-elements — see
-//! `site-template/style.css`), following the DOM nesting directly, so no
-//! data about it needs to leave this module at all. Only `meshfox:edge`
-//! cross-references — which can point anywhere, not just to a DOM sibling —
-//! still need real endpoints from a browser and get drawn by a small JS pass
-//! instead; `SiteData.edges` carries only those (`build_edges`).
+//! `SiteData.edges` carries both structural and extra edges, including
+//! authored route metadata. A template may draw ordinary structural
+//! connectors with CSS (`site-template/`) or draw them all in SVG
+//! (`site-template-archive/`). Browser measurement supplies endpoints after
+//! the layout is known.
 //!
 //! Local-file references (`build`'s `canvas_dir`/`links_base_url` parameters) get
 //! three different treatments, matching how the web UI already resolves
@@ -84,10 +82,8 @@ pub struct SiteData {
     /// `Canvas` guarantees this; see `mdcanvas::parse`'s "single root"
     /// check).
     pub root: NodeView,
-    /// Every `meshfox:edge` cross-reference — see the module doc comment
-    /// and `build_edges`. Structural (`parent`→child) edges aren't included
-    /// here at all: they're drawn by pure CSS straight from `NodeView.
-    /// children`'s own DOM nesting, so there's nothing for this list to add.
+    /// Structural and extra edges with authored labels/routes, available to
+    /// templates that draw their own connectors.
     pub edges: Vec<EdgeView>,
 }
 
@@ -131,6 +127,14 @@ pub struct NodeView {
     /// comment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position: Option<Position>,
+    /// Coordinates exactly as authored on this node, before group-relative
+    /// positions are resolved. A spatial group can use these even when the
+    /// group itself has no absolute anchor on the outer canvas.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authored_position: Option<Position>,
+    /// Direct children all have authored boxes, so a template may display
+    /// them inside this node's own coordinate system.
+    pub spatial_children: bool,
     /// The node's own explicit `color`, or a fallback derived from its
     /// tags against the document's `meshfox:tag-color` defaults — whatever
     /// `node.effective_color` already resolved to (`crate::tag_colors`).
@@ -189,17 +193,22 @@ pub struct Position {
     pub height: f64,
 }
 
-/// A `meshfox:edge` cross-reference — see the module doc comment for why
-/// structural (`parent`→child) edges have no equivalent here.
+/// A structural or extra edge with the route attributes a site template needs.
 #[derive(Debug, Clone, Serialize)]
 pub struct EdgeView {
     pub from: String,
     pub to: String,
+    pub kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
+    pub label_at: Option<u16>,
+    pub source_side: Option<&'static str>,
+    pub target_side: Option<&'static str>,
+    pub via: Vec<crate::canvas::RoutePoint>,
     pub style: &'static str,
+    pub arrow_start: bool,
     pub arrow_end: bool,
 }
 
@@ -505,11 +514,19 @@ fn build_node_view(
         }),
         _ => None,
     };
-    let children = canvas
+    let children: Vec<NodeView> = canvas
         .children(&node.id)
         .into_iter()
         .map(|c| build_node_view(canvas, c, depth + 1, ctx, assets, errors, canvas_links))
         .collect();
+    let authored_position = match (node.x, node.y, node.width, node.height) {
+        (Some(x), Some(y), Some(width), Some(height)) => Some(Position { x, y, width, height }),
+        _ => None,
+    };
+    let spatial_children = !children.is_empty()
+        && canvas.children(&node.id).iter().all(|child| {
+            child.x.is_some() && child.y.is_some() && child.width.is_some() && child.height.is_some()
+        });
 
     NodeView {
         id: node.id.clone(),
@@ -518,6 +535,8 @@ fn build_node_view(
         node_type: node.node_type.as_str(),
         depth,
         position,
+        authored_position,
+        spatial_children,
         color: crate::tag_colors::effective_color(node, ctx.tag_colors).map(str::to_string),
         tags: node.tags.clone(),
         html_body,
@@ -585,13 +604,26 @@ fn resolve_default_fold(
     (folded, foldable)
 }
 
-/// Every `meshfox:edge` cross-reference — see the module doc comment.
-/// Structural (`parent`→child) edges are deliberately excluded: they're
-/// drawn by pure CSS directly from `NodeView.children`'s own DOM nesting,
-/// with no real endpoints for anything here to compute.
+/// Every structural and `meshfox:edge` connection.
 fn build_edges(canvas: &Canvas) -> Vec<EdgeView> {
     let mut edges = Vec::new();
     for node in &canvas.nodes {
+        if let Some(parent) = &node.parent {
+            edges.push(EdgeView {
+                from: parent.clone(),
+                to: node.id.clone(),
+                kind: "tree",
+                label: node.edge_label.clone(),
+                color: None,
+                label_at: node.edge_label_at,
+                source_side: node.edge_source_side.map(|side| side.as_str()),
+                target_side: node.edge_target_side.map(|side| side.as_str()),
+                via: node.edge_via.clone(),
+                style: "solid",
+                arrow_start: false,
+                arrow_end: false,
+            });
+        }
         for extra in &node.extra_parents {
             if extra.from == node.id {
                 continue; // defensively skip a self-loop; shouldn't occur post-`validate`
@@ -599,9 +631,15 @@ fn build_edges(canvas: &Canvas) -> Vec<EdgeView> {
             edges.push(EdgeView {
                 from: extra.from.clone(),
                 to: node.id.clone(),
+                kind: "extra",
                 label: extra.label.clone(),
                 color: extra.color.clone(),
+                label_at: extra.label_at,
+                source_side: extra.source_side.map(|side| side.as_str()),
+                target_side: extra.target_side.map(|side| side.as_str()),
+                via: extra.via.clone(),
                 style: extra.style.map(|s| s.as_str()).unwrap_or("dashed"),
+                arrow_start: matches!(extra.arrow_start, Some(ArrowEnd::Arrow)),
                 arrow_end: extra
                     .arrow_end
                     .map(|a| matches!(a, ArrowEnd::Arrow))
@@ -1706,6 +1744,9 @@ mod tests {
         );
         let site = build_site(&c);
         assert!(site.find("member").unwrap().position.is_none());
+        assert!(site.find("frame").unwrap().spatial_children);
+        let authored = site.find("member").unwrap().authored_position.unwrap();
+        assert_eq!((authored.x, authored.y, authored.width, authored.height), (20.0, 20.0, 100.0, 80.0));
     }
 
     #[test]
@@ -1857,13 +1898,11 @@ mod tests {
     }
 
     #[test]
-    fn structural_parent_child_links_are_not_in_site_edges() {
-        // Structural edges are drawn by pure CSS straight from
-        // `NodeView.children`'s own nesting — see the module doc comment —
-        // so `site.edges` (JS-consumed) must never carry one.
+    fn structural_parent_child_links_are_available_to_templates() {
         let c = canvas("# Root\n\n## Child\n<!-- meshfox:node id=\"child\" -->\n");
         let (site, _) = build(&c, Path::new("/nonexistent-meshfox-test-dir"), None);
-        assert!(site.edges.is_empty());
+        assert_eq!(site.edges.len(), 1);
+        assert_eq!(site.edges[0].kind, "tree");
     }
 
     #[test]
@@ -1874,8 +1913,30 @@ mod tests {
              ## B\n<!-- meshfox:node id=\"b\" -->\n<!-- meshfox:edge from=\"a\" -->\n",
         );
         let site = build_site(&c);
-        let extra = site.edges.first().unwrap();
+        let extra = site.edges.iter().find(|e| e.kind == "extra").unwrap();
         assert_eq!((extra.from.as_str(), extra.to.as_str()), ("a", "b"));
+    }
+
+    #[test]
+    fn authored_edge_routes_and_labels_reach_the_template() {
+        let c = canvas(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+             ## A\n<!-- meshfox:node id=\"a\" edgeLabel=\"parent clue\" edgeLabelAt=\"725\" edgeSourceSide=\"bottom\" edgeVia=\"20,30\" -->\n\n\
+             ## B\n<!-- meshfox:node id=\"b\" -->\n<!-- meshfox:edge from=\"a\" label=\"witness\" labelAt=\"250\" sourceSide=\"right\" targetSide=\"top\" via=\"40,20;60,30\" arrowStart=\"arrow\" -->\n",
+        );
+        let site = build_site(&c);
+        let tree = site.edges.iter().find(|e| e.kind == "tree").unwrap();
+        assert_eq!(tree.label.as_deref(), Some("parent clue"));
+        assert_eq!(tree.label_at, Some(725));
+        assert_eq!(tree.source_side, Some("bottom"));
+        assert_eq!((tree.via[0].x, tree.via[0].y), (20, 30));
+        let extra = site.edges.iter().find(|e| e.kind == "extra").unwrap();
+        assert_eq!(extra.label.as_deref(), Some("witness"));
+        assert_eq!(extra.label_at, Some(250));
+        assert_eq!(extra.source_side, Some("right"));
+        assert_eq!(extra.target_side, Some("top"));
+        assert_eq!(extra.via.len(), 2);
+        assert!(extra.arrow_start);
     }
 
     #[test]

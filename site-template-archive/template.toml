@@ -1,0 +1,30 @@
+base_url = "https://meshfox.orofarne.net"
+links_base_url = "https://github.com/orofarne/meshfox/blob/main/"
+
+[[icons]]
+rel = "icon"
+href = "favicon.ico"
+sizes = "any"
+
+[[icons]]
+rel = "icon"
+type = "image/png"
+sizes = "16x16"
+href = "favicon-16.png"
+
+[[icons]]
+rel = "icon"
+type = "image/png"
+sizes = "32x32"
+href = "favicon-32.png"
+
+[[icons]]
+rel = "icon"
+type = "image/png"
+sizes = "192x192"
+href = "icon-192.png"
+
+[[icons]]
+rel = "apple-touch-icon"
+sizes = "180x180"
+href = "apple-touch-icon.png"

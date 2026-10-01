@@ -1,0 +1,22 @@
+{% import "_macros.html.tera" as macros %}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ site.title }} · Case archive</title>
+{%- for icon in icons %}
+<link rel="{{ icon.rel }}" href="{{ icon.href }}"{% if icon.type %} type="{{ icon.type }}"{% endif %}{% if icon.sizes %} sizes="{{ icon.sizes }}"{% endif %}>
+{%- endfor %}
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="archive-header">
+  <h1>{{ site.title }}</h1>
+  <span class="stamp">VERSION {{ canvas_commit | default(value="UNFILED") }}</span>
+</header>
+<main class="board-wrap"><div class="tree all-svg-edges">{{ macros::node(n=site.root, spatial=false) }}</div></main>
+<footer class="archive-footer">ARCHIVED WITH MESHFOX {{ meshfox_version }}</footer>
+<script id="mesh-edge-data" type="application/json">{{ site.edges | json_encode | safe }}</script>
+<script src="layout.js" defer></script>
+<script src="edges.js" defer></script>
+</body></html>

@@ -5401,18 +5401,23 @@ fn render_canvas_site<'a>(
 /// input filename stem worth reusing the same way a single output file does
 /// here.
 fn pdf_cmd(canvas_path: &Path, out: Option<&Path>, force: bool, mode: Option<pdf::Mode>) {
-    let raw = read_raw_or_exit(canvas_path);
-    let canvas = Canvas::from_markdown(&raw).unwrap_or_else(|e| {
-        eprintln!("failed to parse {}: {e}", canvas_path.display());
+    // Worker-routed, same as `static`: `GET /api/canvas` already returns
+    // the `include`-resolved tree, so the exported PDF shows the fully
+    // composed document without re-resolving includes locally.
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+        eprintln!("meshfox pdf: failed to start a Tokio runtime: {e}");
         std::process::exit(1);
     });
-    // Same as `static`/`validate`/`view`: splice in `include` nodes so the
-    // exported PDF shows the fully composed document, not the bare link
-    // `run` sees in the raw file.
-    let canvas = meshfox_core::include::resolve(&canvas, canvas_path).unwrap_or_else(|e| {
-        eprintln!("meshfox pdf: {}: {e}", canvas_path.display());
-        std::process::exit(1);
-    });
+    let port = worker_port_or_exit(&runtime, canvas_path);
+    let canvas = runtime
+        .block_on(worker_client::get_canvas(port))
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "meshfox pdf: failed to read {} through the worker: {e}",
+                canvas_path.display()
+            );
+            std::process::exit(1);
+        });
 
     let out_path = out
         .map(PathBuf::from)

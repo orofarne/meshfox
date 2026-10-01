@@ -20,7 +20,14 @@ fn unique_path() -> PathBuf {
 }
 
 fn meshfox() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_meshfox"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_meshfox"));
+    // Isolates this process from the real machine's own
+    // `~/.meshfox/config.toml` — a developer with `server_socket` set for
+    // daily use would otherwise have this command routed through *their*
+    // external coordinator (see `validate_cmd.rs`'s `meshfox()` for the
+    // full rationale). The directory doesn't need to exist.
+    cmd.env("HOME", unique_path());
+    cmd
 }
 
 #[test]
