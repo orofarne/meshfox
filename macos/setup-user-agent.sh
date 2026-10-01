@@ -27,13 +27,6 @@ fi
 
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 
-# Migrate a copy installed by the former per-user ZIP installer.
-OLD_APP="$HOME/Applications/Meshfox.app"
-if [ -d "$OLD_APP" ] && [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$OLD_APP/Contents/Info.plist" 2>/dev/null)" = "$LABEL" ]; then
-  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -u -f "$OLD_APP" 2>/dev/null || true
-  rm -rf "$OLD_APP"
-fi
-
 mkdir -p "$HOME/Library/LaunchAgents" "$(dirname "$SOCKET_PATH")" "$LOG_DIR"
 rm -f "$SOCKET_PATH" "$AGENT_PLIST"
 plutil -create xml1 "$AGENT_PLIST"
@@ -41,8 +34,7 @@ plutil -create xml1 "$AGENT_PLIST"
 "$PB" -c "Add :ProgramArguments array" "$AGENT_PLIST"
 "$PB" -c "Add :ProgramArguments:0 string $APP/Contents/MacOS/Meshfox" "$AGENT_PLIST"
 "$PB" -c "Add :RunAtLoad bool true" "$AGENT_PLIST"
-"$PB" -c "Add :KeepAlive dict" "$AGENT_PLIST"
-"$PB" -c "Add :KeepAlive:SuccessfulExit bool false" "$AGENT_PLIST"
+# Leave KeepAlive unset: a clean Quit must return to socket-triggered demand.
 "$PB" -c "Add :Sockets dict" "$AGENT_PLIST"
 "$PB" -c "Add :Sockets:Listener dict" "$AGENT_PLIST"
 "$PB" -c "Add :Sockets:Listener:SockPathName string $SOCKET_PATH" "$AGENT_PLIST"

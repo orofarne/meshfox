@@ -76,16 +76,36 @@ struct Registry {
     /// per-worker task holds its own `Receiver` and kills its own child on
     /// the first (and only) value that ever arrives.
     shutdown: broadcast::Sender<()>,
+    /// Hands a URL to the user's browser. A field rather than a direct
+    /// `open::that` call so tests can substitute a recorder — otherwise
+    /// every `cargo test` run pops real browser tabs.
+    tab_opener: Box<dyn Fn(String) + Send + Sync>,
 }
 
 impl Registry {
     fn new() -> Self {
+        Self::with_tab_opener(Box::new(open_url_in_browser))
+    }
+
+    fn with_tab_opener(tab_opener: Box<dyn Fn(String) + Send + Sync>) -> Self {
         let (shutdown, _) = broadcast::channel(1);
         Self {
             entries: Mutex::new(HashMap::new()),
             empty: Notify::new(),
             shutdown,
+            tab_opener,
         }
+    }
+
+    /// Opens a browser tab on `127.0.0.1:<port>` (plus `#fragment`), via
+    /// this registry's `tab_opener`.
+    fn open_browser_tab(&self, port: u16, fragment: Option<&str>) {
+        let mut url = format!("http://127.0.0.1:{port}/");
+        if let Some(fragment) = fragment {
+            url.push('#');
+            url.push_str(fragment);
+        }
+        (self.tab_opener)(url);
     }
 
     fn is_empty(&self) -> bool {
@@ -126,7 +146,7 @@ impl Registry {
             )
         };
         if let Some(fragment) = pending_open {
-            open_browser_tab(port, fragment.as_deref());
+            self.open_browser_tab(port, fragment.as_deref());
         }
         for waiter in waiters {
             let _ = waiter.send(Ok(()));
@@ -172,17 +192,12 @@ impl Registry {
     }
 }
 
-/// `http://127.0.0.1:<port>/[#fragment]`, best-effort — same reasoning
-/// `meshfox view`'s old direct `open::that` call always had: no browser,
-/// no display, or an unsupported platform shouldn't be fatal to anything,
-/// just means the user opens the URL by hand. Runs on a blocking thread
-/// since `open::that` shells out synchronously.
-fn open_browser_tab(port: u16, fragment: Option<&str>) {
-    let mut url = format!("http://127.0.0.1:{port}/");
-    if let Some(fragment) = fragment {
-        url.push('#');
-        url.push_str(fragment);
-    }
+/// Best-effort — same reasoning `meshfox view`'s old direct `open::that`
+/// call always had: no browser, no display, or an unsupported platform
+/// shouldn't be fatal to anything, just means the user opens the URL by
+/// hand. Runs on a blocking thread since `open::that` shells out
+/// synchronously.
+fn open_url_in_browser(url: String) {
     tokio::task::spawn_blocking(move || {
         if let Err(e) = open::that(&url) {
             eprintln!("meshfox: couldn't open a browser automatically ({e}) — open {url} yourself");
@@ -427,7 +442,7 @@ async fn handle_connection(
             };
             let result = match action {
                 Action::OpenNow(port) => {
-                    open_browser_tab(port, fragment.as_deref());
+                    registry.open_browser_tab(port, fragment.as_deref());
                     Ok(())
                 }
                 Action::Wait => {
@@ -598,6 +613,16 @@ mod tests {
         }
     }
 
+    /// A registry whose browser opener records URLs instead of launching
+    /// anything.
+    fn recording_registry() -> (Arc<Mutex<Vec<String>>>, Registry) {
+        let opened = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&opened);
+        let registry =
+            Registry::with_tab_opener(Box::new(move |url| sink.lock().unwrap().push(url)));
+        (opened, registry)
+    }
+
     #[tokio::test]
     async fn registry_wait_until_empty_resolves_once_the_last_entry_is_removed() {
         let registry = Arc::new(Registry::new());
@@ -626,7 +651,7 @@ mod tests {
 
     #[tokio::test]
     async fn mark_ready_opens_the_pending_fragment_and_satisfies_waiters() {
-        let registry = Registry::new();
+        let (opened, registry) = recording_registry();
         let (tx, rx) = oneshot::channel();
         registry.entries.lock().unwrap().insert(
             PathBuf::from("/tmp/a.canvas.md"),
@@ -647,6 +672,10 @@ mod tests {
         drop(entries);
 
         assert_eq!(rx.await.unwrap(), Ok(()));
+        assert_eq!(
+            *opened.lock().unwrap(),
+            vec!["http://127.0.0.1:4242/#some-node".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -744,7 +773,8 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
         let listener = UnixListener::bind(&socket_path).unwrap();
 
-        let registry = Arc::new(Registry::new());
+        let (opened, registry) = recording_registry();
+        let registry = Arc::new(registry);
         let canvas_path = std::env::temp_dir().join("already-ready.canvas.md");
         let canonical = canvas_path
             .canonicalize()
@@ -772,6 +802,7 @@ mod tests {
         .await
         .expect("should ack promptly, not hang");
         assert!(result.is_ok());
+        assert_eq!(*opened.lock().unwrap(), vec!["http://127.0.0.1:7777/".to_string()]);
 
         let _ = std::fs::remove_file(&socket_path);
     }

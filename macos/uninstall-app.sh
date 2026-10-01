@@ -40,12 +40,6 @@ while IFS= read -r user; do
       "$config"
   fi
 
-  # Clean up installations made by the earlier per-user ZIP installer.
-  legacy_app="$home/Applications/Meshfox.app"
-  if [ -d "$legacy_app" ] && [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$legacy_app/Contents/Info.plist" 2>/dev/null)" = "$DAEMON_LABEL" ]; then
-    /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -u -f "$legacy_app" 2>/dev/null || true
-    rm -rf "$legacy_app"
-  fi
 done < <(dscl . -list /Users)
 
 rm -f "$SETUP_PLIST"
