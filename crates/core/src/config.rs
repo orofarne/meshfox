@@ -319,6 +319,15 @@ fn flatten_into(table: &toml::Table, prefix: &str, out: &mut Vec<(String, String
 mod tests {
     use super::*;
 
+    /// `MESHFOX_SERVER_SOCKET` is process-wide, and tests run on parallel
+    /// threads: every test that sets, clears or relies on it being unset
+    /// holds this for its whole body, so one can't see another's value.
+    static SERVER_SOCKET_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_server_socket_env() -> std::sync::MutexGuard<'static, ()> {
+        SERVER_SOCKET_ENV.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn flatten_to_env_joins_nested_keys_with_underscores() {
         let table: toml::Table = "[interpreters.agent]\nprovider = \"codex\"\n"
@@ -417,6 +426,7 @@ mod tests {
 
     #[test]
     fn server_socket_env_override_takes_a_path_over_the_config_file() {
+        let _env = lock_server_socket_env();
         let dir = tempfile_dir();
         std::fs::create_dir_all(dir.join(".meshfox")).unwrap();
         std::fs::write(
@@ -432,6 +442,7 @@ mod tests {
 
     #[test]
     fn server_socket_env_override_empty_string_forces_it_off() {
+        let _env = lock_server_socket_env();
         let dir = tempfile_dir();
         std::fs::create_dir_all(dir.join(".meshfox")).unwrap();
         std::fs::write(
@@ -447,6 +458,7 @@ mod tests {
 
     #[test]
     fn server_socket_falls_back_to_config_file_when_env_unset() {
+        let _env = lock_server_socket_env();
         let dir = tempfile_dir();
         std::fs::create_dir_all(dir.join(".meshfox")).unwrap();
         std::fs::write(

@@ -334,6 +334,151 @@ fn node_set_id_routes_through_a_running_worker() {
 }
 
 #[test]
+fn node_meta_adds_and_removes_tags_and_refuses_to_replace_the_list() {
+    let dir = unique_dir();
+    let canvas_path = dir.join("base.canvas.md");
+    std::fs::write(
+        &canvas_path,
+        concat!(
+            "<!-- meshfox:canvas -->\n# Base\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## A\n<!-- meshfox:node id=\"a\" tags=\"keep,drop\" -->\n",
+        ),
+    )
+    .unwrap();
+
+    let worker = spawn_worker(&dir, &canvas_path);
+
+    let meta = |args: &[&str]| {
+        meshfox()
+            .args(["node", "meta", "--canvas"])
+            .arg(&canvas_path)
+            .arg("a")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let output = meta(&["--add-tag", "new, keep", "--remove-tag", "drop"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let after = std::fs::read_to_string(&canvas_path).unwrap();
+    assert!(after.contains("tags=\"keep,new\""), "after: {after}");
+
+    // `--tags` used to replace the whole list; it must now fail loudly
+    // rather than quietly doing something else.
+    let output = meta(&["--tags", "only"]);
+    kill(worker);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--add-tag"), "stderr: {stderr}");
+    let unchanged = std::fs::read_to_string(&canvas_path).unwrap();
+    assert!(unchanged.contains("tags=\"keep,new\""), "after: {unchanged}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn node_body_needs_the_current_base_rev_and_add_takes_its_body_with_it() {
+    let dir = unique_dir();
+    let canvas_path = dir.join("base.canvas.md");
+    std::fs::write(
+        &canvas_path,
+        concat!(
+            "<!-- meshfox:canvas -->\n# Base\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## A\n<!-- meshfox:node id=\"a\" -->\n\nold body\n",
+        ),
+    )
+    .unwrap();
+    let first = dir.join("first.md");
+    let second = dir.join("second.md");
+    std::fs::write(&first, "first rewrite\n").unwrap();
+    std::fs::write(&second, "second rewrite\n").unwrap();
+
+    let worker = spawn_worker(&dir, &canvas_path);
+
+    let body_rev_of = |id: &str| -> String {
+        let output = meshfox()
+            .args(["node", "show", "--canvas"])
+            .arg(&canvas_path)
+            .arg(id)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|l| l.strip_prefix("body-rev: "))
+            .expect("node show prints body-rev")
+            .to_string()
+    };
+    let write_body = |file: &std::path::Path, base_rev: Option<&str>| {
+        let mut command = meshfox();
+        command
+            .args(["node", "body", "--canvas"])
+            .arg(&canvas_path)
+            .arg("a")
+            .arg("--file")
+            .arg(file);
+        if let Some(rev) = base_rev {
+            command.args(["--base-rev", rev]);
+        }
+        command.output().unwrap()
+    };
+
+    // No revision: refused before anything is sent.
+    let output = write_body(&first, None);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--base-rev"));
+
+    // The revision `node show` printed goes through.
+    let stale = body_rev_of("a");
+    let output = write_body(&first, Some(&stale));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(std::fs::read_to_string(&canvas_path)
+        .unwrap()
+        .contains("first rewrite"));
+
+    // The same revision again is stale now: nothing is written, and the
+    // error hands back the current body and the revision to retry with.
+    let output = write_body(&second, Some(&stale));
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("current revision:"), "stderr: {stderr}");
+    assert!(stderr.contains("first rewrite"), "stderr: {stderr}");
+    assert!(!std::fs::read_to_string(&canvas_path)
+        .unwrap()
+        .contains("second rewrite"));
+    let current = body_rev_of("a");
+    assert!(stderr.contains(&current), "stderr: {stderr}");
+    assert!(write_body(&second, Some(&current)).status.success());
+
+    // A new node gets its body in the write that creates it.
+    let output = meshfox()
+        .args(["node", "add", "--canvas"])
+        .arg(&canvas_path)
+        .args(["root", "Fresh", "--body-file"])
+        .arg(&first)
+        .output()
+        .unwrap();
+    kill(worker);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let after = std::fs::read_to_string(&canvas_path).unwrap();
+    assert!(after.contains("## Fresh"), "after: {after}");
+    assert_eq!(after.matches("first rewrite").count(), 1, "after: {after}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn node_edges_routes_through_a_running_worker() {
     let dir = unique_dir();
     let canvas_path = dir.join("base.canvas.md");
@@ -355,7 +500,7 @@ fn node_edges_routes_through_a_running_worker() {
         .arg("--canvas")
         .arg(&canvas_path)
         .arg("b")
-        .arg("--from")
+        .arg("--add")
         .arg("a")
         .output()
         .unwrap();

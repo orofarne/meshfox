@@ -30,6 +30,7 @@ pub mod shared_env;
 pub mod staticgen;
 pub mod subsup;
 pub mod syntax_dirs;
+pub mod body_rev;
 pub mod tag_colors;
 pub mod timestamp;
 pub mod tree;
@@ -65,6 +66,7 @@ pub use options::{declared_options, OptionsError};
 pub use output::{cached_output_hash, format_duration_ms, write_output, ExecOutput};
 pub use shared_env::{load as load_shared_env, SharedEnv, SharedOrigin, SharedVar};
 pub use staticgen::{Asset, EdgeView, NodeView, Position, SiteData};
+pub use body_rev::{annotate_body_revs, body_rev};
 pub use tag_colors::{
     annotate_effective_colors, declared_tag_colors, effective_color, TagColorError,
 };

@@ -159,6 +159,7 @@ mod tests {
             updated_at: None,
             constraint_results: Vec::new(),
             effective_color: None,
+            body_rev: None,
             asset_base: None,
             plain_markdown_include: false,
         }

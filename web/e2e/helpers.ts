@@ -70,3 +70,21 @@ export async function selectNode(node: Locator) {
 export function toolbarButton(page: Page, titleSubstring: string): Locator {
   return page.locator(`.mesh-node-toolbar button[title*="${titleSubstring}" i]`);
 }
+
+/** Puts the canvas file back to exactly `raw` through the whole-file
+ * endpoint — a fixture reset at the end of a test that rewrote it. That
+ * endpoint requires the ETag of the version being replaced (`If-Match`), so
+ * this reads the current one first; asserts the write was accepted. */
+export async function restoreRaw(page: Page, raw: string) {
+  const status = await page.evaluate(async (text) => {
+    const current = await fetch("/api/canvas/raw");
+    const etag = current.headers.get("ETag") ?? "";
+    const res = await fetch("/api/canvas/raw", {
+      method: "PUT",
+      headers: { "content-type": "text/plain", "if-match": etag },
+      body: text,
+    });
+    return res.status;
+  }, raw);
+  expect(status, "restoring the fixture via PUT /api/canvas/raw").toBe(204);
+}

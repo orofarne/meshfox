@@ -4,7 +4,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { usePrefersDark } from "./NodeTextEditor";
-import { killRun } from "./api";
+import { killRun, watchSilence } from "./api";
 
 /** Mirrors `crates/server/src/lib.rs`'s `RunEvent` (JSON shape, camelCase)
  * as seen over `/api/run/tty`'s WebSocket — a superset of `./api.ts`'s
@@ -208,6 +208,24 @@ export function TtyPanel({
     const ws = new WebSocket(`${proto}//${base.host}${endpoint}?${params}`);
     ws.binaryType = "arraybuffer";
     wsRef.current = ws;
+    // The worker sends a heartbeat even while the shell is quiet; nothing at
+    // all for the silence limit means the worker hung or the connection died
+    // (a browser raises no event for that), so say so instead of leaving a
+    // dead terminal looking alive.
+    const silence = watchSilence(() => {
+      ws.onmessage = null;
+      ws.onerror = null;
+      ws.onclose = null;
+      try {
+        ws.close();
+      } catch {
+        // Already closing.
+      }
+      ttyActiveRef.current = false;
+      setCanKill(false);
+      setStatus("error");
+      setErrorMsg("The worker stopped responding.");
+    });
 
     if (attachTo) {
       // No chain to resolve, no `step-start`/`tty-start` to wait for —
@@ -222,6 +240,7 @@ export function TtyPanel({
     }
 
     ws.onmessage = (ev) => {
+      silence.touch();
       if (typeof ev.data === "string") {
         const event = JSON.parse(ev.data) as TtyRunEvent;
         switch (event.type) {
@@ -282,10 +301,12 @@ export function TtyPanel({
       }
     };
     ws.onerror = () => {
+      silence.stop();
       setCanKill(false);
       setStatus((s) => (s === "exited" || s === "killed" ? s : "error"));
     };
     ws.onclose = () => {
+      silence.stop();
       ttyActiveRef.current = false;
       setCanKill(false);
       setStatus((s) => (s === "exited" || s === "killed" || s === "error" ? s : "closed"));
@@ -312,6 +333,7 @@ export function TtyPanel({
     return () => {
       resizeObserver.disconnect();
       dataSub.dispose();
+      silence.stop();
       ws.close();
       term.dispose();
     };

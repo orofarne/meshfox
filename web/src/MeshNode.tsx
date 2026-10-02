@@ -28,6 +28,7 @@ import {
   fetchFormFields,
   type LinkPreview,
   type FormFieldStatus,
+  type SaveTextOutcome,
 } from "./api";
 import type { ConstraintStatusDto, NodeType, ServiceStatusDto } from "./types";
 
@@ -395,6 +396,9 @@ export interface MeshNodeData {
    * description/image) below the link — see `LinkPreviewCard`. */
   preview?: boolean;
   text: string;
+  /** Fingerprint of `text` as the server has it — what the text editor
+   * sends back as `baseRev` when saving (see `onSaveText`). */
+  bodyRev?: string;
   /** Absolute directory a relative `img`/link target in `text` should
    * resolve against, when it's not the canvas file's own directory — set
    * when this node's body was spliced in from an `include` target that
@@ -509,8 +513,10 @@ export interface MeshNodeData {
    * Available read-only, unlike the edit-mode-only actions above. */
   onExpand: () => void;
   /** Persists a full replacement of this node's raw Markdown body — the
-   * inline text editor's auto-save. */
-  onSaveText: (text: string) => void;
+   * inline text editor's auto-save. `baseRev` is the `bodyRev` the editor
+   * last saw; the outcome says whether it landed or the body had changed
+   * since (see `SaveTextOutcome`). */
+  onSaveText: (text: string, baseRev: string) => Promise<SaveTextOutcome>;
   /** `plainMarkdownInclude` nodes only — opens Source mode scoped to this
    * node's own id (the include's `nodeId`) instead of the inline text
    * editor, since that's the only place this content can actually be
@@ -3299,7 +3305,9 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
         <NodeTextEditor
           title={data.title}
           initialText={data.text}
-          onChange={(text) => data.onSaveText(text)}
+          serverText={data.text}
+          serverRev={data.bodyRev ?? ""}
+          onChange={(text, baseRev) => data.onSaveText(text, baseRev)}
           onSaveTitle={(title) => data.onCommitTitle(title)}
           onOpenSettings={data.onOpenSettings}
           onClose={() => setEditingText(false)}

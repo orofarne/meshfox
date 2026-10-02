@@ -103,7 +103,11 @@ test("root's own edges (level 1) exit from its Left handle, not the routing-only
     expect(Math.abs(start.x - sourceHandle.x), `${edgeId} starts on root's left border`).toBeLessThan(4);
     expect(endToTargetHandle, `${edgeId} end vs. ${targetId}'s target-default handle`).toBeLessThan(4);
   }
-  expect(Math.hypot(starts[0].x - starts[1].x, starts[0].y - starts[1].y)).toBeGreaterThan(4);
+  // Automatic outgoing edges of one node share its one centred port instead
+  // of fanning out along the border (decided after the fan of parallel
+  // strokes proved distracting; only an explicitly chosen source side
+  // spreads them), so both leave from the same point.
+  expect(Math.hypot(starts[0].x - starts[1].x, starts[0].y - starts[1].y)).toBeLessThan(4);
 });
 
 test("a deeper node's own edges (level ≥ 2) exit from its Right handle", async ({ page }) => {

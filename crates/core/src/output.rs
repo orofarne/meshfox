@@ -373,7 +373,7 @@ mod tests {
         for flag in ["", " cache=false", " cache", " cache=true"] {
             let input =
                 format!("before\n```bash name=\"demo\"{flag}\necho 1\n```\n{region}\nafter\n");
-            let expected = if flag == "" || flag == " cache=false" {
+            let expected = if flag.is_empty() || flag == " cache=false" {
                 input.replace(region, "")
             } else {
                 input.clone()

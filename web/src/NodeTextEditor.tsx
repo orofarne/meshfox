@@ -10,6 +10,7 @@ import { attachVSCodeContextMenu } from "./vsCodeContextMenu";
 import { ensureMonacoConfigured, LazyEditor } from "./monacoSetup";
 import { THEMES } from "./shiki";
 import { THEME_CHANGE_EVENT } from "./theme";
+import type { SaveTextOutcome } from "./api";
 
 /** Resolves once Monaco is self-hosted and ready to mount (see
  * `monacoSetup.ts`'s own doc comment for why this is lazy rather than
@@ -145,10 +146,16 @@ interface NodeTextEditorProps {
    * `onSaveTitle`. */
   title: string;
   initialText: string;
+  /** The node's body as the server has it right now, and its revision —
+   * both change whenever the body is changed elsewhere (another tab, an
+   * agent, an editor) or by this editor's own save landing. */
+  serverText: string;
+  serverRev: string;
   /** Auto-save callback — fired (debounced) as the text changes, and once
-   * more on close to flush anything still pending. Doesn't close the
-   * editor itself; only `onClose` does. */
-  onChange: (text: string) => void;
+   * more on close to flush anything still pending, with the revision this
+   * editor last saw. The outcome says whether it landed or the body had
+   * moved on since. Doesn't close the editor itself; only `onClose` does. */
+  onChange: (text: string, baseRev: string) => Promise<SaveTextOutcome>;
   /** Commits the header's title field — fired on blur/Enter, same
    * "wherever the title is being edited" shape as MeshNode's own inline
    * canvas title edit (TODO.canvas.md: "Редактирование заголовка и вызов
@@ -187,8 +194,24 @@ interface NodeTextEditorProps {
  * Save/Cancel step, just a "done" button to close once whatever's pending
  * has flushed.
  */
-export function NodeTextEditor({ title, initialText, onChange, onSaveTitle, onOpenSettings, onClose }: NodeTextEditorProps) {
-  const [text, setText] = useState(initialText);
+export function NodeTextEditor({
+  title,
+  initialText,
+  serverText,
+  serverRev,
+  onChange,
+  onSaveTitle,
+  onOpenSettings,
+  onClose,
+}: NodeTextEditorProps) {
+  const [text, setTextState] = useState(initialText);
+  // The latest buffer, readable from async callbacks without a stale
+  // closure.
+  const textRef = useRef(initialText);
+  const setText = (value: string) => {
+    textRef.current = value;
+    setTextState(value);
+  };
   const [titleDraft, setTitleDraft] = useState(title);
   // Keeps the header's title field in sync with a rename made elsewhere
   // while this editor stayed open — most commonly via the gear button
@@ -201,6 +224,96 @@ export function NodeTextEditor({ title, initialText, onChange, onSaveTitle, onOp
   const monacoReady = useMonacoReady();
   const detachRef = useRef<(() => void) | null>(null);
 
+  // What this editor knows about the server's copy of the body:
+  // - `known`: the body text and revision it last saw there (a save of its
+  //   own landing, or another client's change it adopted), the `baseRev`
+  //   every save is written against;
+  // - `synced`: the buffer text that corresponds to `known`. The buffer is
+  //   "clean" exactly when it still equals this; it's tracked apart from
+  //   `known.text` because the server may store a body slightly differently
+  //   from what was sent.
+  const known = useRef({ text: initialText, rev: serverRev });
+  const synced = useRef(initialText);
+  // The body as another client left it, while this editor holds unsaved
+  // edits of its own: nothing is written until the user picks a side.
+  const [conflict, setConflict] = useState<{ text: string; rev: string } | null>(null);
+  const conflictRef = useRef<{ text: string; rev: string } | null>(null);
+  const [showTheirs, setShowTheirs] = useState(false);
+  const raiseConflict = (theirs: { text: string; rev: string } | null) => {
+    conflictRef.current = theirs;
+    setConflict(theirs);
+    if (!theirs) setShowTheirs(false);
+  };
+
+  // Saves run one at a time: a second save started while the first is in
+  // flight would be written against a revision the first is about to
+  // replace, and be refused as a conflict with this editor's own earlier
+  // write.
+  const saving = useRef(false);
+  const queued = useRef(false);
+  const latestServer = useRef({ text: serverText, rev: serverRev });
+
+  /** Compares what the server now has against what this editor knows. A
+   * body changed elsewhere is adopted silently while the buffer has no
+   * unsaved edits, and otherwise held back as a conflict. */
+  const reconcile = () => {
+    const { text: theirText, rev } = latestServer.current;
+    if (rev === known.current.rev) return;
+    if (theirText === known.current.text) {
+      known.current = { text: theirText, rev };
+      return;
+    }
+    if (textRef.current === synced.current) {
+      known.current = { text: theirText, rev };
+      synced.current = theirText;
+      setText(theirText);
+      return;
+    }
+    raiseConflict({ text: theirText, rev });
+  };
+
+  const runSave = async () => {
+    saving.current = true;
+    try {
+      do {
+        queued.current = false;
+        if (conflictRef.current) break;
+        const toSave = textRef.current;
+        if (toSave === synced.current) break;
+        const outcome = await onChange(toSave, known.current.rev);
+        if (outcome.status === "saved") {
+          known.current = { text: outcome.text, rev: outcome.rev };
+          synced.current = toSave;
+        } else if (outcome.status === "conflict") {
+          raiseConflict({ text: outcome.currentText, rev: outcome.currentRev });
+          break;
+        } else {
+          break;
+        }
+      } while (queued.current);
+    } finally {
+      saving.current = false;
+    }
+    // The server's copy may have moved on while the save was in flight.
+    reconcile();
+  };
+  const requestSave = () => {
+    if (saving.current) {
+      queued.current = true;
+      return;
+    }
+    void runSave();
+  };
+
+  useEffect(() => {
+    latestServer.current = { text: serverText, rev: serverRev };
+    // While a save is in flight its own result is about to arrive; sorting
+    // out the server's copy then (see the end of `runSave`) can't mistake
+    // this editor's own write for somebody else's.
+    if (!saving.current) reconcile();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [serverText, serverRev]);
+
   const isFirstRender = useRef(true);
   const pendingSave = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
@@ -209,8 +322,8 @@ export function NodeTextEditor({ title, initialText, onChange, onSaveTitle, onOp
       return;
     }
     pendingSave.current = setTimeout(() => {
-      onChange(text);
       pendingSave.current = null;
+      requestSave();
     }, AUTOSAVE_DELAY_MS);
     return () => {
       if (pendingSave.current) clearTimeout(pendingSave.current);
@@ -225,11 +338,40 @@ export function NodeTextEditor({ title, initialText, onChange, onSaveTitle, onOp
     editor.focus();
   };
 
+  /** Drops this editor's unsaved edits in favor of the body as another
+   * client left it. */
+  const takeTheirs = () => {
+    const theirs = conflictRef.current;
+    if (!theirs) return;
+    known.current = { text: theirs.text, rev: theirs.rev };
+    synced.current = theirs.text;
+    setText(theirs.text);
+    raiseConflict(null);
+  };
+
+  /** Writes this editor's buffer over the other client's body — written
+   * against *their* revision, so it still fails if the body moves on yet
+   * again before it lands. */
+  const keepMine = () => {
+    const theirs = conflictRef.current;
+    if (!theirs) return;
+    known.current = { text: theirs.text, rev: theirs.rev };
+    raiseConflict(null);
+    requestSave();
+  };
+
   const handleClose = () => {
+    if (conflictRef.current) {
+      if (!window.confirm("This node's body was changed elsewhere. Close and discard your unsaved edits?")) {
+        return;
+      }
+      onClose();
+      return;
+    }
     if (pendingSave.current) {
       clearTimeout(pendingSave.current);
       pendingSave.current = null;
-      onChange(text);
+      requestSave();
     }
     onClose();
   };
@@ -280,6 +422,21 @@ export function NodeTextEditor({ title, initialText, onChange, onSaveTitle, onOp
             ⚙
           </button>
         </div>
+        {conflict && (
+          <div className="mesh-text-editor-conflict" role="alert">
+            <span>This node's body was changed elsewhere while you were editing.</span>
+            <button type="button" onClick={takeTheirs}>
+              take theirs
+            </button>
+            <button type="button" onClick={keepMine}>
+              keep mine
+            </button>
+            <button type="button" onClick={() => setShowTheirs((v) => !v)}>
+              {showTheirs ? "hide theirs" : "compare"}
+            </button>
+            {showTheirs && <pre className="mesh-text-editor-conflict-theirs">{conflict.text}</pre>}
+          </div>
+        )}
         <div className="mesh-text-editor-panes">
           <div className="mesh-text-editor-source" data-vscode-context="{}">
             {monacoReady ? (

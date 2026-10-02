@@ -261,16 +261,31 @@ const CAPTURED_STDERR_LIMIT: usize = 4096;
 /// worker that dies before ever reporting `Ready` can fail any `Open`
 /// caller waiting on it with the worker's own real reason, not just "it
 /// exited" — see `watch_worker`.
-fn spawn_worker(
-    registry: &Arc<Registry>,
-    exe: &Path,
-    watcher_socket: &Path,
+/// What `spawn_worker` launches a worker with, beyond where the `meshfox`
+/// binary and the watcher socket live: which canvas, which port (`0` lets the
+/// OS pick), what to open once it reports `Ready`, whether it exits on its
+/// own when its last tab closes, and who to notify the moment it's ready.
+struct WorkerSpec {
     canonical_path: PathBuf,
     port: u16,
     pending_open: Option<Option<String>>,
     auto_exit: bool,
     initial_waiter: Option<oneshot::Sender<Result<(), String>>>,
+}
+
+fn spawn_worker(
+    registry: &Arc<Registry>,
+    exe: &Path,
+    watcher_socket: &Path,
+    spec: WorkerSpec,
 ) -> io::Result<()> {
+    let WorkerSpec {
+        canonical_path,
+        port,
+        pending_open,
+        auto_exit,
+        initial_waiter,
+    } = spec;
     let mut command = Command::new(exe);
     command
         .arg("view")
@@ -460,11 +475,13 @@ async fn handle_connection(
                         &registry,
                         &exe,
                         &socket_path,
-                        canonical,
-                        0,
-                        Some(fragment),
-                        true,
-                        Some(tx),
+                        WorkerSpec {
+                            canonical_path: canonical,
+                            port: 0,
+                            pending_open: Some(fragment),
+                            auto_exit: true,
+                            initial_waiter: Some(tx),
+                        },
                     ) {
                         Ok(()) => await_ready(rx).await,
                         Err(e) => Err(format!(
@@ -541,11 +558,13 @@ pub async fn run(
         &registry,
         &exe,
         &socket_path,
-        canonical,
-        port,
-        initial_open,
-        auto_exit,
-        None,
+        WorkerSpec {
+            canonical_path: canonical,
+            port,
+            pending_open: initial_open,
+            auto_exit,
+            initial_waiter: None,
+        },
     )?;
 
     let accept_registry = Arc::clone(&registry);
@@ -664,12 +683,13 @@ mod tests {
 
         registry.mark_ready(Path::new("/tmp/a.canvas.md"), 4242);
 
-        let entries = registry.entries.lock().unwrap();
-        let entry = entries.get(Path::new("/tmp/a.canvas.md")).unwrap();
-        assert_eq!(entry.port, Some(4242));
-        assert_eq!(entry.pending_open, None);
-        assert!(entry.waiters.is_empty());
-        drop(entries);
+        {
+            let entries = registry.entries.lock().unwrap();
+            let entry = entries.get(Path::new("/tmp/a.canvas.md")).unwrap();
+            assert_eq!(entry.port, Some(4242));
+            assert_eq!(entry.pending_open, None);
+            assert!(entry.waiters.is_empty());
+        }
 
         assert_eq!(rx.await.unwrap(), Ok(()));
         assert_eq!(

@@ -60,8 +60,11 @@ test("a reloaded tab gets the last run's output back", async ({ page }) => {
 
 test("editing the block marks its earlier runs stale", async ({ page }) => {
   const greet = node(page, "greet");
+  // A body replacement names the revision it was written against.
+  const canvas = await (await page.request.get("/api/canvas")).json();
+  const baseRev = canvas.nodes.find((n: { id: string }) => n.id === "greet").bodyRev;
   const res = await page.request.patch("/api/nodes/greet", {
-    data: { text: "```bash name=\"greet\"\necho changed\n```\n" },
+    data: { text: "```bash name=\"greet\"\necho changed\n```\n", baseRev },
   });
   expect(res.ok()).toBeTruthy();
   await page.reload();

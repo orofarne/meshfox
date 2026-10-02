@@ -1,5 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
-import { clickFitViewAndWait } from "./helpers";
+import { clickFitViewAndWait, restoreRaw } from "./helpers";
 
 // Drives web/e2e/fixtures/fold.canvas.md, in the default read-only mode
 // (never clicks "Edit") — folding is a view-only preference (see App.tsx's
@@ -209,9 +209,6 @@ test("a folded auto-placed node restores its real height after an unrelated canv
     .poll(async () => (await node(page, "sibling-node").boundingBox())?.height ?? null)
     .toBeGreaterThan(unfoldedHeight - 5);
 
-  await page.evaluate(
-    (raw) => fetch("/api/canvas/raw", { method: "PUT", headers: { "content-type": "text/plain" }, body: raw }),
-    before,
-  );
+  await restoreRaw(page, before);
   expect(await fetchRaw(page)).toBe(before);
 });

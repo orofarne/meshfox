@@ -964,7 +964,6 @@ fn print_tty_transcript_event(event: crate::worker_client::RunEvent) -> TtyPrelu
 /// equivalent of — it's never in an alt screen to begin with, just needs
 /// its own raw-mode enable/disable around this call).
 pub(crate) async fn bridge_http_tty(socket: &mut crate::worker_client::TtySocket) -> i32 {
-    use futures_util::StreamExt;
     use tokio_tungstenite::tungstenite::Message;
 
     // Pre-tty phase: a `tty`-touching chain can (and typically does) run
@@ -984,8 +983,8 @@ pub(crate) async fn bridge_http_tty(socket: &mut crate::worker_client::TtySocket
     // but sometimes the interactive program gets flooded with garbage the
     // instant it starts and crashes" bug this restructuring fixes.
     loop {
-        match socket.next().await {
-            Some(Ok(Message::Text(text))) => {
+        match crate::worker_client::ws_next(socket).await {
+            crate::worker_client::WsNext::Frame(Message::Text(text)) => {
                 let Ok(event) = serde_json::from_str::<crate::worker_client::RunEvent>(&text)
                 else {
                     continue;
@@ -999,9 +998,14 @@ pub(crate) async fn bridge_http_tty(socket: &mut crate::worker_client::TtySocket
             // A binary frame has no meaning before `TtyStart` — nothing
             // should send one this early, but ignoring rather than
             // erroring costs nothing.
-            Some(Ok(Message::Binary(_))) => {}
-            Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return -1,
-            Some(Ok(_)) => {}
+            crate::worker_client::WsNext::Frame(Message::Binary(_)) => {}
+            crate::worker_client::WsNext::Frame(Message::Close(_))
+            | crate::worker_client::WsNext::Closed => return -1,
+            crate::worker_client::WsNext::Silent => {
+                eprintln!("meshfox: the worker stopped responding");
+                return -1;
+            }
+            crate::worker_client::WsNext::Frame(_) => {}
         }
     }
 
@@ -1051,6 +1055,11 @@ async fn bridge_tty_pty_phase(socket: &mut crate::worker_client::TtySocket) -> i
     let mut stdout = std::io::stdout();
     let mut last_size = crossterm::terminal::size().ok();
 
+    // The select below is restarted every 300 ms by its resize arm, so a
+    // per-read timeout would never fire; track the last frame heard instead
+    // (the worker pings even when the shell is quiet).
+    let mut last_heard = std::time::Instant::now();
+    let mut worker_silent = false;
     let exit_code = loop {
         tokio::select! {
             input = stdin_rx.recv() => {
@@ -1060,6 +1069,7 @@ async fn bridge_tty_pty_phase(socket: &mut crate::worker_client::TtySocket) -> i
                 }
             }
             msg = socket.next() => {
+                last_heard = std::time::Instant::now();
                 match msg {
                     Some(Ok(Message::Binary(bytes))) => {
                         if write_all_retrying(&mut stdout, &bytes).is_err() {
@@ -1080,6 +1090,10 @@ async fn bridge_tty_pty_phase(socket: &mut crate::worker_client::TtySocket) -> i
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(300)) => {
+                if last_heard.elapsed() > crate::worker_client::ws_silence_limit() {
+                    worker_silent = true;
+                    break -1;
+                }
                 if let Ok(size) = crossterm::terminal::size() {
                     if Some(size) != last_size {
                         last_size = Some(size);
@@ -1093,6 +1107,10 @@ async fn bridge_tty_pty_phase(socket: &mut crate::worker_client::TtySocket) -> i
         }
     };
     stop.store(true, Ordering::Release);
+    if worker_silent {
+        // Raw mode is still on here: `\r\n`, not `\n`.
+        eprint!("\r\nmeshfox: the worker stopped responding\r\n");
+    }
     // Waits for the thread to actually notice `stop` and revert stdin's
     // fd mode (`set_stdin_nonblocking(false)`) before this function
     // returns — skipping this (as an earlier version did) left a real

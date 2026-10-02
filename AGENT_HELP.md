@@ -31,8 +31,13 @@ Map your intent to a subcommand instead:
 - Rename a node's heading text → `meshfox node rename <id> <title>`
 - Change a node's stable id (updates every reference: `parent=`, `meshfox:edge
   from=`, best-effort `deps=`) → `meshfox node set-id <id> <new-id>`
-- Replace a node's body → `meshfox node body <id> --file <path>` (or pipe to
-  stdin)
+- Replace a node's body → `meshfox node body <id> --base-rev <rev> --file
+  <path>` (or pipe to stdin). `--base-rev` is required: the `body-rev:` line
+  `meshfox node show <id>` prints. If the body changed since you read it
+  (another tab, an agent, an editor), nothing is written and the error gives
+  the current body and revision — merge, then retry with that revision. Not
+  sure it hasn't changed, or just adding to it? `node append` needs no
+  revision.
 - Append to a node's existing body, without reading it back first → `meshfox
   node append <id> --file <path>` (or pipe to stdin)
 - Set position/size/style/tags (`x`/`y`/`w`/`h`/`color`/`type`/`display`/
@@ -43,11 +48,14 @@ Map your intent to a subcommand instead:
   - `1` red, `2` orange, `3` yellow, `4` green, `5` blue, `6` purple
   - e.g. `meshfox node meta <id> --color 4` for green, or `--color ""` to
     clear it back to no color
-  - `--tags "bag,fixed"` replaces the whole tag list outright (comma-
-    separated, same spelling as the file's own `tags=`); `--tags ""` clears
-    it. Omitting `--tags` entirely leaves existing tags untouched.
-- Replace a node's extra incoming edges → `meshfox node edges <id> --from
-  <id>... ` (or `--clear`)
+  - tags are only ever added or removed, never replaced as a whole list:
+    `--add-tag "bag,fixed"` / `--remove-tag "old"` (comma-separated, same
+    spelling as the file's own `tags=`). A tag already there keeps its
+    place. (`node add` takes `--tags "bag,fixed"` for a new node's initial
+    tags; `node meta --tags` is gone.)
+- Add or remove a node's extra incoming edges → `meshfox node edges <id>
+  --add <id>... --remove <id>...` (never replaces the whole set; adding an
+  edge that's already there leaves its label and route alone)
 - Resync on-disk heading order to match on-canvas layout after moving things
   by position → `meshfox node reorder`
 - Inspect a node before changing it (parent, children, extra parents, type,
@@ -113,10 +121,16 @@ binary itself starts (a host launches it: `{"command": "meshfox", "args":
 becomes its root. It's multi-canvas: `canvas_open`/`canvas_close`/
 `canvas_list` manage a registry of open canvases (each its own isolated
 spawned process — a crash or hung debug session on one canvas can't touch
-another), and **every other tool requires a `canvas_id` from `canvas_open`
-as its first argument** — there's no implicit "current" canvas. `canvas_open`
-only resolves files under that root directory; nothing above it is
-reachable. If this session already has that configured, its tools are
+another), and **every other tool requires a `canvas_id` as its first
+argument** — there's no implicit "current" canvas. A `canvas_id` is the
+file's path relative to the root, so a call with the id of a canvas that
+isn't open (never opened, closed after sitting idle, or whose process died)
+just reopens it; `canvas_open` is only needed to create a file or to get the
+id. A canvas whose process is hung (alive, not answering) is stopped after
+three unanswered pings or a call with no answer in 90 s and reopened by the
+next call; `canvas_list` reports each canvas's `busy` and `health` and never
+waits on one. `canvas_open` only resolves files under that root directory;
+nothing above it is reachable. If this session already has that configured, its tools are
 usually a better fit than shelling out through this same CLI for two
 specific cases:
 
@@ -128,7 +142,9 @@ specific cases:
   just a subset: `node_show`/`node_find`/`node_add`/`node_body`/
   `node_append`/`node_meta`/`node_block`/`node_rm`/`node_mv`/`node_rename`/
   `node_set_id`/`node_edges`/`node_move`/`node_reorder` — `node_show`
-  returns JSON, not text to re-parse.
+  returns JSON, not text to re-parse, including each node's `body_rev`:
+  `node_body` requires it back as `base_rev` and refuses a body that changed
+  since (the error carries the current body and revision to retry with).
 - **`validate`/`check`** — same checks `meshfox validate`/`meshfox check`
   run, as structured JSON instead of text to re-parse: `validate` returns a
   tool error naming the specific problem on failure (same convention

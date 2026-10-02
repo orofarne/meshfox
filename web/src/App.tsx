@@ -16,7 +16,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import {
   fetchCanvas,
-  saveCanvas,
+  saveLayout,
   runBlockStream,
   runFileStream,
   openNodeFile,
@@ -28,6 +28,7 @@ import {
   updateOptions,
   createNode,
   updateNode,
+  BodyConflictError,
   deleteNode,
   reparentNode,
   renameNodeId,
@@ -53,6 +54,9 @@ import {
   submitForm,
   type RunEvent,
   type NodePatch,
+  type NodeBox,
+  type SaveTextOutcome,
+  edgePatchBetween,
   type ActiveRunDto,
   type NodeOpEvent,
   type HistoryEntry,
@@ -2043,15 +2047,27 @@ export default function App() {
   }, []);
 
   // Persists a full replacement of a node's raw Markdown body — the inline
-  // NodeTextEditor's auto-save.
-  const handleSaveText = useCallback(async (id: string, text: string) => {
-    try {
-      const updated = await updateNode(id, { text });
-      setCanvas(updated);
-    } catch (e) {
-      setError(String(e));
-    }
-  }, []);
+  // NodeTextEditor's auto-save. `baseRev` is the body revision the editor
+  // last saw; if the body has changed since (another tab, an agent, an
+  // editor), nothing is written and the outcome carries the body as it is
+  // now, for the editor to show instead of overwriting it.
+  const handleSaveText = useCallback(
+    async (id: string, text: string, baseRev: string): Promise<SaveTextOutcome> => {
+      try {
+        const updated = await updateNode(id, { text, baseRev });
+        setCanvas(updated);
+        const saved = updated.nodes.find((n) => n.id === id);
+        return { status: "saved", text: saved?.text ?? text, rev: saved?.bodyRev ?? "" };
+      } catch (e) {
+        if (e instanceof BodyConflictError) {
+          return { status: "conflict", currentText: e.currentText, currentRev: e.currentRev };
+        }
+        setError(String(e));
+        return { status: "error" };
+      }
+    },
+    [],
+  );
 
   // A `plainMarkdownInclude` node's title-bar button (see `MeshNode.tsx`):
   // that content has no per-node write path of its own (see
@@ -2072,8 +2088,7 @@ export default function App() {
       if (!canvas) return;
       const target = canvas.nodes.find((n) => n.id === targetNodeId);
       if (!target) return;
-      const next = (target.extraParents ?? []).filter((e) => e.from !== sourceNodeId);
-      updateNode(targetNodeId, { extraParents: next })
+      updateNode(targetNodeId, { edges: { remove: [sourceNodeId] } })
         .then(setCanvas)
         .catch((e) => setError(String(e)));
     },
@@ -2082,18 +2097,21 @@ export default function App() {
 
   // Patches one extra edge's own styling (label/color/style/arrow ends) —
   // the on-canvas edge editor's auto-save (see DeletableEdge), fired with
-  // just the changed field(s). Full-array replace, same as every other
-  // `extraParents` write here — re-sending the untouched entries alongside
-  // is a harmless no-op.
+  // just the changed field(s). Sent as a patch of just those fields of just
+  // this edge, so a change another tab made to some other field (or some
+  // other edge) can't be reverted.
   const updateExtraEdgeStyle = useCallback(
     (targetNodeId: string, sourceNodeId: string, patch: Partial<Omit<ExtraEdgeDto, "from">>) => {
       if (!canvas) return;
       const target = canvas.nodes.find((n) => n.id === targetNodeId);
       if (!target) return;
-      const next = (target.extraParents ?? []).map((e) =>
-        e.from === sourceNodeId ? { ...e, ...patch } : e,
-      );
-      updateNode(targetNodeId, { extraParents: next })
+      const current = (target.extraParents ?? []).find((e) => e.from === sourceNodeId);
+      if (!current) return;
+      // Only the fields that changed go to the server, so a change another
+      // tab made to some *other* field of this edge isn't reverted.
+      const fieldPatch = edgePatchBetween(current, { ...current, ...patch });
+      if (!fieldPatch) return;
+      updateNode(targetNodeId, { edges: { patch: [fieldPatch] } })
         .then(setCanvas)
         .catch((e) => setError(String(e)));
     },
@@ -2139,7 +2157,7 @@ export default function App() {
       if (!targetNode) return;
       const current = targetNode.extraParents ?? [];
       if (current.some((e) => e.from === source)) return;
-      updateNode(target, { extraParents: [...current, { from: source }] })
+      updateNode(target, { edges: { add: [source] } })
         .then(setCanvas)
         .catch((e) => setError(String(e)));
     },
@@ -2322,6 +2340,7 @@ export default function App() {
             interpreter: n.interpreter,
             preview: n.preview,
             text: n.text,
+            bodyRev: n.bodyRev,
             color: n.color,
             effectiveColor: n.effectiveColor,
             tags: n.tags,
@@ -2353,7 +2372,7 @@ export default function App() {
             onOpenSettings: () => setSettingsNodeId(n.id),
             onCommitTitle: (title: string) => handleCommitTitleEdit(n.id, title),
             onExpand: () => setExpandedNodeId(n.id),
-            onSaveText: (text: string) => handleSaveText(n.id, text),
+            onSaveText: (text: string, baseRev: string) => handleSaveText(n.id, text, baseRev),
             onOpenSourceMode: handleOpenSourceMode,
             canDelete: !!n.parent,
             onRequestDelete: () => setDeleteConfirmNodeId(n.id),
@@ -2393,7 +2412,7 @@ export default function App() {
       const groups = new Map<string, string[]>();
       for (const e of derivedEdges) {
         if (!e.extra) continue;
-        const key = [e.source, e.target].sort().join(" ");
+        const key = [e.source, e.target].sort().join("\u0000");
         const group = groups.get(key);
         if (group) group.push(e.id);
         else groups.set(key, [e.id]);
@@ -3378,13 +3397,13 @@ export default function App() {
         y: n.position.y + ownOffsetY - parentOffsetY,
       };
     };
+    // Only what this tab itself dragged or resized goes to the server: a
+    // node it merely shows (its saved position already in the file, or
+    // still auto-placed) is left alone, so a drag here can't write this
+    // tab's possibly out-of-date copy of some other node back.
     const layout = new Map(
       nodes
-        .filter((n) =>
-          n.data.nodeType === "group"
-            ? touchedNodeIds.current.has(n.id)
-            : !n.data.suggested || touchedNodeIds.current.has(n.id),
-        )
+        .filter((n) => touchedNodeIds.current.has(n.id))
         .map((n) => {
           const position = canvasPosition(n);
           return [
@@ -3398,23 +3417,10 @@ export default function App() {
           ] as const;
         }),
     );
-    const updated: CanvasDoc = {
-      ...canvas,
-      nodes: canvas.nodes.map((n) => {
-        const box = layout.get(n.id);
-        if (!box) return n;
-        return {
-          ...n,
-          x: box.x,
-          y: box.y,
-          width: box.width ?? n.width,
-          height: box.height ?? n.height,
-        };
-      }),
-    };
+    const boxes: NodeBox[] = [...layout].map(([id, box]) => ({ id, ...box }));
     // For every node *not* in `layout` above (still fully auto this save),
     // pass along where it's currently actually drawn as a same-request-only
-    // sort hint (see `saveCanvas`'s own doc comment) — lets a sibling that
+    // sort hint (see `saveLayout`'s own doc comment) — lets a sibling that
     // *is* being positioned this save slot in among them by where it
     // visually landed, rather than always sorting before all of them.
     const layoutHints: Record<string, { x: number; y: number }> = {};
@@ -3423,7 +3429,7 @@ export default function App() {
       layoutHints[n.id] = canvasPosition(n);
     }
     try {
-      await saveCanvas(updated, layoutHints);
+      await saveLayout(boxes, layoutHints);
       // Re-fetch rather than `setCanvas(updated)`: `updated` only carries
       // the positions/sizes this client already knew about, but saving can
       // shift server-computed values it didn't — most importantly every

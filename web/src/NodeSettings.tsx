@@ -1,6 +1,6 @@
 import { useRef, useState } from "react";
 import type { CanvasNode, ExtraEdgeDto, NodeType } from "./types";
-import type { NodePatch } from "./api";
+import { edgeOpsBetween, tagOpsBetween, type NodePatch } from "./api";
 import { basicSlug, translitSlug } from "./slug";
 import { TagEditor } from "./TagEditor";
 
@@ -155,8 +155,15 @@ export function NodeSettings({ node, allNodes, onChange, onRenameId, onClearId, 
     if (title !== node.title) patch.title = title;
     if (nodeType !== (node.type ?? "text")) patch.nodeType = nodeType;
     if (color !== (node.color ?? "")) patch.color = color;
-    if (JSON.stringify(tags) !== JSON.stringify(node.tags ?? [])) patch.tags = tags;
-    if (JSON.stringify(extraParents) !== JSON.stringify(node.extraParents ?? [])) patch.extraParents = extraParents;
+    // Sent as changes to what the node has now, not as the whole edited
+    // list: a replacement written from this modal's copy would drop a tag
+    // or an edge another tab added while it was open.
+    if (JSON.stringify(tags) !== JSON.stringify(node.tags ?? [])) {
+      patch.tags = tagOpsBetween(node.tags ?? [], tags);
+    }
+    if (JSON.stringify(extraParents) !== JSON.stringify(node.extraParents ?? [])) {
+      patch.edges = edgeOpsBetween(node.extraParents ?? [], extraParents);
+    }
     if (
       (nodeType === "file" || nodeType === "link" || nodeType === "include") &&
       target !== (node.target ?? "")

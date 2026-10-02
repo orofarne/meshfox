@@ -83,10 +83,15 @@ test("MCP edits appear in an already-open VS Code canvas without reloading", asy
     const { canvas_id } = await mcp.tool("canvas_open", { path: "mcp-live.canvas.md" });
     const args = (extra: object) => ({ canvas_id, ...extra });
 
-    await mcp.tool("node_meta", args({ node_id: "mcp-live", tags: "live-tag" }));
+    await mcp.tool("node_meta", args({ node_id: "mcp-live", add_tags: ["live-tag"] }));
     await expect(root.locator(".mesh-tag-chip")).toContainText("live-tag");
 
-    await mcp.tool("node_body", args({ node_id: "mcp-live", body: "After MCP body edit." }));
+    // `node_body` is written against the revision `node_show` returned.
+    const shown = await mcp.tool("node_show", args({ node_id: "mcp-live" }));
+    await mcp.tool(
+      "node_body",
+      args({ node_id: "mcp-live", body: "After MCP body edit.", base_rev: shown.body_rev }),
+    );
     await expect(root.locator(".mesh-node-body")).toContainText("After MCP body edit.");
 
     await mcp.tool("node_rename", args({ node_id: "mcp-live", title: "After MCP title edit" }));
@@ -97,12 +102,12 @@ test("MCP edits appear in an already-open VS Code canvas without reloading", asy
     await expect(added).toBeVisible();
     await expect(added).toContainText("Added by MCP");
 
-    await mcp.tool("node_edges", args({ node_id, from: ["target-node"] }));
+    await mcp.tool("node_edges", args({ node_id, add: ["target-node"] }));
     const edge = frame.locator(`.react-flow__edge[data-id="target-node->${node_id}:extra"]`);
     await expect(edge).toHaveCount(1);
     await expect(edge.locator("path.react-flow__edge-path")).toHaveAttribute("d", /\S/);
 
-    await mcp.tool("node_edges", args({ node_id, from: [] }));
+    await mcp.tool("node_edges", args({ node_id, remove: ["target-node"] }));
     await expect(edge).toHaveCount(0);
 
     await mcp.tool("node_rm", args({ node_id }));

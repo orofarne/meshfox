@@ -186,6 +186,67 @@ fn a_worker_with_no_traffic_at_all_does_not_auto_exit() {
     );
 }
 
+fn http_post_json(port: u16, path: &str, body: &str) -> String {
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    write!(
+        stream,
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut buf = Vec::new();
+    let _ = stream.read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// A debug session is a registry entry of the worker's own, like a run or a
+/// `tty` session: with no tab and no open connection of any kind, a worker
+/// holding a live one must stay up (it used to depend on the MCP process
+/// holding a dummy `/api/watch` connection), and must exit once the
+/// session is stopped.
+#[test]
+fn a_worker_holding_a_live_debug_session_does_not_auto_exit_until_it_is_stopped() {
+    let dir = unique_dir();
+    let canvas_path = dir.join("base.canvas.md");
+    std::fs::write(
+        &canvas_path,
+        "<!-- meshfox:canvas -->\n# Base\n<!-- meshfox:node id=\"root\" -->\n\n```bash name=\"snippet\"\necho hi\n```\n",
+    )
+    .unwrap();
+    let (mut worker, port) = spawn_worker(&dir, &canvas_path);
+
+    let started = http_post_json(
+        port,
+        "/api/debug/start",
+        r#"{"nodeId":"root","blockName":"snippet","vars":{}}"#,
+    );
+    assert!(started.contains("200 OK"), "debug start failed: {started}");
+    let body = started.split("\r\n\r\n").nth(1).unwrap_or_default();
+    let session_id = serde_json::from_str::<serde_json::Value>(body.trim())
+        .ok()
+        .and_then(|v| v["sessionId"].as_str().map(str::to_string))
+        .unwrap_or_else(|| panic!("no sessionId in {started}"));
+
+    // Well past `AUTO_EXIT_GRACE` + the poll interval, with nothing connected.
+    let exited = exited_within(&mut worker, Duration::from_secs(25));
+    if exited {
+        kill(worker);
+        panic!("worker exited under a live debug session");
+    }
+
+    let stopped = http_post_json(
+        port,
+        "/api/debug/stop",
+        &format!(r#"{{"sessionId":"{session_id}"}}"#),
+    );
+    assert!(stopped.contains("204"), "debug stop failed: {stopped}");
+    let exited = exited_within(&mut worker, Duration::from_secs(25));
+    if !exited {
+        kill(worker);
+    }
+    assert!(exited, "worker should auto-exit once its debug session is stopped");
+}
+
 /// A worker nobody ever touches at all shouldn't wait *forever* either —
 /// real-world case: a `get_port` caller fetches a port and then never
 /// actually calls anything, or an `Open` never gets followed by a browser

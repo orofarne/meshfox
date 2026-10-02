@@ -24,11 +24,19 @@
 //! Three ways a row's own before/after state is stored, chosen by the caller
 //! per op kind (see `crate::record_undo`): a small structured [`Payload::Diff`]
 //! for a single-node/single-parent op that's cheap to describe precisely and
-//! replay directly; the whole document's before/after text ([`Payload::Raw`])
-//! for anything document-wide, rare, or otherwise not worth a bespoke replay
-//! shape; or both at once ([`Payload::RawWithDiff`]) for a document-wide op
-//! that's still cheap to *describe* specifically even though it isn't cheap
-//! to *replay* precisely.
+//! replay directly; a document-wide step ([`Payload::Raw`]) for anything
+//! document-wide, rare, or otherwise not worth a bespoke replay shape; or
+//! both at once ([`Payload::RawWithDiff`]) for a document-wide op that's
+//! still cheap to *describe* specifically even though it isn't cheap to
+//! *replay* precisely.
+//!
+//! A document-wide step is stored as a [`Splice`] — the one span of text
+//! that differs between the document before and after, with the lengths of
+//! the unchanged text around it — not as two whole copies of the document.
+//! Replaying it is exact (the changed span goes back where it came from),
+//! and a step that touched one node costs roughly that node's own text
+//! instead of the size of the canvas. Rows written before this existed keep
+//! their two whole copies (`raw_before`/`raw_after`) and still replay.
 
 use rusqlite::{params, Connection, OptionalExtension};
 use std::io;
@@ -48,7 +56,8 @@ const SCHEMA_SQL: &str = "
         op_kind     TEXT NOT NULL,
         diff_json   TEXT,
         raw_before  TEXT,
-        raw_after   TEXT
+        raw_after   TEXT,
+        splice_json TEXT
     );
     CREATE TABLE IF NOT EXISTS undo_meta (
         id        INTEGER PRIMARY KEY CHECK (id = 1),
@@ -56,6 +65,10 @@ const SCHEMA_SQL: &str = "
         last_raw  TEXT NOT NULL
     );
 ";
+
+/// The columns every read of `undo_log` selects, in the order
+/// [`UndoLog::row_mapper`] reads them.
+const ENTRY_COLUMNS: &str = "seq, created_at, op_kind, diff_json, raw_before, raw_after, splice_json";
 
 /// One recorded step of history, as read back by [`UndoLog::history`]/
 /// [`UndoLog::peek_undo`]/[`UndoLog::peek_redo`].
@@ -65,8 +78,131 @@ pub struct UndoEntry {
     pub created_at: String,
     pub op_kind: String,
     pub diff_json: Option<String>,
+    /// Both whole documents — only on rows written before [`Splice`]
+    /// existed; a newer document-wide step has `splice` instead.
     pub raw_before: Option<String>,
     pub raw_after: Option<String>,
+    pub splice: Option<Splice>,
+}
+
+impl UndoEntry {
+    /// The document one step further in `undo`'s direction, given the
+    /// `current` document: for a document-wide step, what the document was
+    /// before (`undo`) or becomes after (redo) this step. `None` if this
+    /// row carries no document-wide replay data (a structured `Diff` row —
+    /// the caller replays those itself), or the step no longer applies to
+    /// `current` (see [`Splice::undo`]).
+    pub fn replay_document(&self, current: &str, undo: bool) -> Option<String> {
+        if let Some(splice) = &self.splice {
+            return if undo {
+                splice.undo(current)
+            } else {
+                splice.redo(current)
+            };
+        }
+        if undo {
+            self.raw_before.clone()
+        } else {
+            self.raw_after.clone()
+        }
+    }
+}
+
+/// A document-wide step stored as the one span that changed: `before` and
+/// `after` share their first `prefix_len` and last `suffix_len` bytes, and
+/// differ only in what lies between (`before_mid` / `after_mid`). Both
+/// whole documents are also fingerprinted (`body_rev`) so a replay can tell
+/// whether the document it is handed is the one this step belongs to.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Splice {
+    pub prefix_len: usize,
+    pub suffix_len: usize,
+    pub before_mid: String,
+    pub after_mid: String,
+    pub before_rev: String,
+    pub after_rev: String,
+}
+
+impl Splice {
+    /// The splice that turns `before` into `after` (and back).
+    pub fn between(before: &str, after: &str) -> Splice {
+        let common_prefix = before
+            .bytes()
+            .zip(after.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        // Both strings agree on these bytes, so a char boundary in one is
+        // one in the other.
+        let mut prefix_len = common_prefix;
+        while !before.is_char_boundary(prefix_len) {
+            prefix_len -= 1;
+        }
+        let max_suffix = before.len().min(after.len()) - prefix_len;
+        let mut suffix_len = before
+            .bytes()
+            .rev()
+            .zip(after.bytes().rev())
+            .take(max_suffix)
+            .take_while(|(a, b)| a == b)
+            .count();
+        while !before.is_char_boundary(before.len() - suffix_len)
+            || !after.is_char_boundary(after.len() - suffix_len)
+        {
+            suffix_len -= 1;
+        }
+        Splice {
+            prefix_len,
+            suffix_len,
+            before_mid: before[prefix_len..before.len() - suffix_len].to_string(),
+            after_mid: after[prefix_len..after.len() - suffix_len].to_string(),
+            before_rev: meshfox_core::body_rev(before),
+            after_rev: meshfox_core::body_rev(after),
+        }
+    }
+
+    /// The document before this step, given `current` — normally the
+    /// document this step produced.
+    pub fn undo(&self, current: &str) -> Option<String> {
+        self.apply(current, &self.after_rev, &self.after_mid, &self.before_mid)
+    }
+
+    /// The document after this step, given `current` — normally the
+    /// document this step started from.
+    pub fn redo(&self, current: &str) -> Option<String> {
+        self.apply(current, &self.before_rev, &self.before_mid, &self.after_mid)
+    }
+
+    fn apply(&self, current: &str, expected_rev: &str, from_mid: &str, to_mid: &str) -> Option<String> {
+        // Exactly the document this step belongs to: put the span back where
+        // it came from.
+        if meshfox_core::body_rev(current) == expected_rev
+            && current.len() >= self.prefix_len + self.suffix_len
+        {
+            let suffix_start = current.len() - self.suffix_len;
+            return Some(format!(
+                "{}{}{}",
+                &current[..self.prefix_len],
+                to_mid,
+                &current[suffix_start..]
+            ));
+        }
+        // The document differs somewhere from what this step saw (an earlier
+        // step was replayed that isn't byte-for-byte reversible): still
+        // safe if the changed span can be found in exactly one place.
+        if from_mid.is_empty() {
+            return None;
+        }
+        let mut at = current.match_indices(from_mid);
+        match (at.next(), at.next()) {
+            (Some((i, _)), None) => Some(format!(
+                "{}{}{}",
+                &current[..i],
+                to_mid,
+                &current[i + from_mid.len()..]
+            )),
+            _ => None,
+        }
+    }
 }
 
 /// What a [`UndoLog::push`] call actually records for one step — see this
@@ -110,17 +246,36 @@ impl UndoLog {
     /// contention). Runs this module's own schema, unconditionally —
     /// harmless if `run_ledger` already ran its own on the same connection.
     pub fn from_connection(conn: Arc<Mutex<Connection>>) -> io::Result<Self> {
-        conn.lock()
-            .unwrap()
-            .execute_batch(SCHEMA_SQL)
-            .map_err(sqlite_err)?;
+        {
+            let guard = conn.lock().unwrap();
+            guard.execute_batch(SCHEMA_SQL).map_err(sqlite_err)?;
+            Self::migrate(&guard)?;
+        }
         Ok(UndoLog { conn })
+    }
+
+    /// Adds `splice_json` to a session file created before it existed
+    /// (`CREATE TABLE IF NOT EXISTS` leaves an existing table alone).
+    fn migrate(conn: &Connection) -> io::Result<()> {
+        let has_splice: bool = conn
+            .prepare("PRAGMA table_info(undo_log)")
+            .map_err(sqlite_err)?
+            .query_map([], |r| r.get::<_, String>(1))
+            .map_err(sqlite_err)?
+            .filter_map(Result::ok)
+            .any(|name| name == "splice_json");
+        if !has_splice {
+            conn.execute("ALTER TABLE undo_log ADD COLUMN splice_json TEXT", [])
+                .map_err(sqlite_err)?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
     fn open_in_memory() -> io::Result<Self> {
         let conn = Connection::open_in_memory().map_err(sqlite_err)?;
         conn.execute_batch(SCHEMA_SQL).map_err(sqlite_err)?;
+        Self::migrate(&conn)?;
         Ok(UndoLog {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -132,18 +287,17 @@ impl UndoLog {
     /// (always the whole document's new text, regardless of `payload`'s own
     /// shape), then caps total depth to [`MAX_DEPTH`].
     pub fn push(&self, op_kind: &str, payload: Payload, full_after: &str) -> io::Result<()> {
-        let (diff_json, raw_before, raw_after): (Option<String>, Option<String>, Option<String>) =
-            match payload {
-                Payload::Diff(v) => (Some(v.to_string()), None, None),
-                Payload::Raw { before } => {
-                    (None, Some(before.to_string()), Some(full_after.to_string()))
-                }
-                Payload::RawWithDiff { before, diff } => (
-                    Some(diff.to_string()),
-                    Some(before.to_string()),
-                    Some(full_after.to_string()),
-                ),
-            };
+        let splice_of = |before: &str| {
+            serde_json::to_string(&Splice::between(before, full_after))
+                .map_err(|e| io::Error::other(e.to_string()))
+        };
+        let (diff_json, splice_json): (Option<String>, Option<String>) = match payload {
+            Payload::Diff(v) => (Some(v.to_string()), None),
+            Payload::Raw { before } => (None, Some(splice_of(before)?)),
+            Payload::RawWithDiff { before, diff } => {
+                (Some(diff.to_string()), Some(splice_of(before)?))
+            }
+        };
         let created_at = meshfox_core::timestamp::now_utc_rfc3339();
 
         let mut conn = self.conn.lock().unwrap();
@@ -161,9 +315,9 @@ impl UndoLog {
         tx.execute("DELETE FROM undo_log WHERE seq > ?1", params![cursor])
             .map_err(sqlite_err)?;
         tx.execute(
-            "INSERT INTO undo_log (created_at, op_kind, diff_json, raw_before, raw_after) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![created_at, op_kind, diff_json, raw_before, raw_after],
+            "INSERT INTO undo_log (created_at, op_kind, diff_json, splice_json) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![created_at, op_kind, diff_json, splice_json],
         )
         .map_err(sqlite_err)?;
         let new_seq = tx.last_insert_rowid();
@@ -258,19 +412,9 @@ impl UndoLog {
     fn row_at(&self, seq: i64) -> io::Result<Option<UndoEntry>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT seq, created_at, op_kind, diff_json, raw_before, raw_after \
-             FROM undo_log WHERE seq = ?1",
+            &format!("SELECT {ENTRY_COLUMNS} FROM undo_log WHERE seq = ?1"),
             params![seq],
-            |r| {
-                Ok(UndoEntry {
-                    seq: r.get(0)?,
-                    created_at: r.get(1)?,
-                    op_kind: r.get(2)?,
-                    diff_json: r.get(3)?,
-                    raw_before: r.get(4)?,
-                    raw_after: r.get(5)?,
-                })
-            },
+            Self::row_mapper,
         )
         .optional()
         .map_err(sqlite_err)
@@ -404,27 +548,18 @@ impl UndoLog {
     pub fn history(&self, limit: usize) -> io::Result<Vec<UndoEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare(
-                "SELECT seq, created_at, op_kind, diff_json, raw_before, raw_after \
-                 FROM undo_log ORDER BY seq DESC LIMIT ?1",
-            )
+            .prepare(&format!(
+                "SELECT {ENTRY_COLUMNS} FROM undo_log ORDER BY seq DESC LIMIT ?1"
+            ))
             .map_err(sqlite_err)?;
         let rows = stmt
-            .query_map(params![limit as i64], |r| {
-                Ok(UndoEntry {
-                    seq: r.get(0)?,
-                    created_at: r.get(1)?,
-                    op_kind: r.get(2)?,
-                    diff_json: r.get(3)?,
-                    raw_before: r.get(4)?,
-                    raw_after: r.get(5)?,
-                })
-            })
+            .query_map(params![limit as i64], Self::row_mapper)
             .map_err(sqlite_err)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)
     }
 
     fn row_mapper(r: &rusqlite::Row) -> rusqlite::Result<UndoEntry> {
+        let splice_json: Option<String> = r.get(6)?;
         Ok(UndoEntry {
             seq: r.get(0)?,
             created_at: r.get(1)?,
@@ -432,6 +567,7 @@ impl UndoLog {
             diff_json: r.get(3)?,
             raw_before: r.get(4)?,
             raw_after: r.get(5)?,
+            splice: splice_json.and_then(|j| serde_json::from_str(&j).ok()),
         })
     }
 
@@ -449,12 +585,17 @@ impl UndoLog {
     pub fn history_around(&self, limit: usize) -> io::Result<Vec<HistoryEntry>> {
         let cursor = self.cursor()?;
         let conn = self.conn.lock().unwrap();
+        // A listing is only ever described for a person, never replayed: it
+        // reads each row's kind and summary, and leaves the replay payload
+        // (whole documents, spans of text) in the database — a panel of 200
+        // steps must not pull 200 copies of the canvas into memory.
+        const LISTING_COLUMNS: &str =
+            "seq, created_at, op_kind, diff_json, NULL, NULL, NULL";
         let redo_tail: Vec<UndoEntry> = {
             let mut stmt = conn
-                .prepare(
-                    "SELECT seq, created_at, op_kind, diff_json, raw_before, raw_after \
-                     FROM undo_log WHERE seq > ?1 ORDER BY seq DESC",
-                )
+                .prepare(&format!(
+                    "SELECT {LISTING_COLUMNS} FROM undo_log WHERE seq > ?1 ORDER BY seq DESC"
+                ))
                 .map_err(sqlite_err)?;
             let rows = stmt
                 .query_map(params![cursor], Self::row_mapper)
@@ -463,10 +604,9 @@ impl UndoLog {
         };
         let applied: Vec<UndoEntry> = {
             let mut stmt = conn
-                .prepare(
-                    "SELECT seq, created_at, op_kind, diff_json, raw_before, raw_after \
-                     FROM undo_log WHERE seq <= ?1 ORDER BY seq DESC LIMIT ?2",
-                )
+                .prepare(&format!(
+                    "SELECT {LISTING_COLUMNS} FROM undo_log WHERE seq <= ?1 ORDER BY seq DESC LIMIT ?2"
+                ))
                 .map_err(sqlite_err)?;
             let rows = stmt
                 .query_map(params![cursor, limit as i64], Self::row_mapper)
@@ -522,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn diff_payload_rows_have_null_raw_columns_and_vice_versa() {
+    fn a_diff_row_has_no_document_data_and_a_document_row_has_a_splice_not_two_copies() {
         let log = UndoLog::open_in_memory().unwrap();
         log.push("node_upserted", Payload::Diff(json!({"a": 1})), "doc-v1")
             .unwrap();
@@ -537,11 +677,147 @@ mod tests {
         assert!(diff_row.diff_json.is_some());
         assert!(diff_row.raw_before.is_none());
         assert!(diff_row.raw_after.is_none());
+        assert!(diff_row.splice.is_none());
 
         let raw_row = history.iter().find(|e| e.op_kind == "raw_replace").unwrap();
         assert!(raw_row.diff_json.is_none());
-        assert_eq!(raw_row.raw_before.as_deref(), Some("old"));
-        assert_eq!(raw_row.raw_after.as_deref(), Some("new"));
+        // Not two whole documents any more: the changed span, which replays
+        // in both directions.
+        assert!(raw_row.raw_before.is_none());
+        assert!(raw_row.raw_after.is_none());
+        assert!(raw_row.splice.is_some());
+        assert_eq!(raw_row.replay_document("new", true).as_deref(), Some("old"));
+        assert_eq!(raw_row.replay_document("old", false).as_deref(), Some("new"));
+    }
+
+    // ---- Splice: a document-wide step stored as the one span that changed ----
+
+    fn roundtrip(before: &str, after: &str) -> Splice {
+        let splice = Splice::between(before, after);
+        assert_eq!(splice.undo(after).as_deref(), Some(before), "undo of {before:?} -> {after:?}");
+        assert_eq!(splice.redo(before).as_deref(), Some(after), "redo of {before:?} -> {after:?}");
+        splice
+    }
+
+    #[test]
+    fn a_splice_replays_every_shape_of_change_in_both_directions() {
+        roundtrip("abc", "abc");
+        roundtrip("abc", "abXc");
+        roundtrip("abXc", "abc");
+        roundtrip("", "new document");
+        roundtrip("old document", "");
+        roundtrip("start middle end", "start MIDDLE end");
+        roundtrip("a\nb\nc\n", "a\nb\nc\nd\n");
+        // The same text before and after a repeated pattern.
+        roundtrip("xyxyxy", "xyxy");
+        roundtrip("aaaa", "aaaaaa");
+    }
+
+    #[test]
+    fn a_splice_never_cuts_through_a_multibyte_character() {
+        // The changed character shares leading/trailing bytes with its
+        // neighbours in UTF-8 (Cyrillic а/б, a two-byte pair), so a naive
+        // byte-wise common prefix/suffix would split one.
+        for (before, after) in [
+            ("привет мир", "привет, мир"),
+            ("аб", "ав"),
+            ("héllo wörld", "héllo wörld!"),
+            ("日本語のテキスト", "日本語のテキストです"),
+            ("a→b", "a←b"),
+        ] {
+            let splice = roundtrip(before, after);
+            // `before_mid`/`after_mid` are valid strings by construction;
+            // what matters is the replay above reproduced exact text.
+            assert!(before.is_char_boundary(splice.prefix_len));
+            assert!(before.is_char_boundary(before.len() - splice.suffix_len));
+        }
+    }
+
+    #[test]
+    fn a_splice_of_a_small_edit_stores_the_edit_not_the_document() {
+        let before = format!("{}\nbody a\n{}", "x".repeat(500_000), "y".repeat(500_000));
+        let after = before.replacen("body a", "body a edited", 1);
+        let splice = Splice::between(&before, &after);
+        assert_eq!(splice.before_mid, "");
+        assert_eq!(splice.after_mid, " edited");
+        let stored = serde_json::to_string(&splice).unwrap();
+        assert!(stored.len() < 1_000, "stored {} bytes for a 7-byte edit", stored.len());
+        assert_eq!(splice.undo(&after).as_deref(), Some(before.as_str()));
+    }
+
+    /// The document differs somewhere else from what the step saw (an
+    /// earlier step was replayed that wasn't byte-for-byte reversible):
+    /// still replayable when the changed span sits in exactly one place, and
+    /// refused — not guessed at — when it doesn't.
+    #[test]
+    fn a_splice_tolerates_drift_elsewhere_only_when_the_span_is_unambiguous() {
+        let before = "head\nline one\ntail\n";
+        let after = "head\nline ONE\ntail\n";
+        let splice = Splice::between(before, after);
+        // Whitespace elsewhere moved: the offsets no longer line up, but
+        // "ONE" is in one place only.
+        let drifted = "head \nline ONE\ntail\n";
+        assert_eq!(
+            splice.undo(drifted).as_deref(),
+            Some("head \nline one\ntail\n")
+        );
+        // The span appears twice: refuse.
+        let ambiguous = "ONE head\nline ONE\ntail\n";
+        assert_eq!(splice.undo(ambiguous), None);
+        // A pure insertion has no span to look for: refuse when drifted.
+        let insertion = Splice::between("ab", "aXb");
+        assert_eq!(insertion.undo("a  b"), None);
+        // ...but replays exactly against the right document.
+        assert_eq!(insertion.undo("aXb").as_deref(), Some("ab"));
+    }
+
+    #[test]
+    fn a_row_written_before_splices_existed_still_replays_and_a_session_file_is_migrated() {
+        // An old session file: the table as it was, one whole-document row.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE undo_log (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL,
+                op_kind TEXT NOT NULL, diff_json TEXT, raw_before TEXT, raw_after TEXT);
+             CREATE TABLE undo_meta (id INTEGER PRIMARY KEY CHECK (id = 1),
+                cursor INTEGER NOT NULL, last_raw TEXT NOT NULL);
+             INSERT INTO undo_log (created_at, op_kind, raw_before, raw_after)
+                VALUES ('2026-01-01T00:00:00Z', 'raw_replace', 'old text', 'new text');
+             INSERT INTO undo_meta (id, cursor, last_raw) VALUES (1, 1, 'new text');",
+        )
+        .unwrap();
+        let log = UndoLog::from_connection(Arc::new(Mutex::new(conn))).unwrap();
+
+        let entry = log.peek_undo().unwrap().unwrap();
+        assert!(entry.splice.is_none());
+        assert_eq!(entry.replay_document("whatever", true).as_deref(), Some("old text"));
+        assert_eq!(entry.replay_document("whatever", false).as_deref(), Some("new text"));
+
+        // New steps go on top in the new format, in the same file.
+        log.push("raw_replace", Payload::Raw { before: "new text" }, "newer text")
+            .unwrap();
+        let history = log.history(10).unwrap();
+        assert!(history[0].splice.is_some() && history[0].raw_before.is_none());
+        assert!(history[1].splice.is_none() && history[1].raw_before.is_some());
+    }
+
+    #[test]
+    fn a_history_listing_leaves_the_replay_payload_in_the_database() {
+        let log = UndoLog::open_in_memory().unwrap();
+        log.push("raw_replace", Payload::Raw { before: "old" }, "new").unwrap();
+        log.push("node_upserted", Payload::Diff(json!({"a": 1})), "newer").unwrap();
+
+        let listing = log.history_around(10).unwrap();
+        assert_eq!(listing.len(), 2);
+        for item in &listing {
+            assert!(item.entry.splice.is_none(), "{:?}", item.entry);
+            assert!(item.entry.raw_before.is_none() && item.entry.raw_after.is_none());
+        }
+        // The kind and the summary data are still there to describe it.
+        assert!(listing.iter().any(|h| h.entry.diff_json.is_some()));
+        // And the real row, read for replay, still carries its span.
+        assert!(log.peek_undo().unwrap().is_some());
+        assert!(log.history(10).unwrap().iter().any(|e| e.splice.is_some()));
     }
 
     #[test]
@@ -587,8 +863,14 @@ mod tests {
         let history = log.history(10).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].op_kind, "external_edit");
-        assert_eq!(history[0].raw_before.as_deref(), Some("# Doc v1\n"));
-        assert_eq!(history[0].raw_after.as_deref(), Some("# Doc v2\n"));
+        assert_eq!(
+            history[0].replay_document("# Doc v2\n", true).as_deref(),
+            Some("# Doc v1\n")
+        );
+        assert_eq!(
+            history[0].replay_document("# Doc v1\n", false).as_deref(),
+            Some("# Doc v2\n")
+        );
 
         // A third call sees the now-updated last_raw, not the original.
         let drifted_again = log.reconcile_startup_drift("# Doc v2\n").unwrap();

@@ -1,5 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
-import { clickFitViewAndWait, selectNode } from "./helpers";
+import { clickFitViewAndWait, selectNode, restoreRaw } from "./helpers";
 
 // Drives web/e2e/fixtures/move-sibling.canvas.md — the web UI's `↑`/`↓`
 // sibling-reorder buttons, an auto-placed node's only lever for changing
@@ -70,10 +70,7 @@ test("clicking ↓ moves a node after its next sibling, even a positioned one", 
   await expect(page.locator(".mesh-node-toolbar")).toBeVisible();
   await expect(moveDownButton(page)).toBeVisible();
 
-  await page.evaluate(
-    (raw) => fetch("/api/canvas/raw", { method: "PUT", headers: { "content-type": "text/plain" }, body: raw }),
-    before,
-  );
+  await restoreRaw(page, before);
   expect(await fetchRaw(page)).toBe(before);
 });
 
@@ -91,9 +88,6 @@ test("clicking ↑ moves a node before its previous sibling", async ({ page }) =
   await expect(page.locator(".mesh-node-toolbar")).toBeVisible();
   await expect(moveUpButton(page)).toBeVisible();
 
-  await page.evaluate(
-    (raw) => fetch("/api/canvas/raw", { method: "PUT", headers: { "content-type": "text/plain" }, body: raw }),
-    before,
-  );
+  await restoreRaw(page, before);
   expect(await fetchRaw(page)).toBe(before);
 });

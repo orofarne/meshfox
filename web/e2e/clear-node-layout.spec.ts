@@ -1,5 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
-import { clickFitViewAndWait, selectNode } from "./helpers";
+import { clickFitViewAndWait, selectNode, restoreRaw } from "./helpers";
 
 // Drives web/e2e/fixtures/clear-node-layout.canvas.md — the web UI's ↺
 // "reset to auto-layout" button, a positioned node's way to drop its own
@@ -58,10 +58,7 @@ test("clicking ↺ on a size-only node clears its w/h even with no x/y to clear"
   await selectNode(node(page, "sized-only"));
   await expect(clearLayoutButton(page)).toHaveCount(0);
 
-  await page.evaluate(
-    (raw) => fetch("/api/canvas/raw", { method: "PUT", headers: { "content-type": "text/plain" }, body: raw }),
-    before,
-  );
+  await restoreRaw(page, before);
   expect(await fetchRaw(page)).toBe(before);
 });
 
@@ -94,9 +91,6 @@ test("clicking ↺ clears the node's authored position/size and preserves everyt
   // layout gives it a box even with no authored position.
   await expect(node(page, "positioned")).toBeVisible();
 
-  await page.evaluate(
-    (raw) => fetch("/api/canvas/raw", { method: "PUT", headers: { "content-type": "text/plain" }, body: raw }),
-    before,
-  );
+  await restoreRaw(page, before);
   expect(await fetchRaw(page)).toBe(before);
 });

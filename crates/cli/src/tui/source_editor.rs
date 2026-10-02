@@ -57,8 +57,15 @@ pub struct SourceEditorState {
     pub is_canvas: bool,
     pub editor: EditorState,
     events: EditorEventHandler,
-    /// Last-saved (or last-loaded) snapshot — the dirty check.
+    /// Last-saved (or last-loaded) snapshot — the dirty check, and the
+    /// version of the file every save claims to be based on (`base_rev`).
     original: String,
+    /// The revision a save found the file at when it had changed on disk
+    /// since `original` was read: nothing was written, and the *next*
+    /// save is written against this one instead — an explicit second
+    /// `Ctrl-s` to overwrite what is there now. Cleared whenever the
+    /// editor is saved or switches file.
+    conflict_rev: Option<String>,
     /// Every include reachable from the primary document (however deeply
     /// nested), computed once at open time — switching files (`Ctrl-f`)
     /// reads straight out of this rather than re-walking the include
@@ -162,6 +169,7 @@ impl SourceEditorState {
             editor,
             events: EditorEventHandler::default(),
             original: raw,
+            conflict_rev: None,
             files,
             file_picker_open: false,
             file_picker_selected: 0,
@@ -186,7 +194,24 @@ impl SourceEditorState {
     /// right after it successfully writes `self.path` to disk, so the
     /// dirty check (and thus `Ctrl-f`'s switch-file guard) reflects it
     /// immediately rather than comparing against stale content.
+    /// The revision (`meshfox_core::body_rev`) of the file as this editor
+    /// last read it — what a save must name as the version it replaces. A
+    /// save that already found the file changed (`conflict_rev`) names the
+    /// revision it found instead, so pressing `Ctrl-s` again overwrites it.
+    pub fn base_rev(&self) -> String {
+        self.conflict_rev
+            .clone()
+            .unwrap_or_else(|| meshfox_core::body_rev(&self.original))
+    }
+
+    /// Records that a save found the file already changed, at `rev`: the
+    /// next save writes over it.
+    pub fn note_conflict(&mut self, rev: String) {
+        self.conflict_rev = Some(rev);
+    }
+
     pub fn mark_saved(&mut self) {
+        self.conflict_rev = None;
         self.original = self.editor.lines.to_string();
         if self.path == self.primary_path {
             self.primary_raw = self.original.clone();
@@ -327,6 +352,7 @@ impl SourceEditorState {
         };
         self.editor = EditorState::new(Lines::from(raw.as_str()));
         self.original = raw;
+        self.conflict_rev = None;
         self.path = path;
         self.is_canvas = is_canvas;
         self.error = None;
@@ -708,6 +734,36 @@ pub fn byte_offset_to_cursor(text: &str, mut byte_offset: usize) -> Index2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn open_editor(raw: &str) -> SourceEditorState {
+        let path = PathBuf::from("/tmp/meshfox-source-editor-test.canvas.md");
+        SourceEditorState::open(
+            path.clone(),
+            path,
+            true,
+            Index2::new(0, 0),
+            Vec::new(),
+            Vec::new(),
+            raw.to_string(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_save_is_based_on_the_text_the_editor_opened_with() {
+        let editor = open_editor("# Root\n");
+        assert_eq!(editor.base_rev(), meshfox_core::body_rev("# Root\n"));
+    }
+
+    #[test]
+    fn after_a_conflict_the_next_save_is_based_on_what_the_file_is_now() {
+        let mut editor = open_editor("# Root\n");
+        editor.note_conflict("abc123".to_string());
+        assert_eq!(editor.base_rev(), "abc123");
+        // Saving (or switching file) starts over from the saved text.
+        editor.mark_saved();
+        assert_eq!(editor.base_rev(), meshfox_core::body_rev("# Root\n"));
+    }
 
     #[test]
     fn byte_offset_to_cursor_skips_a_leading_newline() {

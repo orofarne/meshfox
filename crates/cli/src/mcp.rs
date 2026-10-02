@@ -34,17 +34,22 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use meshfox_core::Canvas;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolRequestParams, CallToolResult, ServerCapabilities, ServerInfo};
-use rmcp::service::RunningService;
+use rmcp::model::{
+    CallToolRequestParams, CallToolResult, ClientRequest, PingRequest, ServerCapabilities,
+    ServerInfo,
+};
+use rmcp::service::{Peer, RequestContext, RunningService};
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
 use rmcp::{
-    tool, tool_handler, tool_router, ErrorData, RoleClient, ServerHandler, ServiceError, ServiceExt,
+    tool, tool_handler, tool_router, ErrorData, RoleClient, RoleServer, ServerHandler,
+    ServiceError, ServiceExt,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -52,8 +57,70 @@ use serde_json::json;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
-const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-const SWEEP_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// How long an open canvas may go without a call before its process is
+/// closed to free it (it is reopened on demand by the next call, see
+/// `MeshfoxMcpRoot::lookup`). `MESHFOX_MCP_IDLE_SECS` overrides it — a test
+/// hook, same spirit as `MESHFOX_TEST_UNTOUCHED_TIMEOUT_SECS`, so the idle
+/// path can be exercised without waiting half an hour.
+fn idle_timeout() -> Duration {
+    env_secs("MESHFOX_MCP_IDLE_SECS").unwrap_or(DEFAULT_IDLE_TIMEOUT)
+}
+
+/// How often the sweep looks for idle and dead canvas processes.
+/// `MESHFOX_MCP_SWEEP_SECS` overrides it (test hook).
+fn sweep_interval() -> Duration {
+    env_secs("MESHFOX_MCP_SWEEP_SECS").unwrap_or(DEFAULT_SWEEP_INTERVAL)
+}
+
+/// How often the root asks each open canvas's process whether it is still
+/// answering. `MESHFOX_MCP_PING_SECS` overrides it (test hook).
+fn ping_interval() -> Duration {
+    env_secs("MESHFOX_MCP_PING_SECS").unwrap_or(Duration::from_secs(15))
+}
+
+/// How long one ping may take before it counts as a failure.
+/// `MESHFOX_MCP_PING_TIMEOUT_SECS` overrides it (test hook).
+fn ping_timeout() -> Duration {
+    env_secs("MESHFOX_MCP_PING_TIMEOUT_SECS").unwrap_or(Duration::from_secs(5))
+}
+
+/// Consecutive failed pings after which a canvas's process is considered hung
+/// and is stopped.
+const PING_STRIKES: u32 = 3;
+
+/// What a canvas's process answers a ping with when it is fine itself but the
+/// worker it talks to is not answering — reported, not acted on: stopping the
+/// process would not unhang a worker that lives elsewhere.
+const WORKER_UNRESPONSIVE: &str = "the canvas's worker is not answering";
+
+/// How long the root waits for a canvas's process to answer one tool call
+/// before treating it as hung. Generous: the process may first have to find
+/// or start a worker (up to 31 s: two tries of the coordinator's 15 s) and
+/// then wait on it (up to 60 s). A `debug_send` gets its own command timeout
+/// plus 30 s. `MESHFOX_MCP_CALL_DEADLINE_SECS` overrides every one (test hook).
+fn call_deadline(tool_name: &str, arguments: Option<&serde_json::Map<String, serde_json::Value>>) -> Duration {
+    if let Some(overridden) = env_secs("MESHFOX_MCP_CALL_DEADLINE_SECS") {
+        return overridden;
+    }
+    if tool_name == "debug_send" {
+        let command_ms = arguments
+            .and_then(|a| a.get("timeout_ms"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(60_000);
+        return Duration::from_millis(command_ms) + Duration::from_secs(30);
+    }
+    Duration::from_secs(90)
+}
+
+fn env_secs(name: &str) -> Option<Duration> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+}
 const DEFAULT_SEND_TIMEOUT_MS: u64 = 60_000;
 const CANVAS_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -104,6 +171,7 @@ async fn run_root() -> Result<(), String> {
     })?;
     let server = MeshfoxMcpRoot::new(root);
     server.spawn_idle_sweep();
+    server.spawn_pinger();
     let service = server
         .serve(rmcp::transport::stdio())
         .await
@@ -138,15 +206,9 @@ enum DebugHandle {
 struct MeshfoxMcp {
     canvas_path: PathBuf,
     sessions: Arc<Mutex<HashMap<String, DebugHandle>>>,
-    /// One `worker_client::hold_watch_connection` per `DebugHandle::Remote`
-    /// currently in `sessions`, keyed the same way — see that function's
-    /// own doc comment for why a remote debug session needs this at all
-    /// (it has no registry of its own the worker could otherwise consult
-    /// to know it's still wanted between `debug_send` calls, unlike a
-    /// `run`/`tty` step). Aborted (dropping the connection) wherever the
-    /// matching `sessions` entry is removed — `debug_stop`, or `debug_send`
-    /// noticing `session_ended`.
-    remote_keepalives: Arc<Mutex<HashMap<String, tokio::task::AbortHandle>>>,
+    /// The worker this process last talked to, so a ping can ask whether it
+    /// is still answering — without starting one if there never was one.
+    last_worker_port: Arc<std::sync::Mutex<Option<u16>>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -155,7 +217,7 @@ impl MeshfoxMcp {
         Self {
             canvas_path,
             sessions: Arc::new(Mutex::new(HashMap::new())),
-            remote_keepalives: Arc::new(Mutex::new(HashMap::new())),
+            last_worker_port: Arc::new(std::sync::Mutex::new(None)),
             tool_router: Self::tool_router(),
         }
     }
@@ -167,17 +229,24 @@ impl MeshfoxMcp {
             .map_err(|e| ErrorData::internal_error(format!("worker read failed: {e}"), None))
     }
 
+    /// The port of this canvas's worker, starting one if none is running.
+    /// A worker that did not come up in time (the coordinator gives it 15
+    /// seconds and then kills it — a large canvas on a busy machine can
+    /// miss that) is tried once more before the call fails: the next
+    /// attempt starts a fresh one.
     async fn worker_port(&self) -> Result<u16, ErrorData> {
-        crate::coordinator::get_or_spawn(&self.canvas_path)
-            .await
-            .map_err(|e| ErrorData::internal_error(format!("worker unavailable: {e}"), None))
-    }
-
-    /// Ends the keep-alive connection when a session is removed.
-    async fn stop_remote_keepalive(&self, session_id: &str) {
-        if let Some(handle) = self.remote_keepalives.lock().await.remove(session_id) {
-            handle.abort();
-        }
+        let first = crate::coordinator::get_or_spawn(&self.canvas_path).await;
+        let result = match first {
+            Ok(port) => Ok(port),
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                crate::coordinator::get_or_spawn(&self.canvas_path).await
+            }
+        };
+        let port = result
+            .map_err(|e| ErrorData::internal_error(format!("worker unavailable: {e}"), None))?;
+        *self.last_worker_port.lock().unwrap() = Some(port);
+        Ok(port)
     }
 }
 
@@ -264,9 +333,6 @@ struct McpNodeFields {
     /// clear it back to following the document's own default.
     #[serde(default)]
     fold: Option<String>,
-    /// Comma-separated, replacing the whole list. Pass `""` to clear.
-    #[serde(default)]
-    tags: Option<String>,
     /// Override `createdAt=` (RFC3339, e.g. `2026-08-29T10:15:00Z` or with
     /// an explicit offset). Meant for backfilling/importing existing data —
     /// meshfox only stamps a fresh one automatically at creation time when
@@ -292,7 +358,9 @@ impl McpNodeFields {
             interpreter: self.interpreter,
             preview: self.preview,
             fold: self.fold,
-            tags: self.tags,
+            tags: None,
+            add_tag: None,
+            remove_tag: None,
             created_at: self.created_at,
         }
     }
@@ -306,6 +374,9 @@ struct NodeAddParams {
     /// instance — instead of a separate follow-up `node_body` call.
     #[serde(default)]
     body: Option<String>,
+    /// Comma-separated tags to give the new node.
+    #[serde(default)]
+    tags: Option<String>,
     #[serde(flatten)]
     fields: McpNodeFields,
 }
@@ -317,6 +388,15 @@ struct NodeMetaParams {
     /// passing any of them in `fields`.
     #[serde(default)]
     clear_position: bool,
+    /// Tags to add to the node; tags it already has stay where they are.
+    /// There is deliberately no way to replace the whole tag list: a
+    /// replacement written from a stale read silently drops tags someone
+    /// else added in between.
+    #[serde(default)]
+    add_tags: Vec<String>,
+    /// Tags to remove from the node; a tag it doesn't have is ignored.
+    #[serde(default)]
+    remove_tags: Vec<String>,
     #[serde(flatten)]
     fields: McpNodeFields,
 }
@@ -325,6 +405,11 @@ struct NodeMetaParams {
 struct NodeBodyParams {
     node_id: String,
     body: String,
+    /// The `body_rev` `node_show`/`node_find` returned when you read the
+    /// node's body — required. If the body has changed since, nothing is
+    /// written and the error carries the current body and revision to merge
+    /// against and retry with.
+    base_rev: String,
 }
 
 #[derive(Deserialize, Serialize, JsonSchema)]
@@ -412,11 +497,14 @@ struct NodeSetIdParams {
 #[derive(Deserialize, Serialize, JsonSchema, Default)]
 struct NodeEdgesParams {
     node_id: String,
-    /// Full replacement list of extra-parent ids (`meshfox:edge from="..."`
-    /// lines) — replaces whatever was already there, doesn't add to it.
-    /// Pass an empty list to clear them all.
+    /// Ids to add as extra parents (`meshfox:edge from="..."` lines). An
+    /// edge that's already there is left exactly as it is, label and route
+    /// included.
     #[serde(default)]
-    from: Vec<String>,
+    add: Vec<String>,
+    /// Ids to remove from the extra parents.
+    #[serde(default)]
+    remove: Vec<String>,
 }
 
 #[derive(Deserialize, Serialize, JsonSchema)]
@@ -550,10 +638,10 @@ impl MeshfoxMcp {
 
     /// Starts the session at the worker (`POST /api/debug/start`), tracked under `DebugHandle::
     /// Remote` keyed by the *worker's own* session id (no separate local id
-    /// needed on top of it). Also opens this session's own keep-alive
-    /// connection (`remote_keepalives`) right away — the worker otherwise
-    /// has no way to know this session is still wanted the moment this
-    /// call returns and no `debug_send` is yet in flight.
+    /// needed on top of it). The worker itself knows the session is wanted —
+    /// it keeps its debug sessions in a registry it consults before exiting,
+    /// like its runs, services and `tty` sessions — so nothing here has to
+    /// hold a connection open on its behalf.
     async fn debug_start_remote(
         &self,
         port: u16,
@@ -573,10 +661,6 @@ impl MeshfoxMcp {
                 port,
                 session_id: session_id.clone(),
             },
-        );
-        self.remote_keepalives.lock().await.insert(
-            session_id.clone(),
-            crate::worker_client::hold_watch_connection(port),
         );
         Ok(CallToolResult::structured(json!({
             "session_id": session_id,
@@ -618,7 +702,6 @@ impl MeshfoxMcp {
         );
         if session_ended {
             self.sessions.lock().await.remove(&params.session_id);
-            self.stop_remote_keepalive(&params.session_id).await;
         }
         Ok(CallToolResult::structured(json!({
             "stdout": stdout,
@@ -635,7 +718,6 @@ impl MeshfoxMcp {
         Parameters(params): Parameters<DebugStopParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let removed = self.sessions.lock().await.remove(&params.session_id);
-        self.stop_remote_keepalive(&params.session_id).await;
         match removed {
             Some(DebugHandle::Remote { port, session_id }) => {
                 crate::worker_client::debug_stop(port, &session_id)
@@ -679,14 +761,22 @@ impl MeshfoxMcp {
         Parameters(params): Parameters<NodeAddParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let port = self.worker_port().await?;
-        let new_id =
-            crate::worker_client::create_node(port, &params.parent_id, &params.title, true)
-                .await
-                .map_err(invalid_params)?;
-        let meta_fields = params.fields.into_node_meta_fields();
-        if params.body.is_some() || meta_fields.is_set() {
-            let update = crate::node_update_from_fields(&meta_fields, params.body.as_deref())
-                .map_err(invalid_params)?;
+        // The body goes in with the node itself — a node that doesn't exist
+        // yet has no earlier body revision to be stale against.
+        let new_id = crate::worker_client::create_node(
+            port,
+            &params.parent_id,
+            &params.title,
+            true,
+            params.body.as_deref(),
+        )
+        .await
+        .map_err(invalid_params)?;
+        let mut meta_fields = params.fields.into_node_meta_fields();
+        meta_fields.tags = params.tags;
+        if meta_fields.is_set() {
+            let update =
+                crate::node_update_from_fields(&meta_fields, None).map_err(invalid_params)?;
             crate::worker_client::update_node(port, &new_id, &update)
                 .await
                 .map_err(invalid_params)?;
@@ -702,7 +792,13 @@ impl MeshfoxMcp {
         Parameters(params): Parameters<NodeMetaParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let port = self.worker_port().await?;
-        let meta_fields = params.fields.into_node_meta_fields();
+        let mut meta_fields = params.fields.into_node_meta_fields();
+        if !params.add_tags.is_empty() {
+            meta_fields.add_tag = Some(params.add_tags.join(","));
+        }
+        if !params.remove_tags.is_empty() {
+            meta_fields.remove_tag = Some(params.remove_tags.join(","));
+        }
         let mut update =
             crate::node_update_from_fields(&meta_fields, None).map_err(invalid_params)?;
         update.clear_position = params.clear_position;
@@ -714,14 +810,21 @@ impl MeshfoxMcp {
         ))
     }
 
-    #[tool(description = "Replaces a node's whole Markdown body.")]
+    #[tool(
+        description = "Replaces a node's whole Markdown body. Requires `base_rev`, the `body_rev` node_show/node_find returned when you read it; if the body changed since, nothing is written and the error carries the current body and revision so you can merge and retry. To add to a body without reading it first, use node_append."
+    )]
     async fn node_body(
         &self,
         Parameters(params): Parameters<NodeBodyParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let port = self.worker_port().await?;
-        crate::worker_client::update_node_body(port, &params.node_id, &params.body)
-            .await
+        crate::worker_client::update_node_body(
+            port,
+            &params.node_id,
+            &params.body,
+            &params.base_rev,
+        )
+        .await
             .map_err(invalid_params)?;
         Ok(CallToolResult::structured(
             json!({ "updated": params.node_id }),
@@ -867,20 +970,23 @@ impl MeshfoxMcp {
     }
 
     #[tool(
-        description = "Replaces a node's whole set of extra incoming edges (meshfox:edge from=\"...\" lines) — the non-structural, non-nesting cross-references. `from` replaces whatever was already there; an empty list clears them all."
+        description = "Adds or removes extra incoming edges on a node (meshfox:edge from=\"...\" lines) — the non-structural, non-nesting cross-references. Never replaces the whole set: `add` leaves an edge that already exists exactly as it is, `remove` drops just the ones named."
     )]
     async fn node_edges(
         &self,
         Parameters(params): Parameters<NodeEdgesParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let port = self.worker_port().await?;
-        let edges: Vec<meshfox_core::ExtraEdge> = params
-            .from
-            .iter()
-            .map(|p| meshfox_core::ExtraEdge::new(p.as_str()))
-            .collect();
+        if params.add.is_empty() && params.remove.is_empty() {
+            return Err(invalid_params(
+                "nothing to do — pass `add` and/or `remove`".to_string(),
+            ));
+        }
         let update = crate::worker_client::NodeUpdate {
-            extra_parents: Some(edges),
+            edges: Some(crate::worker_client::EdgeOps {
+                add: params.add.clone(),
+                remove: params.remove.clone(),
+            }),
             ..Default::default()
         };
         crate::worker_client::update_node(port, &params.node_id, &update)
@@ -888,7 +994,8 @@ impl MeshfoxMcp {
             .map_err(invalid_params)?;
         Ok(CallToolResult::structured(json!({
             "updated": params.node_id,
-            "extra_parents": params.from,
+            "added": params.add,
+            "removed": params.remove,
         })))
     }
 
@@ -1102,6 +1209,8 @@ fn node_json(canvas: &Canvas, node: &meshfox_core::Node, include_body: bool) -> 
         "height": node.height,
         "color": node.color,
         "tags": node.tags,
+        // What `node_body` needs as `base_rev` to replace this node's body.
+        "body_rev": meshfox_core::body_rev(&node.text),
         "target": node.target,
         "display": node.display.map(|d| d.as_str()),
         "preview": node.preview,
@@ -1117,6 +1226,27 @@ fn node_json(canvas: &Canvas, node: &meshfox_core::Node, include_body: bool) -> 
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for MeshfoxMcp {
+    /// Answers the root's ping: this process is up and its runtime is
+    /// serving. It also asks the worker it last talked to — a worker that
+    /// has exited is no problem (the next call finds or starts another), but
+    /// one that is there and not answering is reported, so the root can say
+    /// so rather than stopping a process that is not the one that is stuck.
+    async fn ping(&self, _context: RequestContext<RoleServer>) -> Result<(), ErrorData> {
+        let port = *self.last_worker_port.lock().unwrap();
+        let Some(port) = port else { return Ok(()) };
+        match crate::worker_client::ping(port).await {
+            crate::worker_client::WorkerHealth::Answering => Ok(()),
+            crate::worker_client::WorkerHealth::Gone => {
+                *self.last_worker_port.lock().unwrap() = None;
+                Ok(())
+            }
+            crate::worker_client::WorkerHealth::Unresponsive => Err(ErrorData::internal_error(
+                format!("{WORKER_UNRESPONSIVE} (port {port})"),
+                None,
+            )),
+        }
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "Tools for a meshfox canvas: a persistent debug shell (debug_start/debug_send/debug_stop) \
@@ -1133,16 +1263,92 @@ impl ServerHandler for MeshfoxMcp {
 // canvas-scoped tool is a proxy to that canvas's own leaf child process.
 // =======================================================================
 
-struct CanvasHandle {
-    client: RunningService<RoleClient, ()>,
+/// One open canvas: the MCP session with its process, plus what the
+/// registry has to know about it *without waiting for a call to finish* — a
+/// call holds `session` for as long as it runs, so anything that needed that
+/// lock to look (listing, sweeping, pinging) would stall behind a call that
+/// is stuck, which is exactly when it matters.
+struct OpenCanvas {
+    /// One call at a time on a canvas: held for the call's whole duration.
+    session: Mutex<RunningService<RoleClient, ()>>,
+    /// A second handle onto the same session: liveness and pings need no lock.
+    peer: Peer<RoleClient>,
     path: PathBuf,
-    last_used: Instant,
+    /// The canvas process's pid, to stop it when it is hung rather than gone.
+    pid: Option<u32>,
+    last_used: std::sync::Mutex<Instant>,
+    /// Pings in a row that went unanswered.
+    ping_failures: AtomicU32,
+    /// The process answers, but its worker does not (see `WORKER_UNRESPONSIVE`).
+    worker_unresponsive: AtomicBool,
+}
+
+impl OpenCanvas {
+    /// Whether the canvas's own process is still there to talk to: its
+    /// stdio transport ends the moment the child exits, however it exits
+    /// (crash, `kill`, idle auto-exit), so a closed transport is a dead
+    /// canvas — not an open one that merely errors.
+    fn is_alive(&self) -> bool {
+        !self.peer.is_transport_closed()
+    }
+
+    fn touch(&self) {
+        *self.last_used.lock().unwrap() = Instant::now();
+    }
+
+    fn idle_for(&self) -> Duration {
+        self.last_used.lock().unwrap().elapsed()
+    }
+
+    /// A call is in flight right now.
+    fn is_busy(&self) -> bool {
+        self.session.try_lock().is_err()
+    }
+
+    /// Stops the process outright (`SIGKILL`) — for one that is alive and not
+    /// answering. Does nothing once the transport is closed: the process is
+    /// gone, and its pid may already belong to something else.
+    fn kill(&self) {
+        if let (true, Some(pid)) = (self.is_alive(), self.pid) {
+            // SAFETY: a plain `SIGKILL` by pid, of a child this registry
+            // spawned and whose transport is still open.
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
+
+    /// What `canvas_list` says about it.
+    fn health(&self) -> String {
+        let failures = self.ping_failures.load(Ordering::Relaxed);
+        if failures > 0 {
+            format!("not answering pings ({failures} in a row)")
+        } else if self.worker_unresponsive.load(Ordering::Relaxed) {
+            "its worker is not answering".to_string()
+        } else {
+            "ok".to_string()
+        }
+    }
+}
+
+/// Closes a canvas's process gracefully, and stops it outright if that
+/// doesn't happen in time — a call stuck inside it holds the session, and
+/// waiting for the session would wait for ever.
+async fn close_canvas(canvas: &OpenCanvas) {
+    let closed = tokio::time::timeout(CANVAS_CLOSE_TIMEOUT, async {
+        let mut session = canvas.session.lock().await;
+        let _ = session.close_with_timeout(CANVAS_CLOSE_TIMEOUT).await;
+    })
+    .await;
+    if closed.is_err() {
+        canvas.kill();
+    }
 }
 
 #[derive(Clone)]
 struct MeshfoxMcpRoot {
     root: PathBuf,
-    canvases: Arc<Mutex<HashMap<String, Arc<Mutex<CanvasHandle>>>>>,
+    canvases: Arc<Mutex<HashMap<String, Arc<OpenCanvas>>>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -1155,30 +1361,96 @@ impl MeshfoxMcpRoot {
         }
     }
 
+    /// Every open canvas, as `(id, canvas)` — a snapshot taken under the
+    /// registry lock and used after it is released.
+    async fn snapshot(&self) -> Vec<(String, Arc<OpenCanvas>)> {
+        self.canvases
+            .lock()
+            .await
+            .iter()
+            .map(|(id, canvas)| (id.clone(), Arc::clone(canvas)))
+            .collect()
+    }
+
+    /// Takes `canvas` out of the registry — unless a newer process has
+    /// already replaced it under the same id. `true` if it was removed.
+    async fn remove_if_same(&self, canvas_id: &str, canvas: &Arc<OpenCanvas>) -> bool {
+        let mut canvases = self.canvases.lock().await;
+        if canvases.get(canvas_id).is_some_and(|c| Arc::ptr_eq(c, canvas)) {
+            canvases.remove(canvas_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Closes canvases whose process died or that sat idle too long. One that
+    /// has a call in flight is not idle (the call has its own deadline).
     fn spawn_idle_sweep(&self) {
-        let canvases = Arc::clone(&self.canvases);
+        let this = self.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(SWEEP_INTERVAL).await;
-                let idle_ids: Vec<String> = {
-                    let map = canvases.lock().await;
-                    let mut idle = Vec::new();
-                    for (id, handle) in map.iter() {
-                        if handle.lock().await.last_used.elapsed() > IDLE_TIMEOUT {
-                            idle.push(id.clone());
-                        }
-                    }
-                    idle
-                };
-                for id in idle_ids {
-                    let removed = canvases.lock().await.remove(&id);
-                    if let Some(handle) = removed {
-                        let mut guard = handle.lock().await;
-                        let _ = guard.client.close_with_timeout(CANVAS_CLOSE_TIMEOUT).await;
+                tokio::time::sleep(sweep_interval()).await;
+                for (id, canvas) in this.snapshot().await {
+                    let dead = !canvas.is_alive();
+                    let idle = !canvas.is_busy() && canvas.idle_for() > idle_timeout();
+                    if (dead || idle) && this.remove_if_same(&id, &canvas).await {
+                        close_canvas(&canvas).await;
                     }
                 }
             }
         });
+    }
+
+    /// Asks every open canvas's process, every `ping_interval`, whether it is
+    /// still answering. A process that is alive (its transport open) but
+    /// hung — blocked, deadlocked, stopped — never closes anything, so
+    /// nothing else would ever notice; after `PING_STRIKES` unanswered pings
+    /// in a row it is stopped and dropped, and the next call reopens the
+    /// canvas. Pings go over the session's own peer, not through the lock a
+    /// running call holds, so they work while a call is stuck.
+    fn spawn_pinger(&self) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(ping_interval()).await;
+                for (id, canvas) in this.snapshot().await {
+                    if !canvas.is_alive() {
+                        continue;
+                    }
+                    let this = this.clone();
+                    tokio::spawn(async move { this.ping_canvas(&id, &canvas).await });
+                }
+            }
+        });
+    }
+
+    async fn ping_canvas(&self, canvas_id: &str, canvas: &Arc<OpenCanvas>) {
+        let ping = canvas
+            .peer
+            .send_request(ClientRequest::PingRequest(PingRequest::default()));
+        match tokio::time::timeout(ping_timeout(), ping).await {
+            Ok(Ok(_)) => {
+                canvas.ping_failures.store(0, Ordering::Relaxed);
+                canvas.worker_unresponsive.store(false, Ordering::Relaxed);
+            }
+            // The process answered, saying its worker does not: it is fine,
+            // and stopping it would not help.
+            Ok(Err(ServiceError::McpError(e))) if e.message.starts_with(WORKER_UNRESPONSIVE) => {
+                canvas.ping_failures.store(0, Ordering::Relaxed);
+                canvas.worker_unresponsive.store(true, Ordering::Relaxed);
+            }
+            _ => {
+                let failures = canvas.ping_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                if failures >= PING_STRIKES && self.remove_if_same(canvas_id, canvas).await {
+                    eprintln!(
+                        "meshfox mcp: the process for canvas {canvas_id:?} stopped answering \
+                         pings ({failures} in a row) and was stopped; the next call reopens it"
+                    );
+                    canvas.kill();
+                }
+            }
+        }
     }
 
     /// Resolves `requested` (relative to this server's own root, or
@@ -1253,23 +1525,104 @@ impl MeshfoxMcpRoot {
         Ok((canonical, canvas_id))
     }
 
-    async fn lookup(&self, canvas_id: &str) -> Result<Arc<Mutex<CanvasHandle>>, ErrorData> {
-        self.canvases
-            .lock()
-            .await
-            .get(canvas_id)
-            .cloned()
-            .ok_or_else(|| {
-                invalid_params(format!(
-                    "no open canvas {canvas_id:?} — call canvas_open first"
-                ))
-            })
+    /// The registry's entry for `canvas_id` if its process is still alive; a
+    /// dead one (the child exited, crashed or was killed) is dropped from the
+    /// registry on the spot, so nothing keeps answering for a canvas that is
+    /// no longer there.
+    async fn live_handle(&self, canvas_id: &str) -> Option<Arc<OpenCanvas>> {
+        let mut canvases = self.canvases.lock().await;
+        let canvas = canvases.get(canvas_id).cloned()?;
+        if canvas.is_alive() {
+            return Some(canvas);
+        }
+        canvases.remove(canvas_id);
+        None
+    }
+
+    /// Spawns a process for `resolved` and registers it as `canvas_id`; when
+    /// another call registered the same canvas first, this call's own
+    /// just-spawned duplicate is dropped and the winner returned.
+    async fn open_canvas(
+        &self,
+        resolved: PathBuf,
+        canvas_id: String,
+    ) -> Result<Arc<OpenCanvas>, ErrorData> {
+        let exe = std::env::current_exe().map_err(|e| {
+            ErrorData::internal_error(format!("failed to locate own executable: {e}"), None)
+        })?;
+        let command = Command::new(exe).configure(|cmd| {
+            cmd.arg("mcp")
+                .env(LEAF_ENV_VAR, "1")
+                .env(LEAF_PATH_ENV_VAR, &resolved)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped());
+        });
+        let transport = TokioChildProcess::new(command).map_err(|e| {
+            ErrorData::internal_error(
+                format!("failed to spawn a process for canvas {canvas_id:?}: {e}"),
+                None,
+            )
+        })?;
+        let pid = transport.id();
+        let client = ().serve(transport).await.map_err(|e| {
+            ErrorData::internal_error(
+                format!("failed to start MCP session for canvas {canvas_id:?}: {e}"),
+                None,
+            )
+        })?;
+
+        let mut canvases = self.canvases.lock().await;
+        if let Some(existing) = canvases.get(&canvas_id).cloned() {
+            if existing.is_alive() {
+                // Lost a race with a concurrent open of the same file.
+                drop(canvases);
+                let _ = client.cancel().await;
+                return Ok(existing);
+            }
+        }
+        let canvas = Arc::new(OpenCanvas {
+            peer: client.peer().clone(),
+            session: Mutex::new(client),
+            path: resolved,
+            pid,
+            last_used: std::sync::Mutex::new(Instant::now()),
+            ping_failures: AtomicU32::new(0),
+            worker_unresponsive: AtomicBool::new(false),
+        });
+        canvases.insert(canvas_id, Arc::clone(&canvas));
+        Ok(canvas)
+    }
+
+    /// The live entry for `canvas_id`, opening the canvas first if it isn't
+    /// open — never opened, closed by the idle sweep, or its process died.
+    /// A `canvas_id` is the canvas file's path relative to this server's
+    /// root (that is all `canvas_open` ever derived it from), so it names
+    /// what to open as well as what is open; a tool call therefore never
+    /// needs a preceding `canvas_open` to succeed, and a canvas that went
+    /// away between two calls costs the caller nothing.
+    async fn lookup(&self, canvas_id: &str) -> Result<Arc<OpenCanvas>, ErrorData> {
+        if let Some(canvas) = self.live_handle(canvas_id).await {
+            return Ok(canvas);
+        }
+        let (resolved, canonical_id) = self.resolve_under_root(canvas_id).map_err(|e| {
+            invalid_params(format!(
+                "canvas {canvas_id:?} is not open, and there is no canvas file by that path \
+                 under {} to open on demand: {}",
+                self.root.display(),
+                e.message
+            ))
+        })?;
+        self.open_canvas(resolved, canonical_id).await
     }
 
     /// Forwards `inner` to `tool_name` on `canvas_id`'s own child process,
     /// one-to-one — same tool name, same argument shape, minus the
     /// `canvas_id` wrapper this level adds. The child's own success/failure
     /// comes back exactly as it sent it.
+    ///
+    /// A process that does not answer within `call_deadline` is hung: it is
+    /// stopped and dropped (left in the registry, every later call on that
+    /// canvas would queue behind the stuck one), and the caller is told so.
     async fn forward(
         &self,
         canvas_id: &str,
@@ -1292,25 +1645,73 @@ impl MeshfoxMcpRoot {
                 ))
             }
         };
+        let deadline = call_deadline(tool_name, arguments.as_ref());
 
-        let handle = self.lookup(canvas_id).await?;
-        let mut guard = handle.lock().await;
-        guard.last_used = Instant::now();
+        // A process found dead *before* the call is replaced and the call
+        // goes to its successor: nothing was sent, so nothing can have been
+        // applied twice. (At most one replacement per call.) Waiting for the
+        // session lock is waiting behind earlier calls on this canvas, each
+        // bounded by its own deadline.
+        let mut canvas = self.lookup(canvas_id).await?;
+        let mut session = canvas.session.lock().await;
+        if !canvas.is_alive() {
+            drop(session);
+            self.remove_if_same(canvas_id, &canvas).await;
+            canvas = self.lookup(canvas_id).await?;
+            session = canvas.session.lock().await;
+        }
+        canvas.touch();
         let mut request = CallToolRequestParams::new(tool_name);
         if let Some(arguments) = arguments {
             request = request.with_arguments(arguments);
         }
-        match guard.client.call_tool(request).await {
-            Ok(result) => Ok(result),
+        match tokio::time::timeout(deadline, session.call_tool(request)).await {
+            Ok(Ok(result)) => Ok(result),
             // The child's own tool returned `Err(ErrorData)` — propagate
             // its exact code/message rather than wrapping it, so calling a
             // proxied tool reads no differently than calling it directly
             // on a single-canvas leaf server would.
-            Err(ServiceError::McpError(e)) => Err(e),
-            Err(e) => Err(ErrorData::internal_error(
-                format!("canvas {canvas_id:?} ({tool_name}): {e}"),
-                None,
-            )),
+            Ok(Err(ServiceError::McpError(e))) => Err(e),
+            Ok(Err(e)) => {
+                let died = !canvas.is_alive();
+                drop(session);
+                if died {
+                    // The process went away *during* the call, so whether
+                    // the operation was applied is unknown: not retried
+                    // (an edit could land twice), and said so plainly. The
+                    // dead entry is dropped; the next call reopens.
+                    self.remove_if_same(canvas_id, &canvas).await;
+                    return Err(ErrorData::internal_error(
+                        format!(
+                            "canvas {canvas_id:?}: its process went away during {tool_name} ({e}); \
+                             the call may or may not have been applied — read the current state \
+                             before repeating it. The next call reopens the canvas."
+                        ),
+                        None,
+                    ));
+                }
+                Err(ErrorData::internal_error(
+                    format!("canvas {canvas_id:?} ({tool_name}): {e}"),
+                    None,
+                ))
+            }
+            Err(_) => {
+                // No answer in time: alive, but hung. Stop it, so nothing else
+                // queues behind it.
+                drop(session);
+                if self.remove_if_same(canvas_id, &canvas).await {
+                    canvas.kill();
+                }
+                Err(ErrorData::internal_error(
+                    format!(
+                        "canvas {canvas_id:?}: its process did not answer {tool_name} within {}s \
+                         and was stopped; the call may or may not have been applied — read the \
+                         current state before repeating it. The next call reopens the canvas.",
+                        deadline.as_secs()
+                    ),
+                    None,
+                ))
+            }
         }
     }
 }
@@ -1359,7 +1760,7 @@ struct EmptyParams {}
 #[tool_router]
 impl MeshfoxMcpRoot {
     #[tool(
-        description = "Opens a canvas file for editing/debugging, spawning its own isolated process if it isn't already open (a crash or hang on one canvas can't affect another). `path` must resolve under this server's own root directory. Returns a canvas_id — required by every other tool. Opening an already-open file just returns its existing id. Pass `create: true` to create the file first (an empty canvas) if it doesn't exist yet — a no-op if it already does."
+        description = "Opens a canvas file for editing/debugging, spawning its own isolated process if it isn't already open (a crash or hang on one canvas can't affect another). `path` must resolve under this server's own root directory. Returns a canvas_id — the file's path relative to that root, which every other tool takes. Opening an already-open file just returns its existing id. Calling any other tool with the canvas_id of a canvas that isn't open (never opened, closed after sitting idle, or whose process died) reopens it on demand, so calling canvas_open first is only needed to create a file or to see its id. Pass `create: true` to create the file first (an empty canvas) if it doesn't exist yet — a no-op if it already does."
     )]
     async fn canvas_open(
         &self,
@@ -1387,56 +1788,13 @@ impl MeshfoxMcpRoot {
             self.resolve_under_root(&params.path)?
         };
 
-        if let Some(handle) = self.canvases.lock().await.get(&canvas_id).cloned() {
-            handle.lock().await.last_used = Instant::now();
-            return Ok(CallToolResult::structured(
-                json!({ "canvas_id": canvas_id, "path": canvas_id }),
-            ));
-        }
-
-        let exe = std::env::current_exe().map_err(|e| {
-            ErrorData::internal_error(format!("failed to locate own executable: {e}"), None)
-        })?;
-        let command = Command::new(exe).configure(|cmd| {
-            cmd.arg("mcp")
-                .env(LEAF_ENV_VAR, "1")
-                .env(LEAF_PATH_ENV_VAR, &resolved)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped());
-        });
-        let transport = TokioChildProcess::new(command).map_err(|e| {
-            ErrorData::internal_error(
-                format!("failed to spawn a process for canvas {canvas_id:?}: {e}"),
-                None,
-            )
-        })?;
-        let client = ().serve(transport).await.map_err(|e| {
-            ErrorData::internal_error(
-                format!("failed to start MCP session for canvas {canvas_id:?}: {e}"),
-                None,
-            )
-        })?;
-
-        let mut canvases = self.canvases.lock().await;
-        if let Some(handle) = canvases.get(&canvas_id).cloned() {
-            // Lost a race with a concurrent canvas_open for the same file
-            // — drop this call's own just-spawned duplicate, keep the
-            // winner already in the registry.
-            drop(canvases);
-            let _ = client.cancel().await;
-            handle.lock().await.last_used = Instant::now();
-            return Ok(CallToolResult::structured(
-                json!({ "canvas_id": canvas_id, "path": canvas_id }),
-            ));
-        }
-        canvases.insert(
-            canvas_id.clone(),
-            Arc::new(Mutex::new(CanvasHandle {
-                client,
-                path: resolved,
-                last_used: Instant::now(),
-            })),
-        );
+        // Already open and alive: just its id. One whose process has died is
+        // not "already open" — it is reopened here, same as by any other call.
+        let canvas = match self.live_handle(&canvas_id).await {
+            Some(canvas) => canvas,
+            None => self.open_canvas(resolved, canvas_id.clone()).await?,
+        };
+        canvas.touch();
         Ok(CallToolResult::structured(
             json!({ "canvas_id": canvas_id, "path": canvas_id }),
         ))
@@ -1449,34 +1807,46 @@ impl MeshfoxMcpRoot {
         &self,
         Parameters(params): Parameters<CanvasIdOnlyParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let handle = self
+        let canvas = self
             .canvases
             .lock()
             .await
             .remove(&params.canvas_id)
             .ok_or_else(|| invalid_params(format!("no open canvas {:?}", params.canvas_id)))?;
-        let mut guard = handle.lock().await;
-        let _ = guard.client.close_with_timeout(CANVAS_CLOSE_TIMEOUT).await;
+        close_canvas(&canvas).await;
         Ok(CallToolResult::structured(
             json!({ "closed": params.canvas_id }),
         ))
     }
 
-    #[tool(description = "Lists every currently open canvas and its id.")]
+    #[tool(
+        description = "Lists every currently open canvas: its id, whether a call is in flight (busy), and its health — ok, not answering pings, or its worker not answering. Never waits for a busy canvas."
+    )]
     async fn canvas_list(
         &self,
         Parameters(_params): Parameters<EmptyParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let canvases = self.canvases.lock().await;
-        let mut items = Vec::new();
-        for (id, handle) in canvases.iter() {
-            let guard = handle.lock().await;
-            items.push(json!({
-                "canvas_id": id,
-                "path": id,
-                "resolved_path": guard.path.display().to_string(),
-            }));
-        }
+        // A canvas whose process has died is not open — drop it, don't list
+        // it. Nothing below waits on a canvas's session lock: a call stuck in
+        // one canvas must not stop this from answering about all the others.
+        self.canvases
+            .lock()
+            .await
+            .retain(|_, canvas| canvas.is_alive());
+        let items: Vec<serde_json::Value> = self
+            .snapshot()
+            .await
+            .into_iter()
+            .map(|(id, canvas)| {
+                json!({
+                    "canvas_id": id,
+                    "path": id,
+                    "resolved_path": canvas.path.display().to_string(),
+                    "busy": canvas.is_busy(),
+                    "health": canvas.health(),
+                })
+            })
+            .collect();
         Ok(CallToolResult::structured(json!({ "canvases": items })))
     }
 
@@ -1631,7 +2001,7 @@ impl MeshfoxMcpRoot {
     }
 
     #[tool(
-        description = "Same as node_edges, scoped to canvas_id (see canvas_open) — replaces a node's extra incoming edges in that canvas."
+        description = "Same as node_edges, scoped to canvas_id (see canvas_open) — adds or removes a node's extra incoming edges in that canvas."
     )]
     async fn node_edges(
         &self,

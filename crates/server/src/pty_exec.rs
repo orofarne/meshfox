@@ -127,6 +127,8 @@ impl PtyProcess {
 /// `[process_env]`. `canvas_path`, when given, is the canvas file this
 /// step's fence actually lives in — only consulted for an `@name` builtin
 /// `interpreter` (see `meshfox_core::resolve_command`'s own doc comment).
+/// `(cols, rows)` is the pty's initial size, one tuple so this stays under
+/// clippy's argument limit.
 pub fn spawn<I, K, V>(
     code: &str,
     interpreter: Option<&str>,
@@ -134,8 +136,7 @@ pub fn spawn<I, K, V>(
     envs: I,
     cwd: Option<&Path>,
     canvas_path: Option<&Path>,
-    cols: u16,
-    rows: u16,
+    (cols, rows): (u16, u16),
 ) -> io::Result<PtyProcess>
 where
     I: IntoIterator<Item = (K, V)>,
@@ -276,7 +277,7 @@ mod tests {
 
     #[tokio::test]
     async fn runs_bash_and_captures_output() {
-        let mut proc = spawn("echo hello", None, None, no_envs(), None, None, 80, 24).unwrap();
+        let mut proc = spawn("echo hello", None, None, no_envs(), None, None, (80, 24)).unwrap();
         let mut collected = Vec::new();
         while let Some(chunk) = proc.output_rx.recv().await {
             collected.extend_from_slice(&chunk);
@@ -290,7 +291,7 @@ mod tests {
 
     #[tokio::test]
     async fn reports_nonzero_exit_code() {
-        let mut proc = spawn("exit 7", None, None, no_envs(), None, None, 80, 24).unwrap();
+        let mut proc = spawn("exit 7", None, None, no_envs(), None, None, (80, 24)).unwrap();
         while proc.output_rx.recv().await.is_some() {}
         assert_eq!(proc.wait().await, 7);
     }
@@ -304,8 +305,7 @@ mod tests {
             no_envs(),
             None,
             None,
-            80,
-            24,
+            (80, 24),
         )
         .unwrap();
         proc.write(b"hi there\n".to_vec());
@@ -328,8 +328,7 @@ mod tests {
             [("INSTALL_PATH", "/opt/meshfox")],
             None,
             None,
-            80,
-            24,
+            (80, 24),
         )
         .unwrap();
         let mut collected = Vec::new();
@@ -344,7 +343,7 @@ mod tests {
 
     #[tokio::test]
     async fn kill_terminates_a_long_running_process() {
-        let proc = spawn("sleep 30", None, None, no_envs(), None, None, 80, 24).unwrap();
+        let proc = spawn("sleep 30", None, None, no_envs(), None, None, (80, 24)).unwrap();
         proc.kill().unwrap();
         // Draining output_rx (dropped instead here, deliberately) isn't
         // needed to confirm the kill worked — `wait` below is enough.
@@ -365,8 +364,7 @@ mod tests {
             no_envs(),
             None,
             None,
-            80,
-            24,
+            (80, 24),
         )
         .unwrap();
         let mut collected = Vec::new();
@@ -388,8 +386,7 @@ mod tests {
             no_envs(),
             None,
             None,
-            80,
-            24,
+            (80, 24),
         )
         .unwrap();
         let path = proc
@@ -409,7 +406,7 @@ mod tests {
     #[tokio::test]
     async fn runs_in_the_given_cwd() {
         let dir = std::env::temp_dir();
-        let mut proc = spawn("pwd -P", None, None, no_envs(), Some(&dir), None, 80, 24).unwrap();
+        let mut proc = spawn("pwd -P", None, None, no_envs(), Some(&dir), None, (80, 24)).unwrap();
         let want = dir.canonicalize().unwrap().to_string_lossy().into_owned();
         let mut collected = Vec::new();
         while let Some(chunk) = proc.output_rx.recv().await {
@@ -453,8 +450,7 @@ mod tests {
             no_envs(),
             Some(&dir),
             None,
-            80,
-            24,
+            (80, 24),
         )
         .unwrap();
         std::env::remove_var("MESHFOX_PTY_ENV_OVERRIDE_TEST");

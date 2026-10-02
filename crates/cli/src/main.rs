@@ -13,10 +13,10 @@
 
 use clap::{Args, Parser, Subcommand};
 use meshfox_core::{
-    mdcanvas, Canvas, ExtraEdge, FileDisplay, Node, NodeType, VarCache, VarDecl, VarType,
+    mdcanvas, Canvas, FileDisplay, Node, NodeType, VarCache, VarDecl, VarType,
 };
 #[cfg(test)]
-use meshfox_core::{FenceAttrsPatch, NodeMeta};
+use meshfox_core::{ExtraEdge, FenceAttrsPatch, NodeMeta};
 use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -545,13 +545,21 @@ struct NodeMetaFields {
     /// leave the new node with no override at all).
     #[arg(long)]
     fold: Option<String>,
-    /// Comma-separated tags (`meshfox:node`'s own `tags=` spelling — see
-    /// `meshfox_core::parse_tags`), replacing the whole list. Omit this
-    /// flag entirely to leave the current tags untouched (or, on `node
-    /// add`, to leave the new node with none); pass `--tags ""` to clear
-    /// them.
+    /// Comma-separated tags to give a *new* node (`meshfox:node`'s own
+    /// `tags=` spelling — see `meshfox_core::parse_tags`). `node add` only:
+    /// `node meta` never replaces a whole tag list, it takes
+    /// `--add-tag`/`--remove-tag` instead, so two people tagging the same
+    /// node at once both land.
     #[arg(long)]
     tags: Option<String>,
+    /// Comma-separated tags to add to the node (`node meta`); tags it
+    /// already has are left where they are.
+    #[arg(long = "add-tag")]
+    add_tag: Option<String>,
+    /// Comma-separated tags to remove from the node (`node meta`); a tag it
+    /// doesn't have is ignored.
+    #[arg(long = "remove-tag")]
+    remove_tag: Option<String>,
     /// Override `createdAt=` (see SPEC.md's "Timestamps") — RFC3339, e.g.
     /// `2026-08-29T10:15:00Z` or with an explicit offset like
     /// `2026-08-29T13:15:00+03:00`. Meant for backfilling/importing
@@ -582,6 +590,8 @@ impl NodeMetaFields {
             || self.preview.is_some()
             || self.fold.is_some()
             || self.tags.is_some()
+            || self.add_tag.is_some()
+            || self.remove_tag.is_some()
             || self.created_at.is_some()
     }
 }
@@ -690,6 +700,12 @@ enum NodeCommand {
         /// Read the new body from this file instead of stdin.
         #[arg(long)]
         file: Option<PathBuf>,
+        /// The `body-rev` `meshfox node show` printed when you read the
+        /// node's body — required. If the body has changed since (another
+        /// tab, an agent, an editor), nothing is written and the error
+        /// carries the current body and revision to merge against and retry.
+        #[arg(long = "base-rev")]
+        base_rev: String,
     },
     /// Appends to the end of a node's existing Markdown body
     /// (`mdcanvas::append_node_body`) — after whatever's already there,
@@ -818,25 +834,25 @@ enum NodeCommand {
         #[arg(long)]
         clear_position: bool,
     },
-    /// Replace a node's whole set of extra incoming edges (`meshfox:edge
+    /// Add or remove extra incoming edges on a node (`meshfox:edge
     /// from="..."` lines, `mdcanvas::set_node_edges`) — the
     /// non-structural, non-nesting cross-references JSON Canvas-style
-    /// graphs use. The given `--from` list (repeatable) *replaces*
-    /// whatever was already there, it doesn't add to it; `--clear` removes
-    /// them all.
+    /// graphs use. Never replaces the whole set: `--add` leaves an edge
+    /// that's already there exactly as it is (label, route and all) and
+    /// `--remove` drops just the ones named, so two people editing the same
+    /// node's edges at once both land.
     Edges {
         /// Path to the .canvas.md file. If omitted: auto-discover the
         /// single candidate in the current directory.
         #[arg(long)]
         canvas: Option<PathBuf>,
         node_id: String,
-        /// An id to add as an extra parent (repeatable). Ignored if
-        /// `--clear` is also given.
-        #[arg(long = "from")]
-        from: Vec<String>,
-        /// Remove every extra parent instead of setting a new list.
-        #[arg(long)]
-        clear: bool,
+        /// An id to add as an extra parent (repeatable).
+        #[arg(long = "add")]
+        add: Vec<String>,
+        /// An id to remove from the extra parents (repeatable).
+        #[arg(long = "remove")]
+        remove: Vec<String>,
     },
     /// Moves a node's whole subtree to sit immediately before or after
     /// another sibling under the same structural parent
@@ -1327,7 +1343,8 @@ fn main() {
                 canvas,
                 node_id,
                 file,
-            } => node_body(&canvas.unwrap_or_else(find_canvas), &node_id, file),
+                base_rev,
+            } => node_body(&canvas.unwrap_or_else(find_canvas), &node_id, file, &base_rev),
             NodeCommand::Append {
                 canvas,
                 node_id,
@@ -1407,14 +1424,16 @@ fn main() {
                 fields.preview,
                 fields.fold,
                 fields.tags,
+                fields.add_tag,
+                fields.remove_tag,
                 fields.created_at,
             ),
             NodeCommand::Edges {
                 canvas,
                 node_id,
-                from,
-                clear,
-            } => node_edges(&canvas.unwrap_or_else(find_canvas), &node_id, from, clear),
+                add,
+                remove,
+            } => node_edges(&canvas.unwrap_or_else(find_canvas), &node_id, add, remove),
             NodeCommand::Move {
                 canvas,
                 node_id,
@@ -1619,7 +1638,7 @@ fn shared_origin_note(origin: &meshfox_core::SharedOrigin) -> String {
     }
 }
 
-fn configure(canvas_path: &PathBuf) {
+fn configure(canvas_path: &Path) {
     let raw = read_raw_or_exit(canvas_path);
     let decls = declared_vars_or_exit(canvas_path, &raw);
     // `secret` and `session` are both never cached -- `configure`'s whole
@@ -1724,7 +1743,7 @@ fn validate_canvas(raw: &str, canvas_path: &Path) -> Result<usize, String> {
     Ok(canvas.nodes.len())
 }
 
-fn validate(canvas_path: &PathBuf) {
+fn validate(canvas_path: &Path) {
     let raw = read_raw_or_exit(canvas_path);
     match validate_canvas(&raw, canvas_path) {
         Ok(n) => println!(
@@ -1773,7 +1792,7 @@ fn check_canvas(
     ))
 }
 
-fn check(canvas_path: &PathBuf) {
+fn check(canvas_path: &Path) {
     let raw = read_raw_or_exit(canvas_path);
     let results = check_canvas(&raw, canvas_path).unwrap_or_else(|e| {
         eprintln!("meshfox check: {}: {e}", canvas_path.display());
@@ -2106,7 +2125,7 @@ fn closest_node_path(canvas: &Canvas, missing: &str) -> Option<String> {
         .map(|(_, n)| node_path_string(canvas, &n.id))
 }
 
-fn run(canvas_path: &PathBuf, args: Vec<String>, no_deps: bool, set: Vec<(String, String)>) {
+fn run(canvas_path: &Path, args: Vec<String>, no_deps: bool, set: Vec<(String, String)>) {
     let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
         eprintln!("failed to start async runtime: {e}");
         std::process::exit(1);
@@ -2168,7 +2187,7 @@ fn persist_set_overrides(
 }
 
 async fn run_async(
-    canvas_path: &PathBuf,
+    canvas_path: &Path,
     mut args: Vec<String>,
     no_deps: bool,
     set: Vec<(String, String)>,
@@ -2238,7 +2257,7 @@ async fn run_async(
             // would otherwise land intermixed with `run_via_worker`'s
             // own clean, `RunEvent`-driven console output.
             tokio::spawn(meshfox_server::serve_as_worker(
-                canvas_path.clone(),
+                canvas_path.to_path_buf(),
                 0,
                 false,
                 None,
@@ -2754,10 +2773,11 @@ async fn node_mv_via_worker(
         return Err(format!("no node {new_parent_id:?}"));
     }
     if !node.extra_parents.iter().any(|e| e.from == new_parent_id) {
-        let mut extra_parents = node.extra_parents.clone();
-        extra_parents.push(ExtraEdge::new(new_parent_id));
         let update = worker_client::NodeUpdate {
-            extra_parents: Some(extra_parents),
+            edges: Some(worker_client::EdgeOps {
+                add: vec![new_parent_id.to_string()],
+                ..Default::default()
+            }),
             ..Default::default()
         };
         worker_client::update_node(port, node_id, &update).await?;
@@ -3090,7 +3110,7 @@ fn var_decl_from_status(status: &worker_client::VarStatus) -> VarDecl {
     }
 }
 
-fn list(canvas_path: &PathBuf) {
+fn list(canvas_path: &Path) {
     let raw = read_raw_or_exit(canvas_path);
     let canvas = Canvas::from_markdown(&raw).unwrap_or_else(|e| {
         eprintln!("failed to parse {}: {e}", canvas_path.display());
@@ -3359,15 +3379,23 @@ fn node_add(
     // to change which scheme a caller gets back (see
     // `crates/server/src/lib.rs`'s `CreateNodeRequest::title_slug_id`
     // doc comment).
-    let new_id = match runtime.block_on(worker_client::create_node(port, parent_id, title, true)) {
+    // The body, if any, goes in with the node itself: a node that doesn't
+    // exist yet has no earlier body revision to be stale against.
+    let new_id = match runtime.block_on(worker_client::create_node(
+        port,
+        parent_id,
+        title,
+        true,
+        body.as_deref(),
+    )) {
         Ok(id) => id,
         Err(e) => {
             eprintln!("meshfox node add: {e} (worker on port {port})");
             std::process::exit(1);
         }
     };
-    if body.is_some() || fields.is_set() {
-        let update = match node_update_from_fields(&fields, body.as_deref()) {
+    if fields.is_set() {
+        let update = match node_update_from_fields(&fields, None) {
             Ok(u) => u,
             Err(e) => {
                 eprintln!("meshfox node add: added {new_id:?}, but {e}");
@@ -3663,7 +3691,7 @@ fn node_set_id(canvas_path: &Path, node_id: &str, new_id: &str) {
     }
 }
 
-fn node_body(canvas_path: &Path, node_id: &str, file: Option<PathBuf>) {
+fn node_body(canvas_path: &Path, node_id: &str, file: Option<PathBuf>, base_rev: &str) {
     let new_body = match &file {
         Some(path) => std::fs::read_to_string(path).unwrap_or_else(|e| {
             eprintln!("failed to read {}: {e}", path.display());
@@ -3687,7 +3715,9 @@ fn node_body(canvas_path: &Path, node_id: &str, file: Option<PathBuf>) {
         std::process::exit(1);
     });
     let port = worker_port_or_exit(&runtime, canvas_path);
-    match runtime.block_on(worker_client::update_node_body(port, node_id, &new_body)) {
+    match runtime.block_on(worker_client::update_node_body(
+        port, node_id, &new_body, base_rev,
+    )) {
         Ok(()) => {
             println!("meshfox node body: updated {node_id:?} via the running worker on port {port}")
         }
@@ -4015,12 +4045,23 @@ fn node_update_from_fields(
         .map(parse_node_type)
         .transpose()?;
     let display = fields.display.as_deref().map(parse_display).transpose()?;
-    let tags = match &fields.tags {
-        None => None,
-        Some(s) => {
-            validate_tags_input(s)?;
-            Some(meshfox_core::parse_tags(Some(s)))
+    let parse_tag_list = |value: &Option<String>| -> Result<Vec<String>, String> {
+        match value {
+            None => Ok(Vec::new()),
+            Some(s) => {
+                validate_tags_input(s)?;
+                Ok(meshfox_core::parse_tags(Some(s)))
+            }
         }
+    };
+    // `--tags` (a new node's initial tags) and `--add-tag` both just add.
+    let mut add = parse_tag_list(&fields.tags)?;
+    add.extend(parse_tag_list(&fields.add_tag)?);
+    let remove = parse_tag_list(&fields.remove_tag)?;
+    let tags = if add.is_empty() && remove.is_empty() {
+        None
+    } else {
+        Some(worker_client::TagOps { add, remove })
     };
     Ok(worker_client::NodeUpdate {
         text: body.map(str::to_string),
@@ -4058,8 +4099,17 @@ fn node_meta(
     preview: Option<bool>,
     fold: Option<String>,
     tags: Option<String>,
+    add_tag: Option<String>,
+    remove_tag: Option<String>,
     created_at: Option<String>,
 ) {
+    if tags.is_some() {
+        eprintln!(
+            "meshfox node meta: --tags replaced a node's whole tag list and is gone — \
+             use --add-tag/--remove-tag (comma-separated) instead"
+        );
+        std::process::exit(1);
+    }
     let fields = NodeMetaFields {
         x,
         y,
@@ -4073,6 +4123,8 @@ fn node_meta(
         preview,
         fold,
         tags,
+        add_tag,
+        remove_tag,
         created_at,
     };
     let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
@@ -4167,15 +4219,21 @@ fn apply_node_meta(
         None => node.fold,
         Some(s) => meshfox_core::parse_fold_override(s)?,
     };
-    // Same "omitted keeps current, given replaces outright" contract as
-    // `--from` on `node edges` — `--tags ""` parses to an empty list (see
-    // `meshfox_core::parse_tags`), clearing every tag rather than being a
-    // no-op.
+    // Direct-file counterpart of the server's `TagOps::add`: given tags are
+    // added after the ones the node already has (an existing one keeps its
+    // place); omitted leaves them untouched. There is no way to replace the
+    // whole list — see `NodeMetaFields::tags`.
     let parsed_tags = match &tags {
         None => node.tags.clone(),
         Some(s) => {
             validate_tags_input(s)?;
-            meshfox_core::parse_tags(Some(s))
+            let mut merged = node.tags.clone();
+            for tag in meshfox_core::parse_tags(Some(s)) {
+                if !merged.contains(&tag) {
+                    merged.push(tag);
+                }
+            }
+            merged
         }
     };
 
@@ -4235,25 +4293,27 @@ fn apply_node_meta(
     Ok(updated)
 }
 
-fn node_edges(canvas_path: &Path, node_id: &str, from: Vec<String>, clear: bool) {
-    let extra_parents: Vec<String> = if clear { Vec::new() } else { from };
+fn node_edges(canvas_path: &Path, node_id: &str, add: Vec<String>, remove: Vec<String>) {
+    if add.is_empty() && remove.is_empty() {
+        eprintln!("meshfox node edges: nothing to do — pass --add <id> and/or --remove <id>");
+        std::process::exit(1);
+    }
     let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
         eprintln!("failed to start async runtime: {e}");
         std::process::exit(1);
     });
     let port = worker_port_or_exit(&runtime, canvas_path);
-    let edges: Vec<ExtraEdge> = extra_parents
-        .iter()
-        .map(|p| ExtraEdge::new(p.as_str()))
-        .collect();
+    let (added, removed) = (add.len(), remove.len());
     let update = worker_client::NodeUpdate {
-        extra_parents: Some(edges),
+        edges: Some(worker_client::EdgeOps {
+            add,
+            remove,
+        }),
         ..Default::default()
     };
     match runtime.block_on(worker_client::update_node(port, node_id, &update)) {
         Ok(()) => println!(
-            "meshfox node edges: set {} extra parent(s) on {node_id:?} via the running worker on port {port}",
-            extra_parents.len()
+            "meshfox node edges: added {added} and removed {removed} extra parent(s) on {node_id:?} via the running worker on port {port}"
         ),
         Err(e) => {
             eprintln!("meshfox node edges: {e} (worker on port {port})");
@@ -4262,12 +4322,26 @@ fn node_edges(canvas_path: &Path, node_id: &str, from: Vec<String>, clear: bool)
     }
 }
 
+/// Direct-file counterpart of the server's `EdgeOps` handling (`remove`
+/// first, then `add`, which never touches an edge that's already there).
 #[cfg(test)]
-fn apply_node_edges(raw: &str, node_id: &str, extra_parents: &[String]) -> Result<String, String> {
-    let edges: Vec<ExtraEdge> = extra_parents
-        .iter()
-        .map(|p| ExtraEdge::new(p.as_str()))
-        .collect();
+fn apply_node_edges(
+    raw: &str,
+    node_id: &str,
+    add: &[String],
+    remove: &[String],
+) -> Result<String, String> {
+    let canvas = Canvas::from_markdown(raw).map_err(|e| e.to_string())?;
+    let node = canvas
+        .node(node_id)
+        .ok_or_else(|| format!("no node {node_id:?}"))?;
+    let mut edges = node.extra_parents.clone();
+    edges.retain(|e| !remove.contains(&e.from));
+    for from in add {
+        if !edges.iter().any(|e| &e.from == from) {
+            edges.push(ExtraEdge::new(from.as_str()));
+        }
+    }
     let updated = mdcanvas::set_node_edges(raw, node_id, &edges)
         .ok_or_else(|| format!("no node {node_id:?}"))?;
     validate_patch(&updated)?;
@@ -4530,6 +4604,9 @@ fn format_node_show(raw: &str, node_id: &str) -> Result<String, String> {
     if let Some(u) = &node.updated_at {
         out.push_str(&format!("updated: {u}\n"));
     }
+    // What `node body --base-rev` (and the MCP `node_body`'s `base_rev`)
+    // must be given to replace this body.
+    out.push_str(&format!("body-rev: {}\n", meshfox_core::body_rev(&node.text)));
     if let Some(c) = &node.color {
         out.push_str(&format!("color: {c}\n"));
     }
@@ -5741,10 +5818,18 @@ Shared body.
     }
 
     #[test]
-    fn meta_sets_and_clears_tags() {
+    fn meta_adds_tags_and_never_replaces_the_list() {
+        let tags_of = |raw: &str| {
+            Canvas::from_markdown(raw)
+                .unwrap()
+                .node("smoke-test")
+                .unwrap()
+                .tags
+                .clone()
+        };
         // Omitted (`None`) leaves the node's tags untouched, same contract
         // as every other field here.
-        let updated = apply_node_meta(
+        let untouched = apply_node_meta(
             TEST_DOC,
             "smoke-test",
             None,
@@ -5763,15 +5848,10 @@ Shared body.
             None,
         )
         .unwrap();
-        assert!(Canvas::from_markdown(&updated)
-            .unwrap()
-            .node("smoke-test")
-            .unwrap()
-            .tags
-            .is_empty());
+        assert!(tags_of(&untouched).is_empty());
 
-        // Given, replaces the whole list outright — trimmed/split the same
-        // way the file's own `tags="a, b"` attribute is.
+        // Given, adds — trimmed/split the same way the file's own
+        // `tags="a, b"` attribute is.
         let updated = apply_node_meta(
             TEST_DOC,
             "smoke-test",
@@ -5791,14 +5871,7 @@ Shared body.
             None,
         )
         .unwrap();
-        assert_eq!(
-            Canvas::from_markdown(&updated)
-                .unwrap()
-                .node("smoke-test")
-                .unwrap()
-                .tags,
-            vec!["bag".to_string(), "fixed".to_string()],
-        );
+        assert_eq!(tags_of(&updated), vec!["bag".to_string(), "fixed".to_string()]);
         // Untouched fields (here, color) still keep their prior value.
         assert_eq!(
             Canvas::from_markdown(&updated)
@@ -5810,8 +5883,9 @@ Shared body.
             Some("1")
         );
 
-        // `--tags ""` explicitly clears rather than being a no-op.
-        let cleared = apply_node_meta(
+        // Given again, only what's new is appended; the tags already there
+        // keep their place instead of being replaced.
+        let again = apply_node_meta(
             &updated,
             "smoke-test",
             None,
@@ -5826,17 +5900,36 @@ Shared body.
             None,
             None,
             None,
-            Some(String::new()),
+            Some("fixed, new".to_string()),
             None,
         )
         .unwrap();
-        assert!(Canvas::from_markdown(&cleared)
-            .unwrap()
-            .node("smoke-test")
-            .unwrap()
-            .tags
-            .is_empty());
-        assert!(!cleared.contains("tags="));
+        assert_eq!(
+            tags_of(&again),
+            vec!["bag".to_string(), "fixed".to_string(), "new".to_string()]
+        );
+    }
+
+    #[test]
+    fn node_update_from_fields_turns_tag_flags_into_add_and_remove() {
+        let fields = NodeMetaFields {
+            tags: Some("first".to_string()),
+            add_tag: Some("second, third".to_string()),
+            remove_tag: Some("old".to_string()),
+            ..Default::default()
+        };
+        let update = node_update_from_fields(&fields, None).unwrap();
+        let json = serde_json::to_value(&update).unwrap();
+        assert_eq!(
+            json["tags"],
+            serde_json::json!({ "add": ["first", "second", "third"], "remove": ["old"] })
+        );
+        // No tag flag at all: nothing is sent, so the tags stay as they are.
+        let json = serde_json::to_value(
+            node_update_from_fields(&NodeMetaFields::default(), None).unwrap(),
+        )
+        .unwrap();
+        assert!(json["tags"].is_null(), "{json}");
     }
 
     #[test]
@@ -6117,19 +6210,33 @@ Shared body.
     }
 
     #[test]
-    fn edges_replaces_the_extra_parent_list() {
+    fn edges_add_keeps_the_existing_extra_parents() {
+        let before: Vec<ExtraEdge> = Canvas::from_markdown(TEST_DOC)
+            .unwrap()
+            .node("shared-smoke")
+            .unwrap()
+            .extra_parents
+            .clone();
         let updated =
-            apply_node_edges(TEST_DOC, "shared-smoke", &["examples".to_string()]).unwrap();
+            apply_node_edges(TEST_DOC, "shared-smoke", &["examples".to_string()], &[]).unwrap();
         let canvas = Canvas::from_markdown(&updated).unwrap();
-        assert_eq!(
-            canvas.node("shared-smoke").unwrap().extra_parents,
-            vec![ExtraEdge::new("examples")]
-        );
+        let after = &canvas.node("shared-smoke").unwrap().extra_parents;
+        assert!(after.iter().any(|e| e.from == "examples"), "{after:?}");
+        for edge in &before {
+            assert!(after.contains(edge), "{edge:?} was dropped: {after:?}");
+        }
     }
 
     #[test]
-    fn edges_empty_list_clears_them() {
-        let updated = apply_node_edges(TEST_DOC, "shared-smoke", &[]).unwrap();
+    fn edges_remove_drops_only_the_named_ones() {
+        let before = Canvas::from_markdown(TEST_DOC)
+            .unwrap()
+            .node("shared-smoke")
+            .unwrap()
+            .extra_parents
+            .clone();
+        let removed: Vec<String> = before.iter().map(|e| e.from.clone()).collect();
+        let updated = apply_node_edges(TEST_DOC, "shared-smoke", &[], &removed).unwrap();
         let canvas = Canvas::from_markdown(&updated).unwrap();
         assert!(canvas
             .node("shared-smoke")

@@ -112,6 +112,10 @@ export interface CanvasNode {
   edgeTargetSide?: "left" | "right" | "top" | "bottom";
   edgeVia?: { x: number; y: number }[];
   text: string;
+  /** Fingerprint of `text` as the server has it right now — send it back as
+   * `baseRev` when replacing the body (`updateNode`'s `text` patch), so the
+   * server can tell whether the body changed since this was read. */
+  bodyRev?: string;
   /** Results of every embedded ` ```starlark constraint ` fence in this
    * node's own body, in document order — see `ConstraintStatusDto`. Absent
    * or empty means this node has no constraint fences. */

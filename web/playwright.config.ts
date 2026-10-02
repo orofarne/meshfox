@@ -214,6 +214,16 @@ const UNDO_REDO_PORT = 4621;
 // fixture (run-history.canvas.md) and port, so its runs and its rewrite of
 // the block's code never collide with any other suite's server/canvas.
 const RUN_HISTORY_PORT = 4622;
+// Server + port for body-conflict.spec.ts — same reasoning again, its own
+// fixture (body-conflict.canvas.md, one plain text child) and port, so the
+// body replacements it makes "from another client" never collide with any
+// other suite's server/canvas. Chromium only (the spec skips Firefox), so
+// one port is enough.
+const BODY_CONFLICT_PORT = 4623;
+// Server + port for ws-liveness.spec.ts — its own fixture copy and port; the
+// spec replaces `/api/watch` with a scripted socket and never writes, but a
+// worker is one-per-canvas-file, so it cannot share body-conflict's.
+const WS_LIVENESS_PORT = 4624;
 const MCP_LIVE_DIRS = Object.fromEntries(
   (["chrome", "firefox"] as const).map((browser) => {
     const dir = path.join(os.tmpdir(), `meshfox-e2e-mcp-live-${browser}-fixture`);
@@ -427,6 +437,16 @@ export default defineConfig({
       testMatch: /(^|\/)undo-redo\.spec\.ts$/,
       use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${UNDO_REDO_PORT}` },
     },
+    {
+      name: `${browser}-body-conflict`,
+      testMatch: /(^|\/)body-conflict\.spec\.ts$/,
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${BODY_CONFLICT_PORT}` },
+    },
+    {
+      name: `${browser}-ws-liveness`,
+      testMatch: /(^|\/)ws-liveness\.spec\.ts$/,
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${WS_LIVENESS_PORT}` },
+    },
   ]),
   webServer: [
     {
@@ -632,6 +652,18 @@ export default defineConfig({
     {
       command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/undo-redo.canvas.md --port ${UNDO_REDO_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${UNDO_REDO_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/body-conflict.canvas.md --port ${BODY_CONFLICT_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${BODY_CONFLICT_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/ws-liveness.canvas.md --port ${WS_LIVENESS_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${WS_LIVENESS_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },

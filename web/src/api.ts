@@ -129,7 +129,22 @@ export async function updateOptions(options: string[]): Promise<CanvasDoc> {
   return res.json();
 }
 
+/** One node's new position (and, if it was resized, size) in `saveLayout`. */
+export interface NodeBox {
+  id: string;
+  x: number;
+  y: number;
+  width?: number;
+  height?: number;
+}
+
 /**
+ * Saves the boxes of the nodes this tab itself just dragged or resized —
+ * nothing else. The server applies each box onto the node's *current*
+ * fields, so a stale copy of a node's tags or colour in this tab (another
+ * tab changed them a moment ago) can never be written back along with a
+ * drag. `width`/`height` omitted mean "leave the size as it is".
+ *
  * `layoutHints` — a same-request-only sort hint for the server's own
  * `mdcanvas::reorder_by_position` (see its doc comment), keyed by node id:
  * this tab's own current on-screen position for a node it did *not* just
@@ -140,14 +155,14 @@ export async function updateOptions(options: string[]): Promise<CanvasDoc> {
  * every node, positioned or not). Never persisted as real `x`/`y` on the
  * nodes it's about — purely advisory for this one save's reorder pass.
  */
-export async function saveCanvas(
-  canvas: CanvasDoc,
+export async function saveLayout(
+  nodes: NodeBox[],
   layoutHints?: Record<string, { x: number; y: number }>,
 ): Promise<void> {
   const res = await fetch("/api/canvas", {
     method: "PUT",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ ...canvas, layoutHints: layoutHints ?? {} }),
+    body: JSON.stringify({ nodes, layoutHints: layoutHints ?? {} }),
   });
   if (!res.ok) throw new Error(`PUT /api/canvas: ${res.status}`);
 }
@@ -171,14 +186,43 @@ export async function fetchIncludes(): Promise<IncludeManifestEntry[]> {
 }
 
 /** The raw Markdown text of the document itself, verbatim — what the
- * toolbar's "Source" mode edits by default. Pass an `IncludeManifestEntry`'s
- * `nodeId` (from `fetchIncludes`) to read that include's own target file
- * instead. */
-export async function fetchCanvasSource(includeNodeId?: string): Promise<string> {
+ * toolbar's "Source" mode edits by default — with the file's revision (its
+ * `ETag`), which a later `saveCanvasSource` must name. Pass an
+ * `IncludeManifestEntry`'s `nodeId` (from `fetchIncludes`) to read that
+ * include's own target file instead. */
+export async function fetchCanvasSource(includeNodeId?: string): Promise<{ text: string; rev: string }> {
   const url = includeNodeId ? `/api/canvas/raw?include=${encodeURIComponent(includeNodeId)}` : "/api/canvas/raw";
   const res = await fetch(url);
   if (!res.ok) throw new Error(`GET /api/canvas/raw: ${res.status}`);
-  return res.text();
+  return { text: await res.text(), rev: res.headers.get("ETag") ?? "" };
+}
+
+/**
+ * A whole-file write made against a version of the file that is no longer
+ * the current one — it changed (another tab, an agent, an editor) since it
+ * was read. Carries the file as it is now, for the caller to show or merge
+ * against, and its revision to retry with.
+ */
+export class SourceConflictError extends Error {
+  constructor(
+    readonly currentText: string,
+    readonly currentRev: string,
+  ) {
+    super("the file changed since it was read");
+    this.name = "SourceConflictError";
+  }
+}
+
+function parseSourceConflict(text: string): SourceConflictError | undefined {
+  try {
+    const body = JSON.parse(text);
+    if (body?.error === "sourceConflict" && typeof body.currentText === "string" && typeof body.currentRev === "string") {
+      return new SourceConflictError(body.currentText, body.currentRev);
+    }
+  } catch {
+    // Not JSON: an ordinary text error body, reported as such by the caller.
+  }
+  return undefined;
 }
 
 /**
@@ -189,18 +233,28 @@ export async function fetchCanvasSource(includeNodeId?: string): Promise<string>
  * thrown error's message is the parser's, suitable to show right next to
  * Source mode's Save button so an invalid edit is never silently lost or
  * half-applied.
+ *
+ * `rev` is the file's revision as it was read (`fetchCanvasSource`) — the
+ * server requires it, and refuses a file that has changed since with a
+ * `SourceConflictError` instead of overwriting it. Returns the revision of
+ * what was written.
  */
-export async function saveCanvasSource(text: string, includeNodeId?: string): Promise<void> {
+export async function saveCanvasSource(text: string, rev: string, includeNodeId?: string): Promise<string> {
   const url = includeNodeId ? `/api/canvas/raw?include=${encodeURIComponent(includeNodeId)}` : "/api/canvas/raw";
   const res = await fetch(url, {
     method: "PUT",
-    headers: { "content-type": "text/plain" },
+    headers: { "content-type": "text/plain", "if-match": rev },
     body: text,
   });
   if (!res.ok) {
     const msg = await res.text();
+    if (res.status === 412) {
+      const conflict = parseSourceConflict(msg);
+      if (conflict) throw conflict;
+    }
     throw new Error(msg || `PUT /api/canvas/raw: ${res.status}`);
   }
+  return res.headers.get("ETag") ?? "";
 }
 
 /**
@@ -225,6 +279,107 @@ export async function createNode(parentId: string, title: string): Promise<Canva
   return res.json();
 }
 
+/**
+ * Changes to a node's tags, applied by the server to the tags the node has at
+ * that moment — never a replacement list, so two tabs adding different tags
+ * both land. `remove` first, then `add`.
+ */
+export interface TagOps {
+  add?: string[];
+  remove?: string[];
+}
+
+/**
+ * Changes to individual fields of one extra edge, same conventions as a
+ * node's own fields: a field left out is not touched, so two tabs changing
+ * different fields of the same edge both land; a field that is present is
+ * set, and cleared back to unset by `""` (`label`, `color`), `"auto"` (the
+ * sides), `"default"` (`style`, and the arrow ends — `"none"` there is a real
+ * value, an end with no arrowhead), `500` (`labelAt`, the midpoint) or `[]`
+ * (`via`). `tags` are a change to the edge's tags, like a node's.
+ */
+export interface EdgePatch {
+  from: string;
+  label?: string;
+  labelAt?: number;
+  color?: string;
+  style?: "solid" | "dashed" | "dotted" | "default";
+  arrowStart?: "none" | "arrow" | "default";
+  arrowEnd?: "none" | "arrow" | "default";
+  sourceSide?: "left" | "right" | "top" | "bottom" | "auto";
+  targetSide?: "left" | "right" | "top" | "bottom" | "auto";
+  via?: { x: number; y: number }[];
+  tags?: TagOps;
+}
+
+/**
+ * Changes to a node's extra incoming edges, keyed by the source node's id,
+ * applied to the edges the node has at that moment: `remove`, then `add` (a
+ * plain edge; a no-op when one from that node already exists), then `patch`
+ * (changes to fields of the edge from that node; a missing edge is skipped).
+ * An edge created with properties is an `add` and a `patch` together.
+ */
+export interface EdgeOps {
+  add?: string[];
+  patch?: EdgePatch[];
+  remove?: string[];
+}
+
+/** Diffs a tag list against the one it was edited from into the `TagOps` that turns one into the other. */
+export function tagOpsBetween(before: string[], after: string[]): TagOps {
+  return {
+    add: after.filter((t) => !before.includes(t)),
+    remove: before.filter((t) => !after.includes(t)),
+  };
+}
+
+/**
+ * The `EdgePatch` that turns edge `before` into `after` — only the fields
+ * that differ, each in the spelling that sets it or clears it — or
+ * `undefined` when nothing differs.
+ */
+export function edgePatchBetween(before: ExtraEdgeDto, after: ExtraEdgeDto): EdgePatch | undefined {
+  const patch: EdgePatch = { from: after.from };
+  let changed = false;
+  const set = <K extends keyof EdgePatch>(key: K, value: EdgePatch[K]) => {
+    patch[key] = value;
+    changed = true;
+  };
+  if ((before.label ?? "") !== (after.label ?? "")) set("label", after.label ?? "");
+  if ((before.labelAt ?? 500) !== (after.labelAt ?? 500)) set("labelAt", after.labelAt ?? 500);
+  if ((before.color ?? "") !== (after.color ?? "")) set("color", after.color ?? "");
+  if (before.style !== after.style) set("style", after.style ?? "default");
+  if (before.arrowStart !== after.arrowStart) set("arrowStart", after.arrowStart ?? "default");
+  if (before.arrowEnd !== after.arrowEnd) set("arrowEnd", after.arrowEnd ?? "default");
+  if ((before.sourceSide ?? null) !== (after.sourceSide ?? null)) set("sourceSide", after.sourceSide ?? "auto");
+  if ((before.targetSide ?? null) !== (after.targetSide ?? null)) set("targetSide", after.targetSide ?? "auto");
+  if (JSON.stringify(before.via ?? []) !== JSON.stringify(after.via ?? [])) set("via", after.via ?? []);
+  if (JSON.stringify(before.tags ?? []) !== JSON.stringify(after.tags ?? [])) {
+    set("tags", tagOpsBetween(before.tags ?? [], after.tags ?? []));
+  }
+  return changed ? patch : undefined;
+}
+
+/**
+ * Same for a node's list of extra edges: sources that went away are
+ * removed, new ones are added (with a patch for whatever properties they
+ * came with), and an edge that exists on both sides gets a patch of just
+ * its changed fields.
+ */
+export function edgeOpsBetween(before: ExtraEdgeDto[], after: ExtraEdgeDto[]): EdgeOps {
+  const old = new Map(before.map((e) => [e.from, e]));
+  const ops: EdgeOps = {
+    remove: before.filter((e) => !after.some((a) => a.from === e.from)).map((e) => e.from),
+    add: after.filter((e) => !old.has(e.from)).map((e) => e.from),
+    patch: [],
+  };
+  for (const edge of after) {
+    const patch = edgePatchBetween(old.get(edge.from) ?? { from: edge.from }, edge);
+    if (patch) ops.patch!.push(patch);
+  }
+  return ops;
+}
+
 /** Only the fields actually present are changed — see `updateNode`. */
 export interface NodePatch {
   title?: string;
@@ -232,11 +387,15 @@ export interface NodePatch {
   color?: string;
   /** New link target for a `file`/`link` node (replaces its whole body). */
   target?: string;
-  /** New raw Markdown body for a `text` node. */
+  /** New raw Markdown body for a `text` node. Needs `baseRev`. */
   text?: string;
-  /** Full replacement list of extra incoming edges (`meshfox:edge`) — omit
-   * to leave them untouched, pass `[]` to remove them all. */
-  extraParents?: ExtraEdgeDto[];
+  /** The `bodyRev` of the node as this client last read it — required
+   * whenever `text` is sent. A body that has changed since is a
+   * `BodyConflictError`, never a silent overwrite. */
+  baseRev?: string;
+  /** Changes to the extra incoming edges (`meshfox:edge`) — omit to leave
+   * them untouched. Never a replacement list, see `EdgeOps`. */
+  edges?: EdgeOps;
   /** file-node display mode — see `CanvasNode.display`. */
   display?: "link" | "code";
   /** file-node syntax-highlighting language hint — see `CanvasNode.lang`. */
@@ -256,9 +415,9 @@ export interface NodePatch {
   edgeSourceSide?: "left" | "right" | "top" | "bottom" | "auto";
   edgeTargetSide?: "left" | "right" | "top" | "bottom" | "auto";
   edgeVia?: { x: number; y: number }[];
-  /** Full replacement list of tags — omit to leave them untouched, pass
-   * `[]` to clear them. */
-  tags?: string[];
+  /** Changes to the tags — omit to leave them untouched. Never a
+   * replacement list, see `TagOps`. */
+  tags?: TagOps;
   /** Per-node fold-state override — see `CanvasNode.fold`. Omit to leave
    * it untouched; otherwise a string sentinel (not a plain boolean,
    * matching the server's own `UpdateNodeRequest.fold`): `"true"`/
@@ -271,12 +430,12 @@ export interface NodePatch {
 }
 
 /**
- * Applies `patch` to node `id` — title/type/color/target/text/extraParents
+ * Applies `patch` to node `id` — title/type/color/target/text/edges
  * are all independently optional, so a caller only ever sends what it
  * actually changed. The server validates the fully-patched document parses
  * before saving anything (e.g. `nodeType: "group"` on a node with a
  * non-empty body is rejected, 422, with nothing written) — surfaces as a
- * thrown error carrying the server's message, same as `saveCanvas`.
+ * thrown error carrying the server's message, same as `saveLayout`.
  */
 export async function updateNode(id: string, patch: NodePatch): Promise<CanvasDoc> {
   const res = await fetch(`/api/nodes/${encodeURIComponent(id)}`, {
@@ -286,10 +445,48 @@ export async function updateNode(id: string, patch: NodePatch): Promise<CanvasDo
   });
   if (!res.ok) {
     const text = await res.text();
+    if (res.status === 409) {
+      const conflict = parseBodyConflict(text);
+      if (conflict) throw conflict;
+    }
     throw new Error(text || `PATCH /api/nodes/${id}: ${res.status}`);
   }
   return res.json();
 }
+
+/**
+ * A body replacement written against a revision the node no longer has: the
+ * body changed (another tab, an agent, an editor) since this client read it.
+ * Carries the node's body and revision as they are now, so the caller can
+ * show them, merge, and retry against `currentRev` without another read.
+ */
+export class BodyConflictError extends Error {
+  constructor(
+    readonly currentText: string,
+    readonly currentRev: string,
+  ) {
+    super("the node's body changed since it was read");
+    this.name = "BodyConflictError";
+  }
+}
+
+function parseBodyConflict(text: string): BodyConflictError | undefined {
+  try {
+    const body = JSON.parse(text);
+    if (body?.error === "bodyConflict" && typeof body.currentText === "string" && typeof body.currentRev === "string") {
+      return new BodyConflictError(body.currentText, body.currentRev);
+    }
+  } catch {
+    // Not JSON: an ordinary text error body, reported as such by the caller.
+  }
+  return undefined;
+}
+
+/** How one attempt to save a node's body ended — see `App.tsx`'s `handleSaveText`. */
+export type SaveTextOutcome =
+  | { status: "saved"; text: string; rev: string }
+  | { status: "conflict"; currentText: string; currentRev: string }
+  | { status: "error" };
 
 /**
  * Deletes `id` — the root is rejected by the server (422) rather than
@@ -587,6 +784,59 @@ function wsUrl(path: string): string {
   return url.toString();
 }
 
+/** How long a worker's WebSocket may deliver nothing — not even the
+ * `{"type":"heartbeat"}` the worker sends every 15 s on every stream — before
+ * the page treats the worker as hung or the connection as dead. A browser
+ * `WebSocket` never surfaces ping frames and never times out on silence (a
+ * hung worker with its socket still open raises no event at all), so the
+ * worker's heartbeat is an ordinary message and this clock is the page's own.
+ * `localStorage["meshfox.wsSilenceMs"]` overrides it (test hook). */
+const WS_SILENCE_MS = 45_000;
+
+function wsSilenceMs(): number {
+  try {
+    const override = Number(localStorage.getItem("meshfox.wsSilenceMs"));
+    if (override > 0) return override;
+  } catch {
+    // Storage can be unavailable (private window, blocked site data).
+  }
+  return WS_SILENCE_MS;
+}
+
+/** A restartable silence clock for one socket: `touch()` on every message
+ * (heartbeats included), `stop()` once the socket is done. `onSilent` fires
+ * after `wsSilenceMs()` with nothing touched. */
+export function watchSilence(onSilent: () => void): { touch: () => void; stop: () => void } {
+  const limit = wsSilenceMs();
+  let timer: ReturnType<typeof setTimeout> | undefined = setTimeout(onSilent, limit);
+  return {
+    touch() {
+      if (timer === undefined) return;
+      clearTimeout(timer);
+      timer = setTimeout(onSilent, limit);
+    },
+    stop() {
+      if (timer !== undefined) clearTimeout(timer);
+      timer = undefined;
+    },
+  };
+}
+
+/** Gives up on a silent socket without waiting for it: a hung peer never
+ * answers the closing handshake, so `onclose` may not fire for minutes —
+ * detach the handlers, ask it to close, and let the caller treat the
+ * connection as lost right away. */
+function abandonSocket(ws: WebSocket): void {
+  ws.onmessage = null;
+  ws.onerror = null;
+  ws.onclose = null;
+  try {
+    ws.close();
+  } catch {
+    // Already closing.
+  }
+}
+
 /** Opens `url` as a WebSocket, calls `onEvent` for every JSON text frame it
  * sends, and resolves once the socket closes — the shared plumbing behind
  * `runBlockStream`/`forceRun`/`runFileStream`/`subscribeRun`, now that all
@@ -602,16 +852,30 @@ function openEventSocket<T>(url: string, onEvent: (event: T) => void): Promise<v
   return new Promise((resolve, reject) => {
     let settled = false;
     const ws = new WebSocket(url);
+    // A worker that stops answering mid-stream ends the stream with an
+    // error, not as if the run had finished.
+    const silence = watchSilence(() => {
+      if (settled) return;
+      settled = true;
+      abandonSocket(ws);
+      reject(new Error(`${url}: the worker stopped responding`));
+    });
     ws.onmessage = (ev) => {
-      if (typeof ev.data === "string") onEvent(JSON.parse(ev.data) as T);
+      silence.touch();
+      if (typeof ev.data !== "string") return;
+      const event = JSON.parse(ev.data) as T & { type?: string };
+      if (event.type === "heartbeat") return;
+      onEvent(event);
     };
     ws.onerror = () => {
+      silence.stop();
       if (!settled) {
         settled = true;
         reject(new Error(`${url}: WebSocket error`));
       }
     };
     ws.onclose = () => {
+      silence.stop();
       if (!settled) {
         settled = true;
         resolve();
@@ -1149,8 +1413,16 @@ export function watchChanges(
     new Promise((_resolve, reject) => {
       const ws = new WebSocket(socketUrl());
       socket = ws;
+      // A silent connection is a dropped one: abandon it and reject, which
+      // runs the same reconnect logic a close would.
+      const silence = watchSilence(() => {
+        if (socket === ws) socket = undefined;
+        abandonSocket(ws);
+        reject(new Error("WS /api/watch: the worker stopped responding"));
+      });
       ws.onopen = () => onEstablished();
       ws.onmessage = (ev) => {
+        silence.touch();
         const event = JSON.parse(ev.data as string) as {
           type: string;
           seq?: number;
@@ -1164,6 +1436,7 @@ export function watchChanges(
           canUndo?: boolean;
           canRedo?: boolean;
         };
+        if (event.type === "heartbeat") return;
         if (event.seq !== undefined) lastSeq = event.seq;
         if (event.type === "changed" || (event.type === "connected" && event.resync) || event.type === "resync") {
           onChanged();
@@ -1206,6 +1479,7 @@ export function watchChanges(
       // `stop()` closing the socket deliberately — `run`'s own `stopped`
       // check (below) is what tells those two apart, not anything here.
       ws.onclose = () => {
+        silence.stop();
         if (socket === ws) socket = undefined;
         reject(new Error("WS /api/watch: closed"));
       };

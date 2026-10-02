@@ -1,6 +1,12 @@
 import { Suspense, useEffect, useRef, useState } from "react";
 import type { OnMount } from "@monaco-editor/react";
-import { fetchCanvasSource, fetchIncludes, saveCanvasSource, type IncludeManifestEntry } from "./api";
+import {
+  fetchCanvasSource,
+  fetchIncludes,
+  saveCanvasSource,
+  SourceConflictError,
+  type IncludeManifestEntry,
+} from "./api";
 import { LazyEditor } from "./monacoSetup";
 import { MONACO_OPTIONS, attachMeshfoxEditorExtensions, useMonacoReady, usePrefersDark } from "./NodeTextEditor";
 import { THEMES } from "./shiki";
@@ -55,6 +61,13 @@ export function CanvasSourceEditor({ initialInclude, onSaved, onClose, onDirtyCh
   const [selected, setSelected] = useState(initialInclude ?? PRIMARY);
   const [text, setText] = useState<string | null>(null);
   const [original, setOriginal] = useState<string | null>(null);
+  // The file's revision as this editor last saw it (its `ETag`) — what a
+  // save is written against.
+  const [rev, setRev] = useState("");
+  // The file as another client left it, when a save found it had changed
+  // since this editor read it: nothing is written until a side is picked.
+  const [conflict, setConflict] = useState<{ text: string; rev: string } | null>(null);
+  const [showTheirs, setShowTheirs] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const dark = usePrefersDark();
@@ -75,10 +88,13 @@ export function CanvasSourceEditor({ initialInclude, onSaved, onClose, onDirtyCh
   useEffect(() => {
     setText(null);
     setError(null);
+    setConflict(null);
+    setShowTheirs(false);
     fetchCanvasSource(selected === PRIMARY ? undefined : selected)
-      .then((t) => {
+      .then(({ text: t, rev: r }) => {
         setText(t);
         setOriginal(t);
+        setRev(r);
       })
       .catch((e) => setError(String(e)));
   }, [selected]);
@@ -102,18 +118,43 @@ export function CanvasSourceEditor({ initialInclude, onSaved, onClose, onDirtyCh
     setSelected(nodeId);
   };
 
-  const handleSave = async () => {
+  const handleSave = async (baseRev: string = rev) => {
     if (text === null) return;
     setSaving(true);
     setError(null);
     try {
-      await saveCanvasSource(text, selected === PRIMARY ? undefined : selected);
+      await saveCanvasSource(text, baseRev, selected === PRIMARY ? undefined : selected);
       onSaved();
     } catch (e) {
-      setError(String(e));
+      if (e instanceof SourceConflictError) {
+        setConflict({ text: e.currentText, rev: e.currentRev });
+      } else {
+        setError(String(e));
+      }
     } finally {
       setSaving(false);
     }
+  };
+
+  /** Drops this editor's edits in favor of the file as it is now. */
+  const takeTheirs = () => {
+    if (!conflict) return;
+    setText(conflict.text);
+    setOriginal(conflict.text);
+    setRev(conflict.rev);
+    setConflict(null);
+    setShowTheirs(false);
+  };
+
+  /** Writes this editor's text over the file as it is now — against *its*
+   * revision, so it still fails if the file changes again before it lands. */
+  const keepMine = () => {
+    if (!conflict) return;
+    const theirRev = conflict.rev;
+    setRev(theirRev);
+    setConflict(null);
+    setShowTheirs(false);
+    void handleSave(theirRev);
   };
 
   return (
@@ -141,11 +182,26 @@ export function CanvasSourceEditor({ initialInclude, onSaved, onClose, onDirtyCh
           <button type="button" onClick={handleClose} disabled={saving}>
             Cancel
           </button>
-          <button type="button" onClick={handleSave} disabled={saving || text === null || !dirty}>
+          <button type="button" onClick={() => handleSave()} disabled={saving || text === null || !dirty || !!conflict}>
             {saving ? "Saving…" : "Save"}
           </button>
         </div>
       </div>
+      {conflict && (
+        <div className="mesh-source-editor-conflict" role="alert">
+          <span>This file was changed elsewhere since you opened it. Nothing has been saved.</span>
+          <button type="button" onClick={takeTheirs}>
+            take theirs
+          </button>
+          <button type="button" onClick={keepMine}>
+            keep mine
+          </button>
+          <button type="button" onClick={() => setShowTheirs((v) => !v)}>
+            {showTheirs ? "hide theirs" : "compare"}
+          </button>
+          {showTheirs && <pre className="mesh-source-editor-conflict-theirs">{conflict.text}</pre>}
+        </div>
+      )}
       <div className="mesh-source-editor-body" data-vscode-context="{}">
         {text === null || !monacoReady ? (
           <div className="mesh-source-editor-loading">Loading…</div>

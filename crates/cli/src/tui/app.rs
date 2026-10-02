@@ -962,6 +962,12 @@ pub(super) fn var_form_from_statuses_for_test(
     var_form_from_statuses(statuses)
 }
 
+/// What the source editor says when a save found the file changed on disk
+/// since the editor read it. Nothing was written; pressing `Ctrl-s` again
+/// writes over what is there now.
+const SOURCE_CHANGED_ELSEWHERE: &str =
+    "the file changed since you opened it — Ctrl-s again overwrites it, Esc discards your edits";
+
 impl App {
     /// Loads the primary canvas from its worker. A failed request is a
     /// startup error; unit tests may pass `None` to exercise local UI code.
@@ -2635,6 +2641,10 @@ impl App {
             || std::fs::read_to_string(&se.path)
                 .is_ok_and(|raw| meshfox_core::mdcanvas::has_marker(&raw));
         let path = se.path.clone();
+        // The version of the file this editor read: a save is refused if the
+        // file has changed since.
+        let base_rev = se.base_rev();
+        let mut conflict_rev: Option<String> = None;
 
         if is_canvas {
             if let Err(e) = Canvas::from_markdown(&text) {
@@ -2654,24 +2664,43 @@ impl App {
                     .map_err(|e| e.to_string())
             };
             match port {
-                Ok(port) => match crate::worker_client::put_canvas_raw(port, &text).await {
-                    Ok(()) => match crate::worker_client::get_canvas_raw(port).await {
-                        Ok(saved) => {
-                            text = saved;
-                            Ok(())
+                Ok(port) => {
+                    match crate::worker_client::put_canvas_raw(port, &text, &base_rev).await {
+                        Ok(()) => match crate::worker_client::get_canvas_raw(port).await {
+                            Ok(saved) => {
+                                text = saved;
+                                Ok(())
+                            }
+                            Err(e) => Err(format!("saved, but failed to reload: {e}")),
+                        },
+                        Err(crate::worker_client::PutRawError::Conflict { current_rev }) => {
+                            conflict_rev = Some(current_rev);
+                            Err(SOURCE_CHANGED_ELSEWHERE.to_string())
                         }
-                        Err(e) => Err(format!("saved, but failed to reload: {e}")),
-                    },
-                    Err(e) => Err(e),
-                },
+                        Err(crate::worker_client::PutRawError::Other(e)) => Err(e),
+                    }
+                }
                 Err(e) => Err(e),
             }
         } else {
-            std::fs::write(&path, &text)
-                .map_err(|e| format!("failed to write {}: {e}", path.display()))
+            // A plain-Markdown include target is written here, not by a
+            // worker, so the same check is made here: against what is on
+            // disk right now.
+            match std::fs::read_to_string(&path) {
+                Ok(on_disk) if meshfox_core::body_rev(&on_disk) != base_rev => {
+                    conflict_rev = Some(meshfox_core::body_rev(&on_disk));
+                    Err(SOURCE_CHANGED_ELSEWHERE.to_string())
+                }
+                _ => std::fs::write(&path, &text)
+                    .map_err(|e| format!("failed to write {}: {e}", path.display())),
+            }
         };
         if let Err(e) = write_result {
-            self.source_editor.as_mut().unwrap().error = Some(e);
+            let se = self.source_editor.as_mut().unwrap();
+            se.error = Some(e);
+            if let Some(rev) = conflict_rev {
+                se.note_conflict(rev);
+            }
             return;
         }
 

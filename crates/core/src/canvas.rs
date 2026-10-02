@@ -374,6 +374,13 @@ pub struct Node {
     /// field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_color: Option<String>,
+    /// Fingerprint of this node's current `text` (see `crate::body_rev`) —
+    /// what a client sends back as `baseRev` when it replaces the body, so
+    /// the server can tell whether the text changed since the client read
+    /// it. Same "never set by `mdcanvas::parse` itself, only by whatever
+    /// consumer wants it" convention as `effective_color` right above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_rev: Option<String>,
     /// Absolute directory a relative asset reference (an `![](...)` image,
     /// or a plain link) inside this node's `text` should resolve against,
     /// when that differs from this document's own directory — i.e. this

@@ -193,6 +193,38 @@ pub struct NodeMeta {
     pub fold: Option<bool>,
 }
 
+impl NodeMeta {
+    /// Every field `set_node_meta` writes, set to `node`'s own current value
+    /// — the starting point for changing just a few fields of a node (a
+    /// drag only moves `x`/`y`) without disturbing the rest: `set_node_meta`
+    /// replaces all of them, so a caller that builds a `NodeMeta` from
+    /// anything staler than the document it patches silently reverts
+    /// whatever changed in between. `node_type` stays `None` ("keep what's
+    /// on the line").
+    pub fn from_node(node: &crate::canvas::Node) -> Self {
+        NodeMeta {
+            x: node.x,
+            y: node.y,
+            width: node.width,
+            height: node.height,
+            color: node.color.clone(),
+            node_type: None,
+            display: node.display,
+            lang: node.lang.clone(),
+            interpreter: node.interpreter.clone(),
+            preview: Some(node.preview),
+            edge_label: node.edge_label.clone(),
+            edge_label_at: node.edge_label_at,
+            edge_source_side: node.edge_source_side,
+            edge_target_side: node.edge_target_side,
+            edge_via: node.edge_via.clone(),
+            fold: node.fold,
+            tags: node.tags.clone(),
+            created_at: node.created_at.clone(),
+        }
+    }
+}
+
 /// Parses the `"true"`/`"false"`/`"default"` string sentinel used
 /// wherever a caller needs to distinguish "not touching `fold` at all"
 /// (simply not calling this — see `NodeMeta::fold`'s own doc comment)
@@ -418,6 +450,7 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
             updated_at,
             constraint_results: Vec::new(),
             effective_color: None,
+            body_rev: None,
             asset_base: None,
             plain_markdown_include: false,
         });

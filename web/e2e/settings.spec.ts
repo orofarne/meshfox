@@ -1,5 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
-import { clickFitViewAndWait, disableDefaultFold, selectNode, toolbarButton } from "./helpers";
+import { clickFitViewAndWait, disableDefaultFold, selectNode, toolbarButton, restoreRaw } from "./helpers";
 
 // Drives web/e2e/fixtures/settings.canvas.md: one node per NodeSettings-
 // relevant type/field combination (see the fixture's own root body for the
@@ -156,10 +156,7 @@ test("renaming the id and changing another field in the same 'ok' click both lan
   // to whitespace), so restore the fixture's exact original text directly
   // via Source mode's own save endpoint instead, same as every other test
   // above expects to find the file in.
-  await page.evaluate(
-    (raw) => fetch("/api/canvas/raw", { method: "PUT", headers: { "content-type": "text/plain" }, body: raw }),
-    before,
-  );
+  await restoreRaw(page, before);
   expect(await fetchRaw(page)).toBe(before);
 });
 
@@ -187,10 +184,7 @@ test("leaving the ID field empty on 'ok' clears the explicit id back to the titl
   // client re-fetched it under the new id rather than losing track of it.
   await expect(page.locator('.react-flow__node[data-id="plain-text"]')).toBeVisible();
 
-  await page.evaluate(
-    (raw) => fetch("/api/canvas/raw", { method: "PUT", headers: { "content-type": "text/plain" }, body: raw }),
-    before,
-  );
+  await restoreRaw(page, before);
   expect(await fetchRaw(page)).toBe(before);
 });
 
@@ -224,10 +218,7 @@ test("a freshly created node gets a random base36 id, not a slug of its placehol
   await page.locator(".vars-modal-actions button", { hasText: "cancel" }).click();
   await expect(page.locator(".node-settings-modal")).toHaveCount(0);
 
-  await page.evaluate(
-    (raw) => fetch("/api/canvas/raw", { method: "PUT", headers: { "content-type": "text/plain" }, body: raw }),
-    before,
-  );
+  await restoreRaw(page, before);
   expect(await fetchRaw(page)).toBe(before);
 });
 
@@ -276,10 +267,7 @@ test("double-clicking a node's title renames it inline on the canvas", async ({ 
   expect(raw).toContain("Renamed Plain Text");
   expect(raw).not.toContain("## Plain Text\n");
 
-  await page.evaluate(
-    (raw) => fetch("/api/canvas/raw", { method: "PUT", headers: { "content-type": "text/plain" }, body: raw }),
-    before,
-  );
+  await restoreRaw(page, before);
   expect(await fetchRaw(page)).toBe(before);
 });
 
@@ -326,10 +314,7 @@ test("the body editor's header can rename the node and open NodeSettings", async
 
   await page.locator(".mesh-text-editor-actions button", { hasText: "done" }).click();
 
-  await page.evaluate(
-    (raw) => fetch("/api/canvas/raw", { method: "PUT", headers: { "content-type": "text/plain" }, body: raw }),
-    before,
-  );
+  await restoreRaw(page, before);
   expect(await fetchRaw(page)).toBe(before);
 });
 
@@ -369,10 +354,7 @@ test("a link node's caption renders below the plain link, with inline formatting
     "[example](https://example.com)\n",
     "[example](https://example.com)\n\nA **bold** note with `code` and a [nested link](https://other.example).\n",
   );
-  await page.evaluate(
-    (raw) => fetch("/api/canvas/raw", { method: "PUT", headers: { "content-type": "text/plain" }, body: raw }),
-    withCaption,
-  );
+  await restoreRaw(page, withCaption);
   await page.reload();
   await page.waitForSelector(".mesh-node");
 
@@ -386,10 +368,7 @@ test("a link node's caption renders below the plain link, with inline formatting
     "https://other.example",
   );
 
-  await page.evaluate(
-    (raw) => fetch("/api/canvas/raw", { method: "PUT", headers: { "content-type": "text/plain" }, body: raw }),
-    before,
-  );
+  await restoreRaw(page, before);
   expect(await fetchRaw(page)).toBe(before);
 });
 
@@ -400,20 +379,14 @@ test("a file node's display=code caption renders after the file preview", async 
     '<!-- meshfox:node id="file-code" type="file" display="code" lang="text" interpreter="cat" -->\n\n[settings-file-target.txt](./settings-file-target.txt)\n\nCaption for the preview.\n',
   );
   expect(withCaption).not.toBe(before);
-  await page.evaluate(
-    (raw) => fetch("/api/canvas/raw", { method: "PUT", headers: { "content-type": "text/plain" }, body: raw }),
-    withCaption,
-  );
+  await restoreRaw(page, withCaption);
   await page.reload();
   await page.waitForSelector(".mesh-node");
 
   const node = page.locator('.react-flow__node[data-id="file-code"]');
   await expect(node).toContainText("Caption for the preview.");
 
-  await page.evaluate(
-    (raw) => fetch("/api/canvas/raw", { method: "PUT", headers: { "content-type": "text/plain" }, body: raw }),
-    before,
-  );
+  await restoreRaw(page, before);
   expect(await fetchRaw(page)).toBe(before);
 });
 
@@ -426,10 +399,7 @@ test("changing a link node's URL via NodeSettings preserves its existing caption
     "[example](https://example.com)\n",
     "[example](https://example.com)\n\nAn existing caption.\n",
   );
-  await page.evaluate(
-    (raw) => fetch("/api/canvas/raw", { method: "PUT", headers: { "content-type": "text/plain" }, body: raw }),
-    withCaption,
-  );
+  await restoreRaw(page, withCaption);
   // A reload resets Edit mode and the viewport — both needed again for
   // `openSettings` below (the settings gear only shows in Edit mode, and
   // `selectNode`'s click needs the node actually on-screen).
@@ -449,9 +419,6 @@ test("changing a link node's URL via NodeSettings preserves its existing caption
   expect(raw).toContain("https://changed.example");
   expect(raw).toContain("An existing caption.");
 
-  await page.evaluate(
-    (raw) => fetch("/api/canvas/raw", { method: "PUT", headers: { "content-type": "text/plain" }, body: raw }),
-    before,
-  );
+  await restoreRaw(page, before);
   expect(await fetchRaw(page)).toBe(before);
 });
