@@ -282,11 +282,10 @@ enum Command {
     /// out to this same binary. Takes no arguments — a host launches it the
     /// same way as any other stdio MCP server: `{"command": "meshfox",
     /// "args": ["mcp"]}`, and whichever directory it's started in becomes
-    /// its root. Multi-canvas by design, but keeps "one file, one process"
-    /// isolation underneath: `canvas_open`/`canvas_close`/`canvas_list`
-    /// manage a registry of canvases, each backed by its own spawned,
-    /// isolated child process (a crash or hung debug session on one canvas
-    /// can't affect another) — resolved only under that root directory,
+    /// its root. Multi-canvas by design, in one process:
+    /// `canvas_open`/`canvas_close`/`canvas_list` manage a registry of
+    /// canvases, each served by its own file's worker (a hung worker fails
+    /// only that canvas's calls) — resolved only under that root directory,
     /// never above it. Every other tool requires that `canvas_id` as its
     /// first argument, mirroring its single-canvas equivalent exactly:
     /// a stateful debug session (`debug_start`/`debug_send`/`debug_stop` —
