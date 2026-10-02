@@ -2561,7 +2561,8 @@ mod tests {
         let rect = |id: &str| nodes.iter().find(|node| node.id == id).unwrap().rect;
         let obstacles: Vec<_> = nodes.iter().map(|node| node.rect).collect();
         for (source, target) in [
-            ("mcp-root", "mcp-leaf"),
+            ("mcp-root", "coordinator-resolve"),
+            ("mcp-root", "worker-axum-http-server"),
             ("cli-one-shot-ops", "coordinator-resolve"),
         ] {
             let mut grid = vec![vec![' '; area.width as usize]; area.height as usize];
