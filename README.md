@@ -44,7 +44,7 @@ Rough checklist for what's needed before a 1.0.0 release:
 - [x] Undo/redo
 - [x] Full canvas-geometry support in the TUI
 - [x] A unified interface for external renderers
-- [ ] LaTeX, Vega, Mermaid/PlantUML sub-render support
+- [x] LaTeX, Vega, Mermaid/PlantUML sub-render support (as SVG output from external renderers, see "Showing a diagram, formula or chart")
 - [x] Conflict resolution for concurrent editing
 - [ ] Encryption for stored secrets
 
@@ -257,6 +257,25 @@ a macro's own process as `MESHFOX_CONFIG_<PATH>` (e.g.
 <!-- meshfox:node id="example-8" type="file" -->
 
 [examples/agent-prompt.canvas.md](./examples/agent-prompt.canvas.md)
+
+### Showing a diagram, formula or chart (SVG)
+<!-- meshfox:node id="showing-a-diagram-formula-or-chart-svg" -->
+
+[examples/svg.canvas.md](./examples/svg.canvas.md) — an SVG is an ordinary
+Markdown image (`![](data:image/svg+xml;base64,…)`), shown the same way in the
+web UI, the TUI, `meshfox static` and `meshfox pdf`, with no renderer built
+into meshfox: any command that prints an SVG will do (Graphviz, Typst,
+Mermaid, PlantUML, Vega, matplotlib, ...). `output="image"` (SPEC.md's "Image
+output") takes the block's stdout *as* the SVG and stores it as that image;
+`output="markdown"` does the same when a script prints the image line itself.
+An SVG follows the light/dark theme through `currentColor` and
+`var(--mf-fg, …)`, and one drawn for a white page can be backed per block with
+`output-attrs="bg=#fff"` (MARKDOWN.md's "SVG images").
+
+#### Example
+<!-- meshfox:node id="example-9" type="file" -->
+
+[examples/svg.canvas.md](./examples/svg.canvas.md)
 
 ## Configuration
 <!-- meshfox:node id="configuration" -->
@@ -613,9 +632,10 @@ Every `<!-- meshfox:... -->` marker comment is also highlighted on top of the bu
 
 Multi-canvas by design, but keeping "one file, one process" isolation underneath it: `canvas_open`/`canvas_close`/`canvas_list` manage a registry of open canvases, each backed by its own spawned, isolated child process — a crash or a hung `debug_send` on one canvas can't touch another, even though a host still sees exactly one MCP server. `canvas_open` only resolves paths under that **root directory** — it refuses anything above that (`..`, an absolute path elsewhere, a symlink pointing out). A canvas id is that file's path relative to the root; opening an already-open file just returns its existing id rather than spawning a second process. **Every other tool takes that `canvas_id` as its first argument** — there's no implicit "current" canvas. The registry follows what is actually alive: a canvas whose process died is dropped from `canvas_list`, and one that is not open — never opened, closed by the idle sweep (30 minutes without a call; `MESHFOX_MCP_IDLE_SECS` overrides it, for tests), or dead — is reopened by the next call that names it, so no call needs a preceding `canvas_open`. A process that dies *during* a call is reported as such, the call is not repeated (an edit could land twice), and the next call reopens the canvas. A process that is alive but not answering is found too: every open canvas's process is pinged every 15 s (5 s to answer; `MESHFOX_MCP_PING_SECS`/`MESHFOX_MCP_PING_TIMEOUT_SECS` override, for tests), three unanswered pings in a row stop it as hung, and a call that gets no answer within 90 s (a `debug_send`: its own `timeout_ms` + 30 s; `MESHFOX_MCP_CALL_DEADLINE_SECS` overrides) stops it too and says so — either way the next call reopens the canvas. `canvas_list` never waits on a canvas with a call in flight; it reports each one's `busy` and `health`. A process that is fine while the *worker* it talks to is hung (checked with the worker's `GET /api/ping`, which does not count as API activity) is reported as `its worker is not answering` rather than stopped, since stopping it would not unhang a worker that lives elsewhere.
 
-Two tool groups, each mirroring its single-canvas equivalent exactly:
+Three tool groups, each mirroring its single-canvas equivalent exactly:
 
 - **Debug session** — `debug_start`/`debug_send`/`debug_stop`: a persistent `bash` kept alive in a node/block's own resolved cwd/env, so a multi-step snippet's state (exported vars, files it wrote) survives between calls, unlike a one-shot `run`. `debug_start` resolves `env=` the same way `run` does, taking `vars` as an explicit override for anything `meshfox:var` would otherwise need to prompt for — there's no interactive terminal on the other end of a tool call to prompt.
+- **Running blocks** — `run` (a block and its `deps=` chain, like `meshfox run`: every step's exit code, duration and output tail as JSON; `fresh: true` runs the whole chain for real this once, `no_deps: true` just the block, `vars` supplies unresolved non-secret variables, `timeout_ms` kills a step that is still going; never for interactive `tty` blocks) and `session_reset` (forgets what the session remembers, like the web UI's button and `meshfox session reset`).
 - **Node operations** — `node_show`/`node_find` (structured JSON, `find` matching a CSS selector against the canvas tree the same way `node find` does, both with an optional `include_body` to also get a node's own Markdown text) plus every mutating `node <op>` subcommand: `node_add`/`node_meta`/`node_body`/`node_block`/`node_rm`/`node_mv`/`node_rename`/`node_set_id`/`node_edges`/`node_move`/`node_reorder`. Each is a thin wrapper around the exact same validated read-modify-write `node <op>` already does — no batch/transactional multi-edit. A body replacement (`node_body`) is checked against the revision you read (`body_rev` from `node_show`/`node_find`, sent back as `base_rev`): if the body changed since, nothing is written and the error carries the current body and revision.
 
 See [`AGENT_HELP.md`](./AGENT_HELP.md) (also `meshfox --agent-help`) for the same "prefer structured operations over hand-editing" guidance this tool surface exists to make available as tool calls rather than shell commands.
@@ -1007,7 +1027,7 @@ echo "binary: target/release/meshfox"
 
 Run unit tests, typecheck, and e2e tests:
 
-```bash deps="unit-tests/run,linting/typecheck,e2e-tests/run,release-build/release-build"
+```bash name="full-check" deps="unit-tests/run!,linting/typecheck!,e2e-tests/run!,release-build/release-build!"
 echo "done"
 ```
 
@@ -1023,12 +1043,19 @@ echo "installed to $INSTALL_PATH/meshfox"
 ```
 
 ### Fix macOS Gatekeeper kill
-<!-- meshfox:node id="fix-macos-gatekeeper-kill" -->
+<!-- meshfox:node id="fix-macos-kill" -->
 
-macOS only, and not fully deterministic: a locally built/installed binary can get silently `SIGKILL`ed on launch (exit code 137, no error message) — an AMFI/Gatekeeper code-signature check a plain `cargo build`'s own output doesn't satisfy, and one that's been seen resurfacing even on a binary that already ran fine earlier in the same session, not only right after a fresh build. Re-signing ad hoc (no real identity, just enough to satisfy the check) clears it. Deliberately without `cache`, same reasoning as "Install" above — nothing here worth freezing, and re-running this is exactly the point whenever the kill resurfaces:
+macOS only, and not fully deterministic: a locally built/installed binary can get silently `SIGKILL`ed on launch (exit code 137, no error message) — an AMFI/Gatekeeper code-signature check a plain `cargo build`'s own output doesn't satisfy, and one that's been seen resurfacing even on a binary that already ran fine earlier in the same session, not only right after a fresh build. Re-signing ad hoc (no real identity, just enough to satisfy the check) clears it. This block depends on `install`, so one command builds, installs and — only if the installed binary then fails to start; a working one is left alone — re-signs it: `meshfox README.md run --fresh development fix-macos-kill` (the node and its block share the name, like `install`, so the pair addresses it). The `--fresh` matters: a dependency that already ran this session and looks unchanged (`release-build`, `install`) is otherwise skipped as already fresh, even though the sources behind it changed (see SPEC.md's "Forcing a run"). Deliberately without `cache`, same reasoning as "Install" above — nothing here worth freezing, and re-running this is exactly the point whenever the kill resurfaces:
 
-```sh name="fix-macos-kill" env="$INSTALL_PATH"
+```sh name="fix-macos-kill" deps="install/install" env="$INSTALL_PATH"
+# An installed binary that already starts is left alone: re-signing replaces
+# a working signature for nothing.
+if "$INSTALL_PATH/meshfox" --version; then
+  exit 0
+fi
+echo "$INSTALL_PATH/meshfox doesn't start — re-signing it ad hoc"
 codesign --force -s - "$INSTALL_PATH/meshfox"
+"$INSTALL_PATH/meshfox" --version
 ```
 
 ## License

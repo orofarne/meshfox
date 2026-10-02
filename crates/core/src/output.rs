@@ -183,6 +183,124 @@ fn render_output_block_markdown(name: &str, output: &ExecOutput, hash: &str) -> 
     )
 }
 
+/// Standard base64 (RFC 4648, with padding). Hand-rolled — the one place
+/// `meshfox-core` needs to *encode* anything, not worth a new dependency
+/// (`meshfox-cli` has its own `base64` for decoding `data:` URLs).
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// The Markdown image line for an `output="image"` run's stdout —
+/// `![name](data:image/svg+xml;base64,…){attrs}` — or `None` when it isn't
+/// one: a failed run, or stdout that isn't an SVG. Shared by the cached
+/// write (`render_output_block_image`) and the TUI's live view, so both
+/// show exactly the same thing. `attrs` is the fence's `output-attrs=`,
+/// forwarded in canonical form; an invalid one is left off
+/// (`meshfox validate` is what reports it).
+pub fn image_output_markdown(
+    name: &str,
+    stdout: &str,
+    exit_code: i32,
+    attrs: Option<&str>,
+) -> Option<String> {
+    let stdout = stdout.trim();
+    if exit_code != 0 || !crate::svg::looks_like_svg(stdout) {
+        return None;
+    }
+    // The name is a block identifier, but it lands in link-text position,
+    // so neutralize anything that could end the alt text early.
+    let alt: String = name
+        .chars()
+        .filter(|c| !matches!(c, '[' | ']' | '\\' | '\n' | '\r'))
+        .collect();
+    let braces = attrs
+        .and_then(crate::image_attrs::parse_inner)
+        .map(|a| a.to_braces())
+        .unwrap_or_default();
+    Some(format!(
+        "![{alt}](data:image/svg+xml;base64,{}){braces}",
+        base64_encode(stdout.as_bytes())
+    ))
+}
+
+/// Image-mode counterpart of `render_output_block`/`render_output_block_
+/// markdown` (opted into via the fence's own `output="image"` — see
+/// `write_output`): the command's stdout *is* the picture (an SVG, e.g.
+/// `plantuml -tsvg -pipe` or `typst compile - -f svg -`), and this wraps it
+/// into the one Markdown line every renderer already knows how to show,
+/// `![name](data:image/svg+xml;base64,…){attrs}` — the same shape a script
+/// would print by hand under `output="markdown"` (see
+/// `examples/pandas-dataframe.canvas.md`), minus the base64 boilerplate.
+/// `attrs` is the fence's `output-attrs=` (the image-attribute grammar,
+/// `crate::image_attrs`), forwarded in canonical form; an invalid one is
+/// simply left off here — `meshfox validate` is what reports it.
+///
+/// The region has the same shape `render_output_block_markdown` writes, so
+/// every reader that already understands `output="markdown"` (the web UI's
+/// `parseCachedOutputBlockMarkdown`, the TUI's own splice) reads it
+/// unchanged: stderr, if any, is its own leading `text` block; a failed run
+/// gets the leading bold exit-code line.
+///
+/// Anything that isn't a successful run printing an SVG shows what the
+/// command actually printed — in a plain (info-string-less) fence, never
+/// as Markdown and never as a broken image — so a failed renderer's error
+/// message, or a tool that printed something else entirely, reads as what
+/// it is. (No `text` info string on purpose: a leading ```` ```text ````
+/// block is what readers take to be stderr.)
+fn render_output_block_image(
+    name: &str,
+    output: &ExecOutput,
+    hash: &str,
+    attrs: Option<&str>,
+) -> String {
+    let mut body = String::new();
+    let stderr_trimmed = output.stderr.trim_end();
+    if !stderr_trimmed.is_empty() {
+        let escaped = escape_html_comments(stderr_trimmed);
+        let fence = "`".repeat(safe_fence_len(&escaped));
+        body.push_str(&format!("{fence}text\n{escaped}\n{fence}\n\n"));
+    }
+    if output.exit_code != 0 {
+        body.push_str(&format!(
+            "**⚠ exit code: {} · {}**\n\n",
+            output.exit_code,
+            format_duration_ms(output.duration_ms)
+        ));
+    }
+    if let Some(image) = image_output_markdown(name, &output.stdout, output.exit_code, attrs) {
+        body.push_str(&image);
+    } else if !output.stdout.trim().is_empty() {
+        let escaped = escape_html_comments(output.stdout.trim());
+        let fence = "`".repeat(safe_fence_len(&escaped));
+        body.push_str(&format!("{fence}\n{escaped}\n{fence}"));
+    }
+    format!(
+        "{start}\n\n{body}\n\n{end}\n",
+        start = start_marker(name, hash),
+        end = END_MARKER,
+    )
+}
+
 /// Byte ranges of every `<!-- meshfox:output name="..." ... --> ...
 /// <!-- /meshfox:output -->` region anywhere in `markdown`. A candidate
 /// start match only counts as a real region if it's structurally where
@@ -284,8 +402,9 @@ pub fn strip_uncached_output(markdown: &str) -> String {
 /// without needing any separate session state; see SPEC.md's "Cached
 /// output".
 ///
-/// The block's own `output="markdown"` attribute (`render_output_block_markdown`
-/// vs. the default `render_output_block`) picks how the captured stdout is
+/// The block's own `output="markdown"`/`output="image"` attribute
+/// (`render_output_block_markdown`/`render_output_block_image` vs. the
+/// default `render_output_block`) picks how the captured stdout is
 /// written back — see SPEC.md's "Cached output".
 pub fn write_output(markdown: &str, block_name: &str, output: &ExecOutput) -> Option<String> {
     let blocks = scan_runnable_blocks(block_name, markdown);
@@ -294,11 +413,15 @@ pub fn write_output(markdown: &str, block_name: &str, output: &ExecOutput) -> Op
         .find(|b| b.name.as_deref() == Some(block_name))?;
     let insert_point = block.span.end;
     let hash = fingerprint(block);
-    let markdown_mode = block.attrs.get("output").map(String::as_str) == Some("markdown");
-    let rendered = if markdown_mode {
-        render_output_block_markdown(block_name, output, &hash)
-    } else {
-        render_output_block(block_name, output, &hash)
+    let rendered = match block.attrs.get("output").map(String::as_str) {
+        Some("markdown") => render_output_block_markdown(block_name, output, &hash),
+        Some("image") => render_output_block_image(
+            block_name,
+            output,
+            &hash,
+            block.attrs.get("output-attrs").map(String::as_str),
+        ),
+        _ => render_output_block(block_name, output, &hash),
     };
     let marker = start_marker_prefix(block_name);
 
@@ -306,19 +429,30 @@ pub fn write_output(markdown: &str, block_name: &str, output: &ExecOutput) -> Op
     let trimmed_after = after.trim_start_matches(['\n', ' ', '\t']);
     let gap = after.len() - trimmed_after.len();
 
-    let mut result = String::with_capacity(markdown.len() + rendered.len());
-    result.push_str(&markdown[..insert_point]);
-    result.push('\n');
-    result.push_str(&rendered);
-
+    // Whatever follows the region we're about to write (the rest of the
+    // document), starting with the newline that ends the line it sits on:
+    // the fence's closing line when there's no region yet, or the old
+    // region's `<!-- /meshfox:output -->` line when there is one.
+    // `rendered` is written *without* its own trailing newline for exactly
+    // that reason — that newline is already the first byte of `rest`, so
+    // keeping both added one more blank line after the region on every
+    // single re-run.
+    let mut rest = after;
     if trimmed_after.starts_with(&marker) {
         if let Some(end_idx) = trimmed_after.find(END_MARKER) {
             let region_end = gap + end_idx + END_MARKER.len();
-            result.push_str(&markdown[insert_point + region_end..]);
-            return Some(result);
+            rest = &markdown[insert_point + region_end..];
         }
     }
-    result.push_str(after);
+
+    let mut result = String::with_capacity(markdown.len() + rendered.len());
+    result.push_str(&markdown[..insert_point]);
+    result.push('\n');
+    result.push_str(rendered.trim_end_matches('\n'));
+    if !rest.starts_with('\n') {
+        result.push('\n');
+    }
+    result.push_str(rest);
     Some(result)
 }
 
@@ -717,5 +851,176 @@ mod tests {
         let canvas = crate::mdcanvas::parse(md).unwrap();
         assert_eq!(canvas.nodes.len(), 2);
         assert!(canvas.node("real-section").is_some());
+    }
+
+    // `output="image"` — see `render_output_block_image`.
+    const SVG: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><rect width="4" height="4"/></svg>"#;
+
+    #[test]
+    fn base64_encode_matches_rfc4648_vectors() {
+        for (input, expected) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64_encode(input.as_bytes()), expected, "{input:?}");
+        }
+    }
+
+    fn image_doc(fence_attrs: &str) -> String {
+        format!("# R\n<!-- meshfox:node id=\"r\" -->\n\n```bash name=\"d\" cache output=\"image\"{fence_attrs}\nx\n```\n")
+    }
+
+    #[test]
+    fn image_mode_wraps_an_svg_stdout_into_a_data_url_image() {
+        let result = write_output(&image_doc(""), "d", &out(0, SVG)).unwrap();
+        let expected = format!(
+            "![d](data:image/svg+xml;base64,{})",
+            base64_encode(SVG.as_bytes())
+        );
+        assert!(result.contains(&expected), "{result}");
+        assert!(result.contains("<!-- meshfox:output name=\"d\""), "{result}");
+        assert!(!result.contains("exit code"), "{result}");
+        // Nothing after the image but the region's own end marker.
+        assert!(result.contains(&format!("{expected}\n\n<!-- /meshfox:output -->")), "{result}");
+    }
+
+    #[test]
+    fn image_mode_forwards_output_attrs_in_canonical_form() {
+        let doc = image_doc(" output-attrs=\"bg=#FFF width=50%\"");
+        let result = write_output(&doc, "d", &out(0, SVG)).unwrap();
+        assert!(result.contains("){width=50% bg=#ffffff}\n"), "{result}");
+    }
+
+    #[test]
+    fn image_mode_leaves_off_invalid_output_attrs() {
+        let doc = image_doc(" output-attrs=\"color=red\"");
+        let result = write_output(&doc, "d", &out(0, SVG)).unwrap();
+        assert!(result.contains("base64,"), "{result}");
+        assert!(!result.contains('{'), "{result}");
+    }
+
+    #[test]
+    fn image_mode_shows_non_svg_stdout_in_a_plain_fence_not_as_stderr() {
+        let result = write_output(&image_doc(""), "d", &out(0, "plantuml: not found")).unwrap();
+        assert!(result.contains("```\nplantuml: not found\n```"), "{result}");
+        assert!(!result.contains("```text"), "{result}");
+        assert!(!result.contains("data:image"), "{result}");
+        assert!(!result.contains("exit code"), "{result}");
+    }
+
+    #[test]
+    fn image_mode_marks_a_failed_run_with_the_exit_code_line_even_with_svg_stdout() {
+        let result = write_output(&image_doc(""), "d", &out(2, SVG)).unwrap();
+        assert!(result.contains("**⚠ exit code: 2 · 0ms**"), "{result}");
+        assert!(!result.contains("data:image"), "{result}");
+        assert!(result.contains("<svg xmlns"), "{result}");
+    }
+
+    #[test]
+    fn image_mode_fallback_keeps_stderr_first_then_exit_line_then_stdout() {
+        let mut o = out(1, "oops stdout");
+        o.stderr = "boom\n".to_string();
+        let result = write_output(&image_doc(""), "d", &o).unwrap();
+        let (a, b, c) = (
+            result.find("```text\nboom").unwrap(),
+            result.find("**⚠ exit code: 1").unwrap(),
+            result.find("```\noops stdout").unwrap(),
+        );
+        assert!(a < b && b < c, "{result}");
+    }
+
+    #[test]
+    fn image_mode_shows_stderr_as_its_own_block_before_the_image() {
+        let mut o = out(0, SVG);
+        o.stderr = "warning: font fallback\n".to_string();
+        let result = write_output(&image_doc(""), "d", &o).unwrap();
+        let warn = result.find("warning: font fallback").unwrap();
+        let img = result.find("![d](").unwrap();
+        assert!(warn < img, "{result}");
+        assert!(result.contains("```text\nwarning: font fallback\n```"), "{result}");
+    }
+
+    #[test]
+    fn image_mode_rewrites_in_place_on_a_rerun() {
+        let once = write_output(&image_doc(""), "d", &out(0, SVG)).unwrap();
+        let twice = write_output(&once, "d", &out(0, SVG)).unwrap();
+        assert_eq!(once, twice);
+        assert_eq!(twice.matches("meshfox:output name=").count(), 1);
+        assert_eq!(twice.matches("![d](").count(), 1);
+        assert_eq!(cached_output_hash(&once, "d"), cached_output_hash(&twice, "d"));
+    }
+
+    #[test]
+    fn editing_output_attrs_invalidates_the_cached_hash_but_nothing_else_does() {
+        let plain = write_output(&image_doc(""), "d", &out(0, SVG)).unwrap();
+        let backed_doc = image_doc(" output-attrs=\"bg=#fff\"");
+        // Output written for the plain fence is stale under the edited one.
+        let stale = plain.replace(&image_doc(""), &backed_doc);
+        assert_ne!(
+            cached_output_hash(&stale, "d"),
+            cached_output_hash(&write_output(&backed_doc, "d", &out(0, SVG)).unwrap(), "d")
+        );
+        // A fence without output-attrs keeps the hash it always had.
+        let md = "```bash name=\"x\" cache\nhi\n```\n";
+        let b = &scan_code_blocks(md)[0];
+        let rebuilt = crate::fence::fingerprint(b);
+        assert_eq!(rebuilt, crate::fence::fingerprint(&scan_code_blocks(md)[0]));
+    }
+
+    // Regression: every re-run used to add one more blank line after the
+    // region (the rendered region's own trailing newline plus the one
+    // already starting the text after it) — in every output mode.
+    fn rerun_is_a_fixed_point(doc: &str, out_a: ExecOutput, out_b: ExecOutput) {
+        let once = write_output(doc, "t", &out_a).unwrap();
+        let twice = write_output(&once, "t", &out_b).unwrap();
+        let thrice = write_output(&twice, "t", &out_b).unwrap();
+        assert_eq!(twice, thrice, "a re-run must not change the document further");
+        // Same output again is a fixed point from the very first run on.
+        let again = write_output(&once, "t", &out_a).unwrap();
+        assert_eq!(once, again);
+    }
+
+    #[test]
+    fn rerunning_a_text_mode_block_does_not_grow_the_document() {
+        for tail in ["", "\nNext para\n", "\n\nNext para\n", "\n## Next node\n"] {
+            let doc = format!("# R\n\n```bash name=\"t\" cache\nx\n```\n{tail}");
+            rerun_is_a_fixed_point(&doc, out(0, "hi"), out(1, "other"));
+        }
+    }
+
+    #[test]
+    fn rerunning_a_markdown_mode_block_does_not_grow_the_document() {
+        for tail in ["", "\nNext para\n", "\n\nNext para\n"] {
+            let doc = format!("# R\n\n```bash name=\"t\" cache output=\"markdown\"\nx\n```\n{tail}");
+            rerun_is_a_fixed_point(&doc, out(0, "| a |\n|---|\n| 1 |"), out(0, "| b |\n|---|\n| 2 |"));
+        }
+    }
+
+    #[test]
+    fn rerunning_an_image_mode_block_does_not_grow_the_document() {
+        for tail in ["", "\nNext para\n", "\n\nNext para\n"] {
+            let doc = format!("# R\n\n```bash name=\"t\" cache output=\"image\"\nx\n```\n{tail}");
+            rerun_is_a_fixed_point(&doc, out(0, SVG), out(0, "not an svg"));
+        }
+    }
+
+    #[test]
+    fn a_fence_at_end_of_file_with_no_trailing_newline_still_gets_a_clean_region() {
+        let doc = "```bash name=\"t\" cache\nx\n```";
+        let once = write_output(doc, "t", &out(0, "hi")).unwrap();
+        assert!(once.ends_with("<!-- /meshfox:output -->\n"), "{once:?}");
+        assert_eq!(write_output(&once, "t", &out(0, "hi")).unwrap(), once);
+    }
+
+    #[test]
+    fn the_blank_line_between_a_block_and_the_next_paragraph_is_kept_as_it_was() {
+        let doc = "```bash name=\"t\" cache\nx\n```\n\nNext para\n";
+        let result = write_output(doc, "t", &out(0, "hi")).unwrap();
+        assert!(result.ends_with("<!-- /meshfox:output -->\n\nNext para\n"), "{result:?}");
     }
 }

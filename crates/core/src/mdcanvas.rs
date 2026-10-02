@@ -105,6 +105,11 @@ pub enum ParseError {
     #[error("id {0:?} contains a forbidden character (a `\"`, a `,`, or a control character)")]
     InvalidId(String),
     #[error(
+        "id {0:?} is reserved for the document's root node (the top-level # heading) — give \
+         this node a different id"
+    )]
+    ReservedId(String),
+    #[error(
         "node {0:?} has an invalid {1}={2:?} — expected RFC3339, e.g. \"2026-08-29T10:15:00Z\" \
          or with an explicit offset like \"2026-08-29T13:15:00+03:00\""
     )]
@@ -1151,13 +1156,43 @@ pub fn set_fence_attrs(
     Some(out)
 }
 
+#[derive(Debug, Error, PartialEq)]
+pub enum SetTitleError {
+    #[error("no node {0:?}")]
+    NotFound(String),
+    #[error(
+        "node {0:?} has no explicit id — its id is derived from its title, so renaming it would \
+         change the id and break anything that refers to it by name. Pin the id first: \
+         `meshfox node set-id {0} <id>` (or write id=\"...\" in its meshfox:node comment)"
+    )]
+    DerivedId(String),
+}
+
 /// Rewrites just node `node_id`'s heading *text*, preserving its `#` level
 /// and leaving its `meshfox:node`/`meshfox:edge` lines and body untouched.
-pub fn set_node_title(markdown: &str, node_id: &str, new_title: &str) -> Option<String> {
+///
+/// A node's id is "pinned the first time it's written and never follows
+/// later title edits". The root needs no pinning — without an `id=` it is
+/// always `root` (`ROOT_ID`), whatever its title — but any other node with
+/// no explicit `id=` (a hand-written bare `<!-- meshfox:node -->`; every
+/// tool writes the id when it creates a node) has an id *derived* from its
+/// title, so renaming the heading would silently change the id out from
+/// under every `parent=`/`meshfox:edge`/`deps=` reference and the caller's
+/// own handle on the node. That is refused, with the way out in the error
+/// (`SetTitleError::DerivedId`).
+pub fn try_set_node_title(
+    markdown: &str,
+    node_id: &str,
+    new_title: &str,
+) -> Result<String, SetTitleError> {
+    let not_found = || SetTitleError::NotFound(node_id.to_string());
     let segments = scan(markdown);
-    let ids = assign_ids(&segments).ok()?;
-    let idx = ids.iter().position(|id| id == node_id)?;
+    let ids = assign_ids(&segments).map_err(|_| not_found())?;
+    let idx = ids.iter().position(|id| id == node_id).ok_or_else(not_found)?;
     let seg = &segments[idx];
+    if !seg.node_attrs.contains_key("id") && Some(idx) != root_index(&segments) {
+        return Err(SetTitleError::DerivedId(node_id.to_string()));
+    }
 
     let mut heading = "#".repeat(seg.level as usize);
     heading.push(' ');
@@ -1168,7 +1203,13 @@ pub fn set_node_title(markdown: &str, node_id: &str, new_title: &str) -> Option<
     out.push_str(&markdown[..seg.heading_span.start]);
     out.push_str(&heading);
     out.push_str(&markdown[seg.heading_span.end..]);
-    Some(out)
+    Ok(out)
+}
+
+/// `try_set_node_title` for callers that only need to know whether it
+/// worked (a reconcile pass over a document it already knows is fine).
+pub fn set_node_title(markdown: &str, node_id: &str, new_title: &str) -> Option<String> {
+    try_set_node_title(markdown, node_id, new_title).ok()
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -1181,6 +1222,8 @@ pub enum RenameIdError {
     Empty,
     #[error("id can't contain a `\"`, a `,`, or a control character")]
     InvalidChar,
+    #[error("id {0:?} is reserved for the document's root node")]
+    Reserved(String),
 }
 
 /// Renames node `old_id` to `new_id`: rewrites its own `meshfox:node id=`
@@ -1208,6 +1251,13 @@ pub fn rename_node_id(markdown: &str, old_id: &str, new_id: &str) -> Result<Stri
         Canvas::from_markdown(markdown).map_err(|_| RenameIdError::NotFound(old_id.to_string()))?;
     if canvas.node(new_id).is_some() {
         return Err(RenameIdError::AlreadyExists(new_id.to_string()));
+    }
+    // "root" belongs to the root node alone: any other node would make the
+    // document stop parsing (`ParseError::ReservedId`). (The root itself
+    // already has it or has been given something else on purpose, and
+    // `canvas.node(new_id)` above already turned "root is taken" away.)
+    if new_id == ROOT_ID && canvas.node(old_id).is_some_and(|n| n.parent.is_some()) {
+        return Err(RenameIdError::Reserved(new_id.to_string()));
     }
 
     let mut result = set_node_id_attr(markdown, old_id, Some(new_id))
@@ -1311,7 +1361,13 @@ pub fn clear_node_id(markdown: &str, id: &str) -> Result<(String, String), Clear
     let segments = scan(markdown);
     let ids = assign_ids(&segments).map_err(|_| ClearIdError::NotFound(id.to_string()))?;
     let used: HashSet<String> = ids.iter().filter(|i| i.as_str() != id).cloned().collect();
-    let derived_id = unique_slug(&node.title, &used);
+    // Without an explicit `id=` the root is "root", not a slug of its title
+    // (see `ROOT_ID`); every other node falls back to its title's slug.
+    let derived_id = if node.parent.is_none() {
+        ROOT_ID.to_string()
+    } else {
+        unique_slug(&node.title, &used)
+    };
 
     let renamed = if derived_id == id {
         markdown.to_string()
@@ -2600,20 +2656,51 @@ fn subtree_end_idx(ids: &[String], parents: &[Option<String>], idx: usize) -> Op
     ((idx + 1)..ids.len()).find(|&j| !is_descendant(j))
 }
 
+/// The id the document's root node (the one top-level `#` heading) has when
+/// it doesn't spell one out: not a slug of its title but this fixed word, so
+/// it never changes when the title does and every canvas's root is
+/// addressable the same way (`parent_id: "root"`). Reserved — no other node
+/// may use it (`ParseError::ReservedId`, `RenameIdError::Reserved`) — but a
+/// root can still be given a different explicit `id=`.
+pub const ROOT_ID: &str = "root";
+
+/// Index of the root segment: the first top-level (`#`) heading. `parse`
+/// insists there is exactly one; the lenient callers that scan documents
+/// which don't parse (yet) just get the first.
+fn root_index(segments: &[Segment]) -> Option<usize> {
+    segments.iter().position(|s| s.level == 1)
+}
+
 fn assign_ids(segments: &[Segment]) -> Result<Vec<String>, ParseError> {
+    let root_idx = root_index(segments);
+    let root_is_default_named = root_idx
+        .map(|i| segments[i].node_attrs.get("id").map_or(true, |v| v == ROOT_ID))
+        .unwrap_or(false);
     let mut used = HashSet::new();
+    // Taken up front, so a title-derived slug of "root" (a bare marker under
+    // a heading called "Root") is deduped to "root-2" however early in the
+    // document it comes, rather than stealing the id from the root.
+    if root_is_default_named {
+        used.insert(ROOT_ID.to_string());
+    }
     let mut ids = Vec::with_capacity(segments.len());
-    for seg in segments {
+    for (idx, seg) in segments.iter().enumerate() {
+        let is_root = Some(idx) == root_idx;
         let id = match seg.node_attrs.get("id") {
             Some(v) => {
                 if id_has_forbidden_char(v) {
                     return Err(ParseError::InvalidId(v.clone()));
                 }
+                if v == ROOT_ID && !is_root {
+                    return Err(ParseError::ReservedId(v.clone()));
+                }
                 v.clone()
             }
+            None if is_root => ROOT_ID.to_string(),
             None => unique_slug(&seg.title, &used),
         };
-        if !used.insert(id.clone()) {
+        // The root's "root" was reserved above, not a duplicate of itself.
+        if !(is_root && id == ROOT_ID) && !used.insert(id.clone()) {
             return Err(ParseError::DuplicateId(id));
         }
         ids.push(id);
@@ -4048,6 +4135,97 @@ Reused from Tests as well.
         assert_eq!(c.node("smoke-test").unwrap().level, 3);
         assert_eq!(c.node("root").unwrap().title, "Hello Project");
         assert_eq!(c.node("tests").unwrap().title, "Tests");
+    }
+
+    // The root without an explicit `id=` is "root" — not a slug of its title —
+    // so retitling it never touches its id (this is what used to fail with
+    // "no node <old slug>" through the CLI/MCP/web rename).
+    #[test]
+    fn an_unmarked_root_is_called_root_whatever_its_title() {
+        let doc = "<!-- meshfox:canvas -->\n# Plain Root\n\nbody\n\n## Child\n<!-- meshfox:node id=\"child\" -->\n\nkid\n";
+        let c = parse(doc).unwrap();
+        assert_eq!(c.node("root").unwrap().title, "Plain Root");
+        assert!(c.node("plain-root").is_none());
+        assert_eq!(c.node("child").unwrap().parent.as_deref(), Some("root"));
+        // A marker with other attributes but no id is the same root.
+        let doc = "# Whatever\n<!-- meshfox:node x=0 y=0 w=100 h=50 -->\n";
+        assert_eq!(parse(doc).unwrap().node("root").unwrap().title, "Whatever");
+    }
+
+    #[test]
+    fn set_node_title_on_the_root_keeps_its_id_and_writes_nothing_else() {
+        let doc = "<!-- meshfox:canvas -->\n# Plain Root\n\nbody\n\n## Child\n<!-- meshfox:node id=\"child\" -->\n\nkid\n";
+        let updated = try_set_node_title(doc, "root", "Other Name").unwrap();
+        assert_eq!(updated, doc.replace("# Plain Root", "# Other Name"));
+        let c = parse(&updated).unwrap();
+        assert_eq!(c.node("root").unwrap().title, "Other Name");
+        assert_eq!(c.node("child").unwrap().parent.as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn a_root_can_still_be_given_a_different_explicit_id() {
+        let doc = "# Top\n<!-- meshfox:node id=\"top\" -->\n\n## Kid\n<!-- meshfox:node id=\"kid\" -->\n";
+        let c = parse(doc).unwrap();
+        assert!(c.node("top").is_some());
+        assert!(c.node("root").is_none());
+        // ...and is renameable to / from "root" with the usual id tools.
+        let renamed = rename_node_id(doc, "top", "root").unwrap();
+        assert!(parse(&renamed).unwrap().node("root").is_some());
+        let (cleared, id) = clear_node_id(doc, "top").unwrap();
+        assert_eq!(id, "root");
+        assert!(parse(&cleared).unwrap().node("root").is_some());
+        assert!(!cleared.contains("id=\"top\""), "{cleared}");
+    }
+
+    #[test]
+    fn no_other_node_may_have_the_id_root() {
+        let doc = "# Top\n<!-- meshfox:node id=\"top\" -->\n\n## Kid\n<!-- meshfox:node id=\"root\" -->\n";
+        assert_eq!(parse(doc).unwrap_err(), ParseError::ReservedId("root".into()));
+        let doc = "# Top\n\n## Kid\n<!-- meshfox:node id=\"root\" -->\n";
+        assert_eq!(parse(doc).unwrap_err(), ParseError::ReservedId("root".into()));
+        // Not by renaming into it either.
+        let doc = "# Top\n<!-- meshfox:node id=\"top\" -->\n\n## Kid\n<!-- meshfox:node id=\"kid\" -->\n";
+        assert_eq!(
+            rename_node_id(doc, "kid", "root").unwrap_err(),
+            RenameIdError::Reserved("root".into())
+        );
+        let doc = "# Top\n\n## Kid\n<!-- meshfox:node id=\"kid\" -->\n";
+        assert_eq!(
+            rename_node_id(doc, "kid", "root").unwrap_err(),
+            RenameIdError::AlreadyExists("root".into())
+        );
+    }
+
+    #[test]
+    fn a_derived_slug_of_root_for_another_node_is_deduped() {
+        let doc = "# Project\n\n## Root\n<!-- meshfox:node -->\n\nbody\n";
+        let c = parse(doc).unwrap();
+        assert_eq!(c.node("root").unwrap().title, "Project");
+        assert_eq!(c.node("root-2").unwrap().title, "Root");
+        // Tool-created nodes can't take it either.
+        let added = insert_child_node(doc, "root", "Root").unwrap();
+        assert!(parse(&added.0).unwrap().nodes.len() == 3);
+    }
+
+    #[test]
+    fn set_node_title_refuses_a_node_whose_id_is_derived_from_its_title() {
+        let doc = "# Root\n\n## My Section\n<!-- meshfox:node tags=\"a\" -->\n\nbody\n";
+        let err = try_set_node_title(doc, "my-section", "Renamed").unwrap_err();
+        assert_eq!(err, SetTitleError::DerivedId("my-section".into()));
+        let msg = err.to_string();
+        assert!(msg.contains("node set-id my-section"), "{msg}");
+        assert_eq!(set_node_title(doc, "my-section", "Renamed"), None);
+        assert_eq!(
+            try_set_node_title(doc, "nope", "x").unwrap_err(),
+            SetTitleError::NotFound("nope".into())
+        );
+    }
+
+    #[test]
+    fn set_node_title_on_an_explicitly_id_d_node_does_not_touch_its_marker() {
+        let doc = "# Root\n<!-- meshfox:node id=\"root\" -->\n\n## A\n<!-- meshfox:node id=\"a\" -->\n";
+        let updated = set_node_title(doc, "a", "B").unwrap();
+        assert_eq!(updated, "# Root\n<!-- meshfox:node id=\"root\" -->\n\n## B\n<!-- meshfox:node id=\"a\" -->\n");
     }
 
     #[test]

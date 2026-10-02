@@ -1423,7 +1423,7 @@ pub async fn run_stream(
     save_secrets: HashSet<String>,
     force: Option<(String, String)>,
 ) -> Result<tokio::sync::mpsc::UnboundedReceiver<RunEvent>, String> {
-    run_stream_inner(port, path, block, no_deps, false, vars, save_secrets, force).await
+    run_stream_inner(port, path, block, no_deps, false, false, vars, save_secrets, force).await
 }
 
 /// Same as [`run_stream`], but with `persist: true` — the CLI's own
@@ -1439,11 +1439,12 @@ pub async fn run_stream_persisted(
     path: &[String],
     block: &str,
     no_deps: bool,
+    fresh: bool,
     vars: HashMap<String, String>,
     save_secrets: HashSet<String>,
     force: Option<(String, String)>,
 ) -> Result<tokio::sync::mpsc::UnboundedReceiver<RunEvent>, String> {
-    run_stream_inner(port, path, block, no_deps, true, vars, save_secrets, force).await
+    run_stream_inner(port, path, block, no_deps, fresh, true, vars, save_secrets, force).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1452,6 +1453,7 @@ async fn run_stream_inner(
     path: &[String],
     block: &str,
     no_deps: bool,
+    fresh: bool,
     persist: bool,
     vars: HashMap<String, String>,
     save_secrets: HashSet<String>,
@@ -1468,6 +1470,7 @@ async fn run_stream_inner(
         ("path", path.join(",")),
         ("block", block.to_string()),
         ("noDeps", no_deps.to_string()),
+        ("fresh", fresh.to_string()),
         ("persist", persist.to_string()),
         ("vars", vars_json),
         ("saveSecrets", secrets_json),
@@ -1563,6 +1566,21 @@ pub async fn run_file_node_stream(
 /// `POST /api/kill` — cancels whatever's currently registered for this
 /// address (see `crates/server/src/lib.rs`'s own `KillRequest` doc
 /// comment: usable even by a caller that never itself started the run).
+/// `POST /api/session/reset` — forgets every block's session-freshness
+/// record and submitted `form` values (`reset_session` on the server side;
+/// the web UI's "reset session" button), so the next chain run executes every
+/// block for real. Finished runs stay as history; the canvas file and any
+/// saved `<!-- meshfox:output -->` cache are never touched.
+pub async fn reset_session(port: u16) -> Result<(), String> {
+    let res = client()
+        .post(format!("{}/api/session/reset", base_url(port)))
+        .timeout(time_limit(CONTROL))
+        .send()
+        .await
+        .map_err(|e| describe(&e))?;
+    into_result(res).await
+}
+
 pub async fn kill_run(port: u16, node_id: &str, block: &str) -> Result<(), String> {
     let res = client()
         .post(format!("{}/api/kill", base_url(port)))
@@ -1649,6 +1667,7 @@ pub async fn tty_connect(
     path: &[String],
     block: &str,
     no_deps: bool,
+    fresh: bool,
     vars: HashMap<String, String>,
     save_secrets: HashSet<String>,
     cols: u16,
@@ -1663,6 +1682,7 @@ pub async fn tty_connect(
         ("path", path.join(",")),
         ("block", block.to_string()),
         ("noDeps", no_deps.to_string()),
+        ("fresh", fresh.to_string()),
         ("vars", vars_json),
         ("saveSecrets", secrets_json),
         ("cols", cols.to_string()),

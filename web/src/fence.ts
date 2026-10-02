@@ -139,6 +139,7 @@ export function fingerprint(
   interpreter: string | undefined,
   envAttr: string | undefined,
   depsAttr: string | undefined,
+  outputAttr?: string,
 ): string {
   const parts = [lang, code, interpreter ?? ""];
   for (const raw of (envAttr ?? "").split(",").map((s) => s.trim()).filter((s) => s.length > 0)) {
@@ -153,6 +154,10 @@ export function fingerprint(
   for (const raw of (depsAttr ?? "").split(",").map((s) => s.trim()).filter((s) => s.length > 0)) {
     parts.push(raw);
   }
+  // `output-attrs=` is baked into the cached image (`output="image"`), so
+  // it's part of what makes a cached output stale — only when present,
+  // exactly like `core::fence::fingerprint`.
+  if (outputAttr !== undefined) parts.push(`output-attrs${NUL}${outputAttr}`);
   return fnv1aHex(new TextEncoder().encode(parts.join(NUL)));
 }
 
@@ -203,6 +208,18 @@ export interface CodeSegment {
    * `RunOutput`/`LiveRunOutput` (render the result through `ReactMarkdown`
    * instead of a `<pre>`/`AnsiText` block). */
   outputMarkdown: boolean;
+  /** `output="image"` (`core::output::render_output_block_image`): the
+   * cached region has exactly the markdown-mode shape (an optional stderr
+   * `text` block, then Markdown — here one image line), so `outputMarkdown`
+   * is set too and everything that renders a markdown-mode block works
+   * unchanged. This flag only matters for the *live* "done" view, where the
+   * captured stdout is the raw SVG and has to be turned into that image
+   * line client-side (`imageOutput.ts`). */
+  outputImage: boolean;
+  /** The fence's `output-attrs=` — the image-attribute grammar forwarded
+   * onto the generated image (`{width=50% bg=#fff}`). Only with
+   * `output="image"`. */
+  outputAttrs?: string;
   /** Mirrors `core::fence::CodeBlock.default` — the explicit `default`
    * flag (`` ```bash name="run" default ``). A block also counts as this
    * node's default when `name` equals the node's own id (see `MeshNode.tsx`'s
@@ -506,7 +523,9 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
     const autorun = attrs.autorun !== undefined && attrs.autorun !== "false";
     const render = attrs.render;
     const fold = attrs.fold !== undefined && attrs.fold !== "false";
-    const outputMarkdown = attrs.output === "markdown";
+    const outputImage = attrs.output === "image";
+    const outputMarkdown = attrs.output === "markdown" || outputImage;
+    const outputAttrs = attrs["output-attrs"];
     const interpreter = attrs.interpreter;
     const envRefs = attrs.env !== undefined ? parseEnvList(attrs.env) : [];
     const deps = (attrs.deps ?? "")
@@ -538,7 +557,7 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
         // "can't vouch this is still current" defaults to stale.
         const stale =
           markerAttrs.hash === undefined ||
-          markerAttrs.hash !== fingerprint(lang, code, interpreter, attrs.env, attrs.deps);
+          markerAttrs.hash !== fingerprint(lang, code, interpreter, attrs.env, attrs.deps, outputAttrs);
         const parsed = outputMarkdown
           ? parseCachedOutputBlockMarkdown(inner.join("\n"))
           : parseCachedOutputBlock(inner.join("\n"));
@@ -547,7 +566,7 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
       }
     }
 
-    segments.push({ type: "code", lang, name, cache, tty, autoclose, service, deps, envRefs, default: isDefault, autorun, render, fold, outputMarkdown, interpreter, code: codeLines.join("\n"), output });
+    segments.push({ type: "code", lang, name, cache, tty, autoclose, service, deps, envRefs, default: isDefault, autorun, render, fold, outputMarkdown, outputImage, outputAttrs, interpreter, code: codeLines.join("\n"), output });
     i = cursor;
   }
   flushMarkdown();

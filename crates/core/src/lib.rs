@@ -28,6 +28,7 @@ pub mod secret_index;
 pub mod secret_store;
 pub mod shared_env;
 pub mod staticgen;
+pub mod svg;
 pub mod subsup;
 pub mod syntax_dirs;
 pub mod body_rev;

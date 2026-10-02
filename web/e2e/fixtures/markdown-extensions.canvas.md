@@ -12,6 +12,10 @@ edited by the suite.
 
 ![alt](https://example.com/pic.png){width=300 height=50%}
 
+![backed](https://example.com/chart.svg){bg=#FFF}
+
+![themed](data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI4IiBoZWlnaHQ9IjgiPjxyZWN0IHdpZHRoPSI4IiBoZWlnaHQ9IjgiIGZpbGw9ImN1cnJlbnRDb2xvciIvPjwvc3ZnPg==)
+
 H~2~O and x^n^
 
 > [!WARNING]

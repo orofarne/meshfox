@@ -37,6 +37,12 @@ pub enum Segment {
         /// the rest of this syntax uses elsewhere.
         width_percent: Option<u32>,
         height_percent: Option<u32>,
+        /// `{bg=#rrggbb}` — painted behind an SVG when it's rasterized
+        /// (`svg_raster::rasterize`), so a transparent diagram drawn for a
+        /// light page stays legible on the terminal's dark background.
+        /// Only SVGs are rasterized by us, so it has no effect on a PNG/
+        /// JPEG (those already carry their own pixels).
+        bg: Option<meshfox_core::image_attrs::Background>,
     },
 }
 
@@ -734,7 +740,30 @@ impl<'a> Renderer<'a> {
             }
         };
 
-        if live.output_markdown && !live.running && !live.stdout.trim().is_empty() {
+        // The Markdown to render this finished run's stdout as: its stdout
+        // itself for an `output="markdown"` block, or — for an
+        // `output="image"` block, whose stdout is a raw SVG — the same
+        // image line the cached copy has (`None` for a failed run or
+        // non-SVG stdout, which then shows as the plain text it is below).
+        let markdown_stdout: Option<String> = if live.running {
+            None
+        } else if live.output_markdown && !live.stdout.trim().is_empty() {
+            Some(live.stdout.clone())
+        } else {
+            self.runnable
+                .iter()
+                .find(|b| b.name.as_deref() == Some(block_name))
+                .filter(|b| b.attrs.get("output").map(String::as_str) == Some("image"))
+                .and_then(|b| {
+                    meshfox_core::output::image_output_markdown(
+                        block_name,
+                        &live.stdout,
+                        live.exit_code,
+                        b.attrs.get("output-attrs").map(String::as_str),
+                    )
+                })
+        };
+        if let Some(markdown) = markdown_stdout {
             any_output = true;
             // stderr first, muted, then a rule — the web UI's
             // `MarkdownOutput` does the same: stderr was never this block's
@@ -751,7 +780,7 @@ impl<'a> Renderer<'a> {
                 framed.push(Line::from(Span::styled("│ ────", border)));
             }
             let (segs, _clicks) = render(
-                &live.stdout,
+                &markdown,
                 self.base_dir,
                 self.hl,
                 self.node_id,
@@ -883,6 +912,7 @@ impl<'a> Renderer<'a> {
         let Some(Segment::Image {
             width_percent,
             height_percent,
+            bg,
             ..
         }) = self.segments.last_mut()
         else {
@@ -898,6 +928,7 @@ impl<'a> Renderer<'a> {
                 *height_percent = Some(h.value);
             }
         }
+        *bg = attrs.bg;
     }
 
     fn event(&mut self, ev: Event, span_start: usize) {
@@ -1144,6 +1175,7 @@ impl<'a> Renderer<'a> {
                         alt,
                         width_percent: None,
                         height_percent: None,
+                        bg: None,
                     });
                 } else {
                     let path = self.base_dir.join(dest_url.as_ref());
@@ -1152,6 +1184,7 @@ impl<'a> Renderer<'a> {
                         alt,
                         width_percent: None,
                         height_percent: None,
+                        bg: None,
                     });
                 }
             }
@@ -1762,6 +1795,97 @@ mod tests {
             "stderr, rule, then the rendered markdown:\n{text}"
         );
         assert!(text.trim_end().ends_with("└─"), "frame is closed:\n{text}");
+    }
+
+    // `output="image"`: a finished run's stdout is a raw SVG; the live frame
+    // shows it as the same image line the cached copy has, with the fence's
+    // `output-attrs=` applied — and plain text when it isn't one.
+    fn image_live_segments(stdout: &str, exit_code: i32, running: bool) -> Vec<Segment> {
+        let hl = Highlighter::new();
+        let md = "```bash name=\"t\" cache output=\"image\" output-attrs=\"bg=#fff\"\nx\n```\n";
+        let mut live_output = std::collections::HashMap::new();
+        live_output.insert(
+            "t".to_string(),
+            super::super::app::StepOutput {
+                stdout: stdout.to_string(),
+                stderr: String::new(),
+                output_markdown: false,
+                exit_code,
+                duration_ms: 5,
+                running,
+            },
+        );
+        render(
+            md,
+            Path::new("/nonexistent-base-dir"),
+            &hl,
+            "n",
+            &[],
+            &std::collections::HashMap::new(),
+            None,
+            &live_output,
+        )
+        .0
+    }
+
+    const LIVE_SVG: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><rect width="4" height="4"/></svg>"#;
+
+    #[test]
+    fn finished_image_live_output_becomes_an_image_segment_with_its_bg() {
+        let segments = image_live_segments(LIVE_SVG, 0, false);
+        let image = segments.iter().find_map(|s| match s {
+            Segment::Image { path, bg, .. } => Some((path.clone(), *bg)),
+            _ => None,
+        });
+        let (path, bg) = image.expect("an image segment for the SVG");
+        assert!(path.to_string_lossy().starts_with("data:image/svg+xml;base64,"));
+        assert_eq!(bg, meshfox_core::image_attrs::Background::parse("#fff"));
+    }
+
+    #[test]
+    fn a_cached_image_region_is_drawn_as_an_image_with_its_attrs() {
+        let hl = Highlighter::new();
+        let region = meshfox_core::output::write_output(
+            "# R\n<!-- meshfox:node id=\"r\" -->\n\n```bash name=\"t\" cache output=\"image\" output-attrs=\"width=50% bg=#fff\"\nx\n```\n",
+            "t",
+            &meshfox_core::output::ExecOutput {
+                exit_code: 0,
+                output: LIVE_SVG.to_string(),
+                duration_ms: 1,
+                stdout: LIVE_SVG.to_string(),
+                stderr: "warn\n".to_string(),
+            },
+        )
+        .unwrap();
+        let (segments, _) = render(
+            &region,
+            Path::new("/nonexistent-base-dir"),
+            &hl,
+            "r",
+            &[],
+            &std::collections::HashMap::new(),
+            None,
+            &std::collections::HashMap::new(),
+        );
+        let image = segments.iter().find_map(|s| match s {
+            Segment::Image { path, width_percent, bg, .. } => Some((path.clone(), *width_percent, *bg)),
+            _ => None,
+        });
+        let (path, width, bg) = image.expect("the cached region's image");
+        assert!(path.to_string_lossy().starts_with("data:image/svg+xml;base64,"));
+        assert_eq!(width, Some(50));
+        assert_eq!(bg, meshfox_core::image_attrs::Background::parse("#fff"));
+    }
+
+    #[test]
+    fn running_or_failed_image_live_output_stays_plain_text() {
+        for (stdout, code, running) in [(LIVE_SVG, 0, true), (LIVE_SVG, 2, false), ("not an svg", 0, false)] {
+            let segments = image_live_segments(stdout, code, running);
+            assert!(
+                !segments.iter().any(|s| matches!(s, Segment::Image { .. })),
+                "{stdout:?} {code} {running}"
+            );
+        }
     }
 
     // The web UI's `RunOutput` shows live output *instead of* the cached

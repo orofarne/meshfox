@@ -27,7 +27,17 @@ of JSON, for readable diffs and hand-editability.
   heading text; only write it explicitly for a stable handle that survives
   renames (e.g. because an edge references it). First write-back (running a
   cached block, saving layout) pins the id used, so identity is stable
-  afterward. `x`/`y` are absolute document coordinates for every node
+  afterward. The one exception to the slug default is the **root** — the
+  document's single top-level `#` heading, marked or not: with no `id` it is
+  always `root`, whatever its title, so every canvas's root is addressable the
+  same way and retitling it never changes its id. `root` is reserved for it: a
+  `meshfox:node` anywhere else with `id="root"` is an error (and a title-derived
+  slug of `root` for another node becomes `root-2`); the root itself may still
+  be given a different explicit `id`. Retitling a node whose id is derived
+  from its title (a bare marker, not the root — nodes made by `meshfox node
+  add`, the MCP tools or the web UI always get an explicit id) is refused,
+  since it would change the id and break whatever refers to it; pin it first
+  (`meshfox node set-id`). `x`/`y` are absolute document coordinates for every node
   *except* a direct child of a `group` node (see "Node types" below) — for
   a group member, `x`/`y` are relative to that group's own `x`/`y` instead
   (its own top-left corner), so moving the group moves every member with
@@ -374,8 +384,17 @@ Lives inside a node's Markdown text, as fence-info-string attributes:
   for a command that already prints Markdown worth rendering, e.g. a
   `pandas` `DataFrame` via `df.to_markdown()` (needs the `tabulate`
   package), which then renders as an actual table rather than
-  preformatted text. Any other value (or omitting the attribute) keeps the
-  default text rendering.
+  preformatted text. With `output="image"`, stdout is a picture — an SVG —
+  and is stored as a Markdown image instead (see "Image output" below).
+  Any other value (or omitting the attribute) keeps the default text
+  rendering.
+- `output-attrs="..."` — optional; only with `output="image"` (`meshfox
+  validate` rejects it otherwise). Image attributes — the same narrow
+  grammar as `{width=..}`/`{bg=..}` after a Markdown image (see
+  MARKDOWN.md's "Image size and background") without the braces, e.g.
+  `output-attrs="width=50% bg=#fff"` — forwarded onto the generated image.
+  `meshfox validate` also rejects a value outside that grammar. Part of
+  the cache fingerprint: editing it makes the cached output stale.
 - `autorun` — optional flag (`autorun` or `autorun="true"`); in a live
   session (`meshfox view`/`meshfox tui` — never one-shot `meshfox run`,
   which has no ongoing session to react within), re-runs this block's full
@@ -508,6 +527,30 @@ loading step, with plain (no `always`) `migrate`, ties `migrate`'s
 freshness to the loading step's own decision, rather than forcing it (and
 cascading from it) on every run regardless of what anything downstream
 actually needs.
+
+### Forcing a run: `--fresh` and `session reset`
+
+"Already ran this session and hasn't changed" is remembered across restarts (the
+*session*, stored per canvas next to its other `.meshfox/` state) and is judged
+by the block's own text and variables — not by files it reads or produces. A
+`cargo build`, a test run or an install step can therefore look fresh long
+after what it depends on changed, and a plain `meshfox run` skips it as a
+dependency. Besides the per-block tools above (`always`, a `!` on the
+consumer's `deps=` entry), two switches act on a single invocation or on the
+whole session, from outside the document:
+
+- `meshfox run --fresh <block>` — runs *every* block of the chain for real, this
+  once (the requested block always does anyway). Nothing is forgotten: the fresh
+  results are recorded as usual, so a following plain `run` may skip again, and
+  other blocks' records and submitted `form` values are left alone. Meaningless
+  with `--no-deps`, which is rejected together with it. The same flag is the
+  `fresh` parameter of the MCP `run` tool.
+- `meshfox session reset` — forgets everything the session remembers: every
+  block's freshness record and every submitted `form` value, so the next run
+  executes every block and asks for any form-supplied variable again. Finished
+  runs stay as history (marked stale); the canvas file and any saved
+  `<!-- meshfox:output -->` cache are untouched. The same as the web UI's
+  "reset session" button, and the MCP `session_reset` tool.
 
 ## Button fences
 
@@ -1430,6 +1473,43 @@ detection (`crate::mdcanvas::scan`) treats the whole marker-to-marker
 region as opaque. `output="markdown"` is therefore meant for output you
 trust to *look at*, not output from an untrusted source — same trust level
 as any other Markdown already committed to the file.
+
+### Image output (`output="image"`)
+
+For a block whose stdout *is* a picture — `dot -Tsvg`, `plantuml -tsvg
+-pipe`, `typst compile --format svg - -`, `mmdc -e svg`, `vl2vg | vg2svg`,
+a Python script that prints `fig.savefig(buf, format="svg")` — meshfox
+wraps the SVG into the one Markdown line every renderer already shows, so
+no script has to base64-encode anything:
+
+    ```bash name="g" cache output="image" output-attrs="bg=#fff"
+    dot -Tsvg graph.dot
+    ```
+    <!-- meshfox:output name="g" hash="a1b2c3d4" -->
+
+    ![g](data:image/svg+xml;base64,PHN2Zy…){bg=#ffffff}
+
+    <!-- /meshfox:output -->
+
+The region has exactly the shape `output="markdown"` writes (any stderr as
+its own leading ` ```text ` block, a leading bold `**⚠ exit code: N ·
+duration**` line on a failure), and is the same line a script could print
+by hand under `output="markdown"` (see `examples/pandas-dataframe.canvas.md`);
+the image's alt text is the block's name. Only a *successful* run whose
+stdout is an SVG (`meshfox_core::svg::looks_like_svg`: an optional XML
+prolog/comments/doctype, then a root `<svg`) becomes an image. Anything
+else — a failed run, a tool that printed an error message — is stored as
+what it printed, in a plain (info-string-less) fence, never as a broken
+image and never parsed as Markdown. Only SVG is recognised: stdout is
+captured line by line as text, so a binary format (PNG) can't pass through
+it; print a `data:image/png;base64,…` Markdown image under
+`output="markdown"` for those.
+
+In the TUI and the web UI, the same conversion is applied to a finished
+run's live output, so a block shows its picture right after it runs, before
+anything is saved.
+
+See `examples/svg.canvas.md` for runnable variations.
 
 The marker's own `hash=` is a short fingerprint
 (`meshfox_core::fence::fingerprint`) of everything about the fence that

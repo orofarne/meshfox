@@ -21,7 +21,9 @@ import { implicitDepsForBlock, interpreterVarRefsNaive, type ClientVarDecl } fro
 import { AnsiText } from "./AnsiText";
 import { formatDurationMs } from "./format";
 import { RunHistoryDialog } from "./RunHistoryDialog";
-import { NodeTextEditor } from "./NodeTextEditor";
+import { NodeTextEditor, usePrefersDark } from "./NodeTextEditor";
+import { readPageTheme, themeSvgDataUrl } from "./svgTheme";
+import { imageOutputMarkdown } from "./imageOutput";
 import {
   fetchNodeFileContent,
   fetchLinkPreview,
@@ -121,6 +123,27 @@ function MarkdownCodeBlock({ className, children }: { className?: string; childr
 }
 
 /**
+ * A Markdown image. An inline SVG (`data:image/svg+xml;base64,…`, e.g.
+ * `output="image"`'s own output) is shown through `<img>`, which can't see
+ * the page's CSS — so the page's live theme is injected into the SVG text
+ * first (see `svgTheme.ts`): `currentColor` and `var(--mf-*)` then follow
+ * the light/dark theme. Recomputed whenever the theme changes
+ * (`usePrefersDark` fires on both the OS preference and the toolbar's
+ * manual override); every other `src` passes through untouched.
+ */
+function ThemedImg({ src, ...props }: React.ImgHTMLAttributes<HTMLImageElement>) {
+  const dark = usePrefersDark();
+  const themed = useMemo(() => {
+    if (!src?.startsWith("data:image/svg+xml;base64,")) return src;
+    // `dark` is only the cache key: the actual colors are read from the
+    // page's CSS custom properties, which `index.css` swaps per theme.
+    void dark;
+    return themeSvgDataUrl(src, readPageTheme());
+  }, [src, dark]);
+  return <img {...props} src={themed} />;
+}
+
+/**
  * Builds this file's `<ReactMarkdown>` `components` — same shape
  * everywhere (a link in a node's rendered body opens in a new tab rather
  * than navigating the canvas itself away from the app; `rel=` is the
@@ -146,7 +169,7 @@ function makeMarkdownComponents(assetBase: string | undefined): Components {
     a: ({ node: _node, href, ...props }) => (
       <a {...props} href={resolveAssetHref(href, assetBase)} target="_blank" rel="noopener noreferrer" />
     ),
-    img: ({ node: _node, src, ...props }) => <img {...props} src={resolveAssetHref(src, assetBase)} />,
+    img: ({ node: _node, src, ...props }) => <ThemedImg {...props} src={resolveAssetHref(src, assetBase)} />,
     pre: ({ children }) => <InsideMarkdownPre.Provider value={true}>{children}</InsideMarkdownPre.Provider>,
     code: ({ node: _node, className, children }) => (
       <MarkdownCodeBlock className={className}>{children}</MarkdownCodeBlock>
@@ -2031,14 +2054,22 @@ function MarkdownOutput({
  * (`"done"`) rendering to Markdown — a still-`"running"` stream is shown
  * raw regardless, the same way a Jupyter cell doesn't try to incrementally
  * render partial rich output either; it only ever renders once a
- * `display_data` payload is complete. */
+ * `display_data` payload is complete.
+ *
+ * `outputImage` (an `output="image"` block: its block name plus its
+ * `output-attrs=`) turns the finished run's stdout — the raw SVG — into the
+ * same one-line Markdown image the cached copy has (`imageOutputMarkdown`).
+ * A failed run, or stdout that isn't an SVG, isn't an image: it falls back
+ * to the plain streamed text below. */
 function LiveRunOutput({
   live,
   outputMarkdown = false,
+  outputImage,
   assetBase,
 }: {
   live: LiveBlockState;
   outputMarkdown?: boolean;
+  outputImage?: { name: string; attrs?: string };
   assetBase?: string;
 }) {
   if (live.status === "skipped") {
@@ -2079,8 +2110,15 @@ function LiveRunOutput({
   // `ExecOutput.stdout`/`.stderr` gives a `cache`d run's persisted result —
   // so the live "done" view renders correctly split even before `App.tsx`
   // reloads the canvas and swaps in the cached copy.
+  const imageMarkdown =
+    outputImage && live.status === "done"
+      ? imageOutputMarkdown(outputImage.name, live.stdoutText ?? "", live.exitCode, outputImage.attrs)
+      : null;
   const renderMarkdown =
-    outputMarkdown && live.status === "done" && (live.stdoutText !== undefined || live.stderrText !== undefined);
+    outputMarkdown &&
+    live.status === "done" &&
+    (live.stdoutText !== undefined || live.stderrText !== undefined) &&
+    (!outputImage || imageMarkdown !== null);
   return (
     <div className="mesh-code-output" data-exit={exitState}>
       <div className="mesh-code-output-head">
@@ -2088,7 +2126,7 @@ function LiveRunOutput({
         <span className="mesh-code-output-transient"> · not saved</span>
       </div>
       {renderMarkdown && (
-        <MarkdownOutput text={live.stdoutText ?? ""} stderrText={live.stderrText} assetBase={assetBase} />
+        <MarkdownOutput text={imageMarkdown ?? live.stdoutText ?? ""} stderrText={live.stderrText} assetBase={assetBase} />
       )}
       {live.text && !renderMarkdown && (
         <pre>
@@ -2134,7 +2172,14 @@ function TtyRunStatus({ live }: { live?: LiveBlockState }) {
  * `App.tsx` reloads the canvas after a persisted run. */
 function RunOutput({ seg, live, assetBase }: { seg: CodeSegment; live?: LiveBlockState; assetBase?: string }) {
   if (live && live.status !== "queued") {
-    return <LiveRunOutput live={live} outputMarkdown={seg.outputMarkdown} assetBase={assetBase} />;
+    return (
+      <LiveRunOutput
+        live={live}
+        outputMarkdown={seg.outputMarkdown}
+        outputImage={seg.outputImage ? { name: seg.name, attrs: seg.outputAttrs } : undefined}
+        assetBase={assetBase}
+      />
+    );
   }
   if (!live && seg.output) {
     return (

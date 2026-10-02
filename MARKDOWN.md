@@ -67,7 +67,7 @@ any single flavor's full feature set wholesale, since every one of them
 needs an independent implementation on both the Rust side and the web
 side (`pulldown-cmark` and `remark` share nothing with each other).
 
-### Image size (`{width=..}`/`{height=..}`)
+### Image size and background (`{width=..}`/`{height=..}`/`{bg=..}`)
 
 GitLab/Pandoc-style, written with no space directly after an image's
 closing `)`:
@@ -76,19 +76,60 @@ closing `)`:
 ![alt](pic.png){width=300}
 ![alt](pic.png){height=50%}
 ![alt](pic.png){width=300 height=50%}
+![alt](diagram.svg){bg=#fff}
+![alt](diagram.svg){width=50% bg=transparent}
 ```
 
-Only `width=`/`height=`, each a bare integer (pixels) or integer+`%`, each
-at most once — not Pandoc's full `{.class #id ...}` attribute grammar.
-Anything that doesn't match this exact shape is left alone as ordinary
+Only `width=`/`height=` (each a bare integer — pixels — or integer+`%`) and
+`bg=` (`#rgb`, `#rrggbb` or `transparent`, any case), each at most once —
+not Pandoc's full `{.class #id ...}` attribute grammar, and never free-form
+CSS. Anything that doesn't match this exact shape is left alone as ordinary
 literal text.
+
+`bg=` paints a fixed backing color behind the image — for a transparent SVG
+drawn for a white page (Mermaid, PlantUML, a formula), which is unreadable
+on a dark theme. There is deliberately no global rule: you choose per image.
+`bg=transparent` says "no backing" explicitly (the default).
 
 | | web | static/PDF | TUI |
 |---|---|---|---|
-| Support | full — real `width`/`height` on the rendered `<img>` | full, same as web | `%` only, scales the terminal image protocol's fixed size budget; a literal pixel value is parsed but has no effect (no pixel grid to map it onto) |
+| `width`/`height` | full — real `width`/`height` on the rendered `<img>` | full, same as web | `%` only, scales the terminal image protocol's fixed size budget; a literal pixel value is parsed but has no effect (no pixel grid to map it onto) |
+| `bg` | `style="background:#rrggbb"` on the `<img>` | same | painted behind the SVG when it is rasterized; only SVGs are rasterized by meshfox, so it has no effect on a PNG/JPEG (those carry their own pixels) |
 
 Shared parser: `crates/core/src/image_attrs.rs` (Rust) /
 `web/src/remarkImageAttrs.ts` (web).
+
+### SVG images
+
+An SVG is an ordinary Markdown image — a relative `.svg` file, or a
+`data:image/svg+xml;base64,…` URL (what `output="image"` / `output="markdown"`
+blocks produce; see SPEC.md's "Image output" and `examples/svg.canvas.md`) —
+and shows on all four platforms. Inline `<svg>` HTML is **not** supported
+(raw HTML is dropped, same as for any other element): that keeps scripts out
+of the page, and an SVG shown through `<img>` can't run any.
+
+| | web | static/PDF | TUI |
+|---|---|---|---|
+| Support | `<img>`; the page's theme is injected (below) | `<img>`; no theme injection (a static page has no live theme to follow — use `bg=` for an SVG drawn for a white page) | rasterized with `resvg` (always the dark theme, like the rest of the TUI); an SVG's embedded raster `<image>` is skipped |
+
+**Theme.** An SVG shown through `<img>` can't see the page's CSS, so a
+diagram drawn black-on-transparent vanishes on a dark theme. Right before
+showing a `data:image/svg+xml;base64,…` image, the web UI and the TUI
+rewrite the SVG's *text* (the file keeps what the tool produced), giving a
+tool two ways to follow the theme:
+
+- `currentColor` becomes the theme's text color;
+- `var(--mf-fg)`, `var(--mf-bg)`, `var(--mf-accent)`, `var(--mf-border)`
+  become the theme's colors. Write a fallback —
+  `var(--mf-fg, #000)` — so a viewer that knows nothing about meshfox
+  (GitHub, a plain browser) still draws sensible colors.
+
+A tool's own explicit colors (`fill="#ffd166"`) are never touched, and
+neither are SVGs behind a relative file path (only inline `data:` URLs are
+rewritten). Shared logic: `crates/core/src/svg.rs` (Rust; the TUI also
+substitutes `var()` textually, since `resvg` has no CSS-variable support at
+all) / `web/src/svgTheme.ts` (web, where the browser resolves `var()` from
+the injected `:root` properties itself).
 
 ### Subscript / superscript (`x~2~` / `x^2^`)
 

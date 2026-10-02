@@ -41,6 +41,10 @@ ratatui-image = { version = "11.0.6", default-features = false, features = ["cro
 # to the same 0.22.x here so the TUI's own `data:` image decoding
 # (`tui::app::decode_data_url_image`) doesn't pull in a second copy.
 base64 = "0.22"
+# SVG rasterizer for the TUI's inline images (a terminal can only show
+# pixels). `text` + `system-fonts` so `<text>` renders; no `raster-images`
+# (embedded `<image>` inside an SVG is skipped) and no `memmap-fonts`.
+resvg = { version = "0.45", default-features = false, features = ["text", "system-fonts"] }
 edtui = "0.11.6"
 open = "5"
 self_update = { version = "0.44.0", default-features = false, features = ["ureq", "rustls", "archive-tar", "compression-flate2"] }

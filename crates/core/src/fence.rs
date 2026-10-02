@@ -507,6 +507,7 @@ const FENCE_ATTRS: &[&str] = &[
     "default",
     "interpreter",
     "output",
+    "output-attrs",
     "autorun",
     "render",
     "send",
@@ -721,6 +722,13 @@ pub fn fingerprint(block: &CodeBlock) -> String {
             part.push('!');
         }
         parts.push(part);
+    }
+    // `output-attrs=` is baked into the cached output's own image (see
+    // `output::render_output_block_image`), so editing it must make the
+    // cache stale. Only folded in when present: a fence without it keeps
+    // the exact hash it always had, so existing cached output stays valid.
+    if let Some(attrs) = block.attrs.get("output-attrs") {
+        parts.push(format!("output-attrs\u{0}{attrs}"));
     }
     format!("{:08x}", fnv1a(parts.join("\u{0}").as_bytes()))
 }

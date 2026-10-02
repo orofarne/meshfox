@@ -112,7 +112,27 @@ fn call_deadline(tool_name: &str, arguments: Option<&serde_json::Map<String, ser
             .unwrap_or(60_000);
         return Duration::from_millis(command_ms) + Duration::from_secs(30);
     }
+    if tool_name == "run" {
+        return Duration::from_millis(run_timeout_ms(arguments)) + Duration::from_secs(60);
+    }
     Duration::from_secs(90)
+}
+
+/// How long a `run` call lets its chain run before killing the step that is
+/// still going: the call's own `timeout_ms`, default 10 minutes, at most an
+/// hour (the root's hung-process deadline is this plus a minute — see
+/// `call_deadline`).
+const DEFAULT_RUN_TIMEOUT_MS: u64 = 600_000;
+const MAX_RUN_TIMEOUT_MS: u64 = 3_600_000;
+/// Per step, the tail of its output kept in a `run` result.
+const RUN_OUTPUT_CAP_BYTES: usize = 20_000;
+
+fn run_timeout_ms(arguments: Option<&serde_json::Map<String, serde_json::Value>>) -> u64 {
+    arguments
+        .and_then(|a| a.get("timeout_ms"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(DEFAULT_RUN_TIMEOUT_MS)
+        .clamp(1, MAX_RUN_TIMEOUT_MS)
 }
 
 fn env_secs(name: &str) -> Option<Duration> {
@@ -477,11 +497,45 @@ struct NodeBlockParams {
 }
 
 #[derive(Deserialize, Serialize, JsonSchema)]
+struct RunParams {
+    /// The node that owns the block to run.
+    node_id: String,
+    /// The block's `name=`. Omit it to run the node's default block (the one
+    /// flagged `default`, or named like the node).
+    #[serde(default)]
+    block: Option<String>,
+    /// Run only this block, skipping its `deps=` chain.
+    #[serde(default)]
+    no_deps: bool,
+    /// Run every block of the chain for real, ignoring "already ran this
+    /// session and hasn't changed" for this call only — for a build/test
+    /// step whose result depends on files rather than on the block's own
+    /// text. The results are recorded as usual; nothing is forgotten (see
+    /// session_reset). Not combinable with no_deps.
+    #[serde(default)]
+    fresh: bool,
+    /// Values for declared `meshfox:var`s that aren't already resolvable
+    /// (from the on-disk cache, the environment or a default). Never for a
+    /// `secret` variable — secrets are not passed through this tool.
+    #[serde(default)]
+    vars: HashMap<String, String>,
+    /// Give up after this many milliseconds, killing the step that is still
+    /// running (default 600000, at most 3600000).
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Deserialize, Serialize, JsonSchema, Default)]
+struct SessionResetParams {}
+
+#[derive(Deserialize, Serialize, JsonSchema)]
 struct NodeRenameParams {
     node_id: String,
     /// New heading text. The node's id, heading level, and body are left
     /// untouched — an id is pinned the first time it's written and never
-    /// follows later title edits.
+    /// follows later title edits. (The root is always `root` unless it
+    /// declares another id; a non-root node with no explicit id — its id is
+    /// derived from its title — is refused: pin one first with `node_set_id`.)
     title: String,
 }
 
@@ -929,6 +983,144 @@ impl MeshfoxMcp {
             "moved": params.node_id,
             "new_parent_id": params.new_parent_id,
         })))
+    }
+
+    #[tool(
+        description = "Runs a runnable block (a code fence with a name=) together with its deps= chain, like `meshfox run`, and returns every step's exit code, duration and output (the tail of each, up to 20 KB), plus an overall success flag. A dependency that already ran this session and looks unchanged is skipped — pass fresh: true to run the whole chain for real this once (for builds/tests that depend on files, not on the block's text), or no_deps: true to run just this block. `cache`d output is saved into the canvas file, as with the CLI. Not for interactive (`tty`) blocks. Variables not yet resolved must be given in `vars` (never secrets). A step still running after timeout_ms (default 10 minutes) is killed."
+    )]
+    async fn run(
+        &self,
+        Parameters(params): Parameters<RunParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if params.fresh && params.no_deps {
+            return Err(invalid_params(
+                "fresh and no_deps can't be combined — no_deps already runs just the named block"
+                    .to_string(),
+            ));
+        }
+        let port = self.worker_port().await?;
+        let raw = crate::worker_client::get_canvas_raw(port)
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("worker read failed: {e}"), None))?;
+        let primary = Canvas::from_markdown(&raw).map_err(|e| invalid_params(e.to_string()))?;
+        let canvas = meshfox_core::include::resolve(&primary, &self.canvas_path).unwrap_or(primary);
+        let mut path = canvas
+            .id_path_to(&params.node_id)
+            .ok_or_else(|| invalid_params(format!("no node {:?}", params.node_id)))?;
+        // `meshfox run a b` addresses a node's default block by giving the
+        // node's own id where the block name goes (see `resolve_run_chain`).
+        let name = match &params.block {
+            Some(block) => block.clone(),
+            None => {
+                path.pop();
+                params.node_id.clone()
+            }
+        };
+
+        let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
+        if crate::chain_contains_tty(&self.canvas_path, &raw, &path_refs, &[&name], params.no_deps)
+        {
+            return Err(invalid_params(
+                "this chain contains an interactive (`tty`) block, which needs a real terminal \
+                 — run it with `meshfox run` yourself"
+                    .to_string(),
+            ));
+        }
+
+        // Variables: only what the caller supplied for a declared, non-secret
+        // variable; anything still unresolved is reported rather than asked.
+        let statuses = crate::worker_client::get_vars(port, &path, &name, params.no_deps)
+            .await
+            .map_err(invalid_params)?;
+        let mut vars = HashMap::new();
+        let mut missing = Vec::new();
+        for status in &statuses {
+            match params.vars.get(&status.name) {
+                Some(_) if status.secret => {
+                    return Err(invalid_params(format!(
+                        "{} is a secret variable — secrets are not passed through this tool; \
+                         set it in the environment or the secret store",
+                        status.name
+                    )))
+                }
+                Some(value) => {
+                    vars.insert(status.name.clone(), value.clone());
+                }
+                None if !status.resolved => missing.push(status.name.clone()),
+                None => {}
+            }
+        }
+        if !missing.is_empty() {
+            return Err(invalid_params(format!(
+                "missing required variable(s): {} — pass the non-secret ones in `vars`; a secret \
+                 has to be set in the environment or the secret store",
+                missing.join(", ")
+            )));
+        }
+
+        let mut rx = crate::worker_client::run_stream_persisted(
+            port,
+            &path,
+            &name,
+            params.no_deps,
+            params.fresh,
+            vars,
+            std::collections::HashSet::new(),
+            None,
+        )
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("couldn't start the run: {e}"), None))?;
+
+        let timeout_ms = params
+            .timeout_ms
+            .unwrap_or(DEFAULT_RUN_TIMEOUT_MS)
+            .clamp(1, MAX_RUN_TIMEOUT_MS);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+        let mut report = RunReport::default();
+        loop {
+            let event = if report.timed_out {
+                // Killed: give the worker a moment to say how it ended.
+                match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await {
+                    Ok(event) => event,
+                    Err(_) => break,
+                }
+            } else {
+                match tokio::time::timeout_at(deadline, rx.recv()).await {
+                    Ok(event) => event,
+                    Err(_) => {
+                        report.timed_out = true;
+                        if let Some(step) = report.running_step() {
+                            let _ = crate::worker_client::kill_run(
+                                port,
+                                &step.node_id.clone(),
+                                &step.block.clone(),
+                            )
+                            .await;
+                        }
+                        continue;
+                    }
+                }
+            };
+            let Some(event) = event else { break };
+            if report.apply(event) {
+                break;
+            }
+        }
+        report.finish()
+    }
+
+    #[tool(
+        description = "Forgets what this canvas's session remembers — every block's \"already ran this session\" record and every submitted form value — so the next run executes every block for real. Finished runs stay as history; the canvas file and saved output are untouched. For a single run use run's fresh: true instead."
+    )]
+    async fn session_reset(
+        &self,
+        Parameters(_params): Parameters<SessionResetParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let port = self.worker_port().await?;
+        crate::worker_client::reset_session(port)
+            .await
+            .map_err(invalid_params)?;
+        Ok(CallToolResult::structured(json!({ "reset": true })))
     }
 
     #[tool(
@@ -1723,6 +1915,174 @@ impl MeshfoxMcpRoot {
 /// Wraps any leaf tool's own parameter type with the `canvas_id` every
 /// proxied tool now requires — one generic wrapper instead of a bespoke
 /// `canvas_id`-plus-everything-else struct per tool.
+/// One step of a `run` call, as reported back to the agent.
+#[derive(Serialize)]
+struct RunStepReport {
+    node_id: String,
+    block: String,
+    /// `ran`, `failed`, `skipped` (already fresh this session), `running`
+    /// (still going when the call ended), `service_started` or `killed`.
+    status: &'static str,
+    exit_code: Option<i32>,
+    duration_ms: Option<u64>,
+    /// The tail of the step's output (stdout and stderr merged).
+    output: String,
+    output_truncated: bool,
+}
+
+/// What a `run` call collected from the worker's `RunEvent` stream.
+#[derive(Default)]
+struct RunReport {
+    steps: Vec<RunStepReport>,
+    timed_out: bool,
+    done: Option<i32>,
+    error: Option<String>,
+    conflict: Option<String>,
+}
+
+impl RunReport {
+    fn step_mut(&mut self, node_id: &str, block: &str) -> &mut RunStepReport {
+        if let Some(i) = self
+            .steps
+            .iter()
+            .rposition(|s| s.node_id == node_id && s.block == block && s.status == "running")
+        {
+            return &mut self.steps[i];
+        }
+        self.steps.push(RunStepReport {
+            node_id: node_id.to_string(),
+            block: block.to_string(),
+            status: "running",
+            exit_code: None,
+            duration_ms: None,
+            output: String::new(),
+            output_truncated: false,
+        });
+        self.steps.last_mut().expect("just pushed")
+    }
+
+    fn running_step(&self) -> Option<&RunStepReport> {
+        self.steps.iter().rev().find(|s| s.status == "running")
+    }
+
+    /// Folds one event in; `true` once the stream is over.
+    fn apply(&mut self, event: crate::worker_client::RunEvent) -> bool {
+        use crate::worker_client::RunEvent;
+        match event {
+            RunEvent::Started { .. } | RunEvent::TtyStart { .. } => {}
+            RunEvent::StepStart { node_id, block } => {
+                self.step_mut(&node_id, &block);
+            }
+            RunEvent::StepSkipped {
+                node_id,
+                block,
+                duration_ms,
+                ..
+            } => {
+                let step = self.step_mut(&node_id, &block);
+                step.status = "skipped";
+                step.duration_ms = Some(duration_ms);
+            }
+            RunEvent::Output {
+                node_id,
+                block,
+                text,
+                ..
+            } => {
+                let step = self.step_mut(&node_id, &block);
+                step.output.push_str(&text);
+                step.output.push('\n');
+                if step.output.len() > RUN_OUTPUT_CAP_BYTES * 2 {
+                    cap_tail(&mut step.output, RUN_OUTPUT_CAP_BYTES);
+                    step.output_truncated = true;
+                }
+            }
+            RunEvent::ServiceStarted { node_id, block, .. } => {
+                self.step_mut(&node_id, &block).status = "service_started";
+            }
+            RunEvent::StepEnd {
+                node_id,
+                block,
+                exit_code,
+                duration_ms,
+            } => {
+                let step = self.step_mut(&node_id, &block);
+                step.status = if exit_code == 0 { "ran" } else { "failed" };
+                step.exit_code = Some(exit_code);
+                step.duration_ms = Some(duration_ms);
+            }
+            RunEvent::Killed { node_id, block } => {
+                self.step_mut(&node_id, &block).status = "killed";
+            }
+            RunEvent::LockConflict {
+                node_id,
+                block,
+                owner_pid,
+                owner_desc,
+            } => {
+                self.conflict = Some(format!(
+                    "{node_id}/{block} is already running (pid {owner_pid}, started via {owner_desc})"
+                ));
+                return true;
+            }
+            RunEvent::Error { message } => {
+                self.error = Some(message);
+                return true;
+            }
+            RunEvent::Done { exit_code } => {
+                self.done = Some(exit_code);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn finish(mut self) -> Result<CallToolResult, ErrorData> {
+        if let Some(conflict) = self.conflict.take() {
+            return Err(invalid_params(format!(
+                "can't start: {conflict} — wait for it, or stop it, then try again"
+            )));
+        }
+        for step in &mut self.steps {
+            if step.output.len() > RUN_OUTPUT_CAP_BYTES {
+                cap_tail(&mut step.output, RUN_OUTPUT_CAP_BYTES);
+                step.output_truncated = true;
+            }
+        }
+        let success = !self.timed_out
+            && self.error.is_none()
+            && self.done == Some(0)
+            && self
+                .steps
+                .iter()
+                .all(|s| matches!(s.status, "ran" | "skipped" | "service_started"));
+        let value = json!({
+            "success": success,
+            "exit_code": self.done,
+            "timed_out": self.timed_out,
+            "error": self.error,
+            "steps": self.steps,
+        });
+        Ok(if success {
+            CallToolResult::structured(value)
+        } else {
+            CallToolResult::structured_error(value)
+        })
+    }
+}
+
+/// Keeps the last `max` bytes of `text` (cut on a char boundary).
+fn cap_tail(text: &mut String, max: usize) {
+    if text.len() <= max {
+        return;
+    }
+    let mut cut = text.len() - max;
+    while !text.is_char_boundary(cut) {
+        cut += 1;
+    }
+    text.drain(..cut);
+}
+
 #[derive(Deserialize, JsonSchema)]
 struct WithCanvas<T> {
     /// Which open canvas to operate on — from `canvas_open`.
@@ -1978,6 +2338,26 @@ impl MeshfoxMcpRoot {
         Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<NodeMvParams>>,
     ) -> Result<CallToolResult, ErrorData> {
         self.forward(&canvas_id, "node_mv", inner).await
+    }
+
+    #[tool(
+        description = "Same as run, scoped to canvas_id (see canvas_open) — runs a block and its deps= chain in that canvas; fresh: true runs the whole chain for real."
+    )]
+    async fn run(
+        &self,
+        Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<RunParams>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.forward(&canvas_id, "run", inner).await
+    }
+
+    #[tool(
+        description = "Same as session_reset, scoped to canvas_id (see canvas_open) — forgets what that canvas's session remembers."
+    )]
+    async fn session_reset(
+        &self,
+        Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<SessionResetParams>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.forward(&canvas_id, "session_reset", inner).await
     }
 
     #[tool(

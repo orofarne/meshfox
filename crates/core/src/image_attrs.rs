@@ -1,9 +1,10 @@
-//! Narrow Pandoc/GitLab-style image-size syntax: `{width=300}`,
-//! `{height=50%}`, or both, written with no space directly after an
-//! image's closing `)` — see SPEC.md's "Formal grammar" and TODO.canvas.md's
-//! `image-attrs` task for why this is deliberately narrow (only
-//! `width=`/`height=`, a bare integer or integer+`%`, not the full Pandoc
-//! `{.class #id ...}` grammar). Shared by every consumer that needs to
+//! Narrow Pandoc/GitLab-style image attribute syntax: `{width=300}`,
+//! `{height=50%}`, `{bg=#fff}`, or any of them together, written with no
+//! space directly after an image's closing `)` — see SPEC.md's "Formal
+//! grammar" and TODO.canvas.md's `image-attrs` task for why this is
+//! deliberately narrow (only `width=`/`height=` — a bare integer or
+//! integer+`%` — and `bg=` — a hex color or `transparent` — not the full
+//! Pandoc `{.class #id ...}` grammar, and never free-form CSS). Shared by every consumer that needs to
 //! recognize this syntax after an image (`staticgen.rs`, the TUI's
 //! `markdown.rs`) so it's parsed identically everywhere rather than as a
 //! third copy of the same small grammar.
@@ -28,15 +29,81 @@ impl fmt::Display for Size {
     }
 }
 
+/// A `bg=` value: a fixed backing color painted behind an image (so a
+/// transparent SVG drawn for a light page stays legible on a dark theme),
+/// or an explicit `transparent` (no backing at all). Only hex colors —
+/// a named-color table would have to be duplicated in every consumer
+/// (`web/src/remarkImageAttrs.ts`, the TUI's rasterizer), and a bounded
+/// grammar is what keeps this safe to splice into a `style` attribute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Background {
+    Transparent,
+    Rgb(u8, u8, u8),
+}
+
+impl Background {
+    /// Parses `#rgb` or `#rrggbb` (any case) or `transparent`.
+    pub fn parse(s: &str) -> Option<Background> {
+        if s.eq_ignore_ascii_case("transparent") {
+            return Some(Background::Transparent);
+        }
+        let hex = s.strip_prefix('#')?;
+        if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let pair = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+        match hex.len() {
+            3 => {
+                let nib = |i: usize| u8::from_str_radix(&hex[i..i + 1], 16).ok().map(|n| n * 17);
+                Some(Background::Rgb(nib(0)?, nib(1)?, nib(2)?))
+            }
+            6 => Some(Background::Rgb(pair(0)?, pair(2)?, pair(4)?)),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Background {
+    /// The canonical CSS spelling — always `#rrggbb` (lowercase) or
+    /// `transparent`, so it can go straight into a `style` attribute.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Background::Transparent => write!(f, "transparent"),
+            Background::Rgb(r, g, b) => write!(f, "#{r:02x}{g:02x}{b:02x}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ImageAttrs {
     pub width: Option<Size>,
     pub height: Option<Size>,
+    pub bg: Option<Background>,
 }
 
 impl ImageAttrs {
     pub fn is_empty(&self) -> bool {
-        self.width.is_none() && self.height.is_none()
+        self.width.is_none() && self.height.is_none() && self.bg.is_none()
+    }
+
+    /// The canonical `{width=.. height=.. bg=..}` spelling (`parse`
+    /// round-trips it), or an empty string when nothing is set.
+    pub fn to_braces(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(w) = self.width {
+            parts.push(format!("width={w}"));
+        }
+        if let Some(h) = self.height {
+            parts.push(format!("height={h}"));
+        }
+        if let Some(bg) = self.bg {
+            parts.push(format!("bg={bg}"));
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!("{{{}}}", parts.join(" "))
+        }
     }
 }
 
@@ -50,21 +117,28 @@ impl ImageAttrs {
 pub fn parse(text: &str) -> Option<(ImageAttrs, usize)> {
     let rest = text.strip_prefix('{')?;
     let close = rest.find('}')?;
-    let inner = &rest[..close];
+    let attrs = parse_inner(&rest[..close])?;
+    Some((attrs, close + 2)) // '{' + inner + '}'
+}
+
+/// The same grammar as `parse`, for just what sits *between* the braces —
+/// what a fence's `output-attrs="width=50% bg=#fff"` carries. `None` for
+/// the same reasons `parse` is, including empty/whitespace-only input.
+pub fn parse_inner(inner: &str) -> Option<ImageAttrs> {
     let mut attrs = ImageAttrs::default();
     for tok in inner.split_whitespace() {
         let (key, val) = tok.split_once('=')?;
-        let size = parse_size(val)?;
         match key {
-            "width" if attrs.width.is_none() => attrs.width = Some(size),
-            "height" if attrs.height.is_none() => attrs.height = Some(size),
+            "width" if attrs.width.is_none() => attrs.width = Some(parse_size(val)?),
+            "height" if attrs.height.is_none() => attrs.height = Some(parse_size(val)?),
+            "bg" if attrs.bg.is_none() => attrs.bg = Some(Background::parse(val)?),
             _ => return None,
         }
     }
     if attrs.is_empty() {
         return None;
     }
-    Some((attrs, close + 2)) // '{' + inner + '}'
+    Some(attrs)
 }
 
 fn parse_size(s: &str) -> Option<Size> {
@@ -79,8 +153,9 @@ fn parse_size(s: &str) -> Option<Size> {
     Some(Size { value, percent })
 }
 
-/// ` width="300" height="50%"`-style HTML attribute fragment — leading
-/// space included when non-empty, nothing at all when both are unset.
+/// ` width="300" height="50%" style="background:#ffffff"`-style HTML
+/// attribute fragment — leading space included when non-empty, nothing at
+/// all when everything is unset.
 /// Only `staticgen.rs` needs this (the TUI has no HTML to write and
 /// applies these as a terminal-image sizing hint instead).
 pub fn html_attrs(attrs: &ImageAttrs) -> String {
@@ -90,6 +165,9 @@ pub fn html_attrs(attrs: &ImageAttrs) -> String {
     }
     if let Some(h) = attrs.height {
         out.push_str(&format!(" height=\"{h}\""));
+    }
+    if let Some(bg) = attrs.bg {
+        out.push_str(&format!(" style=\"background:{bg}\""));
     }
     out
 }
@@ -174,6 +252,7 @@ mod tests {
                 value: 50,
                 percent: true,
             }),
+            bg: None,
         };
         assert_eq!(html_attrs(&attrs), r#" width="300" height="50%""#);
     }
@@ -181,5 +260,54 @@ mod tests {
     #[test]
     fn html_attrs_empty_for_no_attrs() {
         assert_eq!(html_attrs(&ImageAttrs::default()), "");
+    }
+
+    #[test]
+    fn parses_bg_hex_and_transparent() {
+        let (attrs, len) = parse("{bg=#fff}").unwrap();
+        assert_eq!(attrs.bg, Some(Background::Rgb(255, 255, 255)));
+        assert_eq!(len, "{bg=#fff}".len());
+        let (attrs, _) = parse("{bg=#1A2b3C}").unwrap();
+        assert_eq!(attrs.bg, Some(Background::Rgb(0x1a, 0x2b, 0x3c)));
+        let (attrs, _) = parse("{bg=transparent}").unwrap();
+        assert_eq!(attrs.bg, Some(Background::Transparent));
+    }
+
+    #[test]
+    fn parses_bg_alongside_size() {
+        let (attrs, _) = parse("{width=50% bg=#fff}").unwrap();
+        assert_eq!(attrs.width.map(|s| s.value), Some(50));
+        assert_eq!(attrs.bg, Some(Background::Rgb(255, 255, 255)));
+    }
+
+    #[test]
+    fn rejects_bad_bg_values() {
+        assert_eq!(parse("{bg=white}"), None);
+        assert_eq!(parse("{bg=#ff}"), None);
+        assert_eq!(parse("{bg=#ggg}"), None);
+        assert_eq!(parse("{bg=#ffff}"), None);
+        assert_eq!(parse("{bg=#ffffffff}"), None);
+        assert_eq!(parse("{bg=red;x:y}"), None);
+        assert_eq!(parse("{bg=}"), None);
+        assert_eq!(parse("{bg=#fff bg=#000}"), None);
+    }
+
+    #[test]
+    fn html_attrs_emits_a_canonical_background_style() {
+        let (attrs, _) = parse("{bg=#FFF}").unwrap();
+        assert_eq!(html_attrs(&attrs), r#" style="background:#ffffff""#);
+        let (attrs, _) = parse("{bg=transparent}").unwrap();
+        assert_eq!(html_attrs(&attrs), r#" style="background:transparent""#);
+    }
+
+    #[test]
+    fn parse_inner_and_to_braces_round_trip() {
+        let attrs = parse_inner("bg=#FFF  width=50%").unwrap();
+        assert_eq!(attrs.to_braces(), "{width=50% bg=#ffffff}");
+        assert_eq!(parse(&attrs.to_braces()).unwrap().0, attrs);
+        assert_eq!(parse_inner(""), None);
+        assert_eq!(parse_inner("  "), None);
+        assert_eq!(parse_inner("width=1}"), None);
+        assert_eq!(ImageAttrs::default().to_braces(), "");
     }
 }

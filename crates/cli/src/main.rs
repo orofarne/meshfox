@@ -91,6 +91,20 @@ impl CanvasOpt {
 }
 
 #[derive(Subcommand)]
+enum SessionOp {
+    /// Forget every block's "already ran, still fresh" record and every
+    /// submitted `form` value, so the next `run` executes every block of its
+    /// chain for real (and asks for any `form`-supplied variable again).
+    /// Finished runs are kept as history, only marked stale; the canvas
+    /// file and any saved `<!-- meshfox:output -->` cache are never
+    /// touched. The same as the web UI's "reset session" button.
+    Reset {
+        #[command(flatten)]
+        canvas: CanvasOpt,
+    },
+}
+
+#[derive(Subcommand)]
 enum Command {
     /// Run one or more named code blocks.
     ///
@@ -118,6 +132,17 @@ enum Command {
         /// "⛓ run chain").
         #[arg(long)]
         no_deps: bool,
+        /// Run every block of the chain for real, ignoring "already ran this
+        /// session and hasn't changed" for *this run only* — what you want
+        /// for a step whose result depends on files rather than on the
+        /// block's own text (a `cargo build`, a test run) when something it
+        /// depends on was re-run in a session that outlived the change. The
+        /// results are recorded as usual, so later plain runs may skip again;
+        /// nothing is forgotten (for that, see `meshfox session reset`).
+        /// Meaningless with `--no-deps`, which already runs just the named
+        /// blocks.
+        #[arg(long, conflicts_with = "no_deps")]
+        fresh: bool,
         /// Supply a declared `meshfox:var`'s value directly (repeatable),
         /// skipping any prompt for it — the non-interactive equivalent of
         /// answering one, e.g. for CI. Takes precedence over the process
@@ -137,6 +162,17 @@ enum Command {
     Configure {
         #[command(flatten)]
         canvas: CanvasOpt,
+    },
+    /// Manage a canvas's *session*: what the core remembers between runs —
+    /// which blocks already ran and still look unchanged (so a later `run`
+    /// skips them as already-fresh dependencies), and the values a `form`
+    /// fence submitted. It survives restarts, so a build step whose result
+    /// depends on files rather than on its own text can look "fresh"
+    /// forever; `meshfox run --fresh` forces one run, `session reset` forgets
+    /// everything. See SPEC.md's "Session".
+    Session {
+        #[command(subcommand)]
+        op: SessionOp,
     },
     /// Manage values in the system secret store (`secret_store =
     /// "keychain"` in `.meshfox/config.toml`; macOS only so far): `set`,
@@ -662,7 +698,10 @@ enum NodeCommand {
     },
     /// Rename a node's heading text, leaving its id, heading level, and
     /// body untouched (`mdcanvas::set_node_title`) — a node's id is pinned
-    /// the first time it's written and never follows later title edits.
+    /// the first time it's written and never follows later title edits. The
+    /// root is always `root` unless it declares another id; a non-root node
+    /// with no explicit id (its id is derived from its title) is refused —
+    /// pin one first with `node set-id`.
     Rename {
         /// Path to the .canvas.md file. If omitted: auto-discover the
         /// single candidate in the current directory.
@@ -1158,6 +1197,7 @@ fn main() {
             args,
             canvas,
             no_deps,
+            fresh,
             set,
         } => {
             let canvas_path = canvas.unwrap_or_else(|| {
@@ -1176,11 +1216,17 @@ fn main() {
                 }
                 find_canvas()
             });
-            run(&canvas_path, args, no_deps, set)
+            run(&canvas_path, args, no_deps, fresh, set)
         }
         Command::Configure { canvas } => {
             let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
             configure(&canvas_path)
+        }
+        Command::Session {
+            op: SessionOp::Reset { canvas },
+        } => {
+            let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
+            session_reset(&canvas_path);
         }
         Command::Secret { op } => {
             if let Err(e) = secret_cmd::run(op, find_canvas) {
@@ -2129,12 +2175,18 @@ fn closest_node_path(canvas: &Canvas, missing: &str) -> Option<String> {
         .map(|(_, n)| node_path_string(canvas, &n.id))
 }
 
-fn run(canvas_path: &Path, args: Vec<String>, no_deps: bool, set: Vec<(String, String)>) {
+fn run(
+    canvas_path: &Path,
+    args: Vec<String>,
+    no_deps: bool,
+    fresh: bool,
+    set: Vec<(String, String)>,
+) {
     let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
         eprintln!("failed to start async runtime: {e}");
         std::process::exit(1);
     });
-    runtime.block_on(run_async(canvas_path, args, no_deps, set));
+    runtime.block_on(run_async(canvas_path, args, no_deps, fresh, set));
 }
 
 /// `--set NAME=VALUE` is the one place a value can enter `resolve`'s
@@ -2194,6 +2246,7 @@ async fn run_async(
     canvas_path: &Path,
     mut args: Vec<String>,
     no_deps: bool,
+    fresh: bool,
     set: Vec<(String, String)>,
 ) {
     let block_arg = args.pop().expect("clap requires at least one arg");
@@ -2277,6 +2330,7 @@ async fn run_async(
                         &path,
                         &block_names,
                         no_deps,
+                        fresh,
                         overrides,
                     )
                     .await;
@@ -2288,8 +2342,16 @@ async fn run_async(
             }
         }
         Ok(coordinator::Resolved::Other(port)) => {
-            return run_via_worker(port, canvas_path, &path, &block_names, no_deps, overrides)
-                .await;
+            return run_via_worker(
+                port,
+                canvas_path,
+                &path,
+                &block_names,
+                no_deps,
+                fresh,
+                overrides,
+            )
+            .await;
         }
         Err(e) => {
             eprintln!("meshfox run: {e}");
@@ -2362,12 +2424,14 @@ fn chain_contains_tty(
 /// A `service` block conflict (`RunEvent::LockConflict`) gets the same
 /// interactive kill-and-retry `App::on_service_conflict_key` already does
 /// for the TUI — see `confirm_kill_and_retry`/`retry_after_lock_conflict`.
+#[allow(clippy::too_many_arguments)]
 async fn run_via_worker(
     port: u16,
     canvas_path: &Path,
     path: &[&str],
     block_names: &[&str],
     no_deps: bool,
+    fresh: bool,
     mut overrides: HashMap<String, String>,
 ) {
     let path: Vec<String> = path.iter().map(|s| s.to_string()).collect();
@@ -2452,7 +2516,7 @@ async fn run_via_worker(
         if let Ok(raw) = worker_client::get_canvas_raw(port).await {
             let path_str: Vec<&str> = path.iter().map(String::as_str).collect();
             if chain_contains_tty(canvas_path, &raw, &path_str, &[name], no_deps) {
-                if !run_worker_tty(port, &path, name, no_deps, vars).await {
+                if !run_worker_tty(port, &path, name, no_deps, fresh, vars).await {
                     had_failure = true;
                 }
                 continue;
@@ -2471,6 +2535,7 @@ async fn run_via_worker(
             &path,
             name,
             no_deps,
+            fresh,
             vars,
             std::collections::HashSet::new(),
             None,
@@ -2498,6 +2563,7 @@ async fn run_via_worker(
                     &path,
                     name,
                     no_deps,
+                    fresh,
                     vars_for_retry,
                     node_id,
                     block,
@@ -2693,6 +2759,7 @@ async fn run_worker_tty(
     path: &[String],
     name: &str,
     no_deps: bool,
+    fresh: bool,
     vars: HashMap<String, String>,
 ) -> bool {
     if !prompt::stdin_is_tty() || !std::io::stdout().is_terminal() {
@@ -2707,6 +2774,7 @@ async fn run_worker_tty(
         path,
         name,
         no_deps,
+        fresh,
         vars.clone(),
         std::collections::HashSet::new(),
         cols,
@@ -2725,6 +2793,7 @@ async fn run_worker_tty(
                 path,
                 name,
                 no_deps,
+                fresh,
                 vars,
                 std::collections::HashSet::new(),
                 cols,
@@ -2997,6 +3066,7 @@ async fn retry_after_lock_conflict(
     path: &[String],
     name: &str,
     no_deps: bool,
+    fresh: bool,
     vars: HashMap<String, String>,
     conflict_node_id: String,
     conflict_block: String,
@@ -3012,6 +3082,7 @@ async fn retry_after_lock_conflict(
         path,
         name,
         no_deps,
+        fresh,
         vars,
         std::collections::HashSet::new(),
         Some((conflict_node_id, conflict_block)),
@@ -3138,16 +3209,25 @@ fn list(canvas_path: &Path) {
         eprintln!("failed to parse {}: {e}", canvas_path.display());
         std::process::exit(1);
     });
-    let blocks = canvas.list_runnable().unwrap_or_else(|e| {
-        eprintln!("meshfox list: {}: {e}", canvas_path.display());
-        std::process::exit(1);
-    });
-    if blocks.is_empty() {
-        println!(
+    match render_list(&canvas) {
+        Ok(Some(text)) => print!("{text}"),
+        Ok(None) => println!(
             "meshfox list: no runnable blocks in {}",
             canvas_path.display()
-        );
-        return;
+        ),
+        Err(e) => {
+            eprintln!("meshfox list: {}: {e}", canvas_path.display());
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `meshfox list`'s whole output (one line per entry, each newline-
+/// terminated), or `None` when the canvas has no runnable block.
+fn render_list(canvas: &Canvas) -> Result<Option<String>, meshfox_core::tree::TreeError> {
+    let blocks = canvas.list_runnable()?;
+    if blocks.is_empty() {
+        return Ok(None);
     }
 
     // Group consecutive entries by owning node — already contiguous, since
@@ -3174,21 +3254,27 @@ fn list(canvas_path: &Path) {
     // printing a header for each new ancestor path segment the first time
     // it's seen, same grouping idea as before — then right-pad every
     // line's label to the widest one so the "meshfox run ..." column lines
-    // up. A node whose *only* runnable block is its `default` (implicitly,
-    // via a matching `name=`/sole unnamed fence, or via an explicit
-    // `default` flag) skips its own header line entirely: the block line
-    // takes its place, since showing both would just repeat the same
-    // identifier twice for no reason. A node with more than one block that
-    // still has a `default` among them gets the node-id shortcut command
-    // printed on its own header line instead, alongside its full ordinary
-    // per-block lines below.
+    // up. A node whose *only* runnable block is its `default` *and is named
+    // like the node* (a matching `name=`, or the sole unnamed fence, which
+    // takes the node's id as its name) skips its own header line entirely:
+    // the block line takes its place, since showing both would just repeat
+    // the same identifier twice for no reason. Every other node keeps its
+    // header — in particular one whose single block is default only through
+    // an explicit `default` flag but has a different name: collapsing that
+    // one would show just the block's name under the node's *parent*, as
+    // though the block belonged to the parent (`run development my-block`
+    // is not a valid command; `run development my-node my-block` is), so
+    // it gets its own header instead, carrying the node-id shortcut command
+    // (`meshfox run development my-node`) whenever a `default` block exists
+    // to shortcut to, alongside its full ordinary per-block lines below.
     let mut headers: Vec<(usize, Line)> = Vec::new(); // (position in `lines`, header), interleaved by position
     let mut lines: Vec<Line> = Vec::new();
     let mut last_path: Vec<String> = Vec::new();
 
     for g in &groups {
-        let default =
-            g.blocks.len() == 1 && meshfox_core::fence::is_default(&g.blocks[0].block, g.node_id);
+        let default = g.blocks.len() == 1
+            && meshfox_core::fence::is_default(&g.blocks[0].block, g.node_id)
+            && g.blocks[0].block.name.as_deref() == Some(g.node_id);
         let collapse = !g.path.is_empty() && default;
         let header_depth = if collapse {
             g.path.len() - 1
@@ -3235,14 +3321,16 @@ fn list(canvas_path: &Path) {
         .max()
         .unwrap_or(0);
 
+    let mut out = String::new();
     let mut header_iter = headers.into_iter().peekable();
     for (i, line) in lines.iter().enumerate() {
         while header_iter.peek().is_some_and(|(pos, _)| *pos == i) {
             let (_, header) = header_iter.next().unwrap();
-            print_line(&header, max_width);
+            out.push_str(&format_line(&header, max_width));
         }
-        print_line(line, max_width);
+        out.push_str(&format_line(line, max_width));
     }
+    Ok(Some(out))
 }
 
 struct Line {
@@ -3251,11 +3339,11 @@ struct Line {
     command: Option<String>,
 }
 
-fn print_line(line: &Line, max_width: usize) {
+fn format_line(line: &Line, max_width: usize) -> String {
     let prefix = format!("{}{}", "  ".repeat(line.indent), line.label);
     match &line.command {
-        Some(command) => println!("{:<width$}    {}", prefix, command, width = max_width),
-        None => println!("{prefix}"),
+        Some(command) => format!("{:<width$}    {}\n", prefix, command, width = max_width),
+        None => format!("{prefix}\n"),
     }
 }
 
@@ -3368,6 +3456,24 @@ fn read_raw_or_exit(canvas_path: &Path) -> String {
             );
             std::process::exit(1);
         })
+}
+
+fn session_reset(canvas_path: &Path) {
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+        eprintln!("failed to start async runtime: {e}");
+        std::process::exit(1);
+    });
+    let port = worker_port_or_exit(&runtime, canvas_path);
+    match runtime.block_on(worker_client::reset_session(port)) {
+        Ok(()) => println!(
+            "meshfox session reset: forgot what already ran in {} (worker on port {port})",
+            canvas_path.display()
+        ),
+        Err(e) => {
+            eprintln!("meshfox session reset: {e} (worker on port {port})");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn worker_port_or_exit(runtime: &tokio::runtime::Runtime, canvas_path: &Path) -> u16 {
@@ -3674,8 +3780,7 @@ fn node_rename(canvas_path: &Path, node_id: &str, title: &str) {
 
 #[cfg(test)]
 fn apply_node_rename(raw: &str, node_id: &str, title: &str) -> Result<String, String> {
-    let updated = mdcanvas::set_node_title(raw, node_id, title)
-        .ok_or_else(|| format!("no node {node_id:?}"))?;
+    let updated = mdcanvas::try_set_node_title(raw, node_id, title).map_err(|e| e.to_string())?;
     validate_patch(&updated)?;
     Ok(updated)
 }
@@ -5862,6 +5967,90 @@ Shared body.
         assert_eq!(node.id, "smoke-test");
         assert_eq!(node.title, "Renamed");
         assert_eq!(node.text, original_text);
+    }
+
+    // An unmarked root is "root" whatever its title, so renaming it keeps the
+    // id (this used to end with "no node <old slug>").
+    #[test]
+    fn rename_of_an_unmarked_root_keeps_its_id_and_body() {
+        let doc = "<!-- meshfox:canvas -->\n# Plain Root\n\nroot body\n\n## Child\n<!-- meshfox:node id=\"child\" -->\n\nkid\n";
+        let updated = apply_node_rename(doc, "root", "Renamed Root").unwrap();
+        let canvas = Canvas::from_markdown(&updated).unwrap();
+        let root = canvas.node("root").expect("id unchanged");
+        assert_eq!(root.title, "Renamed Root");
+        assert_eq!(root.text.trim(), "root body");
+        assert_eq!(canvas.node("child").unwrap().parent.as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn rename_of_a_node_with_a_derived_id_is_refused_with_the_way_out() {
+        let doc = "# R\n\n## My Section\n<!-- meshfox:node -->\n\nbody\n";
+        let err = apply_node_rename(doc, "my-section", "Other").unwrap_err();
+        assert!(err.contains("node set-id my-section"), "{err}");
+    }
+
+    // `meshfox list` must show which node owns a block. Collapsing a node's
+    // header into its single default block is only right when the block is
+    // named like the node; otherwise the line reads as a direct child of the
+    // node's parent, and the command people then assemble from it
+    // (`run development fix-macos-kill`) doesn't resolve.
+    fn list_text(doc: &str) -> String {
+        let canvas = Canvas::from_markdown(doc).unwrap();
+        render_list(&canvas).ok().flatten().expect("has runnable blocks")
+    }
+
+    const LIST_DOC: &str = concat!(
+        "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "## Development\n<!-- meshfox:node id=\"development\" -->\n\n",
+        "### Install\n<!-- meshfox:node id=\"install\" -->\n\n```sh name=\"install\"\ntrue\n```\n\n",
+        "### Fix macOS kill\n<!-- meshfox:node id=\"fix-kill-node\" -->\n\n",
+        "```sh name=\"fix-kill\" default\ntrue\n```\n\n",
+        "### Unit tests\n<!-- meshfox:node id=\"unit-tests\" -->\n\n",
+        "```sh name=\"run\" default\ntrue\n```\n\n",
+        "```sh name=\"extra\"\ntrue\n```\n",
+    );
+
+    #[test]
+    fn list_collapses_a_single_default_block_only_when_it_is_named_like_its_node() {
+        let text = list_text(LIST_DOC);
+        let line = |needle: &str| text.lines().find(|l| l.contains(needle)).unwrap().to_string();
+        // `install` is both the node and its only block: one line, as before.
+        assert!(line("install").trim_start().starts_with("install"), "{text}");
+        assert!(line("install").trim_end().ends_with("meshfox run development install"), "{text}");
+        assert!(!text.lines().any(|l| l.trim() == "install"), "no separate header for it: {text}");
+    }
+
+    #[test]
+    fn list_keeps_the_node_header_for_a_default_block_with_another_name() {
+        let text = list_text(LIST_DOC);
+        let header = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("fix-kill-node"))
+            .unwrap_or_else(|| panic!("the owning node must be shown: {text}"));
+        // The header carries the node-id shortcut (the block is its default)...
+        assert!(header.trim_end().ends_with("meshfox run development fix-kill-node"), "{text}");
+        // ...and the block sits under it with the full, valid command.
+        let block = text.lines().find(|l| l.contains("fix-kill [default]")).unwrap();
+        assert!(
+            block.trim_end().ends_with("meshfox run development fix-kill-node fix-kill"),
+            "{text}"
+        );
+        let header_at = text.lines().position(|l| std::ptr::eq(l, header)).unwrap();
+        let block_at = text.lines().position(|l| std::ptr::eq(l, block)).unwrap();
+        assert_eq!(block_at, header_at + 1, "{text}");
+        let indent = |l: &str| l.len() - l.trim_start().len();
+        assert!(indent(block) > indent(header), "block is nested under its node: {text}");
+    }
+
+    #[test]
+    fn list_keeps_the_node_header_when_a_node_has_several_blocks() {
+        let text = list_text(LIST_DOC);
+        assert!(
+            text.lines()
+                .any(|l| l.trim_start().starts_with("unit-tests") && l.trim_end().ends_with("meshfox run development unit-tests")),
+            "{text}"
+        );
+        assert!(text.lines().any(|l| l.contains("extra") && l.trim_end().ends_with("unit-tests extra")), "{text}");
     }
 
     #[test]

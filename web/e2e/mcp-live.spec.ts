@@ -64,7 +64,7 @@ test("MCP edits appear in an already-open WebUI without reloading", async ({ pag
   const browser = testInfo.project.name.startsWith("firefox") ? "FIREFOX" : "CHROME";
   const fixtureDir = process.env[`MESHFOX_E2E_MCP_LIVE_${browser}_DIR`];
   if (!fixtureDir) throw new Error(`MESHFOX_E2E_MCP_LIVE_${browser}_DIR is unset`);
-  const root = page.locator('.react-flow__node[data-id="mcp-live"]');
+  const root = page.locator('.react-flow__node[data-id="root"]');
   const target = page.locator('.react-flow__node[data-id="target-node"]');
   await page.goto("/");
   await expect(root).toBeVisible();
@@ -75,25 +75,25 @@ test("MCP edits appear in an already-open WebUI without reloading", async ({ pag
     const { canvas_id } = await mcp.tool("canvas_open", { path: "mcp-live.canvas.md" });
     const args = (extra: object) => ({ canvas_id, ...extra });
 
-    await mcp.tool("node_meta", args({ node_id: "mcp-live", add_tags: ["live-tag"] }));
+    await mcp.tool("node_meta", args({ node_id: "root", add_tags: ["live-tag"] }));
     await expect.poll(async () => {
       const canvas = await (await page.request.get("/api/canvas")).json();
-      return canvas.nodes.find((node: { id: string }) => node.id === "mcp-live")?.tags;
+      return canvas.nodes.find((node: { id: string }) => node.id === "root")?.tags;
     }).toEqual(["live-tag"]);
     await expect(root.locator(".mesh-tag-chip")).toContainText("live-tag");
 
     // `node_body` is written against the revision `node_show` returned.
-    const shown = await mcp.tool("node_show", args({ node_id: "mcp-live" }));
+    const shown = await mcp.tool("node_show", args({ node_id: "root" }));
     await mcp.tool(
       "node_body",
-      args({ node_id: "mcp-live", body: "After MCP body edit.", base_rev: shown.body_rev }),
+      args({ node_id: "root", body: "After MCP body edit.", base_rev: shown.body_rev }),
     );
     await expect(root.locator(".mesh-node-body")).toContainText("After MCP body edit.");
 
-    await mcp.tool("node_rename", args({ node_id: "mcp-live", title: "After MCP title edit" }));
+    await mcp.tool("node_rename", args({ node_id: "root", title: "After MCP title edit" }));
     await expect(root.locator(".mesh-node-title-text, .mesh-node-title-centered-text")).toHaveText("After MCP title edit");
 
-    const { node_id } = await mcp.tool("node_add", args({ parent_id: "mcp-live", title: "Added by MCP", body: "New node body.", x: 700, y: 300 }));
+    const { node_id } = await mcp.tool("node_add", args({ parent_id: "root", title: "Added by MCP", body: "New node body.", x: 700, y: 300 }));
     const added = page.locator(`.react-flow__node[data-id="${node_id}"]`);
     await expect(added).toBeVisible();
     await expect(added).toContainText("Added by MCP");

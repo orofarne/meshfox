@@ -19,7 +19,9 @@ landing as a corrupt file.
 
 Map your intent to a subcommand instead:
 
-- Add a child node → `meshfox node add <parent-id> <title>`. Prints the new
+- Add a child node → `meshfox node add <parent-id> <title>` (the root's id is
+  `root` in every canvas, unless that canvas's root declares another one —
+  `meshfox node show` of any node prints its parent). Prints the new
   node's id (a slug of `title`) — pass `--body-file <path>` (or `--body-file
   -` for stdin) and/or any `node meta` flag below in that same call to give
   it real starting content/position/style too, instead of a separate
@@ -134,6 +136,14 @@ nothing above it is reachable. If this session already has that configured, its 
 usually a better fit than shelling out through this same CLI for two
 specific cases:
 
+- **Running a block** (`run`, `session_reset`): `run` executes a block with
+  its `deps=` chain and returns every step's exit code, duration and output
+  tail as JSON. A dependency that already ran this session and looks
+  unchanged is skipped — for a build/test step that depends on files rather
+  than on the block's own text, pass `fresh: true` (the whole chain runs for
+  real this once; nothing is forgotten), or call `session_reset` to forget
+  everything. The CLI equivalents are `meshfox run --fresh` and `meshfox
+  session reset`.
 - **A multi-step debug session** (`debug_start`/`debug_send`/`debug_stop`):
   a persistent shell in a node/block's own resolved cwd/env, so state
   (exported vars, files a snippet wrote) survives between calls — a

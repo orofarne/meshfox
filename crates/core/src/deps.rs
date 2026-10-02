@@ -68,6 +68,10 @@ pub enum DepsError {
     AutorunTtyConflict(String, String),
     #[error("node {0:?} block {1:?}: `send=` only means anything on a `form` fence")]
     SendWithoutForm(String, String),
+    #[error("node {0:?} block {1:?}: `output-attrs=` only means anything with `output=\"image\"`")]
+    OutputAttrsWithoutImage(String, String),
+    #[error("node {0:?} block {1:?}: invalid output-attrs={2:?} — expected the image-attribute grammar, e.g. `width=50% bg=#fff` (`width=`/`height=` an integer or integer%, `bg=` `#rgb`/`#rrggbb`/`transparent`)")]
+    InvalidOutputAttrs(String, String, String),
     #[error("node {0:?} block {1:?}: unknown render={2:?} — known kinds are {3:?}")]
     UnknownRenderKind(String, String, String, &'static [&'static str]),
     #[error("node {0:?} block {1:?}: `deps=` names {2:?}, a `form` fence — a form has no \"done\" state, so nothing can depend on it")]
@@ -493,6 +497,21 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
             }
             if block.attrs.contains_key("send") && !crate::exec::is_form(&block.lang) {
                 return Err(DepsError::SendWithoutForm(node.id.clone(), name.clone()));
+            }
+            if let Some(attrs) = block.attrs.get("output-attrs") {
+                if block.attrs.get("output").map(String::as_str) != Some("image") {
+                    return Err(DepsError::OutputAttrsWithoutImage(
+                        node.id.clone(),
+                        name.clone(),
+                    ));
+                }
+                if crate::image_attrs::parse_inner(attrs).is_none() {
+                    return Err(DepsError::InvalidOutputAttrs(
+                        node.id.clone(),
+                        name.clone(),
+                        attrs.clone(),
+                    ));
+                }
             }
             if let Some(kind) = &block.render {
                 if !crate::fence::RENDER_KINDS.contains(&kind.as_str()) {
@@ -1343,6 +1362,47 @@ mod tests {
                 crate::fence::RENDER_KINDS,
             )
         );
+    }
+
+    #[test]
+    fn validate_catches_output_attrs_without_output_image() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```bash name=\"d\" cache output-attrs=\"bg=#fff\"\necho hi\n```\n",
+        ));
+        assert_eq!(
+            validate(&c).unwrap_err(),
+            DepsError::OutputAttrsWithoutImage("root".to_string(), "d".to_string())
+        );
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```bash name=\"d\" cache output=\"markdown\" output-attrs=\"bg=#fff\"\necho hi\n```\n",
+        ));
+        assert_eq!(
+            validate(&c).unwrap_err(),
+            DepsError::OutputAttrsWithoutImage("root".to_string(), "d".to_string())
+        );
+    }
+
+    #[test]
+    fn validate_catches_invalid_output_attrs_and_accepts_valid_ones() {
+        let bad = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```bash name=\"d\" cache output=\"image\" output-attrs=\"bg=white\"\necho hi\n```\n",
+        ));
+        assert_eq!(
+            validate(&bad).unwrap_err(),
+            DepsError::InvalidOutputAttrs(
+                "root".to_string(),
+                "d".to_string(),
+                "bg=white".to_string()
+            )
+        );
+        let good = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```bash name=\"d\" cache output=\"image\" output-attrs=\"width=50% bg=transparent\"\necho hi\n```\n",
+        ));
+        assert!(validate(&good).is_ok());
     }
 
     #[test]

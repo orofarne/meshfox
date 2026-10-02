@@ -14,6 +14,7 @@ use meshfox_server::link_preview::{self, PreviewMeta};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use meshfox_core::deps::BlockAddr;
 use meshfox_core::fence::{self, scan_runnable_blocks};
+use meshfox_core::image_attrs::Background;
 use meshfox_core::mdcanvas;
 use meshfox_core::vars::{declared_vars, VarDecl, VarType};
 use meshfox_core::{Canvas, FileDisplay, Node, NodeType, VarCache};
@@ -1145,7 +1146,7 @@ impl App {
             return;
         }
         if self.reset_session_confirm {
-            self.on_reset_session_confirm_key(key);
+            self.on_reset_session_confirm_key(key).await;
             return;
         }
         if self.service_conflict.is_some() {
@@ -2887,7 +2888,7 @@ impl App {
             })
             .collect();
 
-        let images: Vec<(PathBuf, Option<u32>, Option<u32>)> = self
+        let images: Vec<(PathBuf, Option<u32>, Option<u32>, Option<Background>)> = self
             .doc_segments
             .iter()
             .filter_map(|s| match s {
@@ -2895,14 +2896,20 @@ impl App {
                     path,
                     width_percent,
                     height_percent,
+                    bg,
                     ..
-                } => Some((path.clone(), *width_percent, *height_percent)),
+                } => Some((path.clone(), *width_percent, *height_percent, *bg)),
                 Segment::Text(_) => None,
             })
             .collect();
-        for (path, width_percent, height_percent) in images {
-            let protocol =
-                load_image_protocol(&mut self.picker, &path, width_percent, height_percent);
+        for (path, width_percent, height_percent, bg) in images {
+            let protocol = load_image_protocol(
+                &mut self.picker,
+                &path,
+                width_percent,
+                height_percent,
+                bg,
+            );
             self.doc_images.insert(path, protocol);
         }
 
@@ -2956,6 +2963,7 @@ impl App {
                     alt: "preview image".to_string(),
                     width_percent: None,
                     height_percent: None,
+                    bg: None,
                 });
             }
         }
@@ -3331,6 +3339,7 @@ impl App {
             &path,
             &block_name,
             !with_deps,
+            false,
             vars,
             save_secrets,
             cols,
@@ -4922,20 +4931,25 @@ impl App {
 
     /// Forgets every `form` field this process has submitted
     /// (`session_vars`) and every autorun this process has already fired
-    /// (`pending_autoruns`) — meant to mirror the web server's own `POST
-    /// /api/session/reset` (which additionally forgets *its* session-
-    /// freshness cache, `AppState::session_runs`, the actual thing that lets
-    /// a worker-routed chain run skip re-running an unchanged dependency),
-    /// but this TUI-local reset doesn't yet call that endpoint — pressing
-    /// `S` here doesn't currently make the *next worker-routed run*
-    /// re-run anything it would otherwise skip (see TODO.canvas.md's own
-    /// note on this gap). Purely in-memory either way, so this never
-    /// touches the canvas file itself or any persisted `<!-- meshfox:output
-    /// ... -->` cache. See TODO.canvas.md: "Сброс сессии".
-    fn reset_session(&mut self) {
+    /// (`pending_autoruns`), and — when this TUI runs blocks through a worker
+    /// (`worker_port`) — has the worker forget *its* session
+    /// (`POST /api/session/reset`: every block's "already ran, still fresh"
+    /// record, `AppState::session_runs`, the thing that lets a chain run skip
+    /// re-running an unchanged dependency, plus its own copy of submitted
+    /// form values). Without that second half `S` looked like it reset the
+    /// session but the next `r` still skipped every dependency the worker
+    /// thought fresh. Never touches the canvas file itself or any persisted
+    /// `<!-- meshfox:output ... -->` cache. See TODO.canvas.md: "Сброс
+    /// сессии".
+    async fn reset_session(&mut self) {
         self.session_vars.clear();
         self.pending_autoruns.clear();
         self.status = "session reset".into();
+        if let Some(port) = self.worker_port {
+            if let Err(e) = crate::worker_client::reset_session(port).await {
+                self.status = format!("session reset here, but the worker didn't reset: {e}");
+            }
+        }
     }
 
     /// While `reset_session_confirm` is up (see `on_key`'s early dispatch) —
@@ -4974,11 +4988,11 @@ impl App {
         }
     }
 
-    fn on_reset_session_confirm_key(&mut self, key: KeyEvent) {
+    async fn on_reset_session_confirm_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {
                 self.reset_session_confirm = false;
-                self.reset_session();
+                self.reset_session().await;
             }
             KeyCode::Char('n') | KeyCode::Esc => {
                 self.reset_session_confirm = false;
@@ -5252,14 +5266,26 @@ fn link_preview_image_path(image_url: &str) -> PathBuf {
 /// in memory — unlike `App::maybe_fetch_link_preview_image`'s async fetch,
 /// there's no network round-trip to wait on, the bytes are already right
 /// there in the document.
-fn decode_data_url_image(url: &str) -> Option<image::DynamicImage> {
+fn decode_data_url_image(url: &str, bg: Option<Background>) -> Option<image::DynamicImage> {
     let rest = url.strip_prefix("data:")?;
     let (meta, payload) = rest.split_once(',')?;
     if !meta.ends_with(";base64") {
         return None;
     }
     let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, payload).ok()?;
+    // The `image` crate has no SVG decoder: an SVG goes through the
+    // rasterizer (themed, `bg` painted behind it) instead.
+    if meta.eq_ignore_ascii_case("image/svg+xml;base64") {
+        return super::svg_raster::rasterize(std::str::from_utf8(&bytes).ok()?, bg);
+    }
     image::load_from_memory(&bytes).ok()
+}
+
+/// A `.svg` file path (case-insensitive) — rasterized instead of decoded
+/// by `image`, same as an `image/svg+xml` data URL.
+fn is_svg_path(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("svg"))
 }
 
 /// `Picker::from_query_stdio()` does a real capability round-trip (writes
@@ -5300,9 +5326,13 @@ fn load_image_protocol(
     path: &Path,
     width_percent: Option<u32>,
     height_percent: Option<u32>,
+    bg: Option<Background>,
 ) -> Option<Protocol> {
     let dyn_img = match path.to_str().filter(|s| s.starts_with("data:")) {
-        Some(data_url) => decode_data_url_image(data_url)?,
+        Some(data_url) => decode_data_url_image(data_url, bg)?,
+        None if is_svg_path(path) => {
+            super::svg_raster::rasterize(&std::fs::read_to_string(path).ok()?, bg)?
+        }
         None => image::ImageReader::open(path)
             .ok()?
             .with_guessed_format()
@@ -5465,25 +5495,58 @@ mod tests {
 
     #[test]
     fn decode_data_url_image_decodes_a_valid_base64_png() {
-        let img = decode_data_url_image(ONE_PIXEL_PNG_DATA_URL).expect("valid data: URL");
+        let img = decode_data_url_image(ONE_PIXEL_PNG_DATA_URL, None).expect("valid data: URL");
         assert_eq!((img.width(), img.height()), (1, 1));
     }
 
     #[test]
     fn decode_data_url_image_rejects_a_non_base64_data_url() {
-        assert!(decode_data_url_image("data:image/png,not-base64-payload").is_none());
+        assert!(decode_data_url_image("data:image/png,not-base64-payload", None).is_none());
     }
 
     #[test]
     fn decode_data_url_image_rejects_a_garbage_payload() {
-        assert!(decode_data_url_image("data:image/png;base64,not valid base64!!!").is_none());
+        assert!(decode_data_url_image("data:image/png;base64,not valid base64!!!", None).is_none());
     }
 
     #[test]
     fn load_image_protocol_loads_a_data_url_without_touching_disk() {
         let mut picker = Picker::halfblocks();
         let path = PathBuf::from(ONE_PIXEL_PNG_DATA_URL);
-        assert!(load_image_protocol(&mut picker, &path, None, None).is_some());
+        assert!(load_image_protocol(&mut picker, &path, None, None, None).is_some());
+    }
+
+    const SVG_BASE64_DATA_URL: &str = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI0IiBoZWlnaHQ9IjQiPjxyZWN0IHdpZHRoPSI0IiBoZWlnaHQ9IjQiLz48L3N2Zz4=";
+
+    #[test]
+    fn decode_data_url_image_rasterizes_an_svg() {
+        let img = decode_data_url_image(SVG_BASE64_DATA_URL, None).expect("valid svg data: URL");
+        // A 4x4 SVG, scaled up by the rasterizer's own 8x cap.
+        assert_eq!((img.width(), img.height()), (32, 32));
+    }
+
+    #[test]
+    fn decode_data_url_image_rejects_an_svg_data_url_with_a_garbage_payload() {
+        // Valid base64, not an SVG.
+        assert!(decode_data_url_image("data:image/svg+xml;base64,aGVsbG8=", None).is_none());
+    }
+
+    #[test]
+    fn load_image_protocol_loads_an_svg_data_url_and_an_svg_file() {
+        let mut picker = Picker::halfblocks();
+        let path = PathBuf::from(SVG_BASE64_DATA_URL);
+        assert!(load_image_protocol(&mut picker, &path, None, None, Background::parse("#fff")).is_some());
+
+        let dir = std::env::temp_dir().join(format!("meshfox-svg-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("pic.SVG");
+        std::fs::write(
+            &file,
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><rect width="4" height="4"/></svg>"#,
+        )
+        .unwrap();
+        assert!(load_image_protocol(&mut picker, &file, None, None, None).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // TODO.canvas.md: "Формальные граматики для meshfox:*" subtree ->
@@ -5554,10 +5617,74 @@ mod tests {
             .insert("greeting".to_string(), "hi".to_string());
         assert!(!app.session_vars.is_empty());
 
-        app.reset_session();
+        app.reset_session().await;
 
         assert!(app.session_vars.is_empty());
         assert_eq!(app.status, "session reset");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A one-shot HTTP server that answers 204 to whatever it is sent and
+    /// reports the request line of the first request — enough of a "worker"
+    /// to see what the TUI asks it.
+    async fn stub_worker() -> (u16, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = socket.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let _ = socket
+                .write_all(b"HTTP/1.1 204 No Content\r\nconnection: close\r\n\r\n")
+                .await;
+            let _ = tx.send(request.lines().next().unwrap_or_default().to_string());
+        });
+        (port, rx)
+    }
+
+    // The bug this guards: `S` in a worker-routed TUI only cleared the TUI's
+    // own state, so the worker still considered every dependency fresh and
+    // the next `r` ran only the block itself.
+    #[tokio::test]
+    async fn reset_session_also_resets_the_workers_session_when_there_is_one() {
+        let dir =
+            std::env::temp_dir().join(format!("meshfox-tui-reset-worker-test-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.md");
+        std::fs::write(
+            &path,
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
+        )
+        .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(path, tx, None, None).await.unwrap();
+        // `main` installs the rustls provider reqwest needs; a test has to.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (port, request) = stub_worker().await;
+        app.worker_port = Some(port);
+
+        app.on_key(key(KeyCode::Char('S'))).await;
+        app.on_key(key(KeyCode::Char('y'))).await;
+
+        assert_eq!(request.await.unwrap(), "POST /api/session/reset HTTP/1.1");
+        assert_eq!(app.status, "session reset");
+
+        // A worker that can't be reached is reported, not silently ignored.
+        let dead = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        app.worker_port = Some(dead);
+        app.reset_session().await;
+        assert!(
+            app.status.contains("worker didn't reset"),
+            "status was {:?}",
+            app.status
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -2303,6 +2303,13 @@ struct RunRequest {
     /// UI's plain "run" button (as opposed to "⛓ run chain") sends.
     #[serde(default)]
     no_deps: bool,
+    /// Run every block of the chain for real, ignoring the session-freshness
+    /// skip (`AppState::session_runs`) for *this run only* — nothing is
+    /// forgotten: the fresh results are recorded as usual, other blocks'
+    /// records and submitted `form` values are untouched (that wider reset is
+    /// `POST /api/session/reset`). What `meshfox run --fresh` sends.
+    #[serde(default)]
+    fresh: bool,
     /// Answers for any `meshfox:var` the UI's pre-run form just collected
     /// (see `GET /api/vars`) — takes precedence over the process
     /// environment/cache/default, same as the CLI's `--set`. Every
@@ -4540,7 +4547,13 @@ async fn update_node(
     let mut title = initial_node.title.clone();
 
     if let Some(new_title) = &req.title {
-        raw = mdcanvas::set_node_title(&raw, &local_id, new_title).ok_or_else(not_found)?;
+        raw = mdcanvas::try_set_node_title(&raw, &local_id, new_title).map_err(|e| match e {
+            mdcanvas::SetTitleError::NotFound(_) => not_found(),
+            // The node exists; the request itself can't be honoured safely.
+            mdcanvas::SetTitleError::DerivedId(_) => {
+                ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
+            }
+        })?;
         title = new_title.clone();
     }
 
@@ -5654,7 +5667,8 @@ async fn rename_node_id(
                 mdcanvas::RenameIdError::NotFound(_) => StatusCode::NOT_FOUND,
                 mdcanvas::RenameIdError::AlreadyExists(_)
                 | mdcanvas::RenameIdError::Empty
-                | mdcanvas::RenameIdError::InvalidChar => StatusCode::UNPROCESSABLE_ENTITY,
+                | mdcanvas::RenameIdError::InvalidChar
+                | mdcanvas::RenameIdError::Reserved(_) => StatusCode::UNPROCESSABLE_ENTITY,
             };
             ApiError(status, e.to_string())
         })?;
@@ -5741,6 +5755,8 @@ struct RunWsQuery {
     #[serde(default)]
     no_deps: bool,
     #[serde(default)]
+    fresh: bool,
+    #[serde(default)]
     persist: bool,
     #[serde(default)]
     vars: String,
@@ -5760,6 +5776,7 @@ fn parse_run_request(
     path: &str,
     block: String,
     no_deps: bool,
+    fresh: bool,
     persist: bool,
     vars: &str,
     save_secrets: &str,
@@ -5790,6 +5807,7 @@ fn parse_run_request(
         block,
         persist,
         no_deps,
+        fresh,
         vars,
         save_secrets,
     })
@@ -5814,6 +5832,7 @@ async fn run_block(
             &query.path,
             query.block,
             query.no_deps,
+            query.fresh,
             query.persist,
             &query.vars,
             &query.save_secrets,
@@ -5840,6 +5859,8 @@ struct ForceRunWsQuery {
     block: String,
     #[serde(default)]
     no_deps: bool,
+    #[serde(default)]
+    fresh: bool,
     #[serde(default)]
     persist: bool,
     #[serde(default)]
@@ -5900,6 +5921,7 @@ async fn force_run(
                 &query.path,
                 query.block,
                 query.no_deps,
+                query.fresh,
                 query.persist,
                 &query.vars,
                 &query.save_secrets,
@@ -6042,6 +6064,13 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
             },
         )
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?
+    };
+    // `fresh`: nothing in this chain counts as already-fresh — every block
+    // runs (and takes its run lock) for real, this once.
+    let forced_reruns: std::collections::HashSet<meshfox_core::BlockAddr> = if req.fresh {
+        chain.iter().cloned().collect()
+    } else {
+        forced_reruns
     };
 
     // Queued-time, transactional locking: claim every address this chain
@@ -6686,6 +6715,7 @@ async fn trigger_autorun(state: Arc<AppState>, addr: meshfox_core::BlockAddr) {
         block: addr.block_name.clone(),
         persist: false,
         no_deps: false,
+        fresh: false,
         vars: HashMap::new(),
         save_secrets: std::collections::HashSet::new(),
     };
@@ -7070,6 +7100,8 @@ struct TtyRunQuery {
     #[serde(default)]
     no_deps: bool,
     #[serde(default)]
+    fresh: bool,
+    #[serde(default)]
     persist: bool,
     #[serde(default)]
     vars: String,
@@ -7245,6 +7277,12 @@ async fn run_block_tty(
             },
         )
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?
+    };
+    // `fresh` — same as in `run_block_impl`.
+    let forced_reruns: std::collections::HashSet<meshfox_core::BlockAddr> = if query.fresh {
+        chain.iter().cloned().collect()
+    } else {
+        forced_reruns
     };
 
     // Force-kill prep, mirroring `force_run_kill_prep` — see its own doc
@@ -12754,8 +12792,9 @@ mod include_edit_tests {
 
         let body = expect_ok_clear(clear_node_id(State(state), Path("base".to_string())).await);
 
-        assert_eq!(body.id, "base");
-        assert!(body.canvas.node("base").is_some());
+        // Without an explicit `id=` the root is "root", not a slug of its title.
+        assert_eq!(body.id, "root");
+        assert!(body.canvas.node("root").is_some());
         assert!(!std::fs::read_to_string(&base_path)
             .unwrap()
             .contains(r#"id="base""#));
@@ -14479,9 +14518,14 @@ mod session_skip_tests {
     }
 
     async fn run_target(addr: SocketAddr) -> Vec<serde_json::Value> {
+        run_target_with(addr, "").await
+    }
+
+    /// `run_target` with extra query parameters (`"&fresh=true"`).
+    async fn run_target_with(addr: SocketAddr, extra_query: &str) -> Vec<serde_json::Value> {
         use futures_util::StreamExt;
         use tokio_tungstenite::tungstenite::Message as WsMessage;
-        let url = format!("ws://{addr}/api/run?block=target&persist=true");
+        let url = format!("ws://{addr}/api/run?block=target&persist=true{extra_query}");
         let (mut ws, _) = tokio_tungstenite::connect_async(url)
             .await
             .expect("connect");
@@ -14760,6 +14804,36 @@ mod session_skip_tests {
         assert!(!skipped_for(&second, "dep"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // `fresh=true` on the run itself: this one run ignores the freshness skip,
+    // without forgetting anything — the next plain run still skips again.
+    #[tokio::test]
+    async fn a_fresh_run_reruns_a_skippable_dependency_this_once_only() {
+        let path = write_dep_chain_canvas("echo dep-ran");
+        let addr = spawn_test_server(path.clone()).await;
+
+        let first = run_target(addr).await;
+        assert!(really_ran(&first, "dep"));
+        let second = run_target(addr).await;
+        assert!(skipped_for(&second, "dep"), "{second:?}");
+
+        let fresh = run_target_with(addr, "&fresh=true").await;
+        assert!(
+            really_ran(&fresh, "dep"),
+            "a fresh run must run the unchanged dependency for real: {fresh:?}"
+        );
+        assert!(!skipped_for(&fresh, "dep"));
+
+        // Not a reset: the fresh run recorded its result as usual, so the
+        // following plain run is free to skip again.
+        let after = run_target(addr).await;
+        assert!(
+            skipped_for(&after, "dep"),
+            "`fresh` must not leave the dependency permanently un-skippable: {after:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[tokio::test]

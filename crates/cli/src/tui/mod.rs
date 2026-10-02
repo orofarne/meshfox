@@ -13,6 +13,7 @@ mod app;
 mod markdown;
 mod source_editor;
 mod spatial;
+mod svg_raster;
 mod theme;
 mod tree;
 // `pub(crate)` (not the default private) so `syntax_registry.rs`'s own

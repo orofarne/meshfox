@@ -15,9 +15,42 @@ test.beforeEach(async ({ page }) => {
 
 test("image size attributes become real width/height on the rendered <img>", async ({ page }) => {
   const root = page.locator('.react-flow__node[data-id="root"]');
-  const img = root.locator(".mesh-node-body img");
+  const img = root.locator('.mesh-node-body img[alt="alt"]');
   await expect(img).toHaveAttribute("width", "300");
   await expect(img).toHaveAttribute("height", "50%");
+});
+
+test("a bg attribute becomes an inline background style on the rendered <img>", async ({ page }) => {
+  const root = page.locator('.react-flow__node[data-id="root"]');
+  const img = root.locator('.mesh-node-body img[alt="backed"]');
+  // Normalised to the long lowercase form, same as the Rust side's `Display`.
+  await expect(img).toHaveCSS("background-color", "rgb(255, 255, 255)");
+  await expect(root.locator(".mesh-node-body")).not.toContainText("{bg=");
+});
+
+test("an inline SVG image gets the page's theme injected and follows a theme switch", async ({ page }) => {
+  const root = page.locator('.react-flow__node[data-id="root"]');
+  const img = root.locator('.mesh-node-body img[alt="themed"]');
+  const prefix = "data:image/svg+xml;base64,";
+  const decoded = async () => {
+    const src = (await img.getAttribute("src")) ?? "";
+    expect(src.startsWith(prefix)).toBe(true);
+    return Buffer.from(src.slice(prefix.length), "base64").toString("utf8");
+  };
+  const setTheme = (theme: "dark" | "light") =>
+    page.evaluate((t) => {
+      document.documentElement.dataset.theme = t;
+      window.dispatchEvent(new Event("meshfox:theme-change"));
+    }, theme);
+
+  await setTheme("dark");
+  await expect.poll(decoded).toContain("--mf-fg:#f2ede6");
+  expect(await decoded()).toContain("svg{color:#f2ede6}");
+  // The tool's own markup is left exactly as it was, after the injected style.
+  expect(await decoded()).toContain('<rect width="8" height="8" fill="currentColor"/></svg>');
+
+  await setTheme("light");
+  await expect.poll(decoded).toContain("--mf-fg:#201a14");
 });
 
 test("subscript and superscript render as real <sub>/<sup> elements", async ({ page }) => {

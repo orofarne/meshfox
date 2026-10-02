@@ -1700,6 +1700,19 @@ mod tests {
     }
 
     #[test]
+    fn image_bg_attr_becomes_an_inline_background_style() {
+        let c = canvas(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n![alt](pic.svg){width=50% bg=#FFF}\n",
+        );
+        let (site, _assets) = build(&c, Path::new("/nonexistent-meshfox-test-dir"), None);
+        let body = &site.find("root").unwrap().html_body;
+        assert!(
+            body.contains(r#"width="50%" style="background:#ffffff" />"#),
+            "{body}"
+        );
+    }
+
+    #[test]
     fn text_right_after_an_image_with_no_size_attrs_is_left_alone() {
         let c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n![alt](pic.png) not attrs\n");
         let (site, _assets) = build(&c, Path::new("/nonexistent-meshfox-test-dir"), None);
