@@ -46,7 +46,7 @@ Rough checklist for what's needed before a 1.0.0 release:
 - [x] A unified interface for external renderers
 - [x] LaTeX, Vega, Mermaid/PlantUML sub-render support (as SVG output from external renderers, see "Showing a diagram, formula or chart")
 - [x] Conflict resolution for concurrent editing
-- [ ] Encryption for stored secrets
+- [ ] Encryption for stored secrets (macOS Keychain done; Linux Secret Service backend still missing)
 
 ## Concept
 <!-- meshfox:node id="concept" -->
