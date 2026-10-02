@@ -359,9 +359,13 @@ enum Command {
     /// rendered standalone) is rendered and written to `--out` at the same
     /// relative path minus `.tera`; every other file is copied verbatim
     /// (CSS, fonts, ...) — except `template.toml` itself, the template's
-    /// own config file (optional; a template with none gets no
-    /// `base_url`/`links_base_url` and no `icons`), read from `--template`'s own directory
-    /// and never copied to `--out`. A local image referenced from a node's
+    /// own config file (optional, but if present it must declare
+    /// `api_version`, and unknown keys are an error; a template with none
+    /// gets no `base_url`/`links_base_url` and no `icons`), read from
+    /// `--template`'s own directory and never copied to `--out`. Every page
+    /// is HTML-escaped automatically; `html_body` and `script_json` output
+    /// are the markup a template marks `| safe`. What a template receives
+    /// and must do is described in TEMPLATES.md. A local image referenced from a node's
     /// Markdown body is copied alongside the output automatically; a
     /// `file`-type node's `display="code"` target is read once and inlined
     /// into the HTML directly (nothing left to fetch once static). A plain
@@ -2562,6 +2566,24 @@ async fn run_via_worker(
                         }
                     }
                     if !any_running {
+                        // `meshfox run` hosts its worker in-process, and the
+                        // worker's own shutdown handler also listens for
+                        // SIGINT: it stops every service the moment Ctrl-C
+                        // lands, which can be before this loop's own `ctrl_c`
+                        // arm below gets polled — so a poll in flight at that
+                        // instant sees "nothing running". That's the user's
+                        // Ctrl-C, not the services ending by themselves:
+                        // exit 130 like the arm below, not 0.
+                        if tokio::time::timeout(std::time::Duration::from_millis(100), &mut ctrl_c)
+                            .await
+                            .is_ok()
+                        {
+                            println!("^C — stopping {} service(s)", started_services.len());
+                            for (node_id, block) in &started_services {
+                                let _ = worker_client::stop_service(port, node_id, block).await;
+                            }
+                            std::process::exit(130);
+                        }
                         break 'watch;
                     }
                 }
@@ -4895,6 +4917,30 @@ fn html_escape_attr(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// The `script_json` Tera filter: any value as JSON that is safe to put
+/// inside a `<script type="application/json">` element. Plain `json_encode`
+/// is not — it leaves `</script>` intact, so an edge label or node title
+/// containing it would end the element and let the rest run as markup.
+/// `<`, `>` and `&` (and the two line separators JavaScript treats as
+/// newlines) are written as `\uXXXX` escapes, which any JSON parser reads
+/// back as the same characters.
+fn script_json_filter(
+    value: &tera::Value,
+    _args: &HashMap<String, tera::Value>,
+) -> tera::Result<tera::Value> {
+    let json = serde_json::to_string(value).map_err(|e| tera::Error::msg(e.to_string()))?;
+    let mut out = String::with_capacity(json.len());
+    for c in json.chars() {
+        match c {
+            '<' | '>' | '&' | '\u{2028}' | '\u{2029}' => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    Ok(tera::Value::String(out))
+}
+
 /// Basename of a template's own optional config file (`--template`'s own
 /// directory, never a page — see `load_template_config`) — excluded by name
 /// from `copy_template_assets`'s otherwise-copy-everything sweep the same
@@ -4902,17 +4948,32 @@ fn html_escape_attr(s: &str) -> String {
 /// than being part of it.
 const TEMPLATE_CONFIG_FILE: &str = "template.toml";
 
+/// The version of the template API — the Tera context keys, the `SiteData`
+/// shape, and the `template.toml` format, all described in `TEMPLATES.md` —
+/// that this build implements. Bumped on any change a template written for
+/// the previous version could not simply ignore.
+const TEMPLATE_API_VERSION: u32 = 1;
+
 /// A template's own settings, read from `template.toml` in its directory —
-/// deliberately not a `--static` CLI flag: both fields are a property of
-/// *this template* (how it wants relative links resolved, which icons it
-/// ships), not something a caller picks per invocation, so they belong
-/// checked into the template alongside its own `.tera`/CSS files instead of
-/// repeated on every command line that uses it. Both are optional — a
-/// template with no `template.toml` at all gets `Default::default()`
-/// (no `base_url`/`links_base_url`, no `icons`), same as today's behavior
-/// before this file existed.
+/// deliberately not `static` CLI flags: these are a property of *this
+/// template* (which API version it targets, how it wants relative links
+/// resolved, which icons it ships), not something a caller picks per
+/// invocation, so they belong checked into the template alongside its own
+/// `.tera`/CSS files instead of repeated on every command line that uses it.
+/// The file is optional — a template with none gets `Default::default()` (no
+/// `base_url`/`links_base_url`, no `icons`, and no version check) — but one
+/// that exists must declare `api_version` (`load_template_config`), and a key
+/// this struct doesn't know is an error, so a typo can't silently do
+/// nothing. TEMPLATES.md documents every key.
 #[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TemplateConfig {
+    /// Which version of the template API (see `TEMPLATES.md`) this template
+    /// was written against — `TEMPLATE_API_VERSION` today. Required in any
+    /// `template.toml` (a template with no `template.toml` at all is taken
+    /// to be current), and a different number is refused up front rather
+    /// than rendering a page against context it wasn't written for.
+    api_version: Option<u32>,
     /// The site's own canonical, absolute URL (e.g.
     /// `https://example.com`, no trailing content path) — `--sitemap`'s
     /// own `<loc>` prefix (`sitemap_xml`), required whenever `--sitemap` is
@@ -4953,6 +5014,7 @@ struct TemplateConfig {
 /// template can render one directly from each entry's fields, e.g.:
 /// `<link rel="{{ icon.rel }}" href="{{ icon.href }}">`.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 struct IconLink {
     /// `"icon"` or `"apple-touch-icon"`, same as the real attribute.
     rel: String,
@@ -4980,10 +5042,30 @@ fn load_template_config(template_dir: &Path) -> TemplateConfig {
     let Ok(raw) = std::fs::read_to_string(&path) else {
         return TemplateConfig::default();
     };
-    toml::from_str(&raw).unwrap_or_else(|e| {
+    let config: TemplateConfig = toml::from_str(&raw).unwrap_or_else(|e| {
         eprintln!("meshfox static: failed to parse {}: {e}", path.display());
         std::process::exit(1);
-    })
+    });
+    match config.api_version {
+        Some(TEMPLATE_API_VERSION) => {}
+        Some(other) => {
+            eprintln!(
+                "meshfox static: {} is written for template API version {other}, but this meshfox \
+                 implements version {TEMPLATE_API_VERSION} (see TEMPLATES.md)",
+                path.display()
+            );
+            std::process::exit(1);
+        }
+        None => {
+            eprintln!(
+                "meshfox static: {} has no `api_version` — add `api_version = {TEMPLATE_API_VERSION}` \
+                 (see TEMPLATES.md)",
+                path.display()
+            );
+            std::process::exit(1);
+        }
+    }
+    config
 }
 
 /// `canvas_dir`'s repo HEAD, short form (e.g. `"a1b2c3d"`) — `None` when
@@ -5211,13 +5293,21 @@ fn static_cmd(
     // `--recursive` renders — same template for the whole site, not
     // reloaded per nested page.
     let glob = format!("{}/**/*.tera", template_dir.display());
-    let tera = tera::Tera::new(&glob).unwrap_or_else(|e| {
+    let mut tera = tera::Tera::new(&glob).unwrap_or_else(|e| {
         eprintln!(
             "meshfox static: failed to load templates from {}: {e}",
             template_dir.display()
         );
         std::process::exit(1);
     });
+    // Tera escapes only templates whose *name* ends in `.html`/`.htm`/`.xml`,
+    // and ours end in `.tera` (`index.html.tera`) — so by default a node
+    // title or tag like `<img onerror=...>` would reach the page as live
+    // markup. Every template here is a page, so escape them all; the few
+    // values that really are markup (`html_body`, the edge JSON) opt out with
+    // `| safe`, as `TEMPLATES.md` describes.
+    tera.autoescape_on(vec![".tera"]);
+    tera.register_filter("script_json", script_json_filter);
 
     let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
         eprintln!("meshfox static: failed to start a Tokio runtime: {e}");

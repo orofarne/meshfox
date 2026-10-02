@@ -151,7 +151,7 @@ fn template_toml_supplies_links_base_url_and_icons_but_is_never_copied_to_out() 
     );
     write_file(
         &template_dir.join("template.toml"),
-        "links_base_url = \"https://example.com/repo\"\n\n[[icons]]\nrel = \"icon\"\nhref = \"favicon.ico\"\n",
+        "api_version = 1\nlinks_base_url = \"https://example.com/repo\"\n\n[[icons]]\nrel = \"icon\"\nhref = \"favicon.ico\"\n",
     );
     // A real (if tiny) asset `icons` points at — proves `template.toml`
     // itself doesn't need to be the only new file in the template dir for
@@ -298,7 +298,7 @@ fn sitemap_lists_the_rendered_page_with_an_absolute_url() {
     write_file(&template_dir.join("index.html.tera"), "{{ site.title }}");
     write_file(
         &template_dir.join("template.toml"),
-        "base_url = \"https://example.com/repo\"\n",
+        "api_version = 1\nbase_url = \"https://example.com/repo\"\n",
     );
 
     let canvas_path = unique_dir("canvas-sitemap").join("doc.canvas.md");
@@ -370,7 +370,7 @@ fn sitemap_git_dates_refuses_to_run_without_sitemap() {
     write_file(&template_dir.join("index.html.tera"), "{{ site.title }}");
     write_file(
         &template_dir.join("template.toml"),
-        "base_url = \"https://example.com/repo\"\n",
+        "api_version = 1\nbase_url = \"https://example.com/repo\"\n",
     );
 
     let canvas_path = unique_dir("canvas-sitemap-git-dates-alone").join("doc.canvas.md");
@@ -401,7 +401,7 @@ fn sitemap_git_dates_sets_lastmod_from_the_canvass_own_commit_date() {
     write_file(&template_dir.join("index.html.tera"), "{{ site.title }}");
     write_file(
         &template_dir.join("template.toml"),
-        "base_url = \"https://example.com/repo\"\n",
+        "api_version = 1\nbase_url = \"https://example.com/repo\"\n",
     );
 
     // A throwaway git repo, committed once, so `git log` has exactly one,
@@ -468,5 +468,163 @@ fn sitemap_git_dates_sets_lastmod_from_the_canvass_own_commit_date() {
 
     let _ = std::fs::remove_dir_all(&template_dir);
     let _ = std::fs::remove_dir_all(&repo_dir);
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// Tera only escapes a template whose name ends in `.html`/`.htm`/`.xml`,
+/// and ours end in `.tera` — `meshfox static` turns escaping on for them
+/// itself, so a title or tag with markup in it reaches the page as text.
+#[test]
+fn node_titles_and_tags_are_html_escaped_in_the_output() {
+    let template_dir = unique_dir("template-escape");
+    write_file(
+        &template_dir.join("index.html.tera"),
+        "<title>{{ site.root.title }}</title>{% for c in site.root.children %}<h2>{{ c.title }}</h2>{% for t in c.tags %}<i>{{ t }}</i>{% endfor %}{% endfor %}",
+    );
+    let canvas_path = unique_dir("canvas-escape").join("doc.canvas.md");
+    write_file(
+        &canvas_path,
+        concat!(
+            "<!-- meshfox:canvas -->\n",
+            "# Root <img src=x onerror=alert(1)>\n",
+            "<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Child <script>alert(2)</script>\n",
+            "<!-- meshfox:node id=\"child\" tags=\"a<b\" -->\n",
+        ),
+    );
+    let out_dir = unique_dir("out-escape");
+
+    let output = meshfox()
+        .args(["static"])
+        .arg(&canvas_path)
+        .arg("--template")
+        .arg(&template_dir)
+        .arg("-o")
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+
+    let index = std::fs::read_to_string(out_dir.join("index")).unwrap_or_else(|_| {
+        std::fs::read_to_string(out_dir.join("index.html")).unwrap()
+    });
+    assert!(!index.contains("<img"), "title markup reached the page: {index}");
+    assert!(!index.contains("<script"), "title markup reached the page: {index}");
+    assert!(index.contains("&lt;img src=x onerror=alert(1)&gt;"), "{index}");
+    assert!(index.contains("<i>a&lt;b</i>"), "tag not escaped: {index}");
+
+    let _ = std::fs::remove_dir_all(&template_dir);
+    let _ = std::fs::remove_dir_all(canvas_path.parent().unwrap());
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// Runs `meshfox static` on a one-page template whose `template.toml` is
+/// `toml`, expecting it to refuse, and returns what it said on stderr.
+fn static_refuses_template_toml(tag: &str, toml: &str) -> String {
+    let template_dir = unique_dir(&format!("template-{tag}"));
+    write_file(&template_dir.join("index.html.tera"), "{{ site.title }}");
+    write_file(&template_dir.join("template.toml"), toml);
+    let canvas_path = unique_dir(&format!("canvas-{tag}")).join("doc.canvas.md");
+    write_file(&canvas_path, FIXTURE_CANVAS);
+    let out_dir = unique_dir(&format!("out-{tag}"));
+
+    let output = meshfox()
+        .args(["static"])
+        .arg(&canvas_path)
+        .arg("--template")
+        .arg(&template_dir)
+        .arg("-o")
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "should have been refused");
+    assert!(!out_dir.exists(), "nothing should be written for a refused template");
+
+    let _ = std::fs::remove_dir_all(&template_dir);
+    let _ = std::fs::remove_dir_all(canvas_path.parent().unwrap());
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[test]
+fn template_toml_with_an_unknown_key_is_refused() {
+    let stderr = static_refuses_template_toml("unknown-key", "api_version = 1\nlinks_base_ulr = \"x\"\n");
+    assert!(stderr.contains("links_base_ulr"), "{stderr}");
+}
+
+#[test]
+fn template_toml_with_an_unknown_icon_key_is_refused() {
+    let stderr = static_refuses_template_toml(
+        "unknown-icon-key",
+        "api_version = 1\n[[icons]]\nrel = \"icon\"\nhref = \"a.ico\"\nsize = \"16x16\"\n",
+    );
+    assert!(stderr.contains("size"), "{stderr}");
+}
+
+#[test]
+fn template_toml_without_an_api_version_is_refused() {
+    let stderr = static_refuses_template_toml("no-api-version", "base_url = \"https://example.com\"\n");
+    assert!(stderr.contains("api_version"), "{stderr}");
+}
+
+#[test]
+fn template_toml_for_another_api_version_is_refused() {
+    let stderr = static_refuses_template_toml("other-api-version", "api_version = 2\n");
+    assert!(stderr.contains("version 2"), "{stderr}");
+}
+
+/// `json_encode` leaves `</script>` as it is, so an edge label containing it
+/// would end the `<script type="application/json">` element a template puts
+/// the edges in; `script_json` writes `<`, `>` and `&` as `\uXXXX`.
+#[test]
+fn script_json_cannot_end_the_script_element_it_sits_in() {
+    let template_dir = unique_dir("template-script-json");
+    write_file(
+        &template_dir.join("index.html.tera"),
+        "<script id=\"d\" type=\"application/json\">{{ site.edges | script_json | safe }}</script>",
+    );
+    let canvas_path = unique_dir("canvas-script-json").join("doc.canvas.md");
+    write_file(
+        &canvas_path,
+        concat!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## A\n<!-- meshfox:node id=\"a\" -->\n\n",
+            "## B\n<!-- meshfox:node id=\"b\" -->\n",
+            "<!-- meshfox:edge from=\"a\" label=\"</script><img src=x onerror=alert(9)> & more\" -->\n",
+        ),
+    );
+    let out_dir = unique_dir("out-script-json");
+
+    let output = meshfox()
+        .args(["static"])
+        .arg(&canvas_path)
+        .arg("--template")
+        .arg(&template_dir)
+        .arg("-o")
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+
+    let index = std::fs::read_to_string(out_dir.join("index.html")).unwrap();
+    assert_eq!(index.matches("</script>").count(), 1, "the element ended early: {index}");
+    assert!(!index.contains("<img"), "{index}");
+    assert!(index.contains("\\u003c/script\\u003e\\u003cimg"), "{index}");
+    // Still the same JSON once a parser has read it.
+    let json = index
+        .split_once("type=\"application/json\">")
+        .and_then(|(_, rest)| rest.split_once("</script>"))
+        .map(|(json, _)| json)
+        .unwrap();
+    let edges: serde_json::Value = serde_json::from_str(json).unwrap();
+    let label = edges
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|e| e["label"].as_str())
+        .unwrap();
+    assert_eq!(label, "</script><img src=x onerror=alert(9)> & more");
+
+    let _ = std::fs::remove_dir_all(&template_dir);
+    let _ = std::fs::remove_dir_all(canvas_path.parent().unwrap());
     let _ = std::fs::remove_dir_all(&out_dir);
 }

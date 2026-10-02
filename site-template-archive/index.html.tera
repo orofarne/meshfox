@@ -16,7 +16,7 @@
 </header>
 <main class="board-wrap"><div class="tree all-svg-edges">{{ macros::node(n=site.root, spatial=false) }}</div></main>
 <footer class="archive-footer">ARCHIVED WITH MESHFOX {{ meshfox_version }}</footer>
-<script id="mesh-edge-data" type="application/json">{{ site.edges | json_encode | safe }}</script>
+<script id="mesh-edge-data" type="application/json">{{ site.edges | script_json | safe }}</script>
 <script src="layout.js" defer></script>
 <script src="edges.js" defer></script>
 </body></html>

@@ -995,6 +995,12 @@ export default function App() {
   // for one of these must not spawn a second reader (see `executeRun`).
   const selfInitiatedRuns = useRef<Set<string>>(new Set());
 
+  // Run ids of the runs this tab started itself (from each stream's own
+  // `"started"` event). `selfInitiatedRuns` only covers a run while its
+  // stream is open, but the `"run-started"` broadcast travels on a different
+  // socket and can arrive after the stream is already over.
+  const ownRunIds = useRef<Set<string>>(new Set());
+
   // Claims `key` (an address, `"<nodeId>::<block>"`) as of *this* call —
   // bumps its generation and returns a checker any later event handler for
   // this same call should gate every state mutation on. Shared by
@@ -1032,6 +1038,10 @@ export default function App() {
     (targetNodeId: string, blockName: string) => {
       const isCurrent = beginAddressWatch(`${targetNodeId}::${blockName}`);
 
+      // What the block showed before this watch claimed it — put back if
+      // the subscription turns out to have nothing to watch (see below).
+      const before = nodesRef.current.find((n) => n.id === targetNodeId)?.data.liveBlocks[blockName];
+      let heardAnything = false;
       patchLiveBlock(targetNodeId, blockName, {
         status: "running",
         text: "",
@@ -1044,6 +1054,7 @@ export default function App() {
       });
       subscribeRun(targetNodeId, blockName, 0, (event) => {
         if (!isCurrent()) return;
+        heardAnything = true;
         if (event.type === "line") {
           appendConsoleLine(targetNodeId, blockName, event);
           setNodes((nds) =>
@@ -1064,6 +1075,24 @@ export default function App() {
             status: event.outcome === "killed" ? "killed" : "done",
             exitCode: event.exitCode,
           });
+        }
+      }).then(() => {
+        // A stream that ended without a single event had no run to watch:
+        // `"run-started"` names a chain's *target*, but a chain that stops
+        // at a failed dependency never starts it, and one this tab ran
+        // itself can already be over by the time the broadcast arrives.
+        // Leaving the optimistic "running" above in place would show that
+        // block as running forever.
+        if (isCurrent() && !heardAnything) {
+          setNodes((nds) =>
+            nds.map((n) => {
+              if (n.id !== targetNodeId) return n;
+              const liveBlocks = { ...n.data.liveBlocks };
+              if (before) liveBlocks[blockName] = before;
+              else delete liveBlocks[blockName];
+              return { ...n, data: { ...n.data, liveBlocks } };
+            }),
+          );
         }
       }).catch(() => {
         // A transient fetch failure here just means this one passive watch
@@ -1164,8 +1193,11 @@ export default function App() {
         load();
       },
       () => setServerGone(true),
-      (nodeId, block) => {
+      (nodeId, block, runId) => {
         if (selfInitiatedRuns.current.has(`${nodeId}::${block}`)) return;
+        // This tab's own run, announced after its stream already ended —
+        // watching it now would claim the block for a run that is over.
+        if (runId !== undefined && ownRunIds.current.has(runId)) return;
         watchAutorunBlock(nodeId, block);
       },
       handleNodeOp,
@@ -1322,6 +1354,7 @@ export default function App() {
           switch (event.type) {
             case "started":
               runId = event.runId;
+              ownRunIds.current.add(event.runId);
               break;
             case "step-start":
               patchLiveBlock(event.nodeId, event.block, {
@@ -1526,11 +1559,16 @@ export default function App() {
         if (run.kind !== "plain") continue;
         if (selfInitiatedRuns.current.has(`${run.nodeId}::${run.block}`)) continue;
         const local = nodesRef.current.find((n) => n.id === run.nodeId)?.data.liveBlocks[run.block];
-        if (run.status === "running") {
-          if (local?.status === "running") continue;
-        } else {
+        // Only a block showing nothing, or a finished run, is adopted from
+        // the server: a block that is running, queued, skipped or blocked
+        // here is part of a chain this tab is running itself. The ledger
+        // claims every step of a chain up front, so it already reports a
+        // queued step as running — adopting that would replace "queued"
+        // with a run that never starts, and a chain that stops at a failed
+        // dependency would never show that step as blocked.
+        if (local && local.status !== "done" && local.status !== "killed") continue;
+        if (run.status !== "running") {
           const status = run.status === "killed" ? "killed" : "done";
-          if (local && local.status !== "done" && local.status !== "killed") continue;
           if (local && local.status === status && local.exitCode === run.exitCode) continue;
         }
         adoptPlainRun(run);

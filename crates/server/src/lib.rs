@@ -2990,6 +2990,12 @@ enum ServerEvent {
     RunStarted {
         node_id: String,
         block: String,
+        /// The chain's own run id — the same one its `RunEvent::Started`
+        /// reports to the client that started it, so that client can
+        /// recognise this broadcast as its own even when it arrives after
+        /// its run stream already ended (a chain that stops at a failing
+        /// dependency finishes within milliseconds).
+        run_id: String,
     },
     /// A node was created, or an existing one's own fields (title/body/
     /// meta/edges/parent) changed — `node.parent` already says where it
@@ -6079,6 +6085,7 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
     // never reaches that point at all (an earlier dependency failing and
     // breaking the loop, say), so an already-waiting subscriber isn't left
     // hanging on a `Running` outcome forever.
+    let run_id = uuid::Uuid::new_v4().to_string();
     let target_reservation = chain.last().map(|target| {
         let reserved = run_registry::reserve(target.node_id.clone(), target.block_name.clone());
         state.runs_registry.lock().unwrap().insert(
@@ -6099,11 +6106,11 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
         state.canvas_events.push(ServerEvent::RunStarted {
             node_id: target.node_id.clone(),
             block: target.block_name.clone(),
+            run_id: run_id.clone(),
         });
         reserved
     });
 
-    let run_id = uuid::Uuid::new_v4().to_string();
     let (kill_tx, mut kill_rx) = oneshot::channel::<()>();
     state.runs.lock().unwrap().insert(run_id.clone(), kill_tx);
 
@@ -13568,6 +13575,93 @@ mod ws_tests {
         let step_end = next_event(&mut ws).await;
         assert_eq!(step_end["type"], "step-end");
         assert_eq!(step_end["exitCode"], 0);
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    /// `run_tty_chain`'s counterpart of `run_block_ws_tests`'s
+    /// `persisting_run_output_keeps_edits_made_while_the_block_was_running`:
+    /// a `tty` block can't be `cache`d itself, but a `cache`d dependency of
+    /// it is written back after the chain, and that write-back must be
+    /// re-applied to the file as it is *then*, not replace the document
+    /// with the copy the chain started from.
+    #[tokio::test]
+    async fn a_tty_chains_persisted_dep_output_keeps_edits_made_meanwhile() {
+        let canvas_path = write_test_canvas(concat!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## A\n<!-- meshfox:node id=\"a\" -->\n\n",
+            "```bash name=\"slow\" cache\nsleep 1; echo finished\n```\n\n",
+            "```bash name=\"go\" deps=\"slow\" tty\necho ready\n```\n\n",
+            "## B\n<!-- meshfox:node id=\"b\" -->\n\nbody b\n",
+        ));
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let url = format!("ws://{addr}/api/run/tty?path=a&block=go&cols=80&rows=24&persist=true");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("connect");
+        let run = tokio::spawn(async move {
+            let mut events = Vec::new();
+            // The server drops the socket after `done` without a closing
+            // handshake, so an error ends the stream like a close does.
+            while let Some(Ok(msg)) = ws.next().await {
+                match msg {
+                    WsMessage::Text(t) => {
+                        events.push(serde_json::from_str::<serde_json::Value>(&t).expect("event"))
+                    }
+                    WsMessage::Close(_) => break,
+                    _ => continue,
+                }
+            }
+            events
+        });
+
+        // Well inside the dependency's `sleep 1`.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = reqwest::Client::new();
+        let canvas: serde_json::Value = serde_json::from_str(
+            &client
+                .get(format!("http://{addr}/api/canvas"))
+                .send()
+                .await
+                .expect("get canvas")
+                .text()
+                .await
+                .expect("canvas body"),
+        )
+        .expect("canvas json");
+        let base_rev = canvas["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["id"] == "b")
+            .and_then(|n| n["bodyRev"].as_str())
+            .expect("every node carries its bodyRev")
+            .to_string();
+        let response = client
+            .patch(format!("http://{addr}/api/nodes/b"))
+            .header("content-type", "application/json")
+            .body(serde_json::json!({"text": "b edited during the chain", "baseRev": base_rev}).to_string())
+            .send()
+            .await
+            .expect("patch request");
+        assert!(response.status().is_success(), "{}", response.status());
+
+        let events = run.await.unwrap();
+        assert!(
+            events.iter().any(|e| e["type"] == "done"),
+            "chain did not finish: {events:?}"
+        );
+
+        let on_disk = std::fs::read_to_string(&canvas_path).unwrap();
+        assert!(
+            on_disk.contains("<!-- meshfox:output name=\"slow\""),
+            "the dependency's output was not written back:\n{on_disk}"
+        );
+        assert!(
+            on_disk.contains("b edited during the chain"),
+            "the tty chain's write-back dropped the edit made meanwhile:\n{on_disk}"
+        );
 
         let _ = std::fs::remove_file(&canvas_path);
     }

@@ -52,6 +52,7 @@ mod tests {
         log.push(ServerEvent::RunStarted {
             node_id: "n".into(),
             block: "b".into(),
+            run_id: "r".into(),
         });
 
         let (backlog, _rx, gap) = log.subscribe_from(0);

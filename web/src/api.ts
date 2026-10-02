@@ -1368,7 +1368,7 @@ export function watchChanges(
    * doesn't need this; it's for every *other* open tab on the same
    * document. Optional — a caller that doesn't care about autorun-
    * triggered runs elsewhere just omits it. */
-  onRunStarted?: (nodeId: string, block: string) => void,
+  onRunStarted?: (nodeId: string, block: string, runId?: string) => void,
   /** See `NodeOpEvent`'s own doc comment. Optional — a caller that skips
    * this just falls back to `onChanged`'s full reload for these too (see
    * below), same graceful degradation the server's own `ServerEvent` doc
@@ -1428,6 +1428,7 @@ export function watchChanges(
           seq?: number;
           nodeId?: string;
           block?: string;
+          runId?: string;
           resync?: boolean;
           node?: CanvasNode;
           keepChildren?: boolean;
@@ -1443,7 +1444,7 @@ export function watchChanges(
         } else if (event.type === "runs-changed") {
           onRunsChanged?.();
         } else if (event.type === "run-started" && event.nodeId !== undefined && event.block !== undefined) {
-          onRunStarted?.(event.nodeId, event.block);
+          onRunStarted?.(event.nodeId, event.block, event.runId);
         } else if (event.type === "node-upserted" && event.node !== undefined) {
           if (onNodeOp) onNodeOp({ type: "node-upserted", node: event.node });
           else onChanged();

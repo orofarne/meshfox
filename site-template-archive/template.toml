@@ -1,3 +1,5 @@
+# See site-template/template.toml for what each key means, and TEMPLATES.md.
+api_version = 1
 base_url = "https://meshfox.orofarne.net"
 links_base_url = "https://github.com/orofarne/meshfox/blob/main/"
 

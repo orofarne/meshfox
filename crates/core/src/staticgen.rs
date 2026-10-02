@@ -105,11 +105,11 @@ pub struct NodeView {
     /// `parent` links — not the same as `level` above, which is only the
     /// Markdown heading level and can diverge from tree depth (an explicit
     /// `parent=` attribute can reparent a node past the heading ceiling; see
-    /// `mdcanvas`'s `insert_child_node_past_heading_ceiling*` tests). Lets
-    /// the template/JS tell "root or its direct children" (depth ≤1, plain
-    /// CSS nesting, no repositioning) apart from "real rightward branching"
-    /// (depth ≥2, measured and repositioned by JS) — see the module doc
-    /// comment.
+    /// `mdcanvas`'s `insert_child_node_past_heading_ceiling*` tests). Lets a
+    /// template treat the root and its direct children (depth ≤1) differently
+    /// from deeper nodes — `site-template/` stacks the former in one column
+    /// and branches the latter to the right (see the module doc comment);
+    /// `site-template-archive/` only exposes it as a `data-depth` attribute.
     pub depth: u32,
     /// `"text"` | `"file"` | `"link"` | `"group"` | `"include"` — see
     /// `NodeType::as_str`. In practice `"include"` never appears in a
@@ -537,7 +537,7 @@ fn build_node_view(
         position,
         authored_position,
         spatial_children,
-        color: crate::tag_colors::effective_color(node, ctx.tag_colors).map(str::to_string),
+        color: crate::tag_colors::effective_color(node, ctx.tag_colors).map(css_color),
         tags: node.tags.clone(),
         html_body,
         target,
@@ -604,6 +604,24 @@ fn resolve_default_fold(
     (folded, foldable)
 }
 
+/// A node/edge `color` as something CSS accepts: one of the six numbered
+/// presets (`1` red … `6` purple, see `AGENT_HELP.md`) becomes the hex value
+/// the web UI's swatch picker uses for it (`resolveNodeColor` in
+/// `web/src/MeshNode.tsx`); anything else is a literal color and passes
+/// through unchanged.
+fn css_color(color: &str) -> String {
+    match color {
+        "1" => "#c22b2b",
+        "2" => "#d9822b",
+        "3" => "#d9c02b",
+        "4" => "#3d9e4f",
+        "5" => "#3d6ef5",
+        "6" => "#a05dd1",
+        other => other,
+    }
+    .to_string()
+}
+
 /// Every structural and `meshfox:edge` connection.
 fn build_edges(canvas: &Canvas) -> Vec<EdgeView> {
     let mut edges = Vec::new();
@@ -633,7 +651,7 @@ fn build_edges(canvas: &Canvas) -> Vec<EdgeView> {
                 to: node.id.clone(),
                 kind: "extra",
                 label: extra.label.clone(),
-                color: extra.color.clone(),
+                color: extra.color.as_deref().map(css_color),
                 label_at: extra.label_at,
                 source_side: extra.source_side.map(|side| side.as_str()),
                 target_side: extra.target_side.map(|side| side.as_str()),
@@ -1058,6 +1076,37 @@ fn dest_rel_for(
     (resolved.to_string_lossy().replace('\\', "/"), None)
 }
 
+/// Whether a Markdown link/image URL may reach the output at all — the
+/// same rule the web UI applies through `react-markdown`'s
+/// `defaultUrlTransform` (and its own `allowDataImageUrls` for images): a
+/// URL with a scheme must be `http(s)`, `irc(s)`, `mailto` or `xmpp`;
+/// anything without one (relative, `/root`, `#anchor`, `?query`) is fine,
+/// and an image alone may also be a `data:image/...` URI (a pasted image).
+/// Anything else (`javascript:`, `vbscript:`, `data:text/html`, ...) is
+/// replaced by an empty URL, so a canvas cannot smuggle a script into the
+/// exported page through a link.
+fn url_allowed(url: &str, is_image: bool) -> bool {
+    if is_image && url.starts_with("data:image/") {
+        return true;
+    }
+    // Same scheme detection as `react-markdown`: a colon only starts a
+    // scheme if no `/`, `?` or `#` comes before it.
+    let Some(colon) = url.find(':') else {
+        return true;
+    };
+    if [url.find('/'), url.find('?'), url.find('#')]
+        .into_iter()
+        .flatten()
+        .any(|i| colon > i)
+    {
+        return true;
+    }
+    matches!(
+        url[..colon].to_ascii_lowercase().as_str(),
+        "http" | "https" | "irc" | "ircs" | "mailto" | "xmpp"
+    )
+}
+
 /// True for anything this module leaves untouched no matter what: an
 /// in-page anchor, a URL with a scheme (`https://`, `mailto:`, `data:`,
 /// ...), or a root-absolute path (ambiguous once site root and repo root
@@ -1088,6 +1137,9 @@ fn resolve_image_url(
     ctx: &RenderCtx,
     assets: &mut Vec<Asset>,
 ) -> String {
+    if !url_allowed(url, true) {
+        return String::new();
+    }
     if is_external_or_absolute(url) {
         return url.to_string();
     }
@@ -1126,6 +1178,9 @@ fn resolve_image_url(
 /// it's prefixed with it. Never copies anything — see the module doc
 /// comment for why plain links get this lighter treatment than images.
 fn resolve_link_url(url: &str, ctx: &RenderCtx) -> String {
+    if !url_allowed(url, false) {
+        return String::new();
+    }
     if is_external_or_absolute(url) {
         return url.to_string();
     }
@@ -1493,7 +1548,7 @@ mod tests {
             "## Child\n<!-- meshfox:node id=\"child\" tags=\"untagged,bug\" -->\n\nbody\n",
         ));
         let site = build_site(&c);
-        assert_eq!(site.find("child").unwrap().color.as_deref(), Some("1"));
+        assert_eq!(site.find("child").unwrap().color.as_deref(), Some("#c22b2b"));
     }
 
     #[test]
@@ -1504,7 +1559,7 @@ mod tests {
             "## Child\n<!-- meshfox:node id=\"child\" color=\"3\" tags=\"bug\" -->\n\nbody\n",
         ));
         let site = build_site(&c);
-        assert_eq!(site.find("child").unwrap().color.as_deref(), Some("3"));
+        assert_eq!(site.find("child").unwrap().color.as_deref(), Some("#d9c02b"));
     }
 
     // TODO.canvas.md: "Base64 image" — a `data:` image `src` must pass
@@ -1544,6 +1599,59 @@ mod tests {
         assert!(!body.contains("<div"), "{body}");
         assert!(body.contains("before"), "{body}");
         assert!(body.contains("after"), "{body}");
+    }
+
+    // Same posture as the raw-HTML test above, for URLs: the web UI's
+    // `react-markdown` (`defaultUrlTransform`) blanks a link whose scheme
+    // isn't http(s)/irc(s)/mailto/xmpp, so `javascript:`/`data:text/html`
+    // must not survive into the exported page either — with or without a
+    // `links_base_url` to (mis)prefix them with.
+    #[test]
+    fn links_with_a_script_capable_scheme_are_blanked() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "[a](javascript:alert(1)) [b](JaVaScript:alert(2)) [c](data:text/html,x) ",
+            "[d](vbscript:x) [ok](https://example.com) [mail](mailto:a@b.c) ",
+            "[rel](foo.md) [anchor](#top) [root](/x?a:b)\n",
+        ));
+        let site = build_site(&c);
+        let body = &site.find("root").unwrap().html_body;
+        for bad in ["javascript:", "JaVaScript:", "data:text/html", "vbscript:"] {
+            assert!(!body.contains(bad), "{bad} survived: {body}");
+        }
+        for good in [
+            "href=\"https://example.com\"",
+            "href=\"mailto:a@b.c\"",
+            "href=\"foo.md\"",
+            "href=\"#top\"",
+            "href=\"/x?a:b\"",
+        ] {
+            assert!(body.contains(good), "{good} missing: {body}");
+        }
+    }
+
+    #[test]
+    fn numbered_color_presets_become_css_colors_for_nodes_and_edges() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" color=\"4\" -->\n\n",
+            "## A\n<!-- meshfox:node id=\"a\" color=\"#123456\" -->\n\n",
+            "## B\n<!-- meshfox:node id=\"b\" -->\n",
+            "<!-- meshfox:edge from=\"a\" color=\"1\" -->\n",
+        ));
+        let site = build_site(&c);
+        assert_eq!(site.find("root").unwrap().color.as_deref(), Some("#3d9e4f"));
+        assert_eq!(site.find("a").unwrap().color.as_deref(), Some("#123456"));
+        let extra = site.edges.iter().find(|e| e.kind == "extra").unwrap();
+        assert_eq!(extra.color.as_deref(), Some("#c22b2b"));
+    }
+
+    #[test]
+    fn only_an_image_may_be_a_data_image_uri() {
+        assert!(url_allowed("data:image/png;base64,AAAA", true));
+        assert!(!url_allowed("data:image/png;base64,AAAA", false));
+        assert!(!url_allowed("data:text/html,x", true));
+        assert!(!url_allowed("javascript:alert(1)", true));
+        assert!(url_allowed("pics/a.png", true));
     }
 
     // Raw-HTML filtering (above) must only touch what the parser itself

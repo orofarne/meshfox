@@ -1,6 +1,11 @@
 # This template's own config — read by `meshfox static` from this exact
 # path (`--template`'s own directory + "template.toml"), never rendered or
-# copied into --out itself. Both keys are optional; see `meshfox static -h`.
+# copied into --out itself. See TEMPLATES.md for every key.
+
+# Which version of the template API this template was written against
+# (TEMPLATES.md). Required in any template.toml; `meshfox static` refuses a
+# template for a different version instead of rendering it wrongly.
+api_version = 1
 
 # This export's own canonical, absolute URL — required by `--sitemap`
 # (sitemap.xml's own <loc> prefix), and distinct from links_base_url below

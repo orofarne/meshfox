@@ -186,7 +186,15 @@ fn run_stays_attached_streams_output_and_ctrl_c_stops_the_service() {
         None,
         "should exit normally with code 130, not be killed by a signal itself"
     );
-    assert_eq!(status.code(), Some(130));
+    if status.code() != Some(130) {
+        let mut rest = String::new();
+        let _ = reader.read_to_string(&mut rest);
+        let mut err = String::new();
+        if let Some(mut e) = child.stderr.take() {
+            let _ = e.read_to_string(&mut err);
+        }
+        panic!("exit {:?}\n--stdout after banner--\n{rest}\n--stderr--\n{err}", status.code());
+    }
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut still_alive = is_alive(service_pid);
