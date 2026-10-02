@@ -629,6 +629,28 @@ pub async fn get_canvas_raw(port: u16) -> Result<String, String> {
     res.text().await.map_err(|e| e.to_string())
 }
 
+/// `GET /api/info` — whether the worker serves this canvas read-only (the
+/// canvas or its directory isn't writable): blocks run, edits are refused.
+/// Best-effort: a worker that can't be asked (or an older one without the
+/// endpoint) is taken to be editable, and its own refusal says otherwise.
+pub async fn is_read_only(port: u16) -> bool {
+    let Ok(res) = client()
+        .get(format!("{}/api/info", base_url(port)))
+        .timeout(time_limit(QUICK))
+        .send()
+        .await
+    else {
+        return false;
+    };
+    if !res.status().is_success() {
+        return false;
+    }
+    res.json::<serde_json::Value>()
+        .await
+        .map(|v| v["readOnly"] == true)
+        .unwrap_or(false)
+}
+
 /// Why a whole-file `PUT /api/canvas/raw` wrote nothing.
 pub enum PutRawError {
     /// The file changed since `base_rev` was read (`412`): its current

@@ -889,6 +889,49 @@ alive or not.
 process, with the exact parameters it was last started with — it never
 touches, reruns, or even looks at anything that depends on it.
 
+## Read-only canvases
+
+A canvas whose file, or the directory its `.meshfox/` state would live
+in, can't be written — a read-only mount, a checkout owned by another
+user, a container image — is served **read-only**. Blocks still run;
+nothing is ever written to disk on its behalf.
+
+**How it's decided**: when a worker takes the per-file lock
+(`worker_lock::try_acquire`), the attempt itself is the probe. The canvas
+is read-only if the file refuses a write-open, or if `.meshfox/` can't be
+created or the lock file can't be opened in it (`EACCES`/`EPERM`/
+`EROFS`). Any other failure — a full disk, an I/O error — is a real
+error, not a read-only canvas. The verdict is fixed for the worker's
+lifetime.
+
+**What changes**:
+
+- **No lock, no port file.** A read-only worker holds no `flock` and isn't
+  discoverable; any number of them may serve the same canvas side by side
+  (every `meshfox run`, `view` or MCP session starts its own).
+- **State lives in memory only.** The session database (undo history, run
+  ledger, run history, freshness) and the variable cache are in-memory for
+  the worker's lifetime. An existing `.meshfox/<file>.env` is still *read*,
+  but an answer is never written back, so it's asked for again next time.
+- **Nothing is persisted into the file.** A `cache`d block's output stays
+  in the session; the run itself is not an error.
+- **The one disk exception**: a `python_venv` block's venv lives in an
+  owner-only directory under the system temp dir
+  (`meshfox-readonly-<hash of the canvas path>/<file>.venv`), reused across
+  runs and cleaned up by the system, instead of `.meshfox/<file>.venv`.
+- **Config is still read** — `<canvas_root>/.meshfox/config.toml` and
+  `syntax/` are read-only inputs, as is the global `~/.meshfox/`.
+- **Edits are refused.** The worker answers every request that would
+  change the file — node and canvas edits, `PUT /api/canvas*`,
+  `PUT /api/options`, undo/redo/history jumps — with `403` and a message
+  saying why (and `write_raw`, the single place that writes the file,
+  refuses as well). `GET /api/info` reports `{"readOnly": true}`.
+  `meshfox node ...`, `undo`/`redo` and the MCP `node_*` tools surface that
+  message; `run`, `check`, `validate`, `node show`/`find` work as usual.
+- **Clients**: the browser UI shows its `read-only` badge with no `Edit`
+  button; the TUI's `e` (source editor) and `H` (history) only report why
+  they're unavailable.
+
 ## Variables
 
 Document-scoped configuration values a canvas wants from whoever runs

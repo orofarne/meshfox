@@ -2176,6 +2176,7 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         "e               edit this node's own file, full-screen (Ctrl-s save,",
         "                Ctrl-f switch file, Ctrl-n heading->node, Ctrl-p",
         "                suggest attributes/tags, mouse click/drag/scroll, esc close)",
+        "                (unavailable on a read-only canvas, like H below)",
         "i               (Document focus) open/focus this node's own form —",
         "                tab/down next field, shift-tab/up previous, left/right",
         "                toggle a bool or cycle a select, enter submits the whole",

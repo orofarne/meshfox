@@ -87,6 +87,15 @@ impl VarCache {
         })
     }
 
+    /// Like [`VarCache::load`], for a canvas that can't be written: whatever
+    /// an earlier session left in its cache file is still read, but nothing
+    /// is ever written back — an answer lives for this process only.
+    pub fn load_read_only(canvas_path: &Path) -> io::Result<VarCache> {
+        let mut cache = VarCache::load(canvas_path)?;
+        cache.path = None;
+        Ok(cache)
+    }
+
     /// A cache backed by nothing on disk — for tests.
     pub fn in_memory() -> VarCache {
         VarCache {

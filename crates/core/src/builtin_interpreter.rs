@@ -128,7 +128,9 @@ pub fn resolve_with_env(
 
 /// `.meshfox/<canvas filename>.venv` next to the canvas file — same
 /// colocation convention `crate::varcache::cache_path` already uses for
-/// `<filename>.env`, just a directory instead of a dotenv file. See
+/// `<filename>.env`, just a directory instead of a dotenv file. For a canvas
+/// that can't be written, a scratch directory under the system temp dir
+/// instead (see `read_only_venv_dir`). See
 /// `resolve_with_env`'s own doc comment for why this is keyed by the
 /// canvas's own path rather than shared per-directory.
 ///
@@ -156,7 +158,29 @@ fn venv_dir(canvas_path: &Path) -> PathBuf {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
+    if crate::worker_lock::is_read_only(&absolute) {
+        return read_only_venv_dir(&absolute, &file_name);
+    }
     dir.join(".meshfox").join(format!("{file_name}.venv"))
+}
+
+/// Where the venv of a canvas that can't be written lives instead:
+/// `<system temp>/meshfox-readonly-<hash of the canvas path>/<filename>.venv`,
+/// owner-only, so it's reused across runs but never needs the canvas's own
+/// directory — and the system cleans it up, rather than meshfox leaving state
+/// behind for canvases that are long gone. Keyed by the full path, since
+/// unlike the colocated venv nothing here separates two canvases that happen
+/// to share a file name.
+fn read_only_venv_dir(absolute: &Path, file_name: &str) -> PathBuf {
+    use std::os::unix::fs::DirBuilderExt;
+    let key = fnv1a(absolute.to_string_lossy().as_bytes());
+    let root = std::env::temp_dir().join(format!("meshfox-readonly-{key:08x}"));
+    // Best-effort: if this fails, the script's own `mkdir -p` reports it.
+    let _ = std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&root);
+    root.join(format!("{file_name}.venv"))
 }
 
 /// True if `name` (without the `@`, e.g. `"agent"`) is a known builtin —
@@ -428,5 +452,33 @@ mod tests {
             String::from_utf8_lossy(&unsupported.stderr).contains("expected a text or toml block")
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_read_only_canvas_gets_its_venv_under_the_system_temp_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: `geteuid` takes no arguments and can't fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("meshfox-ro-venv-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let canvas = dir.join("doc.canvas.md");
+        std::fs::write(&canvas, "# Doc\n").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let venv = venv_dir(&canvas);
+        assert!(venv.starts_with(std::env::temp_dir()), "unexpected venv dir: {venv:?}");
+        assert!(!venv.starts_with(&dir), "venv must not be inside the read-only directory");
+        assert!(venv.ends_with("doc.canvas.md.venv"));
+        // Stable: the same canvas always maps to the same place.
+        assert_eq!(venv, venv_dir(&canvas));
+        assert!(!dir.join(".meshfox").exists());
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        if let Some(root) = venv.parent() {
+            std::fs::remove_dir_all(root).ok();
+        }
     }
 }

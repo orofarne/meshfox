@@ -55,3 +55,11 @@ pub fn open(canvas_path: &Path) -> io::Result<Arc<Mutex<Connection>>> {
     let conn = Connection::open(path).map_err(sqlite_err)?;
     Ok(Arc::new(Mutex::new(conn)))
 }
+
+/// The connection for a canvas served read-only: an in-memory database, so
+/// undo history and the run ledger work for as long as the worker lives and
+/// nothing is written next to the canvas (or anywhere else).
+pub fn open_in_memory() -> io::Result<Arc<Mutex<Connection>>> {
+    let conn = Connection::open_in_memory().map_err(sqlite_err)?;
+    Ok(Arc::new(Mutex::new(conn)))
+}

@@ -550,6 +550,10 @@ pub struct App {
     /// The canvas worker's port. Production startup requires `Some`;
     /// `None` is used only by local TUI unit tests.
     pub worker_port: Option<u16>,
+    /// The worker serves this canvas read-only (it or its directory isn't
+    /// writable): `e` and `H` — the two ways in that change the file — are
+    /// unavailable. Blocks still run. Fixed for the session.
+    pub read_only: bool,
     /// Set only while a `VarFormState` opened by `start_run_via_worker` is
     /// waiting on an answer — see `PendingHttpRun`'s own doc comment.
     pub pending_http_run: Option<PendingHttpRun>,
@@ -969,6 +973,9 @@ pub(super) fn var_form_from_statuses_for_test(
 const SOURCE_CHANGED_ELSEWHERE: &str =
     "the file changed since you opened it — Ctrl-s again overwrites it, Esc discards your edits";
 
+/// What `e`/`H` say on a canvas served read-only — see `App::read_only`.
+const READ_ONLY_STATUS: &str = "read-only canvas (it or its directory isn't writable) — blocks run, nothing is saved";
+
 impl App {
     /// Loads the primary canvas from its worker. A failed request is a
     /// startup error; unit tests may pass `None` to exercise local UI code.
@@ -1018,6 +1025,10 @@ impl App {
         let syntax_root = crate::canvas_root_dir(&canvas_path).to_path_buf();
         let editor_theme = crate::syntax_registry::resolve_editor_theme(&syntax_root);
 
+        let read_only = match worker_port {
+            Some(port) => crate::worker_client::is_read_only(port).await,
+            None => false,
+        };
         let mut app = App {
             canvas_path,
             raw,
@@ -1051,6 +1062,7 @@ impl App {
             editor_theme,
             picker,
             worker_port,
+            read_only,
             pending_http_run: None,
             run: None,
             file_run: None,
@@ -1070,7 +1082,11 @@ impl App {
             pending_child_canvas: None,
             block_picker: None,
             var_form: None,
-            status: String::new(),
+            status: if read_only {
+                READ_ONLY_STATUS.into()
+            } else {
+                String::new()
+            },
             show_help: false,
             help_scroll: 0,
             should_quit: false,
@@ -2548,6 +2564,10 @@ impl App {
     /// straight into this node's body, so there's no node-specific cursor
     /// position to jump to; just opens that file at the top.
     fn open_source_editor(&mut self) {
+        if self.read_only {
+            self.status = READ_ONLY_STATUS.into();
+            return;
+        }
         let Some(row) = self.rows.get(self.selected) else {
             return;
         };
@@ -4565,6 +4585,10 @@ impl App {
     /// about (`GET /api/history`), newest first, with the current cursor
     /// preselected. Worker-only, like `t`: the log lives in the worker.
     async fn open_history_view(&mut self) {
+        if self.read_only {
+            self.status = READ_ONLY_STATUS.into();
+            return;
+        }
         let Some(port) = self.worker_port else {
             self.status = "history needs a worker — none reachable".into();
             return;
@@ -5644,6 +5668,39 @@ mod tests {
             let _ = tx.send(request.lines().next().unwrap_or_default().to_string());
         });
         (port, rx)
+    }
+
+    // On a canvas served read-only, `e` (the source editor) and `H` (history
+    // jumps) — the two ways into the file from the TUI — do nothing but say
+    // why, so a write that can only be refused is never started.
+    #[tokio::test]
+    async fn a_read_only_canvas_opens_neither_the_source_editor_nor_the_history_view() {
+        let dir = std::env::temp_dir().join(format!("meshfox-tui-read-only-test-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.md");
+        std::fs::write(
+            &path,
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
+        )
+        .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(path, tx, None, None).await.unwrap();
+        app.read_only = true;
+
+        app.on_key(key(KeyCode::Char('e'))).await;
+        assert!(app.source_editor.is_none());
+        assert!(app.status.contains("read-only"), "status: {}", app.status);
+
+        app.status.clear();
+        app.on_key(key(KeyCode::Char('H'))).await;
+        assert!(app.history_view.is_none());
+        assert!(app.status.contains("read-only"), "status: {}", app.status);
+
+        // Writable, `e` opens the editor — the guard is the read-only flag, not the key.
+        app.read_only = false;
+        app.on_key(key(KeyCode::Char('e'))).await;
+        assert!(app.source_editor.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // The bug this guards: `S` in a worker-routed TUI only cleared the TUI's

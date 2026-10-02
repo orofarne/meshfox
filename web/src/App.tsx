@@ -16,6 +16,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import {
   fetchCanvas,
+  fetchReadOnly,
   saveLayout,
   runBlockStream,
   runFileStream,
@@ -377,6 +378,15 @@ export default function App() {
   // Opening a canvas shouldn't be one click away from running its bash
   // blocks — read-only until the user explicitly opts in.
   const [editMode, setEditMode] = useState(false);
+  // The worker serves this canvas read-only for good (it or its directory
+  // isn't writable) — as opposed to `!editMode`, which is only "not yet
+  // clicked Edit". Hides the Edit button; the worker refuses edits anyway.
+  const [workerReadOnly, setWorkerReadOnly] = useState(false);
+  useEffect(() => {
+    fetchReadOnly()
+      .then(setWorkerReadOnly)
+      .catch(() => setWorkerReadOnly(false));
+  }, []);
   // True while the toolbar's "Source" toggle has swapped the graph view for
   // CanvasSourceEditor's raw-Markdown editor — edit-mode-only, see the
   // effect below that clears it if editMode itself turns off.
@@ -3638,8 +3648,17 @@ export default function App() {
           </>
         ) : (
           <>
-            <span className="mode-badge">read-only</span>
-            <button onClick={() => setEditMode(true)}>Edit</button>
+            <span
+              className="mode-badge"
+              title={
+                workerReadOnly
+                  ? "This canvas or its directory isn't writable — blocks run, but nothing is saved"
+                  : undefined
+              }
+            >
+              read-only
+            </span>
+            {!workerReadOnly && <button onClick={() => setEditMode(true)}>Edit</button>}
           </>
         )}
         {hasConfigurableVars && (

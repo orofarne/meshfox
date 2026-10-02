@@ -312,6 +312,8 @@ A run counts as *stale* — kept in the history, flagged as such, never shown as
 
 A run that was still in flight when the core died leaves no saved output, same as it leaves no process.
 
+**Read-only canvases.** If the canvas file, or the directory its `.meshfox/` state would go in, can't be written (a read-only mount, someone else's checkout, a container image), meshfox serves it read-only instead of failing: blocks run, and nothing is written to disk. No lock file is taken (several workers can serve the same canvas side by side), the session database and variable answers live in memory only, a `cache`d block's output isn't written into the file, and edits — from the browser, TUI, CLI or MCP — are refused with a message saying why. The browser UI hides `Edit`; the TUI's `e` and `H` are unavailable. The local `.meshfox/config.toml` is still read, and a `python_venv` block's venv goes under the system temp dir. See SPEC.md's "Read-only canvases".
+
 ## Usage
 <!-- meshfox:node id="usage" -->
 

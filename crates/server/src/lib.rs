@@ -119,6 +119,13 @@ pub fn find_web_asset(prefix: &str, suffix: &str) -> Option<Vec<u8>> {
 
 struct AppState {
     canvas_path: PathBuf,
+    /// The canvas (or the directory its state would live in) can't be
+    /// written, so this worker serves it read-only: running blocks works,
+    /// but nothing is ever written to the canvas file, and its session state
+    /// (history, run ledger, variables) lives in memory only. Decided once,
+    /// when the worker takes its lock (`worker_lock::try_acquire`); every
+    /// write to the file goes through `write_raw`, which refuses.
+    read_only: bool,
     raw: Mutex<String>,
     /// Serialises every read-modify-write of the canvas file: a mutating
     /// handler takes this (via `begin_mutation`) before it first reads
@@ -314,6 +321,9 @@ impl AppState {
     /// very redo tail an undo just made reachable) for what's actually a
     /// cursor move, not a new edit.
     fn write_raw(&self, raw: &str) -> std::io::Result<()> {
+        if self.read_only {
+            return Err(read_only_error(&self.canvas_path));
+        }
         std::fs::write(&self.canvas_path, raw)?;
         *self.raw.lock().unwrap() = raw.to_string();
         Ok(())
@@ -927,7 +937,22 @@ fn undo_redo_response(
 }
 
 fn io_err(e: std::io::Error) -> ApiError {
+    if e.kind() == std::io::ErrorKind::ReadOnlyFilesystem {
+        return ApiError(StatusCode::FORBIDDEN, e.to_string());
+    }
     ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+}
+
+/// What a write to a canvas served read-only fails with — and what the
+/// clients show: the canvas isn't editable here, running it is.
+fn read_only_error(canvas_path: &std::path::Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::ReadOnlyFilesystem,
+        format!(
+            "{} is read-only (it or its directory isn't writable): it can be run but not edited",
+            canvas_path.display()
+        ),
+    )
 }
 
 /// The one place that actually moves `undo_log`'s own cursor and writes
@@ -1839,6 +1864,47 @@ async fn api_ping() -> &'static str {
     "pong"
 }
 
+/// `GET /api/info` — what a client needs to know about this worker's canvas
+/// before it offers anything: today only whether it's read-only (see
+/// `AppState::read_only`), so the web UI can hide Edit and the TUI/MCP can
+/// say why an edit is refused. Fixed for the worker's whole lifetime.
+async fn api_info(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "readOnly": state.read_only }))
+}
+
+/// Whether `method path` changes the canvas file — the requests a read-only
+/// worker refuses. Running blocks, variables, services and the other POSTs
+/// that never touch the document stay allowed. `write_raw` refuses too, so
+/// a route missing from this list still can't write; this is what turns that
+/// into a clear `403` before the handler does any work.
+fn edits_canvas(method: &axum::http::Method, path: &str) -> bool {
+    use axum::http::Method;
+    if method == Method::PUT || method == Method::PATCH || method == Method::DELETE {
+        return true;
+    }
+    if method != Method::POST {
+        return false;
+    }
+    if path.starts_with("/api/nodes") {
+        return !(path.ends_with("/open") || path.ends_with("/open-folder"));
+    }
+    path.starts_with("/api/canvas/")
+        || matches!(path, "/api/undo" | "/api/redo" | "/api/history/goto")
+}
+
+/// Refuses every request for which [`edits_canvas`] holds, with `403`, when
+/// the worker serves its canvas read-only.
+async fn deny_edits_when_read_only(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if state.read_only && edits_canvas(req.method(), req.uri().path()) {
+        return io_err(read_only_error(&state.canvas_path)).into_response();
+    }
+    next.run(req).await
+}
+
 /// Records that *some* `/api/*` request just happened — an
 /// `axum::middleware` layered onto every explicitly-declared route (via
 /// `Router::route_layer`, so it never wraps the static-asset `fallback`)
@@ -2030,7 +2096,9 @@ struct PendingOutput {
 /// editor) made in the meantime. A node that was deleted or renamed during
 /// the run, or whose block no longer exists, is simply skipped.
 async fn persist_run_outputs(state: &AppState, pending: &[PendingOutput]) -> Result<(), String> {
-    if pending.is_empty() {
+    // A read-only canvas keeps a `cache`d block's output in the session only —
+    // there's no file to write it into, and that's not an error of the run.
+    if pending.is_empty() || state.read_only {
         return Ok(());
     }
     let _guard = state.begin_mutation().await;
@@ -9554,10 +9622,23 @@ async fn get_link_preview(
 /// closed — see `TabGuard`). `port` of `0` asks the OS to assign a free
 /// port instead — the actual bound port is read back from the listener
 /// below.
+#[cfg(test)]
 async fn build_state(
     canvas_path: PathBuf,
     auto_exit: bool,
     watcher_socket: Option<PathBuf>,
+) -> std::io::Result<Arc<AppState>> {
+    build_state_with(canvas_path, auto_exit, watcher_socket, false).await
+}
+
+/// `build_state`, for a canvas that is `read_only` (see `AppState::read_only`)
+/// or not. A read-only canvas gets its session database and variable cache
+/// in memory: nothing is written next to the canvas, or anywhere else.
+async fn build_state_with(
+    canvas_path: PathBuf,
+    auto_exit: bool,
+    watcher_socket: Option<PathBuf>,
+    read_only: bool,
 ) -> std::io::Result<Arc<AppState>> {
     let raw = std::fs::read_to_string(&canvas_path)?;
     if let Err(e) = Canvas::from_markdown(&raw) {
@@ -9567,12 +9648,20 @@ async fn build_state(
         ));
     }
 
-    let vars_cache = VarCache::load(&canvas_path)?;
+    let vars_cache = if read_only {
+        VarCache::load_read_only(&canvas_path)?
+    } else {
+        VarCache::load(&canvas_path)?
+    };
 
     // One shared connection for both session-database modules below — see
     // `session_db`'s own module doc comment for why this isn't two
     // independent `Connection::open` calls against the same file.
-    let session_conn = session_db::open(&canvas_path)?;
+    let session_conn = if read_only {
+        session_db::open_in_memory()?
+    } else {
+        session_db::open(&canvas_path)?
+    };
 
     // Detect a file that changed while nothing was tracking it — another
     // process's own worker, a text editor, or a worker-less CLI invocation
@@ -9652,6 +9741,7 @@ async fn build_state(
 
     let state = Arc::new(AppState {
         canvas_path,
+        read_only,
         raw: Mutex::new(raw),
         mutation_lock: tokio::sync::Mutex::new(()),
         runs: Mutex::new(HashMap::new()),
@@ -9736,6 +9826,7 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/debug/send", post(debug_send))
         .route("/api/debug/stop", post(debug_stop))
         .route("/api/session/reset", post(reset_session))
+        .route("/api/info", get(api_info))
         .route("/api/watch", get(watch_changes))
         .route("/api/include-asset", get(get_include_asset))
         .route("/api/syntax", get(get_syntax_list))
@@ -9746,6 +9837,10 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             touch_api_activity,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            deny_edits_when_read_only,
         ))
         // Declared *after* the layer above on purpose: a health check is not
         // use. If it counted as API activity, a client probing a worker every
@@ -9863,7 +9958,19 @@ pub async fn serve_as_worker(
     mut lock_guard: worker_lock::LockGuard,
     ready_tx: Option<tokio::sync::oneshot::Sender<u16>>,
 ) -> std::io::Result<()> {
-    let state = build_state(canvas_path.clone(), auto_exit, watcher_socket.clone()).await?;
+    let state = build_state_with(
+        canvas_path.clone(),
+        auto_exit,
+        watcher_socket.clone(),
+        lock_guard.is_read_only(),
+    )
+    .await?;
+    if state.read_only && !quiet {
+        eprintln!(
+            "meshfox: {} isn't writable — serving it read-only (blocks run, nothing is saved)",
+            canvas_path.display()
+        );
+    }
     spawn_file_watcher(Arc::clone(&state));
     spawn_shutdown_signal_handler(Arc::clone(&state));
     spawn_api_idle_checker(Arc::clone(&state));
@@ -17704,5 +17811,178 @@ mod heartbeat_tests {
         };
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value["type"], "heartbeat");
+    }
+}
+
+#[cfg(test)]
+mod read_only_tests {
+    use super::*;
+    use axum::http::Method;
+
+    const CANVAS: &str = concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "## A\n<!-- meshfox:node id=\"a\" -->\n\n",
+        "```bash name=\"go\" cache\necho hello\n```\n",
+    );
+
+    /// A canvas in a directory of its own, so a stray `.meshfox/` is visible.
+    fn canvas_in_own_dir() -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("meshfox-read-only-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("doc.canvas.md");
+        std::fs::write(&path, CANVAS).unwrap();
+        (dir, path)
+    }
+
+    async fn spawn_read_only_server(canvas_path: PathBuf) -> SocketAddr {
+        let state = build_state_with(canvas_path, false, None, true)
+            .await
+            .expect("valid test canvas");
+        let app = build_app(state);
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        addr
+    }
+
+    #[test]
+    fn only_requests_that_change_the_document_count_as_edits() {
+        for (method, path) in [
+            (Method::PUT, "/api/canvas"),
+            (Method::PUT, "/api/canvas/raw"),
+            (Method::PUT, "/api/options"),
+            (Method::PATCH, "/api/nodes/a"),
+            (Method::PATCH, "/api/nodes/a/block/go"),
+            (Method::DELETE, "/api/nodes/a"),
+            (Method::POST, "/api/nodes"),
+            (Method::POST, "/api/nodes/a/append"),
+            (Method::POST, "/api/nodes/a/rename-id"),
+            (Method::POST, "/api/canvas/clear-layout"),
+            (Method::POST, "/api/undo"),
+            (Method::POST, "/api/redo"),
+            (Method::POST, "/api/history/goto"),
+        ] {
+            assert!(edits_canvas(&method, path), "{method} {path} edits the canvas");
+        }
+        for (method, path) in [
+            (Method::GET, "/api/canvas"),
+            (Method::GET, "/api/run"),
+            (Method::POST, "/api/nodes/a/open"),
+            (Method::POST, "/api/nodes/a/open-folder"),
+            (Method::POST, "/api/kill"),
+            (Method::POST, "/api/vars/configure"),
+            (Method::POST, "/api/form/submit"),
+            (Method::POST, "/api/services/stop"),
+            (Method::POST, "/api/session/reset"),
+        ] {
+            assert!(!edits_canvas(&method, path), "{method} {path} doesn't edit the canvas");
+        }
+    }
+
+    #[tokio::test]
+    async fn every_edit_is_refused_with_403_and_the_file_stays_as_it_was() {
+        let (dir, canvas_path) = canvas_in_own_dir();
+        let addr = spawn_read_only_server(canvas_path.clone()).await;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}");
+        let json = |body: serde_json::Value| body.to_string();
+
+        let responses = [
+            client
+                .patch(format!("{base}/api/nodes/a"))
+                .header("content-type", "application/json")
+                .body(json(serde_json::json!({ "text": "changed" }))),
+            client
+                .post(format!("{base}/api/nodes"))
+                .header("content-type", "application/json")
+                .body(json(serde_json::json!({ "parent": "root", "title": "New" }))),
+            client.delete(format!("{base}/api/nodes/a")),
+            client
+                .put(format!("{base}/api/canvas/raw"))
+                .body("<!-- meshfox:canvas -->\n# Other\n"),
+            client.post(format!("{base}/api/undo")),
+        ];
+        for request in responses {
+            let response = request.send().await.expect("request");
+            assert_eq!(response.status(), 403);
+            let body = response.text().await.unwrap();
+            assert!(body.contains("read-only"), "unexpected body: {body}");
+        }
+
+        assert_eq!(std::fs::read_to_string(&canvas_path).unwrap(), CANVAS);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn info_says_whether_the_canvas_is_read_only() {
+        let (dir, canvas_path) = canvas_in_own_dir();
+        let read_only = spawn_read_only_server(canvas_path.clone()).await;
+        let editable = spawn_test_server(canvas_path).await;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = reqwest::Client::new();
+        for (addr, expected) in [(read_only, true), (editable, false)] {
+            let body = client
+                .get(format!("http://{addr}/api/info"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(info["readOnly"], expected);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Running is the point of a read-only canvas: the block runs, its
+    /// `cache`d output isn't written back (there's nowhere to write it), the
+    /// run still ends cleanly, and nothing — not even a `.meshfox/` — appears
+    /// next to the canvas.
+    #[tokio::test]
+    async fn a_block_runs_without_writing_anything_to_disk() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+        let (dir, canvas_path) = canvas_in_own_dir();
+        let addr = spawn_read_only_server(canvas_path.clone()).await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{addr}/api/run?path=a&block=go&persist=true"
+        ))
+        .await
+        .expect("connect");
+        let mut events = Vec::new();
+        while let Some(msg) = ws.next().await {
+            match msg.expect("no ws error") {
+                WsMessage::Text(t) => events.push(serde_json::from_str::<serde_json::Value>(&t).unwrap()),
+                WsMessage::Close(_) => break,
+                _ => continue,
+            }
+        }
+        assert!(events.iter().any(|e| e["type"] == "done"), "events: {events:?}");
+        assert!(
+            events.iter().all(|e| e["type"] != "error"),
+            "a read-only run must not report the skipped write-back: {events:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&canvas_path).unwrap(), CANVAS);
+        assert!(!dir.join(".meshfox").exists(), "state leaked next to a read-only canvas");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_raw_refuses_even_if_a_route_slips_past_the_middleware() {
+        let (dir, canvas_path) = canvas_in_own_dir();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let state = runtime
+            .block_on(build_state_with(canvas_path.clone(), false, None, true))
+            .unwrap();
+        let err = state.write_raw("changed").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::ReadOnlyFilesystem);
+        assert_eq!(std::fs::read_to_string(&canvas_path).unwrap(), CANVAS);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

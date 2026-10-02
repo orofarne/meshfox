@@ -7,6 +7,17 @@ export async function fetchCanvas(): Promise<CanvasDoc> {
 }
 
 /**
+ * Whether this worker serves its canvas read-only (the canvas or its
+ * directory isn't writable): blocks still run, but nothing can be edited, so
+ * the toolbar offers no "Edit". Fixed for the worker's whole lifetime.
+ */
+export async function fetchReadOnly(): Promise<boolean> {
+  const res = await fetch("/api/info");
+  if (!res.ok) throw new Error(`GET /api/info: ${res.status}`);
+  return (await res.json()).readOnly === true;
+}
+
+/**
  * Only the declared `meshfox:var`s `block`'s own chain actually
  * references (via `env=` — a block that declares none gets back an empty
  * list, regardless of how many variables the document declares), each
