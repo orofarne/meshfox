@@ -99,3 +99,16 @@ Its sole fence has no `name=` at all — implicitly runnable as
 ```bash cache
 echo "implicit block ran"
 ```
+
+## Console lifecycle
+<!-- meshfox:node id="console-lifecycle" -->
+
+The producer prints once; the target finishes silently after the console grace period. This verifies that completion starts a fresh grace period and a repeated chain does not replay producer logs.
+
+```sh name="prepare"
+echo console-producer-marker
+```
+
+```sh name="silent" deps="prepare"
+sleep 11
+```

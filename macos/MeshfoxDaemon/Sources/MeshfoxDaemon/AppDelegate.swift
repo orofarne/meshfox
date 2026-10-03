@@ -97,11 +97,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             for session in sessions {
                 let title = session.port == nil ? "\(session.displayTitle) (starting…)" : session.displayTitle
-                let item = NSMenuItem(title: title, action: #selector(openSession(_:)), keyEquivalent: "")
-                item.target = self
-                item.representedObject = session.canvasPath
+                // No action: clicking the title only opens the Open/Kill
+                // submenu. Kept enabled even while starting so Kill stays reachable.
+                let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
                 item.toolTip = session.canvasPath
-                item.isEnabled = session.port != nil
 
                 let submenu = NSMenu()
                 let openItem = NSMenuItem(title: "Open", action: #selector(openSession(_:)), keyEquivalent: "")

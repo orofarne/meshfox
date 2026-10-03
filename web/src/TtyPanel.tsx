@@ -256,9 +256,6 @@ export function TtyPanel({
             break;
           case "step-skipped":
             term.write(`\x1b[2m(skipped ${event.block} — already ran this session, unchanged)\x1b[0m\r\n`);
-            if (event.output) {
-              term.write(`\x1b[2m${event.output.replace(/\n/g, "\r\n")}\x1b[0m\r\n`);
-            }
             break;
           case "tty-start":
             ttyActiveRef.current = true;

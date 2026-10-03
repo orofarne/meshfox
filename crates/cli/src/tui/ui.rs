@@ -844,6 +844,25 @@ fn render_spatial_parent(f: &mut Frame, area: Rect, app: &mut App, group_id: &st
     );
 }
 
+/// `nodes` plus every non-root ancestor of each, by document nesting.
+fn with_ancestors<'a>(
+    canvas: &'a meshfox_core::Canvas,
+    nodes: &std::collections::HashSet<&'a str>,
+) -> std::collections::HashSet<&'a str> {
+    let mut all = nodes.clone();
+    for id in nodes {
+        let mut cur = canvas.node(id).and_then(|n| n.parent.as_deref());
+        while let Some(pid) = cur {
+            let parent = canvas.node(pid);
+            if parent.is_none_or(|p| p.parent.is_none()) || !all.insert(pid) {
+                break;
+            }
+            cur = parent.and_then(|p| p.parent.as_deref());
+        }
+    }
+    all
+}
+
 fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
     if app.tree_collapsed {
         // A narrow, borderless handle — no room for a title the way
@@ -918,6 +937,12 @@ fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
             failed_nodes.insert(file_run.node_id.as_str());
         }
     }
+
+    // A running/failed block also marks every non-root ancestor of its node
+    // (same rule as the web UI's `runningAncestors`/`failedAncestors`), so a
+    // collapsed parent still shows what's going on underneath it.
+    let running_nodes = with_ancestors(&app.display_canvas, &running_nodes);
+    let failed_nodes = with_ancestors(&app.display_canvas, &failed_nodes);
 
     let items: Vec<ListItem> = app
         .rows

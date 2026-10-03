@@ -3443,7 +3443,9 @@ name = "meshfox-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "csv",
+ "globset",
  "libc",
  "pulldown-cmark 0.12.2",
  "rusqlite",

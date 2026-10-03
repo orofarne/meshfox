@@ -11,6 +11,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct Canvas {
     pub nodes: Vec<Node>,
+    /// Execution-only context; never serialized into canvas documents or APIs.
+    #[serde(skip)]
+    pub artifact_root: std::path::PathBuf,
+    #[serde(skip)]
+    pub artifact_values: std::collections::HashMap<String, String>,
     /// Every `<!-- meshfox:option name="..." -->` this document declares
     /// (see `crate::options`) — e.g. `unfold`, which flips the web UI's
     /// own default fold state for the whole document. Never set by

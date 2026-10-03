@@ -178,6 +178,7 @@ mod tests {
                 ),
             ],
             options: Vec::new(),
+            ..Canvas::default()
         }
     }
 

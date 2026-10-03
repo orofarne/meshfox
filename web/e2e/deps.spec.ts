@@ -164,3 +164,47 @@ test("a failing step in a chain marks what comes after it blocked, not stuck que
   // and enabled here too — see the top of this file's own `block` helper).
   await expect(afterFail.locator("button:not(.mesh-run-chain)", { hasText: "run" })).toBeEnabled();
 });
+
+test("console keeps a full grace period after silent completion and does not replay skipped logs", async ({ page, browserName }) => {
+  test.skip(browserName !== "chromium", "owns one stateful producer session");
+  test.setTimeout(60_000);
+  const target = block(page, "console-lifecycle", "silent");
+  const consolePanel = page.locator(".console-panel");
+  await target.locator("button.mesh-run-chain").click();
+  await expect(consolePanel).toHaveClass(/console-panel-open/);
+  await expect(consolePanel).toContainText("console-producer-marker");
+  await expect(target.locator('[data-exit="ok"]')).toBeVisible({ timeout: 15_000 });
+  await page.waitForTimeout(1500); // past the collapse polling tick
+  await expect(consolePanel).toHaveClass(/console-panel-open/);
+
+  await target.locator("button.mesh-run-chain").click();
+  await expect(consolePanel).toContainText("skipped, already fresh this session");
+  await expect(consolePanel).not.toContainText("console-producer-marker");
+  await expect(target.locator('[data-exit="ok"]')).toBeVisible({ timeout: 15_000 });
+  await page.waitForTimeout(1500);
+  await expect(consolePanel).toHaveClass(/console-panel-open/);
+  await expect(consolePanel).not.toHaveClass(/console-panel-open/, { timeout: 12_000 });
+});
+
+test("console opened manually stays pinned across idle time and subsequent runs", async ({ page, browserName }) => {
+  test.skip(browserName !== "chromium", "owns one console lifecycle");
+  await page.clock.install();
+  const consolePanel = page.locator(".console-panel");
+  await page.getByRole("button", { name: "⎙ Console" }).click();
+  await page.clock.fastForward(12_000);
+  await expect(consolePanel).toHaveClass(/console-panel-open/);
+
+  const target = block(page, "build-node", "test");
+  await target.locator("button.mesh-run-chain").click();
+  await expect(target.locator('[data-exit="ok"]')).toBeVisible();
+  await page.clock.fastForward(12_000);
+  await expect(consolePanel).toHaveClass(/console-panel-open/);
+
+  await consolePanel.locator(".console-panel-close").click();
+  await expect(consolePanel).not.toHaveClass(/console-panel-open/);
+  await target.locator("button.mesh-run-chain").click();
+  await expect(consolePanel).toHaveClass(/console-panel-open/);
+  await expect(target.locator('[data-exit="ok"]')).toBeVisible();
+  await page.clock.fastForward(12_000);
+  await expect(consolePanel).not.toHaveClass(/console-panel-open/);
+});

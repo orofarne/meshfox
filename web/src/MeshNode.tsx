@@ -385,6 +385,11 @@ export interface MeshNodeData {
    * one (see App.tsx's own `searchMatches` doc comment). `undefined`
    * outside active search navigation. */
   searchCurrentOccurrence?: number;
+  /** Some descendant node (not this node itself) has a running / failed
+   * block — set by App.tsx for every non-root ancestor, so a folded parent
+   * shows the same spinner / failed badge as the node actually running. */
+  descendantRunning?: boolean;
+  descendantFailed?: boolean;
   target?: string;
   /** file/link/include only: optional plain-prose caption after the
    * required link (see `CanvasNode.caption`'s own doc comment) — rendered
@@ -2854,10 +2859,13 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
   // keys each node's map by that node alone), so this covers both a `text`
   // node's fenced blocks (keyed by block name) and a runnable `file` node's
   // own run (keyed under its own id) without needing to special-case either.
-  const nodeRunning = Object.values(data.liveBlocks).some((lb) => lb.status === "running");
-  const nodeFailed = Object.values(data.liveBlocks).some(
-    (lb) => lb.status === "killed" || (lb.status === "done" && lb.exitCode !== 0),
-  );
+  const nodeRunning =
+    !!data.descendantRunning || Object.values(data.liveBlocks).some((lb) => lb.status === "running");
+  const nodeFailed =
+    !!data.descendantFailed ||
+    Object.values(data.liveBlocks).some(
+      (lb) => lb.status === "killed" || (lb.status === "done" && lb.exitCode !== 0),
+    );
   // Clicking the title text toggles fold both ways in read-only mode
   // (alongside `FoldToggle` itself), but the title text is also meant to
   // stay selectable (e.g. to copy it) — a plain `onClick` alone can't

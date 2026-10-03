@@ -140,6 +140,8 @@ export function fingerprint(
   envAttr: string | undefined,
   depsAttr: string | undefined,
   outputAttr?: string,
+  inputsAttr?: string,
+  outputsAttr?: string,
 ): string {
   const parts = [lang, code, interpreter ?? ""];
   for (const raw of (envAttr ?? "").split(",").map((s) => s.trim()).filter((s) => s.length > 0)) {
@@ -158,6 +160,8 @@ export function fingerprint(
   // it's part of what makes a cached output stale — only when present,
   // exactly like `core::fence::fingerprint`.
   if (outputAttr !== undefined) parts.push(`output-attrs${NUL}${outputAttr}`);
+  if (inputsAttr !== undefined) parts.push(`inputs${NUL}${inputsAttr}`);
+  if (outputsAttr !== undefined) parts.push(`outputs${NUL}${outputsAttr}`);
   return fnv1aHex(new TextEncoder().encode(parts.join(NUL)));
 }
 
@@ -557,7 +561,7 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
         // "can't vouch this is still current" defaults to stale.
         const stale =
           markerAttrs.hash === undefined ||
-          markerAttrs.hash !== fingerprint(lang, code, interpreter, attrs.env, attrs.deps, outputAttrs);
+          markerAttrs.hash !== fingerprint(lang, code, interpreter, attrs.env, attrs.deps, outputAttrs, attrs.inputs, attrs.outputs);
         const parsed = outputMarkdown
           ? parseCachedOutputBlockMarkdown(inner.join("\n"))
           : parseCachedOutputBlock(inner.join("\n"));

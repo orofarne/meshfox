@@ -26,6 +26,8 @@ use meshfox_core::mdcanvas::{EDGE_ATTRS, NODE_ATTRS};
 const FENCE_VALUE_ATTRS: &[&str] = &[
     "name",
     "deps",
+    "inputs",
+    "outputs",
     "env",
     "interpreter",
     "output",

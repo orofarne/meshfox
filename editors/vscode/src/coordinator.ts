@@ -75,7 +75,7 @@ export class Coordinator implements vscode.Disposable {
       );
     }
     await new Promise<void>((resolve, reject) => {
-      const server = net.createServer((socket) => this.handleConnection(socket));
+      const server = net.createServer({ allowHalfOpen: true }, (socket) => this.handleConnection(socket));
       server.once("error", reject);
       server.listen(this.socketPath, () => {
         server.removeListener("error", reject);
@@ -88,6 +88,10 @@ export class Coordinator implements vscode.Disposable {
 
   private handleConnection(socket: net.Socket): void {
     let buf = "";
+    // `allowHalfOpen` (see `start`) lets a `ready` be acked after the
+    // worker has half-closed its write side — so close our own end once the
+    // peer is done, which is what the default would have done for us.
+    socket.on("end", () => socket.end());
     socket.on("data", (chunk) => {
       buf += chunk.toString("utf8");
       let idx: number;
@@ -96,6 +100,11 @@ export class Coordinator implements vscode.Disposable {
         buf = buf.slice(idx + 1);
         if (line.trim().length > 0) {
           this.handleLine(line);
+          if (isReadyLine(line)) {
+            // The worker waits for this (`watcher_protocol::send`) so a
+            // `ready` closed too early on macOS can't be lost unnoticed.
+            socket.write("{}\n");
+          }
         }
       }
     });
@@ -252,4 +261,8 @@ export class Coordinator implements vscode.Disposable {
       // failing deactivation over.
     }
   }
+}
+
+function isReadyLine(line: string): boolean {
+  return parseWorkerMessage(line)?.op === "ready";
 }

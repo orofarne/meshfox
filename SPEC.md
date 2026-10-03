@@ -306,15 +306,39 @@ Lives inside a node's Markdown text, as fence-info-string attributes:
   dependency is left to its own normal freshness decision instead — see
   `always` below for the plain (unconditional) alternative, and why a `!`
   edge exists as a separate mechanism from it.
+- `inputs` / `outputs` — optional, comma-separated file paths. Inputs accept
+  glob patterns (`src/**/*.rs`); outputs must name exact files. Paths are
+  relative to the block's effective working directory and normalized before
+  matching. `$NAME` / `${NAME}` substitute declared variables; `$$` is a
+  literal dollar sign. These references resolve variables and `from=` sources
+  even without `env=` (use `env=` separately to expose them to the process).
+  A matching `outputs=` declaration automatically supplies an input's producer
+  from the same canvas, including glob matches whose files do not exist yet.
+  Computed output-path sources are observed before matching producers, so
+  matching also works when input and output use different variable names.
+  An input-bearing chain resolves variables in the entire output-path namespace.
+  Other variables of a producer selected dynamically must already have defaults
+  or cached values (use `configure`); unresolved values fail the run.
+  This edge orders execution but invalidates by file content, not by the
+  producer's execution or code. No producer means an external input. Multiple
+  producers of the same normalized output and cycles are errors.
+  Freshness includes file paths, glob membership and streaming BLAKE3 content
+  digests. Missing or modified outputs invalidate their producer. Before
+  execution all exact inputs and at least one file per input glob must exist;
+  after a successful exit all outputs must exist and inputs must still have
+  the same content. A violation fails the run and does not certify freshness.
+  These attributes apply to finite executable blocks (including `tty`), not
+  services, forms or buttons. `outputs=` declares files; the singular
+  `output=` below controls stdout presentation. `--no-deps` still prepares
+  computed variables and automatically found file producers.
 - `env` — optional, comma-separated list of declared `meshfox:var`s (see
   "Variables" below) this block wants in its own process environment.
   Each entry is a bare name (pass the declared variable through under the
   same name) or `local=name` (expose it under a different name in this
   block's own environment) — a leading `$` on the variable-name side is
   accepted and stripped, but purely cosmetic: `env="$X,LOCAL=$Y"` and
-  `env="X,LOCAL=Y"` mean exactly the same thing. A block with no `env=`
-  never resolves or prompts for *any* declared variable, however many the
-  document declares as a whole — this is what scopes "does running this
+  `env="X,LOCAL=Y"` mean exactly the same thing. A block with no `env=`, path-variable references or interpreter-variable
+  references never resolves or prompts for declared variables — this is what scopes "does running this
   block need to ask about anything" to the block itself, not the whole
   canvas. An `env=` entry naming a variable nothing declares is a
   `meshfox validate` error.
@@ -497,8 +521,9 @@ Naming that same source in `deps=` opts back into execution cascade.
 Computed-variable sources are visited before a block's explicit action
 dependencies. The runner re-evaluates freshness with their actual values
 before deciding whether a consumer (and its `!` preparations) must run.
-Code changes in dependencies still invalidate closure fingerprints, even
-when a computed value is unchanged.
+Code changes in explicit `deps=` dependencies still invalidate closure
+fingerprints. Sources reached only through `from=` contribute their values,
+and producers reached only through `inputs=` contribute file contents.
 
 `always` — optional flag (`always` or `always="true"`), opts a block out of
 the fingerprint-based part of this skip entirely: even unchanged and
@@ -1715,6 +1740,7 @@ leading token instead of a `key=value` pair (`crates/core/src/fence.rs`):
     runnable-attr   ::= 'name' | 'cache' | 'default' | 'deps' | 'env' | 'tty'
                      | 'autoclose' | 'service' | 'always' | 'interpreter'
                      | 'autorun' | 'render' | 'output' | 'send' | 'fold'
+                     | 'inputs' | 'outputs'
     constraint-attr ::= 'constraint' | 'name'
 
 A runnable fence additionally requires `lang` to be `bash` or `sh`, *or* its

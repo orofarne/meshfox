@@ -557,11 +557,13 @@ pub fn validate_var_scope(canvas: &Canvas) -> Result<(), VarsError> {
 /// variable reference this fence has, regardless of which attribute it's
 /// written under" checks.
 fn interpreter_refs(block: &crate::fence::CodeBlock) -> Vec<String> {
-    block
+    let mut refs = block
         .interpreter
         .as_deref()
         .map(crate::exec::interpreter_var_refs)
-        .unwrap_or_default()
+        .unwrap_or_default();
+    refs.extend(crate::artifacts::var_refs(block));
+    refs
 }
 
 /// Validates that every runnable fence's `env=` (see `crate::fence::EnvRef`)

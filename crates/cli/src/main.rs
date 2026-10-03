@@ -2985,7 +2985,7 @@ async fn drain_worker_run_events(
                             println!("==> {block}");
                             current_step = Some((node_id, block));
                         }
-                        worker_client::RunEvent::StepSkipped { block, output, .. } => {
+                        worker_client::RunEvent::StepSkipped { block, .. } => {
                             // No equivalent in the in-process loop above,
                             // which always re-executes every step
                             // regardless of a previous cached run — this is
@@ -2995,9 +2995,6 @@ async fn drain_worker_run_events(
                             // of joining a shared session rather than a gap
                             // to hide.
                             println!("==> {block} (already run this session, skipped)");
-                            if !output.is_empty() {
-                                println!("{output}");
-                            }
                         }
                         worker_client::RunEvent::Output { stream, text, .. } => match stream {
                             meshfox_server::stream_exec::OutputStream::Stdout => println!("{text}"),

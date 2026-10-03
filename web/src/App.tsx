@@ -790,6 +790,7 @@ export default function App() {
   // a live monitor" scope `LiveBlockState` itself already has.
   const [consoleLines, setConsoleLines] = useState<ConsoleLine[]>([]);
   const [consoleCollapsed, setConsoleCollapsed] = useState(true);
+  const [consolePinned, setConsolePinned] = useState(false);
   // A ref, not state — updated far too often (every streamed line) to
   // re-render on, only ever read from the auto-collapse effect below.
   const consoleLastActivityRef = useRef<number>(0);
@@ -818,9 +819,12 @@ export default function App() {
   // `previewChain.length >= 2` check, mirroring the TUI's
   // `resolved_chain_len` gate); a lone block's output isn't worth losing
   // canvas space over. This effect only ever *closes* it again, once
-  // everything has been idle for a while — regardless of why it was open.
+  // everything has been idle for a while, unless the user opened it manually.
   useEffect(() => {
-    if (anyBlockRunning) return;
+    if (anyBlockRunning || consoleCollapsed || consolePinned) return;
+    // Give the completed transcript a full grace period, even if the process
+    // spent its final seconds working silently.
+    consoleLastActivityRef.current = Date.now();
     // Only polling while something *could* still need to re-collapse —
     // same "true no-op once there's nothing left to check" reasoning the
     // TUI's own guarded tick has.
@@ -830,7 +834,7 @@ export default function App() {
       }
     }, 500);
     return () => clearInterval(id);
-  }, [anyBlockRunning]);
+  }, [anyBlockRunning, consoleCollapsed, consolePinned]);
 
   // Folds the polled `services` list into every node's own `data.services`
   // (matched by `nodeId`) — the service-equivalent of `liveBlocks`' own
@@ -1260,6 +1264,8 @@ export default function App() {
     ) => {
       if (!canvas) return;
       const path = pathTo(canvas, nodeId);
+      // Start a new transcript without erasing another concurrently running chain.
+      if (!anyBlockRunningRef.current) setConsoleLines([]);
 
       // Best-effort preview of the full chain this run will trigger
       // server-side, purely so every block about to run (not just the one
@@ -1379,6 +1385,7 @@ export default function App() {
               });
               break;
             case "step-skipped":
+              appendConsoleLine(event.nodeId, event.block, { stream: "stdout", text: "skipped, already fresh this session" });
               // `event.output` is `SessionRun::output` (merged stdout+stderr
               // only — the session-skip cache doesn't keep them split, see
               // `crates/server/src/lib.rs`'s own `SessionRun`), and
@@ -1654,6 +1661,7 @@ export default function App() {
               });
               break;
             case "step-skipped":
+              appendConsoleLine(event.nodeId, event.block, { stream: "stdout", text: "skipped, already fresh this session" });
               // `event.output` is `SessionRun::output` (merged stdout+stderr
               // only — the session-skip cache doesn't keep them split, see
               // `crates/server/src/lib.rs`'s own `SessionRun`), and
@@ -3264,12 +3272,42 @@ export default function App() {
     searchOpen && searchMatches.length > 0 && searchMatches[clampedSearchMatchIndex].nodeId === focusedNodeId
       ? searchMatches[clampedSearchMatchIndex].occurrence
       : undefined;
+  // Every non-root ancestor of a node with a running (or failed) block,
+  // so a folded parent still shows the spinner/failed badge for whatever's
+  // going on underneath it — same rule as the TUI's `render_tree`. Walks the
+  // canvas's own structural parents (not just visible ones), and stops
+  // before the root.
+  const { runningAncestors, failedAncestors } = useMemo(() => {
+    const parentOf = new Map<string, string | undefined>();
+    canvas?.nodes.forEach((n) => parentOf.set(n.id, n.parent));
+    const running = new Set<string>();
+    const failed = new Set<string>();
+    const mark = (set: Set<string>, id: string) => {
+      let cur = parentOf.get(id);
+      while (cur !== undefined && parentOf.get(cur) !== undefined && !set.has(cur)) {
+        set.add(cur);
+        cur = parentOf.get(cur);
+      }
+    };
+    for (const n of nodes) {
+      const blocks = Object.values(n.data.liveBlocks);
+      if (blocks.some((lb) => lb.status === "running")) mark(running, n.id);
+      if (blocks.some((lb) => lb.status === "killed" || (lb.status === "done" && lb.exitCode !== 0))) {
+        mark(failed, n.id);
+      }
+    }
+    return { runningAncestors: running, failedAncestors: failed };
+  }, [canvas, nodes]);
   const focusedRenderNodes = useMemo(
     () =>
       visibleNodes.map((n) => {
         const focused = n.id === focusedNodeId;
         const autoStartTitleEdit = n.id === autoStartTitleEditNodeId;
+        const descendantRunning = runningAncestors.has(n.id);
+        const descendantFailed = failedAncestors.has(n.id);
         if (
+          (n.data.descendantRunning ?? false) === descendantRunning &&
+          (n.data.descendantFailed ?? false) === descendantFailed &&
           (n.data.focused ?? false) === focused &&
           (n.data.autoStartTitleEdit ?? false) === autoStartTitleEdit &&
           (n.data.searchQuery ?? "") === trimmedSearchQuery &&
@@ -3281,6 +3319,8 @@ export default function App() {
           ...n,
           data: {
             ...n.data,
+            descendantRunning,
+            descendantFailed,
             focused,
             autoStartTitleEdit,
             onAutoStartTitleEditConsumed: handleAutoStartTitleEditConsumed,
@@ -3296,6 +3336,8 @@ export default function App() {
       handleAutoStartTitleEditConsumed,
       trimmedSearchQuery,
       currentSearchOccurrence,
+      runningAncestors,
+      failedAncestors,
     ],
   );
 
@@ -3578,7 +3620,10 @@ export default function App() {
           type="button"
           className="service-stats service-stats-ok"
           title="Console — a live transcript of the most recent run's output"
-          onClick={() => setConsoleCollapsed((c) => !c)}
+          onClick={() => {
+            setConsolePinned(consoleCollapsed);
+            setConsoleCollapsed(!consoleCollapsed);
+          }}
         >
           ⎙ Console
         </button>
@@ -3899,7 +3944,7 @@ export default function App() {
           onClose={() => setTtySession(null)}
         />
       )}
-      <ConsolePanel open={!consoleCollapsed} lines={consoleLines} onClose={() => setConsoleCollapsed(true)} />
+      <ConsolePanel open={!consoleCollapsed} lines={consoleLines} onClose={() => { setConsolePinned(false); setConsoleCollapsed(true); }} />
       {ttySessionsPanelOpen && (
         <TtySessionsPanel
           sessions={liveTtySessions}

@@ -70,6 +70,8 @@ pub fn resolve(canvas: &Canvas, base_path: &Path) -> Result<Canvas, IncludeError
     Ok(Canvas {
         nodes,
         options: Vec::new(),
+        artifact_root: base_path.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf(),
+        artifact_values: canvas.artifact_values.clone(),
     })
 }
 

@@ -1055,11 +1055,19 @@ cd web && npm run typecheck
 ### Release build
 <!-- meshfox:node id="release-build" -->
 
-An optimized, distributable single binary. `name=`d so it's runnable like any other block here, deliberately without `cache` — a full release compile is slow and its build log isn't worth freezing into this file on every run:
+An optimized, distributable single binary. The declared inputs cover Rust and frontend sources plus build configuration; the output is the release executable. Installing discovers this producer automatically. Unchanged inputs and an intact binary allow this step to skip when pulled into a chain. Requesting this block directly always builds. On macOS, the build checks the resulting executable and re-signs it ad hoc if it cannot start. The final output fingerprint includes this signature; install copies the finished binary. Toolchain and external environment changes require `--fresh`. Deliberately without `cache`: build logs are per-run output.
 
-```sh name="release-build"
-cd web && npm install && npm run build
+```sh name="release-build" inputs="Cargo.toml,Cargo.lock,.cargo/config.toml,crates/*/Cargo.toml,crates/*/build.rs,crates/*/src/**,web/src/**,web/public/**,web/package*.json,web/index.html,web/vite.config.ts,web/tsconfig*.json,grammars/**" outputs="target/release/meshfox"
+set -e
+(cd web && npm ci && npm run build)
 cargo build --workspace --release
+if [ "$(uname -s)" = "Darwin" ]; then
+  if ! target/release/meshfox --version; then
+    echo "release binary does not start — re-signing it ad hoc"
+    codesign --force -s - target/release/meshfox
+    target/release/meshfox --version
+  fi
+fi
 echo "binary: target/release/meshfox"
 ```
 
@@ -1075,28 +1083,12 @@ echo "done"
 ### Install
 <!-- meshfox:node id="install" -->
 
-Copies the release binary to `$INSTALL_PATH` — see "Variables" above, where it's declared. `env="$INSTALL_PATH"` is what actually pulls it into this block's environment: the first `run`/`configure` that reaches a block with this `env=` prompts for it (default `/usr/local/bin`) and remembers the answer in `.meshfox/README.md.env` afterward, so this doesn't ask again on repeat installs — and, since no other block in this document declares `env=` at all, `INSTALL_PATH` is never resolved or asked about by anything else here. `deps="release-build/release-build"` (a cross-node reference — see "Runnable code fences" in SPEC.md — since `release-build` is a block in a different node than this one) means installing always builds fresh first. This block's own name already matches its node's id (`install`), so it's the node's implicit `default` block — no explicit `default` flag needed, unlike `e2e-tests`' `run` above, which needed one since its block is named `run`, not `e2e-tests`; both mechanisms are demonstrated in this document. Deliberately without `cache`, same reasoning as "Release build": the log is per-run noise, not something worth freezing into this file:
+Copies the release binary to `$INSTALL_PATH` (default `/usr/local/bin`). `inputs=` automatically finds the release build through its declared output, so no explicit `deps=` is needed. `outputs=` also tracks the installed binary: deleting or modifying it makes installation stale. A rebuild with identical binary contents does not invalidate installation when it is a dependency; explicitly requesting install always executes it. `env=` passes the declared path into the shell and the first run remembers the chosen value in `.meshfox/README.md.env`. The block name matches its node id, making it the implicit default block.
 
-```sh name="install" deps="release-build/release-build" env="$INSTALL_PATH"
+```sh name="install" inputs="target/release/meshfox" outputs="$INSTALL_PATH/meshfox" env="$INSTALL_PATH"
 mkdir -p "$INSTALL_PATH"
 cp target/release/meshfox "$INSTALL_PATH/meshfox"
 echo "installed to $INSTALL_PATH/meshfox"
-```
-
-### Fix macOS Gatekeeper kill
-<!-- meshfox:node id="fix-macos-kill" -->
-
-macOS only, and not fully deterministic: a locally built/installed binary can get silently `SIGKILL`ed on launch (exit code 137, no error message) — an AMFI/Gatekeeper code-signature check a plain `cargo build`'s own output doesn't satisfy, and one that's been seen resurfacing even on a binary that already ran fine earlier in the same session, not only right after a fresh build. Re-signing ad hoc (no real identity, just enough to satisfy the check) clears it. This block depends on `install`, so one command builds, installs and — only if the installed binary then fails to start; a working one is left alone — re-signs it: `meshfox README.md run --fresh development fix-macos-kill` (the node and its block share the name, like `install`, so the pair addresses it). The `--fresh` matters: a dependency that already ran this session and looks unchanged (`release-build`, `install`) is otherwise skipped as already fresh, even though the sources behind it changed (see SPEC.md's "Forcing a run"). Deliberately without `cache`, same reasoning as "Install" above — nothing here worth freezing, and re-running this is exactly the point whenever the kill resurfaces:
-
-```sh name="fix-macos-kill" deps="install/install" env="$INSTALL_PATH"
-# An installed binary that already starts is left alone: re-signing replaces
-# a working signature for nothing.
-if "$INSTALL_PATH/meshfox" --version; then
-  exit 0
-fi
-echo "$INSTALL_PATH/meshfox doesn't start — re-signing it ad hoc"
-codesign --force -s - "$INSTALL_PATH/meshfox"
-"$INSTALL_PATH/meshfox" --version
 ```
 
 ## License

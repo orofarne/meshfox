@@ -5,6 +5,7 @@
 //! See the repository README for the on-disk format and conventions (the
 //! README is itself a valid meshfox document).
 
+pub mod artifacts;
 pub mod attrs;
 pub mod body_rev;
 pub mod builtin_interpreter;
@@ -157,12 +158,10 @@ pub fn resolve_run_chain(
 }
 
 /// The set of declared-variable names any block in `chain` actually
-/// references via its own `env=` — the union across the whole chain, not
-/// necessarily every variable the document declares. Used to scope
+/// references via `env=`, `interpreter=` or artifact paths — the union
+/// across the whole chain plus output-path variables needed for producer discovery. Used to scope
 /// resolution/prompting to only what a specific run needs (see
-/// `vars::resolve_block_env`/`vars::map_block_env`) — a chain whose blocks
-/// declare no `env=` at all yields an empty set, meaning nothing about
-/// `meshfox:var` is even looked at for that run.
+/// `vars::resolve_block_env`/`vars::map_block_env`).
 pub fn env_var_names_for_chain(
     canvas: &Canvas,
     chain: &[BlockAddr],
@@ -178,6 +177,16 @@ pub fn env_var_names_for_chain(
             .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()))
         {
             needed.extend(direct_var_seed(block));
+            if block.attrs.contains_key("inputs") {
+                // Matching requires the entire output-path namespace to be known.
+                for node in &canvas.nodes {
+                    if node.plain_markdown_include { continue; }
+                    for mut producer in scan_runnable_blocks(&node.id, &node.text) {
+                        producer.attrs.remove("inputs");
+                        needed.extend(artifacts::var_refs(&producer));
+                    }
+                }
+            }
         }
     }
     // Not just the names literally in each block's own env= -- a var
@@ -204,7 +213,7 @@ pub fn run_chain_var_names(
 }
 
 /// Every declared-variable name `block` itself directly references, via
-/// either `env=` or (if it's a whole `$NAME` token) `interpreter=` — the
+/// `env=`, `interpreter=` or `inputs=`/`outputs=` paths — the
 /// *seed* a closure over `default_var=`/`choices_var=` (`vars::
 /// close_over_var_refs`) starts from. Shared by `env_var_names_for_chain`
 /// (which unions this across a whole chain) and
@@ -215,6 +224,7 @@ fn direct_var_seed(block: &CodeBlock) -> Vec<String> {
     if let Some(spec) = &block.interpreter {
         names.extend(exec::interpreter_var_refs(spec));
     }
+    names.extend(artifacts::var_refs(block));
     names
 }
 

@@ -46,6 +46,8 @@ impl BlockAddr {
 
 #[derive(Debug, Error, PartialEq)]
 pub enum DepsError {
+    #[error("artifact dependency: {0}")]
+    Artifacts(String),
     #[error("no runnable block named {1:?} in node {0:?}")]
     BlockNotFound(String, String),
     #[error("dependency cycle: {}", .0.iter().map(|a| a.key()).collect::<Vec<_>>().join(" -> "))]
@@ -162,7 +164,7 @@ fn find_block(canvas: &Canvas, addr: &BlockAddr) -> Result<crate::fence::CodeBlo
 /// knowing what to spawn, so a `from=`-computed interpreter path is just as
 /// much an implicit dependency as one referenced via `env=`. Shared by
 /// `visit` (which also walks `deps=`, gated by its own `follow_deps`) and
-/// `direct_deps` (which always wants both).
+/// artifact path variable references.
 fn implicit_from_deps(
     node_id: &str,
     block: &crate::fence::CodeBlock,
@@ -173,11 +175,13 @@ fn implicit_from_deps(
         .as_deref()
         .map(crate::exec::interpreter_var_refs)
         .unwrap_or_default();
+    let artifact_names = crate::artifacts::var_refs(block);
     let env_names = block
         .env
         .iter()
         .map(|e| e.var_name.as_str())
-        .chain(interpreter_names.iter().map(String::as_str));
+        .chain(interpreter_names.iter().map(String::as_str))
+        .chain(artifact_names.iter().map(String::as_str));
     crate::vars::close_over_var_refs(decls, env_names)
         .into_iter()
         .filter_map(|name| {
@@ -188,22 +192,6 @@ fn implicit_from_deps(
                 .map(|from| resolve_ref(node_id, from))
         })
         .collect()
-}
-
-/// Every direct dependency address `block` (living in node `node_id`) has —
-/// its own `deps=` entries plus `implicit_from_deps` — regardless of
-/// whether a `deps=` entry carries the `!` (`BlockRef::sync`) marker. Used
-/// by closure fingerprints. Execution cascade separately follows only
-/// explicit `deps=` entries.
-fn direct_deps(
-    node_id: &str,
-    block: &crate::fence::CodeBlock,
-    decls: &[VarDecl],
-) -> Vec<BlockAddr> {
-    let mut dep_addrs: Vec<BlockAddr> =
-        block.deps.iter().map(|d| resolve_ref(node_id, d)).collect();
-    dep_addrs.extend(implicit_from_deps(node_id, block, decls));
-    dep_addrs
 }
 
 /// `follow_deps` gates whether `block.deps` (`deps=`) edges are walked;
@@ -236,6 +224,7 @@ fn visit(
     // Observe computed values before action dependencies, especially `!`
     // preparations whose necessity depends on those values.
     let mut dep_addrs = implicit_from_deps(&addr.node_id, &block, decls);
+    dep_addrs.extend(crate::artifacts::producer_deps(canvas, &addr, &block)?);
     if follow_deps {
         dep_addrs.extend(block.deps.iter().map(|d| resolve_ref(&addr.node_id, d)));
     }
@@ -342,8 +331,8 @@ pub fn compute_forced_reruns_after(
 /// run history). Built from [`crate::fence::session_fingerprint`] of the
 /// block itself (its own code, interpreter, `env=`/`deps=` references, and
 /// the values in `values` of the variables it references) folded with the
-/// closure fingerprints of its direct dependencies (`deps=` plus implicit
-/// `from=` sources), recursively — so editing a dependency's code, or a
+/// closure fingerprints of its explicit `deps=` dependencies, recursively —
+/// so editing a dependency's code, or a
 /// variable value a dependency references, changes the fingerprint of every
 /// block above it, which a block's own fingerprint doesn't (it only names
 /// its `deps=`, not their content).
@@ -394,7 +383,7 @@ pub fn closure_fingerprint_with(
             return Err(DepsError::Cycle(cycle));
         }
         let block = find_block(canvas, addr)?;
-        let mut deps = direct_deps(&addr.node_id, &block, decls);
+        let mut deps: Vec<_> = block.deps.iter().map(|dep| resolve_ref(&addr.node_id, dep)).collect();
         deps.sort_by_key(BlockAddr::key);
         deps.dedup();
         stack.push(addr.clone());
@@ -402,11 +391,29 @@ pub fn closure_fingerprint_with(
             key.clone(),
             crate::fence::session_fingerprint(&block, values),
         ];
+        let mut has_artifacts = block.attrs.contains_key("inputs") || block.attrs.contains_key("outputs");
+        for attr in ["inputs", "outputs"] {
+            if block.attrs.contains_key(attr) {
+                parts.push(crate::artifacts::fingerprint(canvas, addr, &block, values, attr, false)?);
+            }
+        }
         for dep in &deps {
-            parts.push(go(canvas, decls, dep, values, memo, stack)?);
+            let fingerprint = go(canvas, decls, dep, values, memo, stack)?;
+            has_artifacts |= fingerprint.len() == 64;
+            parts.push(fingerprint);
         }
         stack.pop();
-        let fp = crate::fence::combine_fingerprints(parts);
+        let fp = if has_artifacts {
+            // Preserve the full content-digest strength through explicit closures.
+            let mut hash = blake3::Hasher::new();
+            for part in parts {
+                hash.update(&(part.len() as u64).to_le_bytes());
+                hash.update(part.as_bytes());
+            }
+            hash.finalize().to_hex().to_string()
+        } else {
+            crate::fence::combine_fingerprints(parts)
+        };
         memo.insert(key, fp.clone());
         Ok(fp)
     }
@@ -425,6 +432,7 @@ pub fn closure_fingerprint_with(
 /// `default` block (see `crate::fence::default_block`) — used by `meshfox
 /// check`.
 pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
+    crate::artifacts::validate(canvas)?;
     for node in &canvas.nodes {
         let blocks = scan_runnable_blocks(&node.id, &node.text);
         if let Err(names) = crate::fence::default_block(&node.id, &blocks) {

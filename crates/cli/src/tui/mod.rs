@@ -896,16 +896,8 @@ fn print_tty_transcript_event(event: crate::worker_client::RunEvent) -> TtyPrelu
             print!("==> {block}\r\n");
             TtyPreludeOutcome::Continue
         }
-        RunEvent::StepSkipped {
-            block,
-            output,
-            duration_ms,
-            ..
-        } => {
-            print!(
-                "==> {block} (skipped, already fresh this session)\r\n{output}\r\n(skipped · {})\r\n",
-                meshfox_core::format_duration_ms(duration_ms)
-            );
+        RunEvent::StepSkipped { block, .. } => {
+            print!("==> {block} (skipped, already fresh this session)\r\n");
             TtyPreludeOutcome::Continue
         }
         RunEvent::Output { text, .. } => {

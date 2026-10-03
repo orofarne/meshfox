@@ -3577,31 +3577,11 @@ impl App {
                 );
                 touched = Some(addr);
             }
-            RunEvent::StepSkipped {
-                node_id,
-                block,
-                output,
-                duration_ms,
-            } => {
-                run.lines
-                    .push(format!("==> {block} (skipped, already fresh this session)"));
-                run.lines.push(output.clone());
-                run.lines.push(format!(
-                    "(skipped · {})",
-                    meshfox_core::format_duration_ms(duration_ms)
-                ));
+            RunEvent::StepSkipped { node_id, block, .. } => {
+                run.lines.push(format!("==> {block} (skipped, already fresh this session)"));
                 let addr = BlockAddr::new(node_id, block);
-                self.step_output.insert(
-                    addr.clone(),
-                    StepOutput {
-                        stdout: output,
-                        stderr: String::new(),
-                        output_markdown: false,
-                        exit_code: 0,
-                        duration_ms,
-                        running: false,
-                    },
-                );
+                // A skipped step produced no live output for this run.
+                self.step_output.remove(&addr);
                 touched = Some(addr);
             }
             RunEvent::Output {
@@ -5394,6 +5374,50 @@ fn point_in(rect: Rect, x: u16, y: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn skipped_steps_do_not_replay_old_logs_in_the_tui() {
+        let dir = std::env::temp_dir().join(format!("meshfox-tui-skipped-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.canvas.md");
+        std::fs::write(&path, "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n```sh name=build\necho build\n```\n").unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(path, tx, None, None).await.unwrap();
+        app.run = Some(RunState {
+            chain: Vec::new(),
+            idx: 0,
+            http_rx: None,
+            lines: Vec::new(),
+            full_output: String::new(),
+            stdout_only: String::new(),
+            stderr_only: String::new(),
+            output_markdown: false,
+            step_started: std::time::Instant::now(),
+            had_failure: false,
+            killed: false,
+            finished: false,
+        });
+        app.on_run_event(Some(crate::worker_client::RunEvent::StepStart {
+            node_id: "root".into(),
+            block: "build".into(),
+        }))
+        .await;
+        app.on_run_event(Some(crate::worker_client::RunEvent::StepSkipped {
+            node_id: "root".into(),
+            block: "build".into(),
+            output: "old npm/vite log".into(),
+            duration_ms: 50_800,
+        }))
+        .await;
+        let transcript = app.run.as_ref().unwrap().lines.join("\n");
+        assert!(transcript.contains("skipped"));
+        assert!(!transcript.contains("old npm/vite log"));
+        assert!(!transcript.contains("50.8"));
+        assert!(!app
+            .step_output
+            .contains_key(&BlockAddr::new("root", "build")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[tokio::test]
     async fn extra_edge_row_follows_the_real_target_on_enter() {

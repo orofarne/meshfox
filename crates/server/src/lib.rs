@@ -1596,7 +1596,7 @@ fn run_fingerprint_in(
             &relevant,
             &overrides,
             &cache,
-            &HashMap::new(),
+            &state.session_runs.lock().unwrap().values().flat_map(|run| run.produced_vars.clone()).collect(),
             &ctx.shared,
         )
     };
@@ -2227,6 +2227,129 @@ fn lock_conflict_response(conflict: &LockConflict) -> Response {
         .unwrap()
 }
 
+/// Path graph resolution uses the same defaults/cache/overrides as execution.
+/// Cached computed values only predict graph paths; sources still run normally.
+fn seed_artifact_paths(state: &AppState, canvas: &mut Canvas, overrides: &HashMap<String, String>) {
+    let Ok(decls) = meshfox_core::declared_vars(canvas) else {
+        return;
+    };
+    let computed: HashMap<_, _> = state
+        .session_runs
+        .lock()
+        .unwrap()
+        .values()
+        .flat_map(|run| run.produced_vars.clone())
+        .collect();
+    let shared = meshfox_core::load_shared_env(canvas_root_dir(&state.canvas_path));
+    let cache = state.vars_cache.lock().unwrap();
+    canvas.artifact_values =
+        meshfox_core::resolve_with_shared(&decls, overrides, &cache, &computed, &shared).values;
+}
+
+fn artifact_lock_candidates(
+    canvas: &Canvas,
+    chain: &[meshfox_core::BlockAddr],
+    forced: &std::collections::HashSet<meshfox_core::BlockAddr>,
+) -> Result<std::collections::HashSet<meshfox_core::BlockAddr>, meshfox_core::DepsError> {
+    let mut candidates = forced.clone();
+    let has_artifacts = chain.iter().any(|addr| {
+        canvas.node(&addr.node_id).is_some_and(|node| {
+            meshfox_core::scan_runnable_blocks(&node.id, &node.text)
+                .iter()
+                .any(|block| {
+                    block.name.as_deref() == Some(addr.block_name.as_str())
+                        && (block.attrs.contains_key("inputs")
+                            || block.attrs.contains_key("outputs"))
+                })
+        })
+    });
+    if has_artifacts {
+        candidates.extend(chain.iter().cloned());
+        // A computed path may select a different producer after observation.
+        for node in &canvas.nodes {
+            if node.plain_markdown_include {
+                continue;
+            }
+            for block in meshfox_core::scan_runnable_blocks(&node.id, &node.text) {
+                if block.attrs.contains_key("outputs") {
+                    candidates.extend(meshfox_core::deps::resolve_chain(
+                        canvas,
+                        meshfox_core::BlockAddr::new(&node.id, block.name.as_deref().unwrap()),
+                    )?);
+                }
+            }
+        }
+    } else if chain.iter().any(|addr| {
+        !meshfox_core::from_targets(
+            &meshfox_core::declared_vars(canvas).unwrap_or_default(),
+            addr,
+        )
+        .is_empty()
+    }) {
+        candidates.extend(chain.iter().cloned());
+    }
+    Ok(candidates)
+}
+
+fn step_values(
+    state: &AppState,
+    canvas: &Canvas,
+    block: &meshfox_core::CodeBlock,
+    values: &mut HashMap<String, String>,
+) -> Result<(), meshfox_core::DepsError> {
+    let decls = meshfox_core::declared_vars(canvas)
+        .map_err(|e| meshfox_core::DepsError::Artifacts(e.to_string()))?;
+    let mut names = meshfox_core::artifacts::var_refs(block);
+    names.extend(block.env.iter().map(|r| r.var_name.clone()));
+    if let Some(spec) = &block.interpreter {
+        names.extend(meshfox_core::interpreter_var_refs(spec));
+    }
+    let needed = meshfox_core::close_over_var_refs(&decls, names.iter().map(String::as_str));
+    let relevant: Vec<_> = decls
+        .into_iter()
+        .filter(|d| needed.contains(&d.name))
+        .collect();
+    let shared = meshfox_core::load_shared_env(canvas_root_dir(&state.canvas_path));
+    let cache = state.vars_cache.lock().unwrap();
+    let overrides = effective_overrides(state, values);
+    let resolved =
+        meshfox_core::resolve_with_shared(&relevant, &overrides, &cache, values, &shared);
+    if !resolved.missing.is_empty() || !resolved.unresolved_from.is_empty() {
+        let names: Vec<_> = resolved.missing.iter().chain(resolved.unresolved_from.iter())
+            .map(|decl| decl.name.as_str()).collect();
+        return Err(meshfox_core::DepsError::Artifacts(format!(
+            "newly selected producer needs unresolved variables: {}; configure defaults or cached values before running", names.join(", ")
+        )));
+    }
+    values.extend(resolved.values);
+    Ok(())
+}
+
+fn artifact_inputs(
+    canvas: &Canvas,
+    addr: &meshfox_core::BlockAddr,
+    block: &meshfox_core::CodeBlock,
+    values: &HashMap<String, String>,
+) -> Result<String, meshfox_core::DepsError> {
+    meshfox_core::artifacts::fingerprint(canvas, addr, block, values, "inputs", true)
+}
+
+fn artifact_results(
+    canvas: &Canvas,
+    addr: &meshfox_core::BlockAddr,
+    block: &meshfox_core::CodeBlock,
+    values: &HashMap<String, String>,
+    inputs_before: &str,
+) -> Result<(), meshfox_core::DepsError> {
+    if artifact_inputs(canvas, addr, block, values)? != inputs_before {
+        return Err(meshfox_core::DepsError::Artifacts(
+            "inputs changed during execution".into(),
+        ));
+    }
+    meshfox_core::artifacts::fingerprint(canvas, addr, block, values, "outputs", true)?;
+    Ok(())
+}
+
 /// Recompute skip/sync decisions after observing computed variables. Actual
 /// values take precedence over provisional outputs from previous runs.
 fn replan_runs(
@@ -2278,17 +2401,15 @@ fn replan_runs(
 fn steps_needing_a_lock(
     state: &AppState,
     raw_snapshot: &str,
-    chain: &[meshfox_core::BlockAddr],
     forced_reruns: &std::collections::HashSet<meshfox_core::BlockAddr>,
 ) -> Vec<(meshfox_core::BlockAddr, run_ledger::RunKind)> {
     let mut out = Vec::new();
     let Ok(canvas) = resolved_canvas(raw_snapshot, &state.canvas_path) else {
         return out;
     };
-    for addr in chain {
-        if !forced_reruns.contains(addr) {
-            continue;
-        }
+    let mut candidates: Vec<_> = forced_reruns.iter().collect();
+    candidates.sort_by_key(|addr| (addr.node_id.clone(), addr.block_name.clone()));
+    for addr in candidates {
         let key = (addr.node_id.clone(), addr.block_name.clone());
         let already_live_service = state
             .services
@@ -2548,7 +2669,8 @@ async fn get_vars(
     // Include-resolved (not just `parse_or_error`) so `path`/`block` below
     // can address a node spliced in from an `include`, same as `run_block`
     // — see `resolved_canvas`'s own doc comment.
-    let canvas = resolved_canvas(&raw, &state.canvas_path)?;
+    let mut canvas = resolved_canvas(&raw, &state.canvas_path)?;
+    seed_artifact_paths(&state, &mut canvas, &effective_overrides(&state, &HashMap::new()));
     let path: Vec<&str> = if query.path.is_empty() {
         Vec::new()
     } else {
@@ -6067,7 +6189,8 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
     // resolved tree is namespaced (`{include_id}/{original_id}`), same as
     // what `GET /api/canvas` already sends the browser, so a path/block
     // the UI read off that response resolves the same way here.
-    let canvas = resolved_canvas(&raw_snapshot, &state.canvas_path)?;
+    let mut canvas = resolved_canvas(&raw_snapshot, &state.canvas_path)?;
+    seed_artifact_paths(&state, &mut canvas, &effective_overrides(&state, &req.vars));
     let path: Vec<&str> = req.path.iter().map(String::as_str).collect();
     let chain = meshfox_core::resolve_run_chain(&canvas, &path, &req.block, !req.no_deps)?;
     if let Some(addr) = find_tty_block(&canvas, &chain) {
@@ -6200,15 +6323,9 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
     // response, not a streamed event.
     // Computed observations can change the plan after admission. Reserve the
     // whole possible chain atomically rather than executing an unlocked step.
-    let lock_candidates = if chain
-        .iter()
-        .any(|addr| !meshfox_core::from_targets(&decls, addr).is_empty())
-    {
-        chain.iter().cloned().collect()
-    } else {
-        forced_reruns.clone()
-    };
-    let lock_targets = steps_needing_a_lock(&state, &raw_snapshot, &chain, &lock_candidates);
+    let lock_candidates = artifact_lock_candidates(&canvas, &chain, &forced_reruns)
+        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    let lock_targets = steps_needing_a_lock(&state, &raw_snapshot, &lock_candidates);
     let mut held_locks = match acquire_chain_locks(&state.run_ledger, &lock_targets, "webui") {
         Ok(locks) => locks,
         Err(ChainLockError::Conflict(conflict)) => return Ok(lock_conflict_response(&conflict)),
@@ -6318,11 +6435,28 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
         // `persist_run_outputs`.
         let mut pending_outputs: Vec<PendingOutput> = Vec::new();
 
+        let target = chain.last().unwrap().clone();
         let mut executed = std::collections::HashSet::new();
-        for addr in &chain {
+        let mut visited = std::collections::HashSet::new();
+        loop {
+            let mut canvas = canvas.clone();
+            canvas.artifact_values.extend(resolved_vars.clone());
+            let chain = match if req.no_deps { meshfox_core::deps::resolve_from_chain(&canvas, target.clone()) }
+                else { meshfox_core::deps::resolve_chain(&canvas, target.clone()) } {
+                Ok(chain) => chain,
+                Err(e) => {
+                    final_exit_code = 1;
+                    yield Ok(ndjson_line(&RunEvent::Error { message: e.to_string() }));
+                    break;
+                }
+            };
+            let Some(addr_owned) = chain.iter().find(|addr| !visited.contains(*addr)).cloned() else { break; };
+            let addr = &addr_owned;
+            visited.insert(addr.clone());
             let forced_reruns = match replan_runs(&state, &canvas, &chain, &resolved_vars, &executed, req.fresh) {
                 Ok(plan) => plan,
                 Err(e) => {
+                    final_exit_code = 1;
                     yield Ok(ndjson_line(&RunEvent::Error { message: e.to_string() }));
                     break;
                 }
@@ -6383,6 +6517,12 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
                 break;
             }
 
+            if block.tty {
+                final_exit_code = 1;
+                yield Ok(ndjson_line(&RunEvent::Error { message: "newly selected tty producer requires /api/run/tty".into() }));
+                break;
+            }
+
             // The block actually requested (always the chain's own last
             // entry — see `resolve_run_chain`'s doc comment) always runs
             // for real; only a pulled-in dependency is ever eligible to be
@@ -6394,6 +6534,11 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
             // table, say). `forced_reruns`, re-planned with observed
             // values, adds a third way in: a `!` `deps=` edge whose
             // declaring block is itself running for real this pass.
+            if let Err(e) = step_values(&state, &canvas, &block, &mut resolved_vars) {
+                final_exit_code = 1;
+                yield Ok(ndjson_line(&RunEvent::Error { message: e.to_string() }));
+                break;
+            }
             let is_requested_target = Some(addr) == chain.last();
             let live_fingerprint = step_fingerprint(Some(&canvas), &decls, addr, &block, &resolved_vars);
             if !is_requested_target && !block.always && !forced_reruns.contains(addr) {
@@ -6424,6 +6569,15 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
                 }
             }
 
+            let input_stamp = match artifact_inputs(&canvas, addr, &block, &resolved_vars) {
+                Ok(stamp) => stamp,
+                Err(e) => {
+                    final_exit_code = 1;
+                    yield Ok(ndjson_line(&RunEvent::Error { message: e.to_string() }));
+                    break;
+                }
+            };
+            let artifact_run_id = held_locks.get(&(addr.node_id.clone(), addr.block_name.clone())).copied();
             executed.insert(addr.clone());
 
             // Only this block's own `env=` list, relabeled to its local
@@ -6735,6 +6889,17 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
                 }
             }
 
+            if exit_code == 0 && !from_value_error {
+                if let Err(e) = artifact_results(&canvas, addr, &block, &resolved_vars, &input_stamp) {
+                    final_exit_code = 1;
+                    if let Some(id) = artifact_run_id { let _ = state.run_ledger.finish(id, run_ledger::FinishOutcome::Exited(1)); }
+                    yield Ok(ndjson_line(&RunEvent::Error { message: e.to_string() }));
+                    break;
+                }
+            }
+            let live_fingerprint = step_fingerprint(Some(&canvas), &decls, addr, &block, &resolved_vars);
+            if let Some(id) = artifact_run_id { stamp_run_fingerprint(&state, addr, id); }
+
             // Never persisted for a block living inside an `include` node's
             // own dumped body — that node's real, on-disk body is just the
             // bare link `include::resolve` dumped this text *over*, so
@@ -6786,6 +6951,10 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
         // through — a step that had already finished and been folded into
         // `file_raws` (above) shouldn't lose its freshly-cached output just
         // because a *later* step in the same chain got killed.
+        for (_, id) in held_locks.drain() {
+            let _ = state.run_ledger.discard_reservation(id);
+        }
+
         if persist {
             if let Err(message) = persist_run_outputs(&state, &pending_outputs).await {
                 yield Ok(ndjson_line(&RunEvent::Error { message }));
@@ -7342,7 +7511,14 @@ async fn run_block_tty(
     let raw_snapshot = state.raw.lock().unwrap().clone();
     // Include-resolved for the same reason `run_block` is — see its own
     // doc comment on the equivalent line.
-    let canvas = resolved_canvas(&raw_snapshot, &state.canvas_path)?;
+    let mut canvas = resolved_canvas(&raw_snapshot, &state.canvas_path)?;
+    let requested_vars: HashMap<String, String> = if query.vars.is_empty() {
+        HashMap::new()
+    } else {
+        serde_json::from_str(&query.vars)
+            .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("invalid `vars`: {e}")))?
+    };
+    seed_artifact_paths(&state, &mut canvas, &effective_overrides(&state, &requested_vars));
     let path: Vec<&str> = if query.path.is_empty() {
         Vec::new()
     } else {
@@ -7352,12 +7528,6 @@ async fn run_block_tty(
     let persist = query.persist;
     let (cols, rows) = (query.cols.max(1), query.rows.max(1));
 
-    let requested_vars: HashMap<String, String> = if query.vars.is_empty() {
-        HashMap::new()
-    } else {
-        serde_json::from_str(&query.vars)
-            .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("invalid `vars`: {e}")))?
-    };
     let save_secrets: std::collections::HashSet<String> = if query.save_secrets.is_empty() {
         std::collections::HashSet::new()
     } else {
@@ -7481,15 +7651,9 @@ async fn run_block_tty(
     // so a conflict is a plain HTTP response, not a WebSocket frame.
     // Computed observations can change the plan after admission. Reserve the
     // whole possible chain atomically rather than executing an unlocked step.
-    let lock_candidates = if chain
-        .iter()
-        .any(|addr| !meshfox_core::from_targets(&decls, addr).is_empty())
-    {
-        chain.iter().cloned().collect()
-    } else {
-        forced_reruns.clone()
-    };
-    let lock_targets = steps_needing_a_lock(&state, &raw_snapshot, &chain, &lock_candidates);
+    let lock_candidates = artifact_lock_candidates(&canvas, &chain, &forced_reruns)
+        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    let lock_targets = steps_needing_a_lock(&state, &raw_snapshot, &lock_candidates);
     let held_locks = match acquire_chain_locks(&state.run_ledger, &lock_targets, "webui") {
         Ok(locks) => locks,
         Err(ChainLockError::Conflict(conflict)) => return Ok(lock_conflict_response(&conflict)),
@@ -7511,6 +7675,7 @@ async fn run_block_tty(
             decls,
             resolved_vars,
             query.fresh,
+            !query.no_deps,
             persist,
             cols,
             rows,
@@ -7565,6 +7730,7 @@ async fn run_tty_chain(
     decls: Vec<meshfox_core::VarDecl>,
     mut resolved_vars: HashMap<String, String>,
     fresh: bool,
+    with_deps: bool,
     persist: bool,
     cols: u16,
     rows: u16,
@@ -7609,8 +7775,24 @@ async fn run_tty_chain(
         resolved_canvas(&raw, &state.canvas_path).ok()
     };
 
+    let target = chain.last().unwrap().clone();
     let mut executed = std::collections::HashSet::new();
-    for addr in &chain {
+    let mut visited = std::collections::HashSet::new();
+    loop {
+        let Some(mut canvas) = fp_canvas.clone() else { return; };
+        canvas.artifact_values.extend(resolved_vars.clone());
+        let chain = match if with_deps { meshfox_core::deps::resolve_chain(&canvas, target.clone()) }
+            else { meshfox_core::deps::resolve_from_chain(&canvas, target.clone()) } {
+            Ok(chain) => chain,
+            Err(e) => {
+                final_exit_code = 1;
+                send_event(&mut socket, &RunEvent::Error { message: e.to_string() }).await;
+                break;
+            }
+        };
+        let Some(addr_owned) = chain.iter().find(|addr| !visited.contains(*addr)).cloned() else { break; };
+        let addr = &addr_owned;
+        visited.insert(addr.clone());
         let forced_reruns = match fp_canvas.as_ref()
             .map(|canvas| replan_runs(&state, canvas, &chain, &resolved_vars, &executed, fresh)) {
             Some(Ok(plan)) => plan,
@@ -7693,6 +7875,11 @@ async fn run_tty_chain(
         // chain` through this WebSocket path always re-ran every pulled-in
         // dependency regardless of whether it had already run successfully
         // this session, unlike the plain (non-`tty`) `/api/run` path.
+        if let Err(e) = step_values(&state, &canvas, &block, &mut resolved_vars) {
+            final_exit_code = 1;
+            send_event(&mut socket, &RunEvent::Error { message: e.to_string() }).await;
+            break;
+        }
         let is_requested_target = Some(addr) == chain.last();
         let live_fingerprint =
             step_fingerprint(fp_canvas.as_ref(), &decls, addr, &block, &resolved_vars);
@@ -7726,6 +7913,16 @@ async fn run_tty_chain(
             }
         }
 
+        let input_stamp = match fp_canvas.as_ref().map(|canvas| artifact_inputs(canvas, addr, &block, &resolved_vars)) {
+            Some(Ok(stamp)) => stamp,
+            Some(Err(e)) => {
+                final_exit_code = 1;
+                send_event(&mut socket, &RunEvent::Error { message: e.to_string() }).await;
+                break;
+            }
+            None => { final_exit_code = 1; break; }
+        };
+        let artifact_run_id = held_locks.0.get(&(addr.node_id.clone(), addr.block_name.clone())).copied();
         executed.insert(addr.clone());
 
         let mut block_env = meshfox_core::map_block_env(&block.env, &resolved_vars);
@@ -8012,6 +8209,17 @@ async fn run_tty_chain(
         // document that reached this endpoint without being validated.
         // Never persisted for a block living inside an `include` node's own
         // dumped body — see the HTTP chain loop's own identical guard.
+        if exit_code == 0 && !from_value_error {
+            if let Some(Err(e)) = fp_canvas.as_ref().map(|canvas| artifact_results(canvas, addr, &block, &resolved_vars, &input_stamp)) {
+                final_exit_code = 1;
+                if let Some(id) = artifact_run_id { let _ = state.run_ledger.finish(id, run_ledger::FinishOutcome::Exited(1)); }
+                send_event(&mut socket, &RunEvent::Error { message: e.to_string() }).await;
+                break;
+            }
+        }
+        let live_fingerprint = step_fingerprint(fp_canvas.as_ref(), &decls, addr, &block, &resolved_vars);
+        if let Some(id) = artifact_run_id { stamp_run_fingerprint(&state, addr, id); }
+
         if persist && block.cache && !block.tty && !step_node.plain_markdown_include {
             let result = ExecOutput {
                 exit_code,
@@ -8060,6 +8268,10 @@ async fn run_tty_chain(
         if exit_code != 0 || from_value_error {
             break;
         }
+    }
+
+    for (_, id) in held_locks.0.drain() {
+        let _ = state.run_ledger.discard_reservation(id);
     }
 
     if persist {
@@ -13891,6 +14103,56 @@ mod ws_tests {
             assert_eq!(skipped.contains(&"prepare".to_string()), should_skip);
             assert!(!skipped.contains(&"observe".to_string()));
             assert!(!skipped.contains(&"target".to_string()));
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn tty_chain_discovers_artifact_producers_and_compares_file_contents() {
+        let dir =
+            std::env::temp_dir().join(format!("meshfox-tty-artifacts-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let canvas_path = dir.join("artifacts.canvas.md");
+        std::fs::write(
+            &canvas_path,
+            concat!(
+                "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
+                "```sh name=build inputs=source outputs=bin\nhead -c 1 source > bin\n```\n",
+                "```sh name=install inputs=bin outputs=installed\ncp bin installed\n```\n",
+                "```sh name=target tty deps=install\ntrue\n```\n",
+            ),
+        )
+        .unwrap();
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        for (value, build_skips, install_skips) in [
+            ("A-one", false, false),
+            ("A-one", true, true),
+            ("A-two", false, true),
+            ("B-three", false, false),
+        ] {
+            std::fs::write(dir.join("source"), value).unwrap();
+            let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+                "ws://{addr}/api/run/tty?block=target&cols=80&rows=24"
+            ))
+            .await
+            .unwrap();
+            let mut skipped = Vec::new();
+            loop {
+                let event =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), next_event(&mut ws))
+                        .await
+                        .unwrap();
+                assert_ne!(event["type"], "error", "{event:?}");
+                if event["type"] == "step-skipped" {
+                    skipped.push(event["block"].as_str().unwrap().to_string());
+                }
+                if event["type"] == "done" {
+                    assert_eq!(event["exitCode"], 0);
+                    break;
+                }
+            }
+            assert_eq!(skipped.contains(&"build".to_string()), build_skips);
+            assert_eq!(skipped.contains(&"install".to_string()), install_skips);
         }
         let _ = std::fs::remove_dir_all(dir);
     }

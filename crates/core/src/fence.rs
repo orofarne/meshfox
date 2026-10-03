@@ -498,6 +498,8 @@ pub(crate) fn in_output_region(ranges: &[Range<usize>], pos: usize) -> bool {
 const FENCE_ATTRS: &[&str] = &[
     "name",
     "deps",
+    "inputs",
+    "outputs",
     "env",
     "cache",
     "tty",
@@ -730,6 +732,11 @@ pub fn fingerprint(block: &CodeBlock) -> String {
     if let Some(attrs) = block.attrs.get("output-attrs") {
         parts.push(format!("output-attrs\u{0}{attrs}"));
     }
+    for name in ["inputs", "outputs"] {
+        if let Some(value) = block.attrs.get(name) {
+            parts.push(format!("{name}\u{0}{value}"));
+        }
+    }
     format!("{:08x}", fnv1a(parts.join("\u{0}").as_bytes()))
 }
 
@@ -755,6 +762,7 @@ pub fn session_fingerprint(block: &CodeBlock, resolved_vars: &HashMap<String, St
     if let Some(spec) = &block.interpreter {
         names.extend(crate::exec::interpreter_var_refs(spec));
     }
+    names.extend(crate::artifacts::var_refs(block));
     names.sort();
     names.dedup();
     let base = fingerprint(block);

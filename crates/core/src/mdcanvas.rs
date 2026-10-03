@@ -482,6 +482,7 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
     Ok(Canvas {
         nodes,
         options: Vec::new(),
+        ..Canvas::default()
     })
 }
 
