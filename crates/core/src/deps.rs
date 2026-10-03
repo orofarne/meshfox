@@ -193,11 +193,8 @@ fn implicit_from_deps(
 /// Every direct dependency address `block` (living in node `node_id`) has —
 /// its own `deps=` entries plus `implicit_from_deps` — regardless of
 /// whether a `deps=` entry carries the `!` (`BlockRef::sync`) marker. Used
-/// by `compute_forced_reruns`'s forward (dependency-forces-consumer)
-/// cascade, which doesn't care how the edge got there, only that one
-/// exists — unlike `visit`'s own `follow_deps`, which exists to let a
-/// caller opt out of `deps=` entirely (`resolve_from_chain`), not to
-/// distinguish a plain `deps=` entry from a `!` one.
+/// by closure fingerprints. Execution cascade separately follows only
+/// explicit `deps=` entries.
 fn direct_deps(
     node_id: &str,
     block: &crate::fence::CodeBlock,
@@ -236,16 +233,12 @@ fn visit(
 
     stack.push(addr.clone());
 
-    let mut dep_addrs: Vec<BlockAddr> = if follow_deps {
-        block
-            .deps
-            .iter()
-            .map(|d| resolve_ref(&addr.node_id, d))
-            .collect()
-    } else {
-        Vec::new()
-    };
-    dep_addrs.extend(implicit_from_deps(&addr.node_id, &block, decls));
+    // Observe computed values before action dependencies, especially `!`
+    // preparations whose necessity depends on those values.
+    let mut dep_addrs = implicit_from_deps(&addr.node_id, &block, decls);
+    if follow_deps {
+        dep_addrs.extend(block.deps.iter().map(|d| resolve_ref(&addr.node_id, d)));
+    }
 
     for dep_addr in dep_addrs {
         visit(canvas, dep_addr, decls, follow_deps, order, visited, stack)?;
@@ -257,60 +250,26 @@ fn visit(
     Ok(())
 }
 
-/// Which of `chain`'s entries a session-freshness-aware runner (the TUI,
-/// the web UI) must actually run for real, bypassing the usual "already ran
-/// successfully this session and hasn't changed" skip — the last entry
-/// (the block actually requested) and every `always` block are always in
-/// this set, same as today. Two propagation passes ride on top of that
-/// baseline:
-///
-/// - *Forward* (dependency forces consumer, every `deps=`/implicit `from=`
-///   edge, unconditionally): if a block ends up in this set for *any*
-///   reason — it's the target, `always`, its own fingerprint no longer
-///   matches, or it was itself forced by this same rule — everything that
-///   depends on it (directly) is forced too, transitively, the same way a
-///   `make`/Bazel-style build propagates a rebuild to everything downstream
-///   of a changed input. This is what keeps a plain, non-`always` step from
-///   silently reusing a cached result that was only valid against whatever
-///   its own dependency looked like *before* that dependency's forced
-///   rerun — in particular, a consumer of an `always` block is no longer
-///   the declaring block's problem to force by hand.
-/// - *Backward* (consumer forces dependency, `deps=` entries marked `!` —
-///   `BlockRef::sync` — only): whenever the block that declared a `!` edge
-///   ends up in this set, its `!` dependency is added too, even if nothing
-///   about the dependency itself (fingerprint, forward cascade) would have
-///   forced it. This is the narrower, opt-in complement to the forward
-///   rule: forward propagation alone can only make a dependency's forced
-///   rerun spread to *more* things running more often, never make an
-///   otherwise-independent, plain-fingerprint dependency (no `always`, own
-///   fingerprint unchanged) rerun *less often than always* just because one
-///   particular consumer needs it fresh — see `BlockRef::sync`'s own doc
-///   comment for the motivating case (a migration that should reset state
-///   exactly when, and only when, the load step that repopulates it is
-///   about to rerun, not on every session-`always` tick).
-///
-/// This is a *dry run*: no block is actually executed. `fingerprint_vars`
-/// computes the same var-name-keyed map `crate::fence::session_fingerprint`
-/// needs for one block, given whatever `from=`-produced values this dry run
-/// has simulated so far (see below) — a caller that resolves its whole
-/// chain's variables up front into one flat map (the web server) can ignore
-/// that second argument and return `overrides/cache/default ∪ computed`;
-/// one that resolves each block's own `env=` independently (the TUI, via
-/// `crate::vars::resolve_block_env`) plugs it straight in as that call's own
-/// `computed` argument, mirroring the real run exactly. `cached_run` looks
-/// up a block's session-freshness record (its `fingerprint` and
-/// `produced_vars`, same fields `SessionRun` in `crates/server`/`crates/cli`
-/// carries) — `None` if it hasn't completed successfully yet this session.
-/// For any entry this dry run decides would be *skipped*, `cached_run`'s
-/// `produced_vars` are folded into the simulated `computed` set feeding
-/// later blocks' `fingerprint_vars` calls, mirroring exactly what the real
-/// run does in that case; for an entry decided to run for real, its
-/// *actual* output values aren't known yet (nothing has run) — only
-/// relevant if some other block's `env=` needs a `from=` value out of a
-/// block that only ends up forced to run via a `!` edge (rather than its own
-/// fingerprint already having flagged it stale), a narrow enough case to
-/// leave as a known gap rather than complicate this further.
+/// Plan required runs using known values. Execution cascades only along explicit
+/// `deps=` edges; implicit `from=` edges provide values, not dirty propagation.
+/// Cached produced values are provisional until a source has actually run.
+/// Runners must re-plan after sources complete, with their actual values and
+/// the set of steps already executed, before deciding whether to skip a step.
 pub fn compute_forced_reruns(
+    canvas: &Canvas,
+    chain: &[BlockAddr],
+    fingerprint_vars: impl FnMut(
+        &crate::fence::CodeBlock,
+        &HashMap<String, String>,
+    ) -> HashMap<String, String>,
+    cached_run: impl Fn(&BlockAddr) -> Option<(String, HashMap<String, String>)>,
+) -> Result<HashSet<BlockAddr>, DepsError> {
+    compute_forced_reruns_after(canvas, chain, fingerprint_vars, cached_run, &HashSet::new())
+}
+
+/// Re-plan with actual execution facts. Already executed explicit dependencies
+/// still force consumers even after their freshness records have been updated.
+pub fn compute_forced_reruns_after(
     canvas: &Canvas,
     chain: &[BlockAddr],
     mut fingerprint_vars: impl FnMut(
@@ -318,6 +277,7 @@ pub fn compute_forced_reruns(
         &HashMap<String, String>,
     ) -> HashMap<String, String>,
     cached_run: impl Fn(&BlockAddr) -> Option<(String, HashMap<String, String>)>,
+    executed: &HashSet<BlockAddr>,
 ) -> Result<HashSet<BlockAddr>, DepsError> {
     let decls = crate::vars::declared_vars(canvas)?;
     let target = chain.last();
@@ -326,17 +286,11 @@ pub fn compute_forced_reruns(
 
     for addr in chain {
         let block = find_block(canvas, addr)?;
-        // Forward cascade: `chain` is topologically sorted (dependencies
-        // before dependents), so every direct dependency has already been
-        // decided by the time we reach `addr` — if any of them is forced,
-        // `addr` is too, regardless of its own fingerprint. A dependency
-        // whose *content* changed no longer needs this to reach `addr`
-        // (the closure fingerprint below already differs); what only this
-        // covers is a rerun no fingerprint can see — an `always` dependency,
-        // a `!` edge, or the requested target itself running.
-        let cascaded = direct_deps(&addr.node_id, &block, &decls)
+        let cascaded = block
+            .deps
             .iter()
-            .any(|dep| forced.contains(dep));
+            .map(|dep| resolve_ref(&addr.node_id, dep))
+            .any(|dep| forced.contains(&dep));
         let live_fingerprint = closure_fingerprint_with(
             canvas,
             &decls,
@@ -344,7 +298,8 @@ pub fn compute_forced_reruns(
             &fingerprint_vars(&block, &sim_computed),
         )?;
         let cached = cached_run(addr);
-        let run_for_real = Some(addr) == target
+        let run_for_real = executed.contains(addr)
+            || Some(addr) == target
             || block.always
             || cascaded
             || !cached
@@ -352,7 +307,10 @@ pub fn compute_forced_reruns(
                 .is_some_and(|(fp, _)| *fp == live_fingerprint);
         if run_for_real {
             forced.insert(addr.clone());
-        } else if let Some((_, produced)) = cached {
+        }
+        // Keep prior values as predictions, including for always sources.
+        // Actual values supplied by the runner must take precedence.
+        if let Some((_, produced)) = cached {
             sim_computed.extend(produced);
         }
     }
@@ -1266,12 +1224,9 @@ mod tests {
         );
     }
 
-    /// The forward cascade also follows an *implicit* `from=` edge, not
-    /// just an explicit `deps=` one — `deploy` never names `provision` in
-    /// its own `deps=`, only reaches it through `env="$X"` plus `X`'s own
-    /// `from="provision"` declaration.
+    /// Rechecking a computed value does not force a fresh consumer.
     #[test]
-    fn compute_forced_reruns_cascades_forward_through_an_implicit_from_edge() {
+    fn compute_forced_reruns_does_not_cascade_through_an_implicit_from_edge() {
         let c = canvas(concat!(
             "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
             "<!-- meshfox:var name=\"X\" from=\"provision\" -->\n\n",
@@ -1298,7 +1253,6 @@ mod tests {
             forced,
             HashSet::from([
                 BlockAddr::new("root", "provision"),
-                BlockAddr::new("root", "deploy"),
                 BlockAddr::new("root", "validate"),
             ])
         );

@@ -154,3 +154,62 @@ fn fresh_conflicts_with_no_deps() {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn always_observation_only_reruns_consumers_when_its_value_changes() {
+    let dir = unique_dir();
+    let home = unique_dir();
+    let canvas = dir.join("values.canvas.md");
+    std::fs::write(dir.join("revision"), "one\n").unwrap();
+    std::fs::write(&canvas, concat!(
+        "<!-- meshfox:canvas -->\n# Values\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "<!-- meshfox:var name=\"REV\" from=\"observe\" -->\n\n",
+        "```bash name=\"observe\" always\nprintf 'REV=%s\\n' \"$(cat revision)\" >> \"$MESHFOX_VARS_OUT\"\necho checked >> checks.txt\n```\n\n",
+        "```bash name=\"prepare\"\necho prepared >> preparations.txt\n```\n\n",
+        "```bash name=\"consume\" env=\"REV\" deps=\"prepare!\"\necho \"$REV\" >> count.txt\n```\n\n",
+        "```bash name=\"explicit\" env=\"REV\" deps=\"observe\"\necho ran >> explicit.txt\n```\n\n",
+        "```bash name=\"target\" deps=\"consume,explicit\"\ntrue\n```\n",
+    )).unwrap();
+    for expected in [1, 1, 2, 2] {
+        if expected == 2 {
+            std::fs::write(dir.join("revision"), "two\n").unwrap();
+        }
+        let out = run_target(&home, &canvas, &[]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(runs(&dir), expected);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("preparations.txt"))
+                .unwrap()
+                .lines()
+                .count(),
+            expected
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.join("checks.txt"))
+            .unwrap()
+            .lines()
+            .count(),
+        4
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("explicit.txt"))
+            .unwrap()
+            .lines()
+            .count(),
+        4
+    );
+    let out = run_target(&home, &canvas, &["--fresh"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(runs(&dir), 3);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&home);
+}

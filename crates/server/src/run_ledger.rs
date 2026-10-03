@@ -504,6 +504,17 @@ impl RunLedger {
         Ok(())
     }
 
+    /// Release a queued reservation for a step that was found fresh and
+    /// never spawned. It is not a killed run and must not appear in history.
+    pub fn discard_reservation(&self, id: i64) -> io::Result<()> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM runs WHERE id = ?1 AND outcome = 'running' AND pid = ?2",
+            params![id, std::process::id()],
+        ).map_err(sqlite_err)?;
+        self.notify();
+        Ok(())
+    }
+
     /// Marks row `id` resolved — the equivalent of `service_lock::release`,
     /// just recording how it ended instead of deleting the record.
     pub fn finish(&self, id: i64, outcome: FinishOutcome) -> io::Result<()> {
@@ -693,6 +704,18 @@ fn kill_process_group(pid: u32) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skipped_reservations_release_the_lock_without_creating_run_history() {
+        let ledger = RunLedger::open_in_memory().unwrap();
+        let id = ledger.start("a", "b", RunKind::Plain, "test", std::process::id()).unwrap();
+        ledger.discard_reservation(id).unwrap();
+        assert!(ledger.active_running().unwrap().is_empty());
+        assert!(ledger.history("a", "b", None).unwrap().is_empty());
+        let child = ledger.start("a", "b", RunKind::Plain, "test", 1).unwrap();
+        ledger.discard_reservation(child).unwrap();
+        assert_eq!(ledger.active_running().unwrap().len(), 1, "a spawned process must not be discarded");
+    }
     use std::os::unix::process::CommandExt;
 
     /// A real, short-lived process to stand in for "whatever a `running`
