@@ -160,8 +160,8 @@ pub enum AckResponse {
 }
 
 /// Sends `msg` to the coordinator listening at `socket_path` as one
-/// newline-delimited JSON line, then closes the connection — used only by
-/// [`notify_ready`], the one message nobody ever replies to. Every other
+/// newline-delimited JSON line and waits for the coordinator's ack — used only by
+/// [`notify_ready`]. Every other
 /// message here keeps the connection open afterward to read a reply — see
 /// [`request_and_await_reply`].
 async fn send(socket_path: &Path, msg: &Message) -> io::Result<()> {
@@ -170,9 +170,36 @@ async fn send(socket_path: &Path, msg: &Message) -> io::Result<()> {
         serde_json::to_string(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     line.push('\n');
     stream.write_all(line.as_bytes()).await?;
-    stream.shutdown().await?;
-    Ok(())
+    // Best-effort half-close: older coordinators wait for EOF before
+    // acting on the line. It can fail (EPIPE/ENOTCONN) if a newer one
+    // already answered and closed — the ack below is what counts.
+    let _ = stream.shutdown().await;
+    // The coordinator acks with one `{}` line once it has *processed* the
+    // message. Waiting for it (rather than dropping the connection right
+    // after writing) avoids a macOS race where an already-closed
+    // connection is discarded at the coordinator's `accept()`
+    // (`ECONNABORTED`), losing the message and leaving the worker stuck
+    // "starting". EOF without an ack (an older coordinator that never
+    // replies) or a timeout still counts as delivered; only a connection
+    // error is reported, so the caller can retry.
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut ack = String::new();
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        BufReader::new(stream).read_line(&mut ack),
+    )
+    .await
+    {
+        Ok(Err(e)) => Err(e),
+        _ => Ok(()),
+    }
 }
+
+/// How many times [`notify_ready`] attempts delivery before giving up, and
+/// the pause between attempts. `Ready` is idempotent on the coordinator
+/// side, so a retry after a spurious failure is always safe.
+const NOTIFY_READY_ATTEMPTS: u32 = 5;
+const NOTIFY_READY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Connects to `socket_path`, writes `msg` as one line, then reads exactly
 /// one JSON reply line back — the shared mechanics every reply-expecting
@@ -214,14 +241,21 @@ async fn request_and_await_reply(socket_path: &Path, msg: &Message) -> io::Resul
 /// canvas navigation only, not this worker's own operation) — see `run`'s
 /// own call site for how it logs rather than propagates this.
 pub async fn notify_ready(socket_path: &Path, canvas_path: &Path, port: u16) -> io::Result<()> {
-    send(
-        socket_path,
-        &Message::Ready {
-            canvas_path: canvas_path.to_path_buf(),
-            port,
-        },
-    )
-    .await
+    let msg = Message::Ready {
+        canvas_path: canvas_path.to_path_buf(),
+        port,
+    };
+    let mut attempt = 1;
+    loop {
+        match send(socket_path, &msg).await {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt >= NOTIFY_READY_ATTEMPTS => return Err(e),
+            Err(_) => {
+                attempt += 1;
+                tokio::time::sleep(NOTIFY_READY_RETRY_DELAY).await;
+            }
+        }
+    }
 }
 
 /// How long [`request_port`]/[`request_open`]/[`request_open_file`] each

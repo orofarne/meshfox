@@ -39,14 +39,14 @@ This document is itself a valid meshfox canvas — every `##` section here is a 
 
 Rough checklist for what's needed before a 1.0.0 release:
 
-- [ ] Linux server support
+- [x] Linux server support (`meshfox serve` under `systemd --user` socket activation, see "macOS menu-bar app" below)
 - [x] Persistent sessions (runs/services/tty survive a core restart)
 - [x] Undo/redo
 - [x] Full canvas-geometry support in the TUI
 - [x] A unified interface for external renderers
 - [x] LaTeX, Vega, Mermaid/PlantUML sub-render support (as SVG output from external renderers, see "Showing a diagram, formula or chart")
 - [x] Conflict resolution for concurrent editing
-- [ ] Encryption for stored secrets (macOS Keychain and Linux Secret Service done; Windows Credential Manager still missing)
+- [x] Encryption for stored secrets (macOS Keychain, Linux Secret Service; Windows Credential Manager comes with Windows support)
 
 ## Concept
 <!-- meshfox:node id="concept" -->
@@ -548,7 +548,7 @@ Options:
 ### macOS menu-bar app (`server_socket`, experimental)
 <!-- meshfox:node id="macos-menu-bar-app-open-experimental" -->
 
-`Meshfox.app` is a menu-bar-only daemon (no Dock icon) that also handles Finder's double-click/drag-onto-icon/"Open With" on a `.canvas.md` — see [macos/app.canvas.md](./macos/app.canvas.md) for building it. The build produces `macos/dist/Meshfox.app`, a graphical `macos/dist/Meshfox.pkg`, and a ZIP containing the package and `Uninstall.command`. The package installs the app in `/Applications` for all users; each user gets a separate socket-activated daemon at login. It seeds `~/.local/bin/meshfox` once for each user, unless that user already has a CLI. The daemon uses that personal binary, which can be updated independently with `meshfox check-updates`, and falls back to the signed copy inside the app if needed. If `/usr/local/bin/meshfox` is free, the package puts a wrapper there that selects the calling user's binary; an existing command is preserved. New worker sessions use an updated CLI, while already running sessions must restart. A newer `.pkg` updates the app itself and refreshes active user agents without overwriting personal CLIs. Installing and uninstalling on another Mac requires neither the source tree nor the canvas file. The app is not built by default.
+`Meshfox.app` is a menu-bar-only daemon (no Dock icon) that also handles Finder's double-click/drag-onto-icon/"Open With" on a `.canvas.md` — see the "Building the macOS app" node below (it opens `macos/app.canvas.md`) for building it. The build produces `macos/dist/Meshfox.app`, a graphical `macos/dist/Meshfox.pkg`, and a ZIP containing the package and `Uninstall.command`. The package installs the app in `/Applications` for all users; each user gets a separate socket-activated daemon at login. It seeds `~/.local/bin/meshfox` once for each user, unless that user already has a CLI. The daemon uses that personal binary, which can be updated independently with `meshfox check-updates`, and falls back to the signed copy inside the app if needed. If `/usr/local/bin/meshfox` is free, the package puts a wrapper there that selects the calling user's binary; an existing command is preserved. New worker sessions use an updated CLI, while already running sessions must restart. A newer `.pkg` updates the app itself and refreshes active user agents without overwriting personal CLIs. Installing and uninstalling on another Mac requires neither the source tree nor the canvas file. The app is not built by default.
 
 The current GitHub release workflow publishes standalone CLI tarballs, not `Meshfox.pkg`; package updates therefore require building or obtaining a newer package separately until the release workflow publishes one.
 
@@ -557,6 +557,11 @@ Once `server_socket` is set, every core-launch operation (`view`, `tui`, `run`, 
 The daemon's own socket is always reachable once its LaunchAgent is installed — launchd itself creates and holds it open via socket activation, spawning (or waking) the actual daemon process on first connection rather than requiring it to already be running. No client anywhere (this CLI, the VS Code extension) needs to know how to find or launch the `.app` itself: a configured-but-unreachable `server_socket` means the LaunchAgent isn't installed at all, reported as a real error rather than a silent fallback to running standalone.
 
 The menu-bar app is macOS only. On Linux, `meshfox serve` is the same coordinator without the UI — it speaks the same socket protocol, so `server_socket` points at it the same way. Run it by hand (`meshfox serve --socket PATH`) or under `systemd --user` socket activation (it takes the listening socket systemd hands it): `linux/install-user-units.sh [PATH_TO_MESHFOX]` installs `meshfox.socket` and `meshfox.service` for the current user and prints the `server_socket` line to add to `~/.meshfox/config.toml`; `--uninstall` removes them. The socket exists from login on and the first connection starts the service; stopping or killing the service leaves the socket in place and takes its workers down with it. It listens with owner-only permissions (`0600`), which is also what protects `kill`. Either coordinator is managed with `meshfox cores`: `ls` lists the live cores (canvas path, port, pid), `open <canvas>` shows one in the browser (starting it if needed), `kill <canvas>` stops it (`no such core` if none is running).
+
+#### Building the macOS app
+<!-- meshfox:node id="building-the-macos-app" type="file" -->
+
+[macos/app.canvas.md](./macos/app.canvas.md)
 
 ### Terminal viewer
 <!-- meshfox:node id="usage-tui" -->
@@ -1001,6 +1006,43 @@ At most six `meshfox tui` sessions are alive at once, whatever `--test-threads` 
 cargo test --test tui_e2e -- --ignored
 ```
 
+### Linux tests
+<!-- meshfox:node id="linux-tests" -->
+
+Linux-only code (the Secret Service backend behind `secret_store = "keychain"`, systemd socket activation of `meshfox serve`) is never compiled on a macOS host, so it is built and tested in a [lima](https://lima-vm.io) VM named `mfx` (Debian 13, 4 CPUs, 8 GiB — a 4 GiB VM gets the linker OOM-killed). `lima-prep` creates and starts it if needed and installs the toolchain, `gnome-keyring` (the real Secret Service the tests talk to) and `secret-tool`; it is idempotent. The repo is mounted into the VM read-only at the same path, so every block builds into `$HOME/target` inside the VM (with debug info off, for the linker's sake) and `Cargo.lock` has to be up to date on the host first.
+
+```sh name="lima-prep"
+if ! limactl list --format '{{.Name}}' | grep -qx mfx; then
+  limactl create --name=mfx --cpus=4 --memory=8 --disk=20 --tty=false template:debian-13
+fi
+limactl list --format '{{.Name}} {{.Status}}' | grep -qx 'mfx Running' || limactl start mfx --tty=false
+limactl shell mfx -- bash -lc '
+  set -e
+  command -v gnome-keyring-daemon >/dev/null && command -v secret-tool >/dev/null && command -v cc >/dev/null || {
+    sudo apt-get update -qq
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+      build-essential pkg-config curl git gnome-keyring libsecret-tools dbus-user-session python3
+  }
+  [ -x "$HOME/.cargo/bin/cargo" ] || { curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal; }
+'
+```
+
+`secrets` runs `crates/core/tests/secret_service_it.rs` and `crates/cli/tests/secret_cmd_linux.rs` against `gnome-keyring` in a throwaway session bus (`scripts/secret-service-it.sh`): the backend's round trips, `meshfox secret set/show/rm/list` through the real CLI, a `run` that reads the stored value, and the loud failure when no Secret Service is reachable. It never touches your own keyring.
+
+```sh name="secrets" deps="lima-prep"
+limactl shell mfx -- bash -lc "cd '$PWD' && export CARGO_TARGET_DIR=\$HOME/target PATH=\$HOME/.cargo/bin:\$PATH CARGO_PROFILE_DEV_DEBUG=0 && scripts/secret-service-it.sh"
+```
+
+`systemd` builds `meshfox`, installs `linux/systemd/meshfox.{socket,service}` for the VM user under a real `systemd --user` and checks socket activation end to end (`scripts/systemd-socket-activation-it.sh`): the service starts on the first connection, `stop` takes the workers down but leaves the socket, a clean `SIGTERM` doesn't restart it, and a worker the service spawned reads a secret from the keyring. The units are removed again afterwards.
+
+```sh name="systemd" deps="lima-prep"
+limactl shell mfx -- bash -lc "cd '$PWD' && export CARGO_TARGET_DIR=\$HOME/target PATH=\$HOME/.cargo/bin:\$PATH CARGO_PROFILE_DEV_DEBUG=0 && cargo build -p meshfox-cli && scripts/systemd-socket-activation-it.sh"
+```
+
+```sh name="run" deps="secrets!,systemd!" default
+echo "Linux tests passed"
+```
+
 ### Linting
 <!-- meshfox:node id="linting" -->
 
@@ -1024,9 +1066,9 @@ echo "binary: target/release/meshfox"
 ### Full check
 <!-- meshfox:node id="full-check" -->
 
-Run unit tests, typecheck, and e2e tests:
+Run unit tests (macOS host and the Linux VM), typecheck, and e2e tests:
 
-```bash name="full-check" deps="unit-tests/run!,linting/typecheck!,e2e-tests/run!,release-build/release-build!"
+```bash name="full-check" deps="unit-tests/run!,linux-tests/run!,linting/typecheck!,e2e-tests/run!,release-build/release-build!"
 echo "done"
 ```
 

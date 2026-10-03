@@ -6,6 +6,7 @@
 //! README is itself a valid meshfox document).
 
 pub mod attrs;
+pub mod body_rev;
 pub mod builtin_interpreter;
 pub mod canvas;
 pub mod comment;
@@ -23,15 +24,14 @@ pub mod locate;
 pub mod mdcanvas;
 pub mod options;
 pub mod output;
-pub mod service_lock;
 pub mod secret_index;
 pub mod secret_store;
+pub mod service_lock;
 pub mod shared_env;
 pub mod staticgen;
-pub mod svg;
 pub mod subsup;
+pub mod svg;
 pub mod syntax_dirs;
-pub mod body_rev;
 pub mod tag_colors;
 pub mod timestamp;
 pub mod tree;
@@ -40,6 +40,7 @@ pub mod varout;
 pub mod vars;
 pub mod worker_lock;
 
+pub use body_rev::{annotate_body_revs, body_rev};
 pub use builtin_interpreter::{
     is_builtin, resolve_builtin_spec, resolve_with_env, ResolvedInterpreter,
 };
@@ -67,7 +68,6 @@ pub use options::{declared_options, OptionsError};
 pub use output::{cached_output_hash, format_duration_ms, write_output, ExecOutput};
 pub use shared_env::{load as load_shared_env, SharedEnv, SharedOrigin, SharedVar};
 pub use staticgen::{Asset, EdgeView, NodeView, Position, SiteData};
-pub use body_rev::{annotate_body_revs, body_rev};
 pub use tag_colors::{
     annotate_effective_colors, declared_tag_colors, effective_color, TagColorError,
 };

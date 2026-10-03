@@ -374,7 +374,10 @@ fn node_meta_adds_and_removes_tags_and_refuses_to_replace_the_list() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("--add-tag"), "stderr: {stderr}");
     let unchanged = std::fs::read_to_string(&canvas_path).unwrap();
-    assert!(unchanged.contains("tags=\"keep,new\""), "after: {unchanged}");
+    assert!(
+        unchanged.contains("tags=\"keep,new\""),
+        "after: {unchanged}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

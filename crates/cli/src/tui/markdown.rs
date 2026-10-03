@@ -1838,7 +1838,9 @@ mod tests {
             _ => None,
         });
         let (path, bg) = image.expect("an image segment for the SVG");
-        assert!(path.to_string_lossy().starts_with("data:image/svg+xml;base64,"));
+        assert!(path
+            .to_string_lossy()
+            .starts_with("data:image/svg+xml;base64,"));
         assert_eq!(bg, meshfox_core::image_attrs::Background::parse("#fff"));
     }
 
@@ -1868,18 +1870,29 @@ mod tests {
             &std::collections::HashMap::new(),
         );
         let image = segments.iter().find_map(|s| match s {
-            Segment::Image { path, width_percent, bg, .. } => Some((path.clone(), *width_percent, *bg)),
+            Segment::Image {
+                path,
+                width_percent,
+                bg,
+                ..
+            } => Some((path.clone(), *width_percent, *bg)),
             _ => None,
         });
         let (path, width, bg) = image.expect("the cached region's image");
-        assert!(path.to_string_lossy().starts_with("data:image/svg+xml;base64,"));
+        assert!(path
+            .to_string_lossy()
+            .starts_with("data:image/svg+xml;base64,"));
         assert_eq!(width, Some(50));
         assert_eq!(bg, meshfox_core::image_attrs::Background::parse("#fff"));
     }
 
     #[test]
     fn running_or_failed_image_live_output_stays_plain_text() {
-        for (stdout, code, running) in [(LIVE_SVG, 0, true), (LIVE_SVG, 2, false), ("not an svg", 0, false)] {
+        for (stdout, code, running) in [
+            (LIVE_SVG, 0, true),
+            (LIVE_SVG, 2, false),
+            ("not an svg", 0, false),
+        ] {
             let segments = image_live_segments(stdout, code, running);
             assert!(
                 !segments.iter().any(|s| matches!(s, Segment::Image { .. })),

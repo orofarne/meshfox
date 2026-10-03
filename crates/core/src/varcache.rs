@@ -159,7 +159,9 @@ impl VarCache {
                     index
                         .record(&secret_store::doc_scope(&binding.canvas_path), name)
                         .map_err(|e| {
-                            io::Error::other(format!("saved, but couldn't note it in the index: {e}"))
+                            io::Error::other(format!(
+                                "saved, but couldn't note it in the index: {e}"
+                            ))
                         })?;
                 }
                 Ok(())
@@ -255,7 +257,10 @@ mod tests {
         let canvas = Path::new("/nonexistent/doc.canvas.md");
         let mut cache = VarCache::in_memory().with_secret_backend(backend.clone(), canvas);
         cache.save_secret("TOKEN", "s3cret").unwrap();
-        assert_eq!(cache.try_get_secret("TOKEN").unwrap().as_deref(), Some("s3cret"));
+        assert_eq!(
+            cache.try_get_secret("TOKEN").unwrap().as_deref(),
+            Some("s3cret")
+        );
         assert_eq!(cache.get("TOKEN"), None);
         assert_eq!(cache.secret_store_kind(), SecretStoreKind::Keychain);
     }
@@ -290,7 +295,11 @@ mod tests {
     fn an_invalid_secret_store_setting_fails_the_load() {
         let dir = std::env::temp_dir().join(format!("meshfox-varcache-badstore-{}", uid()));
         std::fs::create_dir_all(dir.join(".meshfox")).unwrap();
-        std::fs::write(dir.join(".meshfox/config.toml"), "secret_store = \"auto\"\n").unwrap();
+        std::fs::write(
+            dir.join(".meshfox/config.toml"),
+            "secret_store = \"auto\"\n",
+        )
+        .unwrap();
         let err = VarCache::load(&dir.join("doc.canvas.md")).unwrap_err();
         assert!(err.to_string().contains("secret_store"), "{err}");
         std::fs::remove_dir_all(&dir).ok();

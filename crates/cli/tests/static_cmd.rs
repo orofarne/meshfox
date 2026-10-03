@@ -503,14 +503,26 @@ fn node_titles_and_tags_are_html_escaped_in_the_output() {
         .arg(&out_dir)
         .output()
         .unwrap();
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
-    let index = std::fs::read_to_string(out_dir.join("index")).unwrap_or_else(|_| {
-        std::fs::read_to_string(out_dir.join("index.html")).unwrap()
-    });
-    assert!(!index.contains("<img"), "title markup reached the page: {index}");
-    assert!(!index.contains("<script"), "title markup reached the page: {index}");
-    assert!(index.contains("&lt;img src=x onerror=alert(1)&gt;"), "{index}");
+    let index = std::fs::read_to_string(out_dir.join("index"))
+        .unwrap_or_else(|_| std::fs::read_to_string(out_dir.join("index.html")).unwrap());
+    assert!(
+        !index.contains("<img"),
+        "title markup reached the page: {index}"
+    );
+    assert!(
+        !index.contains("<script"),
+        "title markup reached the page: {index}"
+    );
+    assert!(
+        index.contains("&lt;img src=x onerror=alert(1)&gt;"),
+        "{index}"
+    );
     assert!(index.contains("<i>a&lt;b</i>"), "tag not escaped: {index}");
 
     let _ = std::fs::remove_dir_all(&template_dir);
@@ -538,7 +550,10 @@ fn static_refuses_template_toml(tag: &str, toml: &str) -> String {
         .output()
         .unwrap();
     assert!(!output.status.success(), "should have been refused");
-    assert!(!out_dir.exists(), "nothing should be written for a refused template");
+    assert!(
+        !out_dir.exists(),
+        "nothing should be written for a refused template"
+    );
 
     let _ = std::fs::remove_dir_all(&template_dir);
     let _ = std::fs::remove_dir_all(canvas_path.parent().unwrap());
@@ -547,7 +562,8 @@ fn static_refuses_template_toml(tag: &str, toml: &str) -> String {
 
 #[test]
 fn template_toml_with_an_unknown_key_is_refused() {
-    let stderr = static_refuses_template_toml("unknown-key", "api_version = 1\nlinks_base_ulr = \"x\"\n");
+    let stderr =
+        static_refuses_template_toml("unknown-key", "api_version = 1\nlinks_base_ulr = \"x\"\n");
     assert!(stderr.contains("links_base_ulr"), "{stderr}");
 }
 
@@ -562,7 +578,8 @@ fn template_toml_with_an_unknown_icon_key_is_refused() {
 
 #[test]
 fn template_toml_without_an_api_version_is_refused() {
-    let stderr = static_refuses_template_toml("no-api-version", "base_url = \"https://example.com\"\n");
+    let stderr =
+        static_refuses_template_toml("no-api-version", "base_url = \"https://example.com\"\n");
     assert!(stderr.contains("api_version"), "{stderr}");
 }
 
@@ -603,10 +620,18 @@ fn script_json_cannot_end_the_script_element_it_sits_in() {
         .arg(&out_dir)
         .output()
         .unwrap();
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let index = std::fs::read_to_string(out_dir.join("index.html")).unwrap();
-    assert_eq!(index.matches("</script>").count(), 1, "the element ended early: {index}");
+    assert_eq!(
+        index.matches("</script>").count(),
+        1,
+        "the element ended early: {index}"
+    );
     assert!(!index.contains("<img"), "{index}");
     assert!(index.contains("\\u003c/script\\u003e\\u003cimg"), "{index}");
     // Still the same JSON once a parser has read it.

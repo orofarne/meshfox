@@ -974,7 +974,8 @@ const SOURCE_CHANGED_ELSEWHERE: &str =
     "the file changed since you opened it — Ctrl-s again overwrites it, Esc discards your edits";
 
 /// What `e`/`H` say on a canvas served read-only — see `App::read_only`.
-const READ_ONLY_STATUS: &str = "read-only canvas (it or its directory isn't writable) — blocks run, nothing is saved";
+const READ_ONLY_STATUS: &str =
+    "read-only canvas (it or its directory isn't writable) — blocks run, nothing is saved";
 
 impl App {
     /// Loads the primary canvas from its worker. A failed request is a
@@ -2923,13 +2924,8 @@ impl App {
             })
             .collect();
         for (path, width_percent, height_percent, bg) in images {
-            let protocol = load_image_protocol(
-                &mut self.picker,
-                &path,
-                width_percent,
-                height_percent,
-                bg,
-            );
+            let protocol =
+                load_image_protocol(&mut self.picker, &path, width_percent, height_percent, bg);
             self.doc_images.insert(path, protocol);
         }
 
@@ -3311,7 +3307,7 @@ impl App {
                 std::collections::HashSet::new(),
                 force,
             )
-                .await;
+            .await;
         } else {
             self.begin_http_run(
                 node_id,
@@ -3322,7 +3318,7 @@ impl App {
                 std::collections::HashSet::new(),
                 force,
             )
-                .await;
+            .await;
         }
     }
 
@@ -4726,9 +4722,7 @@ impl App {
         let blocks: Vec<_> = scan_runnable_blocks(&node_id, &node.text)
             .into_iter()
             .filter(|b| {
-                !b.service
-                    && !meshfox_core::is_button(&b.lang)
-                    && !meshfox_core::is_form(&b.lang)
+                !b.service && !meshfox_core::is_button(&b.lang) && !meshfox_core::is_form(&b.lang)
             })
             .collect();
         match blocks.len() {
@@ -5559,7 +5553,10 @@ mod tests {
     fn load_image_protocol_loads_an_svg_data_url_and_an_svg_file() {
         let mut picker = Picker::halfblocks();
         let path = PathBuf::from(SVG_BASE64_DATA_URL);
-        assert!(load_image_protocol(&mut picker, &path, None, None, Background::parse("#fff")).is_some());
+        assert!(
+            load_image_protocol(&mut picker, &path, None, None, Background::parse("#fff"))
+                .is_some()
+        );
 
         let dir = std::env::temp_dir().join(format!("meshfox-svg-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -5769,7 +5766,8 @@ mod tests {
 
     #[tokio::test]
     async fn ctrl_s_toggles_save_on_a_secret_field_only() {
-        let dir = std::env::temp_dir().join(format!("meshfox-tui-save-secret-test-{}", uuid_like()));
+        let dir =
+            std::env::temp_dir().join(format!("meshfox-tui-save-secret-test-{}", uuid_like()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("canvas.md");
         std::fs::write(
@@ -5821,7 +5819,10 @@ mod tests {
         app.block_runs = Some(vec![run("term", "tty", "exited", Some(0))]);
         app.sync_tty_results();
         let entry = &app.step_output[&addr];
-        assert_eq!((entry.exit_code, entry.duration_ms, entry.running), (0, 2800, false));
+        assert_eq!(
+            (entry.exit_code, entry.duration_ms, entry.running),
+            (0, 2800, false)
+        );
         assert!(entry.stdout.is_empty() && entry.stderr.is_empty());
         // ...and the Document pane actually draws it under the block.
         app.selected = app.rows.iter().position(|r| r.node_id == "root").unwrap();
@@ -5834,7 +5835,12 @@ mod tests {
                     _ => None,
                 })
                 .flatten()
-                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
                 .collect::<Vec<_>>()
                 .join("\n")
         };
@@ -5845,7 +5851,11 @@ mod tests {
         app.block_runs = Some(vec![run("term", "tty", "exited", Some(3))]);
         app.sync_tty_results();
         assert_eq!(app.step_output[&addr].exit_code, 3);
-        assert!(drawn(&app).contains("output: term · live · failed"), "{}", drawn(&app));
+        assert!(
+            drawn(&app).contains("output: term · live · failed"),
+            "{}",
+            drawn(&app)
+        );
 
         // A plain block's entry is never touched, and a tty one whose run is
         // no longer current (edited / session reset) disappears.
@@ -5863,7 +5873,9 @@ mod tests {
         app.block_runs = Some(Vec::new());
         app.sync_tty_results();
         assert!(!app.step_output.contains_key(&addr));
-        assert!(app.step_output.contains_key(&BlockAddr::new("root", "plain")));
+        assert!(app
+            .step_output
+            .contains_key(&BlockAddr::new("root", "plain")));
     }
 
     #[tokio::test]
@@ -5916,7 +5928,9 @@ mod tests {
         let failed = app.failed_node_ids();
         assert_eq!(
             failed,
-            ["plain-failed", "tty-failed", "tty-killed"].into_iter().collect()
+            ["plain-failed", "tty-failed", "tty-killed"]
+                .into_iter()
+                .collect()
         );
     }
 
@@ -6096,8 +6110,11 @@ mod tests {
         // (A single history-keeping block skips the picker and fetches
         // straight away — that path needs a worker, so it's covered by the
         // pty suite's `run_history.rs`.)
-        let mut app =
-            app_with_blocks("service-only", "```bash name=\"srv\" service\nsleep 1\n```\n").await;
+        let mut app = app_with_blocks(
+            "service-only",
+            "```bash name=\"srv\" service\nsleep 1\n```\n",
+        )
+        .await;
         app.worker_port = Some(1);
         app.on_key(key(KeyCode::Char('L'))).await;
         assert!(app.block_picker.is_none() && app.run_history_view.is_none());

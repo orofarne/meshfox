@@ -167,7 +167,10 @@ pub fn scope_path(scope: &str) -> Option<&Path> {
 
 /// Classifies every index entry against the files as they are now.
 pub fn report(index: &SecretIndex) -> io::Result<Vec<SecretReport>> {
-    report_with_home(index, std::env::var_os("HOME").map(PathBuf::from).as_deref())
+    report_with_home(
+        index,
+        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+    )
 }
 
 fn report_with_home(index: &SecretIndex, home: Option<&Path>) -> io::Result<Vec<SecretReport>> {
@@ -248,13 +251,14 @@ mod tests {
     use crate::secret_store::MemoryBackend;
 
     fn tempdir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "meshfox-secret-index-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ))
-        .to_string_lossy()
-        .replace(['(', ')'], "");
+        let d = std::env::temp_dir()
+            .join(format!(
+                "meshfox-secret-index-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ))
+            .to_string_lossy()
+            .replace(['(', ')'], "");
         let d = PathBuf::from(d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -282,7 +286,10 @@ mod tests {
         idx.record("global:~/w", "A").unwrap();
         let all = idx.entries().unwrap();
         assert_eq!(all.len(), 2);
-        assert_eq!(first[0].created_at, all.iter().find(|e| e.scope == "global").unwrap().created_at);
+        assert_eq!(
+            first[0].created_at,
+            all.iter().find(|e| e.scope == "global").unwrap().created_at
+        );
         idx.forget("global", "A").unwrap();
         assert_eq!(idx.entries().unwrap().len(), 1);
     }
@@ -326,9 +333,14 @@ mod tests {
         let canvas = dir.join("b.canvas.md");
         std::fs::write(&canvas, "not a canvas at all").unwrap();
         let idx = index(&dir);
-        idx.record(&secret_store::doc_scope(&canvas), "TOKEN").unwrap();
+        idx.record(&secret_store::doc_scope(&canvas), "TOKEN")
+            .unwrap();
         let r = report_with_home(&idx, None).unwrap();
-        assert!(matches!(r[0].status, SecretStatus::Unknown(_)), "{:?}", r[0].status);
+        assert!(
+            matches!(r[0].status, SecretStatus::Unknown(_)),
+            "{:?}",
+            r[0].status
+        );
         assert!(!r[0].status.is_orphan());
     }
 
@@ -343,7 +355,11 @@ mod tests {
         idx.record(&scope, "OLD").unwrap();
         idx.record("project:/nonexistent/proj", "DB").unwrap();
 
-        std::fs::write(root.join(".meshfox/config.toml"), "[[env]]\nsecrets = [\"DB\"]\n").unwrap();
+        std::fs::write(
+            root.join(".meshfox/config.toml"),
+            "[[env]]\nsecrets = [\"DB\"]\n",
+        )
+        .unwrap();
         let r = report_with_home(&idx, None).unwrap();
         let st = |scope: &str, name: &str| {
             r.iter()
@@ -354,13 +370,19 @@ mod tests {
         };
         assert_eq!(st(&scope, "DB"), SecretStatus::Ok);
         assert_eq!(st(&scope, "OLD"), SecretStatus::OrphanDecl);
-        assert_eq!(st("project:/nonexistent/proj", "DB"), SecretStatus::OrphanPath);
+        assert_eq!(
+            st("project:/nonexistent/proj", "DB"),
+            SecretStatus::OrphanPath
+        );
 
         // A config that no longer parses is "unknown", never an orphan.
         std::fs::write(root.join(".meshfox/config.toml"), "[[env\n").unwrap();
         let r = report_with_home(&idx, None).unwrap();
         assert!(matches!(
-            r.iter().find(|r| r.entry.scope == scope && r.entry.name == "DB").unwrap().status,
+            r.iter()
+                .find(|r| r.entry.scope == scope && r.entry.name == "DB")
+                .unwrap()
+                .status,
             SecretStatus::Unknown(_)
         ));
     }
@@ -370,11 +392,18 @@ mod tests {
         let dir = tempdir("remove");
         let idx = index(&dir);
         let store = MemoryBackend::new();
-        store.set(&secret_store::account_for("global", "A"), "v").unwrap();
+        store
+            .set(&secret_store::account_for("global", "A"), "v")
+            .unwrap();
         idx.record("global", "A").unwrap();
         assert!(remove(&idx, &store, "global", "A").unwrap());
         assert!(idx.entries().unwrap().is_empty());
-        assert_eq!(store.get(&secret_store::account_for("global", "A")).unwrap(), None);
+        assert_eq!(
+            store
+                .get(&secret_store::account_for("global", "A"))
+                .unwrap(),
+            None
+        );
         // Already gone from the store: still fine.
         idx.record("global", "A").unwrap();
         assert!(!remove(&idx, &store, "global", "A").unwrap());

@@ -12,9 +12,7 @@
 //! block's output actually gets written back into the file, or just shown.
 
 use clap::{Args, Parser, Subcommand};
-use meshfox_core::{
-    mdcanvas, Canvas, FileDisplay, Node, NodeType, VarCache, VarDecl, VarType,
-};
+use meshfox_core::{mdcanvas, Canvas, FileDisplay, Node, NodeType, VarCache, VarDecl, VarType};
 #[cfg(test)]
 use meshfox_core::{ExtraEdge, FenceAttrsPatch, NodeMeta};
 use std::collections::{HashMap, HashSet};
@@ -1432,7 +1430,12 @@ fn main() {
                 node_id,
                 file,
                 base_rev,
-            } => node_body(&canvas.unwrap_or_else(find_canvas), &node_id, file, &base_rev),
+            } => node_body(
+                &canvas.unwrap_or_else(find_canvas),
+                &node_id,
+                file,
+                &base_rev,
+            ),
             NodeCommand::Append {
                 canvas,
                 node_id,
@@ -1574,7 +1577,10 @@ fn check_updates(yes: bool) {
         let contents_dir = macos_dir.and_then(Path::parent);
         let app_dir = contents_dir.and_then(Path::parent);
         if macos_dir.and_then(Path::file_name).and_then(|s| s.to_str()) == Some("MacOS")
-            && contents_dir.and_then(Path::file_name).and_then(|s| s.to_str()) == Some("Contents")
+            && contents_dir
+                .and_then(Path::file_name)
+                .and_then(|s| s.to_str())
+                == Some("Contents")
             && app_dir.is_some_and(|p| p.extension().is_some_and(|s| s == "app"))
         {
             println!("meshfox check-updates: this CLI belongs to a macOS app bundle; install a newer Meshfox.pkg to update the app and CLI together.");
@@ -1629,7 +1635,10 @@ fn check_updates(yes: bool) {
                     .arg(&exe)
                     .status();
                 if !status.is_ok_and(|s| s.success()) {
-                    eprintln!("meshfox check-updates: updated, but re-signing {} failed", exe.display());
+                    eprintln!(
+                        "meshfox check-updates: updated, but re-signing {} failed",
+                        exe.display()
+                    );
                     std::process::exit(1);
                 }
             }
@@ -4470,10 +4479,7 @@ fn node_edges(canvas_path: &Path, node_id: &str, add: Vec<String>, remove: Vec<S
     let port = worker_port_or_exit(&runtime, canvas_path);
     let (added, removed) = (add.len(), remove.len());
     let update = worker_client::NodeUpdate {
-        edges: Some(worker_client::EdgeOps {
-            add,
-            remove,
-        }),
+        edges: Some(worker_client::EdgeOps { add, remove }),
         ..Default::default()
     };
     match runtime.block_on(worker_client::update_node(port, node_id, &update)) {
@@ -4771,7 +4777,10 @@ fn format_node_show(raw: &str, node_id: &str) -> Result<String, String> {
     }
     // What `node body --base-rev` (and the MCP `node_body`'s `base_rev`)
     // must be given to replace this body.
-    out.push_str(&format!("body-rev: {}\n", meshfox_core::body_rev(&node.text)));
+    out.push_str(&format!(
+        "body-rev: {}\n",
+        meshfox_core::body_rev(&node.text)
+    ));
     if let Some(c) = &node.color {
         out.push_str(&format!("color: {c}\n"));
     }
@@ -6017,7 +6026,10 @@ Shared body.
         let root = canvas.node("root").expect("id unchanged");
         assert_eq!(root.title, "Renamed Root");
         assert_eq!(root.text.trim(), "root body");
-        assert_eq!(canvas.node("child").unwrap().parent.as_deref(), Some("root"));
+        assert_eq!(
+            canvas.node("child").unwrap().parent.as_deref(),
+            Some("root")
+        );
     }
 
     #[test]
@@ -6034,7 +6046,10 @@ Shared body.
     // (`run development fix-macos-kill`) doesn't resolve.
     fn list_text(doc: &str) -> String {
         let canvas = Canvas::from_markdown(doc).unwrap();
-        render_list(&canvas).ok().flatten().expect("has runnable blocks")
+        render_list(&canvas)
+            .ok()
+            .flatten()
+            .expect("has runnable blocks")
     }
 
     const LIST_DOC: &str = concat!(
@@ -6051,11 +6066,27 @@ Shared body.
     #[test]
     fn list_collapses_a_single_default_block_only_when_it_is_named_like_its_node() {
         let text = list_text(LIST_DOC);
-        let line = |needle: &str| text.lines().find(|l| l.contains(needle)).unwrap().to_string();
+        let line = |needle: &str| {
+            text.lines()
+                .find(|l| l.contains(needle))
+                .unwrap()
+                .to_string()
+        };
         // `install` is both the node and its only block: one line, as before.
-        assert!(line("install").trim_start().starts_with("install"), "{text}");
-        assert!(line("install").trim_end().ends_with("meshfox run development install"), "{text}");
-        assert!(!text.lines().any(|l| l.trim() == "install"), "no separate header for it: {text}");
+        assert!(
+            line("install").trim_start().starts_with("install"),
+            "{text}"
+        );
+        assert!(
+            line("install")
+                .trim_end()
+                .ends_with("meshfox run development install"),
+            "{text}"
+        );
+        assert!(
+            !text.lines().any(|l| l.trim() == "install"),
+            "no separate header for it: {text}"
+        );
     }
 
     #[test]
@@ -6066,18 +6097,31 @@ Shared body.
             .find(|l| l.trim_start().starts_with("fix-kill-node"))
             .unwrap_or_else(|| panic!("the owning node must be shown: {text}"));
         // The header carries the node-id shortcut (the block is its default)...
-        assert!(header.trim_end().ends_with("meshfox run development fix-kill-node"), "{text}");
-        // ...and the block sits under it with the full, valid command.
-        let block = text.lines().find(|l| l.contains("fix-kill [default]")).unwrap();
         assert!(
-            block.trim_end().ends_with("meshfox run development fix-kill-node fix-kill"),
+            header
+                .trim_end()
+                .ends_with("meshfox run development fix-kill-node"),
+            "{text}"
+        );
+        // ...and the block sits under it with the full, valid command.
+        let block = text
+            .lines()
+            .find(|l| l.contains("fix-kill [default]"))
+            .unwrap();
+        assert!(
+            block
+                .trim_end()
+                .ends_with("meshfox run development fix-kill-node fix-kill"),
             "{text}"
         );
         let header_at = text.lines().position(|l| std::ptr::eq(l, header)).unwrap();
         let block_at = text.lines().position(|l| std::ptr::eq(l, block)).unwrap();
         assert_eq!(block_at, header_at + 1, "{text}");
         let indent = |l: &str| l.len() - l.trim_start().len();
-        assert!(indent(block) > indent(header), "block is nested under its node: {text}");
+        assert!(
+            indent(block) > indent(header),
+            "block is nested under its node: {text}"
+        );
     }
 
     #[test]
@@ -6085,10 +6129,15 @@ Shared body.
         let text = list_text(LIST_DOC);
         assert!(
             text.lines()
-                .any(|l| l.trim_start().starts_with("unit-tests") && l.trim_end().ends_with("meshfox run development unit-tests")),
+                .any(|l| l.trim_start().starts_with("unit-tests")
+                    && l.trim_end().ends_with("meshfox run development unit-tests")),
             "{text}"
         );
-        assert!(text.lines().any(|l| l.contains("extra") && l.trim_end().ends_with("unit-tests extra")), "{text}");
+        assert!(
+            text.lines()
+                .any(|l| l.contains("extra") && l.trim_end().ends_with("unit-tests extra")),
+            "{text}"
+        );
     }
 
     #[test]
@@ -6188,7 +6237,10 @@ Shared body.
             None,
         )
         .unwrap();
-        assert_eq!(tags_of(&updated), vec!["bag".to_string(), "fixed".to_string()]);
+        assert_eq!(
+            tags_of(&updated),
+            vec!["bag".to_string(), "fixed".to_string()]
+        );
         // Untouched fields (here, color) still keep their prior value.
         assert_eq!(
             Canvas::from_markdown(&updated)

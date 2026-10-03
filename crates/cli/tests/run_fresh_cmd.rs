@@ -69,20 +69,40 @@ fn fresh_reruns_a_skippable_dependency_once_and_session_reset_makes_every_run_fr
     let canvas = write_canvas(&dir);
 
     let out = run_target(&home, &canvas, &[]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(runs(&dir), 1, "first run: dep runs");
 
     let out = run_target(&home, &canvas, &[]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(runs(&dir), 1, "second run: dep already fresh, skipped");
 
     let out = run_target(&home, &canvas, &["--fresh"]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(runs(&dir), 2, "--fresh: dep runs for real this once");
 
     let out = run_target(&home, &canvas, &[]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(runs(&dir), 2, "--fresh forgot nothing: the next plain run skips again");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        runs(&dir),
+        2,
+        "--fresh forgot nothing: the next plain run skips again"
+    );
 
     let out = meshfox(&home)
         .arg("session")
@@ -91,7 +111,11 @@ fn fresh_reruns_a_skippable_dependency_once_and_session_reset_makes_every_run_fr
         .arg(&canvas)
         .output()
         .unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("session reset"),
         "{}",
@@ -99,8 +123,16 @@ fn fresh_reruns_a_skippable_dependency_once_and_session_reset_makes_every_run_fr
     );
 
     let out = run_target(&home, &canvas, &[]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(runs(&dir), 3, "after `session reset` the dependency runs again");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        runs(&dir),
+        3,
+        "after `session reset` the dependency runs again"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&home);
@@ -114,7 +146,10 @@ fn fresh_conflicts_with_no_deps() {
     let out = run_target(&home, &canvas, &["--fresh", "--no-deps"]);
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("--fresh") && stderr.contains("--no-deps"), "{stderr}");
+    assert!(
+        stderr.contains("--fresh") && stderr.contains("--no-deps"),
+        "{stderr}"
+    );
     assert_eq!(runs(&dir), 0, "nothing ran");
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&home);

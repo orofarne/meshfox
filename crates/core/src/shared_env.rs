@@ -148,7 +148,8 @@ fn load_from_with_store(
     // than `$HOME` — there's no "directory the file lives in" to resolve
     // against the way the local tier has `canvas_root`.
     let global_sections = parse_env_sections(&global_table, home, home, None);
-    let local_sections = parse_env_sections(&local_table, home, Some(canvas_root), Some(canvas_root));
+    let local_sections =
+        parse_env_sections(&local_table, home, Some(canvas_root), Some(canvas_root));
 
     let normalized_root = normalize(canvas_root);
 
@@ -717,10 +718,15 @@ mod tests {
         let home = tempdir("home-secrets");
         let root = tempdir("project-secrets");
         let global = home.join(".meshfox").join("config.toml");
-        write(&global, "[[env]]\nvars = { DB_URL = \"u\" }\nsecrets = [\"DB_PASSWORD\", \"UNSET\"]\n");
+        write(
+            &global,
+            "[[env]]\nvars = { DB_URL = \"u\" }\nsecrets = [\"DB_PASSWORD\", \"UNSET\"]\n",
+        );
 
         let store = MemoryBackend::new();
-        store.set(&env_account("global", "DB_PASSWORD"), "hunter2").unwrap();
+        store
+            .set(&env_account("global", "DB_PASSWORD"), "hunter2")
+            .unwrap();
 
         let shared = load_from_with_store(Some(&global), &root, Some(&home), Some(&store));
         let pw = shared.get("DB_PASSWORD").expect("secret resolved");
@@ -740,12 +746,20 @@ mod tests {
         let home = tempdir("home-secrets-explicit");
         let root = tempdir("project-secrets-explicit");
         let global = home.join(".meshfox").join("config.toml");
-        write(&global, "[[env]]\nvars = { TOKEN = \"by-hand\" }\nsecrets = [\"TOKEN\"]\n");
+        write(
+            &global,
+            "[[env]]\nvars = { TOKEN = \"by-hand\" }\nsecrets = [\"TOKEN\"]\n",
+        );
         let store = MemoryBackend::new();
-        store.set(&env_account("global", "TOKEN"), "from-store").unwrap();
+        store
+            .set(&env_account("global", "TOKEN"), "from-store")
+            .unwrap();
 
         let shared = load_from_with_store(Some(&global), &root, Some(&home), Some(&store));
-        assert_eq!(shared.get("TOKEN").map(|v| v.value.as_str()), Some("by-hand"));
+        assert_eq!(
+            shared.get("TOKEN").map(|v| v.value.as_str()),
+            Some("by-hand")
+        );
     }
 
     #[test]
@@ -755,10 +769,15 @@ mod tests {
         let root = tempdir("project-secrets-project");
         let global = home.join(".meshfox").join("config.toml");
         write(&global, "[[env]]\nvars = { TOKEN = \"global\" }\n");
-        write(&root.join(".meshfox").join("config.toml"), "[[env]]\nsecrets = [\"TOKEN\"]\n");
+        write(
+            &root.join(".meshfox").join("config.toml"),
+            "[[env]]\nsecrets = [\"TOKEN\"]\n",
+        );
         let store = MemoryBackend::new();
         let scope = project_account_scope(&root);
-        store.set(&env_account(&scope, "TOKEN"), "project-secret").unwrap();
+        store
+            .set(&env_account(&scope, "TOKEN"), "project-secret")
+            .unwrap();
 
         let shared = load_from_with_store(Some(&global), &root, Some(&home), Some(&store));
         let v = shared.get("TOKEN").unwrap();
@@ -773,11 +792,19 @@ mod tests {
         let project_a = home.join("work").join("projectA");
         std::fs::create_dir_all(&project_a).unwrap();
         let global = home.join(".meshfox").join("config.toml");
-        write(&global, "[[env]]\npath = \"~/work/projectA\"\nsecrets = [\"TOKEN\"]\n");
+        write(
+            &global,
+            "[[env]]\npath = \"~/work/projectA\"\nsecrets = [\"TOKEN\"]\n",
+        );
         let store = MemoryBackend::new();
-        store.set(&env_account("global:~/work/projectA", "TOKEN"), "scoped").unwrap();
+        store
+            .set(&env_account("global:~/work/projectA", "TOKEN"), "scoped")
+            .unwrap();
 
         let shared = load_from_with_store(Some(&global), &project_a, Some(&home), Some(&store));
-        assert_eq!(shared.get("TOKEN").map(|v| v.value.as_str()), Some("scoped"));
+        assert_eq!(
+            shared.get("TOKEN").map(|v| v.value.as_str()),
+            Some("scoped")
+        );
     }
 }

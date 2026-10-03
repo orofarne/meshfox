@@ -68,7 +68,8 @@ const SCHEMA_SQL: &str = "
 
 /// The columns every read of `undo_log` selects, in the order
 /// [`UndoLog::row_mapper`] reads them.
-const ENTRY_COLUMNS: &str = "seq, created_at, op_kind, diff_json, raw_before, raw_after, splice_json";
+const ENTRY_COLUMNS: &str =
+    "seq, created_at, op_kind, diff_json, raw_before, raw_after, splice_json";
 
 /// One recorded step of history, as read back by [`UndoLog::history`]/
 /// [`UndoLog::peek_undo`]/[`UndoLog::peek_redo`].
@@ -172,7 +173,13 @@ impl Splice {
         self.apply(current, &self.before_rev, &self.before_mid, &self.after_mid)
     }
 
-    fn apply(&self, current: &str, expected_rev: &str, from_mid: &str, to_mid: &str) -> Option<String> {
+    fn apply(
+        &self,
+        current: &str,
+        expected_rev: &str,
+        from_mid: &str,
+        to_mid: &str,
+    ) -> Option<String> {
         // Exactly the document this step belongs to: put the span back where
         // it came from.
         if meshfox_core::body_rev(current) == expected_rev
@@ -589,8 +596,7 @@ impl UndoLog {
         // reads each row's kind and summary, and leaves the replay payload
         // (whole documents, spans of text) in the database — a panel of 200
         // steps must not pull 200 copies of the canvas into memory.
-        const LISTING_COLUMNS: &str =
-            "seq, created_at, op_kind, diff_json, NULL, NULL, NULL";
+        const LISTING_COLUMNS: &str = "seq, created_at, op_kind, diff_json, NULL, NULL, NULL";
         let redo_tail: Vec<UndoEntry> = {
             let mut stmt = conn
                 .prepare(&format!(
@@ -687,15 +693,26 @@ mod tests {
         assert!(raw_row.raw_after.is_none());
         assert!(raw_row.splice.is_some());
         assert_eq!(raw_row.replay_document("new", true).as_deref(), Some("old"));
-        assert_eq!(raw_row.replay_document("old", false).as_deref(), Some("new"));
+        assert_eq!(
+            raw_row.replay_document("old", false).as_deref(),
+            Some("new")
+        );
     }
 
     // ---- Splice: a document-wide step stored as the one span that changed ----
 
     fn roundtrip(before: &str, after: &str) -> Splice {
         let splice = Splice::between(before, after);
-        assert_eq!(splice.undo(after).as_deref(), Some(before), "undo of {before:?} -> {after:?}");
-        assert_eq!(splice.redo(before).as_deref(), Some(after), "redo of {before:?} -> {after:?}");
+        assert_eq!(
+            splice.undo(after).as_deref(),
+            Some(before),
+            "undo of {before:?} -> {after:?}"
+        );
+        assert_eq!(
+            splice.redo(before).as_deref(),
+            Some(after),
+            "redo of {before:?} -> {after:?}"
+        );
         splice
     }
 
@@ -741,7 +758,11 @@ mod tests {
         assert_eq!(splice.before_mid, "");
         assert_eq!(splice.after_mid, " edited");
         let stored = serde_json::to_string(&splice).unwrap();
-        assert!(stored.len() < 1_000, "stored {} bytes for a 7-byte edit", stored.len());
+        assert!(
+            stored.len() < 1_000,
+            "stored {} bytes for a 7-byte edit",
+            stored.len()
+        );
         assert_eq!(splice.undo(&after).as_deref(), Some(before.as_str()));
     }
 
@@ -790,12 +811,22 @@ mod tests {
 
         let entry = log.peek_undo().unwrap().unwrap();
         assert!(entry.splice.is_none());
-        assert_eq!(entry.replay_document("whatever", true).as_deref(), Some("old text"));
-        assert_eq!(entry.replay_document("whatever", false).as_deref(), Some("new text"));
+        assert_eq!(
+            entry.replay_document("whatever", true).as_deref(),
+            Some("old text")
+        );
+        assert_eq!(
+            entry.replay_document("whatever", false).as_deref(),
+            Some("new text")
+        );
 
         // New steps go on top in the new format, in the same file.
-        log.push("raw_replace", Payload::Raw { before: "new text" }, "newer text")
-            .unwrap();
+        log.push(
+            "raw_replace",
+            Payload::Raw { before: "new text" },
+            "newer text",
+        )
+        .unwrap();
         let history = log.history(10).unwrap();
         assert!(history[0].splice.is_some() && history[0].raw_before.is_none());
         assert!(history[1].splice.is_none() && history[1].raw_before.is_some());
@@ -804,8 +835,10 @@ mod tests {
     #[test]
     fn a_history_listing_leaves_the_replay_payload_in_the_database() {
         let log = UndoLog::open_in_memory().unwrap();
-        log.push("raw_replace", Payload::Raw { before: "old" }, "new").unwrap();
-        log.push("node_upserted", Payload::Diff(json!({"a": 1})), "newer").unwrap();
+        log.push("raw_replace", Payload::Raw { before: "old" }, "new")
+            .unwrap();
+        log.push("node_upserted", Payload::Diff(json!({"a": 1})), "newer")
+            .unwrap();
 
         let listing = log.history_around(10).unwrap();
         assert_eq!(listing.len(), 2);

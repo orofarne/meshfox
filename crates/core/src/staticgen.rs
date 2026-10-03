@@ -520,12 +520,20 @@ fn build_node_view(
         .map(|c| build_node_view(canvas, c, depth + 1, ctx, assets, errors, canvas_links))
         .collect();
     let authored_position = match (node.x, node.y, node.width, node.height) {
-        (Some(x), Some(y), Some(width), Some(height)) => Some(Position { x, y, width, height }),
+        (Some(x), Some(y), Some(width), Some(height)) => Some(Position {
+            x,
+            y,
+            width,
+            height,
+        }),
         _ => None,
     };
     let spatial_children = !children.is_empty()
         && canvas.children(&node.id).iter().all(|child| {
-            child.x.is_some() && child.y.is_some() && child.width.is_some() && child.height.is_some()
+            child.x.is_some()
+                && child.y.is_some()
+                && child.width.is_some()
+                && child.height.is_some()
         });
 
     NodeView {
@@ -1548,7 +1556,10 @@ mod tests {
             "## Child\n<!-- meshfox:node id=\"child\" tags=\"untagged,bug\" -->\n\nbody\n",
         ));
         let site = build_site(&c);
-        assert_eq!(site.find("child").unwrap().color.as_deref(), Some("#c22b2b"));
+        assert_eq!(
+            site.find("child").unwrap().color.as_deref(),
+            Some("#c22b2b")
+        );
     }
 
     #[test]
@@ -1559,7 +1570,10 @@ mod tests {
             "## Child\n<!-- meshfox:node id=\"child\" color=\"3\" tags=\"bug\" -->\n\nbody\n",
         ));
         let site = build_site(&c);
-        assert_eq!(site.find("child").unwrap().color.as_deref(), Some("#d9c02b"));
+        assert_eq!(
+            site.find("child").unwrap().color.as_deref(),
+            Some("#d9c02b")
+        );
     }
 
     // TODO.canvas.md: "Base64 image" — a `data:` image `src` must pass
@@ -1867,7 +1881,10 @@ mod tests {
         assert!(site.find("member").unwrap().position.is_none());
         assert!(site.find("frame").unwrap().spatial_children);
         let authored = site.find("member").unwrap().authored_position.unwrap();
-        assert_eq!((authored.x, authored.y, authored.width, authored.height), (20.0, 20.0, 100.0, 80.0));
+        assert_eq!(
+            (authored.x, authored.y, authored.width, authored.height),
+            (20.0, 20.0, 100.0, 80.0)
+        );
     }
 
     #[test]

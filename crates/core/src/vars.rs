@@ -858,13 +858,17 @@ pub fn resolve_with_shared(
             // explicit choice), which in turn beats shared config.
             if let Some(v) = cache.get(&decl.name) {
                 Some(v.to_string())
-            } else if let Some(v) = decl.secret.then(|| cache.try_get_secret(&decl.name)).and_then(|r| match r {
-                Ok(v) => v,
-                Err(e) => {
-                    secret_errors.insert(decl.name.clone(), e.to_string());
-                    None
-                }
-            }) {
+            } else if let Some(v) = decl
+                .secret
+                .then(|| cache.try_get_secret(&decl.name))
+                .and_then(|r| match r {
+                    Ok(v) => v,
+                    Err(e) => {
+                        secret_errors.insert(decl.name.clone(), e.to_string());
+                        None
+                    }
+                })
+            {
                 Some(v)
             } else if let Some(sv) = shared.get(&decl.name) {
                 shared_origin = Some(sv.origin.clone());
@@ -2309,7 +2313,10 @@ mod tests {
             &cache,
             &HashMap::new(),
         );
-        assert_eq!(r.values.get("TOKEN").map(String::as_str), Some("from-store"));
+        assert_eq!(
+            r.values.get("TOKEN").map(String::as_str),
+            Some("from-store")
+        );
         assert_eq!(r.values.get("BOTH").map(String::as_str), Some("by-hand"));
         assert_eq!(r.missing.len(), 1);
         assert_eq!(r.missing[0].name, "NONE");
@@ -2332,14 +2339,24 @@ mod tests {
         }
         let canvas = std::path::Path::new("/nonexistent/doc.canvas.md");
         let cache = VarCache::in_memory().with_secret_backend(std::sync::Arc::new(Locked), canvas);
-        let r = resolve(&[decl("TOKEN", None, true)], &HashMap::new(), &cache, &HashMap::new());
+        let r = resolve(
+            &[decl("TOKEN", None, true)],
+            &HashMap::new(),
+            &cache,
+            &HashMap::new(),
+        );
         assert_eq!(r.missing.len(), 1);
         assert!(r.secret_errors["TOKEN"].contains("locked"));
 
         // A value from a higher tier makes the error moot.
         let mut overrides = HashMap::new();
         overrides.insert("TOKEN".to_string(), "x".to_string());
-        let r = resolve(&[decl("TOKEN", None, true)], &overrides, &cache, &HashMap::new());
+        let r = resolve(
+            &[decl("TOKEN", None, true)],
+            &overrides,
+            &cache,
+            &HashMap::new(),
+        );
         assert!(r.secret_errors.is_empty());
     }
 
@@ -2362,14 +2379,32 @@ mod tests {
         let locked = VarCache::in_memory().with_secret_backend(std::sync::Arc::new(Locked), canvas);
         let with_default = decl("TOKEN", Some("fallback"), true);
 
-        let r = resolve(std::slice::from_ref(&with_default), &HashMap::new(), &locked, &HashMap::new());
-        assert!(r.values.is_empty(), "must not take the default: {:?}", r.values);
+        let r = resolve(
+            std::slice::from_ref(&with_default),
+            &HashMap::new(),
+            &locked,
+            &HashMap::new(),
+        );
+        assert!(
+            r.values.is_empty(),
+            "must not take the default: {:?}",
+            r.values
+        );
         assert_eq!(r.missing.len(), 1);
-        assert_eq!(r.missing[0].default.as_deref(), Some("fallback"), "still offered as the prefill");
+        assert_eq!(
+            r.missing[0].default.as_deref(),
+            Some("fallback"),
+            "still offered as the prefill"
+        );
         assert!(r.secret_errors.contains_key("TOKEN"));
 
         // A readable (empty) store, or no store at all, keeps the old behaviour.
-        let r = resolve(&[with_default], &HashMap::new(), &VarCache::in_memory(), &HashMap::new());
+        let r = resolve(
+            &[with_default],
+            &HashMap::new(),
+            &VarCache::in_memory(),
+            &HashMap::new(),
+        );
         assert_eq!(r.values.get("TOKEN").map(String::as_str), Some("fallback"));
     }
 }

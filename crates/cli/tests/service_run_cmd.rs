@@ -193,7 +193,10 @@ fn run_stays_attached_streams_output_and_ctrl_c_stops_the_service() {
         if let Some(mut e) = child.stderr.take() {
             let _ = e.read_to_string(&mut err);
         }
-        panic!("exit {:?}\n--stdout after banner--\n{rest}\n--stderr--\n{err}", status.code());
+        panic!(
+            "exit {:?}\n--stdout after banner--\n{rest}\n--stderr--\n{err}",
+            status.code()
+        );
     }
 
     let deadline = Instant::now() + Duration::from_secs(10);

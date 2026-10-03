@@ -84,9 +84,13 @@ fn step<'a>(result: &'a serde_json::Value, block: &str) -> &'a serde_json::Value
 async fn run_reports_the_chain_skips_fresh_dependencies_and_fresh_and_reset_force_them() {
     let dir = unique_dir();
     let mcp = start(&dir).await;
-    call(&mcp, "canvas_open", serde_json::json!({ "path": "doc.canvas.md" }))
-        .await
-        .unwrap();
+    call(
+        &mcp,
+        "canvas_open",
+        serde_json::json!({ "path": "doc.canvas.md" }),
+    )
+    .await
+    .unwrap();
     let id = "doc.canvas.md";
     let run = |extra: serde_json::Value| {
         let mut args = serde_json::json!({ "canvas_id": id, "node_id": "root", "block": "target" });
@@ -110,18 +114,30 @@ async fn run_reports_the_chain_skips_fresh_dependencies_and_fresh_and_reset_forc
 
     let (_, second) = run(serde_json::json!({})).await.unwrap();
     assert_eq!(step(&second, "dep")["status"], "skipped", "{second}");
-    assert_eq!(runs(&dir), 1, "an already-fresh dependency is not run again");
+    assert_eq!(
+        runs(&dir),
+        1,
+        "an already-fresh dependency is not run again"
+    );
 
     let (_, fresh) = run(serde_json::json!({ "fresh": true })).await.unwrap();
     assert_eq!(step(&fresh, "dep")["status"], "ran", "{fresh}");
     assert_eq!(runs(&dir), 2);
 
     let (_, after) = run(serde_json::json!({})).await.unwrap();
-    assert_eq!(step(&after, "dep")["status"], "skipped", "fresh forgets nothing: {after}");
+    assert_eq!(
+        step(&after, "dep")["status"],
+        "skipped",
+        "fresh forgets nothing: {after}"
+    );
 
-    let (is_error, reset) = call(&mcp, "session_reset", serde_json::json!({ "canvas_id": id }))
-        .await
-        .unwrap();
+    let (is_error, reset) = call(
+        &mcp,
+        "session_reset",
+        serde_json::json!({ "canvas_id": id }),
+    )
+    .await
+    .unwrap();
     assert!(!is_error && reset["reset"] == true, "{reset}");
     let (_, again) = run(serde_json::json!({})).await.unwrap();
     assert_eq!(step(&again, "dep")["status"], "ran", "{again}");
@@ -137,9 +153,13 @@ async fn run_reports_the_chain_skips_fresh_dependencies_and_fresh_and_reset_forc
 async fn run_reports_failures_missing_variables_unknown_nodes_defaults_and_timeouts() {
     let dir = unique_dir();
     let mcp = start(&dir).await;
-    call(&mcp, "canvas_open", serde_json::json!({ "path": "doc.canvas.md" }))
-        .await
-        .unwrap();
+    call(
+        &mcp,
+        "canvas_open",
+        serde_json::json!({ "path": "doc.canvas.md" }),
+    )
+    .await
+    .unwrap();
     let id = "doc.canvas.md";
 
     // A failing block: a normal result, flagged as an error, with the exit
@@ -155,7 +175,10 @@ async fn run_reports_failures_missing_variables_unknown_nodes_defaults_and_timeo
     assert_eq!(bad["success"], false);
     assert_eq!(step(&bad, "bad")["status"], "failed");
     assert_eq!(step(&bad, "bad")["exit_code"], 3);
-    assert!(step(&bad, "bad")["output"].as_str().unwrap().contains("nope"));
+    assert!(step(&bad, "bad")["output"]
+        .as_str()
+        .unwrap()
+        .contains("nope"));
 
     // An unresolved variable is named, not prompted for; supplying it works.
     let err = call(
@@ -177,7 +200,10 @@ async fn run_reports_failures_missing_variables_unknown_nodes_defaults_and_timeo
     .await
     .unwrap();
     assert!(!is_error, "{ok}");
-    assert!(step(&ok, "needs-who")["output"].as_str().unwrap().contains("hi agent"));
+    assert!(step(&ok, "needs-who")["output"]
+        .as_str()
+        .unwrap()
+        .contains("hi agent"));
 
     // Unknown node.
     let err = call(

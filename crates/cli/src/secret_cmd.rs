@@ -78,10 +78,12 @@ pub fn run(op: SecretOp, find_canvas: impl FnOnce() -> PathBuf) -> Result<(), St
         SecretOp::Set { name, scope } => {
             let t = resolve(&scope, &name, find_canvas)?;
             let value = read_value(&name)?;
-            t.backend.set(&t.account(), &value).map_err(|e| e.to_string())?;
-            index()?.record(&t.scope, &name).map_err(|e| {
-                format!("stored, but couldn't note {name} in the index: {e}")
-            })?;
+            t.backend
+                .set(&t.account(), &value)
+                .map_err(|e| e.to_string())?;
+            index()?
+                .record(&t.scope, &name)
+                .map_err(|e| format!("stored, but couldn't note {name} in the index: {e}"))?;
             println!("stored {name}");
         }
         SecretOp::Show {
@@ -109,7 +111,10 @@ pub fn run(op: SecretOp, find_canvas: impl FnOnce() -> PathBuf) -> Result<(), St
         SecretOp::List { json } => {
             let reports = secret_index::report(&index()?).map_err(|e| e.to_string())?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&reports_json(&reports)).unwrap());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&reports_json(&reports)).unwrap()
+                );
             } else if reports.is_empty() {
                 println!("no secrets recorded");
             } else {
@@ -153,7 +158,8 @@ pub fn reports_json(reports: &[SecretReport]) -> serde_json::Value {
 }
 
 fn index() -> Result<SecretIndex, String> {
-    SecretIndex::default_location().ok_or_else(|| "HOME isn't set — nowhere to keep the index".to_string())
+    SecretIndex::default_location()
+        .ok_or_else(|| "HOME isn't set — nowhere to keep the index".to_string())
 }
 
 fn prune(yes: bool) -> Result<(), String> {
@@ -222,7 +228,10 @@ fn resolve(
 ) -> Result<Target, String> {
     let (config_root, index_scope): (PathBuf, String) = if scope.global {
         let root = std::env::current_dir().map_err(|e| e.to_string())?;
-        (root, shared_env::global_account_scope(scope.path.as_deref()))
+        (
+            root,
+            shared_env::global_account_scope(scope.path.as_deref()),
+        )
     } else if let Some(dir) = &scope.project {
         (dir.clone(), shared_env::project_account_scope(dir))
     } else {

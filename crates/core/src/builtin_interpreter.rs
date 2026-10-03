@@ -468,8 +468,14 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
         let venv = venv_dir(&canvas);
-        assert!(venv.starts_with(std::env::temp_dir()), "unexpected venv dir: {venv:?}");
-        assert!(!venv.starts_with(&dir), "venv must not be inside the read-only directory");
+        assert!(
+            venv.starts_with(std::env::temp_dir()),
+            "unexpected venv dir: {venv:?}"
+        );
+        assert!(
+            !venv.starts_with(&dir),
+            "venv must not be inside the read-only directory"
+        );
         assert!(venv.ends_with("doc.canvas.md.venv"));
         // Stable: the same canvas always maps to the same place.
         assert_eq!(venv, venv_dir(&canvas));

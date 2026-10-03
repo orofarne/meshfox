@@ -1188,7 +1188,10 @@ pub fn try_set_node_title(
     let not_found = || SetTitleError::NotFound(node_id.to_string());
     let segments = scan(markdown);
     let ids = assign_ids(&segments).map_err(|_| not_found())?;
-    let idx = ids.iter().position(|id| id == node_id).ok_or_else(not_found)?;
+    let idx = ids
+        .iter()
+        .position(|id| id == node_id)
+        .ok_or_else(not_found)?;
     let seg = &segments[idx];
     if !seg.node_attrs.contains_key("id") && Some(idx) != root_index(&segments) {
         return Err(SetTitleError::DerivedId(node_id.to_string()));
@@ -2674,7 +2677,12 @@ fn root_index(segments: &[Segment]) -> Option<usize> {
 fn assign_ids(segments: &[Segment]) -> Result<Vec<String>, ParseError> {
     let root_idx = root_index(segments);
     let root_is_default_named = root_idx
-        .map(|i| segments[i].node_attrs.get("id").map_or(true, |v| v == ROOT_ID))
+        .map(|i| {
+            segments[i]
+                .node_attrs
+                .get("id")
+                .map_or(true, |v| v == ROOT_ID)
+        })
         .unwrap_or(false);
     let mut used = HashSet::new();
     // Taken up front, so a title-derived slug of "root" (a bare marker under
@@ -4164,7 +4172,8 @@ Reused from Tests as well.
 
     #[test]
     fn a_root_can_still_be_given_a_different_explicit_id() {
-        let doc = "# Top\n<!-- meshfox:node id=\"top\" -->\n\n## Kid\n<!-- meshfox:node id=\"kid\" -->\n";
+        let doc =
+            "# Top\n<!-- meshfox:node id=\"top\" -->\n\n## Kid\n<!-- meshfox:node id=\"kid\" -->\n";
         let c = parse(doc).unwrap();
         assert!(c.node("top").is_some());
         assert!(c.node("root").is_none());
@@ -4180,11 +4189,18 @@ Reused from Tests as well.
     #[test]
     fn no_other_node_may_have_the_id_root() {
         let doc = "# Top\n<!-- meshfox:node id=\"top\" -->\n\n## Kid\n<!-- meshfox:node id=\"root\" -->\n";
-        assert_eq!(parse(doc).unwrap_err(), ParseError::ReservedId("root".into()));
+        assert_eq!(
+            parse(doc).unwrap_err(),
+            ParseError::ReservedId("root".into())
+        );
         let doc = "# Top\n\n## Kid\n<!-- meshfox:node id=\"root\" -->\n";
-        assert_eq!(parse(doc).unwrap_err(), ParseError::ReservedId("root".into()));
+        assert_eq!(
+            parse(doc).unwrap_err(),
+            ParseError::ReservedId("root".into())
+        );
         // Not by renaming into it either.
-        let doc = "# Top\n<!-- meshfox:node id=\"top\" -->\n\n## Kid\n<!-- meshfox:node id=\"kid\" -->\n";
+        let doc =
+            "# Top\n<!-- meshfox:node id=\"top\" -->\n\n## Kid\n<!-- meshfox:node id=\"kid\" -->\n";
         assert_eq!(
             rename_node_id(doc, "kid", "root").unwrap_err(),
             RenameIdError::Reserved("root".into())
@@ -4223,9 +4239,13 @@ Reused from Tests as well.
 
     #[test]
     fn set_node_title_on_an_explicitly_id_d_node_does_not_touch_its_marker() {
-        let doc = "# Root\n<!-- meshfox:node id=\"root\" -->\n\n## A\n<!-- meshfox:node id=\"a\" -->\n";
+        let doc =
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n## A\n<!-- meshfox:node id=\"a\" -->\n";
         let updated = set_node_title(doc, "a", "B").unwrap();
-        assert_eq!(updated, "# Root\n<!-- meshfox:node id=\"root\" -->\n\n## B\n<!-- meshfox:node id=\"a\" -->\n");
+        assert_eq!(
+            updated,
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n## B\n<!-- meshfox:node id=\"a\" -->\n"
+        );
     }
 
     #[test]

@@ -322,7 +322,14 @@ final class UnixSocketServer {
                 case .kill(let canvasPath):
                     replyToKill(fd: fd, canvasPath: canvasPath)
                     return
-                case .ready, nil:
+                case .ready:
+                    // Processed, then acked, as soon as the line is in —
+                    // the worker waits for this ack (instead of just
+                    // closing) so a lost `ready` can't leave it "starting".
+                    onLine(foundLine!)
+                    writeReply(fd: fd, reply: AckReply.ok)
+                    return
+                case nil:
                     break
                 }
             }

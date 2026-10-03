@@ -3054,7 +3054,10 @@ mod tests {
         let area = Rect::new(0, 0, 100, 24);
         let screen = render_to_screen(area, |f| render_run_history_view(f, area, &rv));
         assert!(screen.contains("exit 0"), "{screen}");
-        assert!(screen.contains("a tty session's output isn't stored"), "{screen}");
+        assert!(
+            screen.contains("a tty session's output isn't stored"),
+            "{screen}"
+        );
     }
 
     #[test]

@@ -123,7 +123,6 @@ pub enum Acquired {
     Other { port: u16 },
 }
 
-
 /// Whether `canvas_path` is served read-only — the same verdict
 /// [`try_acquire`] reaches, for a caller that has no lock of its own to ask
 /// (the interpreter picking where a venv goes). Probes the directory the way
@@ -342,7 +341,10 @@ mod tests {
             Acquired::Us(second) => assert!(second.is_read_only()),
             Acquired::Other { .. } => panic!("a read-only worker holds no lock to find"),
         }
-        assert!(!dir.join(".meshfox").exists(), "state left in a read-only directory");
+        assert!(
+            !dir.join(".meshfox").exists(),
+            "state left in a read-only directory"
+        );
         restore_and_remove(&dir);
     }
 
@@ -360,7 +362,10 @@ mod tests {
             Acquired::Us(guard) => assert!(guard.is_read_only()),
             Acquired::Other { .. } => panic!("nothing can be holding a lock here"),
         }
-        assert!(!dir.join(".meshfox").exists(), "state left next to a read-only file");
+        assert!(
+            !dir.join(".meshfox").exists(),
+            "state left next to a read-only file"
+        );
         restore_and_remove(&dir);
     }
 
@@ -396,9 +401,17 @@ mod tests {
 
     #[test]
     fn only_permission_and_read_only_filesystem_errors_mean_read_only() {
-        assert!(is_read_only_error(&io::Error::from(io::ErrorKind::PermissionDenied)));
-        assert!(is_read_only_error(&io::Error::from_raw_os_error(libc::EROFS)));
-        assert!(!is_read_only_error(&io::Error::from_raw_os_error(libc::ENOSPC)));
-        assert!(!is_read_only_error(&io::Error::from(io::ErrorKind::NotFound)));
+        assert!(is_read_only_error(&io::Error::from(
+            io::ErrorKind::PermissionDenied
+        )));
+        assert!(is_read_only_error(&io::Error::from_raw_os_error(
+            libc::EROFS
+        )));
+        assert!(!is_read_only_error(&io::Error::from_raw_os_error(
+            libc::ENOSPC
+        )));
+        assert!(!is_read_only_error(&io::Error::from(
+            io::ErrorKind::NotFound
+        )));
     }
 }

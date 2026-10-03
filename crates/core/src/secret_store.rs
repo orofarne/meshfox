@@ -107,7 +107,8 @@ pub fn doc_account(canvas_path: &Path, name: &str) -> String {
 }
 
 pub fn doc_scope(canvas_path: &Path) -> String {
-    let canonical = std::fs::canonicalize(canvas_path).unwrap_or_else(|_| canvas_path.to_path_buf());
+    let canonical =
+        std::fs::canonicalize(canvas_path).unwrap_or_else(|_| canvas_path.to_path_buf());
     format!("doc:{}", canonical.display())
 }
 

@@ -485,8 +485,8 @@ fn ack_json(result: &Result<(), String>) -> String {
 /// Handles one already-accepted connection: reads exactly one
 /// newline-delimited JSON `Message` (matches `watcher_protocol::send`'s/
 /// `request_and_await_reply`'s own one-shot write side) and acts on it.
-/// `Ready` stays fire-and-forget (nothing meaningful to reply with, and
-/// nobody's waiting on a reply to it); `Open`/`OpenFile` now both write an
+/// `Ready` is acked once registered (the worker waits for it — see
+/// `watcher_protocol::send`); `Open`/`OpenFile` also write an
 /// `AckResponse` back on this same connection before returning — see
 /// `meshfox_server::watcher_protocol`'s own doc comment for why that
 /// stopped being optional. A malformed or empty read is just dropped, same
@@ -513,6 +513,7 @@ async fn handle_connection(
     match msg {
         Message::Ready { canvas_path, port } => {
             registry.mark_ready(&canvas_path, port);
+            let _ = write_half.write_all(ack_json(&Ok(())).as_bytes()).await;
         }
         Message::Open {
             canvas_path,
@@ -974,7 +975,10 @@ mod tests {
         .await
         .expect("should ack promptly, not hang");
         assert!(result.is_ok());
-        assert_eq!(*opened.lock().unwrap(), vec!["http://127.0.0.1:7777/".to_string()]);
+        assert_eq!(
+            *opened.lock().unwrap(),
+            vec!["http://127.0.0.1:7777/".to_string()]
+        );
 
         let _ = std::fs::remove_file(&socket_path);
     }

@@ -543,7 +543,12 @@ pub async fn history(port: u16, limit: Option<usize>) -> Result<HistoryDto, Stri
         url.query_pairs_mut()
             .append_pair("limit", &limit.to_string());
     }
-    let res = client().get(url).timeout(time_limit(QUICK)).send().await.map_err(|e| describe(&e))?;
+    let res = client()
+        .get(url)
+        .timeout(time_limit(QUICK))
+        .send()
+        .await
+        .map_err(|e| describe(&e))?;
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
@@ -614,7 +619,10 @@ fn base_url(port: u16) -> String {
 /// include-resolution is already needed either way (e.g. for edits that
 /// land in an `include` target file).
 pub async fn get_canvas_raw(port: u16) -> Result<String, String> {
-    let res = client().get(format!("{}/api/canvas/raw", base_url(port))).timeout(time_limit(QUICK)).send()
+    let res = client()
+        .get(format!("{}/api/canvas/raw", base_url(port)))
+        .timeout(time_limit(QUICK))
+        .send()
         .await
         .map_err(|e| describe(&e))?;
     if !res.status().is_success() {
@@ -704,7 +712,10 @@ pub async fn put_canvas_raw(port: u16, text: &str, base_rev: &str) -> Result<(),
 /// directly instead of re-deriving the same resolved tree itself from a raw
 /// fetch plus a local `include::resolve` call.
 pub async fn get_canvas(port: u16) -> Result<Canvas, String> {
-    let res = client().get(format!("{}/api/canvas", base_url(port))).timeout(time_limit(QUICK)).send()
+    let res = client()
+        .get(format!("{}/api/canvas", base_url(port)))
+        .timeout(time_limit(QUICK))
+        .send()
         .await
         .map_err(|e| describe(&e))?;
     if !res.status().is_success() {
@@ -737,7 +748,12 @@ pub async fn get_node_file_content(port: u16, node_id: &str) -> Result<(String, 
     url.path_segments_mut()
         .map_err(|_| "couldn't build the worker's file-content URL".to_string())?
         .push("file-content");
-    let res = client().get(url).timeout(time_limit(QUICK)).send().await.map_err(|e| describe(&e))?;
+    let res = client()
+        .get(url)
+        .timeout(time_limit(QUICK))
+        .send()
+        .await
+        .map_err(|e| describe(&e))?;
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
@@ -768,7 +784,12 @@ pub async fn get_relative_file(port: u16, path: &str) -> Result<Vec<u8>, String>
         .map_err(|_| "couldn't build the worker's asset URL".to_string())?
         .clear()
         .extend(path.split('/'));
-    let res = client().get(url).timeout(time_limit(QUICK)).send().await.map_err(|e| describe(&e))?;
+    let res = client()
+        .get(url)
+        .timeout(time_limit(QUICK))
+        .send()
+        .await
+        .map_err(|e| describe(&e))?;
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
@@ -803,7 +824,12 @@ pub async fn get_include_asset(port: u16, dir: &str, file: &str) -> Result<Vec<u
     url.query_pairs_mut()
         .append_pair("dir", dir)
         .append_pair("file", file);
-    let res = client().get(url).timeout(time_limit(QUICK)).send().await.map_err(|e| describe(&e))?;
+    let res = client()
+        .get(url)
+        .timeout(time_limit(QUICK))
+        .send()
+        .await
+        .map_err(|e| describe(&e))?;
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
@@ -1086,7 +1112,12 @@ pub async fn run_history(
         &[("nodeId", node_id), ("block", block)],
     )
     .map_err(|e| e.to_string())?;
-    let res = client().get(url).timeout(time_limit(QUICK)).send().await.map_err(|e| describe(&e))?;
+    let res = client()
+        .get(url)
+        .timeout(time_limit(QUICK))
+        .send()
+        .await
+        .map_err(|e| describe(&e))?;
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
@@ -1194,7 +1225,12 @@ pub async fn get_vars(
         ],
     )
     .map_err(|e| e.to_string())?;
-    let res = client().get(url).timeout(time_limit(QUICK)).send().await.map_err(|e| describe(&e))?;
+    let res = client()
+        .get(url)
+        .timeout(time_limit(QUICK))
+        .send()
+        .await
+        .map_err(|e| describe(&e))?;
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
@@ -1213,7 +1249,10 @@ pub async fn get_vars(
 /// reads `self.decls`/`self.var_cache` directly). Unlike `get_vars`, never
 /// scoped to one block's own chain.
 pub async fn get_configure_vars(port: u16) -> Result<Vec<VarStatus>, String> {
-    let res = client().get(format!("{}/api/vars/configure", base_url(port))).timeout(time_limit(QUICK)).send()
+    let res = client()
+        .get(format!("{}/api/vars/configure", base_url(port)))
+        .timeout(time_limit(QUICK))
+        .send()
         .await
         .map_err(|e| describe(&e))?;
     if !res.status().is_success() {
@@ -1445,7 +1484,18 @@ pub async fn run_stream(
     save_secrets: HashSet<String>,
     force: Option<(String, String)>,
 ) -> Result<tokio::sync::mpsc::UnboundedReceiver<RunEvent>, String> {
-    run_stream_inner(port, path, block, no_deps, false, false, vars, save_secrets, force).await
+    run_stream_inner(
+        port,
+        path,
+        block,
+        no_deps,
+        false,
+        false,
+        vars,
+        save_secrets,
+        force,
+    )
+    .await
 }
 
 /// Same as [`run_stream`], but with `persist: true` — the CLI's own
@@ -1466,7 +1516,18 @@ pub async fn run_stream_persisted(
     save_secrets: HashSet<String>,
     force: Option<(String, String)>,
 ) -> Result<tokio::sync::mpsc::UnboundedReceiver<RunEvent>, String> {
-    run_stream_inner(port, path, block, no_deps, fresh, true, vars, save_secrets, force).await
+    run_stream_inner(
+        port,
+        path,
+        block,
+        no_deps,
+        fresh,
+        true,
+        vars,
+        save_secrets,
+        force,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1783,7 +1844,10 @@ pub struct ActiveRunDto {
 }
 
 pub async fn list_active_runs(port: u16) -> Result<Vec<ActiveRunDto>, String> {
-    let res = client().get(format!("{}/api/runs", base_url(port))).timeout(time_limit(QUICK)).send()
+    let res = client()
+        .get(format!("{}/api/runs", base_url(port)))
+        .timeout(time_limit(QUICK))
+        .send()
         .await
         .map_err(|e| describe(&e))?;
     if !res.status().is_success() {
@@ -1823,7 +1887,10 @@ pub struct ServiceDto {
 }
 
 pub async fn list_services(port: u16) -> Result<Vec<ServiceDto>, String> {
-    let res = client().get(format!("{}/api/services", base_url(port))).timeout(time_limit(QUICK)).send()
+    let res = client()
+        .get(format!("{}/api/services", base_url(port)))
+        .timeout(time_limit(QUICK))
+        .send()
         .await
         .map_err(|e| describe(&e))?;
     if !res.status().is_success() {
@@ -1853,7 +1920,12 @@ pub async fn get_service_log(
         &[("nodeId", node_id), ("block", block)],
     )
     .map_err(|e| e.to_string())?;
-    let res = client().get(url).timeout(time_limit(QUICK)).send().await.map_err(|e| describe(&e))?;
+    let res = client()
+        .get(url)
+        .timeout(time_limit(QUICK))
+        .send()
+        .await
+        .map_err(|e| describe(&e))?;
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
@@ -2035,7 +2107,11 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("did not answer in time"), "{err}");
-        assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
 
         // The same goes for the reads that used to be bare `reqwest::get`s.
         let err = LIMIT_OVERRIDE
@@ -2054,7 +2130,9 @@ mod tests {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.local_addr().unwrap().port()
         };
-        let err = update_node(port, "a", &NodeUpdate::default()).await.unwrap_err();
+        let err = update_node(port, "a", &NodeUpdate::default())
+            .await
+            .unwrap_err();
         assert!(err.contains("could not connect"), "{err}");
     }
 
@@ -2103,7 +2181,8 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("doc.canvas.md");
-        let original = "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\nbody\n";
+        let original =
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\nbody\n";
         std::fs::write(&path, original).unwrap();
         let port = crate::coordinator::get_or_spawn(&path).await.unwrap();
 
@@ -2175,7 +2254,10 @@ mod tests {
         let mut ws = connect_fake(port).await;
         LIMIT_OVERRIDE
             .scope(Duration::from_millis(300), async {
-                assert!(matches!(ws_next(&mut ws).await, WsNext::Frame(Message::Text(_))));
+                assert!(matches!(
+                    ws_next(&mut ws).await,
+                    WsNext::Frame(Message::Text(_))
+                ));
                 let started = std::time::Instant::now();
                 assert!(matches!(ws_next(&mut ws).await, WsNext::Silent));
                 assert!(started.elapsed() < Duration::from_secs(5));
@@ -2193,7 +2275,9 @@ mod tests {
             use futures_util::{SinkExt, StreamExt};
             for _ in 0..8 {
                 tokio::time::sleep(Duration::from_millis(100)).await;
-                ws.send(Message::Text(r#"{"type":"heartbeat"}"#.into())).await.unwrap();
+                ws.send(Message::Text(r#"{"type":"heartbeat"}"#.into()))
+                    .await
+                    .unwrap();
             }
             ws.send(Message::Text("done".into())).await.unwrap();
             let _ = ws.close(None).await;
@@ -2208,14 +2292,17 @@ mod tests {
                 let started = std::time::Instant::now();
                 loop {
                     match ws_next(&mut ws).await {
-                        WsNext::Frame(Message::Text(t)) if !t.contains("heartbeat") => break Some((t.to_string(), started.elapsed())),
+                        WsNext::Frame(Message::Text(t)) if !t.contains("heartbeat") => {
+                            break Some((t.to_string(), started.elapsed()))
+                        }
                         WsNext::Frame(_) => {}
                         WsNext::Closed | WsNext::Silent => break None,
                     }
                 }
             })
             .await;
-        let (text, elapsed) = got.expect("a stream with heartbeats must not read as silent or closed");
+        let (text, elapsed) =
+            got.expect("a stream with heartbeats must not read as silent or closed");
         assert_eq!(text, "done");
         assert!(
             elapsed > Duration::from_millis(400),
@@ -2239,7 +2326,6 @@ mod tests {
         }
     }
 
-
     /// The worker's heartbeat is liveness only: `watch` must not turn it into
     /// a "canvas changed" reload (an unknown message type does that), yet a
     /// real change right after it still comes through.
@@ -2249,22 +2335,30 @@ mod tests {
         let port = fake_ws_worker(|mut ws| async move {
             use futures_util::SinkExt;
             let beat = || Message::Text(r#"{"type":"heartbeat"}"#.into());
-            ws.send(Message::Text(r#"{"type":"connected","resync":false}"#.into())).await.unwrap();
+            ws.send(Message::Text(
+                r#"{"type":"connected","resync":false}"#.into(),
+            ))
+            .await
+            .unwrap();
             ws.send(beat()).await.unwrap();
             ws.send(beat()).await.unwrap();
             tokio::time::sleep(Duration::from_millis(400)).await;
-            ws.send(Message::Text(r#"{"type":"changed","seq":1}"#.into())).await.unwrap();
+            ws.send(Message::Text(r#"{"type":"changed","seq":1}"#.into()))
+                .await
+                .unwrap();
             tokio::time::sleep(Duration::from_secs(5)).await;
         })
         .await;
         let mut events = watch(port);
         tokio::time::sleep(Duration::from_millis(250)).await;
-        assert!(events.try_recv().is_err(), "a heartbeat was reported as an event");
+        assert!(
+            events.try_recv().is_err(),
+            "a heartbeat was reported as an event"
+        );
         let event = tokio::time::timeout(Duration::from_secs(3), events.recv())
             .await
             .expect("the later change never arrived")
             .unwrap();
         assert!(matches!(event, WatchEvent::Changed));
     }
-
 }

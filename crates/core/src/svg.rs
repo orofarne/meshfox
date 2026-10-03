@@ -244,7 +244,9 @@ mod tests {
     fn sniffs_plain_svg_and_prologs() {
         assert!(looks_like_svg(SVG));
         assert!(looks_like_svg("\n  <svg>"));
-        assert!(looks_like_svg("\u{feff}<?xml version=\"1.0\"?>\n<svg xmlns=\"x\">"));
+        assert!(looks_like_svg(
+            "\u{feff}<?xml version=\"1.0\"?>\n<svg xmlns=\"x\">"
+        ));
         assert!(looks_like_svg(
             "<?xml version=\"1.0\"?><!-- made by x --><!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\"><svg>"
         ));
@@ -274,16 +276,25 @@ mod tests {
     fn inject_theme_is_quote_aware_and_skips_comments() {
         let svg = r#"<!-- <svg> --><svg data-x="a>b" viewBox="0 0 1 1"><g/></svg>"#;
         let out = inject_theme(svg, &Theme::light());
-        assert!(out.contains(r#"data-x="a>b" viewBox="0 0 1 1"><style>"#), "{out}");
+        assert!(
+            out.contains(r#"data-x="a>b" viewBox="0 0 1 1"><style>"#),
+            "{out}"
+        );
         assert!(out.starts_with("<!-- <svg> -->"));
     }
 
     #[test]
     fn inject_theme_leaves_a_self_closing_or_missing_root_alone() {
         assert_eq!(inject_theme("<svg/>", &Theme::dark()), "<svg/>");
-        assert_eq!(inject_theme("<svg width=\"1\"/>", &Theme::dark()), "<svg width=\"1\"/>");
+        assert_eq!(
+            inject_theme("<svg width=\"1\"/>", &Theme::dark()),
+            "<svg width=\"1\"/>"
+        );
         assert_eq!(inject_theme("plain", &Theme::dark()), "plain");
-        assert_eq!(inject_theme("<svg width=\"1", &Theme::dark()), "<svg width=\"1");
+        assert_eq!(
+            inject_theme("<svg width=\"1", &Theme::dark()),
+            "<svg width=\"1"
+        );
     }
 
     #[test]
@@ -302,13 +313,19 @@ mod tests {
     fn resolve_vars_handles_nested_parens_in_the_fallback() {
         let t = Theme::light();
         assert_eq!(
-            resolve_vars("a var(--mf-nope, rgb(1, 2, 3)) b var(--mf-fg, rgb(0,0,0)) c", &t),
+            resolve_vars(
+                "a var(--mf-nope, rgb(1, 2, 3)) b var(--mf-fg, rgb(0,0,0)) c",
+                &t
+            ),
             "a rgb(1, 2, 3) b #201a14 c"
         );
     }
 
     #[test]
     fn resolve_vars_leaves_an_unbalanced_var_alone() {
-        assert_eq!(resolve_vars("x var(--mf-fg, #000", &Theme::dark()), "x var(--mf-fg, #000");
+        assert_eq!(
+            resolve_vars("x var(--mf-fg, #000", &Theme::dark()),
+            "x var(--mf-fg, #000"
+        );
     }
 }

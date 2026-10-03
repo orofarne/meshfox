@@ -244,7 +244,10 @@ fn a_worker_holding_a_live_debug_session_does_not_auto_exit_until_it_is_stopped(
     if !exited {
         kill(worker);
     }
-    assert!(exited, "worker should auto-exit once its debug session is stopped");
+    assert!(
+        exited,
+        "worker should auto-exit once its debug session is stopped"
+    );
 }
 
 /// A worker nobody ever touches at all shouldn't wait *forever* either —

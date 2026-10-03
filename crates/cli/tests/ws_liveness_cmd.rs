@@ -68,7 +68,10 @@ fn spawn_worker(dir: &Path, canvas: &Path) -> Child {
     let lock = dir.join(".meshfox").join("doc.canvas.md.worker.lock");
     let deadline = Instant::now() + Duration::from_secs(20);
     while !std::fs::read_to_string(&lock).is_ok_and(|s| s.contains("port=")) {
-        assert!(Instant::now() < deadline, "the worker never reported its port");
+        assert!(
+            Instant::now() < deadline,
+            "the worker never reported its port"
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
     worker
@@ -113,7 +116,10 @@ fn a_quiet_run_outlasts_the_silence_limit_because_the_worker_sends_heartbeats() 
         output.status.success(),
         "a quiet but healthy run failed:\nstdout: {stdout}\nstderr: {stderr}"
     );
-    assert!(stdout.contains("finished-quietly"), "output lost: {stdout}\n{stderr}");
+    assert!(
+        stdout.contains("finished-quietly"),
+        "output lost: {stdout}\n{stderr}"
+    );
     assert!(
         elapsed > Duration::from_secs(6),
         "the test only means something if the run was quiet for longer than the limit"
@@ -159,10 +165,16 @@ fn a_run_whose_worker_hangs_ends_with_an_error_instead_of_waiting_for_ever() {
         String::from_utf8_lossy(&output.stderr)
     );
     let status = status.unwrap_or_else(|| panic!("meshfox run waited on a hung worker:\n{text}"));
-    assert!(!status.success(), "a run cut off by a hung worker must not report success:\n{text}");
+    assert!(
+        !status.success(),
+        "a run cut off by a hung worker must not report success:\n{text}"
+    );
     assert!(
         text.contains("stopped responding"),
         "the error should say the worker stopped responding:\n{text}"
     );
-    assert!(elapsed < Duration::from_secs(15), "took {elapsed:?} to notice");
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "took {elapsed:?} to notice"
+    );
 }

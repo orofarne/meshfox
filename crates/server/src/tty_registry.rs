@@ -272,7 +272,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_late_attacher_gets_the_byte_history_then_the_live_tail() {
-        let pty = pty_exec::spawn("echo hello", None, None, no_envs(), None, None, (80, 24)).unwrap();
+        let pty =
+            pty_exec::spawn("echo hello", None, None, no_envs(), None, None, (80, 24)).unwrap();
         let handle = track("root".to_string(), "shell".to_string(), pty, None);
 
         // Poll until the session has actually produced (and this handle

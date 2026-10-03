@@ -187,8 +187,7 @@ fn render_output_block_markdown(name: &str, output: &ExecOutput, hash: &str) -> 
 /// `meshfox-core` needs to *encode* anything, not worth a new dependency
 /// (`meshfox-cli` has its own `base64` for decoding `data:` URLs).
 fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let n = (u32::from(chunk[0]) << 16)
@@ -883,10 +882,16 @@ mod tests {
             base64_encode(SVG.as_bytes())
         );
         assert!(result.contains(&expected), "{result}");
-        assert!(result.contains("<!-- meshfox:output name=\"d\""), "{result}");
+        assert!(
+            result.contains("<!-- meshfox:output name=\"d\""),
+            "{result}"
+        );
         assert!(!result.contains("exit code"), "{result}");
         // Nothing after the image but the region's own end marker.
-        assert!(result.contains(&format!("{expected}\n\n<!-- /meshfox:output -->")), "{result}");
+        assert!(
+            result.contains(&format!("{expected}\n\n<!-- /meshfox:output -->")),
+            "{result}"
+        );
     }
 
     #[test]
@@ -942,7 +947,10 @@ mod tests {
         let warn = result.find("warning: font fallback").unwrap();
         let img = result.find("![d](").unwrap();
         assert!(warn < img, "{result}");
-        assert!(result.contains("```text\nwarning: font fallback\n```"), "{result}");
+        assert!(
+            result.contains("```text\nwarning: font fallback\n```"),
+            "{result}"
+        );
     }
 
     #[test]
@@ -952,7 +960,10 @@ mod tests {
         assert_eq!(once, twice);
         assert_eq!(twice.matches("meshfox:output name=").count(), 1);
         assert_eq!(twice.matches("![d](").count(), 1);
-        assert_eq!(cached_output_hash(&once, "d"), cached_output_hash(&twice, "d"));
+        assert_eq!(
+            cached_output_hash(&once, "d"),
+            cached_output_hash(&twice, "d")
+        );
     }
 
     #[test]
@@ -979,7 +990,10 @@ mod tests {
         let once = write_output(doc, "t", &out_a).unwrap();
         let twice = write_output(&once, "t", &out_b).unwrap();
         let thrice = write_output(&twice, "t", &out_b).unwrap();
-        assert_eq!(twice, thrice, "a re-run must not change the document further");
+        assert_eq!(
+            twice, thrice,
+            "a re-run must not change the document further"
+        );
         // Same output again is a fixed point from the very first run on.
         let again = write_output(&once, "t", &out_a).unwrap();
         assert_eq!(once, again);
@@ -996,8 +1010,13 @@ mod tests {
     #[test]
     fn rerunning_a_markdown_mode_block_does_not_grow_the_document() {
         for tail in ["", "\nNext para\n", "\n\nNext para\n"] {
-            let doc = format!("# R\n\n```bash name=\"t\" cache output=\"markdown\"\nx\n```\n{tail}");
-            rerun_is_a_fixed_point(&doc, out(0, "| a |\n|---|\n| 1 |"), out(0, "| b |\n|---|\n| 2 |"));
+            let doc =
+                format!("# R\n\n```bash name=\"t\" cache output=\"markdown\"\nx\n```\n{tail}");
+            rerun_is_a_fixed_point(
+                &doc,
+                out(0, "| a |\n|---|\n| 1 |"),
+                out(0, "| b |\n|---|\n| 2 |"),
+            );
         }
     }
 
@@ -1021,6 +1040,9 @@ mod tests {
     fn the_blank_line_between_a_block_and_the_next_paragraph_is_kept_as_it_was() {
         let doc = "```bash name=\"t\" cache\nx\n```\n\nNext para\n";
         let result = write_output(doc, "t", &out(0, "hi")).unwrap();
-        assert!(result.ends_with("<!-- /meshfox:output -->\n\nNext para\n"), "{result:?}");
+        assert!(
+            result.ends_with("<!-- /meshfox:output -->\n\nNext para\n"),
+            "{result:?}"
+        );
     }
 }
