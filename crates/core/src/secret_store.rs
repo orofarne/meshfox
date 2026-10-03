@@ -7,9 +7,10 @@
 //! ```
 //!
 //! in `.meshfox/config.toml` (local or global, same local-wins load as any
-//! other setting). Only macOS Keychain is implemented so far; asking for
-//! `"keychain"` anywhere else is a loud error on first use, never a silent
-//! fallback to plaintext. Values live under the service [`SERVICE`], keyed by
+//! other setting). `"keychain"` is the macOS Keychain, or on Linux the
+//! freedesktop Secret Service (`secret_store_linux`); asking for it on any
+//! other platform, or without a reachable Secret Service, is a loud error on
+//! first use, never a silent fallback to plaintext. Values live under the service [`SERVICE`], keyed by
 //! an *account* string built by [`doc_account`] (a document's own saved
 //! answers) or [`env_account`] (a `[[env]]` section's `secrets = [...]`).
 //!
@@ -81,10 +82,22 @@ pub fn backend_for(canvas_root: &Path) -> Result<Option<Arc<dyn SecretBackend>>,
     })
 }
 
-/// The OS keychain backend (an always-failing stub off macOS).
+/// The OS keychain backend: the macOS Keychain, the Linux Secret Service,
+/// or an always-failing stub elsewhere.
 pub fn system_backend() -> Arc<dyn SecretBackend> {
-    Arc::new(SystemKeychain)
+    #[cfg(target_os = "linux")]
+    {
+        Arc::new(linux::SecretServiceBackend)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Arc::new(SystemKeychain)
+    }
 }
+
+#[cfg(target_os = "linux")]
+#[path = "secret_store_linux.rs"]
+mod linux;
 
 /// Account for one variable's saved answer in one document. `canvas_path`
 /// is canonicalized when possible, so different spellings of the same file
@@ -116,6 +129,7 @@ pub fn env_account(scope: &str, name: &str) -> String {
     format!("env:{scope}/{name}")
 }
 
+#[cfg(not(target_os = "linux"))]
 #[derive(Debug)]
 struct SystemKeychain;
 
@@ -148,7 +162,7 @@ impl SecretBackend for SystemKeychain {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 impl SecretBackend for SystemKeychain {
     fn get(&self, _: &str) -> io::Result<Option<String>> {
         Err(unsupported())
@@ -161,11 +175,11 @@ impl SecretBackend for SystemKeychain {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn unsupported() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
-        "secret_store = \"keychain\" is only implemented on macOS so far",
+        "secret_store = \"keychain\" is only implemented on macOS and Linux so far",
     )
 }
 

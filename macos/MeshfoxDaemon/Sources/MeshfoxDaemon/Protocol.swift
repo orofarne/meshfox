@@ -20,6 +20,13 @@ enum WatcherMessage {
     /// side's `Message::GetPort`/`PortResponse` doc comments and
     /// `UnixSocketServer`'s own handling of this case specifically.
     case getPort(canvasPath: String)
+    /// "List the workers you're managing" — answered with a `CoresReply`.
+    /// Mirrors the Rust side's `Message::ListCores`.
+    case listCores
+    /// "Kill the worker for `canvasPath`" — answered with an `AckReply`
+    /// (`no such core: ...` when nothing is tracked). Mirrors the Rust
+    /// side's `Message::Kill`.
+    case kill(canvasPath: String)
 }
 
 extension WatcherMessage: Decodable {
@@ -49,6 +56,11 @@ extension WatcherMessage: Decodable {
         case "get_port":
             let path = try container.decode(String.self, forKey: .canvasPath)
             self = .getPort(canvasPath: path)
+        case "list_cores":
+            self = .listCores
+        case "kill":
+            let path = try container.decode(String.self, forKey: .canvasPath)
+            self = .kill(canvasPath: path)
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .op,
@@ -89,6 +101,53 @@ extension PortReply: Encodable {
         switch self {
         case .port(let port):
             try container.encode(port, forKey: .port)
+        case .error(let message):
+            try container.encode(message, forKey: .error)
+        }
+    }
+}
+
+/// One live worker in a `CoresReply` — mirrors the Rust side's
+/// `watcher_protocol::CoreInfo`. `port` is absent (`null` on the Rust side
+/// once decoded) until the worker has reported `Ready`.
+struct CoreInfo: Encodable {
+    let canvasPath: String
+    let port: UInt16?
+    let pid: Int32
+
+    private enum CodingKeys: String, CodingKey {
+        case canvasPath = "canvas_path"
+        case port
+        case pid
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(canvasPath, forKey: .canvasPath)
+        try container.encodeIfPresent(port, forKey: .port)
+        try container.encode(pid, forKey: .pid)
+    }
+}
+
+/// The one JSON line written back after a `.listCores` request — mirrors
+/// the Rust side's own (untagged) `CoresResponse`: `{"cores": [...]}` or
+/// `{"error": "..."}`.
+enum CoresReply {
+    case cores([CoreInfo])
+    case error(String)
+}
+
+extension CoresReply: Encodable {
+    private enum CodingKeys: String, CodingKey {
+        case cores
+        case error
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .cores(let cores):
+            try container.encode(cores, forKey: .cores)
         case .error(let message):
             try container.encode(message, forKey: .error)
         }

@@ -48,6 +48,10 @@ final class UnixSocketServer {
     /// treatment as `onOpen`, just with no fragment/spawn-and-wait
     /// lifecycle to speak of.
     private let onOpenFile: (String, @escaping (AckReply) -> Void) -> Void
+    /// `.listCores`'s handler — synchronous, the registry is in memory.
+    private let onListCores: () -> CoresReply
+    /// `.kill`'s handler — replies on the same connection like `onOpen`.
+    private let onKill: (String, @escaping (AckReply) -> Void) -> Void
     private var listenFD: Int32 = -1
     /// Whether `listenFD` is a socket this instance itself created (own
     /// `path` file, safe — and necessary — to `unlink` in `stop()`) versus
@@ -62,13 +66,17 @@ final class UnixSocketServer {
         onLine: @escaping (String) -> Void,
         onGetPort: @escaping (String, @escaping (PortReply) -> Void) -> Void,
         onOpen: @escaping (String, String?, @escaping (AckReply) -> Void) -> Void,
-        onOpenFile: @escaping (String, @escaping (AckReply) -> Void) -> Void
+        onOpenFile: @escaping (String, @escaping (AckReply) -> Void) -> Void,
+        onListCores: @escaping () -> CoresReply,
+        onKill: @escaping (String, @escaping (AckReply) -> Void) -> Void
     ) {
         self.path = path
         self.onLine = onLine
         self.onGetPort = onGetPort
         self.onOpen = onOpen
         self.onOpenFile = onOpenFile
+        self.onListCores = onListCores
+        self.onKill = onKill
     }
 
     enum ServerError: Error, CustomStringConvertible {
@@ -292,7 +300,7 @@ final class UnixSocketServer {
             if foundLine == nil, let newlineIndex = data.firstIndex(of: 0x0A) {
                 let lineData = data[data.startIndex..<newlineIndex]
                 foundLine = String(data: lineData, encoding: .utf8)
-                // `get_port`/`open`/`open_file` all get a reply, and none
+                // `get_port`/`open`/`open_file`/`list_cores`/`kill` all get a reply, and none
                 // of their clients shut down their own write half waiting
                 // for one (`request_and_await_reply` on the Rust side keeps
                 // it open) — looping on for an EOF that's never coming
@@ -307,6 +315,12 @@ final class UnixSocketServer {
                     return
                 case .openFile(let path):
                     replyToOpenFile(fd: fd, path: path)
+                    return
+                case .listCores:
+                    writeReply(fd: fd, reply: onListCores())
+                    return
+                case .kill(let canvasPath):
+                    replyToKill(fd: fd, canvasPath: canvasPath)
                     return
                 case .ready, nil:
                     break
@@ -355,6 +369,18 @@ final class UnixSocketServer {
         let semaphore = DispatchSemaphore(value: 0)
         var reply: AckReply = .error("no response")
         onOpenFile(path) { result in
+            reply = result
+            semaphore.signal()
+        }
+        semaphore.wait()
+        writeReply(fd: fd, reply: reply)
+    }
+
+    /// Same shape as `replyToOpen`, for `.kill`.
+    private func replyToKill(fd: Int32, canvasPath: String) {
+        let semaphore = DispatchSemaphore(value: 0)
+        var reply: AckReply = .error("no response")
+        onKill(canvasPath) { result in
             reply = result
             semaphore.signal()
         }

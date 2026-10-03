@@ -1184,9 +1184,12 @@ secret_store = "keychain"   # or "plaintext" (the default)
 ```
 
 Explicit only — there is no auto mode, and an unknown value is an error
-rather than a silent fallback to plaintext. `keychain` is implemented for
-**macOS Keychain only** so far (service `meshfox`); elsewhere it fails loudly
-on first use. With it:
+rather than a silent fallback to plaintext. `keychain` is the **macOS
+Keychain** (service `meshfox`) or, on Linux, the freedesktop **Secret Service**
+on the session bus (gnome-keyring, KWallet, oo7-daemon, ...; items carry the
+attributes `service=meshfox` and `account=<account>`, so other clients such as
+`secret-tool` see them). Elsewhere, or with no reachable Secret Service or an
+unlockable default keyring, it fails loudly on first use. With it:
 
 - The web form's "save" checkbox on a `secret` field is labelled "save to
   keychain" instead of "save (plaintext)" and writes there. It is still off

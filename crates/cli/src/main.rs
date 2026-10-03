@@ -22,10 +22,12 @@ use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 mod coordinator;
+mod cores_cmd;
 mod mcp;
 mod pdf;
 mod prompt;
 mod secret_cmd;
+mod serve;
 mod syntax_registry;
 mod tui;
 mod watcher;
@@ -175,12 +177,29 @@ enum Command {
         op: SessionOp,
     },
     /// Manage values in the system secret store (`secret_store =
-    /// "keychain"` in `.meshfox/config.toml`; macOS only so far): `set`,
+    /// "keychain"` in `.meshfox/config.toml`; macOS and Linux): `set`,
     /// `show` (prints a value only with `--reveal`), `rm`. See SPEC.md's
     /// "Secret store".
     Secret {
         #[command(subcommand)]
         op: secret_cmd::SecretOp,
+    },
+    /// Run the persistent coordinator: the headless, cross-platform
+    /// counterpart of the macOS menu-bar daemon. Listens on the socket
+    /// `server_socket` points at (or `--socket`; or the one systemd hands
+    /// over under socket activation), gets-or-spawns a core per canvas and
+    /// is controlled with `meshfox cores ls|open|kill`.
+    Serve {
+        /// Socket path to listen on; defaults to `server_socket` from the
+        /// config. Ignored under systemd socket activation.
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+    },
+    /// Inspect and control the cores (per-canvas workers) of the persistent
+    /// coordinator `server_socket` points at: `ls`, `open`, `kill`.
+    Cores {
+        #[command(subcommand)]
+        op: cores_cmd::CoresOp,
     },
     /// Create a new, empty canvas file: just the `meshfox:canvas` marker
     /// followed by a lone root heading (`#`) named after the file itself
@@ -1230,6 +1249,26 @@ fn main() {
         Command::Secret { op } => {
             if let Err(e) = secret_cmd::run(op, find_canvas) {
                 eprintln!("meshfox secret: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Serve { socket } => {
+            let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+                eprintln!("failed to start async runtime: {e}");
+                std::process::exit(1);
+            });
+            let exe = std::env::current_exe().unwrap_or_else(|e| {
+                eprintln!("meshfox serve: couldn't resolve this binary's own path: {e}");
+                std::process::exit(1);
+            });
+            if let Err(e) = runtime.block_on(serve::run(exe, socket)) {
+                eprintln!("meshfox serve: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Cores { op } => {
+            if let Err(e) = cores_cmd::run(op) {
+                eprintln!("meshfox cores: {e}");
                 std::process::exit(1);
             }
         }

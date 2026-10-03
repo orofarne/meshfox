@@ -10,13 +10,13 @@
 //! a worker never needs to know or care whether the process on the other
 //! end is this crate's own watcher or something else entirely.
 //!
-//! Four messages. One is genuinely one-way — no response payload a caller
+//! Six messages. One is genuinely one-way — no response payload a caller
 //! needs to act on:
 //! - [`Message::Ready`] — sent once by a freshly-spawned worker, right
 //!   after it binds its listener. Replaces the old `--port-file` polling
 //!   entirely: the coordinator just gets told, instead of having to notice.
 //!
-//! The other three all get a reply on the same connection — every
+//! The other five all get a reply on the same connection — every
 //! coordinator implementation that wants to be usable at all (not just
 //! `server_socket` clients — see [`request_open`]'s own doc comment on why
 //! this stopped being optional) needs to answer each of them:
@@ -49,6 +49,18 @@
 //!   `Open` would, the coordinator writes one JSON response line back on
 //!   the *same* connection before closing it — `{"port": u16}` on success,
 //!   `{"error": string}` on failure — see [`request_port`].
+//! - [`Message::ListCores`] — "which workers are alive right now?" Reply:
+//!   `{"cores": [CoreInfo, ...]}` (or `{"error": ...}`) — see
+//!   [`request_list_cores`]. What the macOS daemon's menu shows.
+//! - [`Message::Kill`] — "stop the worker for this canvas". Reply: an
+//!   [`AckResponse`]; an error (`no such core: ...`) if nothing is tracked
+//!   for that path — see [`request_kill`]. Showing a core's view is just
+//!   [`Message::Open`] again: it already is get-or-spawn-and-show.
+//!
+//! There are deliberately no request ids: a connection carries exactly one
+//! request and its one reply, so the connection itself correlates them. If
+//! long-lived connections (subscriptions, streaming) are ever added, that
+//! is the point to revisit this.
 //!
 //! `Open`/`OpenFile` share [`Message::Ready`]'s pre-existing "unreachable
 //! coordinator" failure contract (a plain `io::Error`), just now also
@@ -92,13 +104,40 @@ pub enum Message {
     /// "Get-or-spawn a worker for `canvas_path`, don't open a browser tab,
     /// just tell me its port" — see this module's own doc comment.
     GetPort { canvas_path: PathBuf },
+    /// "List the workers you're managing" — see [`CoreInfo`].
+    ListCores,
+    /// "Kill the worker for `canvas_path`" — canonicalized by the
+    /// coordinator like `Open`'s path. Replies `no such core` if none is
+    /// tracked for it.
+    Kill { canvas_path: PathBuf },
+}
+
+/// One live worker, as reported by [`Message::ListCores`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoreInfo {
+    /// Canonical path of the canvas this worker serves.
+    pub canvas_path: PathBuf,
+    /// `None` while the worker has been spawned but hasn't reported `Ready`
+    /// yet.
+    pub port: Option<u16>,
+    pub pid: u32,
+}
+
+/// The one JSON line a coordinator writes back after a
+/// [`Message::ListCores`]. `Error` is declared first for the same reason as
+/// in [`AckResponse`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CoresResponse {
+    Error { error: String },
+    Cores { cores: Vec<CoreInfo> },
 }
 
 /// The one JSON line a coordinator writes back after a [`Message::GetPort`]
 /// — see [`request_port`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
-enum PortResponse {
+pub enum PortResponse {
     Port { port: u16 },
     Error { error: String },
 }
@@ -324,6 +363,66 @@ async fn request_open_file_with_timeout(
             io::ErrorKind::TimedOut,
             format!(
                 "coordinator at {} didn't answer open_file within {}s",
+                socket_path.display(),
+                timeout.as_secs_f64()
+            ),
+        )),
+    }
+}
+
+/// [`Message::ListCores`] — the live workers of the coordinator at
+/// `socket_path`. A coordinator-reported error comes back as
+/// `io::ErrorKind::Other`; see [`COORDINATOR_REQUEST_TIMEOUT`] for the wait.
+pub async fn request_list_cores(socket_path: &Path) -> io::Result<Vec<CoreInfo>> {
+    request_list_cores_with_timeout(socket_path, COORDINATOR_REQUEST_TIMEOUT).await
+}
+
+async fn request_list_cores_with_timeout(
+    socket_path: &Path,
+    timeout: std::time::Duration,
+) -> io::Result<Vec<CoreInfo>> {
+    match tokio::time::timeout(
+        timeout,
+        request_and_await_reply(socket_path, &Message::ListCores),
+    )
+    .await
+    {
+        Ok(reply) => match serde_json::from_str::<CoresResponse>(reply?.trim()) {
+            Ok(CoresResponse::Cores { cores }) => Ok(cores),
+            Ok(CoresResponse::Error { error }) => Err(io::Error::other(error)),
+            Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
+        },
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "coordinator at {} didn't answer list_cores within {}s",
+                socket_path.display(),
+                timeout.as_secs_f64()
+            ),
+        )),
+    }
+}
+
+/// [`Message::Kill`] — stop the worker for `canvas_path`. Same failure
+/// contract as [`request_open`]; `no such core` when nothing is tracked.
+pub async fn request_kill(socket_path: &Path, canvas_path: &Path) -> io::Result<()> {
+    request_kill_with_timeout(socket_path, canvas_path, COORDINATOR_REQUEST_TIMEOUT).await
+}
+
+async fn request_kill_with_timeout(
+    socket_path: &Path,
+    canvas_path: &Path,
+    timeout: std::time::Duration,
+) -> io::Result<()> {
+    let msg = Message::Kill {
+        canvas_path: canvas_path.to_path_buf(),
+    };
+    match tokio::time::timeout(timeout, request_and_await_reply(socket_path, &msg)).await {
+        Ok(reply) => parse_ack(&reply?),
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "coordinator at {} didn't answer kill within {}s",
                 socket_path.display(),
                 timeout.as_secs_f64()
             ),
@@ -565,6 +664,119 @@ mod tests {
 
         let (_stream, _) = listener.accept().await.unwrap();
 
+        let err = send_task.await.unwrap().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn request_list_cores_reads_back_the_cores() {
+        let socket_path = temp_socket_path("list-cores");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let send_task = tokio::spawn({
+            let socket_path = socket_path.clone();
+            async move { request_list_cores(&socket_path).await }
+        });
+
+        let msg = accept_and_reply(
+            &listener,
+            "{\"cores\":[{\"canvas_path\":\"/a.canvas.md\",\"port\":4242,\"pid\":7},\
+             {\"canvas_path\":\"/b.canvas.md\",\"port\":null,\"pid\":8}]}\n",
+        )
+        .await;
+        assert!(matches!(msg, Message::ListCores));
+
+        let cores = send_task.await.unwrap().unwrap();
+        assert_eq!(
+            cores,
+            vec![
+                CoreInfo {
+                    canvas_path: PathBuf::from("/a.canvas.md"),
+                    port: Some(4242),
+                    pid: 7
+                },
+                CoreInfo {
+                    canvas_path: PathBuf::from("/b.canvas.md"),
+                    port: None,
+                    pid: 8
+                },
+            ]
+        );
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn request_list_cores_surfaces_a_coordinator_reported_error() {
+        let socket_path = temp_socket_path("list-cores-error");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let send_task = tokio::spawn({
+            let socket_path = socket_path.clone();
+            async move { request_list_cores(&socket_path).await }
+        });
+
+        accept_and_reply(&listener, "{\"error\":\"not supported\"}\n").await;
+        let err = send_task.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("not supported"));
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn request_kill_sends_the_path_and_reads_back_ok() {
+        let socket_path = temp_socket_path("kill");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let canvas_path = PathBuf::from("/tmp/some.canvas.md");
+        let send_task = tokio::spawn({
+            let socket_path = socket_path.clone();
+            let canvas_path = canvas_path.clone();
+            async move { request_kill(&socket_path, &canvas_path).await }
+        });
+
+        let msg = accept_and_reply(&listener, "{}\n").await;
+        send_task.await.unwrap().unwrap();
+        match msg {
+            Message::Kill { canvas_path: p } => assert_eq!(p, canvas_path),
+            other => panic!("expected Kill, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn request_kill_surfaces_no_such_core() {
+        let socket_path = temp_socket_path("kill-missing");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let send_task = tokio::spawn({
+            let socket_path = socket_path.clone();
+            async move { request_kill(&socket_path, &PathBuf::from("/nope.canvas.md")).await }
+        });
+
+        accept_and_reply(&listener, "{\"error\":\"no such core: /nope.canvas.md\"}\n").await;
+        let err = send_task.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("no such core"));
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn request_kill_times_out_when_the_coordinator_never_replies() {
+        let socket_path = temp_socket_path("kill-never-replies");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let send_task = tokio::spawn({
+            let socket_path = socket_path.clone();
+            async move {
+                request_kill_with_timeout(
+                    &socket_path,
+                    &PathBuf::from("/tmp/wedged.canvas.md"),
+                    std::time::Duration::from_millis(200),
+                )
+                .await
+            }
+        });
+
+        let (_stream, _) = listener.accept().await.unwrap();
         let err = send_task.await.unwrap().unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         let _ = std::fs::remove_file(&socket_path);

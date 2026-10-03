@@ -113,6 +113,13 @@ final class SessionStore {
             onOpenFile: { [weak self] path, completion in
                 self?.openFile(path: path, completion: completion)
                     ?? completion(.error("daemon is shutting down"))
+            },
+            onListCores: { [weak self] in
+                self?.listCores() ?? .error("daemon is shutting down")
+            },
+            onKill: { [weak self] canvasPath, completion in
+                self?.killCore(path: canvasPath, completion: completion)
+                    ?? completion(.error("daemon is shutting down"))
             }
         )
         try server.start()
@@ -132,9 +139,9 @@ final class SessionStore {
         switch message {
         case .ready(let canvasPath, let port):
             markReady(canvasPath: canvasPath, port: port)
-        case .open, .openFile, .getPort:
+        case .open, .openFile, .getPort, .listCores, .kill:
             // Never actually reaches here — `UnixSocketServer` intercepts
-            // all three itself and calls `openCanvas(path:fragment:
+            // all of these itself and calls `openCanvas(path:fragment:
             // completion:)`/`openFile(path:completion:)`/`getPort(path:
             // completion:)` directly, since (unlike `ready`, routed
             // through `onLine`) each of these needs a reply on the same
@@ -264,8 +271,16 @@ final class SessionStore {
         }
     }
 
+    /// `realpath(3)`, like the Rust coordinators' `Path::canonicalize`, so a
+    /// canvas has the same canonical form (`/private/var/...` stays
+    /// `/private/var/...`) whichever implementation tracks it. Foundation's
+    /// `resolvingSymlinksInPath` would drop the `/private` prefix. A path
+    /// that doesn't resolve (a deleted canvas, say) is kept as given, which
+    /// is also what the Rust side does.
     private static func canonicalize(_ path: String) -> String {
-        URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+        var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
+        guard realpath(path, &buffer) != nil else { return path }
+        return String(cString: buffer)
     }
 
     /// `port: 0` (let the OS pick) and auto-exit left on (no
@@ -440,6 +455,35 @@ final class SessionStore {
     /// app right after) — each one's own `kill_on_drop`-equivalent
     /// cleanup is `Process.terminate()` itself, not something this needs
     /// to await.
+    /// `list_cores`: every tracked session, ordered by canvas path (same
+    /// order as the Rust coordinator). `pid` is `0` in the brief window
+    /// between a session being registered and its process starting.
+    func listCores() -> CoresReply {
+        lock.lock()
+        let cores = sessions.values.map {
+            CoreInfo(canvasPath: $0.canvasPath, port: $0.port, pid: $0.process.processIdentifier)
+        }
+        lock.unlock()
+        return .cores(cores.sorted { $0.canvasPath < $1.canvasPath })
+    }
+
+    /// `kill`: stops the worker for `path` (`SIGTERM`, via `kill(canvasPath:)`)
+    /// and replies right away — the session leaves the registry once the
+    /// process has actually exited, like any other exit. `no such core`
+    /// when nothing is tracked for the path.
+    func killCore(path: String, completion: @escaping (AckReply) -> Void) {
+        let canonical = Self.canonicalize(path)
+        lock.lock()
+        let exists = sessions[canonical] != nil
+        lock.unlock()
+        guard exists else {
+            completion(.error("no such core: \(canonical)"))
+            return
+        }
+        kill(canvasPath: canonical)
+        completion(.ok)
+    }
+
     func killAll() {
         lock.lock()
         let all = Array(sessions.values)

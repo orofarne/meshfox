@@ -21,3 +21,10 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7.0"
+
+# Linux Secret Service (gnome-keyring, KWallet, oo7-daemon, ...) for
+# `secret_store = "keychain"`. No default features in 5.x: the pure-Rust
+# crypto plus the async-io zbus runtime means no libdbus/openssl to link, and
+# no tokio runtime for the blocking API to collide with.
+[target.'cfg(target_os = "linux")'.dependencies]
+secret-service = { version = "5.2", default-features = false, features = ["rt-async-io-crypto-rust"] }

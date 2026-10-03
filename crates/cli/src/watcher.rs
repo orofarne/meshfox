@@ -29,7 +29,9 @@
 //! macOS, eventually) is a deliberately separate thing — same wire
 //! protocol, entirely different lifecycle policy — not implemented here.
 
-use meshfox_server::watcher_protocol::{AckResponse, Message};
+use meshfox_server::watcher_protocol::{
+    AckResponse, CoreInfo, CoresResponse, Message, PortResponse,
+};
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -58,6 +60,11 @@ struct Entry {
     /// top-level invocation's own primary worker, spawned directly by
     /// `run` rather than via an `Open` message).
     waiters: Vec<oneshot::Sender<Result<(), String>>>,
+    /// The worker process's id, for `ListCores`.
+    pid: u32,
+    /// Asks this worker's own task to stop it (`Registry::kill`); taken on
+    /// first use. `None` once used, or for an entry nobody can kill.
+    kill: Option<oneshot::Sender<()>>,
 }
 
 /// Shared state the accept loop and every per-worker watch task touch.
@@ -65,7 +72,7 @@ struct Entry {
 /// (needed to both `.wait()` on it *and* `.start_kill()` it from the same
 /// place without fighting over `&mut` access) and only reports back here
 /// via `remove`.
-struct Registry {
+pub(crate) struct Registry {
     entries: Mutex<HashMap<PathBuf, Entry>>,
     /// Fired whenever `entries` transitions to empty — `wait_until_empty`
     /// loops on this rather than polling, so the watcher notices "nothing
@@ -80,11 +87,21 @@ struct Registry {
     /// `open::that` call so tests can substitute a recorder — otherwise
     /// every `cargo test` run pops real browser tabs.
     tab_opener: Box<dyn Fn(String) + Send + Sync>,
+    /// A persistent coordinator (`meshfox serve`) as opposed to a private
+    /// per-`view` watcher: answers `GetPort`, `ListCores` and `Kill`
+    /// instead of rejecting/ignoring them.
+    persistent: bool,
 }
 
 impl Registry {
     fn new() -> Self {
         Self::with_tab_opener(Box::new(open_url_in_browser))
+    }
+
+    pub(crate) fn new_persistent() -> Self {
+        let mut registry = Self::new();
+        registry.persistent = true;
+        registry
     }
 
     fn with_tab_opener(tab_opener: Box<dyn Fn(String) + Send + Sync>) -> Self {
@@ -94,6 +111,7 @@ impl Registry {
             empty: Notify::new(),
             shutdown,
             tab_opener,
+            persistent: false,
         }
     }
 
@@ -112,7 +130,36 @@ impl Registry {
         self.entries.lock().unwrap().is_empty()
     }
 
-    async fn wait_until_empty(&self) {
+    /// Every tracked worker, ordered by canvas path.
+    fn list_cores(&self) -> Vec<CoreInfo> {
+        let entries = self.entries.lock().unwrap();
+        let mut cores: Vec<CoreInfo> = entries
+            .iter()
+            .map(|(path, entry)| CoreInfo {
+                canvas_path: path.clone(),
+                port: entry.port,
+                pid: entry.pid,
+            })
+            .collect();
+        cores.sort_by(|a, b| a.canvas_path.cmp(&b.canvas_path));
+        cores
+    }
+
+    /// Asks the worker for `path` to stop. The entry disappears once it has
+    /// actually exited (its own task calls `remove`), not before this
+    /// returns. A second kill of a core that is already stopping is a no-op.
+    fn kill(&self, path: &Path) -> Result<(), String> {
+        let mut entries = self.entries.lock().unwrap();
+        let Some(entry) = entries.get_mut(path) else {
+            return Err(format!("no such core: {}", path.display()));
+        };
+        if let Some(kill) = entry.kill.take() {
+            let _ = kill.send(());
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn wait_until_empty(&self) {
         loop {
             if self.is_empty() {
                 return;
@@ -121,7 +168,7 @@ impl Registry {
         }
     }
 
-    fn signal_shutdown(&self) {
+    pub(crate) fn signal_shutdown(&self) {
         let _ = self.shutdown.send(());
     }
 
@@ -300,8 +347,16 @@ fn spawn_worker(
     let mut child = command
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
+        // A systemd-socket-activated coordinator's workers must not think
+        // they were handed its listening socket too.
+        .env_remove("LISTEN_PID")
+        .env_remove("LISTEN_FDS")
+        .env_remove("LISTEN_FDNAMES")
         .kill_on_drop(true)
         .spawn()?;
+
+    let pid = child.id().unwrap_or(0);
+    let (kill_tx, kill_rx) = oneshot::channel();
 
     let captured_stderr = Arc::new(Mutex::new(String::new()));
     if let Some(stderr) = child.stderr.take() {
@@ -327,13 +382,15 @@ fn spawn_worker(
             port: None,
             pending_open,
             waiters: initial_waiter.into_iter().collect(),
+            pid,
+            kill: Some(kill_tx),
         },
     );
 
     let registry = Arc::clone(registry);
     let mut shutdown_rx = registry.shutdown.subscribe();
     tokio::spawn(async move {
-        watch_worker(child, &mut shutdown_rx).await;
+        watch_worker(child, &mut shutdown_rx, kill_rx).await;
         let had_port = registry
             .entries
             .lock()
@@ -362,13 +419,45 @@ fn spawn_worker(
 /// return before the process is actually gone (matters for a worker
 /// holding real subprocess trees of its own, same reasoning
 /// `stream_exec::SpawnedProcess::kill` documents).
-async fn watch_worker(mut child: Child, shutdown_rx: &mut broadcast::Receiver<()>) {
+async fn watch_worker(
+    mut child: Child,
+    shutdown_rx: &mut broadcast::Receiver<()>,
+    mut kill_rx: oneshot::Receiver<()>,
+) {
     tokio::select! {
         _ = child.wait() => {}
         _ = shutdown_rx.recv() => {
             let _ = child.start_kill();
             let _ = child.wait().await;
         }
+        Ok(()) = &mut kill_rx => {
+            terminate(&mut child).await;
+        }
+    }
+}
+
+/// How long a worker asked to stop (`Kill`) gets to exit after `SIGTERM`
+/// before it is killed outright.
+const TERMINATE_GRACE: Duration = Duration::from_secs(5);
+
+/// `SIGTERM` first (the macOS daemon's `Process.terminate()` does the same),
+/// then `SIGKILL` if the worker is still there after [`TERMINATE_GRACE`].
+async fn terminate(child: &mut Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // SAFETY: plain signal delivery to a pid we own.
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = child.start_kill();
+    if tokio::time::timeout(TERMINATE_GRACE, child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
     }
 }
 
@@ -430,82 +519,153 @@ async fn handle_connection(
             fragment,
         } => {
             let canonical = canvas_path.canonicalize().unwrap_or(canvas_path);
-
-            // Three cases, matching exactly what was asked for: already
-            // open (a port is known) → show it now, ack immediately;
-            // already spawning (tracked, no port yet) → flag it wanted
-            // (with this request's own fragment) and wait alongside
-            // whoever else is already waiting; never seen at all → spawn
-            // it, wanted from the start, and wait the same way.
-            enum Action {
-                OpenNow(u16),
-                Wait,
-                Spawn,
-            }
-            let action = {
-                let mut entries = registry.entries.lock().unwrap();
-                match entries.get_mut(&canonical) {
-                    Some(entry) => match entry.port {
-                        Some(port) => Action::OpenNow(port),
-                        None => {
-                            entry.pending_open = Some(fragment.clone());
-                            Action::Wait
-                        }
-                    },
-                    None => Action::Spawn,
-                }
-            };
-            let result = match action {
-                Action::OpenNow(port) => {
-                    registry.open_browser_tab(port, fragment.as_deref());
-                    Ok(())
-                }
-                Action::Wait => {
-                    let (tx, rx) = oneshot::channel();
-                    registry.add_waiter(&canonical, tx);
-                    await_ready(rx).await
-                }
-                Action::Spawn => {
-                    // `port: 0` (let the OS pick) and `auto_exit: true`
-                    // (exits on its own once its own tabs all close) —
-                    // same defaults every navigated-to worker has always
-                    // had.
-                    let (tx, rx) = oneshot::channel();
-                    match spawn_worker(
-                        &registry,
-                        &exe,
-                        &socket_path,
-                        WorkerSpec {
-                            canonical_path: canonical,
-                            port: 0,
-                            pending_open: Some(fragment),
-                            auto_exit: true,
-                            initial_waiter: Some(tx),
-                        },
-                    ) {
-                        Ok(()) => await_ready(rx).await,
-                        Err(e) => Err(format!(
-                            "couldn't spawn a worker for the requested canvas: {e}"
-                        )),
-                    }
-                }
-            };
+            let result = ensure_core(&registry, &exe, &socket_path, canonical, Some(fragment))
+                .await
+                .map(|_| ());
             let _ = write_half.write_all(ack_json(&result).as_bytes()).await;
         }
         Message::OpenFile { path } => {
             let result = open_plain_file(path).await;
             let _ = write_half.write_all(ack_json(&result).as_bytes()).await;
         }
-        // Deliberately unsupported here: `GetPort` is a request-reply
-        // message too, but this watcher is a private, per-`view`-invocation
-        // process nobody's `server_socket` has a reason to point at (a
-        // persistent, addressable coordinator — the macOS daemon, e.g. —
-        // implements it instead) — see `crates/cli/src/coordinator.rs`'s
-        // own doc comment. Closing without a reply here would leave a
-        // real `GetPort` caller waiting out its own timeout for nothing,
-        // but nothing in this codebase ever actually sends one here, so
-        // that's a non-issue in practice, not a gap worth closing.
+        // A persistent coordinator is the one that `server_socket` points
+        // at, so it answers `GetPort` (get-or-spawn, no browser tab).
+        Message::GetPort { canvas_path } if registry.persistent => {
+            let canonical = canvas_path.canonicalize().unwrap_or(canvas_path);
+            let reply = match ensure_core(&registry, &exe, &socket_path, canonical, None).await {
+                Ok(port) => PortResponse::Port { port },
+                Err(error) => PortResponse::Error { error },
+            };
+            let _ = write_half.write_all(json_line(&reply).as_bytes()).await;
+        }
+        Message::ListCores if registry.persistent => {
+            let reply = CoresResponse::Cores {
+                cores: registry.list_cores(),
+            };
+            let _ = write_half.write_all(json_line(&reply).as_bytes()).await;
+        }
+        Message::Kill { canvas_path } if registry.persistent => {
+            // A core whose canvas file was deleted can't be canonicalized
+            // any more; it is tracked under the path recorded at spawn.
+            let canonical = canvas_path.canonicalize().unwrap_or(canvas_path);
+            let result = registry.kill(&canonical);
+            let _ = write_half.write_all(ack_json(&result).as_bytes()).await;
+        }
+        // Deliberately unsupported on a private watcher: it is a private,
+        // per-`view`-invocation process nobody's `server_socket` has a
+        // reason to point at — see `crates/cli/src/coordinator.rs`'s own
+        // doc comment. Nothing in this codebase sends `GetPort` here, so
+        // that one just closes; `meshfox cores ls|kill` pointed at the
+        // wrong socket is reachable, so those get a readable error.
         Message::GetPort { .. } => {}
+        Message::ListCores | Message::Kill { .. } => {
+            let result: Result<(), String> = Err(
+                "not supported by a private watcher; use a persistent coordinator \
+                     (`meshfox serve` or the macOS daemon)"
+                    .to_string(),
+            );
+            let _ = write_half.write_all(ack_json(&result).as_bytes()).await;
+        }
+    }
+}
+
+/// Get-or-spawn the worker for `canonical` and wait for its port. `open` is
+/// `Some(fragment)` when a browser tab should be shown for it (`Open`),
+/// `None` for a plain port lookup (`GetPort`). Three cases: already ready →
+/// show it now and return its port; already spawning → flag it wanted (with
+/// this request's own fragment) and wait alongside whoever else is waiting;
+/// never seen → spawn it (`port: 0`, `auto_exit: true` — the same defaults
+/// every navigated-to worker has always had) and wait the same way.
+async fn ensure_core(
+    registry: &Arc<Registry>,
+    exe: &Path,
+    socket_path: &Path,
+    canonical: PathBuf,
+    open: Option<Option<String>>,
+) -> Result<u16, String> {
+    enum Action {
+        Ready(u16),
+        Wait,
+        Spawn,
+    }
+    let action = {
+        let mut entries = registry.entries.lock().unwrap();
+        match entries.get_mut(&canonical) {
+            Some(entry) => match entry.port {
+                Some(port) => Action::Ready(port),
+                None => {
+                    if open.is_some() {
+                        entry.pending_open = open.clone();
+                    }
+                    Action::Wait
+                }
+            },
+            None => Action::Spawn,
+        }
+    };
+    let rx = match action {
+        Action::Ready(port) => {
+            if let Some(fragment) = &open {
+                registry.open_browser_tab(port, fragment.as_deref());
+            }
+            return Ok(port);
+        }
+        Action::Wait => {
+            let (tx, rx) = oneshot::channel();
+            registry.add_waiter(&canonical, tx);
+            rx
+        }
+        Action::Spawn => {
+            let (tx, rx) = oneshot::channel();
+            spawn_worker(
+                registry,
+                exe,
+                socket_path,
+                WorkerSpec {
+                    canonical_path: canonical.clone(),
+                    port: 0,
+                    pending_open: open,
+                    auto_exit: true,
+                    initial_waiter: Some(tx),
+                },
+            )
+            .map_err(|e| format!("couldn't spawn a worker for the requested canvas: {e}"))?;
+            rx
+        }
+    };
+    await_ready(rx).await?;
+    registry
+        .entries
+        .lock()
+        .unwrap()
+        .get(&canonical)
+        .and_then(|e| e.port)
+        .ok_or_else(|| "worker exited right after reporting ready".to_string())
+}
+
+fn json_line<T: serde::Serialize>(value: &T) -> String {
+    let mut line = serde_json::to_string(value).expect("protocol replies always serialize");
+    line.push('\n');
+    line
+}
+
+/// Accepts connections on `listener` forever, handling each on its own task.
+pub(crate) async fn accept_loop(
+    listener: UnixListener,
+    registry: Arc<Registry>,
+    exe: PathBuf,
+    socket_path: PathBuf,
+) {
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            continue;
+        };
+        tokio::spawn(handle_connection(
+            stream,
+            Arc::clone(&registry),
+            exe.clone(),
+            socket_path.clone(),
+        ));
     }
 }
 
@@ -567,22 +727,12 @@ pub async fn run(
         },
     )?;
 
-    let accept_registry = Arc::clone(&registry);
-    let accept_exe = exe.clone();
-    let accept_socket = socket_path.clone();
-    let accept_task = tokio::spawn(async move {
-        loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                continue;
-            };
-            tokio::spawn(handle_connection(
-                stream,
-                Arc::clone(&accept_registry),
-                accept_exe.clone(),
-                accept_socket.clone(),
-            ));
-        }
-    });
+    let accept_task = tokio::spawn(accept_loop(
+        listener,
+        Arc::clone(&registry),
+        exe.clone(),
+        socket_path.clone(),
+    ));
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
@@ -601,7 +751,7 @@ pub async fn run(
 }
 
 #[cfg(unix)]
-async fn wait_for_terminate() {
+pub(crate) async fn wait_for_terminate() {
     use tokio::signal::unix::{signal, SignalKind};
     match signal(SignalKind::terminate()) {
         Ok(mut stream) => {
@@ -612,7 +762,7 @@ async fn wait_for_terminate() {
 }
 
 #[cfg(not(unix))]
-async fn wait_for_terminate() {
+pub(crate) async fn wait_for_terminate() {
     std::future::pending().await
 }
 
@@ -629,6 +779,8 @@ mod tests {
             port: None,
             pending_open: None,
             waiters: Vec::new(),
+            pid: 0,
+            kill: None,
         }
     }
 

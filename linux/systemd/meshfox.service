@@ -1,0 +1,22 @@
+# The Meshfox coordinator, started on demand by meshfox.socket. It is not
+# enabled itself: socket activation is what runs it.
+#
+# Deliberately no `Restart=`: a clean exit (SIGTERM, `systemctl --user stop`)
+# leaves the socket in place, and the next connection starts a fresh service.
+# The workers it spawns are its children; stopping the service stops them too
+# (the default `KillMode=control-group`, plus `meshfox serve` terminating its
+# own workers on SIGTERM).
+#
+# Workers run your blocks with this unit's environment, i.e. the user
+# manager's. If your tools live somewhere a login shell adds to PATH, make
+# that visible to the user manager (`systemctl --user import-environment PATH`
+# or an `Environment=PATH=...` drop-in).
+
+[Unit]
+Description=Meshfox coordinator
+Requires=meshfox.socket
+After=meshfox.socket
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/meshfox serve

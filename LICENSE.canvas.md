@@ -8,6 +8,8 @@ Only **direct** dependencies are listed by name below; the full transitive tree 
 
 It grew by one more once `crates/cli`'s `main` gained an explicit `rustls::crypto::ring::default_provider().install_default()` call — `rustls` (already reachable transitively via `headless_chrome`/`self_update`'s own `ureq` backend, and via `meshfox_server`'s `reqwest` feature flags) was promoted to a real, direct `crates/cli` dependency so that call has something to name; picking the `ring` backend there (rather than the default `aws-lc-rs`) keeps only one crypto backend compiled into the binary, matching `reqwest`'s own `rustls-no-provider` feature choice in `meshfox_server`. `Apache-2.0 OR ISC OR MIT` — permissive, no new copyleft exception. `crates/server` now names the same `rustls`/`ring` dependency directly as well: Source-mode saves of a canvas-valued include can make a loopback `reqwest` request when the server is embedded as a library, without the CLI's `main` having installed a provider. This adds no package to the existing transitive tree.
 
+On Linux only, `crates/core` has one more direct dependency, `secret-service` (`cfg(target_os = "linux")`, the freedesktop Secret Service client behind `secret_store = "keychain"` there; `default-features = false` with the `rt-async-io-crypto-rust` feature, so pure-Rust crypto and the async-io `zbus` runtime — no libdbus/OpenSSL to link and no tokio runtime for its blocking API to collide with). It pulls 39 crates that do not reach the macOS binary at all (`zbus` and its `zvariant`/`zbus_names`/`endi` family, `async-io`/`async-lock`/`async-process`/`blocking`/`polling` and friends, `enumflags2`, `hkdf`, `num*`, `winnow`/`toml_edit`) — 16 `MIT OR Apache-2.0`, 14 `Apache-2.0 OR MIT`, 9 `MIT`; no copyleft, so no new exception. The 664 figure above stays the macOS count.
+
 It grew by one more once `service` blocks (see SPEC.md's "Service blocks (experimental)") gained per-process CPU/memory/uptime sampling for the webui's service panel and the TUI's own service view — `sysinfo` (MIT), used from `crates/server`'s new `services` module (shared by both, since the TUI links this crate as a library rather than talking to it over HTTP).
 
 It grew by 5 more once undo/redo gained its own per-canvas history log (`crates/server/src/undo_log.rs`, `.meshfox/<canvas>.session.sqlite3`) — `rusqlite`, `bundled` feature so this doesn't depend on a system SQLite install, plus its own small `fallible-iterator`/`fallible-streaming-iterator`/`hashlink`/`libsqlite3-sys` tree (checked via `git diff Cargo.lock`, same as the `syntect-tmlanguage` entry above). `libsqlite3-sys`'s own `vcpkg` build-dependency (a Windows-only system-library lookup) also landed in `Cargo.lock` but is excluded from the 639 count above, same "dev/build-only trees excluded" rule the rest of this count already follows. All five are MIT or MIT/Apache-2.0 dual — no new copyleft exception.
@@ -52,6 +54,7 @@ Direct dependencies across `crates/core`, `crates/server`, `crates/cli` (`cargo 
 | rustls | Apache-2.0 OR ISC OR MIT |
 | schemars | MIT |
 | scraper | ISC |
+| secret-service | MIT OR Apache-2.0 |
 | self_update | MIT |
 | serde | MIT OR Apache-2.0 |
 | serde_json | MIT OR Apache-2.0 |

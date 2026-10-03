@@ -41,8 +41,18 @@ func resolveMeshfoxPath() -> String? {
 /// `Application Support` (not `Caches`/`../tmp`) since this is meant to be
 /// long-lived for as long as the daemon runs, same idiom any other
 /// per-user macOS app data lives under.
+///
+/// `MESHFOX_DAEMON_SOCKET`, if set, wins — like `MESHFOX_BIN`, a hook for
+/// tests, not a normal launch setting: the default path is long, and a Unix
+/// socket path has a ~104-byte limit, so a test running under a temp `$HOME`
+/// needs a way to put the socket somewhere short.
 func defaultSocketPath() -> String {
-    NSHomeDirectory() + "/Library/Application Support/meshfox/daemon.sock"
+    if let override = ProcessInfo.processInfo.environment["MESHFOX_DAEMON_SOCKET"],
+       !override.isEmpty
+    {
+        return override
+    }
+    return NSHomeDirectory() + "/Library/Application Support/meshfox/daemon.sock"
 }
 
 guard let meshfoxPath = resolveMeshfoxPath() else {

@@ -1,0 +1,21 @@
+# Per-user socket for the Meshfox coordinator (`meshfox serve`). systemd owns
+# the listening socket, so it exists from login on and the first connection
+# (any `meshfox` command with `server_socket` pointing here) starts the
+# service — the Linux counterpart of the macOS LaunchAgent's `Sockets` entry.
+#
+# Point the CLI at it in ~/.meshfox/config.toml (this is $XDG_RUNTIME_DIR, so
+# the line is per user; `linux/install-user-units.sh` prints it for you):
+#
+#   server_socket = "/run/user/1000/meshfox/daemon.sock"
+
+[Unit]
+Description=Meshfox coordinator socket
+
+[Socket]
+ListenStream=%t/meshfox/daemon.sock
+# The socket's permissions are the whole access control (including `kill`).
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target
