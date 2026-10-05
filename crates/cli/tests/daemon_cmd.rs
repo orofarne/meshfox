@@ -45,6 +45,9 @@ fn macos_daemon_spawns_lists_and_kills_cores() {
             .env("HOME", &dir)
             .env("MESHFOX_BIN", env!("CARGO_BIN_EXE_meshfox"))
             .env("MESHFOX_DAEMON_SOCKET", &socket)
+            // `.cargo/config.toml` sets this to "" for every cargo run, and
+            // an env value beats the `server_socket` in the config above.
+            .env("MESHFOX_SERVER_SOCKET", &socket)
             // Not inherited: a daemon still holding the harness's stdout pipe
             // would keep `cargo test` waiting even after a failed run.
             .stdin(Stdio::null())

@@ -10406,15 +10406,18 @@ fn spawn_shutdown_signal_handler(state: Arc<AppState>) {
             _ = sighup.recv() => {}
             _ = tokio::signal::ctrl_c() => {}
         }
-        let service_handles: Vec<_> = state
-            .services
-            .lock()
-            .unwrap()
-            .drain()
-            .map(|(_, h)| h)
-            .collect();
-        for handle in service_handles {
-            let _ = handle.stop();
+        // The registry stays locked until every service has been signalled.
+        // `meshfox run` hosts this worker in-process and its own Ctrl-C arm
+        // asks the worker to stop the same services, then exits at once:
+        // with the handles drained out first, that request found nothing,
+        // returned, and the process could exit before this loop's kills were
+        // sent — leaving the services orphaned. Holding the lock makes that
+        // request wait until the kills are out.
+        {
+            let mut services = state.services.lock().unwrap();
+            for (_, handle) in services.drain() {
+                let _ = handle.stop();
+            }
         }
         let run_handles: Vec<_> = state
             .runs_registry

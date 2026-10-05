@@ -38,6 +38,28 @@ process.on("exit", () => {
   fs.rmSync(FIXTURES_DIR, { recursive: true, force: true });
 });
 
+// Firefox-specific copies of fixtures, for suites whose server keeps state
+// (a session: finished runs, undo/redo history, a running `tty` block) that
+// outlives a test. Chrome and Firefox projects of one suite used to share one
+// server, so whichever browser ran second started from what the first had
+// left behind: extra transient outputs, a `redo` already available, a `tty`
+// block still "running…". A copy under a different file name is a different
+// canvas to the worker — its own session database — so each browser gets a
+// pristine one. The copy is made from the already-copied temp fixtures.
+function firefoxFixtureCopy(name: string): string {
+  const copy = `${name}-firefox`;
+  fs.copyFileSync(path.join(FIXTURES_DIR, `${name}.canvas.md`), path.join(FIXTURES_DIR, `${copy}.canvas.md`));
+  return copy;
+}
+const DEPS_FIREFOX_FIXTURE = firefoxFixtureCopy("deps");
+const QUICK_RUN_FIREFOX_FIXTURE = firefoxFixtureCopy("quick-run");
+const FORM_AUTORUN_OUTPUT_FIREFOX_FIXTURE = firefoxFixtureCopy("form-autorun-output");
+const UNDO_REDO_FIREFOX_FIXTURE = firefoxFixtureCopy("undo-redo");
+const DEPS_FIREFOX_PORT = 4625;
+const QUICK_RUN_FIREFOX_PORT = 4626;
+const FORM_AUTORUN_OUTPUT_FIREFOX_PORT = 4627;
+const UNDO_REDO_FIREFOX_PORT = 4628;
+
 const PORT = 4590;
 // Separate server + port for scroll.spec.ts: it needs its own fixture
 // (scroll.canvas.md, with nodes sized via explicit w=/h= to force specific
@@ -204,11 +226,9 @@ const MCP_LIVE_PORT = 4619;
 const MCP_LIVE_FIREFOX_PORT = 4620;
 // Server + port for undo-redo.spec.ts — same reasoning as CLEAR_NODE_LAYOUT_PORT
 // above, its own fixture (undo-redo.canvas.md, one plain text child) and
-// port; one port shared by both browsers, same as that suite — every test
-// here restores the fixture's own undo history back to "fully undone"
-// before finishing (see the spec file's own per-test cleanup), so chrome
-// and firefox never fight over genuinely divergent state even if a given
-// local run happens to interleave them.
+// port. Firefox gets its own server and fixture copy (see
+// `firefoxFixtureCopy`): "fully undone" still leaves a redo stack behind, so
+// a second browser on the same server could never start with `redo` disabled.
 const UNDO_REDO_PORT = 4621;
 // Server + port for run-history.spec.ts — same reasoning again, its own
 // fixture (run-history.canvas.md) and port, so its runs and its rewrite of
@@ -285,7 +305,15 @@ export default defineConfig({
       ["firefox", devices["Desktop Firefox"]],
     ] as const
   ).flatMap(([browser, device]) => [
-    { name: `${browser}-deps`, testMatch: /(^|\/)deps\.spec\.ts$/, use: { ...device, viewport: VIEWPORT } },
+    {
+      name: `${browser}-deps`,
+      testMatch: /(^|\/)deps\.spec\.ts$/,
+      use: {
+        ...device,
+        viewport: VIEWPORT,
+        baseURL: `http://127.0.0.1:${browser === "firefox" ? DEPS_FIREFOX_PORT : PORT}`,
+      },
+    },
     {
       name: `${browser}-scroll`,
       testMatch: /(^|\/)scroll\.spec\.ts$/,
@@ -347,7 +375,7 @@ export default defineConfig({
     {
       name: `${browser}-quick-run`,
       testMatch: /(^|\/)quick-run\.spec\.ts$/,
-      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${QUICK_RUN_PORT}` },
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${browser === "firefox" ? QUICK_RUN_FIREFOX_PORT : QUICK_RUN_PORT}` },
     },
     {
       name: `${browser}-edge-routing`,
@@ -406,7 +434,7 @@ export default defineConfig({
     {
       name: `${browser}-form-autorun-output`,
       testMatch: /(^|\/)form-autorun-output\.spec\.ts$/,
-      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${FORM_AUTORUN_OUTPUT_PORT}` },
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${browser === "firefox" ? FORM_AUTORUN_OUTPUT_FIREFOX_PORT : FORM_AUTORUN_OUTPUT_PORT}` },
     },
     {
       name: `${browser}-reload-live-run`,
@@ -435,7 +463,7 @@ export default defineConfig({
     {
       name: `${browser}-undo-redo`,
       testMatch: /(^|\/)undo-redo\.spec\.ts$/,
-      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${UNDO_REDO_PORT}` },
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${browser === "firefox" ? UNDO_REDO_FIREFOX_PORT : UNDO_REDO_PORT}` },
     },
     {
       name: `${browser}-body-conflict`,
@@ -652,6 +680,30 @@ export default defineConfig({
     {
       command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/undo-redo.canvas.md --port ${UNDO_REDO_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${UNDO_REDO_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/${DEPS_FIREFOX_FIXTURE}.canvas.md --port ${DEPS_FIREFOX_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${DEPS_FIREFOX_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/${QUICK_RUN_FIREFOX_FIXTURE}.canvas.md --port ${QUICK_RUN_FIREFOX_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${QUICK_RUN_FIREFOX_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/${FORM_AUTORUN_OUTPUT_FIREFOX_FIXTURE}.canvas.md --port ${FORM_AUTORUN_OUTPUT_FIREFOX_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${FORM_AUTORUN_OUTPUT_FIREFOX_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/${UNDO_REDO_FIREFOX_FIXTURE}.canvas.md --port ${UNDO_REDO_FIREFOX_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${UNDO_REDO_FIREFOX_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },

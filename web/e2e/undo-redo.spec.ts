@@ -150,18 +150,19 @@ test("Cmd/Ctrl-Z is swallowed by the node body editor instead of triggering docu
   expect(undoRequests).toBe(0);
 
   // NodeTextEditor has no separate "cancel" — "done" always commits
-  // whatever the editor currently holds (see its own `handleClose`), so
-  // this is itself a second real edit on top of the first. Undo it twice
-  // to fully restore the fixture — whichever exact string "done" just
-  // committed (Monaco's own native undo may or may not have reverted the
-  // typed "x", not this test's concern either way), undoing it once
-  // always lands back on "body a EDITED" (the state from the *first*
-  // `editNodeABody` call, before this second edit), and undoing again
-  // restores the original fixture.
+  // whatever the editor currently holds (see its own `handleClose`). What
+  // that is depends on the browser, which is not this test's concern:
+  // Chrome's Monaco ignores the synthetic Ctrl/Cmd-Z and keeps the typed
+  // "x", so "done" is a second real edit on top of the first; Firefox's
+  // Monaco natively undoes the "x", so "done" commits text identical to
+  // what's already saved and adds no history entry at all. Undo only as
+  // many steps as were really recorded, then check the fixture is restored.
   await page.locator(".mesh-text-editor-actions button", { hasText: "done" }).click();
   await expect(page.locator(".mesh-text-editor")).toHaveCount(0);
-  await undoButton(page).click();
-  await expect.poll(() => nodeAText(page)).toBe("body a EDITED");
+  if ((await nodeAText(page)) !== "body a EDITED") {
+    await undoButton(page).click();
+    await expect.poll(() => nodeAText(page)).toBe("body a EDITED");
+  }
   await undoButton(page).click();
   await expect.poll(() => nodeAText(page)).toBe(before);
 });

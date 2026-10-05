@@ -1031,6 +1031,44 @@ export default function App() {
     return () => autorunWatchGeneration.current.get(key) === generation;
   }, []);
 
+  // `adoptPlainRun`, for `settleUnfinishedWatch` to re-watch a run that is
+  // (declared later; filled in right after its definition).
+  const adoptPlainRunRef = useRef<(run: ActiveRunDto, retried?: boolean) => void>(() => {});
+
+  // A watch's stream can end without a `"done"` — the socket closed empty or
+  // broke part-way, or this watch's own reader was the one left holding the
+  // address after another one took the events. The block was already shown as
+  // "running" optimistically, so without this it stays running forever. Asks
+  // the server what actually happened to the address's run and shows that:
+  // found → adopt it afresh (`retried` stops a stream that keeps ending empty
+  // from looping; the second time only a finished outcome is shown),
+  // unknown → `ifUnknown`.
+  const settleUnfinishedWatch = useCallback(
+    (nodeId: string, blockName: string, retried: boolean, ifUnknown: () => void) => {
+      fetchActiveRuns()
+        .then((runs) => {
+          const run = runs.find((r) => r.kind === "plain" && r.nodeId === nodeId && r.block === blockName);
+          if (!run) return ifUnknown();
+          // Re-adopting replays the output too (a finished run is served from
+          // the ledger); only if that already failed once is the outcome
+          // shown without it.
+          if (!retried) return adoptPlainRunRef.current(run, true);
+          if (run.status === "running") return;
+          patchLiveBlock(nodeId, blockName, {
+            status: run.status === "killed" ? "killed" : "done",
+            exitCode: run.exitCode,
+            runId: undefined,
+            startedAt: undefined,
+            durationMs: run.uptimeMs,
+          });
+        })
+        .catch(() => {
+          // Best-effort, like the watches themselves.
+        });
+    },
+    [patchLiveBlock],
+  );
+
   // Watches one address's own most recent plain-block run via
   // `subscribeRun` and folds it into `liveBlocks` the same way a self-
   // initiated run already does (`patchLiveBlock`/the `"output"` handling
@@ -1056,6 +1094,7 @@ export default function App() {
       // the subscription turns out to have nothing to watch (see below).
       const before = nodesRef.current.find((n) => n.id === targetNodeId)?.data.liveBlocks[blockName];
       let heardAnything = false;
+      let sawDone = false;
       patchLiveBlock(targetNodeId, blockName, {
         status: "running",
         text: "",
@@ -1085,6 +1124,7 @@ export default function App() {
             }),
           );
         } else {
+          sawDone = true;
           patchLiveBlock(targetNodeId, blockName, {
             status: event.outcome === "killed" ? "killed" : "done",
             exitCode: event.exitCode,
@@ -1097,7 +1137,9 @@ export default function App() {
         // itself can already be over by the time the broadcast arrives.
         // Leaving the optimistic "running" above in place would show that
         // block as running forever.
-        if (isCurrent() && !heardAnything) {
+        if (!isCurrent() || sawDone) return;
+        settleUnfinishedWatch(targetNodeId, blockName, false, () => {
+          if (!isCurrent() || heardAnything) return;
           setNodes((nds) =>
             nds.map((n) => {
               if (n.id !== targetNodeId) return n;
@@ -1107,12 +1149,14 @@ export default function App() {
               return { ...n, data: { ...n.data, liveBlocks } };
             }),
           );
-        }
+        });
       }).catch(() => {
-        // A transient fetch failure here just means this one passive watch
-        // missed its updates — the block's own next real run (manual or
-        // another autorun) re-syncs everything, same best-effort posture
-        // the rest of this app's background refreshes already have.
+        // The stream broke part-way: ask the server how the run really ended
+        // rather than leaving the optimistic "running" up. If even that
+        // fails, the block's next real run re-syncs everything — the same
+        // best-effort posture the rest of this app's background refreshes
+        // already have.
+        if (isCurrent() && !sawDone) settleUnfinishedWatch(targetNodeId, blockName, false, () => {});
       });
     },
     [beginAddressWatch, patchLiveBlock, setNodes, appendConsoleLine],
@@ -1502,7 +1546,7 @@ export default function App() {
   // running one then keeps streaming). Used by the on-load reconcile below
   // and by `syncPlainRuns`.
   const adoptPlainRun = useCallback(
-    (run: ActiveRunDto) => {
+    (run: ActiveRunDto, retried = false) => {
       // Claims this address the same way `watchAutorunBlock` does
       // (same shared generation counter, `beginAddressWatch`) — this
       // effect and that one independently decide, for the very same
@@ -1528,6 +1572,7 @@ export default function App() {
         startedAt: run.status === "running" ? Date.now() - run.uptimeMs : undefined,
         durationMs: run.status === "exited" ? run.uptimeMs : undefined,
       });
+      let sawDone = false;
       subscribeRun(run.nodeId, run.block, 0, (event) => {
         if (!isCurrent()) return;
         switch (event.type) {
@@ -1548,6 +1593,7 @@ export default function App() {
             );
             break;
           case "done":
+            sawDone = true;
             patchLiveBlock(run.nodeId, run.block, {
               status: event.outcome === "killed" ? "killed" : "done",
               exitCode: event.exitCode,
@@ -1555,14 +1601,25 @@ export default function App() {
             });
             break;
         }
-      }).catch(() => {
-        // Best-effort — if the subscribe stream itself fails partway
-        // through, just leave whatever was already shown; nothing
-        // meaningful to retry automatically here.
-      });
+      }).then(
+        () => {
+          if (isCurrent() && !sawDone && run.status === "running") {
+            settleUnfinishedWatch(run.nodeId, run.block, retried, () => {});
+          }
+        },
+        () => {
+          // The stream broke part-way (best-effort, nothing to retry blindly):
+          // ask the server how the run really ended instead of leaving the
+          // block running forever.
+          if (isCurrent() && !sawDone && run.status === "running") {
+            settleUnfinishedWatch(run.nodeId, run.block, retried, () => {});
+          }
+        },
+      );
     },
-    [beginAddressWatch, patchLiveBlock, setNodes, appendConsoleLine],
+    [beginAddressWatch, patchLiveBlock, setNodes, appendConsoleLine, settleUnfinishedWatch],
   );
+  adoptPlainRunRef.current = adoptPlainRun;
 
   // Runs that started or ended elsewhere (another tab, the TUI, a chain's
   // dependency — `"run-started"` is only broadcast for a chain's target, so

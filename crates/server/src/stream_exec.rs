@@ -765,9 +765,16 @@ mod tests {
         // it spawned). `Child::start_kill()` alone only kills `bash`,
         // leaving `sleep` running as an orphan — this is the bug `kill`
         // exists to avoid.
-        let mut proc = spawn_bash("echo starting; sleep 30", no_envs(), None).unwrap();
+        //
+        // The script prints `sleep`'s own pid only once it has been forked,
+        // and the test waits for that line before killing: a bare
+        // "starting" line printed *before* the fork leaves a window where
+        // `kill` lands while bash is still mid-fork, bash dies, and the
+        // not-yet-signalled `sleep` is born into the group afterwards and
+        // survives (seen when the whole suite ran under load).
+        let mut proc = spawn_bash("sleep 30 & echo $!; wait", no_envs(), None).unwrap();
         while let Some((_, line)) = proc.output_rx.recv().await {
-            if line == "starting" {
+            if line.trim().parse::<u32>().is_ok() {
                 break;
             }
         }

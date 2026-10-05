@@ -291,11 +291,26 @@ async fn a_worker_with_a_long_running_run_in_flight_does_not_auto_exit() {
         .await
         .expect("connect");
 
+    // Past `AUTO_EXIT_GRACE` (10s) + a full poll interval (5s), so the idle
+    // checker has polled at least once with this run's lone activity touch
+    // already stale — the old bug would have killed the worker by now — but
+    // still well before the step's own `sleep 18` ends.
+    tokio::time::sleep(Duration::from_secs(16)).await;
+    assert!(
+        matches!(worker.try_wait(), Ok(None)),
+        "the worker should still be running mid-way through its own long run"
+    );
+
     // Drain events until the run's own terminal `Done` arrives — proves
-    // the worker survived the *whole* ~18s run, not just some arbitrary
-    // earlier instant. The per-message timeout has to clear the sleep
-    // itself (there's no output at all in between `step-start` and
-    // `step-end`/`done`), not just a normal "did anything arrive" check.
+    // the worker survived the *whole* ~18s run. The per-message timeout has
+    // to clear the rest of the sleep itself (there's no output at all in
+    // between `step-start` and `step-end`/`done`), not just a normal "did
+    // anything arrive" check.
+    //
+    // Deliberately nothing is asserted about the worker *after* `Done`: once
+    // the run is over its `state.runs` entry is gone, and with no tab and a
+    // stale activity touch the worker may legitimately auto-exit at the very
+    // next poll.
     let mut saw_done = false;
     while let Ok(Some(Ok(msg))) = tokio::time::timeout(Duration::from_secs(25), ws.next()).await {
         if let Ok(text) = msg.into_text() {
@@ -306,17 +321,8 @@ async fn a_worker_with_a_long_running_run_in_flight_does_not_auto_exit() {
         }
     }
     let _ = ws.close(None).await;
-    assert!(saw_done, "the run should have completed with a Done event");
-
-    // The worker itself must still be alive right after — the whole point
-    // of this test. A brief grace window in case the process is still
-    // tearing down its own WebSocket connection.
-    let survived = !exited_within(&mut worker, Duration::from_secs(2));
     kill(worker);
-    assert!(
-        survived,
-        "the worker should still have been running immediately after its own long run finished"
-    );
+    assert!(saw_done, "the run should have completed with a Done event");
 }
 
 /// The sharper edge of the same bug, once `has_active_runs` alone fixed

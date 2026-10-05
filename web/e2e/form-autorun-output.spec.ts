@@ -28,15 +28,12 @@ test("filling in the form and clicking Send autoruns the table with the submitte
   const table = block(page, "greeting", "table");
   const output = table.locator(".mesh-code-output");
 
-  // Deliberately doesn't assert "nothing has run yet" here — the chrome
-  // and firefox projects for this suite share one server/fixture (see
-  // playwright.config.ts), so by the time this test's own page loads, an
-  // *earlier* project's own run of this exact suite may already have
-  // left real output behind; `App.tsx`'s reconciliation effect
-  // (`reconciledActiveRunsRef`) correctly shows it on this fresh page
-  // load too — that's its whole job, not a bug. What this test actually
-  // covers is that submitting replaces whatever was there (leftover or
-  // not) with these specific values, not that the slate starts blank.
+  // Deliberately doesn't assert "nothing has run yet" here — a retried test
+  // (or a reused server) may already have left real output behind, which
+  // `App.tsx`'s reconciliation effect (`reconciledActiveRunsRef`)
+  // correctly shows on a fresh page load too. What this test covers is that
+  // submitting replaces whatever was there (leftover or not) with these
+  // specific values, not that the slate starts blank.
 
   await form.getByLabel("Name").fill("Ada");
   await form.getByLabel("City").fill("Paris");
