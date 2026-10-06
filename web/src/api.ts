@@ -1520,3 +1520,22 @@ export function watchChanges(
     socket?.close();
   };
 }
+
+/** Local launch arguments are confirmed per application and never cached as vars. */
+export async function prepareArguments(path: string[], block: string, args: Record<string, string> = {}, withDeps = true): Promise<{
+  tty: boolean;
+  autoclose: boolean;
+  definition: string;
+  path: string[];
+  nodeId: string;
+  fields: (VarStatus & { required: boolean })[];
+  block: string | null;
+}> {
+  const res = await fetch("/api/args", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, block, args, noDeps: !withDeps }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  const result = await res.json();
+  return { ...result, fields: result.fields.map((field: VarStatus) => ({ ...field, secret: false })) };
+}

@@ -106,6 +106,7 @@ pub fn var_refs(block: &CodeBlock) -> Vec<String> {
             }
         }
     }
+    names.retain(|name| !block.arguments.contains_key(name));
     names.sort();
     names.dedup();
     names
@@ -152,10 +153,17 @@ fn paths(
             .join(&canvas.artifact_root)
     };
     let cwd = node.cwd(&root);
+    let mut local_values = values.clone();
+    local_values.extend(
+        block
+            .arguments
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone())),
+    );
     declarations(block, attr)
         .into_iter()
         .map(|raw| {
-            let expanded = substitute(&raw, values, strict)?;
+            let expanded = substitute(&raw, &local_values, strict)?;
             let path = normalize(&cwd.join(expanded));
             if attr == "outputs" && has_glob(&path) {
                 return Err(error(format!(
@@ -191,20 +199,268 @@ fn graph_values(canvas: &Canvas) -> HashMap<String, String> {
     values
 }
 
+#[derive(Clone)]
+struct Producer {
+    definition: BlockAddr,
+    args: Vec<crate::args::ArgDecl>,
+    templates: Vec<Vec<TemplatePart>>,
+}
+
+#[derive(Clone, Debug)]
+enum TemplatePart {
+    Literal(String),
+    Argument(String),
+}
+
+fn producer_templates(
+    canvas: &Canvas,
+    values: &HashMap<String, String>,
+) -> Result<Vec<Producer>, crate::DepsError> {
+    let mut producers = Vec::new();
+    for node in &canvas.nodes {
+        if node.plain_markdown_include {
+            continue;
+        }
+        let signatures = crate::args::scan_signatures(&node.id, &node.text)
+            .map_err(|e| crate::DepsError::Arguments(e.to_string()))?;
+        for block in crate::scan_runnable_blocks(&node.id, &node.text) {
+            if !block.attrs.contains_key("outputs") {
+                continue;
+            }
+            let args = signatures
+                .iter()
+                .find(|sig| sig.block.span == block.span)
+                .map(|sig| sig.args.clone())
+                .unwrap_or_default();
+            let definition = BlockAddr::new(&node.id, block.name.as_deref().unwrap());
+            let root = if canvas.artifact_root.is_absolute() {
+                canvas.artifact_root.clone()
+            } else {
+                std::env::current_dir()
+                    .map_err(|e| error(e.to_string()))?
+                    .join(&canvas.artifact_root)
+            };
+            let cwd = node.cwd(&root);
+            // Pick markers absent from every literal source. Substituted global
+            // values and argument captures remain literal, never re-interpolated.
+            let mut prefix = "__meshfox_argument_".to_string();
+            while cwd.to_string_lossy().contains(&prefix)
+                || block.attrs["outputs"].contains(&prefix)
+                || values.values().any(|v| v.contains(&prefix))
+            {
+                prefix.push('_');
+            }
+            let markers: Vec<_> = args
+                .iter()
+                .enumerate()
+                .map(|(i, arg)| (format!("{prefix}{i}__"), arg.name.clone()))
+                .collect();
+            let mut scope = values.clone();
+            scope.extend(
+                markers
+                    .iter()
+                    .map(|(marker, name)| (name.clone(), marker.clone())),
+            );
+            let mut templates = Vec::new();
+            for raw in declarations(&block, "outputs") {
+                let expanded = normalize(&cwd.join(substitute(&raw, &scope, false)?));
+                if has_glob(&expanded) {
+                    return Err(error(format!(
+                        "output must be an exact file path: {}",
+                        expanded.display()
+                    )));
+                }
+                let text = expanded.to_string_lossy();
+                let mut rest = text.as_ref();
+                let mut parts = Vec::new();
+                while let Some((at, marker, name)) = markers
+                    .iter()
+                    .filter_map(|(marker, name)| rest.find(marker).map(|at| (at, marker, name)))
+                    .min_by_key(|(at, _, _)| *at)
+                {
+                    if at > 0 {
+                        parts.push(TemplatePart::Literal(rest[..at].to_owned()));
+                    }
+                    parts.push(TemplatePart::Argument(name.clone()));
+                    rest = &rest[at + marker.len()..];
+                }
+                if !rest.is_empty() {
+                    parts.push(TemplatePart::Literal(rest.to_owned()));
+                }
+                templates.push(parts);
+            }
+            producers.push(Producer {
+                definition,
+                args,
+                templates,
+            });
+        }
+    }
+    Ok(producers)
+}
+
+/// Enumerate structural captures, including adjacent and repeated placeholders.
+/// No greedy tie-breaking: two valid canonical applications are an ambiguity.
+fn capture_template(
+    parts: &[TemplatePart],
+    text: &str,
+    bindings: &mut BTreeMap<String, String>,
+    budget: &mut usize,
+    accept: &mut impl FnMut(&BTreeMap<String, String>) -> Result<(), crate::DepsError>,
+) -> Result<(), crate::DepsError> {
+    if parts.len() > 128 {
+        return Err(error("output template exceeds 128 literal/capture parts"));
+    }
+    if *budget == 0 {
+        return Err(error("output inference exceeded 20000 matching steps"));
+    }
+    *budget -= 1;
+    match parts.split_first() {
+        None if text.is_empty() => accept(bindings),
+        None => Ok(()),
+        Some((TemplatePart::Literal(literal), rest)) => {
+            if let Some(text) = text.strip_prefix(literal) {
+                capture_template(rest, text, bindings, budget, accept)?;
+            }
+            Ok(())
+        }
+        Some((TemplatePart::Argument(name), rest)) => {
+            if let Some(value) = bindings.get(name) {
+                if let Some(text) = text.strip_prefix(value) {
+                    capture_template(rest, text, bindings, budget, accept)?;
+                }
+                return Ok(());
+            }
+            // Boundaries are UTF-8 boundaries, and may include an empty string or
+            // path separators; the output path is verified again after binding.
+            for end in text
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain(std::iter::once(text.len()))
+            {
+                if let Some(TemplatePart::Literal(next)) = rest.first() {
+                    if !text[end..].starts_with(next) {
+                        continue;
+                    }
+                }
+                bindings.insert(name.clone(), text[..end].to_owned());
+                capture_template(rest, &text[end..], bindings, budget, accept)?;
+                bindings.remove(name);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn infer_producer(
+    canvas: &Canvas,
+    templates: &[Producer],
+    path: &Path,
+    values: &HashMap<String, String>,
+) -> Result<Option<BlockAddr>, crate::DepsError> {
+    let mut candidates = BTreeMap::new();
+    let mut rejected = None;
+    let mut budget = 20000;
+    for producer in templates {
+        let node = canvas.node(&producer.definition.node_id).unwrap();
+        for template in &producer.templates {
+            capture_template(
+                template,
+                &path.to_string_lossy(),
+                &mut BTreeMap::new(),
+                &mut budget,
+                &mut |bindings| {
+                    if let Some(arg) = producer
+                        .args
+                        .iter()
+                        .find(|arg| arg.is_required() && !bindings.contains_key(&arg.name))
+                    {
+                        rejected.get_or_insert_with(|| {
+                            format!(
+                                "cannot infer required argument {:?} for {}/{} from {}",
+                                arg.name,
+                                producer.definition.node_id,
+                                producer.definition.block_name,
+                                path.display()
+                            )
+                        });
+                        return Ok(());
+                    }
+                    // The same binder owns defaults, required rules, type checks
+                    // and canonicalization for explicit and inferred applications.
+                    let address =
+                        crate::args::canonical_name(&producer.definition.block_name, bindings);
+                    let bound =
+                        match crate::args::bind_block(&node.id, &node.text, &address, values) {
+                            Ok(bound) => bound,
+                            Err(message) => {
+                                rejected.get_or_insert_with(|| {
+                                    format!(
+                                        "invalid inferred argument for {}/{} from {}: {message}",
+                                        producer.definition.node_id,
+                                        producer.definition.block_name,
+                                        path.display()
+                                    )
+                                });
+                                return Ok(());
+                            }
+                        };
+                    let addr = BlockAddr::new(&node.id, bound.name.as_deref().unwrap());
+                    // Canonical int values, cwd normalization and all other outputs
+                    // must describe the actual requested file, not a transformed alias.
+                    if paths(canvas, &addr, &bound, "outputs", values, false)?
+                        .contains(&path.to_path_buf())
+                    {
+                        candidates.insert((addr.node_id.clone(), addr.block_name.clone()), addr);
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+    }
+    if candidates.len() > 1 {
+        return Err(error(format!(
+            "ambiguous producer for {}: {}",
+            path.display(),
+            candidates
+                .values()
+                .map(|a| format!("{}/{}", a.node_id, a.block_name))
+                .collect::<Vec<_>>()
+                .join(" and ")
+        )));
+    }
+    if let Some(addr) = candidates.into_values().next() {
+        return Ok(Some(addr));
+    }
+    if let Some(message) = rejected {
+        return Err(error(message));
+    }
+    Ok(None)
+}
+
+// Finite default applications still participate in glob inputs before files
+// exist. A glob never invents an unbounded set of argument values.
 fn producers(
     canvas: &Canvas,
     values: &HashMap<String, String>,
 ) -> Result<BTreeMap<PathBuf, BlockAddr>, crate::DepsError> {
     let mut result = BTreeMap::new();
-    for node in &canvas.nodes {
-        // Included Markdown is not a producer namespace of this canvas.
-        if node.plain_markdown_include {
+    for producer in producer_templates(canvas, values)? {
+        if producer.args.iter().any(|arg| arg.is_required()) {
             continue;
         }
-        for block in crate::scan_runnable_blocks(&node.id, &node.text) {
-            let addr = BlockAddr::new(&node.id, block.name.as_deref().unwrap());
-            for path in paths(canvas, &addr, &block, "outputs", values, false)? {
-                if let Some(other) = result.insert(path.clone(), addr.clone()) {
+        let node = canvas.node(&producer.definition.node_id).unwrap();
+        let block = crate::args::bind_block(
+            &node.id,
+            &node.text,
+            &producer.definition.block_name,
+            values,
+        )
+        .map_err(crate::DepsError::Arguments)?;
+        let addr = BlockAddr::new(&node.id, block.name.as_deref().unwrap());
+        for path in paths(canvas, &addr, &block, "outputs", values, false)? {
+            if let Some(other) = result.insert(path.clone(), addr.clone()) {
+                if other != addr {
                     return Err(error(format!(
                         "ambiguous producer for {}: {}/{} and {}/{}",
                         path.display(),
@@ -227,6 +483,7 @@ pub fn producer_deps(
 ) -> Result<Vec<BlockAddr>, crate::DepsError> {
     let values = graph_values(canvas);
     let producers = producers(canvas, &values)?;
+    let templates = producer_templates(canvas, &values)?;
     let mut deps = Vec::new();
     // Observe computed output paths before deciding which declarations match.
     // Even an unrelated variable name may resolve to this input's path.
@@ -238,7 +495,17 @@ pub fn producer_deps(
             }
             for mut producer in crate::scan_runnable_blocks(&node.id, &node.text) {
                 producer.attrs.remove("inputs");
-                let names = var_refs(&producer);
+                let local: std::collections::HashSet<_> =
+                    crate::args::scan_signatures(&node.id, &node.text)
+                        .map_err(|e| crate::DepsError::Arguments(e.to_string()))?
+                        .into_iter()
+                        .filter(|sig| sig.block.span == producer.span)
+                        .flat_map(|sig| sig.args.into_iter().map(|arg| arg.name))
+                        .collect();
+                let names: Vec<_> = var_refs(&producer)
+                    .into_iter()
+                    .filter(|name| !local.contains(name))
+                    .collect();
                 for name in
                     crate::vars::close_over_var_refs(&decls, names.iter().map(String::as_str))
                 {
@@ -256,11 +523,46 @@ pub fn producer_deps(
             }
         }
     }
-    for input in paths(canvas, addr, block, "inputs", &values, false)? {
-        let pattern = matcher(&input)?;
-        for (output, producer) in &producers {
-            if pattern.is_match(output) && !deps.contains(producer) {
-                deps.push(producer.clone());
+    let inputs = paths(canvas, addr, block, "inputs", &values, false)?;
+    for (input, raw) in inputs.into_iter().zip(declarations(block, "inputs")) {
+        let mut declaration = block.clone();
+        declaration.attrs.remove("outputs");
+        declaration.attrs.insert("inputs".into(), raw);
+        if var_refs(&declaration)
+            .iter()
+            .any(|name| !values.contains_key(name))
+        {
+            // Planning sentinels are not argument values. Preserve finite default
+            // producers (the old graph behavior), and infer only after observation.
+            let pattern = matcher(&input)?;
+            for (output, producer) in &producers {
+                if pattern.is_match(output) && !deps.contains(producer) {
+                    deps.push(producer.clone());
+                }
+            }
+            continue;
+        }
+        let mut requested = if has_glob(&input) {
+            let pattern = matcher(&input)?;
+            let mut paths: Vec<_> = producers
+                .keys()
+                .filter(|output| pattern.is_match(output))
+                .cloned()
+                .collect();
+            paths.extend(files(&input)?);
+            paths.sort();
+            paths.dedup();
+            paths
+        } else {
+            vec![input]
+        };
+        requested.sort();
+        requested.dedup();
+        for output in requested {
+            if let Some(producer) = infer_producer(canvas, &templates, &output, &values)? {
+                if !deps.contains(&producer) {
+                    deps.push(producer);
+                }
             }
         }
     }
@@ -400,6 +702,31 @@ mod tests {
         ))
         .unwrap()
     }
+
+    #[test]
+    fn application_paths_substitute_values_after_list_parsing() {
+        let c = canvas("<!-- meshfox:arg name=\"file\" -->\n```bash name=\"build\" outputs=\"${file}\"\ntrue\n```\n");
+        let block = crate::args::bind_block(
+            "root",
+            &c.node("root").unwrap().text,
+            r#"build[file="name,with$dollar.txt"]"#,
+            &Default::default(),
+        )
+        .unwrap();
+        let resolved = paths(
+            &c,
+            &BlockAddr::new("root", block.name.as_deref().unwrap()),
+            &block,
+            "outputs",
+            &Default::default(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].file_name().unwrap(), "name,with$dollar.txt");
+        assert!(var_refs(&block).is_empty());
+    }
+
     #[test]
     fn discovers_missing_outputs_and_rejects_ambiguous_producers_and_cycles() {
         let c = canvas("```sh name=build outputs=out.bin\ntrue\n```\n```sh name=install inputs=./out.bin\ntrue\n```");
@@ -494,5 +821,344 @@ mod tests {
             crate::deps::closure_fingerprint(&a, &addr, &values).unwrap(),
             crate::deps::closure_fingerprint(&b, &addr, &values).unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod inference_tests {
+    use super::*;
+
+    fn canvas(body: &str) -> Canvas {
+        Canvas::from_markdown(&format!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n{body}"
+        ))
+        .unwrap()
+    }
+    fn inferred(canvas: &Canvas, file: &str) -> Result<Option<BlockAddr>, crate::DepsError> {
+        let values = graph_values(canvas);
+        let requested = normalize(
+            &std::env::current_dir()
+                .unwrap()
+                .join(&canvas.artifact_root)
+                .join(file),
+        );
+        infer_producer(
+            canvas,
+            &producer_templates(canvas, &values)?,
+            &requested,
+            &values,
+        )
+    }
+
+    #[test]
+    fn required_defaults_are_ui_only_but_path_captures_supply_arguments() {
+        let c = canvas(
+            r#"<!-- meshfox:arg name="lang" type="select" choices="en,hy" default="en" required -->
+<!-- meshfox:arg name="pages" type="int" default="1" -->
+```sh name="extract" outputs="${lang}.csv"
+true
+```
+```sh name="merge" inputs="hy.csv"
+true
+```"#,
+        );
+        crate::deps::validate(&c).unwrap();
+        let chain = crate::deps::resolve_chain(&c, BlockAddr::new("root", "merge")).unwrap();
+        assert_eq!(
+            chain,
+            [
+                BlockAddr::new("root", "extract[lang=hy,pages=1]"),
+                BlockAddr::new("root", "merge")
+            ]
+        );
+        assert_eq!(
+            crate::deps::resolve_chain(&c, BlockAddr::new("root", "extract[pages=01,lang=hy]"))
+                .unwrap()[0],
+            chain[0]
+        );
+    }
+
+    #[test]
+    fn file_inputs_recursively_infer_only_requested_languages() {
+        let c = canvas(
+            r#"<!-- meshfox:arg name="lang" type="select" choices="en,hy" -->
+```sh name="download" outputs="pdf/${lang}.pdf"
+true
+```
+<!-- meshfox:arg name="lang" type="select" choices="en,hy" -->
+```sh name="convert" inputs="pdf/${lang}.pdf" outputs="text/${lang}.txt"
+true
+```
+<!-- meshfox:arg name="lang" type="select" choices="en,hy" -->
+```sh name="extract" inputs="text/${lang}.txt" outputs="csv/${lang}.csv,csv/${lang}.csv"
+true
+```
+```sh name="merge" inputs="csv/hy.csv,csv/en.csv"
+true
+```"#,
+        );
+        let chain = crate::deps::resolve_chain(&c, BlockAddr::new("root", "merge")).unwrap();
+        assert_eq!(
+            chain
+                .iter()
+                .map(|a| a.block_name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "download[lang=hy]",
+                "convert[lang=hy]",
+                "extract[lang=hy]",
+                "download[lang=en]",
+                "convert[lang=en]",
+                "extract[lang=en]",
+                "merge"
+            ]
+        );
+    }
+
+    #[test]
+    fn repeated_captures_agree_and_adjacent_captures_cannot_choose_greedily() {
+        let repeated = canvas(
+            r#"<!-- meshfox:arg name="lang" -->
+```sh name="x" outputs="${lang}_${lang}.csv"
+true
+```"#,
+        );
+        assert_eq!(
+            inferred(&repeated, "hy_hy.csv").unwrap(),
+            Some(BlockAddr::new("root", "x[lang=hy]"))
+        );
+        assert_eq!(inferred(&repeated, "hy_en.csv").unwrap(), None);
+        let adjacent = canvas(
+            r#"<!-- meshfox:arg name="a" -->
+<!-- meshfox:arg name="b" -->
+```sh name="x" outputs="${a}${b}.csv"
+true
+```"#,
+        );
+        assert!(inferred(&adjacent, "hy.csv")
+            .unwrap_err()
+            .to_string()
+            .contains("ambiguous"));
+    }
+
+    #[test]
+    fn inferred_values_are_typed_and_all_required_arguments_must_be_known() {
+        let typed = canvas(
+            r#"<!-- meshfox:arg name="n" type="int" -->
+<!-- meshfox:arg name="flag" type="bool" -->
+```sh name="x" outputs="${n}_${flag}.csv"
+true
+```"#,
+        );
+        assert_eq!(
+            inferred(&typed, "1_true.csv").unwrap(),
+            Some(BlockAddr::new("root", "x[flag=true,n=1]"))
+        );
+        for file in ["no_true.csv", "1_yes.csv"] {
+            assert!(inferred(&typed, file)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid inferred argument"));
+        }
+        assert_eq!(
+            inferred(&typed, "01_true.csv").unwrap(),
+            None,
+            "canonical n=1 does not produce 01_true.csv"
+        );
+        let missing = canvas(
+            r#"<!-- meshfox:arg name="lang" -->
+<!-- meshfox:arg name="token" default="ui-only" required -->
+```sh name="x" outputs="${lang}.csv"
+true
+```"#,
+        );
+        assert!(inferred(&missing, "hy.csv")
+            .unwrap_err()
+            .to_string()
+            .contains("cannot infer required argument"));
+    }
+
+    #[test]
+    fn overlap_between_different_producers_is_an_error_even_for_existing_files() {
+        let c = canvas(
+            r#"<!-- meshfox:arg name="lang" -->
+```sh name="x" outputs="${lang}.csv"
+true
+```
+```sh name="y" outputs="hy.csv"
+true
+```"#,
+        );
+        assert!(inferred(&c, "hy.csv")
+            .unwrap_err()
+            .to_string()
+            .contains("ambiguous producer"));
+    }
+
+    #[test]
+    fn globals_are_literal_and_locals_shadow_them_in_normalized_paths() {
+        let mut c = canvas(
+            r#"<!-- meshfox:var name="lang" default="wrong" -->
+<!-- meshfox:arg name="lang" -->
+```sh name="x" outputs="$WORK/./${lang}.csv"
+true
+```"#,
+        );
+        c.artifact_values
+            .insert("WORK".into(), "__meshfox_argument_/folder".into());
+        let addr = inferred(&c, "__meshfox_argument_/folder/հայ,with$dollar.csv")
+            .unwrap()
+            .unwrap();
+        assert_eq!(addr.block_name, r#"x[lang="հայ,with$dollar"]"#);
+        let block = crate::deps::find_block(&c, &addr).unwrap();
+        assert_eq!(block.arguments["lang"], "հայ,with$dollar");
+    }
+
+    #[test]
+    fn inferred_file_edges_detect_cycles_between_concrete_applications() {
+        let c = canvas(
+            r#"<!-- meshfox:arg name="lang" -->
+```sh name="a" inputs="b/${lang}" outputs="a/${lang}"
+true
+```
+<!-- meshfox:arg name="lang" -->
+```sh name="b" inputs="a/${lang}" outputs="b/${lang}"
+true
+```"#,
+        );
+        assert!(matches!(
+            crate::deps::resolve_chain(&c, BlockAddr::new("root", "a[lang=hy]")),
+            Err(crate::DepsError::Cycle(_))
+        ));
+    }
+
+    #[test]
+    fn matching_has_a_finite_budget() {
+        let c = canvas(
+            r#"<!-- meshfox:arg name="n" type="int" -->
+<!-- meshfox:arg name="a" -->
+<!-- meshfox:arg name="b" -->
+```sh name="x" outputs="${n}${a}${b}.csv"
+true
+```"#,
+        );
+        assert!(inferred(&c, &format!("{}.csv", "x".repeat(128)))
+            .unwrap_err()
+            .to_string()
+            .contains("matching steps"));
+    }
+
+    #[test]
+    fn producer_cwd_is_used_before_normalizing_and_matching() {
+        let mut c = canvas(
+            r#"```sh name="merge" inputs="csv/hy.csv"
+true
+```
+## Producer
+<!-- meshfox:node id="p" -->
+<!-- meshfox:arg name="lang" -->
+```sh name="extract" outputs="../csv/${lang}.csv"
+true
+```"#,
+        );
+        c.nodes.iter_mut().find(|n| n.id == "p").unwrap().asset_base = Some(
+            std::env::current_dir()
+                .unwrap()
+                .join("producer")
+                .display()
+                .to_string(),
+        );
+        let chain = crate::deps::resolve_chain(&c, BlockAddr::new("root", "merge")).unwrap();
+        assert_eq!(chain[0], BlockAddr::new("p", "extract[lang=hy]"));
+    }
+
+    #[test]
+    fn computed_global_paths_are_observed_before_template_selection() {
+        let mut c = canvas(
+            r#"<!-- meshfox:var name="DIR" from="observe" -->
+```sh name="observe"
+true
+```
+<!-- meshfox:arg name="lang" type="select" choices="en,hy" -->
+```sh name="extract" outputs="$DIR/${lang}.csv"
+true
+```
+```sh name="merge" inputs="csv/hy.csv"
+true
+```"#,
+        );
+        let target = BlockAddr::new("root", "merge");
+        assert_eq!(
+            crate::deps::resolve_chain(&c, target.clone()).unwrap(),
+            [BlockAddr::new("root", "observe"), target.clone()]
+        );
+        c.artifact_values.insert("DIR".into(), "csv".into());
+        assert_eq!(
+            crate::deps::resolve_chain(&c, target.clone()).unwrap(),
+            [
+                BlockAddr::new("root", "observe"),
+                BlockAddr::new("root", "extract[lang=hy]"),
+                target
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unresolved_input_sentinel_is_never_captured_as_a_typed_argument() {
+        let mut c = canvas(
+            r#"<!-- meshfox:var name="LANG" from="observe" -->
+```sh name="observe"
+true
+```
+<!-- meshfox:arg name="lang" type="select" choices="en,hy" -->
+```sh name="extract" outputs="${lang}.csv"
+true
+```
+```sh name="merge" inputs="${LANG}.csv"
+true
+```"#,
+        );
+        let target = BlockAddr::new("root", "merge");
+        assert_eq!(
+            crate::deps::resolve_chain(&c, target.clone()).unwrap(),
+            [BlockAddr::new("root", "observe"), target.clone()]
+        );
+        c.artifact_values.insert("LANG".into(), "hy".into());
+        assert_eq!(
+            crate::deps::resolve_chain(&c, target.clone()).unwrap(),
+            [
+                BlockAddr::new("root", "observe"),
+                BlockAddr::new("root", "extract[lang=hy]"),
+                target
+            ]
+        );
+    }
+
+    #[test]
+    fn globs_infer_existing_files_without_enumerating_argument_values() {
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-inference-glob-{}",
+            crate::timestamp::now_utc_rfc3339().replace(':', "")
+        ));
+        std::fs::create_dir_all(dir.join("csv")).unwrap();
+        let mut c = canvas(
+            r#"<!-- meshfox:arg name="lang" type="select" choices="en,hy" -->
+```sh name="extract" outputs="csv/${lang}.csv"
+true
+```
+```sh name="merge" inputs="csv/*.csv"
+true
+```"#,
+        );
+        c.artifact_root = dir.clone();
+        let target = BlockAddr::new("root", "merge");
+        let chain = crate::deps::resolve_chain(&c, target.clone()).unwrap();
+        assert_eq!(chain.as_slice(), std::slice::from_ref(&target));
+        std::fs::write(dir.join("csv/hy.csv"), "hy").unwrap();
+        assert_eq!(
+            crate::deps::resolve_chain(&c, target.clone()).unwrap(),
+            [BlockAddr::new("root", "extract[lang=hy]"), target]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

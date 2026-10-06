@@ -342,6 +342,34 @@ Lives inside a node's Markdown text, as fence-info-string attributes:
   block need to ask about anything" to the block itself, not the whole
   canvas. An `env=` entry naming a variable nothing declares is a
   `meshfox validate` error.
+  An explicit alias may select a declared variable by argument, for example
+  `env="PDF_URL=PDF_URL_${lang}"`. Only `${argument}` placeholders are accepted
+  in the source name, using the current application's bound arguments. Selection
+  happens once, before variable discovery and `from=` dependency planning; the
+  selected value is never interpreted as another template. An explicit valid
+  local alias is required. The resulting source must be a valid, non-reserved
+  environment identifier and an actually declared variable within scope.
+  `fetch[lang=hy]` therefore receives `PDF_URL_hy` as local `PDF_URL`.
+  Freshness includes only that selected variable's value; running its `from=`
+  source does not itself force the consumer to rerun. Static validation checks
+  syntax and argument names, and all combinations of finite `select`/`bool`
+  arguments (at most 4096); open `string`/`int` selections are checked when the
+  application is planned. Errors identify the application and selected name.
+  This syntax is confined to `env=`; it does not add parameterized variable
+  declarations, dictionaries, case conversions, or recursive substitution.
+  A selected canvas variable remains a global reference even if a same-named
+  argument shadows it locally. Web/TUI block contracts show the source template
+  and selected names/`from=` sources for applications observed in the session,
+  without exposing variable values. Contracts also show
+  explicit `deps` and implicit `via var` dependencies in the same always-visible
+  list, with links to their producers and no separate dependency fold. They also list declared variable
+  exports (`exports`: names and types), matching each `meshfox:var from=` to
+  its exact producer node/block. Export signatures are visible before execution
+  and remain visible when the block is folded; `outputs` continues to list files.
+  Web button fences show this same contract in a hover/focus popover instead
+  of beneath the button. The popover retains producer links and closes on
+  pointer/focus departure or Escape; TUI button contracts remain inline.
+
 - `interpreter="..."` — a shebang-style command, e.g. `interpreter="python3
   -u"`, to run this fence's code under instead of the implicit `bash`/`sh`
   executor: the fence's own body is written to a fresh temp file and run
@@ -577,6 +605,170 @@ whole session, from outside the document:
   runs stay as history (marked stale); the canvas file and any saved
   `<!-- meshfox:output -->` cache are untouched. The same as the web UI's
   "reset session" button, and the MCP `session_reset` tool.
+
+## Block arguments and applications
+
+Signature parsing, typed binding, canonical application addresses, local process
+arguments and argument substitution in artifact paths are implemented. Concrete
+applications can be launched through CLI/API run endpoints. Parameterized dependency
+graphs support named bindings, local/global reference forwarding, canonical shared
+steps, execution cascades and sync edges. Exact file inputs infer arguments from
+producer output templates and recursively resolve their inputs. Interactive CLI,
+TUI and web launches use typed argument forms; MCP accepts a separate literal
+`args` object. Arguments are never persisted in the canvas variable cache.
+
+`POST /api/args` accepts `{path, block, args, noDeps}` (`path` is an array
+of node ids, `block` an application address, and `args` a map of names to literal
+string values). `noDeps` defaults to false. It returns the resolved owner
+`nodeId` and `path`, whether the bound chain needs a terminal (`tty`,
+`autoclose`), the block
+`definition`, ordered `fields` (`name`, `type`, `prompt`, `choices`, `required`,
+`resolved`, optional `value`), and a canonical `block` address or null while
+mandatory arguments are missing. A suggested `value` does not imply
+`resolved`: required defaults must still be confirmed. Supplying an answer
+overrides a binding in the address and treats the answer literally. Preparation
+does not execute blocks. The returned address is used by ordinary run/TTY
+endpoints, preserving application-specific history, locks and logs. Bare manual
+launches offer the whole signature; a complete explicit application does not
+ask again. Global variable preflight runs after argument binding.
+
+Web and TUI show each block's argument signature and declared `inputs`/`outputs`
+before launch. Argument rows show name, type, select choices and mandatory status.
+Optional defaults are labelled `default`; required defaults are labelled
+`suggestion`. File rows retain the declared templates (including placeholders),
+without implying that these are already resolved paths. In web these rows remain
+visible when the block's source or whole code/output body is folded.
+
+A sequence of `meshfox:arg` declarations immediately before a named runnable
+fence defines that block's signature. Only blank/whitespace lines may intervene.
+Declarations cannot cross node boundaries, prose, headings, or another fence;
+an unattached declaration is a validation error. Declarations inside code fences
+are examples, not signatures. There is no `block=` or fence `args=` attribute.
+
+Each declaration accepts `name`, `type`, `choices`, `default`, `prompt`, and
+`required`. Names use environment identifiers (`[A-Za-z_][A-Za-z0-9_]*`) and
+must be unique within the signature. Types reuse variable types: `string`
+(default), signed 64-bit `int`, `bool` (`true`/`false`), and `select` with
+literal `choices`. Defaults are literal values and must satisfy the type.
+Dynamic choices/defaults, `from`, `secret`, and `session` are outside this first
+contract. The declaration order controls the manual-run form only.
+
+An argument without a default is mandatory. `required` makes an argument
+mandatory even with a default: that default is only a UI suggestion. A manual
+form submission passes its accepted values explicitly. Dependencies and
+noninteractive calls never prompt for missing arguments. Optional omissions
+use the literal default. Output-path inference also counts as passing a value.
+
+Applications use named bindings only, appended to the existing block address:
+
+    application ::= [ node-id '/' ] block-name [ '[' bindings ']' ]
+    bindings    ::= binding { ',' binding }
+    binding     ::= arg-name '=' arg-value
+    arg-value   ::= bare-literal | quoted-literal | reference
+    reference   ::= '$' identifier | '${' identifier '}'
+
+An empty binding list, positional values, unknown names, and duplicate bindings
+are errors. Bare literals are nonempty and contain no whitespace or any of
+`,[]=!$"\\`. Double-quoted literals use JSON string escaping; quoted `$LANG`
+is literal text, whereas unquoted `$LANG` is a whole-value reference. Embedded
+reference interpolation is not supported in binding values. The enclosing
+Markdown attribute has its own escaping layer; for example:
+
+    deps='search[query="ACME, Inc."],extract[lang=hy]'
+
+The shared attribute reader also accepts single-quoted outer values (literal
+contents, no escape processing). This extends the double-quoted/bare grammar,
+needed to carry the double-quoted binding strings above without ambiguity.
+An apostrophe within a binding string can be written as JSON `\u0027`.
+Dependency lists split at commas outside brackets and quoted strings. A forced
+dependency retains its existing suffix, e.g. `extract[lang=hy]!`.
+
+Bind names, resolve references, fill optional defaults, validate every resolved
+value, then construct the canonical application identity. Binding order is
+irrelevant. Integers normalize to decimal (`01` and `1` are identical), booleans
+to `true`/`false`; strings and select values retain their exact contents.
+Identity consists of the existing block address and all effective bindings
+sorted by argument name. Explicit and defaulted equal values share identity.
+Cache, history, locks and cycle checks use this identity; identical applications
+in one graph share a step. Graph expansion is limited to 128 nested applications
+and 4096 distinct applications; exceeding either limit is a diagnostic error.
+
+A dependency reference resolves against canvas values overlaid by the caller's
+local arguments. References to computed globals add their `from=` sources to the
+graph before action dependencies. An edge with an unobserved computed value stays
+pending until its source completes; runners rebuild the graph with actual values.
+Newly discovered applications obtain their own run locks before execution and are
+recorded in history under their canonical addresses. Conflicts discovered during
+replanning stop the chain with a lock-conflict event.
+
+Arguments are immutable and local to an application. They are exported to its
+process without an `env=` opt-in and are available in metadata substitutions
+and dependency bindings. They do not interpolate source code or mutate canvas
+variables. Different blocks may declare the same argument name. An argument
+shadows a same-named canvas variable locally; explicit `env=` aliases targeting
+an argument name and reserved `MESHFOX_*` argument names are validation errors.
+
+`inputs`/`outputs` support argument placeholders such as `${lang}`. Resolve
+canvas variables first, leaving local argument placeholders in producer output
+templates. Match a requested exact file path against those templates, derive
+bindings, validate them and fill optional defaults to identify a producer
+application. All mandatory arguments must be determined. Repeated placeholders
+must agree; multiple valid binding sets or producer applications are errors.
+Equivalent candidates deduplicate by canonical identity. Substitutions cannot
+perform transformations such as `lower(lang)`. Existing cwd-relative path
+normalization and file-content freshness semantics continue to apply. Captures are
+substrings of the normalized requested path; after typed canonicalization, the
+bound producer must still declare that exact path. Matching is bounded to 20000
+recursive steps per requested file and 128 literal/capture parts per template.
+
+Inference runs for exact inputs whether the file exists or is missing. Glob inputs
+select already existing files and finite default producer applications; they never
+enumerate arbitrary argument values or `select` choices to invent missing files.
+Use exact file inputs to request absent parameterized outputs. Unresolved computed
+input variables remain pending until their sources are observed; planning sentinels
+are never inferred as argument values. Equivalent candidates from multiple outputs
+of one application deduplicate; distinct valid applications are an error.
+
+Explicit `deps` retain execution cascade and `!` semantics. File dependencies
+retain value semantics: an extraction producing identical CSV contents does
+not by itself force its file consumer to run. The graph is expanded lazily from
+the requested application or requested file. No generated copies are written
+to the canvas. Arbitrary return values and application-scoped computed-variable
+exports are deferred; the initial parameterized pipeline communicates through
+declared files.
+
+Node-scoped `meshfox:var` declarations are deprecated: their behavior is retained,
+but validation emits a non-failing `deprecated-node-scoped-var` warning recommending
+arguments. CLI prints warnings to stderr; MCP validation returns a `warnings`
+array with stable `code`, `node_id` and `message` fields alongside its successful
+result. No automatic migration is performed. Root configuration variables remain
+supported.
+
+### Parameterized file pipeline example
+
+The extract signature below owns one language per application. A merge requesting
+the HY CSV derives `extract[lang=hy]`, whose PDF input derives
+`download[lang=hy]` from the download output template.
+
+````markdown
+<!-- meshfox:arg name="lang" type="select" choices="en,hy" -->
+```python name="download" env="WORK_DIR" outputs="$WORK_DIR/pharm_am_${lang}.pdf"
+# Download the language-specific PDF, using os.environ["lang"].
+```
+
+<!-- meshfox:arg name="lang" type="select" choices="en,hy" -->
+```python name="extract" env="WORK_DIR" inputs="$WORK_DIR/pharm_am_${lang}.pdf" outputs="$WORK_DIR/pharm_am_${lang}.csv"
+# Extract one language's CSV, using os.environ["lang"].
+```
+
+```python name="merge" env="WORK_DIR" inputs="$WORK_DIR/pharm_am_en.csv,$WORK_DIR/pharm_am_hy.csv" outputs="$WORK_DIR/pharm_am_merged.csv"
+# Merge both CSV files. File dependencies infer the two extract applications.
+```
+````
+
+For explicit execution dependencies the equivalent application spelling is
+`deps="extract[lang=en],extract[lang=hy]"`; unlike the file-input example, that
+opts into execution cascade.
 
 ## Button fences
 
@@ -1664,7 +1856,8 @@ Shared by every construct's attribute list (`crates/core/src/attrs.rs`):
     attr        ::= key '=' value | key
     key         ::= key-char { key-char }
     key-char    ::= <any character except whitespace, '=', '"'>
-    value       ::= '"' { <any character except '"'> } '"' | bare-value
+    value       ::= '"' { <any character except '"'> } '"'
+                  | "'" { <any character except "'"> } "'" | bare-value
     bare-value  ::= <one or more characters, none of them whitespace>
     ws          ::= <one or more whitespace characters>
 
@@ -1689,6 +1882,7 @@ here instead of being repeated per construct below.
     edge-marker      ::= '<!--' ws 'meshfox:edge' attr-list ws '-->'
     canvas-marker    ::= '<!--' ws 'meshfox:canvas' ws '-->'
     var-marker       ::= '<!--' ws 'meshfox:var' attr-list ws '-->'
+    arg-marker       ::= '<!--' ws 'meshfox:arg' attr-list ws '-->'
     option-marker    ::= '<!--' ws 'meshfox:option' attr-list ws '-->'
     tag-color-marker ::= '<!--' ws 'meshfox:tag-color' attr-list ws '-->'
     output-open      ::= '<!--' ws 'meshfox:output' attr-list ws '-->'
@@ -1701,6 +1895,11 @@ here instead of being repeated per construct below.
 `[ws]` only to reuse the same rule name as `attr-list`.
 
 ### Attribute vocabularies
+
+`meshfox:arg` declarations accept `name`, `type`, `choices`, `default`,
+`prompt`, and `required`; duplicate and unknown argument attributes are
+signature errors. Their adjacency and local scope are specified in
+"Block arguments and applications" above.
 
 Each construct restricts `attr-list` (above) to its own known keys — the
 vocabulary `meshfox validate`'s `unknown_*_attr` checks enforce, though every
@@ -1776,10 +1975,19 @@ itself:
     tag          ::= <one or more characters, none of them ',' or '"'>
 
     deps-list    ::= deps-entry { ',' deps-entry }
-    deps-entry   ::= [ node-id '/' ] block-name [ '!' ]
+    deps-entry   ::= [ node-id '/' ] block-name [ '[' bindings ']' ] [ '!' ]
 
     env-list     ::= env-entry { ',' env-entry }
-    env-entry    ::= [ '$' ] var-name [ '=' [ '$' ] var-name ]
+    env-entry    ::= [ '$' ] var-name
+                   | local-name '=' [ '$' ] env-source
+    env-source   ::= var-name | name-template
+    name-template ::= { name-literal | '${' arg-name '}' }
+    name-literal ::= <one or more ASCII letters, digits, or underscores>
+    arg-name     ::= <[A-Za-z_][A-Za-z0-9_]*>
+
+A `name-template` must contain at least one argument placeholder. Its concrete
+result must be a valid declared variable name; the local alias must be a valid,
+non-reserved environment identifier. Template references use arguments only.
 
     choices-list ::= choice { ',' choice }
     choice       ::= <one or more characters, none of them ','>

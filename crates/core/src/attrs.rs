@@ -33,12 +33,15 @@ pub(crate) fn is_indented_as_code(line: &str) -> bool {
 pub fn tokenize(s: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut cur = String::new();
-    let mut in_quotes = false;
+    let mut quote = None;
     for c in s.chars() {
-        if c == '"' {
-            in_quotes = !in_quotes;
+        if quote == Some(c) {
+            quote = None;
             cur.push(c);
-        } else if c.is_whitespace() && !in_quotes {
+        } else if quote.is_none() && (c == '"' || (c == '\'' && cur.ends_with('='))) {
+            quote = Some(c);
+            cur.push(c);
+        } else if c.is_whitespace() && quote.is_none() {
             if !cur.is_empty() {
                 tokens.push(std::mem::take(&mut cur));
             }
@@ -53,7 +56,9 @@ pub fn tokenize(s: &str) -> Vec<String> {
 }
 
 pub fn unquote(v: &str) -> String {
-    if v.len() >= 2 && v.starts_with('"') && v.ends_with('"') {
+    if v.len() >= 2
+        && ((v.starts_with('"') && v.ends_with('"')) || (v.starts_with('\'') && v.ends_with('\'')))
+    {
         v[1..v.len() - 1].to_string()
     } else {
         v.to_string()

@@ -8,7 +8,7 @@
 // preview/UI purposes.
 
 import type { CanvasDoc } from "./types";
-import { parseBody } from "./fence";
+import { parseBody } from "./fence.ts";
 
 export interface BlockAddr {
   nodeId: string;

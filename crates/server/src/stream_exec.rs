@@ -823,6 +823,7 @@ mod tests {
 
     fn block_with_lang(lang: &str) -> meshfox_core::CodeBlock {
         meshfox_core::CodeBlock {
+            arguments: Default::default(),
             lang: lang.to_string(),
             name: Some("x".to_string()),
             cache: false,

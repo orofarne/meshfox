@@ -492,6 +492,10 @@ struct RunParams {
     /// `secret` variable — secrets are not passed through this tool.
     #[serde(default)]
     vars: HashMap<String, String>,
+    /// Literal local block arguments. Required arguments must be supplied,
+    /// even when their declaration carries a UI default. Never cached as vars.
+    #[serde(default)]
+    args: std::collections::BTreeMap<String, String>,
     /// Give up after this many milliseconds, killing the step that is still
     /// running (default 600000, at most 3600000).
     #[serde(default)]
@@ -933,6 +937,23 @@ impl CanvasCtx {
             }
         };
 
+        let prepared = crate::worker_client::prepare_arguments(port, &path, &name, &params.args)
+            .await
+            .map_err(invalid_params)?;
+        let path = prepared.path;
+        let name = prepared.block.ok_or_else(|| {
+            invalid_params(format!(
+                "missing required argument(s): {} — supply args or use a named application",
+                prepared
+                    .fields
+                    .iter()
+                    .filter(|field| !field.resolved)
+                    .map(|field| field.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?;
+
         let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
         if crate::chain_contains_tty(
             &self.canvas_path,
@@ -1183,9 +1204,14 @@ impl CanvasCtx {
     async fn validate(&self, _params: ValidateParams) -> Result<CallToolResult, ErrorData> {
         let raw = self.read_raw().await?;
         let node_count = crate::validate_canvas(&raw, &self.canvas_path).map_err(invalid_params)?;
+        let canvas =
+            meshfox_core::Canvas::from_markdown(&raw).map_err(|e| invalid_params(e.to_string()))?;
+        let warnings = meshfox_core::diagnostics::warnings(&canvas)
+            .map_err(|e| invalid_params(e.to_string()))?;
         Ok(CallToolResult::structured(json!({
             "ok": true,
             "node_count": node_count,
+            "warnings": warnings,
         })))
     }
 

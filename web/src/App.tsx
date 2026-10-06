@@ -24,6 +24,7 @@ import {
   openNodeFileFolder,
   killRun,
   fetchVars,
+  prepareArguments,
   fetchConfigureVars,
   saveConfigureVars,
   updateOptions,
@@ -531,6 +532,7 @@ export default function App() {
     blockName: string;
     withDeps: boolean;
     missing: VarStatus[];
+    arguments?: boolean;
     /** Set for a `tty` block's run — `handleVarsSubmit` opens `TtyPanel`
      * (via `ttySession`) with the answers instead of calling `executeRun`. */
     tty?: boolean;
@@ -1806,9 +1808,22 @@ export default function App() {
         await executeFileRun(nodeId);
         return;
       }
-      const path = pathTo(canvas, nodeId);
+      let path = pathTo(canvas, nodeId);
       let statuses: VarStatus[];
+      let tty = false;
+      let autoclose = false;
       try {
+        const prepared = await prepareArguments(path, blockName, {}, withDeps);
+        tty = prepared.tty;
+        autoclose = prepared.autoclose;
+        nodeId = prepared.nodeId;
+        path = prepared.path;
+        if (!blockName.includes("[")) blockName = prepared.definition;
+        if (prepared.fields.length > 0 && (!blockName.includes("[") || !prepared.block)) {
+          setVarsModal({ nodeId, blockName, withDeps, missing: prepared.fields, arguments: true, tty, autoclose });
+          return;
+        }
+        blockName = prepared.block ?? blockName;
         statuses = await fetchVars(path, blockName, withDeps);
       } catch (e) {
         setError(String(e));
@@ -1816,10 +1831,14 @@ export default function App() {
       }
       const missing = statuses.filter((v) => !v.resolved);
       if (missing.length > 0) {
-        setVarsModal({ nodeId, blockName, withDeps, missing });
+        setVarsModal({ nodeId, blockName, withDeps, missing, tty, autoclose });
         return;
       }
-      await executeRun(nodeId, blockName, withDeps);
+      if (tty) {
+        setTtySession({ path, blockName, withDeps, autoclose });
+      } else {
+        await executeRun(nodeId, blockName, withDeps);
+      }
     },
     [canvas, executeRun, executeFileRun],
   );
@@ -1832,9 +1851,18 @@ export default function App() {
   const handleRunTty = useCallback(
     async (nodeId: string, blockName: string, withDeps: boolean, autoclose: boolean) => {
       if (!canvas) return;
-      const path = pathTo(canvas, nodeId);
+      let path = pathTo(canvas, nodeId);
       let statuses: VarStatus[];
       try {
+        const prepared = await prepareArguments(path, blockName, {}, withDeps);
+        nodeId = prepared.nodeId;
+        path = prepared.path;
+        if (!blockName.includes("[")) blockName = prepared.definition;
+        if (prepared.fields.length > 0 && (!blockName.includes("[") || !prepared.block)) {
+          setVarsModal({ nodeId, blockName, withDeps, missing: prepared.fields, arguments: true, tty: true, autoclose });
+          return;
+        }
+        blockName = prepared.block ?? blockName;
         statuses = await fetchVars(path, blockName, withDeps);
       } catch (e) {
         setError(String(e));
@@ -1854,6 +1882,26 @@ export default function App() {
     async (answers: Record<string, string>, saveSecrets: string[]) => {
       if (!varsModal) return;
       const { nodeId, blockName, withDeps, tty, autoclose } = varsModal;
+      if (varsModal.arguments) {
+        if (!canvas) return;
+        try {
+          const prepared = await prepareArguments(pathTo(canvas, nodeId), blockName, answers, withDeps);
+          if (!prepared.block) throw new Error("Missing required argument");
+          const useTty = tty || prepared.tty;
+          const closeTerminal = autoclose ?? prepared.autoclose;
+          const statuses = await fetchVars(pathTo(canvas, nodeId), prepared.block, withDeps);
+          const missing = statuses.filter((v) => !v.resolved);
+          setVarsModal(null);
+          if (missing.length > 0) {
+            setVarsModal({ nodeId, blockName: prepared.block, withDeps, missing, tty: useTty, autoclose: closeTerminal });
+          } else if (useTty) {
+            setTtySession({ path: pathTo(canvas, nodeId), blockName: prepared.block, withDeps, autoclose: closeTerminal });
+          } else {
+            await executeRun(nodeId, prepared.block, withDeps);
+          }
+        } catch (e) { setError(String(e)); }
+        return;
+      }
       setVarsModal(null);
       if (tty) {
         if (!canvas) return;
@@ -3953,7 +4001,9 @@ export default function App() {
         )}
       </div>
       {varsModal && (
-        <VarsForm vars={varsModal.missing} onSubmit={handleVarsSubmit} onCancel={handleVarsCancel} />
+        <VarsForm key={`${varsModal.blockName}:${varsModal.arguments ? "args" : "vars"}`} vars={varsModal.missing} onSubmit={handleVarsSubmit} onCancel={handleVarsCancel}
+          title={varsModal.arguments ? "Configure arguments" : undefined}
+          hint={varsModal.arguments ? "Confirm arguments for this application. These values are not saved as canvas variables." : undefined} />
       )}
       {configureVars && (
         <VarsForm

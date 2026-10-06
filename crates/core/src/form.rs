@@ -196,6 +196,7 @@ mod tests {
         // `form_block`'s own `MissingName` only matters for a hand-built
         // `CodeBlock` that skipped that filter -- exercised directly here.
         let block = crate::fence::CodeBlock {
+            arguments: Default::default(),
             lang: crate::exec::FORM_LANG.to_string(),
             name: None,
             cache: false,

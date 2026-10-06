@@ -1566,7 +1566,12 @@ struct RunFingerprintCtx {
 impl RunFingerprintCtx {
     fn load(state: &AppState) -> Option<Self> {
         let raw = state.raw.lock().unwrap().clone();
-        let canvas = resolved_canvas(&raw, &state.canvas_path).ok()?;
+        let mut canvas = resolved_canvas(&raw, &state.canvas_path).ok()?;
+        seed_artifact_paths(
+            state,
+            &mut canvas,
+            &effective_overrides(state, &HashMap::new()),
+        );
         let decls = meshfox_core::declared_vars(&canvas).ok()?;
         let shared = meshfox_core::load_shared_env(canvas_root_dir(&state.canvas_path));
         Some(RunFingerprintCtx {
@@ -2253,32 +2258,16 @@ fn artifact_lock_candidates(
 ) -> Result<std::collections::HashSet<meshfox_core::BlockAddr>, meshfox_core::DepsError> {
     let mut candidates = forced.clone();
     let has_artifacts = chain.iter().any(|addr| {
-        canvas.node(&addr.node_id).is_some_and(|node| {
-            meshfox_core::scan_runnable_blocks(&node.id, &node.text)
-                .iter()
-                .any(|block| {
-                    block.name.as_deref() == Some(addr.block_name.as_str())
-                        && (block.attrs.contains_key("inputs")
-                            || block.attrs.contains_key("outputs"))
-                })
+        canvas.node(&addr.node_id).is_some_and(|_| {
+            meshfox_core::deps::find_block(canvas, addr).is_ok_and(|block| {
+                block.attrs.contains_key("inputs") || block.attrs.contains_key("outputs")
+            })
         })
     });
     if has_artifacts {
         candidates.extend(chain.iter().cloned());
-        // A computed path may select a different producer after observation.
-        for node in &canvas.nodes {
-            if node.plain_markdown_include {
-                continue;
-            }
-            for block in meshfox_core::scan_runnable_blocks(&node.id, &node.text) {
-                if block.attrs.contains_key("outputs") {
-                    candidates.extend(meshfox_core::deps::resolve_chain(
-                        canvas,
-                        meshfox_core::BlockAddr::new(&node.id, block.name.as_deref().unwrap()),
-                    )?);
-                }
-            }
-        }
+        // Parameterized producers form an unbounded namespace. Replanning
+        // claims newly selected concrete applications through extend_plan_locks.
     } else if chain.iter().any(|addr| {
         !meshfox_core::from_targets(
             &meshfox_core::declared_vars(canvas).unwrap_or_default(),
@@ -2304,6 +2293,9 @@ fn step_values(
     if let Some(spec) = &block.interpreter {
         names.extend(meshfox_core::interpreter_var_refs(spec));
     }
+    names.extend(meshfox_core::args::dependency_refs(block));
+    names.retain(|name| !block.arguments.contains_key(name));
+    names.extend(meshfox_core::args::selected_env_var_names(block));
     let needed = meshfox_core::close_over_var_refs(&decls, names.iter().map(String::as_str));
     let relevant: Vec<_> = decls
         .into_iter()
@@ -2380,6 +2372,30 @@ fn replan_runs(
     )
 }
 
+/// A computed binding may discover applications absent from the initial plan.
+/// Claim the remaining plan atomically before executing any newly selected step.
+/// Completed addresses have released their rows and must not be reserved again.
+fn extend_plan_locks(
+    state: &AppState,
+    raw: &str,
+    chain: &[meshfox_core::BlockAddr],
+    forced: &std::collections::HashSet<meshfox_core::BlockAddr>,
+    visited: &std::collections::HashSet<meshfox_core::BlockAddr>,
+    current: &meshfox_core::BlockAddr,
+    held: &mut HashMap<(String, String), i64>,
+) -> Result<(), ChainLockError> {
+    let candidates: std::collections::HashSet<_> = chain
+        .iter()
+        .filter(|addr| forced.contains(*addr))
+        .filter(|addr| *addr == current || !visited.contains(*addr))
+        .filter(|addr| !held.contains_key(&(addr.node_id.clone(), addr.block_name.clone())))
+        .cloned()
+        .collect();
+    let targets = steps_needing_a_lock(state, raw, &candidates);
+    held.extend(acquire_chain_locks(&state.run_ledger, &targets, "webui")?);
+    Ok(())
+}
+
 /// Every address in `chain` that actually needs its own `run_ledger` row
 /// claimed before this run can start — every entry `forced_reruns` says
 /// won't be skipped as already-fresh, minus a `service` address that's
@@ -2426,10 +2442,13 @@ fn steps_needing_a_lock(
         let Some(node) = canvas.node(&addr.node_id) else {
             continue;
         };
-        let Some(block) = meshfox_core::scan_runnable_blocks(&addr.node_id, &node.text)
-            .into_iter()
-            .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()))
-        else {
+        let Some(block) = meshfox_core::args::bind_block(
+            &addr.node_id,
+            &node.text,
+            &addr.block_name,
+            &HashMap::new(),
+        )
+        .ok() else {
             continue;
         };
         let kind = if block.service {
@@ -2459,12 +2478,10 @@ enum ChainLockError {
 /// *every* step it will need already exclusively claimed by this process,
 /// or doesn't start at all (the "queued" locking this crate's own design
 /// notes describe — a step is never partway locked once some *other* step
-/// later in the same chain turns out contested). Because this always runs
-/// before the response even begins (both `run_block`'s plain NDJSON body
-/// and `run_block_tty`'s WebSocket upgrade call it from their own pre-
-/// stream setup), a conflict can be reported as an ordinary HTTP error
-/// rather than a streamed terminal event — nothing has been sent to the
-/// client yet either way. `pid` is always a placeholder (`std::process::
+/// later in the same chain turns out contested). Initial admission runs
+/// before streaming and can report a normal HTTP conflict. A computed binding
+/// can discover a new application later; `extend_plan_locks` claims all newly
+/// required rows before that step executes, reporting a streamed conflict. `pid` is always a placeholder (`std::process::
 /// id()`, this core's own — nothing else exists yet) — `update_pid` fixes
 /// it up once each step's real child spawns.
 ///
@@ -2652,6 +2669,95 @@ struct VarsQuery {
     block: String,
     #[serde(default)]
     no_deps: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArgumentsRequest {
+    #[serde(default)]
+    no_deps: bool,
+    #[serde(default)]
+    path: Vec<String>,
+    block: String,
+    #[serde(default)]
+    args: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ArgumentsResponse {
+    tty: bool,
+    autoclose: bool,
+    #[serde(flatten)]
+    prepared: meshfox_core::args::ArgumentPreparation,
+    path: Vec<String>,
+}
+
+/// Argument answers never enter the document's variable cache.
+async fn prepare_arguments(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<ArgumentsRequest>,
+) -> Result<Json<ArgumentsResponse>, ApiError> {
+    let raw = state.raw.lock().unwrap().clone();
+    let mut canvas = resolved_canvas(&raw, &state.canvas_path)?;
+    seed_artifact_paths(
+        &state,
+        &mut canvas,
+        &effective_overrides(&state, &HashMap::new()),
+    );
+    let path: Vec<&str> = request.path.iter().map(String::as_str).collect();
+    let mut node = canvas
+        .resolve_path(&path)
+        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    let mut block_name = request.block.clone();
+    let app = meshfox_core::args::Application::parse(&block_name)
+        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    if !meshfox_core::scan_runnable_blocks(&node.id, &node.text)
+        .iter()
+        .any(|block| block.name.as_deref() == Some(app.definition.as_str()))
+        && app.bindings.is_empty()
+    {
+        let mut extended = path.clone();
+        extended.push(&request.block);
+        if let Ok(child) = canvas.resolve_path(&extended) {
+            let blocks = meshfox_core::scan_runnable_blocks(&child.id, &child.text);
+            if let Ok(Some(default)) = meshfox_core::fence::default_block(&child.id, &blocks) {
+                node = child;
+                block_name = default.name.clone().unwrap();
+            }
+        }
+    }
+    let prepared = meshfox_core::args::prepare_arguments(
+        &node.id,
+        &node.text,
+        &block_name,
+        &request.args,
+        &canvas.artifact_values,
+    )
+    .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    let canonical_path = canvas.id_path_to(&node.id).unwrap_or_default();
+    let canonical_refs: Vec<&str> = canonical_path.iter().map(String::as_str).collect();
+    if let Some(address) = &prepared.block {
+        let bound = meshfox_core::args::bind_block(&node.id, &node.text, address, &canvas.artifact_values)
+            .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+        meshfox_core::vars::validate_selected_env(&canvas, &node.id, &bound)
+            .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    }
+    let terminal = prepared
+        .block
+        .as_ref()
+        .and_then(|block| {
+            meshfox_core::resolve_run_chain(&canvas, &canonical_refs, block, !request.no_deps).ok()
+        })
+        .into_iter()
+        .flatten()
+        .filter_map(|addr| meshfox_core::deps::find_block(&canvas, &addr).ok())
+        .find(|block| block.tty);
+    Ok(Json(ArgumentsResponse {
+        tty: terminal.is_some(),
+        autoclose: terminal.is_some_and(|block| block.autoclose),
+        prepared,
+        path: canonical_path,
+    }))
 }
 
 /// Only the declared `meshfox:var`s the requested block's chain actually
@@ -6132,9 +6238,10 @@ async fn force_run_kill_prep(state: &AppState, force: &ForceTarget) -> Result<()
     // this comment described). A fresh claimant slipping in during the
     // brief gap is an acceptable, rare race — the client's own cue to force
     // again, same as any other conflict `run_block_impl` might report.
+    let addr = canonical_run_address(state, &force.node_id, &force.block);
     state
         .run_ledger
-        .kill_running(&force.node_id, &force.block)
+        .kill_running(&addr.node_id, &addr.block_name)
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
@@ -6461,6 +6568,16 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
                     break;
                 }
             };
+            if let Err(error) = extend_plan_locks(&state, &raw_snapshot, &chain, &forced_reruns, &visited, addr, held_locks) {
+                final_exit_code = 1;
+                match error {
+                    ChainLockError::Conflict(c) => yield Ok(ndjson_line(&RunEvent::LockConflict {
+                        node_id: c.node_id, block: c.block, owner_pid: c.owner_pid, owner_desc: c.owner_desc,
+                    })),
+                    ChainLockError::Io(e) => yield Ok(ndjson_line(&RunEvent::Error { message: e.to_string() })),
+                }
+                break;
+            }
             yield Ok(ndjson_line(&RunEvent::StepStart {
                 node_id: addr.node_id.clone(),
                 block: addr.block_name.clone(),
@@ -6498,9 +6615,7 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
             let node_text = step_node.text.clone();
             let canvas_path_for_step = &state.canvas_path;
             let cwd = step_node.cwd(canvas_root_dir(canvas_path_for_step));
-            let Some(block) = meshfox_core::scan_runnable_blocks(&addr.node_id, &node_text)
-                .into_iter()
-                .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()))
+            let Some(block) = meshfox_core::args::bind_block(&addr.node_id, &node_text, &addr.block_name, &HashMap::new()).ok()
             else {
                 yield Ok(ndjson_line(&RunEvent::Error {
                     message: format!(
@@ -6583,7 +6698,7 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
             // Only this block's own `env=` list, relabeled to its local
             // names — not the whole chain's resolved variables — same
             // "opt-in per block" scoping the CLI applies.
-            let mut block_env = meshfox_core::map_block_env(&block.env, &resolved_vars);
+            let mut block_env = meshfox_core::args::block_env(&block, &resolved_vars);
             // If some declared variable is `from=`-sourced from *this*
             // block, give it a fresh output file to write `NAME=value`
             // lines to (see `meshfox_core::varout`) — read back below,
@@ -6608,8 +6723,8 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
             // `resolved_vars` (which `env_var_names_for_chain` already
             // makes sure includes whatever `interpreter=` itself needs).
             let mut resolved_block = block.clone();
-            if let Some(spec) = &block.interpreter {
-                resolved_block.interpreter = Some(meshfox_core::resolve_interpreter(spec, &resolved_vars));
+            if block.interpreter.is_some() {
+                resolved_block.interpreter = meshfox_core::args::resolve_interpreter(&block, &resolved_vars);
             }
 
             // `service` blocks branch out here, before the normal
@@ -7421,10 +7536,16 @@ fn find_tty_block(
         .find(|addr| {
             canvas
                 .node(&addr.node_id)
-                .map(|node| meshfox_core::scan_runnable_blocks(&addr.node_id, &node.text))
-                .unwrap_or_default()
-                .iter()
-                .any(|b| b.name.as_deref() == Some(addr.block_name.as_str()) && b.tty)
+                .and_then(|node| {
+                    meshfox_core::args::bind_block(
+                        &addr.node_id,
+                        &node.text,
+                        &addr.block_name,
+                        &HashMap::new(),
+                    )
+                    .ok()
+                })
+                .is_some_and(|b| b.tty)
         })
         .cloned()
 }
@@ -7640,9 +7761,10 @@ async fn run_block_tty(
     // below does that, from scratch, for the whole chain).
     if let (Some(force_node_id), Some(force_block)) = (&query.force_node_id, &query.force_block) {
         locate_node(&raw_snapshot, force_node_id)?;
+        let addr = canonical_run_address(&state, force_node_id, force_block);
         state
             .run_ledger
-            .kill_running(force_node_id, force_block)
+            .kill_running(&addr.node_id, &addr.block_name)
             .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
 
@@ -7772,7 +7894,16 @@ async fn run_tty_chain(
     // Parsed once for every step's `step_fingerprint` below.
     let fp_canvas = {
         let raw = state.raw.lock().unwrap().clone();
-        resolved_canvas(&raw, &state.canvas_path).ok()
+        resolved_canvas(&raw, &state.canvas_path)
+            .ok()
+            .map(|mut canvas| {
+                seed_artifact_paths(
+                    &state,
+                    &mut canvas,
+                    &effective_overrides(&state, &resolved_vars),
+                );
+                canvas
+            })
     };
 
     let target = chain.last().unwrap().clone();
@@ -7793,14 +7924,45 @@ async fn run_tty_chain(
         let Some(addr_owned) = chain.iter().find(|addr| !visited.contains(*addr)).cloned() else { break; };
         let addr = &addr_owned;
         visited.insert(addr.clone());
-        let forced_reruns = match fp_canvas.as_ref()
-            .map(|canvas| replan_runs(&state, canvas, &chain, &resolved_vars, &executed, fresh)) {
+        let forced_reruns = match Some(replan_runs(
+            &state,
+            &canvas,
+            &chain,
+            &resolved_vars,
+            &executed,
+            fresh,
+        )) {
             Some(Ok(plan)) => plan,
             _ => {
                 send_event(&mut socket, &RunEvent::Error { message: "could not re-plan run chain".into() }).await;
                 return;
             }
         };
+        let lock_raw = state.raw.lock().unwrap().clone();
+        if let Err(error) = extend_plan_locks(
+            &state,
+            &lock_raw,
+            &chain,
+            &forced_reruns,
+            &visited,
+            addr,
+            &mut held_locks.0,
+        ) {
+            final_exit_code = 1;
+            let event = match error {
+                ChainLockError::Conflict(c) => RunEvent::LockConflict {
+                    node_id: c.node_id,
+                    block: c.block,
+                    owner_pid: c.owner_pid,
+                    owner_desc: c.owner_desc,
+                },
+                ChainLockError::Io(e) => RunEvent::Error {
+                    message: e.to_string(),
+                },
+            };
+            send_event(&mut socket, &event).await;
+            break;
+        }
         if !send_event(
             &mut socket,
             &RunEvent::StepStart {
@@ -7853,10 +8015,13 @@ async fn run_tty_chain(
         let node_text = step_node.text.clone();
         let canvas_path_for_step = &state.canvas_path;
         let cwd = step_node.cwd(canvas_root_dir(canvas_path_for_step));
-        let Some(block) = meshfox_core::scan_runnable_blocks(&addr.node_id, &node_text)
-            .into_iter()
-            .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()))
-        else {
+        let Some(block) = meshfox_core::args::bind_block(
+            &addr.node_id,
+            &node_text,
+            &addr.block_name,
+            &HashMap::new(),
+        )
+        .ok() else {
             send_event(
                 &mut socket,
                 &RunEvent::Error {
@@ -7925,7 +8090,7 @@ async fn run_tty_chain(
         let artifact_run_id = held_locks.0.get(&(addr.node_id.clone(), addr.block_name.clone())).copied();
         executed.insert(addr.clone());
 
-        let mut block_env = meshfox_core::map_block_env(&block.env, &resolved_vars);
+        let mut block_env = meshfox_core::args::block_env(&block, &resolved_vars);
         // If some declared variable is `from=`-sourced from *this* block
         // (tty or not), give it a fresh output file to write `NAME=value`
         // lines to (see `meshfox_core::varout`) — read back below, once
@@ -7949,9 +8114,9 @@ async fn run_tty_chain(
         // Same block-with-substituted-interpreter clone `run_block` uses —
         // see its own comment on the equivalent line.
         let mut resolved_block = block.clone();
-        if let Some(spec) = &block.interpreter {
+        if block.interpreter.is_some() {
             resolved_block.interpreter =
-                Some(meshfox_core::resolve_interpreter(spec, &resolved_vars));
+                meshfox_core::args::resolve_interpreter(&block, &resolved_vars);
         }
 
         let exit_code = if block.tty {
@@ -8999,18 +9164,22 @@ async fn force_start_service(
     })?;
     let node_text = step_node.text.clone();
     let cwd = step_node.cwd(canvas_root_dir(&state.canvas_path));
-    let block = meshfox_core::scan_runnable_blocks(&target.node_id, &node_text)
-        .into_iter()
-        .find(|b| b.name.as_deref() == Some(target.block_name.as_str()))
-        .ok_or_else(|| {
-            ApiError(
-                StatusCode::NOT_FOUND,
-                format!(
-                    "no runnable block named {:?} in node {:?}",
-                    target.block_name, target.node_id
-                ),
-            )
-        })?;
+    let block = meshfox_core::args::bind_block(
+        &target.node_id,
+        &node_text,
+        &target.block_name,
+        &HashMap::new(),
+    )
+    .ok()
+    .ok_or_else(|| {
+        ApiError(
+            StatusCode::NOT_FOUND,
+            format!(
+                "no runnable block named {:?} in node {:?}",
+                target.block_name, target.node_id
+            ),
+        )
+    })?;
     if !block.service {
         return Err(ApiError(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -9018,10 +9187,11 @@ async fn force_start_service(
         ));
     }
 
-    let block_env = meshfox_core::map_block_env(&block.env, &resolved_vars);
+    let block_env = meshfox_core::args::block_env(&block, &resolved_vars);
     let mut resolved_block = block.clone();
-    if let Some(spec) = &block.interpreter {
-        resolved_block.interpreter = Some(meshfox_core::resolve_interpreter(spec, &resolved_vars));
+    if block.interpreter.is_some() {
+        resolved_block.interpreter =
+            meshfox_core::args::resolve_interpreter(&block, &resolved_vars);
     }
 
     // Whole-process-group `SIGKILL` on whatever pid the current `running`
@@ -9309,7 +9479,8 @@ async fn kill_run(State(state): State<Arc<AppState>>, Json(req): Json<KillReques
         };
     }
     if let (Some(node_id), Some(block)) = (&req.node_id, &req.block) {
-        let key = (node_id.clone(), block.clone());
+        let addr = canonical_run_address(&state, node_id, block);
+        let key = (addr.node_id, addr.block_name);
         // A plain block and a `tty` block can never share an address (see
         // `DepsError::ServiceTtyConflict` — this crate never registers a
         // `tty` block in `runs_registry` or a plain one in `tty_registry`
@@ -9532,6 +9703,18 @@ fn serve_stored_run(
         .unwrap())
 }
 
+/// History, replay and cancellation share the execution identity, including typed argument
+/// normalization. Keep the original address when its definition has gone away:
+/// stored runs must remain accessible after edits or removal of a block.
+fn canonical_run_address(state: &AppState, node_id: &str, block: &str) -> meshfox_core::BlockAddr {
+    let addr = meshfox_core::BlockAddr::new(node_id, block);
+    RunFingerprintCtx::load(state)
+        .and_then(|ctx| meshfox_core::deps::find_block(&ctx.canvas, &addr).ok())
+        .and_then(|bound| bound.name)
+        .map(|name| meshfox_core::BlockAddr::new(node_id, name))
+        .unwrap_or(addr)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RunHistoryQuery {
@@ -9549,19 +9732,21 @@ async fn get_run_history(
     State(state): State<Arc<AppState>>,
     Query(query): Query<RunHistoryQuery>,
 ) -> Result<Json<Vec<run_ledger::RunSummary>>, ApiError> {
-    let addr = meshfox_core::BlockAddr::new(&query.node_id, &query.block);
+    let addr = canonical_run_address(&state, &query.node_id, &query.block);
     let current = current_run_fingerprint(&state, &addr);
     state
         .run_ledger
-        .history(&query.node_id, &query.block, current.as_deref())
+        .history(&addr.node_id, &addr.block_name, current.as_deref())
         .map(Json)
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
 async fn subscribe_run_impl(
     state: Arc<AppState>,
-    query: SubscribeRunQuery,
+    mut query: SubscribeRunQuery,
 ) -> Result<Response, ApiError> {
+    let addr = canonical_run_address(&state, &query.node_id, &query.block);
+    query.block = addr.block_name;
     let key = (query.node_id.clone(), query.block.clone());
     let registered = state.runs_registry.lock().unwrap().get(&key).cloned();
     // A run in flight is served live from its handle. Anything finished —
@@ -10156,6 +10341,7 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/nodes/:id/open", post(open_node_file))
         .route("/api/nodes/:id/open-folder", post(open_node_file_folder))
         .route("/api/options", put(put_options))
+        .route("/api/args", post(prepare_arguments))
         .route("/api/vars", get(get_vars))
         .route(
             "/api/vars/configure",
@@ -15161,6 +15347,562 @@ mod session_skip_tests {
     }
 
     #[tokio::test]
+    async fn output_inference_tty_replans_after_observing_the_requested_file() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+        let path = write_dep_chain_canvas("echo unused");
+        let work = path.parent().unwrap();
+        let selection = work.join("selection");
+        std::fs::write(&selection, "hy").unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                r#"<!-- meshfox:canvas -->
+# Root
+<!-- meshfox:node id="root" -->
+<!-- meshfox:var name="WORK" default="{}" -->
+<!-- meshfox:var name="SELECTION" default="{}" -->
+<!-- meshfox:var name="FILE" from="observe" -->
+```bash name="observe" always env="WORK,SELECTION"
+printf 'FILE=%s/csv/%s.csv\n' "$WORK" "$(cat "$SELECTION")" > "$MESHFOX_VARS_OUT"
+```
+<!-- meshfox:arg name="lang" type="select" choices="en,hy" -->
+```bash name="extract" env="WORK" outputs="$WORK/csv/${{lang}}.csv"
+mkdir -p "$WORK/csv"
+printf '%s' "$lang" > "$WORK/csv/$lang.csv"
+```
+```bash name="merge" env="WORK,FILE" inputs="$FILE" outputs="$WORK/result"
+cp "$FILE" "$WORK/result"
+```
+```bash name="target" tty deps="merge"
+true
+```
+"#,
+                work.display(),
+                selection.display()
+            ),
+        )
+        .unwrap();
+        let addr = spawn_test_server(path.clone()).await;
+        for lang in ["hy", "en"] {
+            std::fs::write(&selection, lang).unwrap();
+            let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+                "ws://{addr}/api/run/tty?block=target&cols=80&rows=24"
+            ))
+            .await
+            .unwrap();
+            let mut events = Vec::new();
+            loop {
+                let message = tokio::time::timeout(Duration::from_secs(10), ws.next())
+                    .await
+                    .unwrap()
+                    .expect("chain ended before done")
+                    .unwrap();
+                if let WsMessage::Text(text) = message {
+                    let event: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    let done = event["type"] == "done";
+                    events.push(event);
+                    if done {
+                        break;
+                    }
+                }
+            }
+            assert!(
+                really_ran(&events, &format!("extract[lang={lang}]")),
+                "{events:?}"
+            );
+            assert!(really_ran(&events, "merge"), "{events:?}");
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| e["type"] == "error" || e["type"] == "lock-conflict"),
+                "{events:?}"
+            );
+            assert_eq!(std::fs::read_to_string(work.join("result")).unwrap(), lang);
+        }
+        let _ = std::fs::remove_dir_all(work);
+    }
+
+    #[tokio::test]
+    async fn env_name_templates_preserve_selected_value_freshness_and_history() {
+        let path = write_dep_chain_canvas("echo unused");
+        let work = path.parent().unwrap();
+        std::fs::write(work.join("urls"), "URL_en=en-one\nURL_hy=hy-one\n").unwrap();
+        std::fs::write(
+            &path,
+            r#"<!-- meshfox:canvas -->
+# Root
+<!-- meshfox:node id="root" -->
+<!-- meshfox:var name="URL_en" from="observe" -->
+<!-- meshfox:var name="URL_hy" from="observe" -->
+```bash name="observe" always
+cat urls > "$MESHFOX_VARS_OUT"
+```
+<!-- meshfox:arg name="lang" type="string" -->
+```bash name="fetch" env="URL=URL_${lang}" outputs="${lang}.pdf"
+printf '%s' "$URL" > "$lang.pdf"
+printf '%s=%s\n' "$lang" "$URL"
+```
+```bash name="target" deps="fetch[lang=en],fetch[lang=hy]"
+true
+```
+"#,
+        )
+        .unwrap();
+        let addr = spawn_test_server(path.clone()).await;
+        let first = run_target(addr).await;
+        for lang in ["en", "hy"] {
+            assert!(
+                really_ran(&first, &format!("fetch[lang={lang}]")),
+                "{first:?}"
+            );
+        }
+        std::fs::write(work.join("urls"), "URL_en=en-two\nURL_hy=hy-one\n").unwrap();
+        let second = run_target(addr).await;
+        assert!(really_ran(&second, "observe"), "{second:?}");
+        assert!(really_ran(&second, "fetch[lang=en]"), "{second:?}");
+        assert!(skipped_for(&second, "fetch[lang=hy]"), "{second:?}");
+        assert_eq!(
+            std::fs::read_to_string(work.join("hy.pdf")).unwrap(),
+            "hy-one"
+        );
+        let (status, body) = request(
+            addr,
+            "POST",
+            "/api/args",
+            "application/json",
+            r#"{"path":[],"block":"fetch[lang=fr]"}"#,
+        )
+        .await;
+        assert_eq!(status, 422, "{body}");
+        assert!(body.contains("URL_fr"), "{body}");
+        let restarted = spawn_test_server(path.clone()).await;
+        for (lang, count) in [("en", 2), ("hy", 1)] {
+            let (status, body) = request(
+                restarted,
+                "GET",
+                &format!("/api/run/history?nodeId=root&block=fetch%5Blang%3D{lang}%5D"),
+                "application/json",
+                "",
+            )
+            .await;
+            assert_eq!(status, 200, "{body}");
+            let history: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+            assert_eq!(history.len(), count, "{body}");
+        }
+        let _ = std::fs::remove_dir_all(work);
+    }
+
+    #[tokio::test]
+    async fn output_inference_runs_file_pipeline_with_independent_history_and_value_freshness() {
+        let path = write_dep_chain_canvas("echo unused");
+        let work = path.parent().unwrap();
+        let source = work.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("en.pdf"), "E-one").unwrap();
+        std::fs::write(source.join("hy.pdf"), "A-one").unwrap();
+        std::fs::write(&path, format!(r#"<!-- meshfox:canvas -->
+# Root
+<!-- meshfox:node id="root" -->
+<!-- meshfox:var name="WORK" default="{}" -->
+<!-- meshfox:var name="SOURCE" default="{}" -->
+<!-- meshfox:arg name="lang" type="select" choices="en,hy" -->
+```bash name="download" env="WORK,SOURCE" inputs="$SOURCE/${{lang}}.pdf" outputs="$WORK/pdf/${{lang}}.pdf"
+mkdir -p "$WORK/pdf"
+cp "$SOURCE/$lang.pdf" "$WORK/pdf/$lang.pdf"
+```
+<!-- meshfox:arg name="lang" type="select" choices="en,hy" -->
+```bash name="convert" env="WORK" inputs="$WORK/pdf/${{lang}}.pdf" outputs="$WORK/text/${{lang}}.txt"
+mkdir -p "$WORK/text"
+head -c 1 "$WORK/pdf/$lang.pdf" > "$WORK/text/$lang.txt"
+```
+<!-- meshfox:arg name="lang" type="select" choices="en,hy" default="en" required -->
+```bash name="extract" env="WORK" inputs="$WORK/text/${{lang}}.txt" outputs="$WORK/csv/${{lang}}.csv"
+mkdir -p "$WORK/csv"
+cp "$WORK/text/$lang.txt" "$WORK/csv/$lang.csv"
+printf 'file=%s.csv\n' "$lang"
+```
+```bash name="merge" env="WORK" inputs="$WORK/csv/en.csv,$WORK/csv/hy.csv" outputs="$WORK/merged.csv"
+cat "$WORK/csv/en.csv" "$WORK/csv/hy.csv" > "$WORK/merged.csv"
+```
+```bash name="target" deps="merge"
+true
+```
+"#, work.display(), source.display())).unwrap();
+        let addr = spawn_test_server(path.clone()).await;
+        let first = run_target(addr).await;
+        for block in [
+            "download[lang=en]",
+            "convert[lang=en]",
+            "extract[lang=en]",
+            "download[lang=hy]",
+            "convert[lang=hy]",
+            "extract[lang=hy]",
+            "merge",
+        ] {
+            assert!(really_ran(&first, block), "{first:?}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(work.join("merged.csv")).unwrap(),
+            "EA"
+        );
+        std::fs::write(source.join("hy.pdf"), "A-two").unwrap();
+        let same_value = run_target(addr).await;
+        for block in ["download[lang=hy]", "convert[lang=hy]"] {
+            assert!(really_ran(&same_value, block), "{same_value:?}");
+        }
+        for block in [
+            "download[lang=en]",
+            "convert[lang=en]",
+            "extract[lang=en]",
+            "extract[lang=hy]",
+            "merge",
+        ] {
+            assert!(skipped_for(&same_value, block), "{same_value:?}");
+        }
+        std::fs::remove_file(work.join("csv/hy.csv")).unwrap();
+        let rebuilt = run_target(addr).await;
+        assert!(really_ran(&rebuilt, "extract[lang=hy]"), "{rebuilt:?}");
+        assert!(skipped_for(&rebuilt, "extract[lang=en]"), "{rebuilt:?}");
+        assert!(skipped_for(&rebuilt, "merge"), "{rebuilt:?}");
+        std::fs::write(source.join("hy.pdf"), "B-three").unwrap();
+        let changed = run_target(addr).await;
+        assert!(really_ran(&changed, "extract[lang=hy]"), "{changed:?}");
+        assert!(really_ran(&changed, "merge"), "{changed:?}");
+        assert!(skipped_for(&changed, "extract[lang=en]"), "{changed:?}");
+        assert_eq!(
+            std::fs::read_to_string(work.join("merged.csv")).unwrap(),
+            "EB"
+        );
+        let restarted = spawn_test_server(path.clone()).await;
+        for (lang, count) in [("en", 1), ("hy", 3)] {
+            let (status, body) = request(
+                restarted,
+                "GET",
+                &format!("/api/run/history?nodeId=root&block=extract%5Blang%3D{lang}%5D"),
+                "application/json",
+                "",
+            )
+            .await;
+            assert_eq!(status, 200);
+            let history: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+            assert_eq!(history.len(), count, "{body}");
+            let logs = ws_messages(format!("ws://{restarted}/api/run/subscribe?nodeId=root&block=extract%5Blang%3D{lang}%5D&runId={}", history[0]["id"])).await;
+            assert!(
+                logs.iter()
+                    .any(|e| e["type"] == "line" && e["text"] == format!("file={lang}.csv")),
+                "{logs:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(work);
+    }
+
+    #[tokio::test]
+    async fn application_graph_tty_launch_replans_and_runs_forwarded_arguments() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+        let path = write_dep_chain_canvas("echo unused");
+        std::fs::write(
+            &path,
+            r#"<!-- meshfox:canvas -->
+# Root
+<!-- meshfox:node id="root" -->
+<!-- meshfox:var name="LANG" from="observe" -->
+```bash name="observe" always
+printf 'LANG=hy\n' > "$MESHFOX_VARS_OUT"
+```
+<!-- meshfox:arg name="lang" -->
+```bash name="download"
+printf 'download=%s\n' "$lang"
+```
+<!-- meshfox:arg name="lang" -->
+```bash name="extract" deps="download[lang=$lang]"
+printf 'extract=%s\n' "$lang"
+```
+```bash name="target" tty deps="extract[lang=$LANG]"
+true
+```
+"#,
+        )
+        .unwrap();
+        let addr = spawn_test_server(path.clone()).await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{addr}/api/run/tty?block=target&cols=80&rows=24"
+        ))
+        .await
+        .unwrap();
+        let mut events = Vec::new();
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(10), ws.next())
+                .await
+                .unwrap()
+                .expect("TTY chain ended before done")
+                .unwrap();
+            if let WsMessage::Text(text) = message {
+                let event: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let done = event["type"] == "done";
+                events.push(event);
+                if done {
+                    break;
+                }
+            }
+        }
+        for block in ["observe", "download[lang=hy]", "extract[lang=hy]", "target"] {
+            assert!(really_ran(&events, block), "{events:?}");
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|e| e["type"] == "error" || e["type"] == "lock-conflict"),
+            "{events:?}"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn application_graph_shares_steps_and_skips_each_application_independently() {
+        let path = write_dep_chain_canvas("echo unused");
+        std::fs::write(
+            &path,
+            r#"<!-- meshfox:canvas -->
+# Root
+<!-- meshfox:node id="root" -->
+<!-- meshfox:arg name="lang" type="select" choices="en,hy" -->
+<!-- meshfox:arg name="n" type="int" default="1" -->
+```bash name="download"
+printf 'download=%s:%s\n' "$lang" "$n"
+```
+<!-- meshfox:arg name="lang" type="select" choices="en,hy" -->
+```bash name="extract" deps="download[n=01,lang=$lang]"
+printf 'extract=%s\n' "$lang"
+```
+```bash name="target" deps="extract[lang=en],extract[lang=hy],download[lang=en,n=1]"
+echo merged
+```
+"#,
+        )
+        .unwrap();
+        let addr = spawn_test_server(path.clone()).await;
+        let first = run_target(addr).await;
+        for block in [
+            "download[lang=en,n=1]",
+            "extract[lang=en]",
+            "download[lang=hy,n=1]",
+            "extract[lang=hy]",
+        ] {
+            assert_eq!(
+                first
+                    .iter()
+                    .filter(|e| e["type"] == "step-end" && e["block"] == block)
+                    .count(),
+                1,
+                "{first:?}"
+            );
+        }
+        let second = run_target(addr).await;
+        for block in [
+            "download[lang=en,n=1]",
+            "extract[lang=en]",
+            "download[lang=hy,n=1]",
+            "extract[lang=hy]",
+        ] {
+            assert!(skipped_for(&second, block), "{second:?}");
+        }
+        assert!(really_ran(&second, "target"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn application_graph_conflict_on_a_newly_observed_application_stops_before_spawn() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+        let path = write_dep_chain_canvas("echo unused");
+        let gate = path.parent().unwrap().join("release");
+        std::fs::write(
+            &path,
+            format!(
+                r#"<!-- meshfox:canvas -->
+# Root
+<!-- meshfox:node id="root" -->
+<!-- meshfox:var name="GATE" default="{}" -->
+<!-- meshfox:var name="LANG" from="observe" -->
+```bash name="observe" always
+printf 'LANG=hy\n' > "$MESHFOX_VARS_OUT"
+```
+<!-- meshfox:arg name="lang" -->
+<!-- meshfox:arg name="n" type="int" default="1" -->
+```bash name="extract" env="GATE"
+echo ready
+while [ ! -f "$GATE" ]; do sleep 0.01; done
+```
+```bash name="target" deps="extract[lang=$LANG]"
+echo merged
+```
+"#,
+                gate.display()
+            ),
+        )
+        .unwrap();
+        let addr = spawn_test_server(path.clone()).await;
+        let (mut running, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{addr}/api/run?block=extract%5Blang%3Dhy%5D&persist=true"
+        ))
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(message) = running.next().await {
+                if let WsMessage::Text(text) = message.unwrap() {
+                    let event: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if event["type"] == "output" && event["text"] == "ready" {
+                        return;
+                    }
+                }
+            }
+            panic!("running application did not become ready");
+        })
+        .await
+        .unwrap();
+        let events = run_target(addr).await;
+        let (kill_status, _) = request(
+            addr,
+            "POST",
+            "/api/kill",
+            "application/json",
+            r#"{"nodeId":"root","block":"extract[n=01,lang=hy]"}"#,
+        )
+        .await;
+        // Release the first process before assertions, including on a failed test.
+        std::fs::write(&gate, "release").unwrap();
+        while let Some(message) = running.next().await {
+            if matches!(message.unwrap(), WsMessage::Close(_)) {
+                break;
+            }
+        }
+        assert_eq!(kill_status, 204);
+        assert!(really_ran(&events, "observe"), "{events:?}");
+        assert!(
+            events
+                .iter()
+                .any(|e| e["type"] == "lock-conflict" && e["block"] == "extract[lang=hy,n=1]"),
+            "{events:?}"
+        );
+        assert!(!really_ran(&events, "extract[lang=hy,n=1]"), "{events:?}");
+        assert!(!really_ran(&events, "target"), "{events:?}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn application_graph_replans_computed_bindings_and_records_new_applications() {
+        let path = write_dep_chain_canvas("echo unused");
+        let selection = path.parent().unwrap().join("language");
+        std::fs::write(&selection, "hy").unwrap();
+        let source = format!(
+            r#"<!-- meshfox:canvas -->
+# Root
+<!-- meshfox:node id="root" -->
+<!-- meshfox:var name="SELECTION" default="{}" -->
+<!-- meshfox:var name="LANG" from="observe" -->
+```bash name="observe" always env="SELECTION"
+printf 'LANG=%s\n' "$(cat "$SELECTION")" > "$MESHFOX_VARS_OUT"
+```
+<!-- meshfox:arg name="lang" type="select" choices="en,hy" -->
+```bash name="extract"
+printf 'file=%s.pdf\n' "$lang"
+```
+```bash name="target" deps="extract[lang=$LANG]"
+echo merged
+```
+"#,
+            selection.display()
+        );
+        std::fs::write(&path, source).unwrap();
+        let addr = spawn_test_server(path.clone()).await;
+        let first = run_target(addr).await;
+        assert!(really_ran(&first, "observe"), "{first:?}");
+        assert!(really_ran(&first, "extract[lang=hy]"), "{first:?}");
+        std::fs::write(&selection, "en").unwrap();
+        let second = run_target(addr).await;
+        assert!(really_ran(&second, "extract[lang=en]"), "{second:?}");
+        assert!(!really_ran(&second, "extract[lang=hy]"), "{second:?}");
+        let restarted = spawn_test_server(path.clone()).await;
+        for lang in ["en", "hy"] {
+            let (status, body) = request(
+                restarted,
+                "GET",
+                &format!("/api/run/history?nodeId=root&block=extract%5Blang%3D{lang}%5D"),
+                "application/json",
+                "",
+            )
+            .await;
+            assert_eq!(status, 200);
+            let history: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+            assert_eq!(history.len(), 1, "{body}");
+            assert_eq!(history[0]["exitCode"], 0, "{body}");
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn application_history_and_logs_are_separate_and_survive_restart() {
+        let path = write_dep_chain_canvas("echo unused");
+        std::fs::write(&path, "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n<!-- meshfox:arg name=\"file\" -->\n<!-- meshfox:arg name=\"n\" type=\"int\" -->\n```bash name=\"extract\"\nprintf 'file=%s:%s\\n' \"$file\" \"$n\"\nprintf 'error=%s\\n' \"$file\" >&2\n```\n").unwrap();
+        let first = spawn_test_server(path.clone()).await;
+        for file in ["en.pdf", "hy.pdf"] {
+            let events = ws_messages(format!(
+                "ws://{first}/api/run?block=extract%5Bfile%3D{file}%2Cn%3D1%5D&persist=true"
+            ))
+            .await;
+            assert!(
+                really_ran(&events, &format!("extract[file={file},n=1]")),
+                "{events:?}"
+            );
+        }
+        let restarted = spawn_test_server(path.clone()).await;
+        let mut ids = Vec::new();
+        for file in ["en.pdf", "hy.pdf"] {
+            // Different ordering and a typed alias still find the same run.
+            let block = format!("extract%5Bn%3D01%2Cfile%3D{file}%5D");
+            let (status, body) = request(
+                restarted,
+                "GET",
+                &format!("/api/run/history?nodeId=root&block={block}"),
+                "application/json",
+                "",
+            )
+            .await;
+            assert_eq!(status, 200);
+            let history: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+            assert_eq!(history.len(), 1, "{body}");
+            assert_eq!(history[0]["stale"], false, "{body}");
+            let id = history[0]["id"].as_i64().unwrap();
+            ids.push(id);
+            let logs = ws_messages(format!(
+                "ws://{restarted}/api/run/subscribe?nodeId=root&block={block}&runId={id}"
+            ))
+            .await;
+            assert!(
+                logs.iter()
+                    .any(|e| e["type"] == "line" && e["text"] == format!("file={file}:1")),
+                "{logs:?}"
+            );
+            assert!(
+                logs.iter()
+                    .any(|e| e["type"] == "line" && e["text"] == format!("error={file}")),
+                "{logs:?}"
+            );
+            let other = if file == "en.pdf" { "hy.pdf" } else { "en.pdf" };
+            assert!(
+                !logs
+                    .iter()
+                    .any(|e| e["text"].as_str().is_some_and(|text| text.contains(other))),
+                "{logs:?}"
+            );
+        }
+        assert_ne!(ids[0], ids[1]);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
     async fn a_restarted_core_still_skips_an_unchanged_dependency() {
         let path = write_dep_chain_canvas("echo dep-ran");
         let first_core = spawn_test_server(path.clone()).await;
@@ -15620,6 +16362,102 @@ mod vars_endpoint_tests {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
         (status, body.to_string())
+    }
+
+    #[tokio::test]
+    async fn argument_preparation_confirms_defaults_without_persisting_answers() {
+        let canvas_path = write_test_canvas(concat!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "<!-- meshfox:arg name=\"n\" type=\"int\" default=\"2\" required -->\n",
+            "<!-- meshfox:arg name=\"lang\" type=\"select\" choices=\"en,hy\" default=\"en\" -->\n",
+            "```bash name=\"extract\"\nprintf '%s' \"$lang:$n\"\n```\n",
+            "<!-- meshfox:arg name=\"lang\" type=\"select\" choices=\"en,hy\" -->\n",
+            "```bash name=\"terminal\" tty autoclose\necho ok\n```\n",
+            "```button name=\"launch\" deps=\"terminal[lang=hy]\"\nRun\n```\n",
+        ));
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/api/args");
+        let initial = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .body(r#"{"block":"extract"}"#)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let initial: serde_json::Value = serde_json::from_str(&initial).unwrap();
+        assert!(initial["block"].is_null());
+        assert_eq!(initial["fields"][0]["resolved"], false);
+        assert_eq!(initial["fields"][0]["value"], "2");
+        let bound = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .body(r#"{"block":"extract","args":{"n":"002","lang":"hy"}}"#)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let bound: serde_json::Value = serde_json::from_str(&bound).unwrap();
+        assert_eq!(bound["block"], "extract[lang=hy,n=2]");
+        let events = run_ws_events(addr, &[("block", bound["block"].as_str().unwrap())]).await;
+        assert!(
+            events
+                .iter()
+                .any(|event| event.to_string().contains("hy:2")),
+            "{events:?}"
+        );
+        let bad = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .body(r#"{"block":"extract","args":{"n":"bad"}}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let again = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .body(r#"{"block":"extract"}"#)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let again: serde_json::Value = serde_json::from_str(&again).unwrap();
+        assert!(again["block"].is_null());
+        assert!(!meshfox_core::varcache::cache_path(&canvas_path).exists());
+        for (no_deps, expected_tty) in [(false, true), (true, false)] {
+            let response = client
+                .post(&url)
+                .header("content-type", "application/json")
+                .body(serde_json::json!({"block":"launch", "noDeps":no_deps}).to_string())
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(response["tty"], expected_tty);
+            assert_eq!(response["autoclose"], expected_tty);
+        }
+        let _ = std::fs::remove_file(&canvas_path);
+        let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));
     }
 
     const REQUIRED_CANVAS: &str = concat!(

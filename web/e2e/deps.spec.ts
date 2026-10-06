@@ -35,13 +35,13 @@ test("a block without deps gets a plain run button", async ({ page }) => {
   const btn = block(page, "build-node", "build").locator("button", { hasText: "run" });
   await expect(btn).toHaveText("run build");
   await expect(btn).not.toHaveClass(/mesh-run-chain/);
-  await expect(block(page, "build-node", "build").locator(".mesh-code-deps")).toHaveCount(0);
+  await expect(block(page, "build-node", "build").locator(".mesh-block-details")).toHaveCount(0);
 });
 
-test("a block with deps gets the distinct chain-run button and an after: badge", async ({ page }) => {
+test("a block with deps gets the distinct chain-run button and visible deps", async ({ page }) => {
   const testBlock = block(page, "build-node", "test");
   await expect(testBlock.locator("button.mesh-run-chain")).toHaveText("⛓ run chain: test");
-  await expect(testBlock.locator(".mesh-code-deps")).toContainText("build");
+  await expect(testBlock.locator(".mesh-block-details")).toContainText("build");
 });
 
 test("running a chained block runs its whole dependency chain in order", async ({ page }) => {
@@ -71,14 +71,14 @@ test("running a chain executes an uncached block too, shown transiently like any
   await expect(verifyOutput.locator(".mesh-code-output-transient")).toBeVisible();
 });
 
-test("the multiple-deps badge lists every dependency and each is a separate link", async ({ page }) => {
+test("the deps contract lists every dependency and each is a separate link", async ({ page }) => {
   const links = block(page, "release-node", "release").locator(".mesh-dep-link");
   await expect(links).toHaveCount(2);
   await expect(links.nth(0)).toHaveText("build-node/test");
   await expect(links.nth(1)).toHaveText("deploy-node/deploy");
 });
 
-test("clicking an after: link scrolls to and briefly highlights the dependency block", async ({ page }) => {
+test("clicking a deps link scrolls to and briefly highlights the dependency block", async ({ page }) => {
   const link = block(page, "release-node", "release").locator(".mesh-dep-link", {
     hasText: "deploy-node/deploy",
   });

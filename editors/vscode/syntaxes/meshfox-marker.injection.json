@@ -26,6 +26,14 @@
           }
         },
         {
+          "match": "([^\\s=\"']+)(=)('[^']*')",
+          "captures": {
+            "1": { "name": "entity.other.attribute-name.meshfox" },
+            "2": { "name": "punctuation.separator.key-value.meshfox" },
+            "3": { "name": "string.quoted.single.meshfox" }
+          }
+        },
+        {
           "match": "([^\\s=\"]+)(=)(\\S+)",
           "captures": {
             "1": { "name": "entity.other.attribute-name.meshfox" },

@@ -5,6 +5,7 @@
 //! See the repository README for the on-disk format and conventions (the
 //! README is itself a valid meshfox document).
 
+pub mod args;
 pub mod artifacts;
 pub mod attrs;
 pub mod body_rev;
@@ -14,6 +15,7 @@ pub mod comment;
 pub mod config;
 pub mod constraint;
 pub mod deps;
+pub mod diagnostics;
 mod dotenv;
 pub mod exec;
 pub mod fence;
@@ -168,22 +170,26 @@ pub fn env_var_names_for_chain(
 ) -> std::collections::HashSet<String> {
     let mut needed = std::collections::HashSet::new();
     for addr in chain {
-        let Some(node) = canvas.node(&addr.node_id) else {
-            continue;
-        };
-        let blocks = scan_runnable_blocks(&addr.node_id, &node.text);
-        if let Some(block) = blocks
-            .iter()
-            .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()))
-        {
-            needed.extend(direct_var_seed(block));
+        if let Ok(block) = deps::find_block(canvas, addr) {
+            needed.extend(direct_var_seed(&block));
             if block.attrs.contains_key("inputs") {
                 // Matching requires the entire output-path namespace to be known.
                 for node in &canvas.nodes {
                     if node.plain_markdown_include { continue; }
                     for mut producer in scan_runnable_blocks(&node.id, &node.text) {
                         producer.attrs.remove("inputs");
-                        needed.extend(artifacts::var_refs(&producer));
+                        let local: std::collections::HashSet<_> =
+                            args::scan_signatures(&node.id, &node.text)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .filter(|sig| sig.block.span == producer.span)
+                                .flat_map(|sig| sig.args.into_iter().map(|arg| arg.name))
+                                .collect();
+                        needed.extend(
+                            artifacts::var_refs(&producer)
+                                .into_iter()
+                                .filter(|name| !local.contains(name)),
+                        );
                     }
                 }
             }
@@ -225,6 +231,9 @@ fn direct_var_seed(block: &CodeBlock) -> Vec<String> {
         names.extend(exec::interpreter_var_refs(spec));
     }
     names.extend(artifacts::var_refs(block));
+    names.extend(args::dependency_refs(block));
+    names.retain(|name| !block.arguments.contains_key(name));
+    names.extend(args::selected_env_var_names(block));
     names
 }
 
@@ -255,7 +264,17 @@ pub fn autorun_blocks_for_changed_vars(
                 continue;
             }
             let Some(name) = &block.name else { continue };
-            let seed = direct_var_seed(&block);
+            let bound;
+            let block = if block.env.iter().any(|env| env.var_name.contains("${")) {
+                let Ok(selected) = args::bind_block(&node.id, &node.text, name, &canvas.artifact_values) else {
+                    continue;
+                };
+                bound = selected;
+                &bound
+            } else {
+                &block
+            };
+            let seed = direct_var_seed(block);
             let closure = vars::close_over_var_refs(&decls, seed.iter().map(String::as_str));
             if closure.iter().any(|n| changed.contains(n)) {
                 out.push(BlockAddr::new(node.id.clone(), name.clone()));
@@ -278,6 +297,16 @@ pub fn autorun_blocks_for_changed_vars(
 /// that resolved before it existed.
 fn resolve_target(canvas: &Canvas, path: &[&str], block_name: &str) -> Result<BlockAddr, RunError> {
     let node = canvas.resolve_path(path)?;
+    if block_name.contains('[')
+        || args::scan_signatures(&node.id, &node.text)
+            .map_err(|e| DepsError::Arguments(e.to_string()))?
+            .iter()
+            .any(|s| s.block.name.as_deref() == Some(block_name))
+    {
+        let block = args::bind_block(&node.id, &node.text, block_name, &canvas.artifact_values)
+            .map_err(DepsError::Arguments)?;
+        return Ok(BlockAddr::new(&node.id, block.name.unwrap()));
+    }
     if has_runnable_block(canvas, &node.id, block_name) {
         return Ok(BlockAddr::new(node.id.clone(), block_name.to_string()));
     }

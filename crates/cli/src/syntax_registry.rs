@@ -702,6 +702,45 @@ mod tests {
 mod meshfox_grammar_tests {
     use super::*;
 
+    #[test]
+    fn arg_markers_and_single_quoted_application_addresses_keep_their_colors() {
+        let ss = build_syntax_set(&std::env::temp_dir().join("meshfox-arg-grammar-test"));
+        let syntax = ss
+            .find_syntax_by_name(MESHFOX_MARKDOWN_SYNTAX_NAME)
+            .unwrap();
+        let themes = syntect::highlighting::ThemeSet::load_defaults();
+        let theme = with_meshfox_scope_colors(themes.themes.values().next().unwrap().clone());
+        let mut hl = syntect::easy::HighlightLines::new(syntax, &theme);
+        let ranges = hl
+            .highlight_line(
+                "<!-- meshfox:arg name=\"lang\" prompt='Choose language' required -->\n",
+                &ss,
+            )
+            .unwrap();
+        let color_of = |needle: &str| {
+            ranges
+                .iter()
+                .find(|(_, text)| text.contains(needle))
+                .unwrap()
+                .0
+                .foreground
+        };
+        assert_ne!(color_of("meshfox:arg"), color_of("name"));
+        assert_ne!(color_of("required"), color_of("'Choose language'"));
+        let ranges = hl
+            .highlight_line(
+                "<!-- meshfox:output block='extract[query=\"ACME, Inc.\",lang=hy]' -->\n",
+                &ss,
+            )
+            .unwrap();
+        assert!(
+            ranges
+                .iter()
+                .any(|(_, text)| text.contains("'extract[query=\"ACME, Inc.\",lang=hy]'")),
+            "application address must remain one value-colored span: {ranges:?}"
+        );
+    }
+
     /// The whole point of `crates/cli/src/grammars/meshfox.tmLanguage.json`
     /// existing at all: a real `<!-- meshfox:... -->` marker comment, run
     /// through the actual production `build_syntax_set` + `with_meshfox_

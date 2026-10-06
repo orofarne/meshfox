@@ -35,7 +35,33 @@ fn meshfox() -> Command {
     // Doesn't need to actually exist — `config::global_config_path`'s own
     // read is already a graceful "no global config" on a missing file.
     cmd.env("HOME", unique_path());
+    cmd.env("MESHFOX_SERVER_SOCKET", "");
     cmd
+}
+
+#[test]
+fn local_variables_warn_without_failing_and_signatures_are_checked() {
+    let path = unique_path();
+    let prefix = "# Root\n<!-- meshfox:node id=\"root\" -->\n## Child\n<!-- meshfox:node id=\"child\" -->\n<!-- meshfox:var name=\"LOCAL\" default=\"old\" -->\n";
+    std::fs::write(&path, format!("{prefix}<!-- meshfox:arg name=\"lang\" type=\"select\" choices=\"en,hy\" -->\n```bash name=\"extract\"\necho ok\n```\n")).unwrap();
+    let output = meshfox().arg("validate").arg(&path).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("warning[deprecated-node-scoped-var]"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("LOCAL"), "{stderr}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("ok"));
+    std::fs::write(&path, format!("{prefix}<!-- meshfox:arg name=\"lang\" -->\nprose\n```bash name=\"extract\"\necho ok\n```\n")).unwrap();
+    let output = meshfox().arg("validate").arg(&path).output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("immediately precede"));
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]

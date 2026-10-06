@@ -1803,6 +1803,7 @@ fn configure(canvas_path: &Path) {
 /// what "valid" means.
 fn validate_canvas(raw: &str, canvas_path: &Path) -> Result<usize, String> {
     let canvas = Canvas::from_markdown(raw).map_err(|e| e.to_string())?;
+    meshfox_core::args::validate(&canvas).map_err(|e| e.to_string())?;
     // Resolving includes here is the only way to catch a broken link, a
     // cycle, or a target that doesn't itself parse before `meshfox view`
     // does — this file's own structure is already known good at this
@@ -1843,11 +1844,22 @@ fn validate_canvas(raw: &str, canvas_path: &Path) -> Result<usize, String> {
 fn validate(canvas_path: &Path) {
     let raw = read_raw_or_exit(canvas_path);
     match validate_canvas(&raw, canvas_path) {
-        Ok(n) => println!(
-            "meshfox validate: {} ok ({n} node{})",
-            canvas_path.display(),
-            if n == 1 { "" } else { "s" }
-        ),
+        Ok(n) => {
+            let canvas = Canvas::from_markdown(&raw).expect("validated canvas");
+            for warning in
+                meshfox_core::diagnostics::warnings(&canvas).expect("validated variables")
+            {
+                eprintln!(
+                    "warning[{}] node {}: {}",
+                    warning.code, warning.node_id, warning.message
+                );
+            }
+            println!(
+                "meshfox validate: {} ok ({n} node{})",
+                canvas_path.display(),
+                if n == 1 { "" } else { "s" }
+            );
+        }
         Err(e) => {
             eprintln!("meshfox validate: {}: {e}", canvas_path.display());
             std::process::exit(1);
@@ -2298,7 +2310,7 @@ async fn run_async(
 ) {
     let block_arg = args.pop().expect("clap requires at least one arg");
     let path: Vec<&str> = args.iter().map(String::as_str).collect();
-    let block_names: Vec<&str> = block_arg.split(',').map(str::trim).collect();
+    let block_names = meshfox_core::args::split_list(&block_arg);
 
     let port = coordinator::get_or_spawn(canvas_path)
         .await
@@ -2437,10 +2449,13 @@ fn chain_contains_tty(
             let Some(node) = canvas.node(&addr.node_id) else {
                 continue;
             };
-            let blocks = meshfox_core::scan_runnable_blocks(&addr.node_id, &node.text);
-            if blocks
-                .iter()
-                .any(|b| b.name.as_deref() == Some(addr.block_name.as_str()) && b.tty)
+            if meshfox_core::args::bind_block(
+                &addr.node_id,
+                &node.text,
+                &addr.block_name,
+                &HashMap::new(),
+            )
+            .is_ok_and(|b| b.tty)
             {
                 return true;
             }
@@ -2502,8 +2517,16 @@ async fn run_via_worker(
         // once a worker exists, exactly as it already does with no worker
         // at all — this is what `include_edit_tests`' sibling suite,
         // `crates/cli/tests/run_cmd.rs`, actually caught missing here.
-        let vars = match preflight_worker_vars(port, &path, name, no_deps, &mut overrides).await {
-            Ok(vars) => vars,
+        let prepared = async {
+            let (canonical_path, canonical) = preflight_worker_arguments(port, &path, name).await?;
+            let vars =
+                preflight_worker_vars(port, &canonical_path, &canonical, no_deps, &mut overrides)
+                    .await?;
+            Ok::<_, String>((canonical_path, canonical, vars))
+        }
+        .await;
+        let (path, canonical, vars) = match prepared {
+            Ok(result) => result,
             Err(chain_err) => {
                 match resolve_worker_file_node(port, canvas_path, &path, name).await {
                     Some(node_id) => {
@@ -2549,6 +2572,8 @@ async fn run_via_worker(
                 }
             }
         };
+
+        let name = canonical.as_str();
 
         // A `tty` step needs the real pty-relay socket (`/api/run/tty`),
         // never the plain `RunEvent`-only stream `run_stream_persisted`
@@ -3173,6 +3198,43 @@ async fn retry_after_lock_conflict(
 /// file `crate::VarCache` also reads), so a later requested block name in
 /// this same invocation just sees it there already, and there's nothing
 /// separate for this function to persist on its own.
+async fn preflight_worker_arguments(
+    port: u16,
+    path: &[String],
+    name: &str,
+) -> Result<(Vec<String>, String), String> {
+    let prepared = worker_client::prepare_arguments(port, path, name, &Default::default()).await?;
+    let prompt_all = !name.contains('[') && prompt::stdin_is_tty();
+    let mut answers = std::collections::BTreeMap::new();
+    let mut missing = Vec::new();
+    for field in &prepared.fields {
+        if !prompt_all && field.resolved {
+            continue;
+        }
+        if !prompt::stdin_is_tty() {
+            missing.push(field.name.clone());
+            continue;
+        }
+        let decl = var_decl_from_status(field);
+        let answer = prompt::ask(&decl, field.value.as_deref()).map_err(|e| e.to_string())?;
+        answers.insert(field.name.clone(), answer);
+    }
+    if !missing.is_empty() {
+        return Err(format!("missing required argument(s): {} — use a named application such as {name}[NAME=VALUE], or run interactively", missing.join(", ")));
+    }
+    if answers.is_empty() {
+        return prepared
+            .block
+            .map(|block| (prepared.path, block))
+            .ok_or_else(|| "missing required arguments".into());
+    }
+    let prepared = worker_client::prepare_arguments(port, path, name, &answers).await?;
+    prepared
+        .block
+        .map(|block| (prepared.path, block))
+        .ok_or_else(|| "missing required arguments".into())
+}
+
 async fn preflight_worker_vars(
     port: u16,
     path: &[String],

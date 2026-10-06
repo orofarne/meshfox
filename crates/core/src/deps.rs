@@ -46,6 +46,10 @@ impl BlockAddr {
 
 #[derive(Debug, Error, PartialEq)]
 pub enum DepsError {
+    #[error("application graph exceeds its limit ({0})")]
+    ExpansionLimit(&'static str),
+    #[error("block arguments: {0}")]
+    Arguments(String),
     #[error("artifact dependency: {0}")]
     Artifacts(String),
     #[error("no runnable block named {1:?} in node {0:?}")]
@@ -142,14 +146,141 @@ pub fn resolve_from_chain(canvas: &Canvas, target: BlockAddr) -> Result<Vec<Bloc
 
 /// Fetches the `CodeBlock` `addr` addresses, owned — used by `visit` for
 /// the node currently being expanded.
-fn find_block(canvas: &Canvas, addr: &BlockAddr) -> Result<crate::fence::CodeBlock, DepsError> {
+pub fn find_block(canvas: &Canvas, addr: &BlockAddr) -> Result<crate::fence::CodeBlock, DepsError> {
+    find_block_with_values(canvas, addr, &canvas.artifact_values)
+}
+
+fn find_block_with_values(
+    canvas: &Canvas,
+    addr: &BlockAddr,
+    values: &HashMap<String, String>,
+) -> Result<crate::fence::CodeBlock, DepsError> {
     let node = canvas
         .node(&addr.node_id)
         .ok_or_else(|| DepsError::BlockNotFound(addr.node_id.clone(), addr.block_name.clone()))?;
-    scan_runnable_blocks(&addr.node_id, &node.text)
+    let app = crate::args::Application::parse(&addr.block_name).map_err(DepsError::Arguments)?;
+    if !scan_runnable_blocks(&addr.node_id, &node.text)
+        .iter()
+        .any(|b| b.name.as_deref() == Some(app.definition.as_str()))
+    {
+        return Err(DepsError::BlockNotFound(
+            addr.node_id.clone(),
+            addr.block_name.clone(),
+        ));
+    }
+    let block = crate::args::bind_block(&addr.node_id, &node.text, &addr.block_name, values)
+        .map_err(DepsError::Arguments)?;
+    crate::vars::validate_selected_env(canvas, &addr.node_id, &block)?;
+    Ok(block)
+}
+
+const MAX_APPLICATION_DEPTH: usize = 128;
+const MAX_APPLICATIONS: usize = 4096;
+
+fn check_expansion(depth: usize, applications: usize) -> Result<(), DepsError> {
+    if depth >= MAX_APPLICATION_DEPTH {
+        return Err(DepsError::ExpansionLimit("128 nested applications"));
+    }
+    if applications >= MAX_APPLICATIONS {
+        return Err(DepsError::ExpansionLimit("4096 applications"));
+    }
+    Ok(())
+}
+
+/// Resolve one edge in the caller's lexical scope. A computed global whose
+/// source has not been observed leaves the edge pending; the runner replans
+/// after that source completes. All other missing references remain errors.
+fn application_ref(
+    canvas: &Canvas,
+    node_id: &str,
+    owner: &crate::fence::CodeBlock,
+    dep: &BlockRef,
+    values: &HashMap<String, String>,
+    decls: &[VarDecl],
+) -> Result<Option<BlockAddr>, DepsError> {
+    let addr = resolve_ref(node_id, dep);
+    let app = crate::args::Application::parse(&addr.block_name).map_err(DepsError::Arguments)?;
+    let mut scope = canvas.artifact_values.clone();
+    scope.extend(values.clone());
+    scope.extend(owner.arguments.iter().map(|(k, v)| (k.clone(), v.clone())));
+    if app.bindings.values().any(|binding| match binding {
+        crate::args::Binding::Reference(name) => {
+            !scope.contains_key(name)
+                && decls
+                    .iter()
+                    .any(|decl| decl.name == *name && decl.from.is_some())
+        }
+        _ => false,
+    }) {
+        // Schema validation still catches unknown/missing arguments and bad literals.
+        validate_application_ref(canvas, node_id, owner, dep, decls)?;
+        return Ok(None);
+    }
+    let bound = find_block_with_values(canvas, &addr, &scope)?;
+    Ok(Some(BlockAddr::new(addr.node_id, bound.name.unwrap())))
+}
+
+/// Validate a function's edge without inventing values for its mandatory args.
+fn validate_application_ref(
+    canvas: &Canvas,
+    node_id: &str,
+    owner: &crate::fence::CodeBlock,
+    dep: &BlockRef,
+    decls: &[VarDecl],
+) -> Result<crate::fence::CodeBlock, DepsError> {
+    let addr = resolve_ref(node_id, dep);
+    let app = crate::args::Application::parse(&addr.block_name).map_err(DepsError::Arguments)?;
+    let node = canvas
+        .node(&addr.node_id)
+        .ok_or_else(|| DepsError::BlockNotFound(addr.node_id.clone(), app.definition.clone()))?;
+    let block = scan_runnable_blocks(&node.id, &node.text)
         .into_iter()
-        .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()))
-        .ok_or_else(|| DepsError::BlockNotFound(addr.node_id.clone(), addr.block_name.clone()))
+        .find(|block| block.name.as_deref() == Some(&app.definition))
+        .ok_or_else(|| DepsError::BlockNotFound(addr.node_id.clone(), app.definition.clone()))?;
+    let signatures = crate::args::scan_signatures(&node.id, &node.text)
+        .map_err(|e| DepsError::Arguments(e.to_string()))?;
+    let args = signatures
+        .iter()
+        .find(|sig| sig.block.span == block.span)
+        .map(|sig| sig.args.as_slice())
+        .unwrap_or_default();
+    let owner_node = canvas.node(node_id).unwrap();
+    let local: HashSet<_> = crate::args::scan_signatures(node_id, &owner_node.text)
+        .map_err(|e| DepsError::Arguments(e.to_string()))?
+        .into_iter()
+        .filter(|sig| sig.block.span == owner.span)
+        .flat_map(|sig| sig.args.into_iter().map(|arg| arg.name))
+        .collect();
+    for (name, binding) in &app.bindings {
+        let arg = args.iter().find(|arg| arg.name == *name).ok_or_else(|| {
+            DepsError::Arguments(format!(
+                "unknown argument {name:?} for {:?}",
+                app.definition
+            ))
+        })?;
+        match binding {
+            crate::args::Binding::Literal(value) => {
+                crate::args::canonical_value(arg, value).map_err(DepsError::Arguments)?;
+            }
+            crate::args::Binding::Reference(name) => {
+                if !local.contains(name) && !decls.iter().any(|decl| decl.name == *name) {
+                    return Err(DepsError::Arguments(format!(
+                        "unknown argument reference ${name} in {node_id}/{}",
+                        owner.name.as_deref().unwrap_or("")
+                    )));
+                }
+            }
+        }
+    }
+    for arg in args {
+        if arg.is_required() && !app.bindings.contains_key(&arg.name) {
+            return Err(DepsError::Arguments(format!(
+                "missing required argument {:?} for {:?}",
+                arg.name, app.definition
+            )));
+        }
+    }
+    Ok(block)
 }
 
 /// Implicit `from=` dependency addresses `block` (living in node `node_id`)
@@ -176,22 +307,29 @@ fn implicit_from_deps(
         .map(crate::exec::interpreter_var_refs)
         .unwrap_or_default();
     let artifact_names = crate::artifacts::var_refs(block);
+    let dependency_names = crate::args::dependency_refs(block);
     let env_names = block
         .env
         .iter()
         .map(|e| e.var_name.as_str())
         .chain(interpreter_names.iter().map(String::as_str))
-        .chain(artifact_names.iter().map(String::as_str));
-    crate::vars::close_over_var_refs(decls, env_names)
-        .into_iter()
-        .filter_map(|name| {
-            decls
-                .iter()
-                .find(|d| d.name == name)
-                .and_then(|d| d.from.as_ref())
-                .map(|from| resolve_ref(node_id, from))
-        })
-        .collect()
+        .chain(artifact_names.iter().map(String::as_str))
+        .chain(dependency_names.iter().map(String::as_str));
+    let selected = crate::args::selected_env_var_names(block);
+    crate::vars::close_over_var_refs(
+        decls,
+        env_names.filter(|name| !block.arguments.contains_key(*name))
+            .chain(selected.iter().map(String::as_str)),
+    )
+    .into_iter()
+    .filter_map(|name| {
+        decls
+            .iter()
+            .find(|d| d.name == name)
+            .and_then(|d| d.from.as_ref())
+            .map(|from| resolve_ref(node_id, from))
+    })
+    .collect()
 }
 
 /// `follow_deps` gates whether `block.deps` (`deps=`) edges are walked;
@@ -207,6 +345,8 @@ fn visit(
     visited: &mut std::collections::HashSet<String>,
     stack: &mut Vec<BlockAddr>,
 ) -> Result<(), DepsError> {
+    let block = find_block(canvas, &addr)?;
+    let addr = BlockAddr::new(&addr.node_id, block.name.as_deref().unwrap());
     let key = addr.key();
     if visited.contains(&key) {
         return Ok(());
@@ -217,8 +357,7 @@ fn visit(
         return Err(DepsError::Cycle(cycle));
     }
 
-    let block = find_block(canvas, &addr)?;
-
+    check_expansion(stack.len(), visited.len() + stack.len())?;
     stack.push(addr.clone());
 
     // Observe computed values before action dependencies, especially `!`
@@ -226,7 +365,18 @@ fn visit(
     let mut dep_addrs = implicit_from_deps(&addr.node_id, &block, decls);
     dep_addrs.extend(crate::artifacts::producer_deps(canvas, &addr, &block)?);
     if follow_deps {
-        dep_addrs.extend(block.deps.iter().map(|d| resolve_ref(&addr.node_id, d)));
+        for dep in &block.deps {
+            if let Some(dep) = application_ref(
+                canvas,
+                &addr.node_id,
+                &block,
+                dep,
+                &canvas.artifact_values,
+                decls,
+            )? {
+                dep_addrs.push(dep);
+            }
+        }
     }
 
     for dep_addr in dep_addrs {
@@ -272,20 +422,24 @@ pub fn compute_forced_reruns_after(
     let target = chain.last();
     let mut forced: HashSet<BlockAddr> = HashSet::new();
     let mut sim_computed: HashMap<String, String> = HashMap::new();
+    let mut resolved_edges: HashMap<BlockAddr, Vec<(BlockAddr, bool)>> = HashMap::new();
 
     for addr in chain {
         let block = find_block(canvas, addr)?;
-        let cascaded = block
-            .deps
-            .iter()
-            .map(|dep| resolve_ref(&addr.node_id, dep))
-            .any(|dep| forced.contains(&dep));
-        let live_fingerprint = closure_fingerprint_with(
-            canvas,
-            &decls,
-            addr,
-            &fingerprint_vars(&block, &sim_computed),
-        )?;
+        let mut values = canvas.artifact_values.clone();
+        values.extend(fingerprint_vars(&block, &sim_computed));
+        let mut cascaded = false;
+        let mut edges = Vec::new();
+        for dep in &block.deps {
+            if let Some(resolved) =
+                application_ref(canvas, &addr.node_id, &block, dep, &values, &decls)?
+            {
+                cascaded |= forced.contains(&resolved);
+                edges.push((resolved, dep.sync));
+            }
+        }
+        resolved_edges.insert(addr.clone(), edges);
+        let live_fingerprint = closure_fingerprint_with(canvas, &decls, addr, &values)?;
         let cached = cached_run(addr);
         let run_for_real = executed.contains(addr)
             || Some(addr) == target
@@ -312,10 +466,9 @@ pub fn compute_forced_reruns_after(
         if !forced.contains(addr) {
             continue;
         }
-        let block = find_block(canvas, addr)?;
-        for dep in &block.deps {
-            if dep.sync {
-                forced.insert(resolve_ref(&addr.node_id, dep));
+        for (dep, sync) in &resolved_edges[addr] {
+            if *sync {
+                forced.insert(dep.clone());
             }
         }
     }
@@ -373,6 +526,11 @@ pub fn closure_fingerprint_with(
         memo: &mut HashMap<String, String>,
         stack: &mut Vec<BlockAddr>,
     ) -> Result<String, DepsError> {
+        let mut scope = canvas.artifact_values.clone();
+        scope.extend(values.clone());
+        let block = find_block_with_values(canvas, addr, &scope)?;
+        let canonical = BlockAddr::new(&addr.node_id, block.name.as_deref().unwrap());
+        let addr = &canonical;
         let key = addr.key();
         if let Some(done) = memo.get(&key) {
             return Ok(done.clone());
@@ -382,8 +540,13 @@ pub fn closure_fingerprint_with(
             cycle.push(addr.clone());
             return Err(DepsError::Cycle(cycle));
         }
-        let block = find_block(canvas, addr)?;
-        let mut deps: Vec<_> = block.deps.iter().map(|dep| resolve_ref(&addr.node_id, dep)).collect();
+        check_expansion(stack.len(), memo.len() + stack.len())?;
+        let mut deps = Vec::new();
+        for dep in &block.deps {
+            if let Some(dep) = application_ref(canvas, &addr.node_id, &block, dep, values, decls)? {
+                deps.push(dep);
+            }
+        }
         deps.sort_by_key(BlockAddr::key);
         deps.dedup();
         stack.push(addr.clone());
@@ -433,6 +596,7 @@ pub fn closure_fingerprint_with(
 /// check`.
 pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
     crate::artifacts::validate(canvas)?;
+    let decls = crate::vars::declared_vars(canvas)?;
     for node in &canvas.nodes {
         let blocks = scan_runnable_blocks(&node.id, &node.text);
         if let Err(names) = crate::fence::default_block(&node.id, &blocks) {
@@ -542,7 +706,7 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
             }
             for dep in &block.deps {
                 let dep_addr = resolve_ref(&node.id, dep);
-                let dep_block = find_block(canvas, &dep_addr)?;
+                let dep_block = validate_application_ref(canvas, &node.id, block, dep, &decls)?;
                 if crate::exec::is_form(&dep_block.lang) {
                     return Err(DepsError::FormCannotBeDepsTarget(
                         node.id.clone(),
@@ -551,7 +715,23 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
                     ));
                 }
             }
-            resolve_chain(canvas, BlockAddr::new(node.id.clone(), name.clone()))?;
+            // Parameterized definitions are not applications; mandatory arguments
+            // are checked when a concrete application is requested.
+            let has_unbound_refs = block.deps.iter().any(|dep| {
+                crate::args::Application::parse(&dep.block_name).is_ok_and(|app| {
+                    app.bindings.values().any(|binding| matches!(binding, crate::args::Binding::Reference(name) if !canvas.artifact_values.contains_key(name)))
+                })
+            });
+            if !has_unbound_refs
+                && !crate::args::scan_signatures(&node.id, &node.text)
+                    .map_err(|e| DepsError::Arguments(e.to_string()))?
+                    .iter()
+                    .any(|sig| {
+                        sig.block.span == block.span && sig.args.iter().any(|arg| arg.is_required())
+                    })
+            {
+                resolve_chain(canvas, BlockAddr::new(node.id.clone(), name.clone()))?;
+            }
         }
     }
     Ok(())
@@ -1487,5 +1667,239 @@ mod tests {
             "```form name=\"pick\"\nnot a field line\n```\n",
         ));
         assert!(matches!(validate(&c).unwrap_err(), DepsError::Form(_)));
+    }
+}
+
+#[cfg(test)]
+mod application_graph_tests {
+    use super::*;
+
+    fn doc(extra: &str) -> Canvas {
+        Canvas::from_markdown(&format!(
+            r#"# Root
+<!-- meshfox:node id="root" -->
+<!-- meshfox:arg name="lang" type="select" choices="en,hy" -->
+<!-- meshfox:arg name="n" type="int" default="1" -->
+```bash name="download"
+echo download
+```
+<!-- meshfox:arg name="lang" type="select" choices="en,hy" -->
+```bash name="extract" deps="download[n=01,lang=$lang]"
+echo extract
+```
+{extra}
+"#
+        ))
+        .unwrap()
+    }
+
+    fn names(chain: &[BlockAddr]) -> Vec<&str> {
+        chain.iter().map(|addr| addr.block_name.as_str()).collect()
+    }
+
+    #[test]
+    fn named_edges_forward_locals_and_share_canonical_applications() {
+        let canvas = doc(
+            r#"```bash name="merge" deps="extract[lang=en],extract[lang=hy],download[lang=en,n=1]"
+echo merge
+```"#,
+        );
+        validate(&canvas).unwrap();
+        let chain = resolve_chain(&canvas, BlockAddr::new("root", "merge")).unwrap();
+        assert_eq!(
+            names(&chain),
+            [
+                "download[lang=en,n=1]",
+                "extract[lang=en]",
+                "download[lang=hy,n=1]",
+                "extract[lang=hy]",
+                "merge"
+            ]
+        );
+        let no_deps =
+            resolve_from_chain(&canvas, BlockAddr::new("root", "extract[lang=en]")).unwrap();
+        assert_eq!(names(&no_deps), ["extract[lang=en]"]);
+    }
+
+    #[test]
+    fn closure_fingerprint_tracks_forwarded_arguments_and_child_code() {
+        let forwarded = doc("");
+        let mut literal = forwarded.clone();
+        literal
+            .nodes
+            .iter_mut()
+            .find(|n| n.id == "root")
+            .unwrap()
+            .text = literal
+            .node("root")
+            .unwrap()
+            .text
+            .replace("lang=$lang", "lang=hy");
+        let target = BlockAddr::new("root", "extract[lang=hy]");
+        // Own metadata differs, but the forwarded child's code participates.
+        let before = closure_fingerprint(&forwarded, &target, &HashMap::new()).unwrap();
+        assert_ne!(
+            before,
+            closure_fingerprint(&literal, &target, &HashMap::new()).unwrap()
+        );
+        let node = literal.nodes.iter_mut().find(|n| n.id == "root").unwrap();
+        node.text = node.text.replace("echo download", "echo changed");
+        assert_ne!(
+            before,
+            closure_fingerprint(&literal, &target, &HashMap::new()).unwrap()
+        );
+        assert_ne!(
+            before,
+            closure_fingerprint(
+                &forwarded,
+                &BlockAddr::new("root", "extract[lang=en]"),
+                &HashMap::new()
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn validation_checks_uninstantiated_functions_without_placeholder_values() {
+        for dep in [
+            "download[lang=$TYPO]",
+            "download[lang=fr]",
+            "download",
+            "download[lang=$lang,n=no]",
+            "download[lang=$lang,wrong=1]",
+        ] {
+            let mut canvas = doc("");
+            let node = canvas.nodes.iter_mut().find(|n| n.id == "root").unwrap();
+            node.text = node.text.replace("download[n=01,lang=$lang]", dep);
+            assert!(validate(&canvas).is_err(), "accepted {dep}");
+        }
+    }
+
+    #[test]
+    fn cycle_detection_uses_canonical_applications() {
+        let canvas = Canvas::from_markdown(
+            r#"# Root
+<!-- meshfox:node id="root" -->
+<!-- meshfox:arg name="n" type="int" -->
+```bash name="x" deps="y[n=$n]"
+echo x
+```
+<!-- meshfox:arg name="n" type="int" -->
+```bash name="y" deps="x[n=01]"
+echo y
+```
+"#,
+        )
+        .unwrap();
+        let error = resolve_chain(&canvas, BlockAddr::new("root", "x[n=1]")).unwrap_err();
+        assert_eq!(
+            error,
+            DepsError::Cycle(vec![
+                BlockAddr::new("root", "x[n=1]"),
+                BlockAddr::new("root", "y[n=1]"),
+                BlockAddr::new("root", "x[n=1]")
+            ])
+        );
+        assert!(matches!(
+            closure_fingerprint(&canvas, &BlockAddr::new("root", "x[n=1]"), &HashMap::new()),
+            Err(DepsError::Cycle(_))
+        ));
+    }
+
+    #[test]
+    fn sync_and_execution_cascade_follow_the_resolved_application() {
+        let canvas = doc(r#"```bash name="target" deps="extract[lang=hy]!"
+echo target
+```"#);
+        let chain = resolve_chain(&canvas, BlockAddr::new("root", "target")).unwrap();
+        let cached: HashMap<_, _> = chain
+            .iter()
+            .map(|addr| {
+                (
+                    addr.clone(),
+                    closure_fingerprint(&canvas, addr, &HashMap::new()).unwrap(),
+                )
+            })
+            .collect();
+        let cache = |addr: &BlockAddr| cached.get(addr).map(|fp| (fp.clone(), HashMap::new()));
+        let forced = compute_forced_reruns(&canvas, &chain, |_, _| HashMap::new(), cache).unwrap();
+        assert!(forced.contains(&BlockAddr::new("root", "extract[lang=hy]")));
+        assert!(!forced.contains(&BlockAddr::new("root", "download[lang=hy,n=1]")));
+        let executed = HashSet::from([BlockAddr::new("root", "download[lang=hy,n=1]")]);
+        let forced =
+            compute_forced_reruns_after(&canvas, &chain, |_, _| HashMap::new(), cache, &executed)
+                .unwrap();
+        assert!(forced.contains(&BlockAddr::new("root", "extract[lang=hy]")));
+    }
+
+    #[test]
+    fn computed_bindings_observe_the_source_before_expanding_the_edge() {
+        let mut canvas = doc(r#"<!-- meshfox:var name="LANG" from="observe" -->
+```bash name="observe"
+echo LANG=hy > "$MESHFOX_VARS_OUT"
+```
+```bash name="target" deps="extract[lang=$LANG]"
+echo target
+```"#);
+        validate(&canvas).unwrap();
+        let target = BlockAddr::new("root", "target");
+        assert_eq!(
+            names(&resolve_chain(&canvas, target.clone()).unwrap()),
+            ["observe", "target"]
+        );
+        let needed = crate::run_chain_var_names(&canvas, &target).unwrap();
+        assert!(needed.contains("LANG"));
+        canvas.artifact_values.insert("LANG".into(), "hy".into());
+        assert_eq!(
+            names(&resolve_chain(&canvas, target.clone()).unwrap()),
+            [
+                "observe",
+                "download[lang=hy,n=1]",
+                "extract[lang=hy]",
+                "target"
+            ]
+        );
+        // Fingerprinting accepts the actual observed values even with an unseeded canvas.
+        canvas.artifact_values.clear();
+        let hy = closure_fingerprint(
+            &canvas,
+            &target,
+            &HashMap::from([("LANG".into(), "hy".into())]),
+        )
+        .unwrap();
+        let en = closure_fingerprint(
+            &canvas,
+            &target,
+            &HashMap::from([("LANG".into(), "en".into())]),
+        )
+        .unwrap();
+        assert_ne!(hy, en);
+    }
+
+    #[test]
+    fn expansion_limits_return_errors_instead_of_overflowing_the_stack() {
+        let mut md = String::from("# Root\n<!-- meshfox:node id=\"root\" -->\n");
+        for n in 0..=MAX_APPLICATION_DEPTH {
+            let dep = if n < MAX_APPLICATION_DEPTH {
+                format!(" deps=\"n{}/x\"", n + 1)
+            } else {
+                String::new()
+            };
+            md.push_str(&format!("## Node {n}\n<!-- meshfox:node id=\"n{n}\" -->\n```bash name=\"x\"{dep}\necho x\n```\n"));
+        }
+        let canvas = Canvas::from_markdown(&md).unwrap();
+        let target = BlockAddr::new("n0", "x");
+        assert!(matches!(
+            resolve_chain(&canvas, target.clone()),
+            Err(DepsError::ExpansionLimit(_))
+        ));
+        assert!(matches!(
+            closure_fingerprint(&canvas, &target, &HashMap::new()),
+            Err(DepsError::ExpansionLimit(_))
+        ));
+        assert!(matches!(
+            check_expansion(0, MAX_APPLICATIONS),
+            Err(DepsError::ExpansionLimit(_))
+        ));
     }
 }

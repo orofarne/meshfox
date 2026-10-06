@@ -81,6 +81,7 @@ const MIN_OUTPUT_HEIGHT: u16 = 3;
 /// whatever a run still needs) or by `trigger_configure` (every declared
 /// non-secret variable in the document).
 pub struct VarFormState {
+    pub arguments: bool,
     pub decls: Vec<VarDecl>,
     /// Parallel to `decls` — one editable buffer per field, pre-filled
     /// with `current_value` (so submitting untouched just confirms the
@@ -118,6 +119,7 @@ pub struct VarFormState {
 /// of `advance_run` (the local-mode resume path `configuring: false`
 /// already takes).
 pub struct PendingHttpRun {
+    pub arguments: bool,
     pub node_id: String,
     pub block_name: String,
     pub with_deps: bool,
@@ -949,6 +951,7 @@ fn var_form_from_statuses(missing: Vec<crate::worker_client::VarStatus>) -> VarF
         decls.push(var_decl_from_status(status));
     }
     VarFormState {
+        arguments: false,
         save: vec![false; decls.len()],
         decls,
         inputs,
@@ -958,6 +961,21 @@ fn var_form_from_statuses(missing: Vec<crate::worker_client::VarStatus>) -> VarF
         selected: 0,
         configuring: false,
     }
+}
+
+fn argument_form_from_statuses(mut fields: Vec<crate::worker_client::VarStatus>) -> VarFormState {
+    for field in &mut fields {
+        if field.value.is_none() {
+            field.value = match field.var_type.as_str() {
+                "bool" => Some("false".into()),
+                "select" => field.choices.first().cloned(),
+                _ => None,
+            };
+        }
+    }
+    let mut form = var_form_from_statuses(fields);
+    form.arguments = true;
+    form
 }
 
 #[cfg(test)]
@@ -3210,16 +3228,12 @@ impl App {
         let Ok(chain) = chain_result else { return None };
         let mut autoclose = None;
         for addr in &chain {
-            let Some(block) = self
-                .display_canvas
-                .node(&addr.node_id)
-                .map(|node| meshfox_core::scan_runnable_blocks(&addr.node_id, &node.text))
-                .unwrap_or_default()
-                .into_iter()
-                .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()) && b.tty)
-            else {
+            let Ok(block) = meshfox_core::deps::find_block(&self.display_canvas, addr) else {
                 continue;
             };
+            if !block.tty {
+                continue;
+            }
             autoclose = Some(block.autoclose);
         }
         autoclose
@@ -3270,7 +3284,49 @@ impl App {
         force: Option<(String, String)>,
         extra_vars: HashMap<String, String>,
     ) {
-        let path = self.path_to(&node_id);
+        let mut node_id = node_id;
+        let mut block_name = block_name;
+        let mut path = self.path_to(&node_id);
+        if force.is_none() {
+            match crate::worker_client::prepare_arguments(
+                port,
+                &path,
+                &block_name,
+                &Default::default(),
+            )
+            .await
+            {
+                Ok(prepared) => {
+                    node_id = prepared.node_id;
+                    path = prepared.path;
+                    if !block_name.contains('[') {
+                        block_name = prepared.definition;
+                    }
+                    if !prepared.fields.is_empty()
+                        && (!block_name.contains('[') || prepared.block.is_none())
+                    {
+                        self.pending_http_run = Some(PendingHttpRun {
+                            arguments: true,
+                            node_id,
+                            block_name,
+                            with_deps,
+                            port,
+                            force,
+                            is_tty: false,
+                        });
+                        self.var_form = Some(argument_form_from_statuses(prepared.fields));
+                        return;
+                    }
+                    if let Some(name) = prepared.block {
+                        block_name = name;
+                    }
+                }
+                Err(e) => {
+                    self.status = format!("meshfox: failed to check arguments: {e}");
+                    return;
+                }
+            }
+        }
         let is_tty = self
             .target_chain_tty_autoclose(&node_id, &block_name, with_deps)
             .is_some();
@@ -3280,6 +3336,7 @@ impl App {
                     let missing: Vec<_> = statuses.into_iter().filter(|v| !v.resolved).collect();
                     if !missing.is_empty() {
                         self.pending_http_run = Some(PendingHttpRun {
+                            arguments: false,
                             node_id,
                             block_name,
                             with_deps,
@@ -5050,6 +5107,37 @@ impl App {
                 .zip(vf.inputs.iter())
                 .map(|(d, v)| (d.name.clone(), v.clone()))
                 .collect();
+            if pending.arguments {
+                let answers = vars.into_iter().collect();
+                match crate::worker_client::prepare_arguments(
+                    pending.port,
+                    &self.path_to(&pending.node_id),
+                    &pending.block_name,
+                    &answers,
+                )
+                .await
+                {
+                    Ok(prepared) => {
+                        if let Some(block) = prepared.block {
+                            self.start_run_via_worker(
+                                prepared.node_id,
+                                block,
+                                pending.with_deps,
+                                pending.port,
+                                pending.force,
+                                HashMap::new(),
+                            )
+                            .await;
+                        }
+                    }
+                    Err(e) => {
+                        self.status = format!("meshfox: invalid arguments: {e}");
+                        self.var_form = Some(vf);
+                        self.pending_http_run = Some(pending);
+                    }
+                }
+                return;
+            }
             let save_secrets: std::collections::HashSet<String> = vf
                 .decls
                 .iter()
@@ -5172,6 +5260,7 @@ impl App {
             .map(|d| initial_field_input(d, &self.var_cache, &shared))
             .unzip();
         self.var_form = Some(VarFormState {
+            arguments: false,
             save: vec![false; decls.len()],
             errors: vec![None; decls.len()],
             secret_store: self.var_cache.secret_store_kind().as_str().to_string(),
@@ -6009,6 +6098,39 @@ mod tests {
             duration_ms: Some(120),
             stale,
         }
+    }
+
+    #[test]
+    fn argument_form_offers_valid_bool_and_select_values_without_persisting_them() {
+        let fields = serde_json::from_value(serde_json::json!([
+            {"name":"flag", "type":"bool", "prompt":"flag", "resolved":false},
+            {"name":"lang", "type":"select", "prompt":"lang", "choices":["en", "hy"], "resolved":false},
+        ])).unwrap();
+        let form = argument_form_from_statuses(fields);
+        assert!(form.arguments);
+        assert_eq!(form.inputs, ["false", "en"]);
+        assert!(form.save.iter().all(|save| !save));
+    }
+
+    #[tokio::test]
+    async fn parameterized_tty_targets_and_forwarded_dependencies_select_the_terminal() {
+        let app = app_with_blocks(
+            "arg-tty",
+            concat!(
+                "<!-- meshfox:arg name=\"lang\" type=\"select\" choices=\"en,hy\" -->\n",
+                "```bash name=\"extract\" tty autoclose\necho ok\n```\n",
+                "```button name=\"launch\" deps=\"extract[lang=hy]\"\nRun\n```\n",
+            ),
+        )
+        .await;
+        assert_eq!(
+            app.target_chain_tty_autoclose("root", "extract[lang=hy]", true),
+            Some(true)
+        );
+        assert_eq!(
+            app.target_chain_tty_autoclose("root", "launch", true),
+            Some(true)
+        );
     }
 
     async fn app_with_blocks(name: &str, node_body: &str) -> App {

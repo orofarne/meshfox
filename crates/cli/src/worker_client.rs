@@ -1185,6 +1185,7 @@ pub struct VarStatus {
     pub prompt: String,
     #[serde(default)]
     pub choices: Vec<String>,
+    #[serde(default)]
     pub secret: bool,
     pub resolved: bool,
     #[serde(default)]
@@ -1205,6 +1206,35 @@ pub struct VarStatus {
 pub enum VarOrigin {
     Project,
     Global { path: Option<String> },
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArgumentPreparation {
+    pub definition: String,
+    pub path: Vec<String>,
+    pub node_id: String,
+    pub fields: Vec<VarStatus>,
+    pub block: Option<String>,
+}
+
+pub async fn prepare_arguments(
+    port: u16,
+    path: &[String],
+    block: &str,
+    args: &std::collections::BTreeMap<String, String>,
+) -> Result<ArgumentPreparation, String> {
+    let response = client()
+        .post(format!("{}/api/args", base_url(port)))
+        .timeout(time_limit(QUICK))
+        .json(&serde_json::json!({ "path": path, "block": block, "args": args }))
+        .send()
+        .await
+        .map_err(|e| describe(&e))?;
+    if !response.status().is_success() {
+        return Err(response.text().await.unwrap_or_default());
+    }
+    response.json().await.map_err(|e| e.to_string())
 }
 
 /// `GET /api/vars?path=..&block=..&noDeps=..` — `path` is the node-id path

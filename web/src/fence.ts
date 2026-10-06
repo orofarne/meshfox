@@ -8,12 +8,12 @@
 export function tokenize(s: string): string[] {
   const tokens: string[] = [];
   let cur = "";
-  let inQuotes = false;
+  let quote: string | null = null;
   for (const c of s) {
-    if (c === '"') {
-      inQuotes = !inQuotes;
+    if ((c === '"' || c === "'") && (quote === null || quote === c)) {
+      quote = quote === null ? c : null;
       cur += c;
-    } else if (/\s/.test(c) && !inQuotes) {
+    } else if (/\s/.test(c) && quote === null) {
       if (cur) {
         tokens.push(cur);
         cur = "";
@@ -27,7 +27,7 @@ export function tokenize(s: string): string[] {
 }
 
 function unquote(v: string): string {
-  if (v.length >= 2 && v.startsWith('"') && v.endsWith('"')) {
+  if (v.length >= 2 && (v[0] === '"' || v[0] === "'") && v.endsWith(v[0])) {
     return v.slice(1, -1);
   }
   return v;
@@ -59,11 +59,11 @@ export interface EnvRef {
 function parseEnvRef(s: string): EnvRef {
   const eq = s.indexOf("=");
   if (eq === -1) {
-    const varName = s.trim().replace(/^\$/, "");
+    const varName = s.trim().replace(/^\$(?!\{)/, "");
     return { localName: varName, varName };
   }
   const local = s.slice(0, eq).trim();
-  const value = s.slice(eq + 1).trim().replace(/^\$/, "");
+  const value = s.slice(eq + 1).trim().replace(/^\$(?!\{)/, "");
   return { localName: local, varName: value };
 }
 
@@ -75,6 +75,23 @@ export function parseEnvList(raw: string): EnvRef[] {
     .map((s) => s.trim())
     .filter((s) => s.length > 0)
     .map(parseEnvRef);
+}
+
+/** Preview canonical applications reported by the server; never resolve values. */
+export function selectedEnvNames(template: string, application: string): string | null {
+  const start = application.indexOf("[");
+  if (start < 0) return null;
+  const values: Record<string, string> = {};
+  for (const match of application.slice(start + 1, -1).matchAll(/([A-Za-z_][A-Za-z0-9_]*)=("(?:\\.|[^"\\])*"|[^,\]]+)/g)) {
+    try { values[match[1]] = match[2].startsWith('"') ? JSON.parse(match[2]) : match[2]; }
+    catch { return null; }
+  }
+  let missing = false;
+  const name = template.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_, key: string) => {
+    if (!(key in values)) { missing = true; return ""; }
+    return values[key];
+  });
+  return missing || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) ? null : name;
 }
 
 export interface CachedOutput {
@@ -170,7 +187,35 @@ export interface MarkdownSegment {
   content: string;
 }
 
+export interface BlockArgument {
+  name: string;
+  type: string;
+  choices: string[];
+  required: boolean;
+  default?: string;
+}
+
+// Signatures are adjacent to their fence; prose/other comments stop attachment.
+function precedingArguments(lines: string[], fenceLine: number): BlockArgument[] {
+  const args: BlockArgument[] = [];
+  for (let i = fenceLine - 1; i >= 0; i--) {
+    if (!lines[i].trim()) continue;
+    if (/^(?: {4}|\t)/.test(lines[i])) break;
+    const marker = lines[i].trim().match(/^<!--\s*meshfox:arg\s+(.+?)\s*-->$/);
+    if (!marker) break;
+    const attrs = attrsFromTokens(tokenize(marker[1]));
+    args.unshift({ name: attrs.name, type: attrs.type ?? "string",
+      choices: (attrs.choices ?? "").split(",").map(s => s.trim()).filter(Boolean),
+      required: attrs.required === "true" || attrs.default === undefined,
+      default: attrs.default });
+  }
+  return args;
+}
+
 export interface CodeSegment {
+  args?: BlockArgument[];
+  inputs?: string[];
+  outputs?: string[];
   type: "code";
   lang: string;
   name: string;
@@ -570,7 +615,10 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
       }
     }
 
-    segments.push({ type: "code", lang, name, cache, tty, autoclose, service, deps, envRefs, default: isDefault, autorun, render, fold, outputMarkdown, outputImage, outputAttrs, interpreter, code: codeLines.join("\n"), output });
+    segments.push({ type: "code", args: precedingArguments(lines, i),
+      inputs: (attrs.inputs ?? "").split(",").map(s => s.trim()).filter(Boolean),
+      outputs: (attrs.outputs ?? "").split(",").map(s => s.trim()).filter(Boolean),
+      lang, name, cache, tty, autoclose, service, deps, envRefs, default: isDefault, autorun, render, fold, outputMarkdown, outputImage, outputAttrs, interpreter, code: codeLines.join("\n"), output });
     i = cursor;
   }
   flushMarkdown();

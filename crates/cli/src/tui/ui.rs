@@ -1486,7 +1486,9 @@ pub(super) fn var_form_list_rect(area: Rect, decl_count: usize) -> Rect {
 fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
     let rect = var_form_rect(area, vf.decls.len());
     f.render_widget(Clear, rect);
-    let title = if vf.configuring {
+    let title = if vf.arguments {
+        " arguments for this application "
+    } else if vf.configuring {
         " configure variables "
     } else {
         " variables needed "

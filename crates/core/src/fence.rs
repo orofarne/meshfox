@@ -9,6 +9,8 @@ use std::ops::Range;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodeBlock {
+    /// Effective immutable arguments of this application; empty on definitions.
+    pub arguments: std::collections::BTreeMap<String, String>,
     pub lang: String,
     pub name: Option<String>,
     pub cache: bool,
@@ -181,10 +183,11 @@ pub(crate) fn parse_block_ref(s: &str) -> BlockRef {
         Some(rest) => (rest, true),
         None => (s, false),
     };
-    match s.split_once('/') {
+    let prefix_end = s.find('[').unwrap_or(s.len());
+    match s[..prefix_end].split_once('/') {
         Some((node_id, block_name)) => BlockRef {
             node_id: Some(node_id.to_string()),
-            block_name: block_name.to_string(),
+            block_name: format!("{}{}", block_name, &s[prefix_end..]),
             sync,
         },
         None => BlockRef {
@@ -198,13 +201,7 @@ pub(crate) fn parse_block_ref(s: &str) -> BlockRef {
 fn parse_deps(attrs: &HashMap<String, String>) -> Vec<BlockRef> {
     attrs
         .get("deps")
-        .map(|v| {
-            v.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(parse_block_ref)
-                .collect()
-        })
+        .map(|v| parse_deps_list(v))
         .unwrap_or_default()
 }
 
@@ -225,7 +222,7 @@ pub struct EnvRef {
 /// check`) — the same place a `deps=` reference to a block that doesn't
 /// exist is already caught, not by the fence grammar itself.
 fn strip_dollar(s: &str) -> &str {
-    s.strip_prefix('$').unwrap_or(s)
+    if s.starts_with("${") { s } else { s.strip_prefix('$').unwrap_or(s) }
 }
 
 fn parse_env_ref(s: &str) -> EnvRef {
@@ -262,8 +259,8 @@ fn parse_env(attrs: &HashMap<String, String>) -> Vec<EnvRef> {
 /// what a caller building one from scratch (`node block --deps`) needs,
 /// since it has no fence to have parsed one out of yet.
 pub fn parse_deps_list(s: &str) -> Vec<BlockRef> {
-    s.split(',')
-        .map(str::trim)
+    crate::args::split_list(s)
+        .into_iter()
         .filter(|s| !s.is_empty())
         .map(parse_block_ref)
         .collect()
@@ -566,6 +563,7 @@ fn build_code_block(
     let env = parse_env(&attrs);
     let interpreter = attrs.get("interpreter").cloned();
     CodeBlock {
+        arguments: Default::default(),
         lang,
         name: Some(name),
         cache,
@@ -712,7 +710,14 @@ pub fn fingerprint(block: &CodeBlock) -> String {
         block.code.clone(),
         block.interpreter.clone().unwrap_or_default(),
     ];
-    for env in &block.env {
+    // Bound applications keep the source fingerprint; selected names/values are
+    // folded by session_fingerprint together with their arguments.
+    let source_env;
+    let env_refs = if block.attrs.get("env").is_some_and(|raw| raw.contains("${")) {
+        source_env = parse_env(&block.attrs);
+        &source_env
+    } else { &block.env };
+    for env in env_refs {
         parts.push(format!("{}\u{0}{}", env.local_name, env.var_name));
     }
     for dep in &block.deps {
@@ -763,13 +768,18 @@ pub fn session_fingerprint(block: &CodeBlock, resolved_vars: &HashMap<String, St
         names.extend(crate::exec::interpreter_var_refs(spec));
     }
     names.extend(crate::artifacts::var_refs(block));
+    names.retain(|name| !block.arguments.contains_key(name));
+    names.extend(crate::args::selected_env_var_names(block));
     names.sort();
     names.dedup();
     let base = fingerprint(block);
-    if names.is_empty() {
+    if names.is_empty() && block.arguments.is_empty() {
         return base;
     }
     let mut parts = vec![base];
+    for (name, value) in &block.arguments {
+        parts.push(format!("arg:{name}\u{0}{value}"));
+    }
     for name in names {
         let value = resolved_vars.get(&name).map(String::as_str).unwrap_or("");
         parts.push(format!("{name}\u{0}{value}"));

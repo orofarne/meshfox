@@ -250,3 +250,29 @@ async fn run_reports_failures_missing_variables_unknown_nodes_defaults_and_timeo
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn run_accepts_literal_args_and_keeps_required_defaults_unconfirmed() {
+    let dir = unique_dir();
+    std::fs::write(dir.join("doc.canvas.md"), concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
+        "<!-- meshfox:var name=\"URL_9\" default=\"selected-url$literal\" -->\n",
+        "<!-- meshfox:arg name=\"n\" type=\"int\" default=\"9\" required -->\n",
+        "<!-- meshfox:arg name=\"text\" -->\n",
+        "```bash name=\"extract\" env=\"URL=URL_${n}\"\nprintf '%s:%s:%s\\n' \"$n\" \"$text\" \"$URL\"\n```\n",
+    )).unwrap();
+    let mcp = start(&dir).await;
+    call(&mcp, "canvas_open", serde_json::json!({"path":"doc.canvas.md"})).await.unwrap();
+    let base = serde_json::json!({"canvas_id":"doc.canvas.md","node_id":"root","block":"extract"});
+    let missing = call(&mcp, "run", base.clone()).await.unwrap_err();
+    assert!(missing.contains("missing required argument(s): n, text"), "{missing}");
+    let mut bound = base.clone();
+    bound["args"] = serde_json::json!({"n":"009","text":"$NAME, [hy]"});
+    let (is_error, result) = call(&mcp, "run", bound).await.unwrap();
+    assert!(!is_error, "{result}");
+    let application = "extract[n=9,text=\"$NAME, [hy]\"]";
+    assert!(step(&result, application)["output"].as_str().unwrap().contains("9:$NAME, [hy]:selected-url$literal"));
+    let missing = call(&mcp, "run", base).await.unwrap_err();
+    assert!(missing.contains("missing required argument(s)"), "arguments must not be cached: {missing}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

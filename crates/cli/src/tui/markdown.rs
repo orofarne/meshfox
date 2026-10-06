@@ -54,7 +54,7 @@ pub enum ClickTarget {
     /// A `button` fence's own `▶ caption` marker — runs its `deps=` chain
     /// (plus its own, always-empty body), same as pressing `r` on it would.
     RunBlock { node_id: String, block_name: String },
-    /// A block name inside a deps line (`├─ after: …`/`via …`) — the TUI
+    /// A block name inside a deps line (`├─ deps: …`/`via var: …`) — the TUI
     /// counterpart to the web UI's `jumpTo`: moves the tree's own selection
     /// to the named block's owning node.
     JumpToNode { node_id: String },
@@ -80,7 +80,7 @@ pub enum ClickTarget {
 /// this only decides what's clickable" split `App::doc_segments` itself
 /// already has from `ui::render_document`.
 /// `(col_start, col_end, node_id)` for one not-yet-a-`ClickRegion` deps-line
-/// block-name span — see `Renderer::dep_line`/`push_dep_clicks`.
+/// block-name span — see `Renderer::dep_lines`/`push_dep_clicks`.
 type DepClicks = Vec<(u16, u16, String)>;
 
 pub struct ClickRegion {
@@ -350,6 +350,69 @@ pub fn render(
         form_focus,
         live_output,
     );
+    let signatures = meshfox_core::args::scan_signatures(node_id, md).unwrap_or_default();
+    for block in &runnable {
+        let mut details = Vec::new();
+        if let Some(signature) = signatures.iter().find(|sig| sig.block.span == block.span) {
+            for arg in &signature.args {
+                let mut label = format!("args: {}: {}", arg.name, arg.var_type.as_str());
+                if !arg.choices.is_empty() {
+                    label.push_str(&format!(" [{}]", arg.choices.join(" | ")));
+                }
+                if arg.is_required() {
+                    label.push_str(" · required");
+                }
+                if let Some(default) = &arg.default {
+                    label.push_str(&format!(
+                        " · {}: {:?}",
+                        if arg.is_required() {
+                            "suggestion"
+                        } else {
+                            "default"
+                        },
+                        default
+                    ));
+                }
+                details.push(label);
+            }
+        }
+        for decl in decls.iter().filter(|decl| {
+            decl.from.as_ref().is_some_and(|source| {
+                source.node_id.as_deref() == Some(node_id)
+                    && Some(source.block_name.as_str()) == block.name.as_deref()
+            })
+        }) {
+            details.push(format!("exports: {}: {}", decl.name, decl.var_type.as_str()));
+        }
+        for kind in ["inputs", "outputs"] {
+            if let Some(paths) = block.attrs.get(kind) {
+                for path in paths.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                    details.push(format!("{kind}: {path}"));
+                }
+            }
+        }
+        for env in block.env.iter().filter(|env| env.var_name.contains("${")) {
+            details.push(format!("env: {} ← {}", env.local_name, env.var_name));
+            let mut applications: Vec<_> = live_output.keys().collect();
+            applications.sort();
+            for application in applications {
+                let Ok(app) = meshfox_core::args::Application::parse(application) else { continue; };
+                if Some(app.definition.as_str()) != block.name.as_deref() { continue; }
+                let arguments = app.bindings.into_iter().filter_map(|(name, binding)| match binding {
+                    meshfox_core::args::Binding::Literal(value) => Some((name, value)),
+                    _ => None,
+                }).collect();
+                if let Ok(selected) = meshfox_core::args::bind_env_name(&env.var_name, &arguments) {
+                    let source = decls.iter().find(|decl| decl.name == selected)
+                        .and_then(|decl| decl.from.as_ref())
+                        .map(|source| format!(" ← {}/{}", source.node_id.as_deref().unwrap_or(node_id), source.block_name))
+                        .unwrap_or_default();
+                    details.push(format!("env: {application}: {selected}{source}"));
+                }
+            }
+        }
+        renderer.block_details.insert(block.span.start, details);
+    }
     // `ENABLE_GFM` is what makes `pulldown-cmark` recognize `> [!NOTE]`/...
     // alert blockquotes (`Tag::BlockQuote(Some(kind))`, marker line
     // already stripped) — see `start`'s own `Tag::BlockQuote` arm below.
@@ -387,10 +450,10 @@ struct Renderer<'a> {
     base_dir: &'a Path,
     hl: &'a Highlighter,
     /// The node this body belongs to — bare `deps=`/`env=` references
-    /// resolve against this (see `dep_line`), same convention
+    /// resolve against this (see `dep_lines`), same convention
     /// `deps::resolve_ref`/`vars::scan_all_var_decls` already use.
     node_id: &'a str,
-    /// Every declared `meshfox:var` in the whole document — see `dep_line`.
+    /// Every declared `meshfox:var` in the whole document — see `dep_lines`.
     decls: &'a [meshfox_core::vars::VarDecl],
     /// Every runnable fence in this same body, pre-scanned by `render` —
     /// `Tag::CodeBlock`'s own click-target resolution matches the current
@@ -428,9 +491,11 @@ struct Renderer<'a> {
     /// `web/src/MeshNode.tsx`'s `mesh-code-interpreter`).
     code_interpreter: Option<String>,
     /// This fence's own raw `deps=`/`env=` attributes, if any — parsed in
-    /// `TagEnd::CodeBlock` into `dep_line`'s explicit/implicit deps line.
+    /// `TagEnd::CodeBlock` into `dep_lines`'s explicit/implicit deps line.
     code_deps: Option<String>,
     code_env: Option<String>,
+    block_details: std::collections::HashMap<usize, Vec<String>>,
+    code_details: Vec<String>,
     /// This fence's own `send=` attribute, if any — only meaningful on a
     /// `lang="form"` fence (see `TagEnd::CodeBlock`'s own form branch);
     /// falls back to a plain `"Send"` when omitted, same default
@@ -485,7 +550,7 @@ struct TableState {
 /// State inside a `<!-- meshfox:output name="..." ... --> ... <!--
 /// /meshfox:output -->` region — an `output="markdown"` block's own real
 /// result gets its own purple frame, same color identity as its source
-/// block's (`theme::DEP` — see `dep_line`), so it reads as visually
+/// block's (`theme::DEP` — see `dep_lines`), so it reads as visually
 /// grouped with it instead of blending into surrounding prose.
 /// `render_output_block_markdown` (`crates/core/src/output.rs`) always
 /// writes stderr, if any, first, as its own `` ```text `` fence, *before*
@@ -547,6 +612,8 @@ impl<'a> Renderer<'a> {
             code_interpreter: None,
             code_deps: None,
             code_env: None,
+            block_details: Default::default(),
+            code_details: Vec::new(),
             code_send: None,
             code_click_name: None,
             code_buf: String::new(),
@@ -659,27 +726,24 @@ impl<'a> Renderer<'a> {
         self.segments.push(seg);
     }
 
-    /// Turns `dep_line`'s own `(col_start, col_end, node_id)` triples into
+    /// Turns `dep_lines`'s own `(col_start, col_end, node_id)` triples into
     /// real `ClickRegion`s, now that the segment they belong to is actually
     /// on `self.segments` (always its last entry — nothing else can have
     /// run between `push_segment`/`push_segment_plain` and this) and its
-    /// index is known. The deps line is always line `1` within its own
-    /// segment: line `0` is the fence's header, pushed right before it (see
-    /// `TagEnd::CodeBlock`). A no-op for a fence with no deps line at all
-    /// (`clicks` empty).
-    fn push_dep_clicks(&mut self, clicks: DepClicks) {
-        if clicks.is_empty() {
-            return;
-        }
+    /// index is known. Each contract row carries its actual line index;
+    /// this applies to framed code and button blocks alike.
+    fn push_dep_clicks(&mut self, rows: Vec<(usize, DepClicks)>) {
         let segment_index = self.segments.len() - 1;
-        for (col_start, col_end, node_id) in clicks {
-            self.click_regions.push(ClickRegion {
-                segment_index,
-                line_index: 1,
-                col_start,
-                col_end,
-                target: ClickTarget::JumpToNode { node_id },
-            });
+        for (line_index, clicks) in rows {
+            for (col_start, col_end, node_id) in clicks {
+                self.click_regions.push(ClickRegion {
+                    segment_index,
+                    line_index,
+                    col_start,
+                    col_end,
+                    target: ClickTarget::JumpToNode { node_id },
+                });
+            }
         }
     }
 
@@ -1096,7 +1160,7 @@ impl<'a> Renderer<'a> {
                     // the language token (`name="..."`, `cache`, ...) — see
                     // `meshfox_core::fence`, which this mirrors just enough
                     // to pull out `name`/`interpreter`/`deps`/`env` for the
-                    // block header and its own deps line (`dep_line`) below.
+                    // block header and its own deps line (`dep_lines`) below.
                     CodeBlockKind::Fenced(info) => {
                         let mut tokens = meshfox_core::attrs::tokenize(&info).into_iter();
                         let lang = tokens.next().unwrap_or_else(|| "text".to_string());
@@ -1120,6 +1184,13 @@ impl<'a> Renderer<'a> {
                     .iter()
                     .find(|b| b.span.contains(&span_start))
                     .and_then(|b| b.name.clone());
+                self.code_details = self
+                    .runnable
+                    .iter()
+                    .find(|b| b.span.contains(&span_start))
+                    .and_then(|b| self.block_details.get(&b.span.start))
+                    .cloned()
+                    .unwrap_or_default();
                 self.code_lang = Some(lang);
                 self.code_name = name;
                 self.code_interpreter = interpreter;
@@ -1208,25 +1279,14 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    /// A fenced block's own dependency line, right under its header —
-    /// mirrors the web UI's `.mesh-code-deps` row (`web/src/MeshNode.tsx`):
-    /// explicit `deps=` first (`after: …`), then a `via VAR: …` hint for
-    /// every declared variable this block's `env=`/`interpreter=`
-    /// transitively needs (through `default_var=`/`choices_var=` chains —
-    /// see `vars::close_over_var_refs`) that's itself `from=`-computed —
-    /// the same implicit dependency `deps::implicit_from_deps` folds into
-    /// the run-chain graph. `None` when the block has neither kind.
-    /// `(col_start, col_end, node_id)` for one block-name span in the
-    /// returned `Line` — `dep_line`'s caller turns each into a `ClickRegion`
-    /// once it knows which segment/line the line actually landed at (see
-    /// `TagEnd::CodeBlock`), the same "this only decides what's clickable"
-    /// split `ClickRegion` itself documents.
-    fn dep_line(
+    /// Always-visible contract rows: one explicit dependency or computed
+    /// variable source per row, with jump targets for the source names.
+    fn dep_lines(
         &self,
         deps_raw: Option<&str>,
         env_raw: Option<&str>,
         interpreter: Option<&str>,
-    ) -> Option<(Line<'static>, DepClicks)> {
+    ) -> Vec<(Line<'static>, DepClicks)> {
         let explicit: Vec<(String, String)> = deps_raw
             .map(meshfox_core::fence::parse_deps_list)
             .unwrap_or_default()
@@ -1275,62 +1335,22 @@ impl<'a> Renderer<'a> {
             })
             .collect();
 
-        if explicit.is_empty() && implicit.is_empty() {
-            return None;
-        }
-
         let style = Style::default().fg(super::theme::DEP);
-        // Underlined so a clickable block name reads as clickable at a
-        // glance, the same visual convention as `push_text`'s own
-        // `Inline::Link` — everything else on this line (the literal
-        // `after:`/`via VAR:` text) stays plain, since only the name itself
-        // is ever a `ClickRegion`.
         let click_style = style.add_modifier(Modifier::UNDERLINED);
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        let mut clicks: DepClicks = Vec::new();
-        let mut col: u16 = 0;
-        let push_literal = |spans: &mut Vec<Span<'static>>, col: &mut u16, text: String| {
-            *col += text.chars().count() as u16;
-            spans.push(Span::styled(text, style));
+        let row = |prefix: String, label: String, node_id: String| {
+            let start = prefix.chars().count() as u16;
+            let end = start + label.chars().count() as u16;
+            (Line::from(vec![Span::styled(prefix, style), Span::styled(label, click_style)]),
+                vec![(start, end, node_id)])
         };
-        let push_click = |spans: &mut Vec<Span<'static>>, col: &mut u16, text: String| {
-            *col += text.chars().count() as u16;
-            spans.push(Span::styled(text, click_style));
-        };
-        // `├─` (not `│`, the code lines' own left border) — this line is
-        // metadata branching off the header, not code content, and reusing
-        // `│` made it read as the first line of the block's own body. `├─`
-        // is still drawn from the same box-drawing set as the frame's other
-        // corners/edges, so it reads as "part of the frame, not a stray
-        // glyph" the same way the header's own `┌─` already does — the
-        // trailing `─` matches the header's own corner-plus-dash shape
-        // (`┌─`), rather than a bare `├` whose own built-in horizontal arm
-        // is visibly shorter than a real `─` glyph beside it.
-        push_literal(&mut spans, &mut col, "├─ ".to_string());
-        let mut first_part = true;
-        if !explicit.is_empty() {
-            push_literal(&mut spans, &mut col, "after: ".to_string());
-            for (i, (label, node_id)) in explicit.into_iter().enumerate() {
-                if i > 0 {
-                    push_literal(&mut spans, &mut col, ", ".to_string());
-                }
-                let start = col;
-                push_click(&mut spans, &mut col, label);
-                clicks.push((start, col, node_id));
-            }
-            first_part = false;
+        let mut rows = Vec::new();
+        for (label, node_id) in explicit {
+            rows.push(row("├─ deps: ".into(), label, node_id));
         }
         for (var_name, label, node_id) in implicit {
-            if !first_part {
-                push_literal(&mut spans, &mut col, "  ".to_string());
-            }
-            first_part = false;
-            push_literal(&mut spans, &mut col, format!("via {var_name}: "));
-            let start = col;
-            push_click(&mut spans, &mut col, label);
-            clicks.push((start, col, node_id));
+            rows.push(row(format!("├─ via var: {var_name} → "), label, node_id));
         }
-        Some((Line::from(spans), clicks))
+        rows
     }
 
     fn end(&mut self, tag: TagEnd) {
@@ -1359,6 +1379,7 @@ impl<'a> Renderer<'a> {
                 let env_raw = self.code_env.take();
                 let send_raw = self.code_send.take();
                 let click_name = self.code_click_name.take();
+                let details = std::mem::take(&mut self.code_details);
                 let code = std::mem::take(&mut self.code_buf);
                 if lang == meshfox_core::FORM_LANG {
                     // Same non-executing, no-frame family as `button`
@@ -1512,18 +1533,28 @@ impl<'a> Renderer<'a> {
                     };
                     // Underlined so the clickable "▶ caption" part reads as
                     // clickable at a glance — the same convention
-                    // `dep_line`'s own click spans use — while the
+                    // `dep_lines`'s own click spans use — while the
                     // `(r to run)` hint after it (not itself clickable)
                     // stays plain.
                     let marker = Style::default()
                         .fg(super::theme::ACCENT)
                         .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
                     let hint = Style::default().fg(Color::DarkGray);
-                    self.push_segment(Segment::Text(vec![Line::from(vec![
+                    let mut lines = vec![Line::from(vec![
                         Span::styled("▶ ", marker),
                         Span::styled(caption.clone(), marker),
                         Span::styled("  (r to run)", hint),
-                    ])]));
+                    ])];
+                    let mut dep_clicks = Vec::new();
+                    for (line, clicks) in self.dep_lines(deps_raw.as_deref(), env_raw.as_deref(), interpreter.as_deref()) {
+                        dep_clicks.push((lines.len(), clicks));
+                        lines.push(line);
+                    }
+                    lines.extend(details.into_iter().map(|detail| Line::from(Span::styled(
+                        format!("  {detail}"), Style::default().fg(super::theme::DEP),
+                    ))));
+                    self.push_segment(Segment::Text(lines));
+                    self.push_dep_clicks(dep_clicks);
                     if let Some(block_name) = click_name {
                         let segment_index = self.segments.len() - 1;
                         // Covers "▶ caption" (not the "(r to run)" hint) —
@@ -1565,19 +1596,24 @@ impl<'a> Renderer<'a> {
                 // corner reads as the same kind of line, not a stray glyph.
                 let mut framed: Vec<Line<'static>> =
                     vec![Line::from(Span::styled(format!("┌─{label}──"), border))];
-                // Deps-line click regions (`dep_line`'s own col-range half)
+                // Deps-line click regions (`dep_lines`'s own col-range half)
                 // can't become real `ClickRegion`s until `framed` is
                 // actually pushed as a segment below — only then is
                 // `segment_index` known.
-                let mut dep_clicks: DepClicks = Vec::new();
-                if let Some((dep_line, clicks)) = self.dep_line(
+                let mut dep_clicks = Vec::new();
+                for (dep_line, clicks) in self.dep_lines(
                     deps_raw.as_deref(),
                     env_raw.as_deref(),
                     interpreter.as_deref(),
                 ) {
+                    dep_clicks.push((framed.len(), clicks));
                     framed.push(dep_line);
-                    dep_clicks = clicks;
                 }
+                framed.extend(
+                    details
+                        .into_iter()
+                        .map(|detail| Line::from(Span::styled(format!("├─ {detail}"), border))),
+                );
                 framed.extend(highlighted.into_iter().map(|l| {
                     let mut spans = vec![Span::styled("│ ", border)];
                     spans.extend(l.spans);
@@ -1760,6 +1796,85 @@ mod tests {
             duration_ms: 5,
             running,
         }
+    }
+
+    #[test]
+    fn block_contract_rows_show_arguments_and_file_templates() {
+        let hl = Highlighter::new();
+        let md = concat!(
+            "<!-- meshfox:arg name=\"lang\" type=\"select\" choices=\"en,hy\" default=\"en\" -->\n",
+            "<!-- meshfox:arg name=\"n\" type=\"int\" default=\"09\" required -->\n",
+            "```bash name=\"extract\" inputs=\"pdf_${lang}.pdf,index.txt\" outputs=\"csv_${lang}.csv\"\necho ok\n```\n",
+        );
+        let (segments, _) = render(
+            md,
+            Path::new("/nonexistent-base-dir"),
+            &hl,
+            "root",
+            &[],
+            &Default::default(),
+            None,
+            &Default::default(),
+        );
+        let text = segment_text(&segments);
+        for expected in [
+            "args: lang: select [en | hy] · default: \"en\"",
+            "args: n: int · required · suggestion: \"09\"",
+            "inputs: pdf_${lang}.pdf",
+            "inputs: index.txt",
+            "outputs: csv_${lang}.csv",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn export_contract_matches_producer_nodes_and_shows_types_before_execution() {
+        let md = "```bash name=\"observe\"\ntrue\n```\n";
+        let canvas = meshfox_core::Canvas::from_markdown(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n",
+            "<!-- meshfox:var name=\"URL\" from=\"download/observe\" -->\n",
+            "<!-- meshfox:var name=\"COUNT\" type=\"int\" from=\"download/observe\" -->\n",
+            "<!-- meshfox:var name=\"OTHER\" from=\"other/observe\" -->\n",
+            "<!-- meshfox:var name=\"CONFIG\" default=\"configured\" -->\n",
+            "## Download\n<!-- meshfox:node id=\"download\" -->\n",
+            "<!-- meshfox:var name=\"LOCAL\" type=\"bool\" from=\"observe\" -->\n",
+        )).unwrap();
+        let decls = meshfox_core::vars::declared_vars(&canvas).unwrap();
+        let (segments, _) = render(md, Path::new("/nonexistent-base-dir"), &Highlighter::new(), "download", &decls, &Default::default(), None, &Default::default());
+        let text = segment_text(&segments);
+        for expected in ["exports: URL: string", "exports: COUNT: int", "exports: LOCAL: bool"] {
+            assert!(text.contains(expected), "{text}");
+        }
+        assert!(!text.contains("exports: OTHER"), "{text}");
+        assert!(!text.contains("exports: CONFIG"), "{text}");
+    }
+
+    #[test]
+    fn env_contract_shows_selected_names_and_sources_for_each_application() {
+        let md = "<!-- meshfox:arg name=\"lang\" -->\n```bash name=\"fetch\" env=\"URL=URL_${lang}\"\necho ok\n```\n";
+        let decls = meshfox_core::vars::scan_var_decls(
+            "<!-- meshfox:var name=\"URL_hy\" from=\"download/observe\" -->",
+        )
+        .unwrap();
+        let output =
+            std::collections::HashMap::from([("fetch[lang=hy]".into(), table_output(false, false))]);
+        let (segments, _) = render(
+            md,
+            Path::new("/nonexistent-base-dir"),
+            &Highlighter::new(),
+            "root",
+            &decls,
+            &Default::default(),
+            None,
+            &output,
+        );
+        let text = segment_text(&segments);
+        assert!(text.contains("env: URL ← URL_${lang}"), "{text}");
+        assert!(
+            text.contains("env: fetch[lang=hy]: URL_hy ← download/observe"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -2562,4 +2677,28 @@ mod tests {
             .expect("▶ marker span");
         assert_eq!(marker_span.style.fg, Some(crate::tui::theme::ACCENT));
     }
+    #[test]
+    fn dependency_rows_keep_distinct_click_positions_for_code_and_buttons() {
+        let hl = Highlighter::new();
+        for lang in ["bash", "button"] {
+            let md = format!("```{lang} name=\"go\" deps=\"first/build,second/check\"\nRun\n```\n");
+            let (segments, clicks) = render(
+                &md, Path::new("/nonexistent-base-dir"), &hl, "n", &[],
+                &std::collections::HashMap::new(), None, &std::collections::HashMap::new(),
+            );
+            let jumps: Vec<_> = clicks.iter().filter(|c| matches!(c.target, ClickTarget::JumpToNode { .. })).collect();
+            assert_eq!(jumps.len(), 2);
+            assert_ne!(jumps[0].line_index, jumps[1].line_index);
+            for (click, label) in jumps.iter().zip(["first/build", "second/check"]) {
+                let Segment::Text(lines) = &segments[click.segment_index] else { panic!("text expected") };
+                let text: String = lines[click.line_index].spans.iter().map(|s| s.content.as_ref()).collect();
+                let hit: String = text.chars().skip(click.col_start as usize).take((click.col_end - click.col_start) as usize).collect();
+                assert_eq!(hit, label);
+            }
+            if lang == "button" {
+                assert!(clicks.iter().any(|c| c.line_index == 0 && matches!(c.target, ClickTarget::RunBlock { .. })));
+            }
+        }
+    }
+
 }

@@ -114,6 +114,8 @@ pub struct VarDecl {
 
 #[derive(Debug, Error, PartialEq)]
 pub enum VarsError {
+    #[error("node {0:?} block {1:?}: {2}")]
+    EnvNameTemplate(String, String, String),
     #[error("a meshfox:var comment is missing its required name= attribute")]
     MissingName,
     #[error("meshfox:var {0:?} has unknown type={1:?} (expected string, int, bool, or select)")]
@@ -183,7 +185,7 @@ fn parse_var_comment(line: &str) -> Option<HashMap<String, String>> {
     Some(parse_attrs(rest.trim()))
 }
 
-fn build_var_decl(attrs: HashMap<String, String>) -> Result<VarDecl, VarsError> {
+pub(crate) fn build_var_decl(attrs: HashMap<String, String>) -> Result<VarDecl, VarsError> {
     let name = attrs.get("name").cloned().ok_or(VarsError::MissingName)?;
     let var_type = match attrs.get("type") {
         None => VarType::String,
@@ -478,6 +480,66 @@ fn is_within_subtree(canvas: &Canvas, node_id: &str, ancestor_id: &str) -> bool 
     false
 }
 
+/// Enforce declaration/scope for concretely selected template refs before execution.
+pub fn validate_selected_env(
+    canvas: &Canvas,
+    node_id: &str,
+    block: &crate::CodeBlock,
+) -> Result<(), VarsError> {
+    let Some(raw) = block.attrs.get("env").filter(|raw| raw.contains("${")) else {
+        return Ok(());
+    };
+    let scanned = scan_all_var_decls(canvas)?;
+    for (source, selected) in crate::fence::parse_env_list(raw).iter().zip(&block.env) {
+        if !source.var_name.contains('$') {
+            continue;
+        }
+        let decl = scanned
+            .iter()
+            .find(|decl| decl.decl.name == selected.var_name)
+            .ok_or_else(|| {
+                VarsError::UndeclaredEnvVar(
+                    node_id.into(),
+                    block.name.clone().unwrap_or_default(),
+                    selected.var_name.clone(),
+                    "env",
+                )
+            })?;
+        if !is_within_subtree(canvas, node_id, &decl.owner_node) {
+            return Err(VarsError::VarOutOfScope(
+                node_id.into(),
+                block.name.clone().unwrap_or_default(),
+                selected.var_name.clone(),
+                decl.owner_node.clone(),
+                "env",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn static_block_env_names(
+    node_id: &str,
+    markdown: &str,
+    block: &crate::CodeBlock,
+) -> Result<Vec<String>, VarsError> {
+    let signatures = crate::args::scan_signatures(node_id, markdown).map_err(|e| {
+        VarsError::EnvNameTemplate(
+            node_id.into(),
+            block.name.clone().unwrap_or_default(),
+            e.to_string(),
+        )
+    })?;
+    let args = signatures
+        .iter()
+        .find(|s| s.block.span == block.span)
+        .map(|s| s.args.as_slice())
+        .unwrap_or_default();
+    crate::args::static_env_names(block, args).map_err(|e| {
+        VarsError::EnvNameTemplate(node_id.into(), block.name.clone().unwrap_or_default(), e)
+    })
+}
+
 /// Validates that no block's `env=` reaches outside a node-scoped
 /// `meshfox:var`'s own subtree (a root-declared var has no such
 /// restriction — its subtree is the whole document). `meshfox validate`-only
@@ -499,14 +561,18 @@ pub fn validate_var_scope(canvas: &Canvas) -> Result<(), VarsError> {
         .collect();
     for node in &canvas.nodes {
         for block in crate::fence::scan_runnable_blocks(&node.id, &node.text) {
-            let mut refs: Vec<(String, &'static str)> = block
-                .env
-                .iter()
-                .map(|e| (e.var_name.clone(), "env"))
+            let mut refs: Vec<(String, &'static str)> = static_block_env_names(&node.id, &node.text, &block)?
+                .into_iter()
+                .map(|name| (name, "env"))
                 .chain(
                     interpreter_refs(&block)
                         .into_iter()
                         .map(|n| (n, "interpreter")),
+                )
+                .chain(
+                    crate::args::dependency_refs(&block)
+                        .into_iter()
+                        .map(|n| (n, "deps")),
                 )
                 .collect();
             // A `form` fence's own `field var=` is just as much a
@@ -521,7 +587,17 @@ pub fn validate_var_scope(canvas: &Canvas) -> Result<(), VarsError> {
                     refs.extend(form.fields.into_iter().map(|f| (f.var, "field")));
                 }
             }
+            let argument_names: std::collections::HashSet<_> =
+                crate::args::scan_signatures(&node.id, &node.text)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|sig| sig.block.span == block.span)
+                    .flat_map(|sig| sig.args.into_iter().map(|arg| arg.name))
+                    .collect();
             for (var_name, via) in refs {
+                if argument_names.contains(&var_name) {
+                    continue;
+                }
                 if let Some(owner) = owners.get(var_name.as_str()) {
                     if !is_within_subtree(canvas, &node.id, owner) {
                         return Err(VarsError::VarOutOfScope(
@@ -579,17 +655,31 @@ pub fn validate_env_refs(canvas: &Canvas) -> Result<(), VarsError> {
     let declared: HashSet<&str> = decls.iter().map(|d| d.name.as_str()).collect();
     for node in &canvas.nodes {
         for block in crate::fence::scan_runnable_blocks(&node.id, &node.text) {
-            let refs: Vec<(String, &'static str)> = block
-                .env
-                .iter()
-                .map(|e| (e.var_name.clone(), "env"))
+            let refs: Vec<(String, &'static str)> = static_block_env_names(&node.id, &node.text, &block)?
+                .into_iter()
+                .map(|name| (name, "env"))
                 .chain(
                     interpreter_refs(&block)
                         .into_iter()
                         .map(|n| (n, "interpreter")),
                 )
+                .chain(
+                    crate::args::dependency_refs(&block)
+                        .into_iter()
+                        .map(|n| (n, "deps")),
+                )
                 .collect();
+            let argument_names: std::collections::HashSet<_> =
+                crate::args::scan_signatures(&node.id, &node.text)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|sig| sig.block.span == block.span)
+                    .flat_map(|sig| sig.args.into_iter().map(|arg| arg.name))
+                    .collect();
             for (var_name, via) in refs {
+                if argument_names.contains(&var_name) {
+                    continue;
+                }
                 if !declared.contains(var_name.as_str()) {
                     return Err(VarsError::UndeclaredEnvVar(
                         node.id.clone(),

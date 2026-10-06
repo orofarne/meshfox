@@ -11,11 +11,12 @@
 // skips scope-checking entirely.
 
 import type { CanvasDoc } from "./types";
-import { attrsFromTokens, tokenize } from "./fence";
-import { type BlockAddr, parseBlockRef } from "./deps";
+import { attrsFromTokens, tokenize } from "./fence.ts";
+import { type BlockAddr, parseBlockRef } from "./deps.ts";
 
 export interface ClientVarDecl {
   name: string;
+  type: string;
   from?: BlockAddr;
   defaultVar?: string;
   choicesVar?: string;
@@ -23,9 +24,9 @@ export interface ClientVarDecl {
 
 /** Parses one `<!-- meshfox:var ... -->` line's attributes into a
  * declaration — direct port of `vars.rs`'s `parse_var_comment` +
- * `build_var_decl`'s own name/from/default_var/choices_var handling (every
- * other attribute — type=, choices=, secret=, ... — is irrelevant to
- * computing implicit deps, so it's not parsed here at all). `ownerNodeId`
+ * `build_var_decl`'s own name/from/default_var/choices_var handling. The
+ * declared type is retained for export signatures; values are not read.
+ * `ownerNodeId`
  * resolves a bare `from="block-name"` (no `node-id/`) the same way
  * `scan_all_var_decls` does: against the node the declaration itself lives
  * in. Returns `null` for a line with no `name=`, or one that isn't a
@@ -35,7 +36,7 @@ function parseVarDeclLine(line: string, ownerNodeId: string): ClientVarDecl | nu
   const trimmed = line.trim();
   if (!trimmed.startsWith("<!--") || !trimmed.endsWith("-->")) return null;
   const inner = trimmed.slice(4, -3).trim();
-  if (!inner.startsWith("meshfox:var")) return null;
+  if (!/^meshfox:var(?:\s|$)/.test(inner)) return null;
   const rest = inner.slice("meshfox:var".length).trim();
   const attrs = attrsFromTokens(tokenize(rest));
   const name = attrs.name;
@@ -43,6 +44,7 @@ function parseVarDeclLine(line: string, ownerNodeId: string): ClientVarDecl | nu
   const from = attrs.from ? parseBlockRef(attrs.from, ownerNodeId) : undefined;
   return {
     name,
+    type: attrs.type ?? "string",
     from,
     defaultVar: attrs.default_var,
     choicesVar: attrs.choices_var,
@@ -57,12 +59,36 @@ function parseVarDeclLine(line: string, ownerNodeId: string): ClientVarDecl | nu
 export function parseVarDecls(canvas: CanvasDoc): Map<string, ClientVarDecl> {
   const decls = new Map<string, ClientVarDecl>();
   for (const node of canvas.nodes) {
+    let fence: { marker: string; length: number } | null = null;
+    let output = false;
     for (const line of node.text.split("\n")) {
+      if (output) {
+        if (/^\s*<!--\s*\/meshfox:output\s*-->\s*$/.test(line)) output = false;
+        continue;
+      }
+      if (fence) {
+        const close = /^ {0,3}(`{3,}|~{3,})\s*$/.exec(line);
+        if (close && close[1][0] === fence.marker && close[1].length >= fence.length) fence = null;
+        continue;
+      }
+      const open = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+      if (open && (open[1][0] !== "`" || !open[2].includes("`"))) {
+        fence = { marker: open[1][0], length: open[1].length };
+        continue;
+      }
+      if (/^\s*<!--\s*meshfox:output(?:\s|-->)/.test(line)) { output = true; continue; }
+      if (/^(?: {4}| *\t)/.test(line)) continue;
       const decl = parseVarDeclLine(line, node.id);
       if (decl) decls.set(decl.name, decl);
     }
   }
   return decls;
+}
+
+/** Declared exports belong to the exact producer address, regardless of where
+ * the variable declaration lives. No source-code or runtime-output guessing. */
+export function exportsForBlock(decls: Map<string, ClientVarDecl>, nodeId: string, blockName: string): ClientVarDecl[] {
+  return [...decls.values()].filter(decl => decl.from?.nodeId === nodeId && decl.from.blockName === blockName);
 }
 
 /** Every variable name transitively reachable from `seed` by following

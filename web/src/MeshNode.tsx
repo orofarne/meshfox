@@ -12,12 +12,13 @@ import {
   defaultBlock,
   parseBody,
   parseFormFields,
+  selectedEnvNames,
   type BodySegment,
   type CodeSegment,
   type ConstraintSegment,
 } from "./fence";
 import { parseBlockRef, blockDomId } from "./deps";
-import { implicitDepsForBlock, interpreterVarRefsNaive, type ClientVarDecl } from "./vars";
+import { exportsForBlock, implicitDepsForBlock, interpreterVarRefsNaive, type ClientVarDecl } from "./vars";
 import { AnsiText } from "./AnsiText";
 import { formatDurationMs } from "./format";
 import { RunHistoryDialog } from "./RunHistoryDialog";
@@ -1476,24 +1477,6 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
   const chainBusy = busy && live?.viaChain;
   const runBusy = busy && !live?.viaChain;
   const hasDeps = seg.deps.length > 0;
-  // Implicit (variable-based) deps — see ./vars.ts. Collapsed by default:
-  // unlike `deps=`, this is metadata explaining *why* a block still can't
-  // run standalone, not something that needs the same always-on
-  // prominence as the explicit `after: …` line right below it.
-  const implicit = useMemo(
-    () =>
-      implicitDepsForBlock(
-        nodeId,
-        seg.envRefs.map((e) => e.varName),
-        interpreterVarRefsNaive(seg.interpreter),
-        data.varDecls,
-      ),
-    [nodeId, seg.envRefs, seg.interpreter, data.varDecls],
-  );
-  const hasImplicitDeps = implicit.length > 0;
-  const [showImplicit, setShowImplicit] = useState(false);
-  const { setCenter, getNode, getZoom } = useReactFlow();
-
   const cacheHint = !seg.cache
     ? "output is not cached"
     : data.editMode
@@ -1505,29 +1488,6 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
   const runTitle = hasDeps
     ? `runs only this block, skipping its deps= chain (${cacheHint})`
     : cacheHint;
-
-  // Jumps to a dependency's own block: pans/centers its owning node (if
-  // it's a different one) via React Flow, then scrolls to and briefly
-  // highlights the block itself inside that node's body.
-  const jumpTo = (raw: string) => {
-    const target = parseBlockRef(raw, nodeId);
-    if (target.nodeId !== nodeId) {
-      const flowNode = getNode(target.nodeId);
-      if (flowNode) {
-        const w = flowNode.measured?.width ?? flowNode.width ?? 280;
-        const h = flowNode.measured?.height ?? flowNode.height ?? 160;
-        setCenter(flowNode.position.x + w / 2, flowNode.position.y + h / 2, {
-          zoom: getZoom(),
-          duration: 400,
-        });
-      }
-    }
-    const el = document.getElementById(blockDomId(target));
-    if (!el) return;
-    el.scrollIntoView({ behavior: "smooth", block: "center" });
-    el.classList.add("mesh-code-block-flash");
-    window.setTimeout(() => el.classList.remove("mesh-code-block-flash"), JUMP_HIGHLIGHT_MS);
-  };
 
   // This block's own live entry in the polled service registry (see
   // `MeshNodeData.services`'s doc comment) — `undefined` both for a
@@ -1681,70 +1641,9 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
           )
         )}
       </div>
+      <BlockDetails seg={seg} data={data} nodeId={nodeId} />
       {expanded && (
         <>
-          {sourceExpanded && (hasDeps || hasImplicitDeps) && (
-            <div className="mesh-code-deps">
-              {hasDeps && (
-                <>
-                  after:{" "}
-                  {seg.deps.map((raw, i) => (
-                    <span key={raw}>
-                      {i > 0 && ", "}
-                      <button
-                        type="button"
-                        className="mesh-dep-link"
-                        onClick={() => jumpTo(raw)}
-                        title={`jump to ${raw}`}
-                      >
-                        {raw}
-                      </button>
-                    </span>
-                  ))}
-                </>
-              )}
-              {hasImplicitDeps && (
-                <span className="mesh-implicit-deps">
-                  {hasDeps && "  "}
-                  <FoldToggle
-                    folded={!showImplicit}
-                    onToggle={() => setShowImplicit((s) => !s)}
-                    foldedTitle={`${implicit.length} implicit dependenc${implicit.length === 1 ? "y" : "ies"} via variables — a var referenced here that's itself computed by another block`}
-                    unfoldedTitle="Hide implicit dependencies"
-                  />
-                  {!showImplicit && (
-                    <button
-                      type="button"
-                      className="mesh-implicit-deps-count"
-                      onClick={() => setShowImplicit(true)}
-                      title={`${implicit.length} implicit dependenc${implicit.length === 1 ? "y" : "ies"} via variables — a var referenced here that's itself computed by another block`}
-                    >
-                      {implicit.length} via var
-                    </button>
-                  )}
-                  {showImplicit &&
-                    implicit.map(({ varName, source }, i) => {
-                      const raw =
-                        source.nodeId === nodeId ? source.blockName : `${source.nodeId}/${source.blockName}`;
-                      return (
-                        <span key={varName} className="mesh-implicit-dep">
-                          {i > 0 && ", "}
-                          via {varName}:{" "}
-                          <button
-                            type="button"
-                            className="mesh-dep-link"
-                            onClick={() => jumpTo(raw)}
-                            title={`jump to ${raw}`}
-                          >
-                            {raw}
-                          </button>
-                        </span>
-                      );
-                    })}
-                </span>
-              )}
-            </div>
-          )}
           {sourceExpanded && <HighlightedCode code={seg.code} lang={seg.lang} />}
           {/* Deliberately outside `sourceExpanded` (but still inside the
            * whole-block `expanded`) — folding just the source away
@@ -1773,6 +1672,93 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
   );
 }
 
+function BlockDetails({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData; nodeId: string }) {
+  const exported = exportsForBlock(data.varDecls, nodeId, seg.name);
+  const implicit = implicitDepsForBlock(nodeId, seg.envRefs.map(ref => ref.varName),
+    interpreterVarRefsNaive(seg.interpreter), data.varDecls);
+  const { setCenter, getNode, getZoom } = useReactFlow();
+  // Jumps to a dependency's own block: pans/centers its owning node (if
+  // it's a different one) via React Flow, then scrolls to and briefly
+  // highlights the block itself inside that node's body.
+  const jumpTo = (raw: string) => {
+    const target = parseBlockRef(raw, nodeId);
+    if (target.nodeId !== nodeId) {
+      const flowNode = getNode(target.nodeId);
+      if (flowNode) {
+        const w = flowNode.measured?.width ?? flowNode.width ?? 280;
+        const h = flowNode.measured?.height ?? flowNode.height ?? 160;
+        setCenter(flowNode.position.x + w / 2, flowNode.position.y + h / 2, {
+          zoom: getZoom(),
+          duration: 400,
+        });
+      }
+    }
+    const el = document.getElementById(blockDomId(target));
+    if (!el) return;
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    el.classList.add("mesh-code-block-flash");
+    window.setTimeout(() => el.classList.remove("mesh-code-block-flash"), JUMP_HIGHLIGHT_MS);
+  };
+
+  const templates = seg.envRefs.filter(ref => ref.varName.includes("${"));
+  const applications = Object.keys(data.liveBlocks).filter(name => name.startsWith(`${seg.name}[`)).sort();
+  if ((seg.args?.length ?? 0) + (seg.inputs?.length ?? 0) + (seg.outputs?.length ?? 0) + templates.length + exported.length + seg.deps.length + implicit.length === 0) return null;
+  return (
+    <div className="mesh-block-details nodrag">
+      {seg.deps.length > 0 && <div className="mesh-block-detail-row">
+        <span className="mesh-block-detail-label">deps</span>
+        <div className="mesh-block-detail-values">{seg.deps.map(raw => (
+          <button key={raw} type="button" className="mesh-dep-link" onClick={() => jumpTo(raw)} title={`jump to ${raw}`}>{raw}</button>
+        ))}</div>
+      </div>}
+      {implicit.length > 0 && <div className="mesh-block-detail-row">
+        <span className="mesh-block-detail-label">via var</span>
+        <div className="mesh-block-detail-values">{implicit.map(({varName, source}) => {
+          const raw = source.nodeId === nodeId ? source.blockName : `${source.nodeId}/${source.blockName}`;
+          return <div key={varName}><code>{varName}</code>{" → "}<button type="button" className="mesh-dep-link" onClick={() => jumpTo(raw)} title={`jump to ${raw}`}>{raw}</button></div>;
+        })}</div>
+      </div>}
+      {exported.length > 0 && <div className="mesh-block-detail-row">
+        <span className="mesh-block-detail-label">exports</span>
+        <div className="mesh-block-detail-values">{exported.map(variable => (
+          <div className="mesh-block-argument" key={variable.name}>
+            <code>{variable.name}</code><span className="mesh-block-argument-type">{variable.type}</span>
+          </div>
+        ))}</div>
+      </div>}
+      {templates.map(ref => <div className="mesh-block-detail-row" key={ref.localName}>
+        <span className="mesh-block-detail-label">env</span>
+        <div className="mesh-block-detail-values">
+          <code>{ref.localName} ← {ref.varName}</code>
+          {applications.map(application => {
+            const selected = selectedEnvNames(ref.varName, application);
+            if (!selected) return null;
+            const source = data.varDecls.get(selected)?.from;
+            return <code key={application}>{application}: {selected}{source ? ` ← ${source.nodeId}/${source.blockName}` : ""}</code>;
+          })}
+        </div>
+      </div>)}
+      {(seg.args?.length ?? 0) > 0 && <div className="mesh-block-detail-row">
+        <span className="mesh-block-detail-label">args</span>
+        <div className="mesh-block-detail-values">{seg.args!.map(arg => (
+          <div className="mesh-block-argument" key={arg.name}>
+            <code>{arg.name}</code><span className="mesh-block-argument-type">{arg.type}</span>
+            {arg.choices.length > 0 && <code>[{arg.choices.join(" | ")}]</code>}
+            {arg.required && <span className="mesh-block-required">required</span>}
+            {arg.default !== undefined && <span>{arg.required ? "suggestion" : "default"}: <code>{JSON.stringify(arg.default)}</code></span>}
+          </div>
+        ))}</div>
+      </div>}
+      {(["inputs", "outputs"] as const).map(kind => (seg[kind]?.length ?? 0) > 0 && (
+        <div className="mesh-block-detail-row" key={kind}>
+          <span className="mesh-block-detail-label">{kind}</span>
+          <div className="mesh-block-detail-values">{seg[kind]!.map((path, index) => <code key={index}>{path}</code>)}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 /** Renders a `` ```button `` fence (see SPEC.md's "Button fences") as a
  * single prominent button, with no card/border around it — just the
  * button itself (plus a kill button alongside it while running), in place
@@ -1789,17 +1775,48 @@ function ButtonBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeDa
   const caption = seg.code.trim() || seg.name;
   const buttonLabel = !busy ? caption : queued ? "queued…" : "running…";
 
+  const trigger = useRef<HTMLDivElement>(null);
+  const tooltip = useRef<HTMLDivElement>(null);
+  const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const tooltipId = `mesh-button-details-${nodeId}-${seg.name}`;
+  const showDetails = () => {
+    if (closeTimer.current) clearTimeout(closeTimer.current);
+    const popup = tooltip.current;
+    const anchor = trigger.current;
+    if (!popup || !anchor || !popup.querySelector('.mesh-block-details')) return;
+    popup.showPopover();
+    const rect = anchor.getBoundingClientRect();
+    const box = popup.getBoundingClientRect();
+    popup.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - box.width - 8))}px`;
+    popup.style.top = `${Math.max(8, rect.bottom + box.height + 8 <= window.innerHeight ? rect.bottom + 8 : rect.top - box.height - 8)}px`;
+  };
+  const hideDetails = () => {
+    if (closeTimer.current) clearTimeout(closeTimer.current);
+    closeTimer.current = setTimeout(() => tooltip.current?.hidePopover(), 150);
+  };
+  useEffect(() => () => {
+    if (closeTimer.current) clearTimeout(closeTimer.current);
+  }, []);
+
   return (
-    <div className="mesh-button-block" id={blockDomId({ nodeId, blockName: seg.name })}>
+    <div className="mesh-button-block" ref={trigger}
+      onMouseEnter={showDetails} onMouseLeave={hideDetails}
+      onFocus={showDetails} onBlur={hideDetails}
+      onKeyDown={event => { if (event.key === "Escape") tooltip.current?.hidePopover(); }}
+      id={blockDomId({ nodeId, blockName: seg.name })}>
       <button
         type="button"
         className="mesh-run-button"
         disabled={busy}
         onClick={() => data.onRun(seg.name, true)}
-        title={seg.deps.length > 0 ? `runs its dependency chain: ${seg.deps.join(", ")} → ${seg.name}` : caption}
+        aria-details={tooltipId}
       >
         {buttonLabel}
       </button>
+      <div ref={tooltip} id={tooltipId} popover="manual" role="dialog" aria-label={`Details for ${caption}`}
+        className="mesh-button-details-popover" onMouseEnter={showDetails} onMouseLeave={hideDetails}>
+        <BlockDetails seg={seg} data={data} nodeId={nodeId} />
+      </div>
       {running && (
         <button
           type="button"
