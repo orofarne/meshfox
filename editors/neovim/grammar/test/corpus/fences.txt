@@ -1,0 +1,31 @@
+================
+runnable fence attributes
+================
+ name="x" inputs="a,b" cache
+---
+(source
+  (attribute (key) (value (string)))
+  (attribute (key) (value (string)))
+  (attribute (key)))
+
+================
+constraint flag
+================
+ constraint
+---
+(source
+  (attribute (key)))
+
+================
+form body
+================
+field var=name label="Your name"
+
+field var=age
+---
+(source
+  (field_line
+    (attribute (key) (value (bare_value)))
+    (attribute (key) (value (string))))
+  (field_line
+    (attribute (key) (value (bare_value)))))

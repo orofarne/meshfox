@@ -1,0 +1,67 @@
+================
+node marker
+================
+<!-- meshfox:node id="a" tags=x,y fold -->
+---
+(source
+  (marker
+    (tag)
+    (attribute (key) (value (string)))
+    (attribute (key) (value (bare_value)))
+    (attribute (key))))
+
+================
+canvas marker, glued terminator
+================
+<!-- meshfox:canvas-->
+---
+(source
+  (marker (tag)))
+
+================
+glued terminator after a value
+================
+<!-- meshfox:option name=x-->
+---
+(source
+  (marker (tag) (attribute (key) (value (bare_value)))))
+
+================
+close marker
+================
+<!-- /meshfox:output -->
+---
+(source
+  (marker (tag)))
+
+================
+comment pair on one line
+================
+<!-- meshfox:comment -->Any text<!-- /meshfox:comment -->
+---
+(source
+  (marker (tag))
+  (text)
+  (marker (tag)))
+
+================
+single-quoted value with spaces
+================
+<!-- meshfox:var name='a b' prompt="Say: hi" -->
+---
+(source
+  (marker
+    (tag)
+    (attribute (key) (value (string)))
+    (attribute (key) (value (string)))))
+
+================
+hyphenated tag
+================
+<!-- meshfox:tag-color tag=a color=red -->
+---
+(source
+  (marker
+    (tag)
+    (attribute (key) (value (bare_value)))
+    (attribute (key) (value (bare_value)))))
