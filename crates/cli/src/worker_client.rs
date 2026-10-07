@@ -1211,6 +1211,7 @@ pub enum VarOrigin {
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ArgumentPreparation {
+    pub confirmation: Vec<String>,
     pub definition: String,
     pub path: Vec<String>,
     pub node_id: String,
@@ -1218,16 +1219,31 @@ pub struct ArgumentPreparation {
     pub block: Option<String>,
 }
 
+/// Confirmation gates for the exact launch mode, using the server's planner.
+pub async fn confirmation_blocks(
+    port: u16,
+    path: &[String],
+    block: &str,
+    no_deps: bool,
+) -> Result<Vec<String>, String> {
+    Ok(
+        prepare_arguments(port, path, block, &Default::default(), no_deps)
+            .await?
+            .confirmation,
+    )
+}
+
 pub async fn prepare_arguments(
     port: u16,
     path: &[String],
     block: &str,
     args: &std::collections::BTreeMap<String, String>,
+    no_deps: bool,
 ) -> Result<ArgumentPreparation, String> {
     let response = client()
         .post(format!("{}/api/args", base_url(port)))
         .timeout(time_limit(QUICK))
-        .json(&serde_json::json!({ "path": path, "block": block, "args": args }))
+        .json(&serde_json::json!({ "path": path, "block": block, "args": args, "noDeps": no_deps }))
         .send()
         .await
         .map_err(|e| describe(&e))?;
@@ -1505,6 +1521,7 @@ pub struct LockConflict {
 ///
 /// Always `persist: false` on the wire — see [`run_stream_persisted`] for
 /// the CLI's own `persist: true` variant and why the two callers differ.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_stream(
     port: u16,
     path: &[String],
@@ -1513,6 +1530,7 @@ pub async fn run_stream(
     vars: HashMap<String, String>,
     save_secrets: HashSet<String>,
     force: Option<(String, String)>,
+    confirm: bool,
 ) -> Result<tokio::sync::mpsc::UnboundedReceiver<RunEvent>, String> {
     run_stream_inner(
         port,
@@ -1524,6 +1542,7 @@ pub async fn run_stream(
         vars,
         save_secrets,
         force,
+        confirm,
     )
     .await
 }
@@ -1545,6 +1564,7 @@ pub async fn run_stream_persisted(
     vars: HashMap<String, String>,
     save_secrets: HashSet<String>,
     force: Option<(String, String)>,
+    confirm: bool,
 ) -> Result<tokio::sync::mpsc::UnboundedReceiver<RunEvent>, String> {
     run_stream_inner(
         port,
@@ -1556,6 +1576,7 @@ pub async fn run_stream_persisted(
         vars,
         save_secrets,
         force,
+        confirm,
     )
     .await
 }
@@ -1571,6 +1592,7 @@ async fn run_stream_inner(
     vars: HashMap<String, String>,
     save_secrets: HashSet<String>,
     force: Option<(String, String)>,
+    confirm: bool,
 ) -> Result<tokio::sync::mpsc::UnboundedReceiver<RunEvent>, String> {
     let vars_json = serde_json::to_string(&vars).map_err(|e| e.to_string())?;
     let secrets_json = serde_json::to_string(&save_secrets).map_err(|e| e.to_string())?;
@@ -1583,6 +1605,7 @@ async fn run_stream_inner(
         ("path", path.join(",")),
         ("block", block.to_string()),
         ("noDeps", no_deps.to_string()),
+        ("confirm", confirm.to_string()),
         ("fresh", fresh.to_string()),
         ("persist", persist.to_string()),
         ("vars", vars_json),
@@ -1786,6 +1809,7 @@ pub async fn tty_connect(
     cols: u16,
     rows: u16,
     force: Option<(String, String)>,
+    confirm: bool,
 ) -> Result<TtySocket, TtyConnectError> {
     let vars_json =
         serde_json::to_string(&vars).map_err(|e| TtyConnectError::Other(e.to_string()))?;
@@ -1795,6 +1819,7 @@ pub async fn tty_connect(
         ("path", path.join(",")),
         ("block", block.to_string()),
         ("noDeps", no_deps.to_string()),
+        ("confirm", confirm.to_string()),
         ("fresh", fresh.to_string()),
         ("vars", vars_json),
         ("saveSecrets", secrets_json),
@@ -1987,10 +2012,15 @@ pub async fn stop_service(port: u16, node_id: &str, block: &str) -> Result<(), S
 }
 
 /// Returns the restarted instance's own pid (`ServiceActionResponse::pid`).
-pub async fn restart_service(port: u16, node_id: &str, block: &str) -> Result<u32, String> {
+pub async fn restart_service(
+    port: u16,
+    node_id: &str,
+    block: &str,
+    confirm: bool,
+) -> Result<u32, String> {
     let res = client()
         .post(format!("{}/api/services/restart", base_url(port)))
-        .json(&serde_json::json!({ "nodeId": node_id, "block": block }))
+        .json(&serde_json::json!({ "nodeId": node_id, "block": block, "confirm": confirm }))
         .timeout(time_limit(CONTROL))
         .send()
         .await

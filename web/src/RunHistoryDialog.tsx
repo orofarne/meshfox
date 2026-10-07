@@ -97,7 +97,7 @@ export function RunHistoryDialog({
     setOutput({ id: selected, text: "", loading: true });
     subscribeRun(
       nodeId,
-      blockName,
+      runs?.find(run => run.id === selected)?.block ?? blockName,
       0,
       (ev) => {
         if (ev.type === "line") lines.push(ev.text);
@@ -114,7 +114,7 @@ export function RunHistoryDialog({
     return () => {
       cancelled = true;
     };
-  }, [nodeId, blockName, selected]);
+  }, [nodeId, blockName, selected, runs]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -168,6 +168,7 @@ export function RunHistoryDialog({
                 onClick={() => setSelected(run.id)}
                 title={`started ${run.startedAt}${run.endedAt ? `, ended ${run.endedAt}` : ""}`}
               >
+                {run.block !== blockName && <code className="run-history-application">{run.block}</code>}
                 <span className="run-history-time">{formatRunTime(run.startedAt)}</span>
                 <span className="run-history-exit">{runLabel(run)}</span>
                 {run.durationMs !== null && (
@@ -184,6 +185,7 @@ export function RunHistoryDialog({
           <div className="run-history-detail">
             {current && (
               <div className="run-history-detail-head" data-exit={runState(current)}>
+                {current.block !== blockName && <code>{current.block} · </code>}
                 {formatRunTime(current.startedAt)} · {runLabel(current)}
                 {current.durationMs !== null && ` · ${formatDurationMs(current.durationMs)}`}
                 {current.stale && <span className="run-history-stale-note"> · stale — {STALE_HINT}</span>}

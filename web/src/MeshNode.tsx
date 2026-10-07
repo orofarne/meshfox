@@ -248,6 +248,8 @@ export interface LiveBlockState {
    * identify *this* run to the server. Cleared once the block is no
    * longer the actively-streaming step. */
   runId?: string;
+  /** Persisted ledger identity of a restored finished run. */
+  historyId?: number;
   /** `Date.now()` when this step's own `"step-start"` event arrived —
    * client-side wall-clock, used only to tick a live elapsed-time counter
    * while `status === "running"` (see `LiveElapsed`). Not meant to be
@@ -1435,6 +1437,23 @@ function HighlightedCode({ code, lang }: { code: string; lang: string }) {
   );
 }
 
+/** Keep canonical application state separate, while displaying it at its definition. */
+function useBlockApplication(name: string, states: Record<string, LiveBlockState>) {
+  const applications = Object.keys(states).filter(key => key === name || key.startsWith(`${name}[`))
+    .sort((a, b) => (states[b].startedAt ?? 0) - (states[a].startedAt ?? 0)
+      || (states[b].historyId ?? 0) - (states[a].historyId ?? 0) || a.localeCompare(b));
+  const active = applications.find(key => states[key].status === "running")
+    ?? applications.find(key => states[key].status === "queued");
+  const newest = active ?? applications[0];
+  const [selected, setSelected] = useState<string>();
+  const newestStartedAt = newest ? states[newest].startedAt : undefined;
+  const newestHistoryId = newest ? states[newest].historyId : undefined;
+  useEffect(() => { if (newest) setSelected(newest); }, [newest, newestStartedAt, newestHistoryId]);
+  const application = selected && applications.includes(selected) ? selected : newest ?? name;
+  return { application, applications, select: setSelected, live: states[application],
+    busy: applications.some(key => states[key].status === "running" || states[key].status === "queued") };
+}
+
 function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData; nodeId: string }) {
   // A `button` fence has no real code of its own to show/edit — its whole
   // point is a prominent shortcut to its `deps=` chain (see SPEC.md's
@@ -1470,12 +1489,13 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
   const [expanded, setExpanded] = useState(true);
   const [sourceExpanded, setSourceExpanded] = useState(() => !seg.fold);
   const [historyOpen, setHistoryOpen] = useState(false);
-  const live = data.liveBlocks[seg.name];
+  const applicationState = useBlockApplication(seg.name, data.liveBlocks);
+  const { live, application } = applicationState;
   const queued = live?.status === "queued";
   const running = live?.status === "running";
-  const busy = queued || running;
-  const chainBusy = busy && live?.viaChain;
-  const runBusy = busy && !live?.viaChain;
+  const busy = applicationState.busy;
+  const chainBusy = (queued || running) && live?.viaChain;
+  const runBusy = (queued || running) && !live?.viaChain;
   const hasDeps = seg.deps.length > 0;
   const cacheHint = !seg.cache
     ? "output is not cached"
@@ -1595,7 +1615,7 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
           </span>
         )}
         <button
-          disabled={queued || running}
+          disabled={busy}
           onClick={runHandler}
           title={seg.tty ? "Opens an interactive terminal for this block" : runTitle}
         >
@@ -1604,7 +1624,7 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
         {hasDeps && (
           <button
             className="mesh-run-chain"
-            disabled={queued || running}
+            disabled={busy}
             onClick={chainHandler}
             title={seg.tty ? "Runs its dependency chain first, then opens an interactive terminal for this block" : chainTitle}
           >
@@ -1633,7 +1653,7 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
             <button
               type="button"
               className="mesh-kill-button"
-              onClick={() => data.onKill(seg.name)}
+              onClick={() => data.onKill(application)}
               title="Kill this run — terminates the process (and anything it spawned), and stops the rest of its dependency chain, in case it's hung"
             >
               ⏹ kill
@@ -1652,6 +1672,14 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
            * "Runnable code fences", the `fold` attribute this decoupling
            * exists for); collapsing the *whole* block still hides both
            * together, same as it always has. */}
+          {applicationState.applications.some(name => name !== seg.name) && (
+            <div className="mesh-block-application nodrag nopan">
+              <label>Application <select aria-label={`Application of ${seg.name}`} value={application}
+                onChange={event => applicationState.select(event.target.value)}>
+                {applicationState.applications.map(name => <option key={name} value={name}>{name} · {data.liveBlocks[name].status}</option>)}
+              </select></label>
+            </div>
+          )}
           {seg.tty ? (
             <TtyRunStatus live={live} />
           ) : (
@@ -1768,10 +1796,9 @@ function BlockDetails({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeD
  * ever runs its `deps=` chain (the equivalent of "⛓ run chain" — there's
  * no "just this block" to run, since it has no real code of its own). */
 function ButtonBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData; nodeId: string }) {
-  const live = data.liveBlocks[seg.name];
+  const { live, application, busy } = useBlockApplication(seg.name, data.liveBlocks);
   const queued = live?.status === "queued";
   const running = live?.status === "running";
-  const busy = queued || running;
   const caption = seg.code.trim() || seg.name;
   const buttonLabel = !busy ? caption : queued ? "queued…" : "running…";
 
@@ -1821,7 +1848,7 @@ function ButtonBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeDa
         <button
           type="button"
           className="mesh-kill-button"
-          onClick={() => data.onKill(seg.name)}
+          onClick={() => data.onKill(application)}
           title="Kill this run — terminates the process (and anything it spawned), and stops the rest of its dependency chain, in case it's hung"
         >
           ⏹ kill

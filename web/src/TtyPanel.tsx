@@ -57,6 +57,7 @@ interface TtyPanelProps {
    * Never fires for `"killed"`/`"error"`/`"closed"` — those are already a
    * deliberate or abnormal end, not "the process finished on its own",
    * which is the one case `autoclose` is about. */
+  confirm?: boolean;
   autoclose: boolean;
   /** When set, joins an *already-running* session (`GET /api/run/tty/
    * attach`) instead of starting a fresh one via `/api/run/tty` — every
@@ -129,6 +130,7 @@ export function TtyPanel({
   vars,
   saveSecrets,
   autoclose,
+  confirm = false,
   attachTo,
   onStepState,
   onClose,
@@ -188,6 +190,7 @@ export function TtyPanel({
           path: path.join(","),
           block: blockName,
           noDeps: String(!withDeps),
+          confirm: String(confirm),
           persist: String(persist),
           vars: JSON.stringify(vars ?? {}),
           saveSecrets: JSON.stringify(saveSecrets ?? []),

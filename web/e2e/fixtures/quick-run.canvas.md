@@ -58,3 +58,24 @@ quick-run button here should run that dependency first, same as clicking
 ```bash deps="dep-source/setup"
 echo chained-ran
 ```
+
+## Confirm cleanup
+<!-- meshfox:node id="confirm-cleanup" -->
+
+```bash confirm
+echo confirm-cleanup-ran
+```
+
+## Confirm consumer
+<!-- meshfox:node id="confirm-consumer" -->
+
+```bash deps="confirm-cleanup/confirm-cleanup"
+echo confirm-consumer-ran
+```
+
+## Confirm terminal
+<!-- meshfox:node id="confirm-terminal" -->
+
+```bash tty confirm
+echo confirm-terminal-ran
+```

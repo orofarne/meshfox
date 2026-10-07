@@ -212,6 +212,35 @@ const NOTIFY_READY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_
 /// empty read) is `InvalidData`, same failure kind every caller here
 /// already surfaced for that case before this was factored out.
 async fn request_and_await_reply(socket_path: &Path, msg: &Message) -> io::Result<String> {
+    // A coordinator that is exiting (the macOS daemon quitting) can still
+    // have its launchd socket accept one connection and then drop it: the
+    // write fails with EPIPE/ECONNRESET or the reply is empty. launchd
+    // starts a fresh daemon for the next connection, so retry a few times.
+    const ATTEMPTS: u32 = 4;
+    let mut attempt = 1;
+    loop {
+        match request_and_await_reply_once(socket_path, msg).await {
+            Err(e) if attempt < ATTEMPTS && is_dropped_connection(&e) => {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+fn is_dropped_connection(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::UnexpectedEof
+    ) || (e.kind() == io::ErrorKind::InvalidData
+        && e.to_string().contains("closed the connection without answering"))
+}
+
+async fn request_and_await_reply_once(socket_path: &Path, msg: &Message) -> io::Result<String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     let mut stream = UnixStream::connect(socket_path).await?;

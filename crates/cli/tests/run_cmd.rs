@@ -272,3 +272,54 @@ fn run_via_an_already_running_worker_still_runs_a_file_node() {
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("hi from worker-routed seed"));
 }
+
+#[test]
+fn confirm_blocks_require_approval_for_every_run_and_gate_dependencies_before_side_effects() {
+    let dir = unique_dir();
+    let path = dir.join("confirm.canvas.md");
+    std::fs::write(
+        &path,
+        concat!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
+            "```bash name=\"setup\"\necho setup >> effects\n```\n",
+            "```bash name=\"cleanup\" confirm deps=\"setup\"\necho cleanup >> effects\n```\n",
+            "```bash name=\"consumer\" deps=\"cleanup\"\necho consumer >> effects\n```\n",
+            "```bash name=\"safe\" confirm=false\necho safe\n```\n",
+        ),
+    )
+    .unwrap();
+    let invoke = |extra: &[&str], block: &str| {
+        meshfox()
+            .arg(&path)
+            .arg("run")
+            .args(extra)
+            .arg(block)
+            .output()
+            .unwrap()
+    };
+    let denied = invoke(&[], "consumer");
+    assert!(!denied.status.success());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("--confirm"));
+    assert!(
+        !dir.join("effects").exists(),
+        "even setup must wait for approval"
+    );
+    assert!(invoke(&["--confirm"], "consumer").status.success());
+    assert_eq!(
+        std::fs::read_to_string(dir.join("effects")).unwrap(),
+        "setup\ncleanup\nconsumer\n"
+    );
+    assert!(
+        !invoke(&[], "cleanup").status.success(),
+        "approval must not persist"
+    );
+    assert!(
+        invoke(&["--no-deps"], "consumer").status.success(),
+        "excluded explicit deps need no approval"
+    );
+    assert!(
+        invoke(&["--no-deps"], "safe").status.success(),
+        "confirm=false must remain runnable"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}

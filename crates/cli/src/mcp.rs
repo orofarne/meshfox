@@ -471,6 +471,10 @@ struct NodeBlockParams {
 
 #[derive(Deserialize, Serialize, JsonSchema)]
 struct RunParams {
+    /// Explicit user approval for this invocation's confirm-marked blocks.
+    /// On confirmation-required errors, ask the user before retrying with true.
+    #[serde(default)]
+    confirm: bool,
     /// The node that owns the block to run.
     node_id: String,
     /// The block's `name=`. Omit it to run the node's default block (the one
@@ -937,9 +941,15 @@ impl CanvasCtx {
             }
         };
 
-        let prepared = crate::worker_client::prepare_arguments(port, &path, &name, &params.args)
-            .await
-            .map_err(invalid_params)?;
+        let prepared = crate::worker_client::prepare_arguments(
+            port,
+            &path,
+            &name,
+            &params.args,
+            params.no_deps,
+        )
+        .await
+        .map_err(invalid_params)?;
         let path = prepared.path;
         let name = prepared.block.ok_or_else(|| {
             invalid_params(format!(
@@ -967,6 +977,15 @@ impl CanvasCtx {
                  — run it with `meshfox run` yourself"
                     .to_string(),
             ));
+        }
+
+        let gates = crate::worker_client::confirmation_blocks(port, &path, &name, params.no_deps)
+            .await
+            .map_err(invalid_params)?;
+        if !params.confirm && !gates.is_empty() {
+            return Err(invalid_params(format!(
+                "confirmation required for {} — ask the user for explicit approval, then retry with confirm: true",
+                gates.join(", "))));
         }
 
         // Variables: only what the caller supplied for a declared, non-secret
@@ -1009,6 +1028,7 @@ impl CanvasCtx {
             vars,
             std::collections::HashSet::new(),
             None,
+            params.confirm,
         )
         .await
         .map_err(|e| ErrorData::internal_error(format!("couldn't start the run: {e}"), None))?;

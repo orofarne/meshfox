@@ -143,7 +143,10 @@ specific cases:
   than on the block's own text, pass `fresh: true` (the whole chain runs for
   real this once; nothing is forgotten), or call `session_reset` to forget
   everything. The CLI equivalents are `meshfox run --fresh` and `meshfox
-  session reset`.
+  session reset`. Blocks marked `confirm` require explicit user approval for
+  each invocation, including when reached as dependencies. If `run` reports
+  confirmation required, ask the user before retrying with `confirm: true`;
+  never infer approval from a prior run. CLI uses `--confirm` for automation.
 - **A multi-step debug session** (`debug_start`/`debug_send`/`debug_stop`):
   a persistent shell in a node/block's own resolved cwd/env, so state
   (exported vars, files a snippet wrote) survives between calls — a

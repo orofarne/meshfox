@@ -276,3 +276,43 @@ async fn run_accepts_literal_args_and_keeps_required_defaults_unconfirmed() {
     assert!(missing.contains("missing required argument(s)"), "arguments must not be cached: {missing}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn confirm_marked_dependencies_need_explicit_approval_on_each_mcp_invocation() {
+    let dir = unique_dir();
+    std::fs::write(
+        dir.join("doc.canvas.md"),
+        CANVAS.replace("name=\"dep\"", "name=\"dep\" confirm"),
+    )
+    .unwrap();
+    let mcp = start(&dir).await;
+    call(
+        &mcp,
+        "canvas_open",
+        serde_json::json!({"path": "doc.canvas.md"}),
+    )
+    .await
+    .unwrap();
+    let args =
+        serde_json::json!({"canvas_id": "doc.canvas.md", "node_id": "root", "block": "target"});
+    let denied = call(&mcp, "run", args.clone()).await.unwrap_err();
+    assert!(
+        denied.contains("confirmation required") && denied.contains("root/dep"),
+        "{denied}"
+    );
+    assert_eq!(runs(&dir), 0);
+    let mut approved = args.clone();
+    approved["confirm"] = true.into();
+    let (is_error, report) = call(&mcp, "run", approved).await.unwrap();
+    assert!(!is_error && report["success"] == true, "{report}");
+    assert_eq!(runs(&dir), 1);
+    assert!(call(&mcp, "run", args.clone())
+        .await
+        .unwrap_err()
+        .contains("confirmation required"));
+    let mut local = args;
+    local["no_deps"] = true.into();
+    assert!(!call(&mcp, "run", local).await.unwrap().0);
+    mcp.cancel().await.unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}

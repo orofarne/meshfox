@@ -3190,3 +3190,18 @@ a {
   font-size: 12px;
 }
 .mesh-button-details-popover .mesh-block-details { padding: 0; border: none; margin: 0; }
+
+.run-history-application { flex-basis: 100%; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
+
+/* RunConfirmDialog shares Configure's card, hints and action buttons. */
+.run-confirm-blocks {
+  margin: 0;
+  padding-left: 1.25rem;
+  font-size: 0.8rem;
+  overflow-wrap: anywhere;
+}
+.run-confirm-blocks li + li { margin-top: 0.5rem; }
+
+.mesh-block-application { padding: 6px 8px; font-size: 12px; border-bottom: 1px solid var(--node-border); }
+.mesh-block-application label { display: flex; align-items: baseline; gap: 8px; }
+.mesh-block-application select { min-width: 0; max-width: 100%; flex: 1; color: inherit; background: var(--node-bg); border: 1px solid var(--node-border); border-radius: 4px; }

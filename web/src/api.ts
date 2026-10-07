@@ -773,8 +773,10 @@ export async function runBlockStream(
    * persist to the on-disk var cache anyway, in plaintext — see
    * `VarsForm`'s own "save (plaintext)" checkbox. */
   saveSecrets?: string[],
+  confirm = false,
 ): Promise<void> {
   const params = new URLSearchParams({
+    confirm: String(confirm),
     path: path.join(","),
     block,
     persist: String(persist),
@@ -918,8 +920,10 @@ export async function forceRun(
   force: { nodeId: string; block: string },
   vars?: Record<string, string>,
   saveSecrets?: string[],
+  confirm = false,
 ): Promise<void> {
   const params = new URLSearchParams({
+    confirm: String(confirm),
     path: path.join(","),
     block,
     persist: String(persist),
@@ -970,6 +974,8 @@ export async function subscribeRun(
  * variable value it used changed since, or the session was reset — not that
  * the run failed. */
 export interface RunHistoryEntry {
+  /** Canonical application address, including bound arguments. */
+  block: string;
   id: number;
   outcome: "exited" | "killed";
   exitCode: number | null;
@@ -980,7 +986,8 @@ export interface RunHistoryEntry {
   stale: boolean;
 }
 
-/** The finished runs of one block the server still keeps (newest first —
+/** Finished runs of one application, or all applications for a bare block
+ * name (newest first —
  * how many is the `[session] max_runs_per_block` setting). Pass an entry's
  * `id` as `subscribeRun`'s `runId` to replay its output. */
 export async function fetchRunHistory(nodeId: string, block: string): Promise<RunHistoryEntry[]> {
@@ -1081,6 +1088,8 @@ export interface ActiveRunDto {
   status: "running" | "exited" | "killed";
   exitCode?: number;
   uptimeMs: number;
+  historyId?: number;
+  startedAt?: string;
 }
 
 /**
@@ -1127,11 +1136,11 @@ export async function stopService(nodeId: string, block: string): Promise<void> 
 /** Stops the running instance and spawns a fresh one with the exact
  * parameters it was last started with — "local only", never touches
  * anything that depends on this service. */
-export async function restartService(nodeId: string, block: string): Promise<{ pid: number }> {
+export async function restartService(nodeId: string, block: string, confirm = false): Promise<{ pid: number }> {
   const res = await fetch("/api/services/restart", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ nodeId, block }),
+    body: JSON.stringify({ nodeId, block, confirm }),
   });
   if (!res.ok) throw new Error(`POST /api/services/restart: ${res.status}`);
   return res.json();
@@ -1145,11 +1154,12 @@ export async function forceStartService(
   path: string[],
   block: string,
   vars?: Record<string, string>,
+  confirm = false,
 ): Promise<{ pid: number }> {
   const res = await fetch("/api/services/force-start", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ path, block, vars: vars ?? {} }),
+    body: JSON.stringify({ path, block, vars: vars ?? {}, confirm }),
   });
   if (!res.ok) {
     const text = await res.text();
@@ -1523,6 +1533,7 @@ export function watchChanges(
 
 /** Local launch arguments are confirmed per application and never cached as vars. */
 export async function prepareArguments(path: string[], block: string, args: Record<string, string> = {}, withDeps = true): Promise<{
+  confirmation: string[];
   tty: boolean;
   autoclose: boolean;
   definition: string;

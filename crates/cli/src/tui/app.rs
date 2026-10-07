@@ -422,6 +422,19 @@ pub struct ServicesViewState {
     pub selected: usize,
 }
 
+pub struct RunConfirmation {
+    pub blocks: Vec<String>,
+    restart: bool,
+    node_id: String,
+    block_name: String,
+    with_deps: bool,
+    port: u16,
+    vars: HashMap<String, String>,
+    save_secrets: std::collections::HashSet<String>,
+    force: Option<(String, String)>,
+    tty: bool,
+}
+
 pub struct App {
     pub canvas_path: PathBuf,
     pub raw: String,
@@ -559,6 +572,8 @@ pub struct App {
     /// Set only while a `VarFormState` opened by `start_run_via_worker` is
     /// waiting on an answer — see `PendingHttpRun`'s own doc comment.
     pub pending_http_run: Option<PendingHttpRun>,
+    pub run_confirmation: Option<RunConfirmation>,
+    run_confirmation_approved: bool,
     pub run: Option<RunState>,
     pub file_run: Option<FileRunState>,
     /// Live per-step output from the most recent run, kept around after
@@ -1083,6 +1098,8 @@ impl App {
             worker_port,
             read_only,
             pending_http_run: None,
+            run_confirmation: None,
+            run_confirmation_approved: false,
             run: None,
             file_run: None,
             step_output: HashMap::new(),
@@ -1162,6 +1179,59 @@ impl App {
         }
         if self.block_picker.is_some() {
             self.on_block_picker_key(key).await;
+            return;
+        }
+        if let Some(pending) = self.run_confirmation.take() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    if pending.restart {
+                        match crate::worker_client::restart_service(
+                            pending.port,
+                            &pending.node_id,
+                            &pending.block_name,
+                            true,
+                        )
+                        .await
+                        {
+                            Ok(pid) => {
+                                self.status =
+                                    format!("restarted {} (pid {pid})", pending.block_name)
+                            }
+                            Err(error) => self.status = format!("failed to restart: {error}"),
+                        }
+                        self.refresh_services().await;
+                        return;
+                    }
+                    self.run_confirmation_approved = true;
+                    if pending.tty {
+                        Box::pin(self.begin_http_tty_run(
+                            pending.node_id,
+                            pending.block_name,
+                            pending.with_deps,
+                            pending.port,
+                            pending.vars,
+                            pending.save_secrets,
+                            pending.force,
+                        ))
+                        .await;
+                    } else {
+                        Box::pin(self.begin_http_run(
+                            pending.node_id,
+                            pending.block_name,
+                            pending.with_deps,
+                            pending.port,
+                            pending.vars,
+                            pending.save_secrets,
+                            pending.force,
+                        ))
+                        .await;
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => {
+                    self.status = "run cancelled".into();
+                }
+                _ => self.run_confirmation = Some(pending),
+            }
             return;
         }
         if self.services_view.is_some() {
@@ -1834,6 +1904,9 @@ impl App {
     /// already reflects `fullscreen` (`ui::compute_layout`), so a collapsed
     /// pane's own `point_in` checks below simply never match.
     pub async fn on_mouse(&mut self, mouse: MouseEvent) {
+        if self.run_confirmation.is_some() {
+            return;
+        }
         if let Some(se) = &mut self.source_editor {
             se.on_mouse(mouse);
             return;
@@ -3293,6 +3366,7 @@ impl App {
                 &path,
                 &block_name,
                 &Default::default(),
+                !with_deps,
             )
             .await
             {
@@ -3402,6 +3476,34 @@ impl App {
         save_secrets: std::collections::HashSet<String>,
         force: Option<(String, String)>,
     ) {
+        let approved = std::mem::take(&mut self.run_confirmation_approved);
+        if !approved {
+            let path = self.path_to(&node_id);
+            match crate::worker_client::confirmation_blocks(port, &path, &block_name, !with_deps)
+                .await
+            {
+                Ok(blocks) if !blocks.is_empty() => {
+                    self.run_confirmation = Some(RunConfirmation {
+                        blocks,
+                        restart: false,
+                        node_id,
+                        block_name,
+                        with_deps,
+                        port,
+                        vars,
+                        save_secrets,
+                        force,
+                        tty: true,
+                    });
+                    return;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    self.status = format!("confirmation check failed: {error}");
+                    return;
+                }
+            }
+        }
         let path = self.path_to(&node_id);
         let autoclose = self
             .target_chain_tty_autoclose(&node_id, &block_name, with_deps)
@@ -3418,6 +3520,7 @@ impl App {
             cols,
             rows,
             force,
+            approved,
         )
         .await
         {
@@ -3471,6 +3574,34 @@ impl App {
         save_secrets: std::collections::HashSet<String>,
         force: Option<(String, String)>,
     ) {
+        let approved = std::mem::take(&mut self.run_confirmation_approved);
+        if !approved {
+            let path = self.path_to(&node_id);
+            match crate::worker_client::confirmation_blocks(port, &path, &block_name, !with_deps)
+                .await
+            {
+                Ok(blocks) if !blocks.is_empty() => {
+                    self.run_confirmation = Some(RunConfirmation {
+                        blocks,
+                        restart: false,
+                        node_id,
+                        block_name,
+                        with_deps,
+                        port,
+                        vars,
+                        save_secrets,
+                        force,
+                        tty: false,
+                    });
+                    return;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    self.status = format!("confirmation check failed: {error}");
+                    return;
+                }
+            }
+        }
         let path = self.path_to(&node_id);
         self.output_scroll = 0;
         self.output_hscroll = 0;
@@ -3494,6 +3625,7 @@ impl App {
             vars,
             save_secrets,
             force,
+            approved,
         )
         .await
         {
@@ -3635,7 +3767,8 @@ impl App {
                 touched = Some(addr);
             }
             RunEvent::StepSkipped { node_id, block, .. } => {
-                run.lines.push(format!("==> {block} (skipped, already fresh this session)"));
+                run.lines
+                    .push(format!("==> {block} (skipped, already fresh this session)"));
                 let addr = BlockAddr::new(node_id, block);
                 // A skipped step produced no live output for this run.
                 self.step_output.remove(&addr);
@@ -4507,7 +4640,36 @@ impl App {
             }
             KeyCode::Char('r') => {
                 let (node_id, block) = keys[selected].clone();
-                match crate::worker_client::restart_service(port, &node_id, &block).await {
+                match crate::worker_client::confirmation_blocks(
+                    port,
+                    &self.path_to(&node_id),
+                    &block,
+                    true,
+                )
+                .await
+                {
+                    Ok(blocks) if !blocks.is_empty() => {
+                        self.run_confirmation = Some(RunConfirmation {
+                            blocks,
+                            restart: true,
+                            node_id,
+                            block_name: block,
+                            with_deps: false,
+                            port,
+                            vars: HashMap::new(),
+                            save_secrets: Default::default(),
+                            force: None,
+                            tty: false,
+                        });
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        self.status = format!("confirmation check failed: {error}");
+                        return;
+                    }
+                }
+                match crate::worker_client::restart_service(port, &node_id, &block, false).await {
                     Ok(pid) => self.status = format!("restarted {block} (pid {pid})"),
                     Err(e) => self.status = format!("failed to restart {block}: {e}"),
                 }
@@ -5114,6 +5276,7 @@ impl App {
                     &self.path_to(&pending.node_id),
                     &pending.block_name,
                     &answers,
+                    !pending.with_deps,
                 )
                 .await
                 {

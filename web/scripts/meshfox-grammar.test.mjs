@@ -36,11 +36,13 @@ for (const [label, path, language] of grammars) {
       assert.ok(output.some((span) => span.content.includes(`'${application}'`) && hasScope(span, "string.")),
         "inner JSON quotes and comma must stay inside one outer single-quoted value");
       const envTemplate = 'env="PDF_URL=PDF_URL_${lang}"';
-      const fence = highlighter.codeToTokens('```bash name="fetch" ' + envTemplate + '\necho "$PDF_URL"\n```', {
+      const fence = highlighter.codeToTokens('```bash name="fetch" confirm ' + envTemplate + '\necho "$PDF_URL"\n```', {
         lang: language, theme: "github-light", includeExplanation: true,
       });
       assert.ok(fence.tokens[0].map(token => token.content).join("").includes(envTemplate),
         "argument placeholders must stay intact in the fence info string");
+      assert.ok(fence.tokens[0].map(token => token.content).join("").includes(" confirm "),
+        "confirmation flags remain intact in the fence info string");
       const templateAttribute = spans('<!-- meshfox:node env="PDF_URL=PDF_URL_${lang}" -->');
       assert.ok(templateAttribute.some(span => span.content.includes('PDF_URL_${lang}') && hasScope(span, "string.")),
         "braces/dollars must stay inside an attribute string");

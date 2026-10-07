@@ -120,6 +120,15 @@ pub struct CodeBlock {
     pub span: Range<usize>,
 }
 
+impl CodeBlock {
+    /// Requires explicit approval for each invocation, including dependency runs.
+    pub fn requires_confirmation(&self) -> bool {
+        self.attrs
+            .get("confirm")
+            .is_some_and(|value| value != "false")
+    }
+}
+
 /// True if `block` is its node's "default" block — the one `meshfox run
 /// <path-to-node>` (with no trailing block name) addresses. A block
 /// qualifies either by the explicit `default` flag, or because its `name`
@@ -508,6 +517,7 @@ const FENCE_ATTRS: &[&str] = &[
     "output",
     "output-attrs",
     "autorun",
+    "confirm",
     "render",
     "send",
     "fold",
@@ -806,6 +816,24 @@ fn parse_info_string(info: &str) -> (String, HashMap<String, String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn confirm_flag_parses_and_does_not_change_freshness() {
+        let plain = scan_code_blocks("```bash name=x\necho hi\n```\n");
+        for flag in ["confirm", "confirm=true", "confirm=\"true\""] {
+            let blocks = scan_code_blocks(&format!("```bash name=x {flag}\necho hi\n```\n"));
+            assert!(blocks[0].requires_confirmation());
+            assert_eq!(fingerprint(&plain[0]), fingerprint(&blocks[0]));
+            assert!(
+                unknown_fence_attr(&format!("```bash name=x {flag}\necho hi\n```\n")).is_none()
+            );
+        }
+        assert!(!plain[0].requires_confirmation());
+        assert!(
+            !scan_code_blocks("```bash name=x confirm=false\necho hi\n```\n")[0]
+                .requires_confirmation()
+        );
+    }
 
     #[test]
     fn finds_named_runnable_block() {

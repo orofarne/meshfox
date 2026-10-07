@@ -737,6 +737,20 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
     Ok(())
 }
 
+/// Authored confirmation gates for the complete resolved application chain.
+/// Check before executing any step, including steps that precede the gated one.
+pub fn confirmation_blocks(canvas: &Canvas, chain: &[BlockAddr]) -> Vec<String> {
+    chain
+        .iter()
+        .filter_map(|addr| {
+            find_block(canvas, addr)
+                .ok()
+                .filter(|block| block.requires_confirmation())
+                .map(|_| format!("{}/{}", addr.node_id, addr.block_name))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

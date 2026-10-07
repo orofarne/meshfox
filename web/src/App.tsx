@@ -75,6 +75,7 @@ import { parseVarDecls } from "./vars";
 import { parseBody, type CodeSegment } from "./fence";
 import { MeshNode, resolveNodeColor, type MeshNodeData, type LiveBlockState } from "./MeshNode";
 import { VarsForm } from "./VarsForm";
+import { RunConfirmDialog } from "./RunConfirmDialog";
 import { DocumentOptions } from "./DocumentOptions";
 import { TtyPanel } from "./TtyPanel";
 import { NodeExpandPanel } from "./NodeExpandPanel";
@@ -562,6 +563,29 @@ export default function App() {
   // `handleConfigure`) — the browser counterpart to `meshfox configure`/
   // the TUI's `c` key. Independent of `varsModal`: this isn't gating a
   // run, it can be opened any time the toolbar button is visible.
+  const [runConfirmation, setRunConfirmation] = useState<string[] | null>(null);
+  const runConfirmationResolve = useRef<((approved: boolean | null) => void) | null>(null);
+  const finishRunConfirmation = useCallback((approved: boolean | null) => {
+    const resolve = runConfirmationResolve.current;
+    runConfirmationResolve.current = null;
+    setRunConfirmation(null);
+    resolve?.(approved);
+  }, []);
+  useEffect(() => () => {
+    runConfirmationResolve.current?.(null);
+    runConfirmationResolve.current = null;
+  }, []);
+  const confirmRun = useCallback(async (path: string[], block: string, withDeps: boolean): Promise<boolean | null> => {
+    const prepared = await prepareArguments(path, block, {}, withDeps);
+    if (prepared.confirmation.length === 0) return false;
+    // A newer request cancels any older waiting invocation.
+    runConfirmationResolve.current?.(null);
+    return new Promise((resolve) => {
+      runConfirmationResolve.current = resolve;
+      setRunConfirmation(prepared.confirmation);
+    });
+  }, []);
+
   const [configureVars, setConfigureVars] = useState<VarStatus[] | null>(null);
   // Whether the toolbar's "options" modal (see DocumentOptions) is open —
   // unlike `configureVars`, needs no fetch first: `canvas.options` (from
@@ -580,6 +604,7 @@ export default function App() {
     vars?: Record<string, string>;
     saveSecrets?: string[];
     autoclose: boolean;
+    confirm?: boolean;
     /** Set only when reattaching to an already-running session from
      * `TtySessionsPanel` (`GET /api/run/tty/attach`) rather than starting
      * a fresh one — every field above is ignored in this mode, see
@@ -1011,6 +1036,20 @@ export default function App() {
   // for one of these must not spawn a second reader (see `executeRun`).
   const selfInitiatedRuns = useRef<Set<string>>(new Set());
 
+  // How many `executeRun` streams this tab has open right now. The server
+  // pulls in steps the client's own chain preview never lists (a producer
+  // of an `inputs=` file), so `selfInitiatedRuns` can't name every step of
+  // a chain this tab is streaming; while any stream is open, a still-running
+  // run reported by `"runs-changed"` is part of it, not someone else's.
+  const openOwnStreams = useRef(0);
+
+  // Addresses an `executeRun` stream of this tab has shown a step of, mapped
+  // to when that stream ended (`Infinity` while it is open). `"runs-changed"`
+  // fires as a run finishes, but the `/api/runs` it triggers can still list
+  // that run as running and be handled after the stream closed — adopting it
+  // then would replay lines the stream already showed. Entries expire.
+  const ownStreamedSteps = useRef<Map<string, number>>(new Map());
+
   // Run ids of the runs this tab started itself (from each stream's own
   // `"started"` event). `selfInitiatedRuns` only covers a run while its
   // stream is open, but the `"run-started"` broadcast travels on a different
@@ -1292,6 +1331,13 @@ export default function App() {
     [watchAutorunBlock],
   );
 
+  const openConfirmedTerminal = async (session: NonNullable<typeof ttySession>) => {
+    try {
+      const confirm = await confirmRun(session.path, session.blockName, session.withDeps);
+      if (confirm !== null) setTtySession({ ...session, confirm });
+    } catch (error) { setError(String(error)); }
+  };
+
   // Actually starts a run — split out from `handleRun` (below) so the
   // vars-modal's "run" button can call straight back into this once
   // answered, without re-checking `fetchVars` a second time.
@@ -1310,6 +1356,11 @@ export default function App() {
     ) => {
       if (!canvas) return;
       const path = pathTo(canvas, nodeId);
+      let confirm: boolean | null;
+      try {
+        confirm = await confirmRun(path, blockName, withDeps);
+        if (confirm === null) return;
+      } catch (error) { setError(String(error)); return; }
       // Start a new transcript without erasing another concurrently running chain.
       if (!anyBlockRunningRef.current) setConsoleLines([]);
 
@@ -1397,8 +1448,18 @@ export default function App() {
       // would start a second `watchAutorunBlock` reader on the very run
       // this stream is already folding into `liveBlocks`, and both would
       // append the same lines (doubled output).
-      const selfRunKey = `${nodeId}::${blockName}`;
-      selfInitiatedRuns.current.add(selfRunKey);
+      //
+      // The chain's dependencies count too: `"runs-changed"` reports a
+      // running dependency as an ordinary plain run, and `syncPlainRuns`
+      // would adopt it (replaying the backlog from 0) while this stream
+      // is also appending its lines — the same output twice.
+      const selfRunKeys = [
+        `${nodeId}::${blockName}`,
+        ...previewChain.map((addr) => `${addr.nodeId}::${addr.blockName}`),
+      ];
+      for (const key of selfRunKeys) selfInitiatedRuns.current.add(key);
+      openOwnStreams.current += 1;
+      const streamedKeys = new Set<string>();
       try {
         // Running is always allowed; only Edit mode persists a cache'd
         // block's output to the file. When `withDeps`, the server
@@ -1409,9 +1470,9 @@ export default function App() {
         // this function's own `force` param).
         const stream = force
           ? (onEvent: (event: RunEvent) => void) =>
-              forceRun(path, blockName, editMode, withDeps, onEvent, force, vars, saveSecrets)
+              forceRun(path, blockName, editMode, withDeps, onEvent, force, vars, saveSecrets, confirm)
           : (onEvent: (event: RunEvent) => void) =>
-              runBlockStream(path, blockName, editMode, withDeps, onEvent, vars, saveSecrets);
+              runBlockStream(path, blockName, editMode, withDeps, onEvent, vars, saveSecrets, confirm);
         await stream((event: RunEvent) => {
           switch (event.type) {
             case "started":
@@ -1419,6 +1480,8 @@ export default function App() {
               ownRunIds.current.add(event.runId);
               break;
             case "step-start":
+              streamedKeys.add(`${event.nodeId}::${event.block}`);
+              ownStreamedSteps.current.set(`${event.nodeId}::${event.block}`, Infinity);
               patchLiveBlock(event.nodeId, event.block, {
                 status: "running",
                 text: "",
@@ -1537,7 +1600,10 @@ export default function App() {
         blockStuckQueued();
         setError(String(e));
       } finally {
-        selfInitiatedRuns.current.delete(selfRunKey);
+        for (const key of selfRunKeys) selfInitiatedRuns.current.delete(key);
+        openOwnStreams.current -= 1;
+        const endedAt = Date.now();
+        for (const key of streamedKeys) ownStreamedSteps.current.set(key, endedAt);
       }
     },
     [canvas, editMode, load, blockGraph, setNodes, patchLiveBlock, appendConsoleLine],
@@ -1571,7 +1637,8 @@ export default function App() {
         // Backdated so `LiveElapsed` (`Date.now() - startedAt`) shows
         // the real elapsed time immediately instead of restarting its
         // own clock from the moment this tab happened to notice.
-        startedAt: run.status === "running" ? Date.now() - run.uptimeMs : undefined,
+        startedAt: run.status === "running" ? Date.now() - run.uptimeMs : run.startedAt ? Date.parse(run.startedAt) : undefined,
+        historyId: run.historyId,
         durationMs: run.status === "exited" ? run.uptimeMs : undefined,
       });
       let sawDone = false;
@@ -1579,7 +1646,11 @@ export default function App() {
         if (!isCurrent()) return;
         switch (event.type) {
           case "line":
-            appendConsoleLine(run.nodeId, run.block, event);
+            // The console is a transcript of what this tab saw happen. A
+            // run that already finished when it was adopted is only being
+            // replayed into the block's own output — often it is this
+            // tab's own run, whose lines the stream already logged.
+            if (run.status === "running") appendConsoleLine(run.nodeId, run.block, event);
             setNodes((nds) =>
               nds.map((n) => {
                 if (n.id !== run.nodeId) return n;
@@ -1634,6 +1705,12 @@ export default function App() {
       for (const run of runs) {
         if (run.kind !== "plain") continue;
         if (selfInitiatedRuns.current.has(`${run.nodeId}::${run.block}`)) continue;
+        if (run.status === "running" && openOwnStreams.current > 0) continue;
+        const ownEndedAt = ownStreamedSteps.current.get(`${run.nodeId}::${run.block}`);
+        if (ownEndedAt !== undefined) {
+          if (Date.now() - ownEndedAt < 10_000) continue;
+          ownStreamedSteps.current.delete(`${run.nodeId}::${run.block}`);
+        }
         const local = nodesRef.current.find((n) => n.id === run.nodeId)?.data.liveBlocks[run.block];
         // Only a block showing nothing, or a finished run, is adopted from
         // the server: a block that is running, queued, skipped or blocked
@@ -1645,7 +1722,7 @@ export default function App() {
         if (local && local.status !== "done" && local.status !== "killed") continue;
         if (run.status !== "running") {
           const status = run.status === "killed" ? "killed" : "done";
-          if (local && local.status === status && local.exitCode === run.exitCode) continue;
+          if (local && local.status === status && local.exitCode === run.exitCode && local.historyId === run.historyId) continue;
         }
         adoptPlainRun(run);
       }
@@ -1835,7 +1912,7 @@ export default function App() {
         return;
       }
       if (tty) {
-        setTtySession({ path, blockName, withDeps, autoclose });
+        await openConfirmedTerminal({ path, blockName, withDeps, autoclose });
       } else {
         await executeRun(nodeId, blockName, withDeps);
       }
@@ -1873,7 +1950,7 @@ export default function App() {
         setVarsModal({ nodeId, blockName, withDeps, missing, tty: true, autoclose });
         return;
       }
-      setTtySession({ path, blockName, withDeps, autoclose });
+      await openConfirmedTerminal({ path, blockName, withDeps, autoclose });
     },
     [canvas],
   );
@@ -1895,7 +1972,7 @@ export default function App() {
           if (missing.length > 0) {
             setVarsModal({ nodeId, blockName: prepared.block, withDeps, missing, tty: useTty, autoclose: closeTerminal });
           } else if (useTty) {
-            setTtySession({ path: pathTo(canvas, nodeId), blockName: prepared.block, withDeps, autoclose: closeTerminal });
+            await openConfirmedTerminal({ path: pathTo(canvas, nodeId), blockName: prepared.block, withDeps, autoclose: closeTerminal });
           } else {
             await executeRun(nodeId, prepared.block, withDeps);
           }
@@ -1905,7 +1982,7 @@ export default function App() {
       setVarsModal(null);
       if (tty) {
         if (!canvas) return;
-        setTtySession({
+        await openConfirmedTerminal({
           path: pathTo(canvas, nodeId),
           blockName,
           withDeps,
@@ -3233,6 +3310,7 @@ export default function App() {
         ttySession ||
         varsModal ||
         configureVars ||
+        runConfirmation ||
         deleteConfirmNodeId ||
         reparentPromptNodeId ||
         expandedNodeId ||
@@ -3348,6 +3426,7 @@ export default function App() {
     ttySession,
     varsModal,
     configureVars,
+    runConfirmation,
     deleteConfirmNodeId,
     reparentPromptNodeId,
     expandedNodeId,
@@ -4000,6 +4079,11 @@ export default function App() {
           </ReactFlow>
         )}
       </div>
+      {runConfirmation && (
+        <RunConfirmDialog blocks={runConfirmation}
+          onConfirm={() => finishRunConfirmation(true)}
+          onCancel={() => finishRunConfirmation(null)} />
+      )}
       {varsModal && (
         <VarsForm key={`${varsModal.blockName}:${varsModal.arguments ? "args" : "vars"}`} vars={varsModal.missing} onSubmit={handleVarsSubmit} onCancel={handleVarsCancel}
           title={varsModal.arguments ? "Configure arguments" : undefined}
@@ -4048,6 +4132,7 @@ export default function App() {
                   : { status: "done", exitCode: state.exitCode },
             )
           }
+          confirm={ttySession.confirm}
           onClose={() => setTtySession(null)}
         />
       )}
@@ -4145,11 +4230,14 @@ export default function App() {
               .then(setServices)
               .catch((e) => setError(String(e)));
           }}
-          onRestart={(nodeId, block) => {
-            restartService(nodeId, block)
-              .then(() => fetchServices())
-              .then(setServices)
-              .catch((e) => setError(String(e)));
+          onRestart={async (nodeId, block) => {
+            if (!canvas) return;
+            try {
+              const confirm = await confirmRun(pathTo(canvas, nodeId), block, false);
+              if (confirm === null) return;
+              await restartService(nodeId, block, confirm);
+              setServices(await fetchServices());
+            } catch (error) { setError(String(error)); }
           }}
         />
       )}

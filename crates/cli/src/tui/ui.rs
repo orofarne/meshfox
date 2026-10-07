@@ -401,6 +401,14 @@ pub fn render(f: &mut Frame, app: &mut App) {
         render_block_picker(f, area, bp);
     } else if let Some(vf) = &app.var_form {
         render_var_form(f, area, vf);
+    } else if let Some(pending) = &app.run_confirmation {
+        let rect = centered_rect(70, 12, area);
+        f.render_widget(Clear, rect);
+        f.render_widget(Paragraph::new(format!(
+            "Potentially destructive operation(s):\n{}\n\nRun these blocks?\n\ny confirm · n/esc/enter cancel",
+            pending.blocks.join("\n")))
+            .wrap(Wrap { trim: true })
+            .block(Block::default().borders(Borders::ALL).title(" confirm run ")), rect);
     } else if app.reset_session_confirm {
         render_reset_session_confirm(f, area);
     } else if let Some(conflict) = &app.service_conflict {

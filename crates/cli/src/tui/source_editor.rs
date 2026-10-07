@@ -33,7 +33,7 @@ const FENCE_VALUE_ATTRS: &[&str] = &[
     "output",
     "output-attrs",
 ];
-const FENCE_FLAG_ATTRS: &[&str] = &["cache", "tty", "autoclose", "always", "default"];
+const FENCE_FLAG_ATTRS: &[&str] = &["cache", "tty", "autoclose", "always", "default", "confirm"];
 
 /// What the caller (`App::on_key`) should do after handing a keypress to
 /// the editor.

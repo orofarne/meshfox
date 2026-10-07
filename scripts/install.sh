@@ -230,6 +230,10 @@ bin_src="${workdir}/${TARGET}/${BIN_NAME}"
 
 mkdir -p "$INSTALL_DIR"
 install -m 755 "$bin_src" "${INSTALL_DIR}/${BIN_NAME}"
+if [ "$(uname -s)" = Darwin ]; then
+    # A copied binary's linker signature can be killed by AMFI; re-sign ad-hoc.
+    codesign --force -s - "${INSTALL_DIR}/${BIN_NAME}"
+fi
 info "installed ${BIN_NAME} to ${INSTALL_DIR}/${BIN_NAME}"
 
 path_contains_dir() {

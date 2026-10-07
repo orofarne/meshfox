@@ -409,6 +409,16 @@ impl RunLedger {
             .map_err(sqlite_err)
     }
 
+    /// Stored application addresses, including stale runs after a reset.
+    pub fn history_blocks(&self, node_id: &str) -> io::Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT block FROM runs WHERE node_id = ?1 AND outcome != 'running'",
+        ).map_err(sqlite_err)?;
+        let rows = stmt.query_map([node_id], |r| r.get(0)).map_err(sqlite_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)
+    }
+
     /// Every finished run of `(node_id, block)` still kept, newest first.
     pub fn history(
         &self,
@@ -851,6 +861,7 @@ mod tests {
         let running = ledger.start("a", "b", RunKind::Plain, "test", 1).unwrap();
         ledger.set_fingerprint(running, "fp").unwrap();
         ledger.mark_finished_runs_stale().unwrap();
+        assert_eq!(ledger.history_blocks("a").unwrap(), vec!["b"]);
         assert_eq!(ledger.latest_fresh_run("a", "b", "fp").unwrap(), None);
         assert!(
             ledger

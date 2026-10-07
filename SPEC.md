@@ -280,6 +280,21 @@ Lives inside a node's Markdown text, as fence-info-string attributes:
   trailing block-name argument that would just repeat the node's own id —
   see "CLI" below — and applies the same way to a fence whose *explicit*
   `name` happens to already match its node's `id`.
+- `confirm` — optional flag (`confirm` or `confirm=true`; `confirm=false`
+  disables it), for potentially destructive operations. Before any step starts,
+  all marked blocks in the resolved chain (including implicit variable/file
+  producers) require explicit user approval. Web UI shows an internal confirmation modal styled like Configure;
+  TUI requires `y` (Enter/Escape cancel); CLI asks `[y/N]` in an interactive
+  terminal and otherwise refuses, unless `meshfox run --confirm` is supplied.
+  MCP `run` accepts `confirm: true` only after obtaining user approval; without
+  it the call returns a confirmation-required error naming the gated blocks.
+  Approval applies to one invocation, never to subsequent runs or session cache.
+  `--no-deps` excludes explicit dependencies from the gate, but retains implicit
+  producers. Automatic runs have no approval and are refused if their chain
+  contains a marked block. Server execution endpoints enforce the flag, including
+  TTY, force-run and service restart; dynamic replanning checks it again before
+  executing newly discovered steps. The flag does not affect fingerprints.
+  For example: `python name="cleanup" interpreter="$PYTHON -u" confirm`.
 - `cache` — optional flag (`cache` or `cache=true`); opts into persisting
   output back into the file.
 - `default` — optional flag (`default` or `default=true`); marks this
@@ -689,6 +704,23 @@ irrelevant. Integers normalize to decimal (`01` and `1` are identical), booleans
 to `true`/`false`; strings and select values retain their exact contents.
 Identity consists of the existing block address and all effective bindings
 sorted by argument name. Explicit and defaulted equal values share identity.
+The web source block displays canonical application states separately. A new
+running or queued application is selected automatically; the application
+selector switches between observed variants without mixing their output. Run
+controls stay disabled while any variant is busy, and Kill targets the selected
+running application. Session reconciliation restores variants after reload, including persisted
+start time and ledger ID. The default selection prefers a currently running
+application (then queued), otherwise the most recently started retained result;
+ledger ID breaks timestamp ties. A new run takes over even when it repeats the
+same variant that was previously newest. Manual selection remains available.
+
+The web history dialog for a source block lists finished runs of all its
+applications, newest first, with each canonical address shown alongside its
+arguments. `/api/run/history` with a bare block name returns this combined list;
+an explicit application address returns only that application. Each entry
+includes `block`, which is used with `runId` to replay its own output. Stale
+runs remain visible after a session reset. Retention remains per application.
+
 Cache, history, locks and cycle checks use this identity; identical applications
 in one graph share a step. Graph expansion is limited to 128 nested applications
 and 4096 distinct applications; exceeding either limit is a diagnostic error.

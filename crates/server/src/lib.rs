@@ -2535,6 +2535,8 @@ fn acquire_chain_locks(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RunRequest {
+    #[serde(default)]
+    confirm: bool,
     /// Node-id path from the root's children down to the node that owns
     /// the block, e.g. `["tests", "smoke-test"]`.
     path: Vec<String>,
@@ -2685,6 +2687,7 @@ struct ArgumentsRequest {
 
 #[derive(Debug, Serialize)]
 struct ArgumentsResponse {
+    confirmation: Vec<String>,
     tty: bool,
     autoclose: bool,
     #[serde(flatten)]
@@ -2752,7 +2755,17 @@ async fn prepare_arguments(
         .flatten()
         .filter_map(|addr| meshfox_core::deps::find_block(&canvas, &addr).ok())
         .find(|block| block.tty);
+    let confirmation = prepared
+        .block
+        .as_ref()
+        .map(|block| {
+            meshfox_core::resolve_run_chain(&canvas, &canonical_refs, block, !request.no_deps)
+                .map(|chain| meshfox_core::deps::confirmation_blocks(&canvas, &chain))
+        })
+        .transpose()?
+        .unwrap_or_default();
     Ok(Json(ArgumentsResponse {
+        confirmation,
         tty: terminal.is_some(),
         autoclose: terminal.is_some_and(|block| block.autoclose),
         prepared,
@@ -6098,6 +6111,8 @@ async fn clear_node_id(
 #[serde(rename_all = "camelCase")]
 struct RunWsQuery {
     #[serde(default)]
+    confirm: bool,
+    #[serde(default)]
     path: String,
     block: String,
     #[serde(default)]
@@ -6120,12 +6135,14 @@ struct RunWsQuery {
 /// support `#[serde(flatten)]` the way a JSON body's `ForceRunRequest` used
 /// to rely on, so `TtyRunQuery`'s own precedent — a flat, fully-duplicated
 /// struct — is what `ForceRunWsQuery` below follows instead).
+#[allow(clippy::too_many_arguments)]
 fn parse_run_request(
     path: &str,
     block: String,
     no_deps: bool,
     fresh: bool,
     persist: bool,
+    confirm: bool,
     vars: &str,
     save_secrets: &str,
 ) -> Result<RunRequest, ApiError> {
@@ -6151,6 +6168,7 @@ fn parse_run_request(
         })?
     };
     Ok(RunRequest {
+        confirm,
         path,
         block,
         persist,
@@ -6182,6 +6200,7 @@ async fn run_block(
             query.no_deps,
             query.fresh,
             query.persist,
+            query.confirm,
             &query.vars,
             &query.save_secrets,
         ) {
@@ -6202,6 +6221,8 @@ async fn run_block(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ForceRunWsQuery {
+    #[serde(default)]
+    confirm: bool,
     #[serde(default)]
     path: String,
     block: String,
@@ -6265,16 +6286,23 @@ async fn force_run(
             block: query.force_block,
         };
         let result: Result<Response, ApiError> = async {
-            force_run_kill_prep(&state, &force).await?;
             let req = parse_run_request(
                 &query.path,
                 query.block,
                 query.no_deps,
                 query.fresh,
                 query.persist,
+                query.confirm,
                 &query.vars,
                 &query.save_secrets,
             )?;
+            let raw = state.raw.lock().unwrap().clone();
+            let mut canvas = resolved_canvas(&raw, &state.canvas_path)?;
+            seed_artifact_paths(&state, &mut canvas, &effective_overrides(&state, &req.vars));
+            let path: Vec<&str> = req.path.iter().map(String::as_str).collect();
+            let chain = meshfox_core::resolve_run_chain(&canvas, &path, &req.block, !req.no_deps)?;
+            require_run_confirmation(&canvas, &chain, req.confirm)?;
+            force_run_kill_prep(&state, &force).await?;
             run_block_impl(state, req).await
         }
         .await;
@@ -6287,6 +6315,19 @@ async fn force_run(
 struct ForceTarget {
     node_id: String,
     block: String,
+}
+
+fn require_run_confirmation(
+    canvas: &Canvas,
+    chain: &[meshfox_core::BlockAddr],
+    confirmed: bool,
+) -> Result<(), ApiError> {
+    let blocks = meshfox_core::deps::confirmation_blocks(canvas, chain);
+    if !confirmed && !blocks.is_empty() {
+        return Err(ApiError(StatusCode::PRECONDITION_REQUIRED,
+            format!("confirmation required for {} — obtain explicit user approval, then run with confirm=true", blocks.join(", "))));
+    }
+    Ok(())
 }
 
 async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Response, ApiError> {
@@ -6309,6 +6350,7 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
             ),
         ));
     }
+    require_run_confirmation(&canvas, &chain, req.confirm)?;
     let persist = req.persist;
 
     // Resolve only the declared variables this chain's blocks actually
@@ -6557,6 +6599,11 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
                     break;
                 }
             };
+            if let Err(error) = require_run_confirmation(&canvas, &chain, req.confirm) {
+                final_exit_code = 1;
+                yield Ok(ndjson_line(&RunEvent::Error { message: error.1 }));
+                break;
+            }
             let Some(addr_owned) = chain.iter().find(|addr| !visited.contains(*addr)).cloned() else { break; };
             let addr = &addr_owned;
             visited.insert(addr.clone());
@@ -7174,6 +7221,7 @@ async fn trigger_autorun(state: Arc<AppState>, addr: meshfox_core::BlockAddr) {
         return;
     };
     let build_req = move || RunRequest {
+        confirm: false,
         path: path.clone(),
         block: addr.block_name.clone(),
         persist: false,
@@ -7564,6 +7612,8 @@ fn find_tty_block(
 #[serde(rename_all = "camelCase")]
 struct TtyRunQuery {
     #[serde(default)]
+    confirm: bool,
+    #[serde(default)]
     path: String,
     block: String,
     #[serde(default)]
@@ -7646,6 +7696,7 @@ async fn run_block_tty(
         query.path.split(',').collect()
     };
     let chain = meshfox_core::resolve_run_chain(&canvas, &path, &query.block, !query.no_deps)?;
+    require_run_confirmation(&canvas, &chain, query.confirm)?;
     let persist = query.persist;
     let (cols, rows) = (query.cols.max(1), query.rows.max(1));
 
@@ -7796,6 +7847,7 @@ async fn run_block_tty(
             chain,
             decls,
             resolved_vars,
+            query.confirm,
             query.fresh,
             !query.no_deps,
             persist,
@@ -7851,6 +7903,7 @@ async fn run_tty_chain(
     chain: Vec<meshfox_core::BlockAddr>,
     decls: Vec<meshfox_core::VarDecl>,
     mut resolved_vars: HashMap<String, String>,
+    confirmed: bool,
     fresh: bool,
     with_deps: bool,
     persist: bool,
@@ -7921,6 +7974,11 @@ async fn run_tty_chain(
                 break;
             }
         };
+        if let Err(error) = require_run_confirmation(&canvas, &chain, confirmed) {
+            final_exit_code = 1;
+            send_event(&mut socket, &RunEvent::Error { message: error.1 }).await;
+            break;
+        }
         let Some(addr_owned) = chain.iter().find(|addr| !visited.contains(*addr)).cloned() else { break; };
         let addr = &addr_owned;
         visited.insert(addr.clone());
@@ -8226,8 +8284,19 @@ async fn run_tty_chain(
             );
             let (_backlog, mut run_rx) = run_handle.subscribe_from(0);
             let mut kill_requested = false;
+            // A plain step can stay silent for minutes (a PDF parse that
+            // only prints when done); without a heartbeat here the client's
+            // silence clock would declare a perfectly healthy worker dead.
+            let mut heartbeat = ws_heartbeat();
             loop {
                 tokio::select! {
+                    _ = heartbeat.tick() => {
+                        if socket.send(heartbeat_message()).await.is_err() {
+                            // Client gone — the run keeps going in the
+                            // background, same as on a failed output send.
+                            return;
+                        }
+                    }
                     event = run_rx.recv() => {
                         match event {
                             Ok(run_registry::RunEvent::Line(line)) => {
@@ -8885,6 +8954,11 @@ struct ActiveRunDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     exit_code: Option<i32>,
     uptime_ms: u64,
+    /// Persisted identity and start time for ordering restored finished runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    history_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    started_at: Option<String>,
 }
 
 /// `GET /api/runs` — every plain-block run and `tty` session this process
@@ -8918,6 +8992,8 @@ async fn get_active_runs(State(state): State<Arc<AppState>>) -> Json<Vec<ActiveR
                 status: "running",
                 exit_code: None,
                 uptime_ms: handle.uptime_ms(),
+                history_id: None,
+                started_at: None,
             });
         }
     }
@@ -8969,6 +9045,8 @@ async fn get_active_runs(State(state): State<Arc<AppState>>) -> Json<Vec<ActiveR
                 // For a finished run this is its length, not the time since
                 // it started — what the client shows as its duration.
                 uptime_ms: run.duration_ms.unwrap_or(0),
+                history_id: Some(run.id),
+                started_at: Some(run.started_at),
             });
         }
     }
@@ -8985,6 +9063,8 @@ async fn get_active_runs(State(state): State<Arc<AppState>>) -> Json<Vec<ActiveR
             status,
             exit_code,
             uptime_ms: handle.uptime_ms(),
+            history_id: None,
+            started_at: None,
         });
     }
     Json(out)
@@ -9033,6 +9113,8 @@ async fn get_service_log(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ServiceKeyRequest {
+    #[serde(default)]
+    confirm: bool,
     node_id: String,
     block: String,
 }
@@ -9074,6 +9156,16 @@ async fn restart_service(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ServiceKeyRequest>,
 ) -> Result<Json<ServiceActionResponse>, ApiError> {
+    let raw = state.raw.lock().unwrap().clone();
+    let canvas = resolved_canvas(&raw, &state.canvas_path)?;
+    require_run_confirmation(
+        &canvas,
+        &[meshfox_core::BlockAddr::new(
+            req.node_id.clone(),
+            req.block.clone(),
+        )],
+        req.confirm,
+    )?;
     let mut services = state.services.lock().unwrap();
     let key = (req.node_id.clone(), req.block.clone());
     let old = services.get(&key).ok_or_else(|| {
@@ -9092,6 +9184,8 @@ async fn restart_service(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ForceStartServiceRequest {
+    #[serde(default)]
+    confirm: bool,
     path: Vec<String>,
     block: String,
     #[serde(default)]
@@ -9116,6 +9210,7 @@ async fn force_start_service(
     let canvas = resolved_canvas(&raw_snapshot, &state.canvas_path)?;
     let path: Vec<&str> = req.path.iter().map(String::as_str).collect();
     let chain = meshfox_core::resolve_run_chain(&canvas, &path, &req.block, false)?;
+    require_run_confirmation(&canvas, &chain, req.confirm)?;
     let target = chain
         .last()
         .cloned()
@@ -9723,22 +9818,46 @@ struct RunHistoryQuery {
 }
 
 /// `GET /api/run/history?nodeId=..&block=..` — the finished runs of one
-/// address the session database still holds (see `[session]
+/// application, or all applications of a bare definition, that the session
+/// database still holds (see `[session]
 /// max_runs_per_block`), newest first: id, outcome, exit code, start/end
 /// time, and whether each is `stale` (its block or a dependency, or a
 /// variable value it used, changed since; or the session was reset). Feed an
 /// `id` back as `runId` to `/api/run/subscribe` to replay that run's output.
+#[derive(serde::Serialize)]
+struct RunHistoryItem {
+    block: String,
+    #[serde(flatten)]
+    run: run_ledger::RunSummary,
+}
+
 async fn get_run_history(
     State(state): State<Arc<AppState>>,
     Query(query): Query<RunHistoryQuery>,
-) -> Result<Json<Vec<run_ledger::RunSummary>>, ApiError> {
+) -> Result<Json<Vec<RunHistoryItem>>, ApiError> {
     let addr = canonical_run_address(&state, &query.node_id, &query.block);
-    let current = current_run_fingerprint(&state, &addr);
-    state
-        .run_ledger
-        .history(&addr.node_id, &addr.block_name, current.as_deref())
-        .map(Json)
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+    let blocks = if !query.block.contains('[') {
+        state.run_ledger.history_blocks(&addr.node_id)
+            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .into_iter().filter(|block| {
+                meshfox_core::args::Application::parse(block)
+                    .is_ok_and(|app| app.definition == query.block)
+            }).collect::<Vec<_>>()
+    } else {
+        vec![addr.block_name]
+    };
+    let mut history = Vec::new();
+    for block in blocks {
+        let application = meshfox_core::deps::BlockAddr {
+            node_id: addr.node_id.clone(), block_name: block.clone(),
+        };
+        let current = current_run_fingerprint(&state, &application);
+        let runs = state.run_ledger.history(&application.node_id, &block, current.as_deref())
+            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        history.extend(runs.into_iter().map(|run| RunHistoryItem { block: block.clone(), run }));
+    }
+    history.sort_by(|a, b| b.run.id.cmp(&a.run.id));
+    Ok(Json(history))
 }
 
 async fn subscribe_run_impl(
@@ -14089,11 +14208,56 @@ mod ws_tests {
         loop {
             match ws.next().await.expect("socket open").expect("no ws error") {
                 WsMessage::Text(t) => {
-                    return serde_json::from_str(&t).expect("valid RunEvent JSON")
+                    let value: serde_json::Value =
+                        serde_json::from_str(&t).expect("valid RunEvent JSON");
+                    if value["type"] == "heartbeat" {
+                        continue;
+                    }
+                    return value;
                 }
                 _ => continue,
             }
         }
+    }
+
+    /// A plain (non-`tty`) step in a `tty` chain that prints nothing for a
+    /// while must still keep the socket alive with heartbeats — the browser's
+    /// silence clock would otherwise declare the worker dead mid-run.
+    #[tokio::test]
+    async fn tty_websocket_heartbeats_while_a_plain_step_is_quiet() {
+        std::env::set_var("MESHFOX_WS_HEARTBEAT_SECS", "1");
+        let canvas_path = write_test_canvas(concat!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```bash name=\"dep\"\nsleep 3\necho dep-done\n```\n\n",
+            "```bash name=\"target\" tty deps=\"dep\"\necho ready; read line\n```\n",
+        ));
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let url = format!("ws://{addr}/api/run/tty?path=&block=target&cols=80&rows=24");
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("connect");
+
+        let mut heartbeats = 0;
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(10), ws.next())
+                .await
+                .expect("stream went silent")
+                .expect("socket open")
+                .expect("no ws error");
+            let WsMessage::Text(t) = frame else { continue };
+            let value: serde_json::Value = serde_json::from_str(&t).unwrap();
+            match value["type"].as_str() {
+                Some("heartbeat") => heartbeats += 1,
+                Some("step-end") if value["block"] == "dep" => break,
+                _ => {}
+            }
+        }
+        assert!(
+            heartbeats >= 1,
+            "no heartbeat arrived during a 3 s quiet plain step"
+        );
+
+        let _ = std::fs::remove_file(&canvas_path);
     }
 
     /// Reads binary frames, accumulating them, until the combined bytes
@@ -15575,6 +15739,13 @@ true
             "EB"
         );
         let restarted = spawn_test_server(path.clone()).await;
+        let (status, body) = request(restarted, "GET", "/api/run/history?nodeId=root&block=extract", "application/json", "").await;
+        assert_eq!(status, 200);
+        let combined: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        assert_eq!(combined.len(), 4, "{body}");
+        assert_eq!(combined.iter().filter(|run| run["block"] == "extract[lang=en]").count(), 1);
+        assert_eq!(combined.iter().filter(|run| run["block"] == "extract[lang=hy]").count(), 3);
+        assert!(combined.windows(2).all(|pair| pair[0]["id"].as_i64() > pair[1]["id"].as_i64()));
         for (lang, count) in [("en", 1), ("hy", 3)] {
             let (status, body) = request(
                 restarted,
@@ -19434,5 +19605,140 @@ mod read_only_tests {
         assert_eq!(err.kind(), std::io::ErrorKind::ReadOnlyFilesystem);
         assert_eq!(std::fs::read_to_string(&canvas_path).unwrap(), CANVAS);
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod confirmation_tests {
+    use super::*;
+    use futures_util::StreamExt;
+
+    fn fixture(body: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("meshfox-confirm-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("doc.canvas.md");
+        std::fs::write(
+            &path,
+            format!("<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n{body}"),
+        )
+        .unwrap();
+        path
+    }
+
+    async fn events(addr: SocketAddr, route: &str) -> Vec<serde_json::Value> {
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}{route}"))
+            .await
+            .unwrap();
+        let mut result = vec![];
+        while let Some(message) = socket.next().await {
+            let message = match message {
+                Ok(message) => message,
+                Err(tokio_tungstenite::tungstenite::Error::Protocol(
+                    tokio_tungstenite::tungstenite::error::ProtocolError::ResetWithoutClosingHandshake)) => break,
+                Err(error) => panic!("{error}"),
+            };
+            if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                result.push(serde_json::from_str(&text).unwrap());
+            }
+        }
+        result
+    }
+
+    #[tokio::test]
+    async fn confirmation_gate_covers_implicit_producers_and_is_not_cached() {
+        let path = fixture(concat!(
+            "<!-- meshfox:var name=\"RESULT\" from=\"cleanup\" -->\n",
+            "```bash name=\"setup\"\necho setup >> effects\n```\n",
+            "```bash name=\"cleanup\" confirm deps=\"setup\"\necho cleanup >> effects\nprintf 'RESULT=ok\\n' > \"$MESHFOX_VARS_OUT\"\n```\n",
+            "```bash name=\"target\" env=\"RESULT\"\necho target >> effects\n```\n",
+        ));
+        let addr = spawn_test_server(path.clone()).await;
+        let effect = path.parent().unwrap().join("effects");
+        let denied = events(addr, "/api/run?block=target&noDeps=true").await;
+        assert!(
+            denied.iter().any(|event| event["type"] == "error"
+                && event["message"].as_str().unwrap().contains("root/cleanup")),
+            "{denied:?}"
+        );
+        assert!(!effect.exists());
+        let approved = events(addr, "/api/run?block=target&noDeps=true&confirm=true").await;
+        assert!(
+            approved
+                .iter()
+                .any(|event| event["type"] == "done" && event["exitCode"] == 0),
+            "{approved:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&effect).unwrap(),
+            "cleanup\ntarget\n"
+        );
+        let denied = events(addr, "/api/run?block=target&confirm=false").await;
+        assert!(denied.iter().any(|event| event["type"] == "error"));
+        assert_eq!(
+            std::fs::read_to_string(&effect).unwrap(),
+            "cleanup\ntarget\n"
+        );
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let prepared = reqwest::Client::new()
+            .post(format!("http://{addr}/api/args"))
+            .header("content-type", "application/json")
+            .body(serde_json::json!({"block":"target", "path":[], "noDeps":true}).to_string())
+            .send()
+            .await
+            .unwrap();
+        let prepared: serde_json::Value =
+            serde_json::from_str(&prepared.text().await.unwrap()).unwrap();
+        assert_eq!(
+            prepared["confirmation"],
+            serde_json::json!(["root/cleanup"])
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmation_gate_covers_tty_and_force_before_execution() {
+        let path = fixture("```bash name=\"shell\" tty confirm\necho approved >> effects\n```\n");
+        let addr = spawn_test_server(path.clone()).await;
+        let effect = path.parent().unwrap().join("effects");
+        let error =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/api/run/tty?block=shell"))
+                .await
+                .unwrap_err();
+        match error {
+            tokio_tungstenite::tungstenite::Error::Http(response) => {
+                assert_eq!(response.status().as_u16(), 428)
+            }
+            other => panic!("{other}"),
+        }
+        let denied = events(
+            addr,
+            "/api/run/force?block=shell&forceNodeId=root&forceBlock=shell",
+        )
+        .await;
+        assert!(
+            denied.iter().any(|event| event["type"] == "error"
+                && event["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("confirmation required")),
+            "{denied:?}"
+        );
+        assert!(!effect.exists());
+        let approved = events(addr, "/api/run/tty?block=shell&confirm=true").await;
+        assert!(
+            approved
+                .iter()
+                .any(|event| event["type"] == "done" && event["exitCode"] == 0),
+            "{approved:?}"
+        );
+        assert_eq!(std::fs::read_to_string(effect).unwrap(), "approved\n");
+    }
+
+    #[tokio::test]
+    async fn autorun_cannot_supply_confirmation() {
+        let path =
+            fixture("```bash name=\"cleanup\" autorun confirm\necho forbidden >> effects\n```\n");
+        let state = build_state(path.clone(), false, None).await.unwrap();
+        trigger_autorun(state, meshfox_core::BlockAddr::new("root", "cleanup")).await;
+        assert!(!path.parent().unwrap().join("effects").exists());
     }
 }

@@ -120,6 +120,9 @@ enum Command {
     /// instead of after it (`meshfox examples/hello.canvas.md run tests
     /// smoke-test smoke`), or with `--canvas`, to name one explicitly.
     Run {
+        /// Approve confirm-marked blocks for this invocation without prompting.
+        #[arg(long)]
+        confirm: bool,
         #[arg(required = true, num_args = 1..)]
         args: Vec<String>,
         /// Path to the .canvas.md file. If omitted: auto-discover the
@@ -1210,6 +1213,7 @@ fn main() {
 
     match command {
         Command::Run {
+            confirm,
             args,
             canvas,
             no_deps,
@@ -1232,7 +1236,7 @@ fn main() {
                 }
                 find_canvas()
             });
-            run(&canvas_path, args, no_deps, fresh, set)
+            run(&canvas_path, args, no_deps, fresh, set, confirm)
         }
         Command::Configure { canvas } => {
             let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
@@ -2240,12 +2244,13 @@ fn run(
     no_deps: bool,
     fresh: bool,
     set: Vec<(String, String)>,
+    confirm: bool,
 ) {
     let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
         eprintln!("failed to start async runtime: {e}");
         std::process::exit(1);
     });
-    runtime.block_on(run_async(canvas_path, args, no_deps, fresh, set));
+    runtime.block_on(run_async(canvas_path, args, no_deps, fresh, set, confirm));
 }
 
 /// `--set NAME=VALUE` is the one place a value can enter `resolve`'s
@@ -2307,6 +2312,7 @@ async fn run_async(
     no_deps: bool,
     fresh: bool,
     set: Vec<(String, String)>,
+    confirm: bool,
 ) {
     let block_arg = args.pop().expect("clap requires at least one arg");
     let path: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -2390,6 +2396,7 @@ async fn run_async(
                         &block_names,
                         no_deps,
                         fresh,
+                        confirm,
                         overrides,
                     )
                     .await;
@@ -2408,6 +2415,7 @@ async fn run_async(
                 &block_names,
                 no_deps,
                 fresh,
+                confirm,
                 overrides,
             )
             .await;
@@ -2494,6 +2502,7 @@ async fn run_via_worker(
     block_names: &[&str],
     no_deps: bool,
     fresh: bool,
+    confirm: bool,
     mut overrides: HashMap<String, String>,
 ) {
     let path: Vec<String> = path.iter().map(|s| s.to_string()).collect();
@@ -2518,7 +2527,8 @@ async fn run_via_worker(
         // at all — this is what `include_edit_tests`' sibling suite,
         // `crates/cli/tests/run_cmd.rs`, actually caught missing here.
         let prepared = async {
-            let (canonical_path, canonical) = preflight_worker_arguments(port, &path, name).await?;
+            let (canonical_path, canonical) =
+                preflight_worker_arguments(port, &path, name, no_deps).await?;
             let vars =
                 preflight_worker_vars(port, &canonical_path, &canonical, no_deps, &mut overrides)
                     .await?;
@@ -2574,6 +2584,18 @@ async fn run_via_worker(
         };
 
         let name = canonical.as_str();
+        let gates = worker_client::confirmation_blocks(port, &path, name, no_deps)
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!("meshfox run: {error}");
+                std::process::exit(1)
+            });
+        if !gates.is_empty() && !confirm && !confirm_block_run(&gates) {
+            had_failure = true;
+            continue;
+        }
+
+        let approved = confirm || !gates.is_empty();
 
         // A `tty` step needs the real pty-relay socket (`/api/run/tty`),
         // never the plain `RunEvent`-only stream `run_stream_persisted`
@@ -2588,7 +2610,7 @@ async fn run_via_worker(
         if let Ok(raw) = worker_client::get_canvas_raw(port).await {
             let path_str: Vec<&str> = path.iter().map(String::as_str).collect();
             if chain_contains_tty(canvas_path, &raw, &path_str, &[name], no_deps) {
-                if !run_worker_tty(port, &path, name, no_deps, fresh, vars).await {
+                if !run_worker_tty(port, &path, name, no_deps, fresh, vars, approved).await {
                     had_failure = true;
                 }
                 continue;
@@ -2611,6 +2633,7 @@ async fn run_via_worker(
             vars,
             std::collections::HashSet::new(),
             None,
+            approved,
         )
         .await
         {
@@ -2642,6 +2665,7 @@ async fn run_via_worker(
                     owner_pid,
                     &owner_desc,
                     &mut started_services,
+                    approved,
                 )
                 .await
                 {
@@ -2826,6 +2850,7 @@ async fn worker_did_you_mean_hint(
 /// `App::on_service_conflict_key`'s own `is_tty` branch does: confirm, then
 /// retry `tty_connect` with `force` set to the exact address the conflict
 /// named.
+#[allow(clippy::too_many_arguments)]
 async fn run_worker_tty(
     port: u16,
     path: &[String],
@@ -2833,6 +2858,7 @@ async fn run_worker_tty(
     no_deps: bool,
     fresh: bool,
     vars: HashMap<String, String>,
+    approved: bool,
 ) -> bool {
     if !prompt::stdin_is_tty() || !std::io::stdout().is_terminal() {
         eprintln!(
@@ -2852,6 +2878,7 @@ async fn run_worker_tty(
         cols,
         rows,
         None,
+        approved,
     )
     .await
     {
@@ -2871,6 +2898,7 @@ async fn run_worker_tty(
                 cols,
                 rows,
                 Some((c.node_id.clone(), c.block.clone())),
+                approved,
             )
             .await
             {
@@ -3091,6 +3119,24 @@ async fn drain_worker_run_events(
     }
 }
 
+fn confirm_block_run(blocks: &[String]) -> bool {
+    if !prompt::stdin_is_tty() {
+        eprintln!(
+            "confirmation required for {} — use --confirm to approve this invocation",
+            blocks.join(", ")
+        );
+        return false;
+    }
+    eprint!(
+        "Potentially destructive operation(s): {}. Run? [y/N]: ",
+        blocks.join(", ")
+    );
+    let _ = std::io::stderr().flush();
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer).is_ok()
+        && matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
 /// The interactive confirm `run_via_worker`'s `DrainResult::Conflict` arm
 /// shows before killing another process — same prompt shape as
 /// `App::on_service_conflict_key`'s own modal, just synchronous stdin/
@@ -3142,6 +3188,7 @@ async fn retry_after_lock_conflict(
     owner_pid: u32,
     owner_desc: &str,
     started_services: &mut Vec<(String, String)>,
+    approved: bool,
 ) -> bool {
     if !confirm_kill_and_retry(&conflict_block, owner_pid, owner_desc) {
         return false;
@@ -3155,6 +3202,7 @@ async fn retry_after_lock_conflict(
         vars,
         std::collections::HashSet::new(),
         Some((conflict_node_id, conflict_block)),
+        approved,
     )
     .await
     {
@@ -3202,8 +3250,10 @@ async fn preflight_worker_arguments(
     port: u16,
     path: &[String],
     name: &str,
+    no_deps: bool,
 ) -> Result<(Vec<String>, String), String> {
-    let prepared = worker_client::prepare_arguments(port, path, name, &Default::default()).await?;
+    let prepared =
+        worker_client::prepare_arguments(port, path, name, &Default::default(), no_deps).await?;
     let prompt_all = !name.contains('[') && prompt::stdin_is_tty();
     let mut answers = std::collections::BTreeMap::new();
     let mut missing = Vec::new();
@@ -3228,7 +3278,7 @@ async fn preflight_worker_arguments(
             .map(|block| (prepared.path, block))
             .ok_or_else(|| "missing required arguments".into());
     }
-    let prepared = worker_client::prepare_arguments(port, path, name, &answers).await?;
+    let prepared = worker_client::prepare_arguments(port, path, name, &answers, no_deps).await?;
     prepared
         .block
         .map(|block| (prepared.path, block))
