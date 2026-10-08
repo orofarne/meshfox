@@ -23,5 +23,18 @@ fi
 
 curl -fsSL -o /tmp/meshfox.tar.gz "https://github.com/orofarne/meshfox/releases/latest/download/meshfox-x86_64-unknown-linux-gnu.tar.gz"
 tar xzf /tmp/meshfox.tar.gz -C /tmp
+# examples/tables.canvas.md's `display="table"` nodes are rendered by the
+# DuckDB CLI (`meshfox static` fails the build without it), and two of them
+# point at big generated files (events.csv / events.parquet — gitignored), so
+# fetch duckdb and run the canvas's own generate/to-parquet blocks first.
+# Pinned: bump deliberately instead of breaking the deploy on a new release.
+DUCKDB_VERSION=v1.3.2
+curl -fsSL -o /tmp/duckdb.zip "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb_cli-linux-amd64.zip"
+python3 -m zipfile -e /tmp/duckdb.zip /tmp/duckdb-cli
+chmod +x /tmp/duckdb-cli/duckdb
+export PATH="/tmp/duckdb-cli:$PATH" # meshfox static and the to-parquet block both call plain `duckdb`
+/tmp/x86_64-unknown-linux-gnu/meshfox \
+    run --canvas examples/tables.canvas.md events-parquet-source to-parquet
+
 /tmp/x86_64-unknown-linux-gnu/meshfox static README.md --template ./site-template-archive --out ./site-dist --force \
     --copy-files --recursive --sitemap --sitemap-git-dates
