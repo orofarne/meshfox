@@ -31,7 +31,7 @@ as a plain grid — and **fail** if a table can't be read (no `duckdb`, no file)
 rather than quietly leaving it out.
 
 ## A small CSV
-<!-- meshfox:node id="products" type="file" display="table" w=860 h=420 -->
+<!-- meshfox:node id="products" type="file" display="table" -->
 
 [products.csv](tables-data/products.csv)
 
@@ -49,7 +49,7 @@ searched in a fraction of a second after the first, one-time import
 (which meshfox keeps in `.meshfox/tables/`, capped by `[tables]
 cache_max_bytes`, 4 GiB by default).
 
-```bash name="generate" outputs="tables-data/events.csv"
+```bash name="generate" default outputs="tables-data/events.csv"
 mkdir -p tables-data
 awk 'BEGIN {
   srand(42)
@@ -65,7 +65,7 @@ echo "wrote $(wc -l < tables-data/events.csv) lines"
 ```
 
 ## events.csv
-<!-- meshfox:node id="events" type="file" display="table" w=860 h=480 -->
+<!-- meshfox:node id="events" type="file" display="table" -->
 
 [events.csv](tables-data/events.csv)
 
@@ -82,12 +82,12 @@ Parquet needs no import at all — meshfox reads it in place — so it's the
 cheapest format for really big data. This block turns the CSV into one with
 `duckdb` itself (the same tool the table view uses):
 
-```bash name="to-parquet" deps="events-source/generate" inputs="tables-data/events.csv" outputs="tables-data/events.parquet"
+```bash name="to-parquet" default deps="events-source/generate" inputs="tables-data/events.csv" outputs="tables-data/events.parquet"
 duckdb -c "COPY (SELECT * FROM 'tables-data/events.csv') TO 'tables-data/events.parquet' (FORMAT parquet)"
 ```
 
 ## events.parquet
-<!-- meshfox:node id="events-parquet" type="file" display="table" w=860 h=420 -->
+<!-- meshfox:node id="events-parquet" type="file" display="table" -->
 
 [events.parquet](tables-data/events.parquet)
 
