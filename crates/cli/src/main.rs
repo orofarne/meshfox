@@ -1900,10 +1900,14 @@ fn check_canvas(
 ) -> Result<Vec<meshfox_core::ConstraintResult>, String> {
     let canvas = Canvas::from_markdown(raw).map_err(|e| e.to_string())?;
     let canvas = meshfox_core::include::resolve(&canvas, canvas_path).map_err(|e| e.to_string())?;
-    Ok(meshfox_core::evaluate_constraints(
+    let access = meshfox_core::FileAccess::for_canvas_path(&canvas, canvas_path);
+    let mut results = Vec::new();
+    results.extend(meshfox_core::constraint::evaluate_with_access(
         &canvas,
         Some(canvas_root_dir(canvas_path)),
-    ))
+        &access,
+    ));
+    Ok(results)
 }
 
 fn check(canvas_path: &Path) {

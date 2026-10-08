@@ -20,6 +20,10 @@ pub enum VarType {
     Int,
     Bool,
     Select,
+    /// A directory the canvas may read files from (SPEC.md, "Directory
+    /// variables"): the value, once supplied or confirmed by the user (or
+    /// created by the worker, `@tmp`), becomes a trusted root.
+    Dir,
 }
 
 impl VarType {
@@ -29,6 +33,7 @@ impl VarType {
             "int" => Some(VarType::Int),
             "bool" => Some(VarType::Bool),
             "select" => Some(VarType::Select),
+            "dir" => Some(VarType::Dir),
             _ => None,
         }
     }
@@ -39,6 +44,7 @@ impl VarType {
             VarType::Int => "int",
             VarType::Bool => "bool",
             VarType::Select => "select",
+            VarType::Dir => "dir",
         }
     }
 }
@@ -279,9 +285,32 @@ pub(crate) fn build_var_decl(attrs: HashMap<String, String>) -> Result<VarDecl, 
 /// before saving it, catching a bypass of a UI's own control (a `select`
 /// answered via a raw `--set REGION=mars` or a direct API call, say)
 /// that the control itself would never have produced.
+/// A `dir` value is `@tmp`, `@tmp/...`, `~`/`~/...`, or an absolute or
+/// canvas-relative path. `@tmp/..` is rejected outright; an existing
+/// non-directory is rejected, a missing path is fine (a block may create it).
+fn validate_dir_value(name: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{name:?} expects a directory path, got an empty value"));
+    }
+    if let Some(rest) = value.strip_prefix("@tmp") {
+        if rest.is_empty() || rest.starts_with('/') {
+            if rest.split('/').any(|c| c == "..") {
+                return Err(format!("{name:?}: {value:?} escapes @tmp"));
+            }
+            return Ok(());
+        }
+    }
+    let p = std::path::Path::new(value);
+    if p.exists() && !p.is_dir() {
+        return Err(format!("{name:?}: {value:?} exists and is not a directory"));
+    }
+    Ok(())
+}
+
 pub fn validate_value(decl: &VarDecl, value: &str) -> Result<(), String> {
     match decl.var_type {
         VarType::String => Ok(()),
+        VarType::Dir => validate_dir_value(&decl.name, value),
         VarType::Int => value
             .parse::<i64>()
             .map(|_| ())
@@ -1013,7 +1042,17 @@ pub fn resolve_with_shared(
         // error shown) rather than silently taking its `default` — the user
         // would otherwise get the default with no hint that a stored value
         // exists but couldn't be read.
-        if !decl.required && !secret_errors.contains_key(&decl.name) {
+        // A `dir` default is taken silently only when it is `@tmp[/...]`
+        // (a directory the worker creates); any other path is the canvas
+        // text asking for access outside itself, so it needs the same
+        // one-time confirmation `required` does (SPEC.md, "Directory
+        // variables").
+        let needs_confirmation = decl.required
+            || (decl.var_type == VarType::Dir
+                && effective_default
+                    .as_deref()
+                    .is_some_and(|d| !crate::dirvars::is_tmp_ref(d)));
+        if !needs_confirmation && !secret_errors.contains_key(&decl.name) {
             if let Some(v) = effective_default.clone() {
                 values.insert(decl.name.clone(), v);
                 continue;
@@ -1030,6 +1069,15 @@ pub fn resolve_with_shared(
         missing_decl.default = effective_default;
         missing_decl.choices = effective_choices;
         missing.push(missing_decl);
+    }
+    // A `dir` value is written the way a human wrote it (`@tmp/x`, `~/d`,
+    // a relative path) but consumed as a real path -- expand it once here
+    // so every caller (env injection, fingerprints, `FileAccess`) sees the
+    // same thing. The cache keeps the literal form.
+    for decl in decls.iter().filter(|d| d.var_type == VarType::Dir) {
+        if let Some(v) = values.get_mut(&decl.name) {
+            *v = crate::dirvars::expand_dir_value(v, cache.canvas_path());
+        }
     }
     ResolvedVars {
         values,
@@ -1522,6 +1570,70 @@ mod tests {
             default_var: None,
             choices_var: None,
         }
+    }
+
+    fn dir_decl(name: &str, default: Option<&str>) -> VarDecl {
+        let mut d = decl(name, default, false);
+        d.var_type = VarType::Dir;
+        d
+    }
+
+    #[test]
+    fn dir_default_under_tmp_resolves_silently() {
+        let decls = vec![dir_decl("W", Some("@tmp/work"))];
+        let r = resolve(&decls, &HashMap::new(), &VarCache::in_memory(), &HashMap::new());
+        assert!(r.missing.is_empty());
+        assert_eq!(r.values["W"], "@tmp/work"); // no canvas path -> unexpanded
+    }
+
+    #[test]
+    fn dir_default_outside_tmp_needs_confirmation_like_required() {
+        for d in ["/data", "~/data", "../x", "data"] {
+            let decls = vec![dir_decl("W", Some(d))];
+            let r = resolve(&decls, &HashMap::new(), &VarCache::in_memory(), &HashMap::new());
+            assert!(r.values.get("W").is_none(), "{d} must not resolve silently");
+            assert_eq!(r.missing.len(), 1, "{d}");
+            assert_eq!(r.missing[0].default.as_deref(), Some(d)); // offered as pre-fill
+        }
+    }
+
+    #[test]
+    fn dir_default_outside_tmp_resolves_once_confirmed_in_cache_or_set() {
+        let decls = vec![dir_decl("W", Some("/data"))];
+        let mut cache = VarCache::in_memory();
+        cache.set("W", "/data").unwrap();
+        let r = resolve(&decls, &HashMap::new(), &cache, &HashMap::new());
+        assert_eq!(r.values["W"], "/data");
+        let mut ov = HashMap::new();
+        ov.insert("W".to_string(), "/other".to_string());
+        let r = resolve(&decls, &ov, &VarCache::in_memory(), &HashMap::new());
+        assert_eq!(r.values["W"], "/other");
+    }
+
+    #[test]
+    fn dir_value_is_expanded_against_the_cache_canvas_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-vars-dir-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let canvas = dir.join("c.canvas.md");
+        let cache = VarCache::load(&canvas).unwrap();
+        let decls = vec![dir_decl("W", Some("@tmp/work"))];
+        let r = resolve(&decls, &HashMap::new(), &cache, &HashMap::new());
+        let want = crate::dirvars::tmp_dir(&canvas).join("work");
+        assert_eq!(std::path::PathBuf::from(&r.values["W"]), want);
+        assert!(want.is_dir());
+    }
+
+    #[test]
+    fn non_dir_var_with_a_path_default_is_unchanged() {
+        let decls = vec![decl("P", Some("/usr/local/bin"), false)];
+        let r = resolve(&decls, &HashMap::new(), &VarCache::in_memory(), &HashMap::new());
+        assert_eq!(r.values["P"], "/usr/local/bin");
     }
 
     fn typed_decl(name: &str, var_type: VarType, choices: &[&str]) -> VarDecl {

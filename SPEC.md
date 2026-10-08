@@ -162,7 +162,8 @@ manual path, not gated by it.
   - `display="link"` (default), `display="code"` or `display="table"` — `code` shows the
     target's own file content as a read-only, non-runnable syntax-highlighted
     preview instead of a plain clickable link. The file is read fresh from
-    disk on every view, confined to the canvas's own directory tree —
+    disk on every view, confined to the canvas's own directory tree (plus
+    the directories of `type="dir"` variables, see "Directory variables") —
     never written back.
   - `display="table"` — shows the target as an interactive, read-only
     table (CSV, TSV, Parquet, JSON lines, compressed variants, ... —
@@ -294,7 +295,8 @@ table; there is no fallback preview.
 everything else as delimited text with auto-detected dialect and types
 (a trailing `.gz`/`.zst` is looked through). If type inference over the
 sample fails on a later row, the file is read again with every column as
-text. The target is confined to the canvas directory, like `display="code"`.
+text. The target is confined like `display="code"`: the canvas directory
+and the directories of `type="dir"` variables.
 
 **How it works.** The worker keeps one long-lived `duckdb` process per
 table node over a cache database. Text-like files are imported once, in the
@@ -1366,7 +1368,8 @@ Attributes:
   code fences" above) refers to when it wants this variable — declaring
   one here doesn't, by itself, put it in any block's environment; that's
   opt-in per block, see "Consumption" below.
-- `type` — `string` (default), `int`, `bool`, or `select`. Purely a hint
+- `type` — `string` (default), `int`, `bool`, `select`, or `dir` (see
+  "Directory variables" below). Purely a hint
   for how to *prompt* (a `bool` prompts y/n, a `select` shows its
   `choices` as a menu, ...) and how a UI renders an input for it — an
   incoming value (from `--set`, the environment, the cache, or a typed
@@ -1716,6 +1719,63 @@ suggested default) end up actually coming from running a script:
   (`default`/`choices`) and with `from=` — see each attribute's own
   entry above. `meshfox validate` catches a `default_var`/`choices_var`
   naming a variable nothing declares, and a reference cycle.
+
+### Directory variables (`type="dir"`)
+
+A `file` node's target is confined to the canvas's own directory tree (see
+"Node types"): a canvas file is untrusted input, so what it *says* must
+not widen what it can read. A `type="dir"` variable widens it by its
+**value** — and only a value the canvas text did not supply by itself:
+
+    <!-- meshfox:var name="WORK_DIR" type="dir" default="@tmp/work" -->
+    <!-- meshfox:var name="DATA_DIR" type="dir" default="~/datasets/parsed" -->
+
+Every directory a resolved `dir` variable points to (and the canvas's
+`@tmp`, below) becomes a **trusted root** for that canvas: a `file` node's
+target may resolve inside it, in addition to the canvas directory. The check
+is unchanged — canonicalize, then require the result to lie under the
+canvas directory or a trusted root — so `..` and symlinks cannot step out
+of a root any more than out of the canvas directory. Trusted roots are
+read-only for meshfox (it reads previews and tables there and never writes);
+what a block does there is up to the block.
+
+**Where the value comes from.** Resolution is the ordinary one (override ->
+environment -> cache -> shared config -> `default`, see "Resolution") with
+one rule for the last step: a `dir` variable's `default` is taken silently
+only when it is `@tmp` or `@tmp/...`. Any other `default` — absolute, `~`,
+`../x`, or a relative path inside the canvas — behaves as `required`: the
+first time it is needed it asks for one explicit confirmation, with the
+default as the pre-filled suggestion; the confirmed answer is cached like
+any other and trusted from then on. A value from `--set`, the environment,
+shared config, the cache or a `from=` block is trusted as is (a person or a
+block they ran produced it). Until a variable is confirmed a target naming
+it fails with "`$NAME` is a directory variable that hasn't been confirmed
+yet" rather than "not found". Values are written the way a person writes
+them and expanded when used: `@tmp[/...]`, `~[/...]` and relative paths
+(against the canvas directory) become absolute; the cache keeps the literal
+text. `meshfox configure` prompts for a `dir` like any variable and rejects
+an existing non-directory (a missing path is fine) and `@tmp/..`.
+
+**`@tmp`.** The canvas's own temporary directory,
+`<dir>/.meshfox/<canvas file>.tmp/`, created on first use and owned by the
+worker. It is always a trusted root and needs no confirmation. It lives for
+the **session**: `session reset` (the web button, `meshfox session reset`,
+the MCP `session_reset` tool) deletes it together with the freshness records
+of the blocks that produced its content, so nothing claims to be fresh over
+files that are gone. `GET /api/session/tmp` reports how many bytes a reset
+would delete. For data that must outlive the session, confirm an external
+path instead of `@tmp`.
+
+**Using it in targets.** A `file` node's target may start with `@tmp` or
+contain `$NAME` / `${NAME}` for a declared `dir` variable —
+`[events]($WORK_DIR/by_language/en.csv)`. Only names of `dir` variables are
+expanded; any other `$` is literal. The expansion happens before the
+confinement check, which is then applied to the result.
+
+Scope: a trusted root applies to the whole canvas, including a `dir`
+variable declared inside a node (it is not limited to that subtree).
+`include` nodes are not affected: they read their target as written and
+have no `$NAME` expansion.
 
 ### CLI
 

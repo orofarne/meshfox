@@ -597,6 +597,7 @@ pub fn prepare_arguments(
                 vars::VarType::Int => "int",
                 vars::VarType::Bool => "bool",
                 vars::VarType::Select => "select",
+                vars::VarType::Dir => "dir",
             },
             prompt: arg.prompt.clone(),
             choices: arg.choices.clone(),

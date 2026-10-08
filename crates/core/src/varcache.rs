@@ -43,6 +43,10 @@ pub struct VarCache {
     /// `None` for an in-memory-only cache (tests) — `set` then updates the
     /// in-memory map but never touches disk.
     path: Option<PathBuf>,
+    /// The canvas file this cache belongs to (kept even when `path` is
+    /// `None` for a read-only load) -- what `@tmp` in a `dir` variable
+    /// resolves against. `None` for `in_memory`.
+    canvas_path: Option<PathBuf>,
     entries: HashMap<String, String>,
     /// Where a `secret` answer is saved and looked up when
     /// `secret_store = "keychain"` is configured (see `crate::secret_store`);
@@ -82,6 +86,7 @@ impl VarCache {
             });
         Ok(VarCache {
             path: Some(path),
+            canvas_path: Some(canvas_path.to_path_buf()),
             entries,
             secrets,
         })
@@ -96,10 +101,16 @@ impl VarCache {
         Ok(cache)
     }
 
+    /// The canvas file this cache was loaded for, if any.
+    pub fn canvas_path(&self) -> Option<&Path> {
+        self.canvas_path.as_deref()
+    }
+
     /// A cache backed by nothing on disk — for tests.
     pub fn in_memory() -> VarCache {
         VarCache {
             path: None,
+            canvas_path: None,
             entries: HashMap::new(),
             secrets: None,
         }

@@ -189,7 +189,7 @@ export type VarOrigin = { scope: "project" } | { scope: "global"; path?: string 
 
 export interface VarStatus {
   name: string;
-  type: "string" | "int" | "bool" | "select";
+  type: "string" | "int" | "bool" | "select" | "dir";
   prompt: string;
   choices?: string[];
   secret: boolean;

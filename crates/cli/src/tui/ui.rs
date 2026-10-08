@@ -1548,7 +1548,7 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
             // text-cursor look, shown only on the focused row.
             let value = match decl.var_type {
                 VarType::Bool | VarType::Select => format!("‹ {shown} ›"),
-                VarType::String | VarType::Int => {
+                VarType::String | VarType::Int | VarType::Dir => {
                     format!("{shown}{}", if i == vf.selected { "_" } else { "" })
                 }
             };

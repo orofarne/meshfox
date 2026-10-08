@@ -948,7 +948,7 @@ fn initial_field_input(
             Some(v) if decl.choices.iter().any(|c| c == v) => v.clone(),
             _ => decl.choices.first().cloned().unwrap_or_default(),
         },
-        VarType::String | VarType::Int => suggestion.clone().unwrap_or_default(),
+        VarType::String | VarType::Int | VarType::Dir => suggestion.clone().unwrap_or_default(),
     };
     // Only actually shared if the field's control displays the raw
     // suggestion unchanged -- a `select` falling back to its first choice,
@@ -1544,7 +1544,7 @@ impl App {
                 if let Some(vf) = &mut self.var_form {
                     let i = vf.selected;
                     let allowed = match vf.decls[i].var_type {
-                        VarType::String => true,
+                        VarType::String | VarType::Dir => true,
                         // A leading `+`/`-` (once, only as the very first
                         // character — same grammar `i64::from_str` itself
                         // accepts, see `meshfox_core::validate_value`)
@@ -1599,7 +1599,7 @@ impl App {
                 let next = (current + dir).rem_euclid(len) as usize;
                 vf.inputs[i] = choices[next].clone();
             }
-            VarType::String | VarType::Int => {}
+            VarType::String | VarType::Int | VarType::Dir => {}
         }
     }
 
@@ -1739,7 +1739,7 @@ impl App {
                     let i = form.selected;
                     if i < form.decls.len() {
                         let allowed = match form.decls[i].var_type {
-                            VarType::String => true,
+                            VarType::String | VarType::Dir => true,
                             VarType::Int => {
                                 c.is_ascii_digit()
                                     || ((c == '-' || c == '+') && form.inputs[i].is_empty())
@@ -1792,7 +1792,7 @@ impl App {
                 let next = (current + dir).rem_euclid(len) as usize;
                 form.inputs[i] = choices[next].clone();
             }
-            VarType::String | VarType::Int => {}
+            VarType::String | VarType::Int | VarType::Dir => {}
         }
     }
 
@@ -4242,7 +4242,12 @@ impl App {
         };
         let target = node.target.as_deref().expect("checked by is_runnable_file");
         let origin_dir = crate::canvas_root_dir(&self.canvas_path);
-        let resolved_target = match meshfox_core::confine(origin_dir, target) {
+        let access = std::fs::read_to_string(&self.canvas_path)
+            .ok()
+            .and_then(|raw| meshfox_core::Canvas::from_markdown(&raw).ok())
+            .map(|c| meshfox_core::FileAccess::for_canvas_path(&c, &self.canvas_path))
+            .unwrap_or_default();
+        let resolved_target = match access.confine(origin_dir, target) {
             Ok(p) => p,
             Err(e) => {
                 self.status = e.to_string();
@@ -5605,7 +5610,8 @@ fn resolve_includes(canvas: &Canvas, canvas_path: &Path) -> Canvas {
     // without re-evaluating it themselves.
     let canvas_dir = canvas_path.parent().filter(|p| !p.as_os_str().is_empty());
     let canvas_dir = Some(canvas_dir.unwrap_or(Path::new(".")));
-    meshfox_core::constraint::annotate_status(&mut resolved, canvas_dir);
+    let access = meshfox_core::FileAccess::for_canvas_path(&resolved, canvas_path);
+    meshfox_core::constraint::annotate_status_with_access(&mut resolved, canvas_dir, &access);
     // Same "populate before flatten reads it" idiom as `constraint_results`
     // right above, for `meshfox:tag-color` (TODO.canvas.md: "Node colour by
     // tag") — best-effort, a malformed declaration just means no node

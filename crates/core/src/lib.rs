@@ -61,8 +61,13 @@ pub use fence::{
     fingerprint, parse_deps_list, parse_env_list, scan_code_blocks, scan_runnable_blocks,
     session_fingerprint, BlockRef, CodeBlock, EnvRef, RENDER_KINDS,
 };
+pub mod dirvars;
+pub use dirvars::{
+    expand_dir_value, expand_target, is_tmp_ref, reset_tmp, tmp_dir, tmp_size, FileAccess,
+};
 pub use file_read::{
-    confine, preview, ConfineError, FilePreview, PreviewError, FILE_PREVIEW_MAX_BYTES,
+    confine, confine_in, preview, preview_in, ConfineError, FilePreview, PreviewError,
+    FILE_PREVIEW_MAX_BYTES,
 };
 pub use form::{form_block, parse_form_body, FormBlock, FormError, FormField};
 pub use include::IncludeError;

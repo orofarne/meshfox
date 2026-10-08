@@ -168,7 +168,17 @@ fn globals() -> Globals {
 /// want constraints touching disk at all), which makes every one of those
 /// calls return `None` rather than erroring.
 pub fn evaluate(canvas: &Canvas, base_dir: Option<&Path>) -> Vec<ConstraintResult> {
-    let prelude = build_prelude(canvas, base_dir);
+    evaluate_with_access(canvas, base_dir, &crate::dirvars::FileAccess::none())
+}
+
+/// `evaluate`, additionally letting `file` nodes read targets under the
+/// directories `access` trusts (`type="dir"` variables, `@tmp`).
+pub fn evaluate_with_access(
+    canvas: &Canvas,
+    base_dir: Option<&Path>,
+    access: &crate::dirvars::FileAccess,
+) -> Vec<ConstraintResult> {
+    let prelude = build_prelude(canvas, base_dir, access);
     let globals = globals();
     let mut results = Vec::new();
     for node in &canvas.nodes {
@@ -187,9 +197,19 @@ pub fn evaluate(canvas: &Canvas, base_dir: Option<&Path>) -> Vec<ConstraintResul
 /// server, before serving `GET /api/canvas`), populated by a consumer
 /// rather than by parsing. `base_dir` is forwarded to `evaluate` as-is.
 pub fn annotate_status(canvas: &mut Canvas, base_dir: Option<&Path>) {
+    annotate_status_with_access(canvas, base_dir, &crate::dirvars::FileAccess::none())
+}
+
+/// `annotate_status` with a [`crate::dirvars::FileAccess`] (see
+/// `evaluate_with_access`).
+pub fn annotate_status_with_access(
+    canvas: &mut Canvas,
+    base_dir: Option<&Path>,
+    access: &crate::dirvars::FileAccess,
+) {
     let mut by_node: std::collections::HashMap<String, Vec<ConstraintStatus>> =
         std::collections::HashMap::new();
-    for result in evaluate(canvas, base_dir) {
+    for result in evaluate_with_access(canvas, base_dir, access) {
         by_node
             .entry(result.node_id.clone())
             .or_default()
@@ -260,7 +280,11 @@ fn evaluate_one(
 /// calls), so a script can never see a stale document. `base_dir` is only
 /// used here, to resolve each `file`-type node's target once up front —
 /// see `file_data_literals`.
-fn build_prelude(canvas: &Canvas, base_dir: Option<&Path>) -> String {
+fn build_prelude(
+    canvas: &Canvas,
+    base_dir: Option<&Path>,
+    access: &crate::dirvars::FileAccess,
+) -> String {
     let mut out = String::new();
     out.push_str(
         "def _children_of(id):\n\
@@ -343,7 +367,7 @@ fn build_prelude(canvas: &Canvas, base_dir: Option<&Path>) -> String {
             Some(ts) => ts.to_string(),
             None => "None".to_string(),
         };
-        let file_data = file_data_literals(n, base_dir);
+        let file_data = file_data_literals(n, base_dir, access);
         let _ = writeln!(
             out,
             "    _make_node(id={}, title={}, type={}, parent={}, tags=[{}], text={}, \
@@ -388,7 +412,11 @@ struct FileDataLiterals {
     csv: String,
 }
 
-fn file_data_literals(node: &Node, base_dir: Option<&Path>) -> FileDataLiterals {
+fn file_data_literals(
+    node: &Node,
+    base_dir: Option<&Path>,
+    access: &crate::dirvars::FileAccess,
+) -> FileDataLiterals {
     let none = || FileDataLiterals {
         content: "None".to_string(),
         json: "None".to_string(),
@@ -402,7 +430,7 @@ fn file_data_literals(node: &Node, base_dir: Option<&Path>) -> FileDataLiterals 
     let (Some(dir), Some(target)) = (base_dir, node.target.as_deref()) else {
         return none();
     };
-    let Ok(preview) = crate::file_read::preview(dir, target) else {
+    let Ok(preview) = access.preview(dir, target) else {
         return none();
     };
 

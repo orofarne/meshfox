@@ -3743,7 +3743,12 @@ fn canvas_response(raw: &str, canvas_path: &std::path::Path) -> Result<Json<Canv
     // keeps the UI's pass/fail badges current without a separate endpoint
     // or a stale on-disk cache to invalidate — just no longer free of disk
     // reads for a document whose constraints reach into `file` nodes.
-    meshfox_core::constraint::annotate_status(&mut canvas, Some(canvas_root_dir(canvas_path)));
+    let access = meshfox_core::FileAccess::for_canvas_path(&canvas, canvas_path);
+    meshfox_core::constraint::annotate_status_with_access(
+        &mut canvas,
+        Some(canvas_root_dir(canvas_path)),
+        &access,
+    );
     // Best-effort: a malformed `meshfox:option` declaration shouldn't break
     // *viewing* the canvas (falls back to no options declared, same as if
     // there were none at all) — `meshfox validate` is what surfaces that
@@ -3871,7 +3876,12 @@ fn node_upserted_event(raw: &str, canvas_path: &std::path::Path, local_id: &str)
     let Ok(mut canvas) = resolved_canvas(raw, canvas_path) else {
         return ServerEvent::Changed;
     };
-    meshfox_core::constraint::annotate_status(&mut canvas, Some(canvas_root_dir(canvas_path)));
+    let access = meshfox_core::FileAccess::for_canvas_path(&canvas, canvas_path);
+    meshfox_core::constraint::annotate_status_with_access(
+        &mut canvas,
+        Some(canvas_root_dir(canvas_path)),
+        &access,
+    );
     meshfox_core::annotate_effective_colors(&mut canvas);
     meshfox_core::annotate_body_revs(&mut canvas);
     match canvas.node(local_id).cloned() {
@@ -5349,23 +5359,62 @@ fn canvas_root_dir(canvas_path: &std::path::Path) -> &std::path::Path {
 /// `ApiError`-flavored wrapper around `meshfox_core::file_read::confine`,
 /// the one copy of this confinement logic (also used by `staticgen`'s
 /// static export and `constraint`'s `.content()`/`.json()`/...).
-fn resolve_confined_target(
-    canvas_path: &std::path::Path,
-    target: &str,
-) -> Result<std::path::PathBuf, ApiError> {
-    let canvas_dir = canvas_root_dir(canvas_path);
-    meshfox_core::confine(canvas_dir, target).map_err(|e| match e {
+fn resolve_confined_target(state: &AppState, target: &str) -> Result<std::path::PathBuf, ApiError> {
+    let canvas_dir = canvas_root_dir(&state.canvas_path);
+    file_access(state)
+        .confine(canvas_dir, target)
+        .map_err(confine_api_error(target))
+}
+
+/// What the canvas may read beyond its own directory right now: the
+/// resolved `type="dir"` variables (a value the user supplied or
+/// confirmed, or the worker-owned `@tmp`) and `$VAR` expansion for targets.
+/// Re-resolved on every call, so a newly confirmed answer or a session
+/// reset takes effect immediately (SPEC.md, "Directory variables").
+fn file_access(state: &AppState) -> meshfox_core::FileAccess {
+    let raw = state.raw.lock().unwrap().clone();
+    let Ok(canvas) = parse_or_error(&raw) else {
+        return meshfox_core::FileAccess::none();
+    };
+    let overrides = effective_overrides(state, &HashMap::new());
+    let computed: HashMap<String, String> = state
+        .session_runs
+        .lock()
+        .unwrap()
+        .values()
+        .flat_map(|run| run.produced_vars.clone())
+        .collect();
+    let shared = meshfox_core::load_shared_env(canvas_root_dir(&state.canvas_path));
+    let cache = state.vars_cache.lock().unwrap();
+    meshfox_core::FileAccess::resolve(
+        &canvas,
+        &state.canvas_path,
+        &overrides,
+        &cache,
+        &computed,
+        &shared,
+    )
+}
+
+fn confine_api_error(target: &str) -> impl Fn(meshfox_core::ConfineError) -> ApiError + '_ {
+    move |e| match e {
         meshfox_core::ConfineError::DirNotFound(_, e) => {
             ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         }
         meshfox_core::ConfineError::TargetNotFound(p, e) => {
             ApiError(StatusCode::NOT_FOUND, format!("{}: {e}", p.display()))
         }
+        e @ meshfox_core::ConfineError::Unconfirmed(_) => {
+            ApiError(StatusCode::FORBIDDEN, e.to_string())
+        }
         meshfox_core::ConfineError::Outside(_) => ApiError(
             StatusCode::FORBIDDEN,
-            format!("{target:?} resolves outside the canvas directory"),
+            format!(
+                "{target:?} resolves outside the canvas directory and the directories its \
+                 `type=\"dir\"` variables point to"
+            ),
         ),
-    })
+    }
 }
 
 /// Read-only preview of a `file` node's target, for `display="code"`
@@ -5401,17 +5450,10 @@ async fn get_node_file_content(
 
     let canvas_path = &state.canvas_path;
     let canvas_dir = canvas_root_dir(canvas_path);
-    let preview = meshfox_core::preview(canvas_dir, target).map_err(|e| match e {
-        meshfox_core::PreviewError::Confine(meshfox_core::ConfineError::DirNotFound(_, e)) => {
-            ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        }
-        meshfox_core::PreviewError::Confine(meshfox_core::ConfineError::TargetNotFound(p, e)) => {
-            ApiError(StatusCode::NOT_FOUND, format!("{}: {e}", p.display()))
-        }
-        meshfox_core::PreviewError::Confine(meshfox_core::ConfineError::Outside(_)) => ApiError(
-            StatusCode::FORBIDDEN,
-            format!("{target:?} resolves outside the canvas directory"),
-        ),
+    let preview = file_access(&state)
+        .preview(canvas_dir, target)
+        .map_err(|e| match e {
+        meshfox_core::PreviewError::Confine(c) => confine_api_error(target)(c),
         meshfox_core::PreviewError::Read(_, e) => {
             ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         }
@@ -5448,7 +5490,7 @@ fn table_target(state: &AppState, id: &str) -> Result<std::path::PathBuf, ApiErr
             format!("node {id:?} has no target"),
         )
     })?;
-    resolve_confined_target(&state.canvas_path, target)
+    resolve_confined_target(state, target)
 }
 
 fn table_api_error(e: tables::TableError) -> ApiError {
@@ -5653,7 +5695,7 @@ async fn run_file_node_impl(state: Arc<AppState>, id: String) -> Result<Response
         })?;
     let target = node.target.as_deref().expect("checked by is_runnable_file");
     let canvas_path = &state.canvas_path;
-    let resolved_path = resolve_confined_target(canvas_path, target)?;
+    let resolved_path = resolve_confined_target(&state, target)?;
     // Same file `canvas_path` above already resolved to (the primary
     // document, or the `include` target this node actually lives in) —
     // its own directory is this node's `PWD`, not wherever `meshfox view`
@@ -5819,8 +5861,7 @@ async fn open_node_file(
     })?;
     let (target_path, fragment) = meshfox_core::mdcanvas::split_target_fragment(target);
     let fragment = fragment.map(str::to_string);
-    let canvas_path = &state.canvas_path;
-    let resolved = resolve_confined_target(canvas_path, target_path)?;
+    let resolved = resolve_confined_target(&state, target_path)?;
     let is_canvas = is_canvas_file(&resolved);
     let path = resolved.to_string_lossy().into_owned();
 
@@ -5914,8 +5955,7 @@ async fn open_node_file_folder(
         )
     })?;
     let (target_path, _fragment) = meshfox_core::mdcanvas::split_target_fragment(target);
-    let canvas_path = &state.canvas_path;
-    let resolved = resolve_confined_target(canvas_path, target_path)?;
+    let resolved = resolve_confined_target(&state, target_path)?;
     let folder = resolved.parent().ok_or_else(|| {
         ApiError(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -10213,7 +10253,28 @@ async fn reset_session(State(state): State<Arc<AppState>>) -> StatusCode {
     if let Err(e) = state.run_ledger.mark_finished_runs_stale() {
         eprintln!("meshfox: failed to mark finished runs stale ({e})");
     }
+    // `@tmp` lives exactly as long as the session (SPEC.md, "Directory
+    // variables"): what blocks produced there is forgotten with their
+    // freshness records, so it goes too.
+    if !state.read_only {
+        if let Err(e) = meshfox_core::reset_tmp(&state.canvas_path) {
+            eprintln!("meshfox: failed to delete the canvas's @tmp ({e})");
+        }
+    }
     StatusCode::NO_CONTENT
+}
+
+#[derive(Serialize)]
+struct SessionTmpResponse {
+    bytes: u64,
+}
+
+/// How much `session reset` is about to delete from the canvas's `@tmp`,
+/// so a UI can warn before it does.
+async fn get_session_tmp(State(state): State<Arc<AppState>>) -> Json<SessionTmpResponse> {
+    Json(SessionTmpResponse {
+        bytes: meshfox_core::tmp_size(&state.canvas_path),
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -10706,6 +10767,7 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/debug/send", post(debug_send))
         .route("/api/debug/stop", post(debug_stop))
         .route("/api/session/reset", post(reset_session))
+        .route("/api/session/tmp", get(get_session_tmp))
         .route("/api/info", get(api_info))
         .route("/api/watch", get(watch_changes))
         .route("/api/include-asset", get(get_include_asset))
@@ -15863,6 +15925,80 @@ mod session_skip_tests {
         events
             .iter()
             .any(|e| e["type"] == "step-skipped" && e["block"] == block)
+    }
+
+    fn dir_var_canvas(vars: &str, targets: &[(&str, &str)]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("meshfox-dirvar-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let mut md = format!("<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n{vars}\n");
+        for (id, target) in targets {
+            md.push_str(&format!(
+                "\n## {id}\n<!-- meshfox:node id=\"{id}\" type=\"file\" display=\"code\" -->\n\n[{id}]({target})\n"
+            ));
+        }
+        let path = dir.join("canvas.md");
+        std::fs::write(&path, md).unwrap();
+        path
+    }
+
+    fn outside_dir_with(file: &str, content: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("meshfox-dirvar-data-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        let d = d.canonicalize().unwrap();
+        std::fs::write(d.join(file), content).unwrap();
+        d
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_dir_var_lets_a_file_node_read_outside_the_canvas_dir_only_there() {
+        let data = outside_dir_with("a.txt", "hello-from-data");
+        let other = outside_dir_with("b.txt", "secret");
+        let path = dir_var_canvas(
+            &format!("<!-- meshfox:var name=\"D\" type=\"dir\" default=\"{}\" -->", data.display()),
+            &[
+                ("viavar", "$D/a.txt"),
+                ("other", &format!("{}/b.txt", other.display())),
+            ],
+        );
+        // Unconfirmed default: grants nothing.
+        let addr = spawn_test_server(path.clone()).await;
+        let (status, body) = request(addr, "GET", "/api/nodes/viavar/file-content", "", "").await;
+        assert_eq!(status, 403, "an unconfirmed out-of-canvas default must not grant access");
+        assert!(body.contains("hasn't been confirmed"), "{body}");
+
+        // Confirmed (cached answer): reads there, still not elsewhere.
+        let mut cache = meshfox_core::VarCache::load(&path).unwrap();
+        cache.set("D", data.to_str().unwrap()).unwrap();
+        let addr = spawn_test_server(path.clone()).await;
+        let (status, body) = request(addr, "GET", "/api/nodes/viavar/file-content", "", "").await;
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("hello-from-data"), "{body}");
+        let (status, _) = request(addr, "GET", "/api/nodes/other/file-content", "", "").await;
+        assert_eq!(status, 403);
+    }
+
+    #[tokio::test]
+    async fn at_tmp_is_readable_without_confirmation_and_session_reset_deletes_it() {
+        let path = dir_var_canvas(
+            "<!-- meshfox:var name=\"W\" type=\"dir\" default=\"@tmp/w\" -->",
+            &[("viatmp", "$W/x.txt"), ("direct", "@tmp/w/x.txt")],
+        );
+        let w = meshfox_core::expand_dir_value("@tmp/w", Some(&path));
+        std::fs::write(std::path::Path::new(&w).join("x.txt"), "tmp-content").unwrap();
+        let addr = spawn_test_server(path.clone()).await;
+        for id in ["viatmp", "direct"] {
+            let (status, body) =
+                request(addr, "GET", &format!("/api/nodes/{id}/file-content"), "", "").await;
+            assert_eq!(status, 200, "{id}: {body}");
+            assert!(body.contains("tmp-content"), "{id}: {body}");
+        }
+        let (status, body) = request(addr, "GET", "/api/session/tmp", "", "").await;
+        assert_eq!(status, 200);
+        assert!(body.contains("\"bytes\":11"), "{body}");
+        let (status, _) = request(addr, "POST", "/api/session/reset", "application/json", "").await;
+        assert_eq!(status, 204);
+        assert!(!meshfox_core::tmp_dir(&path).exists(), "@tmp must be gone after reset");
     }
 
     fn write_dep_chain_canvas(dep_code: &str) -> PathBuf {
