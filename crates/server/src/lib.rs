@@ -2635,6 +2635,12 @@ struct VarStatus {
     /// the UI says why instead of leaving it a mystery.
     #[serde(skip_serializing_if = "Option::is_none")]
     secret_error: Option<String>,
+    /// `/api/vars/configure` only, for a `secret` field: whether the
+    /// document's own secret store holds a value for it (never the value
+    /// itself). Combined with `inherited_from`, lets the form say "stored
+    /// in keychain" / "from project config" / "not set".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stored: Option<bool>,
 }
 
 /// `" (secret store: NAME: reason; ...)"` for a "missing required
@@ -2997,6 +3003,7 @@ fn var_status(
         inherited_from,
         secret_store: d.secret.then(|| store.as_str()),
         secret_error,
+        stored: None,
     }
 }
 
@@ -3022,14 +3029,15 @@ fn validate_var_overrides(
     Ok(())
 }
 
-/// `GET /api/vars/configure` — every declared *non-secret* `meshfox:var`
-/// in the whole document, in declaration order, regardless of which (if
-/// any) block's `env=` actually references it. The browser counterpart to
+/// `GET /api/vars/configure` — every declared `meshfox:var` in the whole
+/// document, in declaration order, regardless of which (if any) block's
+/// `env=` actually references it. The browser counterpart to
 /// `meshfox configure` (see `crates/cli/src/main.rs`'s `configure`, and
 /// the TUI's `c` key): unlike `GET /api/vars`, this is never scoped to one
-/// block's chain, and a `secret` declaration is left out entirely — same
-/// as the CLI, asking for one that's never cached and immediately
-/// discarded again wouldn't do anything useful.
+/// block's chain. A `secret` declaration is included only when
+/// `secret_store = "keychain"` (with the plaintext store, configure would
+/// just write it into the cache file); its value is never returned, only
+/// `stored`/`inheritedFrom`.
 async fn get_configure_vars(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<VarStatus>>, ApiError> {
@@ -3042,9 +3050,11 @@ async fn get_configure_vars(
     // Same reasoning as `get_vars`: a `from`-declared variable is computed,
     // never something to configure by hand. A `session` variable is never
     // cached at all, so there's nothing here to configure either.
+    let keychain = state.vars_cache.lock().unwrap().secret_store_kind()
+        == meshfox_core::secret_store::SecretStoreKind::Keychain;
     let configurable: Vec<_> = decls
         .iter()
-        .filter(|d| !d.secret && !d.session && d.from.is_none())
+        .filter(|d| (keychain || !d.secret) && !d.session && d.from.is_none())
         .cloned()
         .collect();
 
@@ -3083,7 +3093,14 @@ async fn get_configure_vars(
                 .get(d.name.as_str())
                 .map(|m| (*m).clone())
                 .unwrap_or(d);
-            var_status(materialized, &resolved, cache.secret_store_kind())
+            let secret = materialized.secret;
+            let name = materialized.name.clone();
+            let mut status = var_status(materialized, &resolved, cache.secret_store_kind());
+            if secret {
+                // Existence only; the value never leaves the cache.
+                status.stored = Some(matches!(cache.try_get_secret(&name), Ok(Some(_))));
+            }
+            status
         })
         .collect();
     Ok(Json(statuses))
@@ -3093,6 +3110,13 @@ async fn get_configure_vars(
 #[serde(rename_all = "camelCase")]
 struct ConfigureVarsRequest {
     vars: HashMap<String, String>,
+    /// New values for `secret` variables, saved to the secret store. A
+    /// name that isn't here (or has an empty value) is left untouched.
+    #[serde(default)]
+    secrets: HashMap<String, String>,
+    /// `secret` variables whose stored value should be deleted.
+    #[serde(default)]
+    clear: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3118,10 +3142,33 @@ async fn post_configure_vars(
     let canvas = resolved_canvas(&raw, &state.canvas_path)?;
     let decls = meshfox_core::declared_vars(&canvas)
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
-    let configurable: Vec<_> = decls
+    let (secret_decls, configurable): (Vec<_>, Vec<_>) = decls
         .into_iter()
-        .filter(|d| !d.secret && !d.session)
-        .collect();
+        .filter(|d| !d.session)
+        .partition(|d| d.secret);
+    for name in req.secrets.keys().chain(req.clear.iter()) {
+        if !secret_decls.iter().any(|d| &d.name == name) {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("{name} is not a declared secret variable"),
+            ));
+        }
+    }
+    if (!req.secrets.is_empty() || !req.clear.is_empty())
+        && state.vars_cache.lock().unwrap().secret_store_kind()
+            != meshfox_core::secret_store::SecretStoreKind::Keychain
+    {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "secrets can only be configured with secret_store = \"keychain\"".into(),
+        ));
+    }
+    for decl in &secret_decls {
+        if let Some(value) = req.secrets.get(&decl.name).filter(|v| !v.is_empty()) {
+            meshfox_core::validate_value(decl, value)
+                .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+        }
+    }
 
     // Validated before anything is saved — this is the one boundary none
     // of the form's own controls (a `bool` checkbox, a `select` dropdown)
@@ -3148,6 +3195,24 @@ async fn post_configure_vars(
             })?;
             saved += 1;
         }
+    }
+    for (name, value) in req.secrets.iter().filter(|(_, v)| !v.is_empty()) {
+        cache.save_secret(name, value).map_err(|e| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to save {name}: {e}"),
+            )
+        })?;
+        saved += 1;
+    }
+    for name in &req.clear {
+        cache.delete_secret(name).map_err(|e| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to clear {name}: {e}"),
+            )
+        })?;
+        saved += 1;
     }
     Ok(Json(ConfigureVarsResponse { saved }))
 }
@@ -17412,6 +17477,98 @@ mod vars_endpoint_tests {
 
         let _ = std::fs::remove_file(&canvas_path);
         let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));
+    }
+
+    // With `secret_store = "keychain"`, configure lists secrets (stored
+    // flag only, never the value), writes a typed value to the store, and
+    // can delete a stored one. Without a keychain it still refuses them.
+    #[tokio::test]
+    async fn configure_vars_manages_secrets_when_the_keychain_store_is_configured() {
+        let canvas_path = write_test_canvas(CONFIGURE_CANVAS);
+        let state = build_state(canvas_path.clone(), false, None)
+            .await
+            .expect("valid test canvas");
+        let backend = std::sync::Arc::new(meshfox_core::secret_store::MemoryBackend::new());
+        *state.vars_cache.lock().unwrap() =
+            VarCache::in_memory().with_secret_backend(backend.clone(), &canvas_path);
+        let app = build_app(state);
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+
+        let list = |body: String| -> serde_json::Value {
+            let statuses: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+            statuses
+                .into_iter()
+                .find(|s| s["name"] == "API_TOKEN")
+                .expect("API_TOKEN is listed with a keychain store")
+        };
+        let (_, body) = get(addr, "/api/vars/configure").await;
+        let token = list(body);
+        assert_eq!(token["stored"], false);
+        assert!(token.get("value").is_none(), "{token}");
+
+        let (status, body) = post_json(
+            addr,
+            "/api/vars/configure",
+            r#"{"vars":{},"secrets":{"API_TOKEN":"sk-new"}}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let (_, body) = get(addr, "/api/vars/configure").await;
+        let token = list(body);
+        assert_eq!(token["stored"], true);
+        assert!(!token.to_string().contains("sk-new"), "{token}");
+
+        // An empty value leaves the stored one alone.
+        let (status, _) = post_json(
+            addr,
+            "/api/vars/configure",
+            r#"{"vars":{},"secrets":{"API_TOKEN":""}}"#,
+        )
+        .await;
+        assert_eq!(status, 200);
+        let (_, body) = get(addr, "/api/vars/configure").await;
+        assert_eq!(list(body)["stored"], true);
+
+        let (status, _) = post_json(
+            addr,
+            "/api/vars/configure",
+            r#"{"vars":{},"clear":["API_TOKEN"]}"#,
+        )
+        .await;
+        assert_eq!(status, 200);
+        let (_, body) = get(addr, "/api/vars/configure").await;
+        assert_eq!(list(body)["stored"], false);
+
+        // Only declared secrets can be named.
+        let (status, _) = post_json(
+            addr,
+            "/api/vars/configure",
+            r#"{"vars":{},"secrets":{"GREETING":"x"}}"#,
+        )
+        .await;
+        assert_eq!(status, 422);
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn configure_vars_refuses_secrets_without_a_keychain_store() {
+        let canvas_path = write_test_canvas(CONFIGURE_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let (status, body) = post_json(
+            addr,
+            "/api/vars/configure",
+            r#"{"vars":{},"secrets":{"API_TOKEN":"sk"}}"#,
+        )
+        .await;
+        assert_eq!(status, 422, "{body}");
+        let _ = std::fs::remove_file(&canvas_path);
     }
 
     const SECRET_ENV_CANVAS: &str = concat!(

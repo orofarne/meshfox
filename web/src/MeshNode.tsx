@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Handle, NodeResizer, NodeToolbar, Position, useReactFlow, type NodeProps } from "@xyflow/react";
+import { Handle, NodeResizer, NodeToolbar, Position, useReactFlow, useUpdateNodeInternals, type NodeProps } from "@xyflow/react";
 import ReactMarkdown, { defaultUrlTransform, type Components, type UrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkImageAttrs from "./remarkImageAttrs";
@@ -2692,6 +2692,13 @@ export function NodeBodyContent({ data, nodeId }: { data: MeshNodeData; nodeId: 
 }
 
 export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeData }) {
+  const updateNodeInternals = useUpdateNodeInternals();
+  // Folding can settle on an already measured row size during initial
+  // mounting. Explicitly refresh the handles after that DOM transition:
+  // waiting for a size change can leave an incoming edge uninitialized.
+  useEffect(() => {
+    updateNodeInternals(id);
+  }, [id, data.folded, data.level, updateNodeInternals]);
   const [editingText, setEditingText] = useState(false);
   const nodeRootRef = useRef<HTMLDivElement | null>(null);
   useSearchHighlight(nodeRootRef, data, editingText);

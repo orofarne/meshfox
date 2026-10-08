@@ -1743,10 +1743,20 @@ fn shared_origin_note(origin: &meshfox_core::SharedOrigin) -> String {
 fn configure(canvas_path: &Path) {
     let raw = read_raw_or_exit(canvas_path);
     let decls = declared_vars_or_exit(canvas_path, &raw);
-    // `secret` and `session` are both never cached -- `configure`'s whole
-    // job is walking the cache, so neither has anything for it to do.
-    let skipped_count = decls.iter().filter(|d| d.secret || d.session).count();
-    let configurable: Vec<&VarDecl> = decls.iter().filter(|d| !d.secret && !d.session).collect();
+    // With the plaintext store a `secret` is never cached, so `configure`
+    // has nothing to do for it; with `secret_store = "keychain"` it can be
+    // set (or overridden) here. `session` is never cached either way.
+    let mut cache = load_var_cache_or_exit(canvas_path);
+    let keychain =
+        cache.secret_store_kind() == meshfox_core::secret_store::SecretStoreKind::Keychain;
+    let skipped_count = decls
+        .iter()
+        .filter(|d| d.session || (d.secret && !keychain))
+        .count();
+    let configurable: Vec<&VarDecl> = decls
+        .iter()
+        .filter(|d| !d.session && (keychain || !d.secret))
+        .collect();
 
     if configurable.is_empty() {
         if skipped_count > 0 {
@@ -1769,7 +1779,6 @@ fn configure(canvas_path: &Path) {
         std::process::exit(1);
     }
 
-    let mut cache = load_var_cache_or_exit(canvas_path);
     let shared = meshfox_core::load_shared_env(canvas_root_dir(canvas_path));
     if skipped_count > 0 {
         println!(
@@ -1777,7 +1786,36 @@ fn configure(canvas_path: &Path) {
         );
     }
 
+    let mut saved = 0;
     for decl in configurable.iter().copied() {
+        if decl.secret {
+            let stored = matches!(cache.try_get_secret(&decl.name), Ok(Some(_)));
+            let origin = shared.get(&decl.name).map(|sv| sv.origin.clone());
+            let status = match (stored, &origin) {
+                (true, _) => "stored in keychain; Enter keeps it, a new value replaces it \
+                              (`meshfox secret rm` deletes it)"
+                    .to_string(),
+                (false, Some(o)) => format!(
+                    "set {}; Enter keeps it, a value here overrides it",
+                    shared_origin_note(o)
+                ),
+                (false, None) => "not set; Enter skips it".to_string(),
+            };
+            println!("{} [{status}]", decl.prompt);
+            let value = prompt::ask(decl, None).unwrap_or_else(|e| {
+                eprintln!("failed to read input: {e}");
+                std::process::exit(1);
+            });
+            if value.is_empty() {
+                continue;
+            }
+            cache.save_secret(&decl.name, &value).unwrap_or_else(|e| {
+                eprintln!("failed to save {}: {e}", decl.name);
+                std::process::exit(1);
+            });
+            saved += 1;
+            continue;
+        }
         let (current, origin) = current_value(decl, &cache, &shared);
         if let Some(origin) = &origin {
             println!("{} {}", decl.prompt, shared_origin_note(origin));
@@ -1790,11 +1828,11 @@ fn configure(canvas_path: &Path) {
             eprintln!("failed to save {}: {e}", decl.name);
             std::process::exit(1);
         });
+        saved += 1;
     }
 
     println!(
-        "meshfox configure: saved {} variable(s) to {}",
-        configurable.len(),
+        "meshfox configure: saved {saved} variable(s) to {}",
         meshfox_core::varcache::cache_path(canvas_path).display()
     );
 }

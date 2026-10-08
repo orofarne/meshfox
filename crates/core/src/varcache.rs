@@ -181,6 +181,23 @@ impl VarCache {
         }
     }
 
+    /// Deletes a `secret` answer saved in the secret store (and its index
+    /// entry). Returns whether there was anything to delete; a no-op for the
+    /// plaintext store, where `secret` answers live in the cache file.
+    pub fn delete_secret(&mut self, name: &str) -> io::Result<bool> {
+        let Some(binding) = &self.secrets else {
+            return Ok(false);
+        };
+        let account = secret_store::doc_account(&binding.canvas_path, name);
+        let existed = binding.backend.delete(&account)?;
+        if let Some(index) = &binding.index {
+            index
+                .forget(&secret_store::doc_scope(&binding.canvas_path), name)
+                .map_err(|e| io::Error::other(format!("deleted, but index update failed: {e}")))?;
+        }
+        Ok(existed)
+    }
+
     pub fn get(&self, name: &str) -> Option<&str> {
         self.entries.get(name).map(String::as_str)
     }
@@ -223,6 +240,21 @@ impl VarCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delete_secret_removes_a_stored_value_and_reports_whether_there_was_one() {
+        use crate::secret_store::MemoryBackend;
+        let canvas = Path::new("/tmp/doc.canvas.md");
+        let mut cache = VarCache::in_memory()
+            .with_secret_backend(Arc::new(MemoryBackend::new()), canvas);
+        cache.save_secret("TOKEN", "sk").unwrap();
+        assert_eq!(cache.try_get_secret("TOKEN").unwrap().as_deref(), Some("sk"));
+        assert!(cache.delete_secret("TOKEN").unwrap());
+        assert_eq!(cache.try_get_secret("TOKEN").unwrap(), None);
+        assert!(!cache.delete_secret("TOKEN").unwrap());
+        // Plaintext: nothing to delete from a store.
+        assert!(!VarCache::in_memory().delete_secret("TOKEN").unwrap());
+    }
 
     #[test]
     fn cache_path_is_a_sibling_meshfox_dir_named_after_the_file() {

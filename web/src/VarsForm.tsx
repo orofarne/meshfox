@@ -14,7 +14,7 @@ interface VarsFormProps {
    * "configure" flow never shows a `secret` field at all (`GET
    * /api/vars/configure` excludes them entirely) to have one checked in the
    * first place. */
-  onSubmit: (answers: Record<string, string>, saveSecrets: string[]) => void;
+  onSubmit: (answers: Record<string, string>, saveSecrets: string[], clearSecrets: string[]) => void;
   onCancel: () => void;
   /** Defaults to the pre-run gate's own copy — `handleConfigure` overrides
    * these three for the "configure every declared variable" flow, the
@@ -22,6 +22,11 @@ interface VarsFormProps {
   title?: string;
   hint?: string;
   submitLabel?: string;
+  /** The "configure every declared variable" flow: a `secret` field shows
+   * whether a value is already stored (or inherited from config) instead of
+   * a "save" checkbox, an empty one means "leave it alone", and a stored one
+   * can be cleared. Typing a value is itself the request to save it. */
+  configure?: boolean;
 }
 
 // Mirrors what `meshfox_core::vars::validate_value` itself accepts for an
@@ -35,7 +40,8 @@ interface VarsFormProps {
 // "3.14", "1e5", ...).
 const INT_PATTERN = /^[+-]?\d+$/;
 
-function isValidValue(v: VarStatus, value: string): boolean {
+function isValidValue(v: VarStatus, value: string, configure = false): boolean {
+  if (configure && v.secret && value === "") return true;
   return v.type !== "int" || INT_PATTERN.test(value);
 }
 
@@ -82,6 +88,7 @@ export function VarsForm({
   title = "Configure variables",
   hint,
   submitLabel = "run",
+  configure = false,
 }: VarsFormProps) {
   const [values, setValues] = useState<Record<string, string>>(() =>
     Object.fromEntries(vars.map((v) => [v.name, initialValue(v)])),
@@ -92,6 +99,8 @@ export function VarsForm({
   // mean threading a `secret`-only branch through every place `values` is
   // built/read.
   const [saveSecret, setSaveSecret] = useState<Record<string, boolean>>({});
+  // Configure only: which stored `secret` fields get deleted on submit.
+  const [clearSecret, setClearSecret] = useState<Record<string, boolean>>({});
   // Set by `handleSubmit` when an `int` field fails `isValidValue` — the
   // server would reject it too (`meshfox_core::validate_value`, wired
   // into `POST /api/vars/configure`/`/api/run`), but catching it here
@@ -103,7 +112,7 @@ export function VarsForm({
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
-    const invalid = vars.find((v) => !isValidValue(v, values[v.name]));
+    const invalid = vars.find((v) => !isValidValue(v, values[v.name], configure));
     if (invalid) {
       setError(`${invalid.prompt} needs a whole number (like 42 or -3), not ${JSON.stringify(values[invalid.name])}.`);
       return;
@@ -112,6 +121,7 @@ export function VarsForm({
     onSubmit(
       values,
       Object.keys(saveSecret).filter((name) => saveSecret[name]),
+      Object.keys(clearSecret).filter((name) => clearSecret[name]),
     );
   };
 
@@ -132,7 +142,14 @@ export function VarsForm({
             <span>
               {v.prompt}
               {v.inheritedFrom && (
-                <span className="vars-modal-inherited" title={inheritedLabel(v.inheritedFrom).title}>
+                <span
+                  className="vars-modal-inherited"
+                  title={
+                    configure && v.secret
+                      ? `${inheritedLabel(v.inheritedFrom).title} — type a value to override`
+                      : inheritedLabel(v.inheritedFrom).title
+                  }
+                >
                   {inheritedLabel(v.inheritedFrom).text}
                 </span>
               )}
@@ -167,7 +184,8 @@ export function VarsForm({
                 // `string` field is allowed to be blank on purpose (e.g. "no
                 // fixed value" style defaults) — `meshfox_core::vars::
                 // validate_value` already accepts "" for it.
-                required={v.type === "int"}
+                required={v.type === "int" && !(configure && v.secret)}
+                placeholder={configure && v.secret ? (v.stored || v.inheritedFrom ? "•••••• (unchanged)" : "") : undefined}
               />
             )}
           </label>
@@ -176,7 +194,25 @@ export function VarsForm({
               Couldn't read the saved value from the secret store: {v.secretError}
             </p>
           )}
-          {v.secret && (
+          {v.secret && configure && (v.stored || !v.inheritedFrom) && (
+            <div className="vars-modal-secret-save">
+              {v.stored ? (
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={clearSecret[v.name] ?? false}
+                    onChange={(e) => setClearSecret((prev) => ({ ...prev, [v.name]: e.target.checked }))}
+                  />
+                  <span title="Deletes the value stored for this variable.">
+                    stored in {v.secretStore === "keychain" ? "keychain" : "secret store"} — clear it
+                  </span>
+                </label>
+              ) : (
+                <span>not set</span>
+              )}
+            </div>
+          )}
+          {v.secret && !configure && (
             <label className="vars-modal-secret-save">
               <input
                 type="checkbox"

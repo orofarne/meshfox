@@ -1565,7 +1565,20 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
             // A `secret` field's "save" toggle (Ctrl-S), labelled by where
             // it would go (`secret_store`), and — if the store couldn't be
             // read — why the field is being asked for again.
-            let save_tag = if decl.secret {
+            let save_tag = if decl.secret && vf.configuring {
+                // Configure: typing a value saves it (empty leaves it
+                // alone), so there's no save toggle — just what's there.
+                let state = if vf.clear[i] {
+                    "[x] clear stored value"
+                } else if vf.stored[i] == Some(true) {
+                    "stored in keychain · ^d clear"
+                } else if origin.is_some() {
+                    "type to override"
+                } else {
+                    "not set"
+                };
+                format!(" ({state})")
+            } else if decl.secret {
                 let label = if vf.secret_store == "keychain" {
                     "keychain"
                 } else {
@@ -1601,7 +1614,7 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
     f.render_stateful_widget(list, rows[0], &mut state);
 
     let esc_hint = if vf.configuring {
-        "↑/↓/tab field · ←/→ toggle/cycle · ^s save secret · enter save all · esc cancel configure"
+        "↑/↓/tab field · ←/→ toggle/cycle · ^d clear secret · enter save all · esc cancel configure"
     } else {
         "↑/↓/tab field · ←/→ toggle/cycle · ^s save secret · enter confirm all · esc cancel run"
     };

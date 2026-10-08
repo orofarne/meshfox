@@ -1957,14 +1957,30 @@ export default function App() {
     }
   }, []);
 
-  const handleConfigureSubmit = useCallback(async (answers: Record<string, string>) => {
+  const handleConfigureSubmit = useCallback(async (
+    answers: Record<string, string>,
+    _saveSecrets: string[],
+    clearSecrets: string[],
+  ) => {
+    const secretNames = new Set((configureVars ?? []).filter((v) => v.secret).map((v) => v.name));
     setConfigureVars(null);
+    // A secret field left empty means "leave it alone"; only typed values go out.
+    const plain: Record<string, string> = {};
+    const secrets: Record<string, string> = {};
+    for (const [name, value] of Object.entries(answers)) {
+      if (!secretNames.has(name)) plain[name] = value;
+      else if (value !== "") secrets[name] = value;
+    }
     try {
-      await saveConfigureVars(answers);
+      await saveConfigureVars(
+        plain,
+        secrets,
+        clearSecrets.filter((name) => !(name in secrets)),
+      );
     } catch (e) {
       setError(String(e));
     }
-  }, []);
+  }, [configureVars]);
 
   const handleConfigureCancel = useCallback(() => setConfigureVars(null), []);
 
@@ -4040,8 +4056,9 @@ export default function App() {
           onSubmit={handleConfigureSubmit}
           onCancel={handleConfigureCancel}
           title="Configure declared variables"
-          hint="Every declared variable, whether or not any block currently needs it — answered here (even left unchanged) is saved right away, same as `meshfox configure`."
+          hint="Every declared variable, whether or not any block currently needs it — answered here (even left unchanged) is saved right away, same as `meshfox configure`. Secrets are only written when you type a value."
           submitLabel="save"
+          configure
         />
       )}
       {documentOptionsOpen && canvas && (

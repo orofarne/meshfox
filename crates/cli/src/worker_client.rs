@@ -1317,6 +1317,10 @@ pub struct VarStatus {
     /// Why the secret store couldn't be read for this field, if it failed.
     #[serde(default)]
     pub secret_error: Option<String>,
+    /// `/api/vars/configure` only: whether the secret store holds a value
+    /// for this `secret` field.
+    #[serde(default)]
+    pub stored: Option<bool>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1441,10 +1445,12 @@ pub async fn get_configure_vars(port: u16) -> Result<Vec<VarStatus>, String> {
 pub async fn post_configure_vars(
     port: u16,
     vars: HashMap<String, String>,
+    secrets: HashMap<String, String>,
+    clear: Vec<String>,
 ) -> Result<usize, String> {
     let res = client()
         .post(format!("{}/api/vars/configure", base_url(port)))
-        .json(&serde_json::json!({ "vars": vars }))
+        .json(&serde_json::json!({ "vars": vars, "secrets": secrets, "clear": clear }))
         .timeout(time_limit(QUICK))
         .send()
         .await

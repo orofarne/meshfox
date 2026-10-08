@@ -1618,8 +1618,21 @@ unlockable default keyring, it fails loudly on first use. With it:
 same section, or a line in the canvas's `.meshfox/<file>.env`. Turning the
 keychain on doesn't take away the plaintext option.
 
-Not implemented yet: other platforms, and managing secrets in the web UI/TUI
-screens — see TODO.canvas.md.
+**Configure.** With `secret_store = "keychain"`, `meshfox configure`, the
+TUI's `c` and the web "configure" button also list the document's `secret`
+variables (with `plaintext` they stay out, as configure would only write them
+into the cache file). The value is never shown or read back into the form;
+each field says what's there instead: *stored in keychain*, *set by
+project/global config — type a value to override* (the same badge as other
+inherited values), or *not set*. Typing a value saves it to the store; leaving
+it empty changes nothing. A stored value can be deleted from the TUI (`Ctrl-D`)
+and the web form ("clear it"); the CLI uses `meshfox secret rm`. Over HTTP,
+`GET /api/vars/configure` adds `stored` to a secret's status and
+`POST /api/vars/configure` takes `secrets: {NAME: value}` and `clear: [NAME]`
+beside `vars`.
+
+Not implemented yet: other platforms, and managing the `[[env]] secrets`
+entries (global/project scope) from the web UI/TUI — see TODO.canvas.md.
 
 ### Computed variables (`from=`)
 

@@ -51,3 +51,16 @@ test("a node with an authored size does not fold by default", async ({ page }) =
 test("root itself never folds by default", async ({ page }) => {
   await expect(node(page, "root").locator(".mesh-node")).toHaveAttribute("data-folded", "false");
 });
+
+test("initially folded nodes keep their incoming arrows on open and reload", async ({ page }) => {
+  const targets = ["plain-leaf", "title-only", "sized-node", "title-only-with-child"];
+  for (let opening = 0; opening < 5; opening++) {
+    if (opening) await page.reload();
+    await expect(node(page, "plain-leaf").locator(".mesh-node")).toHaveAttribute("data-folded", "true");
+    for (const id of targets) {
+      const path = page.locator(`.react-flow__edge[data-id="root->${id}"] path.react-flow__edge-path`);
+      await expect(path).toHaveCount(1);
+      await expect(path).toHaveAttribute("d", /^M/);
+    }
+  }
+});

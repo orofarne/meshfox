@@ -53,13 +53,19 @@ export async function fetchConfigureVars(): Promise<VarStatus[]> {
  * Saves `answers` (declared non-secret variable name -> value) to the
  * on-disk cache — every entry is written, even one left unchanged from
  * its current suggestion, same as `meshfox configure` always confirming
- * whatever's answered. Doesn't run anything.
+ * whatever's answered. `secrets` (new values for `secret` variables) go to
+ * the secret store, and `clear` names `secret` variables whose stored value
+ * is deleted. Doesn't run anything.
  */
-export async function saveConfigureVars(answers: Record<string, string>): Promise<void> {
+export async function saveConfigureVars(
+  answers: Record<string, string>,
+  secrets: Record<string, string> = {},
+  clear: string[] = [],
+): Promise<void> {
   const res = await fetch("/api/vars/configure", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ vars: answers }),
+    body: JSON.stringify({ vars: answers, secrets, clear }),
   });
   if (!res.ok) throw new Error(`POST /api/vars/configure: ${res.status}`);
 }

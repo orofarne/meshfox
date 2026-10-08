@@ -104,6 +104,12 @@ pub struct VarFormState {
     /// Parallel to `decls` — why the secret store couldn't be read for a
     /// field (locked keychain, access denied, ...), shown next to it.
     pub errors: Vec<Option<String>>,
+    /// Parallel to `decls` — `configuring` only: whether the secret store
+    /// already holds a value for a `secret` field (`None` for the rest).
+    pub stored: Vec<Option<bool>>,
+    /// Parallel to `decls` — `configuring` only (`Ctrl-D`): delete the
+    /// stored value of a `secret` field on submit.
+    pub clear: Vec<bool>,
     /// `"plaintext"` or `"keychain"` — what "save" means here; labels it.
     pub secret_store: String,
     /// `true` for a `c`-triggered walk of every declared (non-secret)
@@ -1002,6 +1008,7 @@ fn var_form_from_statuses(missing: Vec<crate::worker_client::VarStatus>) -> VarF
     let mut inputs = Vec::with_capacity(missing.len());
     let mut origins = Vec::with_capacity(missing.len());
     let mut errors = Vec::with_capacity(missing.len());
+    let stored = missing.iter().map(|s| s.stored).collect();
     let mut secret_store = "plaintext".to_string();
     for status in &missing {
         errors.push(status.secret_error.clone());
@@ -1024,6 +1031,8 @@ fn var_form_from_statuses(missing: Vec<crate::worker_client::VarStatus>) -> VarF
         inputs,
         origins,
         errors,
+        stored,
+        clear: vec![false; missing.len()],
         secret_store,
         selected: 0,
         configuring: false,
@@ -1529,6 +1538,16 @@ impl App {
                     let i = vf.selected;
                     if vf.decls[i].secret {
                         vf.save[i] = !vf.save[i];
+                    }
+                }
+            }
+            // Ctrl-D (configure only): delete the stored value of the
+            // focused `secret` field on submit.
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(vf) = &mut self.var_form {
+                    let i = vf.selected;
+                    if vf.configuring && vf.decls[i].secret && vf.stored[i] == Some(true) {
+                        vf.clear[i] = !vf.clear[i];
                     }
                 }
             }
@@ -5380,6 +5399,8 @@ impl App {
                 .iter()
                 .zip(vf.inputs.iter())
                 .enumerate()
+                // An empty secret in `configure` means "leave it alone".
+                .filter(|(_, (d, v))| !(vf.configuring && d.secret && v.is_empty()))
                 .find_map(|(i, (d, v))| meshfox_core::validate_value(d, v).err().map(|e| (i, e)))
             {
                 let vf = self.var_form.as_mut().unwrap();
@@ -5475,13 +5496,28 @@ impl App {
         // not the worker's, so this always resolves against the worker's
         // own `state.vars_cache` (`GET /api/vars`) instead.
         let Some(port) = self.worker_port else { return };
-        let vars: HashMap<String, String> = vf
+        let (secret_pairs, plain_pairs): (Vec<_>, Vec<_>) = vf
             .decls
             .iter()
             .zip(vf.inputs.iter())
+            .partition(|(d, _)| d.secret);
+        let vars: HashMap<String, String> = plain_pairs
+            .into_iter()
             .map(|(d, v)| (d.name.clone(), v.clone()))
             .collect();
-        match crate::worker_client::post_configure_vars(port, vars).await {
+        let secrets: HashMap<String, String> = secret_pairs
+            .into_iter()
+            .filter(|(_, v)| !v.is_empty())
+            .map(|(d, v)| (d.name.clone(), v.clone()))
+            .collect();
+        let clear: Vec<String> = vf
+            .decls
+            .iter()
+            .zip(vf.clear.iter())
+            .filter(|(d, c)| **c && d.secret && !secrets.contains_key(&d.name))
+            .map(|(d, _)| d.name.clone())
+            .collect();
+        match crate::worker_client::post_configure_vars(port, vars, secrets, clear).await {
             Ok(saved) => {
                 self.status = format!("meshfox: saved {saved} declared variable(s) to the cache");
             }
@@ -5526,7 +5562,7 @@ impl App {
                 Ok(statuses) => {
                     if statuses.is_empty() {
                         self.status =
-                            "meshfox: this canvas declares no configurable (non-secret, non-session, non-from=) variable(s)"
+                            "meshfox: this canvas declares no configurable (non-session, non-from=) variable(s)"
                                 .into();
                         return;
                     }
@@ -5561,6 +5597,8 @@ impl App {
             arguments: false,
             save: vec![false; decls.len()],
             errors: vec![None; decls.len()],
+            stored: vec![None; decls.len()],
+            clear: vec![false; decls.len()],
             secret_store: self.var_cache.secret_store_kind().as_str().to_string(),
             decls,
             inputs,
@@ -5577,9 +5615,11 @@ impl App {
     /// `c` could usefully do, same as the CLI's own `configure` skipping
     /// them).
     pub fn has_configurable_vars(&self) -> bool {
+        let keychain = self.var_cache.secret_store_kind()
+            == meshfox_core::secret_store::SecretStoreKind::Keychain;
         self.decls
             .iter()
-            .any(|d| !d.secret && !d.session && d.from.is_none())
+            .any(|d| (keychain || !d.secret) && !d.session && d.from.is_none())
     }
 
     fn cancel_var_form(&mut self) {
@@ -6664,6 +6704,45 @@ mod tests {
         assert_eq!(vf.secret_store, "keychain");
         assert_eq!(vf.errors, vec![None, Some("keychain: locked".to_string())]);
         assert_eq!(vf.save, vec![false, false]);
+    }
+
+    #[tokio::test]
+    async fn ctrl_d_marks_a_stored_secret_for_clearing_in_configure_only() {
+        let dir = std::env::temp_dir().join(format!("meshfox-tui-clear-secret-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.md");
+        std::fs::write(
+            &path,
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
+        )
+        .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(path, tx, None, None).await.unwrap();
+        let statuses: Vec<crate::worker_client::VarStatus> = serde_json::from_value(serde_json::json!([
+            {"name": "TOKEN", "type": "string", "prompt": "TOKEN", "secret": true, "resolved": true,
+             "secretStore": "keychain", "stored": true},
+            {"name": "OTHER", "type": "string", "prompt": "OTHER", "secret": true, "resolved": false,
+             "secretStore": "keychain", "stored": false}
+        ]))
+        .unwrap();
+        let mut form = var_form_from_statuses(statuses);
+        assert_eq!(form.stored, vec![Some(true), Some(false)]);
+        let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+
+        // Outside configure the key does nothing (and isn't typed).
+        app.var_form = Some(form);
+        app.on_var_form_key(ctrl_d).await;
+        assert_eq!(app.var_form.as_ref().unwrap().clear, vec![false, false]);
+
+        form = app.var_form.take().unwrap();
+        form.configuring = true;
+        app.var_form = Some(form);
+        app.on_var_form_key(ctrl_d).await;
+        assert_eq!(app.var_form.as_ref().unwrap().clear, vec![true, false]);
+        // Nothing stored under OTHER, so nothing to clear.
+        app.on_var_form_key(key(KeyCode::Down)).await;
+        app.on_var_form_key(ctrl_d).await;
+        assert_eq!(app.var_form.as_ref().unwrap().clear, vec![true, false]);
     }
 
     #[tokio::test]

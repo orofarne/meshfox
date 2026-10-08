@@ -205,4 +205,7 @@ export interface VarStatus {
   /** Why the secret store couldn't be read for this field (locked keychain,
    * access denied, ...) — it's asked for again; this says why. */
   secretError?: string;
+  /** `GET /api/vars/configure` only, for a `secret` field: whether the
+   * secret store holds a value for it (never the value itself). */
+  stored?: boolean;
 }
