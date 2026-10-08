@@ -1,4 +1,5 @@
 import type { CanvasDoc, CanvasNode, ExtraEdgeDto, NodeType, ServiceStatusDto, VarStatus } from "./types";
+import { isVSCodeHost, vscodeApi } from "./vscodeHost";
 import { isEmptyView, type TableMeta, type TableRowsPage, type ViewSpec } from "./tableView";
 
 export async function fetchCanvas(): Promise<CanvasDoc> {
@@ -1050,24 +1051,55 @@ export async function runFileStream(nodeId: string, onEvent: (event: RunEvent) =
 }
 
 /**
- * Opens a `file` node's target — the web UI's "↗ open" button. Always
- * fire-and-forget (`204`, nothing returned): a plain file goes to the OS's
- * default application for it, best-effort, resolving once the opener has
- * been spawned, not once whatever it opened has itself finished loading. A
- * `.canvas.md` target has no such OS association to hand off to — the
- * server instead asks this worker's own watcher (see
- * `meshfox_server::watcher_protocol`) to get-or-spawn-and-show it, opening
- * the browser tab itself; there's no URL for this call to hand back and
- * `window.open` into a tab any more. Rejects (thrown error) for a non-file
- * node, a node with no target, a target outside the canvas directory, or
- * (canvas targets only) no watcher to ask at all.
+ * What `POST /api/nodes/:id/open` tells this page to do next (see
+ * `open_node_file`'s `OpenAction` in `crates/server/src/lib.rs`).
+ */
+type OpenAction =
+  | { action: "done" }
+  | { action: "open_file"; path: string }
+  | { action: "open_canvas"; path: string; fragment: string | null; port: number | null };
+
+/**
+ * Opens a `file` node's target — the web UI's "↗ open" button. The server
+ * is told which kind of client is asking (`context`, required there) and
+ * answers with what to do about it:
+ * - in a VS Code webview (`vscode`) it opens nothing itself — the file or
+ *   canvas is handed to the extension (`postMessage`), which opens it in an
+ *   editor tab; works the same whichever coordinator spawned this worker;
+ * - in a plain browser tab (`web`) a canvas target opens in a *new tab of
+ *   this same browser* (the server hands back the target worker's port),
+ *   and a plain file goes to the OS's default application via the server's
+ *   coordinator (`done`: nothing left to do here).
+ * Rejects (thrown error) for a non-file node, a node with no target, a
+ * target outside the canvas directory, (web/delegate) no coordinator to ask
+ * at all, or a popup blocker refusing the new tab.
  */
 export async function openNodeFile(nodeId: string): Promise<void> {
-  const res = await fetch(`/api/nodes/${encodeURIComponent(nodeId)}/open`, { method: "POST" });
+  const context = isVSCodeHost ? "vscode" : "web";
+  const res = await fetch(`/api/nodes/${encodeURIComponent(nodeId)}/open?context=${context}`, {
+    method: "POST",
+  });
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `POST /api/nodes/${nodeId}/open: ${res.status}`);
   }
+  const action = (await res.json()) as OpenAction;
+  if (action.action === "done") {
+    return;
+  }
+  if (vscodeApi) {
+    vscodeApi.postMessage({ type: "meshfox.open", ...action });
+    return;
+  }
+  if (action.action === "open_canvas" && action.port !== null) {
+    const hash = action.fragment ? `#${encodeURIComponent(action.fragment)}` : "";
+    const url = `${window.location.protocol}//${window.location.hostname}:${action.port}/${hash}`;
+    if (!window.open(url, "_blank")) {
+      throw new Error(`The browser blocked the new tab — open ${url} manually.`);
+    }
+    return;
+  }
+  throw new Error(`unexpected open action from the server: ${JSON.stringify(action)}`);
 }
 
 /**

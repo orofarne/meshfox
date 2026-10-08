@@ -21,3 +21,20 @@
  * context menu that isn't broken everywhere else.
  */
 export const isVSCodeHost: boolean = document.querySelector('meta[name="meshfox-host"]')?.getAttribute("content") === "vscode";
+
+/** The minimal slice of VS Code's webview API this app uses. */
+interface VsCodeApi {
+  postMessage(message: unknown): void;
+}
+
+/**
+ * The webview's channel back to the extension host (`acquireVsCodeApi()`,
+ * which VS Code injects into every webview and which may only be called
+ * once per page — hence here, at module load, not at each use). `undefined`
+ * outside a VS Code webview. Used for the things only the extension can do,
+ * like opening a file or another canvas in an editor tab (`api.ts`'s
+ * `openNodeFile`).
+ */
+export const vscodeApi: VsCodeApi | undefined = isVSCodeHost
+  ? (window as unknown as { acquireVsCodeApi?: () => VsCodeApi }).acquireVsCodeApi?.()
+  : undefined;

@@ -2077,13 +2077,12 @@ export default function App() {
     [setNodes],
   );
 
-  // Opens a `file` node's target (the title bar's "↗ open" button) —
-  // fire-and-forget from the UI's point of view either way: a plain file
-  // goes to the OS's default opener, a canvas target to this worker's own
-  // watcher (which opens the browser tab itself — see `api.ts`'s
-  // `openNodeFile`). Nothing for this component to do afterward but
-  // surface a failure to the same error banner every other action here
-  // uses.
+  // Opens a `file` node's target (the title bar's "↗ open" button) — what
+  // that means depends on the host (`api.ts`'s `openNodeFile`: an editor
+  // tab in VS Code, a new browser tab for a canvas, the OS's default
+  // application for a plain file). Nothing for this component to do
+  // afterward but surface a failure to the same error banner every other
+  // action here uses.
   const handleOpenFile = useCallback(async (nodeId: string) => {
     try {
       await openNodeFile(nodeId);

@@ -5686,23 +5686,72 @@ fn is_canvas_file(path: &std::path::Path) -> bool {
                 .is_ok_and(|contents| meshfox_core::mdcanvas::has_marker(&contents)))
 }
 
-/// Opens a `file` node's target — the web UI's "↗ open" button. `204` once
-/// the coordinator confirms it actually opened something (see
-/// `crate::watcher_protocol`'s own doc comment for why `Open`/`OpenFile`
-/// get a real reply now, not just a fire-and-forget request); both a plain
-/// file and a `.canvas.md` (or marker-carrying `.md`) target are handed to
-/// this worker's own coordinator (`watcher_protocol::request_open`/
-/// `request_open_file`) — get-or-spawn-and-show for a canvas, "open
-/// however this coordinator opens plain files" for anything else, entirely
-/// that coordinator's decision either way (the OS's default application
-/// for `crate::cli`'s own watcher and the macOS daemon, a fresh editor tab
-/// for the VS Code extension's). No coordinator reachable, or one that's
-/// reachable but failed to actually open anything (a malformed target
-/// canvas, say), both surface here as a real `500`.
+/// Who is asking `open_node_file` to open something — decides *where* the
+/// target gets opened. Required on every call (no default): a client that
+/// forgot to say would silently get the old "ask this worker's coordinator"
+/// behavior, which is exactly wrong for a client the coordinator can't
+/// reach (a VS Code tab served by an external coordinator).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum OpenContext {
+    /// A plain browser tab: a canvas opens in a new tab of this same
+    /// browser (the response carries the target worker's port), a plain
+    /// file goes through the coordinator (the OS's default application).
+    Web,
+    /// A VS Code webview: this worker opens nothing itself, the extension
+    /// does, from the returned action.
+    Vscode,
+    /// The pre-`context` behavior: this worker asks its own coordinator
+    /// (`Open`/`OpenFile`) to do everything, entirely its decision.
+    Delegate,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenNodeFileQuery {
+    context: OpenContext,
+}
+
+/// What `open_node_file` tells its client to do next.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum OpenAction {
+    /// Already opened by this worker's coordinator; nothing for the
+    /// client to do.
+    Done,
+    /// Open this plain file in the client's own way.
+    OpenFile { path: String },
+    /// Open this canvas (at `fragment`, if any) in the client's own way.
+    /// `port` is the target canvas's worker, for a client that opens it as
+    /// a URL (`Web`); absent for one that opens it as a document (`Vscode`).
+    OpenCanvas {
+        path: String,
+        fragment: Option<String>,
+        port: Option<u16>,
+    },
+}
+
+/// Opens a `file` node's target — the web UI's "↗ open" button — in the
+/// way the caller's required `?context=` says (see [`OpenContext`]).
+/// `vscode` never touches the coordinator: it gets back
+/// [`OpenAction::OpenFile`]/[`OpenAction::OpenCanvas`] and the extension
+/// opens it (that's what makes it work when this worker was spawned by an
+/// external coordinator, whose `Open`/`OpenFile` handlers know nothing of
+/// the editor the click came from). `web` on a canvas target gets the
+/// target worker's port (`GetPort`: get-or-spawn, no browser tab opened by
+/// the coordinator) for the page to open in a new tab of its own browser;
+/// `web` on a plain file, and `delegate` on anything, hand the target to
+/// this worker's coordinator (`watcher_protocol::request_open`/
+/// `request_open_file`: get-or-spawn-and-show for a canvas, "open however
+/// this coordinator opens plain files" for anything else — the OS's
+/// default application for the macOS daemon and `crate::cli`'s watcher),
+/// `200 {"action":"done"}` once it confirms. No coordinator reachable, or
+/// one that's reachable but failed to actually open anything, both
+/// surface as a real `500`; no coordinator configured at all, `503`.
 async fn open_node_file(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<StatusCode, ApiError> {
+    Query(query): Query<OpenNodeFileQuery>,
+) -> Result<Json<OpenAction>, ApiError> {
     let primary_raw = state.raw.lock().unwrap().clone();
     let located = locate_node(&primary_raw, &id)?;
     let canvas = parse_or_error(&located.raw)?;
@@ -5722,8 +5771,23 @@ async fn open_node_file(
         )
     })?;
     let (target_path, fragment) = meshfox_core::mdcanvas::split_target_fragment(target);
+    let fragment = fragment.map(str::to_string);
     let canvas_path = &state.canvas_path;
     let resolved = resolve_confined_target(canvas_path, target_path)?;
+    let is_canvas = is_canvas_file(&resolved);
+    let path = resolved.to_string_lossy().into_owned();
+
+    if query.context == OpenContext::Vscode {
+        return Ok(Json(if is_canvas {
+            OpenAction::OpenCanvas {
+                path,
+                fragment,
+                port: None,
+            }
+        } else {
+            OpenAction::OpenFile { path }
+        }));
+    }
 
     let socket = state.watcher_socket.as_deref().ok_or_else(|| {
         ApiError(
@@ -5734,8 +5798,24 @@ async fn open_node_file(
         )
     })?;
 
-    if is_canvas_file(&resolved) {
-        watcher_protocol::request_open(socket, &resolved, fragment.map(str::to_string))
+    if is_canvas && query.context == OpenContext::Web {
+        let port = watcher_protocol::request_port(socket, &resolved)
+            .await
+            .map_err(|e| {
+                ApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("couldn't reach the watcher to open the canvas: {e}"),
+                )
+            })?;
+        return Ok(Json(OpenAction::OpenCanvas {
+            path,
+            fragment,
+            port: Some(port),
+        }));
+    }
+
+    if is_canvas {
+        watcher_protocol::request_open(socket, &resolved, fragment)
             .await
             .map_err(|e| {
                 ApiError(
@@ -5754,7 +5834,7 @@ async fn open_node_file(
             })?;
     }
 
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(OpenAction::Done))
 }
 
 /// Opens the directory containing a `file` node's target — the web UI's
@@ -15176,7 +15256,7 @@ mod run_file_tests {
             "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
         );
         let addr = spawn_test_server(canvas_path.clone()).await;
-        let (status, body) = post(addr, "/api/nodes/root/open").await;
+        let (status, body) = post(addr, "/api/nodes/root/open?context=delegate").await;
         assert_eq!(status, 422);
         assert!(body.contains("not a file node"), "unexpected body: {body}");
         let _ = std::fs::remove_file(&canvas_path);
@@ -15188,9 +15268,156 @@ mod run_file_tests {
             "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
         );
         let addr = spawn_test_server(canvas_path.clone()).await;
-        let (status, _) = post(addr, "/api/nodes/nope/open").await;
+        let (status, _) = post(addr, "/api/nodes/nope/open?context=delegate").await;
         assert_eq!(status, 404);
         let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    /// A scratch directory holding `canvas.canvas.md` (a canvas with one
+    /// `file` node, `f`, whose target is `target`) plus `note.txt` and
+    /// `other.canvas.md` beside it, for the `open_node_file` tests below.
+    fn open_fixture(target: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("meshfox-open-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("note.txt"), "hi").unwrap();
+        std::fs::write(
+            dir.join("other.canvas.md"),
+            "<!-- meshfox:canvas -->\n# Other\n<!-- meshfox:node id=\"o\" -->\n",
+        )
+        .unwrap();
+        let canvas_path = dir.join("canvas.canvas.md");
+        std::fs::write(
+            &canvas_path,
+            format!(
+                "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+                 ## F\n<!-- meshfox:node id=\"f\" type=\"file\" -->\n\n[x]({target})\n"
+            ),
+        )
+        .unwrap();
+        (dir, canvas_path)
+    }
+
+    #[tokio::test]
+    async fn open_node_file_requires_a_context() {
+        let (dir, canvas_path) = open_fixture("./note.txt");
+        let addr = spawn_test_server(canvas_path).await;
+        let (status, body) = post(addr, "/api/nodes/f/open").await;
+        assert_eq!(status, 400, "unexpected body: {body}");
+        assert!(body.contains("context"), "unexpected body: {body}");
+        let (status, body) = post(addr, "/api/nodes/f/open?context=emacs").await;
+        assert_eq!(status, 400, "unexpected body: {body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn open_node_file_vscode_returns_the_file_for_the_extension_to_open() {
+        let (dir, canvas_path) = open_fixture("./note.txt");
+        let addr = spawn_test_server(canvas_path).await;
+        let (status, body) = post(addr, "/api/nodes/f/open?context=vscode").await;
+        assert_eq!(status, 200, "unexpected body: {body}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["action"], "open_file");
+        assert!(json["path"].as_str().unwrap().ends_with("note.txt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn open_node_file_vscode_returns_the_canvas_with_its_fragment() {
+        let (dir, canvas_path) = open_fixture("./other.canvas.md#o");
+        let addr = spawn_test_server(canvas_path).await;
+        let (status, body) = post(addr, "/api/nodes/f/open?context=vscode").await;
+        assert_eq!(status, 200, "unexpected body: {body}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["action"], "open_canvas");
+        assert_eq!(json["fragment"], "o");
+        assert!(json["path"].as_str().unwrap().ends_with("other.canvas.md"));
+        assert!(json["port"].is_null());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn open_node_file_web_and_delegate_need_a_watcher() {
+        let (dir, canvas_path) = open_fixture("./other.canvas.md");
+        let addr = spawn_test_server(canvas_path).await;
+        for context in ["web", "delegate"] {
+            let (status, _) = post(addr, &format!("/api/nodes/f/open?context={context}")).await;
+            assert_eq!(status, 503, "context={context}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A unix socket path short enough for macOS's `SUN_LEN` (a scratch
+    /// dir under `$TMPDIR` is not).
+    fn short_socket_path() -> PathBuf {
+        std::env::temp_dir().join(format!("mfx-open-{}.sock", &uuid::Uuid::new_v4().to_string()[..8]))
+    }
+
+    /// Serves one request on `socket` and answers it with `reply`; returns
+    /// the request line the worker sent.
+    fn fake_coordinator(
+        socket: &std::path::Path,
+        reply: &'static str,
+    ) -> tokio::task::JoinHandle<String> {
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = stream.into_split();
+            let mut line = String::new();
+            BufReader::new(read_half).read_line(&mut line).await.unwrap();
+            write_half.write_all(reply.as_bytes()).await.unwrap();
+            line
+        })
+    }
+
+    async fn spawn_test_server_with_watcher(
+        canvas_path: PathBuf,
+        socket: PathBuf,
+    ) -> SocketAddr {
+        let state = build_state(canvas_path, false, Some(socket))
+            .await
+            .expect("valid test canvas");
+        let app = build_app(state);
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn open_node_file_web_asks_the_coordinator_for_the_canvas_port() {
+        let (dir, canvas_path) = open_fixture("./other.canvas.md#o");
+        let socket = short_socket_path();
+        let coordinator = fake_coordinator(&socket, "{\"port\":4242}\n");
+        let addr = spawn_test_server_with_watcher(canvas_path, socket).await;
+        let (status, body) = post(addr, "/api/nodes/f/open?context=web").await;
+        assert_eq!(status, 200, "unexpected body: {body}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["action"], "open_canvas");
+        assert_eq!(json["port"], 4242);
+        assert_eq!(json["fragment"], "o");
+        let request: serde_json::Value = serde_json::from_str(&coordinator.await.unwrap()).unwrap();
+        assert_eq!(request["op"], "get_port");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn open_node_file_delegate_hands_a_plain_file_to_the_coordinator() {
+        let (dir, canvas_path) = open_fixture("./note.txt");
+        let socket = short_socket_path();
+        let coordinator = fake_coordinator(&socket, "{}\n");
+        let addr = spawn_test_server_with_watcher(canvas_path, socket).await;
+        let (status, body) = post(addr, "/api/nodes/f/open?context=delegate").await;
+        assert_eq!(status, 200, "unexpected body: {body}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["action"], "done");
+        let request: serde_json::Value = serde_json::from_str(&coordinator.await.unwrap()).unwrap();
+        assert_eq!(request["op"], "open_file");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

@@ -3,7 +3,7 @@
 //! the same `meshfox_server::watcher_protocol` on the socket `server_socket`
 //! points at. Headless: no window, no menu; `meshfox cores ls|open|kill`
 //! is its control surface. The registry and request handling are
-//! `crate::watcher`'s own, in its persistent mode (it answers `GetPort`,
+//! `crate::watcher`'s own, in its persistent mode (it also answers
 //! `ListCores` and `Kill`, and never exits just because it went idle).
 //!
 //! The listening socket comes from, in order:

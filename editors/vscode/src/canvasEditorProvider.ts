@@ -47,6 +47,12 @@ export class CanvasEditorProvider implements vscode.CustomReadonlyEditorProvider
 
     panel.onDidDispose(() => this.coordinator.killWorker(document.uri.fsPath));
 
+    // The page's "↗ open" (`web/src/api.ts`'s `openNodeFile`) can't ask a
+    // coordinator to open something in *this* editor — which coordinator
+    // spawned its worker is arbitrary — so it posts what the worker told it
+    // to open back here.
+    panel.webview.onDidReceiveMessage((message: unknown) => this.handleWebviewMessage(message));
+
     let port: number;
     try {
       port = await this.coordinator.getOrSpawnWorker(document.uri.fsPath);
@@ -68,6 +74,21 @@ export class CanvasEditorProvider implements vscode.CustomReadonlyEditorProvider
     }
 
     panel.webview.html = canvasAppHtml(indexHtml, baseUrl, fragment);
+  }
+
+  private handleWebviewMessage(message: unknown): void {
+    if (typeof message !== "object" || message === null) {
+      return;
+    }
+    const msg = message as { type?: unknown; action?: unknown; path?: unknown; fragment?: unknown };
+    if (msg.type !== "meshfox.open" || typeof msg.path !== "string") {
+      return;
+    }
+    if (msg.action === "open_file") {
+      this.coordinator.openFile(msg.path);
+    } else if (msg.action === "open_canvas") {
+      this.coordinator.openCanvas(msg.path, typeof msg.fragment === "string" ? msg.fragment : undefined);
+    }
   }
 }
 

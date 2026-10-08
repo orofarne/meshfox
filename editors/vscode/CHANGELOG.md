@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.1
+
+- Fixed: a file node's "↗ open" button did nothing useful in a canvas
+  served by an external `server_socket` coordinator (the click went to the
+  coordinator, which opened the file in the OS's default application or a
+  browser tab instead of VS Code). The canvas now asks its worker what to
+  open and hands the answer to the extension, so a plain file or another
+  canvas opens in an editor tab whichever coordinator is in use.
+
 ## 0.3.0
 
 - New: if `server_socket` is set in `.meshfox/config.toml` (local, next to

@@ -125,7 +125,7 @@ export class Coordinator implements vscode.Disposable {
       // answer is a fresh editor tab, unlike `crate::watcher`'s (the OS's
       // default application for it): there's no "outside VS Code" for this
       // extension's own context to hand off to.
-      vscode.commands.executeCommand("vscode.open", vscode.Uri.file(msg.path));
+      this.openFile(msg.path);
       return;
     }
     const key = canonical(msg.canvas_path);
@@ -138,9 +138,24 @@ export class Coordinator implements vscode.Disposable {
       const waiters = entry.waiters.splice(0);
       waiters.forEach((w) => w.resolve(msg.port));
     } else if (msg.op === "open") {
-      this.pendingFragments.set(key, msg.fragment ?? undefined);
-      vscode.commands.executeCommand("vscode.openWith", vscode.Uri.file(msg.canvas_path), VIEW_TYPE);
+      this.openCanvas(msg.canvas_path, msg.fragment ?? undefined);
     }
+  }
+
+  /** Opens a plain (non-canvas) file in a fresh editor tab. Reached two
+   * ways: a worker this coordinator spawned sending `OpenFile`, and — for a
+   * worker *any* coordinator spawned — a webview's own `meshfox.open`
+   * message (see `canvasEditorProvider.ts`), which is what makes "↗ open"
+   * work with an external `server_socket` coordinator too. */
+  openFile(fsPath: string): void {
+    void vscode.commands.executeCommand("vscode.open", vscode.Uri.file(fsPath));
+  }
+
+  /** Opens `canvasPath` as a canvas tab (at `fragment`, if any). Same two
+   * entry points as `openFile`. */
+  openCanvas(canvasPath: string, fragment: string | undefined): void {
+    this.pendingFragments.set(canonical(canvasPath), fragment);
+    void vscode.commands.executeCommand("vscode.openWith", vscode.Uri.file(canvasPath), VIEW_TYPE);
   }
 
   /** Consumed once by the editor provider right after a worker for
@@ -170,14 +185,12 @@ export class Coordinator implements vscode.Disposable {
    * (no longer sharing state with whatever else that coordinator manages)
    * would be worse than a clear error.
    *
-   * Known gap, not solved here: a worker an external coordinator spawned
-   * reports its own `Ready`/`Open`/`OpenFile` messages back to *that*
-   * coordinator's socket, not this extension's private one — a cross-
-   * canvas "↗ open" click inside such a tab surfaces wherever the external
-   * coordinator sends it (a browser tab, for the macOS daemon), not a new
-   * VS Code editor tab the way navigating from a locally-spawned worker's
-   * tab does. Not blocking for a first pass; worth a TODO.canvas.md
-   * follow-up if it turns out to matter in practice. */
+   * A worker an external coordinator spawned reports its own `Ready`/
+   * `Open`/`OpenFile` messages to *that* coordinator's socket, not this
+   * extension's private one — so a "↗ open" click inside such a tab must
+   * not rely on them. It doesn't: the webview asks the worker with
+   * `context=vscode`, which opens nothing itself and returns the action,
+   * and the webview hands it to this extension (`openFile`/`openCanvas`). */
   async getOrSpawnWorker(fsPath: string): Promise<number> {
     const key = canonical(fsPath);
     const externalSocket = resolveServerSocket(fsPath);

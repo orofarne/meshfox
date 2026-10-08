@@ -88,8 +88,8 @@ pub(crate) struct Registry {
     /// every `cargo test` run pops real browser tabs.
     tab_opener: Box<dyn Fn(String) + Send + Sync>,
     /// A persistent coordinator (`meshfox serve`) as opposed to a private
-    /// per-`view` watcher: answers `GetPort`, `ListCores` and `Kill`
-    /// instead of rejecting/ignoring them.
+    /// per-`view` watcher: answers `ListCores` and `Kill` instead of
+    /// rejecting them (`GetPort` is answered by both).
     persistent: bool,
 }
 
@@ -529,9 +529,12 @@ async fn handle_connection(
             let result = open_plain_file(path).await;
             let _ = write_half.write_all(ack_json(&result).as_bytes()).await;
         }
-        // A persistent coordinator is the one that `server_socket` points
-        // at, so it answers `GetPort` (get-or-spawn, no browser tab).
-        Message::GetPort { canvas_path } if registry.persistent => {
+        // Answered by every coordinator, private or persistent: besides
+        // `server_socket` clients, a worker asks its own watcher for it when
+        // a web page's "↗ open" on a canvas target needs the target's port
+        // to open in a new tab of the page's own browser (`open_node_file`,
+        // `context=web`). Get-or-spawn, no browser tab opened here.
+        Message::GetPort { canvas_path } => {
             let canonical = canvas_path.canonicalize().unwrap_or(canvas_path);
             let reply = match ensure_core(&registry, &exe, &socket_path, canonical, None).await {
                 Ok(port) => PortResponse::Port { port },
@@ -555,10 +558,8 @@ async fn handle_connection(
         // Deliberately unsupported on a private watcher: it is a private,
         // per-`view`-invocation process nobody's `server_socket` has a
         // reason to point at — see `crates/cli/src/coordinator.rs`'s own
-        // doc comment. Nothing in this codebase sends `GetPort` here, so
-        // that one just closes; `meshfox cores ls|kill` pointed at the
-        // wrong socket is reachable, so those get a readable error.
-        Message::GetPort { .. } => {}
+        // doc comment. `meshfox cores ls|kill` pointed at the wrong socket
+        // is reachable, so those get a readable error.
         Message::ListCores | Message::Kill { .. } => {
             let result: Result<(), String> = Err(
                 "not supported by a private watcher; use a persistent coordinator \
@@ -979,6 +980,54 @@ mod tests {
             *opened.lock().unwrap(),
             vec!["http://127.0.0.1:7777/".to_string()]
         );
+
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// A private (non-persistent) watcher answers `GetPort` too: a worker
+    /// asks its own watcher for a canvas's port when a web page's "↗ open"
+    /// needs to open it in a new tab of the page's own browser. For an
+    /// already-ready entry the port comes back at once and — unlike `Open`
+    /// — no browser tab is opened by the watcher.
+    #[tokio::test]
+    async fn a_private_watcher_answers_get_port_without_opening_a_tab() {
+        let socket_path =
+            std::env::temp_dir().join(format!("mfx-w-getport-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let (opened, registry) = recording_registry();
+        assert!(!registry.persistent);
+        let registry = Arc::new(registry);
+        let canvas_path = std::env::temp_dir().join("get-port-ready.canvas.md");
+        let canonical = canvas_path
+            .canonicalize()
+            .unwrap_or_else(|_| canvas_path.clone());
+        registry.entries.lock().unwrap().insert(
+            canonical.clone(),
+            Entry {
+                port: Some(7778),
+                ..empty_entry()
+            },
+        );
+
+        let accept_registry = Arc::clone(&registry);
+        let exe = PathBuf::from("/bin/true");
+        let socket_for_accept = socket_path.clone();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_connection(stream, accept_registry, exe, socket_for_accept).await;
+        });
+
+        let port = tokio::time::timeout(
+            Duration::from_secs(2),
+            meshfox_server::watcher_protocol::request_port(&socket_path, &canonical),
+        )
+        .await
+        .expect("should answer promptly, not hang")
+        .unwrap();
+        assert_eq!(port, 7778);
+        assert!(opened.lock().unwrap().is_empty());
 
         let _ = std::fs::remove_file(&socket_path);
     }
