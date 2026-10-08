@@ -4,6 +4,10 @@ import { spawn } from "child_process";
 const LAST_CHECK_KEY = "meshfox.lastUpdateCheckAt";
 const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const REPO = "orofarne/meshfox";
+/** The oldest `meshfox` release this extension works with. Bump it
+ * whenever the extension starts relying on something a release introduced
+ * (a worker endpoint, a `watcher_protocol` message, a CLI flag). */
+export const MIN_MESHFOX_VERSION = "v0.16.0";
 const INSTALL_COMMAND = "curl -fsSL https://raw.githubusercontent.com/orofarne/meshfox/main/scripts/install.sh | sh";
 
 /** Mirrors `check_updates`'s own `is_release_tag` check in
@@ -55,6 +59,31 @@ function compareVersionTags(a: string, b: string): number {
     }
   }
   return 0;
+}
+
+/** Warns (never blocks) if the installed `meshfox` is older than
+ * [`MIN_MESHFOX_VERSION`], offering the same confirmed in-place update the
+ * startup update check does. Silent when the version can't be compared — a
+ * dev build (`meshfox commit <hash> (<date>)`, no release tag to go by) or
+ * an executable that doesn't answer `--version` at all (that case has its
+ * own install prompt, see `showInstallInstructions`). Returns whether the
+ * installed version is known to be too old. */
+export async function warnIfMeshfoxTooOld(exe: string, output: vscode.OutputChannel): Promise<boolean> {
+  const installed = await installedVersionTag(exe);
+  if (!installed || compareVersionTags(installed, MIN_MESHFOX_VERSION) >= 0) {
+    return false;
+  }
+  output.appendLine(`meshfox: installed ${installed} is older than the ${MIN_MESHFOX_VERSION} this extension needs.`);
+  const choice = await vscode.window.showWarningMessage(
+    `This version of the meshfox extension needs meshfox ${MIN_MESHFOX_VERSION} or newer, but you have ` +
+      `${installed}. Some features (like opening files and canvases from a canvas) may not work until you update.`,
+    "Update meshfox",
+    "Later"
+  );
+  if (choice === "Update meshfox") {
+    await runInteractiveUpdate(exe, output);
+  }
+  return true;
 }
 
 /** Just a GitHub API read — never touches the installed binary. Actually

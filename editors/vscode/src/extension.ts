@@ -8,6 +8,7 @@ import {
   openInstallTerminal,
   runInteractiveUpdate,
   showInstallInstructions,
+  warnIfMeshfoxTooOld,
 } from "./updates";
 
 let coordinator: Coordinator | undefined;
@@ -78,7 +79,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // it shows. Must never block or fail activation.
   void (async () => {
     const exe = await resolveExecutablePath();
-    await maybeCheckForUpdatesOnStartup(context, exe, output);
+    // First, so a too-old binary gets the specific "needs vX or newer"
+    // prompt rather than (or before) the generic "a new release exists".
+    if (!(await warnIfMeshfoxTooOld(exe, output))) {
+      await maybeCheckForUpdatesOnStartup(context, exe, output);
+    }
   })();
 }
 

@@ -2,6 +2,10 @@
 
 ## 0.3.1
 
+- New: the extension now declares the oldest `meshfox` release it works
+  with (v0.16.0). On startup, if the installed binary is older, a warning
+  offers to update it (`meshfox check-updates`, behind the usual confirmation).
+  Dev builds, which carry no release version, are never flagged.
 - Fixed: a file node's "↗ open" button did nothing useful in a canvas
   served by an external `server_socket` coordinator (the click went to the
   coordinator, which opened the file in the OS's default application or a
