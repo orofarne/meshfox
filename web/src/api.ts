@@ -406,6 +406,8 @@ export interface NodePatch {
    * whenever `text` is sent. A body that has changed since is a
    * `BodyConflictError`, never a silent overwrite. */
   baseRev?: string;
+  /** Original title for an atomic title/body editor save; a mismatch is a conflict. */
+  baseTitle?: string;
   /** Changes to the extra incoming edges (`meshfox:edge`) — omit to leave
    * them untouched. Never a replacement list, see `EdgeOps`. */
   edges?: EdgeOps;
@@ -477,6 +479,7 @@ export class BodyConflictError extends Error {
   constructor(
     readonly currentText: string,
     readonly currentRev: string,
+    readonly currentTitle?: string,
   ) {
     super("the node's body changed since it was read");
     this.name = "BodyConflictError";
@@ -487,7 +490,7 @@ function parseBodyConflict(text: string): BodyConflictError | undefined {
   try {
     const body = JSON.parse(text);
     if (body?.error === "bodyConflict" && typeof body.currentText === "string" && typeof body.currentRev === "string") {
-      return new BodyConflictError(body.currentText, body.currentRev);
+      return new BodyConflictError(body.currentText, body.currentRev, body.currentTitle);
     }
   } catch {
     // Not JSON: an ordinary text error body, reported as such by the caller.
@@ -497,8 +500,8 @@ function parseBodyConflict(text: string): BodyConflictError | undefined {
 
 /** How one attempt to save a node's body ended — see `App.tsx`'s `handleSaveText`. */
 export type SaveTextOutcome =
-  | { status: "saved"; text: string; rev: string }
-  | { status: "conflict"; currentText: string; currentRev: string }
+  | { status: "saved"; text: string; title: string; rev: string; version: number; session: string }
+  | { status: "conflict"; currentText: string; currentRev: string; currentTitle?: string }
   | { status: "error" };
 
 /**

@@ -26,6 +26,7 @@ pub mod include;
 pub mod locate;
 pub mod mdcanvas;
 pub mod options;
+pub mod process_env;
 pub mod output;
 pub mod secret_index;
 pub mod secret_store;

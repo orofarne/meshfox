@@ -668,6 +668,25 @@ canvas session database. Applies the same way whether the
 chain ends in a `tty` step or not — the web UI's `/api/run/tty` WebSocket
 consults the same per-session record `/api/run` does, not a separate one.
 
+For a built-in `@name` interpreter, runtime freshness also includes the
+embedded script's content identity and settings that affect its invocation
+(currently `interpreters.agent.provider`, with `claude` as the default).
+Configuration is resolved from the block's execution directory, including
+included content's own directory. These changes invalidate dependent runs
+and restored session results without changing the authored fence's static
+cached-output hash. Unrelated configuration does not invalidate the run.
+
+Execution processes inherit ordinary user environment variables. Meshfox
+replaces per-invocation context instead of inheriting it from a parent run:
+`MESHFOX_ENV_NAMES` is always the current block's local variable/argument
+names (empty when absent), `MESHFOX_VARS_OUT` is present only when the runner
+allocates an output path, and `MESHFOX_BLOCK_LANG`/`MESHFOX_VENV_DIR` are set
+only for the builtin that needs them. Inherited `MESHFOX_CONFIG_*` values
+are removed; builtin configuration is freshly exported. `[process_env]`
+cannot restore stale values for these reserved context keys. Coordinator
+and debug settings such as `MESHFOX_SERVER_SOCKET` continue to be inherited.
+These rules apply to captured, PTY, service and debug execution.
+
 This skip cascades along **explicit `deps=` edges**: if a dependency runs
 for real, its consumers must run too, transitively. An implicit `from=`
 edge instead observes a computed value: re-running its source does not

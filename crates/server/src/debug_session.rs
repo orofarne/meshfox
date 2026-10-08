@@ -62,7 +62,11 @@ impl DebugSession {
         // ANSI/terminal concerns to strip).
         command.arg("--noprofile").arg("--norc");
         command.current_dir(cwd);
-        command.envs(envs);
+        let context = meshfox_core::process_env::prepare(Some(cwd), envs, &[]);
+        for name in context.remove {
+            command.env_remove(name);
+        }
+        command.envs(context.values);
         command.stdin(Stdio::piped());
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());

@@ -120,9 +120,7 @@ pub fn resolve_with_env(
             ));
         }
     }
-    if !env_names.is_empty() {
-        envs.push(("MESHFOX_ENV_NAMES".to_string(), env_names.join(",")));
-    }
+    envs.push(("MESHFOX_ENV_NAMES".to_string(), env_names.join(",")));
     Ok(Some((interpreter_path, envs)))
 }
 
@@ -210,27 +208,81 @@ pub fn is_builtin(spec: &str) -> bool {
 /// use.
 fn materialize(builtin: &Builtin) -> io::Result<PathBuf> {
     let dir = std::env::temp_dir().join("meshfox-builtins");
-    std::fs::create_dir_all(&dir)?;
+    materialize_in(builtin.name, builtin.script, &dir)
+}
+
+fn materialize_in(name: &str, script: &str, dir: &Path) -> io::Result<PathBuf> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    std::fs::create_dir_all(dir)?;
     let path = dir.join(format!(
-        "{}-{:08x}.sh",
-        builtin.name,
-        fnv1a(builtin.script.as_bytes())
+        "{}-{}.sh",
+        name,
+        blake3::hash(script.as_bytes()).to_hex()
     ));
-    if !path.exists() {
-        std::fs::write(&path, builtin.script)?;
+    if path.exists() {
+        return Ok(path);
+    }
+    let temporary = dir.join(format!(
+        ".{}-{}-{}-{}.tmp",
+        name,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let result = (|| {
+        file.write_all(script.as_bytes())?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o755))?;
         }
-    }
-    Ok(path)
+        // Close the writable descriptor before publication: on Linux another
+        // process executing it while still open for writing gets ETXTBSY.
+        drop(file);
+        // A hard link atomically publishes a complete, executable file without
+        // replacing another process's already-published instance.
+        match std::fs::hard_link(&temporary, &path) {
+            Ok(()) => Ok(path.clone()),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(path.clone()),
+            Err(e) => Err(e),
+        }
+    })();
+    let _ = std::fs::remove_file(&temporary);
+    result
 }
 
-/// Same tiny non-cryptographic hash `crate::fence::fingerprint` uses, for
-/// the same reason: just enough to make a builtin's materialized filename
-/// change when its embedded content does, a collision costing nothing
-/// worse than reusing/overwriting a stale-but-harmless temp file.
+/// Execution identity of a builtin, excluding unrelated machine settings.
+/// Pure counterpart used by tests without reading the developer's config.
+pub fn execution_identity(spec: &str, config: &toml::Table) -> Option<String> {
+    let builtin = lookup(spec.strip_prefix('@')?)?;
+    let mut hash = blake3::Hasher::new();
+    hash.update(builtin.script.as_bytes());
+    if builtin.name == "agent" {
+        // Project exactly the value exported to agent.sh (including key
+        // normalization and the same last-value precedence as envs()).
+        let provider = crate::config::flatten_to_env(config)
+            .into_iter()
+            .rev()
+            .find(|(key, _)| key == "MESHFOX_CONFIG_INTERPRETERS_AGENT_PROVIDER")
+            .map(|(_, value)| value)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "claude".to_string());
+        hash.update(provider.as_bytes());
+    }
+    Some(hash.finalize().to_hex().to_string())
+}
+
+/// Short key for the read-only scratch directory; builtin executable names
+/// use the full BLAKE3 content digest instead.
 fn fnv1a(bytes: &[u8]) -> u32 {
     const OFFSET: u32 = 0x811c_9dc5;
     const PRIME: u32 = 0x0100_0193;
@@ -293,7 +345,17 @@ mod tests {
 
     #[test]
     fn resolve_with_env_sets_venv_dir_only_for_python_venv_with_a_canvas_path() {
-        let canvas_path = Path::new("examples/pandas-dataframe.canvas.md");
+        // Own writable fixture, including when the checkout is mounted read-only.
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-venv-env-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let examples = dir.join("examples");
+        std::fs::create_dir_all(&examples).unwrap();
+        let canvas_file = examples.join("pandas-dataframe.canvas.md");
+        std::fs::write(&canvas_file, "").unwrap();
+        let canvas_path = canvas_file.as_path();
 
         let (_, envs) =
             resolve_with_env("@python_venv", Some("toml"), None, Some(canvas_path), &[])
@@ -327,6 +389,7 @@ mod tests {
             .unwrap();
         assert!(!envs.iter().any(|(k, _)| k == "MESHFOX_VENV_DIR"));
         assert!(!envs.iter().any(|(k, _)| k == "MESHFOX_BLOCK_LANG"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Regression test for a real bug: `agent.sh`'s `interpolate()` used
@@ -376,11 +439,11 @@ mod tests {
     }
 
     #[test]
-    fn resolve_with_env_sets_env_names_only_when_non_empty() {
+    fn resolve_with_env_always_sets_env_names() {
         let (_, envs) = resolve_with_env("@agent", None, None, None, &[])
             .unwrap()
             .unwrap();
-        assert!(!envs.iter().any(|(k, _)| k == "MESHFOX_ENV_NAMES"));
+        assert!(envs.iter().any(|(k, v)| k == "MESHFOX_ENV_NAMES" && v.is_empty()));
 
         let names = vec!["TOPIC".to_string(), "OTHER".to_string()];
         let (_, envs) = resolve_with_env("@agent", None, None, None, &names)
@@ -394,6 +457,172 @@ mod tests {
         );
     }
 
+    #[test]
+    fn agent_identity_tracks_effective_provider_only() {
+        let empty = toml::Table::new();
+        let claude = "[interpreters.agent]\nprovider = 'claude'\n"
+            .parse()
+            .unwrap();
+        let codex = "[interpreters.agent]\nprovider = 'codex'\n"
+            .parse()
+            .unwrap();
+        let unrelated =
+            "[interpreters.agent]\nprovider = 'codex'\n[tables]\ncache_max_bytes = 123\n"
+                .parse()
+                .unwrap();
+        assert_eq!(
+            execution_identity("@agent", &empty),
+            execution_identity("@agent", &claude)
+        );
+        assert_ne!(
+            execution_identity("@agent", &claude),
+            execution_identity("@agent", &codex)
+        );
+        assert_eq!(
+            execution_identity("@agent", &codex),
+            execution_identity("@agent", &unrelated)
+        );
+        assert_eq!(
+            execution_identity("@python_venv", &claude),
+            execution_identity("@python_venv", &codex)
+        );
+        assert_eq!(execution_identity("python3", &empty), None);
+        let non_scalar = "[interpreters.agent]\nprovider = ['codex']\n".parse().unwrap();
+        assert_eq!(
+            execution_identity("@agent", &non_scalar),
+            execution_identity("@agent", &empty)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn agent_prompt_is_single_pass_and_provider_args_are_unrestricted() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-agent-prompt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = "#!/bin/sh\nfor arg do printf '%s\\000' \"$arg\"; done\n";
+        for provider in ["claude", "codex"] {
+            let bin = dir.join(provider);
+            std::fs::write(&bin, fake).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let prompt = dir.join("prompt.txt");
+        std::fs::write(&prompt, "A=$A; braced=${A}; B=$B; prefix=$AB; escaped=$$A; unknown=$HOME; price=$5; bad=${A; shell=$(touch NO); unicode=ёж; ctrl=\u{1}").unwrap();
+        for shell in ["/bin/bash", "bash"] {
+            for provider in ["claude", "codex"] {
+                for names in ["A,B", "B,A"] {
+                    let output = std::process::Command::new(shell)
+                        .arg(resolve_builtin_spec("@agent").unwrap().unwrap())
+                        .arg(&prompt)
+                        .env(
+                            "PATH",
+                            format!(
+                                "{}:{}",
+                                dir.display(),
+                                std::env::var("PATH").unwrap_or_default()
+                            ),
+                        )
+                        .env("MESHFOX_CONFIG_INTERPRETERS_AGENT_PROVIDER", provider)
+                        .env("MESHFOX_ENV_NAMES", names)
+                        .env("A", "$B\n\"quoted\" $$A")
+                        .env("B", "VALUE")
+                        .current_dir(&dir)
+                        .stdin(std::process::Stdio::null())
+                        .output()
+                        .unwrap();
+                    assert!(
+                        output.status.success(),
+                        "{}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    let args: Vec<_> = output
+                        .stdout
+                        .split(|b| *b == 0)
+                        .filter(|b| !b.is_empty())
+                        .collect();
+                    assert_eq!(
+                        args[0],
+                        if provider == "claude" {
+                            b"-p".as_slice()
+                        } else {
+                            b"exec".as_slice()
+                        }
+                    );
+                    assert_eq!(args[1], b"--");
+                    assert_eq!(args.len(), 3);
+                    assert_eq!(args[2], "A=$B\n\"quoted\" $$A; braced=$B\n\"quoted\" $$A; B=VALUE; prefix=$AB; escaped=$A; unknown=$HOME; price=$5; bad=${A; shell=$(touch NO); unicode=ёж; ctrl=\u{1}".as_bytes());
+                    assert!(!dir.join("NO").exists());
+                }
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // Invoked by concurrent_materialization_publishes_complete_executables
+    // in separate processes, without changing this process's environment.
+    #[test]
+    #[cfg(unix)]
+    fn materialization_child() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(dir) = std::env::var_os("MESHFOX_TEST_BUILTIN_DIR") else {
+            return;
+        };
+        for round in 0..16 {
+            let script = format!("#!/bin/sh\n# {}\nexit 0\n", "x".repeat(65536 + round));
+            let path = materialize_in("concurrent", &script, Path::new(&dir)).unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), script);
+            assert_ne!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o111,
+                0
+            );
+            assert!(
+                std::process::Command::new(&path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn concurrent_materialization_publishes_complete_executables() {
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-materialize-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut children: Vec<_> = (0..8)
+            .map(|_| {
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "builtin_interpreter::tests::materialization_child",
+                    ])
+                    .env("MESHFOX_TEST_BUILTIN_DIR", &dir)
+                    .stdout(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        for child in &mut children {
+            assert!(child.wait().unwrap().success());
+        }
+        let files: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+        assert_eq!(files.len(), 16, "no unpublished temporary files remain");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     #[cfg(unix)]
     fn python_venv_dispatches_text_and_toml_to_pip() {

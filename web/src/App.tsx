@@ -1,3 +1,4 @@
+import { canvasVersionGate } from "./canvasVersion";
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
   ReactFlow,
@@ -287,7 +288,14 @@ function countOccurrences(haystack: string, needle: string): number {
 }
 
 export default function App() {
-  const [canvas, setCanvas] = useState<CanvasDoc | null>(null);
+  const [canvas, setCanvasState] = useState<CanvasDoc | null>(null);
+  const acceptCanvas = useRef(canvasVersionGate());
+  const setCanvas = useCallback((next: React.SetStateAction<CanvasDoc | null>) => {
+    setCanvasState((previous) => {
+      const snapshot = typeof next === "function" ? next(previous) : next;
+      return snapshot === null || acceptCanvas.current(snapshot) ? snapshot : previous;
+    });
+  }, []);
   const [error, setError] = useState<string | null>(null);
   // Every `service` block this server process has ever spawned, polled
   // independently of `canvas`/`fetchCanvas` (a service's lifetime spans
@@ -1203,81 +1211,17 @@ export default function App() {
     [beginAddressWatch, patchLiveBlock, setNodes, appendConsoleLine],
   );
 
-  // Applies one `NodeOpEvent` (see its own doc comment) to `canvas.nodes`
-  // in place — the precise counterpart to the plain reload `onChanged`
-  // below does, for a mutation made by *another* client (or a different
-  // tab/TUI on the same worker) on this exact document. Deliberately only
-  // ever patches `canvas` itself, never `nodes`/`edges` (the derived React
-  // Flow state) directly — the existing canvas-load effect already turns
-  // any `canvas` change into the right `nodes`/`edges` update (auto-layout,
-  // group nesting, every per-node callback), so reusing it here for real
-  // means this never has to duplicate (and risk drifting from) that logic.
+  // Watch deltas trigger a versioned reload, sharing the ordering gate with
+  // mutation responses. Derived React Flow state still updates from canvas.
   const handleNodeOp = useCallback(
-    (op: NodeOpEvent) => {
+    (_op: NodeOpEvent) => {
       if (sourceModeRef.current) {
-        // Same "defer, don't apply mid-edit" posture `onChanged` already
-        // has for this case — `load()` once source mode closes picks up
-        // everything that happened while it was open in one shot, this op
-        // included.
         pendingExternalChange.current = true;
         return;
       }
-      if (op.type === "node-removed" && op.keepChildren) {
-        // Never actually sent today (the server falls back to a plain
-        // `changed` for its own `?children=reparent` branch — see
-        // `ServerEvent::NodeRemoved`'s own doc comment) — kept as a safe
-        // fallback rather than silently leaving orphaned `parent`
-        // references in `canvas.nodes` if a future caller ever does send
-        // it without also teaching this branch how to reparent them.
-        load();
-        return;
-      }
-      setCanvas((prev) => {
-        if (!prev) return prev;
-        if (op.type === "node-upserted") {
-          const idx = prev.nodes.findIndex((n) => n.id === op.node.id);
-          const nodes =
-            idx === -1
-              ? [...prev.nodes, op.node]
-              : prev.nodes.map((n, i) => (i === idx ? op.node : n));
-          return { ...prev, nodes };
-        }
-        if (op.type === "node-removed") {
-          // `keepChildren` is always `false` by the time execution reaches
-          // here (see the early-return above) — the whole subtree goes,
-          // found by repeatedly widening the removal set to any node whose
-          // own `parent` is already in it, until nothing new joins.
-          const toRemove = new Set<string>([op.nodeId]);
-          let grew = true;
-          while (grew) {
-            grew = false;
-            for (const n of prev.nodes) {
-              if (n.parent !== undefined && toRemove.has(n.parent) && !toRemove.has(n.id)) {
-                toRemove.add(n.id);
-                grew = true;
-              }
-            }
-          }
-          return { ...prev, nodes: prev.nodes.filter((n) => !toRemove.has(n.id)) };
-        }
-        // "nodes-reordered": reassigns `parentId`'s own children, in their
-        // existing array *slots*, to the new order `childIds` gives —
-        // every other node (including every other parent's own children)
-        // keeps its exact position, so this can never disturb anything
-        // this op doesn't actually describe.
-        const positions: number[] = [];
-        prev.nodes.forEach((n, i) => {
-          if (n.parent === op.parentId) positions.push(i);
-        });
-        const byId = new Map(prev.nodes.map((n) => [n.id, n]));
-        const nodes = [...prev.nodes];
-        op.childIds.forEach((id, i) => {
-          const node = byId.get(id);
-          const pos = positions[i];
-          if (node && pos !== undefined) nodes[pos] = node;
-        });
-        return { ...prev, nodes };
-      });
+      // Watch operations are invalidations. A versioned complete snapshot
+      // avoids applying a delayed delta over a newer HTTP response.
+      void load();
     },
     [load],
   );
@@ -2284,20 +2228,20 @@ export default function App() {
   }, []);
 
   // Persists a full replacement of a node's raw Markdown body — the inline
-  // NodeTextEditor's auto-save. `baseRev` is the body revision the editor
+  // NodeTextEditor's explicit save. `baseRev` is the body revision the editor
   // last saw; if the body has changed since (another tab, an agent, an
   // editor), nothing is written and the outcome carries the body as it is
   // now, for the editor to show instead of overwriting it.
   const handleSaveText = useCallback(
-    async (id: string, text: string, baseRev: string): Promise<SaveTextOutcome> => {
+    async (id: string, text: string, baseRev: string, title: string, baseTitle: string): Promise<SaveTextOutcome> => {
       try {
-        const updated = await updateNode(id, { text, baseRev });
+        const updated = await updateNode(id, { text, baseRev, title, baseTitle });
         setCanvas(updated);
         const saved = updated.nodes.find((n) => n.id === id);
-        return { status: "saved", text: saved?.text ?? text, rev: saved?.bodyRev ?? "" };
+        return { status: "saved", text: saved?.text ?? text, title: saved?.title ?? title, rev: saved?.bodyRev ?? "", version: updated.canvasVersion ?? 0, session: updated.serverSession ?? "" };
       } catch (e) {
         if (e instanceof BodyConflictError) {
-          return { status: "conflict", currentText: e.currentText, currentRev: e.currentRev };
+          return { status: "conflict", currentText: e.currentText, currentRev: e.currentRev, currentTitle: e.currentTitle };
         }
         setError(String(e));
         return { status: "error" };
@@ -2609,7 +2553,9 @@ export default function App() {
             onOpenSettings: () => setSettingsNodeId(n.id),
             onCommitTitle: (title: string) => handleCommitTitleEdit(n.id, title),
             onExpand: () => setExpandedNodeId(n.id),
-            onSaveText: (text: string, baseRev: string) => handleSaveText(n.id, text, baseRev),
+            onSaveText: (text: string, baseRev: string, title: string, baseTitle: string) => handleSaveText(n.id, text, baseRev, title, baseTitle),
+            canvasVersion: canvas.canvasVersion ?? 0,
+            serverSession: canvas.serverSession ?? "",
             onOpenSourceMode: handleOpenSourceMode,
             canDelete: !!n.parent,
             onRequestDelete: () => setDeleteConfirmNodeId(n.id),

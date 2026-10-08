@@ -552,7 +552,11 @@ pub fn closure_fingerprint_with(
         stack.push(addr.clone());
         let mut parts = vec![
             key.clone(),
-            crate::fence::session_fingerprint(&block, values),
+            crate::fence::execution_fingerprint(
+                &block,
+                values,
+                &canvas.node(&addr.node_id).expect("block owner exists").cwd(&canvas.artifact_root),
+            ),
         ];
         let mut has_artifacts = block.attrs.contains_key("inputs") || block.attrs.contains_key("outputs");
         for attr in ["inputs", "outputs"] {

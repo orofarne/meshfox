@@ -797,6 +797,27 @@ pub fn session_fingerprint(block: &CodeBlock, resolved_vars: &HashMap<String, St
     format!("{:08x}", fnv1a(parts.join("\u{0}").as_bytes()))
 }
 
+/// Runtime cache identity, including the resolved builtin and the configuration
+/// loaded from the same cwd as execution. The authored output hash stays static.
+pub fn execution_fingerprint(
+    block: &CodeBlock,
+    resolved_vars: &HashMap<String, String>,
+    cwd: &std::path::Path,
+) -> String {
+    let base = session_fingerprint(block, resolved_vars);
+    let Some(spec) = crate::args::resolve_interpreter(block, resolved_vars) else {
+        return base;
+    };
+    if !crate::builtin_interpreter::is_builtin(&spec) {
+        return base;
+    }
+    let config = crate::config::load(cwd);
+    match crate::builtin_interpreter::execution_identity(&spec, &config) {
+        Some(identity) => combine_fingerprints([base, identity]),
+        None => base,
+    }
+}
+
 /// Folds already-computed fingerprints into one — order-sensitive, same
 /// FNV-1a as [`fingerprint`]. For a caller that fingerprints a *set* of
 /// blocks together (see `crate::deps::closure_fingerprint`); not mirrored in

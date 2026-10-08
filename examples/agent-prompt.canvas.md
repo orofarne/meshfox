@@ -22,7 +22,7 @@ bash fence is still the answer.
 
 The common case: `interpreter="@agent"`, fence body is the prompt, done.
 Captured (non-`tty`, this fence's own shape) means `agent.sh`'s own `[ -t 1
-]` check picks its restricted, one-shot `claude -p`/`codex exec` branch —
+]` check picks its one-shot `claude -p`/`codex exec` branch —
 see [Interactive session via tty](#interactive-session-via-tty) for the
 other one. Which provider it actually calls comes from
 `interpreters.agent.provider` in `.meshfox/config.toml` (unset here, so it
@@ -39,6 +39,10 @@ exit code: 0 · 3.5s
 ```
 <!-- /meshfox:output -->
 
+Meshfox adds no access restrictions in either mode. Like a bash block, the
+agent runs as the current user, with its own tool, sandbox, approval, and
+directory trust settings. Capturing output does not disable tools.
+
 ## Interpolation via env=
 <!-- meshfox:node id="context-injection-via-env" -->
 
@@ -47,8 +51,8 @@ exit code: 0 · 3.5s
 exactly when:
 
 1. **Only names this fence's own `env=` declares are ever candidates.**
-   `agent.sh` never sees the whole ambient environment, just
-   `MESHFOX_ENV_NAMES` — the comma-separated *local* names from `env=`
+   `agent.sh` uses `MESHFOX_ENV_NAMES` — the comma-separated local names
+   from `env=` — to choose which names to substitute
    (here, just `TOPIC`). A `$-looking` token whose name isn't in that list
    — `$PATH`, `$HOME`, a typo, anything not declared — is left completely
    alone, exactly as typed.
@@ -64,6 +68,10 @@ exactly when:
    declared name you don't want substituted *this once*, escape it; for
    anything not declared, rule 1 already leaves it alone with nothing
    extra to write.
+
+Substitution reads the original prompt once. Inserted values are opaque:
+if `A` contains `$B`, substituting `$A` produces the literal `$B`, regardless
+of the order of names in `env=`.
 
 All three at once, in one prompt, one real run:
 
@@ -92,8 +100,6 @@ quoting) out by hand, same as before `@agent` existed.
 ```bash name="ask-raw" env="$TOPIC" cache
 claude -p \
   --model haiku \
-  --restricted \
-  --permission-prompts none \
   --max-budget-usd 0.05 \
   --no-session-persistence \
   -- "$(cat <<EOF
@@ -115,11 +121,11 @@ Git rebase — это команда для перемещения ваших к
 `@agent`'s own script tells the two run shapes apart with the same plain
 `[ -t 1 ]` check mentioned above — no separate meshfox mechanism needed. A
 plain (non-`tty`) block always has its stdout piped for capture, so it gets
-the restricted, one-shot `-p`/`exec` answer [One-shot via
+the one-shot `-p`/`exec` answer [One-shot via
 @agent](#one-shot-via-agent) already demonstrates. A `tty` block hands the
 process a *real* inherited terminal instead — `agent.sh` sees that and
-drops into a genuine, unrestricted interactive `claude`/`codex` session
-(full tool access), seeded with this fence's own body as the opening
+drops into a genuine interactive `claude`/`codex` session
+(using the agent's own access policy), seeded with this fence's own body as the opening
 message, exactly as if you'd typed `claude "..."` by hand in this shell.
 
 Not run here — same as `interpreters.canvas.md`'s own `tty` example, this

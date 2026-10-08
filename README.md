@@ -63,6 +63,11 @@ Rough checklist for what's needed before a 1.0.0 release:
   - a terminal UI (`meshfox tui`) — the browser's tree-and-block-runner experience without leaving the terminal: browse the node tree, read a node's rendered body (syntax-highlighted code, images), and run blocks with the same live streaming/kill/cache behavior as the other two. See "Terminal viewer" under Usage below.
 - Beyond editing and running: a built-in Starlark constraint system (`meshfox check`) lets a canvas validate its own consistency, and a canvas can be exported to a static HTML site or a PDF (both experimental — see Usage below).
 
+The web node editor keeps title and Markdown edits in a local draft. **Apply**
+(or **Ctrl/Cmd+S**) saves both together and leaves the editor open;
+**Save & close** waits for a successful save before closing. **Cancel** discards
+changes since the last save. Conflicts keep the draft open for comparison.
+
 ## File format
 <!-- meshfox:node id="file-format" type="include" -->
 
@@ -234,14 +239,21 @@ live example ("Related Canvas") — opening it takes you to
 `interpreter="@agent"` is one of a small, fixed set of built-in macro
 interpreters meshfox ships in its own binary (`crates/core/src/builtins/`,
 alongside `@python_venv` above) — the fence body becomes a one-shot prompt
-to `claude -p`/`codex exec` (restricted, no tool access), or, on a `tty`
-block, a genuine interactive session instead (`agent.sh`'s own `[ -t 1 ]`
-check tells the two apart, no separate meshfox mechanism needed).
-`env=`-declared variables interpolate right into the prompt as
+to `claude -p`/`codex exec`, or, on a `tty` block, an interactive CLI
+session instead (`agent.sh`'s own `[ -t 1 ]` check tells the two apart,
+no separate meshfox mechanism needed).
+`env=` locals and bound arguments interpolate right into the prompt as
 `$NAME`/`${NAME}` — whole-token only (`$TOPIC` matches, `$TOPICS` doesn't),
-and only names this fence's own `env=` actually declares; `$$NAME` escapes
+and only names belonging to this block are substituted; `$$NAME` escapes
 to a literal `$NAME` for anything that shouldn't be touched. No
-shell-quoting of your own to write for any of it.
+shell-quoting of your own to write for any of it. Substitution is one pass:
+inserted variable values are never interpreted as more references.
+
+Like a bash block, `@agent` runs as the current user. Meshfox adds no agent
+access restrictions; the agent's own tool, sandbox, approval, and directory
+trust settings apply. `tty` changes interactivity, not this access contract.
+Dependency results become stale when the builtin script or effective
+provider setting changes.
 
 Which provider a `@name` macro actually calls (`claude` vs. `codex`, for
 `@agent`) comes from a small settings file meshfox itself reads —

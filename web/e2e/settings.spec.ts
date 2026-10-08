@@ -300,7 +300,7 @@ test("the body editor's header can rename the node and open NodeSettings", async
   const titleInput = page.locator(".mesh-text-editor-title-input");
   await expect(titleInput).toHaveValue("Plain Text");
   await titleInput.fill("Renamed From Editor");
-  await titleInput.press("Enter");
+  await page.getByRole("button", { name: "Apply", exact: true }).click();
   await expect(node.locator(".mesh-node-title-text, .mesh-node-title-centered-text")).toContainText(
     "Renamed From Editor",
   );
@@ -312,7 +312,7 @@ test("the body editor's header can rename the node and open NodeSettings", async
   await page.locator(".vars-modal-actions button", { hasText: "cancel" }).click();
   await expect(page.locator(".node-settings-modal")).toHaveCount(0);
 
-  await page.locator(".mesh-text-editor-actions button", { hasText: "done" }).click();
+  await page.locator(".mesh-text-editor-actions button", { hasText: "Save & close" }).click();
 
   await restoreRaw(page, before);
   expect(await fetchRaw(page)).toBe(before);
@@ -328,7 +328,7 @@ test("double-clicking a node's body opens its inline text editor", async ({ page
   await expect(page.locator(".mesh-text-editor")).toBeVisible();
   await expect(page.locator(".mesh-text-editor-title-input")).toHaveValue("Plain Text");
 
-  await page.locator(".mesh-text-editor-actions button", { hasText: "done" }).click();
+  await page.locator(".mesh-text-editor-actions button", { hasText: "Save & close" }).click();
   await expect(page.locator(".mesh-text-editor")).toHaveCount(0);
 });
 

@@ -23,17 +23,17 @@
 #   - a real terminal -> a genuine interactive `claude`/`codex` session,
 #     full tool access, exactly as if run by hand in this shell. Mark the
 #     fence `tty` to get this.
-#   - piped/captured -> the restricted, one-shot `-p`/`exec` answer below,
-#     safe to run unattended (`cache`, CI, the web UI's captured output).
+#   - piped/captured -> the one-shot `-p`/`exec` invocation below,
+#     using the agent's own access policy (`cache`, CI, captured output).
 set -euo pipefail
 
 provider="${MESHFOX_CONFIG_INTERPRETERS_AGENT_PROVIDER:-claude}"
 
-# Substitutes $NAME / ${NAME} references to this fence's own declared
-# env= vars into `$1` — meshfox exports MESHFOX_ENV_NAMES as the
-# comma-separated *local* names from the block's own `env=` list (see
-# crate::fence::EnvRef), so this only ever touches names the fence itself
-# opted into, never $PATH/$HOME/ambient $MESHFOX_CONFIG_* by accident.
+# Substitutes $NAME / ${NAME} references to this fence's own env= locals
+# and bound arguments into `$1`. MESHFOX_ENV_NAMES is the comma-separated
+# list of these names; invocation-owned context such as MESHFOX_VARS_OUT
+# is excluded. Ambient $PATH/$HOME/$MESHFOX_CONFIG_* is never substituted
+# unless explicitly declared as an ordinary local by the block.
 # Word-boundary aware for the bare $NAME form — same "whole token, not a
 # prefix of a longer identifier" rule crate::exec::interpreter_var_refs
 # already applies to interpreter= (`$TOPIC` matches, `$TOPICS` doesn't;
@@ -46,43 +46,32 @@ provider="${MESHFOX_CONFIG_INTERPRETERS_AGENT_PROVIDER:-claude}"
 # is escaped by doubling it: `$$TOPIC` -> literal `$TOPIC`, never
 # substituted, regardless of whether TOPIC is even a declared name.
 interpolate() {
-  local text=$1 name value out rest idx tail next
-  local esc=$'\x01'
-  local -a names=()
-  text=${text//\$\$/$esc}
-  IFS=',' read -ra names <<< "${MESHFOX_ENV_NAMES:-}"
-  # bash 3.2 (macOS's shipped /bin/bash) treats a zero-element array as
-  # unset under `set -u`/nounset, so a bare `"${names[@]}"` aborts the
-  # whole script when MESHFOX_ENV_NAMES is empty (no env= vars declared)
-  # — bash 4.4+ fixed this, but 3.2 is still what `env bash` finds on a
-  # stock Mac. `${names[@]+"${names[@]}"}` is the standard portable
-  # workaround: expand to nothing at all when the array is unset/empty
-  # instead of erroring.
-  for name in ${names[@]+"${names[@]}"}; do
-    [ -n "$name" ] || continue
-    value=${!name-}
-    text=${text//\$\{$name\}/$value}
-    out="" rest="$text"
-    while true; do
-      idx=${rest%%\$"$name"*}
-      if [ "$idx" = "$rest" ]; then
-        out+="$rest"
-        break
-      fi
-      tail=${rest#"$idx"\$"$name"}
-      next=${tail:0:1}
-      if [[ -n "$next" && "$next" =~ [A-Za-z0-9_] ]]; then
-        out+="$idx\$$name$next"
-        rest=${tail:1}
-      else
-        out+="$idx$value"
-        rest=$tail
-      fi
-    done
-    text="$out"
+  local rest=$1 out="" prefix token name
+  local declared=",${MESHFOX_ENV_NAMES:-},"
+  # Consume only the original text. Inserted values are never rescanned.
+  while [[ "$rest" == *'$'* ]]; do
+    prefix=${rest%%\$*}
+    out+="$prefix"
+    rest=${rest#"$prefix"}
+    if [[ "$rest" == '$$'* ]]; then
+      out+='$'
+      rest=${rest:2}
+      continue
+    fi
+    if [[ "$rest" =~ ^\$\{([A-Za-z_][A-Za-z0-9_]*)\} ]] ||
+       [[ "$rest" =~ ^\$([A-Za-z_][A-Za-z0-9_]*) ]]; then
+      token=${BASH_REMATCH[0]} name=${BASH_REMATCH[1]}
+      case "$declared" in
+        *",$name,"*) out+="${!name-}" ;;
+        *) out+="$token" ;;
+      esac
+      rest=${rest:${#token}}
+    else
+      out+='$'
+      rest=${rest:1}
+    fi
   done
-  text=${text//$esc/\$}
-  printf '%s' "$text"
+  printf '%s' "$out$rest"
 }
 
 if [ -t 1 ]; then
@@ -95,9 +84,7 @@ if [ -t 1 ]; then
       exec claude "$prompt"
       ;;
     codex)
-      # codex's own bare interactive entry point — unverified against a
-      # real `codex` binary while this skeleton was built (it wasn't
-      # installed in the environment that wrote this script).
+      # Interactive CLI, seeded with the prompt; the agent's policy applies.
       exec codex "$prompt"
       ;;
     *)
@@ -110,25 +97,11 @@ fi
 prompt="$(interpolate "$(cat "$1")")"
 case "$provider" in
   claude)
-    # Conservative flags for a *builtin default* — a block whose whole
-    # point is a one-shot answer, not a coding agent with real tool
-    # access. A canvas author who wants the latter should drop down to a
-    # hand-written `interpreter=` script instead (see
-    # examples/agent-prompt.canvas.md) rather than expecting `@agent` to
-    # cover every shape of "call an agent".
-    exec claude -p \
-      --restricted \
-      --permission-prompts none \
-      --no-session-persistence \
-      -- "$prompt"
+    # Meshfox adds no access restrictions; the agent's own policy applies.
+    exec claude -p -- "$prompt"
     ;;
   codex)
-    # codex exec's own non-interactive flag surface, mirroring the same
-    # restricted/one-shot intent as the `claude` branch above — unverified
-    # against a real `codex` binary while this skeleton was built (it
-    # wasn't installed in the environment that wrote this script), so
-    # treat this branch as a starting point to check against the real CLI
-    # before relying on it.
+    # Keep Codex's own trust, sandbox and approval settings.
     exec codex exec -- "$prompt"
     ;;
   *)

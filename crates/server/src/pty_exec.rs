@@ -147,7 +147,11 @@ where
         .into_iter()
         .map(|(k, v)| (k.as_ref().to_string(), v.as_ref().to_string()))
         .collect();
-    let env_names: Vec<String> = envs.iter().map(|(k, _)| k.clone()).collect();
+    let env_names: Vec<String> = envs
+        .iter()
+        .filter(|(k, _)| !meshfox_core::process_env::is_run_context(std::ffi::OsStr::new(k)))
+        .map(|(k, _)| k.clone())
+        .collect();
     let resolved =
         meshfox_core::resolve_command(code, interpreter, lang, cwd, canvas_path, &env_names)?;
 
@@ -165,14 +169,12 @@ where
     for arg in &resolved.args {
         cmd.arg(arg);
     }
-    for (k, v) in meshfox_core::config::env_overrides(cwd.unwrap_or_else(|| Path::new("."))) {
-        cmd.env(k, v);
+    let context = meshfox_core::process_env::prepare(cwd, envs, &resolved.extra_envs);
+    for name in context.remove {
+        cmd.env_remove(name);
     }
-    for (k, v) in &envs {
-        cmd.env(k, v);
-    }
-    for (k, v) in &resolved.extra_envs {
-        cmd.env(k, v);
+    for (name, value) in context.values {
+        cmd.env(name, value);
     }
     if let Some(cwd) = cwd {
         cmd.cwd(cwd);

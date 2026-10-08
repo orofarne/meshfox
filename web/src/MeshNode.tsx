@@ -546,10 +546,12 @@ export interface MeshNodeData {
    * Available read-only, unlike the edit-mode-only actions above. */
   onExpand: () => void;
   /** Persists a full replacement of this node's raw Markdown body — the
-   * inline text editor's auto-save. `baseRev` is the `bodyRev` the editor
+   * inline text editor's explicit save. `baseRev` is the `bodyRev` the editor
    * last saw; the outcome says whether it landed or the body had changed
    * since (see `SaveTextOutcome`). */
-  onSaveText: (text: string, baseRev: string) => Promise<SaveTextOutcome>;
+  onSaveText: (text: string, baseRev: string, title: string, baseTitle: string) => Promise<SaveTextOutcome>;
+  canvasVersion: number;
+  serverSession: string;
   /** `plainMarkdownInclude` nodes only — opens Source mode scoped to this
    * node's own id (the include's `nodeId`) instead of the inline text
    * editor, since that's the only place this content can actually be
@@ -2609,7 +2611,7 @@ export function NodeBodyContent({ data, nodeId }: { data: MeshNodeData; nodeId: 
   if (data.nodeType === "file" && data.display === "table") {
     return (
       <>
-        {data.caption && <div className="mesh-node-body nopan"><FileLinkCaption caption={data.caption} /></div>}
+        {data.caption && <div className="mesh-node-body mesh-table-caption nopan"><FileLinkCaption caption={data.caption} /></div>}
         <FileTablePreview nodeId={nodeId} target={data.target} />
         {fileRunLive && <LiveRunOutput live={fileRunLive} />}
       </>
@@ -3415,8 +3417,9 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
           initialText={data.text}
           serverText={data.text}
           serverRev={data.bodyRev ?? ""}
-          onChange={(text, baseRev) => data.onSaveText(text, baseRev)}
-          onSaveTitle={(title) => data.onCommitTitle(title)}
+          onChange={(text, baseRev, title, baseTitle) => data.onSaveText(text, baseRev, title, baseTitle)}
+          serverVersion={data.canvasVersion}
+          serverSession={data.serverSession}
           onOpenSettings={data.onOpenSettings}
           onClose={() => setEditingText(false)}
         />

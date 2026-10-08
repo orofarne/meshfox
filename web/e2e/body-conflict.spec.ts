@@ -65,7 +65,7 @@ test("unsaved edits are never written over a body changed elsewhere: the editor 
   await typeAtEnd(page, lines, " MINE");
   await expect(lines).toContainText("body a MINE");
 
-  // Lands while the typed text is still waiting out its autosave debounce.
+  // Lands while the editor holds an unsaved local draft.
   await replaceBodyElsewhere(page, "theirs");
 
   await expect(page.locator(".mesh-text-editor-conflict")).toBeVisible();
@@ -75,7 +75,7 @@ test("unsaved edits are never written over a body changed elsewhere: the editor 
   await expect(lines).toContainText("body a MINE");
 
   await page.locator(".mesh-text-editor-conflict button", { hasText: "compare" }).click();
-  await expect(page.locator(".mesh-text-editor-conflict-theirs")).toHaveText("theirs");
+  await expect(page.locator(".mesh-text-editor-conflict-theirs")).toContainText("theirs");
 });
 
 test("'take theirs' drops the unsaved edits and shows the other body", async ({ page }) => {
@@ -170,4 +170,175 @@ test("'keep mine' in Source mode writes the editor's text over the file, against
   const onDisk = await fileText(page);
   expect(onDisk).toContain("MINE");
   expect(onDisk).not.toContain("body a, theirs");
+});
+
+// Explicit saves and ordering regressions. All writes use the real worker;
+// routes only control response timing or simulate a failed connection.
+test("title and body remain local until Apply; Cancel discards subsequent changes", async ({ page }) => {
+  const lines = await openEditor(page);
+  await typeAtEnd(page, lines, " DRAFT");
+  const title = page.locator(".mesh-text-editor-title-input");
+  await title.fill("Local title");
+  await title.blur();
+  await page.waitForTimeout(1000);
+  expect((await serverBody(page)).text).toBe("body a");
+  const initial = await (await page.request.get("/api/canvas")).json();
+  expect(initial.nodes.find((n: { id: string }) => n.id === "a").title).not.toBe("Local title");
+  await page.getByRole("button", { name: "Apply", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Apply", exact: true })).toBeDisabled();
+  const applied = await (await page.request.get("/api/canvas")).json();
+  expect(applied.nodes.find((n: { id: string }) => n.id === "a")).toMatchObject({ title: "Local title", text: "body a DRAFT" });
+  await typeAtEnd(page, lines, " CANCELLED");
+  await title.fill("Cancelled title");
+  await page.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(page.locator(".mesh-text-editor")).toHaveCount(0);
+  expect((await serverBody(page)).text).toBe("body a DRAFT");
+});
+
+test("Apply preserves the cursor and local whitespace; Ctrl/Cmd+S applies without closing", async ({ page }) => {
+  const lines = await openEditor(page);
+  await lines.click();
+  await page.keyboard.press("End");
+  await page.keyboard.press("Enter");
+  await expect(lines.locator(".view-line")).toHaveCount(2);
+  await page.keyboard.press("ArrowUp");
+  await page.keyboard.press("Home");
+  await page.keyboard.type("X ", { delay: 80 });
+  await expect(lines).toContainText("X body a");
+  await page.keyboard.press("ControlOrMeta+s");
+  await expect.poll(async () => (await serverBody(page)).text).toBe("X body a");
+  await expect(page.getByRole("button", { name: "Apply", exact: true })).toBeDisabled();
+  // The server trimmed the trailing newline; the local model keeps it.
+  await expect(lines.locator(".view-line")).toHaveCount(2);
+  await page.keyboard.type("Y", { delay: 80 });
+  await expect(lines).toContainText("X Ybody a");
+  await expect(page.locator(".mesh-text-editor-conflict")).toHaveCount(0);
+  await page.getByRole("button", { name: "Save & close", exact: true }).click();
+  await expect(page.locator(".mesh-text-editor")).toHaveCount(0);
+  expect((await serverBody(page)).text).toBe("X Ybody a");
+});
+
+test("typing while Apply awaits its response stays unsaved and never self-conflicts", async ({ page }) => {
+  const lines = await openEditor(page);
+  await typeAtEnd(page, lines, " FIRST");
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  let arrived!: () => void;
+  const pending = new Promise<void>((resolve) => { arrived = resolve; });
+  await page.route("**/api/nodes/a", async (route) => {
+    const response = await route.fetch();
+    arrived();
+    await held;
+    await route.fulfill({ response });
+  });
+  await page.getByRole("button", { name: "Apply", exact: true }).click();
+  await pending;
+  await typeAtEnd(page, lines, " SECOND");
+  release();
+  await expect(page.getByRole("button", { name: "Apply", exact: true })).toBeEnabled();
+  await expect(lines).toContainText("body a FIRST SECOND");
+  expect((await serverBody(page)).text).toBe("body a FIRST");
+  await expect(page.locator(".mesh-text-editor-conflict")).toHaveCount(0);
+  await page.unroute("**/api/nodes/a");
+  await page.getByRole("button", { name: "Save & close", exact: true }).click();
+  await expect(page.locator(".mesh-text-editor")).toHaveCount(0);
+  expect((await serverBody(page)).text).toBe("body a FIRST SECOND");
+});
+
+test("an older GET arriving after Apply cannot roll back the canvas or editor", async ({ page }) => {
+  const lines = await openEditor(page);
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  let arrived!: () => void;
+  const pending = new Promise<void>((resolve) => { arrived = resolve; });
+  let first = true;
+  await page.route("**/api/canvas", async (route) => {
+    if (!first) { await route.continue(); return; }
+    first = false;
+    const response = await route.fetch();
+    arrived();
+    await held;
+    await route.fulfill({ response });
+  });
+  // An unrelated operation starts a reload holding the old body of a.
+  const changed = await page.request.patch("/api/nodes/root", { data: { title: `Other ${Date.now()}` } });
+  expect(changed.ok()).toBe(true);
+  await pending;
+  await typeAtEnd(page, lines, " NEW");
+  await page.getByRole("button", { name: "Apply", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Apply", exact: true })).toBeDisabled();
+  release();
+  await page.waitForTimeout(500);
+  await expect(lines).toContainText("body a NEW");
+  await expect(page.locator('.react-flow__node[data-id="a"] .mesh-node-body')).toContainText("body a NEW");
+  await expect(page.locator(".mesh-text-editor-conflict")).toHaveCount(0);
+  expect((await serverBody(page)).text).toBe("body a NEW");
+});
+
+test("failed Save & close keeps the entire draft open", async ({ page }) => {
+  const lines = await openEditor(page);
+  await typeAtEnd(page, lines, " RETRY");
+  await page.locator(".mesh-text-editor-title-input").fill("Retry title");
+  await page.route("**/api/nodes/a", (route) => route.fulfill({ status: 500, body: "simulated failure" }));
+  await page.getByRole("button", { name: "Save & close", exact: true }).click();
+  await expect(page.locator(".mesh-text-editor-error")).toBeVisible();
+  await expect(lines).toContainText("body a RETRY");
+  expect((await serverBody(page)).text).toBe("body a");
+  await page.unroute("**/api/nodes/a");
+  await page.getByRole("button", { name: "Save & close", exact: true }).click();
+  await expect(page.locator(".mesh-text-editor")).toHaveCount(0);
+  expect((await serverBody(page)).text).toBe("body a RETRY");
+});
+
+test("adjacent ordinary fences have a visible gap in the editor preview", async ({ page }) => {
+  await replaceBodyElsewhere(page, '```\necho "# Hello!"\n```\n\n```\necho "# Hello!"\n```');
+  await openEditor(page);
+  const blocks = page.locator(".mesh-text-editor-preview .mesh-node-body > .mesh-code-block-source");
+  await expect(blocks).toHaveCount(2);
+  const first = await blocks.nth(0).boundingBox();
+  const second = await blocks.nth(1).boundingBox();
+  expect(second!.y - (first!.y + first!.height)).toBeGreaterThan(4);
+});
+
+test("slug suggestion appears even for a manually assigned ID", async ({ page }) => {
+  await openEditor(page);
+  await page.locator(".mesh-text-editor-header button").click();
+  const settings = page.locator(".node-settings-modal");
+  await settings.locator('.vars-modal-field', { hasText: "Title" }).locator("input").fill("Test Node");
+  await settings.locator('.vars-modal-field', { hasText: "ID" }).locator("input").fill("random123");
+  await expect(settings.locator(".node-settings-id-hint")).toContainText('test-node');
+  await settings.locator(".node-settings-id-hint button").click();
+  await expect(settings.locator('.vars-modal-field', { hasText: "ID" }).locator("input")).toHaveValue("test-node");
+  await expect(settings.locator(".node-settings-id-hint")).toHaveCount(0);
+});
+
+
+test("backdrop close offers save, discard, or continued editing", async ({ page }) => {
+  const lines = await openEditor(page);
+  await typeAtEnd(page, lines, " DRAFT");
+  await page.locator(".mesh-text-editor-backdrop").click({ position: { x: 5, y: 5 } });
+  const prompt = page.getByRole("alertdialog", { name: "Unsaved changes" });
+  await expect(prompt).toBeVisible();
+  await prompt.getByRole("button", { name: "Keep editing" }).click();
+  await expect(prompt).toHaveCount(0);
+  await expect(lines).toContainText("body a DRAFT");
+  await page.locator(".mesh-text-editor-backdrop").click({ position: { x: 5, y: 5 } });
+  await prompt.getByRole("button", { name: "Save & close", exact: true }).click();
+  await expect(page.locator(".mesh-text-editor")).toHaveCount(0);
+  expect((await serverBody(page)).text).toBe("body a DRAFT");
+});
+
+test("a title changed elsewhere conflicts with the local title/body draft", async ({ page }) => {
+  const lines = await openEditor(page);
+  await typeAtEnd(page, lines, " MINE");
+  await page.locator(".mesh-text-editor-title-input").fill("My title");
+  const changed = await page.request.patch("/api/nodes/a", { data: { title: "Their title" } });
+  expect(changed.ok()).toBe(true);
+  await expect(page.locator(".mesh-text-editor-conflict")).toBeVisible();
+  expect((await serverBody(page)).text).toBe("body a");
+  await page.getByRole("button", { name: "keep mine", exact: true }).click();
+  await expect(page.locator(".mesh-text-editor-conflict")).toHaveCount(0);
+  await expect.poll(async () => (await serverBody(page)).text).toBe("body a MINE");
+  const canvas = await (await page.request.get("/api/canvas")).json();
+  expect(canvas.nodes.find((n: { id: string }) => n.id === "a").title).toBe("My title");
 });

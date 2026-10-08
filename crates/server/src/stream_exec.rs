@@ -14,6 +14,13 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
+fn apply_run_env(command: &mut Command, env: meshfox_core::process_env::RunEnvironment) {
+    for name in env.remove {
+        command.env_remove(name);
+    }
+    command.envs(env.values);
+}
+
 /// Which pipe a `SpawnedProcess::output_rx` line came from — see
 /// `SpawnedProcess`'s own doc comment for why a caller needs this at all
 /// given the two are still delivered on one interleaved channel.
@@ -140,10 +147,10 @@ where
     // continue past the failure and report whatever its last line's exit
     // code happens to be — usually success — instead of the real one.
     command.arg("-e").arg("-c").arg(code);
-    command.envs(meshfox_core::config::env_overrides(
-        cwd.unwrap_or_else(|| Path::new(".")),
-    ));
-    command.envs(envs);
+    apply_run_env(
+        &mut command,
+        meshfox_core::process_env::prepare(cwd, envs, &[]),
+    );
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -189,9 +196,10 @@ where
 {
     let mut command = Command::new(program);
     command.args(args);
-    command.envs(meshfox_core::config::env_overrides(
-        cwd.unwrap_or_else(|| Path::new(".")),
-    ));
+    apply_run_env(
+        &mut command,
+        meshfox_core::process_env::prepare(cwd, [] as [(&str, &str); 0], &[]),
+    );
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -253,7 +261,7 @@ where
     K: AsRef<std::ffi::OsStr>,
     V: AsRef<std::ffi::OsStr>,
 {
-    let mut envs: Vec<(std::ffi::OsString, std::ffi::OsString)> = envs
+    let envs: Vec<(std::ffi::OsString, std::ffi::OsString)> = envs
         .into_iter()
         .map(|(k, v)| (k.as_ref().to_os_string(), v.as_ref().to_os_string()))
         .collect();
@@ -262,14 +270,16 @@ where
     // `$PATH`/`$MESHFOX_CONFIG_*` leaking into `MESHFOX_ENV_NAMES`).
     let env_names: Vec<String> = envs
         .iter()
+        .filter(|(k, _)| !meshfox_core::process_env::is_run_context(k))
         .map(|(k, _)| k.to_string_lossy().into_owned())
         .collect();
 
     let resolved_interpreter;
+    let mut extra_envs = Vec::new();
     let interpreter =
         match meshfox_core::resolve_with_env(interpreter, lang, cwd, canvas_path, &env_names)? {
-            Some((path, extra_envs)) => {
-                envs.extend(extra_envs.into_iter().map(|(k, v)| (k.into(), v.into())));
+            Some((path, builtin_envs)) => {
+                extra_envs = builtin_envs;
                 resolved_interpreter = path;
                 resolved_interpreter.as_str()
             }
@@ -290,18 +300,12 @@ where
     ));
     std::fs::write(&path, code)?;
 
-    // Config's `[process_env]` (see `spawn_bash`'s own doc comment) goes in first —
-    // lowest precedence, overridable by both the caller's own `envs` and
-    // whatever `resolve_with_env` just added above.
-    let mut final_envs: Vec<(std::ffi::OsString, std::ffi::OsString)> =
-        meshfox_core::config::env_overrides(cwd.unwrap_or_else(|| Path::new(".")))
-            .into_iter()
-            .map(|(k, v)| (k.into(), v.into()))
-            .collect();
-    final_envs.extend(envs);
-
     let mut command = Command::new(&program);
-    command.args(&args).arg(&path).envs(final_envs);
+    command.args(&args).arg(&path);
+    apply_run_env(
+        &mut command,
+        meshfox_core::process_env::prepare(cwd, envs, &extra_envs),
+    );
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }

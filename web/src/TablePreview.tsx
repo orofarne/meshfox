@@ -72,6 +72,7 @@ export function FileTablePreview({ nodeId, target }: { nodeId: string; target?: 
 
   // --- fetched rows: refs for the cache, `tick` to re-render on arrival ---
   const pagesRef = useRef(new Map<string, Cell[][]>());
+  const sizingSampleRef = useRef<Cell[][]>([]);
   const pendingRef = useRef(new Set<string>());
   const matchedRef = useRef<Record<string, number>>({});
   const knownRowsRef = useRef(0);
@@ -84,6 +85,7 @@ export function FileTablePreview({ nodeId, target }: { nodeId: string; target?: 
   const scrollerRef = useRef<HTMLDivElement | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [boxHeight, setBoxHeight] = useState(0);
+  const [boxWidth, setBoxWidth] = useState(0);
 
   const columns = meta?.columns ?? NO_COLUMNS;
   const ready = meta?.state === "ready";
@@ -119,6 +121,7 @@ export function FileTablePreview({ nodeId, target }: { nodeId: string; target?: 
   // Whatever rows were cached belong to one version/state of the table.
   const resetKey = `${meta?.version ?? ""}|${meta?.state ?? ""}`;
   useEffect(() => {
+    sizingSampleRef.current = [];
     pagesRef.current.clear();
     pendingRef.current.clear();
     matchedRef.current = {};
@@ -163,8 +166,12 @@ export function FileTablePreview({ nodeId, target }: { nodeId: string; target?: 
     observer.current?.disconnect();
     scrollerRef.current = el;
     if (!el) return;
-    setBoxHeight(el.clientHeight);
-    observer.current = new ResizeObserver(() => setBoxHeight(el.clientHeight));
+    const measure = () => {
+      setBoxHeight(el.clientHeight);
+      setBoxWidth(el.clientWidth);
+    };
+    measure();
+    observer.current = new ResizeObserver(measure);
     observer.current.observe(el);
   }, []);
 
@@ -202,6 +209,7 @@ export function FileTablePreview({ nodeId, target }: { nodeId: string; target?: 
             if (page.version !== meta.version) return; // the poll will pick up the change
             const cache = pagesRef.current;
             cache.set(key, page.rows);
+            if (block === 0 && sizingSampleRef.current.length === 0) sizingSampleRef.current = page.rows;
             while (cache.size > MAX_CACHED_BLOCKS) cache.delete(cache.keys().next().value as string);
             if (page.matchedRows != null) matchedRef.current[vk] = page.matchedRows;
             else knownRowsRef.current = Math.max(knownRowsRef.current, page.offset + page.rows.length);
@@ -224,7 +232,20 @@ export function FileTablePreview({ nodeId, target }: { nodeId: string; target?: 
     return pagesRef.current.get(`${vk}#${block}`)?.[row - block * BLOCK_ROWS];
   };
 
-  const colWidth = (c: TableColumn) => widths[c.index] ?? defaultColumnWidth(c);
+  // Use the first page so widths do not change as the user scrolls.
+  const sample = sizingSampleRef.current;
+  const naturalWidths = columns.map((c) => {
+    const longest = sample.reduce((n, row) => Math.max(n, Array.from(row[c.index] ?? "").length), 0);
+    return widths[c.index] ?? Math.max(defaultColumnWidth(c), Math.min(320, longest * 8 + 24));
+  });
+  const spare = Math.max(0, boxWidth - GUTTER_W - naturalWidths.reduce((sum, w) => sum + w, 0));
+  // Give remaining room to text columns; preserve manually resized widths.
+  const flexible = columns.map((c, i) => c.kind === "text" && widths[c.index] == null ? naturalWidths[i] : 0);
+  const weight = flexible.reduce((sum, w) => sum + w, 0);
+  const fittedWidths = new Map(columns.map((c, i) => [c.index,
+    naturalWidths[i] + (weight ? spare * flexible[i] / weight : 0),
+  ]));
+  const colWidth = (c: TableColumn) => fittedWidths.get(c.index) ?? defaultColumnWidth(c);
   const totalW = GUTTER_W + columns.reduce((sum, c) => sum + colWidth(c), 0);
 
   const scrollToRow = (row: number) => {

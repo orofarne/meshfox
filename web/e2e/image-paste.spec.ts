@@ -105,7 +105,7 @@ test("pasting an image into a node's body editor embeds it as base64 and renders
     page.locator(`.mesh-text-editor-preview img[src="data:image/png;base64,${ONE_PIXEL_PNG_BASE64}"]`),
   ).toBeVisible();
 
-  await page.locator(".mesh-text-editor-actions button", { hasText: "done" }).click();
+  await page.locator(".mesh-text-editor-actions button", { hasText: "Save & close" }).click();
   await expect.poll(() => fetchRaw(page)).toContain(`data:image/png;base64,${ONE_PIXEL_PNG_BASE64}`);
 });
 

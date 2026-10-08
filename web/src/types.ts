@@ -140,6 +140,8 @@ export interface CanvasNode {
 }
 
 export interface CanvasDoc {
+  canvasVersion?: number;
+  serverSession?: string;
   nodes: CanvasNode[];
   /** Every `<!-- meshfox:option name="..." -->` this document declares
    * (see `crates/core/src/options.rs`, SPEC.md's "Options" section) — e.g.

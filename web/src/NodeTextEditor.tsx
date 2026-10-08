@@ -32,9 +32,7 @@ export function useMonacoReady(): boolean {
   return ready;
 }
 
-/** How long to wait after the last keystroke before auto-saving — see
- * NodeSettings.tsx's identical constant/rationale. */
-const AUTOSAVE_DELAY_MS = 700;
+
 
 /** Shared Monaco `options` for every editor in the app (NodeTextEditor,
  * CanvasSourceEditor) — kept as one stable module-level object rather than
@@ -142,31 +140,13 @@ export function usePrefersDark(): boolean {
 }
 
 interface NodeTextEditorProps {
-  /** Current title, shown (and editable) in the header — see
-   * `onSaveTitle`. */
   title: string;
   initialText: string;
-  /** The node's body as the server has it right now, and its revision —
-   * both change whenever the body is changed elsewhere (another tab, an
-   * agent, an editor) or by this editor's own save landing. */
   serverText: string;
   serverRev: string;
-  /** Auto-save callback — fired (debounced) as the text changes, and once
-   * more on close to flush anything still pending, with the revision this
-   * editor last saw. The outcome says whether it landed or the body had
-   * moved on since. Doesn't close the editor itself; only `onClose` does. */
-  onChange: (text: string, baseRev: string) => Promise<SaveTextOutcome>;
-  /** Commits the header's title field — fired on blur/Enter, same
-   * "wherever the title is being edited" shape as MeshNode's own inline
-   * canvas title edit (TODO.canvas.md: "Редактирование заголовка и вызов
-   * node settings внутри редактора"), not debounced like `onChange` above:
-   * a title is one short field, not worth a partial-typing round trip. */
-  onSaveTitle: (title: string) => void;
-  /** The header's gear button — opens NodeSettings without leaving this
-   * editor open underneath it (TODO.canvas.md: same node as `onSaveTitle`
-   * above — "убрать отдельное меню node settings" turned out to mean "stop
-   * requiring it for a rename", not remove it: it's still where type,
-   * color, tags, target, and edges live). */
+  serverVersion: number;
+  serverSession: string;
+  onChange: (text: string, baseRev: string, title: string, baseTitle: string) => Promise<SaveTextOutcome>;
   onOpenSettings: () => void;
   onClose: () => void;
 }
@@ -190,206 +170,128 @@ interface NodeTextEditorProps {
  * current view). A portal sidesteps both: fixed size, fixed position,
  * regardless of where the node sits on the canvas.
  *
- * Auto-saves (debounced) as you type, same as NodeSettings — no separate
- * Save/Cancel step, just a "done" button to close once whatever's pending
- * has flushed.
+ * Title and body stay local until Apply or Save & close succeeds.
  */
 export function NodeTextEditor({
-  title,
-  initialText,
-  serverText,
-  serverRev,
-  onChange,
-  onSaveTitle,
-  onOpenSettings,
-  onClose,
+  title, initialText, serverText, serverRev, serverVersion, serverSession,
+  onChange, onOpenSettings, onClose,
 }: NodeTextEditorProps) {
   const [text, setTextState] = useState(initialText);
-  // The latest buffer, readable from async callbacks without a stale
-  // closure.
   const textRef = useRef(initialText);
   const setText = (value: string) => {
     textRef.current = value;
     setTextState(value);
   };
-  const [titleDraft, setTitleDraft] = useState(title);
-  // Keeps the header's title field in sync with a rename made elsewhere
-  // while this editor stayed open — most commonly via the gear button
-  // right next to it (NodeSettings can change the title too). Harmless
-  // while the user is actively typing here instead: `title` only changes
-  // once *this* field's own `onSaveTitle` round-trips back through a fresh
-  // canvas, at which point it matches `titleDraft` already.
-  useEffect(() => setTitleDraft(title), [title]);
+  const [titleDraft, setTitleState] = useState(title);
+  const titleRef = useRef(title);
+  const setTitleDraft = (value: string) => {
+    titleRef.current = value;
+    setTitleState(value);
+  };
   const dark = usePrefersDark();
   const monacoReady = useMonacoReady();
   const detachRef = useRef<(() => void) | null>(null);
-
-  // What this editor knows about the server's copy of the body:
-  // - `known`: the body text and revision it last saw there (a save of its
-  //   own landing, or another client's change it adopted), the `baseRev`
-  //   every save is written against;
-  // - `synced`: the buffer text that corresponds to `known`. The buffer is
-  //   "clean" exactly when it still equals this; it's tracked apart from
-  //   `known.text` because the server may store a body slightly differently
-  //   from what was sent.
-  const known = useRef({ text: initialText, rev: serverRev });
-  const synced = useRef(initialText);
-  // The body as another client left it, while this editor holds unsaved
-  // edits of its own: nothing is written until the user picks a side.
-  const [conflict, setConflict] = useState<{ text: string; rev: string } | null>(null);
-  const conflictRef = useRef<{ text: string; rev: string } | null>(null);
+  const known = useRef({ text: initialText, title, rev: serverRev, version: serverVersion, session: serverSession });
+  // Submitted buffers are tracked separately from the server's normalized
+  // text. An acknowledgement never edits the Monaco model or its undo stack.
+  const synced = useRef({ text: initialText, title });
+  type Conflict = { text: string; title: string; rev: string };
+  const [conflict, setConflict] = useState<Conflict | null>(null);
+  const conflictRef = useRef<Conflict | null>(null);
   const [showTheirs, setShowTheirs] = useState(false);
-  const raiseConflict = (theirs: { text: string; rev: string } | null) => {
+  const raiseConflict = (theirs: Conflict | null) => {
     conflictRef.current = theirs;
     setConflict(theirs);
     if (!theirs) setShowTheirs(false);
   };
-
-  // Saves run one at a time: a second save started while the first is in
-  // flight would be written against a revision the first is about to
-  // replace, and be refused as a conflict with this editor's own earlier
-  // write.
-  const saving = useRef(false);
-  const queued = useRef(false);
-  const latestServer = useRef({ text: serverText, rev: serverRev });
-
-  /** Compares what the server now has against what this editor knows. A
-   * body changed elsewhere is adopted silently while the buffer has no
-   * unsaved edits, and otherwise held back as a conflict. */
+  const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
+  const [closePrompt, setClosePrompt] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [, refresh] = useState(0);
+  const dirtyNow = () => textRef.current !== synced.current.text || titleRef.current !== synced.current.title;
+  const latestServer = useRef({ text: serverText, title, rev: serverRev, version: serverVersion, session: serverSession });
   const reconcile = () => {
-    const { text: theirText, rev } = latestServer.current;
-    if (rev === known.current.rev) return;
-    if (theirText === known.current.text) {
-      known.current = { text: theirText, rev };
+    const theirs = latestServer.current;
+    const base = known.current;
+    if (theirs.session === base.session && theirs.version <= base.version) return;
+    if (theirs.text === base.text && theirs.title === base.title) {
+      known.current = theirs;
       return;
     }
-    if (textRef.current === synced.current) {
-      known.current = { text: theirText, rev };
-      synced.current = theirText;
-      setText(theirText);
-      return;
+    if (!dirtyNow()) {
+      known.current = theirs;
+      synced.current = { text: theirs.text, title: theirs.title };
+      setText(theirs.text);
+      setTitleDraft(theirs.title);
+      raiseConflict(null);
+    } else {
+      raiseConflict(theirs);
     }
-    raiseConflict({ text: theirText, rev });
   };
+  useEffect(() => {
+    latestServer.current = { text: serverText, title, rev: serverRev, version: serverVersion, session: serverSession };
+    if (!savingRef.current) reconcile();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [serverText, title, serverRev, serverVersion, serverSession]);
 
-  const runSave = async () => {
-    saving.current = true;
+  const save = async (close: boolean) => {
+    if (savingRef.current || conflictRef.current || !titleRef.current.trim()) return;
+    if (!dirtyNow()) { if (close) onClose(); return; }
+    const sent = { text: textRef.current, title: titleRef.current };
+    savingRef.current = true;
+    setSaving(true);
+    setSaveError(null);
     try {
-      do {
-        queued.current = false;
-        if (conflictRef.current) break;
-        const toSave = textRef.current;
-        if (toSave === synced.current) break;
-        const outcome = await onChange(toSave, known.current.rev);
-        if (outcome.status === "saved") {
-          known.current = { text: outcome.text, rev: outcome.rev };
-          synced.current = toSave;
-        } else if (outcome.status === "conflict") {
-          raiseConflict({ text: outcome.currentText, rev: outcome.currentRev });
-          break;
-        } else {
-          break;
-        }
-      } while (queued.current);
+      const outcome = await onChange(sent.text, known.current.rev, sent.title, known.current.title);
+      if (outcome.status === "saved") {
+        known.current = { text: outcome.text, title: outcome.title, rev: outcome.rev, version: outcome.version, session: outcome.session };
+        synced.current = sent;
+        if (latestServer.current.session === outcome.session) reconcile();
+        refresh((n) => n + 1);
+        // Typing during Apply stays dirty; never close over newer edits.
+        if (close && !dirtyNow() && !conflictRef.current) onClose();
+      } else if (outcome.status === "conflict") {
+        raiseConflict({ text: outcome.currentText, title: outcome.currentTitle ?? known.current.title, rev: outcome.currentRev });
+      } else {
+        setSaveError("Could not save. Your changes are still here; try again.");
+      }
+    } catch (error) {
+      setSaveError(String(error));
     } finally {
-      saving.current = false;
+      savingRef.current = false;
+      setSaving(false);
     }
-    // The server's copy may have moved on while the save was in flight.
-    reconcile();
   };
-  const requestSave = () => {
-    if (saving.current) {
-      queued.current = true;
-      return;
-    }
-    void runSave();
-  };
-
-  useEffect(() => {
-    latestServer.current = { text: serverText, rev: serverRev };
-    // While a save is in flight its own result is about to arrive; sorting
-    // out the server's copy then (see the end of `runSave`) can't mistake
-    // this editor's own write for somebody else's.
-    if (!saving.current) reconcile();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [serverText, serverRev]);
-
-  const isFirstRender = useRef(true);
-  const pendingSave = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => {
-    if (isFirstRender.current) {
-      isFirstRender.current = false;
-      return;
-    }
-    pendingSave.current = setTimeout(() => {
-      pendingSave.current = null;
-      requestSave();
-    }, AUTOSAVE_DELAY_MS);
-    return () => {
-      if (pendingSave.current) clearTimeout(pendingSave.current);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [text]);
-
+  const saveRef = useRef(save);
+  saveRef.current = save;
   useEffect(() => () => detachRef.current?.(), []);
-
   const handleMount: OnMount = (editor, monaco) => {
     detachRef.current = attachMeshfoxEditorExtensions(editor, monaco);
     editor.focus();
   };
-
-  /** Drops this editor's unsaved edits in favor of the body as another
-   * client left it. */
   const takeTheirs = () => {
     const theirs = conflictRef.current;
     if (!theirs) return;
-    known.current = { text: theirs.text, rev: theirs.rev };
-    synced.current = theirs.text;
+    known.current = { ...known.current, ...theirs };
+    synced.current = { text: theirs.text, title: theirs.title };
     setText(theirs.text);
+    setTitleDraft(theirs.title);
     raiseConflict(null);
   };
-
-  /** Writes this editor's buffer over the other client's body — written
-   * against *their* revision, so it still fails if the body moves on yet
-   * again before it lands. */
   const keepMine = () => {
     const theirs = conflictRef.current;
     if (!theirs) return;
-    known.current = { text: theirs.text, rev: theirs.rev };
+    known.current = { ...known.current, ...theirs };
     raiseConflict(null);
-    requestSave();
+    void save(false);
   };
-
   const handleClose = () => {
-    if (conflictRef.current) {
-      if (!window.confirm("This node's body was changed elsewhere. Close and discard your unsaved edits?")) {
-        return;
-      }
-      onClose();
-      return;
-    }
-    if (pendingSave.current) {
-      clearTimeout(pendingSave.current);
-      pendingSave.current = null;
-      requestSave();
-    }
+    if (savingRef.current) return;
+    if (dirtyNow()) { setClosePrompt(true); return; }
     onClose();
   };
-
-  // Not debounced like the body's own autosave above — a title is one
-  // short field, committed whole on blur/Enter, same as MeshNode's inline
-  // canvas title edit.
-  const handleTitleBlur = () => onSaveTitle(titleDraft);
-  const handleTitleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter") {
-      e.preventDefault();
-      e.currentTarget.blur();
-    } else if (e.key === "Escape") {
-      e.preventDefault();
-      setTitleDraft(title);
-      e.currentTarget.blur();
-    }
-  };
+  const dirty = text !== synced.current.text || titleDraft !== synced.current.title;
 
   // `nokey`: React Flow's own global Space-to-pan shortcut (`panActivationKeyCode`,
   // default-on, never opted into by this app) decides whether to ignore a
@@ -403,15 +305,22 @@ export function NodeTextEditor({
   // (`target.closest('.nokey')`) for exactly this case — same fix applied to
   // CanvasSourceEditor's wrapper for its Monaco instance.
   return createPortal(
-    <div className="mesh-text-editor-backdrop nokey" onClick={handleClose}>
+    <div className="mesh-text-editor-backdrop nokey" onClick={handleClose}
+      onKeyDownCapture={(e) => {
+        if ((e.ctrlKey || e.metaKey) && e.code === "KeyS") {
+          e.preventDefault();
+          e.stopPropagation();
+          void saveRef.current(false);
+        }
+      }}>
       <div className="mesh-text-editor" onClick={(e) => e.stopPropagation()}>
         <div className="mesh-text-editor-header">
           <input
             className="mesh-text-editor-title-input"
             value={titleDraft}
             onChange={(e) => setTitleDraft(e.target.value)}
-            onBlur={handleTitleBlur}
-            onKeyDown={handleTitleKeyDown}
+            disabled={saving}
+            onKeyDown={(e) => { if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") { e.preventDefault(); void save(false); } }}
           />
           <button
             type="button"
@@ -424,17 +333,17 @@ export function NodeTextEditor({
         </div>
         {conflict && (
           <div className="mesh-text-editor-conflict" role="alert">
-            <span>This node's body was changed elsewhere while you were editing.</span>
-            <button type="button" onClick={takeTheirs}>
+            <span>This node was changed elsewhere while you were editing.</span>
+            <button type="button" onClick={takeTheirs} disabled={saving}>
               take theirs
             </button>
-            <button type="button" onClick={keepMine}>
+            <button type="button" onClick={keepMine} disabled={saving}>
               keep mine
             </button>
             <button type="button" onClick={() => setShowTheirs((v) => !v)}>
               {showTheirs ? "hide theirs" : "compare"}
             </button>
-            {showTheirs && <pre className="mesh-text-editor-conflict-theirs">{conflict.text}</pre>}
+            {showTheirs && <pre className="mesh-text-editor-conflict-theirs">{`${conflict.title}\n\n${conflict.text}`}</pre>}
           </div>
         )}
         <div className="mesh-text-editor-panes">
@@ -459,10 +368,20 @@ export function NodeTextEditor({
             <NodeBodyPreview text={text} />
           </div>
         </div>
+        {closePrompt && (
+          <div className="mesh-text-editor-close-prompt" role="alertdialog" aria-label="Unsaved changes">
+            <span>Save your changes before closing?</span>
+            <button type="button" onClick={() => void save(true)} disabled={saving || !!conflict || !titleDraft.trim()}>Save &amp; close</button>
+            <button type="button" onClick={onClose} disabled={saving}>Discard</button>
+            <button type="button" onClick={() => setClosePrompt(false)}>Keep editing</button>
+          </div>
+        )}
+        {saveError && <p className="mesh-text-editor-error" role="alert">{saveError}</p>}
         <div className="mesh-text-editor-actions">
-          <button type="button" onClick={handleClose}>
-            done
-          </button>
+          <span>{saving ? "Saving…" : dirty ? "Unsaved changes" : "Saved"}</span>
+          <button type="button" onClick={() => onClose()} disabled={saving}>Cancel</button>
+          <button type="button" onClick={() => void save(false)} disabled={saving || !dirty || !!conflict || !titleDraft.trim()}>Apply</button>
+          <button type="button" onClick={() => void save(true)} disabled={saving || !!conflict || !titleDraft.trim()}>Save &amp; close</button>
         </div>
       </div>
     </div>,

@@ -2506,6 +2506,7 @@ async fn run_via_worker(
     confirm: bool,
     mut overrides: HashMap<String, String>,
 ) {
+    let run_started = std::time::Instant::now();
     let path: Vec<String> = path.iter().map(|s| s.to_string()).collect();
     let mut had_failure = false;
     // Every `(nodeId, block)` any requested name's own chain started as a
@@ -2675,6 +2676,14 @@ async fn run_via_worker(
             }
         }
     }
+
+    // Wall-clock for the whole invocation (preflight, prompts and
+    // confirmations included), printed before attaching to any service —
+    // which runs until Ctrl-C and isn't part of "how long did this take".
+    println!(
+        "total: {}",
+        meshfox_core::format_duration_ms(run_started.elapsed().as_millis() as u64)
+    );
 
     // Mirrors the in-process loop's own tail exactly (see its own doc
     // comment on why `meshfox run` stays attached to a `service` block

@@ -23,9 +23,7 @@ async function nodeAText(page: Page): Promise<string> {
 }
 
 // Opens node "a"'s inline body editor, appends " EDITED" to its text, and
-// saves via the "done" button (which flushes any still-pending autosave
-// debounce immediately — see NodeTextEditor.tsx's `handleClose` — so the
-// write has already landed by the time this resolves, no polling needed).
+// saves via Save & close, which waits for the write before closing.
 async function editNodeABody(page: Page) {
   const node = page.locator('.react-flow__node[data-id="a"]');
   await selectNode(node);
@@ -42,10 +40,10 @@ async function editNodeABody(page: Page) {
   // Ctrl/Cmd-End lands as "TED", "TED EDID", or similar mangled/reordered
   // output more often than not. A per-key delay avoids it; the trailing
   // `toContainText` still double-checks the exact final string landed
-  // before "done" commits whatever's actually there.
+  // before Save & close commits whatever's actually there.
   await page.keyboard.type(" EDITED", { delay: 80 });
   await expect(lines).toContainText("body a EDITED");
-  await page.locator(".mesh-text-editor-actions button", { hasText: "done" }).click();
+  await page.locator(".mesh-text-editor-actions button", { hasText: "Save & close" }).click();
   await expect(page.locator(".mesh-text-editor")).toHaveCount(0);
 }
 
@@ -149,15 +147,14 @@ test("Cmd/Ctrl-Z is swallowed by the node body editor instead of triggering docu
   // gated the document-level shortcut, which is all this asserts.
   expect(undoRequests).toBe(0);
 
-  // NodeTextEditor has no separate "cancel" — "done" always commits
-  // whatever the editor currently holds (see its own `handleClose`). What
+  // Save & close commits whatever the editor currently holds. What
   // that is depends on the browser, which is not this test's concern:
   // Chrome's Monaco ignores the synthetic Ctrl/Cmd-Z and keeps the typed
-  // "x", so "done" is a second real edit on top of the first; Firefox's
-  // Monaco natively undoes the "x", so "done" commits text identical to
+  // "x", so Save & close is a second real edit on top of the first; Firefox's
+  // Monaco natively undoes the "x", so Save & close commits text identical to
   // what's already saved and adds no history entry at all. Undo only as
   // many steps as were really recorded, then check the fixture is restored.
-  await page.locator(".mesh-text-editor-actions button", { hasText: "done" }).click();
+  await page.locator(".mesh-text-editor-actions button", { hasText: "Save & close" }).click();
   await expect(page.locator(".mesh-text-editor")).toHaveCount(0);
   if ((await nodeAText(page)) !== "body a EDITED") {
     await undoButton(page).click();

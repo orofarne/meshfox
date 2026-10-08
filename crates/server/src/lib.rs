@@ -74,6 +74,8 @@ mod session_state;
 /// `pub` so `meshfox-cli` can reuse the same async spawn/kill primitives
 /// for `meshfox run`'s real-time output — see its `main.rs`.
 pub mod stream_exec;
+#[cfg(all(test, unix))]
+mod run_environment_tests;
 pub mod tables;
 /// Webui-only multi-viewer registry for a `tty` block's own live pty
 /// session — see its own module doc comment.
@@ -131,6 +133,8 @@ struct AppState {
     /// write to the file goes through `write_raw`, which refuses.
     read_only: bool,
     raw: Mutex<String>,
+    snapshot_version: Mutex<(u64, String)>,
+    server_session: String,
     /// Serialises every read-modify-write of the canvas file: a mutating
     /// handler takes this (via `begin_mutation`) before it first reads
     /// `raw` and holds it until its own `save` has landed, so two
@@ -922,12 +926,12 @@ struct UndoRedoResponse {
     can_undo: bool,
     can_redo: bool,
     #[serde(flatten)]
-    canvas: Canvas,
+    canvas: VersionedCanvas,
 }
 
 fn undo_redo_response(
     state: &AppState,
-    raw: &str,
+    _raw: &str,
     changed: bool,
 ) -> Result<Json<UndoRedoResponse>, ApiError> {
     let can_undo = state
@@ -938,7 +942,7 @@ fn undo_redo_response(
         .undo_log
         .can_redo()
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let Json(canvas) = canvas_response(raw, &state.canvas_path)?;
+    let Json(canvas) = state.canvas_snapshot()?;
     Ok(Json(UndoRedoResponse {
         changed,
         can_undo,
@@ -1637,7 +1641,7 @@ fn stamp_run_fingerprint(state: &AppState, addr: &meshfox_core::BlockAddr, id: i
 /// of `addr` against everything resolved for this run so far — so a change
 /// to the block, to anything it depends on, or to a variable value any of
 /// them reference, all make a recorded run stale. Falls back to the block's
-/// own [`meshfox_core::session_fingerprint`] if the closure can't be worked
+/// own runtime fingerprint if the closure can't be worked
 /// out (`canvas` is `None`, or the graph doesn't resolve) — the same answer
 /// every time for the same input, so a record still matches itself.
 fn step_fingerprint(
@@ -1649,7 +1653,12 @@ fn step_fingerprint(
 ) -> String {
     canvas
         .and_then(|c| meshfox_core::closure_fingerprint_with(c, decls, addr, resolved_vars).ok())
-        .unwrap_or_else(|| meshfox_core::session_fingerprint(block, resolved_vars))
+        .unwrap_or_else(|| {
+            let cwd = canvas
+                .and_then(|c| c.node(&addr.node_id).map(|n| n.cwd(&c.artifact_root)))
+                .unwrap_or_else(|| PathBuf::from("."));
+            meshfox_core::fence::execution_fingerprint(block, resolved_vars, &cwd)
+        })
 }
 
 /// Records `run` as `addr`'s latest successful run this session, in memory
@@ -3685,6 +3694,44 @@ fn resolved_canvas(raw: &str, canvas_path: &std::path::Path) -> Result<Canvas, A
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VersionedCanvas {
+    #[serde(flatten)]
+    canvas: Canvas,
+    canvas_version: u64,
+    server_session: String,
+}
+
+impl std::ops::Deref for VersionedCanvas {
+    type Target = Canvas;
+    fn deref(&self) -> &Canvas {
+        &self.canvas
+    }
+}
+
+impl AppState {
+    /// Capture and number the resolved snapshot under the same lock. Never
+    /// stamp an earlier caller-provided raw string with a newer version.
+    /// Includes and derived statuses participate in the snapshot as well.
+    fn canvas_snapshot(&self) -> Result<Json<VersionedCanvas>, ApiError> {
+        let raw = self.raw.lock().unwrap();
+        let Json(canvas) = canvas_response(&raw, &self.canvas_path)?;
+        let fingerprint = serde_json::to_string(&canvas)
+            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let mut version = self.snapshot_version.lock().unwrap();
+        if version.1 != fingerprint {
+            version.0 += 1;
+            version.1 = fingerprint;
+        }
+        Ok(Json(VersionedCanvas {
+            canvas,
+            canvas_version: version.0,
+            server_session: self.server_session.clone(),
+        }))
+    }
+}
+
 fn canvas_response(raw: &str, canvas_path: &std::path::Path) -> Result<Json<Canvas>, ApiError> {
     let mut canvas = resolved_canvas(raw, canvas_path)?;
     // Every embedded constraint fence's script itself is cheap and pure
@@ -3752,9 +3799,8 @@ mod canvas_response_tag_color_tests {
     }
 }
 
-async fn get_canvas(State(state): State<Arc<AppState>>) -> Result<Json<Canvas>, ApiError> {
-    let raw = state.raw.lock().unwrap().clone();
-    canvas_response(&raw, &state.canvas_path)
+async fn get_canvas(State(state): State<Arc<AppState>>) -> Result<Json<VersionedCanvas>, ApiError> {
+    state.canvas_snapshot()
 }
 
 /// Resolves a node id to its raw text and (unchanged, since there's only
@@ -4210,7 +4256,7 @@ async fn put_canvas(
 /// *declares* the include right in this file, with its own real
 /// `meshfox:node` comment (position and all), so it must be cleared exactly
 /// like any other node.
-async fn clear_layout(State(state): State<Arc<AppState>>) -> Result<Json<Canvas>, ApiError> {
+async fn clear_layout(State(state): State<Arc<AppState>>) -> Result<Json<VersionedCanvas>, ApiError> {
     let _guard = state.begin_mutation().await;
     let mut raw = state.raw.lock().unwrap().clone();
     let canvas = parse_or_error(&raw)?;
@@ -4242,8 +4288,7 @@ async fn clear_layout(State(state): State<Arc<AppState>>) -> Result<Json<Canvas>
     state
         .save_with_event(&raw, ServerEvent::LayoutCleared)
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let saved = state.raw.lock().unwrap().clone();
-    canvas_response(&saved, &state.canvas_path)
+    state.canvas_snapshot()
 }
 
 /// Re-sorts every parent's own structural children by their real/auto-
@@ -4256,7 +4301,7 @@ async fn clear_layout(State(state): State<Arc<AppState>>) -> Result<Json<Canvas>
 /// last, stably. Scoped to the primary document only, same as
 /// `clear_layout` above — an include target's own sibling order lives in
 /// a separate file, untouched by this.
-async fn reorder_siblings(State(state): State<Arc<AppState>>) -> Result<Json<Canvas>, ApiError> {
+async fn reorder_siblings(State(state): State<Arc<AppState>>) -> Result<Json<VersionedCanvas>, ApiError> {
     let _guard = state.begin_mutation().await;
     let raw = state.raw.lock().unwrap().clone();
     let updated = mdcanvas::reorder_by_position(&raw, &HashMap::new()).ok_or_else(|| {
@@ -4268,8 +4313,7 @@ async fn reorder_siblings(State(state): State<Arc<AppState>>) -> Result<Json<Can
     state
         .save_with_event(&updated, ServerEvent::AllChildrenReordered)
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let saved = state.raw.lock().unwrap().clone();
-    canvas_response(&saved, &state.canvas_path)
+    state.canvas_snapshot()
 }
 
 /// Clears node `id`'s own authored `x`/`y`/`w`/`h`, reverting it to
@@ -4282,7 +4326,7 @@ async fn reorder_siblings(State(state): State<Arc<AppState>>) -> Result<Json<Can
 async fn clear_node_layout(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<Json<Canvas>, ApiError> {
+) -> Result<Json<VersionedCanvas>, ApiError> {
     let _guard = state.begin_mutation().await;
     let primary_raw = state.raw.lock().unwrap().clone();
     let located = locate_node(&primary_raw, &id)?;
@@ -4314,8 +4358,7 @@ async fn clear_node_layout(
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}")))?;
     let op = node_upserted_event(&updated, &state.canvas_path, &located.local_id);
     commit_located(&state, &located, &updated, op)?;
-    let response_raw = state.raw.lock().unwrap().clone();
-    canvas_response(&response_raw, &state.canvas_path)
+    state.canvas_snapshot()
 }
 
 #[derive(Debug, Deserialize)]
@@ -4354,7 +4397,7 @@ struct CreateNodeRequest {
 struct CreateNodeResponse {
     new_id: String,
     #[serde(flatten)]
-    canvas: Canvas,
+    canvas: VersionedCanvas,
 }
 
 /// Adds a new, empty-bodied child heading node under `parentId`, as the
@@ -4409,8 +4452,7 @@ async fn create_node(
     parse_or_error(&updated)?;
     let op = node_upserted_event(&updated, &state.canvas_path, &new_id);
     commit_located(&state, &located, &updated, op)?;
-    let response_raw = state.raw.lock().unwrap().clone();
-    let Json(canvas) = canvas_response(&response_raw, &state.canvas_path)?;
+    let Json(canvas) = state.canvas_snapshot()?;
     Ok(Json(CreateNodeResponse { new_id, canvas }))
 }
 
@@ -4434,7 +4476,7 @@ struct UpdateOptionsRequest {
 async fn put_options(
     State(state): State<Arc<AppState>>,
     Json(req): Json<UpdateOptionsRequest>,
-) -> Result<Json<Canvas>, ApiError> {
+) -> Result<Json<VersionedCanvas>, ApiError> {
     let _guard = state.begin_mutation().await;
     let raw = state.raw.lock().unwrap().clone();
     let updated = mdcanvas::set_document_options(&raw, &req.options).ok_or_else(|| {
@@ -4447,8 +4489,7 @@ async fn put_options(
     state
         .save_with_event(&updated, ServerEvent::OptionsChanged)
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let saved = state.raw.lock().unwrap().clone();
-    canvas_response(&saved, &state.canvas_path)
+    state.canvas_snapshot()
 }
 
 /// Tag changes for `UpdateNodeRequest::tags`: `remove` first, then `add`
@@ -4619,6 +4660,8 @@ struct UpdateNodeRequest {
     /// node's current text is a `409` carrying that current text and
     /// revision (see `body_conflict`); there is no way to skip the check.
     base_rev: Option<String>,
+    /// Optional original title for atomic editor saves.
+    base_title: Option<String>,
     /// Changes to the node's extra incoming edges (`meshfox:edge
     /// from="..."`), applied to the edges it has right now — never a
     /// replacement list, for the same reason as `tags`. `None` leaves them
@@ -4766,7 +4809,7 @@ async fn update_node(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(req): Json<UpdateNodeRequest>,
-) -> Result<Json<Canvas>, ApiError> {
+) -> Result<Json<VersionedCanvas>, ApiError> {
     let _guard = state.begin_mutation().await;
     let primary_raw = state.raw.lock().unwrap().clone();
     let located = locate_node(&primary_raw, &id)?;
@@ -4861,8 +4904,14 @@ async fn update_node(
             ));
         };
         let current_rev = meshfox_core::body_rev(&initial_node.text);
-        if base_rev != current_rev {
-            return Err(body_conflict(&initial_node.text, &current_rev));
+        if base_rev != current_rev
+            || req.base_title.as_ref().is_some_and(|title| title != &initial_node.title)
+        {
+            let mut error = body_conflict(&initial_node.text, &current_rev);
+            let mut payload: serde_json::Value = serde_json::from_str(&error.1).unwrap();
+            payload["currentTitle"] = serde_json::json!(initial_node.title);
+            error.1 = payload.to_string();
+            return Err(error);
         }
     }
     if initial_node.node_type == NodeType::Include && req.text.is_some() {
@@ -5132,8 +5181,7 @@ async fn update_node(
 
     let op = node_upserted_event(&raw, &state.canvas_path, &local_id);
     commit_located(&state, &located, &raw, op)?;
-    let response_raw = state.raw.lock().unwrap().clone();
-    canvas_response(&response_raw, &state.canvas_path)
+    state.canvas_snapshot()
 }
 
 /// Append against the worker's current body in one request, without a
@@ -5202,7 +5250,7 @@ async fn update_block_attrs(
     State(state): State<Arc<AppState>>,
     Path((id, block_name)): Path<(String, String)>,
     Json(req): Json<UpdateBlockAttrsRequest>,
-) -> Result<Json<Canvas>, ApiError> {
+) -> Result<Json<VersionedCanvas>, ApiError> {
     let _guard = state.begin_mutation().await;
     if req.interpreter.is_some() && req.clear_interpreter {
         return Err(ApiError(
@@ -5262,8 +5310,7 @@ async fn update_block_attrs(
 
     let op = node_upserted_event(&updated, &state.canvas_path, &located.local_id);
     commit_located(&state, &located, &updated, op)?;
-    let response_raw = state.raw.lock().unwrap().clone();
-    canvas_response(&response_raw, &state.canvas_path)
+    state.canvas_snapshot()
 }
 
 #[derive(Debug, Serialize)]
@@ -5918,7 +5965,7 @@ async fn remove_node(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Query(query): Query<DeleteNodeQuery>,
-) -> Result<Json<Canvas>, ApiError> {
+) -> Result<Json<VersionedCanvas>, ApiError> {
     let _guard = state.begin_mutation().await;
     let primary_raw = state.raw.lock().unwrap().clone();
     let located = locate_node(&primary_raw, &id)?;
@@ -5955,8 +6002,7 @@ async fn remove_node(
         }
     };
     commit_located(&state, &located, &updated, op)?;
-    let response_raw = state.raw.lock().unwrap().clone();
-    canvas_response(&response_raw, &state.canvas_path)
+    state.canvas_snapshot()
 }
 
 #[derive(Debug, Deserialize)]
@@ -5976,7 +6022,7 @@ async fn reparent_node(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(req): Json<ReparentNodeRequest>,
-) -> Result<Json<Canvas>, ApiError> {
+) -> Result<Json<VersionedCanvas>, ApiError> {
     let _guard = state.begin_mutation().await;
     let primary_raw = state.raw.lock().unwrap().clone();
     let located = locate_node(&primary_raw, &id)?;
@@ -6078,8 +6124,7 @@ async fn reparent_node(
     }
     let op = node_upserted_event(&updated, &state.canvas_path, local_id);
     commit_located(&state, &located, &updated, op)?;
-    let response_raw = state.raw.lock().unwrap().clone();
-    canvas_response(&response_raw, &state.canvas_path)
+    state.canvas_snapshot()
 }
 
 #[derive(Debug, Deserialize)]
@@ -6104,7 +6149,7 @@ async fn move_sibling(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(req): Json<MoveSiblingRequest>,
-) -> Result<Json<Canvas>, ApiError> {
+) -> Result<Json<VersionedCanvas>, ApiError> {
     let _guard = state.begin_mutation().await;
     let (target_id, position) = match (req.before, req.after) {
         (Some(t), None) => (t, mdcanvas::MoveSiblingPosition::Before),
@@ -6164,8 +6209,7 @@ async fn move_sibling(
         None => ServerEvent::Changed,
     };
     commit_located(&state, &located, &updated, op)?;
-    let response_raw = state.raw.lock().unwrap().clone();
-    canvas_response(&response_raw, &state.canvas_path)
+    state.canvas_snapshot()
 }
 
 #[derive(Debug, Deserialize)]
@@ -6186,7 +6230,7 @@ async fn rename_node_id(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(req): Json<RenameNodeIdRequest>,
-) -> Result<Json<Canvas>, ApiError> {
+) -> Result<Json<VersionedCanvas>, ApiError> {
     let _guard = state.begin_mutation().await;
     let primary_raw = state.raw.lock().unwrap().clone();
     let located = locate_node(&primary_raw, &id)?;
@@ -6220,8 +6264,7 @@ async fn rename_node_id(
             new_id: req.new_id.clone(),
         },
     )?;
-    let response_raw = state.raw.lock().unwrap().clone();
-    canvas_response(&response_raw, &state.canvas_path)
+    state.canvas_snapshot()
 }
 
 #[derive(Debug, Serialize)]
@@ -6233,7 +6276,7 @@ struct ClearNodeIdResponse {
     /// slug if the title's since diverged — the client has no other way to
     /// learn it, since it isn't necessarily the id it asked to clear.
     id: String,
-    canvas: Canvas,
+    canvas: VersionedCanvas,
 }
 
 /// Removes node `id`'s own explicit `id="..."` attribute
@@ -6266,8 +6309,7 @@ async fn clear_node_id(
             new_id: local_new_id.clone(),
         },
     )?;
-    let response_raw = state.raw.lock().unwrap().clone();
-    let Json(canvas) = canvas_response(&response_raw, &state.canvas_path)?;
+    let Json(canvas) = state.canvas_snapshot()?;
     Ok(Json(ClearNodeIdResponse {
         id: local_new_id,
         canvas,
@@ -10576,6 +10618,8 @@ async fn build_state_with(
         tables,
         read_only,
         raw: Mutex::new(raw),
+        snapshot_version: Mutex::new((0, String::new())),
+        server_session: uuid::Uuid::new_v4().to_string(),
         mutation_lock: tokio::sync::Mutex::new(()),
         runs: Mutex::new(HashMap::new()),
         vars_cache: Mutex::new(vars_cache),
@@ -11218,6 +11262,7 @@ mod node_op_broadcast_tests {
             target: None,
             text: Some("new body a".to_string()),
             base_rev: Some(current_body_rev(&state, "a")),
+            base_title: None,
             edges: None,
             display: None,
             lang: None,
@@ -11558,6 +11603,62 @@ mod node_op_broadcast_tests {
             value["baseRev"] = serde_json::json!(rev);
         }
         serde_json::from_value(value).unwrap()
+    }
+
+    #[tokio::test]
+    async fn explicit_editor_save_is_atomic_for_title_and_body() {
+        let path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(path.clone(), false, None).await.unwrap();
+        let Json(before) = get_canvas(State(state.clone())).await.unwrap();
+        let title = before.node("a").unwrap().title.clone();
+        let mut request = text_patch("new body", Some(&current_body_rev(&state, "a")));
+        request.title = Some("New title".into());
+        request.base_title = Some(title.clone());
+        let Json(saved) = update_node(State(state.clone()), Path("a".into()), Json(request)).await.unwrap();
+        assert_eq!(saved.node("a").unwrap().title, "New title");
+        assert_eq!(saved.node("a").unwrap().text, "new body");
+        assert!(saved.canvas_version > before.canvas_version);
+        assert_eq!(saved.server_session, before.server_session);
+
+        // A title-only change elsewhere must invalidate an editor save too.
+        let current = current_body_rev(&state, "a");
+        let raw_before = std::fs::read_to_string(&path).unwrap();
+        let mut stale = text_patch("must not land", Some(&current));
+        stale.title = Some("Must not land".into());
+        stale.base_title = Some(title);
+        let error = update_node(State(state.clone()), Path("a".into()), Json(stale)).await.err().unwrap();
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        let payload: serde_json::Value = serde_json::from_str(&error.1).unwrap();
+        assert_eq!(payload["currentTitle"], "New title");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), raw_before);
+
+        // A stale body must not partially commit its accompanying title.
+        let mut stale = text_patch("must not land", Some(&before.node("a").unwrap().body_rev.clone().unwrap()));
+        stale.title = Some("Must not land".into());
+        stale.base_title = Some("New title".into());
+        assert_eq!(update_node(State(state.clone()), Path("a".into()), Json(stale)).await.err().unwrap().0, StatusCode::CONFLICT);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), raw_before);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn canvas_snapshot_versions_cover_external_edits_and_worker_restart() {
+        let path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(path.clone(), false, None).await.unwrap();
+        let Json(first) = get_canvas(State(state.clone())).await.unwrap();
+        let Json(same) = get_canvas(State(state.clone())).await.unwrap();
+        assert_eq!(first.canvas_version, same.canvas_version);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, mdcanvas::set_node_body(&raw, "a", "external").unwrap()).unwrap();
+        { let _guard = state.begin_mutation().await; }
+        let Json(external) = get_canvas(State(state.clone())).await.unwrap();
+        assert!(external.canvas_version > first.canvas_version);
+        assert_eq!(external.node("a").unwrap().text, "external");
+        let restarted = build_state(path.clone(), false, None).await.unwrap();
+        let Json(restarted) = get_canvas(State(restarted)).await.unwrap();
+        assert_ne!(restarted.server_session, external.server_session);
+        assert_eq!(restarted.canvas_version, 1);
+        let _ = std::fs::remove_file(path);
     }
 
     /// There is no way to replace a body without saying which version of it
@@ -12246,6 +12347,7 @@ mod undo_log_recording_tests {
             target: None,
             text: Some("new body a".to_string()),
             base_rev: Some(current_body_rev(&state, "a")),
+            base_title: None,
             edges: None,
             display: None,
             lang: None,
@@ -13376,9 +13478,9 @@ mod reparent_position_tests {
         path
     }
 
-    fn expect_ok(result: Result<Json<Canvas>, ApiError>) -> Canvas {
+    fn expect_ok(result: Result<Json<VersionedCanvas>, ApiError>) -> Canvas {
         match result {
-            Ok(Json(canvas)) => canvas,
+            Ok(Json(canvas)) => canvas.canvas,
             Err(e) => panic!("request failed: {}", e.1),
         }
     }
@@ -13662,6 +13764,7 @@ mod include_edit_tests {
             target: None,
             text: None,
             base_rev: None,
+            base_title: None,
             edges: None,
             display: None,
             lang: None,
@@ -13682,14 +13785,14 @@ mod include_edit_tests {
         }
     }
 
-    fn expect_ok(result: Result<Json<Canvas>, ApiError>) -> Canvas {
+    fn expect_ok(result: Result<Json<VersionedCanvas>, ApiError>) -> Canvas {
         match result {
-            Ok(Json(canvas)) => canvas,
+            Ok(Json(canvas)) => canvas.canvas,
             Err(e) => panic!("request failed: {}", e.1),
         }
     }
 
-    fn expect_err(result: Result<Json<Canvas>, ApiError>) -> ApiError {
+    fn expect_err(result: Result<Json<VersionedCanvas>, ApiError>) -> ApiError {
         match result {
             Ok(_) => panic!("expected an error"),
             Err(e) => e,
