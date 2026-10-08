@@ -1180,6 +1180,237 @@ a {
 /* A `file` node's `display: "code"` body — see `FileCodePreview` in
  * MeshNode.tsx. Scrolls within its own box rather than growing the node,
  * same as `.mesh-node-body`. */
+/* `display="table"` file node — see TablePreview.tsx. Fills the node (or the
+ * expanded panel) and scrolls inside itself; every colour comes from the
+ * theme variables, so light/dark follow the rest of the app. */
+.mesh-table {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  font-size: 0.78rem;
+}
+/* `.mesh-expand-body` isn't a flex container, so give the table its height
+ * explicitly when it's the panel's content. */
+.mesh-expand-body > .mesh-table {
+  height: 100%;
+}
+.mesh-table-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.25rem 0.4rem;
+  border-bottom: 1px solid var(--node-border);
+  font-size: 0.75rem;
+}
+.mesh-table-status {
+  flex: 1;
+  min-width: 0;
+  opacity: 0.75;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mesh-table-search,
+.mesh-table-filter {
+  font: inherit;
+  box-sizing: border-box;
+  padding: 0.12rem 0.4rem;
+  border: 1px solid var(--node-border);
+  border-radius: 4px;
+  background: var(--code-bg);
+  color: var(--fg);
+}
+.mesh-table-search {
+  width: 11rem;
+  min-width: 5rem;
+}
+.mesh-table-filter {
+  width: 100%;
+  font-size: 0.72rem;
+  background: var(--node-bg);
+}
+.mesh-table-search:disabled,
+.mesh-table-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.mesh-table-btn {
+  font: inherit;
+  padding: 0.12rem 0.5rem;
+  border: 1px solid var(--node-border);
+  border-radius: 4px;
+  background: var(--code-bg);
+  color: var(--fg);
+  cursor: pointer;
+}
+.mesh-table-btn.is-on {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.mesh-table-banner {
+  padding: 0.25rem 0.5rem;
+  background: var(--syntax-tint);
+  font-size: 0.72rem;
+}
+.mesh-table-banner.is-error,
+.mesh-table-error {
+  color: var(--fail);
+}
+.mesh-table-scroller {
+  flex: 1;
+  min-height: 6rem;
+  /* A container with no height of its own (an auto-sized node) would
+   * otherwise let the scroller grow to the whole scroll track. */
+  max-height: 80vh;
+  overflow: auto;
+  position: relative;
+  background: var(--node-bg);
+  user-select: none;
+  outline: none;
+}
+.mesh-table-scroller:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+.mesh-table-head {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  box-sizing: border-box;
+  background: var(--code-head-bg);
+  border-bottom: 1px solid var(--node-border);
+}
+.mesh-table-head-row {
+  display: flex;
+}
+.mesh-table-hcell {
+  position: relative;
+  flex: none;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 0.15rem 0.45rem;
+  overflow: hidden;
+  border-right: 1px solid var(--node-border);
+}
+.mesh-table-hcell.is-sortable {
+  cursor: pointer;
+}
+.mesh-table-hcell.is-sortable:hover {
+  background: var(--syntax-tint);
+}
+.mesh-table-hname {
+  padding-right: 1.5rem;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mesh-table-htype {
+  font-size: 0.64rem;
+  opacity: 0.55;
+}
+.mesh-table-sort {
+  position: absolute;
+  top: 0.3rem;
+  right: 0.5rem;
+  font-size: 0.7rem;
+  color: var(--accent);
+}
+.mesh-table-resizer {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 6px;
+  cursor: col-resize;
+}
+.mesh-table-track {
+  position: relative;
+}
+.mesh-table-layer {
+  position: sticky;
+  width: 100%;
+  overflow: hidden;
+}
+.mesh-table-row {
+  position: absolute;
+  left: 0;
+  display: flex;
+}
+.mesh-table-row.is-odd {
+  background: color-mix(in srgb, var(--code-bg) 60%, transparent);
+}
+.mesh-table-cell {
+  flex: none;
+  box-sizing: border-box;
+  height: 26px;
+  padding: 0 0.45rem;
+  line-height: 26px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  border-right: 1px solid color-mix(in srgb, var(--node-border) 50%, transparent);
+  font-variant-numeric: tabular-nums;
+}
+.mesh-table-cell.is-number {
+  text-align: right;
+}
+.mesh-table-cell.is-selected {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.mesh-table-gutter {
+  text-align: right;
+  opacity: 0.5;
+}
+.mesh-table-row.is-loading .mesh-table-cell:not(.mesh-table-gutter)::after {
+  content: "";
+  display: block;
+  width: 55%;
+  height: 0.5rem;
+  margin-top: 0.55rem;
+  border-radius: 3px;
+  background: var(--node-border);
+  opacity: 0.35;
+}
+.mesh-table-null {
+  font-size: 0.7rem;
+  font-style: italic;
+  opacity: 0.45;
+}
+.mesh-table-empty {
+  position: sticky;
+  left: 0;
+  padding: 1rem;
+  opacity: 0.6;
+}
+.mesh-table-detail {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  max-height: 5.5rem;
+  overflow: auto;
+  padding: 0.25rem 0.5rem;
+  border-top: 1px solid var(--node-border);
+  font-size: 0.75rem;
+  user-select: text;
+}
+.mesh-table-detail-where {
+  flex: none;
+  opacity: 0.6;
+}
+.mesh-table-detail-value {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.mesh-table-hint {
+  opacity: 0.5;
+}
+
 .mesh-file-code-preview {
   flex: 1;
   /* See `.mesh-node-body`'s identical rule/comment just above — same flex

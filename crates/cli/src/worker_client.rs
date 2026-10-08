@@ -767,6 +767,124 @@ pub async fn get_node_file_content(port: u16, node_id: &str) -> Result<(String, 
     Ok((body.content, body.truncated))
 }
 
+/// One column of a `display="table"` node, as `GET /api/nodes/:id/table`
+/// reports it (see `meshfox_server::tables::Column`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct TableColumnDto {
+    pub index: usize,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub col_type: String,
+    /// `number`, `text`, `temporal`, `bool` or `other`.
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct TableFailureDto {
+    /// `duckdb-missing`, `cache`, `import` or `limit`.
+    pub kind: String,
+    pub message: String,
+}
+
+/// `GET /api/nodes/:id/table` — the schema and import state of a
+/// `display="table"` node.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableMetaDto {
+    /// `importing`, `ready` or `failed`.
+    pub state: String,
+    pub error: Option<TableFailureDto>,
+    pub columns: Vec<TableColumnDto>,
+    pub total_rows: Option<u64>,
+    pub file_size: u64,
+    /// Changes whenever the target file does.
+    pub version: String,
+    /// `true` while the columns come from a quick read of the file itself,
+    /// before the import: sorting/filtering aren't available yet.
+    pub preview: bool,
+}
+
+/// `GET /api/nodes/:id/table/rows` — one window of rows. A cell is `None`
+/// for SQL NULL and DuckDB's text rendering otherwise.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableRowsDto {
+    pub version: String,
+    pub offset: usize,
+    pub rows: Vec<Vec<Option<String>>>,
+    pub matched_rows: Option<u64>,
+}
+
+async fn table_get(
+    port: u16,
+    node_id: &str,
+    tail: &[&str],
+    query: &[(&str, String)],
+) -> Result<reqwest::Response, String> {
+    let mut url = node_url(port, node_id)?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| "couldn't build the worker's table URL".to_string())?;
+        segments.extend(tail);
+    }
+    if !query.is_empty() {
+        url.query_pairs_mut()
+            .extend_pairs(query.iter().map(|(k, v)| (*k, v.as_str())));
+    }
+    let res = client()
+        .get(url)
+        .timeout(time_limit(WHOLE_DOCUMENT))
+        .send()
+        .await
+        .map_err(|e| describe(&e))?;
+    if res.status().is_success() {
+        return Ok(res);
+    }
+    let status = res.status();
+    let text = res.text().await.unwrap_or_default();
+    Err(if text.is_empty() {
+        status.to_string()
+    } else {
+        text
+    })
+}
+
+/// `GET /api/nodes/:id/table` — starts the background import on the first
+/// call; a missing `duckdb` comes back as `state: "failed"` rather than an
+/// `Err`. See SPEC.md "Table previews".
+pub async fn get_table_meta(port: u16, node_id: &str) -> Result<TableMetaDto, String> {
+    table_get(port, node_id, &["table"], &[])
+        .await?
+        .json()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// `GET /api/nodes/:id/table/rows` for `view` (sort/filters/search). An
+/// invalid view (a filter value the column can't hold, say) is an `Err`
+/// carrying the worker's message.
+pub async fn get_table_rows(
+    port: u16,
+    node_id: &str,
+    offset: usize,
+    limit: usize,
+    view: &meshfox_server::tables::ViewSpec,
+) -> Result<TableRowsDto, String> {
+    let mut query = vec![("offset", offset.to_string()), ("limit", limit.to_string())];
+    if !view.is_empty() {
+        query.push((
+            "view",
+            serde_json::to_string(view).map_err(|e| e.to_string())?,
+        ));
+    }
+    table_get(port, node_id, &["table", "rows"], &query)
+        .await?
+        .json()
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// A confined file's raw bytes, off the worker's own static-asset fallback
 /// route (`serve_canvas_relative_file`/`serve_embedded` in
 /// `crates/server/src/lib.rs`, wired as the router's catch-all `fallback`) —

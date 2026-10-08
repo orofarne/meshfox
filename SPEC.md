@@ -159,11 +159,15 @@ manual path, not gated by it.
   right after the link's closing `)` is still rejected — a caption has to
   be its own paragraph. A `file` node also accepts two optional display
   attributes on its `meshfox:node` line:
-  - `display="link"` (default) or `display="code"` — `code` shows the
+  - `display="link"` (default), `display="code"` or `display="table"` — `code` shows the
     target's own file content as a read-only, non-runnable syntax-highlighted
     preview instead of a plain clickable link. The file is read fresh from
     disk on every view, confined to the canvas's own directory tree —
     never written back.
+  - `display="table"` — shows the target as an interactive, read-only
+    table (CSV, TSV, Parquet, JSON lines, compressed variants, ... —
+    anything the `duckdb` CLI reads), windowed so huge files stay usable.
+    Requires the `duckdb` executable; see "Table previews" below.
   - `lang="..."` — syntax-highlighting language hint for `display="code"`
     (e.g. `lang="rust"`). Optional; when omitted, the language is guessed
     from the target's file extension. Ignored when `display` isn't `code`.
@@ -261,6 +265,115 @@ directly, or Source mode's file picker, to change it).
 A `file` node's `display="code"` is the read-only-preview counterpart for
 a target you want to *show* without folding its content into this node's
 own body at all — see "Node types" above.
+
+## Table previews
+
+`display="table"` on a `file` node shows its target as a read-only table:
+a virtualized grid in the web UI and a scrollable table in the terminal
+viewer, with sorting, per-column filters and a text search. Nothing is ever
+written back to the file — edit it with any external editor; the preview
+notices the change (size/mtime) and reloads.
+
+```
+<!-- meshfox:node type="file" display="table" -->
+
+[sales](./data/sales.parquet)
+```
+
+**Requires the `duckdb` command-line tool.** meshfox never downloads or
+installs it. It's looked up in this order: the `MESHFOX_DUCKDB` environment
+variable, `duckdb_path` under `[tables]` in `.meshfox/config.toml`, `PATH`,
+then the usual install locations (`~/.duckdb/cli/latest/duckdb`,
+`/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`). A path set explicitly
+that doesn't exist is an error naming it. When nothing is found the node
+shows a platform-neutral message ("DuckDB CLI not found ...") instead of a
+table; there is no fallback preview.
+
+**Formats.** Not restricted: the reader is chosen from the file name —
+`.parquet`/`.parq` read as Parquet, `.json`/`.jsonl`/`.ndjson` as JSON,
+everything else as delimited text with auto-detected dialect and types
+(a trailing `.gz`/`.zst` is looked through). If type inference over the
+sample fails on a later row, the file is read again with every column as
+text. The target is confined to the canvas directory, like `display="code"`.
+
+**How it works.** The worker keeps one long-lived `duckdb` process per
+table node over a cache database. Text-like files are imported once, in the
+background (until then the first 200 rows are read straight from the file and
+sorting/filtering aren't available yet); Parquet is a view over the file
+itself, with no copy. A sorted/filtered/searched view is materialized once
+and then paged cheaply. The client never sends SQL: a view is a list of
+sort keys, filters and a search string, whose columns are indexes checked
+against the table's own columns and whose values are quoted as literals.
+After loading, the process is cut off from the file system and network
+(only the source file of a Parquet view and its cache directory stay
+reachable) and its settings are locked. Cells longer than 10,000
+characters are cut in the preview; values arrive as text, so no precision
+is lost to JSON.
+
+**Cache.** Under `<canvas dir>/.meshfox/tables/`, one directory per table,
+named after a hash of (path, size, mtime) so a changed file re-imports and
+its stale entry is removed. `[tables] cache_max_bytes` in config (default
+4 GiB) bounds the cache including DuckDB's spill files: the least recently
+used tables not being imported are evicted past it, and a single table that
+alone doesn't fit is refused with an error naming that key. In a read-only
+canvas the cache lives in a per-process directory under the system temp dir
+instead (see "Read-only canvases"); if that can't be created the table
+fails with an error — there is no in-memory fallback.
+
+**In the terminal viewer** (`meshfox tui`) a table node shows its status line
+(`1,234 rows × 5 cols`, or the importing note), the header and the first ten
+rows inline under the node's title, cut to the pane's width. `Enter` on the
+node opens it **full screen**: `j`/`k`/arrows and `h`/`l` move the cursor,
+`PgUp`/`PgDn` and `Ctrl-u`/`Ctrl-d` page, `g`/`G` (or `Home`/`End`) jump to the
+first/last row, `0`/`$` to the first/last column; `s` sorts by the cursor's
+column (none → ascending → descending; `S` adds it as a further key), `/`
+searches every column, `f` filters the cursor's column (the same little
+language as the web grid: `text`, `>10 >=10 <10 <=10`, `=x !=x`, `^starts
+$ends ~contains`, `null`, `!null`), `F` clears that column's filter, `x`
+resets sorting, filters and search, `Enter` shows the cell's whole value,
+`y` copies it (OSC 52, so it works over ssh), `q`/`Esc` closes. The mouse
+wheel scrolls (sideways wheel moves by column), a click on a header sorts by
+that column (Shift adds a key), a click on a cell moves the cursor. Sorting,
+filtering and search wait for the import to finish; a rejected view (a
+filter value the column can't hold) shows the worker's message under the grid.
+
+The terminal viewer reads **everything through the worker**, never off disk:
+that goes for a `display="code"` node's content too (`GET
+/api/nodes/:id/file-content`, fetched in the background — the pane says
+"loading preview…" until it lands, and a copy older than two seconds is
+refetched in the background the next time the pane is drawn, so an edited file
+shows up). One consequence: the worker's confinement to the canvas directory
+now applies to `display="code"` in the terminal viewer as well.
+
+**Static export and PDF.** `meshfox static` and `meshfox pdf` render a table node
+as a plain HTML grid of its first 100 rows under a caption (`1,234 rows × 5
+cols · first 100 shown`), with number columns right-aligned and NULLs marked —
+the interactive grid is for the live UIs. Both fetch it through the worker, so
+they need `duckdb` too; they wait for the background import to finish (saying
+so on stderr). When a table can't be fetched (no `duckdb`, an unreadable file,
+a table over the cache limit, an import that doesn't finish within an hour) the
+command **fails** — exit status 1, naming each such node, its target and the
+reason — rather than exporting a page with a hole in it; a canvas with no table
+nodes never needs `duckdb`. `display="code"` in `meshfox pdf` is now read
+through the worker as `meshfox static` already did.
+See TEMPLATES.md for the markup a template can style.
+
+**API** (worker, `GET` only, so allowed on read-only canvases):
+
+- `/api/nodes/:id/table` — `{state: "importing"|"ready"|"failed", error,
+  columns: [{index, name, type, kind}], totalRows, fileSize, mtimeMs,
+  version, preview}`. Starts the import on first call; poll while
+  `importing`. A missing `duckdb` or an unusable cache is `200` with
+  `state: "failed"` and `error: {kind, message}` (`duckdb-missing`,
+  `cache`, `import`, `limit`).
+- `/api/nodes/:id/table/rows?offset=&limit=&view=` — one window
+  (`limit` ≤ 1000) as `{rows: [[string|null, ...]], matchedRows, totalRows,
+  version, state}`. `view` is JSON: `{"sort": [{"column": 2, "desc": true}],
+  "filters": [{"column": 0, "op": "ge", "value": "10"}], "search": "text"}`.
+  Ops: `eq ne lt le gt ge contains startswith endswith isnull notnull`
+  (comparisons use DuckDB's own typing of the value against the column;
+  text ops are case-insensitive). A value the column can't hold is a `400`
+  with DuckDB's message.
 
 ## Runnable code fences
 
@@ -1165,10 +1278,14 @@ lifetime.
   but an answer is never written back, so it's asked for again next time.
 - **Nothing is persisted into the file.** A `cache`d block's output stays
   in the session; the run itself is not an error.
-- **The one disk exception**: a `python_venv` block's venv lives in an
-  owner-only directory under the system temp dir
-  (`meshfox-readonly-<hash of the canvas path>/<file>.venv`), reused across
-  runs and cleaned up by the system, instead of `.meshfox/<file>.venv`.
+- **The disk exceptions**: both live under an owner-only directory in the
+  system temp dir, `meshfox-readonly-<hash of the canvas path>/`.
+  A `python_venv` block's venv is `<file>.venv` there, reused across runs
+  and cleaned up by the system, instead of `.meshfox/<file>.venv`.
+  `display="table"` caches are `tables-<pid>/` there (see "Table previews"):
+  per worker, because several read-only workers may serve one canvas and a
+  DuckDB database has a single writer; removed when the worker exits, and
+  the directories of dead workers are swept the next time one starts.
 - **Config is still read** — `<canvas_root>/.meshfox/config.toml` and
   `syntax/` are read-only inputs, as is the global `~/.meshfox/`.
 - **Edits are refused.** The worker answers every request that would

@@ -525,6 +525,50 @@ summary.node-title::before {
   text-align: left;
 }
 
+/* `display="table"` file node: the head of the table as a plain grid. */
+.file-table-status {
+  color: var(--muted);
+  font-size: 0.75rem;
+  margin: 0 0 0.35rem;
+}
+
+.file-table-scroll {
+  overflow: auto;
+  max-height: 28rem;
+}
+
+.file-table-grid {
+  width: auto;
+}
+
+.file-table-grid th {
+  position: sticky;
+  top: 0;
+  background: var(--code-bg);
+}
+
+.file-table-grid .type {
+  display: block;
+  font-weight: 400;
+  font-size: 0.65rem;
+  color: var(--muted);
+}
+
+.file-table-grid .num,
+.file-table-grid .row-num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.file-table-grid .row-num,
+.file-table-grid .null {
+  color: var(--muted);
+}
+
+.file-table-grid .null {
+  font-style: italic;
+}
+
 .node-body sub,
 .node-body sup {
   font-size: 0.75em;

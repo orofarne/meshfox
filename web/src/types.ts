@@ -87,8 +87,9 @@ export interface CanvasNode {
    * `text` node's body is. */
   caption?: string;
   /** file-node only: how the target is shown — a plain link (default,
-   * absent here) or a read-only code preview of the target file's content. */
-  display?: "link" | "code";
+   * absent here), a read-only code preview of the target file's content, or
+   * an interactive read-only table (needs the `duckdb` CLI). */
+  display?: "link" | "code" | "table";
   /** file-node only: syntax-highlighting language hint for display="code";
    * absent means auto-detect from the target's file extension. */
   lang?: string;

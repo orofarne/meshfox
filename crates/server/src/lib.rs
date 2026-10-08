@@ -74,6 +74,7 @@ mod session_state;
 /// `pub` so `meshfox-cli` can reuse the same async spawn/kill primitives
 /// for `meshfox run`'s real-time output — see its `main.rs`.
 pub mod stream_exec;
+pub mod tables;
 /// Webui-only multi-viewer registry for a `tty` block's own live pty
 /// session — see its own module doc comment.
 mod tty_registry;
@@ -119,6 +120,9 @@ pub fn find_web_asset(prefix: &str, suffix: &str) -> Option<Vec<u8>> {
 
 struct AppState {
     canvas_path: PathBuf,
+    /// `display="table"` sessions (one `duckdb` child per table node) and
+    /// their cache directory — see `tables`.
+    tables: tables::TableManager,
     /// The canvas (or the directory its state would live in) can't be
     /// written, so this worker serves it read-only: running blocks works,
     /// but nothing is ever written to the canvas file, and its session state
@@ -5376,6 +5380,94 @@ async fn get_node_file_content(
     }))
 }
 
+/// Resolves a `display="table"` file node's target to a confined path (see
+/// `resolve_confined_target`).
+fn table_target(state: &AppState, id: &str) -> Result<std::path::PathBuf, ApiError> {
+    let primary_raw = state.raw.lock().unwrap().clone();
+    let located = locate_node(&primary_raw, id)?;
+    let canvas = parse_or_error(&located.raw)?;
+    let node = canvas
+        .node(&located.local_id)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}")))?;
+    if node.node_type != NodeType::File || node.display != Some(FileDisplay::Table) {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("node {id:?} is not a file node with display=\"table\""),
+        ));
+    }
+    let target = node.target.as_deref().ok_or_else(|| {
+        ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("node {id:?} has no target"),
+        )
+    })?;
+    resolve_confined_target(&state.canvas_path, target)
+}
+
+fn table_api_error(e: tables::TableError) -> ApiError {
+    let status = match &e {
+        tables::TableError::Target(_) => StatusCode::NOT_FOUND,
+        tables::TableError::BadRequest(_) | tables::TableError::Query(_) => {
+            StatusCode::BAD_REQUEST
+        }
+        tables::TableError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    ApiError(status, e.message())
+}
+
+/// `GET /api/nodes/:id/table` — schema and state of a `display="table"`
+/// file node (see `tables`). Starts the background import on first call;
+/// poll while `state` is `importing`. An unavailable `duckdb` or cache dir
+/// is `200` with `state: "failed"` and an `error` to show in place.
+async fn get_node_table(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<tables::TableMeta>, ApiError> {
+    let source = table_target(&state, &id)?;
+    state
+        .tables
+        .meta(&id, &source)
+        .await
+        .map(Json)
+        .map_err(table_api_error)
+}
+
+#[derive(Debug, Deserialize)]
+struct TableRowsQuery {
+    #[serde(default)]
+    offset: usize,
+    limit: Option<usize>,
+    /// JSON-encoded `tables::ViewSpec` (sort, filters, search); omitted for
+    /// the plain table.
+    view: Option<String>,
+}
+
+/// `GET /api/nodes/:id/table/rows?offset=&limit=&view=` — one window of a
+/// `display="table"` node's rows, optionally sorted/filtered/searched.
+async fn get_node_table_rows(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<TableRowsQuery>,
+) -> Result<Json<tables::RowsPage>, ApiError> {
+    let source = table_target(&state, &id)?;
+    let spec = match query.view.as_deref() {
+        None | Some("") => tables::ViewSpec::default(),
+        Some(raw) => serde_json::from_str(raw).map_err(|e| {
+            ApiError(StatusCode::BAD_REQUEST, format!("invalid view parameter: {e}"))
+        })?,
+    };
+    let session = state
+        .tables
+        .session(&id, &source)
+        .await
+        .map_err(table_api_error)?;
+    session
+        .rows(spec, query.offset, query.limit.unwrap_or(200))
+        .await
+        .map(Json)
+        .map_err(table_api_error)
+}
+
 /// One entry in `GET /api/syntax`'s listing — enough for the browser to
 /// know what's available and fetch each one's raw grammar via
 /// `GET /api/syntax/:name`. See `meshfox_core::syntax_dirs` for where these
@@ -10398,8 +10490,10 @@ async fn build_state_with(
         }
     }
 
+    let tables = tables::TableManager::new(&canvas_path, read_only);
     let state = Arc::new(AppState {
         canvas_path,
+        tables,
         read_only,
         raw: Mutex::new(raw),
         mutation_lock: tokio::sync::Mutex::new(()),
@@ -10456,6 +10550,8 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/nodes/:id/rename-id", post(rename_node_id))
         .route("/api/nodes/:id/clear-id", post(clear_node_id))
         .route("/api/nodes/:id/file-content", get(get_node_file_content))
+        .route("/api/nodes/:id/table", get(get_node_table))
+        .route("/api/nodes/:id/table/rows", get(get_node_table_rows))
         .route("/api/nodes/:id/run", get(run_file_node))
         .route("/api/nodes/:id/open", post(open_node_file))
         .route("/api/nodes/:id/open-folder", post(open_node_file_folder))
@@ -19740,5 +19836,140 @@ mod confirmation_tests {
         let state = build_state(path.clone(), false, None).await.unwrap();
         trigger_autorun(state, meshfox_core::BlockAddr::new("root", "cleanup")).await;
         assert!(!path.parent().unwrap().join("effects").exists());
+    }
+}
+
+#[cfg(test)]
+mod table_endpoint_tests {
+    use super::*;
+
+    const CANVAS: &str = concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "## Data\n<!-- meshfox:node id=\"data\" type=\"file\" display=\"table\" -->\n\n[d](./d.csv)\n\n",
+        "## Escape\n<!-- meshfox:node id=\"escape\" type=\"file\" display=\"table\" -->\n\n[x](../outside.csv)\n\n",
+        "## Plain\n<!-- meshfox:node id=\"plain\" type=\"file\" -->\n\n[d](./d.csv)\n",
+    );
+
+    fn duckdb_available() -> bool {
+        tables::locate_duckdb(std::path::Path::new(".")).is_ok()
+    }
+
+    /// A canvas in a directory of its own, next to a small CSV.
+    fn canvas_with_csv() -> (PathBuf, PathBuf) {
+        // The canvas lives in `<root>/canvas`, so `<root>/outside.csv` is a
+        // sibling it must not reach, private to this test.
+        let dir = std::env::temp_dir()
+            .join(format!("meshfox-table-test-{}", uuid::Uuid::new_v4()))
+            .join("canvas");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("doc.canvas.md");
+        std::fs::write(&path, CANVAS).unwrap();
+        let mut csv = String::from("id,name\n");
+        for i in 1..=50 {
+            csv.push_str(&format!("{i},row{i}\n"));
+        }
+        std::fs::write(dir.join("d.csv"), csv).unwrap();
+        std::fs::write(dir.parent().unwrap().join("outside.csv"), "a\n1\n").unwrap();
+        (dir, path)
+    }
+
+    async fn get_json(client: &reqwest::Client, url: String) -> (u16, serde_json::Value) {
+        let res = client.get(url).send().await.expect("request");
+        let status = res.status().as_u16();
+        let text = res.text().await.unwrap();
+        let body = serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text));
+        (status, body)
+    }
+
+    async fn wait_ready(client: &reqwest::Client, base: &str, id: &str) -> serde_json::Value {
+        for _ in 0..200 {
+            let (status, meta) = get_json(client, format!("{base}/api/nodes/{id}/table")).await;
+            assert_eq!(status, 200, "{meta}");
+            if meta["state"] != "importing" {
+                return meta;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("table never became ready");
+    }
+
+    #[tokio::test]
+    async fn schema_windows_sorting_and_errors_over_http() {
+        if !duckdb_available() {
+            eprintln!("skipping: no duckdb");
+            return;
+        }
+        let (dir, canvas_path) = canvas_with_csv();
+        let addr = spawn_test_server(canvas_path).await;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}");
+
+        let meta = wait_ready(&client, &base, "data").await;
+        assert_eq!(meta["state"], "ready");
+        assert_eq!(meta["totalRows"], 50);
+        assert_eq!(meta["columns"][1]["name"], "name");
+
+        let (status, page) = get_json(
+            &client,
+            format!("{base}/api/nodes/data/table/rows?offset=48&limit=10"),
+        )
+        .await;
+        assert_eq!(status, 200, "{page}");
+        assert_eq!(page["rows"].as_array().unwrap().len(), 2);
+        assert_eq!(page["rows"][0][1], "row49");
+        assert_eq!(page["matchedRows"], 50);
+
+        let view = r#"{"sort":[{"column":0,"desc":true}],"filters":[{"column":1,"op":"contains","value":"row4"}]}"#;
+        let url = reqwest::Url::parse_with_params(
+            &format!("{base}/api/nodes/data/table/rows"),
+            [("limit", "3"), ("view", view)],
+        )
+        .unwrap();
+        let (status, page) = get_json(&client, url.to_string()).await;
+        assert_eq!(status, 200, "{page}");
+        assert_eq!(page["matchedRows"], 11); // row4, row40..row49
+        assert_eq!(page["rows"][0][1], "row49");
+
+        let (status, body) = get_json(
+            &client,
+            format!("{base}/api/nodes/data/table/rows?view=not-json"),
+        )
+        .await;
+        assert_eq!(status, 400, "{body}");
+
+        // Not a table node, and a target outside the canvas directory.
+        let (status, _) = get_json(&client, format!("{base}/api/nodes/plain/table")).await;
+        assert_eq!(status, 422);
+        let (status, body) = get_json(&client, format!("{base}/api/nodes/escape/table")).await;
+        assert_eq!(status, 403, "{body}");
+
+        std::fs::remove_dir_all(dir.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn missing_duckdb_is_reported_in_place_with_a_neutral_message() {
+        let (dir, canvas_path) = canvas_with_csv();
+        std::fs::create_dir_all(dir.join(".meshfox")).unwrap();
+        std::fs::write(
+            dir.join(".meshfox/config.toml"),
+            "[tables]\nduckdb_path = \"/nonexistent/duckdb\"\n",
+        )
+        .unwrap();
+        let addr = spawn_test_server(canvas_path).await;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = reqwest::Client::new();
+        let (status, meta) =
+            get_json(&client, format!("http://{addr}/api/nodes/data/table")).await;
+        assert_eq!(status, 200, "{meta}");
+        assert_eq!(meta["state"], "failed");
+        assert_eq!(meta["error"]["kind"], "duckdb-missing");
+        let (status, _) = get_json(
+            &client,
+            format!("http://{addr}/api/nodes/data/table/rows"),
+        )
+        .await;
+        assert_eq!(status, 503);
+        std::fs::remove_dir_all(dir.parent().unwrap()).ok();
     }
 }

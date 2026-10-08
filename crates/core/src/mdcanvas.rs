@@ -423,6 +423,7 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
                 .and_then(|v| match v.as_str() {
                     "link" => Some(FileDisplay::Link),
                     "code" => Some(FileDisplay::Code),
+                    "table" => Some(FileDisplay::Table),
                     _ => None,
                 }),
             lang: seg.node_attrs.get("lang").cloned(),
@@ -3828,6 +3829,27 @@ Reused from Tests as well.
         assert!(rendered.contains("display=\"code\""));
         assert!(rendered.contains("lang=\"rust\""));
         assert_eq!(parse(&rendered).unwrap(), c);
+    }
+
+    #[test]
+    fn file_node_table_display_round_trips_and_is_settable() {
+        let doc = "# Root\n\n## Data\n<!-- meshfox:node type=\"file\" display=\"table\" -->\n\n[sales](./sales.parquet)\n";
+        let c = parse(doc).unwrap();
+        assert_eq!(c.node("data").unwrap().display, Some(FileDisplay::Table));
+        let rendered = render(&c);
+        assert!(rendered.contains("display=\"table\""));
+        assert_eq!(parse(&rendered).unwrap(), c);
+
+        let plain = "# Root\n\n## Data\n<!-- meshfox:node type=\"file\" -->\n\n[sales](./sales.csv)\n";
+        let meta = NodeMeta {
+            display: Some(FileDisplay::Table),
+            ..Default::default()
+        };
+        let updated = set_node_meta(plain, "data", &meta).unwrap();
+        assert_eq!(
+            parse(&updated).unwrap().node("data").unwrap().display,
+            Some(FileDisplay::Table)
+        );
     }
 
     #[test]

@@ -583,7 +583,8 @@ struct NodeMetaFields {
     /// `text` (the default), `file`, `link`, `group`, or `include`.
     #[arg(long = "type")]
     node_type: Option<String>,
-    /// `file`-node display mode: `link` (the default) or `code`.
+    /// `file`-node display mode: `link` (the default), `code` (a read-only code
+    /// preview) or `table` (an interactive, read-only table — needs the `duckdb` CLI).
     #[arg(long)]
     display: Option<String>,
     /// `file`-node syntax-highlighting language hint.
@@ -4300,7 +4301,10 @@ fn parse_display(s: &str) -> Result<FileDisplay, String> {
     match s {
         "link" => Ok(FileDisplay::Link),
         "code" => Ok(FileDisplay::Code),
-        _ => Err(format!("unknown --display {s:?} (expected link/code)")),
+        "table" => Ok(FileDisplay::Table),
+        _ => Err(format!(
+            "unknown --display {s:?} (expected link/code/table)"
+        )),
     }
 }
 
@@ -5491,6 +5495,104 @@ async fn fetch_code_previews(
     previews
 }
 
+/// Every `display="code"` and `display="table"` file-node in `canvas`, fetched
+/// through the worker at `port` — what `meshfox static` and `meshfox pdf` hand
+/// to `staticgen::build_with_previews`/`build_for_static_export`, so neither
+/// reads a target off disk (or runs `duckdb`) itself. A table that can't be
+/// fetched is an error, never a placeholder: every such node is collected
+/// (not just the first) as a ready-to-print line, so one run reports them all.
+async fn fetch_node_previews(
+    port: u16,
+    canvas: &Canvas,
+) -> Result<meshfox_core::staticgen::NodePreviews, Vec<String>> {
+    let mut previews = meshfox_core::staticgen::NodePreviews {
+        code: fetch_code_previews(port, canvas).await,
+        tables: HashMap::new(),
+    };
+    let mut errors = Vec::new();
+    for node in &canvas.nodes {
+        if node.node_type == NodeType::File && node.display == Some(FileDisplay::Table) {
+            match fetch_table_preview(port, &node.id).await {
+                Ok(table) => {
+                    previews.tables.insert(node.id.clone(), table);
+                }
+                Err(message) => errors.push(format!(
+                    "table node {:?} (target {}): {message}",
+                    node.id,
+                    node.target.as_deref().unwrap_or("none")
+                )),
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(previews)
+    } else {
+        Err(errors)
+    }
+}
+
+/// How long an export waits for one table's background import before giving
+/// up on it (the export then fails with that as the reason).
+const TABLE_IMPORT_WAIT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// One `display="table"` node's head: waits for the worker's background
+/// import to finish (the export has nothing to show until then), then takes
+/// the first `TABLE_PREVIEW_ROWS` rows of the plain, unsorted table. An `Err`
+/// is why the export must fail — no `duckdb`, an unreadable file, a table over
+/// the cache limit, a timed-out import.
+async fn fetch_table_preview(
+    port: u16,
+    node_id: &str,
+) -> Result<meshfox_core::staticgen::TablePreview, String> {
+    use meshfox_core::staticgen::{TablePreview, TablePreviewColumn, TABLE_PREVIEW_ROWS};
+    let started = std::time::Instant::now();
+    let mut announced = false;
+    let meta = loop {
+        let meta = worker_client::get_table_meta(port, node_id).await?;
+        match meta.state.as_str() {
+            "ready" => break meta,
+            "failed" => {
+                return Err(meta
+                    .error
+                    .map(|e| e.message)
+                    .unwrap_or_else(|| "table preview failed".to_string()))
+            }
+            _ => {
+                if started.elapsed() > TABLE_IMPORT_WAIT {
+                    return Err("timed out waiting for the table to be imported".to_string());
+                }
+                if !announced {
+                    eprintln!("meshfox: waiting for the import of table node {node_id:?}…");
+                    announced = true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+        }
+    };
+    let page = worker_client::get_table_rows(
+        port,
+        node_id,
+        0,
+        TABLE_PREVIEW_ROWS,
+        &meshfox_server::tables::ViewSpec::default(),
+    )
+    .await?;
+    Ok(TablePreview {
+        columns: meta
+            .columns
+            .into_iter()
+            .map(|c| TablePreviewColumn {
+                name: c.name,
+                col_type: c.col_type,
+                kind: c.kind,
+            })
+            .collect(),
+        total_rows: meta.total_rows.unwrap_or(page.rows.len() as u64),
+        rows: page.rows,
+        file_size: meta.file_size,
+    })
+}
+
 /// Every `node` subcommand's last step before handing a patch back to be
 /// written: make sure it still parses — the same validate-before-commit
 /// shape every mutating `/api/nodes*` server handler uses.
@@ -5691,14 +5793,21 @@ fn render_canvas_site<'a>(
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        let code_previews = fetch_code_previews(port, &canvas).await;
+        let previews = fetch_node_previews(port, &canvas)
+            .await
+            .unwrap_or_else(|errors| {
+                for e in &errors {
+                    eprintln!("meshfox static: {e}");
+                }
+                std::process::exit(1);
+            });
         let (site, assets, canvas_links) = meshfox_core::staticgen::build_for_static_export(
             &canvas,
             canvas_dir,
             &root_canvas_path,
             &current_slot,
             config.links_base_url.as_deref(),
-            Some(&code_previews),
+            Some(&previews),
             copy_files,
             recursive,
         )
@@ -5866,7 +5975,15 @@ fn pdf_cmd(canvas_path: &Path, out: Option<&Path>, force: bool, mode: Option<pdf
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let bytes = pdf::generate(&canvas, canvas_dir, mode).unwrap_or_else(|e| {
+    let previews = runtime
+        .block_on(fetch_node_previews(port, &canvas))
+        .unwrap_or_else(|errors| {
+            for e in &errors {
+                eprintln!("meshfox pdf: {e}");
+            }
+            std::process::exit(1);
+        });
+    let bytes = pdf::generate(&canvas, canvas_dir, mode, &previews).unwrap_or_else(|e| {
         eprintln!("meshfox pdf: {e}");
         std::process::exit(1);
     });
@@ -7114,6 +7231,7 @@ Shared body.
     fn parse_display_accepts_every_variant_and_rejects_garbage() {
         assert_eq!(parse_display("link").unwrap(), FileDisplay::Link);
         assert_eq!(parse_display("code").unwrap(), FileDisplay::Code);
+        assert_eq!(parse_display("table").unwrap(), FileDisplay::Table);
         assert!(parse_display("bogus").is_err());
     }
 }

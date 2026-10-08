@@ -173,6 +173,43 @@ fn session_max_output_bytes_from_table(table: &toml::Table) -> usize {
         .unwrap_or(DEFAULT_SESSION_MAX_OUTPUT_BYTES)
 }
 
+/// Default for [`tables_cache_max_bytes`] — 4 GiB.
+pub const DEFAULT_TABLES_CACHE_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// `[tables] cache_max_bytes = N` in `.meshfox/config.toml` (local or
+/// global, same merge as every other setting here) — the most disk the
+/// worker lets `display="table"` caches (imported `.duckdb` files plus
+/// DuckDB's spill files) take up; the least recently used unopened tables
+/// are evicted past it, and a single table that alone won't fit is refused
+/// with an error naming this key. Unset or not a non-negative integer falls
+/// back to [`DEFAULT_TABLES_CACHE_MAX_BYTES`].
+pub fn tables_cache_max_bytes(canvas_root: &Path) -> u64 {
+    tables_cache_max_bytes_from_table(&load(canvas_root))
+}
+
+fn tables_cache_max_bytes_from_table(table: &toml::Table) -> u64 {
+    table
+        .get("tables")
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("cache_max_bytes"))
+        .and_then(|v| v.as_integer())
+        .and_then(|n| u64::try_from(n).ok())
+        .unwrap_or(DEFAULT_TABLES_CACHE_MAX_BYTES)
+}
+
+/// `[tables] duckdb_path = "..."` in `.meshfox/config.toml` — the `duckdb`
+/// executable `display="table"` drives, when it isn't on `PATH` (see
+/// `meshfox_server::tables::locate_duckdb` for the full lookup order).
+pub fn tables_duckdb_path(canvas_root: &Path) -> Option<PathBuf> {
+    load(canvas_root)
+        .get("tables")
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("duckdb_path"))
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
 /// `[process_env]` in `.meshfox/config.toml` (local or global, same merge
 /// as every other setting here) — extra environment variables applied to
 /// every spawned block/interpreter process (`stream_exec::spawn_bash`/

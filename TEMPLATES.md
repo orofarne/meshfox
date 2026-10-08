@@ -47,7 +47,7 @@ reported instead of being silently ignored.
 |---|---|---|
 | `api_version` | integer, required | The template API version this template was written against: `1`. |
 | `base_url` | string | This site's own canonical absolute URL, with no trailing path (`https://example.com`). Prefix of every `<loc>` in the `--sitemap` file, which is refused without it. Not used to rewrite links. |
-| `links_base_url` | string | Prefixed onto a relative link that `static` does not copy into `--out` (a plain Markdown link, or a `file`/`link` node's target when it is not `display="code"`). Use it when the canvas's own files are published somewhere other than the site, e.g. a repository. Images and `display="code"` targets are unaffected. |
+| `links_base_url` | string | Prefixed onto a relative link that `static` does not copy into `--out` (a plain Markdown link, or a `file`/`link` node's target when it is not `display="code"`). Use it when the canvas's own files are published somewhere other than the site, e.g. a repository. Images and `display="code"`/`display="table"` targets are unaffected. |
 | `[[icons]]` | array of tables | `<link>` tags for the page's icons, exposed to templates as `icons`. Each has `rel` and `href` (required), and optional `sizes` and `type`. Each `href` should be a relative path to a file the template itself ships; nothing is fetched or copied from elsewhere. Unknown keys inside an `[[icons]]` table are an error too. |
 
 `base_url` and `links_base_url` differ on purpose: the first is where *this
@@ -176,6 +176,16 @@ responsibility; the markup it hard-codes, and its own scripts, are trusted.
   a node spliced in by an `include`, inside that include's directory).
 - A `file` node with `display="code"` has its target read once at export time
   and its content is part of `html_body` — there is nothing to fetch later.
+- A `file` node with `display="table"` becomes a plain HTML grid inside
+  `html_body` — a `div.file-table` holding a `p.file-table-status` caption
+  (`1,234 rows × 5 cols · first 100 shown`) and a
+  `table.file-table-grid` of the table's first 100 rows (`th`/`td` carry
+  `num` for number columns, `row-num` for the counter, `null` for SQL NULL;
+  each `th` ends in `span.type`). The rows come from the `duckdb` the worker
+  drives, so an export needs it: when a table can't be fetched (no `duckdb`,
+  an unreadable file, a table over the cache limit) the export fails with the
+  reason rather than leaving a placeholder. A template's stylesheet decides how
+  the grid looks.
 - Any other relative reference is left alone, or prefixed with
   `links_base_url` when the template sets one. `--copy-files` additionally
   copies a `file` node's target next to the site; with `--recursive` a

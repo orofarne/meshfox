@@ -218,6 +218,9 @@ pub enum FileDisplay {
     #[default]
     Link,
     Code,
+    /// Interactive, read-only table view of a tabular target (CSV, Parquet,
+    /// ...), served by the worker through the `duckdb` CLI — see SPEC.md.
+    Table,
 }
 
 impl FileDisplay {
@@ -229,6 +232,7 @@ impl FileDisplay {
         match self {
             FileDisplay::Link => "link",
             FileDisplay::Code => "code",
+            FileDisplay::Table => "table",
         }
     }
 }

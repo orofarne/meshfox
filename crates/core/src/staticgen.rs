@@ -58,8 +58,16 @@
 //!     is read once at build time and inlined directly into the HTML
 //!     (same confinement boundary, same binary-sniff/size-cap as the
 //!     server route — see `render_file_code`).
+//!   - a `file`-type node's `display="table"` preview — an interactive grid
+//!     in the live UI, backed by the worker's `duckdb` — becomes a plain
+//!     HTML `<table>` of the table's first `TABLE_PREVIEW_ROWS` rows with a
+//!     "N rows × M cols" caption (see `render_file_table`). Unlike a code
+//!     preview this can't be read here: the caller fetches it through the
+//!     worker ahead of time (`NodePreviews::tables`) and refuses to export at
+//!     all when it can't (no `duckdb`, an unreadable file) — a table is never
+//!     silently replaced by a placeholder.
 //!   - anything else relative (a plain Markdown link, or a `file`/`link`
-//!     node's own target when *not* `display="code"`) is left untouched
+//!     node's own target when *not* `display="code"`/`"table"`) is left untouched
 //!     unless `links_base_url` is set, in which case it's prefixed with it —
 //!     these were never resolved through the canvas's own directory to
 //!     begin with (an ordinary link can point anywhere, including outside
@@ -261,22 +269,24 @@ pub fn build(
     canvas_dir: &Path,
     links_base_url: Option<&str>,
 ) -> (SiteData, Vec<Asset>) {
-    build_with_code_previews(canvas, canvas_dir, links_base_url, None)
+    build_with_previews(canvas, canvas_dir, links_base_url, None)
 }
 
-/// Same as `build`, but every `display="code"` file-node's content is taken
-/// from `code_previews` (keyed by node id) instead of read off local disk —
-/// see `CodePreview`/`RenderCtx::code_previews`. Pass `None` for exactly
-/// `build`'s own behavior (local disk, `crate::file_read::preview`); pass
-/// `Some(map)` once every such node's content has already been fetched
-/// through a worker (`meshfox static`'s own worker-routed path) — a node
-/// with no entry in `map` renders the same fallback link `file_read::preview`
-/// returning `Err` produces locally, never a silent disk read.
-pub fn build_with_code_previews(
+/// Same as `build`, but every `display="code"` file-node's content and every
+/// `display="table"` file-node's rows are taken from `previews` (keyed by node
+/// id) instead of read off local disk — see `NodePreviews`/
+/// `RenderCtx::previews`. Pass `None` for exactly `build`'s own behavior
+/// (local disk, `crate::file_read::preview`, and a plain link for a table,
+/// which has no local reader); pass `Some(..)` once every such node has
+/// already been fetched through a worker (`meshfox static`/`meshfox pdf`) —
+/// a node with no entry renders the same fallback link
+/// `file_read::preview` returning `Err` produces locally, never a silent disk
+/// read.
+pub fn build_with_previews(
     canvas: &Canvas,
     canvas_dir: &Path,
     links_base_url: Option<&str>,
-    code_previews: Option<&std::collections::HashMap<String, CodePreview>>,
+    previews: Option<&NodePreviews>,
 ) -> (SiteData, Vec<Asset>) {
     // `copy_files`/`recursive` both `false` means `root_canvas_path`/`""`
     // (the root's own slot) are never actually consulted (no `file`-node
@@ -290,7 +300,7 @@ pub fn build_with_code_previews(
         &root_canvas_path,
         "",
         links_base_url,
-        code_previews,
+        previews,
         false,
         false,
     )
@@ -300,7 +310,7 @@ pub fn build_with_code_previews(
     (site, assets)
 }
 
-/// Same as `build_with_code_previews`, but also handles `--copy-files`
+/// Same as `build_with_previews`, but also handles `--copy-files`
 /// (`copy_files: true`) and, on top of that, `--recursive` (`recursive:
 /// true`, meaningless unless `copy_files` is also `true` — enforced by the
 /// caller, not here):
@@ -332,7 +342,7 @@ pub fn build_with_code_previews(
 /// whatever `CanvasLinkTarget::subdir` the *caller* discovered this canvas
 /// under) — both only matter when `recursive` is `true`.
 ///
-/// `copy_files: false` is exactly `build_with_code_previews` (an empty
+/// `copy_files: false` is exactly `build_with_previews` (an empty
 /// `Vec<CanvasLinkTarget>`, and can never itself produce an `Err`).
 #[allow(clippy::too_many_arguments)]
 pub fn build_for_static_export(
@@ -341,7 +351,7 @@ pub fn build_for_static_export(
     root_canvas_path: &Path,
     current_slot: &str,
     links_base_url: Option<&str>,
-    code_previews: Option<&std::collections::HashMap<String, CodePreview>>,
+    previews: Option<&NodePreviews>,
     copy_files: bool,
     recursive: bool,
 ) -> Result<(SiteData, Vec<Asset>, Vec<CanvasLinkTarget>), Vec<CopyFilesTargetError>> {
@@ -367,7 +377,7 @@ pub fn build_for_static_export(
         folded_ids: &folded_ids,
         foldable_ids: &foldable_ids,
         tag_colors: &tag_colors,
-        code_previews,
+        previews,
         copy_files,
         recursive,
     };
@@ -421,7 +431,10 @@ fn build_node_view(
     let base_dir = node.cwd(ctx.canvas_dir);
     let (html_body, target) = if node.node_type == NodeType::Group {
         (String::new(), None)
-    } else if node.node_type == NodeType::File && node.display == Some(FileDisplay::Code) {
+    } else if node.node_type == NodeType::File
+        && matches!(node.display, Some(FileDisplay::Code | FileDisplay::Table))
+    {
+        let is_table = node.display == Some(FileDisplay::Table);
         // `render_file_code` replaces the node's own body with the
         // target's file content — but an optional caption (see
         // `Node::caption`) is still part of that body, and still worth
@@ -440,7 +453,11 @@ fn build_node_view(
                 None,
             ));
         }
-        html.push_str(&render_file_code(node, ctx));
+        html.push_str(&if is_table {
+            render_file_table(node, ctx)
+        } else {
+            render_file_code(node, ctx)
+        });
         (html, node.target.clone())
     } else {
         // `--copy-files` only ever applies here, to a `file`-node whose
@@ -705,15 +722,15 @@ struct RenderCtx<'a> {
     /// tag-derived color, same as if none were declared) — `meshfox
     /// validate` is what surfaces that loudly, not a site/PDF export.
     tag_colors: &'a std::collections::HashMap<String, String>,
-    /// Pre-fetched `display="code"` file-node content, keyed by node id —
-    /// see `CodePreview`/`build_with_code_previews`. `None` means "read the
-    /// target off local disk instead" (`build`'s own default, and what
-    /// `meshfox pdf` still uses); `Some(map)` means every `display="code"`
-    /// node's content was already fetched through a worker ahead of time,
-    /// and a missing entry means the fetch itself resulted in the same
-    /// "can't preview this" outcome `file_read::preview`'s `Err` does
-    /// locally — never a silent fall-through to a local disk read.
-    code_previews: Option<&'a std::collections::HashMap<String, CodePreview>>,
+    /// Pre-fetched `display="code"`/`display="table"` file-node content,
+    /// keyed by node id — see `NodePreviews`/`build_with_previews`. `None`
+    /// means "read a code target off local disk instead" (`build`'s own
+    /// default), and a table gets just its plain link; `Some` means every such
+    /// node was already fetched through a worker ahead of time, and a missing
+    /// entry means the fetch itself resulted in the same "can't preview
+    /// this" outcome `file_read::preview`'s `Err` does locally — never a
+    /// silent fall-through to a local disk read.
+    previews: Option<&'a NodePreviews>,
     /// `--copy-files` (see `build_for_static_export`) — `false` for `build`/
     /// `build_with_code_previews` (unchanged default behavior: a `file`-
     /// node's own target is a plain link, never copied — see the module
@@ -790,6 +807,44 @@ pub struct CanvasLinkTarget {
 pub struct CodePreview {
     pub content: String,
     pub truncated: bool,
+}
+
+/// Rows of a `display="table"` node a static export/PDF includes — the same
+/// "first screenful" idea as the code preview's size cap: the full table is for
+/// the live UI.
+pub const TABLE_PREVIEW_ROWS: usize = 100;
+
+/// One column of a [`TablePreview`].
+#[derive(Debug, Clone)]
+pub struct TablePreviewColumn {
+    pub name: String,
+    /// DuckDB's own type name.
+    pub col_type: String,
+    /// `number`, `text`, `temporal`, `bool` or `other` — numbers are
+    /// right-aligned.
+    pub kind: String,
+}
+
+/// A `display="table"` file-node's head, fetched ahead of time through the
+/// worker's `/table` and `/table/rows` endpoints.
+#[derive(Debug, Clone)]
+pub struct TablePreview {
+    pub columns: Vec<TablePreviewColumn>,
+    /// At most [`TABLE_PREVIEW_ROWS`]; `None` is SQL NULL.
+    pub rows: Vec<Vec<Option<String>>>,
+    pub total_rows: u64,
+    pub file_size: u64,
+}
+
+/// Everything a caller fetches through a worker ahead of `build`, by node id:
+/// `display="code"` content and `display="table"` heads. A table that can't be
+/// fetched (no `duckdb`, an unreadable file) has no entry here because the
+/// caller has already failed the export with the reason — see
+/// `meshfox static`/`meshfox pdf`.
+#[derive(Debug, Clone, Default)]
+pub struct NodePreviews {
+    pub code: std::collections::HashMap<String, CodePreview>,
+    pub tables: std::collections::HashMap<String, TablePreview>,
 }
 
 /// GFM-flavored Markdown -> HTML, with meshfox's own fence attributes
@@ -1391,7 +1446,7 @@ fn resolve_file_target_for_copy(
 /// Inline `<pre><code>` replacement for a `file`-type node's `display="code"`
 /// preview (`web/src/MeshNode.tsx`'s `FileCodePreview`, backed there by a
 /// live `GET /api/nodes/:id/file-content` fetch — nothing to fetch from
-/// once static). `ctx.code_previews`, when set, is consulted first (see its
+/// once static). `ctx.previews`, when set, is consulted first (see its
 /// own doc comment) — the worker-routed path, content already fetched
 /// through that same `GET /api/nodes/:id/file-content` route ahead of time.
 /// `None` (or no entry for this node) falls back to reading the target once
@@ -1410,7 +1465,7 @@ fn render_file_code(node: &Node, ctx: &RenderCtx) -> String {
         )
     };
 
-    let (content, truncated) = match ctx.code_previews {
+    let (content, truncated) = match ctx.previews.map(|p| &p.code) {
         Some(map) => {
             let Some(preview) = map.get(&node.id) else {
                 return fallback_link();
@@ -1439,6 +1494,84 @@ fn render_file_code(node: &Node, ctx: &RenderCtx) -> String {
         "<pre><code{class_attr}>{}</code></pre>{note}",
         html_escape(&content)
     )
+}
+
+/// Inline HTML for a `file`-type node's `display="table"` preview: a caption
+/// (`1,234 rows × 5 cols · first 100 shown`) over a plain `<table>` of the
+/// head of the table, values escaped, NULLs marked, number columns
+/// right-aligned. With no fetched table for the node (a plain `build`, which
+/// has no worker to ask) it is just the node's plain link — the CLI never
+/// gets here without one, it fails the export first.
+fn render_file_table(node: &Node, ctx: &RenderCtx) -> String {
+    let Some(target) = node.target.as_deref() else {
+        return "<p><em>no target</em></p>".to_string();
+    };
+    let Some(table) = ctx.previews.and_then(|p| p.tables.get(&node.id)) else {
+        return format!(
+            "<p><a target=\"_blank\" rel=\"noopener noreferrer\" href=\"{0}\">{0}</a></p>",
+            html_escape(target)
+        );
+    };
+
+    let shown = table.rows.len();
+    let mut caption = format!(
+        "{} row{} \u{d7} {} col{}",
+        group_thousands(table.total_rows),
+        if table.total_rows == 1 { "" } else { "s" },
+        table.columns.len(),
+        if table.columns.len() == 1 { "" } else { "s" }
+    );
+    if (shown as u64) < table.total_rows {
+        caption.push_str(&format!(" \u{b7} first {} shown", group_thousands(shown as u64)));
+    }
+
+    let mut html = format!(
+        "<div class=\"file-table\"><p class=\"file-table-status\">{}</p>\
+         <div class=\"file-table-scroll\"><table class=\"file-table-grid\"><thead><tr><th class=\"row-num\">#</th>",
+        html_escape(&caption)
+    );
+    for c in &table.columns {
+        let class = if c.kind == "number" { " class=\"num\"" } else { "" };
+        html.push_str(&format!(
+            "<th{class}>{}<span class=\"type\">{}</span></th>",
+            html_escape(&c.name),
+            html_escape(&c.col_type.to_lowercase())
+        ));
+    }
+    html.push_str("</tr></thead><tbody>");
+    for (i, row) in table.rows.iter().enumerate() {
+        html.push_str(&format!("<tr><td class=\"row-num\">{}</td>", i + 1));
+        for (j, c) in table.columns.iter().enumerate() {
+            let class = if c.kind == "number" { "num" } else { "" };
+            match row.get(j) {
+                Some(Some(v)) => html.push_str(&format!(
+                    "<td{}>{}</td>",
+                    if class.is_empty() { String::new() } else { format!(" class=\"{class}\"") },
+                    html_escape(v)
+                )),
+                _ => html.push_str(&format!(
+                    "<td class=\"null{}\">NULL</td>",
+                    if class.is_empty() { String::new() } else { format!(" {class}") }
+                )),
+            }
+        }
+        html.push_str("</tr>");
+    }
+    html.push_str("</tbody></table></div></div>");
+    html
+}
+
+/// `1234567` -> `1,234,567`.
+fn group_thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Extension-based language guess for a `display="code"` preview whose node
@@ -2805,6 +2938,114 @@ mod tests {
             "{}",
             src.html_body
         );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    const TABLE_CANVAS: &str = "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+         ## Sales\n<!-- meshfox:node id=\"sales\" type=\"file\" display=\"table\" -->\n\n[sales.csv](sales.csv)\n";
+
+    fn sample_table(total_rows: u64) -> TablePreview {
+        let col = |name: &str, ty: &str, kind: &str| TablePreviewColumn {
+            name: name.into(),
+            col_type: ty.into(),
+            kind: kind.into(),
+        };
+        TablePreview {
+            columns: vec![
+                col("id", "BIGINT", "number"),
+                col("note <b>", "VARCHAR", "text"),
+            ],
+            rows: vec![
+                vec![Some("1".into()), Some("a < b & \"c\"".into())],
+                vec![Some("22".into()), None],
+            ],
+            total_rows,
+            file_size: 2048,
+        }
+    }
+
+    fn previews_with(node: &str, table: TablePreview) -> NodePreviews {
+        let mut previews = NodePreviews::default();
+        previews.tables.insert(node.to_string(), table);
+        previews
+    }
+
+    #[test]
+    fn display_table_renders_the_head_as_an_escaped_grid() {
+        let dir = temp_dir("table-grid");
+        let c = canvas(TABLE_CANVAS);
+        let previews = previews_with("sales", sample_table(2));
+
+        let (site, _assets) = build_with_previews(&c, &dir, None, Some(&previews));
+        let html = &site.find("sales").unwrap().html_body;
+        assert!(html.contains("<p class=\"file-table-status\">2 rows \u{d7} 2 cols</p>"), "{html}");
+        // All rows shown: no "first N shown" suffix.
+        assert!(!html.contains("shown"), "{html}");
+        assert!(html.contains("<th class=\"num\">id<span class=\"type\">bigint</span></th>"), "{html}");
+        // Names and values are escaped, not interpreted.
+        assert!(html.contains("note &lt;b&gt;"), "{html}");
+        assert!(html.contains("a &lt; b &amp; &quot;c&quot;"), "{html}");
+        assert!(!html.contains("<b>"), "{html}");
+        // Numbers are right-aligned, NULL is marked.
+        assert!(html.contains("<td class=\"num\">22</td>"), "{html}");
+        assert!(html.contains("<td class=\"null\">NULL</td>"), "{html}");
+        assert!(html.contains("<td class=\"row-num\">2</td>"), "{html}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn display_table_says_how_many_rows_are_not_shown() {
+        let dir = temp_dir("table-truncated");
+        let c = canvas(TABLE_CANVAS);
+        let previews = previews_with("sales", sample_table(1_234_567));
+
+        let (site, _assets) = build_with_previews(&c, &dir, None, Some(&previews));
+        let html = &site.find("sales").unwrap().html_body;
+        assert!(
+            html.contains("1,234,567 rows \u{d7} 2 cols \u{b7} first 2 shown"),
+            "{html}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn display_table_without_fetched_previews_is_just_its_link() {
+        let dir = temp_dir("table-plain");
+        let c = canvas(TABLE_CANVAS);
+
+        // `build` has no worker to ask: no table, no error text, the link.
+        let (site, _assets) = build(&c, &dir, None);
+        let html = &site.find("sales").unwrap().html_body;
+        assert!(html.contains("href=\"sales.csv\""), "{html}");
+        assert!(!html.contains("file-table"), "{html}");
+
+        // A fetched set with no entry for this node behaves the same.
+        let (site, _assets) = build_with_previews(&c, &dir, None, Some(&NodePreviews::default()));
+        let html = &site.find("sales").unwrap().html_body;
+        assert!(html.contains("href=\"sales.csv\""), "{html}");
+        assert!(!html.contains("file-table"), "{html}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn display_table_puts_its_caption_above_the_grid() {
+        let dir = temp_dir("table-caption");
+        let c = canvas(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+             ## Sales\n<!-- meshfox:node id=\"sales\" type=\"file\" display=\"table\" -->\n\n\
+             [sales.csv](sales.csv)\n\nQuarterly **numbers**.\n",
+        );
+        let previews = previews_with("sales", sample_table(2));
+
+        let (site, _assets) = build_with_previews(&c, &dir, None, Some(&previews));
+        let html = &site.find("sales").unwrap().html_body;
+        let caption_at = html.find("<strong>numbers</strong>").expect("caption");
+        let table_at = html.find("<table").expect("table");
+        assert!(caption_at < table_at, "{html}");
 
         fs::remove_dir_all(&dir).ok();
     }

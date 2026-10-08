@@ -172,15 +172,23 @@ fn venv_dir(canvas_path: &Path) -> PathBuf {
 /// unlike the colocated venv nothing here separates two canvases that happen
 /// to share a file name.
 fn read_only_venv_dir(absolute: &Path, file_name: &str) -> PathBuf {
+    read_only_temp_root(absolute).join(format!("{file_name}.venv"))
+}
+
+/// `<system temp>/meshfox-readonly-<hash of the canvas path>`, created
+/// owner-only (best effort) — the one place state for a canvas that can't be
+/// written may live on disk (its venv, `display="table"` caches). `absolute`
+/// is the canvas's absolute path.
+pub fn read_only_temp_root(absolute: &Path) -> PathBuf {
     use std::os::unix::fs::DirBuilderExt;
     let key = fnv1a(absolute.to_string_lossy().as_bytes());
     let root = std::env::temp_dir().join(format!("meshfox-readonly-{key:08x}"));
-    // Best-effort: if this fails, the script's own `mkdir -p` reports it.
+    // Best-effort: if this fails, the caller's own create reports it.
     let _ = std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(&root);
-    root.join(format!("{file_name}.venv"))
+    root
 }
 
 /// True if `name` (without the `@`, e.g. `"agent"`) is a known builtin —

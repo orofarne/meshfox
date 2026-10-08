@@ -35,3 +35,4 @@ mod mouse_resize;
 mod mouse_run_buttons;
 mod run_history;
 mod services;
+mod table_view;

@@ -313,7 +313,8 @@ struct McpNodeFields {
     /// `text` (the default), `file`, `link`, `group`, or `include`.
     #[serde(default, rename = "type")]
     node_type: Option<String>,
-    /// `file`-node display mode: `link` (the default) or `code`.
+    /// `file`-node display mode: `link` (the default), `code` (a read-only code
+    /// preview) or `table` (an interactive, read-only table — needs the `duckdb` CLI).
     #[serde(default)]
     display: Option<String>,
     #[serde(default)]

@@ -97,7 +97,7 @@ export function NodeSettings({ node, allNodes, onChange, onRenameId, onClearId, 
   const [nodeType, setNodeType] = useState<NodeType>(node.type ?? "text");
   const [color, setColor] = useState(node.color ?? "");
   const [target, setTarget] = useState(node.target ?? "");
-  const [display, setDisplay] = useState<"link" | "code">(node.display ?? "link");
+  const [display, setDisplay] = useState<"link" | "code" | "table">(node.display ?? "link");
   const [lang, setLang] = useState(node.lang ?? "");
   const [interpreter, setInterpreter] = useState(node.interpreter ?? "");
   const [preview, setPreview] = useState(node.preview ?? false);
@@ -299,9 +299,10 @@ export function NodeSettings({ node, allNodes, onChange, onRenameId, onClearId, 
         {nodeType === "file" && (
           <label className="vars-modal-field">
             <span>Display</span>
-            <select value={display} onChange={(e) => setDisplay(e.target.value as "link" | "code")}>
+            <select value={display} onChange={(e) => setDisplay(e.target.value as "link" | "code" | "table")}>
               <option value="link">link</option>
               <option value="code">code (read-only preview)</option>
+              <option value="table">table (read-only, needs duckdb)</option>
             </select>
           </label>
         )}

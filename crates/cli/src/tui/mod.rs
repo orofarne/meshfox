@@ -14,6 +14,7 @@ mod markdown;
 mod source_editor;
 mod spatial;
 mod svg_raster;
+mod table;
 mod theme;
 mod tree;
 // `pub(crate)` (not the default private) so `syntax_registry.rs`'s own
@@ -35,7 +36,7 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use app::{App, LinkPreviewMsg};
+use app::{App, BackgroundMsg};
 use meshfox_core::deps::BlockAddr;
 
 pub async fn run(canvas_path: PathBuf, initial_node: Option<String>) -> io::Result<()> {
@@ -55,8 +56,8 @@ pub async fn run(canvas_path: PathBuf, initial_node: Option<String>) -> io::Resu
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let (link_preview_tx, mut link_preview_rx) =
-        tokio::sync::mpsc::unbounded_channel::<LinkPreviewMsg>();
+    let (background_tx, mut background_rx) =
+        tokio::sync::mpsc::unbounded_channel::<BackgroundMsg>();
 
     // TUI is always a client of *some* worker for this file from here on —
     // its own embedded one if nobody else's is running, someone else's
@@ -124,7 +125,7 @@ pub async fn run(canvas_path: PathBuf, initial_node: Option<String>) -> io::Resu
 
     let result = match App::new(
         canvas_path,
-        link_preview_tx,
+        background_tx,
         initial_node.as_deref(),
         worker_port,
     )
@@ -198,7 +199,7 @@ pub async fn run(canvas_path: PathBuf, initial_node: Option<String>) -> io::Resu
                 &mut input_rx,
                 &paused,
                 &mut reload_rx,
-                &mut link_preview_rx,
+                &mut background_rx,
                 &mut external_run_rx,
             )
             .await
@@ -444,7 +445,7 @@ async fn main_loop(
     input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
     input_paused: &Arc<AtomicBool>,
     reload_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
-    link_preview_rx: &mut tokio::sync::mpsc::UnboundedReceiver<LinkPreviewMsg>,
+    background_rx: &mut tokio::sync::mpsc::UnboundedReceiver<BackgroundMsg>,
     external_run_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExternalMsg>,
 ) -> io::Result<()> {
     loop {
@@ -544,8 +545,8 @@ async fn main_loop(
             Some(content) = reload_rx.recv() => {
                 app.on_external_change(content);
             }
-            Some(msg) = link_preview_rx.recv() => {
-                app.on_link_preview_msg(msg);
+            Some(msg) = background_rx.recv() => {
+                app.on_background_msg(msg);
             }
             Some(msg) = external_run_rx.recv() => match msg {
                 ExternalMsg::Run(update) => app.on_reconciled_run_event(
@@ -555,7 +556,13 @@ async fn main_loop(
                 ),
                 ExternalMsg::RunsChanged => app.refresh_runs_soon = true,
             },
+            // A table that is still importing (or hasn't answered yet) is
+            // polled faster than the general tick below.
+            _ = tokio::time::sleep(std::time::Duration::from_millis(700)), if app.tables_want_fast_poll() => {
+                app.poll_tables();
+            }
             _ = tokio::time::sleep(std::time::Duration::from_secs(3)), if worker_reachable => {
+                app.poll_tables();
                 app.refresh_services().await;
                 app.refresh_block_runs().await;
             }

@@ -1,4 +1,5 @@
 import type { CanvasDoc, CanvasNode, ExtraEdgeDto, NodeType, ServiceStatusDto, VarStatus } from "./types";
+import { isEmptyView, type TableMeta, type TableRowsPage, type ViewSpec } from "./tableView";
 
 export async function fetchCanvas(): Promise<CanvasDoc> {
   const res = await fetch("/api/canvas");
@@ -408,7 +409,7 @@ export interface NodePatch {
    * them untouched. Never a replacement list, see `EdgeOps`. */
   edges?: EdgeOps;
   /** file-node display mode — see `CanvasNode.display`. */
-  display?: "link" | "code";
+  display?: "link" | "code" | "table";
   /** file-node syntax-highlighting language hint — see `CanvasNode.lang`. */
   lang?: string;
   /** file-node interpreter — see `CanvasNode.interpreter`. */
@@ -538,6 +539,43 @@ export async function fetchNodeFileContent(id: string): Promise<NodeFileContent>
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `GET /api/nodes/${id}/file-content: ${res.status}`);
+  }
+  return res.json();
+}
+
+/**
+ * Schema and state of a `display="table"` file node (see SPEC.md "Table
+ * previews"). The first call makes the worker start importing the target in
+ * the background; poll while `state` is `"importing"`. A missing `duckdb` is
+ * not a rejection — it comes back as `state: "failed"` with an `error` the
+ * caller shows in place. Rejects for a node that isn't a table node, a
+ * missing file, or a target outside the canvas directory.
+ */
+export async function fetchTableMeta(id: string, signal?: AbortSignal): Promise<TableMeta> {
+  const res = await fetch(`/api/nodes/${encodeURIComponent(id)}/table`, { signal });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `GET /api/nodes/${id}/table: ${res.status}`);
+  }
+  return res.json();
+}
+
+/** One window of a table node's rows under `view` (sort/filters/search).
+ * Rejects with the server's message when the view is invalid — e.g. a filter
+ * value the column can't hold. */
+export async function fetchTableRows(
+  id: string,
+  offset: number,
+  limit: number,
+  view: ViewSpec,
+  signal?: AbortSignal,
+): Promise<TableRowsPage> {
+  const params = new URLSearchParams({ offset: String(offset), limit: String(limit) });
+  if (!isEmptyView(view)) params.set("view", JSON.stringify(view));
+  const res = await fetch(`/api/nodes/${encodeURIComponent(id)}/table/rows?${params}`, { signal });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `GET /api/nodes/${id}/table/rows: ${res.status}`);
   }
   return res.json();
 }

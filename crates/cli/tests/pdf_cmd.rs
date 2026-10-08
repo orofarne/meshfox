@@ -286,3 +286,75 @@ fn defaults_the_out_path_to_the_canvas_filename_with_a_pdf_extension() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn duckdb_available() -> bool {
+    if let Ok(p) = std::env::var("MESHFOX_DUCKDB") {
+        return Path::new(&p).exists();
+    }
+    let on_path = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).any(|d| d.join("duckdb").exists()))
+        .unwrap_or(false);
+    on_path
+        || [
+            "/opt/homebrew/bin/duckdb",
+            "/usr/local/bin/duckdb",
+            "/usr/bin/duckdb",
+        ]
+        .iter()
+        .any(|p| Path::new(p).exists())
+}
+
+const TABLE_CANVAS: &str = concat!(
+    "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+    "## Sales\n<!-- meshfox:node id=\"sales\" type=\"file\" display=\"table\" -->\n\n[sales.csv](sales.csv)\n",
+);
+
+/// 120 rows are far more than one A4 page, so a document-mode PDF that
+/// includes the table's first 100 rows runs to several pages.
+#[test]
+fn a_table_node_prints_its_first_rows_into_the_document_pages() {
+    if !system_browser_available() || !duckdb_available() {
+        eprintln!("skipping: needs a system Chrome/Chromium/Edge and the duckdb CLI");
+        return;
+    }
+    let dir = unique_dir("table-canvas");
+    let canvas_path = dir.join("doc.canvas.md");
+    write_file(&canvas_path, TABLE_CANVAS);
+    let mut csv = String::from("id,name,amount\n");
+    for i in 1..=120 {
+        csv.push_str(&format!("{i},name{i:03},{}\n", i * 2));
+    }
+    write_file(&dir.join("sales.csv"), &csv);
+
+    let out = unique_dir("out").join("with.pdf");
+    let pages = run_pdf(&canvas_path, &out, Some("document"));
+    assert!(pages >= 3, "100 table rows should fill several pages, got {pages}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A table that can't be read fails `meshfox pdf` — no file is written.
+#[test]
+fn a_table_without_duckdb_fails_the_pdf() {
+    let dir = unique_dir("table-no-duckdb");
+    let canvas_path = dir.join("doc.canvas.md");
+    write_file(&canvas_path, TABLE_CANVAS);
+    write_file(&dir.join("sales.csv"), "id\n1\n");
+    let out = unique_dir("out").join("doc.pdf");
+
+    let output = meshfox()
+        .env("MESHFOX_DUCKDB", "/nonexistent/duckdb")
+        .arg("pdf")
+        .arg(&canvas_path)
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .expect("failed to run meshfox");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("table node \"sales\""), "{stderr}");
+    assert!(stderr.contains("/nonexistent/duckdb"), "{stderr}");
+    assert!(!out.exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

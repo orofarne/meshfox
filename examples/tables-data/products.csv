@@ -1,0 +1,25 @@
+sku,name,category,price,stock,note
+A-1001,"Desk lamp, brass",lighting,39.90,120,
+A-1002,Floor lamp,lighting,89.00,35,"ships in 2 boxes"
+A-1003,LED bulb 4-pack,lighting,12.50,980,
+B-2001,Oak shelf 80 cm,furniture,59.00,44,
+B-2002,Oak shelf 120 cm,furniture,79.00,18,
+B-2003,Writing desk,furniture,249.00,7,"assembly required"
+B-2004,Office chair,furniture,189.00,0,"back in stock in March"
+C-3001,Ceramic mug,kitchen,8.90,640,
+C-3002,"Mug set, 6 pcs",kitchen,44.00,90,
+C-3003,Cast-iron pan 26 cm,kitchen,64.00,52,
+C-3004,Chef's knife,kitchen,72.50,31,"hand wash only"
+C-3005,Cutting board,kitchen,23.00,210,
+D-4001,Wool blanket,textiles,69.00,60,
+D-4002,Linen cushion,textiles,28.00,150,
+D-4003,Cotton towel,textiles,14.00,420,
+D-4004,"Curtain, 140x250",textiles,52.00,26,
+E-5001,Notebook A5,stationery,4.50,1500,
+E-5002,Fountain pen,stationery,34.00,75,"blue ink included"
+E-5003,Ink refill,stationery,6.00,0,
+E-5004,Desk organiser,stationery,19.00,88,
+F-6001,Plant pot 20 cm,garden,11.00,330,
+F-6002,Watering can,garden,17.50,95,
+F-6003,Garden shears,garden,26.00,40,
+F-6004,Seed mix,garden,3.80,1200,"sow in spring"

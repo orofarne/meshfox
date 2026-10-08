@@ -6,6 +6,7 @@ import remarkImageAttrs from "./remarkImageAttrs";
 import remarkSubSup from "./remarkSubSup";
 import remarkGfmAlerts from "./remarkGfmAlerts";
 import { highlightToHtml } from "./shiki";
+import { FileTablePreview } from "./TablePreview";
 import {
   BUTTON_LANG,
   FORM_LANG,
@@ -414,8 +415,9 @@ export interface MeshNodeData {
    * this node has no known service blocks. */
   services?: ServiceStatusDto[];
   /** file-node display mode — `"code"` shows a read-only, syntax-highlighted
-   * preview of the target file's own content instead of a plain link. */
-  display?: "link" | "code";
+   * preview of the target file's own content instead of a plain link;
+   * `"table"` an interactive, read-only grid of a tabular target. */
+  display?: "link" | "code" | "table";
   /** file-node syntax-highlighting language hint for `display: "code"`;
    * absent means auto-detect from the target's file extension. */
   lang?: string;
@@ -2600,6 +2602,15 @@ export function NodeBodyContent({ data, nodeId }: { data: MeshNodeData; nodeId: 
          * naturally reads as elaborating on the link above it). */}
         {data.caption && <div className="mesh-node-body nopan"><FileLinkCaption caption={data.caption} /></div>}
         <FileCodePreview nodeId={nodeId} target={data.target} lang={data.lang} />
+        {fileRunLive && <LiveRunOutput live={fileRunLive} />}
+      </>
+    );
+  }
+  if (data.nodeType === "file" && data.display === "table") {
+    return (
+      <>
+        {data.caption && <div className="mesh-node-body nopan"><FileLinkCaption caption={data.caption} /></div>}
+        <FileTablePreview nodeId={nodeId} target={data.target} />
         {fileRunLive && <LiveRunOutput live={fileRunLive} />}
       </>
     );

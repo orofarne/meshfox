@@ -277,6 +277,31 @@ An SVG follows the light/dark theme through `currentColor` and
 
 [examples/svg.canvas.md](./examples/svg.canvas.md)
 
+### Browsing a huge table (CSV, Parquet, ...)
+<!-- meshfox:node id="browsing-a-huge-table-csv-parquet" -->
+
+[examples/tables.canvas.md](./examples/tables.canvas.md) — a `file` node with
+`display="table"` (SPEC.md's "Table previews") shows its target as an
+interactive, read-only grid in the web UI and, full screen with `Enter`, in the
+terminal viewer: sortable by column, filterable per column (`>10`, `=x`,
+`^start`, `~part`, `null`, ...), searchable across every column, with the whole
+value of any cell a click away. Only the rows on screen are ever fetched, so a
+CSV with a million rows opens as fast as one with twenty — the canvas generates
+one to try, and turns it into Parquet (read in place, no import) with `duckdb`
+itself. Any format the `duckdb` command-line tool reads works, `.csv.gz`
+included.
+
+It needs that `duckdb` executable on `PATH` (or `duckdb_path` under `[tables]`
+in the config below): meshfox never installs it, and a table node without it
+says so rather than showing anything. The table is read-only — edit the file
+with any editor and the node reloads — and `meshfox static`/`meshfox pdf` print
+its first 100 rows as a plain grid, failing loudly if a table can't be read.
+
+#### Example
+<!-- meshfox:node id="example-10" type="file" -->
+
+[examples/tables.canvas.md](./examples/tables.canvas.md)
+
 ## Configuration
 <!-- meshfox:node id="configuration" -->
 
@@ -296,6 +321,8 @@ Local wins over global **key by key, at every nesting level**: a global `[sessio
 | `[interpreters.agent] provider` | `claude` | Which agent CLI the `@agent` macro calls (`claude` or `codex`) — see "Calling an AI agent from a block". Every scalar key in the file is also exported to a `@`-macro's process as `MESHFOX_CONFIG_<PATH>` (`MESHFOX_CONFIG_INTERPRETERS_AGENT_PROVIDER`), so a hand-written `interpreter=` script can read it too. |
 | `[tui] editor_theme` | `base16-ocean.dark` | `syntect` theme of the terminal viewer's editor and code panes — see "Terminal viewer". An unknown name falls back to the default. |
 | `[session] max_output_bytes` | `262144` (256 KiB) | How much of *each* finished run's output the core keeps in `.meshfox/<canvas>.session.sqlite3`; past the limit the oldest lines of that run are dropped, keeping the tail. `0` stores no output at all (runs, freshness and variables are still kept). Read once when the core starts, so restart it to apply a change. |
+| `[tables] cache_max_bytes` | `4294967296` (4 GiB) | Most disk `display="table"` caches may take — the imported tables plus DuckDB's spill files, in `.meshfox/tables/` (or, for a read-only canvas, an owner-only per-process directory under the system temp dir). Past it the least recently used tables not being imported are evicted; a single table that alone doesn't fit is refused with an error naming this key. |
+| `[tables] duckdb_path` | unset | The `duckdb` executable `display="table"` drives when it isn't on `PATH` (the `MESHFOX_DUCKDB` environment variable overrides it). Looked up in this order: the variable, this key, `PATH`, then `~/.duckdb/cli/latest/duckdb`, `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`. |
 | `[session] max_runs_per_block` | `10` | How many finished runs of one block the core keeps (run record and stored output together); when a run finishes, the oldest beyond this are rotated out. At most `max_runs_per_block × max_output_bytes` of output per block. Minimum `1`. Read once when the core starts. |
 
 #### What survives a core restart
@@ -695,6 +722,8 @@ On the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName
 
 Renders a canvas's node graph — boxes, tags, cached output, and every structural/`meshfox:edge` connection — as a static HTML/CSS/SVG site (no live server), through a user-supplied [Tera](https://keats.github.io/tera/) template: every `*.tera` file in `--template` is rendered with the canvas's data (context key `site`) and written to `--out` at the same relative path minus `.tera`; everything else in the template directory is copied verbatim (CSS, fonts, images, ...). [`site-template/`](./site-template) is the project-page example used below. [`site-template-archive/`](./site-template-archive) is the investigation-board template used by this repo's published site. Both templates use a small browser script to place SVG arrows after layout, including authored waypoints and labels.
 
+A `file` node with `display="table"` is exported as a plain HTML grid of the table's first 100 rows under an "N rows × M cols" caption (see TEMPLATES.md); that needs the `duckdb` CLI, and the export **fails** — naming the node and why — if a table can't be read, rather than leaving it out.
+
 To try the archive with this README: `meshfox static README.md --template site-template-archive -o /tmp/meshfox-archive --force --copy-files --recursive`.
 
 [TEMPLATES.md](./TEMPLATES.md) is the reference for writing a template: what each page receives (`site`, `icons`, ...), the `SiteData` fields, escaping, and `template.toml`. A template's own settings live in an optional `template.toml` right in its own directory (see [`site-template/template.toml`](./site-template/template.toml)) rather than as `static` command-line flags — they're a property of *that template*, not something to repeat on every invocation: `api_version`, the template API version it was written for (required whenever the file exists; a different version is refused); `base_url`, this export's own canonical URL (`--sitemap`'s own `<loc>` prefix, below); `links_base_url`, prefixed onto a relative link/target the command doesn't already copy into `--out` (distinct from `base_url` — this repo's own [`site-template-archive/template.toml`](./site-template-archive/template.toml) points `base_url` at `meshfox.orofarne.net`, the site itself, and `links_base_url` at GitHub, where its canvases' own plain-Markdown source actually lives); and `icons`, a list of `<link rel="..." href="...">` tags (exposed to every template as the `icons` context key) for the page's own favicon/apple-touch-icon set. `template.toml` itself is read, never rendered or copied into `--out`, and a key it doesn't know is an error rather than ignored. A template with no `template.toml` gets an empty config — no `base_url`/`links_base_url` prefixing, no icon tags. Every page is HTML-escaped automatically (node titles and tags are untrusted text); `html_body` and the `script_json` filter's output are the two things a template marks `| safe`.
@@ -756,6 +785,8 @@ tui-editor-themes.html
 <!-- meshfox:node id="pdf-export-experimental" -->
 
 Renders a canvas straight to a PDF file, via a real (headless) Chrome/Chromium rather than a hand-rolled layout engine — a system install is used if one can be found (`CHROME` env var, common binary names on `PATH`, well-known install locations); otherwise a pinned Chromium build is downloaded once and cached for next time. Builds on the same `meshfox_core::staticgen` data `static` uses (see above), so it gets the same real, browser-computed layout instead of guessing at Markdown-body heights in Rust.
+
+A `file` node with `display="table"` prints the first 100 rows of its table as a plain grid, like `meshfox static` does — which needs the `duckdb` CLI, and `meshfox pdf` fails (naming the node and why) when a table can't be read, rather than printing a page with a hole in it.
 
 Two kinds of pages, normally both, in this order:
 
@@ -952,6 +983,12 @@ Working on the frontend itself: the embedded copy is a snapshot from your last `
 cargo test --workspace
 ```
 
+`web/scripts/*.test.mjs` are the frontend's own unit tests: plain `node --test` files over the pure-logic modules under `web/src/` (the fence/argument-signature parser, edge routing, the meshfox Markdown grammar, SVG theming, the table view's filter language and virtual-scroll arithmetic) — no browser, no server, a second or two in total. Nothing runs them implicitly (the release workflow only builds the web app, and `test:e2e`'s `pretest` hook only builds), so run them yourself, alongside the type-check under "Linting" below; the end-to-end suite that drives the real UI is the next section:
+
+```sh name="web"
+cd web && npm run test:unit
+```
+
 ### End-to-end tests
 <!-- meshfox:node id="e2e-tests" -->
 
@@ -969,6 +1006,8 @@ npx playwright install chromium firefox
 cd web
 npm run test:e2e
 ```
+
+`display="table"` has its own opt-in suite, `cd web && npm run test:table` (`web/table.playwright.config.ts`, `web/e2e/table.spec.ts`): one real worker over a generated 400,000-row CSV, driving sorting, filters, search, scrolling to the very end through the capped scroll track, cell selection and the expanded window. It needs the `duckdb` CLI on the machine (the spec skips itself when there isn't one) and, like `test:arguments`, isn't part of the main `playwright.config.ts` run.
 
 For interactive debugging instead of a one-shot run, use `npm run test:e2e:ui` (opens Playwright's UI mode — not runnable here, since it doesn't exit on its own).
 
@@ -999,6 +1038,8 @@ npm test
 `crates/cli/tests/tui_e2e/` is a third, separate, deliberately opt-in suite alongside the two above — Rust's own counterpart to them, for the TUI (`crates/cli/src/tui/`). Every existing TUI test (`crates/cli/src/tui/{app,ui,markdown}.rs`) drives `App` directly (`app.on_key(...).await`) or renders one frame via `ratatui::backend::TestBackend` — none of them ever touch the real `crossterm::event::read()`/raw-mode/`EnableMouseCapture` event loop in `crates/cli/src/tui/mod.rs::run`, so a bug specific to that real path (real terminal setup, real mouse escape-sequence parsing, real terminal cleanup on exit) is structurally invisible to them. This suite spawns the real, compiled `meshfox` binary inside a real pty (`portable-pty` — already a real dependency, `crates/server/src/pty_exec.rs` uses it for `tty` blocks) and drives it with real keystrokes and real xterm SGR mouse escape sequences, asserting on the real rendered screen via `vt100`.
 
 Every test in it is `#[ignore]`d — Cargo has no other way to exclude one integration-test target from `cargo test --workspace`'s default run, so this is what keeps it out of that gate (confirmed: `cargo test --workspace` reports this target's tests as `ignored`, not run, adding ~0s). The suite's `mouse_*.rs` tests each mirror one mouse-support checklist item in TODO.canvas.md's "Мышь в панелях TUI (tree/document/output)" — written first, failing on purpose, against a feature that didn't exist yet, with implementing the item and greening its test happening together, the same red-then-green shape as TDD; every item on that checklist is now implemented, so the whole suite is green. `baseline.rs` covers the keyboard-driven flows underneath all of it (start up and render, select a node and run its block, quit and actually exit), so a regression in the real event loop itself doesn't slip through unnoticed.
+
+`table_view.rs` there covers `display="table"` end to end — inline window, full-screen mode, sort/filter/search, wheel and header click — against the real worker and the real `duckdb` CLI (it skips itself without one), plus `display="code"` reading through the worker.
 
 At most six `meshfox tui` sessions are alive at once, whatever `--test-threads` says (`MAX_LIVE_SESSIONS` in `harness.rs`, a semaphore that `TuiSession::spawn` takes a permit from and `Drop` gives back): each one is a real process, a real embedded worker and a pty, and with every test running at once the machine gets loaded enough that tests which look for something on screen right after the first frame fail at random — a different one each run, each green on its own.
 

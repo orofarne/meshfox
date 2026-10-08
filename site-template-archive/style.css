@@ -60,6 +60,14 @@ summary.node-title::before { content:"▾ "; color:var(--accent); }
 .node-body :not(pre) > code { background:#dfd1b4; padding:.1em .25em; }
 .node-body table { display:block; overflow:auto; border-collapse:collapse; }
 .node-body th,.node-body td { border:1px solid #bdae94; padding:.3rem .5rem; }
+.file-table-status { margin:0 0 .3rem; font:.7rem var(--mono); opacity:.7; }
+.file-table-scroll { overflow:auto; max-height:26rem; }
+.file-table-grid { display:table; }
+.file-table-grid th { position:sticky; top:0; background:#eadfc7; }
+.file-table-grid .type { display:block; font:400 .62rem var(--mono); opacity:.6; }
+.file-table-grid .num,.file-table-grid .row-num { text-align:right; font-variant-numeric:tabular-nums; }
+.file-table-grid .row-num,.file-table-grid .null { opacity:.55; }
+.file-table-grid .null { font-style:italic; }
 .node-body blockquote { margin:1rem 0; padding:.2rem .8rem; border-left:3px solid var(--accent); background:#eadfc7; }
 /* Ordinary groups look like folder covers. A group whose direct children
    all have authored boxes carries a local cork board instead. */

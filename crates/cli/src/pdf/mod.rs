@@ -61,10 +61,16 @@ pub enum Mode {
 
 /// Renders `canvas` to PDF bytes. `canvas_dir` is the canvas file's own
 /// directory (confinement boundary for local image references, same as
-/// `static`). `mode` restricts the output to a single page kind — see
-/// `Mode`.
-pub fn generate(canvas: &Canvas, canvas_dir: &Path, mode: Option<Mode>) -> Result<Vec<u8>, String> {
-    let (site, assets) = staticgen::build(canvas, canvas_dir, None);
+/// `static`). `previews` is what `display="code"`/`display="table"` nodes show,
+/// fetched through the worker by the caller. `mode` restricts the output to a
+/// single page kind — see `Mode`.
+pub fn generate(
+    canvas: &Canvas,
+    canvas_dir: &Path,
+    mode: Option<Mode>,
+    previews: &staticgen::NodePreviews,
+) -> Result<Vec<u8>, String> {
+    let (site, assets) = staticgen::build_with_previews(canvas, canvas_dir, None, Some(previews));
 
     let work_dir = render::temp_work_dir();
     std::fs::create_dir_all(&work_dir)

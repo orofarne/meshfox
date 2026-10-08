@@ -17,6 +17,7 @@ use super::app::{App, Focus, ServiceConflictState, ServicesViewState};
 use super::markdown::Segment;
 use super::source_editor::SourceEditorState;
 use super::spatial;
+use super::table;
 use super::theme::{ACCENT, BORDER, DEP, FAIL, MAP_NODE_BG, MAP_NODE_FG, MAP_SELECTED_BG, OK};
 use super::tree::TreeRow;
 use crate::pdf::render::resolve_color_hex;
@@ -373,6 +374,15 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if let Some(se) = &mut app.source_editor {
         let syntax_set = Arc::clone(app.highlighter.syntax_set());
         render_source_editor(f, area, se, &syntax_set, &app.editor_theme);
+        return;
+    }
+
+    // So is the full-screen table (`Enter` on a `display="table"` node): it
+    // owns the keymap too (`App::on_table_key`), so nothing else is drawn.
+    if let Some(tm) = &app.table_mode {
+        let empty = table::TableData::default();
+        let data = app.tables.get(&tm.node_id).unwrap_or(&empty);
+        table::render_overlay(f, area, data, tm);
         return;
     }
 
@@ -1381,6 +1391,9 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     if app.selected_is_open_target() {
         hint.push_str(" · o open");
     }
+    if app.selected_is_table() && app.worker_port.is_some() {
+        hint.push_str(" · enter open table");
+    }
     if app.has_configurable_vars() {
         hint.push_str(" · c configure");
     }
@@ -2219,6 +2232,14 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
     ];
     if app.selected_is_open_target() {
         items.push("o               open this file node's target in the OS's default application");
+    }
+    if app.selected_is_table() && app.worker_port.is_some() {
+        items.push("enter           (a display=\"table\" node) open the table full screen —");
+        items.push("                j/k h/l move, PgUp/PgDn, g/G top/bottom, s sort by the");
+        items.push("                column (S adds a key), / search, f filter the column");
+        items.push("                (text, >10, =x, ^starts, $ends, ~has, null), F clear it,");
+        items.push("                x reset, enter shows the whole cell, y copies it, q closes;");
+        items.push("                click a header to sort, wheel scrolls (needs the duckdb CLI)");
     }
     if app.has_configurable_vars() {
         items.push(

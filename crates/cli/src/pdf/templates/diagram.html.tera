@@ -74,6 +74,13 @@ html, body { background: #ffffff; }
 .node-body code { font-family: "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .node-body table { border-collapse: collapse; width: 100%; margin: 0 0 6pt; font-size: 7.5pt; }
 .node-body th, .node-body td { border: 0.5pt solid #ccc; padding: 2pt 4pt; text-align: left; }
+.file-table-status { margin: 0 0 3pt; font-size: 7pt; color: #666; }
+.file-table-scroll { overflow: visible; }
+.file-table-grid { width: auto; }
+.file-table-grid .type { display: block; font-size: 6pt; font-weight: 400; color: #888; }
+.file-table-grid .num, .file-table-grid .row-num { text-align: right; }
+.file-table-grid .row-num, .file-table-grid .null { color: #999; }
+.file-table-grid .null { font-style: italic; }
 .edge-overlay { position: absolute; top: 0; left: 0; pointer-events: none; }
 </style>
 </head>

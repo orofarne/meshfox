@@ -32,6 +32,7 @@ use super::ui;
 
 use super::markdown::{self, ClickRegion, ClickTarget, Highlighter, Segment};
 use super::source_editor::{self, SourceEditorOutcome, SourceEditorState};
+use super::table::{self, TableData, TableInput, TableMode};
 use super::tree::{self, TreeRow};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -701,8 +702,8 @@ pub struct App {
     /// Where a background fetch (see `maybe_fetch_link_preview`/
     /// `maybe_fetch_link_preview_image`) reports back once it's done —
     /// consumed by `mod.rs`'s `main_loop`, which forwards each message to
-    /// `on_link_preview_msg`. Cloned into every spawned fetch task.
-    pub link_preview_tx: tokio::sync::mpsc::UnboundedSender<LinkPreviewMsg>,
+    /// `on_background_msg`. Cloned into every spawned fetch task.
+    pub background_tx: tokio::sync::mpsc::UnboundedSender<BackgroundMsg>,
     /// URLs a metadata fetch has already been kicked off for — gates
     /// `maybe_fetch_link_preview` against re-spawning one on every
     /// selection change while the first is still in flight (or already
@@ -747,6 +748,15 @@ pub struct App {
     /// the currently selected node) — `Some` while open. See
     /// `ServicesViewState`'s own doc comment.
     pub services_view: Option<ServicesViewState>,
+    /// `display="code"` nodes' content, fetched from the worker by node id —
+    /// see `ensure_file_preview`.
+    pub file_previews: HashMap<String, FilePreview>,
+    /// `display="table"` nodes' schema, view and fetched rows, by node id —
+    /// see `tui/table.rs`.
+    pub tables: HashMap<String, TableData>,
+    /// The full-screen table (`Enter` on a table node) — `Some` takes over
+    /// the whole screen and the keymap, like `source_editor`.
+    pub table_mode: Option<TableMode>,
     /// Every `GET /api/services` entry as of the last poll
     /// (`refresh_services`, on a periodic tick from `mod.rs` whenever
     /// `worker_port` is `Some`, the same ~3s cadence the web UI's own
@@ -827,11 +837,13 @@ pub struct InlineFormState {
     pub editing: bool,
 }
 
-/// A background link-preview fetch's result, reported back through
-/// `App::link_preview_tx` into `mod.rs`'s `main_loop` (same shape as the
-/// existing `reload_rx`/output-line channels) — never sent at all on
-/// failure, see `App::link_preview_requested`'s own doc comment.
-pub enum LinkPreviewMsg {
+/// A background fetch's result, reported back through
+/// `App::background_tx` into `mod.rs`'s `main_loop` (same shape as the
+/// existing `reload_rx`/output-line channels). A link-preview fetch never
+/// sends anything on failure (see `App::link_preview_requested`); the
+/// worker-backed ones below always report, an error included, so the
+/// document can say why instead of staying on "loading…".
+pub enum BackgroundMsg {
     Meta {
         url: String,
         meta: PreviewMeta,
@@ -840,7 +852,47 @@ pub enum LinkPreviewMsg {
         url: String,
         image: image::DynamicImage,
     },
+    /// A `display="code"` node's file content, from the worker.
+    FileContent {
+        node_id: String,
+        result: Result<(String, bool), String>,
+    },
+    /// A `display="table"` node's schema/import state, from the worker.
+    TableMeta {
+        node_id: String,
+        result: Result<crate::worker_client::TableMetaDto, String>,
+    },
+    /// One block of a `display="table"` node's rows. `generation` is the
+    /// `TableData` generation the request was made under — an answer for an
+    /// older view is dropped.
+    TableRows {
+        node_id: String,
+        generation: u64,
+        block: usize,
+        result: Result<crate::worker_client::TableRowsDto, String>,
+    },
 }
+
+/// A `display="code"` node's fetched file content (see
+/// `App::ensure_file_preview`).
+pub enum FilePreviewState {
+    Loading,
+    Ready { content: String, truncated: bool },
+    Failed(String),
+}
+
+pub struct FilePreview {
+    pub state: FilePreviewState,
+    inflight: bool,
+    fetched: Option<std::time::Instant>,
+}
+
+/// How old a fetched preview may get before the next render refreshes it in
+/// the background (the old content stays on screen meanwhile).
+const FILE_PREVIEW_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
+/// A table's `GET /table` is re-asked this often once it's ready, to notice
+/// the file changing underneath.
+const TABLE_META_REFRESH: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// A non-secret declaration's currently-resolved value with no overrides
 /// in play — the process environment, then the on-disk cache, then its
@@ -1015,7 +1067,7 @@ impl App {
     /// startup error; unit tests may pass `None` to exercise local UI code.
     pub async fn new(
         canvas_path: PathBuf,
-        link_preview_tx: tokio::sync::mpsc::UnboundedSender<LinkPreviewMsg>,
+        background_tx: tokio::sync::mpsc::UnboundedSender<BackgroundMsg>,
         initial_node: Option<&str>,
         worker_port: Option<u16>,
     ) -> io::Result<App> {
@@ -1131,7 +1183,7 @@ impl App {
             known_raw,
             pending_external_change: None,
             link_preview_cache: Arc::new(link_preview::PreviewCache::new()),
-            link_preview_tx,
+            background_tx,
             link_preview_requested: HashSet::new(),
             link_preview_meta: HashMap::new(),
             link_preview_image_requested: HashSet::new(),
@@ -1140,6 +1192,9 @@ impl App {
             service_stats: None,
             service_conflict: None,
             services_view: None,
+            file_previews: HashMap::new(),
+            tables: HashMap::new(),
+            table_mode: None,
             service_list: Vec::new(),
             service_log: Vec::new(),
             session_vars: HashMap::new(),
@@ -1171,6 +1226,10 @@ impl App {
                 }
                 SourceEditorOutcome::Save => self.save_source_editor().await,
             }
+            return;
+        }
+        if self.table_mode.is_some() {
+            self.on_table_key(key);
             return;
         }
         if self.var_form.is_some() {
@@ -1337,6 +1396,7 @@ impl App {
                 Focus::Document => self.scroll_document(1),
                 Focus::Output => self.scroll_output(1),
             },
+            KeyCode::Enter if self.selected_opens_table() => self.open_table_mode(),
             KeyCode::Enter if self.focus == Focus::Tree => self.toggle_expand(),
             KeyCode::Backspace if self.focus == Focus::Tree => {
                 if !self.exit_spatial_parent() {
@@ -1909,6 +1969,10 @@ impl App {
         }
         if let Some(se) = &mut self.source_editor {
             se.on_mouse(mouse);
+            return;
+        }
+        if self.table_mode.is_some() {
+            self.on_table_mouse(mouse);
             return;
         }
         if self.history_view.is_some() {
@@ -2923,39 +2987,69 @@ impl App {
             .collect();
 
         // `file` nodes with `display="code"` (see SPEC.md) show the
-        // target's own file content, read fresh off disk — same as the
+        // target's own file content — fetched from the worker, which reads
+        // it fresh off disk confined to the canvas directory, same as the
         // browser's read-only preview — rather than the node's own body
-        // (which for a `file` node is just the one Markdown link).
-        if node.node_type == NodeType::File && node.display == Some(FileDisplay::Code) {
-            if let Some(target) = &node.target {
-                let path = base_dir.join(target);
-                let preview = match std::fs::read_to_string(&path) {
-                    Ok(content) => {
-                        vec![Segment::Text(self.highlighter.highlight_file(
-                            node.lang.as_deref(),
-                            &path,
-                            &content,
-                        ))]
+        // (which for a `file` node is just the one Markdown link). The
+        // fetch is in the background (`ensure_file_preview`); until it
+        // lands the pane says so, and a refresh keeps the old content up.
+        if node.node_type == NodeType::File
+            && matches!(node.display, Some(FileDisplay::Code | FileDisplay::Table))
+        {
+            let is_table = node.display == Some(FileDisplay::Table);
+            if let Some(target) = node.target.clone() {
+                let path = base_dir.join(&target);
+                let node_id = node.id.clone();
+                let lang = node.lang.clone();
+                let caption = node.caption.clone();
+                let preview = if is_table {
+                    self.ensure_table(&node_id);
+                    let width = self.document_inner_width();
+                    let lines = match self.tables.get(&node_id) {
+                        Some(data) => table::inline_lines(data, width),
+                        None => Vec::new(),
+                    };
+                    vec![Segment::Text(lines)]
+                } else {
+                    self.ensure_file_preview(&node_id);
+                    match self.file_previews.get(&node_id).map(|p| &p.state) {
+                        Some(FilePreviewState::Ready { content, truncated }) => {
+                            let mut lines =
+                                self.highlighter.highlight_file(lang.as_deref(), &path, content);
+                            if *truncated {
+                                lines.push(Line::from(Span::styled(
+                                    "preview truncated to the first part of the file",
+                                    Style::default().fg(Color::DarkGray),
+                                )));
+                            }
+                            vec![Segment::Text(lines)]
+                        }
+                        Some(FilePreviewState::Failed(e)) => {
+                            vec![Segment::Text(vec![Line::from(Span::styled(
+                                format!("failed to read {}: {e}", path.display()),
+                                Style::default().fg(Color::Red),
+                            ))])]
+                        }
+                        _ => vec![Segment::Text(vec![Line::from(Span::styled(
+                            "loading preview…",
+                            Style::default().fg(Color::DarkGray),
+                        ))])],
                     }
-                    Err(e) => vec![Segment::Text(vec![Line::from(Span::styled(
-                        format!("failed to read {}: {e}", path.display()),
-                        Style::default().fg(Color::Red),
-                    ))])],
                 };
-                // The file-content preview replaces `node.text` entirely
-                // (it's the target's own content, not the node's body) —
-                // but an optional caption (see `Node::caption`) is still
-                // part of that body and still worth showing. Above the
-                // preview, not below (unlike the plain-link display mode,
-                // which gets its caption for free below the link by
-                // rendering `node.text` whole) — it reads as a heading/
-                // intro for the file content, not a footnote on it.
-                if let Some(caption) = &node.caption {
+                // The preview replaces `node.text` entirely (it's the
+                // target's own content, not the node's body) — but an
+                // optional caption (see `Node::caption`) is still part of
+                // that body and still worth showing. Above the preview, not
+                // below (unlike the plain-link display mode, which gets its
+                // caption for free below the link by rendering `node.text`
+                // whole) — it reads as a heading/intro for the content, not
+                // a footnote on it.
+                if let Some(caption) = &caption {
                     let (segs, regions) = markdown::render(
                         caption,
                         &base_dir,
                         &self.highlighter,
-                        &node.id,
+                        &node_id,
                         &decls,
                         &form_values,
                         None,
@@ -3082,17 +3176,17 @@ impl App {
     /// gates against re-spawning on every selection change, and is never
     /// cleared, so a prior failure isn't retried within this session
     /// either (same cache contract the web server's own copy has). Result
-    /// (if any — a failure sends nothing) arrives via `link_preview_tx`,
-    /// handled by `on_link_preview_msg`.
+    /// (if any — a failure sends nothing) arrives via `background_tx`,
+    /// handled by `on_background_msg`.
     fn maybe_fetch_link_preview(&mut self, url: String) {
         if !self.link_preview_requested.insert(url.clone()) {
             return;
         }
         let cache = Arc::clone(&self.link_preview_cache);
-        let tx = self.link_preview_tx.clone();
+        let tx = self.background_tx.clone();
         tokio::spawn(async move {
             if let Some(meta) = cache.get_or_fetch(&url).await {
-                let _ = tx.send(LinkPreviewMsg::Meta { url, meta });
+                let _ = tx.send(BackgroundMsg::Meta { url, meta });
             }
         });
     }
@@ -3102,13 +3196,13 @@ impl App {
     /// `link_preview::fetch_image_bytes`), decoded here in the background
     /// task (cheap enough for one small preview image) and handed back as
     /// a plain `image::DynamicImage`; building the actual `Protocol` still
-    /// has to happen on the main thread (`on_link_preview_msg`), since
+    /// has to happen on the main thread (`on_background_msg`), since
     /// that needs `&mut self.picker`.
     fn maybe_fetch_link_preview_image(&mut self, url: String) {
         if !self.link_preview_image_requested.insert(url.clone()) {
             return;
         }
-        let tx = self.link_preview_tx.clone();
+        let tx = self.background_tx.clone();
         tokio::spawn(async move {
             let Ok(bytes) = link_preview::fetch_image_bytes(&url).await else {
                 return;
@@ -3116,22 +3210,58 @@ impl App {
             let Ok(image) = image::load_from_memory(&bytes) else {
                 return;
             };
-            let _ = tx.send(LinkPreviewMsg::Image { url, image });
+            let _ = tx.send(BackgroundMsg::Image { url, image });
         });
     }
 
     /// Applies a background link-preview fetch's result (see
-    /// `LinkPreviewMsg`) — called from `mod.rs`'s `main_loop`. Just updates
+    /// `BackgroundMsg`) — called from `mod.rs`'s `main_loop`. Just updates
     /// the cache and re-renders the currently selected node's document
     /// pane; if the fetch that just landed belongs to some other node than
     /// whatever's selected now, this is a harmless no-op-ish redraw rather
     /// than something that needs special-casing away.
-    pub fn on_link_preview_msg(&mut self, msg: LinkPreviewMsg) {
+    pub fn on_background_msg(&mut self, msg: BackgroundMsg) {
         match msg {
-            LinkPreviewMsg::Meta { url, meta } => {
+            BackgroundMsg::FileContent { node_id, result } => {
+                if let Some(entry) = self.file_previews.get_mut(&node_id) {
+                    entry.inflight = false;
+                    entry.fetched = Some(std::time::Instant::now());
+                    entry.state = match result {
+                        Ok((content, truncated)) => FilePreviewState::Ready { content, truncated },
+                        Err(e) => FilePreviewState::Failed(e),
+                    };
+                }
+            }
+            BackgroundMsg::TableMeta { node_id, result } => {
+                let data = self.tables.entry(node_id.clone()).or_default();
+                data.meta_inflight = false;
+                data.meta_fetched = Some(std::time::Instant::now());
+                match result {
+                    Ok(meta) => data.apply_meta(meta),
+                    Err(e) => data.meta_error = Some(e),
+                }
+                self.schedule_table_rows(&node_id);
+            }
+            BackgroundMsg::TableRows {
+                node_id,
+                generation,
+                block,
+                result,
+            } => {
+                if let Some(data) = self.tables.get_mut(&node_id) {
+                    match result {
+                        Ok(page) => {
+                            data.apply_rows(generation, block, page);
+                        }
+                        Err(e) => data.fail_rows(generation, block, e),
+                    }
+                }
+                self.schedule_table_rows(&node_id);
+            }
+            BackgroundMsg::Meta { url, meta } => {
                 self.link_preview_meta.insert(url, meta);
             }
-            LinkPreviewMsg::Image { url, image } => {
+            BackgroundMsg::Image { url, image } => {
                 let budget = ratatui::layout::Size::new(56, 24);
                 if let Ok(protocol) =
                     self.picker
@@ -5621,6 +5751,496 @@ fn image_size_budget(
 
 fn point_in(rect: Rect, x: u16, y: u16) -> bool {
     x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+}
+
+// ---------------------------------------------------------------------------
+// Worker-backed node data: `display="code"` content and `display="table"`.
+// All of it goes through the worker's API (never straight off disk), so the
+// confinement to the canvas directory and — for tables — the `duckdb` process
+// live in one place, shared with the web UI.
+// ---------------------------------------------------------------------------
+
+impl App {
+    /// Columns the document pane has for text — what the inline table is cut
+    /// to, since it would otherwise wrap into a mess. Falls back to a common
+    /// width when the terminal size can't be read (unit tests).
+    fn document_inner_width(&self) -> usize {
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+        let layout = ui::compute_layout(
+            Rect::new(0, 0, cols, rows),
+            self.fullscreen,
+            self.navigation_width_pct(),
+            self.output_height,
+            self.console_collapsed,
+            self.tree_collapsed,
+        );
+        usize::from(layout.document.width.saturating_sub(2)).max(20)
+    }
+
+    /// Starts (or refreshes) the background fetch of a `display="code"`
+    /// node's content. The first call leaves a "loading" entry; once content
+    /// has landed, an entry older than [`FILE_PREVIEW_REFRESH`] is refetched
+    /// while the old content stays on screen — so an edit to the file shows
+    /// up the next time the pane is drawn, as it did when this read the disk
+    /// itself.
+    fn ensure_file_preview(&mut self, node_id: &str) {
+        let Some(port) = self.worker_port else {
+            self.file_previews.insert(
+                node_id.to_string(),
+                FilePreview {
+                    state: FilePreviewState::Failed("no worker to read it through".into()),
+                    inflight: false,
+                    fetched: None,
+                },
+            );
+            return;
+        };
+        let entry = self
+            .file_previews
+            .entry(node_id.to_string())
+            .or_insert(FilePreview {
+                state: FilePreviewState::Loading,
+                inflight: false,
+                fetched: None,
+            });
+        let due = entry
+            .fetched
+            .is_none_or(|t| t.elapsed() >= FILE_PREVIEW_REFRESH);
+        if entry.inflight || !due {
+            return;
+        }
+        entry.inflight = true;
+        let tx = self.background_tx.clone();
+        let node_id = node_id.to_string();
+        tokio::spawn(async move {
+            let result = crate::worker_client::get_node_file_content(port, &node_id).await;
+            let _ = tx.send(BackgroundMsg::FileContent { node_id, result });
+        });
+    }
+
+    /// The selected node's id when it is a `display="table"` file node.
+    fn selected_table_node_id(&self) -> Option<String> {
+        let row = self.rows.get(self.selected)?;
+        let node = self.display_canvas.node(&row.node_id)?;
+        (node.node_type == NodeType::File && node.display == Some(FileDisplay::Table))
+            .then(|| node.id.clone())
+    }
+
+    /// Whether `Enter` should open the selected node's table: it is one, there
+    /// is a worker to serve it, and (from the tree) it has no children whose
+    /// expansion `Enter` would otherwise toggle.
+    pub fn selected_opens_table(&self) -> bool {
+        if self.worker_port.is_none() || self.selected_table_node_id().is_none() {
+            return false;
+        }
+        self.focus == Focus::Document
+            || self.rows.get(self.selected).is_some_and(|r| !r.has_children)
+    }
+
+    /// For the footer: the selected node is a table node.
+    pub fn selected_is_table(&self) -> bool {
+        self.selected_table_node_id().is_some()
+    }
+
+    fn spawn_table_meta(&mut self, port: u16, node_id: &str) {
+        let data = self.tables.entry(node_id.to_string()).or_default();
+        if data.meta_inflight {
+            return;
+        }
+        data.meta_inflight = true;
+        let tx = self.background_tx.clone();
+        let node_id = node_id.to_string();
+        tokio::spawn(async move {
+            let result = crate::worker_client::get_table_meta(port, &node_id).await;
+            let _ = tx.send(BackgroundMsg::TableMeta { node_id, result });
+        });
+    }
+
+    fn spawn_table_blocks(&mut self, port: u16, node_id: &str, blocks: Vec<usize>) {
+        let Some(data) = self.tables.get(node_id) else {
+            return;
+        };
+        let generation = data.generation;
+        let view = data.view.clone();
+        for block in blocks {
+            let tx = self.background_tx.clone();
+            let node_id = node_id.to_string();
+            let view = view.clone();
+            tokio::spawn(async move {
+                let result = crate::worker_client::get_table_rows(
+                    port,
+                    &node_id,
+                    block * table::BLOCK_ROWS,
+                    table::BLOCK_ROWS,
+                    &view,
+                )
+                .await;
+                let _ = tx.send(BackgroundMsg::TableRows {
+                    node_id,
+                    generation,
+                    block,
+                    result,
+                });
+            });
+        }
+    }
+
+    /// Makes sure the selected table node's schema is being fetched, then
+    /// asks for the rows its inline window needs.
+    fn ensure_table(&mut self, node_id: &str) {
+        let Some(port) = self.worker_port else {
+            self.tables.entry(node_id.to_string()).or_default().meta_error =
+                Some("no worker to read it through".into());
+            return;
+        };
+        let data = self.tables.entry(node_id.to_string()).or_default();
+        if data.meta.is_none() && !data.meta_inflight {
+            self.spawn_table_meta(port, node_id);
+        }
+        self.schedule_table_rows(node_id);
+    }
+
+    /// Fetches whichever blocks the window being shown for `node_id` still
+    /// lacks: the full-screen mode's rows (plus a block of margin either
+    /// side) when it's open on that node, else the inline window's first rows
+    /// when it's the selected node.
+    fn schedule_table_rows(&mut self, node_id: &str) {
+        let Some(port) = self.worker_port else { return };
+        let window = match &self.table_mode {
+            Some(tm) if tm.node_id == node_id => {
+                Some((tm.top_row, usize::from(tm.body_height.get()), 1))
+            }
+            _ if self.selected_table_node_id().as_deref() == Some(node_id) => {
+                Some((0, table::INLINE_ROWS, 0))
+            }
+            _ => None,
+        };
+        let Some((first, count, margin)) = window else {
+            return;
+        };
+        let Some(data) = self.tables.get_mut(node_id) else {
+            return;
+        };
+        if data.meta.as_ref().is_none_or(|m| m.state == "failed") {
+            return;
+        }
+        let blocks = data.blocks_to_fetch(first, count, margin);
+        if !blocks.is_empty() {
+            self.spawn_table_blocks(port, node_id, blocks);
+        }
+    }
+
+    /// The table nodes this client is currently looking at.
+    fn watched_tables(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.selected_table_node_id().into_iter().collect();
+        if let Some(tm) = &self.table_mode {
+            if !ids.contains(&tm.node_id) {
+                ids.push(tm.node_id.clone());
+            }
+        }
+        ids
+    }
+
+    /// While a watched table is still importing (or hasn't answered once),
+    /// `mod.rs` polls fast instead of waiting for its slow tick.
+    pub fn tables_want_fast_poll(&self) -> bool {
+        self.worker_port.is_some()
+            && self.watched_tables().iter().any(|id| {
+                self.tables
+                    .get(id)
+                    .is_none_or(|d| d.meta.is_none() || d.is_importing())
+            })
+    }
+
+    /// Re-asks the worker about each watched table: continually while it
+    /// imports, every [`TABLE_META_REFRESH`] otherwise, so a changed file (a
+    /// new `version`) is noticed and the rows reloaded.
+    pub fn poll_tables(&mut self) {
+        let Some(port) = self.worker_port else { return };
+        for id in self.watched_tables() {
+            let due = match self.tables.get(&id) {
+                None => true,
+                Some(d) if d.meta_inflight => false,
+                Some(d) => match &d.meta {
+                    None => true,
+                    Some(m) if m.state == "importing" => true,
+                    Some(m) => {
+                        let wait = if m.state == "failed" {
+                            TABLE_META_REFRESH * 2
+                        } else {
+                            TABLE_META_REFRESH
+                        };
+                        d.meta_fetched.is_none_or(|t| t.elapsed() >= wait)
+                    }
+                },
+            };
+            if due {
+                self.spawn_table_meta(port, &id);
+            }
+        }
+    }
+
+    /// `Enter` on a table node: opens it full screen.
+    fn open_table_mode(&mut self) {
+        let Some(id) = self.selected_table_node_id() else {
+            return;
+        };
+        let title = self
+            .display_canvas
+            .node(&id)
+            .map(|n| n.target.clone().unwrap_or_else(|| n.title.clone()))
+            .unwrap_or_else(|| id.clone());
+        self.table_mode = Some(TableMode::new(id.clone(), title));
+        self.ensure_table(&id);
+    }
+
+    fn close_table_mode(&mut self) {
+        self.table_mode = None;
+        self.render_current_document();
+    }
+
+    /// Moves the cursor by `drow`/`dcol` (clamped), scrolling to keep it in
+    /// view and fetching what's newly visible.
+    fn table_move(&mut self, drow: isize, dcol: isize) {
+        let Some(tm) = &self.table_mode else { return };
+        let row = tm.cursor_row.saturating_add_signed(drow);
+        let col = tm.cursor_col.saturating_add_signed(dcol);
+        self.table_goto(row, col);
+    }
+
+    fn table_goto(&mut self, row: usize, col: usize) {
+        let Some(tm) = self.table_mode.as_mut() else {
+            return;
+        };
+        let Some(data) = self.tables.get(&tm.node_id) else {
+            return;
+        };
+        let max_row = data.row_count().unwrap_or(0).saturating_sub(1);
+        let max_col = data.columns().len().saturating_sub(1);
+        tm.cursor_row = row.min(max_row);
+        tm.cursor_col = col.min(max_col);
+        let height = usize::from(tm.body_height.get()).max(1);
+        if tm.cursor_row < tm.top_row {
+            tm.top_row = tm.cursor_row;
+        } else if tm.cursor_row >= tm.top_row + height {
+            tm.top_row = tm.cursor_row + 1 - height;
+        }
+        let id = tm.node_id.clone();
+        self.schedule_table_rows(&id);
+    }
+
+    /// Applies a new sort/filter/search: refetches from the top.
+    fn apply_table_view(&mut self, view: meshfox_server::tables::ViewSpec) {
+        let Some(tm) = self.table_mode.as_mut() else {
+            return;
+        };
+        let id = tm.node_id.clone();
+        let Some(data) = self.tables.get_mut(&id) else {
+            return;
+        };
+        if !data.is_ready() {
+            tm.notice = Some("sorting, filtering and search wait for the import to finish".into());
+            return;
+        }
+        data.set_view(view);
+        tm.cursor_row = 0;
+        tm.top_row = 0;
+        self.schedule_table_rows(&id);
+    }
+
+    fn current_table_view(&self) -> Option<meshfox_server::tables::ViewSpec> {
+        let tm = self.table_mode.as_ref()?;
+        Some(self.tables.get(&tm.node_id)?.view.clone())
+    }
+
+    fn sort_table_by_cursor(&mut self, additive: bool) {
+        let Some(mut view) = self.current_table_view() else {
+            return;
+        };
+        let Some(tm) = &self.table_mode else { return };
+        view.sort = table::toggle_sort(&view.sort, tm.cursor_col, additive);
+        self.apply_table_view(view);
+    }
+
+    /// Rebuilds the view from what's typed in the prompts and applies it.
+    fn apply_table_filters(&mut self) {
+        let Some(mut view) = self.current_table_view() else {
+            return;
+        };
+        let Some(tm) = &self.table_mode else { return };
+        let Some(data) = self.tables.get(&tm.node_id) else {
+            return;
+        };
+        view.filters = table::build_filters(&tm.filter_texts, data.columns());
+        let search = tm.search_text.trim();
+        view.search = (!search.is_empty()).then(|| search.to_string());
+        self.apply_table_view(view);
+    }
+
+    fn copy_table_cell(&mut self) {
+        let Some(tm) = self.table_mode.as_mut() else {
+            return;
+        };
+        let value = self.tables.get(&tm.node_id).and_then(|d| {
+            let col = d.columns().get(tm.cursor_col)?;
+            d.row(tm.cursor_row)?.get(col.index).cloned()
+        });
+        tm.notice = Some(match value {
+            None => "nothing to copy yet".to_string(),
+            Some(v) => match table::copy_to_clipboard(v.as_deref().unwrap_or("")) {
+                Ok(()) => "copied the cell to the clipboard".to_string(),
+                Err(e) => format!("copy failed: {e}"),
+            },
+        });
+    }
+
+    /// Keys in the full-screen table. A prompt (`/`, `f`) claims every key
+    /// until Enter applies it or Esc drops it.
+    fn on_table_key(&mut self, key: KeyEvent) {
+        let Some(tm) = self.table_mode.as_mut() else {
+            return;
+        };
+        tm.notice = None;
+
+        if tm.input.is_some() {
+            match key.code {
+                KeyCode::Esc => tm.input = None,
+                KeyCode::Enter => {
+                    match tm.input.take() {
+                        Some(TableInput::Search(text)) => tm.search_text = text,
+                        Some(TableInput::Filter { column, text }) => {
+                            if text.trim().is_empty() {
+                                tm.filter_texts.remove(&column);
+                            } else {
+                                tm.filter_texts.insert(column, text);
+                            }
+                        }
+                        None => {}
+                    }
+                    self.apply_table_filters();
+                }
+                KeyCode::Backspace => {
+                    if let Some(TableInput::Search(t) | TableInput::Filter { text: t, .. }) =
+                        tm.input.as_mut()
+                    {
+                        t.pop();
+                    }
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(TableInput::Search(t) | TableInput::Filter { text: t, .. }) =
+                        tm.input.as_mut()
+                    {
+                        t.push(c);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        if tm.show_cell {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
+                tm.show_cell = false;
+            }
+            return;
+        }
+
+        let page = tm.page() as isize;
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.close_table_mode(),
+            KeyCode::Down | KeyCode::Char('j') => self.table_move(1, 0),
+            KeyCode::Up | KeyCode::Char('k') => self.table_move(-1, 0),
+            KeyCode::Right | KeyCode::Char('l') => self.table_move(0, 1),
+            KeyCode::Left | KeyCode::Char('h') => self.table_move(0, -1),
+            KeyCode::PageDown => self.table_move(page, 0),
+            KeyCode::PageUp => self.table_move(-page, 0),
+            KeyCode::Char('d') if ctrl => self.table_move(page / 2, 0),
+            KeyCode::Char('u') if ctrl => self.table_move(-page / 2, 0),
+            KeyCode::Char('g') | KeyCode::Home => {
+                let col = tm.cursor_col;
+                self.table_goto(0, col);
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                let col = tm.cursor_col;
+                self.table_goto(usize::MAX, col);
+            }
+            KeyCode::Char('0') => {
+                let row = tm.cursor_row;
+                self.table_goto(row, 0);
+            }
+            KeyCode::Char('$') => {
+                let row = tm.cursor_row;
+                self.table_goto(row, usize::MAX);
+            }
+            KeyCode::Char('s') => self.sort_table_by_cursor(false),
+            KeyCode::Char('S') => self.sort_table_by_cursor(true),
+            KeyCode::Char('/') => {
+                tm.input = Some(TableInput::Search(tm.search_text.clone()));
+            }
+            KeyCode::Char('f') => {
+                let column = tm.cursor_col;
+                let text = tm.filter_texts.get(&column).cloned().unwrap_or_default();
+                tm.input = Some(TableInput::Filter { column, text });
+            }
+            KeyCode::Char('F') => {
+                let column = tm.cursor_col;
+                tm.filter_texts.remove(&column);
+                self.apply_table_filters();
+            }
+            KeyCode::Char('x') => {
+                tm.filter_texts.clear();
+                tm.search_text.clear();
+                if let Some(mut view) = self.current_table_view() {
+                    view.sort.clear();
+                    view.filters.clear();
+                    view.search = None;
+                    self.apply_table_view(view);
+                }
+            }
+            KeyCode::Enter => tm.show_cell = true,
+            KeyCode::Char('y') => self.copy_table_cell(),
+            _ => {}
+        }
+    }
+
+    /// Mouse in the full-screen table: the wheel scrolls (horizontal wheel
+    /// moves by column), a click on a header sorts by that column (Shift adds
+    /// a key), a click on a cell moves the cursor there.
+    fn on_table_mouse(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::ScrollDown => self.table_move(3, 0),
+            MouseEventKind::ScrollUp => self.table_move(-3, 0),
+            MouseEventKind::ScrollRight => self.table_move(0, 1),
+            MouseEventKind::ScrollLeft => self.table_move(0, -1),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(tm) = &self.table_mode else { return };
+                let geometry = tm.geometry.borrow().clone();
+                let column = geometry
+                    .columns
+                    .iter()
+                    .find(|(x0, x1, _)| mouse.column >= *x0 && mouse.column < *x1)
+                    .map(|(_, _, c)| *c);
+                let in_header = mouse.row == geometry.header_y || mouse.row == geometry.header_y + 1;
+                let body = geometry.body;
+                let in_body = mouse.row >= body.y
+                    && mouse.row < body.y + body.height
+                    && mouse.column >= body.x
+                    && mouse.column < body.x + body.width;
+                if in_header {
+                    if let Some(c) = column {
+                        let row = tm.cursor_row;
+                        self.table_goto(row, c);
+                        self.sort_table_by_cursor(mouse.modifiers.contains(KeyModifiers::SHIFT));
+                    }
+                } else if in_body {
+                    let row = tm.top_row + usize::from(mouse.row - body.y);
+                    let col = column.unwrap_or(tm.cursor_col);
+                    self.table_goto(row, col);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]
