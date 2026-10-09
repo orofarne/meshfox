@@ -351,6 +351,8 @@ impl RunState {
 /// that's still *in flight* — see `running`.
 #[derive(Clone)]
 pub struct StepOutput {
+    /// stdout and stderr in event arrival order, for plain text rendering.
+    pub text: String,
     pub stdout: String,
     pub stderr: String,
     pub output_markdown: bool,
@@ -4136,6 +4138,10 @@ impl App {
             RunEvent::Started { .. } => {}
             RunEvent::StepStart { node_id, block } => {
                 let addr = BlockAddr::new(node_id, block);
+                // The passive watch stream can deliver a line before this
+                // stream announces the step. Transfer ownership of its badge
+                // along with its output to the foreground run.
+                self.external_running.remove(&addr);
                 run.chain.push(addr.clone());
                 run.idx += 1;
                 run.stdout_only.clear();
@@ -4164,6 +4170,7 @@ impl App {
                 self.step_output.insert(
                     addr.clone(),
                     StepOutput {
+                        text: String::new(),
                         stdout: String::new(),
                         stderr: String::new(),
                         output_markdown: run.output_markdown,
@@ -4206,6 +4213,7 @@ impl App {
                     .step_output
                     .entry(addr.clone())
                     .or_insert_with(|| StepOutput {
+                        text: String::new(),
                         stdout: String::new(),
                         stderr: String::new(),
                         output_markdown: run.output_markdown,
@@ -4217,6 +4225,8 @@ impl App {
                     meshfox_server::stream_exec::OutputStream::Stdout => &mut entry.stdout,
                     meshfox_server::stream_exec::OutputStream::Stderr => &mut entry.stderr,
                 };
+                entry.text.push_str(&text);
+                entry.text.push('\n');
                 dest.push_str(&text);
                 dest.push('\n');
                 touched = Some(addr);
@@ -4244,6 +4254,11 @@ impl App {
                 self.step_output.insert(
                     addr.clone(),
                     StepOutput {
+                        text: self
+                            .step_output
+                            .get(&addr)
+                            .map(|entry| entry.text.clone())
+                            .unwrap_or_default(),
                         stdout: run.stdout_only.clone(),
                         stderr: run.stderr_only.clone(),
                         output_markdown: run.output_markdown,
@@ -4292,6 +4307,11 @@ impl App {
                 self.step_output.insert(
                     addr.clone(),
                     StepOutput {
+                        text: self
+                            .step_output
+                            .get(&addr)
+                            .map(|entry| entry.text.clone())
+                            .unwrap_or_default(),
                         stdout: run.stdout_only.clone(),
                         stderr: run.stderr_only.clone(),
                         output_markdown: run.output_markdown,
@@ -4414,6 +4434,9 @@ impl App {
     ) {
         use crate::worker_client::SubscribeEvent;
         if self.run.as_ref().is_some_and(|r| r.chain.contains(&addr)) {
+            // A passive Line may have arrived before our StepStart. Even
+            // when ignoring duplicate output, never retain its running badge.
+            self.external_running.remove(&addr);
             return;
         }
         match event {
@@ -4439,6 +4462,7 @@ impl App {
                     .step_output
                     .entry(addr.clone())
                     .or_insert_with(|| StepOutput {
+                        text: String::new(),
                         stdout: String::new(),
                         stderr: String::new(),
                         output_markdown,
@@ -4447,6 +4471,8 @@ impl App {
                         running: true,
                     });
                 entry.running = true;
+                entry.text.push_str(&text);
+                entry.text.push('\n');
                 let line = match stream {
                     meshfox_server::stream_exec::OutputStream::Stdout => &mut entry.stdout,
                     meshfox_server::stream_exec::OutputStream::Stderr => &mut entry.stderr,
@@ -4463,6 +4489,7 @@ impl App {
                     .step_output
                     .entry(addr.clone())
                     .or_insert_with(|| StepOutput {
+                        text: String::new(),
                         stdout: String::new(),
                         stderr: String::new(),
                         output_markdown,
@@ -4818,6 +4845,7 @@ impl App {
             self.step_output.insert(
                 addr.clone(),
                 StepOutput {
+                    text: String::new(),
                     stdout: String::new(),
                     stderr: String::new(),
                     output_markdown: false,
@@ -6557,6 +6585,79 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn passive_output_before_foreground_step_does_not_leave_a_spinner() {
+        use crate::worker_client::{RunEvent, SubscribeEvent};
+        let mut app = app_with_blocks("spinner-race", "```sh name=build\necho build\n```\n").await;
+        let addr = BlockAddr::new("root", "build");
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        app.run = Some(RunState {
+            chain: Vec::new(),
+            idx: 0,
+            http_rx: Some(rx),
+            lines: Vec::new(),
+            full_output: String::new(),
+            stdout_only: String::new(),
+            stderr_only: String::new(),
+            output_markdown: false,
+            step_started: std::time::Instant::now(),
+            had_failure: false,
+            killed: false,
+            finished: false,
+        });
+        app.on_external_run_event(
+            addr.clone(),
+            SubscribeEvent::Line {
+                stream: meshfox_server::stream_exec::OutputStream::Stdout,
+                text: "build".into(),
+            },
+        );
+        assert!(app.external_running.contains_key(&addr));
+        app.on_run_event(Some(RunEvent::StepStart {
+            node_id: "root".into(),
+            block: "build".into(),
+        }))
+        .await;
+        assert!(!app.external_running.contains_key(&addr));
+        assert!(app.spinner_active());
+        for (stream, text) in [
+            (meshfox_server::stream_exec::OutputStream::Stderr, "waiting"),
+            (
+                meshfox_server::stream_exec::OutputStream::Stdout,
+                "wrote files",
+            ),
+            (meshfox_server::stream_exec::OutputStream::Stderr, "warning"),
+        ] {
+            app.on_run_event(Some(RunEvent::Output {
+                node_id: "root".into(),
+                block: "build".into(),
+                stream,
+                text: text.into(),
+            }))
+            .await;
+        }
+        assert_eq!(
+            app.step_output[&addr].text,
+            "waiting\nwrote files\nwarning\n"
+        );
+        app.on_run_event(Some(RunEvent::StepEnd {
+            node_id: "root".into(),
+            block: "build".into(),
+            exit_code: 0,
+            duration_ms: 10,
+        }))
+        .await;
+        app.on_external_run_event(addr.clone(), SubscribeEvent::Done { exit_code: Some(0) });
+        app.on_run_event(Some(RunEvent::Done { exit_code: 0 }))
+            .await;
+        assert!(!app.step_output[&addr].running);
+        assert_eq!(
+            app.step_output[&addr].text,
+            "waiting\nwrote files\nwarning\n"
+        );
+        assert!(!app.spinner_active());
+    }
+
+    #[tokio::test]
     async fn skipped_steps_do_not_replay_old_logs_in_the_tui() {
         let dir = std::env::temp_dir().join(format!("meshfox-tui-skipped-{}", uuid_like()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -7137,6 +7238,7 @@ mod tests {
         app.step_output.insert(
             BlockAddr::new("root", "plain"),
             StepOutput {
+                text: "hi\n".into(),
                 stdout: "hi\n".into(),
                 stderr: String::new(),
                 output_markdown: false,
@@ -7180,6 +7282,7 @@ mod tests {
         app.step_output.insert(
             BlockAddr::new("session-only", "b"),
             StepOutput {
+                text: String::new(),
                 stdout: String::new(),
                 stderr: String::new(),
                 output_markdown: false,
@@ -7576,6 +7679,7 @@ mod tests {
             (entry.stdout.as_str(), entry.stderr.as_str()),
             ("hello\n", "oops\n")
         );
+        assert_eq!(entry.text, "hello\noops\n");
         assert_eq!(
             (entry.exit_code, entry.duration_ms, entry.running),
             (3, 1234, false)

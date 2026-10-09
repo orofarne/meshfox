@@ -978,7 +978,7 @@ impl<'a> Renderer<'a> {
                 first_seg = false;
             }
         } else {
-            for text in [&live.stdout, &live.stderr] {
+            for text in [&live.text] {
                 for line in text.lines() {
                     any_output = true;
                     framed.push(Line::from(vec![
@@ -2004,12 +2004,37 @@ mod tests {
 
     fn table_output(output_markdown: bool, running: bool) -> super::super::app::StepOutput {
         super::super::app::StepOutput {
+            text: "| score | name |\n|---|---|\n| 1.0 | ZMARKERZ |\nsome warning\n".into(),
             stdout: "| score | name |\n|---|---|\n| 1.0 | ZMARKERZ |\n".to_string(),
             stderr: "some warning\n".to_string(),
             output_markdown,
             exit_code: 0,
             duration_ms: 5,
             running,
+        }
+    }
+
+    #[test]
+    fn plain_live_output_preserves_interleaved_stream_order() {
+        let mut output = table_output(false, false);
+        output.stdout = "wrote files\n".into();
+        output.stderr = "waiting\nwarning\n".into();
+        output.text = "waiting\nwrote files\nwarning\n".into();
+        for running in [true, false] {
+            output.running = running;
+            let (segments, _) = render(
+                "```sh name=build\necho build\n```\n",
+                Path::new("/nonexistent-base-dir"),
+                &Highlighter::new(),
+                "n",
+                &[],
+                &Default::default(),
+                None,
+                &std::collections::HashMap::from([("build".into(), output.clone())]),
+            );
+            let text = segment_text(&segments);
+            assert!(text.find("waiting").unwrap() < text.find("wrote files").unwrap());
+            assert!(text.find("wrote files").unwrap() < text.find("warning").unwrap());
         }
     }
 
@@ -2137,6 +2162,7 @@ mod tests {
         live_output.insert(
             "t".to_string(),
             super::super::app::StepOutput {
+                text: stdout.to_string(),
                 stdout: stdout.to_string(),
                 stderr: String::new(),
                 output_markdown: false,

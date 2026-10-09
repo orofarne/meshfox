@@ -364,6 +364,10 @@ export interface MeshNodeData {
    * that case (mirrors the TUI's own `has_children`-gated marker, just
    * scoped to this one node shape rather than every node). */
   hasChildren: boolean;
+  /** Whether folding does anything (App.tsx's `canFold`): false for a
+   * childless title-only node and for a childless node with a one-/two-line
+   * body — those get no fold toggle and ignore title clicks. */
+  foldable: boolean;
   onToggleFold: () => void;
   /** True for the one node keyboard nav (j/k/h/l/Enter, see App.tsx)
    * currently has focus on — distinct from React Flow's own mouse-driven
@@ -2967,7 +2971,7 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
   };
   const handleTitleClick = (e: React.MouseEvent) => {
     if (data.editMode) return;
-    if (isTitleOnly && !data.hasChildren) return;
+    if (!data.foldable) return;
     const start = titleMouseDownRef.current;
     const moved = start ? Math.hypot(e.clientX - start.x, e.clientY - start.y) : 0;
     if (moved > TITLE_CLICK_MOVE_THRESHOLD) return;
@@ -3144,7 +3148,7 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
         </div>
       ) : (
         <div className="mesh-node-title" data-level={data.level}>
-          <FoldToggle folded={data.folded} onToggle={data.onToggleFold} />
+          {data.foldable && <FoldToggle folded={data.folded} onToggle={data.onToggleFold} />}
           {editingTitle ? (
             <input {...titleEditInputProps} />
           ) : (

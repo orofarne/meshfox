@@ -163,8 +163,9 @@ pub struct NodeView {
     /// body to hide and no subtree to collapse, so the template renders it
     /// as a plain element with no disclosure control. Every other node
     /// (real body content, or at least one child) is always `true` here
-    /// regardless of its own `folded` state. Mirrors `web/src/App.tsx`'s
-    /// `canFold`.
+    /// regardless of its own `folded` state. A childless node whose body is
+    /// one or two plain lines (see `is_short_body_node`) isn't foldable
+    /// either. Mirrors `web/src/App.tsx`'s `canFold`.
     pub foldable: bool,
     /// This node's default fold state on first render — `true` starts its
     /// `<details>` closed (see `site-template/_macros.html.tera`), hiding
@@ -581,6 +582,31 @@ fn is_title_only_node(n: &Node) -> bool {
     n.node_type == NodeType::Text && n.text.trim().is_empty()
 }
 
+/// A childless text/file/link node whose body is one or two short plain
+/// lines (no fenced block) — folding it saves next to nothing, so it's never
+/// foldable. Mirrors `isShortBodyNode` in `web/src/App.tsx`.
+fn is_short_body_node(n: &Node) -> bool {
+    const SHORT_BODY_MAX_LINES: usize = 2;
+    const SHORT_BODY_MAX_CHARS: usize = 120;
+    if !matches!(n.node_type, NodeType::Text | NodeType::File | NodeType::Link) {
+        return false;
+    }
+    // A `display="code"`/`"table"` file node's one-line body is just the
+    // link; what it renders is the whole target's content.
+    if n.display.is_some_and(|d| !d.is_link()) {
+        return false;
+    }
+    let lines: Vec<&str> = n.text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let chars: usize = lines.iter().map(|l| l.trim().chars().count()).sum();
+    !lines.is_empty()
+        && lines.len() <= SHORT_BODY_MAX_LINES
+        && chars <= SHORT_BODY_MAX_CHARS
+        && !lines.iter().any(|l| {
+            let t = l.trim_start();
+            t.starts_with("```") || t.starts_with("~~~")
+        })
+}
+
 /// The default fold state for every node in `canvas` on a static export's
 /// first render — a direct Rust port of `web/src/App.tsx`'s
 /// `resolveDefaultFold`/`canFold`, computed once here up front (rather than
@@ -614,14 +640,16 @@ fn resolve_default_fold(
     let mut folded = std::collections::HashSet::new();
     let mut foldable = std::collections::HashSet::new();
     for n in &canvas.nodes {
-        let can_fold = !is_title_only_node(n) || with_children.contains(n.id.as_str());
+        let can_fold = with_children.contains(n.id.as_str())
+            || (!is_title_only_node(n) && !is_short_body_node(n));
         if can_fold {
             foldable.insert(n.id.clone());
         }
         let has_explicit_size = n.width.is_some() || n.height.is_some();
-        let resolved = n.fold.unwrap_or_else(|| {
-            n.id != root_id && !has_unfold_option && !has_explicit_size && can_fold
-        });
+        let resolved = can_fold
+            && n.fold.unwrap_or_else(|| {
+                n.id != root_id && !has_unfold_option && !has_explicit_size
+            });
         if resolved {
             folded.insert(n.id.clone());
         }
@@ -2029,7 +2057,7 @@ mod tests {
 
     #[test]
     fn a_plain_child_folds_by_default() {
-        let c = canvas("# Root\n\n## Child\n<!-- meshfox:node id=\"child\" -->\n\nbody\n");
+        let c = canvas("# Root\n\n## Child\n<!-- meshfox:node id=\"child\" -->\n\na\nb\nc\n");
         let site = build_site(&c);
         let child = site.find("child").unwrap();
         assert!(child.foldable);
@@ -2040,7 +2068,7 @@ mod tests {
     fn the_unfold_option_flips_the_default_to_expanded() {
         let c = canvas(
             "# Root\n<!-- meshfox:node id=\"root\" -->\n<!-- meshfox:option name=\"unfold\" -->\n\nprose\n\n\
-             ## Child\n<!-- meshfox:node id=\"child\" -->\n\nbody\n",
+             ## Child\n<!-- meshfox:node id=\"child\" -->\n\na\nb\nc\n",
         );
         let site = build_site(&c);
         assert!(!site.find("child").unwrap().folded);
@@ -2053,7 +2081,7 @@ mod tests {
         // folding by default.
         let c = canvas(
             "# Root\n<!-- meshfox:node id=\"root\" fold=\"true\" -->\n\n\
-             ## Child\n<!-- meshfox:node id=\"child\" fold=\"false\" -->\n\nbody\n",
+             ## Child\n<!-- meshfox:node id=\"child\" fold=\"false\" -->\n\na\nb\nc\n",
         );
         let site = build_site(&c);
         assert!(site.find("root").unwrap().folded);
@@ -2063,7 +2091,7 @@ mod tests {
     #[test]
     fn a_node_with_an_explicit_size_does_not_fold_by_default() {
         let c = canvas(
-            "# Root\n\n## Child\n<!-- meshfox:node id=\"child\" x=10 y=20 w=200 h=80 -->\n\nbody\n",
+            "# Root\n\n## Child\n<!-- meshfox:node id=\"child\" x=10 y=20 w=200 h=80 -->\n\na\nb\nc\n",
         );
         let site = build_site(&c);
         assert!(!site.find("child").unwrap().folded);
@@ -2076,6 +2104,22 @@ mod tests {
         let child = site.find("child").unwrap();
         assert!(!child.foldable);
         assert!(!child.folded);
+    }
+
+    #[test]
+    fn a_childless_short_body_node_is_not_foldable() {
+        let c = canvas(
+            "# Root\n\n## One\n<!-- meshfox:node id=\"one\" -->\n\nline\n\n\
+             ## Two\n<!-- meshfox:node id=\"two\" -->\n\na\nb\n\n\
+             ## Three\n<!-- meshfox:node id=\"three\" -->\n\na\nb\nc\n",
+        );
+        let site = build_site(&c);
+        for id in ["one", "two"] {
+            let n = site.find(id).unwrap();
+            assert!(!n.foldable && !n.folded, "{id}");
+        }
+        let three = site.find("three").unwrap();
+        assert!(three.foldable && three.folded);
     }
 
     #[test]

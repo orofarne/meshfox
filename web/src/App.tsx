@@ -190,7 +190,33 @@ function nodesWithChildren(canvas: CanvasDoc): Set<string> {
  * foldable; one with children still is, purely for that subtree's sake.
  * Every other node is always foldable (its own body, if nothing else). */
 function canFold(n: CanvasNode, withChildren: ReadonlySet<string>): boolean {
-  return !isTitleOnlyNode(n) || withChildren.has(n.id);
+  if (withChildren.has(n.id)) return true;
+  return !isTitleOnlyNode(n) && !isShortBodyNode(n);
+}
+
+/** A "short" body: at most this many non-blank lines and this many
+ * characters in total (a long wrapped paragraph is one source line but many
+ * rendered ones). See `isShortBodyNode`. */
+const SHORT_BODY_MAX_LINES = 2;
+const SHORT_BODY_MAX_CHARS = 120;
+
+/** A childless text/file/link node whose body is one or two short plain
+ * lines (no fenced block): folding it saves next to nothing, so it's never
+ * foldable. Mirrors `is_short_body_node` in `crates/core/src/staticgen.rs`. */
+function isShortBodyNode(n: CanvasNode): boolean {
+  const type = n.type ?? "text";
+  if (type !== "text" && type !== "file" && type !== "link") return false;
+  // A `display="code"`/`"table"` file node's one-line body is just the
+  // link; what it renders is the whole target's content.
+  if (n.display === "code" || n.display === "table") return false;
+  const lines = n.text.split("\n").filter((l) => l.trim() !== "");
+  const chars = lines.reduce((sum, l) => sum + l.trim().length, 0);
+  return (
+    lines.length > 0 &&
+    lines.length <= SHORT_BODY_MAX_LINES &&
+    chars <= SHORT_BODY_MAX_CHARS &&
+    !lines.some((l) => /^\s*(```|~~~)/.test(l))
+  );
 }
 
 /** The default folded set for `canvas` on its very first open (nothing
@@ -346,7 +372,19 @@ export default function App() {
   // folded subtree (see `computeAutoLayout`'s `foldedNodeIds`). Persisted
   // to localStorage per canvas (see the restore/persist effects below) so
   // it survives a reload without polluting the document itself.
-  const [foldedNodeIds, setFoldedNodeIds] = useState<Set<string>>(new Set());
+  const [rawFoldedNodeIds, setFoldedNodeIds] = useState<Set<string>>(new Set());
+  // What's actually folded: the stored set minus nodes that aren't
+  // foldable (a stale localStorage entry or an explicit `fold="true"` on a
+  // short-body node must not collapse it).
+  const foldedNodeIds = useMemo(() => {
+    if (!canvas) return rawFoldedNodeIds;
+    const withChildren = nodesWithChildren(canvas);
+    const byId = new Map(canvas.nodes.map((n) => [n.id, n]));
+    return new Set([...rawFoldedNodeIds].filter((id) => {
+      const n = byId.get(id);
+      return !n || canFold(n, withChildren);
+    }));
+  }, [canvas, rawFoldedNodeIds]);
   const foldedStorageKeyRef = useRef<string | null>(null);
   // Restores folded state for whichever canvas just loaded, keyed by its
   // root node's id (stable across reloads/renames per SPEC.md — the only
@@ -380,8 +418,8 @@ export default function App() {
   useEffect(() => {
     const key = foldedStorageKeyRef.current;
     if (!key) return;
-    localStorage.setItem(key, JSON.stringify([...foldedNodeIds]));
-  }, [foldedNodeIds]);
+    localStorage.setItem(key, JSON.stringify([...rawFoldedNodeIds]));
+  }, [rawFoldedNodeIds]);
   // True from the moment a drag/resize changes a node's position/size
   // until the debounced auto-save (below) has actually persisted it —
   // drives the toolbar's "saving layout…" indicator.
@@ -2523,6 +2561,7 @@ export default function App() {
             varDecls,
             folded: isFolded,
             hasChildren: parentIdSet.has(n.id),
+            foldable: canFold(n, parentIdSet),
             onToggleFold: () => toggleFold(n.id),
             target: n.target,
             caption: n.caption,
