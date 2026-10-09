@@ -109,3 +109,41 @@ summary.node-title:focus-visible { outline:none; }
   .node { width:min(75vw,480px); }
   .tree > .node-row > .node { width:min(78vw,500px); }
 }
+
+/* "Under the lamp": a paper lifted off the board and read full screen (lamp.js). */
+.lamp-btn { position:absolute; top:.55rem; right:.6rem; z-index:3; width:1.9rem; height:1.9rem; padding:0; display:grid; place-items:center; border:2px solid var(--accent); border-radius:50%; background:var(--paper-light); color:var(--accent); font:700 1rem/1 var(--mono); cursor:zoom-in; opacity:.7; transform:rotate(-8deg); transition:opacity .15s,transform .15s; }
+.lamp-btn:hover,.lamp-btn:focus-visible { opacity:1; transform:rotate(0) scale(1.08); }
+.lamp-btn:focus-visible { outline:3px solid #1b66c9; outline-offset:2px; }
+.node-title:has(> .lamp-btn) { padding-right:2.2rem; }
+html.lamp-on { overflow:hidden; }
+dialog.lamp { position:fixed; inset:0; width:100vw; height:100vh; max-width:none; max-height:none; margin:0; padding:0; border:0; background:transparent; color:var(--ink); overflow:hidden; }
+dialog.lamp::backdrop { background:transparent; }
+.lamp-dim { position:fixed; inset:0; background:radial-gradient(ellipse 70% 60% at 50% 38%,#ffdf9a2e 0%,#2a1f1799 45%,#0a0705f0 100%); backdrop-filter:blur(2px); }
+.lamp-stage { position:relative; height:100%; display:flex; align-items:center; justify-content:center; padding:3vh 3vw; }
+.lamp-shadow { max-height:100%; width:min(860px,100%); display:flex; filter:drop-shadow(0 22px 30px #000b) drop-shadow(0 2px 3px #0008); }
+.lamp-sheet { --accent:var(--accent-default); position:relative; width:100%; max-height:calc(94vh); display:flex; flex-direction:column; padding:2.4rem 2.2rem 1.6rem 4.2rem; background:
+    linear-gradient(90deg,transparent 3.1rem,#c4584a66 3.1rem,#c4584a66 calc(3.1rem + 2px),transparent calc(3.1rem + 2px)),
+    linear-gradient(#fff8e8,#f6ecd2);
+  clip-path:polygon(0 -40px,100% -40px,100% calc(100% - 38px),calc(100% - 38px) 100%,0 100%); }
+/* The curled corner and the paperclip (the sheet's clip-path reaches above its top so the clip can overhang). */
+.lamp-sheet::after { content:""; position:absolute; right:0; bottom:0; width:38px; height:38px; background:linear-gradient(135deg,transparent 50%,#b9a77f 50%,#e9dfc4 100%); }
+.lamp-sheet::before { content:""; position:absolute; top:-26px; left:1.3rem; width:26px; height:70px; background:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 26 70'%3E%3Cpath d='M10 46V16A6 6 0 0 1 22 16V54A9 9 0 0 1 4 54V22A4 4 0 0 1 12 22V50' fill='none' stroke='%239aa1a8' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M10 46V16A6 6 0 0 1 22 16V54A9 9 0 0 1 4 54V22' fill='none' stroke='%23d5dade' stroke-width='.8' stroke-linecap='round' transform='translate(-.5 -.5)'/%3E%3C/svg%3E") center/contain no-repeat; transform:rotate(5deg); filter:drop-shadow(1px 2px 1px #0007); pointer-events:none; z-index:2; }
+.lamp-head { flex:none; }
+.lamp-crumbs { font:400 .8rem/1.4 var(--display); letter-spacing:.04em; color:#7b6552; margin:0 2.4rem .5rem 0; overflow-wrap:anywhere; }
+.lamp-crumbs a { color:#8e392f; text-decoration:none; border-bottom:1px dotted currentColor; }
+.lamp-crumbs a:hover { background:#e9d9b4; }
+.lamp-title { margin:0 2.4rem .8rem 0; padding-bottom:.6rem; border-bottom:2px solid color-mix(in srgb,var(--accent) 60%,#b7a68c); font:400 clamp(1.4rem,3vw,2rem)/1.25 var(--display); overflow-wrap:anywhere; }
+.lamp-tags { display:flex; gap:.35rem; flex-wrap:wrap; margin:0 0 .8rem; }
+.lamp-scroll { flex:1 1 auto; min-height:0; overflow:auto; overscroll-behavior:contain; padding:.2rem .4rem 1.2rem 0; font-size:16px; line-height:1.65; outline:none; }
+.lamp-scroll .node-body { overflow:visible; }
+.lamp-scroll .node-body pre { font-size:13px; }
+.lamp-close { position:absolute; top:.7rem; right:.8rem; width:2rem; height:2rem; padding:0; border:2px solid var(--accent); border-radius:50%; background:#fff8e8; color:var(--accent); font:700 .9rem/1 var(--mono); cursor:pointer; z-index:2; }
+.lamp-close:hover,.lamp-close:focus-visible { background:var(--accent); color:#fff8e8; outline:none; }
+@media(max-width:760px) {
+  .lamp-stage { padding:0; }
+  .lamp-shadow { width:100%; height:100%; }
+  .lamp-sheet { max-height:none; padding:2.4rem 1rem 1rem 2.6rem; background:
+      linear-gradient(90deg,transparent 1.7rem,#c4584a66 1.7rem,#c4584a66 calc(1.7rem + 2px),transparent calc(1.7rem + 2px)),linear-gradient(#fff8e8,#f6ecd2); clip-path:none; }
+  .lamp-sheet::after { display:none; }
+  .lamp-btn { width:2.2rem; height:2.2rem; }
+}

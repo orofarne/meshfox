@@ -20,4 +20,5 @@
 <script src="layout.js" defer></script>
 <script src="highlight.js" defer></script>
 <script src="edges.js" defer></script>
+<script src="lamp.js" defer></script>
 </body></html>
