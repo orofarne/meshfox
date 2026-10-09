@@ -7,7 +7,7 @@ const REPO = "orofarne/meshfox";
 /** The oldest `meshfox` release this extension works with. Bump it
  * whenever the extension starts relying on something a release introduced
  * (a worker endpoint, a `watcher_protocol` message, a CLI flag). */
-export const MIN_MESHFOX_VERSION = "v0.16.0";
+export const MIN_MESHFOX_VERSION = "v0.17.1";
 const INSTALL_COMMAND = "curl -fsSL https://raw.githubusercontent.com/orofarne/meshfox/main/scripts/install.sh | sh";
 
 /** Mirrors `check_updates`'s own `is_release_tag` check in

@@ -1,11 +1,17 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
 
-- New: **meshfox: New canvas** command — pick a path and it creates the
-  file and opens it. An empty `*.canvas.md` (however created) is now
-  initialized with the starting structure instead of failing with "document
-  has no top-level (#) heading"; non-empty invalid files still fail.
+- New: **meshfox: New canvas** command (Command Palette) — pick a path and
+  it creates the file and opens it as a canvas.
+- New: an empty (or whitespace-only) `*.canvas.md`, however it was created
+  (e.g. VS Code's own "New File"), now opens with the starting structure
+  filled in instead of failing with "document has no top-level (#)
+  heading". Non-empty files without a root heading are still rejected, as
+  before. This is done by the `meshfox` binary, not the extension.
+- Changed: the oldest supported `meshfox` release is now v0.17.1 (was
+  v0.16.0), the first one with the blank-file initialization above. An
+  older binary gets the usual "needs vX or newer" update prompt.
 
 ## 0.3.1
 
