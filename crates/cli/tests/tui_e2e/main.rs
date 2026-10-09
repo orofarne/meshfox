@@ -21,9 +21,12 @@
 //! regardless, same as `mouse_output_pane`'s already were).
 
 mod baseline;
+mod block_controls;
+mod file_node_run;
 mod fixtures;
 mod harness;
 mod history;
+mod include_reload;
 mod markdown_output;
 mod mouse_deps_line;
 mod mouse_drag_dblclick;

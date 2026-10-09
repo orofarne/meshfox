@@ -1776,6 +1776,7 @@ function BlockDetails({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeD
           <div className="mesh-block-argument" key={arg.name}>
             <code>{arg.name}</code><span className="mesh-block-argument-type">{arg.type}</span>
             {arg.choices.length > 0 && <code>[{arg.choices.join(" | ")}]</code>}
+            {arg.choicesVar && <code>[from ${arg.choicesVar}]</code>}
             {arg.required && <span className="mesh-block-required">required</span>}
             {arg.default !== undefined && <span>{arg.required ? "suggestion" : "default"}: <code>{JSON.stringify(arg.default)}</code></span>}
           </div>

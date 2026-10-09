@@ -946,7 +946,7 @@ fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
             .and_then(super::app::RunState::current_addr)
             .map(|addr| addr.node_id.as_str()),
     );
-    if let Some(file_run) = app.file_run.as_ref().filter(|f| f.proc.is_some()) {
+    if let Some(file_run) = app.file_run.as_ref().filter(|f| f.events.is_some()) {
         running_nodes.insert(file_run.node_id.as_str());
     }
     let mut failed_nodes: std::collections::HashSet<&str> = app.failed_node_ids();
@@ -1099,6 +1099,61 @@ fn wrapped_text_layout(total: u16, skip: u16, available: u16) -> Option<TextLayo
     })
 }
 
+/// Let ratatui wrap the same text with a private marker style, so mouse
+/// regions follow word wrapping, wide glyphs and partially scrolled lines.
+fn wrapped_click_rects(line: &Line<'_>, width: u16, start: u16, end: u16) -> Vec<Rect> {
+    use ratatui::buffer::Buffer;
+    use ratatui::widgets::Widget;
+    if width == 0 {
+        return Vec::new();
+    }
+    let marker = Color::Rgb(1, 2, 3);
+    let mut col = 0usize;
+    let spans: Vec<_> = line
+        .styled_graphemes(Style::default())
+        .map(|g| {
+            let w = Span::raw(g.symbol).width();
+            let marked = col < usize::from(end) && col + w > usize::from(start);
+            col += w;
+            Span::styled(
+                g.symbol.to_owned(),
+                if marked { g.style.bg(marker) } else { g.style },
+            )
+        })
+        .collect();
+    let paragraph = Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false });
+    let height = paragraph.line_count(width).min(u16::MAX as usize) as u16;
+    let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+    paragraph.render(buffer.area, &mut buffer);
+    let mut rects = Vec::new();
+    for y in 0..height {
+        let mut x = 0;
+        while x < width {
+            if buffer[(x, y)].bg != marker {
+                x += 1;
+                continue;
+            }
+            let begin = x;
+            while x < width && buffer[(x, y)].bg == marker {
+                x += Span::raw(buffer[(x, y)].symbol()).width().max(1) as u16;
+            }
+            rects.push(Rect::new(begin, y, x.min(width) - begin, 1));
+        }
+    }
+    rects
+}
+
+/// Reveal an off-screen header with the smallest scroll adjustment.
+fn reveal_header_scroll(scroll: u16, height: u16, header: u16) -> u16 {
+    if header < scroll {
+        header
+    } else if u32::from(header) >= u32::from(scroll) + u32::from(height) {
+        header.saturating_sub(height.saturating_sub(1))
+    } else {
+        scroll
+    }
+}
+
 fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1113,6 +1168,37 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
+    if app.reveal_selected_block {
+        if let Some(addr) = &app.selected_block {
+            let header = app.doc_click_regions.iter().find(|r| matches!(&r.target,
+                super::markdown::ClickTarget::Block { node_id, block_name, action: super::markdown::BlockAction::ToggleBlock }
+                if node_id == &addr.node_id && block_name == &addr.block_name));
+            if let Some(header) = header {
+                let rows: usize = app
+                    .doc_segments
+                    .iter()
+                    .take(header.segment_index)
+                    .map(|seg| match seg {
+                        Segment::Text(lines) => Paragraph::new(Text::from(lines.clone()))
+                            .wrap(Wrap { trim: false })
+                            .line_count(inner.width),
+                        Segment::Image { path, .. } => app
+                            .doc_images
+                            .get(path)
+                            .and_then(|p| p.as_ref())
+                            .map(|p| p.size().height as usize)
+                            .unwrap_or(1),
+                    })
+                    .sum();
+                app.doc_scroll = reveal_header_scroll(
+                    app.doc_scroll,
+                    inner.height,
+                    rows.min(u16::MAX as usize) as u16,
+                );
+            }
+        }
+        app.reveal_selected_block = false;
+    }
     let mut y = inner.y;
     let bottom = inner.y + inner.height;
     let mut skip = app.doc_scroll;
@@ -1201,27 +1287,30 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
                         let Some(&line_start) = line_row_starts.get(region.line_index) else {
                             continue;
                         };
-                        if line_start < seg_skip {
-                            continue; // scrolled above the visible window
-                        }
-                        let row_in_view = line_start - seg_skip;
-                        if row_in_view >= layout.height {
-                            continue; // scrolled below the visible window
-                        }
-                        let col_start = region.col_start.min(inner.width);
-                        let col_end = region.col_end.min(inner.width);
-                        if col_end <= col_start {
+                        let line_end = line_row_starts
+                            .get(region.line_index + 1)
+                            .copied()
+                            .unwrap_or(total);
+                        if line_end <= seg_skip
+                            || line_start >= seg_skip.saturating_add(layout.height)
+                        {
                             continue;
                         }
-                        app.doc_click_targets.push((
-                            Rect {
-                                x: inner.x + col_start,
-                                y: y + row_in_view,
-                                width: col_end - col_start,
-                                height: 1,
-                            },
-                            region.target.clone(),
-                        ));
+                        for local in wrapped_click_rects(
+                            &lines[region.line_index],
+                            inner.width,
+                            region.col_start,
+                            region.col_end,
+                        ) {
+                            let row = line_start.saturating_add(local.y);
+                            if row < seg_skip || row - seg_skip >= layout.height {
+                                continue;
+                            }
+                            app.doc_click_targets.push((
+                                Rect::new(inner.x + local.x, y + row - seg_skip, local.width, 1),
+                                region.target.clone(),
+                            ));
+                        }
                     }
                 }
 
@@ -1270,7 +1359,7 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
             " Output (done) ".to_string()
         }
     } else if let Some(run) = &app.file_run {
-        if run.proc.is_some() {
+        if run.events.is_some() {
             " Output (running — K to kill) ".to_string()
         } else if run.had_failure {
             " Output (failed) ".to_string()
@@ -1385,6 +1474,13 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     let mut hint = String::from(
         "tab focus · f fullscreen focused pane · z collapse focused pane · j/k move/scroll · enter expand/follow link · h/l collapse/expand · r run · R run (no deps) · K kill · e edit",
     );
+    if app.focus == Focus::Document {
+        hint = if let Some(addr) = &app.selected_block {
+            format!("block: {} · [/] select · Enter fold · c code · r chain · R run · L history · Esc clear · j/k scroll · tab focus", addr.block_name)
+        } else {
+            "[/] select block · r run · R run (no deps) · L history · j/k scroll · tab focus".into()
+        };
+    }
     if spatial::active_spatial_parent(app).is_some() {
         hint.push_str(" · a all/selected arrows");
     }
@@ -1394,7 +1490,9 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     if app.selected_is_table() && app.worker_port.is_some() {
         hint.push_str(" · enter open table");
     }
-    if app.has_configurable_vars() {
+    if app.has_configurable_vars()
+        && !(app.focus == Focus::Document && app.selected_block.is_some())
+    {
         hint.push_str(" · c configure");
     }
     if app.service_stats.is_some() {
@@ -2226,7 +2324,10 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         "r               run this node's block, with its deps chain",
         "R               run this node's block only (skip deps)",
         "  (a node with more than one block opens a picker first)",
-        "L               run history of this node's block (picker if several)",
+        "L               run history of selected block, otherwise node/picker",
+        "[ / ]           select previous/next code block in Document",
+        "enter / c       fold selected block / its code (output stays visible)",
+        "esc             clear Document block selection; r/R/L target node again",
         "K               kill the running block",
         "f               expand the focused pane to fill the screen, or",
         "                shrink it back (esc also shrinks it back)",
@@ -3324,6 +3425,27 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revealing_block_preserves_visible_headers_and_moves_only_when_needed() {
+        assert_eq!(reveal_header_scroll(10, 8, 10), 10);
+        assert_eq!(reveal_header_scroll(10, 8, 15), 10);
+        assert_eq!(reveal_header_scroll(10, 8, 17), 10);
+        assert_eq!(reveal_header_scroll(10, 8, 18), 11);
+        assert_eq!(reveal_header_scroll(10, 8, 3), 3);
+    }
+
+    #[test]
+    fn block_controls_hit_test_after_wrapping_and_wide_glyphs() {
+        let line = Line::from("┌─[▾] [code ▾] sh · 構築 [history] [run]");
+        let prefix = "┌─[▾] [code ▾] sh · 構築 ";
+        let start = Span::raw(prefix).width() as u16;
+        let rects = wrapped_click_rects(&line, 18, start, start + 9);
+        assert!(!rects.is_empty());
+        assert!(rects.iter().all(|r| r.y > 0 && r.x + r.width <= 18));
+        let wide = wrapped_click_rects(&Line::from("ab構築z"), 20, 2, 6);
+        assert_eq!(wide, vec![Rect::new(2, 0, 4, 1)]);
     }
 
     #[tokio::test]

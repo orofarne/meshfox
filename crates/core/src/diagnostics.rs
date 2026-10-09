@@ -1,5 +1,10 @@
 //! Non-failing validation diagnostics with stable machine-readable codes.
-use crate::{vars, Canvas, VarsError};
+//!
+//! No check emits a warning at the moment (node-scoped `meshfox:var`s used
+//! to, see SPEC.md "Block arguments and applications"); the type and the
+//! `warnings` entry point stay so the CLI's stderr output and the MCP
+//! `warnings` array keep their shape for the next diagnostic.
+use crate::{Canvas, VarsError};
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Warning {
@@ -8,33 +13,19 @@ pub struct Warning {
     pub message: String,
 }
 
-pub fn warnings(canvas: &Canvas) -> Result<Vec<Warning>, VarsError> {
-    let mut warnings = Vec::new();
-    for node in &canvas.nodes {
-        if node.parent.is_some() {
-            for decl in vars::scan_var_decls(&node.text)? {
-                warnings.push(Warning {
-                    code: "deprecated-node-scoped-var",
-                    node_id: node.id.clone(),
-                    message: format!("node-scoped meshfox:var {:?} is deprecated; use meshfox:arg before its runnable block (existing behavior is preserved)", decl.name),
-                });
-            }
-        }
-    }
-    Ok(warnings)
+pub fn warnings(_canvas: &Canvas) -> Result<Vec<Warning>, VarsError> {
+    Ok(Vec::new())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vars;
+
     #[test]
-    fn warns_only_for_real_local_variables_without_changing_them() {
-        let canvas = Canvas::from_markdown("<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n<!-- meshfox:var name=\"GLOBAL\" default=\"a\" -->\n## Child\n<!-- meshfox:node id=\"child\" -->\n<!-- meshfox:var name=\"LOCAL\" default=\"b\" -->\n```text\n<!-- meshfox:var name=\"EXAMPLE\" -->\n```\n").unwrap();
-        let before = vars::declared_vars(&canvas).unwrap();
-        let warnings = warnings(&canvas).unwrap();
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].code, "deprecated-node-scoped-var");
-        assert_eq!(warnings[0].node_id, "child");
-        assert_eq!(before, vars::declared_vars(&canvas).unwrap());
+    fn node_scoped_variables_do_not_warn() {
+        let canvas = Canvas::from_markdown("<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n<!-- meshfox:var name=\"GLOBAL\" default=\"a\" -->\n## Child\n<!-- meshfox:node id=\"child\" -->\n<!-- meshfox:var name=\"LOCAL\" default=\"b\" -->\n").unwrap();
+        assert!(warnings(&canvas).unwrap().is_empty());
+        assert_eq!(vars::declared_vars(&canvas).unwrap().len(), 2);
     }
 }

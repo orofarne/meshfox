@@ -158,7 +158,7 @@ pub enum VarsError {
 /// non-empty tokens -- shared by `build_var_decl` (a literal `choices=`)
 /// and `resolve` (a `choices_var=`-referenced variable's resolved value),
 /// so both end up with lists shaped the same way.
-fn split_choices(s: &str) -> Vec<String> {
+pub fn split_choices(s: &str) -> Vec<String> {
     s.split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -743,6 +743,24 @@ pub fn validate_var_refs(canvas: &Canvas) -> Result<(), VarsError> {
                         decl.name.clone(),
                         name.clone(),
                         attr,
+                    ));
+                }
+            }
+        }
+    }
+
+    // A block argument's `choices_var` must name a declared variable too.
+    for node in &canvas.nodes {
+        let Ok(signatures) = crate::args::scan_signatures(&node.id, &node.text) else {
+            continue; // reported by `args::validate`
+        };
+        for arg in signatures.iter().flat_map(|s| &s.args) {
+            if let Some(name) = &arg.choices_var {
+                if !declared.contains(name.as_str()) {
+                    return Err(VarsError::UndeclaredVarRef(
+                        arg.name.clone(),
+                        name.clone(),
+                        "choices_var",
                     ));
                 }
             }
@@ -2461,6 +2479,20 @@ mod tests {
         assert_eq!(
             validate_var_refs(&canvas(doc)).unwrap_err(),
             VarsError::UndeclaredVarRef("X".to_string(), "NOPE".to_string(), "default_var")
+        );
+    }
+
+    #[test]
+    fn validate_var_refs_checks_an_argument_choices_var() {
+        let arg = |name: &str| {
+            format!(
+                "# Root\n<!-- meshfox:node id=\"root\" -->\n<!-- meshfox:var name=\"FILES\" default=\"a,b\" -->\n<!-- meshfox:arg name=\"f\" type=\"select\" choices_var=\"{name}\" -->\n```bash name=\"x\"\necho\n```\n"
+            )
+        };
+        assert!(validate_var_refs(&canvas(&arg("FILES"))).is_ok());
+        assert_eq!(
+            validate_var_refs(&canvas(&arg("NOPE"))).unwrap_err(),
+            VarsError::UndeclaredVarRef("f".to_string(), "NOPE".to_string(), "choices_var")
         );
     }
 

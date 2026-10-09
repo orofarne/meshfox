@@ -59,6 +59,7 @@ pub enum SecretOp {
     /// it); `orphan-path` (the canvas/project directory is gone — or was
     /// moved or renamed); `unknown` (a file that should say couldn't be
     /// read).
+    #[command(alias = "ls")]
     List {
         /// Machine-readable output.
         #[arg(long)]

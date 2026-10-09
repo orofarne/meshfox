@@ -1,4 +1,4 @@
-//! `meshfox cores ls|open|kill` — inspect and control the workers ("cores") of
+//! `meshfox cores list|open|kill` — inspect and control the workers ("cores") of
 //! the persistent coordinator `server_socket` points at (the macOS daemon, or
 //! `meshfox serve`). Speaks `meshfox_server::watcher_protocol`'s `ListCores`,
 //! `Open` and `Kill`. Without a configured `server_socket` there is nothing
@@ -13,7 +13,8 @@ use meshfox_server::watcher_protocol;
 #[derive(clap::Subcommand, Debug)]
 pub enum CoresOp {
     /// List the coordinator's live cores: canvas path, port, pid.
-    Ls,
+    #[command(alias = "ls")]
+    List,
     /// Show a canvas in the browser, spawning its core first if needed.
     Open {
         /// The canvas to open.
@@ -41,7 +42,7 @@ fn configured_socket() -> Result<PathBuf, String> {
 
 async fn run_op(op: CoresOp, socket: &Path) -> Result<(), String> {
     match op {
-        CoresOp::Ls => {
+        CoresOp::List => {
             let cores = watcher_protocol::request_list_cores(socket)
                 .await
                 .map_err(|e| describe(socket, e))?;

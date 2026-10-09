@@ -189,7 +189,7 @@ enum Command {
     /// counterpart of the macOS menu-bar daemon. Listens on the socket
     /// `server_socket` points at (or `--socket`; or the one systemd hands
     /// over under socket activation), gets-or-spawns a core per canvas and
-    /// is controlled with `meshfox cores ls|open|kill`.
+    /// is controlled with `meshfox cores list|open|kill`.
     Serve {
         /// Socket path to listen on; defaults to `server_socket` from the
         /// config. Ignored under systemd socket activation.
@@ -391,6 +391,7 @@ enum Command {
     /// don't have to go spelunking through the file to find out what's
     /// runnable. Same raw-file-only scope as `run`/`validate` (no
     /// include resolution).
+    #[command(alias = "ls")]
     List {
         #[command(flatten)]
         canvas: CanvasOpt,

@@ -40,7 +40,7 @@ fn meshfox() -> Command {
 }
 
 #[test]
-fn local_variables_warn_without_failing_and_signatures_are_checked() {
+fn local_variables_do_not_warn_and_signatures_are_checked() {
     let path = unique_path();
     let prefix = "# Root\n<!-- meshfox:node id=\"root\" -->\n## Child\n<!-- meshfox:node id=\"child\" -->\n<!-- meshfox:var name=\"LOCAL\" default=\"old\" -->\n";
     std::fs::write(&path, format!("{prefix}<!-- meshfox:arg name=\"lang\" type=\"select\" choices=\"en,hy\" -->\n```bash name=\"extract\"\necho ok\n```\n")).unwrap();
@@ -51,11 +51,7 @@ fn local_variables_warn_without_failing_and_signatures_are_checked() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("warning[deprecated-node-scoped-var]"),
-        "{stderr}"
-    );
-    assert!(stderr.contains("LOCAL"), "{stderr}");
+    assert!(!stderr.contains("warning["), "{stderr}");
     assert!(String::from_utf8_lossy(&output.stdout).contains("ok"));
     std::fs::write(&path, format!("{prefix}<!-- meshfox:arg name=\"lang\" -->\nprose\n```bash name=\"extract\"\necho ok\n```\n")).unwrap();
     let output = meshfox().arg("validate").arg(&path).output().unwrap();

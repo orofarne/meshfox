@@ -1,5 +1,5 @@
 //! `meshfox serve` end to end, against real processes: the coordinator
-//! answers `get_port` by spawning a real worker, `meshfox cores ls|kill`
+//! answers `get_port` by spawning a real worker, `meshfox cores list|kill`
 //! see and stop it, and the same coordinator works when systemd (here: a
 //! `sh` that sets `LISTEN_PID`/`LISTEN_FDS` and `exec`s it) hands it the
 //! listening socket.

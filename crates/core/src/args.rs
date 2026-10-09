@@ -7,6 +7,10 @@ pub struct ArgDecl {
     pub name: String,
     pub var_type: vars::VarType,
     pub choices: Vec<String>,
+    /// `choices_var="NAME"`: the select's choices come from the resolved
+    /// value of the declared variable `NAME` (comma-separated), looked up
+    /// when the launch form is prepared. Until then any value is accepted.
+    pub choices_var: Option<String>,
     pub default: Option<String>,
     pub prompt: String,
     pub required: bool,
@@ -51,7 +55,15 @@ fn declaration(rest: &str) -> Result<ArgDecl, String> {
         if !keys.insert(key) {
             return Err(format!("duplicate attribute {key:?}"));
         }
-        if !["name", "type", "choices", "default", "prompt", "required"].contains(&key) {
+        if ![
+            "name",
+            "type",
+            "choices",
+            "choices_var",
+            "default",
+            "prompt",
+            "required",
+        ].contains(&key) {
             return Err(format!("unknown meshfox:arg attribute {key:?}"));
         }
     }
@@ -75,6 +87,7 @@ fn declaration(rest: &str) -> Result<ArgDecl, String> {
         name: decl.name,
         var_type: decl.var_type,
         choices: decl.choices,
+        choices_var: decl.choices_var,
         default: decl.default,
         prompt: decl.prompt,
         required: decl.required,
@@ -320,6 +333,9 @@ pub fn canonical_value(arg: &ArgDecl, value: &str) -> Result<String, String> {
     if !arg.choices.is_empty() {
         attrs.insert("choices".into(), arg.choices.join(","));
     }
+    if let Some(choices_var) = &arg.choices_var {
+        attrs.insert("choices_var".into(), choices_var.clone());
+    }
     let declaration = vars::build_var_decl(attrs).map_err(|e| e.to_string())?;
     vars::validate_value(&declaration, value)?;
     Ok(if arg.var_type == vars::VarType::Int {
@@ -522,6 +538,10 @@ pub struct ArgumentStatus {
     pub var_type: &'static str,
     pub prompt: String,
     pub choices: Vec<String>,
+    /// Set for a `choices_var` argument whose source variable has no value
+    /// yet: the choices are not known, so a form must not offer a menu.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub choices_pending: Option<String>,
     pub required: bool,
     pub resolved: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -543,6 +563,7 @@ pub fn prepare_arguments(
     address: &str,
     answers: &std::collections::BTreeMap<String, String>,
     values: &std::collections::HashMap<String, String>,
+    choice_sources: &std::collections::HashMap<String, String>,
 ) -> Result<ArgumentPreparation, String> {
     let mut app = Application::parse(address)?;
     for (name, value) in answers {
@@ -586,6 +607,18 @@ pub fn prepare_arguments(
             None => None,
         };
         let resolved = value.is_some() || !arg.is_required();
+        let mut arg = arg.clone();
+        let mut choices_pending = None;
+        if let Some(source) = &arg.choices_var {
+            match choice_sources.get(source) {
+                Some(list) => {
+                    arg.choices = vars::split_choices(list);
+                    arg.choices_var = None;
+                }
+                None => choices_pending = Some(source.clone()),
+            }
+        }
+        let arg = &arg;
         let value = value.map(|v| canonical_value(arg, &v)).transpose()?;
         if let Some(value) = &value {
             supplied.insert(arg.name.clone(), value.clone());
@@ -601,6 +634,7 @@ pub fn prepare_arguments(
             },
             prompt: arg.prompt.clone(),
             choices: arg.choices.clone(),
+            choices_pending,
             required: arg.is_required(),
             resolved,
             value: value.or_else(|| arg.default.clone()),
@@ -692,6 +726,7 @@ mod tests {
             "extract",
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         )
         .unwrap();
         assert!(prepared.block.is_none());
@@ -700,13 +735,22 @@ mod tests {
         assert!(prepared.fields[1].resolved);
         let answers = std::collections::BTreeMap::from([("n".into(), "002".into())]);
         let prepared =
-            prepare_arguments("root", md, "extract", &answers, &Default::default()).unwrap();
+            prepare_arguments(
+            "root",
+            md,
+            "extract",
+            &answers,
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
         assert_eq!(prepared.block.as_deref(), Some("extract[lang=en,n=2]"));
         for address in ["extract[n=bad]", "extract[other=2]", "extract[n=$MISSING]"] {
             assert!(prepare_arguments(
                 "root",
                 md,
                 address,
+                &Default::default(),
                 &Default::default(),
                 &Default::default()
             )
@@ -724,6 +768,7 @@ mod tests {
             "search[q=$MISSING]",
             &answers,
             &Default::default(),
+            &Default::default(),
         )
         .unwrap();
         let block = bind_block(
@@ -736,8 +781,49 @@ mod tests {
         assert_eq!(block.arguments["q"], "$NAME, [hy]");
         let values = std::collections::HashMap::from([("NAME".into(), "hy".into())]);
         let prepared =
-            prepare_arguments("root", md, "search[q=$NAME]", &Default::default(), &values).unwrap();
+            prepare_arguments(
+                "root",
+                md,
+                "search[q=$NAME]",
+                &Default::default(),
+                &values,
+                &Default::default(),
+            )
+            .unwrap();
         assert_eq!(prepared.block.as_deref(), Some("search[q=hy]"));
+    }
+
+    #[test]
+    fn choices_var_argument_takes_its_choices_from_the_source_value() {
+        let md = "<!-- meshfox:arg name=\"file\" type=\"select\" choices_var=\"FILES\" -->\n```bash name=\"import\"\necho ok\n```";
+        let none = std::collections::HashMap::new();
+        // Source not resolved yet: no choices, flagged pending, not bound.
+        let prepared = prepare_arguments("root", md, "import", &Default::default(), &none, &none)
+            .unwrap();
+        assert_eq!(prepared.fields[0].choices_pending.as_deref(), Some("FILES"));
+        assert!(prepared.fields[0].choices.is_empty());
+        assert!(prepared.block.is_none());
+        // Source resolved: choices substituted and the answer is checked.
+        let sources = std::collections::HashMap::from([("FILES".into(), "a.csv,b.csv".into())]);
+        let answers = std::collections::BTreeMap::from([("file".into(), "b.csv".into())]);
+        let prepared =
+            prepare_arguments("root", md, "import", &answers, &none, &sources).unwrap();
+        assert_eq!(prepared.fields[0].choices, ["a.csv", "b.csv"]);
+        assert_eq!(prepared.fields[0].choices_pending, None);
+        assert_eq!(prepared.block.as_deref(), Some("import[file=b.csv]"));
+        let answers = std::collections::BTreeMap::from([("file".into(), "c.csv".into())]);
+        assert!(prepare_arguments("root", md, "import", &answers, &none, &sources).is_err());
+    }
+
+    #[test]
+    fn choices_var_argument_requires_select_and_excludes_literal_choices() {
+        for decl in [
+            "name=\"f\" choices_var=\"X\"",
+            "name=\"f\" type=\"select\" choices=\"a\" choices_var=\"X\"",
+        ] {
+            let md = format!("<!-- meshfox:arg {decl} -->\n```bash name=\"b\"\necho\n```");
+            assert!(scan_signatures("root", &md).is_err(), "{decl}");
+        }
     }
 
     #[test]

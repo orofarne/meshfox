@@ -165,7 +165,7 @@ pub async fn run(canvas_path: PathBuf, initial_node: Option<String>) -> io::Resu
                 }
             });
 
-            let (reload_tx, mut reload_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let (reload_tx, mut reload_rx) = tokio::sync::mpsc::unbounded_channel::<Reload>();
             let (external_run_tx, mut external_run_rx) =
                 tokio::sync::mpsc::unbounded_channel::<ExternalMsg>();
             // `app.worker_port` (not the outer `worker_port` this function
@@ -179,18 +179,8 @@ pub async fn run(canvas_path: PathBuf, initial_node: Option<String>) -> io::Resu
             // against a shared worker; fallback (no-worker) mode has no
             // such thing to discover, so `external_run_rx` just never
             // receives anything then.
-            match app.worker_port {
-                Some(port) => spawn_worker_watcher(
-                    port,
-                    Arc::clone(&app.known_raw),
-                    reload_tx,
-                    external_run_tx,
-                ),
-                None => spawn_file_watcher(
-                    app.canvas_path.clone(),
-                    Arc::clone(&app.known_raw),
-                    reload_tx,
-                ),
+            if let Some(port) = app.worker_port {
+                spawn_worker_watcher(port, reload_tx, external_run_tx);
             }
 
             main_loop(
@@ -274,59 +264,20 @@ fn restore_terminal_best_effort() {
     );
 }
 
-/// Polls `canvas_path`'s mtime every 500ms on its own OS thread — same
-/// cadence and same "diff the actual content, not just the mtime" trick as
-/// the web server's own `spawn_file_watcher`
-/// (`crates/server/src/lib.rs`) — and pushes the new content through
-/// `reload_tx` whenever it differs from `known_raw`, which it also
-/// updates so it doesn't re-report a change this process just wrote
-/// itself (see `App::known_raw`'s doc comment for who else writes to it).
-fn spawn_file_watcher(
-    canvas_path: PathBuf,
-    known_raw: Arc<std::sync::Mutex<String>>,
-    reload_tx: tokio::sync::mpsc::UnboundedSender<String>,
-) {
-    std::thread::spawn(move || {
-        let mut last_mtime = std::fs::metadata(&canvas_path)
-            .and_then(|m| m.modified())
-            .ok();
-        loop {
-            std::thread::sleep(Duration::from_millis(500));
-            let Ok(meta) = std::fs::metadata(&canvas_path) else {
-                continue;
-            };
-            let Ok(mtime) = meta.modified() else { continue };
-            if Some(mtime) == last_mtime {
-                continue;
-            }
-            last_mtime = Some(mtime);
-            let Ok(contents) = std::fs::read_to_string(&canvas_path) else {
-                continue;
-            };
-            let mut raw = known_raw.lock().unwrap();
-            if *raw != contents {
-                *raw = contents.clone();
-                drop(raw);
-                if reload_tx.send(contents).is_err() {
-                    return;
-                }
-            }
-        }
-    });
-}
+/// What the worker's watcher hands the main loop on a `Changed`: the
+/// canvas's raw text plus the worker's include-resolved document (`None`
+/// when the worker couldn't produce it).
+type Reload = (String, Option<meshfox_core::Canvas>);
 
-/// The worker-routed equivalent of `spawn_file_watcher` — consumes
-/// `worker_client::watch`'s change notifications instead of polling
-/// `canvas_path`'s own mtime, re-fetching `GET /api/canvas/raw` on each one
-/// and pushing it through `reload_tx` the same "diff against `known_raw`
-/// first" way `spawn_file_watcher` already does (so this process's own
-/// writes, echoed back as a notification, don't re-trigger a reload of
-/// what's already on screen). Also reacts to `WatchEvent::RunStarted` —
+/// Consumes `worker_client::watch`'s change notifications, re-fetching
+/// `GET /api/canvas/raw` and the include-resolved `GET /api/canvas` on each
+/// one and pushing them through `reload_tx` (`App::on_external_change`
+/// drops it if nothing on screen would change, e.g. this process's own
+/// write echoed back). Also reacts to `WatchEvent::RunStarted` —
 /// see `spawn_run_subscriber`.
 fn spawn_worker_watcher(
     port: u16,
-    known_raw: Arc<std::sync::Mutex<String>>,
-    reload_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    reload_tx: tokio::sync::mpsc::UnboundedSender<Reload>,
     external_run_tx: tokio::sync::mpsc::UnboundedSender<ExternalMsg>,
 ) {
     tokio::spawn(async move {
@@ -341,13 +292,9 @@ fn spawn_worker_watcher(
                     let Ok(contents) = crate::worker_client::get_canvas_raw(port).await else {
                         continue;
                     };
-                    let mut raw = known_raw.lock().unwrap();
-                    if *raw != contents {
-                        *raw = contents.clone();
-                        drop(raw);
-                        if reload_tx.send(contents).is_err() {
-                            return;
-                        }
+                    let display = crate::worker_client::get_canvas(port).await.ok();
+                    if reload_tx.send((contents, display)).is_err() {
+                        return;
                     }
                 }
                 WatchEvent::RunStarted { node_id, block } => {
@@ -444,7 +391,7 @@ async fn main_loop(
     app: &mut App,
     input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
     input_paused: &Arc<AtomicBool>,
-    reload_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    reload_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Reload>,
     background_rx: &mut tokio::sync::mpsc::UnboundedReceiver<BackgroundMsg>,
     external_run_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExternalMsg>,
 ) -> io::Result<()> {
@@ -500,7 +447,7 @@ async fn main_loop(
         }
 
         let has_http_run = app.run.as_ref().is_some_and(|r| r.http_rx.is_some());
-        let has_file_proc = app.file_run.as_ref().is_some_and(|r| r.proc.is_some());
+        let has_file_proc = app.file_run.as_ref().is_some_and(|r| r.events.is_some());
         // Polls `GET /api/services` (`App::refresh_services`) on the same
         // ~3s cadence the web UI's own service panel already uses,
         // unconditionally whenever a worker is reachable — the whole point
@@ -538,12 +485,12 @@ async fn main_loop(
                 app.on_run_event(event).await;
             }
             line = async {
-                app.file_run.as_mut().unwrap().proc.as_mut().unwrap().output_rx.recv().await
+                app.file_run.as_mut().unwrap().events.as_mut().unwrap().recv().await
             }, if has_file_proc => {
-                app.on_file_output_line(line).await;
+                app.on_file_run_event(line);
             }
-            Some(content) = reload_rx.recv() => {
-                app.on_external_change(content);
+            Some((content, display)) = reload_rx.recv() => {
+                app.on_external_change(content, display);
             }
             Some(msg) = background_rx.recv() => {
                 app.on_background_msg(msg);

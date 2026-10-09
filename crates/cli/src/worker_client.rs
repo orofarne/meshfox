@@ -610,14 +610,8 @@ fn base_url(port: u16) -> String {
 
 /// `GET /api/canvas/raw` — the worker's own in-memory copy of the primary
 /// document's raw Markdown text (`state.raw`), unresolved (no `include`
-/// splicing) — the same "raw-file-only scope" `App.raw`/`App.canvas`
-/// already have. This is what `App::new` loads instead of
-/// `std::fs::read_to_string` when a worker is reachable; `display_canvas`
-/// (the include-resolved tree) is still built locally from it
-/// (`meshfox_core::include::resolve`) —
-/// there's no separate "fetch the resolved tree" round trip, since local
-/// include-resolution is already needed either way (e.g. for edits that
-/// land in an `include` target file).
+/// splicing) — what `App.raw`/`App.canvas` hold. The include-resolved tree
+/// the UI renders comes from `get_canvas`.
 pub async fn get_canvas_raw(port: u16) -> Result<String, String> {
     let res = client()
         .get(format!("{}/api/canvas/raw", base_url(port)))
@@ -637,26 +631,90 @@ pub async fn get_canvas_raw(port: u16) -> Result<String, String> {
     res.text().await.map_err(|e| e.to_string())
 }
 
-/// `GET /api/info` — whether the worker serves this canvas read-only (the
-/// canvas or its directory isn't writable): blocks run, edits are refused.
-/// Best-effort: a worker that can't be asked (or an older one without the
-/// endpoint) is taken to be editable, and its own refusal says otherwise.
-pub async fn is_read_only(port: u16) -> bool {
+/// `GET /api/canvas/raw?include=<nodeId>` — the raw text of an `include`
+/// node's target file, read fresh by the worker (what the source editor
+/// shows when switched to that file).
+pub async fn get_include_raw(port: u16, include: &str) -> Result<String, String> {
+    let res = client()
+        .get(format!("{}/api/canvas/raw", base_url(port)))
+        .query(&[("include", include)])
+        .timeout(time_limit(QUICK))
+        .send()
+        .await
+        .map_err(|e| describe(&e))?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        return Err(if text.is_empty() {
+            status.to_string()
+        } else {
+            text
+        });
+    }
+    res.text().await.map_err(|e| e.to_string())
+}
+
+/// One entry of `GET /api/includes`.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IncludeEntry {
+    pub node_id: String,
+    pub title: String,
+    pub target: String,
+}
+
+/// `GET /api/includes` — every `include` node declared directly in the
+/// document, without dumping any content in.
+pub async fn get_includes(port: u16) -> Result<Vec<IncludeEntry>, String> {
+    let res = client()
+        .get(format!("{}/api/includes", base_url(port)))
+        .timeout(time_limit(QUICK))
+        .send()
+        .await
+        .map_err(|e| describe(&e))?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        return Err(if text.is_empty() {
+            status.to_string()
+        } else {
+            text
+        });
+    }
+    res.json().await.map_err(|e| e.to_string())
+}
+
+/// What `GET /api/info` says about the worker: whether it serves this
+/// canvas read-only (the canvas or its directory isn't writable: blocks
+/// run, edits are refused) and whether `secret` answers go to the OS
+/// keychain. Best-effort: a worker that can't be asked (or an older one
+/// without the endpoint) is taken to be editable with plaintext secrets,
+/// and its own refusal says otherwise.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WorkerInfo {
+    pub read_only: bool,
+    pub secret_keychain: bool,
+}
+
+pub async fn info(port: u16) -> WorkerInfo {
     let Ok(res) = client()
         .get(format!("{}/api/info", base_url(port)))
         .timeout(time_limit(QUICK))
         .send()
         .await
     else {
-        return false;
+        return WorkerInfo::default();
     };
     if !res.status().is_success() {
-        return false;
+        return WorkerInfo::default();
     }
     res.json::<serde_json::Value>()
         .await
-        .map(|v| v["readOnly"] == true)
-        .unwrap_or(false)
+        .map(|v| WorkerInfo {
+            read_only: v["readOnly"] == true,
+            secret_keychain: v["secretStore"] == "keychain",
+        })
+        .unwrap_or_default()
 }
 
 /// Why a whole-file `PUT /api/canvas/raw` wrote nothing.
@@ -678,9 +736,15 @@ pub enum PutRawError {
 /// `base_rev` is the `meshfox_core::body_rev` of the file's text as the
 /// caller read it, sent as `If-Match`; the server refuses the write if the
 /// file has changed since.
-pub async fn put_canvas_raw(port: u16, text: &str, base_rev: &str) -> Result<(), PutRawError> {
+pub async fn put_canvas_raw(
+    port: u16,
+    text: &str,
+    base_rev: &str,
+    include: Option<&str>,
+) -> Result<(), PutRawError> {
     let res = client()
         .put(format!("{}/api/canvas/raw", base_url(port)))
+        .query(&include.map(|id| [("include", id)]).unwrap_or_default())
         .header("if-match", format!("\"{base_rev}\""))
         .body(text.to_string())
         .timeout(time_limit(WHOLE_DOCUMENT))
@@ -705,12 +769,9 @@ pub async fn put_canvas_raw(port: u16, text: &str, base_rev: &str) -> Result<(),
 /// `meshfox_core::include::resolve` the server already runs before serving
 /// this, plus constraint-status annotation — see `canvas_response` in
 /// `crates/server/src/lib.rs`), unlike `get_canvas_raw`'s unresolved text.
-/// A mutating client (the TUI) deliberately avoids this and resolves
-/// includes locally instead (see `get_canvas_raw`'s own doc comment) so it
-/// still knows which file an edit inside an include target should land in —
-/// a read-only export has no such concern, so `meshfox static` uses this
-/// directly instead of re-deriving the same resolved tree itself from a raw
-/// fetch plus a local `include::resolve` call.
+/// Edits never go through this tree — they address the raw document
+/// (`get_canvas_raw`) or a node by id. The TUI renders from it and
+/// `meshfox static` exports from it.
 pub async fn get_canvas(port: u16) -> Result<Canvas, String> {
     let res = client()
         .get(format!("{}/api/canvas", base_url(port)))
@@ -1435,6 +1496,48 @@ pub async fn get_configure_vars(port: u16) -> Result<Vec<VarStatus>, String> {
     res.json().await.map_err(|e| e.to_string())
 }
 
+/// One field of `GET /api/form/fields`.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct FormFieldStatus {
+    #[serde(flatten)]
+    pub var: VarStatus,
+}
+
+#[derive(serde::Deserialize)]
+struct FormFieldsResponse {
+    fields: Vec<FormFieldStatus>,
+}
+
+/// `GET /api/form/fields` — a `form` fence's own fields with their
+/// currently resolved values (environment, cache, shared env, default),
+/// as the worker sees them.
+pub async fn get_form_fields(
+    port: u16,
+    node_id: &str,
+    block: &str,
+) -> Result<Vec<FormFieldStatus>, String> {
+    let res = client()
+        .get(format!("{}/api/form/fields", base_url(port)))
+        .query(&[("nodeId", node_id), ("block", block)])
+        .timeout(time_limit(QUICK))
+        .send()
+        .await
+        .map_err(|e| describe(&e))?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        return Err(if text.is_empty() {
+            status.to_string()
+        } else {
+            text
+        });
+    }
+    res.json::<FormFieldsResponse>()
+        .await
+        .map(|r| r.fields)
+        .map_err(|e| e.to_string())
+}
+
 /// `POST /api/vars/configure` — writes every entry in `vars` naming a
 /// declared non-secret variable to the worker's own on-disk cache
 /// (`state.vars_cache`), *even if unchanged* from what was already there
@@ -1845,6 +1948,19 @@ pub async fn kill_run(port: u16, node_id: &str, block: &str) -> Result<(), Strin
     let res = client()
         .post(format!("{}/api/kill", base_url(port)))
         .json(&serde_json::json!({ "nodeId": node_id, "block": block }))
+        .timeout(time_limit(CONTROL))
+        .send()
+        .await
+        .map_err(|e| describe(&e))?;
+    into_result(res).await
+}
+
+/// `POST /api/kill` by run id — how a `file` node's run (which has no
+/// block address in the run registry) is cancelled.
+pub async fn kill_run_id(port: u16, run_id: &str) -> Result<(), String> {
+    let res = client()
+        .post(format!("{}/api/kill", base_url(port)))
+        .json(&serde_json::json!({ "runId": run_id }))
         .timeout(time_limit(CONTROL))
         .send()
         .await
@@ -2375,11 +2491,11 @@ mod tests {
         let held = meshfox_core::body_rev(&read);
 
         let first = original.replace("body", "first");
-        assert!(put_canvas_raw(port, &first, &held).await.is_ok());
+        assert!(put_canvas_raw(port, &first, &held, None).await.is_ok());
 
         // The revision just read is stale now.
         let second = original.replace("body", "second");
-        match put_canvas_raw(port, &second, &held).await {
+        match put_canvas_raw(port, &second, &held, None).await {
             Err(PutRawError::Conflict { current_rev }) => {
                 assert_eq!(current_rev, meshfox_core::body_rev(&first));
             }
@@ -2391,7 +2507,7 @@ mod tests {
         // Writing over it is an explicit second attempt, against the
         // revision the conflict reported.
         let current = meshfox_core::body_rev(&first);
-        assert!(put_canvas_raw(port, &second, &current).await.is_ok());
+        assert!(put_canvas_raw(port, &second, &current, None).await.is_ok());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), second);
 
         let _ = std::fs::remove_dir_all(&dir);

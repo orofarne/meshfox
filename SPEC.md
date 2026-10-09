@@ -607,10 +607,10 @@ Lives inside a node's Markdown text, as fence-info-string attributes:
   today is `"form"` (see "Form fences" below) — deliberately left open
   for a future kind (e.g. rendering a `cache`d block's own tabular output
   as a chart) rather than hard-coded to that one case.
-- `fold` — optional flag (`fold` or `fold="true"`), **web UI only** (the
-  TUI has no per-block source fold at all today — every runnable fence's
-  code always shows in full there). Starts this one block's own source
-  collapsed, one click away via a dedicated `‹/›` toggle in its head —
+- `fold` — optional flag (`fold` or `fold="true"`), supported by the web
+  UI and TUI. Starts this one block's own source collapsed, one click
+  away via a dedicated `‹/›` toggle in the web head or `[code ▸]` in the
+  TUI head (`c` with that block selected in Document) —
   distinct from the block's own ▸/▾ fold toggle right next to it, which
   collapses the block as a whole (code *and* output together, same as it
   always has). Folding just the source this way never hides the block's
@@ -794,13 +794,13 @@ Declarations cannot cross node boundaries, prose, headings, or another fence;
 an unattached declaration is a validation error. Declarations inside code fences
 are examples, not signatures. There is no `block=` or fence `args=` attribute.
 
-Each declaration accepts `name`, `type`, `choices`, `default`, `prompt`, and
-`required`. Names use environment identifiers (`[A-Za-z_][A-Za-z0-9_]*`) and
+Each declaration accepts `name`, `type`, `choices`, `choices_var`, `default`,
+`prompt`, and `required`. Names use environment identifiers (`[A-Za-z_][A-Za-z0-9_]*`) and
 must be unique within the signature. Types reuse variable types: `string`
 (default), signed 64-bit `int`, `bool` (`true`/`false`), and `select` with
 literal `choices`. Defaults are literal values and must satisfy the type.
-Dynamic choices/defaults, `from`, `secret`, and `session` are outside this first
-contract. The declaration order controls the manual-run form only.
+Dynamic defaults (`default_var`), `from`, `secret`, and `session` are outside this first
+contract; dynamic choices are `choices_var=`, below. The declaration order controls the manual-run form only.
 
 An argument without a default is mandatory. `required` makes an argument
 mandatory even with a default: that default is only a UI suggestion. A manual
@@ -903,12 +903,33 @@ to the canvas. Arbitrary return values and application-scoped computed-variable
 exports are deferred; the initial parameterized pipeline communicates through
 declared files.
 
-Node-scoped `meshfox:var` declarations are deprecated: their behavior is retained,
-but validation emits a non-failing `deprecated-node-scoped-var` warning recommending
-arguments. CLI prints warnings to stderr; MCP validation returns a `warnings`
-array with stable `code`, `node_id` and `message` fields alongside its successful
-result. No automatic migration is performed. Root configuration variables remain
-supported.
+Node-scoped `meshfox:var` declarations are supported and not deprecated;
+validation emits no warning for them. Choose by what the value is:
+
+- a **variable** is mutable, cached state that a person confirms once and
+  later runs reuse (a credential, a region, a working directory). It has one
+  value at a time, so a changed value is a change of the same history.
+- an **argument** belongs to one application of one block and is part of its
+  identity: `import[file=a.csv]` and `import[file=b.csv]` have separate
+  history, locks, freshness and logs, and are never cached.
+
+Root configuration variables stay the place for shared configuration.
+
+The signature accepts `choices_var=` on a `select` argument (mutually
+exclusive with a literal `choices`; `meshfox validate` rejects an undeclared
+name). It names a declared `meshfox:var` whose resolved value, split on
+commas like `choices=`, is the argument's choices — typically a `from=`
+variable populated by a listing block. Choices are looked up only when a
+launch form is prepared: `POST /api/args` runs the source blocks the
+`choices_var` chain needs (exactly like the pre-run variable form does for
+`choices_var` on a variable, with an empty environment) and returns the
+field with its real `choices`. If the value still cannot be computed, the
+field carries `choicesPending` (the variable's name) and no choices, and the
+application is not bound. An answer is checked against the substituted
+choices; an application address bound directly (`import[file=x]`) is only
+checked when its form is prepared, since binding a block performs no
+lookups. Dependencies and noninteractive runs never prompt: without a value
+for a required argument they fail as before.
 
 ### Parameterized file pipeline example
 
@@ -2137,8 +2158,8 @@ here instead of being repeated per construct below.
 
 ### Attribute vocabularies
 
-`meshfox:arg` declarations accept `name`, `type`, `choices`, `default`,
-`prompt`, and `required`; duplicate and unknown argument attributes are
+`meshfox:arg` declarations accept `name`, `type`, `choices`, `choices_var`,
+`default`, `prompt`, and `required`; duplicate and unknown argument attributes are
 signature errors. Their adjacency and local scope are specified in
 "Block arguments and applications" above.
 

@@ -1,4 +1,5 @@
 import { canvasVersionGate } from "./canvasVersion";
+import { retainLiveBlocks } from "./liveBlockSnapshot";
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
   ReactFlow,
@@ -1530,13 +1531,7 @@ export default function App() {
           }
         });
         blockStuckQueued();
-        // Reloading clears every node's `liveBlocks` (see the canvas-load
-        // effect below) — worth it when it picks up a `cache`d block's
-        // freshly-persisted output, but pure loss for a chain that has no
-        // `cache`d step at all: nothing changed on disk, so there's
-        // nothing to pick up, and the reload would just wipe the live
-        // output this very run produced right as it finishes (it'd
-        // otherwise stay visible, same as it does in read-only mode).
+        // Pick up freshly persisted cached output without resetting live runs.
         if (editMode && previewChain.some((addr) => isBlockCached(canvas, addr))) {
           await load();
         }
@@ -2397,7 +2392,12 @@ export default function App() {
       // buttons, reloads `canvas` and used to lose its own toolbar and
       // selection highlight as a result). Carried forward by id instead.
       const selectedIds = new Set(prevNodes.filter((n) => n.selected).map((n) => n.id));
+      const previousById = new Map(prevNodes.map((n) => [n.id, n.data]));
       return canvas.nodes.map((n) => {
+        // A document edit must not erase output and wait for /api/runs to
+        // replay it: that shrinks expanded nodes before growing them again.
+        // Retain only addresses still defined in this worker's snapshot.
+        const liveBlocks = retainLiveBlocks(n, canvas.serverSession ?? "", previousById.get(n.id));
         const isGroup = n.type === "group";
         const isFolded = foldedNodeIds.has(n.id);
         // Nothing about this node's box — position *or* size — has ever
@@ -2519,7 +2519,7 @@ export default function App() {
             fixedSize,
             fixedHeight,
             editMode,
-            liveBlocks: {},
+            liveBlocks,
             varDecls,
             folded: isFolded,
             hasChildren: parentIdSet.has(n.id),

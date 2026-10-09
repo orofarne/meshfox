@@ -68,6 +68,12 @@ fn confirm_button_waits_for_y_and_does_not_remember_approval() {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert_eq!(std::fs::read_to_string(&effect).unwrap(), "approved\n");
+    // The file is written before StepDone/Done reaches the TUI. Wait for
+    // completion before requesting another run, otherwise its busy guard
+    // correctly rejects the click and no confirmation can appear.
+    session
+        .wait_for("Output (done)", Duration::from_secs(5))
+        .unwrap();
     let (row, col) = session.find("Go").unwrap();
     session.send_mouse_click(row, col);
     session

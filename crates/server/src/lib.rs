@@ -1894,11 +1894,13 @@ async fn api_ping() -> &'static str {
 }
 
 /// `GET /api/info` — what a client needs to know about this worker's canvas
-/// before it offers anything: today only whether it's read-only (see
+/// before it offers anything: whether it's read-only and where `secret` answers are stored (see
 /// `AppState::read_only`), so the web UI can hide Edit and the TUI/MCP can
 /// say why an edit is refused. Fixed for the worker's whole lifetime.
 async fn api_info(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "readOnly": state.read_only }))
+    let keychain = state.vars_cache.lock().unwrap().secret_store_kind()
+        == meshfox_core::secret_store::SecretStoreKind::Keychain;
+    Json(serde_json::json!({ "readOnly": state.read_only, "secretStore": if keychain { "keychain" } else { "plaintext" } }))
 }
 
 /// Whether `method path` changes the canvas file — the requests a read-only
@@ -2083,13 +2085,38 @@ fn untouched_worker_timeout() -> Duration {
 /// `AppState::save`, `state.raw` already matches what's now on disk, so
 /// nothing looks different and nothing is sent.
 ///
+/// (path, mtime, len) of every `include` target of the current document.
+fn include_stamps(state: &AppState) -> Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)> {
+    let raw = state.raw.lock().unwrap().clone();
+    let Ok(canvas) = Canvas::from_markdown(&raw) else {
+        return Vec::new();
+    };
+    meshfox_core::include::list_includes(&canvas, &state.canvas_path)
+        .into_iter()
+        .map(|info| {
+            let stamp = std::fs::metadata(&info.path)
+                .ok()
+                .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
+            (info.path, stamp)
+        })
+        .collect()
+}
+
 fn spawn_file_watcher(state: Arc<AppState>) {
     std::thread::spawn(move || {
         let mut last_mtime = std::fs::metadata(&state.canvas_path)
             .and_then(|m| m.modified())
             .ok();
+        let mut last_includes = include_stamps(&state);
         loop {
             std::thread::sleep(Duration::from_millis(500));
+            // An `include` target edited on its own leaves the canvas file
+            // untouched, so it is stamped separately and just announced.
+            let stamps = include_stamps(&state);
+            if stamps != last_includes {
+                last_includes = stamps;
+                state.canvas_events.push(ServerEvent::Changed);
+            }
             let Ok(meta) = std::fs::metadata(&state.canvas_path) else {
                 continue;
             };
@@ -2748,12 +2775,15 @@ async fn prepare_arguments(
             }
         }
     }
+    let choice_sources =
+        argument_choice_sources(&state, &canvas, &node.id, &node.text, &block_name).await;
     let prepared = meshfox_core::args::prepare_arguments(
         &node.id,
         &node.text,
         &block_name,
         &request.args,
         &canvas.artifact_values,
+        &choice_sources,
     )
     .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e))?;
     let canonical_path = canvas.id_path_to(&node.id).unwrap_or_default();
@@ -2790,6 +2820,66 @@ async fn prepare_arguments(
         prepared,
         path: canonical_path,
     }))
+}
+
+/// Resolved values of the variables the block's `choices_var=` arguments
+/// name, for `meshfox_core::args::prepare_arguments`. Like `get_vars`, this
+/// runs the `from=` source blocks the `choices_var` chain needs (see
+/// `materialize_choices_and_defaults`); a variable that still can't be
+/// resolved is simply absent, which the argument reports as
+/// `choicesPending`. Never fails the request.
+async fn argument_choice_sources(
+    state: &Arc<AppState>,
+    canvas: &Canvas,
+    node_id: &str,
+    node_text: &str,
+    block_name: &str,
+) -> HashMap<String, String> {
+    let Ok(app) = meshfox_core::args::Application::parse(block_name) else {
+        return HashMap::new();
+    };
+    let Ok(signatures) = meshfox_core::args::scan_signatures(node_id, node_text) else {
+        return HashMap::new();
+    };
+    let sources: Vec<String> = signatures
+        .iter()
+        .filter(|s| s.block.name.as_deref() == Some(app.definition.as_str()))
+        .flat_map(|s| s.args.iter().filter_map(|a| a.choices_var.clone()))
+        .collect();
+    if sources.is_empty() {
+        return HashMap::new();
+    }
+    let Ok(decls) = meshfox_core::declared_vars(canvas) else {
+        return HashMap::new();
+    };
+    let wanted: Vec<_> = decls
+        .iter()
+        .filter(|d| sources.contains(&d.name))
+        .cloned()
+        .collect();
+    let computed =
+        materialize_choices_and_defaults(canvas, &decls, &wanted, &state.canvas_path).await;
+    let closure =
+        meshfox_core::close_over_var_refs(&decls, wanted.iter().map(|d| d.name.as_str()));
+    let decls_for_resolve: Vec<_> = decls
+        .iter()
+        .filter(|d| closure.contains(d.name.as_str()))
+        .cloned()
+        .collect();
+    let cache = state.vars_cache.lock().unwrap();
+    let shared = meshfox_core::load_shared_env(canvas_root_dir(&state.canvas_path));
+    let overrides = effective_overrides(state, &HashMap::new());
+    let resolved = meshfox_core::resolve_with_shared(
+        &decls_for_resolve,
+        &overrides,
+        &cache,
+        &computed,
+        &shared,
+    );
+    sources
+        .into_iter()
+        .filter_map(|name| resolved.values.get(&name).cloned().map(|v| (name, v)))
+        .collect()
 }
 
 /// Only the declared `meshfox:var`s the requested block's chain actually
@@ -17106,12 +17196,19 @@ mod vars_endpoint_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
+    /// Each canvas gets its own directory with a local `plaintext` config,
+    /// so a developer's global `secret_store = "keychain"` never lets these
+    /// tests write into the real keychain (and the secret index).
     fn write_test_canvas(contents: &str) -> PathBuf {
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "meshfox-vars-test-{}.canvas.md",
-            uuid::Uuid::new_v4()
-        ));
+        let id = uuid::Uuid::new_v4();
+        let dir = std::env::temp_dir().join(format!("meshfox-vars-test-{id}"));
+        std::fs::create_dir_all(dir.join(".meshfox")).unwrap();
+        std::fs::write(
+            dir.join(".meshfox").join("config.toml"),
+            "secret_store = \"plaintext\"\n",
+        )
+        .unwrap();
+        let path = dir.join("test.canvas.md");
         std::fs::write(&path, contents).unwrap();
         path
     }
@@ -17390,6 +17487,46 @@ mod vars_endpoint_tests {
             statuses[0]["choices"],
             serde_json::json!(["us-east-1", "eu-west-1"])
         );
+
+        let _ = std::fs::remove_file(&canvas_path);
+        let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));
+    }
+
+    #[tokio::test]
+    async fn post_args_materializes_an_argument_choices_var_through_a_from_computed_variable() {
+        let canvas_path = write_test_canvas(concat!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "<!-- meshfox:var name=\"FILES\" from=\"root/list-files\" -->\n\n",
+            "```bash name=\"list-files\"\necho \"FILES=a.csv,b.csv\" >> \"$MESHFOX_VARS_OUT\"\n```\n\n",
+            "<!-- meshfox:arg name=\"file\" type=\"select\" choices_var=\"FILES\" -->\n",
+            "```bash name=\"import\"\necho \"$file\"\n```\n",
+        ));
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, body) = post_json(addr, "/api/args", r#"{"block":"import"}"#).await;
+        assert_eq!(status, 200, "{body}");
+        let prepared: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(prepared["fields"][0]["choices"], serde_json::json!(["a.csv", "b.csv"]));
+        assert!(prepared["fields"][0].get("choicesPending").is_none());
+        assert!(prepared["block"].is_null());
+
+        let (status, body) = post_json(
+            addr,
+            "/api/args",
+            r#"{"block":"import","args":{"file":"b.csv"}}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let prepared: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(prepared["block"], "import[file=b.csv]");
+
+        let (status, _) = post_json(
+            addr,
+            "/api/args",
+            r#"{"block":"import","args":{"file":"c.csv"}}"#,
+        )
+        .await;
+        assert_eq!(status, 422);
 
         let _ = std::fs::remove_file(&canvas_path);
         let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));

@@ -143,7 +143,7 @@ pub fn run_scenario(dir: &Path, socket: &Path) {
     let canvas_arg = canvas.to_str().unwrap();
     let out = cores(dir, socket, &["kill", canvas_arg]);
     assert!(out.status.success(), "{out:?}");
-    wait_for("the core to disappear from `cores ls`", || {
+    wait_for("the core to disappear from `cores list`", || {
         stdout(&cores(dir, socket, &["ls"])) == "no cores running\n"
     });
 

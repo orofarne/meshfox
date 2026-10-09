@@ -60,3 +60,56 @@ test("reloading mid-run keeps the already-printed output and resumes the live ta
   await expect(outputAfterReload).toContainText("done");
   await expect(taskAfterReload.getByRole("button", { name: "run long-task" })).toBeVisible();
 });
+
+test("editing a node preserves completed output without a replay or height jump", async ({ page }) => {
+  const task = block(page, "root", "long-task");
+  await task.getByRole("button", { name: "run long-task" }).click();
+  await expect(task.getByRole("button", { name: "running long-task…" })).toBeVisible();
+  await expect(task.locator(".mesh-code-output")).toContainText("done", { timeout: 10_000 });
+  await expect(task.getByRole("button", { name: "run long-task" })).toBeVisible();
+  await page.getByRole("button", { name: "Edit", exact: true }).click();
+
+  // Observe every DOM mutation and frame, so an eventual assertion cannot
+  // hide the old bug: output disappears, then /api/runs replays it later.
+  await page.evaluate(() => {
+    const node = document.querySelector('.react-flow__node[data-id="root"]')!;
+    const height = node.getBoundingClientRect().height;
+    const samples: { missing: boolean; height: number }[] = [];
+    let observing = true;
+    const sample = () => samples.push({
+      missing: !node.querySelector('.mesh-code-output')?.textContent?.includes('done'),
+      height: node.getBoundingClientRect().height,
+    });
+    const observer = new MutationObserver(sample);
+    observer.observe(node, { childList: true, subtree: true, characterData: true });
+    const frame = () => { if (observing) { sample(); requestAnimationFrame(frame); } };
+    requestAnimationFrame(frame);
+    Object.assign(window, { outputObservation: {
+      finish: () => { observing = false; observer.disconnect(); sample(); return { height, samples }; },
+    } });
+  });
+  let replays = 0;
+  await page.route('**/api/run/subscribe**', route => { replays++; return route.abort(); });
+
+  // Use the real inline title editor, which PATCHes the node and receives
+  // a fresh versioned canvas through both its response and the watch feed.
+  const title = page.locator('.react-flow__node[data-id="root"] .mesh-node-title');
+  await title.locator('.mesh-node-title-text').dblclick();
+  const input = page.locator('.mesh-node-title-edit-input');
+  const changedTitle = `Edited output fixture ${Date.now()}`;
+  await input.fill(changedTitle);
+  const saved = page.waitForResponse(response => response.url().endsWith('/api/nodes/root') && response.request().method() === 'PATCH');
+  await input.press('Enter');
+  expect((await saved).ok()).toBe(true);
+  await expect(title).toContainText(changedTitle);
+  // Span a full registry poll (3s), including the delayed replay that
+  // previously masked the temporary disappearance.
+  await page.waitForTimeout(3500);
+  const observation = await page.evaluate(() => (window as unknown as {
+    outputObservation: { finish: () => { height: number; samples: { missing: boolean; height: number }[] } };
+  }).outputObservation.finish());
+  expect(observation.samples.length).toBeGreaterThan(0);
+  expect(observation.samples.some(sample => sample.missing)).toBe(false);
+  expect(Math.min(...observation.samples.map(sample => sample.height))).toBeGreaterThanOrEqual(observation.height - 1);
+  expect(replays).toBe(0);
+});

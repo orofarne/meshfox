@@ -558,7 +558,7 @@ async fn handle_connection(
         // Deliberately unsupported on a private watcher: it is a private,
         // per-`view`-invocation process nobody's `server_socket` has a
         // reason to point at — see `crates/cli/src/coordinator.rs`'s own
-        // doc comment. `meshfox cores ls|kill` pointed at the wrong socket
+        // doc comment. `meshfox cores list|kill` pointed at the wrong socket
         // is reachable, so those get a readable error.
         Message::ListCores | Message::Kill { .. } => {
             let result: Result<(), String> = Err(

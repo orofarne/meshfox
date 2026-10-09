@@ -43,6 +43,9 @@ pub enum SourceEditorOutcome {
     /// The buffer's own Esc handling wants to close (see `SourceEditorState::on_key`)
     /// — the caller drops `App::source_editor`.
     Close,
+    /// The file picker chose an include target: the caller fetches its
+    /// text from the worker and calls `SourceEditorState::finish_switch`.
+    Switch { path: PathBuf, is_canvas: bool },
     /// `Ctrl-s` was pressed — the caller calls `App::save_source_editor`,
     /// which needs `App`'s own fields (`raw`/`canvas`) that this type
     /// deliberately doesn't hold, to keep file I/O and validation in one
@@ -151,7 +154,8 @@ impl SourceEditorState {
     /// Opens `path` (the primary document if `path == primary_path`,
     /// otherwise some include target already resolved by the caller —
     /// see `App::open_source_editor`) with `cursor` as the starting
-    /// position. `files` is computed once here via `list_includes` and
+    /// position. `raw` is `path`'s own text (the caller reads it from the
+    /// worker; for the primary document it equals `primary_raw`). `files` is computed once here via `list_includes` and
     /// reused for every subsequent file switch this session.
     pub fn open(
         primary_path: PathBuf,
@@ -161,12 +165,8 @@ impl SourceEditorState {
         files: Vec<IncludeInfo>,
         all_tags: Vec<String>,
         primary_raw: String,
+        raw: String,
     ) -> std::io::Result<Self> {
-        let raw = if path == primary_path {
-            primary_raw.clone()
-        } else {
-            std::fs::read_to_string(&path)?
-        };
         let mut editor = EditorState::new(Lines::from(raw.as_str()));
         editor.cursor = cursor;
         prime_viewport(&mut editor);
@@ -229,8 +229,10 @@ impl SourceEditorState {
 
     pub fn on_key(&mut self, key: KeyEvent) -> SourceEditorOutcome {
         if self.file_picker_open {
-            self.on_file_picker_key(key);
-            return SourceEditorOutcome::Stay;
+            return match self.on_file_picker_key(key) {
+                Some((path, is_canvas)) => SourceEditorOutcome::Switch { path, is_canvas },
+                None => SourceEditorOutcome::Stay,
+            };
         }
         if self.tag_suggest_open {
             self.on_tag_suggest_key(key);
@@ -314,7 +316,10 @@ impl SourceEditorState {
         self.files.iter().position(|i| i.path == self.path)
     }
 
-    fn on_file_picker_key(&mut self, key: KeyEvent) {
+    /// `Some((path, is_canvas))` when the user picked an *include target*
+    /// (needs a worker fetch); the primary document is switched to here,
+    /// from the copy already held.
+    fn on_file_picker_key(&mut self, key: KeyEvent) -> Option<(PathBuf, bool)> {
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.file_picker_selected = self.file_picker_selected.saturating_sub(1);
@@ -330,7 +335,7 @@ impl SourceEditorState {
                         "save or discard changes before switching files (Ctrl-s, or Esc twice)"
                             .to_string(),
                     );
-                    return;
+                    return None;
                 }
                 let target = if self.file_picker_selected == 0 {
                     Some((self.primary_path.clone(), true))
@@ -340,25 +345,21 @@ impl SourceEditorState {
                         .map(|i| (i.path.clone(), false))
                 };
                 if let Some((path, is_canvas)) = target {
-                    self.switch_to(path, is_canvas);
+                    if path == self.primary_path {
+                        let raw = self.primary_raw.clone();
+                        self.finish_switch(path, is_canvas, raw);
+                    } else {
+                        return Some((path, is_canvas));
+                    }
                 }
             }
             _ => {}
         }
+        None
     }
 
-    fn switch_to(&mut self, path: PathBuf, is_canvas: bool) {
-        let raw = match if path == self.primary_path {
-            Ok(self.primary_raw.clone())
-        } else {
-            std::fs::read_to_string(&path)
-        } {
-            Ok(s) => s,
-            Err(e) => {
-                self.error = Some(format!("failed to read {}: {e}", path.display()));
-                return;
-            }
-        };
+    /// Loads `raw` (`path`'s text) into the editor.
+    pub fn finish_switch(&mut self, path: PathBuf, is_canvas: bool, raw: String) {
         self.editor = EditorState::new(Lines::from(raw.as_str()));
         self.original = raw;
         self.conflict_rev = None;
@@ -754,6 +755,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             raw.to_string(),
+            raw.to_string(),
         )
         .unwrap()
     }
@@ -863,6 +865,7 @@ mod tests {
             Index2::new(0, 0),
             Vec::new(),
             all_tags,
+            text.to_string(),
             text.to_string(),
         )
         .unwrap();

@@ -46,11 +46,33 @@ pub enum Segment {
     },
 }
 
+/// Session-local presentation of a runnable code block. `None` follows `fold`.
+#[derive(Clone, Default)]
+pub struct BlockView {
+    pub collapsed: bool,
+    pub source_expanded: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockAction {
+    Select,
+    ToggleBlock,
+    ToggleSource,
+    History,
+    Run,
+    Chain,
+}
+
 /// What clicking a `ClickRegion` (below) should do — resolved once, at
 /// render time, into everything `App::on_mouse` needs to act on it without
 /// re-parsing the document's own Markdown.
 #[derive(Clone)]
 pub enum ClickTarget {
+    Block {
+        node_id: String,
+        block_name: String,
+        action: BlockAction,
+    },
     /// A `button` fence's own `▶ caption` marker — runs its `deps=` chain
     /// (plus its own, always-empty body), same as pressing `r` on it would.
     RunBlock { node_id: String, block_name: String },
@@ -316,6 +338,33 @@ pub fn render(
     node_id: &str,
     decls: &[meshfox_core::vars::VarDecl],
     form_values: &std::collections::HashMap<String, String>,
+    form_focus: Option<(&str, usize)>,
+    live_output: &std::collections::HashMap<String, super::app::StepOutput>,
+) -> (Vec<Segment>, Vec<ClickRegion>) {
+    render_with_blocks(
+        md,
+        base_dir,
+        hl,
+        node_id,
+        decls,
+        form_values,
+        form_focus,
+        live_output,
+        &Default::default(),
+        None,
+        false,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_with_blocks(
+    md: &str,
+    base_dir: &Path,
+    hl: &Highlighter,
+    node_id: &str,
+    decls: &[meshfox_core::vars::VarDecl],
+    form_values: &std::collections::HashMap<String, String>,
     // `Some((block_name, selected_index))` while this node's own inline
     // form is actively `editing` (see `App::active_inline_form`'s own doc
     // comment) — lets the form-lang branch of `TagEnd::CodeBlock` draw a
@@ -333,6 +382,10 @@ pub fn render(
     // `OutputRegion` would occupy, but sourced from `App::step_output`
     // instead of the document's own text — this never touches `md` at all.
     live_output: &std::collections::HashMap<String, super::app::StepOutput>,
+    block_views: &std::collections::HashMap<String, BlockView>,
+    selected_block: Option<&str>,
+    focused: bool,
+    runnable_controls: bool,
 ) -> (Vec<Segment>, Vec<ClickRegion>) {
     // Pre-scanned once so `Tag::CodeBlock`'s own handling (`start`) can
     // resolve a fence's *real* run name — including the implicit "sole
@@ -350,6 +403,10 @@ pub fn render(
         form_focus,
         live_output,
     );
+    renderer.block_views = block_views.clone();
+    renderer.selected_block = selected_block.map(str::to_owned);
+    renderer.focused = focused;
+    renderer.runnable_controls = runnable_controls;
     let signatures = meshfox_core::args::scan_signatures(node_id, md).unwrap_or_default();
     for block in &runnable {
         let mut details = Vec::new();
@@ -447,6 +504,10 @@ enum Inline {
 }
 
 struct Renderer<'a> {
+    block_views: std::collections::HashMap<String, BlockView>,
+    selected_block: Option<String>,
+    focused: bool,
+    runnable_controls: bool,
     base_dir: &'a Path,
     hl: &'a Highlighter,
     /// The node this body belongs to — bare `deps=`/`env=` references
@@ -592,6 +653,10 @@ impl<'a> Renderer<'a> {
         live_output: &'a std::collections::HashMap<String, super::app::StepOutput>,
     ) -> Self {
         Renderer {
+            block_views: Default::default(),
+            selected_block: None,
+            focused: false,
+            runnable_controls: true,
             base_dir,
             hl,
             node_id,
@@ -624,6 +689,36 @@ impl<'a> Renderer<'a> {
             pending_image_attrs: false,
             image_alt: None,
         }
+    }
+
+    fn block_border(&self, name: Option<&str>) -> Style {
+        let selected = name.is_some() && name == self.selected_block.as_deref();
+        Style::default().fg(if selected {
+            if self.focused {
+                super::theme::ACCENT
+            } else {
+                Color::DarkGray
+            }
+        } else {
+            super::theme::DEP
+        })
+    }
+
+    fn block_header(&self, name: Option<&str>) -> Style {
+        let border = self.block_border(name);
+        if name.is_some() && name == self.selected_block.as_deref() {
+            border.add_modifier(Modifier::BOLD).bg(if self.focused {
+                super::theme::MAP_SELECTED_BG
+            } else {
+                super::theme::MAP_NODE_BG
+            })
+        } else {
+            border
+        }
+    }
+
+    fn output_border(&self) -> Style {
+        self.block_border(self.output_region.as_ref().map(|r| r.name.as_str()))
     }
 
     fn indent(&self) -> String {
@@ -693,7 +788,7 @@ impl<'a> Renderer<'a> {
             let name = self.output_region.as_ref().unwrap().name.clone();
             self.push_segment_plain(Segment::Text(vec![Line::from(Span::styled(
                 format!("┌─ output: {name} · markdown ──"),
-                Style::default().fg(super::theme::DEP),
+                self.block_header(Some(&name)),
             ))]));
             if let Some(region) = &mut self.output_region {
                 region.first_segment_pending = false;
@@ -759,7 +854,7 @@ impl<'a> Renderer<'a> {
     /// done" the web UI's `LiveRunOutput` and the Output pane
     /// (`ui::render_output`) give it; stderr always stays plain text.
     fn push_live_output(&mut self, block_name: &str, live: &super::app::StepOutput) {
-        let border = Style::default().fg(super::theme::DEP);
+        let border = self.block_border(Some(block_name));
         let kind = if live.output_markdown {
             " · markdown"
         } else {
@@ -786,7 +881,10 @@ impl<'a> Renderer<'a> {
                 meshfox_core::format_duration_ms(live.duration_ms)
             )
         };
-        let mut framed: Vec<Line<'static>> = vec![Line::from(Span::styled(header, border))];
+        let mut framed: Vec<Line<'static>> = vec![Line::from(Span::styled(
+            header,
+            self.block_header(Some(block_name)),
+        ))];
         let mut any_output = false;
         // Only the first piece of this frame goes through `push_segment`
         // (which adds the blank separator above it); every later piece is
@@ -843,7 +941,7 @@ impl<'a> Renderer<'a> {
                 }
                 framed.push(Line::from(Span::styled("│ ────", border)));
             }
-            let (segs, _clicks) = render(
+            let (segs, _clicks) = render_with_blocks(
                 &markdown,
                 self.base_dir,
                 self.hl,
@@ -852,6 +950,10 @@ impl<'a> Renderer<'a> {
                 &std::collections::HashMap::new(),
                 None,
                 &std::collections::HashMap::new(),
+                &Default::default(),
+                None,
+                false,
+                false,
             );
             let mut first_seg = true;
             for seg in segs {
@@ -907,8 +1009,7 @@ impl<'a> Renderer<'a> {
                 lines
                     .into_iter()
                     .map(|l| {
-                        let mut spans =
-                            vec![Span::styled("│ ", Style::default().fg(super::theme::DEP))];
+                        let mut spans = vec![Span::styled("│ ", self.output_border())];
                         spans.extend(l.spans);
                         Line::from(spans)
                     })
@@ -942,7 +1043,8 @@ impl<'a> Renderer<'a> {
             // content, so an empty region (or one whose only content is
             // the leading stderr fence, handled separately) never leaves
             // a stray, contentless frame behind.
-            let suppressed = self.live_output.contains_key(name.as_str());
+            let suppressed = self.live_output.contains_key(name.as_str())
+                || self.block_views.get(&name).is_some_and(|v| v.collapsed);
             self.output_region = Some(OutputRegion {
                 name,
                 first_segment_pending: true,
@@ -960,7 +1062,7 @@ impl<'a> Renderer<'a> {
             if frame_open {
                 self.push_segment_plain(Segment::Text(vec![Line::from(Span::styled(
                     "└─",
-                    Style::default().fg(super::theme::DEP),
+                    self.output_border(),
                 ))]));
             }
             self.output_region = None;
@@ -1340,8 +1442,13 @@ impl<'a> Renderer<'a> {
         let row = |prefix: String, label: String, node_id: String| {
             let start = prefix.chars().count() as u16;
             let end = start + label.chars().count() as u16;
-            (Line::from(vec![Span::styled(prefix, style), Span::styled(label, click_style)]),
-                vec![(start, end, node_id)])
+            (
+                Line::from(vec![
+                    Span::styled(prefix, style),
+                    Span::styled(label, click_style),
+                ]),
+                vec![(start, end, node_id)],
+            )
         };
         let mut rows = Vec::new();
         for (label, node_id) in explicit {
@@ -1378,7 +1485,10 @@ impl<'a> Renderer<'a> {
                 let deps_raw = self.code_deps.take();
                 let env_raw = self.code_env.take();
                 let send_raw = self.code_send.take();
-                let click_name = self.code_click_name.take();
+                let click_name = self
+                    .code_click_name
+                    .take()
+                    .filter(|_| self.runnable_controls);
                 let details = std::mem::take(&mut self.code_details);
                 let code = std::mem::take(&mut self.code_buf);
                 if lang == meshfox_core::FORM_LANG {
@@ -1546,13 +1656,20 @@ impl<'a> Renderer<'a> {
                         Span::styled("  (r to run)", hint),
                     ])];
                     let mut dep_clicks = Vec::new();
-                    for (line, clicks) in self.dep_lines(deps_raw.as_deref(), env_raw.as_deref(), interpreter.as_deref()) {
+                    for (line, clicks) in self.dep_lines(
+                        deps_raw.as_deref(),
+                        env_raw.as_deref(),
+                        interpreter.as_deref(),
+                    ) {
                         dep_clicks.push((lines.len(), clicks));
                         lines.push(line);
                     }
-                    lines.extend(details.into_iter().map(|detail| Line::from(Span::styled(
-                        format!("  {detail}"), Style::default().fg(super::theme::DEP),
-                    ))));
+                    lines.extend(details.into_iter().map(|detail| {
+                        Line::from(Span::styled(
+                            format!("  {detail}"),
+                            Style::default().fg(super::theme::DEP),
+                        ))
+                    }));
                     self.push_segment(Segment::Text(lines));
                     self.push_dep_clicks(dep_clicks);
                     if let Some(block_name) = click_name {
@@ -1573,8 +1690,27 @@ impl<'a> Renderer<'a> {
                     }
                     return;
                 }
-                let highlighted = self.hl.highlight(&lang, &code);
-                let border = Style::default().fg(super::theme::DEP);
+                let view = click_name
+                    .as_ref()
+                    .and_then(|n| self.block_views.get(n))
+                    .cloned()
+                    .unwrap_or_default();
+                let block = click_name
+                    .as_ref()
+                    .and_then(|n| self.runnable.iter().find(|b| b.name.as_ref() == Some(n)));
+                let source_expanded = view
+                    .source_expanded
+                    .unwrap_or(!block.is_some_and(|b| b.fold));
+                let border = self.block_border(
+                    click_name
+                        .as_deref()
+                        .or_else(|| self.output_region.as_ref().map(|r| r.name.as_str())),
+                );
+                let highlighted = if !view.collapsed && source_expanded {
+                    self.hl.highlight(&lang, &code)
+                } else {
+                    Vec::new()
+                };
                 // Mirrors the web UI's code-block head (lang + run name) so
                 // it's clear at a glance what `r` would actually run, and
                 // doubles as a visual break between back-to-back fences —
@@ -1594,32 +1730,79 @@ impl<'a> Renderer<'a> {
                 // `┌` matches the box-drawing set ratatui's own pane
                 // borders already use (see `Borders::ALL` in ui.rs), so the
                 // corner reads as the same kind of line, not a stray glyph.
-                let mut framed: Vec<Line<'static>> =
-                    vec![Line::from(Span::styled(format!("┌─{label}──"), border))];
+                let mut controls = Vec::new();
+                let mut header = if self.focused && click_name.is_some()
+                    && click_name.as_deref() == self.selected_block.as_deref() {
+                    "›─".to_string()
+                } else { "┌─".to_string() };
+                if click_name.is_some() {
+                    let mut control = |text: &str, action| {
+                        let start = Span::raw(header.as_str()).width() as u16;
+                        header.push_str(text);
+                        controls.push((start, Span::raw(header.as_str()).width() as u16, action));
+                        header.push(' ');
+                    };
+                    control(
+                        if view.collapsed { "[▸]" } else { "[▾]" },
+                        BlockAction::ToggleBlock,
+                    );
+                    if !view.collapsed {
+                        control(
+                            if source_expanded {
+                                "[code ▾]"
+                            } else {
+                                "[code ▸]"
+                            },
+                            BlockAction::ToggleSource,
+                        );
+                    }
+                }
+                header.push_str(&label);
+                if let Some(block) = block {
+                    for (text, action, show) in [
+                        (" [history]", BlockAction::History, !block.service),
+                        (" [run]", BlockAction::Run, true),
+                        (" [chain]", BlockAction::Chain, !block.deps.is_empty()),
+                    ] {
+                        if show {
+                            let start = Span::raw(header.as_str()).width() as u16;
+                            header.push_str(text);
+                            controls.push((
+                                start,
+                                Span::raw(header.as_str()).width() as u16,
+                                action,
+                            ));
+                        }
+                    }
+                }
+                let header_style = self.block_header(click_name.as_deref());
+                let mut framed = vec![Line::from(Span::styled(header, header_style))];
                 // Deps-line click regions (`dep_lines`'s own col-range half)
                 // can't become real `ClickRegion`s until `framed` is
                 // actually pushed as a segment below — only then is
                 // `segment_index` known.
                 let mut dep_clicks = Vec::new();
-                for (dep_line, clicks) in self.dep_lines(
-                    deps_raw.as_deref(),
-                    env_raw.as_deref(),
-                    interpreter.as_deref(),
-                ) {
-                    dep_clicks.push((framed.len(), clicks));
-                    framed.push(dep_line);
+                if !view.collapsed {
+                    for (dep_line, clicks) in self.dep_lines(
+                        deps_raw.as_deref(),
+                        env_raw.as_deref(),
+                        interpreter.as_deref(),
+                    ) {
+                        dep_clicks.push((framed.len(), clicks));
+                        framed.push(dep_line);
+                    }
+                    framed.extend(
+                        details
+                            .into_iter()
+                            .map(|detail| Line::from(Span::styled(format!("├─ {detail}"), border))),
+                    );
+                    framed.extend(highlighted.into_iter().map(|l| {
+                        let mut spans = vec![Span::styled("│ ", border)];
+                        spans.extend(l.spans);
+                        Line::from(spans)
+                    }));
+                    framed.push(Line::from(Span::styled("└─", border)));
                 }
-                framed.extend(
-                    details
-                        .into_iter()
-                        .map(|detail| Line::from(Span::styled(format!("├─ {detail}"), border))),
-                );
-                framed.extend(highlighted.into_iter().map(|l| {
-                    let mut spans = vec![Span::styled("│ ", border)];
-                    spans.extend(l.spans);
-                    Line::from(spans)
-                }));
-                framed.push(Line::from(Span::styled("└─", border)));
 
                 // Inside an output region, a leading `` ```text `` fence
                 // is `render_output_block_markdown`'s own stderr capture
@@ -1633,7 +1816,7 @@ impl<'a> Renderer<'a> {
                         let name = region.name.clone();
                         framed[0] = Line::from(Span::styled(
                             format!("┌─ output: {name} · text ──"),
-                            Style::default().fg(super::theme::DEP),
+                            border,
                         ));
                         self.push_segment_plain(Segment::Text(framed));
                         self.push_dep_clicks(dep_clicks);
@@ -1643,8 +1826,40 @@ impl<'a> Renderer<'a> {
                 self.push_segment(Segment::Text(framed));
                 self.push_dep_clicks(dep_clicks);
                 if let Some(block_name) = &click_name {
-                    if let Some(live) = self.live_output.get(block_name.as_str()) {
-                        self.push_live_output(block_name, live);
+                    let segment_index = self.segments.len() - 1;
+                    for (col_start, col_end, action) in controls {
+                        self.click_regions.push(ClickRegion {
+                            segment_index,
+                            line_index: 0,
+                            col_start,
+                            col_end,
+                            target: ClickTarget::Block {
+                                node_id: self.node_id.to_owned(),
+                                block_name: block_name.clone(),
+                                action,
+                            },
+                        });
+                    }
+                    // Controls win hit-testing over the fallback selection region.
+                    if let Segment::Text(lines) = &self.segments[segment_index] {
+                        for (line_index, line) in lines.iter().enumerate() {
+                            self.click_regions.push(ClickRegion {
+                                segment_index,
+                                line_index,
+                                col_start: 0,
+                                col_end: line.width().min(u16::MAX as usize) as u16,
+                                target: ClickTarget::Block {
+                                    node_id: self.node_id.to_owned(),
+                                    block_name: block_name.clone(),
+                                    action: BlockAction::Select,
+                                },
+                            });
+                        }
+                    }
+                    if !view.collapsed {
+                        if let Some(live) = self.live_output.get(block_name.as_str()) {
+                            self.push_live_output(block_name, live);
+                        }
                     }
                 }
             }
@@ -2014,6 +2229,40 @@ mod tests {
                 "{stdout:?} {code} {running}"
             );
         }
+    }
+
+    #[test]
+    fn runnable_examples_inside_live_markdown_output_have_no_run_controls() {
+        let hl = Highlighter::new();
+        let mut output = table_output(true, false);
+        output.stdout = "```sh\nprintf example\n```\n".into();
+        let live = std::collections::HashMap::from([("actual".into(), output)]);
+        let (segments, _) = render(
+            "```sh name=actual\ntrue\n```\n",
+            Path::new("/nonexistent-base-dir"),
+            &hl,
+            "n",
+            &[],
+            &Default::default(),
+            None,
+            &live,
+        );
+        let text = segments
+            .into_iter()
+            .filter_map(|seg| match seg {
+                Segment::Text(lines) => Some(
+                    lines
+                        .iter()
+                        .map(Line::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("printf example"));
+        assert_eq!(text.matches("[run]").count(), 1, "{text}");
     }
 
     // The web UI's `RunOutput` shows live output *instead of* the cached

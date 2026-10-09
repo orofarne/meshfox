@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use meshfox_server::link_preview::{self, PreviewMeta};
 
@@ -17,8 +17,8 @@ use meshfox_core::fence::{self, scan_runnable_blocks};
 use meshfox_core::image_attrs::Background;
 use meshfox_core::mdcanvas;
 use meshfox_core::vars::{declared_vars, VarDecl, VarType};
-use meshfox_core::{Canvas, FileDisplay, Node, NodeType, VarCache};
-use meshfox_server::stream_exec::{OutputStream, SpawnedProcess};
+use meshfox_core::{Canvas, FileDisplay, Node, NodeType};
+use meshfox_server::stream_exec::OutputStream;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -381,7 +381,10 @@ pub struct FileRunState {
     /// to key off of (see this struct's own doc comment), so the node id
     /// is tracked directly instead.
     pub node_id: String,
-    pub proc: Option<SpawnedProcess>,
+    /// The worker's event stream for this run (`None` once it ended).
+    pub events: Option<tokio::sync::mpsc::UnboundedReceiver<crate::worker_client::RunEvent>>,
+    /// The worker's id for the run, once `Started` arrived — what a kill names.
+    pub run_id: Option<String>,
     pub lines: Vec<String>,
     pub had_failure: bool,
     /// Set once the process has exited — `run` stays around afterward
@@ -457,7 +460,9 @@ pub struct App {
     /// TUI reads the same way it does in the browser.
     pub display_canvas: Canvas,
     pub decls: Vec<VarDecl>,
-    pub var_cache: VarCache,
+    /// Whether the worker stores `secret` answers in the OS keychain
+    /// (`GET /api/info`) — decides if `c` has anything to offer for them.
+    pub secret_keychain: bool,
     pub expanded: HashSet<String>,
     pub rows: Vec<TreeRow>,
     pub selected: usize,
@@ -470,6 +475,12 @@ pub struct App {
     pub list_state: ListState,
     pub focus: Focus,
     pub doc_segments: Vec<Segment>,
+    /// Document selection is independent of pane focus; actions target it
+    /// only while Document is focused. Cleared when its node/block disappears.
+    pub selected_block: Option<BlockAddr>,
+    /// Authored `fold` defaults remain separate from manual session choices.
+    pub block_views: HashMap<BlockAddr, markdown::BlockView>,
+    pub reveal_selected_block: bool,
     /// Every clickable span in `doc_segments`, in the same segment-local
     /// coordinates `markdown::render` returned them in — recomputed
     /// alongside `doc_segments` (`render_current_document`), consulted by
@@ -484,6 +495,11 @@ pub struct App {
     /// against exactly what's currently on screen, scroll/wrap included.
     pub doc_click_targets: Vec<(Rect, ClickTarget)>,
     pub doc_images: HashMap<PathBuf, Option<Protocol>>,
+    /// Bytes of the document's image files, fetched from the worker
+    /// (`GET /<relative path>`) — `doc_images` is rebuilt from these on
+    /// every render. `image_requested` keeps one fetch per path in flight.
+    image_bytes: HashMap<PathBuf, Vec<u8>>,
+    image_requested: std::collections::HashSet<PathBuf>,
     pub doc_scroll: u16,
     /// Lines scrolled back from the *bottom* of the Output pane — `0`
     /// (the default) pins it to the live tail, same as before this
@@ -678,16 +694,6 @@ pub struct App {
     /// nothing rather than a vacuous "0/0" (same convention the web UI's
     /// toolbar badge uses).
     pub constraint_stats: Option<(usize, usize)>,
-    /// The last content of `canvas_path` either loaded from or written to
-    /// disk by *this* process — shared with the background file-watcher
-    /// thread (`mod.rs`'s `spawn_file_watcher`) purely so it can tell an
-    /// external edit apart from its own write-back landing on disk, same
-    /// "compare against what we last wrote" trick the web server's own
-    /// watcher uses (`crates/server/src/lib.rs`'s `spawn_file_watcher`).
-    /// Every place that writes `self.raw` to `canvas_path` must update
-    /// this right after, or the watcher will (harmlessly, but
-    /// distractingly) mistake that write for an external change.
-    pub known_raw: Arc<Mutex<String>>,
     /// An external change to `canvas_path` that arrived while
     /// `source_editor` was open — applying it immediately could yank the
     /// document out from under an in-progress edit (or, worse, get
@@ -696,7 +702,7 @@ pub struct App {
     /// makes it stale (the editor's own write is now what's on disk), so
     /// it's just dropped in that case. Mirrors the web UI's
     /// `pendingExternalChange` (`web/src/App.tsx`).
-    pub pending_external_change: Option<String>,
+    pub pending_external_change: Option<(String, Option<Canvas>)>,
     /// `link`+`preview` social-preview fetch — SSRF-safe, in-process (see
     /// `meshfox_server::link_preview`), shared with whatever background
     /// task is currently fetching via `Arc`. Same "alive for exactly this
@@ -858,6 +864,17 @@ pub enum BackgroundMsg {
         url: String,
         image: image::DynamicImage,
     },
+    /// A `form` fence's fields with their resolved values, from the worker.
+    FormFields {
+        node_id: String,
+        block: String,
+        result: Result<Vec<crate::worker_client::FormFieldStatus>, String>,
+    },
+    /// A document image file's bytes, from the worker.
+    ImageBytes {
+        path: PathBuf,
+        result: Result<Vec<u8>, String>,
+    },
     /// A `display="code"` node's file content, from the worker.
     FileContent {
         node_id: String,
@@ -900,72 +917,33 @@ const FILE_PREVIEW_REFRESH: std::time::Duration = std::time::Duration::from_secs
 /// the file changing underneath.
 const TABLE_META_REFRESH: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// A non-secret declaration's currently-resolved value with no overrides
-/// in play — the process environment, then the on-disk cache, then its
-/// own `default` — same precedence `vars::resolve` uses minus the
-/// `run_overrides`/form-override step, and the same idea as the CLI's own
-/// `current_value` in `main.rs`. Shown as a var form field's pre-filled
-/// suggestion, both for `advance_run`'s "still missing" form (where, by
-/// construction, this can only ever equal `decl.default` — env/cache
-/// already failed, or it wouldn't be missing) and for `trigger_configure`'s
-/// "every declared variable" form (where it's the actual point: show
-/// what's already resolved, not just the bare `default`).
-fn current_value(
-    decl: &VarDecl,
-    cache: &VarCache,
-    shared: &meshfox_core::SharedEnv,
-) -> (Option<String>, Option<meshfox_core::SharedOrigin>) {
-    if let Ok(v) = std::env::var(&decl.name) {
-        return (Some(v), None);
-    }
-    if let Some(v) = cache.get(&decl.name) {
-        return (Some(v.to_string()), None);
-    }
-    if let Some(sv) = shared.get(&decl.name) {
-        return (Some(sv.value.clone()), Some(sv.origin.clone()));
-    }
-    (decl.default.clone(), None)
-}
-
 /// A var form field's starting value, coerced to something its own
 /// control can actually represent — a `bool` field is a toggle, so its
 /// value is always canonically `"true"` or `"false"` (anything else,
 /// including no suggestion at all, starts as `"false"`); a `select` field
 /// is a chooser over `decl.choices`, so a suggestion that isn't actually
-/// one of them (a stale cache entry from before `choices=` changed, say)
-/// falls back to the first choice rather than displaying something the
-/// left/right cycle could never have produced itself. `String`/`Int`
-/// fields are free text, so whatever `current_value` found (or an empty
-/// string) passes through unchanged.
-fn initial_field_input(
-    decl: &VarDecl,
-    cache: &VarCache,
-    shared: &meshfox_core::SharedEnv,
-) -> (String, Option<meshfox_core::SharedOrigin>) {
-    let (suggestion, origin) = current_value(decl, cache, shared);
-    let value = match decl.var_type {
-        VarType::Bool => if suggestion.as_deref() == Some("true") {
+/// one of them falls back to the first choice rather than displaying
+/// something the left/right cycle could never have produced itself.
+/// `String`/`Int`/`Dir` fields are free text, so the suggestion (or an
+/// empty string) passes through unchanged. The suggestion starts as the
+/// declaration's `default`; the worker's resolved value (environment,
+/// cache, shared env) replaces it once `GET /api/form/fields` answers.
+fn coerce_field_input(decl: &VarDecl, suggestion: Option<&str>) -> String {
+    match decl.var_type {
+        VarType::Bool => if suggestion == Some("true") {
             "true"
         } else {
             "false"
         }
         .to_string(),
-        VarType::Select => match &suggestion {
-            Some(v) if decl.choices.iter().any(|c| c == v) => v.clone(),
+        VarType::Select => match suggestion {
+            Some(v) if decl.choices.iter().any(|c| c == v) => v.to_string(),
             _ => decl.choices.first().cloned().unwrap_or_default(),
         },
-        VarType::String | VarType::Int | VarType::Dir => suggestion.clone().unwrap_or_default(),
-    };
-    // Only actually shared if the field's control displays the raw
-    // suggestion unchanged -- a `select` falling back to its first choice,
-    // or a `bool` coerced from something that isn't literally "true"/
-    // "false", isn't really showing the shared value at all.
-    let origin = if suggestion.as_deref() == Some(value.as_str()) {
-        origin
-    } else {
-        None
-    };
-    (value, origin)
+        VarType::String | VarType::Int | VarType::Dir => {
+            suggestion.map(str::to_string).unwrap_or_default()
+        }
+    }
 }
 
 /// A worker-reported `VarStatus` reshaped into the `VarDecl` shape
@@ -1086,7 +1064,7 @@ impl App {
                 Err(e) => {
                     return Err(io::Error::other(format!(
                         "failed to load canvas from worker on port {port}: {e}"
-                    )))
+                    )));
                 }
             },
             #[cfg(test)]
@@ -1096,8 +1074,12 @@ impl App {
         };
         let canvas = Canvas::from_markdown(&raw).map_err(|e| io::Error::other(e.to_string()))?;
         let decls = declared_vars(&canvas).unwrap_or_default();
-        let var_cache = VarCache::load(&canvas_path).unwrap_or_else(|_| VarCache::in_memory());
-        let display_canvas = resolve_includes(&canvas, &canvas_path);
+        let display_canvas = match worker_port {
+            Some(port) => crate::worker_client::get_canvas(port)
+                .await
+                .unwrap_or_else(|_| canvas.clone()),
+            None => local_display_canvas(&canvas, &canvas_path),
+        };
         // Deep-link start (`meshfox tui <path> --node <id>` — see
         // `Command::Tui`): expand every ancestor of `initial_node` so its
         // row actually exists in `flatten`'s output below, same as the web
@@ -1114,32 +1096,37 @@ impl App {
         let constraint_stats = constraint_stats(&display_canvas);
         let rows = tree::flatten(&display_canvas, &expanded);
         let picker = build_picker();
-        let known_raw = Arc::new(Mutex::new(raw.clone()));
         // Computed before `canvas_path` is moved into the struct literal
         // below (its `canvas_path,` shorthand field).
         let syntax_root = crate::canvas_root_dir(&canvas_path).to_path_buf();
         let editor_theme = crate::syntax_registry::resolve_editor_theme(&syntax_root);
 
-        let read_only = match worker_port {
-            Some(port) => crate::worker_client::is_read_only(port).await,
-            None => false,
+        let info = match worker_port {
+            Some(port) => crate::worker_client::info(port).await,
+            None => Default::default(),
         };
+        let read_only = info.read_only;
         let mut app = App {
             canvas_path,
             raw,
             canvas,
             display_canvas,
             decls,
-            var_cache,
+            secret_keychain: info.secret_keychain,
             expanded,
             rows,
             selected: 0,
             list_state: ListState::default(),
             focus: Focus::Tree,
             doc_segments: Vec::new(),
+            selected_block: None,
+            block_views: HashMap::new(),
+            reveal_selected_block: false,
             doc_click_regions: Vec::new(),
             doc_click_targets: Vec::new(),
             doc_images: HashMap::new(),
+            image_bytes: HashMap::new(),
+            image_requested: std::collections::HashSet::new(),
             doc_scroll: 0,
             output_scroll: 0,
             output_hscroll: 0,
@@ -1189,7 +1176,6 @@ impl App {
             should_quit: false,
             source_editor: None,
             constraint_stats,
-            known_raw,
             pending_external_change: None,
             link_preview_cache: Arc::new(link_preview::PreviewCache::new()),
             background_tx,
@@ -1229,11 +1215,14 @@ impl App {
                 SourceEditorOutcome::Stay => {}
                 SourceEditorOutcome::Close => {
                     self.source_editor = None;
-                    if let Some(pending) = self.pending_external_change.take() {
-                        self.apply_external_reload(pending);
+                    if let Some((pending, display)) = self.pending_external_change.take() {
+                        self.apply_external_reload(pending, display);
                     }
                 }
                 SourceEditorOutcome::Save => self.save_source_editor().await,
+                SourceEditorOutcome::Switch { path, is_canvas } => {
+                    self.switch_source_editor_file(path, is_canvas).await
+                }
             }
             return;
         }
@@ -1351,6 +1340,35 @@ impl App {
             return;
         }
 
+        if self.focus == Focus::Document {
+            match key.code {
+                KeyCode::Char('[') => {
+                    self.select_adjacent_block(-1);
+                    return;
+                }
+                KeyCode::Char(']') => {
+                    self.select_adjacent_block(1);
+                    return;
+                }
+                KeyCode::Esc if self.selected_block.is_some() => {
+                    self.selected_block = None;
+                    self.render_current_document();
+                    return;
+                }
+                KeyCode::Enter | KeyCode::Char('c') if self.selected_block.is_some() => {
+                    let addr = self.selected_block.clone().unwrap();
+                    let action = if key.code == KeyCode::Enter {
+                        markdown::BlockAction::ToggleBlock
+                    } else {
+                        markdown::BlockAction::ToggleSource
+                    };
+                    self.activate_block_action(addr, action).await;
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         match key.code {
             KeyCode::Char('q') => self.quit(),
             KeyCode::Esc => {
@@ -1444,7 +1462,7 @@ impl App {
             KeyCode::Char('L') => self.open_run_history().await,
             KeyCode::Char('o') => self.trigger_open_file(),
             KeyCode::Char('c') => self.trigger_configure().await,
-            KeyCode::Char('e') => self.open_source_editor(),
+            KeyCode::Char('e') => self.open_source_editor().await,
             // The keyboard counterpart to clicking a pane's own `[+]`/`[-]`
             // title-row icon or double-clicking its title (`on_mouse`) —
             // those are mouse-only and, on a TUI, have no visual
@@ -1639,7 +1657,6 @@ impl App {
             return None;
         }
         let form = meshfox_core::form_block(&block).ok()?;
-        let shared = meshfox_core::load_shared_env(crate::canvas_root_dir(&self.canvas_path));
         let mut fields = Vec::new();
         let mut decls = Vec::new();
         let mut inputs = Vec::new();
@@ -1651,10 +1668,27 @@ impl App {
                 .session_vars
                 .get(&field.var)
                 .cloned()
-                .unwrap_or_else(|| initial_field_input(decl, &self.var_cache, &shared).0);
+                .unwrap_or_else(|| coerce_field_input(decl, decl.default.as_deref()));
             fields.push(field);
             decls.push(decl.clone());
             inputs.push(input);
+        }
+        // The worker knows the resolved values (environment, cache, shared
+        // env); they replace the defaults above once they arrive.
+        if let Some(port) = self.worker_port {
+            let (node, block, tx) = (
+                node_id.to_string(),
+                block_name.to_string(),
+                self.background_tx.clone(),
+            );
+            tokio::spawn(async move {
+                let result = crate::worker_client::get_form_fields(port, &node, &block).await;
+                let _ = tx.send(BackgroundMsg::FormFields {
+                    node_id: node,
+                    block,
+                    result,
+                });
+            });
         }
         Some(InlineFormState {
             node_id: node_id.to_string(),
@@ -2184,6 +2218,81 @@ impl App {
         }
     }
 
+    fn select_adjacent_block(&mut self, direction: i32) {
+        let Some(row) = self.rows.get(self.selected) else {
+            return;
+        };
+        let Some(node) = self.display_canvas.node(&row.node_id) else {
+            return;
+        };
+        let blocks: Vec<_> = scan_runnable_blocks(&node.id, &node.text)
+            .into_iter()
+            .filter(|b| !meshfox_core::is_button(&b.lang) && !meshfox_core::is_form(&b.lang))
+            .filter_map(|b| b.name)
+            .collect();
+        if blocks.is_empty() {
+            return;
+        }
+        let current = self
+            .selected_block
+            .as_ref()
+            .and_then(|addr| blocks.iter().position(|name| name == &addr.block_name));
+        let next = match current {
+            Some(i) => (i as i32 + direction).rem_euclid(blocks.len() as i32) as usize,
+            None if direction < 0 => blocks.len() - 1,
+            None => 0,
+        };
+        self.selected_block = Some(BlockAddr::new(&node.id, &blocks[next]));
+        self.reveal_selected_block = true;
+        self.render_current_document();
+    }
+
+    async fn activate_block_action(&mut self, addr: BlockAddr, action: markdown::BlockAction) {
+        use markdown::BlockAction;
+        let Some(node) = self.display_canvas.node(&addr.node_id) else {
+            return;
+        };
+        let Some(block) = scan_runnable_blocks(&node.id, &node.text)
+            .into_iter()
+            .find(|b| b.name.as_deref() == Some(&addr.block_name))
+        else {
+            return;
+        };
+        if let Some(form) = &mut self.active_inline_form {
+            form.editing = false;
+        }
+        self.selected_block = Some(addr.clone());
+        self.set_focus(Focus::Document);
+        match action {
+            BlockAction::Select => {}
+            BlockAction::ToggleBlock => {
+                let view = self.block_views.entry(addr.clone()).or_default();
+                view.collapsed = !view.collapsed;
+                self.reveal_selected_block = true;
+            }
+            BlockAction::ToggleSource => {
+                let view = self.block_views.entry(addr.clone()).or_default();
+                view.source_expanded = Some(!view.source_expanded.unwrap_or(!block.fold));
+                self.reveal_selected_block = true;
+            }
+            BlockAction::History => {
+                if block.service
+                    || meshfox_core::is_button(&block.lang)
+                    || meshfox_core::is_form(&block.lang)
+                {
+                    self.status = "this block keeps no run history".into();
+                } else {
+                    self.open_run_history_for(addr.node_id, addr.block_name)
+                        .await;
+                }
+            }
+            BlockAction::Run | BlockAction::Chain => {
+                self.trigger_run(action == BlockAction::Chain).await;
+            }
+        }
+        self.render_current_document();
+    }
+
     /// A `ClickTarget` (see its own doc comment) actually being clicked —
     /// split out of `on_mouse` so its own `match` doesn't have to live
     /// inside that already-long function. Respects the same "one run at a
@@ -2194,6 +2303,14 @@ impl App {
     /// own exact block already).
     async fn activate_click_target(&mut self, target: ClickTarget) {
         match target {
+            ClickTarget::Block {
+                node_id,
+                block_name,
+                action,
+            } => {
+                self.activate_block_action(BlockAddr::new(&node_id, &block_name), action)
+                    .await;
+            }
             ClickTarget::RunBlock {
                 node_id,
                 block_name,
@@ -2602,14 +2719,30 @@ impl App {
         }
     }
 
-    fn rebuild_display_canvas(&mut self) {
-        self.display_canvas = resolve_includes(&self.canvas, &self.canvas_path);
+    /// `display` is the worker's include-resolved document
+    /// (`GET /api/canvas`, see `fetch_display_canvas`). `None` — the fetch
+    /// failed, e.g. a broken `include` target — falls back to the
+    /// unresolved canvas so the rest of the document stays browsable.
+    fn rebuild_display_canvas(&mut self, display: Option<Canvas>) {
+        self.display_canvas = match display {
+            Some(display) => display,
+            None => local_display_canvas(&self.canvas, &self.canvas_path),
+        };
         self.constraint_stats = constraint_stats(&self.display_canvas);
+    }
+
+    /// The worker's include-resolved, constraint-annotated document
+    /// (`GET /api/canvas`) — what the tree and Document pane render.
+    /// `None` without a worker or when the worker refuses to resolve it.
+    async fn fetch_display_canvas(&self) -> Option<Canvas> {
+        crate::worker_client::get_canvas(self.worker_port?)
+            .await
+            .ok()
     }
 
     /// Applies an edit to `canvas_path` made by something other than this
     /// process — reported by the background file-watcher thread (see
-    /// `mod.rs`'s `spawn_file_watcher`) via `known_raw`. Deferred instead
+    /// `mod.rs`'s `spawn_worker_watcher`). Deferred instead
     /// (into `pending_external_change`) rather than applied here if the
     /// source editor is open on this same file; see that field's own doc
     /// comment. Mirrors the web UI's own reload-on-change
@@ -2622,17 +2755,20 @@ impl App {
     /// instead of applying immediately while the source editor is open on
     /// this file (see that field's doc comment), applies right away
     /// otherwise.
-    pub fn on_external_change(&mut self, content: String) {
+    pub fn on_external_change(&mut self, content: String, display: Option<Canvas>) {
+        if content == self.raw && display.as_ref().is_none_or(|d| *d == self.display_canvas) {
+            return;
+        }
         if self.source_editor.is_some() {
-            self.pending_external_change = Some(content);
+            self.pending_external_change = Some((content, display));
             self.status = "file changed on disk — will reload once the editor closes".into();
             return;
         }
-        self.apply_external_reload(content);
+        self.apply_external_reload(content, display);
     }
 
-    fn apply_external_reload(&mut self, content: String) {
-        if content == self.raw {
+    fn apply_external_reload(&mut self, content: String, display: Option<Canvas>) {
+        if content == self.raw && display.as_ref().is_none_or(|d| *d == self.display_canvas) {
             return;
         }
         self.raw = content;
@@ -2640,7 +2776,7 @@ impl App {
             Ok(parsed) => {
                 self.canvas = parsed;
                 self.decls = declared_vars(&self.canvas).unwrap_or_default();
-                self.rebuild_display_canvas();
+                self.rebuild_display_canvas(display);
                 self.rebuild_rows();
                 self.render_current_document();
                 self.status = "reloaded — file changed on disk".into();
@@ -2738,7 +2874,7 @@ impl App {
     /// identity of its own at all — its target's own content was dumped
     /// straight into this node's body, so there's no node-specific cursor
     /// position to jump to; just opens that file at the top.
-    fn open_source_editor(&mut self) {
+    async fn open_source_editor(&mut self) {
         if self.read_only {
             self.status = READ_ONLY_STATUS.into();
             return;
@@ -2751,23 +2887,40 @@ impl App {
             return;
         };
 
-        let (path, is_canvas, local_id): (PathBuf, bool, Option<String>) =
-            if node.plain_markdown_include {
-                match meshfox_core::include::list_includes(&self.canvas, &self.canvas_path)
-                    .into_iter()
-                    .find(|i| i.node_id == node_id)
-                {
-                    Some(info) => (info.path, false, None),
-                    None => {
-                        self.status = "couldn't resolve this include's target file".into();
+        let plain_include = node.plain_markdown_include;
+        let Some(port) = self.worker_port else {
+            self.status = "no worker for this canvas".into();
+            return;
+        };
+        let files = match self.include_files(port).await {
+            Ok(files) => files,
+            Err(e) => {
+                self.status = format!("couldn't list this canvas's includes: {e}");
+                return;
+            }
+        };
+
+        let (path, is_canvas, local_id, target_raw): (PathBuf, bool, Option<String>, String) =
+            if plain_include {
+                let Some(info) = files.iter().find(|i| i.node_id == node_id) else {
+                    self.status = "couldn't resolve this include's target file".into();
+                    return;
+                };
+                match crate::worker_client::get_include_raw(port, &node_id).await {
+                    Ok(raw) => (info.path.clone(), false, None, raw),
+                    Err(e) => {
+                        self.status = format!("failed to open source editor: {e}");
                         return;
                     }
                 }
             } else {
-                (self.canvas_path.clone(), true, Some(node_id))
+                (
+                    self.canvas_path.clone(),
+                    true,
+                    Some(node_id),
+                    self.raw.clone(),
+                )
             };
-
-        let files = meshfox_core::include::list_includes(&self.canvas, &self.canvas_path);
 
         // Cursor placement needs the *target file's own raw text* (to
         // convert a byte offset into a row/col) — read once here and
@@ -2777,14 +2930,9 @@ impl App {
         // case.
         let cursor = local_id
             .as_deref()
-            .zip(if path == self.canvas_path {
-                Some(self.raw.clone())
-            } else {
-                std::fs::read_to_string(&path).ok()
-            })
-            .and_then(|(id, raw)| {
-                mdcanvas::node_body_offset(&raw, id)
-                    .map(|off| source_editor::byte_offset_to_cursor(&raw, off))
+            .and_then(|id| {
+                mdcanvas::node_body_offset(&target_raw, id)
+                    .map(|off| source_editor::byte_offset_to_cursor(&target_raw, off))
             })
             .unwrap_or_default();
 
@@ -2810,9 +2958,54 @@ impl App {
             files,
             all_tags,
             self.raw.clone(),
+            target_raw,
         ) {
             Ok(state) => self.source_editor = Some(state),
             Err(e) => self.status = format!("failed to open source editor: {e}"),
+        }
+    }
+
+    /// The document's `include` nodes as the worker lists them. `path` is
+    /// only a label for the editor's title and file picker (the target as
+    /// written, next to the canvas) — nothing reads it from disk.
+    async fn include_files(
+        &self,
+        port: u16,
+    ) -> Result<Vec<meshfox_core::include::IncludeInfo>, String> {
+        let base_dir = self.canvas_path.parent().unwrap_or(Path::new("."));
+        Ok(crate::worker_client::get_includes(port)
+            .await?
+            .into_iter()
+            .map(|e| meshfox_core::include::IncludeInfo {
+                path: base_dir.join(&e.target),
+                node_id: e.node_id,
+                title: e.title,
+                target: e.target,
+            })
+            .collect())
+    }
+
+    /// The file picker chose an include target: fetch its text from the
+    /// worker and load it into the editor.
+    async fn switch_source_editor_file(&mut self, path: PathBuf, is_canvas: bool) {
+        let (Some(port), Some(se)) = (self.worker_port, self.source_editor.as_ref()) else {
+            return;
+        };
+        let Some(node_id) = se
+            .files
+            .iter()
+            .find(|i| i.path == path)
+            .map(|i| i.node_id.clone())
+        else {
+            return;
+        };
+        let result = crate::worker_client::get_include_raw(port, &node_id).await;
+        let Some(se) = self.source_editor.as_mut() else {
+            return;
+        };
+        match result {
+            Ok(raw) => se.finish_switch(path, is_canvas, raw),
+            Err(e) => se.error = Some(format!("failed to read {}: {e}", path.display())),
         }
     }
 
@@ -2833,10 +3026,15 @@ impl App {
         let mut text = se.editor.lines.to_string();
         let is_canvas = se.is_canvas
             || meshfox_core::mdcanvas::is_canvas_path(&se.path)
-            || meshfox_core::mdcanvas::has_marker(&text)
-            || std::fs::read_to_string(&se.path)
-                .is_ok_and(|raw| meshfox_core::mdcanvas::has_marker(&raw));
+            || meshfox_core::mdcanvas::has_marker(&text);
         let path = se.path.clone();
+        // The include node whose target is being edited (`None`: the
+        // primary document). The worker owns the write either way.
+        let include_id = se
+            .files
+            .iter()
+            .find(|i| i.path == path)
+            .map(|i| i.node_id.clone());
         // The version of the file this editor read: a save is refused if the
         // file has changed since.
         let base_rev = se.base_rev();
@@ -2850,45 +3048,34 @@ impl App {
         }
 
         let is_primary = path == self.canvas_path;
-        let write_result = if is_canvas {
-            let port = if is_primary {
-                self.worker_port
-                    .ok_or_else(|| "no worker for primary canvas".to_string())
-            } else {
-                crate::coordinator::get_or_spawn(&path)
-                    .await
-                    .map_err(|e| e.to_string())
-            };
-            match port {
-                Ok(port) => {
-                    match crate::worker_client::put_canvas_raw(port, &text, &base_rev).await {
-                        Ok(()) => match crate::worker_client::get_canvas_raw(port).await {
+        let include_id = if is_primary { None } else { include_id };
+        let write_result = match self.worker_port {
+            None => Err("no worker for this canvas".to_string()),
+            Some(port) => {
+                match crate::worker_client::put_canvas_raw(
+                    port,
+                    &text,
+                    &base_rev,
+                    include_id.as_deref(),
+                )
+                .await
+                {
+                    Ok(()) if is_primary => {
+                        match crate::worker_client::get_canvas_raw(port).await {
                             Ok(saved) => {
                                 text = saved;
                                 Ok(())
                             }
                             Err(e) => Err(format!("saved, but failed to reload: {e}")),
-                        },
-                        Err(crate::worker_client::PutRawError::Conflict { current_rev }) => {
-                            conflict_rev = Some(current_rev);
-                            Err(SOURCE_CHANGED_ELSEWHERE.to_string())
                         }
-                        Err(crate::worker_client::PutRawError::Other(e)) => Err(e),
                     }
+                    Ok(()) => Ok(()),
+                    Err(crate::worker_client::PutRawError::Conflict { current_rev }) => {
+                        conflict_rev = Some(current_rev);
+                        Err(SOURCE_CHANGED_ELSEWHERE.to_string())
+                    }
+                    Err(crate::worker_client::PutRawError::Other(e)) => Err(e),
                 }
-                Err(e) => Err(e),
-            }
-        } else {
-            // A plain-Markdown include target is written here, not by a
-            // worker, so the same check is made here: against what is on
-            // disk right now.
-            match std::fs::read_to_string(&path) {
-                Ok(on_disk) if meshfox_core::body_rev(&on_disk) != base_rev => {
-                    conflict_rev = Some(meshfox_core::body_rev(&on_disk));
-                    Err(SOURCE_CHANGED_ELSEWHERE.to_string())
-                }
-                _ => std::fs::write(&path, &text)
-                    .map_err(|e| format!("failed to write {}: {e}", path.display())),
             }
         };
         if let Err(e) = write_result {
@@ -2908,14 +3095,14 @@ impl App {
             if let Ok(reparsed) = Canvas::from_markdown(&text) {
                 self.canvas = reparsed;
             }
-            *self.known_raw.lock().unwrap() = self.raw.clone();
             // Whatever arrived externally while the editor was open is now
             // stale — this save just overwrote it on disk with the
             // editor's own buffer, same "last write wins" behavior a save
             // conflicting with a concurrent external edit already has.
             self.pending_external_change = None;
         }
-        self.rebuild_display_canvas();
+        let display = self.fetch_display_canvas().await;
+        self.rebuild_display_canvas(display);
         self.rebuild_rows();
         self.render_current_document();
         self.status = "saved".into();
@@ -2934,6 +3121,24 @@ impl App {
         let Some(node) = self.display_canvas.node(&row.node_id) else {
             return;
         };
+        if self.selected_block.as_ref().is_some_and(|addr| {
+            addr.node_id != node.id
+                || !scan_runnable_blocks(&node.id, &node.text)
+                    .iter()
+                    .any(|b| b.name.as_deref() == Some(&addr.block_name))
+        }) {
+            self.selected_block = None;
+        }
+        let block_views: HashMap<String, markdown::BlockView> = self
+            .block_views
+            .iter()
+            .filter(|(addr, _)| addr.node_id == node.id)
+            .map(|(addr, view)| (addr.block_name.clone(), view.clone()))
+            .collect();
+        let selected_block = self
+            .selected_block
+            .as_ref()
+            .map(|addr| addr.block_name.as_str());
         let mut heading = Vec::new();
         if let Some(color) = ui::tree_row_color(node.color.as_deref()) {
             heading.push(Span::styled("● ", Style::default().fg(color)));
@@ -3034,7 +3239,8 @@ impl App {
                     match self.file_previews.get(&node_id).map(|p| &p.state) {
                         Some(FilePreviewState::Ready { content, truncated }) => {
                             let mut lines =
-                                self.highlighter.highlight_file(lang.as_deref(), &path, content);
+                                self.highlighter
+                                    .highlight_file(lang.as_deref(), &path, content);
                             if *truncated {
                                 lines.push(Line::from(Span::styled(
                                     "preview truncated to the first part of the file",
@@ -3093,7 +3299,7 @@ impl App {
             }
         }
 
-        let (segs, regions) = markdown::render(
+        let (segs, regions) = markdown::render_with_blocks(
             &node.text,
             &base_dir,
             &self.highlighter,
@@ -3102,6 +3308,10 @@ impl App {
             &form_values,
             form_focus,
             &live_output,
+            &block_views,
+            selected_block,
+            self.focus == Focus::Document,
+            true,
         );
         let offset = self.doc_segments.len();
         self.doc_segments.extend(segs);
@@ -3128,8 +3338,26 @@ impl App {
             })
             .collect();
         for (path, width_percent, height_percent, bg) in images {
-            let protocol =
-                load_image_protocol(&mut self.picker, &path, width_percent, height_percent, bg);
+            let is_data_url = path.to_str().is_some_and(|s| s.starts_with("data:"));
+            if !is_data_url && !self.image_bytes.contains_key(&path) {
+                request_image(
+                    self.worker_port,
+                    &self.background_tx,
+                    &mut self.image_requested,
+                    &base_dir,
+                    &path,
+                );
+                self.doc_images.insert(path, None);
+                continue;
+            }
+            let protocol = load_image_protocol(
+                &mut self.picker,
+                &path,
+                self.image_bytes.get(&path).map(Vec::as_slice),
+                width_percent,
+                height_percent,
+                bg,
+            );
             self.doc_images.insert(path, protocol);
         }
 
@@ -3280,6 +3508,30 @@ impl App {
             BackgroundMsg::Meta { url, meta } => {
                 self.link_preview_meta.insert(url, meta);
             }
+            BackgroundMsg::FormFields {
+                node_id,
+                block,
+                result,
+            } => {
+                if let (Ok(statuses), Some(form)) = (result, self.active_inline_form.as_mut()) {
+                    if form.node_id == node_id && form.block_name == block {
+                        for (decl, input) in form.decls.iter().zip(form.inputs.iter_mut()) {
+                            // Only fields still showing the untouched default.
+                            let untouched = !self.session_vars.contains_key(&decl.name)
+                                && *input == coerce_field_input(decl, decl.default.as_deref());
+                            let resolved = statuses.iter().find(|s| s.var.name == decl.name);
+                            if let (true, Some(status)) = (untouched, resolved) {
+                                *input = coerce_field_input(decl, status.var.value.as_deref());
+                            }
+                        }
+                    }
+                }
+            }
+            BackgroundMsg::ImageBytes { path, result } => {
+                if let Ok(bytes) = result {
+                    self.image_bytes.insert(path, bytes);
+                }
+            }
             BackgroundMsg::Image { url, image } => {
                 let budget = ratatui::layout::Size::new(56, 24);
                 if let Ok(protocol) =
@@ -3313,6 +3565,13 @@ impl App {
             return;
         };
         let node_id = row.node_id.clone();
+        if self.focus == Focus::Document {
+            if let Some(addr) = self.selected_block.clone() {
+                self.start_run(addr.node_id, addr.block_name, with_deps)
+                    .await;
+                return;
+            }
+        }
 
         // A runnable `file` node (`type="file" interpreter="..."`) has no
         // fenced blocks at all — it's its own single, uncached, unchained
@@ -4246,48 +4505,20 @@ impl App {
     /// the TUI counterpart to the web UI's own "▷ run" button on a `file`
     /// node's title bar (`run_file_node` in `crates/server/src/lib.rs`),
     /// previously the only way to run one at all.
-    async fn start_file_run(&mut self, node_id: String, node: Node) {
-        let interpreter = node
-            .interpreter
-            .as_deref()
-            .expect("checked by is_runnable_file");
-        let (program, args) = match meshfox_core::split_interpreter(interpreter) {
-            Some(pair) => pair,
-            None => {
-                self.status =
-                    format!("interpreter={interpreter:?} isn't a valid shell-word command");
-                return;
-            }
+    async fn start_file_run(&mut self, node_id: String, _node: Node) {
+        let Some(port) = self.worker_port else {
+            self.status = "no worker for this canvas".into();
+            return;
         };
-        let target = node.target.as_deref().expect("checked by is_runnable_file");
-        let origin_dir = crate::canvas_root_dir(&self.canvas_path);
-        let access = std::fs::read_to_string(&self.canvas_path)
-            .ok()
-            .and_then(|raw| meshfox_core::Canvas::from_markdown(&raw).ok())
-            .map(|c| meshfox_core::FileAccess::for_canvas_path(&c, &self.canvas_path))
-            .unwrap_or_default();
-        let resolved_target = match access.confine(origin_dir, target) {
-            Ok(p) => p,
-            Err(e) => {
-                self.status = e.to_string();
-                return;
-            }
-        };
-
-        match meshfox_server::stream_exec::spawn_process(
-            &program,
-            args.iter()
-                .map(std::ffi::OsStr::new)
-                .chain([resolved_target.as_os_str()]),
-            Some(origin_dir),
-        ) {
-            Ok(proc) => {
+        match crate::worker_client::run_file_node_stream(port, &node_id).await {
+            Ok(events) => {
                 self.status.clear();
                 self.output_scroll = 0;
                 self.output_hscroll = 0;
                 self.file_run = Some(FileRunState {
                     node_id: node_id.clone(),
-                    proc: Some(proc),
+                    events: Some(events),
+                    run_id: None,
                     lines: vec![format!("==> {node_id}")],
                     had_failure: false,
                     finished: false,
@@ -4303,29 +4534,37 @@ impl App {
         }
     }
 
-    /// Called by `mod.rs` once `file_run`'s own output channel closes —
-    /// mirrors `on_output_line`, minus everything that only applies to a
+    /// One event from `file_run`'s worker stream (`None`: the stream ended).
+    /// Mirrors `on_run_event`, minus everything that only applies to a
     /// fenced block (no `cache`, no `meshfox:var`, no chain to advance).
-    pub async fn on_file_output_line(&mut self, line: Option<(OutputStream, String)>) {
+    pub fn on_file_run_event(&mut self, event: Option<crate::worker_client::RunEvent>) {
+        use crate::worker_client::RunEvent;
         let Some(run) = &mut self.file_run else {
             return;
         };
         self.console_last_activity = Some(std::time::Instant::now());
-        match line {
-            Some((_, text)) => run.lines.push(text),
-            None => {
-                let mut proc = run
-                    .proc
-                    .take()
-                    .expect("output channel closed without a process");
-                let status = proc.child.wait().await;
-                let exit_code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
-                let run = self.file_run.as_mut().unwrap();
-                run.lines.push(format!("(exit {exit_code})"));
-                run.had_failure = exit_code != 0;
-                run.finished = true;
+        let exit_code = match event {
+            Some(RunEvent::Started { run_id }) => {
+                run.run_id = Some(run_id);
+                return;
             }
-        }
+            Some(RunEvent::Output { text, .. }) => {
+                run.lines.push(text);
+                return;
+            }
+            Some(RunEvent::Done { exit_code }) => exit_code,
+            Some(RunEvent::Error { message }) => {
+                run.lines.push(message);
+                -1
+            }
+            Some(RunEvent::Killed { .. }) => -1,
+            Some(_) => return,
+            None => -1,
+        };
+        run.events = None;
+        run.lines.push(format!("(exit {exit_code})"));
+        run.had_failure = exit_code != 0;
+        run.finished = true;
     }
 
     /// Called by `mod.rs` once `bridge_http_tty`'s relay loop returns —
@@ -4416,7 +4655,11 @@ impl App {
             self.collapse_pane(self.focus);
             self.auto_expanded_pane = None;
         }
+        let changed = self.focus != new_focus;
         self.focus = new_focus;
+        if changed && self.selected_block.is_some() {
+            self.render_current_document();
+        }
     }
 
     /// `Tab`/`BackTab` landing on a collapsed Tree/Output — expands it for
@@ -4456,7 +4699,7 @@ impl App {
     /// own ticks.
     pub fn spinner_active(&self) -> bool {
         self.run.as_ref().is_some_and(RunState::is_running)
-            || self.file_run.as_ref().is_some_and(|f| f.proc.is_some())
+            || self.file_run.as_ref().is_some_and(|f| f.events.is_some())
             || !self.external_running.is_empty()
     }
 
@@ -4488,7 +4731,7 @@ impl App {
             return;
         }
         let running = self.run.as_ref().is_some_and(RunState::is_running)
-            || self.file_run.as_ref().is_some_and(|r| r.proc.is_some());
+            || self.file_run.as_ref().is_some_and(|r| r.events.is_some());
         if running {
             return;
         }
@@ -5056,6 +5299,13 @@ impl App {
     /// never leaves a run record behind, so those aren't offered (and a node
     /// with none says so).
     async fn open_run_history(&mut self) {
+        if self.focus == Focus::Document {
+            if let Some(addr) = self.selected_block.clone() {
+                self.activate_block_action(addr, markdown::BlockAction::History)
+                    .await;
+                return;
+            }
+        }
         if self.worker_port.is_none() {
             self.status = "run history needs a worker — none reachable".into();
             return;
@@ -5241,7 +5491,8 @@ impl App {
                 // Pull the rewritten canvas right away instead of waiting for
                 // the `/api/watch` push, so the tree is already current.
                 if let Ok(content) = crate::worker_client::get_canvas_raw(port).await {
-                    self.on_external_change(content);
+                    let display = self.fetch_display_canvas().await;
+                    self.on_external_change(content, display);
                 }
                 self.status = format!("jumped to #{} · {}", entry.seq, entry.summary);
             }
@@ -5292,11 +5543,11 @@ impl App {
                 }
             }
         }
-        if let Some(run) = &mut self.file_run {
-            if let Some(proc) = &run.proc {
-                let _ = proc.kill();
+        if let (Some(run), Some(port)) = (&self.file_run, self.worker_port) {
+            if let (true, Some(run_id)) = (run.events.is_some(), run.run_id.clone()) {
+                let _ = crate::worker_client::kill_run_id(port, &run_id).await;
+                self.status = "killing...".into();
             }
-            self.status = "killing...".into();
         }
     }
 
@@ -5576,36 +5827,7 @@ impl App {
             }
             return;
         }
-        let decls: Vec<VarDecl> = self
-            .decls
-            .iter()
-            .filter(|d| !d.secret && !d.session && d.from.is_none())
-            .cloned()
-            .collect();
-        if decls.is_empty() {
-            self.status =
-                "meshfox: this canvas declares no configurable (non-secret, non-session, non-from=) variable(s)"
-                    .into();
-            return;
-        }
-        let shared = meshfox_core::load_shared_env(crate::canvas_root_dir(&self.canvas_path));
-        let (inputs, origins): (Vec<String>, Vec<Option<meshfox_core::SharedOrigin>>) = decls
-            .iter()
-            .map(|d| initial_field_input(d, &self.var_cache, &shared))
-            .unzip();
-        self.var_form = Some(VarFormState {
-            arguments: false,
-            save: vec![false; decls.len()],
-            errors: vec![None; decls.len()],
-            stored: vec![None; decls.len()],
-            clear: vec![false; decls.len()],
-            secret_store: self.var_cache.secret_store_kind().as_str().to_string(),
-            decls,
-            inputs,
-            origins,
-            selected: 0,
-            configuring: true,
-        });
+        self.status = "no worker for this canvas".into();
     }
 
     /// Whether the footer/help hint for `c` (configure) should be shown at
@@ -5615,8 +5837,7 @@ impl App {
     /// `c` could usefully do, same as the CLI's own `configure` skipping
     /// them).
     pub fn has_configurable_vars(&self) -> bool {
-        let keychain = self.var_cache.secret_store_kind()
-            == meshfox_core::secret_store::SecretStoreKind::Keychain;
+        let keychain = self.secret_keychain;
         self.decls
             .iter()
             .any(|d| (keychain || !d.secret) && !d.session && d.from.is_none())
@@ -5641,6 +5862,18 @@ impl App {
 /// `include::resolve` errors (a broken target, a cycle) fall back to the
 /// unresolved canvas rather than refusing to show anything — the rest of
 /// the document is still worth browsing even if one `include` is broken.
+#[cfg(not(test))]
+fn local_display_canvas(canvas: &Canvas, _canvas_path: &Path) -> Canvas {
+    canvas.clone()
+}
+
+/// Unit tests run `App` without a worker, so they resolve locally.
+#[cfg(test)]
+fn local_display_canvas(canvas: &Canvas, canvas_path: &Path) -> Canvas {
+    resolve_includes(canvas, canvas_path)
+}
+
+#[cfg(test)]
 fn resolve_includes(canvas: &Canvas, canvas_path: &Path) -> Canvas {
     let mut resolved =
         meshfox_core::include::resolve(canvas, canvas_path).unwrap_or_else(|_| canvas.clone());
@@ -5741,6 +5974,34 @@ fn build_picker() -> Picker {
     Picker::from_query_stdio_with_options(options).unwrap_or_else(|_| Picker::halfblocks())
 }
 
+/// Fetches an image file of the document from the worker (once per path);
+/// the result arrives as `BackgroundMsg::ImageBytes`.
+fn request_image(
+    port: Option<u16>,
+    tx: &tokio::sync::mpsc::UnboundedSender<BackgroundMsg>,
+    requested: &mut std::collections::HashSet<PathBuf>,
+    base_dir: &Path,
+    path: &Path,
+) {
+    let Some(port) = port else { return };
+    if !requested.insert(path.to_path_buf()) {
+        return;
+    }
+    let Ok(relative) = path.strip_prefix(base_dir) else {
+        return;
+    };
+    let relative = relative
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
+    let (path, tx) = (path.to_path_buf(), tx.clone());
+    tokio::spawn(async move {
+        let result = crate::worker_client::get_relative_file(port, &relative).await;
+        let _ = tx.send(BackgroundMsg::ImageBytes { path, result });
+    });
+}
+
 /// `path` is a real file for every ordinary `Segment::Image`, but a
 /// `data:` URL string doubling as its own synthetic cache key for one
 /// pasted/embedded directly in the document (see `markdown::Renderer`'s
@@ -5750,6 +6011,7 @@ fn build_picker() -> Picker {
 fn load_image_protocol(
     picker: &mut Picker,
     path: &Path,
+    bytes: Option<&[u8]>,
     width_percent: Option<u32>,
     height_percent: Option<u32>,
     bg: Option<Background>,
@@ -5757,14 +6019,9 @@ fn load_image_protocol(
     let dyn_img = match path.to_str().filter(|s| s.starts_with("data:")) {
         Some(data_url) => decode_data_url_image(data_url, bg)?,
         None if is_svg_path(path) => {
-            super::svg_raster::rasterize(&std::fs::read_to_string(path).ok()?, bg)?
+            super::svg_raster::rasterize(std::str::from_utf8(bytes?).ok()?, bg)?
         }
-        None => image::ImageReader::open(path)
-            .ok()?
-            .with_guessed_format()
-            .ok()?
-            .decode()
-            .ok()?,
+        None => image::load_from_memory(bytes?).ok()?,
     };
     let budget = image_size_budget(width_percent, height_percent);
     picker
@@ -5880,7 +6137,10 @@ impl App {
             return false;
         }
         self.focus == Focus::Document
-            || self.rows.get(self.selected).is_some_and(|r| !r.has_children)
+            || self
+                .rows
+                .get(self.selected)
+                .is_some_and(|r| !r.has_children)
     }
 
     /// For the footer: the selected node is a table node.
@@ -5935,8 +6195,10 @@ impl App {
     /// asks for the rows its inline window needs.
     fn ensure_table(&mut self, node_id: &str) {
         let Some(port) = self.worker_port else {
-            self.tables.entry(node_id.to_string()).or_default().meta_error =
-                Some("no worker to read it through".into());
+            self.tables
+                .entry(node_id.to_string())
+                .or_default()
+                .meta_error = Some("no worker to read it through".into());
             return;
         };
         let data = self.tables.entry(node_id.to_string()).or_default();
@@ -6266,7 +6528,8 @@ impl App {
                     .iter()
                     .find(|(x0, x1, _)| mouse.column >= *x0 && mouse.column < *x1)
                     .map(|(_, _, c)| *c);
-                let in_header = mouse.row == geometry.header_y || mouse.row == geometry.header_y + 1;
+                let in_header =
+                    mouse.row == geometry.header_y || mouse.row == geometry.header_y + 1;
                 let body = geometry.body;
                 let in_body = mouse.row >= body.y
                     && mouse.row < body.y + body.height
@@ -6473,7 +6736,7 @@ mod tests {
     fn load_image_protocol_loads_a_data_url_without_touching_disk() {
         let mut picker = Picker::halfblocks();
         let path = PathBuf::from(ONE_PIXEL_PNG_DATA_URL);
-        assert!(load_image_protocol(&mut picker, &path, None, None, None).is_some());
+        assert!(load_image_protocol(&mut picker, &path, None, None, None, None).is_some());
     }
 
     const SVG_BASE64_DATA_URL: &str = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI0IiBoZWlnaHQ9IjQiPjxyZWN0IHdpZHRoPSI0IiBoZWlnaHQ9IjQiLz48L3N2Zz4=";
@@ -6495,10 +6758,15 @@ mod tests {
     fn load_image_protocol_loads_an_svg_data_url_and_an_svg_file() {
         let mut picker = Picker::halfblocks();
         let path = PathBuf::from(SVG_BASE64_DATA_URL);
-        assert!(
-            load_image_protocol(&mut picker, &path, None, None, Background::parse("#fff"))
-                .is_some()
-        );
+        assert!(load_image_protocol(
+            &mut picker,
+            &path,
+            None,
+            None,
+            None,
+            Background::parse("#fff")
+        )
+        .is_some());
 
         let dir = std::env::temp_dir().join(format!("meshfox-svg-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -6508,7 +6776,8 @@ mod tests {
             r#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><rect width="4" height="4"/></svg>"#,
         )
         .unwrap();
-        assert!(load_image_protocol(&mut picker, &file, None, None, None).is_some());
+        let bytes = std::fs::read(&file).unwrap();
+        assert!(load_image_protocol(&mut picker, &file, Some(&bytes), None, None, None).is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6591,6 +6860,32 @@ mod tests {
     /// A one-shot HTTP server that answers 204 to whatever it is sent and
     /// reports the request line of the first request — enough of a "worker"
     /// to see what the TUI asks it.
+    /// A real embedded worker for `path` (never the user's daemon: the lock
+    /// is taken directly, no `server_socket` lookup) and an `App` talking to it.
+    async fn app_with_real_worker(path: PathBuf) -> App {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let canonical = path.canonicalize().unwrap();
+        let guard = match meshfox_core::worker_lock::try_acquire(&canonical).unwrap() {
+            meshfox_core::worker_lock::Acquired::Us(guard) => guard,
+            meshfox_core::worker_lock::Acquired::Other { .. } => {
+                panic!("test canvas already served")
+            }
+        };
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(meshfox_server::serve_as_worker(
+            canonical,
+            0,
+            false,
+            None,
+            true,
+            guard,
+            Some(ready_tx),
+        ));
+        let port = ready_rx.await.unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(path, tx, None, Some(port)).await.unwrap()
+    }
+
     async fn stub_worker() -> (u16, tokio::sync::oneshot::Receiver<String>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -6622,8 +6917,7 @@ mod tests {
             "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
         )
         .unwrap();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(path, tx, None, None).await.unwrap();
+        let mut app = app_with_real_worker(path).await;
         app.read_only = true;
 
         app.on_key(key(KeyCode::Char('e'))).await;
@@ -7001,6 +7295,237 @@ mod tests {
         );
     }
 
+    fn document_text(app: &App) -> String {
+        app.doc_segments
+            .iter()
+            .filter_map(|seg| match seg {
+                Segment::Text(lines) => Some(
+                    lines
+                        .iter()
+                        .map(Line::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn block_focus_keyboard_and_mouse_share_independent_fold_state() {
+        let mut app = app_with_blocks("block-focus", concat!(
+            "```sh name=a fold\necho SOURCE_A\n```\n",
+            "<!-- meshfox:output name=\"a\" exit=\"0\" -->\n```text\nCACHED_A\n```\n<!-- /meshfox:output -->\n",
+            "```sh name=b fold=false\necho SOURCE_B\n```\n",
+        )).await;
+        app.set_focus(Focus::Document);
+        assert!(!document_text(&app).contains("SOURCE_A"));
+        assert!(document_text(&app).contains("SOURCE_B"));
+        assert!(document_text(&app).contains("CACHED_A"));
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.on_key(key(KeyCode::Char(']'))).await;
+        assert_eq!(app.selected_block, Some(BlockAddr::new("root", "a")));
+        assert!(!document_text(&app).contains("› ┌─"));
+        app.on_key(key(KeyCode::Char('c'))).await;
+        assert!(document_text(&app).contains("SOURCE_A"));
+        app.on_key(key(KeyCode::Enter)).await;
+        assert!(!document_text(&app).contains("SOURCE_A"));
+        assert!(!document_text(&app).contains("CACHED_A"));
+        assert!(document_text(&app).contains("[run]"));
+        app.activate_click_target(ClickTarget::Block {
+            node_id: "root".into(),
+            block_name: "a".into(),
+            action: markdown::BlockAction::ToggleBlock,
+        })
+        .await;
+        assert!(document_text(&app).contains("SOURCE_A"));
+        assert!(document_text(&app).contains("CACHED_A"));
+        app.activate_click_target(ClickTarget::Block {
+            node_id: "root".into(),
+            block_name: "a".into(),
+            action: markdown::BlockAction::ToggleSource,
+        })
+        .await;
+        assert!(!document_text(&app).contains("SOURCE_A"));
+        assert!(document_text(&app).contains("CACHED_A"));
+        app.on_key(key(KeyCode::Char(']'))).await;
+        assert_eq!(app.selected_block, Some(BlockAddr::new("root", "b")));
+        app.on_key(key(KeyCode::Char(']'))).await;
+        assert_eq!(app.selected_block, Some(BlockAddr::new("root", "a")));
+        assert!(!document_text(&app).contains("SOURCE_A"));
+        app.on_key(key(KeyCode::Esc)).await;
+        assert!(app.selected_block.is_none());
+        app.on_key(key(KeyCode::Char('['))).await;
+        assert_eq!(app.selected_block, Some(BlockAddr::new("root", "b")));
+        let _ = std::fs::remove_dir_all(app.canvas_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn block_selection_preserves_geometry_and_highlights_cached_and_live_output() {
+        let mut app = app_with_blocks("block-highlight", concat!(
+            "```sh name=a\necho CODE\n```\n",
+            "<!-- meshfox:output name=\"a\" exit=\"0\" -->\n```text\nCACHED\n```\n<!-- /meshfox:output -->\n",
+            "```sh name=b\ntrue\n```\n",
+        )).await;
+        let before = document_text(&app);
+        app.activate_block_action(BlockAddr::new("root", "a"), markdown::BlockAction::Select)
+            .await;
+        assert_eq!(
+            document_text(&app).replace("›─", "┌─"),
+            before,
+            "selection must not add columns or rows"
+        );
+        let check_output = |app: &App, color: Color| {
+            let line = app
+                .doc_segments
+                .iter()
+                .find_map(|seg| match seg {
+                    Segment::Text(lines) => lines
+                        .iter()
+                        .find(|line| line.to_string().starts_with("┌─ output: a")),
+                    _ => None,
+                })
+                .expect("output header");
+            assert_eq!(line.spans[0].style.fg, Some(color));
+            let other = app
+                .doc_segments
+                .iter()
+                .find_map(|seg| match seg {
+                    Segment::Text(lines) => lines.iter().find(|line| {
+                        (line.to_string().starts_with("┌─") || line.to_string().starts_with("›─"))
+                            && line.to_string().contains("sh · b")
+                    }),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(other.spans[0].style.fg, Some(super::super::theme::DEP));
+        };
+        check_output(&app, super::super::theme::ACCENT);
+        app.on_reconciled_run_event(
+            BlockAddr::new("root", "a"),
+            crate::worker_client::SubscribeEvent::Line {
+                stream: meshfox_server::stream_exec::OutputStream::Stdout,
+                text: "LIVE".into(),
+            },
+            None,
+        );
+        check_output(&app, super::super::theme::ACCENT);
+        app.set_focus(Focus::Tree);
+        check_output(&app, Color::DarkGray);
+        app.set_focus(Focus::Document);
+        check_output(&app, super::super::theme::ACCENT);
+        app.selected_block = None;
+        app.render_current_document();
+        check_output(&app, super::super::theme::DEP);
+        let _ = std::fs::remove_dir_all(app.canvas_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn block_fold_choices_survive_node_navigation_and_reload() {
+        let mut app = app_with_blocks(
+            "block-navigation",
+            concat!(
+                "```sh name=a fold\necho SOURCE\n```\n",
+                "## Child\n<!-- meshfox:node id=\"child\" -->\nChild body\n",
+            ),
+        )
+        .await;
+        app.activate_block_action(
+            BlockAddr::new("root", "a"),
+            markdown::BlockAction::ToggleSource,
+        )
+        .await;
+        assert!(document_text(&app).contains("echo SOURCE"));
+        app.jump_to_node("child");
+        assert!(app.selected_block.is_none());
+        app.jump_to_node("root");
+        assert!(document_text(&app).contains("echo SOURCE"));
+        let updated = app.raw.replace("echo SOURCE", "echo UPDATED_SOURCE");
+        app.apply_external_reload(updated, None);
+        assert!(document_text(&app).contains("echo UPDATED_SOURCE"));
+        app.activate_block_action(BlockAddr::new("root", "a"), markdown::BlockAction::Select)
+            .await;
+        let removed = app.raw.replace(
+            "```sh name=a fold\necho UPDATED_SOURCE\n```",
+            "Removed block",
+        );
+        app.apply_external_reload(removed, None);
+        assert!(app.selected_block.is_none());
+        let _ = std::fs::remove_dir_all(app.canvas_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn collapsed_block_stays_collapsed_when_live_output_arrives() {
+        let mut app = app_with_blocks("block-live-fold", "```sh name=a\necho SOURCE\n```\n").await;
+        app.activate_block_action(
+            BlockAddr::new("root", "a"),
+            markdown::BlockAction::ToggleBlock,
+        )
+        .await;
+        app.on_reconciled_run_event(
+            BlockAddr::new("root", "a"),
+            crate::worker_client::SubscribeEvent::Line {
+                stream: meshfox_server::stream_exec::OutputStream::Stdout,
+                text: "LIVE_OUTPUT".into(),
+            },
+            None,
+        );
+        assert!(!document_text(&app).contains("LIVE_OUTPUT"));
+        app.activate_block_action(
+            BlockAddr::new("root", "a"),
+            markdown::BlockAction::ToggleBlock,
+        )
+        .await;
+        assert!(document_text(&app).contains("LIVE_OUTPUT"));
+        app.activate_block_action(
+            BlockAddr::new("root", "a"),
+            markdown::BlockAction::ToggleSource,
+        )
+        .await;
+        assert!(!document_text(&app).contains("echo SOURCE"));
+        assert!(document_text(&app).contains("LIVE_OUTPUT"));
+        let _ = std::fs::remove_dir_all(app.canvas_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn selected_block_highlight_dims_on_blur_and_history_addresses_it_directly() {
+        let mut app = app_with_blocks(
+            "block-blur",
+            "```sh name=a\necho a\n```\n```sh name=b\necho b\n```\n",
+        )
+        .await;
+        app.activate_block_action(BlockAddr::new("root", "b"), markdown::BlockAction::Select)
+            .await;
+        let header_color = |app: &App| {
+            app.doc_segments.iter().find_map(|seg| match seg {
+                Segment::Text(lines) => lines
+                    .iter()
+                    .find(|line| {
+                        (line.to_string().starts_with("┌─") || line.to_string().starts_with("›─"))
+                            && line.to_string().contains("sh · b")
+                    })
+                    .map(|line| line.spans[0].style.fg),
+                _ => None,
+            })
+        };
+        assert_eq!(header_color(&app), Some(Some(super::super::theme::ACCENT)));
+        assert!(document_text(&app).contains("›─"));
+        app.set_focus(Focus::Tree);
+        assert_eq!(header_color(&app), Some(Some(Color::DarkGray)));
+        assert!(!document_text(&app).contains("›─"));
+        app.set_focus(Focus::Document);
+        assert!(document_text(&app).contains("›─"));
+        app.open_run_history().await;
+        assert!(app.block_picker.is_none());
+        assert!(app.status.contains("none reachable"));
+        app.selected_block = None;
+        app.worker_port = Some(1);
+        app.open_run_history().await;
+        assert!(app.block_picker.is_some());
+        let _ = std::fs::remove_dir_all(app.canvas_path.parent().unwrap());
+    }
+
     async fn app_with_blocks(name: &str, node_body: &str) -> App {
         let dir =
             std::env::temp_dir().join(format!("meshfox-tui-run-history-{name}-{}", uuid_like()));
@@ -7344,8 +7869,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(path, tx, None, None).await.unwrap();
+        let mut app = app_with_real_worker(path).await;
 
         assert!(app.has_configurable_vars());
 
@@ -7384,8 +7908,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(path, tx, None, None).await.unwrap();
+        let mut app = app_with_real_worker(path).await;
 
         assert!(!app.has_configurable_vars());
 

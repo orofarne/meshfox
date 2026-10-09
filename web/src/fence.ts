@@ -191,6 +191,9 @@ export interface BlockArgument {
   name: string;
   type: string;
   choices: string[];
+  /** `choices_var="NAME"`: choices come from the variable `NAME` when the
+   * launch form is prepared (see SPEC.md "Block arguments"). */
+  choicesVar?: string;
   required: boolean;
   default?: string;
 }
@@ -206,6 +209,7 @@ function precedingArguments(lines: string[], fenceLine: number): BlockArgument[]
     const attrs = attrsFromTokens(tokenize(marker[1]));
     args.unshift({ name: attrs.name, type: attrs.type ?? "string",
       choices: (attrs.choices ?? "").split(",").map(s => s.trim()).filter(Boolean),
+      choicesVar: attrs.choices_var,
       required: attrs.required === "true" || attrs.default === undefined,
       default: attrs.default });
   }
