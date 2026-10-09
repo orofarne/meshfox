@@ -26,10 +26,24 @@
       body.style.maxHeight=Math.max(0,bottom-top-padding)+'px';
     }
   }
-  fitBodies();
-  window.addEventListener('load',fitBodies);
-  window.addEventListener('resize',fitBodies);
-  document.addEventListener('toggle',() => requestAnimationFrame(fitBodies),true);
+  // An ordinary body flows at its natural height; only one far taller than
+  // the screen is capped (.long), so tall prose does not shove its siblings
+  // off the page. Measured uncapped, synchronously, before arrows redraw.
+  function markLong() {
+    for (const body of document.querySelectorAll('.node-row:not(.authored-item):not(.spatial-item) > details.node[open] > .node-body')) {
+      body.classList.remove('long');
+      if (body.scrollHeight > innerHeight*3) body.classList.add('long');
+    }
+  }
+  markLong(); fitBodies();
+  window.addEventListener('load',() => { markLong(); fitBodies(); });
+  window.addEventListener('resize',() => { markLong(); fitBodies(); });
+  document.addEventListener('toggle',() => { markLong(); requestAnimationFrame(fitBodies); },true);
+  // One-line code blocks (an install command) wrap instead of scrolling
+  // sideways inside a board that already scrolls sideways.
+  for (const pre of document.querySelectorAll('.node-body pre')) {
+    if (!pre.textContent.trim().includes('\n')) pre.classList.add('oneline');
+  }
 
   // Like the web canvas, opening a subtree that extends past the right edge
   // brings its parent paper near the left edge, leaving room for the reveal.
@@ -52,7 +66,7 @@
         if (!hidden && child.getClientRects().length) right=Math.max(right,child.getBoundingClientRect().right);
       }
       if (cardBox.left >= bounds.left+16 && right <= bounds.right-16) return;
-      viewport.scrollTo({left:viewport.scrollLeft+cardBox.left-bounds.left-24,behavior:'smooth'});
+      viewport.scrollTo({left:viewport.scrollLeft+cardBox.left-bounds.left-24,behavior:matchMedia('(prefers-reduced-motion:reduce)').matches?'auto':'smooth'});
     }));
   });
 })();

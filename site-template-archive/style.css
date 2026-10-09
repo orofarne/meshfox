@@ -38,8 +38,12 @@ a { color:#8e392f; }
 .node-row:nth-child(4n+3) > .node:not(.group-sheet) { transform:rotate(.8deg); }
 .tree > .node-row > .node { width:500px; background:#ddcfac; transform:rotate(-.4deg); }
 /* Scroll only the root's long prose. Its paper and pin remain unclipped. */
-.tree > .node-row > .node > .node-body { max-height:62vh; overflow:auto; padding-right:.25rem; }
-.node[open] > .node-body { max-height:70vh; overflow:auto; }
+/* An opened paper lies flat: a rotated tall card drags its bounding box
+   sideways over the sibling column, which is what the height caps used to
+   guard against. Only a body far taller than the screen (layout.js marks it
+   .long) is still capped, so it cannot push its siblings thousands of px away. */
+.tree .node-row > .node[open]:not(.group-sheet) { transform:none; }
+.node[open] > .node-body.long { max-height:75vh; overflow:auto; overscroll-behavior:contain; box-shadow:inset 0 -14px 12px -12px #0006; }
 .node::before { content:""; position:absolute; left:calc(50% - 7px); top:-8px; width:14px; height:14px; border-radius:50%; background:radial-gradient(circle at 35% 30%,#f8bd9a,var(--pin) 55%,#642d28 85%); box-shadow:1px 3px 3px #0007; z-index:2; }
 .node::after { content:""; position:absolute; top:4px; left:calc(50% + 2px); width:9px; height:10px; background:#0003; border-radius:50%; filter:blur(3px); }
 .node-row.authored-item > .node { max-width:none; overflow:visible; }
@@ -47,8 +51,15 @@ a { color:#8e392f; }
 .group-canvas > .node-row.spatial-item > .node > .node-body { overflow:auto; }
 .node-title { display:block; border-bottom:2px solid color-mix(in srgb,var(--accent) 60%,#b7a68c); padding-bottom:.55rem; margin-bottom:.8rem; font:400 1.15rem/1.35 var(--display); overflow-wrap:anywhere; }
 summary.node-title { cursor:pointer; list-style:none; }
-summary.node-title::before { content:"▾ "; color:var(--accent); }
+summary.node-title::before { content:"▾ "; color:var(--accent); font-size:1.25em; line-height:1; }
 .node:not([open]) > summary.node-title::before { content:"▸ "; }
+details.node:not([open]):not(.group-sheet) { padding-bottom:.9rem; }
+details.node:not([open]) > summary.node-title { margin-bottom:0; }
+/* The paper itself is the tap target while collapsed; once open it must not
+   cover the prose and links below the title. */
+details.node:not([open]) > summary.node-title::after { content:""; position:absolute; inset:0; }
+summary.node-title:focus-visible { outline:none; }
+.node:has(> summary.node-title:focus-visible) { outline:3px solid #1b66c9; outline-offset:3px; }
 .node-row > .node:not([open]) ~ .node-children { display:none; }
 .node-tags { display:flex; gap:.35rem; flex-wrap:wrap; margin:.5rem 0; }
 .tag { background:#d9c9a9; color:#6e493b; padding:.1rem .45rem; font:700 .67rem var(--mono); text-transform:uppercase; }
@@ -56,7 +67,14 @@ summary.node-title::before { content:"▾ "; color:var(--accent); }
 .node-body > :first-child { margin-top:0; }
 .node-body > :last-child { margin-bottom:0; }
 .node-body img { max-width:100%; height:auto; }
-.node-body pre { overflow:auto; padding:.8rem; background:#342e2a; color:#f6e9d4; font:12px/1.5 var(--mono); }
+.node-body pre { overflow:auto; overscroll-behavior-x:contain; padding:.8rem; color:#f6e9d4; font:12px/1.5 var(--mono);
+  /* Edge shadows appear only on a side that still has hidden content. */
+  background:linear-gradient(90deg,#342e2a,#342e2a) left/1.2rem 100% no-repeat local,
+             linear-gradient(270deg,#342e2a,#342e2a) right/1.2rem 100% no-repeat local,
+             linear-gradient(90deg,#f6e9d44d,transparent) left/.9rem 100% no-repeat scroll,
+             linear-gradient(270deg,#f6e9d44d,transparent) right/.9rem 100% no-repeat scroll,
+             #342e2a; }
+.node-body pre.oneline { white-space:pre-wrap; overflow-wrap:anywhere; }
 .node-body :not(pre) > code { background:#dfd1b4; padding:.1em .25em; }
 .node-body table { display:block; overflow:auto; border-collapse:collapse; }
 .node-body th,.node-body td { border:1px solid #bdae94; padding:.3rem .5rem; }
@@ -85,6 +103,7 @@ summary.node-title::before { content:"▾ "; color:var(--accent); }
 .mesh-edge-label { font:700 12px var(--mono); fill:#352820; paint-order:stroke; stroke:#f5ead2; stroke-width:6px; stroke-linejoin:round; }
 .archive-footer { color:#b7a184; padding:1rem 3rem; }
 @media(max-width:760px) {
+  .tree .node-row > .node:not(.group-sheet) { transform:none; }
   .node { width:min(75vw,480px); }
   .tree > .node-row > .node { width:min(78vw,500px); }
 }
