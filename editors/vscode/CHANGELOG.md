@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- New: **meshfox: New canvas** command — pick a path and it creates the
+  file and opens it. An empty `*.canvas.md` (however created) is now
+  initialized with the starting structure instead of failing with "document
+  has no top-level (#) heading"; non-empty invalid files still fail.
+
 ## 0.3.1
 
 - New: the extension now declares the oldest `meshfox` release it works

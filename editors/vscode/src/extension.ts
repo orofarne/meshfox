@@ -43,6 +43,28 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
       await vscode.commands.executeCommand("vscode.openWith", target, VIEW_TYPE);
     }),
+    vscode.commands.registerCommand("meshfox.newCanvas", async () => {
+      const folder = vscode.workspace.workspaceFolders?.[0]?.uri;
+      const picked = await vscode.window.showSaveDialog({
+        defaultUri: folder ? vscode.Uri.joinPath(folder, "untitled.canvas.md") : undefined,
+        filters: { "meshfox canvas": ["canvas.md"] },
+        title: "New meshfox canvas",
+      });
+      if (!picked) {
+        return;
+      }
+      const target = picked.path.endsWith(".canvas.md")
+        ? picked
+        : picked.with({ path: picked.path.replace(/(\.canvas)?(\.md)?$/, "") + ".canvas.md" });
+      try {
+        await vscode.workspace.fs.stat(target);
+      } catch {
+        // Doesn't exist yet: create it empty — meshfox fills in the
+        // starting structure when it first opens a blank file.
+        await vscode.workspace.fs.writeFile(target, new Uint8Array());
+      }
+      await vscode.commands.executeCommand("vscode.openWith", target, VIEW_TYPE);
+    }),
     vscode.commands.registerCommand("meshfox.install", () => {
       openInstallTerminal();
     }),

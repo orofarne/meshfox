@@ -15,6 +15,11 @@ as `Orofarne.meshfox-vscode` — install from there (Extensions view, search
 "meshfox", or `ext install Orofarne.meshfox-vscode`) rather than building
 it yourself; the rest of this file is for developing the extension itself.
 
+To start a new canvas, run **meshfox: New canvas** from the Command Palette
+(or just create an empty `*.canvas.md` file yourself — meshfox fills in the
+starting structure the first time it opens a blank file; a non-empty file
+without a `#` root heading is still rejected).
+
 `*.canvas.md` opens as a canvas automatically (it's the default editor for
 that pattern). A plain `.md` file that's a canvas without the suffix — a
 marker-carrying file like this project's own README.md — doesn't

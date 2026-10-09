@@ -1325,6 +1325,7 @@ fn main() {
                         write_canvas_template(&canvas_path);
                         println!("meshfox view: created {}", canvas_path.display());
                     }
+                    init_blank_canvas(&canvas_path);
                     view_or_hand_off(canvas_path, port, no_open, no_auto_exit)
                 }
             }
@@ -2020,6 +2021,22 @@ pub(crate) fn canvas_template_content(canvas_path: &Path) -> String {
     )
 }
 
+/// If `canvas_path` exists but is empty (or only whitespace) — e.g. a file a
+/// user just made with their editor's "New File" — fills it with the same
+/// template `create` writes, so opening it doesn't fail with "no top-level
+/// heading". Anything with real content is left untouched.
+fn init_blank_canvas(canvas_path: &Path) {
+    let Ok(content) = std::fs::read_to_string(canvas_path) else {
+        return;
+    };
+    if !content.trim().is_empty() {
+        return;
+    }
+    if let Err(e) = std::fs::write(canvas_path, canvas_template_content(canvas_path)) {
+        eprintln!("failed to initialize {}: {e}", canvas_path.display());
+    }
+}
+
 fn write_canvas_template(canvas_path: &Path) {
     use std::io::Write;
     let result = std::fs::OpenOptions::new()
@@ -2052,6 +2069,7 @@ fn canvas_title(path: &Path) -> String {
 /// opens a browser tab itself; see `meshfox_server::run`'s own doc
 /// comment.
 fn view_worker(canvas_path: PathBuf, port: u16, auto_exit: bool, watcher_socket: PathBuf) {
+    init_blank_canvas(&canvas_path);
     let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
         eprintln!("failed to start async runtime: {e}");
         std::process::exit(1);
@@ -2126,6 +2144,7 @@ fn view_or_hand_off(canvas_path: PathBuf, port: u16, no_open: bool, no_auto_exit
 }
 
 fn tui(canvas_path: PathBuf, initial_node: Option<String>) {
+    init_blank_canvas(&canvas_path);
     let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
         eprintln!("failed to start async runtime: {e}");
         std::process::exit(1);

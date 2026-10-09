@@ -46,6 +46,11 @@
     ],
     "commands": [
       {
+        "command": "meshfox.newCanvas",
+        "title": "New canvas",
+        "category": "meshfox"
+      },
+      {
         "command": "meshfox.openAsCanvas",
         "title": "Open as meshfox canvas",
         "category": "meshfox"
