@@ -1024,8 +1024,8 @@ pub fn resolve_with_shared(
             None
         };
         if already_resolved.is_none() {
-            if let Some(e) = shared.secret_errors.get(&decl.name) {
-                secret_errors.insert(decl.name.clone(), e.clone());
+            if let Some(e) = shared.secret_error(&decl.name) {
+                secret_errors.insert(decl.name.clone(), e.to_string());
             }
         }
         if let Some(v) = already_resolved {

@@ -166,12 +166,34 @@ export function routeAroundNodes(
   boxes: Rect[], sourceBox?: Rect, targetBox?: Rect, occupied: Segment[] = [],
   noStartStub = false, noEndStub = false,
 ): RoutedPath | undefined {
+  // Adjacent rows have a 25 px gap, narrower than two default clearance
+  // envelopes. Keep an exit corridor even when the next card is an
+  // intermediate obstacle rather than the link's target.
+  let clearance = CLEARANCE;
+  for (const [point, side, own, skip] of [
+    [start, startSide, sourceBox, noStartStub],
+    [end, endSide, targetBox, noEndStub],
+  ] as const) {
+    if (!own || skip) continue;
+    for (const other of [...boxes, sourceBox, targetBox]) {
+      if (!other || other === own) continue;
+      const transverse = side === "left" || side === "right"
+        ? point.y >= other.y && point.y <= other.y + other.height
+        : point.x >= other.x && point.x <= other.x + other.width;
+      if (!transverse) continue;
+      const gap = side === "bottom" ? other.y - own.y - own.height
+        : side === "top" ? own.y - other.y - other.height
+        : side === "right" ? other.x - own.x - own.width
+        : own.x - other.x - other.width;
+      if (gap > 0) clearance = Math.min(clearance, Math.max(0, gap / 2 - 2));
+    }
+  }
   const bounds = {
     left: Math.min(start.x, end.x) - ROUTE_MARGIN, right: Math.max(start.x, end.x) + ROUTE_MARGIN,
     top: Math.min(start.y, end.y) - ROUTE_MARGIN, bottom: Math.max(start.y, end.y) + ROUTE_MARGIN,
   };
-  const expand = (r: Rect): Rect => ({ x: r.x - CLEARANCE, y: r.y - CLEARANCE,
-    width: r.width + 2 * CLEARANCE, height: r.height + 2 * CLEARANCE });
+  const expand = (r: Rect): Rect => ({ x: r.x - clearance, y: r.y - clearance,
+    width: r.width + 2 * clearance, height: r.height + 2 * clearance });
   const obstacles = boxes
     .filter((r) => r.x < bounds.right && r.x + r.width > bounds.left && r.y < bounds.bottom && r.y + r.height > bounds.top)
     .map(expand);

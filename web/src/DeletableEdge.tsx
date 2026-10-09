@@ -167,6 +167,8 @@ export function DeletableEdge({
         sourceHandle: candidate?.end === "source" ? `source-${candidate.side}` : edge.sourceHandle,
         targetHandle: candidate?.end === "target" ? `target-${candidate.side}` : edge.targetHandle,
         data: { ...edge.data,
+          sourceSide: candidate?.end === "source" ? candidate.side : edge.data?.sourceSide,
+          targetSide: candidate?.end === "target" ? candidate.side : edge.data?.targetSide,
           routedPath: undefined,
           routedPoints: undefined,
           routeFailed: undefined,

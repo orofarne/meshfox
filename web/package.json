@@ -20,6 +20,7 @@
     "test:arguments": "npm run build && playwright test --config=arguments.playwright.config.ts",
     "test:meshfox-grammar": "node --test scripts/meshfox-grammar.test.mjs",
     "test:routing": "node --test scripts/edge-routing.test.mjs",
+    "test:routing:e2e": "npm run build && playwright test --config=edge-routing.playwright.config.ts",
     "test:svg-theme": "node --test scripts/svg-theme.test.mjs",
     "test:table-view": "node --test scripts/table-view.test.mjs",
     "pretest:e2e": "npm run build",

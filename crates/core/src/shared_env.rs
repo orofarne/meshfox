@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 /// Where a resolved shared value came from — attached to `SharedVar` and,
 /// via `crate::vars::ResolvedVars::origins`/`BlockEnvResolution::origins`,
@@ -37,33 +38,96 @@ pub struct SharedVar {
     pub origin: SharedOrigin,
 }
 
-/// name -> resolved shared value, for one `canvas_root`, plus the reason any
-/// `secrets = [...]` entry couldn't be read from the secret store (locked
-/// keychain, access denied, ...). Derefs to the map, so `get`/`is_empty`
-/// work on it directly.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// name -> resolved shared value, for one `canvas_root`. A `secrets = [...]`
+/// entry is *lazy*: the secret store is only asked when something looks the
+/// name up with [`SharedEnv::get`], so a project whose canvases never use a
+/// shared secret never touches the keychain (no password prompt).
+#[derive(Debug, Clone, Default)]
 pub struct SharedEnv {
-    vars: HashMap<String, SharedVar>,
-    /// name -> error message, for a declared secret whose store read failed.
-    pub secret_errors: HashMap<String, String>,
+    slots: HashMap<String, Slot>,
+}
+
+#[derive(Debug, Clone)]
+enum Slot {
+    Value(SharedVar),
+    Lazy(Arc<LazySecret>),
+}
+
+/// A `secrets = [...]` entry not yet read from the store.
+#[derive(Debug)]
+struct LazySecret {
+    backend: Arc<dyn crate::secret_store::SecretBackend>,
+    account: String,
+    origin: SharedOrigin,
+    /// What the name resolved to in an earlier (global) tier — used when the
+    /// store has nothing, or can't be read.
+    fallback: Option<Slot>,
+    fetched: OnceLock<Fetched>,
+}
+
+#[derive(Debug)]
+enum Fetched {
+    Found(SharedVar),
+    NotFound,
+    Failed(String),
+}
+
+impl Slot {
+    fn get(&self) -> Option<&SharedVar> {
+        match self {
+            Slot::Value(v) => Some(v),
+            Slot::Lazy(l) => match l.fetch() {
+                Fetched::Found(v) => Some(v),
+                _ => l.fallback.as_ref().and_then(Slot::get),
+            },
+        }
+    }
+}
+
+impl LazySecret {
+    fn fetch(&self) -> &Fetched {
+        self.fetched
+            .get_or_init(|| match self.backend.get(&self.account) {
+                Ok(Some(value)) => Fetched::Found(SharedVar {
+                    value,
+                    origin: self.origin.clone(),
+                }),
+                Ok(None) => Fetched::NotFound,
+                Err(e) => Fetched::Failed(e.to_string()),
+            })
+    }
 }
 
 impl SharedEnv {
     pub fn new() -> SharedEnv {
         SharedEnv::default()
     }
-}
 
-impl std::ops::Deref for SharedEnv {
-    type Target = HashMap<String, SharedVar>;
-    fn deref(&self) -> &Self::Target {
-        &self.vars
+    /// The value for `name`, reading it from the secret store if it is a
+    /// `secrets = [...]` entry (once; the answer is kept).
+    pub fn get(&self, name: &str) -> Option<&SharedVar> {
+        self.slots.get(name).and_then(Slot::get)
     }
-}
 
-impl std::ops::DerefMut for SharedEnv {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.vars
+    /// Why `name`'s `secrets = [...]` entry couldn't be read from the store
+    /// (locked keychain, access denied, ...), if that is what happened.
+    pub fn secret_error(&self, name: &str) -> Option<&str> {
+        match self.slots.get(name)? {
+            Slot::Lazy(l) => match l.fetch() {
+                Fetched::Failed(e) => Some(e),
+                _ => None,
+            },
+            Slot::Value(_) => None,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// Sets a plain value (tests, and the `vars` of a section).
+    pub fn insert(&mut self, name: String, var: SharedVar) {
+        self.slots.insert(name, Slot::Value(var));
     }
 }
 
@@ -119,7 +183,7 @@ pub fn load(canvas_root: &Path) -> SharedEnv {
         crate::config::global_config_path().as_deref(),
         canvas_root,
         home_dir().as_deref(),
-        backend.as_deref(),
+        backend,
     )
 }
 
@@ -137,7 +201,7 @@ fn load_from_with_store(
     global_path: Option<&Path>,
     canvas_root: &Path,
     home: Option<&Path>,
-    store: Option<&dyn crate::secret_store::SecretBackend>,
+    store: Option<Arc<dyn crate::secret_store::SecretBackend>>,
 ) -> SharedEnv {
     let global_table = global_path
         .map(crate::config::read_table)
@@ -163,7 +227,7 @@ fn load_from_with_store(
         &global_sections,
         &normalized_root,
         &mut out,
-        store,
+        store.clone(),
         |raw_path| SharedOrigin::Global { path: raw_path },
     );
     apply_tier(
@@ -186,7 +250,7 @@ fn apply_tier(
     sections: &[EnvSection],
     normalized_root: &Path,
     out: &mut SharedEnv,
-    store: Option<&dyn crate::secret_store::SecretBackend>,
+    store: Option<Arc<dyn crate::secret_store::SecretBackend>>,
     origin_for: impl Fn(Option<String>) -> SharedOrigin,
 ) {
     // (specificity, section index) chosen so far, per variable name.
@@ -210,28 +274,24 @@ fn apply_tier(
     }
     for (name, (_, idx)) in winners {
         let section = &sections[idx];
-        // An explicit `vars` value beats the secret store.
-        let value = match section.vars.get(name) {
-            Some(value) => Some(value.clone()),
-            None => store.and_then(|store| {
-                let account = crate::secret_store::env_account(&section.account_scope, name);
-                match store.get(&account) {
-                    Ok(value) => value,
-                    Err(e) => {
-                        out.secret_errors.insert(name.to_string(), e.to_string());
-                        None
-                    }
-                }
-            }),
+        // An explicit `vars` value beats the secret store, which is only
+        // read when the name is first looked up.
+        let slot = match (section.vars.get(name), &store) {
+            (Some(value), _) => Some(Slot::Value(SharedVar {
+                value: value.clone(),
+                origin: origin_for(section.raw_path.clone()),
+            })),
+            (None, Some(backend)) => Some(Slot::Lazy(Arc::new(LazySecret {
+                backend: backend.clone(),
+                account: crate::secret_store::env_account(&section.account_scope, name),
+                origin: origin_for(section.raw_path.clone()),
+                fallback: out.slots.remove(name),
+                fetched: OnceLock::new(),
+            }))),
+            (None, None) => None,
         };
-        if let Some(value) = value {
-            out.insert(
-                name.to_string(),
-                SharedVar {
-                    value,
-                    origin: origin_for(section.raw_path.clone()),
-                },
-            );
+        if let Some(slot) = slot {
+            out.slots.insert(name.to_string(), slot);
         }
     }
 }
@@ -728,7 +788,7 @@ mod tests {
             .set(&env_account("global", "DB_PASSWORD"), "hunter2")
             .unwrap();
 
-        let shared = load_from_with_store(Some(&global), &root, Some(&home), Some(&store));
+        let shared = load_from_with_store(Some(&global), &root, Some(&home), Some(Arc::new(store)));
         let pw = shared.get("DB_PASSWORD").expect("secret resolved");
         assert_eq!(pw.value, "hunter2");
         assert_eq!(pw.origin, SharedOrigin::Global { path: None });
@@ -755,7 +815,7 @@ mod tests {
             .set(&env_account("global", "TOKEN"), "from-store")
             .unwrap();
 
-        let shared = load_from_with_store(Some(&global), &root, Some(&home), Some(&store));
+        let shared = load_from_with_store(Some(&global), &root, Some(&home), Some(Arc::new(store)));
         assert_eq!(
             shared.get("TOKEN").map(|v| v.value.as_str()),
             Some("by-hand")
@@ -779,7 +839,7 @@ mod tests {
             .set(&env_account(&scope, "TOKEN"), "project-secret")
             .unwrap();
 
-        let shared = load_from_with_store(Some(&global), &root, Some(&home), Some(&store));
+        let shared = load_from_with_store(Some(&global), &root, Some(&home), Some(Arc::new(store)));
         let v = shared.get("TOKEN").unwrap();
         assert_eq!(v.value, "project-secret");
         assert_eq!(v.origin, SharedOrigin::Project);
@@ -801,10 +861,49 @@ mod tests {
             .set(&env_account("global:~/work/projectA", "TOKEN"), "scoped")
             .unwrap();
 
-        let shared = load_from_with_store(Some(&global), &project_a, Some(&home), Some(&store));
+        let shared = load_from_with_store(Some(&global), &project_a, Some(&home), Some(Arc::new(store)));
         assert_eq!(
             shared.get("TOKEN").map(|v| v.value.as_str()),
             Some("scoped")
         );
+    }
+
+    #[test]
+    fn the_store_is_not_read_until_a_secret_is_looked_up() {
+        use crate::secret_store::SecretBackend;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug, Default)]
+        struct Counting(Arc<AtomicUsize>);
+        impl SecretBackend for Counting {
+            fn get(&self, _: &str) -> std::io::Result<Option<String>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(Some("v".into()))
+            }
+            fn set(&self, _: &str, _: &str) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn delete(&self, _: &str) -> std::io::Result<bool> {
+                Ok(false)
+            }
+        }
+
+        let home = tempdir("home-lazy");
+        let root = tempdir("project-lazy");
+        let global = home.join(".meshfox").join("config.toml");
+        write(&global, "[[env]]\nsecrets = [\"TOKEN\"]\n");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let shared = load_from_with_store(
+            Some(&global),
+            &root,
+            Some(&home),
+            Some(Arc::new(Counting(calls.clone()))),
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "load must not read the store");
+        assert_eq!(shared.get("OTHER"), None);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(shared.get("TOKEN").map(|v| v.value.as_str()), Some("v"));
+        assert_eq!(shared.get("TOKEN").map(|v| v.value.as_str()), Some("v"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "read once, then kept");
     }
 }

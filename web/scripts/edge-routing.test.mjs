@@ -4,6 +4,26 @@ import { draw, routeAroundNodes } from "../src/edgeRouting.ts";
 import { distributeEdgePorts } from "../src/edgePorts.ts";
 import { withEdgeRoutes } from "../src/edgeRouteLayout.ts";
 
+test("folded adjacent rows replace stale horizontal ports with a short gap route", () => {
+  const nodes = Array.from({ length: 5 }, (_, i) => ({
+    id: `row-${i}`, position: { x: 100, y: i * 69 }, width: 800, height: 44,
+    data: { level: 3, nodeType: "text" },
+  }));
+  const edge = { id: "request->jwt", source: "row-0", target: "row-1", type: "extra",
+    sourceHandle: "source-default", targetHandle: "target-default", data: {} };
+  const routed = withEdgeRoutes(nodes, [edge])[0];
+  assert.equal(routed.sourceHandle, "source-bottom");
+  assert.equal(routed.targetHandle, "target-top");
+  assert.ok(routed.data.routedPoints);
+  assert.ok(routed.data.routedPoints.every(p => p.y >= 44 && p.y <= 69));
+  assertOutside(routed.data.routedPath[0], nodes.map(n => ({ ...n.position, width: n.width, height: n.height })));
+
+  const sideBySide = nodes.map((n, i) => i === 1 ? { ...n, position: { x: 1100, y: 0 } } : n);
+  const moved = withEdgeRoutes(sideBySide, [routed])[0];
+  assert.equal(moved.sourceHandle, "source-default");
+  assert.equal(moved.targetHandle, "target-default");
+});
+
 // Sample the actual SVG path, including its rounded quadratic corners.
 // Checking just the orthogonal waypoints would miss a curve cutting into a box.
 function sampledPath(path) {
@@ -54,6 +74,21 @@ test("an intermediate node diverts an extra edge, including its rounded corners"
   const routed = routeAroundNodes({ x: 0, y: 0 }, "bottom", { x: 0, y: 200 }, "top", [blocker], source, target);
   assert.ok(routed);
   assertOutside(routed[0], [source, target, blocker]);
+});
+
+test("a distant group link can exit through narrow gaps beside intermediate cards", () => {
+  const group = { id: "g1", position: { x: 320, y: 240 }, width: 880, height: 1000,
+    data: { level: 2, nodeType: "group" } };
+  const members = Array.from({ length: 12 }, (_, i) => ({
+    id: `node${i + 1}`, parentId: "g1", position: { x: 40, y: 80 + i * 85 },
+    width: 800, height: 60, data: { level: 3, nodeType: "text" },
+  }));
+  const routed = withEdgeRoutes([group, ...members], [{ id: "node2->node10:extra", type: "extra",
+    source: "node2", target: "node10", data: {} }])[0];
+  assert.ok(routed.data.routedPath, "must not fall back to a curve through the cards");
+  assertOutside(routed.data.routedPath[0], members.map(n => ({
+    x: group.position.x + n.position.x, y: group.position.y + n.position.y, width: n.width, height: n.height,
+  })));
 });
 
 test("a link entering the far side of its target goes around the target", () => {

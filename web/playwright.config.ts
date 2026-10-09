@@ -141,6 +141,7 @@ const QUICK_RUN_PORT = 4600;
 // its own fixture (edge-routing.canvas.md, a root with two children, one
 // of which has a child of its own) and port.
 const EDGE_ROUTING_PORT = 4601;
+const GROUP_EDGE_ROUTING_PORT = 4629;
 // Thirteenth server + port for vars-form.spec.ts — same reasoning again,
 // its own fixture (vars-form.canvas.md, a `choices_var` chain reaching a
 // `from=`-computed variable) and port.
@@ -383,6 +384,11 @@ export default defineConfig({
       use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${EDGE_ROUTING_PORT}` },
     },
     {
+      name: `${browser}-group-edge-routing`,
+      testMatch: /(^|\/)group-edge-routing\.spec\.ts$/,
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${GROUP_EDGE_ROUTING_PORT}` },
+    },
+    {
       name: `${browser}-vars-form`,
       testMatch: /(^|\/)vars-form\.spec\.ts$/,
       use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${VARS_FORM_PORT}` },
@@ -477,6 +483,12 @@ export default defineConfig({
     },
   ]),
   webServer: [
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/group-edge-routing.canvas.md --port ${GROUP_EDGE_ROUTING_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${GROUP_EDGE_ROUTING_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
     {
       // `web/dist` is built by `pretest:e2e` before Cargo starts. The server
       // embeds those assets at compile time; its build script watches the

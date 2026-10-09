@@ -1,7 +1,7 @@
 import type { Edge, Node } from "@xyflow/react";
 import type { MeshNodeData } from "./MeshNode";
 import type { DeletableEdgeData } from "./DeletableEdge";
-import type { EdgeSide } from "./edgePorts";
+import { distributeEdgePorts, type EdgeSide } from "./edgePorts.ts";
 import { draw, routeAroundNodes, type Point, type Rect, type Segment } from "./edgeRouting.ts";
 
 function sideFor(handle: string | null | undefined, source: boolean, level: number): EdgeSide {
@@ -46,6 +46,21 @@ export function withEdgeRoutes(nodes: Node<MeshNodeData>[], edges: Edge[]): Edge
       if (node.data.nodeType !== "group") solidIds.add(node.id);
     }
   }
+  // Folding, measuring and dragging change geometry without rebuilding the
+  // authored edge state. Choose automatic ports from the same live boxes as
+  // the router, otherwise a stacked pair can retain a far-side attachment.
+  const ports = distributeEdgePorts(edges.map((edge) => {
+    const data = edge.data as DeletableEdgeData | undefined;
+    return { id: edge.id, source: edge.source, target: edge.target,
+      extra: edge.type === "extra", sourceSide: data?.sourceSide, targetSide: data?.targetSide };
+  }), boxes, new Map(nodes.map((node) => [node.id, node.data.level])));
+  edges = edges.map((edge) => {
+    const port = ports.get(edge.id);
+    return edge.type === "extra" && port
+      ? { ...edge, sourceHandle: port.sourceHandle, targetHandle: port.targetHandle,
+          data: { ...edge.data, sourceOffset: port.sourceOffset, targetOffset: port.targetOffset } }
+      : edge;
+  });
   const occupied: Segment[] = [];
   const routes = new Map<string, [string, number, number, Point[]]>();
   const failedManual = new Set<string>();
