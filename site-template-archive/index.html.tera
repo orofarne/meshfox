@@ -3,7 +3,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{{ site.title }} · Case archive</title>
+<title>{{ site.title }}</title>
 {%- for icon in icons %}
 <link rel="{{ icon.rel }}" href="{{ icon.href }}"{% if icon.type %} type="{{ icon.type }}"{% endif %}{% if icon.sizes %} sizes="{{ icon.sizes }}"{% endif %}>
 {%- endfor %}
