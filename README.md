@@ -47,6 +47,7 @@ Rough checklist for what's needed before a 1.0.0 release:
 - [x] LaTeX, Vega, Mermaid/PlantUML sub-render support (as SVG output from external renderers, see "Showing a diagram, formula or chart")
 - [x] Conflict resolution for concurrent editing
 - [x] Encryption for stored secrets (macOS Keychain, Linux Secret Service; Windows Credential Manager comes with Windows support)
+- [ ] Rewrite docs
 
 ## Concept
 <!-- meshfox:node id="concept" -->
