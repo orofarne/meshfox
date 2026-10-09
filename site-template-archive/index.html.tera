@@ -18,5 +18,6 @@
 <footer class="archive-footer">ARCHIVED WITH MESHFOX {{ meshfox_version }}</footer>
 <script id="mesh-edge-data" type="application/json">{{ site.edges | script_json | safe }}</script>
 <script src="layout.js" defer></script>
+<script src="highlight.js" defer></script>
 <script src="edges.js" defer></script>
 </body></html>

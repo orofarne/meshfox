@@ -8,6 +8,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
+    "build:site-highlight": "vite build --config vite.site-highlight.config.ts && cp ../site-template-archive/highlight.js ../site-template/highlight.js && cp ../site-template-archive/highlight.LICENSE.txt ../site-template/highlight.LICENSE.txt",
     "gen-icons": "node scripts/gen-icons.mjs",
     "gen-screenshot": "node scripts/gen-screenshot.mjs",
     "gen-screenshot-tui": "node scripts/gen-screenshot-tui.mjs",

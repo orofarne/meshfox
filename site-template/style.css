@@ -512,6 +512,13 @@ summary.node-title::before {
   padding: 0;
 }
 
+/* highlight.js tags each token with --shiki-light/--shiki-dark; follow the
+   page's own color scheme. */
+.node-body pre code.highlighted span { color: var(--shiki-light); }
+@media (prefers-color-scheme: dark) {
+  .node-body pre code.highlighted span { color: var(--shiki-dark); }
+}
+
 .node-body table {
   border-collapse: collapse;
   width: 100%;

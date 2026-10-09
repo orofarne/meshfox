@@ -75,6 +75,8 @@ summary.node-title:focus-visible { outline:none; }
              linear-gradient(270deg,#f6e9d44d,transparent) right/.9rem 100% no-repeat scroll,
              #342e2a; }
 .node-body pre.oneline { white-space:pre-wrap; overflow-wrap:anywhere; }
+/* highlight.js tags tokens with both theme colors; these cards are always dark. */
+.node-body pre code.highlighted span { color:var(--shiki-dark); }
 .node-body :not(pre) > code { background:#dfd1b4; padding:.1em .25em; }
 .node-body table { display:block; overflow:auto; border-collapse:collapse; }
 .node-body th,.node-body td { border:1px solid #bdae94; padding:.3rem .5rem; }
