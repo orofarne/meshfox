@@ -8,6 +8,17 @@ import path from "node:path";
 // workers and any MCP processes they spawn inherit this setting too.
 process.env.MESHFOX_SERVER_SOCKET = "";
 
+// TEMPORARY workaround for Playwright's bundled Firefox on macOS 27+, which
+// hangs or dies with "Could not find profile folder": Gecko still resolves
+// ~/Library/Application Support/Firefox (TCC-protected there, regardless of
+// the `-profile` Playwright passes) and the denial is charged to whichever
+// process launched the browser. Pointing CoreFoundation's home at a
+// writable per-run dir sidesteps it. Node/npm keep using the real $HOME.
+// See microsoft/playwright#42768; drop once a Firefox build fixes it.
+if (process.platform === "darwin" && !process.env.CFFIXED_USER_HOME) {
+  process.env.CFFIXED_USER_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "meshfox-e2e-firefox-home-"));
+}
+
 // Drives the real `meshfox view` server (embedded UI + axum backend +
 // actual bash execution), not a mocked frontend — the two bugs this suite
 // exists to catch (a clipped dependency badge, a box-shadow eaten by

@@ -7,7 +7,10 @@ import path from "node:path";
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "meshfox-routing-e2e-"));
 fs.cpSync(path.join(import.meta.dirname, "e2e/fixtures"), dir, { recursive: true });
 fs.mkdirSync(path.join(dir, "home"));
+fs.mkdirSync(path.join(dir, "ff-home"));
 process.env.MESHFOX_SERVER_SOCKET = "";
+// TEMPORARY macOS 27+ Firefox launch workaround — see playwright.config.ts.
+if (process.platform === "darwin" && !process.env.CFFIXED_USER_HOME) process.env.CFFIXED_USER_HOME = path.join(dir, "ff-home");
 process.on("exit", () => fs.rmSync(dir, { recursive: true, force: true }));
 const suites = ["edge-routing", "group-edge-routing"];
 export default defineConfig({
