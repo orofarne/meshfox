@@ -71,7 +71,7 @@ pub fn ask(decl: &VarDecl, current: Option<&str>) -> io::Result<String> {
                 }
             },
             VarType::String => return Ok(input),
-            VarType::Dir => match meshfox_core::validate_value(decl, &input) {
+            VarType::Dir | VarType::File => match meshfox_core::validate_value(decl, &input) {
                 Ok(()) => return Ok(input),
                 Err(e) => {
                     println!("{e}");

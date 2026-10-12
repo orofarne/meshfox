@@ -2102,14 +2102,59 @@ fn include_stamps(state: &AppState) -> Vec<(PathBuf, Option<(std::time::SystemTi
         .collect()
 }
 
+/// (node id, (mtime, len) of the confined target — `None` while it is
+/// missing, unconfirmed or outside every trusted root) of every `file` node
+/// shown with `display="code"`. Resolved through [`file_access`], so a
+/// `$VAR` target follows the variable's current value. Nothing is read or
+/// resolved at all for a canvas without such a node.
+fn file_node_stamps(
+    state: &AppState,
+) -> Vec<(String, Option<(std::time::SystemTime, u64)>)> {
+    let raw = state.raw.lock().unwrap().clone();
+    let Ok(canvas) = Canvas::from_markdown(&raw) else {
+        return Vec::new();
+    };
+    let targets: Vec<(String, String)> = canvas
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == NodeType::File && n.display == Some(FileDisplay::Code))
+        .filter_map(|n| Some((n.id.clone(), n.target.clone()?)))
+        .collect();
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let access = file_access(state);
+    let dir = canvas_root_dir(&state.canvas_path);
+    targets
+        .into_iter()
+        .map(|(id, target)| {
+            let stamp = access
+                .confine(dir, &target)
+                .ok()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
+            (id, stamp)
+        })
+        .collect()
+}
+
 fn spawn_file_watcher(state: Arc<AppState>) {
     std::thread::spawn(move || {
         let mut last_mtime = std::fs::metadata(&state.canvas_path)
             .and_then(|m| m.modified())
             .ok();
         let mut last_includes = include_stamps(&state);
+        let mut last_files = file_node_stamps(&state);
         loop {
             std::thread::sleep(Duration::from_millis(500));
+            // A code preview's target changing on disk — a block that just
+            // ran wrote it, or an editor did. The canvas file itself is
+            // untouched, so this is its own, light event (no reload).
+            let files = file_node_stamps(&state);
+            if files != last_files {
+                last_files = files;
+                state.canvas_events.push(ServerEvent::FilesChanged);
+            }
             // An `include` target edited on its own leaves the canvas file
             // untouched, so it is stamped separately and just announced.
             let stamps = include_stamps(&state);
@@ -2638,6 +2683,12 @@ struct VarStatus {
     prompt: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     choices: Vec<String>,
+    /// `"open"`/`"save"` for a `type="file"` variable, absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<&'static str>,
+    /// A `type="file"` variable's `ext=` filter hint (picker only).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    ext: Vec<String>,
     secret: bool,
     resolved: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3087,6 +3138,8 @@ fn var_status(
         var_type: d.var_type.as_str(),
         prompt: d.prompt,
         choices: d.choices,
+        mode: d.file_mode.map(|m| m.as_str()),
+        ext: d.ext,
         secret: d.secret,
         resolved: is_resolved,
         value: if d.secret { None } else { value },
@@ -3512,6 +3565,10 @@ enum ServerEvent {
     /// Pushed by the `run_ledger` (see `RunLedger::set_notifier`), so it
     /// covers every kind of run and every way one can end.
     RunsChanged,
+    /// The target of a `file` node shown with `display="code"` changed on
+    /// disk (appeared, was edited or removed) — such a preview re-reads it.
+    /// Carries nothing: the preview fetches its own content.
+    FilesChanged,
     RunStarted {
         node_id: String,
         block: String,
@@ -10434,6 +10491,87 @@ async fn get_session_tmp(State(state): State<Arc<AppState>>) -> Json<SessionTmpR
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct FsListQuery {
+    /// Where to look: `@tmp[/...]`, `~[/...]`, absolute, or relative to the
+    /// canvas directory. Empty means the canvas directory.
+    #[serde(default)]
+    path: String,
+    /// `dir` (default) lists only directories, `file` lists files too.
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    hidden: bool,
+}
+
+/// Whether a request that reached the picker's listing endpoint may be
+/// answered. The endpoint exposes names from the whole file system, and the
+/// server's CORS layer is permissive, so an arbitrary web page in the
+/// user's browser could otherwise read a listing from `127.0.0.1:<port>`.
+/// Allowed: `Host` is a loopback name (refuses DNS rebinding), and either
+/// there is no `Origin` (curl, the TUI's HTTP client, same-origin GET) or
+/// its authority equals `Host` (the embedded web UI, including inside VS
+/// Code's webview iframe).
+fn fs_list_request_allowed(headers: &axum::http::HeaderMap) -> bool {
+    let host = match headers.get(axum::http::header::HOST).and_then(|v| v.to_str().ok()) {
+        Some(h) => h,
+        None => return false,
+    };
+    let host_name = host.rsplit_once(':').map_or(host, |(n, p)| {
+        if p.chars().all(|c| c.is_ascii_digit()) {
+            n
+        } else {
+            host
+        }
+    });
+    if !matches!(host_name, "127.0.0.1" | "localhost" | "[::1]") {
+        return false;
+    }
+    match headers.get(axum::http::header::ORIGIN) {
+        None => true,
+        Some(o) => o
+            .to_str()
+            .ok()
+            .and_then(|o| o.split_once("://").map(|(_, authority)| authority))
+            .is_some_and(|authority| authority == host),
+    }
+}
+
+/// `GET /api/fs/list?path=&kind=dir|file&hidden=` — the directory listing
+/// behind the `dir`/`file` variable pickers (web `PathPicker`, TUI modal).
+/// Names only, never file content; starts wherever `path` points (a file
+/// lists its directory, a missing path its nearest existing ancestor).
+async fn get_fs_list(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<FsListQuery>,
+) -> Result<Json<meshfox_core::fsbrowse::FsListing>, ApiError> {
+    if !fs_list_request_allowed(&headers) {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "the file listing is only available to the local web UI".to_string(),
+        ));
+    }
+    let kind = match q.kind.as_deref() {
+        None => meshfox_core::fsbrowse::PickKind::Dir,
+        Some(k) => meshfox_core::fsbrowse::PickKind::parse(k).ok_or_else(|| {
+            ApiError(
+                StatusCode::BAD_REQUEST,
+                format!("unknown kind {k:?} (expected dir or file)"),
+            )
+        })?,
+    };
+    let canvas_path = state.canvas_path.clone();
+    let listing = tokio::task::spawn_blocking(move || {
+        meshfox_core::fsbrowse::list(&q.path, kind, q.hidden, &canvas_path)
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    Ok(Json(listing))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct WatchQuery {
     /// The last `seq` this client already saw, from a previous connection —
     /// omitted (or, equivalently, any value at or past the buffer's own
@@ -10923,6 +11061,7 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/debug/stop", post(debug_stop))
         .route("/api/session/reset", post(reset_session))
         .route("/api/session/tmp", get(get_session_tmp))
+        .route("/api/fs/list", get(get_fs_list))
         .route("/api/info", get(api_info))
         .route("/api/watch", get(watch_changes))
         .route("/api/include-asset", get(get_include_asset))
@@ -16134,6 +16273,112 @@ mod session_skip_tests {
     }
 
     #[tokio::test]
+    async fn a_confirmed_file_var_grants_exactly_that_file() {
+        let data = outside_dir_with("in.mp4.txt", "hello-from-file");
+        std::fs::write(data.join("sibling.txt"), "secret").unwrap();
+        let file = data.join("in.mp4.txt");
+        let path = dir_var_canvas(
+            &format!(
+                "<!-- meshfox:var name=\"IN\" type=\"file\" default=\"{}\" -->",
+                file.display()
+            ),
+            &[
+                ("viavar", "$IN"),
+                ("direct", file.to_str().unwrap()),
+                ("sibling", &format!("{}/sibling.txt", data.display())),
+            ],
+        );
+        // Unconfirmed default: grants nothing, even to the literal path.
+        let addr = spawn_test_server(path.clone()).await;
+        let (status, body) = request(addr, "GET", "/api/nodes/viavar/file-content", "", "").await;
+        assert_eq!(status, 403, "{body}");
+        assert!(body.contains("hasn't been confirmed"), "{body}");
+        let (status, _) = request(addr, "GET", "/api/nodes/direct/file-content", "", "").await;
+        assert_eq!(status, 403);
+
+        // Confirmed: that file only, not its sibling.
+        let mut cache = meshfox_core::VarCache::load(&path).unwrap();
+        cache.set("IN", file.to_str().unwrap()).unwrap();
+        let addr = spawn_test_server(path.clone()).await;
+        for id in ["viavar", "direct"] {
+            let (status, body) =
+                request(addr, "GET", &format!("/api/nodes/{id}/file-content"), "", "").await;
+            assert_eq!(status, 200, "{id}: {body}");
+            assert!(body.contains("hello-from-file"), "{id}: {body}");
+        }
+        let (status, _) = request(addr, "GET", "/api/nodes/sibling/file-content", "", "").await;
+        assert_eq!(status, 403);
+    }
+
+    #[tokio::test]
+    async fn a_file_var_whose_value_is_a_directory_grants_nothing() {
+        let data = outside_dir_with("a.txt", "secret");
+        let path = dir_var_canvas(
+            "<!-- meshfox:var name=\"OUT\" type=\"file\" mode=\"save\" -->",
+            &[("inside", &format!("{}/a.txt", data.display()))],
+        );
+        let mut cache = meshfox_core::VarCache::load(&path).unwrap();
+        cache.set("OUT", data.to_str().unwrap()).unwrap();
+        let addr = spawn_test_server(path).await;
+        let (status, _) = request(addr, "GET", "/api/nodes/inside/file-content", "", "").await;
+        assert_eq!(status, 403);
+    }
+
+    async fn request_with_headers(
+        addr: SocketAddr,
+        path: &str,
+        host: &str,
+        origin: Option<&str>,
+    ) -> (u16, String) {
+        let origin = origin.map(|o| format!("Origin: {o}\r\n")).unwrap_or_default();
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: {host}\r\n{origin}Connection: close\r\n\r\n"
+        );
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).await.expect("read");
+        let status = raw
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        (status, raw)
+    }
+
+    #[tokio::test]
+    async fn fs_list_serves_the_local_ui_and_refuses_foreign_origins_and_hosts() {
+        let data = outside_dir_with("clip.mp4", "x");
+        std::fs::create_dir(data.join("sub")).unwrap();
+        let path = dir_var_canvas("", &[]);
+        let addr = spawn_test_server(path).await;
+        let url = format!("/api/fs/list?path={}&kind=file", data.display());
+        let host = addr.to_string();
+
+        // No Origin (curl, the TUI client): fine.
+        let (status, raw) = request_with_headers(addr, &url, &host, None).await;
+        assert_eq!(status, 200, "{raw}");
+        assert!(raw.contains("\"name\":\"clip.mp4\""), "{raw}");
+        assert!(raw.contains("\"name\":\"sub\""), "{raw}");
+        // Same-origin web UI: fine.
+        let (status, _) =
+            request_with_headers(addr, &url, &host, Some(&format!("http://{host}"))).await;
+        assert_eq!(status, 200);
+        // Another web page in the browser: refused.
+        let (status, _) =
+            request_with_headers(addr, &url, &host, Some("https://evil.example")).await;
+        assert_eq!(status, 403);
+        // DNS rebinding (loopback address, attacker's Host): refused.
+        let (status, _) = request_with_headers(addr, &url, "evil.example:80", None).await;
+        assert_eq!(status, 403);
+        // Bad kind.
+        let (status, _) =
+            request_with_headers(addr, "/api/fs/list?kind=socket", &host, None).await;
+        assert_eq!(status, 400);
+    }
+
+    #[tokio::test]
     async fn at_tmp_is_readable_without_confirmation_and_session_reset_deletes_it() {
         let path = dir_var_canvas(
             "<!-- meshfox:var name=\"W\" type=\"dir\" default=\"@tmp/w\" -->",
@@ -17112,6 +17357,8 @@ mod var_status_tests {
             session: false,
             default_var: None,
             choices_var: None,
+            file_mode: None,
+            ext: Vec::new(),
         }
     }
 

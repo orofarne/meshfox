@@ -673,6 +673,9 @@ pub struct App {
     pub pending_child_canvas: Option<PendingChildCanvas>,
     pub block_picker: Option<BlockPickerState>,
     pub var_form: Option<VarFormState>,
+    /// The `dir`/`file` path picker (`Ctrl-O` on such a field of `var_form`
+    /// or `active_inline_form`), drawn above whichever of them opened it.
+    pub path_picker: Option<super::path_picker::PathPickerState>,
     pub status: String,
     pub show_help: bool,
     /// How far the `?` help modal's own content is scrolled down — counts
@@ -926,7 +929,7 @@ const TABLE_META_REFRESH: std::time::Duration = std::time::Duration::from_secs(3
 /// is a chooser over `decl.choices`, so a suggestion that isn't actually
 /// one of them falls back to the first choice rather than displaying
 /// something the left/right cycle could never have produced itself.
-/// `String`/`Int`/`Dir` fields are free text, so the suggestion (or an
+/// `String`/`Int`/`Dir`/`File` fields are free text, so the suggestion (or an
 /// empty string) passes through unchanged. The suggestion starts as the
 /// declaration's `default`; the worker's resolved value (environment,
 /// cache, shared env) replaces it once `GET /api/form/fields` answers.
@@ -942,7 +945,7 @@ fn coerce_field_input(decl: &VarDecl, suggestion: Option<&str>) -> String {
             Some(v) if decl.choices.iter().any(|c| c == v) => v.to_string(),
             _ => decl.choices.first().cloned().unwrap_or_default(),
         },
-        VarType::String | VarType::Int | VarType::Dir => {
+        VarType::String | VarType::Int | VarType::Dir | VarType::File => {
             suggestion.map(str::to_string).unwrap_or_default()
         }
     }
@@ -960,6 +963,8 @@ fn var_decl_from_status(status: &crate::worker_client::VarStatus) -> VarDecl {
         "int" => VarType::Int,
         "bool" => VarType::Bool,
         "select" => VarType::Select,
+        "dir" => VarType::Dir,
+        "file" => VarType::File,
         _ => VarType::String,
     };
     VarDecl {
@@ -974,6 +979,11 @@ fn var_decl_from_status(status: &crate::worker_client::VarStatus) -> VarDecl {
         session: false,
         default_var: None,
         choices_var: None,
+        file_mode: (var_type == VarType::File).then(|| match status.mode.as_deref() {
+            Some("save") => meshfox_core::FileMode::Save,
+            _ => meshfox_core::FileMode::Open,
+        }),
+        ext: status.ext.clone(),
     }
 }
 
@@ -1168,6 +1178,7 @@ impl App {
             pending_child_canvas: None,
             block_picker: None,
             var_form: None,
+            path_picker: None,
             status: if read_only {
                 READ_ONLY_STATUS.into()
             } else {
@@ -1230,6 +1241,10 @@ impl App {
         }
         if self.table_mode.is_some() {
             self.on_table_key(key);
+            return;
+        }
+        if self.path_picker.is_some() {
+            self.on_path_picker_key(key).await;
             return;
         }
         if self.var_form.is_some() {
@@ -1359,6 +1374,18 @@ impl App {
                 }
                 KeyCode::Enter | KeyCode::Char('c') if self.selected_block.is_some() => {
                     let addr = self.selected_block.clone().unwrap();
+                    // A selected `form` fence has no source or output to
+                    // fold: `Enter` starts editing it, `c` does nothing.
+                    if self.is_form_block(&addr) {
+                        if key.code == KeyCode::Enter {
+                            self.ensure_inline_form_open(&addr.node_id, &addr.block_name);
+                            if let Some(form) = &mut self.active_inline_form {
+                                form.editing = true;
+                            }
+                            self.render_current_document();
+                        }
+                        return;
+                    }
                     let action = if key.code == KeyCode::Enter {
                         markdown::BlockAction::ToggleBlock
                     } else {
@@ -1552,6 +1579,16 @@ impl App {
             }
             KeyCode::Left => self.cycle_var_form_field(-1),
             KeyCode::Right => self.cycle_var_form_field(1),
+            // Ctrl-O: browse for the focused `dir`/`file` field.
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let target = self.var_form.as_ref().and_then(|vf| {
+                    matches!(vf.decls[vf.selected].var_type, VarType::Dir | VarType::File)
+                        .then_some(super::path_picker::PickerTarget::VarForm(vf.selected))
+                });
+                if let Some(target) = target {
+                    self.open_path_picker(target).await;
+                }
+            }
             // Ctrl-S: toggle "save" on the focused `secret` field.
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(vf) = &mut self.var_form {
@@ -1574,7 +1611,10 @@ impl App {
             KeyCode::Backspace => {
                 if let Some(vf) = &mut self.var_form {
                     let i = vf.selected;
-                    if matches!(vf.decls[i].var_type, VarType::String | VarType::Int) {
+                    if matches!(
+                        vf.decls[i].var_type,
+                        VarType::String | VarType::Int | VarType::Dir | VarType::File
+                    ) {
                         vf.inputs[i].pop();
                     }
                 }
@@ -1583,7 +1623,7 @@ impl App {
                 if let Some(vf) = &mut self.var_form {
                     let i = vf.selected;
                     let allowed = match vf.decls[i].var_type {
-                        VarType::String | VarType::Dir => true,
+                        VarType::String | VarType::Dir | VarType::File => true,
                         // A leading `+`/`-` (once, only as the very first
                         // character — same grammar `i64::from_str` itself
                         // accepts, see `meshfox_core::validate_value`)
@@ -1638,7 +1678,7 @@ impl App {
                 let next = (current + dir).rem_euclid(len) as usize;
                 vf.inputs[i] = choices[next].clone();
             }
-            VarType::String | VarType::Int | VarType::Dir => {}
+            VarType::String | VarType::Int | VarType::Dir | VarType::File => {}
         }
     }
 
@@ -1723,11 +1763,26 @@ impl App {
             .filter(|b| meshfox_core::is_form(&b.lang))
             .filter_map(|b| b.name)
             .collect();
+        // A form selected with `[`/`]` wins over the "only one form" rule.
+        if let Some(addr) = self.selected_block.clone() {
+            if addr.node_id == node_id && form_blocks.contains(&addr.block_name) {
+                if let Some(mut form) = self.try_build_inline_form(&node_id, &addr.block_name) {
+                    form.editing = true;
+                    self.active_inline_form = Some(form);
+                    self.render_current_document();
+                } else {
+                    self.status = "meshfox: this form has no usable fields".into();
+                }
+                return;
+            }
+        }
         match form_blocks.as_slice() {
             [] => self.status = "no form in this node".into(),
             [name] => {
-                if let Some(mut form) = self.try_build_inline_form(&node_id, name) {
+                let name = name.clone();
+                if let Some(mut form) = self.try_build_inline_form(&node_id, &name) {
                     form.editing = true;
+                    self.selected_block = Some(BlockAddr::new(&node_id, &name));
                     self.active_inline_form = Some(form);
                     self.render_current_document();
                 } else {
@@ -1778,11 +1833,26 @@ impl App {
                 self.cycle_inline_form_field(1);
                 self.render_current_document();
             }
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let target = self.active_inline_form.as_ref().and_then(|form| {
+                    let i = form.selected;
+                    (i < form.decls.len()
+                        && matches!(form.decls[i].var_type, VarType::Dir | VarType::File))
+                    .then_some(super::path_picker::PickerTarget::InlineForm(i))
+                });
+                if let Some(target) = target {
+                    self.open_path_picker(target).await;
+                }
+                self.render_current_document();
+            }
             KeyCode::Backspace => {
                 if let Some(form) = &mut self.active_inline_form {
                     let i = form.selected;
                     if i < form.decls.len()
-                        && matches!(form.decls[i].var_type, VarType::String | VarType::Int)
+                        && matches!(
+                            form.decls[i].var_type,
+                            VarType::String | VarType::Int | VarType::Dir | VarType::File
+                        )
                     {
                         form.inputs[i].pop();
                     }
@@ -1794,7 +1864,7 @@ impl App {
                     let i = form.selected;
                     if i < form.decls.len() {
                         let allowed = match form.decls[i].var_type {
-                            VarType::String | VarType::Dir => true,
+                            VarType::String | VarType::Dir | VarType::File => true,
                             VarType::Int => {
                                 c.is_ascii_digit()
                                     || ((c == '-' || c == '+') && form.inputs[i].is_empty())
@@ -1847,7 +1917,7 @@ impl App {
                 let next = (current + dir).rem_euclid(len) as usize;
                 form.inputs[i] = choices[next].clone();
             }
-            VarType::String | VarType::Int | VarType::Dir => {}
+            VarType::String | VarType::Int | VarType::Dir | VarType::File => {}
         }
     }
 
@@ -2040,8 +2110,12 @@ impl App {
         }
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
         let area = Rect::new(0, 0, cols, rows);
+        if self.path_picker.is_some() {
+            self.on_path_picker_mouse(mouse, area).await;
+            return;
+        }
         if self.var_form.is_some() || self.block_picker.is_some() {
-            self.on_modal_mouse(mouse, area);
+            self.on_modal_mouse(mouse, area).await;
             return;
         }
         let layout = ui::compute_layout(
@@ -2220,6 +2294,16 @@ impl App {
         }
     }
 
+    /// Whether `addr` names a `form` fence (which `[`/`]` can select, but
+    /// which has no run, source or output of its own).
+    fn is_form_block(&self, addr: &BlockAddr) -> bool {
+        self.display_canvas.node(&addr.node_id).is_some_and(|node| {
+            scan_runnable_blocks(&node.id, &node.text).iter().any(|b| {
+                b.name.as_deref() == Some(addr.block_name.as_str()) && meshfox_core::is_form(&b.lang)
+            })
+        })
+    }
+
     fn select_adjacent_block(&mut self, direction: i32) {
         let Some(row) = self.rows.get(self.selected) else {
             return;
@@ -2229,7 +2313,7 @@ impl App {
         };
         let blocks: Vec<_> = scan_runnable_blocks(&node.id, &node.text)
             .into_iter()
-            .filter(|b| !meshfox_core::is_button(&b.lang) && !meshfox_core::is_form(&b.lang))
+            .filter(|b| !meshfox_core::is_button(&b.lang))
             .filter_map(|b| b.name)
             .collect();
         if blocks.is_empty() {
@@ -2331,6 +2415,7 @@ impl App {
                 block_name,
                 field_index,
             } => {
+                self.select_form_block(&node_id, &block_name);
                 self.ensure_inline_form_open(&node_id, &block_name);
                 if let Some(form) = &mut self.active_inline_form {
                     if field_index < form.fields.len() {
@@ -2344,10 +2429,45 @@ impl App {
                 node_id,
                 block_name,
             } => {
+                self.select_form_block(&node_id, &block_name);
                 self.ensure_inline_form_open(&node_id, &block_name);
                 self.submit_inline_form().await;
             }
+            ClickTarget::FormBrowse {
+                node_id,
+                block_name,
+                field_index,
+            } => {
+                self.select_form_block(&node_id, &block_name);
+                self.ensure_inline_form_open(&node_id, &block_name);
+                let usable = self.active_inline_form.as_mut().is_some_and(|form| {
+                    let ok = field_index < form.decls.len()
+                        && matches!(
+                            form.decls[field_index].var_type,
+                            VarType::Dir | VarType::File
+                        );
+                    if ok {
+                        form.selected = field_index;
+                        form.editing = true;
+                    }
+                    ok
+                });
+                if usable {
+                    self.open_path_picker(super::path_picker::PickerTarget::InlineForm(
+                        field_index,
+                    ))
+                    .await;
+                }
+                self.render_current_document();
+            }
         }
+    }
+
+    /// Selects the form fence `(node_id, block_name)` the way `[`/`]` would
+    /// (frame highlight, Document focus) — what clicking into a form does.
+    fn select_form_block(&mut self, node_id: &str, block_name: &str) {
+        self.selected_block = Some(BlockAddr::new(node_id, block_name));
+        self.set_focus(Focus::Document);
     }
 
     /// Makes sure `active_inline_form` is open for exactly this
@@ -2367,6 +2487,134 @@ impl App {
         }
     }
 
+    /// Lists `path` for the path picker — through the worker when there is
+    /// one (the file system a run happens on), otherwise straight off disk.
+    async fn picker_list(
+        &self,
+        path: &str,
+        kind: meshfox_core::fsbrowse::PickKind,
+        hidden: bool,
+    ) -> Result<meshfox_core::fsbrowse::FsListing, String> {
+        match self.worker_port {
+            Some(port) => crate::worker_client::fs_list(port, path, kind, hidden).await,
+            None => meshfox_core::fsbrowse::list(path, kind, hidden, &self.canvas_path)
+                .map_err(|e| e.to_string()),
+        }
+    }
+
+    /// Opens the path picker for the focused `dir`/`file` field, starting
+    /// from the text it currently holds.
+    async fn open_path_picker(&mut self, target: super::path_picker::PickerTarget) {
+        use super::path_picker::{PathPickerState, PickerTarget};
+        let (decl, current) = match target {
+            PickerTarget::VarForm(i) => match &self.var_form {
+                Some(vf) => (vf.decls[i].clone(), vf.inputs[i].clone()),
+                None => return,
+            },
+            PickerTarget::InlineForm(i) => match &self.active_inline_form {
+                Some(f) => (f.decls[i].clone(), f.inputs[i].clone()),
+                None => return,
+            },
+        };
+        let mut picker = PathPickerState::new(target, &decl);
+        match self.picker_list(&current, picker.kind, false).await {
+            Ok(listing) => picker.set_listing(listing),
+            Err(e) => picker.error = Some(e),
+        }
+        self.path_picker = Some(picker);
+    }
+
+    async fn on_path_picker_key(&mut self, key: KeyEvent) {
+        let Some(picker) = &mut self.path_picker else {
+            return;
+        };
+        let action = picker.on_key(key);
+        self.apply_picker_action(action).await;
+    }
+
+    async fn apply_picker_action(&mut self, action: super::path_picker::PickerAction) {
+        use super::path_picker::{PickerAction, PickerTarget};
+        match action {
+            PickerAction::Stay => {}
+            PickerAction::Cancel => self.path_picker = None,
+            PickerAction::Navigate(path) => {
+                let Some(picker) = &self.path_picker else {
+                    return;
+                };
+                let (kind, hidden) = (picker.kind, picker.show_hidden);
+                let result = self.picker_list(&path, kind, hidden).await;
+                if let Some(picker) = &mut self.path_picker {
+                    match result {
+                        Ok(listing) => picker.set_listing(listing),
+                        Err(e) => picker.error = Some(e),
+                    }
+                }
+            }
+            PickerAction::Choose(path) => {
+                let Some(picker) = self.path_picker.take() else {
+                    return;
+                };
+                match picker.target {
+                    PickerTarget::VarForm(i) => {
+                        if let Some(vf) = &mut self.var_form {
+                            if let Some(slot) = vf.inputs.get_mut(i) {
+                                *slot = path;
+                            }
+                        }
+                    }
+                    PickerTarget::InlineForm(i) => {
+                        if let Some(form) = &mut self.active_inline_form {
+                            if let Some(slot) = form.inputs.get_mut(i) {
+                                *slot = path;
+                            }
+                        }
+                        self.render_current_document();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Mouse for the open path picker: a click on a row selects it (a second
+    /// click on the selected row activates it, like `Enter`), the wheel
+    /// moves the selection, and the geometry is `ui::path_picker_layout`'s
+    /// own so a hit-test can't drift from what is drawn.
+    async fn on_path_picker_mouse(&mut self, mouse: MouseEvent, area: Rect) {
+        let Some(picker) = &mut self.path_picker else {
+            return;
+        };
+        let layout = ui::path_picker_layout(area, picker.save);
+        let action = match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                picker.scroll(-3);
+                None
+            }
+            MouseEventKind::ScrollDown => {
+                picker.scroll(3);
+                None
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let inside = mouse.column >= layout.list.x
+                    && mouse.column < layout.list.x + layout.list.width
+                    && mouse.row >= layout.list.y
+                    && mouse.row < layout.list.y + layout.list.height;
+                if inside {
+                    let start = super::path_picker::window_start(
+                        picker.selected,
+                        layout.list.height as usize,
+                    );
+                    Some(picker.click_row(start + (mouse.row - layout.list.y) as usize))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(action) = action {
+            self.apply_picker_action(action).await;
+        }
+    }
+
     /// `on_mouse`'s own modal branch: while `var_form`/`block_picker` is up,
     /// a left-click on one of its own list rows selects it, same as `j`/`k`
     /// would — everything else (including a click that lands outside the
@@ -2376,17 +2624,32 @@ impl App {
     /// `render_block_picker` themselves compute (`ui::var_form_list_rect`/
     /// `ui::block_picker_list_rect`), so a row's hit-test can never drift
     /// from where it actually renders.
-    fn on_modal_mouse(&mut self, mouse: MouseEvent, area: Rect) {
+    async fn on_modal_mouse(&mut self, mouse: MouseEvent, area: Rect) {
         if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             return;
         }
         if let Some(vf) = &mut self.var_form {
             let list_rect = ui::var_form_list_rect(area, vf.decls.len());
+            let mut browse = None;
             if mouse.row >= list_rect.y && mouse.row < list_rect.y + list_rect.height {
                 let idx = (mouse.row - list_rect.y) as usize;
                 if idx < vf.decls.len() {
                     vf.selected = idx;
+                    // The right-aligned "[Browse… ^o]" strip of a
+                    // `dir`/`file` row (see `render_var_form`).
+                    let marker = super::path_picker::BROWSE_MARKER.chars().count() as u16;
+                    let on_marker = mouse.column + marker >= list_rect.x + list_rect.width
+                        && mouse.column < list_rect.x + list_rect.width;
+                    if on_marker
+                        && matches!(vf.decls[idx].var_type, VarType::Dir | VarType::File)
+                    {
+                        browse = Some(idx);
+                    }
                 }
+            }
+            if let Some(idx) = browse {
+                self.open_path_picker(super::path_picker::PickerTarget::VarForm(idx))
+                    .await;
             }
         } else if let Some(bp) = &mut self.block_picker {
             let list_rect = ui::block_picker_list_rect(area, bp.blocks.len());
@@ -3569,6 +3832,11 @@ impl App {
         let node_id = row.node_id.clone();
         if self.focus == Focus::Document {
             if let Some(addr) = self.selected_block.clone() {
+                if self.is_form_block(&addr) {
+                    self.status =
+                        "a form isn't run — Enter edits it, its Send button applies it".into();
+                    return;
+                }
                 self.start_run(addr.node_id, addr.block_name, with_deps)
                     .await;
                 return;
@@ -7413,6 +7681,104 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[tokio::test]
+    async fn a_form_is_framed_selectable_with_brackets_and_enter_edits_it() {
+        let mut app = app_with_blocks(
+            "form-select",
+            concat!(
+                "<!-- meshfox:var name=\"IN\" type=\"file\" session -->\n\n",
+                "```sh name=first\necho one\n```\n\n",
+                "```form name=pick\nfield var=\"IN\" label=\"Input\"\n```\n\n",
+                "```sh name=last\necho two\n```\n",
+            ),
+        )
+        .await;
+        app.set_focus(Focus::Document);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let text = |app: &App| document_text(app);
+        // Framed like a code block, unselected: plain corner, gutter, foot,
+        // and the Browse marker after the file field.
+        assert!(text(&app).contains("┌─ form · pick"), "{}", text(&app));
+        assert!(text(&app).contains("│ Input: "));
+        assert!(text(&app).contains("[Browse… ^o]"));
+        assert!(!text(&app).contains("›─ form"));
+
+        // `]` walks document order: first -> pick -> last -> (wraps) first.
+        app.on_key(key(KeyCode::Char(']'))).await;
+        assert_eq!(app.selected_block, Some(BlockAddr::new("root", "first")));
+        app.on_key(key(KeyCode::Char(']'))).await;
+        assert_eq!(app.selected_block, Some(BlockAddr::new("root", "pick")));
+        // Selected + Document focused: `›` replaces the corner.
+        assert!(text(&app).contains("›─ form · pick"), "{}", text(&app));
+        assert!(!text(&app).contains("┌─ form · pick"));
+        // The other blocks' frames are untouched by the selection.
+        assert_eq!(
+            text(&app).matches("┌─[").count(),
+            2,
+            "the two code blocks keep their plain corners: {}",
+            text(&app)
+        );
+
+        // Selection is dimmed (no `›`) while another pane has focus, but kept.
+        app.set_focus(Focus::Tree);
+        app.render_current_document();
+        assert_eq!(app.selected_block, Some(BlockAddr::new("root", "pick")));
+        assert!(text(&app).contains("┌─ form · pick"), "{}", text(&app));
+        app.set_focus(Focus::Document);
+        app.render_current_document();
+
+        // `r` on a form says so instead of trying to run it.
+        app.on_key(key(KeyCode::Char('r'))).await;
+        assert!(app.status.contains("isn't run"), "{}", app.status);
+
+        // Enter edits it: the header says so and the foot lists the keys.
+        app.on_key(key(KeyCode::Enter)).await;
+        let form = app.active_inline_form.as_ref().expect("Enter opens the form");
+        assert!(form.editing);
+        assert_eq!(form.block_name, "pick");
+        assert!(text(&app).contains("· editing"), "{}", text(&app));
+        assert!(text(&app).contains("└─ ↑/↓ field · enter apply · esc done"));
+        app.on_key(key(KeyCode::Esc)).await;
+        assert!(!app.active_inline_form.as_ref().unwrap().editing);
+        assert!(!text(&app).contains("· editing"));
+        // Esc only stopped editing; the form is still the selected block.
+        assert_eq!(app.selected_block, Some(BlockAddr::new("root", "pick")));
+
+        app.on_key(key(KeyCode::Char(']'))).await;
+        assert_eq!(app.selected_block, Some(BlockAddr::new("root", "last")));
+        assert!(text(&app).contains("┌─ form · pick"), "{}", text(&app));
+        app.on_key(key(KeyCode::Char(']'))).await;
+        assert_eq!(app.selected_block, Some(BlockAddr::new("root", "first")));
+        // And `[` goes back the other way, through the form.
+        app.on_key(key(KeyCode::Char('['))).await;
+        assert_eq!(app.selected_block, Some(BlockAddr::new("root", "last")));
+        app.on_key(key(KeyCode::Char('['))).await;
+        assert_eq!(app.selected_block, Some(BlockAddr::new("root", "pick")));
+    }
+
+    #[tokio::test]
+    async fn clicking_into_a_form_selects_it() {
+        let mut app = app_with_blocks(
+            "form-click-select",
+            concat!(
+                "<!-- meshfox:var name=\"IN\" session -->\n\n",
+                "```form name=pick\nfield var=\"IN\" label=\"Input\"\n```\n",
+            ),
+        )
+        .await;
+        app.set_focus(Focus::Tree);
+        assert!(app.selected_block.is_none());
+        app.activate_click_target(ClickTarget::FormField {
+            node_id: "root".into(),
+            block_name: "pick".into(),
+            field_index: 0,
+        })
+        .await;
+        assert_eq!(app.selected_block, Some(BlockAddr::new("root", "pick")));
+        assert!(app.focus == Focus::Document);
+        assert!(document_text(&app).contains("›─ form · pick"));
     }
 
     #[tokio::test]

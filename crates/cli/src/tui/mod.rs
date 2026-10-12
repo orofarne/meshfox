@@ -11,6 +11,7 @@
 
 mod app;
 mod markdown;
+mod path_picker;
 mod source_editor;
 mod spatial;
 mod svg_raster;

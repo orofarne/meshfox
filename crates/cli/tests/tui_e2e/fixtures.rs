@@ -119,3 +119,17 @@ pub const FORM_AUTORUN: &str = concat!(
     "```form name=\"pick\" send=\"Send\"\nfield var=\"GREETING\" label=\"Greeting\"\n```\n\n",
     "```bash name=\"show\" env=\"$GREETING\" autorun\necho \"greeting is $GREETING\"\n```\n",
 );
+
+/// A `form` fence over a `type="file"` (with an `ext=` hint) and a
+/// `type="dir"` variable — the smallest fixture for the TUI's `Ctrl-O`
+/// path picker. Used by `path_picker.rs`, which also creates a `footage/`
+/// directory next to the canvas.
+pub const FORM_PATHS: &str = concat!(
+    "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+    "<!-- meshfox:var name=\"INPUT\" type=\"file\" ext=\"mp4,mkv\" session -->\n",
+    "<!-- meshfox:var name=\"WORK\" type=\"dir\" session -->\n\n",
+    "```form name=\"pick\" send=\"Send\"\n",
+    "field var=\"INPUT\" label=\"Input video\"\n",
+    "field var=\"WORK\" label=\"Work dir\"\n",
+    "```\n",
+);

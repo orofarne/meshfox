@@ -93,7 +93,7 @@ Edit mode's toolbar also has an **⚙ options** button, next to Auto-layout: it 
 ## Variables
 <!-- meshfox:node id="variables" -->
 
-Document-scoped config values a canvas wants from whoever runs it — declared once as `<!-- meshfox:var ... -->` comments in the root node (this document declares exactly one, `INSTALL_PATH`, right above "Concept" — invisible here since it's an HTML comment, same as every other bit of meshfox bookkeeping). Declaring one doesn't put it in any block's environment by itself, though — a block has to opt in with its own `env=` fence attribute to actually reference it (`env="$INSTALL_PATH"`, see "Install" below), and only blocks that do ever resolve or prompt for anything: running any *other* block in this file never asks about `INSTALL_PATH`, however many blocks elsewhere might use it. Asked for interactively the first time some block's `env=` actually needs it, then remembered in a local `.meshfox/<filename>.env` cache (`.gitignore`d, analogous to CMake's `CMakeCache.txt`) so it's not asked for again by any block referencing it afterward. `meshfox configure` walks every declared variable up front regardless of `env=` usage; `meshfox run --set NAME=value` supplies one non-interactively (e.g. for CI); the web UI shows a small form in place of a prompt, scoped to just the clicked block's own chain, only for whatever isn't already resolved. See SPEC.md's "Variables" for the full writeup, including `secret` (never cached, always re-asked) and the `int`/`bool`/`select` types.
+Document-scoped config values a canvas wants from whoever runs it — declared once as `<!-- meshfox:var ... -->` comments in the root node (this document declares exactly one, `INSTALL_PATH`, right above "Concept" — invisible here since it's an HTML comment, same as every other bit of meshfox bookkeeping). Declaring one doesn't put it in any block's environment by itself, though — a block has to opt in with its own `env=` fence attribute to actually reference it (`env="$INSTALL_PATH"`, see "Install" below), and only blocks that do ever resolve or prompt for anything: running any *other* block in this file never asks about `INSTALL_PATH`, however many blocks elsewhere might use it. Asked for interactively the first time some block's `env=` actually needs it, then remembered in a local `.meshfox/<filename>.env` cache (`.gitignore`d, analogous to CMake's `CMakeCache.txt`) so it's not asked for again by any block referencing it afterward. `meshfox configure` walks every declared variable up front regardless of `env=` usage; `meshfox run --set NAME=value` supplies one non-interactively (e.g. for CI); the web UI shows a small form in place of a prompt, scoped to just the clicked block's own chain, only for whatever isn't already resolved. See SPEC.md's "Variables" for the full writeup, including `secret` (never cached, always re-asked) and the `int`/`bool`/`select`/`dir`/`file` types.
 
 ## Constraints
 <!-- meshfox:node id="constraints" -->
@@ -314,6 +314,33 @@ its first 100 rows as a plain grid, failing loudly if a table can't be read.
 <!-- meshfox:node id="example-10" type="file" -->
 
 [examples/tables.canvas.md](./examples/tables.canvas.md)
+
+### Typed variables, forms and file pickers
+<!-- meshfox:node id="typed-variables-forms-and-file-pickers" -->
+
+[examples/ffmpeg.canvas.md](./examples/ffmpeg.canvas.md) — a cut-down `ffmpeg`
+how-to that uses every variable type at once and one `form` fence to set them:
+`type="file"` (an input with `mode="open"`, an output with `mode="save"`,
+`ext="mp4,mkv"` as a picker hint), `type="dir"`, `select`, `int`, `bool` and
+plain strings. A `dir` or `file` field has a **Browse…** button in the web UI
+(`Ctrl-O` in the terminal) that opens a file browser over the *worker's* file
+system — where the blocks actually run, which may not be where the UI is — and
+answers with an absolute path. SPEC.md's "File variables" and "Path pickers"
+have the details.
+
+A chosen path is also a *permission*: a `dir` value becomes a trusted location
+a `file` node may read below, and a `file` value one trusted file — exactly that
+one, never its folder — so `[report]($OUTPUT_DIR/probe.json)` or `[clip]($INPUT)`
+previews what you picked, while a canvas's own text still cannot reach outside
+its directory by itself.
+
+Needs `ffmpeg` and `ffprobe` on `PATH`; the first block generates a test clip,
+so the example works before you pick a video of your own.
+
+#### Example
+<!-- meshfox:node id="example-11" type="file" -->
+
+[examples/ffmpeg.canvas.md](./examples/ffmpeg.canvas.md)
 
 ## Configuration
 <!-- meshfox:node id="configuration" -->

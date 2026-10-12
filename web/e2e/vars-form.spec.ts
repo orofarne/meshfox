@@ -40,3 +40,41 @@ test("the vars modal offers a choices_var-declared select's real, from=-computed
     "using eu-west-1",
   );
 });
+
+test("the vars modal browses for a type=file variable and runs with the chosen path", async ({ page }) => {
+  await block(page, "clips", "use-clip").locator("button", { hasText: "run" }).click();
+
+  const modal = page.locator(".vars-modal:not(.path-picker)");
+  await expect(modal).toBeVisible();
+  await modal.locator(".path-field-browse").click();
+
+  const picker = page.locator(".path-picker");
+  await expect(picker).toBeVisible();
+  await picker.locator(".path-picker-entry", { hasText: "path-picker-data" }).click();
+  await picker.locator(".path-picker-entry", { hasText: "footage" }).click();
+  await picker.locator(".path-picker-entry", { hasText: "clip.mp4" }).click();
+  await picker.getByRole("button", { name: "choose", exact: true }).click();
+  await expect(picker).toHaveCount(0);
+
+  // The modal is still open, holding the picked absolute path.
+  await expect(modal.locator(".path-field input")).toHaveValue(/path-picker-data\/footage\/clip\.mp4$/);
+  await modal.locator("button", { hasText: "run" }).click();
+
+  await expect(modal).toHaveCount(0);
+  await expect(block(page, "clips", "use-clip").locator(".mesh-code-output")).toContainText(
+    /clip is .*path-picker-data\/footage\/clip\.mp4/,
+  );
+});
+
+test("a file node's code preview re-reads its target after a run writes it", async ({ page }) => {
+  const preview = page.locator('.react-flow__node[data-id="report-file"]');
+  const text = async () => (await preview.innerText()).replace(/\s+/g, " ");
+
+  await block(page, "report", "write-report").locator("button", { hasText: "run" }).click();
+  await expect.poll(text).toMatch(/report-\d+/);
+  const first = (await text()).match(/report-\d+/)![0];
+
+  await block(page, "report", "write-report").locator("button", { hasText: "run" }).click();
+  // A new run writes a new token; the preview must pick it up without a reload.
+  await expect.poll(async () => (await text()).match(/report-\d+/)?.[0]).not.toBe(first);
+});

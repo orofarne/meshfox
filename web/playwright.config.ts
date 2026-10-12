@@ -256,6 +256,10 @@ const BODY_CONFLICT_PORT = 4623;
 // spec replaces `/api/watch` with a scripted socket and never writes, but a
 // worker is one-per-canvas-file, so it cannot share body-conflict's.
 const WS_LIVENESS_PORT = 4624;
+// Server + port for path-picker.spec.ts — its own fixture (path-picker.
+// canvas.md plus the path-picker-data/ tree it browses) and port; the
+// suite only reads (the picker lists, the form's values are session-only).
+const PATH_PICKER_PORT = 4630;
 const MCP_LIVE_DIRS = Object.fromEntries(
   (["chrome", "firefox"] as const).map((browser) => {
     const dir = path.join(os.tmpdir(), `meshfox-e2e-mcp-live-${browser}-fixture`);
@@ -491,6 +495,11 @@ export default defineConfig({
       name: `${browser}-ws-liveness`,
       testMatch: /(^|\/)ws-liveness\.spec\.ts$/,
       use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${WS_LIVENESS_PORT}` },
+    },
+    {
+      name: `${browser}-path-picker`,
+      testMatch: /(^|\/)path-picker\.spec\.ts$/,
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${PATH_PICKER_PORT}` },
     },
   ]),
   webServer: [
@@ -739,6 +748,12 @@ export default defineConfig({
     {
       command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/ws-liveness.canvas.md --port ${WS_LIVENESS_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${WS_LIVENESS_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/path-picker.canvas.md --port ${PATH_PICKER_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${PATH_PICKER_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },

@@ -75,7 +75,7 @@ import { computeAutoLayout, FOLDED_HEIGHT, type LayoutBox } from "./autolayout";
 import { buildBlockGraph, resolveChain, type BlockAddr } from "./deps";
 import { parseVarDecls } from "./vars";
 import { parseBody, type CodeSegment } from "./fence";
-import { MeshNode, resolveNodeColor, type MeshNodeData, type LiveBlockState } from "./MeshNode";
+import { FileRefreshContext, MeshNode, resolveNodeColor, type MeshNodeData, type LiveBlockState } from "./MeshNode";
 import { VarsForm } from "./VarsForm";
 import { RunConfirmDialog } from "./RunConfirmDialog";
 import { DocumentOptions } from "./DocumentOptions";
@@ -605,6 +605,8 @@ export default function App() {
   // than just trusting whatever `handleUndo`/`handleRedo` last computed:
   // another client's own edit can change this at any time.
   const [canUndo, setCanUndo] = useState(false);
+  // Bumped on every `"files-changed"` — see `FileRefreshContext`.
+  const [fileRefreshTick, setFileRefreshTick] = useState(0);
   const [canRedo, setCanRedo] = useState(false);
   // The open "configure every declared variable" modal (see VarsForm,
   // `handleConfigure`) — the browser counterpart to `meshfox configure`/
@@ -1290,6 +1292,8 @@ export default function App() {
       () => {
         refreshLiveTtySessions();
       },
+      // A code preview's target changed on disk — see `FileRefreshContext`.
+      () => setFileRefreshTick((t) => t + 1),
     );
     return stop;
   }, [load, watchAutorunBlock, handleNodeOp, refreshLiveTtySessions]);
@@ -3969,6 +3973,7 @@ export default function App() {
   }
 
   return (
+    <FileRefreshContext.Provider value={fileRefreshTick}>
     <div className="app">
       {toolbar}
       <div className="canvas-area">
@@ -4275,5 +4280,6 @@ export default function App() {
         />
       )}
     </div>
+    </FileRefreshContext.Provider>
   );
 }

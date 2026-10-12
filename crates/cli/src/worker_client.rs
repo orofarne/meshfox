@@ -1145,6 +1145,9 @@ pub fn watch(port: u16) -> tokio::sync::mpsc::UnboundedReceiver<WatchEvent> {
                 block: String,
             },
             RunsChanged,
+            /// A `display="code"` file node's target changed on disk — the
+            /// TUI re-reads the document, same as for `"changed"`.
+            FilesChanged,
             NodeUpserted,
             NodeRemoved,
             NodesReordered,
@@ -1169,6 +1172,7 @@ pub fn watch(port: u16) -> tokio::sync::mpsc::UnboundedReceiver<WatchEvent> {
                 let event = match parsed {
                     WatchMsg::Connected | WatchMsg::Heartbeat => continue,
                     WatchMsg::Changed
+                    | WatchMsg::FilesChanged
                     | WatchMsg::Resync
                     | WatchMsg::NodeUpserted
                     | WatchMsg::NodeRemoved
@@ -1364,6 +1368,12 @@ pub struct VarStatus {
     pub prompt: String,
     #[serde(default)]
     pub choices: Vec<String>,
+    /// `"open"`/`"save"` for a `type="file"` field.
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// A `type="file"` field's `ext=` filter hint.
+    #[serde(default)]
+    pub ext: Vec<String>,
     #[serde(default)]
     pub secret: bool,
     pub resolved: bool,
@@ -1506,6 +1516,34 @@ pub struct FormFieldStatus {
 #[derive(serde::Deserialize)]
 struct FormFieldsResponse {
     fields: Vec<FormFieldStatus>,
+}
+
+/// `GET /api/fs/list` — one directory of the worker's file system, for the
+/// TUI's `dir`/`file` path picker (the same endpoint the web picker uses;
+/// see SPEC.md, "Path pickers"). `path` is whatever the field holds.
+pub async fn fs_list(
+    port: u16,
+    path: &str,
+    kind: meshfox_core::fsbrowse::PickKind,
+    hidden: bool,
+) -> Result<meshfox_core::fsbrowse::FsListing, String> {
+    let kind = match kind {
+        meshfox_core::fsbrowse::PickKind::Dir => "dir",
+        meshfox_core::fsbrowse::PickKind::File => "file",
+    };
+    let res = client()
+        .get(format!("{}/api/fs/list", base_url(port)))
+        .query(&[("path", path), ("kind", kind), ("hidden", if hidden { "true" } else { "false" })])
+        .timeout(time_limit(QUICK))
+        .send()
+        .await
+        .map_err(|e| describe(&e))?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        return Err(if text.is_empty() { status.to_string() } else { text });
+    }
+    res.json().await.map_err(|e| e.to_string())
 }
 
 /// `GET /api/form/fields` — a `form` fence's own fields with their

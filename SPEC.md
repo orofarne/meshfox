@@ -162,9 +162,14 @@ manual path, not gated by it.
   - `display="link"` (default), `display="code"` or `display="table"` — `code` shows the
     target's own file content as a read-only, non-runnable syntax-highlighted
     preview instead of a plain clickable link. The file is read fresh from
-    disk on every view, confined to the canvas's own directory tree (plus
-    the directories of `type="dir"` variables, see "Directory variables") —
-    never written back.
+    disk on every view, and again whenever it changes while the page is
+    open (the worker stamps each such target's mtime and size twice a second
+    and announces a change over `/api/watch` as `files-changed` — a block
+    that just wrote the file, or an editor, refreshes the preview without a
+    reload), confined to the canvas's own directory tree (plus
+    the directories of `type="dir"` variables and the exact files of
+    `type="file"` variables, see "Directory variables" and "File variables")
+    — never written back.
   - `display="table"` — shows the target as an interactive, read-only
     table (CSV, TSV, Parquet, JSON lines, compressed variants, ... —
     anything the `duckdb` CLI reads), windowed so huge files stay usable.
@@ -296,7 +301,8 @@ everything else as delimited text with auto-detected dialect and types
 (a trailing `.gz`/`.zst` is looked through). If type inference over the
 sample fails on a later row, the file is read again with every column as
 text. The target is confined like `display="code"`: the canvas directory
-and the directories of `type="dir"` variables.
+and the directories of `type="dir"` variables plus the exact files of
+`type="file"` variables.
 
 **How it works.** The worker keeps one long-lived `duckdb` process per
 table node over a cache database. Text-like files are imported once, in the
@@ -1040,6 +1046,15 @@ only ever prompting before a run. Its body is a line-based list, one
   It's addressed instead by whatever submits it — the web UI's own
   rendered Send button, the TUI's inline field-and-Send rendering (`i` to
   start editing it, or a click) — never by a document's own `deps=`.
+- In the TUI a `form` is drawn in the same frame as a code block
+  (`┌─ form · name` header, `│ ` gutter, `└─` foot) and is selected with
+  `[`/`]` in document order, with the same highlight rules: accent border
+  and a filled header while the Document pane has focus, dimmed when
+  another pane has it, `›` replacing the corner only while focused.
+  Clicking a field, the Browse marker or Send selects it too. `Enter` (or
+  `i`) starts editing — the header then reads `· editing` and the foot
+  lists the keys — `Esc` stops editing and keeps the selection, and `r`
+  says a form is not run.
 - **Nothing happens live as a field is edited.** Clicking Send is the one
   and only moment values take effect: every field's current value is
   committed together, into a *session-lifetime* store (the web server's
@@ -1389,12 +1404,17 @@ Attributes:
   code fences" above) refers to when it wants this variable — declaring
   one here doesn't, by itself, put it in any block's environment; that's
   opt-in per block, see "Consumption" below.
-- `type` — `string` (default), `int`, `bool`, `select`, or `dir` (see
-  "Directory variables" below). Purely a hint
+- `type` — `string` (default), `int`, `bool`, `select`, `dir` (see
+  "Directory variables" below) or `file` (see "File variables"). Purely a hint
   for how to *prompt* (a `bool` prompts y/n, a `select` shows its
   `choices` as a menu, ...) and how a UI renders an input for it — an
   incoming value (from `--set`, the environment, the cache, or a typed
   answer) is never validated against it; it's just a string either way.
+- `mode` — `type="file"` only: `open` (default) or `save`, see "File
+  variables".
+- `ext` — `type="file"` only: a comma-separated list of extensions
+  (`mp4,mkv`) the path picker highlights/filters by. A hint — a value is
+  never checked against it.
 - `prompt` — question text to show when asking for a value; defaults to
   `name` itself.
 - `default` — used if nothing else resolves the variable (see below).
@@ -1810,6 +1830,78 @@ Scope: a trusted root applies to the whole canvas, including a `dir`
 variable declared inside a node (it is not limited to that subtree).
 `include` nodes are not affected: they read their target as written and
 have no `$NAME` expansion.
+
+### File variables (`type="file"`)
+
+A `type="file"` variable holds the path of one file:
+
+    <!-- meshfox:var name="INPUT" type="file" ext="mp4,mkv,mov" -->
+    <!-- meshfox:var name="OUTPUT" type="file" mode="save" default="@tmp/out.mp4" -->
+
+- `mode="open"` (default) is an input: the file must exist and be a file.
+  `mode="save"` is an output: only its parent directory has to exist, and
+  the value must not be an existing directory. These are checked when a
+  *new* answer is accepted (`--set`, a form, a prompt) and only for what is
+  decidable without the canvas — an absolute or `~` path; a relative path or
+  `@tmp/...` is taken as written.
+- `ext="mp4,mkv"` is a filter hint for the path picker. Nothing is
+  validated against it.
+- Values are written the way a person writes them (`@tmp/...`, `~/...`,
+  relative to the canvas directory) and expanded to an absolute path when
+  used; the cache keeps the literal text. For `@tmp/dir/x.mp4` the worker
+  creates `dir/` — never `x.mp4` itself.
+
+**Trusted root.** Like a `dir`, a resolved `file` value is a trusted root
+for the canvas — but of **exactly that file**: a `file` node's target may
+resolve to it (and `$NAME` / `${NAME}` expands for `file` variables as it
+does for `dir` ones, so `[clip]($INPUT)` previews the chosen file), while
+its siblings and the directory it lives in stay out of reach. The match is
+on the canonical path, never a prefix, so a value that is — or later
+becomes — a directory grants nothing. A `mode="save"` file that does not
+exist yet is a root once a block has created it.
+
+The rules for *where the value comes from* are the `dir` ones: a `default`
+that is not `@tmp[/...]` behaves as `required` (one confirmation, then
+cached); a value from `--set`, the environment, shared config, the cache or
+a `from=` block is trusted as is. A `default` with a `..` component under
+`@tmp` is not an `@tmp` path (for `dir` variables too) and needs
+confirmation the same way.
+
+### Path pickers
+
+A `dir` or `file` field is rendered as a path field with a **Browse**
+action wherever a variable is asked for — the web variable forms and
+`form` fences, the TUI variable form. The picker lists directories through
+the worker (the file system it browses is the one blocks run against, and
+the worker may not be where the UI is):
+
+    GET /api/fs/list?path=<path>&kind=dir|file&hidden=true|false
+
+`path` is `@tmp[/...]`, `~[/...]`, absolute or relative to the canvas
+directory (empty: the canvas directory). A file path lists its directory and
+reports the file as `selected`; a path that does not exist lists its
+nearest existing ancestor. The response carries `path`, `parent`, `home`,
+`canvasDir`, `entries` (`name`, `isDir`, `size`; directories first) and
+`truncated`. Only names are returned, never content, and the browsable root
+is the whole file system. Browsing grants nothing: a path becomes a trusted
+root only as a variable value, by the rules above.
+
+In the TUI the picker opens with `Ctrl-O` on a focused `dir`/`file` field
+(of the variable form or a `form` fence) and lists through the same
+endpoint — or straight off disk when no worker is running. Keys:
+`↑`/`↓`/`j`/`k` move, `Enter`/`→` descend into a directory (or choose a
+file; for a `mode="save"` file it fills the name line), `Backspace`/`←` go
+up, `/` filters, `.` toggles hidden files, `e` toggles the `ext=` hint,
+`~` and `c` jump to the home and canvas directories, `s` or `Space` chooses
+the listed directory (a `dir` picker), `Tab` focuses the name line of a
+`save` picker, `Esc` cancels. A click selects a row; a second click on it
+activates it. So the keys can be found without knowing them, a `dir`/`file`
+field ends in a clickable `[Browse… ^o]` marker (right-aligned in the
+variable form, after the value in a `form` fence).
+
+The endpoint answers only requests whose `Host` is a loopback name and
+whose `Origin`, if any, is the server's own — a page from another origin
+open in the same browser cannot read a listing.
 
 ### CLI
 

@@ -27,11 +27,13 @@ use crate::file_read::{self, ConfineError, FilePreview, PreviewError};
 use crate::vars::{VarDecl, VarType};
 
 /// Whether `value` is `@tmp` itself or a path under it (`@tmp/...`);
-/// `@tmpfoo` is an ordinary relative path.
+/// `@tmpfoo` is an ordinary relative path. A `..` component disqualifies
+/// it: `@tmp/../..` would otherwise be taken silently as "inside the
+/// worker's own directory" while denoting somewhere else entirely.
 pub fn is_tmp_ref(value: &str) -> bool {
-    value
-        .strip_prefix("@tmp")
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    value.strip_prefix("@tmp").is_some_and(|rest| {
+        (rest.is_empty() || rest.starts_with('/')) && !rest.split('/').any(|c| c == "..")
+    })
 }
 
 /// The canvas's worker-owned temporary directory, next to its other
@@ -125,6 +127,25 @@ pub fn expand_dir_value(value: &str, canvas_path: Option<&Path>) -> String {
     }
 }
 
+/// [`expand_dir_value`] for a `file` variable's value. Differs only for
+/// `@tmp/...`: the worker creates the *parent* directory (so a block can
+/// write the file there) but never the file's own path as a directory.
+pub fn expand_file_value(value: &str, canvas_path: Option<&Path>) -> String {
+    if is_tmp_ref(value) {
+        let Some(canvas_path) = canvas_path else {
+            return value.to_string();
+        };
+        let rest = value["@tmp".len()..].trim_start_matches('/');
+        let base = tmp_dir(canvas_path);
+        let full = if rest.is_empty() { base } else { base.join(rest) };
+        if let Some(parent) = full.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        return absolutize(&full).to_string_lossy().into_owned();
+    }
+    expand_dir_value(value, canvas_path)
+}
+
 fn absolutize(p: &Path) -> PathBuf {
     if p.is_absolute() {
         p.to_path_buf()
@@ -136,7 +157,7 @@ fn absolutize(p: &Path) -> PathBuf {
 }
 
 /// Replaces `$NAME` / `${NAME}` in `target` for every `NAME` in `vars`
-/// (the resolved `dir` variables); any other `$` is left alone, so an
+/// (the resolved `dir` and `file` variables); any other `$` is left alone, so an
 /// ordinary file name containing one still works. A leading `@tmp` is
 /// expanded like a `dir` value.
 pub fn expand_target(
@@ -189,6 +210,11 @@ pub struct FileAccess {
     canvas_path: Option<PathBuf>,
     vars: HashMap<String, String>,
     roots: Vec<PathBuf>,
+    /// The values of resolved `file` variables: each is a trusted root for
+    /// exactly that file. Kept apart from `roots` on purpose — roots match
+    /// by prefix, and a file value that is (or later becomes) a directory
+    /// must never turn into a whole-directory root.
+    files: Vec<PathBuf>,
     /// `dir` variables with no trusted value yet (an unconfirmed default),
     /// so a target naming one can say so instead of just "not found".
     pending: Vec<String>,
@@ -210,11 +236,22 @@ impl FileAccess {
             canvas_path: Some(canvas_path.to_path_buf()),
             vars: values,
             roots,
+            files: Vec::new(),
             pending: Vec::new(),
         }
     }
 
-    /// Resolves `canvas`'s declared `dir` variables the same way a run
+    /// Adds the resolved `file` variable `values` (name -> expanded path):
+    /// each is usable as `$NAME` in a target and grants exactly that file.
+    pub fn with_files(mut self, values: HashMap<String, String>) -> FileAccess {
+        for (name, value) in values {
+            self.files.push(PathBuf::from(&value));
+            self.vars.insert(name, value);
+        }
+        self
+    }
+
+    /// Resolves `canvas`'s declared `dir`/`file` variables the same way a run
     /// would (overrides -> env -> cache -> shared -> trusted default) and
     /// keeps the ones that resolved; an unconfirmed or unresolvable one
     /// grants nothing.
@@ -229,11 +266,20 @@ impl FileAccess {
         let decls: Vec<VarDecl> = crate::vars::declared_vars(canvas)
             .unwrap_or_default()
             .into_iter()
-            .filter(|d| d.var_type == VarType::Dir)
+            .filter(|d| matches!(d.var_type, VarType::Dir | VarType::File))
             .collect();
         let resolved = crate::vars::resolve_with_shared(&decls, overrides, cache, computed, shared);
         let pending: Vec<String> = resolved.missing.iter().map(|d| d.name.clone()).collect();
-        let mut fa = FileAccess::from_values(canvas_path, resolved.values.into_iter().collect());
+        let file_names: std::collections::HashSet<&str> = decls
+            .iter()
+            .filter(|d| d.var_type == VarType::File)
+            .map(|d| d.name.as_str())
+            .collect();
+        let (files, dirs): (HashMap<String, String>, HashMap<String, String>) = resolved
+            .values
+            .into_iter()
+            .partition(|(name, _)| file_names.contains(name.as_str()));
+        let mut fa = FileAccess::from_values(canvas_path, dirs).with_files(files);
         fa.pending = pending;
         fa
     }
@@ -265,6 +311,11 @@ impl FileAccess {
         &self.roots
     }
 
+    /// The exact-file trusted roots (see [`FileAccess::with_files`]).
+    pub fn files(&self) -> &[PathBuf] {
+        &self.files
+    }
+
     pub fn vars(&self) -> &HashMap<String, String> {
         &self.vars
     }
@@ -283,12 +334,12 @@ impl FileAccess {
                 return Err(ConfineError::Unconfirmed(name.clone()));
             }
         }
-        file_read::confine_in(dir, &self.roots, &self.expand(target))
+        file_read::confine_in_files(dir, &self.roots, &self.files, &self.expand(target))
     }
 
     pub fn preview(&self, dir: &Path, target: &str) -> Result<FilePreview, PreviewError> {
         self.confine(dir, target)?;
-        file_read::preview_in(dir, &self.roots, &self.expand(target))
+        file_read::preview_in_files(dir, &self.roots, &self.files, &self.expand(target))
     }
 }
 
@@ -366,6 +417,61 @@ mod tests {
         assert!(fa.confine(&dir, abs_other.to_str().unwrap()).is_err());
         assert!(fa.confine(&dir, "$DATA/../../x").is_err());
         assert!(FileAccess::none().confine(&dir, "$DATA/a.csv").is_err());
+    }
+
+    #[test]
+    fn tmp_ref_with_a_dotdot_component_is_not_a_tmp_ref() {
+        assert!(!is_tmp_ref("@tmp/.."));
+        assert!(!is_tmp_ref("@tmp/a/../../b"));
+        assert!(is_tmp_ref("@tmp/a..b"));
+    }
+
+    #[test]
+    fn at_tmp_file_value_creates_only_the_parent() {
+        let dir = tmp("file-tmp");
+        let canvas = dir.join("c.canvas.md");
+        let v = expand_file_value("@tmp/out/clip.mp4", Some(&canvas));
+        assert_eq!(PathBuf::from(&v), tmp_dir(&canvas).join("out/clip.mp4"));
+        assert!(Path::new(&v).parent().unwrap().is_dir());
+        assert!(!Path::new(&v).exists());
+    }
+
+    #[test]
+    fn a_file_value_grants_exactly_that_file() {
+        let dir = tmp("ff-canvas");
+        let canvas = dir.join("c.canvas.md");
+        let media = tmp("ff-media");
+        std::fs::write(media.join("in.mp4"), "x").unwrap();
+        std::fs::write(media.join("in.mp4.txt"), "sibling").unwrap();
+        std::fs::write(media.join("other.mp4"), "y").unwrap();
+        std::fs::create_dir_all(media.join("sub")).unwrap();
+        std::fs::write(media.join("sub").join("deep.mp4"), "z").unwrap();
+
+        let mut files = HashMap::new();
+        files.insert("INPUT".to_string(), media.join("in.mp4").to_string_lossy().into_owned());
+        let fa = FileAccess::from_values(&canvas, HashMap::new()).with_files(files);
+        assert!(fa.confine(&dir, "$INPUT").is_ok());
+        let sibling = media.join("other.mp4");
+        assert!(fa.confine(&dir, sibling.to_str().unwrap()).is_err());
+        let text = media.join("in.mp4.txt");
+        assert!(fa.confine(&dir, text.to_str().unwrap()).is_err());
+        let deep = media.join("sub").join("deep.mp4");
+        assert!(fa.confine(&dir, deep.to_str().unwrap()).is_err());
+        assert!(fa.confine(&dir, "$INPUT/../other.mp4").is_err());
+    }
+
+    #[test]
+    fn a_file_value_that_is_a_directory_grants_nothing() {
+        let dir = tmp("fd-canvas");
+        let canvas = dir.join("c.canvas.md");
+        let media = tmp("fd-media");
+        std::fs::write(media.join("a.mp4"), "x").unwrap();
+        let mut files = HashMap::new();
+        files.insert("OUT".to_string(), media.to_string_lossy().into_owned());
+        let fa = FileAccess::from_values(&canvas, HashMap::new()).with_files(files);
+        let inside = media.join("a.mp4");
+        assert!(fa.confine(&dir, inside.to_str().unwrap()).is_err());
+        assert!(fa.confine(&dir, "$OUT").is_err());
     }
 
     #[test]

@@ -2725,6 +2725,151 @@ a {
   font-weight: 600;
 }
 
+/* PathPicker.tsx — the file/directory chooser behind a `dir`/`file`
+ * variable's "Browse…" button. Reuses `.vars-modal`'s card/actions; it
+ * opens from *inside* another modal (VarsForm) or a node's form fence, so
+ * its backdrop sits above `.vars-modal-backdrop`'s 2100. */
+.path-picker-backdrop {
+  z-index: 2200;
+}
+
+.path-picker {
+  width: min(640px, 92vw);
+}
+
+.path-picker-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.path-picker-bar button {
+  font: inherit;
+  font-size: 0.8rem;
+  padding: 0.25rem 0.5rem;
+  border: 1px solid var(--node-border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--fg);
+  cursor: pointer;
+}
+
+.path-picker-bar button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.path-picker-location,
+.path-picker-filter,
+.path-field input {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--node-border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+.path-picker-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.75rem;
+  white-space: nowrap;
+  opacity: 0.85;
+}
+
+.path-picker-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  height: 18rem;
+  overflow-y: auto;
+  border: 1px solid var(--node-border);
+  border-radius: 4px;
+}
+
+.path-picker-entry {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.2rem 0.5rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+  user-select: none;
+}
+
+.path-picker-entry:hover {
+  background: var(--node-border);
+}
+
+.path-picker-entry.is-picked {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+  color: var(--accent);
+}
+
+.path-picker-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.path-picker-size {
+  font-size: 0.7rem;
+  opacity: 0.6;
+  white-space: nowrap;
+}
+
+.path-picker-empty {
+  padding: 0.6rem 0.75rem;
+  font-size: 0.8rem;
+  opacity: 0.6;
+}
+
+.vars-modal-actions .path-picker-choose {
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.vars-modal-actions .path-picker-choose:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.path-picker-target {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono, monospace);
+}
+
+/* PathField (PathPicker.tsx) — the text input and "Browse…" button of a
+ * `dir`/`file` field, inside `.vars-modal-field` or a node's form fence. */
+.path-field {
+  display: flex;
+  gap: 0.4rem;
+  align-items: stretch;
+}
+
+.path-field-browse {
+  font: inherit;
+  font-size: 0.8rem;
+  padding: 0.3rem 0.6rem;
+  border: 1px solid var(--node-border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--fg);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
 /* NodeSettings.tsx — reuses .vars-modal's backdrop/card/field/actions
  * wholesale (same "small blocking form" shape); only the color swatches
  * and the extra-edges chip list below are genuinely new. */

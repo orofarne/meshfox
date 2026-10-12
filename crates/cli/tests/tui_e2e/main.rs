@@ -36,6 +36,7 @@ mod mouse_modals;
 mod mouse_output_pane;
 mod mouse_resize;
 mod mouse_run_buttons;
+mod path_picker;
 mod run_history;
 mod services;
 mod table_view;

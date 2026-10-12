@@ -93,6 +93,13 @@ pub enum ClickTarget {
     /// directly, no prior field focus needed, same one-click convention
     /// `RunBlock` already has for a `button` fence's marker.
     FormSend { node_id: String, block_name: String },
+    /// The `[Browse… ^o]` marker after a `dir`/`file` field's value —
+    /// focuses the field and opens the path picker, same as `Ctrl-O` there.
+    FormBrowse {
+        node_id: String,
+        block_name: String,
+        field_index: usize,
+    },
 }
 
 /// One clickable span inside a rendered `Segment::Text`, in the segment's
@@ -600,11 +607,15 @@ struct Renderer<'a> {
     image_alt: Option<String>,
 }
 
+/// One table cell: its inline content as styled spans (code, emphasis,
+/// links keep their look), so a cell's width is the sum of its spans'.
+type TableCell = Vec<Span<'static>>;
+
 struct TableState {
     alignments: Vec<Alignment>,
-    rows: Vec<Vec<String>>,
-    current_row: Vec<String>,
-    current_cell: String,
+    rows: Vec<Vec<TableCell>>,
+    current_row: Vec<TableCell>,
+    current_cell: TableCell,
     in_head: bool,
 }
 
@@ -725,7 +736,9 @@ impl<'a> Renderer<'a> {
         "  ".repeat(self.quote_depth + self.list_stack.len())
     }
 
-    fn push_text(&mut self, text: &str, extra: Style) {
+    /// The style the currently open inline markers (emphasis, strong,
+    /// code, link, ...) add up to.
+    fn inline_style(&self) -> Style {
         let mut style = Style::default();
         for m in &self.inline_stack {
             style = match m {
@@ -740,6 +753,11 @@ impl<'a> Renderer<'a> {
                     .add_modifier(Modifier::UNDERLINED),
             };
         }
+        style
+    }
+
+    fn push_text(&mut self, text: &str, extra: Style) {
+        let style = self.inline_style();
         self.current
             .push(Span::styled(text.to_string(), style.patch(extra)));
     }
@@ -1141,18 +1159,38 @@ impl<'a> Renderer<'a> {
             Event::Text(t) => {
                 if self.code_lang.is_some() {
                     self.code_buf.push_str(&t);
-                } else if let Some(table) = &mut self.table {
-                    table
-                        .current_cell
-                        .push_str(&meshfox_core::subsup::render_unicode(&t));
+                } else if self.table.is_some() {
+                    let span = Span::styled(
+                        meshfox_core::subsup::render_unicode(&t),
+                        self.inline_style(),
+                    );
+                    if let Some(table) = &mut self.table {
+                        table.current_cell.push(span);
+                    }
                 } else {
                     self.push_text(&meshfox_core::subsup::render_unicode(&t), Style::default());
+                }
+            }
+            // A table cell is collected as one plain string (see `TableState`),
+            // so inline code inside it belongs there too — pushed into
+            // `current` it would be flushed after the whole table instead.
+            Event::Code(t) if self.table.is_some() => {
+                self.inline_stack.push(Inline::Code);
+                let span = Span::styled(t.to_string(), self.inline_style());
+                self.inline_stack.pop();
+                if let Some(table) = &mut self.table {
+                    table.current_cell.push(span);
                 }
             }
             Event::Code(t) => {
                 self.inline_stack.push(Inline::Code);
                 self.push_text(&t, Style::default());
                 self.inline_stack.pop();
+            }
+            Event::SoftBreak if self.table.is_some() => {
+                if let Some(table) = &mut self.table {
+                    table.current_cell.push(Span::raw(" "));
+                }
             }
             Event::SoftBreak => self.push_text(" ", Style::default()),
             Event::HardBreak => self.flush_line(),
@@ -1367,7 +1405,7 @@ impl<'a> Renderer<'a> {
                     alignments,
                     rows: Vec::new(),
                     current_row: Vec::new(),
-                    current_cell: String::new(),
+                    current_cell: Vec::new(),
                     in_head: false,
                 });
             }
@@ -1528,8 +1566,31 @@ impl<'a> Renderer<'a> {
                         _ => None,
                     };
 
-                    let mut lines: Vec<Line<'static>> = Vec::new();
+                    // The same frame a code block gets (`┌─ lang · name`
+                    // header, `│ ` gutter, `└─` foot) and the same selection
+                    // rules: accent border and a filled header while the
+                    // Document pane has focus, dimmed when it has not, `›`
+                    // in place of the corner only while focused. Selecting
+                    // never changes a line's width or the form's height.
+                    let selected = click_name.is_some()
+                        && click_name.as_deref() == self.selected_block.as_deref();
+                    let border = self.block_border(click_name.as_deref());
+                    let header_style = self.block_header(click_name.as_deref());
+                    let editing_this = focused_index.is_some();
+                    let gutter_chars = 2u16; // "│ "
+                    let browse_text = super::path_picker::BROWSE_MARKER;
+                    let browse_chars = browse_text.chars().count() as u16;
+
+                    let corner = if self.focused && selected { "›─" } else { "┌─" };
+                    let mut header = format!("{corner} form · {form_name} ");
+                    if editing_this {
+                        header.push_str("· editing ");
+                    }
+                    let mut lines: Vec<Line<'static>> =
+                        vec![Line::from(Span::styled(header, header_style))];
                     let mut col_ends: Vec<u16> = Vec::new();
+                    // `(field index, col_start, col_end)` of each Browse marker.
+                    let mut browse_spans: Vec<(usize, u16, u16)> = Vec::new();
                     for (i, field) in fields.iter().enumerate() {
                         let focused = focused_index == Some(i);
                         let label = field.label.clone().unwrap_or_else(|| field.var.clone());
@@ -1539,8 +1600,8 @@ impl<'a> Renderer<'a> {
                             .cloned()
                             .unwrap_or_default();
                         let prefix = format!("{label}: ");
-                        let col_end =
-                            (prefix.chars().count() + value.chars().count().max(1)) as u16;
+                        let col_end = gutter_chars
+                            + (prefix.chars().count() + value.chars().count().max(1)) as u16;
                         // A blinking `_` text cursor on the focused row's
                         // own value, same convention `render_var_form`
                         // (`ui.rs`) already uses for its own text fields —
@@ -1561,6 +1622,11 @@ impl<'a> Renderer<'a> {
                                 Some(meshfox_core::vars::VarType::Bool)
                                     | Some(meshfox_core::vars::VarType::Select)
                             );
+                        let browsable = matches!(
+                            var_type,
+                            Some(meshfox_core::vars::VarType::Dir)
+                                | Some(meshfox_core::vars::VarType::File)
+                        );
                         let mut shown = if value.is_empty() {
                             " ".to_string()
                         } else {
@@ -1569,8 +1635,9 @@ impl<'a> Renderer<'a> {
                         if cursor {
                             shown.push('_');
                         }
+                        let shown_chars = shown.chars().count() as u16;
                         let mut value_span = Span::styled(shown, value_style);
-                        let mut label_span = Span::styled(prefix, label_style);
+                        let mut label_span = Span::styled(prefix.clone(), label_style);
                         if focused {
                             label_span = label_span
                                 .patch_style(Style::default().add_modifier(Modifier::REVERSED));
@@ -1581,17 +1648,33 @@ impl<'a> Renderer<'a> {
                                     Modifier::REVERSED
                                 }));
                         }
-                        lines.push(Line::from(vec![label_span, value_span]));
+                        let mut spans = vec![Span::styled("│ ", border), label_span, value_span];
+                        if browsable {
+                            let start =
+                                gutter_chars + prefix.chars().count() as u16 + shown_chars + 2;
+                            spans.push(Span::raw("  "));
+                            spans.push(Span::styled(browse_text, marker_style));
+                            browse_spans.push((i, start, start + browse_chars));
+                        }
+                        lines.push(Line::from(spans));
                         col_ends.push(col_end);
                     }
                     let send_line = format!("[{send_caption}]");
-                    let send_col_end = send_line.chars().count() as u16;
+                    let send_col_end = gutter_chars + send_line.chars().count() as u16;
                     let mut send_span = Span::styled(send_line, marker_style);
                     if focused_index == Some(fields.len()) {
                         send_span = send_span
                             .patch_style(Style::default().add_modifier(Modifier::REVERSED));
                     }
-                    lines.push(Line::from(send_span));
+                    lines.push(Line::from(vec![Span::styled("│ ", border), send_span]));
+                    let foot = if editing_this {
+                        "└─ ↑/↓ field · enter apply · esc done"
+                    } else {
+                        "└─"
+                    };
+                    lines.push(Line::from(Span::styled(foot, border)));
+                    let foot_index = lines.len() - 1;
+                    let header_width = lines[0].width().min(u16::MAX as usize) as u16;
 
                     self.push_segment(Segment::Text(lines));
                     if let Some(block_name) = click_name {
@@ -1599,7 +1682,7 @@ impl<'a> Renderer<'a> {
                         for (i, col_end) in col_ends.into_iter().enumerate() {
                             self.click_regions.push(ClickRegion {
                                 segment_index,
-                                line_index: i,
+                                line_index: i + 1,
                                 col_start: 0,
                                 col_end,
                                 target: ClickTarget::FormField {
@@ -1609,16 +1692,46 @@ impl<'a> Renderer<'a> {
                                 },
                             });
                         }
+                        for (i, col_start, col_end) in browse_spans {
+                            self.click_regions.push(ClickRegion {
+                                segment_index,
+                                line_index: i + 1,
+                                col_start,
+                                col_end,
+                                target: ClickTarget::FormBrowse {
+                                    node_id: self.node_id.to_string(),
+                                    block_name: block_name.clone(),
+                                    field_index: i,
+                                },
+                            });
+                        }
                         self.click_regions.push(ClickRegion {
                             segment_index,
-                            line_index: fields.len(),
-                            col_start: 0,
+                            line_index: fields.len() + 1,
+                            col_start: gutter_chars,
                             col_end: send_col_end,
                             target: ClickTarget::FormSend {
                                 node_id: self.node_id.to_string(),
-                                block_name,
+                                block_name: block_name.clone(),
                             },
                         });
+                        // Header and foot select the form, like clicking a
+                        // code block's frame does.
+                        for (line_index, col_end) in
+                            [(0usize, header_width), (foot_index, 40u16)]
+                        {
+                            self.click_regions.push(ClickRegion {
+                                segment_index,
+                                line_index,
+                                col_start: 0,
+                                col_end,
+                                target: ClickTarget::Block {
+                                    node_id: self.node_id.to_string(),
+                                    block_name: block_name.clone(),
+                                    action: BlockAction::Select,
+                                },
+                            });
+                        }
                     }
                     return;
                 }
@@ -1919,38 +2032,40 @@ impl<'a> Renderer<'a> {
 }
 
 fn render_table(t: &TableState) -> Vec<Line<'static>> {
+    let cell_width =
+        |cell: &TableCell| -> usize { cell.iter().map(|s| s.content.chars().count()).sum() };
     let cols = t.rows.iter().map(|r| r.len()).max().unwrap_or(0);
     let mut widths = vec![0usize; cols];
     for row in &t.rows {
         for (i, cell) in row.iter().enumerate() {
-            widths[i] = widths[i].max(cell.chars().count());
+            widths[i] = widths[i].max(cell_width(cell));
         }
     }
-    let pad = |cell: &str, w: usize, align: Alignment| -> String {
-        let len = cell.chars().count();
-        let gap = w.saturating_sub(len);
-        match align {
-            Alignment::Right => format!("{}{cell}", " ".repeat(gap)),
-            Alignment::Center => {
-                let left = gap / 2;
-                format!("{}{cell}{}", " ".repeat(left), " ".repeat(gap - left))
-            }
-            _ => format!("{cell}{}", " ".repeat(gap)),
-        }
-    };
     let mut lines = Vec::new();
     for (ri, row) in t.rows.iter().enumerate() {
         let mut spans = Vec::new();
         for (i, w) in widths.iter().enumerate() {
-            let cell = row.get(i).map(String::as_str).unwrap_or("");
+            let cell: &[Span<'static>] = row.get(i).map(Vec::as_slice).unwrap_or(&[]);
             let align = t.alignments.get(i).copied().unwrap_or(Alignment::None);
-            let text = pad(cell, *w, align);
-            let style = if ri == 0 {
-                Style::default().add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
+            let gap = w.saturating_sub(cell.iter().map(|s| s.content.chars().count()).sum());
+            let (left, right) = match align {
+                Alignment::Right => (gap, 0),
+                Alignment::Center => (gap / 2, gap - gap / 2),
+                _ => (0, gap),
             };
-            spans.push(Span::styled(text, style));
+            if left > 0 {
+                spans.push(Span::raw(" ".repeat(left)));
+            }
+            for span in cell {
+                let mut span = span.clone();
+                if ri == 0 {
+                    span = span.patch_style(Style::default().add_modifier(Modifier::BOLD));
+                }
+                spans.push(span);
+            }
+            if right > 0 {
+                spans.push(Span::raw(" ".repeat(right)));
+            }
             spans.push(Span::raw(" │ "));
         }
         lines.push(Line::from(spans));
@@ -2012,6 +2127,80 @@ mod tests {
             duration_ms: 5,
             running,
         }
+    }
+
+    #[test]
+    fn table_cells_keep_their_inline_styles_and_alignment() {
+        let hl = Highlighter::new();
+        let md = "| a | b |\n|:-:|--:|\n| `code` | **bold** |\n";
+        let (segs, _) = render(
+            md,
+            Path::new("/x"),
+            &hl,
+            "n",
+            &[],
+            &std::collections::HashMap::new(),
+            None,
+            &std::collections::HashMap::new(),
+        );
+        let lines: Vec<&Line> = segs
+            .iter()
+            .filter_map(|s| match s {
+                Segment::Text(l) => Some(l),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        let row = lines
+            .iter()
+            .find(|l| l.to_string().contains("code"))
+            .expect("the body row");
+        let code = row.spans.iter().find(|s| s.content == "code").unwrap();
+        assert_eq!(code.style.fg, Some(Color::Rgb(255, 184, 108)), "code keeps its colour");
+        let bold = row.spans.iter().find(|s| s.content == "bold").unwrap();
+        assert!(bold.style.add_modifier.contains(Modifier::BOLD));
+        // `--:` right-aligns: "bold" (4) under header "b" (1) is the wider
+        // cell, so column b is 4 wide and its header gets 3 spaces of left pad.
+        let header = lines.iter().find(|l| l.to_string().starts_with("a")).or(lines.first()).unwrap();
+        assert!(
+            lines.iter().any(|l| l.to_string().contains("   b")),
+            "right-aligned header: {header:?}"
+        );
+    }
+
+    #[test]
+    fn inline_code_in_a_table_cell_stays_in_its_cell() {
+        let hl = Highlighter::new();
+        let md = "| Variable | What |\n|---|---|\n| `INPUT` | pick a `file` now |\n| `OUT` | name it |\n";
+        let (segs, _) = render(
+            md,
+            Path::new("/x"),
+            &hl,
+            "n",
+            &[],
+            &std::collections::HashMap::new(),
+            None,
+            &std::collections::HashMap::new(),
+        );
+        let lines: Vec<String> = segs
+            .iter()
+            .filter_map(|s| match s {
+                Segment::Text(lines) => Some(lines),
+                _ => None,
+            })
+            .flatten()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect();
+        let row = lines
+            .iter()
+            .find(|l| l.contains("INPUT"))
+            .unwrap_or_else(|| panic!("no INPUT cell in {lines:?}"));
+        assert!(row.contains("pick a file now"), "code stayed in the row: {row:?}");
+        assert!(lines.iter().any(|l| l.contains("OUT") && l.contains("name it")));
+        assert!(
+            !lines.iter().any(|l| l.trim() == "INPUTfileOUT"),
+            "code spans must not be flushed after the table: {lines:?}"
+        );
     }
 
     #[test]
@@ -2465,6 +2654,8 @@ mod tests {
             session: false,
             default_var: None,
             choices_var: None,
+            file_mode: None,
+            ext: Vec::new(),
         }];
         let mut values = std::collections::HashMap::new();
         values.insert("NAME".to_string(), "abc".to_string());
@@ -2495,7 +2686,8 @@ mod tests {
             else {
                 unreachable!()
             };
-            lines[0].spans[1].clone()
+            // Line 0 is the frame's header; then `│ `, label, value.
+            lines[1].spans[2].clone()
         };
         let unfocused_value = value_span(&unfocused);
         let focused_value = value_span(&focused);

@@ -21,6 +21,7 @@ pub mod exec;
 pub mod fence;
 pub mod file_read;
 pub mod form;
+pub mod fsbrowse;
 pub mod image_attrs;
 pub mod include;
 pub mod locate;
@@ -63,7 +64,7 @@ pub use fence::{
 };
 pub mod dirvars;
 pub use dirvars::{
-    expand_dir_value, expand_target, is_tmp_ref, reset_tmp, tmp_dir, tmp_size, FileAccess,
+    expand_dir_value, expand_file_value, expand_target, is_tmp_ref, reset_tmp, tmp_dir, tmp_size, FileAccess,
 };
 pub use file_read::{
     confine, confine_in, preview, preview_in, ConfineError, FilePreview, PreviewError,
@@ -89,7 +90,7 @@ pub use varout::{
 pub use vars::{
     close_over_var_refs, declared_vars, map_block_env, resolve as resolve_vars, resolve_block_env,
     resolve_block_env_with_shared, resolve_with_shared, validate_env_refs, validate_value,
-    validate_var_refs, validate_var_scope, BlockEnvResolution, ResolvedVars, VarDecl, VarType,
+    validate_var_refs, validate_var_scope, BlockEnvResolution, FileMode, ResolvedVars, VarDecl, VarType,
     VarsError,
 };
 

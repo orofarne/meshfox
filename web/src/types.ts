@@ -189,9 +189,15 @@ export type VarOrigin = { scope: "project" } | { scope: "global"; path?: string 
 
 export interface VarStatus {
   name: string;
-  type: "string" | "int" | "bool" | "select" | "dir";
+  type: "string" | "int" | "bool" | "select" | "dir" | "file";
   prompt: string;
   choices?: string[];
+  /** `type="file"` only: `open` (the file must exist) or `save` (an output
+   * path; only its directory must exist). */
+  mode?: "open" | "save";
+  /** `type="file"` only: extensions (lowercase, no dot) the path picker
+   * filters by — a hint, never validated. */
+  ext?: string[];
   secret: boolean;
   resolved: boolean;
   value?: string;
@@ -208,4 +214,26 @@ export interface VarStatus {
   /** `GET /api/vars/configure` only, for a `secret` field: whether the
    * secret store holds a value for it (never the value itself). */
   stored?: boolean;
+}
+
+/** One entry of `GET /api/fs/list` — see `meshfox_core::fsbrowse`. */
+export interface FsEntry {
+  name: string;
+  isDir: boolean;
+  /** Bytes; files only. */
+  size?: number;
+}
+
+/** `GET /api/fs/list`'s response: one directory, as the worker sees it. */
+export interface FsListing {
+  /** The directory listed — absolute and canonical. */
+  path: string;
+  /** Absent at the file system root. */
+  parent?: string;
+  home?: string;
+  canvasDir: string;
+  /** When the requested path named a file: its name inside `path`. */
+  selected?: string;
+  entries: FsEntry[];
+  truncated: boolean;
 }

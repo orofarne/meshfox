@@ -45,6 +45,19 @@ pub fn confine(dir: &Path, target: &str) -> Result<PathBuf, ConfineError> {
 /// can't contain an existing target anyway), so `..` and symlinks can't
 /// step out of a root any more than out of `dir`.
 pub fn confine_in(dir: &Path, roots: &[PathBuf], target: &str) -> Result<PathBuf, ConfineError> {
+    confine_in_files(dir, roots, &[], target)
+}
+
+/// [`confine_in`] plus exact-file roots: a result is also accepted when it
+/// *is* one of `files` (canonicalized; equality, never a prefix match, and a
+/// `files` entry that is not an existing regular file grants nothing). This
+/// is what a `type="file"` variable's value grants.
+pub fn confine_in_files(
+    dir: &Path,
+    roots: &[PathBuf],
+    files: &[PathBuf],
+    target: &str,
+) -> Result<PathBuf, ConfineError> {
     let dir = dir
         .canonicalize()
         .map_err(|e| ConfineError::DirNotFound(dir.to_path_buf(), e))?;
@@ -56,7 +69,11 @@ pub fn confine_in(dir: &Path, roots: &[PathBuf], target: &str) -> Result<PathBuf
         || roots
             .iter()
             .filter_map(|r| r.canonicalize().ok())
-            .any(|r| resolved.starts_with(r));
+            .any(|r| resolved.starts_with(r))
+        || files
+            .iter()
+            .filter_map(|f| f.canonicalize().ok())
+            .any(|f| f.is_file() && resolved == f);
     if !allowed {
         return Err(ConfineError::Outside(resolved));
     }
@@ -100,7 +117,17 @@ pub fn preview_in(
     roots: &[PathBuf],
     target: &str,
 ) -> Result<FilePreview, PreviewError> {
-    let resolved = confine_in(dir, roots, target)?;
+    preview_in_files(dir, roots, &[], target)
+}
+
+/// [`preview_in`] with exact-file roots (see [`confine_in_files`]).
+pub fn preview_in_files(
+    dir: &Path,
+    roots: &[PathBuf],
+    files: &[PathBuf],
+    target: &str,
+) -> Result<FilePreview, PreviewError> {
+    let resolved = confine_in_files(dir, roots, files, target)?;
     let bytes = fs::read(&resolved).map_err(|e| PreviewError::Read(resolved.clone(), e))?;
     let sample_len = bytes.len().min(8000);
     if bytes[..sample_len].contains(&0) {

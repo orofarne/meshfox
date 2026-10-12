@@ -30,3 +30,34 @@ echo "REGIONS_LIST=us-east-1,eu-west-1" >> "$MESHFOX_VARS_OUT"
 ```bash name="use-region" env="$REGION"
 echo "using $REGION"
 ```
+
+
+## Clips
+<!-- meshfox:node id="clips" -->
+
+A `type="file"` variable: the run-gate modal shows it as a path field with a
+"Browse…" button (the worker-backed file browser, see `path-picker.canvas.md`).
+`path-picker-data/` is a sibling of this canvas in the copied fixtures dir.
+
+<!-- meshfox:var name="CLIP" type="file" ext="mp4,mkv" prompt="Clip?" required session -->
+
+```bash name="use-clip" env="$CLIP"
+echo "clip is $CLIP"
+```
+
+
+## Report
+<!-- meshfox:node id="report" -->
+
+A block that writes a file the node below previews with `display="code"` —
+the preview has to re-read it when the run ends, not only when the node
+first mounts (`FileRefreshContext` in `web/src/MeshNode.tsx`).
+
+```bash name="write-report"
+echo "report-$(date +%s%N)" > report.txt
+```
+
+### Report file
+<!-- meshfox:node id="report-file" type="file" display="code" -->
+
+[report.txt](report.txt)

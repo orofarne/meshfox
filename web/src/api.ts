@@ -1,4 +1,4 @@
-import type { CanvasDoc, CanvasNode, ExtraEdgeDto, NodeType, ServiceStatusDto, VarStatus } from "./types";
+import type { CanvasDoc, CanvasNode, ExtraEdgeDto, FsListing, NodeType, ServiceStatusDto, VarStatus } from "./types";
 import { isVSCodeHost, vscodeApi } from "./vscodeHost";
 import { isEmptyView, type TableMeta, type TableRowsPage, type ViewSpec } from "./tableView";
 
@@ -68,6 +68,27 @@ export async function saveConfigureVars(
     body: JSON.stringify({ vars: answers, secrets, clear }),
   });
   if (!res.ok) throw new Error(`POST /api/vars/configure: ${res.status}`);
+}
+
+/**
+ * `GET /api/fs/list` — a directory of the worker's file system, for the
+ * `dir`/`file` variable pickers (SPEC.md, "Path pickers"). `path` may be
+ * `@tmp[/...]`, `~[/...]`, absolute or relative to the canvas directory;
+ * a file path lists its directory, a missing one its nearest existing
+ * ancestor. Names only — never file content.
+ */
+export async function fetchFsList(
+  path: string,
+  kind: "dir" | "file",
+  hidden: boolean,
+): Promise<FsListing> {
+  const params = new URLSearchParams({ path, kind, hidden: String(hidden) });
+  const res = await fetch(`/api/fs/list?${params}`);
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `GET /api/fs/list: ${res.status}`);
+  }
+  return res.json();
 }
 
 /** One field of a `form`-lang fence's own `GET /api/form/fields` response
@@ -1490,6 +1511,10 @@ export function watchChanges(
    * reset: `GET /api/runs` may differ from what was last fetched, so refetch
    * it. Optional — a caller that skips this just relies on its own polling. */
   onRunsChanged?: () => void,
+  /** `"files-changed"` — the target of a `display="code"` file node changed
+   * on disk (a block wrote it, an editor edited it): re-read the preview.
+   * Optional. */
+  onFilesChanged?: () => void,
 ): () => void {
   let leaving = false;
   let stopped = false;
@@ -1543,6 +1568,8 @@ export function watchChanges(
           onChanged();
         } else if (event.type === "runs-changed") {
           onRunsChanged?.();
+        } else if (event.type === "files-changed") {
+          onFilesChanged?.();
         } else if (event.type === "run-started" && event.nodeId !== undefined && event.block !== undefined) {
           onRunStarted?.(event.nodeId, event.block, event.runId);
         } else if (event.type === "node-upserted" && event.node !== undefined) {

@@ -7,6 +7,7 @@ import remarkSubSup from "./remarkSubSup";
 import remarkGfmAlerts from "./remarkGfmAlerts";
 import { highlightToHtml } from "./shiki";
 import { FileTablePreview } from "./TablePreview";
+import { PathField } from "./PathPicker";
 import {
   BUTTON_LANG,
   FORM_LANG,
@@ -87,6 +88,12 @@ const allowDataImageUrls: UrlTransform = (url, key, node) => {
  * needs, without needing `node`/parent access react-markdown doesn't give it.
  */
 const InsideMarkdownPre = createContext(false);
+
+/** Bumped by `App` on the watch socket's `"files-changed"` — the server
+ * noticed (by mtime/size, like it does for the canvas file) that the target
+ * of some `display="code"` file node changed on disk: the signal for such a
+ * preview to re-read its own target. */
+export const FileRefreshContext = createContext(0);
 
 /**
  * A fenced code block embedded in plain prose (not a runnable/constraint
@@ -1965,6 +1972,16 @@ function FormBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData
                 </option>
               ))}
             </select>
+          ) : f.type === "dir" || f.type === "file" ? (
+            <PathField
+              kind={f.type}
+              mode={f.mode}
+              ext={f.ext}
+              value={values[f.name] ?? ""}
+              onChange={(value) => set(f.name, value)}
+              label={f.label ?? f.prompt}
+              autoFocus={i === 0}
+            />
           ) : (
             <input
               type={f.type === "int" ? "number" : f.secret ? "password" : "text"}
@@ -2296,6 +2313,7 @@ function extensionOf(target: string | undefined): string | undefined {
  */
 function FileCodePreview({ nodeId, target, lang }: { nodeId: string; target?: string; lang?: string }) {
   const wheelRef = useStopWheelIfScrollable<HTMLDivElement>();
+  const refreshTick = useContext(FileRefreshContext);
   const [state, setState] = useState<
     | { status: "loading" }
     | { status: "error"; message: string }
@@ -2304,7 +2322,9 @@ function FileCodePreview({ nodeId, target, lang }: { nodeId: string; target?: st
 
   useEffect(() => {
     let cancelled = false;
-    setState({ status: "loading" });
+    // A refresh (`refreshTick` changed) keeps showing the old preview until
+    // the new one arrives — no flash of "loading…" after every run.
+    setState((prev) => (prev.status === "ready" ? prev : { status: "loading" }));
     fetchNodeFileContent(nodeId)
       .then(async ({ content, truncated }) => {
         const html = await highlightToHtml(content, lang ?? extensionOf(target) ?? "text");
@@ -2319,7 +2339,7 @@ function FileCodePreview({ nodeId, target, lang }: { nodeId: string; target?: st
     return () => {
       cancelled = true;
     };
-  }, [nodeId, target, lang]);
+  }, [nodeId, target, lang, refreshTick]);
 
   if (state.status === "error") {
     return (

@@ -24,6 +24,37 @@ pub enum VarType {
     /// variables"): the value, once supplied or confirmed by the user (or
     /// created by the worker, `@tmp`), becomes a trusted root.
     Dir,
+    /// A single file path (SPEC.md, "File variables"): the value, once
+    /// supplied or confirmed, becomes a trusted root consisting of exactly
+    /// that file (never its directory) for `file` nodes.
+    File,
+}
+
+/// `mode=` of a `type="file"` variable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileMode {
+    /// The file must already exist (an input).
+    Open,
+    /// The file is going to be produced (an output): only its parent
+    /// directory has to exist.
+    Save,
+}
+
+impl FileMode {
+    fn parse(s: &str) -> Option<FileMode> {
+        match s {
+            "open" => Some(FileMode::Open),
+            "save" => Some(FileMode::Save),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FileMode::Open => "open",
+            FileMode::Save => "save",
+        }
+    }
 }
 
 impl VarType {
@@ -34,6 +65,7 @@ impl VarType {
             "bool" => Some(VarType::Bool),
             "select" => Some(VarType::Select),
             "dir" => Some(VarType::Dir),
+            "file" => Some(VarType::File),
             _ => None,
         }
     }
@@ -45,6 +77,7 @@ impl VarType {
             VarType::Bool => "bool",
             VarType::Select => "select",
             VarType::Dir => "dir",
+            VarType::File => "file",
         }
     }
 }
@@ -116,6 +149,13 @@ pub struct VarDecl {
     /// Mutually exclusive with a literal `choices=` and with `from=`;
     /// requires `type="select"`, same as a literal `choices=` does.
     pub choices_var: Option<String>,
+    /// `mode="open"|"save"` — only `Some` for `type="file"` (`open` when
+    /// the attribute is omitted).
+    pub file_mode: Option<FileMode>,
+    /// `ext="mp4,mkv"` — a hint for a file picker's filter (lowercase, no
+    /// leading dot). Never validated against a value. Only meaningful for
+    /// `type="file"`.
+    pub ext: Vec<String>,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -124,8 +164,12 @@ pub enum VarsError {
     EnvNameTemplate(String, String, String),
     #[error("a meshfox:var comment is missing its required name= attribute")]
     MissingName,
-    #[error("meshfox:var {0:?} has unknown type={1:?} (expected string, int, bool, or select)")]
+    #[error("meshfox:var {0:?} has unknown type={1:?} (expected string, int, bool, select, dir, or file)")]
     UnknownType(String, String),
+    #[error("meshfox:var {0:?} has mode= or ext= but type={1:?} (expected file)")]
+    FileAttrRequiresFile(String, String),
+    #[error("meshfox:var {0:?} has unknown mode={1:?} (expected open or save)")]
+    UnknownFileMode(String, String),
     #[error("meshfox:var {0:?} has type=select but no choices= attribute")]
     SelectMissingChoices(String),
     #[error("duplicate meshfox:var name {0:?}")]
@@ -182,6 +226,8 @@ const VAR_ATTRS: &[&str] = &[
     "default",
     "default_var",
     "from",
+    "mode",
+    "ext",
 ];
 
 fn parse_var_comment(line: &str) -> Option<HashMap<String, String>> {
@@ -218,6 +264,30 @@ pub(crate) fn build_var_decl(attrs: HashMap<String, String>) -> Result<VarDecl, 
     if var_type == VarType::Select && choices.is_empty() && choices_var.is_none() {
         return Err(VarsError::SelectMissingChoices(name));
     }
+    let file_mode = match attrs.get("mode") {
+        None => None,
+        Some(m) => Some(
+            FileMode::parse(m)
+                .ok_or_else(|| VarsError::UnknownFileMode(name.clone(), m.clone()))?,
+        ),
+    };
+    let ext: Vec<String> = attrs
+        .get("ext")
+        .map(|v| {
+            split_choices(v)
+                .into_iter()
+                .map(|e| e.trim_start_matches('.').to_ascii_lowercase())
+                .filter(|e| !e.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    if var_type != VarType::File && (file_mode.is_some() || attrs.contains_key("ext")) {
+        return Err(VarsError::FileAttrRequiresFile(
+            name,
+            var_type.as_str().to_string(),
+        ));
+    }
+    let file_mode = (var_type == VarType::File).then(|| file_mode.unwrap_or(FileMode::Open));
     let secret = attrs.get("secret").map(|v| v != "false").unwrap_or(false);
     let required = attrs.get("required").map(|v| v != "false").unwrap_or(false);
     let session = attrs.get("session").map(|v| v != "false").unwrap_or(false);
@@ -264,6 +334,8 @@ pub(crate) fn build_var_decl(attrs: HashMap<String, String>) -> Result<VarDecl, 
         session,
         default_var,
         choices_var,
+        file_mode,
+        ext,
     })
 }
 
@@ -307,10 +379,58 @@ fn validate_dir_value(name: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A `file` value is `@tmp/...`, `~/...`, or an absolute or canvas-relative
+/// path. `@tmp` itself, a trailing `/` and `@tmp/..` are rejected. Anything
+/// that can be checked without the canvas path (an absolute or `~` path)
+/// is: an existing directory is always rejected (a file value must never
+/// become a directory root, see `dirvars::FileAccess`), and `mode="open"`
+/// additionally requires the file to exist. A relative path or `@tmp`
+/// reference is accepted as written — the picker always answers with an
+/// absolute path.
+fn validate_file_value(decl: &VarDecl, value: &str) -> Result<(), String> {
+    let name = &decl.name;
+    if value.is_empty() {
+        return Err(format!("{name:?} expects a file path, got an empty value"));
+    }
+    if value.ends_with('/') {
+        return Err(format!("{name:?}: {value:?} names a directory, not a file"));
+    }
+    if let Some(rest) = value.strip_prefix("@tmp") {
+        if rest.is_empty() || rest.starts_with('/') {
+            if rest.is_empty() {
+                return Err(format!("{name:?}: @tmp is a directory, not a file"));
+            }
+            if rest.split('/').any(|c| c == "..") {
+                return Err(format!("{name:?}: {value:?} escapes @tmp"));
+            }
+            return Ok(());
+        }
+    }
+    let expanded = if value == "~" || value.starts_with("~/") {
+        match std::env::var_os("HOME") {
+            Some(h) => std::path::Path::new(&h).join(value.trim_start_matches('~').trim_start_matches('/')),
+            None => return Ok(()),
+        }
+    } else {
+        std::path::PathBuf::from(value)
+    };
+    if !expanded.is_absolute() {
+        return Ok(());
+    }
+    if expanded.is_dir() {
+        return Err(format!("{name:?}: {value:?} is a directory, not a file"));
+    }
+    if decl.file_mode != Some(FileMode::Save) && !expanded.is_file() {
+        return Err(format!("{name:?}: {value:?} does not exist"));
+    }
+    Ok(())
+}
+
 pub fn validate_value(decl: &VarDecl, value: &str) -> Result<(), String> {
     match decl.var_type {
         VarType::String => Ok(()),
         VarType::Dir => validate_dir_value(&decl.name, value),
+        VarType::File => validate_file_value(decl, value),
         VarType::Int => value
             .parse::<i64>()
             .map(|_| ())
@@ -1066,7 +1186,7 @@ pub fn resolve_with_shared(
         // one-time confirmation `required` does (SPEC.md, "Directory
         // variables").
         let needs_confirmation = decl.required
-            || (decl.var_type == VarType::Dir
+            || (matches!(decl.var_type, VarType::Dir | VarType::File)
                 && effective_default
                     .as_deref()
                     .is_some_and(|d| !crate::dirvars::is_tmp_ref(d)));
@@ -1095,6 +1215,13 @@ pub fn resolve_with_shared(
     for decl in decls.iter().filter(|d| d.var_type == VarType::Dir) {
         if let Some(v) = values.get_mut(&decl.name) {
             *v = crate::dirvars::expand_dir_value(v, cache.canvas_path());
+        }
+    }
+    // Same for a `file` value; `@tmp/a/b.mp4` must not be created as a
+    // directory, only its parent is.
+    for decl in decls.iter().filter(|d| d.var_type == VarType::File) {
+        if let Some(v) = values.get_mut(&decl.name) {
+            *v = crate::dirvars::expand_file_value(v, cache.canvas_path());
         }
     }
     ResolvedVars {
@@ -1587,6 +1714,8 @@ mod tests {
             session: false,
             default_var: None,
             choices_var: None,
+            file_mode: None,
+            ext: Vec::new(),
         }
     }
 
@@ -1594,6 +1723,88 @@ mod tests {
         let mut d = decl(name, default, false);
         d.var_type = VarType::Dir;
         d
+    }
+
+    fn file_decl(name: &str, default: Option<&str>, mode: FileMode) -> VarDecl {
+        let mut d = decl(name, default, false);
+        d.var_type = VarType::File;
+        d.file_mode = Some(mode);
+        d
+    }
+
+    #[test]
+    fn file_var_parses_mode_and_ext() {
+        let d = scan_var_decls(
+            "<!-- meshfox:var name=\"IN\" type=\"file\" ext=\".MP4, mkv\" -->\n\
+             <!-- meshfox:var name=\"OUT\" type=\"file\" mode=\"save\" -->\n",
+        )
+        .unwrap();
+        assert_eq!(d[0].var_type, VarType::File);
+        assert_eq!(d[0].file_mode, Some(FileMode::Open)); // default
+        assert_eq!(d[0].ext, vec!["mp4", "mkv"]);
+        assert_eq!(d[1].file_mode, Some(FileMode::Save));
+        assert!(d[1].ext.is_empty());
+    }
+
+    #[test]
+    fn mode_and_ext_require_type_file_and_mode_is_checked() {
+        assert!(matches!(
+            scan_var_decls("<!-- meshfox:var name=\"X\" mode=\"save\" -->\n"),
+            Err(VarsError::FileAttrRequiresFile(..))
+        ));
+        assert!(matches!(
+            scan_var_decls("<!-- meshfox:var name=\"X\" type=\"dir\" ext=\"a\" -->\n"),
+            Err(VarsError::FileAttrRequiresFile(..))
+        ));
+        assert!(matches!(
+            scan_var_decls("<!-- meshfox:var name=\"X\" type=\"file\" mode=\"rw\" -->\n"),
+            Err(VarsError::UnknownFileMode(..))
+        ));
+    }
+
+    #[test]
+    fn file_value_validation() {
+        let open = file_decl("F", None, FileMode::Open);
+        let save = file_decl("F", None, FileMode::Save);
+        assert!(validate_value(&open, "").is_err());
+        assert!(validate_value(&open, "@tmp").is_err());
+        assert!(validate_value(&open, "@tmp/../x").is_err());
+        assert!(validate_value(&open, "@tmp/out/a.mp4").is_ok());
+        assert!(validate_value(&open, "clip.mp4").is_ok()); // relative: not checkable here
+        assert!(validate_value(&open, "/some/dir/").is_err());
+        let dir = std::env::temp_dir();
+        let dir = dir.to_str().unwrap();
+        assert!(validate_value(&open, dir).is_err());
+        assert!(validate_value(&save, dir).is_err());
+        let missing = format!("{dir}/meshfox-no-such-file-{}", std::process::id());
+        assert!(validate_value(&open, &missing).is_err());
+        assert!(validate_value(&save, &missing).is_ok());
+        let real = std::env::current_exe().unwrap();
+        assert!(validate_value(&open, real.to_str().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn file_default_outside_tmp_needs_confirmation_like_dir() {
+        for d in ["/media/in.mp4", "~/in.mp4", "in.mp4"] {
+            let decls = vec![file_decl("F", Some(d), FileMode::Open)];
+            let r = resolve(&decls, &HashMap::new(), &VarCache::in_memory(), &HashMap::new());
+            assert!(r.values.get("F").is_none(), "{d} must not resolve silently");
+            assert_eq!(r.missing[0].default.as_deref(), Some(d));
+        }
+        let decls = vec![file_decl("F", Some("@tmp/out.mp4"), FileMode::Save)];
+        let r = resolve(&decls, &HashMap::new(), &VarCache::in_memory(), &HashMap::new());
+        assert!(r.missing.is_empty());
+        assert_eq!(r.values["F"], "@tmp/out.mp4");
+    }
+
+    #[test]
+    fn tmp_default_with_dotdot_needs_confirmation() {
+        for mk in [dir_decl("W", Some("@tmp/../..")), file_decl("F", Some("@tmp/../x"), FileMode::Save)] {
+            let decls = vec![mk];
+            let r = resolve(&decls, &HashMap::new(), &VarCache::in_memory(), &HashMap::new());
+            assert!(r.values.is_empty());
+            assert_eq!(r.missing.len(), 1);
+        }
     }
 
     #[test]
@@ -1667,6 +1878,8 @@ mod tests {
             session: false,
             default_var: None,
             choices_var: None,
+            file_mode: None,
+            ext: Vec::new(),
         }
     }
 
@@ -1683,6 +1896,8 @@ mod tests {
             session: false,
             default_var: None,
             choices_var: None,
+            file_mode: None,
+            ext: Vec::new(),
         }
     }
 
@@ -2169,6 +2384,8 @@ mod tests {
             session: true,
             default_var: None,
             choices_var: None,
+            file_mode: None,
+            ext: Vec::new(),
         }
     }
 
@@ -2315,6 +2532,8 @@ mod tests {
             session: false,
             default_var: Some(default_var.to_string()),
             choices_var: None,
+            file_mode: None,
+            ext: Vec::new(),
         }
     }
 
@@ -2331,6 +2550,8 @@ mod tests {
             session: false,
             default_var: None,
             choices_var: Some(choices_var.to_string()),
+            file_mode: None,
+            ext: Vec::new(),
         }
     }
 

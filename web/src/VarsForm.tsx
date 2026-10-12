@@ -1,4 +1,5 @@
 import { useState, type FormEvent } from "react";
+import { PathField } from "./PathPicker";
 import type { VarOrigin, VarStatus } from "./types";
 
 interface VarsFormProps {
@@ -172,6 +173,16 @@ export function VarsForm({
                   </option>
                 ))}
               </select>
+            ) : v.type === "dir" || v.type === "file" ? (
+              <PathField
+                kind={v.type}
+                mode={v.mode}
+                ext={v.ext}
+                value={values[v.name]}
+                onChange={(value) => set(v.name, value)}
+                label={v.prompt}
+                autoFocus={i === 0}
+              />
             ) : (
               <input
                 type={v.type === "int" ? "number" : v.secret ? "password" : "text"}

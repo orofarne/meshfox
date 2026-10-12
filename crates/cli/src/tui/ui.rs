@@ -407,7 +407,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
     }
     render_footer(f, layout.footer, &*app);
 
-    if let Some(bp) = &app.block_picker {
+    if let Some(pp) = &app.path_picker {
+        render_path_picker(f, area, pp);
+    } else if let Some(bp) = &app.block_picker {
         render_block_picker(f, area, bp);
     } else if let Some(vf) = &app.var_form {
         render_var_form(f, area, vf);
@@ -1170,9 +1172,18 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
 
     if app.reveal_selected_block {
         if let Some(addr) = &app.selected_block {
-            let header = app.doc_click_regions.iter().find(|r| matches!(&r.target,
-                super::markdown::ClickTarget::Block { node_id, block_name, action: super::markdown::BlockAction::ToggleBlock }
-                if node_id == &addr.node_id && block_name == &addr.block_name));
+            let header = app
+                .doc_click_regions
+                .iter()
+                .find(|r| matches!(&r.target,
+                    super::markdown::ClickTarget::Block { node_id, block_name, action: super::markdown::BlockAction::ToggleBlock }
+                    if node_id == &addr.node_id && block_name == &addr.block_name))
+                // A `form` fence's header carries a `Select` region instead.
+                .or_else(|| {
+                    app.doc_click_regions.iter().find(|r| matches!(&r.target,
+                        super::markdown::ClickTarget::Block { node_id, block_name, action: super::markdown::BlockAction::Select }
+                        if node_id == &addr.node_id && block_name == &addr.block_name))
+                });
             if let Some(header) = header {
                 let rows: usize = app
                     .doc_segments
@@ -1646,7 +1657,7 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
             // text-cursor look, shown only on the focused row.
             let value = match decl.var_type {
                 VarType::Bool | VarType::Select => format!("‹ {shown} ›"),
-                VarType::String | VarType::Int | VarType::Dir => {
+                VarType::String | VarType::Int | VarType::Dir | VarType::File => {
                     format!("{shown}{}", if i == vf.selected { "_" } else { "" })
                 }
             };
@@ -1691,18 +1702,43 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
                 .map(|e| format!(" ⚠ {e}"))
                 .unwrap_or_default();
             let prefix = format!("{}{origin_tag}: ", decl.prompt);
+            // A `dir`/`file` field ends in a right-aligned, clickable
+            // "[Browse… ^o]" (`App::on_modal_mouse` hit-tests the same
+            // `BROWSE_MARKER`-wide strip at the row's right edge).
+            let browse_width = if matches!(decl.var_type, VarType::Dir | VarType::File) {
+                super::path_picker::BROWSE_MARKER.chars().count() + 2
+            } else {
+                0
+            };
             let value_budget = (inner.width as usize).saturating_sub(
-                prefix.chars().count() + save_tag.chars().count() + error_tag.chars().count(),
+                prefix.chars().count()
+                    + save_tag.chars().count()
+                    + error_tag.chars().count()
+                    + browse_width,
             );
             let value = tail_fit(&value, value_budget.max(8));
-            ListItem::new(Line::from(vec![
+            let mut spans = vec![
                 Span::raw(decl.prompt.clone()),
                 Span::styled(origin_tag, Style::default().fg(Color::DarkGray)),
                 Span::raw(": "),
-                Span::styled(value, Style::default().fg(Color::LightGreen)),
-                Span::styled(save_tag, Style::default().fg(Color::DarkGray)),
-                Span::styled(error_tag, Style::default().fg(Color::Red)),
-            ]))
+                Span::styled(value.clone(), Style::default().fg(Color::LightGreen)),
+                Span::styled(save_tag.clone(), Style::default().fg(Color::DarkGray)),
+                Span::styled(error_tag.clone(), Style::default().fg(Color::Red)),
+            ];
+            if browse_width > 0 {
+                let used = prefix.chars().count()
+                    + value.chars().count()
+                    + save_tag.chars().count()
+                    + error_tag.chars().count();
+                let pad = (inner.width as usize)
+                    .saturating_sub(used + super::path_picker::BROWSE_MARKER.chars().count());
+                spans.push(Span::raw(" ".repeat(pad.max(2))));
+                spans.push(Span::styled(
+                    super::path_picker::BROWSE_MARKER,
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                ));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
@@ -1716,12 +1752,218 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
     } else {
         "↑/↓/tab field · ←/→ toggle/cycle · ^s save secret · enter confirm all · esc cancel run"
     };
+    let browse = vf
+        .decls
+        .get(vf.selected)
+        .is_some_and(|d| matches!(d.var_type, VarType::Dir | VarType::File));
+    let esc_hint = if browse {
+        format!("^o browse · {esc_hint}")
+    } else {
+        esc_hint.to_string()
+    };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             esc_hint,
             Style::default().fg(Color::DarkGray),
         ))),
         rows[1],
+    );
+}
+
+/// Every rect of the path picker modal, shared by `render_path_picker` and
+/// `App::on_path_picker_mouse` so a click can't drift from what is drawn.
+pub(super) struct PathPickerLayout {
+    pub outer: Rect,
+    pub location: Rect,
+    pub flags: Rect,
+    pub list: Rect,
+    /// The file-name line — `mode="save"` pickers only.
+    pub name: Option<Rect>,
+    pub footer: Rect,
+}
+
+pub(super) fn path_picker_layout(area: Rect, save: bool) -> PathPickerLayout {
+    let outer = centered_rect(100, 26, area);
+    let inner = Block::default().borders(Borders::ALL).inner(outer);
+    let mut constraints = vec![
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+    ];
+    if save {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.push(Constraint::Length(1));
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(inner);
+    PathPickerLayout {
+        outer,
+        location: rows[0],
+        flags: rows[1],
+        list: rows[2],
+        name: save.then(|| rows[3]),
+        footer: rows[rows.len() - 1],
+    }
+}
+
+fn human_size(n: u64) -> String {
+    if n < 1024 {
+        return format!("{n} B");
+    }
+    let mut v = n as f64 / 1024.0;
+    for unit in ["KB", "MB", "GB"] {
+        if v < 1024.0 {
+            return if v < 10.0 {
+                format!("{v:.1} {unit}")
+            } else {
+                format!("{:.0} {unit}", v)
+            };
+        }
+        v /= 1024.0;
+    }
+    format!("{:.0} TB", v)
+}
+
+/// The `Ctrl-O` file/directory chooser — see `super::path_picker`.
+fn render_path_picker(f: &mut Frame, area: Rect, pp: &super::path_picker::PathPickerState) {
+    use super::path_picker::{window_start, PickerFocus};
+    let layout = path_picker_layout(area, pp.save);
+    f.render_widget(Clear, layout.outer);
+    let what = match (pp.kind, pp.save) {
+        (meshfox_core::fsbrowse::PickKind::Dir, _) => "directory",
+        (_, true) => "output file",
+        (_, false) => "file",
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .title(format!(" {} — choose {what} ", pp.title));
+    f.render_widget(block, layout.outer);
+
+    let location = pp.listing.as_ref().map(|l| l.path.as_str()).unwrap_or("…");
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("in ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                tail_fit(location, (layout.location.width as usize).saturating_sub(3).max(8)),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        layout.location,
+    );
+
+    let on_off = |b: bool| if b { "on" } else { "off" };
+    let mut flags = vec![
+        Span::styled("/ filter: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            if pp.focus == PickerFocus::Filter {
+                format!("{}_", pp.filter)
+            } else if pp.filter.is_empty() {
+                "—".to_string()
+            } else {
+                pp.filter.clone()
+            },
+            Style::default().fg(Color::LightGreen),
+        ),
+        Span::styled(
+            format!("   . hidden: {}", on_off(pp.show_hidden)),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ];
+    if pp.kind == meshfox_core::fsbrowse::PickKind::File && !pp.ext.is_empty() {
+        flags.push(Span::styled(
+            format!("   e .{} only: {}", pp.ext.join(" ."), on_off(pp.only_ext)),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(flags)), layout.flags);
+
+    let rows = pp.rows();
+    let height = layout.list.height as usize;
+    let start = window_start(pp.selected, height);
+    let items: Vec<ListItem> = rows
+        .iter()
+        .skip(start)
+        .take(height)
+        .map(|r| {
+            let (marker, style) = if r.is_dir {
+                ("▸ ", Style::default().fg(ACCENT))
+            } else {
+                ("  ", Style::default())
+            };
+            let name = if r.is_dir && !r.is_parent {
+                format!("{}/", r.name)
+            } else if r.is_parent {
+                "../".to_string()
+            } else {
+                r.name.clone()
+            };
+            let mut spans = vec![Span::raw(marker), Span::styled(name, style)];
+            if let Some(n) = r.size {
+                spans.push(Span::styled(
+                    format!("  {}", human_size(n)),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let mut state = ListState::default();
+    if !rows.is_empty() {
+        state.select(Some(pp.selected - start));
+    }
+    let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    f.render_stateful_widget(list, layout.list, &mut state);
+    if rows.is_empty() {
+        let msg = match (&pp.error, &pp.listing) {
+            (Some(e), _) => format!("⚠ {e}"),
+            (None, Some(_)) => "(nothing here)".to_string(),
+            (None, None) => "loading…".to_string(),
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled(msg, Style::default().fg(Color::DarkGray))),
+            layout.list,
+        );
+    }
+
+    if let Some(name_rect) = layout.name {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("name: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    if pp.focus == PickerFocus::Name {
+                        format!("{}_", pp.name)
+                    } else {
+                        pp.name.clone()
+                    },
+                    Style::default().fg(Color::LightGreen),
+                ),
+            ])),
+            name_rect,
+        );
+    }
+
+    let hint = match pp.focus {
+        PickerFocus::Filter => "type to filter · enter/tab list · esc clear".to_string(),
+        PickerFocus::Name => "type a file name · enter choose · tab/esc list".to_string(),
+        PickerFocus::List => {
+            let choose = match (pp.kind, pp.save) {
+                (meshfox_core::fsbrowse::PickKind::Dir, _) => "s choose this dir",
+                (_, true) => "tab name",
+                (_, false) => "enter choose",
+            };
+            format!("↑/↓ move · enter open · ⌫ up · ~ home · c canvas · {choose} · esc cancel")
+        }
+    };
+    let footer = match (&pp.error, rows.is_empty()) {
+        (Some(e), false) => format!("⚠ {e}"),
+        _ => hint,
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(footer, Style::default().fg(Color::DarkGray))),
+        layout.footer,
     );
 }
 

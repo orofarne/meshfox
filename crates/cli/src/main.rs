@@ -3417,6 +3417,8 @@ fn var_decl_from_status(status: &worker_client::VarStatus) -> VarDecl {
             "int" => VarType::Int,
             "bool" => VarType::Bool,
             "select" => VarType::Select,
+            "dir" => VarType::Dir,
+            "file" => VarType::File,
             _ => VarType::String,
         },
         prompt: status.prompt.clone(),
@@ -3428,6 +3430,11 @@ fn var_decl_from_status(status: &worker_client::VarStatus) -> VarDecl {
         session: false,
         default_var: None,
         choices_var: None,
+        file_mode: (status.var_type == "file").then(|| match status.mode.as_deref() {
+            Some("save") => meshfox_core::FileMode::Save,
+            _ => meshfox_core::FileMode::Open,
+        }),
+        ext: status.ext.clone(),
     }
 }
 
@@ -7377,6 +7384,8 @@ mod set_override_tests {
             session: false,
             default_var: None,
             choices_var: None,
+            file_mode: None,
+            ext: Vec::new(),
         }
     }
 
