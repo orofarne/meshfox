@@ -4,7 +4,7 @@ import { draw, routeAroundNodes } from "../src/edgeRouting.ts";
 import { distributeEdgePorts } from "../src/edgePorts.ts";
 import { withEdgeRoutes } from "../src/edgeRouteLayout.ts";
 
-test("folded adjacent rows replace stale horizontal ports with a short gap route", () => {
+test("folded adjacent rows use a visible right lane and update ports after moving", () => {
   const nodes = Array.from({ length: 5 }, (_, i) => ({
     id: `row-${i}`, position: { x: 100, y: i * 69 }, width: 800, height: 44,
     data: { level: 3, nodeType: "text" },
@@ -12,10 +12,11 @@ test("folded adjacent rows replace stale horizontal ports with a short gap route
   const edge = { id: "request->jwt", source: "row-0", target: "row-1", type: "extra",
     sourceHandle: "source-default", targetHandle: "target-default", data: {} };
   const routed = withEdgeRoutes(nodes, [edge])[0];
-  assert.equal(routed.sourceHandle, "source-bottom");
-  assert.equal(routed.targetHandle, "target-top");
+  assert.equal(routed.sourceHandle, "source-default");
+  assert.equal(routed.targetHandle, "target-right");
   assert.ok(routed.data.routedPoints);
-  assert.ok(routed.data.routedPoints.every(p => p.y >= 44 && p.y <= 69));
+  assert.ok(routed.data.routedPoints.every(p => p.x >= 902));
+  assert.ok(routed.data.routedPoints.some(p => p.x >= 936));
   assertOutside(routed.data.routedPath[0], nodes.map(n => ({ ...n.position, width: n.width, height: n.height })));
 
   const sideBySide = nodes.map((n, i) => i === 1 ? { ...n, position: { x: 1100, y: 0 } } : n);
@@ -181,4 +182,36 @@ test("the routed path uses explicit left and right handles", () => {
   assert.ok(routed);
   assert.equal(routed[0].x, 102);
   assert.equal(routed.at(-1).x, 402);
+});
+
+test("stacked links route upward, share their source and use separate right lanes", () => {
+  const nodes = [0, 1, 2].map(i => ({ id: `n${i}`, position: { x: 100, y: i * 100 },
+    width: 800, height: 44, data: { level: 1, nodeType: "text" } }));
+  const edges = ["n0", "n1"].map(target => ({ id: `n2->${target}`, source: "n2", target, type: "extra", data: {} }));
+  const routes = withEdgeRoutes(nodes, edges);
+  for (const route of routes) {
+    assert.equal(route.sourceHandle, "source-right", "level-one default is left, so right must be explicit");
+    assert.equal(route.targetHandle, "target-right");
+    assert.equal(route.data.sourceOffset, 0);
+    assertOutside(route.data.routedPath[0], nodes.map(n => ({ ...n.position, width: n.width, height: n.height })));
+  }
+  assert.deepEqual(routes[0].data.routedPoints[0], routes[1].data.routedPoints[0]);
+  const lanes = routes.map(route => route.data.routedPoints.slice(1).filter((p, i) =>
+    p.x === route.data.routedPoints[i].x && p.y !== route.data.routedPoints[i].y).map(p => p.x));
+  assert.notDeepEqual(lanes[0], lanes[1]);
+});
+
+test("stacked right lanes avoid a neighboring card and respect pinned vertical sides", () => {
+  const nodes = [
+    { id: "a", position: { x: 100, y: 0 }, width: 800, height: 44, data: { level: 3, nodeType: "text" } },
+    { id: "b", position: { x: 100, y: 200 }, width: 800, height: 44, data: { level: 3, nodeType: "text" } },
+    { id: "obstacle", position: { x: 920, y: 80 }, width: 100, height: 60, data: { level: 3, nodeType: "text" } },
+  ];
+  const edge = { id: "a->b", source: "a", target: "b", type: "extra", data: {} };
+  const route = withEdgeRoutes(nodes, [edge])[0];
+  assert.ok(route.data.routedPath);
+  assertOutside(route.data.routedPath[0], nodes.map(n => ({ ...n.position, width: n.width, height: n.height })));
+  const pinned = withEdgeRoutes(nodes, [{ ...edge, data: { sourceSide: "bottom", targetSide: "top" } }])[0];
+  assert.equal(pinned.sourceHandle, "source-bottom");
+  assert.equal(pinned.targetHandle, "target-top");
 });

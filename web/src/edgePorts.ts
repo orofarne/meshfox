@@ -26,16 +26,25 @@ export function distributeEdgePorts(
     const source = boxes.get(edge.source);
     const target = boxes.get(edge.target);
     if (!source || !target) continue;
-    let sourceSide: EdgeSide = levels.get(edge.source) === 1 ? "left" : "right";
+    const defaultSourceSide = levels.get(edge.source) === 1 ? "left" : "right";
+    let sourceSide: EdgeSide = defaultSourceSide;
     let targetSide: EdgeSide = "left";
     if (edge.extra && (source.y + source.height <= target.y || target.y + target.height <= source.y)) {
-      sourceSide = source.y < target.y ? "bottom" : "top";
-      targetSide = source.y < target.y ? "top" : "bottom";
+      const overlap = Math.min(source.x + source.width, target.x + target.width) - Math.max(source.x, target.x);
+      // Stacked cards in one column need a visible side lane rather than
+      // a tiny vertical link hidden in the gap between their wide bodies.
+      if (overlap >= Math.min(source.width, target.width) / 2) {
+        sourceSide = "right";
+        targetSide = "right";
+      } else {
+        sourceSide = source.y < target.y ? "bottom" : "top";
+        targetSide = source.y < target.y ? "top" : "bottom";
+      }
     }
     sourceSide = edge.sourceSide ?? sourceSide;
     targetSide = edge.targetSide ?? targetSide;
     result.set(edge.id, {
-      sourceHandle: edge.sourceSide ? `source-${sourceSide}` : sourceSide === "left" || sourceSide === "right" ? "source-default" : `source-${sourceSide}`,
+      sourceHandle: !edge.sourceSide && sourceSide === defaultSourceSide ? "source-default" : `source-${sourceSide}`,
       targetHandle: targetSide === "left" ? "target-default" : `target-${targetSide}`,
       sourceOffset: 0,
       targetOffset: 0,

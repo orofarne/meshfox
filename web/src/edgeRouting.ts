@@ -21,12 +21,12 @@ function outside(point: Point, side: EdgeSide, length: number): Point {
   }
 }
 
-function stubLength(point: Point, side: EdgeSide, own: Rect | undefined, others: Rect[]): number | undefined {
+function stubLength(point: Point, side: EdgeSide, own: Rect | undefined, others: Rect[], preferred = END_STUB): number | undefined {
   const ownExit = own ? {
     left: point.x - own.x, right: own.x + own.width - point.x,
     top: point.y - own.y, bottom: own.y + own.height - point.y,
   }[side] + 2 : 0;
-  let length = END_STUB;
+  let length = preferred;
   for (const r of others) {
     const transverse = side === "left" || side === "right"
       ? point.y > r.y && point.y < r.y + r.height
@@ -201,8 +201,9 @@ export function routeAroundNodes(
   const targetObstacle = targetBox && expand(targetBox);
   if (sourceObstacle) obstacles.push(sourceObstacle);
   if (targetObstacle) obstacles.push(targetObstacle);
-  const startLength = noStartStub ? 0 : stubLength(start, startSide, sourceObstacle, obstacles.filter((r) => r !== sourceObstacle));
-  const endLength = noEndStub ? 0 : stubLength(end, endSide, targetObstacle, obstacles.filter((r) => r !== targetObstacle));
+  const preferredStub = startSide === "right" && endSide === "right" ? 36 : END_STUB;
+  const startLength = noStartStub ? 0 : stubLength(start, startSide, sourceObstacle, obstacles.filter((r) => r !== sourceObstacle), preferredStub);
+  const endLength = noEndStub ? 0 : stubLength(end, endSide, targetObstacle, obstacles.filter((r) => r !== targetObstacle), preferredStub);
   if (startLength === undefined || endLength === undefined) return undefined;
   const from = outside(start, startSide, startLength);
   const to = outside(end, endSide, endLength);

@@ -23,10 +23,12 @@ async function inspectLink(page: Page) {
     });
     const crossings: string[] = [];
     const hidden: string[] = [];
+    let rightmost = -Infinity;
     // At most one screen pixel between samples, including both endpoints.
     const steps = Math.ceil(length * Math.hypot(matrix.a, matrix.b));
     for (let i = 0; i <= steps; i++) {
       const point = screenPoint(length * i / steps);
+      rightmost = Math.max(rightmost, point.x);
       for (const { id, box } of cards) {
         if (point.x > box.left + 1 && point.x < box.right - 1 &&
             point.y > box.top + 1 && point.y < box.bottom - 1) crossings.push(id);
@@ -50,8 +52,9 @@ async function inspectLink(page: Page) {
     const start = screenPoint(0);
     return {
       crossings: [...new Set(crossings)], hidden: hidden.slice(0, 5),
-      sourceDistance: endpointDistance("node2", "source-bottom", 0),
-      targetDistance: endpointDistance("node10", "target-top", length),
+      rightLane: rightmost > Math.max(cards[1].box.right, cards[9].box.right) + 10,
+      sourceDistance: endpointDistance("node2", "source-default", 0),
+      targetDistance: endpointDistance("node10", "target-right", length),
       marker: path.getAttribute("marker-end"),
       endpointsInView: [start, end].every(p => p.x > 0 && p.x < innerWidth && p.y > 0 && p.y < innerHeight),
     };
@@ -75,6 +78,6 @@ for (const folded of [false, true]) {
       const link = await inspectLink(page);
       return { ...link, sourceDistance: link.sourceDistance < 4, targetDistance: link.targetDistance < 4,
         marker: !!link.marker && link.marker !== "none" };
-    }).toEqual({ crossings: [], hidden: [], sourceDistance: true, targetDistance: true, marker: true, endpointsInView: true });
+    }).toEqual({ crossings: [], hidden: [], rightLane: true, sourceDistance: true, targetDistance: true, marker: true, endpointsInView: true });
   });
 }

@@ -737,6 +737,9 @@ pub fn set_node_body(markdown: &str, node_id: &str, new_body: &str) -> Option<St
     let mut restamped = String::with_capacity(out.len() + new_line.len());
     restamped.push_str(&out[..line_span.start]);
     restamped.push_str(&new_line);
+    // `line_span` includes the line's own `\n` (see `scan`) — put it back,
+    // or a `meshfox:edge` comment right below gets glued onto this line.
+    restamped.push('\n');
     restamped.push_str(&out[line_span.end..]);
     Some(restamped)
 }
@@ -4422,6 +4425,23 @@ Reused from Tests as well.
             parse(&updated2).unwrap().node("child").unwrap().updated_at,
             n.updated_at
         );
+    }
+
+    #[test]
+    fn set_node_body_stamp_keeps_following_edge_comment_on_its_own_line() {
+        let doc = "# Root\n<!-- meshfox:node id=\"root\" -->\n<!-- meshfox:option name=\"auto-timestamps\" -->\n\n## A\n<!-- meshfox:node id=\"a\" -->\n\n## B\n<!-- meshfox:node id=\"b\" -->\n<!-- meshfox:edge from=\"a\" -->\n\nold body\n";
+        for updated in [
+            set_node_body(doc, "b", "new body").unwrap(),
+            append_node_body(doc, "b", "more").unwrap(),
+        ] {
+            assert!(
+                updated.contains("\" -->\n<!-- meshfox:edge from=\"a\" -->\n"),
+                "node and edge comments got glued:\n{updated}"
+            );
+            assert!(!updated.contains("--><!--"), "{updated}");
+            let c = parse(&updated).unwrap();
+            assert!(c.node("b").unwrap().updated_at.is_some());
+        }
     }
 
     #[test]
