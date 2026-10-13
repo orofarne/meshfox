@@ -624,7 +624,7 @@ async fn run_http_tty_handoff(
         LeaveAlternateScreen,
         DisableMouseCapture
     )?;
-    print!("==> {block_name}\r\n");
+    crate::run_output::banner(block_name, "\r\n");
     io::stdout().flush()?;
 
     let exit_code = bridge_http_tty(&mut socket).await;
@@ -677,7 +677,7 @@ async fn run_http_tty_attach_handoff(
         LeaveAlternateScreen,
         DisableMouseCapture
     )?;
-    print!("==> attached to {block_name}\r\n");
+    crate::run_output::banner(&format!("attached to {block_name}"), "\r\n");
     io::stdout().flush()?;
 
     bridge_http_tty_attach(&mut socket).await;
@@ -849,11 +849,14 @@ fn print_tty_transcript_event(event: crate::worker_client::RunEvent) -> TtyPrelu
         RunEvent::TtyStart { .. } => TtyPreludeOutcome::EnterPty,
         RunEvent::Started { .. } | RunEvent::ServiceStarted { .. } => TtyPreludeOutcome::Continue,
         RunEvent::StepStart { block, .. } => {
-            print!("==> {block}\r\n");
+            crate::run_output::banner(&block, "\r\n");
             TtyPreludeOutcome::Continue
         }
         RunEvent::StepSkipped { block, .. } => {
-            print!("==> {block} (skipped, already fresh this session)\r\n");
+            crate::run_output::banner(
+                &format!("{block} (skipped, already fresh this session)"),
+                "\r\n",
+            );
             TtyPreludeOutcome::Continue
         }
         RunEvent::Output { text, .. } => {
@@ -865,10 +868,7 @@ fn print_tty_transcript_event(event: crate::worker_client::RunEvent) -> TtyPrelu
             duration_ms,
             ..
         } => {
-            print!(
-                "(exit {exit_code} · {})\r\n",
-                meshfox_core::format_duration_ms(duration_ms)
-            );
+            crate::run_output::step_end(exit_code, duration_ms, "\r\n");
             TtyPreludeOutcome::Continue
         }
         RunEvent::Killed { .. } => TtyPreludeOutcome::Done(-1),

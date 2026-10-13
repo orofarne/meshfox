@@ -24,6 +24,7 @@ mod cores_cmd;
 mod mcp;
 mod pdf;
 mod prompt;
+mod run_output;
 mod secret_cmd;
 mod serve;
 mod syntax_registry;
@@ -2751,9 +2752,12 @@ async fn run_via_worker(
     // Wall-clock for the whole invocation (preflight, prompts and
     // confirmations included), printed before attaching to any service —
     // which runs until Ctrl-C and isn't part of "how long did this take".
-    println!(
-        "total: {}",
-        meshfox_core::format_duration_ms(run_started.elapsed().as_millis() as u64)
+    run_output::banner(
+        &format!(
+            "total: {}",
+            meshfox_core::format_duration_ms(run_started.elapsed().as_millis() as u64)
+        ),
+        "\n",
     );
 
     // Mirrors the in-process loop's own tail exactly (see its own doc
@@ -3116,7 +3120,7 @@ async fn drain_worker_run_events(
                     match event {
                         worker_client::RunEvent::Started { .. } => {}
                         worker_client::RunEvent::StepStart { node_id, block } => {
-                            println!("==> {block}");
+                            run_output::banner(&block, "\n");
                             current_step = Some((node_id, block));
                         }
                         worker_client::RunEvent::StepSkipped { block, .. } => {
@@ -3128,21 +3132,18 @@ async fn drain_worker_run_events(
                             // `compute_forced_reruns`), a deliberate benefit
                             // of joining a shared session rather than a gap
                             // to hide.
-                            println!("==> {block} (already run this session, skipped)");
+                            run_output::banner(&format!("{block} (already run this session, skipped)"), "\n");
                         }
                         worker_client::RunEvent::Output { stream, text, .. } => match stream {
                             meshfox_server::stream_exec::OutputStream::Stdout => println!("{text}"),
                             meshfox_server::stream_exec::OutputStream::Stderr => eprintln!("{text}"),
                         },
                         worker_client::RunEvent::ServiceStarted { node_id, block, pid } => {
-                            println!("==> {block} (service started, pid {pid})");
+                            run_output::banner(&format!("{block} (service started, pid {pid})"), "\n");
                             started_services.push((node_id, block));
                         }
                         worker_client::RunEvent::StepEnd { exit_code, duration_ms, .. } => {
-                            println!(
-                                "(exit {exit_code} · {})",
-                                meshfox_core::format_duration_ms(duration_ms)
-                            );
+                            run_output::step_end(exit_code, duration_ms, "\n");
                         }
                         worker_client::RunEvent::LockConflict { node_id, block, owner_pid, owner_desc } => {
                             return DrainResult::Conflict { node_id, block, owner_pid, owner_desc };

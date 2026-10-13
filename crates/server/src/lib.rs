@@ -7311,10 +7311,6 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
                 }
                 break;
             }
-            yield Ok(ndjson_line(&RunEvent::StepStart {
-                node_id: addr.node_id.clone(),
-                block: addr.block_name.clone(),
-            }));
 
             let primary_raw_now = file_raws
                 .get(&None)
@@ -7416,6 +7412,11 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
                     continue;
                 }
             }
+
+            yield Ok(ndjson_line(&RunEvent::StepStart {
+                node_id: addr.node_id.clone(),
+                block: addr.block_name.clone(),
+            }));
 
             let input_stamp = match artifact_inputs(&canvas, addr, &block, &resolved_vars) {
                 Ok(stamp) => stamp,
@@ -8707,17 +8708,6 @@ async fn run_tty_chain(
             send_event(&mut socket, &event).await;
             break;
         }
-        if !send_event(
-            &mut socket,
-            &RunEvent::StepStart {
-                node_id: addr.node_id.clone(),
-                block: addr.block_name.clone(),
-            },
-        )
-        .await
-        {
-            return;
-        }
 
         let primary_raw_now = file_raws
             .get(&None)
@@ -8820,6 +8810,18 @@ async fn run_tty_chain(
                 }
                 continue;
             }
+        }
+
+        if !send_event(
+            &mut socket,
+            &RunEvent::StepStart {
+                node_id: addr.node_id.clone(),
+                block: addr.block_name.clone(),
+            },
+        )
+        .await
+        {
+            return;
         }
 
         let input_stamp = match fp_canvas.as_ref().map(|canvas| artifact_inputs(canvas, addr, &block, &resolved_vars)) {
@@ -15609,14 +15611,6 @@ mod ws_tests {
             .await
             .expect("connect");
         next_event(&mut ws2).await; // started
-                                    // `step-start` is sent unconditionally for every chain step, even
-                                    // one about to be skipped a moment later (same "brief flash" the
-                                    // plain `/api/run` path already has — see `RunEvent::StepSkipped`'s
-                                    // own doc comment) — the real signal is the `step-skipped` right
-                                    // after it, not the absence of `step-start`.
-        let dep_step_start = next_event(&mut ws2).await;
-        assert_eq!(dep_step_start["type"], "step-start");
-        assert_eq!(dep_step_start["block"], "dep");
         let second_step = next_event(&mut ws2).await;
         assert_eq!(
             second_step["type"], "step-skipped",
@@ -16786,10 +16780,8 @@ mod session_skip_tests {
         (status, body)
     }
 
-    // `step-start` is emitted unconditionally, even for a step that turns
-    // out to be skipped a moment later (see `run_block`'s own doc comment
-    // on `RunEvent::StepSkipped`) -- "actually ran" means it reached a real
-    // `step-end`, not just a `step-start`.
+    // A completed execution reached `step-end`; `step-start` alone can
+    // also mean a step that failed during preparation.
     fn really_ran(events: &[serde_json::Value], block: &str) -> bool {
         events
             .iter()
@@ -17743,7 +17735,13 @@ echo merged
         );
         assert!(
             !really_ran(&second, "dep"),
-            "a skipped dep must not also get a real step-start: {second:?}"
+            "a skipped dep must not complete a real execution: {second:?}"
+        );
+        assert!(
+            !second
+                .iter()
+                .any(|e| e["type"] == "step-start" && e["block"] == "dep"),
+            "a skipped dep must not also get a step-start: {second:?}"
         );
         assert!(
             really_ran(&second, "target"),
