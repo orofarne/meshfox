@@ -2436,12 +2436,13 @@ fn replan_runs(
     values: &HashMap<String, String>,
     executed: &std::collections::HashSet<meshfox_core::BlockAddr>,
     fresh: bool,
+    skip_fresh: bool,
 ) -> Result<std::collections::HashSet<meshfox_core::BlockAddr>, meshfox_core::DepsError> {
     if fresh {
         return Ok(chain.iter().cloned().collect());
     }
     let runs = state.session_runs.lock().unwrap();
-    meshfox_core::deps::compute_forced_reruns_after(
+    meshfox_core::deps::compute_forced_reruns_planned(
         canvas,
         chain,
         |_block, provisional| {
@@ -2454,6 +2455,7 @@ fn replan_runs(
                 .map(|run| (run.fingerprint.clone(), run.produced_vars.clone()))
         },
         executed,
+        skip_fresh,
     )
 }
 
@@ -2644,6 +2646,13 @@ struct RunRequest {
     /// `POST /api/session/reset`). What `meshfox run --fresh` sends.
     #[serde(default)]
     fresh: bool,
+    /// The opposite lever to `fresh`: the requested block itself is judged
+    /// like any pulled-in dependency, and skipped (as `StepSkipped`) when its
+    /// session-freshness record still matches — an `always` block, or one
+    /// with no record yet, still runs. Ignored when `fresh` is set. What
+    /// `meshfox run --skip-fresh` sends.
+    #[serde(default)]
+    skip_fresh: bool,
     /// Answers for any `meshfox:var` the UI's pre-run form just collected
     /// (see `GET /api/vars`) — takes precedence over the process
     /// environment/cache/default, same as the CLI's `--set`. Every
@@ -6806,6 +6815,8 @@ struct RunWsQuery {
     #[serde(default)]
     fresh: bool,
     #[serde(default)]
+    skip_fresh: bool,
+    #[serde(default)]
     persist: bool,
     #[serde(default)]
     vars: String,
@@ -6827,6 +6838,7 @@ fn parse_run_request(
     block: String,
     no_deps: bool,
     fresh: bool,
+    skip_fresh: bool,
     persist: bool,
     confirm: bool,
     vars: &str,
@@ -6860,6 +6872,7 @@ fn parse_run_request(
         persist,
         no_deps,
         fresh,
+        skip_fresh,
         vars,
         save_secrets,
     })
@@ -6885,6 +6898,7 @@ async fn run_block(
             query.block,
             query.no_deps,
             query.fresh,
+            query.skip_fresh,
             query.persist,
             query.confirm,
             &query.vars,
@@ -6916,6 +6930,8 @@ struct ForceRunWsQuery {
     no_deps: bool,
     #[serde(default)]
     fresh: bool,
+    #[serde(default)]
+    skip_fresh: bool,
     #[serde(default)]
     persist: bool,
     #[serde(default)]
@@ -6977,6 +6993,7 @@ async fn force_run(
                 query.block,
                 query.no_deps,
                 query.fresh,
+                query.skip_fresh,
                 query.persist,
                 query.confirm,
                 &query.vars,
@@ -7127,7 +7144,7 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
         // `resolved_vars` map, not a per-block-filtered subset (see its own
         // `session_fingerprint` call) — mirror that here: this dry run's
         // own seed plus whatever a skipped step's `produced_vars` folds in.
-        meshfox_core::compute_forced_reruns(
+        meshfox_core::deps::compute_forced_reruns_planned(
             &canvas,
             &chain,
             |_block, sim_computed| {
@@ -7140,6 +7157,8 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
                     .get(&(addr.node_id.clone(), addr.block_name.clone()))
                     .map(|run| (run.fingerprint.clone(), run.produced_vars.clone()))
             },
+            &std::collections::HashSet::new(),
+            req.skip_fresh,
         )
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?
     };
@@ -7293,7 +7312,7 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
             let Some(addr_owned) = chain.iter().find(|addr| !visited.contains(*addr)).cloned() else { break; };
             let addr = &addr_owned;
             visited.insert(addr.clone());
-            let forced_reruns = match replan_runs(&state, &canvas, &chain, &resolved_vars, &executed, req.fresh) {
+            let forced_reruns = match replan_runs(&state, &canvas, &chain, &resolved_vars, &executed, req.fresh, req.skip_fresh) {
                 Ok(plan) => plan,
                 Err(e) => {
                     final_exit_code = 1;
@@ -7369,7 +7388,8 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
 
             // The block actually requested (always the chain's own last
             // entry — see `resolve_run_chain`'s doc comment) always runs
-            // for real; only a pulled-in dependency is ever eligible to be
+            // for real unless the request opted in with `skip_fresh`; by
+            // default only a pulled-in dependency is ever eligible to be
             // skipped as "already fresh this session" — see
             // `AppState::session_runs`. A block's own `always` flag opts it
             // out of the skip entirely, even as a pulled-in dependency —
@@ -7385,7 +7405,7 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
             }
             let is_requested_target = Some(addr) == chain.last();
             let live_fingerprint = step_fingerprint(Some(&canvas), &decls, addr, &block, &resolved_vars);
-            if !is_requested_target && !block.always && !forced_reruns.contains(addr) {
+            if (!is_requested_target || req.skip_fresh) && !block.always && !forced_reruns.contains(addr) {
                 let already_fresh = state
                     .session_runs
                     .lock()
@@ -7914,6 +7934,7 @@ async fn trigger_autorun(state: Arc<AppState>, addr: meshfox_core::BlockAddr) {
         persist: false,
         no_deps: false,
         fresh: false,
+        skip_fresh: false,
         vars: HashMap::new(),
         save_secrets: std::collections::HashSet::new(),
     };
@@ -8308,6 +8329,8 @@ struct TtyRunQuery {
     #[serde(default)]
     fresh: bool,
     #[serde(default)]
+    skip_fresh: bool,
+    #[serde(default)]
     persist: bool,
     #[serde(default)]
     vars: String,
@@ -8470,7 +8493,7 @@ async fn run_block_tty(
         // `resolved_vars` map, not a per-block-filtered subset (see its own
         // `session_fingerprint` call) — mirror that here: this dry run's
         // own seed plus whatever a skipped step's `produced_vars` folds in.
-        meshfox_core::compute_forced_reruns(
+        meshfox_core::deps::compute_forced_reruns_planned(
             &canvas,
             &chain,
             |_block, sim_computed| {
@@ -8483,6 +8506,8 @@ async fn run_block_tty(
                     .get(&(addr.node_id.clone(), addr.block_name.clone()))
                     .map(|run| (run.fingerprint.clone(), run.produced_vars.clone()))
             },
+            &std::collections::HashSet::new(),
+            query.skip_fresh,
         )
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?
     };
@@ -8536,6 +8561,7 @@ async fn run_block_tty(
             resolved_vars,
             query.confirm,
             query.fresh,
+            query.skip_fresh,
             !query.no_deps,
             persist,
             cols,
@@ -8592,6 +8618,7 @@ async fn run_tty_chain(
     mut resolved_vars: HashMap<String, String>,
     confirmed: bool,
     fresh: bool,
+    skip_fresh: bool,
     with_deps: bool,
     persist: bool,
     cols: u16,
@@ -8676,6 +8703,7 @@ async fn run_tty_chain(
             &resolved_vars,
             &executed,
             fresh,
+            skip_fresh,
         )) {
             Some(Ok(plan)) => plan,
             _ => {
@@ -8782,7 +8810,7 @@ async fn run_tty_chain(
         let is_requested_target = Some(addr) == chain.last();
         let live_fingerprint =
             step_fingerprint(fp_canvas.as_ref(), &decls, addr, &block, &resolved_vars);
-        if !is_requested_target && !block.always && !forced_reruns.contains(addr) {
+        if (!is_requested_target || skip_fresh) && !block.always && !forced_reruns.contains(addr) {
             let already_fresh = state
                 .session_runs
                 .lock()

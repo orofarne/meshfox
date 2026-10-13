@@ -4224,6 +4224,7 @@ impl App {
             &block_name,
             !with_deps,
             false,
+            false,
             vars,
             save_secrets,
             cols,

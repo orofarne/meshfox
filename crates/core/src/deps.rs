@@ -411,12 +411,31 @@ pub fn compute_forced_reruns(
 pub fn compute_forced_reruns_after(
     canvas: &Canvas,
     chain: &[BlockAddr],
+    fingerprint_vars: impl FnMut(
+        &crate::fence::CodeBlock,
+        &HashMap<String, String>,
+    ) -> HashMap<String, String>,
+    cached_run: impl Fn(&BlockAddr) -> Option<(String, HashMap<String, String>)>,
+    executed: &HashSet<BlockAddr>,
+) -> Result<HashSet<BlockAddr>, DepsError> {
+    compute_forced_reruns_planned(canvas, chain, fingerprint_vars, cached_run, executed, false)
+}
+
+/// [`compute_forced_reruns_after`], plus the one decision it otherwise
+/// hard-codes: with `skip_fresh_target` the chain's last entry (the block
+/// actually requested) is judged like any pulled-in dependency — forced only
+/// if it's `always`, has no matching freshness record, or something it
+/// explicitly depends on is itself forced — instead of unconditionally.
+pub fn compute_forced_reruns_planned(
+    canvas: &Canvas,
+    chain: &[BlockAddr],
     mut fingerprint_vars: impl FnMut(
         &crate::fence::CodeBlock,
         &HashMap<String, String>,
     ) -> HashMap<String, String>,
     cached_run: impl Fn(&BlockAddr) -> Option<(String, HashMap<String, String>)>,
     executed: &HashSet<BlockAddr>,
+    skip_fresh_target: bool,
 ) -> Result<HashSet<BlockAddr>, DepsError> {
     let decls = crate::vars::declared_vars(canvas)?;
     let target = chain.last();
@@ -442,7 +461,7 @@ pub fn compute_forced_reruns_after(
         let live_fingerprint = closure_fingerprint_with(canvas, &decls, addr, &values)?;
         let cached = cached_run(addr);
         let run_for_real = executed.contains(addr)
-            || Some(addr) == target
+            || (Some(addr) == target && !skip_fresh_target)
             || block.always
             || cascaded
             || !cached

@@ -737,7 +737,7 @@ freshness to the loading step's own decision, rather than forcing it (and
 cascading from it) on every run regardless of what anything downstream
 actually needs.
 
-### Forcing a run: `--fresh` and `session reset`
+### Forcing or skipping a run: `--fresh`, `--skip-fresh` and `session reset`
 
 "Already ran this session and hasn't changed" is remembered across restarts (the
 *session*, stored per canvas next to its other `.meshfox/` state) and is judged
@@ -745,7 +745,7 @@ by the block's own text and variables — not by files it reads or produces. A
 `cargo build`, a test run or an install step can therefore look fresh long
 after what it depends on changed, and a plain `meshfox run` skips it as a
 dependency. Besides the per-block tools above (`always`, a `!` on the
-consumer's `deps=` entry), two switches act on a single invocation or on the
+consumer's `deps=` entry), three switches act on a single invocation or on the
 whole session, from outside the document:
 
 - `meshfox run --fresh <block>` — runs *every* block of the chain for real, this
@@ -754,6 +754,14 @@ whole session, from outside the document:
   other blocks' records and submitted `form` values are left alone. Meaningless
   with `--no-deps`, which is rejected together with it. The same flag is the
   `fresh` parameter of the MCP `run` tool.
+- `meshfox run --skip-fresh <block>` — the opposite lever: the block named on
+  the command line is judged exactly like a pulled-in dependency and skipped when
+  its freshness record still matches (code, `env=`, its `deps=` closure and any
+  `inputs=`/`outputs=` fingerprint), so an install or build step that is
+  requested directly only does its work when something changed. A block that is
+  `always`, has no recorded run yet, or whose dependency ran for real this pass
+  still runs. Rejected together with `--fresh`. Without the flag a block
+  requested by name always runs, as before.
 - `meshfox session reset` — forgets everything the session remembers: every
   block's freshness record and every submitted `form` value, so the next run
   executes every block and asks for any form-supplied variable again. Finished

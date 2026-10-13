@@ -1166,7 +1166,7 @@ echo "done"
 ### Install
 <!-- meshfox:node id="install" -->
 
-Copies the release binary to `$INSTALL_PATH` (default `/usr/local/bin`), re-signing it ad-hoc on macOS. `inputs=` automatically finds the release build through its declared output, so no explicit `deps=` is needed. `outputs=` also tracks the installed binary: deleting or modifying it makes installation stale. A rebuild with identical binary contents does not invalidate installation when it is a dependency; explicitly requesting install always executes it. `env=` passes the declared path into the shell and the first run remembers the chosen value in `.meshfox/README.md.env`. The block name matches its node id, making it the implicit default block.
+Copies the release binary to `$INSTALL_PATH` (default `/usr/local/bin`), re-signing it ad-hoc on macOS. `inputs=` automatically finds the release build through its declared output, so no explicit `deps=` is needed. `outputs=` also tracks the installed binary: deleting or modifying it makes installation stale. A rebuild with identical binary contents does not invalidate installation when it is a dependency; explicitly requesting install always executes it, unless `meshfox run --skip-fresh` asks for the same up-to-date check a dependency gets. `env=` passes the declared path into the shell and the first run remembers the chosen value in `.meshfox/README.md.env`. The block name matches its node id, making it the implicit default block.
 
 ```sh name="install" inputs="target/release/meshfox" outputs="$INSTALL_PATH/meshfox" env="$INSTALL_PATH"
 mkdir -p "$INSTALL_PATH"

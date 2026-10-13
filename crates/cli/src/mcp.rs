@@ -1046,6 +1046,7 @@ impl CanvasCtx {
             &name,
             params.no_deps,
             params.fresh,
+            false,
             vars,
             std::collections::HashSet::new(),
             None,

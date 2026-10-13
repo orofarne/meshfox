@@ -147,6 +147,16 @@ enum Command {
         /// blocks.
         #[arg(long, conflicts_with = "no_deps")]
         fresh: bool,
+        /// The opposite lever to `--fresh`: the block(s) named on the
+        /// command line are held to the same "already ran this session and
+        /// hasn't changed" check a pulled-in dependency gets, and skipped
+        /// when they pass — so a step that declares `inputs=`/`outputs=`
+        /// (an install, a build) only does its work when something it
+        /// depends on or produces actually changed. Without it, a block
+        /// requested by name always runs. An `always` block, and one with
+        /// no recorded run yet, still run. Can't be combined with `--fresh`.
+        #[arg(long, conflicts_with = "fresh")]
+        skip_fresh: bool,
         /// Supply a declared `meshfox:var`'s value directly (repeatable),
         /// skipping any prompt for it — the non-interactive equivalent of
         /// answering one, e.g. for CI. Takes precedence over the process
@@ -1228,6 +1238,7 @@ fn main() {
             canvas,
             no_deps,
             fresh,
+            skip_fresh,
             set,
         } => {
             let canvas_path = canvas.unwrap_or_else(|| {
@@ -1246,7 +1257,7 @@ fn main() {
                 }
                 find_canvas()
             });
-            run(&canvas_path, args, no_deps, fresh, set, confirm)
+            run(&canvas_path, args, no_deps, fresh, skip_fresh, set, confirm)
         }
         Command::Configure { canvas } => {
             let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
@@ -2316,6 +2327,7 @@ fn run(
     args: Vec<String>,
     no_deps: bool,
     fresh: bool,
+    skip_fresh: bool,
     set: Vec<(String, String)>,
     confirm: bool,
 ) {
@@ -2323,7 +2335,7 @@ fn run(
         eprintln!("failed to start async runtime: {e}");
         std::process::exit(1);
     });
-    runtime.block_on(run_async(canvas_path, args, no_deps, fresh, set, confirm));
+    runtime.block_on(run_async(canvas_path, args, no_deps, fresh, skip_fresh, set, confirm));
 }
 
 /// `--set NAME=VALUE` is the one place a value can enter `resolve`'s
@@ -2384,6 +2396,7 @@ async fn run_async(
     mut args: Vec<String>,
     no_deps: bool,
     fresh: bool,
+    skip_fresh: bool,
     set: Vec<(String, String)>,
     confirm: bool,
 ) {
@@ -2469,6 +2482,7 @@ async fn run_async(
                         &block_names,
                         no_deps,
                         fresh,
+                        skip_fresh,
                         confirm,
                         overrides,
                     )
@@ -2488,6 +2502,7 @@ async fn run_async(
                 &block_names,
                 no_deps,
                 fresh,
+                skip_fresh,
                 confirm,
                 overrides,
             )
@@ -2575,6 +2590,7 @@ async fn run_via_worker(
     block_names: &[&str],
     no_deps: bool,
     fresh: bool,
+    skip_fresh: bool,
     confirm: bool,
     mut overrides: HashMap<String, String>,
 ) {
@@ -2684,7 +2700,7 @@ async fn run_via_worker(
         if let Ok(raw) = worker_client::get_canvas_raw(port).await {
             let path_str: Vec<&str> = path.iter().map(String::as_str).collect();
             if chain_contains_tty(canvas_path, &raw, &path_str, &[name], no_deps) {
-                if !run_worker_tty(port, &path, name, no_deps, fresh, vars, approved).await {
+                if !run_worker_tty(port, &path, name, no_deps, fresh, skip_fresh, vars, approved).await {
                     had_failure = true;
                 }
                 continue;
@@ -2704,6 +2720,7 @@ async fn run_via_worker(
             name,
             no_deps,
             fresh,
+            skip_fresh,
             vars,
             std::collections::HashSet::new(),
             None,
@@ -2733,6 +2750,7 @@ async fn run_via_worker(
                     name,
                     no_deps,
                     fresh,
+                    skip_fresh,
                     vars_for_retry,
                     node_id,
                     block,
@@ -2942,6 +2960,7 @@ async fn run_worker_tty(
     name: &str,
     no_deps: bool,
     fresh: bool,
+    skip_fresh: bool,
     vars: HashMap<String, String>,
     approved: bool,
 ) -> bool {
@@ -2958,6 +2977,7 @@ async fn run_worker_tty(
         name,
         no_deps,
         fresh,
+        skip_fresh,
         vars.clone(),
         std::collections::HashSet::new(),
         cols,
@@ -2978,6 +2998,7 @@ async fn run_worker_tty(
                 name,
                 no_deps,
                 fresh,
+                skip_fresh,
                 vars,
                 std::collections::HashSet::new(),
                 cols,
@@ -3264,6 +3285,7 @@ async fn retry_after_lock_conflict(
     name: &str,
     no_deps: bool,
     fresh: bool,
+    skip_fresh: bool,
     vars: HashMap<String, String>,
     conflict_node_id: String,
     conflict_block: String,
@@ -3281,6 +3303,7 @@ async fn retry_after_lock_conflict(
         name,
         no_deps,
         fresh,
+        skip_fresh,
         vars,
         std::collections::HashSet::new(),
         Some((conflict_node_id, conflict_block)),
