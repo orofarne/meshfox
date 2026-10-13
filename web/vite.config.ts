@@ -6,6 +6,13 @@ import react from "@vitejs/plugin-react";
 // output directly, same-origin.
 export default defineConfig({
   plugins: [react()],
+  build: {
+    // Monaco's core (~2.5 MB) and a few on-demand Shiki grammars (cpp,
+    // emacs-lisp, wasm: 600-800 kB each) are already lazy-loaded chunks
+    // that can't be split further; the default 500 kB limit just warned
+    // about them on every build.
+    chunkSizeWarningLimit: 3000,
+  },
   server: {
     proxy: {
       "/api": "http://127.0.0.1:4590",
