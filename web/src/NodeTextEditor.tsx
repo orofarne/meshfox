@@ -10,7 +10,8 @@ import { attachVSCodeContextMenu } from "./vsCodeContextMenu";
 import { ensureMonacoConfigured, LazyEditor } from "./monacoSetup";
 import { THEMES } from "./shiki";
 import { THEME_CHANGE_EVENT } from "./theme";
-import type { SaveTextOutcome } from "./api";
+import type { ConflictHunk, SaveTextOutcome } from "./api";
+import { ConflictDiff } from "./ConflictDiff";
 
 /** Resolves once Monaco is self-hosted and ready to mount (see
  * `monacoSetup.ts`'s own doc comment for why this is lazy rather than
@@ -195,10 +196,18 @@ export function NodeTextEditor({
   // Submitted buffers are tracked separately from the server's normalized
   // text. An acknowledgement never edits the Monaco model or its undo stack.
   const synced = useRef({ text: initialText, title });
-  type Conflict = { text: string; title: string; rev: string };
+  // `hunks`/`mine` (the exact text that was compared) are only there when a
+  // merge was attempted and the edits really overlapped.
+  type Conflict = { text: string; title: string; rev: string; hunks?: ConflictHunk[]; mine?: string };
   const [conflict, setConflict] = useState<Conflict | null>(null);
   const conflictRef = useRef<Conflict | null>(null);
   const [showTheirs, setShowTheirs] = useState(false);
+  // A note, not a blocker: "elsewhere" — the body changed while this buffer
+  // has unsaved edits (Apply will merge them); "merged" — the last Apply was
+  // combined with such a change and the buffer now shows the result.
+  const [note, setNote] = useState<"elsewhere" | "merged" | null>(null);
+  const editorRef = useRef<MonacoNS.editor.IStandaloneCodeEditor | null>(null);
+  const monacoRef = useRef<typeof MonacoNS | null>(null);
   const raiseConflict = (theirs: Conflict | null) => {
     conflictRef.current = theirs;
     setConflict(theirs);
@@ -225,8 +234,12 @@ export function NodeTextEditor({
       setText(theirs.text);
       setTitleDraft(theirs.title);
       raiseConflict(null);
+      setNote(null);
     } else {
-      raiseConflict(theirs);
+      // Unsaved edits and a changed body: keep `known` where the buffer
+      // started — that is the base Apply names, and the server merges the
+      // two (or reports exactly what overlaps). Nothing is written now.
+      setNote("elsewhere");
     }
   };
   useEffect(() => {
@@ -246,13 +259,39 @@ export function NodeTextEditor({
       const outcome = await onChange(sent.text, known.current.rev, sent.title, known.current.title);
       if (outcome.status === "saved") {
         known.current = { text: outcome.text, title: outcome.title, rev: outcome.rev, version: outcome.version, session: outcome.session };
-        synced.current = sent;
+        if (outcome.merged) {
+          const typedSince = textRef.current !== sent.text || titleRef.current !== sent.title;
+          if (!typedSince) {
+            // The server combined this buffer with a concurrent change:
+            // show the result, as a minimal edit so the cursor and undo
+            // stack stay where they were.
+            replaceBuffer(outcome.text);
+            setTitleDraft(outcome.title);
+            synced.current = { text: outcome.text, title: outcome.title };
+            setNote("merged");
+          } else {
+            // Typing during Apply: the buffer holds this save's text plus
+            // newer edits, but not what the merge brought in. Writing it as
+            // is would drop that silently — ask instead.
+            synced.current = { text: outcome.text, title: outcome.title };
+            raiseConflict({ text: outcome.text, title: outcome.title, rev: outcome.rev });
+          }
+        } else {
+          synced.current = sent;
+          setNote(null);
+        }
         if (latestServer.current.session === outcome.session) reconcile();
         refresh((n) => n + 1);
         // Typing during Apply stays dirty; never close over newer edits.
         if (close && !dirtyNow() && !conflictRef.current) onClose();
       } else if (outcome.status === "conflict") {
-        raiseConflict({ text: outcome.currentText, title: outcome.currentTitle ?? known.current.title, rev: outcome.currentRev });
+        raiseConflict({
+          text: outcome.currentText,
+          title: outcome.currentTitle ?? known.current.title,
+          rev: outcome.currentRev,
+          hunks: outcome.conflicts,
+          mine: sent.text,
+        });
       } else {
         setSaveError("Could not save. Your changes are still here; try again.");
       }
@@ -267,23 +306,66 @@ export function NodeTextEditor({
   saveRef.current = save;
   useEffect(() => () => detachRef.current?.(), []);
   const handleMount: OnMount = (editor, monaco) => {
+    editorRef.current = editor;
+    monacoRef.current = monaco;
     detachRef.current = attachMeshfoxEditorExtensions(editor, monaco);
     editor.focus();
+  };
+  // Makes the buffer `next` by replacing only the span that differs from
+  // what is there, so the cursor (and everything before it) and Monaco's
+  // undo stack survive — a whole-value swap would reset both.
+  const replaceBuffer = (next: string) => {
+    const editor = editorRef.current;
+    const monaco = monacoRef.current;
+    const model = editor?.getModel();
+    if (!editor || !monaco || !model) {
+      setText(next);
+      return;
+    }
+    const current = model.getValue();
+    if (current !== next) {
+      let start = 0;
+      const shortest = Math.min(current.length, next.length);
+      while (start < shortest && current.charCodeAt(start) === next.charCodeAt(start)) start++;
+      let endCurrent = current.length;
+      let endNext = next.length;
+      while (endCurrent > start && endNext > start && current.charCodeAt(endCurrent - 1) === next.charCodeAt(endNext - 1)) {
+        endCurrent--;
+        endNext--;
+      }
+      // Never cut a surrogate pair in half.
+      const isHigh = (c: number) => c >= 0xd800 && c <= 0xdbff;
+      const isLow = (c: number) => c >= 0xdc00 && c <= 0xdfff;
+      if (start > 0 && isHigh(current.charCodeAt(start - 1))) start--;
+      if (endCurrent < current.length && isLow(current.charCodeAt(endCurrent))) {
+        endCurrent++;
+        endNext++;
+      }
+      const from = model.getPositionAt(start);
+      const to = model.getPositionAt(endCurrent);
+      editor.executeEdits("meshfox-merge", [
+        { range: new monaco.Range(from.lineNumber, from.column, to.lineNumber, to.column), text: next.slice(start, endNext) },
+      ]);
+      editor.pushUndoStop();
+    }
+    setText(next);
   };
   const takeTheirs = () => {
     const theirs = conflictRef.current;
     if (!theirs) return;
-    known.current = { ...known.current, ...theirs };
+    known.current = { ...known.current, text: theirs.text, title: theirs.title, rev: theirs.rev };
     synced.current = { text: theirs.text, title: theirs.title };
     setText(theirs.text);
     setTitleDraft(theirs.title);
     raiseConflict(null);
+    setNote(null);
   };
   const keepMine = () => {
     const theirs = conflictRef.current;
     if (!theirs) return;
-    known.current = { ...known.current, ...theirs };
+    known.current = { ...known.current, text: theirs.text, title: theirs.title, rev: theirs.rev };
     raiseConflict(null);
+    setNote(null);
     void save(false);
   };
   const handleClose = () => {
@@ -331,9 +413,20 @@ export function NodeTextEditor({
             ⚙
           </button>
         </div>
+        {note && !conflict && (
+          <div className="mesh-text-editor-note" role="status">
+            {note === "merged"
+              ? "Merged with changes made elsewhere — the text above is the result."
+              : "This node was changed elsewhere. Apply will merge your edits with it."}
+          </div>
+        )}
         {conflict && (
           <div className="mesh-text-editor-conflict" role="alert">
-            <span>This node was changed elsewhere while you were editing.</span>
+            <span>
+              {conflict.hunks && conflict.hunks.length > 0
+                ? "Your edits overlap changes made elsewhere — nothing was saved."
+                : "This node was changed elsewhere while you were editing."}
+            </span>
             <button type="button" onClick={takeTheirs} disabled={saving}>
               take theirs
             </button>
@@ -343,7 +436,21 @@ export function NodeTextEditor({
             <button type="button" onClick={() => setShowTheirs((v) => !v)}>
               {showTheirs ? "hide theirs" : "compare"}
             </button>
-            {showTheirs && <pre className="mesh-text-editor-conflict-theirs">{`${conflict.title}\n\n${conflict.text}`}</pre>}
+            {showTheirs && (
+              <div className="mesh-text-editor-conflict-compare">
+                {conflict.title !== titleDraft && (
+                  <p className="mesh-text-editor-conflict-title">
+                    Title — theirs: “{conflict.title}”, yours: “{titleDraft}”
+                  </p>
+                )}
+                <ConflictDiff
+                  theirs={conflict.text}
+                  mine={text}
+                  hunks={conflict.mine === text ? conflict.hunks : undefined}
+                  dark={dark}
+                />
+              </div>
+            )}
           </div>
         )}
         <div className="mesh-text-editor-panes">

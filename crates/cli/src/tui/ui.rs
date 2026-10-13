@@ -1385,10 +1385,15 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
         // A 1-row strip (see `compute_layout`) — no border (there's no room
         // for one plus content), just the same title text a click here
         // expands back into the full pane.
-        let line = Line::styled(
-            format!("▸{}", title.trim()),
-            pane_border(app.focus == Focus::Output),
-        );
+        // A status message ("saved — merged with changes made elsewhere",
+        // "reloaded — file changed on disk") would otherwise be invisible
+        // here: it is drawn in the pane body, which this strip hides.
+        let text = if app.status.is_empty() {
+            format!("▸{}", title.trim())
+        } else {
+            format!("▸{} — {}", title.trim(), app.status)
+        };
+        let line = Line::styled(text, pane_border(app.focus == Focus::Output));
         f.render_widget(Paragraph::new(line), area);
         return;
     }
@@ -2690,6 +2695,12 @@ fn render_source_editor(
     syntax_set: &Arc<SyntaxSet>,
     theme_name: &str,
 ) {
+    // A save that found the file changed and couldn't combine it with the
+    // buffer: the comparison owns the whole screen until it is decided.
+    if se.diff.is_some() {
+        render_source_diff(f, area, se);
+        return;
+    }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -2769,6 +2780,169 @@ fn render_source_editor(
     if se.tag_suggest_open {
         render_tag_suggest_popup(f, area, se);
     }
+}
+
+/// Columns `skip..skip+width` of `text` (display columns, so a wide
+/// character counts as two), tabs shown as four spaces — one line of the
+/// side-by-side comparison's column, never wider than the column.
+fn visible_columns(text: &str, skip: usize, width: usize) -> String {
+    let mut out = String::new();
+    let mut col = 0usize;
+    for c in text.replace('\t', "    ").chars() {
+        let w = Span::raw(c.to_string()).width();
+        if col + w <= skip {
+            col += w;
+            continue;
+        }
+        if col < skip {
+            // A wide character cut by the left edge: a blank in its place.
+            out.push(' ');
+            col += w;
+            continue;
+        }
+        if col - skip + w > width {
+            break;
+        }
+        out.push(c);
+        col += w;
+    }
+    out
+}
+
+/// The source editor's comparison after a refused save (`source_diff.rs`):
+/// the file as it is on disk now on the left, the buffer on the right, the
+/// lines both sides changed marked with `!`.
+fn render_source_diff(f: &mut Frame, area: Rect, se: &mut SourceEditorState) {
+    let path = se.path.display().to_string();
+    let Some(diff) = se.diff.as_mut() else {
+        return;
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    diff.view_height = chunks[2].height as usize;
+
+    let summary = if diff.overlapped {
+        format!(
+            "your edits overlap changes made elsewhere ({} region{}) — nothing was saved",
+            diff.conflict_starts.len(),
+            if diff.conflict_starts.len() == 1 { "" } else { "s" },
+        )
+    } else {
+        "the file changed elsewhere and couldn't be merged automatically — nothing was saved"
+            .to_string()
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            // The verdict first — a long path must not push it off-screen.
+            Span::styled(format!(" {summary} "), Style::default().fg(FAIL)),
+            Span::styled(
+                format!("· {path}"),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])),
+        chunks[0],
+    );
+
+    // Two equal columns with a one-cell marker gutter between them.
+    let total = chunks[2].width as usize;
+    let left_w = total.saturating_sub(1) / 2;
+    let right_w = total.saturating_sub(1) - left_w;
+    let digits = |n: usize| n.max(1).to_string().len();
+    let left_lines = diff.rows.iter().filter(|r| r.left.is_some()).count();
+    let right_lines = diff.rows.iter().filter(|r| r.right.is_some()).count();
+    let (left_nw, right_nw) = (digits(left_lines), digits(right_lines));
+
+    let head = |label: &str, width: usize| {
+        let mut text = format!(" {label}");
+        text.truncate(width);
+        format!("{text:<width$}")
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                head("theirs — the file on disk now", left_w),
+                Style::default().fg(FAIL).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                head("yours — the editor buffer", right_w),
+                Style::default().fg(OK).add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        chunks[1],
+    );
+
+    let cell = |side: &Option<(usize, String)>, nw: usize, width: usize, hscroll: usize| {
+        match side {
+            Some((idx, text)) => {
+                let prefix = format!("{:>nw$} ", idx + 1);
+                let room = width.saturating_sub(prefix.len());
+                let body = visible_columns(text, hscroll, room);
+                (prefix, body)
+            }
+            None => (String::new(), String::new()),
+        }
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    for i in diff.scroll..(diff.scroll + diff.view_height).min(diff.rows.len()) {
+        let row = &diff.rows[i];
+        let conflict = diff.conflict_rows[i];
+        let (mark, mark_style) = if conflict {
+            (
+                '!',
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            match row.kind {
+                meshfox_core::DiffKind::Same => (' ', Style::default()),
+                meshfox_core::DiffKind::Changed => ('~', Style::default().fg(Color::Yellow)),
+                meshfox_core::DiffKind::Removed => ('-', Style::default().fg(FAIL)),
+                meshfox_core::DiffKind::Added => ('+', Style::default().fg(OK)),
+            }
+        };
+        let bold = if conflict {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        };
+        let changed = row.kind != meshfox_core::DiffKind::Same;
+        let side_style = |color: Color| {
+            if changed {
+                Style::default().fg(color).add_modifier(bold)
+            } else {
+                Style::default()
+            }
+        };
+        let (lp, lt) = cell(&row.left, left_nw, left_w, diff.hscroll);
+        let (rp, rt) = cell(&row.right, right_nw, right_w, diff.hscroll);
+        let pad = |used: usize, width: usize| " ".repeat(width.saturating_sub(used));
+        let l_used = lp.len() + Span::raw(lt.clone()).width();
+        lines.push(Line::from(vec![
+            Span::styled(lp, Style::default().fg(Color::DarkGray)),
+            Span::styled(lt, side_style(FAIL)),
+            Span::raw(pad(l_used, left_w)),
+            Span::styled(mark.to_string(), mark_style),
+            Span::styled(rp, Style::default().fg(Color::DarkGray)),
+            Span::styled(rt, side_style(OK)),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines), chunks[2]);
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "t take theirs · m keep mine (overwrite) · n/N conflicts · j/k scroll · h/l pan · \
+             esc back",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        chunks[3],
+    );
 }
 
 /// TODO.canvas.md: "Саджесты и подсветка синтаксиса в TUI", item 2 —

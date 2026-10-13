@@ -20,6 +20,9 @@ use edtui::{EditorEventHandler, EditorMode, EditorState, Index2, Lines};
 use meshfox_core::include::IncludeInfo;
 use meshfox_core::mdcanvas::{EDGE_ATTRS, NODE_ATTRS};
 
+use super::source_diff::{DiffOutcome, SourceDiff};
+use crate::worker_client::ConflictLines;
+
 /// A runnable fence's own attribute vocabulary (`crates/core/src/fence.rs`)
 /// — value-taking (`name="..."`) vs. bare presence flags (`cache`, no
 /// `=value` at all) need different insertion shapes, see `AttrCandidate`.
@@ -78,6 +81,10 @@ pub struct SourceEditorState {
     /// `Ctrl-s` to overwrite what is there now. Cleared whenever the
     /// editor is saved or switches file.
     conflict_rev: Option<String>,
+    /// The side-by-side comparison shown after a save that found the file
+    /// changed and could not combine it with the buffer — while it is
+    /// `Some`, it owns the keymap and the screen (see `source_diff.rs`).
+    pub diff: Option<SourceDiff>,
     /// Every include reachable from the primary document (however deeply
     /// nested), computed once at open time — switching files (`Ctrl-f`)
     /// reads straight out of this rather than re-walking the include
@@ -179,6 +186,7 @@ impl SourceEditorState {
             events: EditorEventHandler::default(),
             original: raw,
             conflict_rev: None,
+            diff: None,
             files,
             file_picker_open: false,
             file_picker_selected: 0,
@@ -213,12 +221,6 @@ impl SourceEditorState {
             .unwrap_or_else(|| meshfox_core::body_rev(&self.original))
     }
 
-    /// Records that a save found the file already changed, at `rev`: the
-    /// next save writes over it.
-    pub fn note_conflict(&mut self, rev: String) {
-        self.conflict_rev = Some(rev);
-    }
-
     pub fn mark_saved(&mut self) {
         self.conflict_rev = None;
         self.original = self.editor.lines.to_string();
@@ -227,7 +229,72 @@ impl SourceEditorState {
         }
     }
 
+    /// Shows the comparison of the file as it is on disk now (`theirs_text`,
+    /// at `theirs_rev`) against the buffer, after a save that could not
+    /// combine them. `conflicts` are the line ranges that overlapped; none
+    /// means no merge was possible at all.
+    pub fn open_diff(
+        &mut self,
+        theirs_text: String,
+        theirs_rev: String,
+        conflicts: &[ConflictLines],
+    ) {
+        let mine = self.editor.lines.to_string();
+        self.diff = Some(SourceDiff::new(theirs_text, theirs_rev, &mine, conflicts));
+    }
+
+    /// Replaces the buffer with the file as it is on disk (the comparison's
+    /// "take theirs"): nothing of the buffer's own edits survives, and
+    /// there is nothing left to save.
+    fn take_theirs(&mut self, theirs: String) {
+        let row = self.editor.cursor.row;
+        self.editor = EditorState::new(Lines::from(theirs.as_str()));
+        let last = self.editor.lines.len().saturating_sub(1);
+        self.editor.cursor = Index2::new(row.min(last), 0);
+        prime_viewport(&mut self.editor);
+        self.original = theirs;
+        if self.path == self.primary_path {
+            self.primary_raw = self.original.clone();
+        }
+        self.conflict_rev = None;
+        self.error = None;
+        self.pending_discard = false;
+    }
+
+    fn on_diff_key(&mut self, key: KeyEvent) -> SourceEditorOutcome {
+        let Some(diff) = self.diff.as_mut() else {
+            return SourceEditorOutcome::Stay;
+        };
+        match diff.on_key(key) {
+            DiffOutcome::Stay => SourceEditorOutcome::Stay,
+            DiffOutcome::Back => {
+                self.diff = None;
+                self.error = Some(
+                    "not saved — the file changed elsewhere; Ctrl-s compares again".to_string(),
+                );
+                SourceEditorOutcome::Stay
+            }
+            DiffOutcome::TakeTheirs => {
+                let theirs = self.diff.take().map(|d| d.theirs_text).unwrap_or_default();
+                self.take_theirs(theirs);
+                SourceEditorOutcome::Stay
+            }
+            DiffOutcome::KeepMine => {
+                // The next save is written against the file as it is now —
+                // it still fails if the file moves again before it lands.
+                if let Some(diff) = self.diff.take() {
+                    self.conflict_rev = Some(diff.theirs_rev);
+                }
+                self.error = None;
+                SourceEditorOutcome::Save
+            }
+        }
+    }
+
     pub fn on_key(&mut self, key: KeyEvent) -> SourceEditorOutcome {
+        if self.diff.is_some() {
+            return self.on_diff_key(key);
+        }
         if self.file_picker_open {
             return match self.on_file_picker_key(key) {
                 Some((path, is_canvas)) => SourceEditorOutcome::Switch { path, is_canvas },
@@ -306,6 +373,10 @@ impl SourceEditorState {
     /// — same as `on_key`'s own picker branch, it has no mouse handling of
     /// its own yet.
     pub fn on_mouse(&mut self, mouse: MouseEvent) {
+        if let Some(diff) = self.diff.as_mut() {
+            diff.on_mouse(mouse);
+            return;
+        }
         if self.file_picker_open || self.attr_suggest_open || self.tag_suggest_open {
             return;
         }
@@ -767,12 +838,43 @@ mod tests {
     }
 
     #[test]
-    fn after_a_conflict_the_next_save_is_based_on_what_the_file_is_now() {
+    fn keeping_mine_after_a_conflict_saves_against_what_the_file_is_now() {
         let mut editor = open_editor("# Root\n");
-        editor.note_conflict("abc123".to_string());
+        editor.open_diff("# Root, theirs\n".to_string(), "abc123".to_string(), &[]);
+        assert!(editor.diff.is_some());
+        let outcome = editor.on_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert!(matches!(outcome, SourceEditorOutcome::Save));
+        assert!(editor.diff.is_none());
         assert_eq!(editor.base_rev(), "abc123");
         // Saving (or switching file) starts over from the saved text.
         editor.mark_saved();
+        assert_eq!(editor.base_rev(), meshfox_core::body_rev("# Root\n"));
+    }
+
+    #[test]
+    fn taking_theirs_replaces_the_buffer_and_leaves_nothing_to_save() {
+        let mut editor = open_editor("# Root\n");
+        editor.open_diff("# Root, theirs\n".to_string(), "abc123".to_string(), &[]);
+        editor.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert!(editor.diff.is_none());
+        assert_eq!(editor.editor.lines.to_string(), "# Root, theirs\n");
+        assert!(!editor.dirty());
+        assert_eq!(
+            editor.base_rev(),
+            meshfox_core::body_rev("# Root, theirs\n")
+        );
+    }
+
+    #[test]
+    fn going_back_from_the_comparison_keeps_the_buffer_and_a_note() {
+        let mut editor = open_editor("# Root\n");
+        editor.open_diff("# Root, theirs\n".to_string(), "abc123".to_string(), &[]);
+        let outcome = editor.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(outcome, SourceEditorOutcome::Stay));
+        assert!(editor.diff.is_none());
+        assert_eq!(editor.editor.lines.to_string(), "# Root\n");
+        assert!(editor.error.as_deref().is_some_and(|e| e.contains("not saved")));
+        // Nothing was decided: the next save is still against what was read.
         assert_eq!(editor.base_rev(), meshfox_core::body_rev("# Root\n"));
     }
 

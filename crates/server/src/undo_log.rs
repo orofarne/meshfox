@@ -578,6 +578,31 @@ impl UndoLog {
         })
     }
 
+    /// All retained steps with their replay payload (spans of text, or whole
+    /// documents for old rows), split at the cursor. Read-only: nothing is
+    /// moved or committed. Unlike [`Self::history_around`] this does pull
+    /// the payloads into memory — it exists for finding the document a
+    /// client's revision was read from, which only happens on a conflict.
+    pub fn replay_window(&self) -> io::Result<ReplayWindow> {
+        let cursor = self.cursor()?;
+        let conn = self.conn.lock().unwrap();
+        let read = |sql: String| -> io::Result<Vec<UndoEntry>> {
+            let mut stmt = conn.prepare(&sql).map_err(sqlite_err)?;
+            let rows = stmt
+                .query_map(params![cursor], Self::row_mapper)
+                .map_err(sqlite_err)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)
+        };
+        Ok(ReplayWindow {
+            applied: read(format!(
+                "SELECT {ENTRY_COLUMNS} FROM undo_log WHERE seq <= ?1 ORDER BY seq DESC"
+            ))?,
+            redo: read(format!(
+                "SELECT {ENTRY_COLUMNS} FROM undo_log WHERE seq > ?1 ORDER BY seq ASC"
+            ))?,
+        })
+    }
+
     /// Every currently-applied step, most recent first, capped to the last
     /// `limit`, plus the *entire* current redo tail prepended ahead of
     /// them (never separately capped — it's already bounded by how many
@@ -631,6 +656,20 @@ impl UndoLog {
             }))
             .collect())
     }
+}
+
+/// Every step this log can still replay, with its replay payload, split at
+/// the cursor — what a base search walks (see [`UndoLog::replay_window`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReplayWindow {
+    /// Steps at or below the cursor, newest first: applying each one's
+    /// *undo* to the current document, in this order, yields the document as
+    /// it was before that step.
+    pub applied: Vec<UndoEntry>,
+    /// Steps above the cursor (the redo tail), oldest first: applying each
+    /// one's *redo* to the current document, in this order, walks forward
+    /// through what an undo threw away.
+    pub redo: Vec<UndoEntry>,
 }
 
 /// One entry as listed by [`UndoLog::history_around`], resolved against
@@ -1117,6 +1156,34 @@ mod tests {
         assert_eq!(
             seqs_and_applied,
             vec![(5, false), (4, false), (3, false), (2, true)]
+        );
+    }
+
+    #[test]
+    fn replay_window_splits_the_log_at_the_cursor() {
+        let log = UndoLog::open_in_memory().unwrap();
+        log.push("raw_replace", Payload::Raw { before: "v0" }, "v1")
+            .unwrap();
+        log.push("raw_replace", Payload::Raw { before: "v1" }, "v2")
+            .unwrap();
+        log.push("raw_replace", Payload::Raw { before: "v2" }, "v3")
+            .unwrap();
+        let entry = log.peek_undo().unwrap().unwrap();
+        log.commit_undo(entry.seq, "v2").unwrap();
+
+        let window = log.replay_window().unwrap();
+        let applied: Vec<i64> = window.applied.iter().map(|e| e.seq).collect();
+        let redo: Vec<i64> = window.redo.iter().map(|e| e.seq).collect();
+        assert_eq!(applied, vec![2, 1]);
+        assert_eq!(redo, vec![3]);
+        // Each side replays from the current document ("v2").
+        assert_eq!(
+            window.applied[0].replay_document("v2", true).as_deref(),
+            Some("v1")
+        );
+        assert_eq!(
+            window.redo[0].replay_document("v2", false).as_deref(),
+            Some("v3")
         );
     }
 }

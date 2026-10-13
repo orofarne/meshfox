@@ -20,8 +20,8 @@ use axum::{
     Json, Router,
 };
 use meshfox_core::{
-    mdcanvas, worker_lock, Canvas, ExecOutput, ExtraEdge, FenceAttrsPatch, FileDisplay, NodeMeta,
-    NodeType, RunError, VarCache,
+    mdcanvas, merge3, worker_lock, Canvas, ExecOutput, ExtraEdge, FenceAttrsPatch, FileDisplay,
+    Merge, MergeConflict, NodeMeta, NodeType, RunError, VarCache,
 };
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
@@ -3810,17 +3810,29 @@ impl IntoResponse for ApiError {
 /// longer has: carries the node's current text and revision, so the caller
 /// can show or merge the new text and retry in one step without a further
 /// read.
-fn body_conflict(current_text: &str, current_rev: &str) -> ApiError {
-    ApiError(
-        StatusCode::CONFLICT,
-        serde_json::json!({
-            "error": "bodyConflict",
-            "message": "the node's body changed since it was read — merge or reread, then retry with the current revision",
-            "currentText": current_text,
-            "currentRev": current_rev,
-        })
-        .to_string(),
-    )
+///
+/// When a merge was attempted and the two edits really did overlap, also
+/// carries the line ranges that could not be combined (`conflicts`, from
+/// `meshfox_core::ConflictHunk`: `mine` indexes the text the client sent,
+/// `theirs` the `currentText` returned alongside) and `marked`, the whole
+/// body with `<<<<<<< mine` / `=======` / `>>>>>>> theirs` around each of
+/// them — the text to resolve by hand and send back against `currentRev`.
+fn body_conflict_with(
+    current_text: &str,
+    current_rev: &str,
+    conflict: Option<&MergeConflict>,
+) -> ApiError {
+    let mut payload = serde_json::json!({
+        "error": "bodyConflict",
+        "message": "the node's body changed since it was read — merge or reread, then retry with the current revision",
+        "currentText": current_text,
+        "currentRev": current_rev,
+    });
+    if let Some(conflict) = conflict {
+        payload["conflicts"] = serde_json::json!(conflict.hunks);
+        payload["marked"] = serde_json::json!(conflict.marked);
+    }
+    ApiError(StatusCode::CONFLICT, payload.to_string())
 }
 
 impl From<RunError> for ApiError {
@@ -3838,16 +3850,124 @@ impl From<RunError> for ApiError {
 /// file that is no longer the current one: carries the file's current text
 /// and revision, same shape as `body_conflict`.
 fn source_conflict(current_text: &str, current_rev: &str) -> ApiError {
-    ApiError(
-        StatusCode::PRECONDITION_FAILED,
-        serde_json::json!({
-            "error": "sourceConflict",
-            "message": "the file changed since it was read — merge or reread, then retry with the current ETag",
-            "currentText": current_text,
-            "currentRev": current_rev,
-        })
-        .to_string(),
-    )
+    source_conflict_with(current_text, current_rev, None)
+}
+
+/// [`source_conflict`] plus the unmergeable line ranges, same as
+/// [`body_conflict_with`].
+fn source_conflict_with(
+    current_text: &str,
+    current_rev: &str,
+    conflict: Option<&MergeConflict>,
+) -> ApiError {
+    let mut payload = serde_json::json!({
+        "error": "sourceConflict",
+        "message": "the file changed since it was read — merge or reread, then retry with the current ETag",
+        "currentText": current_text,
+        "currentRev": current_rev,
+    });
+    if let Some(conflict) = conflict {
+        payload["conflicts"] = serde_json::json!(conflict.hunks);
+        payload["marked"] = serde_json::json!(conflict.marked);
+    }
+    ApiError(StatusCode::PRECONDITION_FAILED, payload.to_string())
+}
+
+/// What a merge-on-write attempt came to.
+enum MergeAttempt {
+    /// The two edits combined; this is the text to write.
+    Clean(String),
+    /// Both sides changed the same region; nothing is written.
+    Conflict(MergeConflict),
+    /// No merge was possible — the revision the client based its edit on is
+    /// no longer in the undo history, or the combined text would not parse.
+    /// The caller answers with the ordinary conflict.
+    Unavailable,
+}
+
+/// Finds a document the undo history says this canvas once had: starting
+/// from `current_raw`, walks the log back through every applied step and
+/// then forward through the redo tail, and returns what `find` extracts from
+/// the first state it accepts.
+///
+/// This is how a merge gets its *base*: a revision (`bodyRev`, `ETag`) is
+/// only a hash, but every state the file passed through — a save, a block's
+/// output being written back, an external edit the watcher noticed — was
+/// recorded, so the text a client read is reconstructable as long as it is
+/// still inside the log's window. Read-only: nothing is written or moved, and
+/// each step is replayed in memory (`apply_history_entry`). Costly — a
+/// structured step re-parses the document — but it only runs on a conflict.
+/// A step that no longer applies ends that direction of the walk.
+fn find_in_history(
+    state: &AppState,
+    current_raw: &str,
+    find: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    let window = match state.undo_log.replay_window() {
+        Ok(window) => window,
+        Err(e) => {
+            eprintln!("meshfox: failed to read undo history for a merge ({e})");
+            return None;
+        }
+    };
+    let mut doc = current_raw.to_string();
+    for entry in &window.applied {
+        doc = apply_history_entry(&doc, entry, true)?;
+        if let Some(found) = find(&doc) {
+            return Some(found);
+        }
+    }
+    let mut doc = current_raw.to_string();
+    for entry in &window.redo {
+        doc = match apply_history_entry(&doc, entry, false) {
+            Some(next) => next,
+            None => break,
+        };
+        if let Some(found) = find(&doc) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Merge-on-write for a node body: `mine` is the text the client sent,
+/// `current` what the node holds now, and the base is whatever the node's
+/// body was at revision `base_rev` (`current` itself, if that is still the
+/// revision). The combined text must also still parse as the node's body, or
+/// the attempt is `Unavailable` and the caller reports the plain conflict.
+fn merge_node_body(
+    state: &AppState,
+    raw: &str,
+    local_id: &str,
+    base_rev: &str,
+    mine: &str,
+    current: &str,
+) -> MergeAttempt {
+    let base = if meshfox_core::body_rev(current) == base_rev {
+        current.to_string()
+    } else {
+        let found = find_in_history(state, raw, |doc| {
+            let canvas = Canvas::from_markdown(doc).ok()?;
+            let node = canvas.node(local_id)?;
+            (meshfox_core::body_rev(&node.text) == base_rev).then(|| node.text.clone())
+        });
+        match found {
+            Some(base) => base,
+            None => return MergeAttempt::Unavailable,
+        }
+    };
+    match merge3(&base, mine, current) {
+        Merge::Conflict(conflict) => MergeAttempt::Conflict(conflict),
+        Merge::Clean(text) => {
+            let parses = mdcanvas::set_node_body(raw, local_id, &text)
+                .is_some_and(|patched| Canvas::from_markdown(&patched).is_ok());
+            if parses {
+                MergeAttempt::Clean(text)
+            } else {
+                MergeAttempt::Unavailable
+            }
+        }
+    }
 }
 
 /// The `ETag` of a file whose text is `text`: its `body_rev`, quoted.
@@ -3913,6 +4033,12 @@ struct VersionedCanvas {
     canvas: Canvas,
     canvas_version: u64,
     server_session: String,
+    /// Set (to `true`) only on the response to a write that was combined
+    /// with someone else's concurrent change (`merge: true`, see
+    /// `UpdateNodeRequest::merge`): the node in this snapshot then holds
+    /// the merged body, not what the client sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    merged: Option<bool>,
 }
 
 impl std::ops::Deref for VersionedCanvas {
@@ -3940,6 +4066,7 @@ impl AppState {
             canvas,
             canvas_version: version.0,
             server_session: self.server_session.clone(),
+            merged: None,
         }))
     }
 }
@@ -4141,6 +4268,12 @@ struct SourceFileQuery {
     /// primary document itself.
     #[serde(default)]
     include: Option<String>,
+    /// `merge=1` on a whole-file `PUT`: when `If-Match` is stale, find the
+    /// file the client started from in the undo history and three-way merge
+    /// instead of answering `412` (primary document only — an include has no
+    /// history here).
+    #[serde(default)]
+    merge: Option<String>,
 }
 
 /// Which file Source mode is actually pointed at — `state`'s own document,
@@ -4233,8 +4366,44 @@ async fn put_canvas_raw(
             // really is right now.
             let current = state.raw.lock().unwrap().clone();
             let current_rev = meshfox_core::body_rev(&current);
+            let mut conflict = None;
             if base_rev != current_rev {
-                return Err(source_conflict(&current, &current_rev));
+                if query.include.is_none() && matches!(query.merge.as_deref(), Some("1" | "true")) {
+                    let base = find_in_history(&state, &current, |doc| {
+                        (meshfox_core::body_rev(doc) == base_rev).then(|| doc.to_string())
+                    });
+                    if let Some(base) = base {
+                        match merge3(&base, &body, &current) {
+                            Merge::Clean(text) if Canvas::from_markdown(&text).is_ok() => {
+                                state.save(&text).map_err(|e| {
+                                    ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                                })?;
+                                // What was stored, not what was merged:
+                                // saving strips uncached output.
+                                let stored = state.raw.lock().unwrap().clone();
+                                let mut headers = HeaderMap::new();
+                                headers.insert(
+                                    header::ETAG,
+                                    header::HeaderValue::from_str(&etag_for(&stored))
+                                        .expect("an ETag is plain ASCII"),
+                                );
+                                headers.insert(
+                                    "x-meshfox-merged",
+                                    header::HeaderValue::from_static("true"),
+                                );
+                                return Ok((StatusCode::OK, headers, stored).into_response());
+                            }
+                            Merge::Conflict(found) => conflict = Some(found),
+                            // A merge that would not parse: the ordinary 412.
+                            Merge::Clean(_) => {}
+                        }
+                    }
+                }
+                return Err(source_conflict_with(
+                    &current,
+                    &current_rev,
+                    conflict.as_ref(),
+                ));
             }
             parse_or_error(&body)?;
             state
@@ -4884,6 +5053,14 @@ struct UpdateNodeRequest {
     base_rev: Option<String>,
     /// Optional original title for atomic editor saves.
     base_title: Option<String>,
+    /// With `text`: when `baseRev` (or `baseTitle`) is stale, don't reject —
+    /// find the body the client started from in the undo history and
+    /// three-way merge the client's text with the current one. A clean merge
+    /// is written (response `merged: true`); overlapping edits are still a
+    /// `409`, now with `conflicts`; a base that is no longer in the history
+    /// is the ordinary `409`. Off by default: a line-level merge of prose
+    /// can read wrong, so only a caller that looks at the result opts in.
+    merge: Option<bool>,
     /// Changes to the node's extra incoming edges (`meshfox:edge
     /// from="..."`), applied to the edges it has right now — never a
     /// replacement list, for the same reason as `tags`. `None` leaves them
@@ -5030,7 +5207,7 @@ mod resolve_fold_override_tests {
 async fn update_node(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(req): Json<UpdateNodeRequest>,
+    Json(mut req): Json<UpdateNodeRequest>,
 ) -> Result<Json<VersionedCanvas>, ApiError> {
     let _guard = state.begin_mutation().await;
     let primary_raw = state.raw.lock().unwrap().clone();
@@ -5116,6 +5293,8 @@ async fn update_node(
     // try to overwrite the link with the target's whole content — reject
     // it with a clear reason up front rather than relying on the later
     // `parse_or_error` to incidentally catch it as a mangled link body.
+    // Set when the write was combined with a concurrent change (`merge`).
+    let mut merged = false;
     if req.text.is_some() {
         let Some(base_rev) = req.base_rev.as_deref() else {
             return Err(ApiError(
@@ -5126,14 +5305,51 @@ async fn update_node(
             ));
         };
         let current_rev = meshfox_core::body_rev(&initial_node.text);
-        if base_rev != current_rev
-            || req.base_title.as_ref().is_some_and(|title| title != &initial_node.title)
-        {
-            let mut error = body_conflict(&initial_node.text, &current_rev);
-            let mut payload: serde_json::Value = serde_json::from_str(&error.1).unwrap();
-            payload["currentTitle"] = serde_json::json!(initial_node.title);
-            error.1 = payload.to_string();
-            return Err(error);
+        let title_stale = req
+            .base_title
+            .as_ref()
+            .is_some_and(|title| title != &initial_node.title);
+        if base_rev != current_rev || title_stale {
+            // The title merges by equality: if the client changed it and so
+            // did someone else, to something different, that is a conflict
+            // no text merge can settle.
+            let title_conflict = title_stale
+                && req.title.as_ref().is_some_and(|title| {
+                    Some(title) != req.base_title.as_ref() && title != &initial_node.title
+                });
+            let attempt = match (req.merge, req.text.as_deref()) {
+                (Some(true), Some(mine)) if !title_conflict => merge_node_body(
+                    &state,
+                    &primary_raw,
+                    &local_id,
+                    base_rev,
+                    mine,
+                    &initial_node.text,
+                ),
+                _ => MergeAttempt::Unavailable,
+            };
+            let mut conflict = None;
+            match attempt {
+                MergeAttempt::Clean(text) => {
+                    req.text = Some(text);
+                    // A title left as the client first read it is not an
+                    // edit: don't write it back over someone else's rename.
+                    if title_stale && req.title == req.base_title {
+                        req.title = None;
+                    }
+                    merged = true;
+                }
+                MergeAttempt::Conflict(found) => conflict = Some(found),
+                MergeAttempt::Unavailable => {}
+            }
+            if !merged {
+                let mut error =
+                    body_conflict_with(&initial_node.text, &current_rev, conflict.as_ref());
+                let mut payload: serde_json::Value = serde_json::from_str(&error.1).unwrap();
+                payload["currentTitle"] = serde_json::json!(initial_node.title);
+                error.1 = payload.to_string();
+                return Err(error);
+            }
         }
     }
     if initial_node.node_type == NodeType::Include && req.text.is_some() {
@@ -5403,7 +5619,11 @@ async fn update_node(
 
     let op = node_upserted_event(&raw, &state.canvas_path, &local_id);
     commit_located(&state, &located, &raw, op)?;
-    state.canvas_snapshot()
+    let Json(mut snapshot) = state.canvas_snapshot()?;
+    if merged {
+        snapshot.merged = Some(true);
+    }
+    Ok(Json(snapshot))
 }
 
 /// Append against the worker's current body in one request, without a
@@ -11619,6 +11839,7 @@ mod node_op_broadcast_tests {
             text: Some("new body a".to_string()),
             base_rev: Some(current_body_rev(&state, "a")),
             base_title: None,
+            merge: None,
             edges: None,
             display: None,
             lang: None,
@@ -12102,6 +12323,359 @@ mod node_op_broadcast_tests {
         let _ = std::fs::remove_file(&canvas_path);
     }
 
+    /// A document whose node `a` has several separate lines, so two edits
+    /// can land in different places.
+    const MERGE_DOC: &str = concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "## A\n<!-- meshfox:node id=\"a\" -->\n\n",
+        "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\n\n",
+        "## B\n<!-- meshfox:node id=\"b\" -->\n\nbody b\n",
+    );
+
+    fn node_text(state: &AppState, id: &str) -> String {
+        let raw = state.raw.lock().unwrap().clone();
+        Canvas::from_markdown(&raw)
+            .unwrap()
+            .node(id)
+            .unwrap()
+            .text
+            .clone()
+    }
+
+    fn merge_patch(text: &str, base_rev: &str) -> UpdateNodeRequest {
+        let mut request = text_patch(text, Some(base_rev));
+        request.merge = Some(true);
+        request
+    }
+
+    async fn conflict_json(err: ApiError) -> serde_json::Value {
+        serde_json::from_str(&response_text(err.into_response()).await).unwrap()
+    }
+
+    /// Two clients read the same body; one saves a change to line 1, and the
+    /// other then saves a change to line 6 with `merge`. The second write
+    /// is not refused: the server finds the body the second client started
+    /// from in the undo history, merges, and the node ends up with both.
+    #[tokio::test]
+    async fn merge_combines_edits_to_different_lines_and_marks_the_response() {
+        let canvas_path = write_test_canvas(MERGE_DOC);
+        let state = build_state(canvas_path.clone(), false, None).await.unwrap();
+        let base_rev = current_body_rev(&state, "a");
+        let base = node_text(&state, "a");
+
+        let _ = update_node(
+            State(state.clone()),
+            Path("a".to_string()),
+            Json(text_patch(&base.replace("line 1", "line one"), Some(&base_rev))),
+        )
+        .await
+        .expect("first write is current");
+
+        let Json(saved) = update_node(
+            State(state.clone()),
+            Path("a".to_string()),
+            Json(merge_patch(&base.replace("line 6", "line six"), &base_rev)),
+        )
+        .await
+        .expect("disjoint edits merge");
+        assert_eq!(saved.merged, Some(true));
+        let text = &saved.node("a").unwrap().text;
+        assert!(text.contains("line one"), "{text:?}");
+        assert!(text.contains("line six"), "{text:?}");
+        let on_disk = std::fs::read_to_string(&canvas_path).unwrap();
+        assert!(on_disk.contains("line one") && on_disk.contains("line six"));
+        assert_eq!(current_body_rev(&state, "a"), meshfox_core::body_rev(text));
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    /// A write that is current needs no merge, and says so.
+    #[tokio::test]
+    async fn a_current_write_with_merge_set_is_an_ordinary_write() {
+        let canvas_path = write_test_canvas(MERGE_DOC);
+        let state = build_state(canvas_path.clone(), false, None).await.unwrap();
+        let rev = current_body_rev(&state, "a");
+        let Json(saved) = update_node(
+            State(state.clone()),
+            Path("a".to_string()),
+            Json(merge_patch("brand new", &rev)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.merged, None);
+        assert_eq!(saved.node("a").unwrap().text, "brand new");
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    /// Overlapping edits stay a 409, now naming the conflicting lines, and
+    /// nothing is written.
+    #[tokio::test]
+    async fn merge_of_overlapping_edits_is_a_409_with_conflicts_and_writes_nothing() {
+        let canvas_path = write_test_canvas(MERGE_DOC);
+        let state = build_state(canvas_path.clone(), false, None).await.unwrap();
+        let base_rev = current_body_rev(&state, "a");
+        let base = node_text(&state, "a");
+        let _ = update_node(
+            State(state.clone()),
+            Path("a".to_string()),
+            Json(text_patch(&base.replace("line 3", "their line"), Some(&base_rev))),
+        )
+        .await
+        .unwrap();
+        let before = std::fs::read_to_string(&canvas_path).unwrap();
+
+        let err = update_node(
+            State(state.clone()),
+            Path("a".to_string()),
+            Json(merge_patch(&base.replace("line 3", "my line"), &base_rev)),
+        )
+        .await
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        let conflict = conflict_json(err).await;
+        assert_eq!(conflict["error"], "bodyConflict");
+        assert!(conflict["currentText"].as_str().unwrap().contains("their line"));
+        let hunks = conflict["conflicts"].as_array().expect("conflicts listed");
+        assert_eq!(hunks.len(), 1);
+        // Line 3 of the body: index 2 in both texts, one line long.
+        assert_eq!(hunks[0]["mine"], serde_json::json!({"start": 2, "end": 3}));
+        assert_eq!(hunks[0]["theirs"], serde_json::json!({"start": 2, "end": 3}));
+        let marked = conflict["marked"].as_str().unwrap();
+        assert!(
+            marked.contains("<<<<<<< mine\nmy line\n=======\ntheir line\n>>>>>>> theirs\n"),
+            "{marked:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&canvas_path).unwrap(), before);
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    /// A revision the history has never held cannot be merged from — the
+    /// answer is the ordinary 409, without `conflicts`.
+    #[tokio::test]
+    async fn merge_with_a_revision_outside_the_history_is_the_plain_409() {
+        let canvas_path = write_test_canvas(MERGE_DOC);
+        let state = build_state(canvas_path.clone(), false, None).await.unwrap();
+        let err = update_node(
+            State(state.clone()),
+            Path("a".to_string()),
+            Json(merge_patch("my body", "0123456789abcdef")),
+        )
+        .await
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        let conflict = conflict_json(err).await;
+        assert!(conflict.get("conflicts").is_none());
+        assert!(conflict["currentText"].as_str().unwrap().contains("line 1"));
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    /// Without `merge` a stale write is refused exactly as before, however
+    /// mergeable the edits are.
+    #[tokio::test]
+    async fn a_stale_write_without_merge_is_still_refused_even_if_mergeable() {
+        let canvas_path = write_test_canvas(MERGE_DOC);
+        let state = build_state(canvas_path.clone(), false, None).await.unwrap();
+        let base_rev = current_body_rev(&state, "a");
+        let base = node_text(&state, "a");
+        let _ = update_node(
+            State(state.clone()),
+            Path("a".to_string()),
+            Json(text_patch(&base.replace("line 1", "line one"), Some(&base_rev))),
+        )
+        .await
+        .unwrap();
+        let err = update_node(
+            State(state.clone()),
+            Path("a".to_string()),
+            Json(text_patch(&base.replace("line 6", "line six"), Some(&base_rev))),
+        )
+        .await
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(conflict_json(err).await.get("conflicts").is_none());
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    /// The body the client started from can also be *ahead* of the current
+    /// document: after someone undoes a step, the state the client read sits
+    /// in the redo tail, and is found there.
+    #[tokio::test]
+    async fn merge_finds_its_base_in_the_redo_tail_after_an_undo() {
+        let canvas_path = write_test_canvas(MERGE_DOC);
+        let state = build_state(canvas_path.clone(), false, None).await.unwrap();
+        let first = node_text(&state, "a");
+        let first_rev = current_body_rev(&state, "a");
+        // A second state, which "my" client reads.
+        let second = first.replace("line 6", "line six");
+        let _ = update_node(
+            State(state.clone()),
+            Path("a".to_string()),
+            Json(text_patch(&second, Some(&first_rev))),
+        )
+        .await
+        .unwrap();
+        let second_rev = current_body_rev(&state, "a");
+        // Someone undoes it: the document is back at `first`.
+        let _ = api_undo(State(state.clone())).await.unwrap();
+        assert_eq!(node_text(&state, "a"), first);
+
+        let Json(saved) = update_node(
+            State(state.clone()),
+            Path("a".to_string()),
+            Json(merge_patch(&second.replace("line 1", "line one"), &second_rev)),
+        )
+        .await
+        .expect("the base is in the redo tail");
+        assert_eq!(saved.merged, Some(true));
+        let text = &saved.node("a").unwrap().text;
+        // `theirs` (the undone state) wins line 6, `mine` brings line 1.
+        assert!(text.contains("line one"), "{text:?}");
+        assert!(text.contains("line 6") && !text.contains("line six"), "{text:?}");
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    /// Someone else renamed the node and the client, which never touched the
+    /// title, saves its body with the title it read: the rename survives.
+    #[tokio::test]
+    async fn merge_keeps_a_concurrent_rename_the_client_did_not_make() {
+        let canvas_path = write_test_canvas(MERGE_DOC);
+        let state = build_state(canvas_path.clone(), false, None).await.unwrap();
+        let rev = current_body_rev(&state, "a");
+        let base = node_text(&state, "a");
+        let rename: UpdateNodeRequest =
+            serde_json::from_value(serde_json::json!({ "title": "Renamed" })).unwrap();
+        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(rename))
+            .await
+            .unwrap();
+
+        let mut mine = merge_patch(&base.replace("line 6", "line six"), &rev);
+        mine.base_title = Some("A".into());
+        mine.title = Some("A".into());
+        let Json(saved) = update_node(State(state.clone()), Path("a".to_string()), Json(mine))
+            .await
+            .expect("an unchanged title does not conflict under merge");
+        assert_eq!(saved.merged, Some(true));
+        assert_eq!(saved.node("a").unwrap().title, "Renamed");
+        assert!(saved.node("a").unwrap().text.contains("line six"));
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    /// Both sides renaming the node differently is a conflict merge can't
+    /// settle.
+    #[tokio::test]
+    async fn merge_does_not_settle_two_different_renames() {
+        let canvas_path = write_test_canvas(MERGE_DOC);
+        let state = build_state(canvas_path.clone(), false, None).await.unwrap();
+        let rev = current_body_rev(&state, "a");
+        let base = node_text(&state, "a");
+        let rename: UpdateNodeRequest =
+            serde_json::from_value(serde_json::json!({ "title": "Theirs" })).unwrap();
+        let _ = update_node(State(state.clone()), Path("a".to_string()), Json(rename))
+            .await
+            .unwrap();
+
+        let mut mine = merge_patch(&base.replace("line 6", "line six"), &rev);
+        mine.base_title = Some("A".into());
+        mine.title = Some("Mine".into());
+        let err = update_node(State(state.clone()), Path("a".to_string()), Json(mine))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        let conflict = conflict_json(err).await;
+        assert_eq!(conflict["currentTitle"], "Theirs");
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    /// The history is a sqlite file next to the canvas, so a base written
+    /// before a worker restart is still found after it.
+    #[tokio::test]
+    async fn merge_finds_its_base_after_a_worker_restart() {
+        let canvas_path = write_test_canvas(MERGE_DOC);
+        let state = build_state(canvas_path.clone(), false, None).await.unwrap();
+        let base_rev = current_body_rev(&state, "a");
+        let base = node_text(&state, "a");
+        let _ = update_node(
+            State(state.clone()),
+            Path("a".to_string()),
+            Json(text_patch(&base.replace("line 1", "line one"), Some(&base_rev))),
+        )
+        .await
+        .unwrap();
+        drop(state);
+
+        let state = build_state(canvas_path.clone(), false, None).await.unwrap();
+        let Json(saved) = update_node(
+            State(state.clone()),
+            Path("a".to_string()),
+            Json(merge_patch(&base.replace("line 6", "line six"), &base_rev)),
+        )
+        .await
+        .expect("the log outlives the worker");
+        assert_eq!(saved.merged, Some(true));
+        let text = &saved.node("a").unwrap().text;
+        assert!(text.contains("line one") && text.contains("line six"), "{text:?}");
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    /// Source mode: `?merge=1` with a stale `If-Match` merges against the
+    /// file the client read, writes, and answers `200` with the stored text.
+    #[tokio::test]
+    async fn source_put_with_merge_combines_edits_and_returns_the_merged_file() {
+        let canvas_path = write_test_canvas(MERGE_DOC);
+        let state = build_state(canvas_path.clone(), false, None).await.unwrap();
+        let read = get_canvas_raw(State(state.clone()), raw_query()).await.unwrap();
+        let base_etag = etag_of(&read);
+
+        let theirs = MERGE_DOC.replace("line 1", "line one");
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_MATCH, base_etag.parse().unwrap());
+        put_canvas_raw(State(state.clone()), raw_query(), headers.clone(), theirs)
+            .await
+            .expect("current ETag");
+
+        let mine = MERGE_DOC.replace("line 6", "line six");
+        let query = Query(SourceFileQuery {
+            include: None,
+            merge: Some("1".into()),
+        });
+        let response = put_canvas_raw(State(state.clone()), query, headers.clone(), mine.clone())
+            .await
+            .expect("disjoint edits merge");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get("x-meshfox-merged").unwrap(), "true");
+        let etag = etag_of(&response);
+        let body = response_text(response).await;
+        assert!(body.contains("line one") && body.contains("line six"));
+        assert_eq!(etag, etag_for(&body));
+        assert_eq!(std::fs::read_to_string(&canvas_path).unwrap(), body);
+
+        // The same stale ETag against an overlapping edit: 412 with conflicts.
+        let overlapping = MERGE_DOC.replace("line 1", "my line");
+        let query = Query(SourceFileQuery {
+            include: None,
+            merge: Some("1".into()),
+        });
+        let err = put_canvas_raw(State(state.clone()), query, headers.clone(), overlapping)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::PRECONDITION_FAILED);
+        let conflict = conflict_json(err).await;
+        assert_eq!(conflict["error"], "sourceConflict");
+        assert_eq!(conflict["conflicts"].as_array().unwrap().len(), 1);
+        assert_eq!(std::fs::read_to_string(&canvas_path).unwrap(), body);
+
+        // And without `merge=1` it is the plain 412, as before.
+        let err = put_canvas_raw(State(state), raw_query(), headers, mine)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::PRECONDITION_FAILED);
+        assert!(conflict_json(err).await.get("conflicts").is_none());
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
     /// The revision tracks the body only: changing another field of the node
     /// (a drag, a recolour, a tag) must not make a body write in flight
     /// stale.
@@ -12183,7 +12757,7 @@ mod node_op_broadcast_tests {
     }
 
     fn raw_query() -> Query<SourceFileQuery> {
-        Query(SourceFileQuery { include: None })
+        Query(SourceFileQuery { include: None, merge: None })
     }
 
     fn etag_of(response: &Response) -> String {
@@ -12608,7 +13182,7 @@ mod undo_log_recording_tests {
         let held = if_match_for(&state.raw.lock().unwrap());
         let status = put_canvas_raw(
             State(state.clone()),
-            Query(SourceFileQuery { include: None }),
+            Query(SourceFileQuery { include: None, merge: None }),
             held,
             input.clone(),
         )
@@ -12704,6 +13278,7 @@ mod undo_log_recording_tests {
             text: Some("new body a".to_string()),
             base_rev: Some(current_body_rev(&state, "a")),
             base_title: None,
+            merge: None,
             edges: None,
             display: None,
             lang: None,
@@ -14121,6 +14696,7 @@ mod include_edit_tests {
             text: None,
             base_rev: None,
             base_title: None,
+            merge: None,
             edges: None,
             display: None,
             lang: None,
@@ -14660,6 +15236,7 @@ mod include_edit_tests {
                 State(state.clone()),
                 Query(SourceFileQuery {
                     include: Some("child".to_string()),
+                    merge: None,
                 }),
             )
             .await
@@ -14674,6 +15251,7 @@ mod include_edit_tests {
             State(state),
             Query(SourceFileQuery {
                 include: Some("child".to_string()),
+                merge: None,
             }),
             if_match_for(&source),
             new_source.clone(),
@@ -14701,6 +15279,7 @@ mod include_edit_tests {
             State(state),
             Query(SourceFileQuery {
                 include: Some("nope".to_string()),
+                merge: None,
             }),
         )
         .await
@@ -14739,6 +15318,7 @@ mod include_edit_tests {
         let query = || {
             Query(SourceFileQuery {
                 include: Some("notes".to_string()),
+                merge: None,
             })
         };
 
@@ -14799,6 +15379,7 @@ mod include_edit_tests {
             State(state),
             Query(SourceFileQuery {
                 include: Some("notes".to_string()),
+                merge: None,
             }),
             if_match_for(&std::fs::read_to_string(dir.join("notes.md")).unwrap()),
             new_prose.to_string(),

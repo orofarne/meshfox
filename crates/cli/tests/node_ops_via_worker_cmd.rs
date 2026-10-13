@@ -482,6 +482,95 @@ fn node_body_needs_the_current_base_rev_and_add_takes_its_body_with_it() {
 }
 
 #[test]
+fn node_body_merge_combines_a_stale_write_with_the_concurrent_one() {
+    let dir = unique_dir();
+    let canvas_path = dir.join("merge.canvas.md");
+    std::fs::write(
+        &canvas_path,
+        concat!(
+            "<!-- meshfox:canvas -->\n# Merge\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## A\n<!-- meshfox:node id=\"a\" -->\n\n",
+            "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\n",
+        ),
+    )
+    .unwrap();
+    let worker = spawn_worker(&dir, &canvas_path);
+
+    let show = || -> (String, String) {
+        let output = meshfox()
+            .args(["node", "show", "--canvas"])
+            .arg(&canvas_path)
+            .arg("a")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let rev = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("body-rev: "))
+            .expect("node show prints body-rev")
+            .to_string();
+        let body = std::fs::read_to_string(&canvas_path).unwrap();
+        (rev, body)
+    };
+    let write = |text: &str, rev: &str, merge: bool| {
+        let file = dir.join("write.md");
+        std::fs::write(&file, text).unwrap();
+        let mut command = meshfox();
+        command
+            .args(["node", "body", "--canvas"])
+            .arg(&canvas_path)
+            .arg("a")
+            .arg("--file")
+            .arg(&file)
+            .args(["--base-rev", rev]);
+        if merge {
+            command.arg("--merge");
+        }
+        command.output().unwrap()
+    };
+
+    // Both writers start from this revision; the first lands.
+    let (base_rev, _) = show();
+    let base = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\n";
+    let first = write(&base.replace("line 1", "line one"), &base_rev, false);
+    assert!(first.status.success());
+
+    // Without --merge the stale write is refused, as before.
+    let plain = write(&base.replace("line 6", "line six"), &base_rev, false);
+    assert!(!plain.status.success());
+    assert!(!String::from_utf8_lossy(&plain.stderr).contains("merge failed"));
+
+    // With --merge it is combined, and the result is printed.
+    let merged = write(&base.replace("line 6", "line six"), &base_rev, true);
+    let stdout = String::from_utf8_lossy(&merged.stdout);
+    assert!(
+        merged.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&merged.stderr)
+    );
+    assert!(stdout.contains("merged"), "stdout: {stdout}");
+    assert!(stdout.contains("body-rev: "), "stdout: {stdout}");
+    let on_disk = std::fs::read_to_string(&canvas_path).unwrap();
+    assert!(on_disk.contains("line one"), "disk: {on_disk}");
+    assert!(on_disk.contains("line six"), "disk: {on_disk}");
+
+    // The same stale revision against an overlapping edit: nothing is
+    // written; the error names the lines and carries the marked body.
+    let before = std::fs::read_to_string(&canvas_path).unwrap();
+    let clash = write(&base.replace("line 1", "my line"), &base_rev, true);
+    assert!(!clash.status.success());
+    let stderr = String::from_utf8_lossy(&clash.stderr);
+    assert!(stderr.contains("merge failed"), "stderr: {stderr}");
+    assert!(stderr.contains("your line 1 against current line 1"), "stderr: {stderr}");
+    assert!(stderr.contains("<<<<<<< mine\nmy line\n=======\nline one\n>>>>>>> theirs"), "stderr: {stderr}");
+    assert_eq!(std::fs::read_to_string(&canvas_path).unwrap(), before);
+
+    kill(worker);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn node_edges_routes_through_a_running_worker() {
     let dir = unique_dir();
     let canvas_path = dir.join("base.canvas.md");

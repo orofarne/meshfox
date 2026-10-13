@@ -247,6 +247,9 @@ export class SourceConflictError extends Error {
   constructor(
     readonly currentText: string,
     readonly currentRev: string,
+    /** Present when a merge was attempted and the two edits overlapped;
+     * `mine` indexes the text that was sent, `theirs` indexes `currentText`. */
+    readonly conflicts?: ConflictHunk[],
   ) {
     super("the file changed since it was read");
     this.name = "SourceConflictError";
@@ -257,7 +260,7 @@ function parseSourceConflict(text: string): SourceConflictError | undefined {
   try {
     const body = JSON.parse(text);
     if (body?.error === "sourceConflict" && typeof body.currentText === "string" && typeof body.currentRev === "string") {
-      return new SourceConflictError(body.currentText, body.currentRev);
+      return new SourceConflictError(body.currentText, body.currentRev, parseHunks(body.conflicts));
     }
   } catch {
     // Not JSON: an ordinary text error body, reported as such by the caller.
@@ -276,11 +279,25 @@ function parseSourceConflict(text: string): SourceConflictError | undefined {
  *
  * `rev` is the file's revision as it was read (`fetchCanvasSource`) — the
  * server requires it, and refuses a file that has changed since with a
- * `SourceConflictError` instead of overwriting it. Returns the revision of
- * what was written.
+ * `SourceConflictError` instead of overwriting it. With `merge`, a stale
+ * revision of the document itself is instead three-way merged by the server
+ * (the file this editor started from is found in the undo history): a clean
+ * merge is written and comes back as `merged: true` with the text as stored;
+ * overlapping edits are a `SourceConflictError` carrying `conflicts`. An
+ * include has no history there, so `merge` has no effect on one. Returns the
+ * revision of what was written.
  */
-export async function saveCanvasSource(text: string, rev: string, includeNodeId?: string): Promise<string> {
-  const url = includeNodeId ? `/api/canvas/raw?include=${encodeURIComponent(includeNodeId)}` : "/api/canvas/raw";
+export async function saveCanvasSource(
+  text: string,
+  rev: string,
+  includeNodeId?: string,
+  merge = false,
+): Promise<{ rev: string; merged: boolean; text?: string }> {
+  const params = new URLSearchParams();
+  if (includeNodeId) params.set("include", includeNodeId);
+  if (merge && !includeNodeId) params.set("merge", "1");
+  const query = params.toString();
+  const url = query ? `/api/canvas/raw?${query}` : "/api/canvas/raw";
   const res = await fetch(url, {
     method: "PUT",
     headers: { "content-type": "text/plain", "if-match": rev },
@@ -294,7 +311,12 @@ export async function saveCanvasSource(text: string, rev: string, includeNodeId?
     }
     throw new Error(msg || `PUT /api/canvas/raw: ${res.status}`);
   }
-  return res.headers.get("ETag") ?? "";
+  const savedRev = res.headers.get("ETag") ?? "";
+  // 200 (rather than 204) is a merge: the body is the merged file.
+  if (res.status === 200 && res.headers.get("x-meshfox-merged") === "true") {
+    return { rev: savedRev, merged: true, text: await res.text() };
+  }
+  return { rev: savedRev, merged: false };
 }
 
 /**
@@ -435,6 +457,11 @@ export interface NodePatch {
   baseRev?: string;
   /** Original title for an atomic title/body editor save; a mismatch is a conflict. */
   baseTitle?: string;
+  /** With `text`: when `baseRev` is stale, have the server three-way merge
+   * this text with the concurrent change instead of refusing. A clean merge
+   * comes back as a document with `merged: true`; overlapping edits are a
+   * `BodyConflictError` carrying `conflicts`. */
+  merge?: boolean;
   /** Changes to the extra incoming edges (`meshfox:edge`) — omit to leave
    * them untouched. Never a replacement list, see `EdgeOps`. */
   edges?: EdgeOps;
@@ -496,6 +523,35 @@ export async function updateNode(id: string, patch: NodePatch): Promise<CanvasDo
   return res.json();
 }
 
+/** A zero-based, end-exclusive line range. */
+export interface LineRange {
+  start: number;
+  end: number;
+}
+
+/** One region both sides of a merge changed differently. */
+export interface ConflictHunk {
+  base: LineRange;
+  mine: LineRange;
+  theirs: LineRange;
+}
+
+function parseHunks(value: unknown): ConflictHunk[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const range = (r: unknown): LineRange | undefined => {
+    const o = r as { start?: unknown; end?: unknown } | null;
+    return typeof o?.start === "number" && typeof o?.end === "number" ? { start: o.start, end: o.end } : undefined;
+  };
+  const hunks: ConflictHunk[] = [];
+  for (const h of value) {
+    const base = range(h?.base);
+    const mine = range(h?.mine);
+    const theirs = range(h?.theirs);
+    if (base && mine && theirs) hunks.push({ base, mine, theirs });
+  }
+  return hunks;
+}
+
 /**
  * A body replacement written against a revision the node no longer has: the
  * body changed (another tab, an agent, an editor) since this client read it.
@@ -507,6 +563,10 @@ export class BodyConflictError extends Error {
     readonly currentText: string,
     readonly currentRev: string,
     readonly currentTitle?: string,
+    /** Present when a merge was attempted and the two edits overlapped:
+     * the lines both sides changed (`mine` indexes the text that was sent,
+     * `theirs` indexes `currentText`). */
+    readonly conflicts?: ConflictHunk[],
   ) {
     super("the node's body changed since it was read");
     this.name = "BodyConflictError";
@@ -517,7 +577,7 @@ function parseBodyConflict(text: string): BodyConflictError | undefined {
   try {
     const body = JSON.parse(text);
     if (body?.error === "bodyConflict" && typeof body.currentText === "string" && typeof body.currentRev === "string") {
-      return new BodyConflictError(body.currentText, body.currentRev, body.currentTitle);
+      return new BodyConflictError(body.currentText, body.currentRev, body.currentTitle, parseHunks(body.conflicts));
     }
   } catch {
     // Not JSON: an ordinary text error body, reported as such by the caller.
@@ -527,8 +587,8 @@ function parseBodyConflict(text: string): BodyConflictError | undefined {
 
 /** How one attempt to save a node's body ended — see `App.tsx`'s `handleSaveText`. */
 export type SaveTextOutcome =
-  | { status: "saved"; text: string; title: string; rev: string; version: number; session: string }
-  | { status: "conflict"; currentText: string; currentRev: string; currentTitle?: string }
+  | { status: "saved"; text: string; title: string; rev: string; version: number; session: string; merged?: boolean }
+  | { status: "conflict"; currentText: string; currentRev: string; currentTitle?: string; conflicts?: ConflictHunk[] }
   | { status: "error" };
 
 /**

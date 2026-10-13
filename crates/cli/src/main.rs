@@ -770,6 +770,13 @@ enum NodeCommand {
         /// carries the current body and revision to merge against and retry.
         #[arg(long = "base-rev")]
         base_rev: String,
+        /// If the body changed since `--base-rev`, three-way merge the new
+        /// text with the current body instead of refusing. A clean merge is
+        /// written and the resulting body and revision are printed; when the
+        /// two edits overlap nothing is written, and the error lists the
+        /// overlapping lines and the body with conflict markers.
+        #[arg(long)]
+        merge: bool,
     },
     /// Appends to the end of a node's existing Markdown body
     /// (`mdcanvas::append_node_body`) — after whatever's already there,
@@ -1437,11 +1444,13 @@ fn main() {
                 node_id,
                 file,
                 base_rev,
+                merge,
             } => node_body(
                 &canvas.unwrap_or_else(find_canvas),
                 &node_id,
                 file,
                 &base_rev,
+                merge,
             ),
             NodeCommand::Append {
                 canvas,
@@ -4053,7 +4062,13 @@ fn node_set_id(canvas_path: &Path, node_id: &str, new_id: &str) {
     }
 }
 
-fn node_body(canvas_path: &Path, node_id: &str, file: Option<PathBuf>, base_rev: &str) {
+fn node_body(
+    canvas_path: &Path,
+    node_id: &str,
+    file: Option<PathBuf>,
+    base_rev: &str,
+    merge: bool,
+) {
     let new_body = match &file {
         Some(path) => std::fs::read_to_string(path).unwrap_or_else(|e| {
             eprintln!("failed to read {}: {e}", path.display());
@@ -4078,9 +4093,17 @@ fn node_body(canvas_path: &Path, node_id: &str, file: Option<PathBuf>, base_rev:
     });
     let port = worker_port_or_exit(&runtime, canvas_path);
     match runtime.block_on(worker_client::update_node_body(
-        port, node_id, &new_body, base_rev,
+        port, node_id, &new_body, base_rev, merge,
     )) {
-        Ok(()) => {
+        Ok(written) if written.merged => {
+            // The caller never wrote this text, so show it.
+            println!(
+                "meshfox node body: updated {node_id:?} via the running worker on port {port} \
+                 — merged with a concurrent change; the body is now:\n{}\nbody-rev: {}",
+                written.body, written.rev
+            )
+        }
+        Ok(_) => {
             println!("meshfox node body: updated {node_id:?} via the running worker on port {port}")
         }
         Err(e) => {

@@ -2288,13 +2288,13 @@ export default function App() {
   const handleSaveText = useCallback(
     async (id: string, text: string, baseRev: string, title: string, baseTitle: string): Promise<SaveTextOutcome> => {
       try {
-        const updated = await updateNode(id, { text, baseRev, title, baseTitle });
+        const updated = await updateNode(id, { text, baseRev, title, baseTitle, merge: true });
         setCanvas(updated);
         const saved = updated.nodes.find((n) => n.id === id);
-        return { status: "saved", text: saved?.text ?? text, title: saved?.title ?? title, rev: saved?.bodyRev ?? "", version: updated.canvasVersion ?? 0, session: updated.serverSession ?? "" };
+        return { status: "saved", text: saved?.text ?? text, title: saved?.title ?? title, rev: saved?.bodyRev ?? "", version: updated.canvasVersion ?? 0, session: updated.serverSession ?? "", merged: updated.merged === true };
       } catch (e) {
         if (e instanceof BodyConflictError) {
-          return { status: "conflict", currentText: e.currentText, currentRev: e.currentRev, currentTitle: e.currentTitle };
+          return { status: "conflict", currentText: e.currentText, currentRev: e.currentRev, currentTitle: e.currentTitle, conflicts: e.conflicts };
         }
         setError(String(e));
         return { status: "error" };

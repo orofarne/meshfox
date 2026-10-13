@@ -22,6 +22,12 @@ import { getHighlighter } from "./shiki";
  */
 export const LazyEditor = lazy(() => import("@monaco-editor/react"));
 
+/** `@monaco-editor/react`'s `DiffEditor`, lazy for the same reason as
+ * `LazyEditor` — the conflict banners' side-by-side "compare" view. */
+export const LazyDiffEditor = lazy(() =>
+  import("@monaco-editor/react").then((m) => ({ default: m.DiffEditor })),
+);
+
 /**
  * Self-hosts Monaco — without this, `@monaco-editor/react`'s default
  * loader fetches Monaco from a CDN (`cdn.jsdelivr.net`) at runtime, which

@@ -16,6 +16,8 @@ It grew by 5 more once undo/redo gained its own per-canvas history log (`crates/
 
 File input/output tracking adds direct uses of `blake3` (CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception) and `globset` (Unlicense OR MIT). Both were already in Cargo.lock. The macOS normal-edge count was refreshed from `cargo metadata --filter-platform aarch64-apple-darwin`; the license scan found no additional mandatory copyleft requirement beyond the existing MPL exceptions. Alternative-license crates retain a permissive option.
 
+It grew by exactly 1 more once `meshfox-core` gained a line-based three-way merge (`crates/core/src/merge.rs`, used to combine two concurrent edits of one node body or file instead of rejecting the later one) — `similar` (Apache-2.0, `default-features` untouched, so only its `text` line-diff module) computes the base→mine and base→theirs line diffs; the `diff3` grouping on top of them is this repo's own code. `similar` has no dependencies of its own — it was the only new `Cargo.lock` package the change added (checked via `git diff Cargo.lock`), permissive, no new copyleft exception.
+
 ## MIT License
 <!-- meshfox:node id="license-file" type="file" display="code" -->
 
@@ -65,6 +67,7 @@ Direct dependencies across `crates/core`, `crates/server`, `crates/cli` (`cargo 
 | serde_json | MIT OR Apache-2.0 |
 | serde_norway | MIT OR Apache-2.0 |
 | shlex | MIT OR Apache-2.0 |
+| similar | Apache-2.0 |
 | starlark | Apache-2.0 |
 | syntect | MIT |
 | syntect-tmlanguage | MIT OR Apache-2.0 |

@@ -1,12 +1,14 @@
 import { Suspense, useEffect, useRef, useState } from "react";
 import type { OnMount } from "@monaco-editor/react";
 import {
+  type ConflictHunk,
   fetchCanvasSource,
   fetchIncludes,
   saveCanvasSource,
   SourceConflictError,
   type IncludeManifestEntry,
 } from "./api";
+import { ConflictDiff } from "./ConflictDiff";
 import { LazyEditor } from "./monacoSetup";
 import { MONACO_OPTIONS, attachMeshfoxEditorExtensions, useMonacoReady, usePrefersDark } from "./NodeTextEditor";
 import { THEMES } from "./shiki";
@@ -66,7 +68,14 @@ export function CanvasSourceEditor({ initialInclude, onSaved, onClose, onDirtyCh
   const [rev, setRev] = useState("");
   // The file as another client left it, when a save found it had changed
   // since this editor read it: nothing is written until a side is picked.
-  const [conflict, setConflict] = useState<{ text: string; rev: string } | null>(null);
+  // `hunks`/`mine` — the lines that overlapped and the exact text that was
+  // compared — are there when a merge was attempted.
+  const [conflict, setConflict] = useState<{
+    text: string;
+    rev: string;
+    hunks?: ConflictHunk[];
+    mine?: string;
+  } | null>(null);
   const [showTheirs, setShowTheirs] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -123,11 +132,15 @@ export function CanvasSourceEditor({ initialInclude, onSaved, onClose, onDirtyCh
     setSaving(true);
     setError(null);
     try {
-      await saveCanvasSource(text, baseRev, selected === PRIMARY ? undefined : selected);
+      // `merge`: a file changed elsewhere since it was read is combined with
+      // this text by the server when the edits don't overlap (the editor
+      // closes on success either way, so a merged result needs no buffer
+      // update here).
+      await saveCanvasSource(text, baseRev, selected === PRIMARY ? undefined : selected, true);
       onSaved();
     } catch (e) {
       if (e instanceof SourceConflictError) {
-        setConflict({ text: e.currentText, rev: e.currentRev });
+        setConflict({ text: e.currentText, rev: e.currentRev, hunks: e.conflicts, mine: text });
       } else {
         setError(String(e));
       }
@@ -189,7 +202,11 @@ export function CanvasSourceEditor({ initialInclude, onSaved, onClose, onDirtyCh
       </div>
       {conflict && (
         <div className="mesh-source-editor-conflict" role="alert">
-          <span>This file was changed elsewhere since you opened it. Nothing has been saved.</span>
+          <span>
+            {conflict.hunks && conflict.hunks.length > 0
+              ? "Your edits overlap changes made elsewhere since you opened this file. Nothing has been saved."
+              : "This file was changed elsewhere since you opened it. Nothing has been saved."}
+          </span>
           <button type="button" onClick={takeTheirs}>
             take theirs
           </button>
@@ -199,7 +216,16 @@ export function CanvasSourceEditor({ initialInclude, onSaved, onClose, onDirtyCh
           <button type="button" onClick={() => setShowTheirs((v) => !v)}>
             {showTheirs ? "hide theirs" : "compare"}
           </button>
-          {showTheirs && <pre className="mesh-source-editor-conflict-theirs">{conflict.text}</pre>}
+          {showTheirs && (
+            <div className="mesh-source-editor-conflict-compare">
+              <ConflictDiff
+                theirs={conflict.text}
+                mine={text ?? ""}
+                hunks={conflict.mine === text ? conflict.hunks : undefined}
+                dark={dark}
+              />
+            </div>
+          )}
         </div>
       )}
       <div className="mesh-source-editor-body" data-vscode-context="{}">

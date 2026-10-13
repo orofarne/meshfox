@@ -40,6 +40,15 @@ async function typeAtEnd(page: Page, lines: ReturnType<Page["locator"]>, text: s
   await page.keyboard.type(text, { delay: 80 });
 }
 
+/** Types at the end of the line that contains `anchor` — a real edit of that
+ * line, unlike the end of the buffer, which in Source mode is past the
+ * blank line the file ends with. */
+async function typeAtEndOfLine(page: Page, lines: ReturnType<Page["locator"]>, anchor: string, text: string) {
+  await lines.locator(".view-line", { hasText: anchor }).first().click();
+  await page.keyboard.press("End");
+  await page.keyboard.type(text, { delay: 80 });
+}
+
 test.beforeEach(async ({ page }) => {
   await page.goto("/");
   await page.waitForSelector(".mesh-node");
@@ -60,28 +69,105 @@ test("an editor with no unsaved edits quietly adopts a body changed elsewhere", 
   await expect(page.locator(".mesh-text-editor-conflict")).toHaveCount(0);
 });
 
-test("unsaved edits are never written over a body changed elsewhere: the editor asks first", async ({ page }) => {
+/** Applies without moving focus out of the editor. */
+async function applyWithKeyboard(page: Page) {
+  await page.keyboard.press("ControlOrMeta+s");
+}
+
+const MULTI = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6";
+
+/** Starts a test from a body with several separate lines, with the editor
+ * open on it. */
+async function openEditorOnMultiLineBody(page: Page) {
+  await replaceBodyElsewhere(page, MULTI);
+  await page.reload();
+  await page.waitForSelector(".mesh-node");
+  await page.getByRole("button", { name: "Edit" }).click();
+  const lines = await openEditor(page);
+  await expect(lines).toContainText("line 6");
+  return lines;
+}
+
+test("unsaved edits are never written over a body changed elsewhere: Apply reports the overlap", async ({ page }) => {
   const lines = await openEditor(page);
   await typeAtEnd(page, lines, " MINE");
   await expect(lines).toContainText("body a MINE");
 
-  // Lands while the editor holds an unsaved local draft.
+  // Lands while the editor holds an unsaved local draft: only a note, and
+  // nothing is written by itself.
   await replaceBodyElsewhere(page, "theirs");
-
-  await expect(page.locator(".mesh-text-editor-conflict")).toBeVisible();
-  // Well past the debounce: nothing may have been written over "theirs".
+  await expect(page.locator(".mesh-text-editor-note")).toContainText("changed elsewhere");
+  await expect(page.locator(".mesh-text-editor-conflict")).toHaveCount(0);
   await page.waitForTimeout(1500);
   expect((await serverBody(page)).text).toBe("theirs");
   await expect(lines).toContainText("body a MINE");
 
+  // The draft and the new body replace the same line: Apply can't combine them.
+  await page.getByRole("button", { name: "Apply", exact: true }).click();
+  await expect(page.locator(".mesh-text-editor-conflict")).toBeVisible();
+  expect((await serverBody(page)).text).toBe("theirs");
+  await expect(lines).toContainText("body a MINE");
+
   await page.locator(".mesh-text-editor-conflict button", { hasText: "compare" }).click();
-  await expect(page.locator(".mesh-text-editor-conflict-theirs")).toContainText("theirs");
+  const diff = page.locator(".mesh-text-editor-conflict .mesh-conflict-diff");
+  await expect(diff).toBeVisible();
+  await expect(diff).toContainText("theirs");
+  await expect(diff).toContainText("body a MINE");
+});
+
+test("Apply merges edits to different lines with a change made elsewhere, keeping the cursor", async ({ page }) => {
+  const lines = await openEditorOnMultiLineBody(page);
+  // Two local edits: the end of line 6, then the end of line 3 (cursor stays there).
+  await typeAtEndOfLine(page, lines, "line 6", " MINE");
+  await typeAtEndOfLine(page, lines, "line 3", " MID");
+  await expect(lines).toContainText("line 3 MID");
+
+  // Elsewhere: a new first line — a different place, and it shifts every line.
+  await replaceBodyElsewhere(page, `intro\n${MULTI}`);
+  await expect(page.locator(".mesh-text-editor-note")).toContainText("changed elsewhere");
+
+  await applyWithKeyboard(page);
+
+  await expect(page.locator(".mesh-text-editor-note")).toContainText("Merged");
+  await expect(page.locator(".mesh-text-editor-conflict")).toHaveCount(0);
+  await expect(lines).toContainText("intro");
+  await expect(lines).toContainText("line 3 MID");
+  await expect(lines).toContainText("line 6 MINE");
+  const stored = (await serverBody(page)).text;
+  expect(stored).toBe("intro\nline 1\nline 2\nline 3 MID\nline 4\nline 5\nline 6 MINE");
+  await expect(page.getByRole("button", { name: "Apply", exact: true })).toBeDisabled();
+
+  // The cursor is still where it was (end of line 3), not reset to the end.
+  await page.keyboard.type("!", { delay: 80 });
+  await expect(lines).toContainText("line 3 MID!");
+  await expect(lines).not.toContainText("line 6 MINE!");
+});
+
+test("Apply with overlapping edits keeps the draft, marks the lines and writes nothing", async ({ page }) => {
+  const lines = await openEditorOnMultiLineBody(page);
+  await typeAtEnd(page, lines, " MINE");
+  await replaceBodyElsewhere(page, MULTI.replace("line 6", "line six"));
+
+  await page.getByRole("button", { name: "Apply", exact: true }).click();
+
+  await expect(page.locator(".mesh-text-editor-conflict")).toBeVisible();
+  await expect(page.locator(".mesh-text-editor-conflict")).toContainText("overlap");
+  expect((await serverBody(page)).text).toBe(MULTI.replace("line 6", "line six"));
+  await expect(lines).toContainText("line 6 MINE");
+
+  await page.locator(".mesh-text-editor-conflict button", { hasText: "compare" }).click();
+  const diff = page.locator(".mesh-text-editor-conflict .mesh-conflict-diff");
+  await expect(diff).toContainText("line six");
+  await expect(diff).toContainText("line 6 MINE");
+  // The overlapping line is marked on both sides.
+  await expect(diff.locator(".mesh-conflict-line").first()).toBeVisible();
 });
 
 test("'take theirs' drops the unsaved edits and shows the other body", async ({ page }) => {
   const lines = await openEditor(page);
   await typeAtEnd(page, lines, " MINE");
   await replaceBodyElsewhere(page, "theirs");
+  await page.getByRole("button", { name: "Apply", exact: true }).click();
   await expect(page.locator(".mesh-text-editor-conflict")).toBeVisible();
 
   await page.locator(".mesh-text-editor-conflict button", { hasText: "take theirs" }).click();
@@ -97,6 +183,7 @@ test("'keep mine' writes the editor's text over the other body, against its revi
   const lines = await openEditor(page);
   await typeAtEnd(page, lines, " MINE");
   await replaceBodyElsewhere(page, "theirs");
+  await page.getByRole("button", { name: "Apply", exact: true }).click();
   await expect(page.locator(".mesh-text-editor-conflict")).toBeVisible();
 
   await page.locator(".mesh-text-editor-conflict button", { hasText: "keep mine" }).click();
@@ -133,7 +220,7 @@ async function openSourceEditor(page: Page) {
 
 test("a Source-mode save over a file changed elsewhere is refused: the editor asks first", async ({ page }) => {
   const lines = await openSourceEditor(page);
-  await typeAtEnd(page, lines, " MINE");
+  await typeAtEndOfLine(page, lines, "body a", " MINE");
   await expect(lines).toContainText("MINE");
 
   await replaceFileElsewhere(page, (t) => t.replace("body a", "body a, theirs"));
@@ -145,7 +232,7 @@ test("a Source-mode save over a file changed elsewhere is refused: the editor as
   expect(onDisk).not.toContain("MINE");
 
   await page.locator(".mesh-source-editor-conflict button", { hasText: "compare" }).click();
-  await expect(page.locator(".mesh-source-editor-conflict-theirs")).toContainText("body a, theirs");
+  await expect(page.locator(".mesh-source-editor-conflict-compare")).toContainText("body a, theirs");
 
   await page.locator(".mesh-source-editor-conflict button", { hasText: "take theirs" }).click();
   await expect(page.locator(".mesh-source-editor-conflict")).toHaveCount(0);
@@ -156,9 +243,30 @@ test("a Source-mode save over a file changed elsewhere is refused: the editor as
   await expect(page.locator(".mesh-source-editor-actions button", { hasText: "Save" })).toBeDisabled();
 });
 
+test("a Source-mode save over a change made elsewhere to a different line is merged", async ({ page }) => {
+  await replaceBodyElsewhere(page, MULTI);
+  await page.reload();
+  await page.waitForSelector(".mesh-node");
+  await page.getByRole("button", { name: "Edit" }).click();
+  const lines = await openSourceEditor(page);
+  await expect(lines).toContainText("line 6");
+  await typeAtEnd(page, lines, " MINE");
+
+  // Elsewhere: the first body line, far from where this editor typed.
+  await replaceFileElsewhere(page, (t) => t.replace("line 1", "line one"));
+
+  await page.locator(".mesh-source-editor-actions button", { hasText: "Save" }).click();
+
+  // Saved (no conflict): Source mode closes, and the file holds both edits.
+  await expect(page.locator(".mesh-source-editor")).toHaveCount(0);
+  const onDisk = await fileText(page);
+  expect(onDisk).toContain("line one");
+  expect(onDisk).toContain("MINE");
+});
+
 test("'keep mine' in Source mode writes the editor's text over the file, against its current ETag", async ({ page }) => {
   const lines = await openSourceEditor(page);
-  await typeAtEnd(page, lines, " MINE");
+  await typeAtEndOfLine(page, lines, "body a", " MINE");
   await replaceFileElsewhere(page, (t) => t.replace("body a", "body a, theirs"));
   await page.locator(".mesh-source-editor-actions button", { hasText: "Save" }).click();
   await expect(page.locator(".mesh-source-editor-conflict")).toBeVisible();
@@ -334,6 +442,9 @@ test("a title changed elsewhere conflicts with the local title/body draft", asyn
   await page.locator(".mesh-text-editor-title-input").fill("My title");
   const changed = await page.request.patch("/api/nodes/a", { data: { title: "Their title" } });
   expect(changed.ok()).toBe(true);
+  await expect(page.locator(".mesh-text-editor-note")).toContainText("changed elsewhere");
+  // Both sides renamed the node differently: no merge can settle that.
+  await page.getByRole("button", { name: "Apply", exact: true }).click();
   await expect(page.locator(".mesh-text-editor-conflict")).toBeVisible();
   expect((await serverBody(page)).text).toBe("body a");
   await page.getByRole("button", { name: "keep mine", exact: true }).click();

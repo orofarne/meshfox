@@ -413,6 +413,15 @@ pub struct ServiceConflictState {
     pub http_retry: Option<HttpRunRetry>,
 }
 
+/// A source-editor save the worker refused because the file changed and
+/// could not be combined with the buffer: the file as it is now, at `rev`,
+/// and the lines that overlapped (none: no merge was possible at all).
+struct RefusedSave {
+    rev: String,
+    text: String,
+    conflicts: Vec<crate::worker_client::ConflictLines>,
+}
+
 /// What to re-issue, and how, after a worker-routed run's lock conflict is
 /// confirmed away — see `ServiceConflictState::http_retry`.
 pub struct HttpRunRetry {
@@ -1050,12 +1059,6 @@ pub(super) fn var_form_from_statuses_for_test(
 ) -> VarFormState {
     var_form_from_statuses(statuses)
 }
-
-/// What the source editor says when a save found the file changed on disk
-/// since the editor read it. Nothing was written; pressing `Ctrl-s` again
-/// writes over what is there now.
-const SOURCE_CHANGED_ELSEWHERE: &str =
-    "the file changed since you opened it — Ctrl-s again overwrites it, Esc discards your edits";
 
 /// What `e`/`H` say on a canvas served read-only — see `App::read_only`.
 const READ_ONLY_STATUS: &str =
@@ -3303,7 +3306,13 @@ impl App {
         // The version of the file this editor read: a save is refused if the
         // file has changed since.
         let base_rev = se.base_rev();
-        let mut conflict_rev: Option<String> = None;
+        // Set when the worker refused the write because the file changed
+        // and could not be combined with the buffer: the file as it is, its
+        // revision, and the lines that overlapped — shown side by side.
+        let mut conflict: Option<RefusedSave> = None;
+        // Set when the worker combined the buffer with a change made
+        // elsewhere instead of refusing.
+        let mut merged = false;
 
         if is_canvas {
             if let Err(e) = Canvas::from_markdown(&text) {
@@ -3322,10 +3331,12 @@ impl App {
                     &text,
                     &base_rev,
                     include_id.as_deref(),
+                    true,
                 )
                 .await
                 {
-                    Ok(()) if is_primary => {
+                    Ok(outcome) if is_primary => {
+                        merged = outcome.merged;
                         match crate::worker_client::get_canvas_raw(port).await {
                             Ok(saved) => {
                                 text = saved;
@@ -3334,10 +3345,21 @@ impl App {
                             Err(e) => Err(format!("saved, but failed to reload: {e}")),
                         }
                     }
-                    Ok(()) => Ok(()),
-                    Err(crate::worker_client::PutRawError::Conflict { current_rev }) => {
-                        conflict_rev = Some(current_rev);
-                        Err(SOURCE_CHANGED_ELSEWHERE.to_string())
+                    Ok(outcome) => {
+                        merged = outcome.merged;
+                        Ok(())
+                    }
+                    Err(crate::worker_client::PutRawError::Conflict {
+                        current_rev,
+                        current_text,
+                        conflicts,
+                    }) => {
+                        conflict = Some(RefusedSave {
+                            rev: current_rev,
+                            text: current_text,
+                            conflicts,
+                        });
+                        Err(String::new())
                     }
                     Err(crate::worker_client::PutRawError::Other(e)) => Err(e),
                 }
@@ -3345,9 +3367,14 @@ impl App {
         };
         if let Err(e) = write_result {
             let se = self.source_editor.as_mut().unwrap();
-            se.error = Some(e);
-            if let Some(rev) = conflict_rev {
-                se.note_conflict(rev);
+            match conflict {
+                // Not an error to read in a footer: put both versions side
+                // by side and let the user decide (see `source_diff.rs`).
+                Some(refused) => {
+                    se.error = None;
+                    se.open_diff(refused.text, refused.rev, &refused.conflicts);
+                }
+                None => se.error = Some(e),
             }
             return;
         }
@@ -3370,7 +3397,11 @@ impl App {
         self.rebuild_display_canvas(display);
         self.rebuild_rows();
         self.render_current_document();
-        self.status = "saved".into();
+        self.status = if merged {
+            "saved — merged with changes made elsewhere".into()
+        } else {
+            "saved".into()
+        };
         self.source_editor = None;
     }
 

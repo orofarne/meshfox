@@ -37,9 +37,16 @@ Map your intent to a subcommand instead:
   <path>` (or pipe to stdin). `--base-rev` is required: the `body-rev:` line
   `meshfox node show <id>` prints. If the body changed since you read it
   (another tab, an agent, an editor), nothing is written and the error gives
-  the current body and revision — merge, then retry with that revision. Not
-  sure it hasn't changed, or just adding to it? `node append` needs no
-  revision.
+  the current body and revision — merge, then retry with that revision. Add
+  `--merge` to have meshfox do that for you: it finds the body you read in
+  the canvas's undo history and three-way merges your text with the current
+  one by line. A clean merge is written and printed (read it — a line-level
+  merge of prose can read wrong); if your edit overlaps the other one,
+  nothing is written and the error lists the overlapping lines and the body
+  with `<<<<<<< mine` / `=======` / `>>>>>>> theirs` markers — resolve that
+  and write it back against the current revision. A body too old to still be
+  in the history is the ordinary refusal. Just adding to it? `node append`
+  needs no revision.
 - Append to a node's existing body, without reading it back first → `meshfox
   node append <id> --file <path>` (or pipe to stdin)
 - Set position/size/style/tags (`x`/`y`/`w`/`h`/`color`/`type`/`display`/
@@ -157,7 +164,9 @@ specific cases:
   `node_set_id`/`node_edges`/`node_move`/`node_reorder` — `node_show`
   returns JSON, not text to re-parse, including each node's `body_rev`:
   `node_body` requires it back as `base_rev` and refuses a body that changed
-  since (the error carries the current body and revision to retry with).
+  since (the error carries the current body and revision to retry with);
+  `merge: true` merges instead — see `meshfox node body --merge` above — and
+  returns `merged: true` with the stored `body` and its `body_rev`.
 - **`validate`/`check`** — same checks `meshfox validate`/`meshfox check`
   run, as structured JSON instead of text to re-parse: `validate` returns a
   tool error naming the specific problem on failure (same convention

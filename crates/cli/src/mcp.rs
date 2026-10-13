@@ -404,6 +404,15 @@ struct NodeBodyParams {
     /// written and the error carries the current body and revision to merge
     /// against and retry with.
     base_rev: String,
+    /// If the body changed since `base_rev`, three-way merge your `body`
+    /// with the current one instead of refusing. A clean merge is written
+    /// and the result carries `merged: true` with the body as stored (check
+    /// it — a line-level merge of prose can read wrong); when your edit
+    /// overlaps the other one, nothing is written and the error lists the
+    /// overlapping lines and the body with conflict markers to resolve and
+    /// resend against the current revision. Default false.
+    #[serde(default)]
+    merge: bool,
 }
 
 #[derive(Deserialize, Serialize, JsonSchema)]
@@ -817,20 +826,31 @@ impl CanvasCtx {
         ))
     }
 
-    /// Replaces a node's whole Markdown body. Requires `base_rev`, the `body_rev` node_show/node_find returned when you read it; if the body changed since, nothing is written and the error carries the current body and revision so you can merge and retry. To add to a body without reading it first, use node_append.
+    /// Replaces a node's whole Markdown body. Requires `base_rev`, the `body_rev` node_show/node_find returned when you read it; if the body changed since, nothing is written and the error carries the current body and revision so you can merge and retry. Pass `merge: true` to have the server three-way merge your text with the concurrent change instead (a clean merge is written and returned as `merged: true` with the resulting `body` and `body_rev`; overlapping edits are an error listing the conflicting lines and the body with conflict markers). To add to a body without reading it first, use node_append.
     async fn node_body(&self, params: NodeBodyParams) -> Result<CallToolResult, ErrorData> {
         let port = self.worker_port().await?;
-        crate::worker_client::update_node_body(
+        let written = crate::worker_client::update_node_body(
             port,
             &params.node_id,
             &params.body,
             &params.base_rev,
+            params.merge,
         )
         .await
         .map_err(invalid_params)?;
-        Ok(CallToolResult::structured(
-            json!({ "updated": params.node_id }),
-        ))
+        // A plain write stored exactly what was sent; only a merge has
+        // something the caller doesn't already have.
+        let result = if written.merged {
+            json!({
+                "updated": params.node_id,
+                "merged": true,
+                "body": written.body,
+                "body_rev": written.rev,
+            })
+        } else {
+            json!({ "updated": params.node_id })
+        };
+        Ok(CallToolResult::structured(result))
     }
 
     /// Appends text to the end of a node's existing Markdown body — after whatever's already there, still before its first child's own heading — without having to read the current body back first just to resend it unchanged.

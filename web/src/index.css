@@ -3633,3 +3633,33 @@ a {
 .mesh-block-application { padding: 6px 8px; font-size: 12px; border-bottom: 1px solid var(--node-border); }
 .mesh-block-application label { display: flex; align-items: baseline; gap: 8px; }
 .mesh-block-application select { min-width: 0; max-width: 100%; flex: 1; color: inherit; background: var(--node-bg); border: 1px solid var(--node-border); border-radius: 4px; }
+
+/* Conflict banners: the side-by-side "compare" (ConflictDiff.tsx), the note
+   about a concurrent change, and the lines both sides changed. */
+.mesh-text-editor-conflict-compare,
+.mesh-source-editor-conflict-compare {
+  flex-basis: 100%;
+}
+
+.mesh-text-editor-conflict-title {
+  margin: 0 0 0.3rem;
+  font-size: 0.75rem;
+}
+
+.mesh-conflict-diff {
+  height: 14rem;
+  border: 1px solid var(--node-border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.mesh-conflict-line {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+.mesh-text-editor-note {
+  padding: 0.35rem 0.75rem;
+  border-top: 1px solid var(--node-border);
+  font-size: 0.8rem;
+  color: var(--accent);
+}

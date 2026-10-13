@@ -167,6 +167,10 @@ pub struct NodeUpdate {
     /// requires it whenever `text` is set and answers `409` if the body has
     /// changed since.
     pub base_rev: Option<String>,
+    /// With `text`: merge with a concurrent change to the body instead of
+    /// refusing a stale `base_rev` (see the server's
+    /// `UpdateNodeRequest::merge`).
+    pub merge: Option<bool>,
     pub edges: Option<EdgeOps>,
     pub display: Option<FileDisplay>,
     pub lang: Option<String>,
@@ -204,28 +208,75 @@ pub async fn update_node(port: u16, node_id: &str, update: &NodeUpdate) -> Resul
     into_result(res).await
 }
 
+/// What a body write left in the node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BodyWritten {
+    /// `true` if the write was combined with a concurrent change, so
+    /// `body` is not what the caller sent.
+    pub merged: bool,
+    /// The node's body as it is now.
+    pub body: String,
+    /// Its `body_rev` — what the next write should name as `base_rev`.
+    pub rev: String,
+}
+
 /// `update_node` with just `text` set — the same `mdcanvas::set_node_body`
 /// primitive `update_node`'s own `req.text` handling already applies, so
 /// this has identical semantics to `apply_node_body`'s direct-file version.
 /// `base_rev` is the `bodyRev` the caller read the body at; if the body has
 /// changed since, this fails with the node's current text and revision in
 /// the error, ready to retry against.
+///
+/// With `merge`, a stale `base_rev` is not refused: the worker finds the
+/// body it named in the canvas's undo history and three-way merges. A clean
+/// merge is written and reported as `merged`; overlapping edits are still an
+/// error, now listing the overlapping lines and a copy of the body with
+/// conflict markers to resolve and send back against the current revision.
 pub async fn update_node_body(
     port: u16,
     node_id: &str,
     body: &str,
     base_rev: &str,
-) -> Result<(), String> {
-    update_node(
-        port,
-        node_id,
-        &NodeUpdate {
-            text: Some(body.to_string()),
-            base_rev: Some(base_rev.to_string()),
-            ..Default::default()
-        },
-    )
-    .await
+    merge: bool,
+) -> Result<BodyWritten, String> {
+    let update = NodeUpdate {
+        text: Some(body.to_string()),
+        base_rev: Some(base_rev.to_string()),
+        merge: merge.then_some(true),
+        ..Default::default()
+    };
+    let res = client()
+        .patch(node_url(port, node_id)?)
+        .json(&update)
+        .timeout(time_limit(QUICK))
+        .send()
+        .await
+        .map_err(|e| describe(&e))?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        return Err(if text.is_empty() {
+            status.to_string()
+        } else {
+            describe_error_body(status, text)
+        });
+    }
+    // The response is the whole canvas; the node in it holds what was
+    // stored. A body this can't read back is reported as what was sent.
+    let canvas: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+    let node = canvas["nodes"]
+        .as_array()
+        .and_then(|nodes| nodes.iter().find(|n| n["id"] == node_id));
+    let stored = node.and_then(|n| n["text"].as_str()).unwrap_or(body);
+    let rev = node
+        .and_then(|n| n["bodyRev"].as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| meshfox_core::body_rev(stored));
+    Ok(BodyWritten {
+        merged: canvas["merged"].as_bool().unwrap_or(false),
+        body: stored.to_string(),
+        rev,
+    })
 }
 
 pub async fn append_node_body(port: u16, node_id: &str, addition: &str) -> Result<(), String> {
@@ -579,18 +630,53 @@ async fn into_result(res: reqwest::Response) -> Result<(), String> {
 
 /// A `409` body conflict (see the server's `body_conflict`) comes back as
 /// JSON; turn it into text a person or an agent can act on — the message,
-/// the revision to retry against, and the body as it is now. Any other
-/// error body is passed through as it came.
+/// the revision to retry against, and the body as it is now. When a merge
+/// was attempted and the edits really overlapped, also which lines overlap
+/// and the body with conflict markers, which is the quickest thing to
+/// resolve and send back. Any other error body is passed through as it came.
 fn describe_error_body(status: reqwest::StatusCode, text: String) -> String {
     if status == reqwest::StatusCode::CONFLICT {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
             if value["error"] == "bodyConflict" {
-                return format!(
+                let mut out = format!(
                     "{}\ncurrent revision: {}\ncurrent body:\n{}",
                     value["message"].as_str().unwrap_or("body conflict"),
                     value["currentRev"].as_str().unwrap_or("?"),
                     value["currentText"].as_str().unwrap_or("")
                 );
+                if let Some(hunks) = value["conflicts"].as_array() {
+                    out.push_str(&format!(
+                        "\nmerge failed: {} region(s) were changed on both sides",
+                        hunks.len()
+                    ));
+                    for hunk in hunks {
+                        // Lines are zero-based and end-exclusive on the wire;
+                        // show them the way an editor numbers them.
+                        let span = |side: &serde_json::Value| {
+                            let start = side["start"].as_u64().unwrap_or(0) + 1;
+                            let end = side["end"].as_u64().unwrap_or(0);
+                            if end < start {
+                                format!("(nothing, before line {start})")
+                            } else if end == start {
+                                format!("line {start}")
+                            } else {
+                                format!("lines {start}-{end}")
+                            }
+                        };
+                        out.push_str(&format!(
+                            "\n  your {} against current {}",
+                            span(&hunk["mine"]),
+                            span(&hunk["theirs"])
+                        ));
+                    }
+                }
+                if let Some(marked) = value["marked"].as_str() {
+                    out.push_str(&format!(
+                        "\nboth versions, with conflict markers (resolve, then write it back \
+                         against the current revision):\n{marked}"
+                    ));
+                }
+                return out;
             }
         }
     }
@@ -717,14 +803,40 @@ pub async fn info(port: u16) -> WorkerInfo {
         .unwrap_or_default()
 }
 
+/// One region of a whole-file write that overlapped a concurrent change:
+/// zero-based, end-exclusive line ranges in the text that was sent (`mine`)
+/// and in the file as it is now (`theirs`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictLines {
+    pub mine: std::ops::Range<usize>,
+    pub theirs: std::ops::Range<usize>,
+}
+
 /// Why a whole-file `PUT /api/canvas/raw` wrote nothing.
 pub enum PutRawError {
-    /// The file changed since `base_rev` was read (`412`): its current
-    /// revision, to write over it on an explicit second attempt.
-    Conflict { current_rev: String },
+    /// The file changed since `base_rev` was read (`412`) and — with
+    /// `merge` — could not be combined with this write: the file as it is
+    /// now, its revision, and (when a merge was actually attempted) which
+    /// lines overlapped. An empty `conflicts` means no merge was possible
+    /// at all: the version this write started from is no longer in the
+    /// worker's undo history.
+    Conflict {
+        current_rev: String,
+        current_text: String,
+        conflicts: Vec<ConflictLines>,
+    },
     /// Anything else (a parse failure's `422`, a transport error, …), as
     /// text for the user.
     Other(String),
+}
+
+/// What a whole-file write that went through left behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PutOutcome {
+    /// `true` if the file had changed since `base_rev` and the worker
+    /// combined this write with that change (`merge`): what is on disk is
+    /// not exactly the text that was sent.
+    pub merged: bool,
 }
 
 /// `PUT /api/canvas/raw` — whole-document replace, what the source
@@ -735,16 +847,27 @@ pub enum PutRawError {
 ///
 /// `base_rev` is the `meshfox_core::body_rev` of the file's text as the
 /// caller read it, sent as `If-Match`; the server refuses the write if the
-/// file has changed since.
+/// file has changed since — unless `merge` is set (primary document only:
+/// an include has no history to find the original in), in which case the
+/// worker finds the file the caller started from in its undo history and
+/// three-way merges, refusing only when the two edits overlap.
 pub async fn put_canvas_raw(
     port: u16,
     text: &str,
     base_rev: &str,
     include: Option<&str>,
-) -> Result<(), PutRawError> {
+    merge: bool,
+) -> Result<PutOutcome, PutRawError> {
+    let mut query: Vec<(&str, &str)> = Vec::new();
+    if let Some(id) = include {
+        query.push(("include", id));
+    }
+    if merge && include.is_none() {
+        query.push(("merge", "1"));
+    }
     let res = client()
         .put(format!("{}/api/canvas/raw", base_url(port)))
-        .query(&include.map(|id| [("include", id)]).unwrap_or_default())
+        .query(&query)
         .header("if-match", format!("\"{base_rev}\""))
         .body(text.to_string())
         .timeout(time_limit(WHOLE_DOCUMENT))
@@ -755,14 +878,41 @@ pub async fn put_canvas_raw(
         let body = res.text().await.unwrap_or_default();
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
             if value["error"] == "sourceConflict" {
+                let range = |v: &serde_json::Value| {
+                    let start = v["start"].as_u64().unwrap_or(0) as usize;
+                    let end = v["end"].as_u64().unwrap_or(0) as usize;
+                    start..end.max(start)
+                };
+                let conflicts = value["conflicts"]
+                    .as_array()
+                    .map(|hunks| {
+                        hunks
+                            .iter()
+                            .map(|h| ConflictLines {
+                                mine: range(&h["mine"]),
+                                theirs: range(&h["theirs"]),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 return Err(PutRawError::Conflict {
                     current_rev: value["currentRev"].as_str().unwrap_or_default().to_string(),
+                    current_text: value["currentText"].as_str().unwrap_or_default().to_string(),
+                    conflicts,
                 });
             }
         }
         return Err(PutRawError::Other(body));
     }
-    into_result(res).await.map_err(PutRawError::Other)
+    let merged = res.status().is_success()
+        && res
+            .headers()
+            .get("x-meshfox-merged")
+            .is_some_and(|v| v == "true");
+    into_result(res)
+        .await
+        .map(|()| PutOutcome { merged })
+        .map_err(PutRawError::Other)
 }
 
 /// `GET /api/canvas` — the worker's own `include`-resolved tree (same
@@ -2529,23 +2679,32 @@ mod tests {
         let held = meshfox_core::body_rev(&read);
 
         let first = original.replace("body", "first");
-        assert!(put_canvas_raw(port, &first, &held, None).await.is_ok());
+        assert!(put_canvas_raw(port, &first, &held, None, false).await.is_ok());
 
         // The revision just read is stale now.
         let second = original.replace("body", "second");
-        match put_canvas_raw(port, &second, &held, None).await {
-            Err(PutRawError::Conflict { current_rev }) => {
+        match put_canvas_raw(port, &second, &held, None, false).await {
+            Err(PutRawError::Conflict {
+                current_rev,
+                current_text,
+                conflicts,
+            }) => {
                 assert_eq!(current_rev, meshfox_core::body_rev(&first));
+                assert_eq!(current_text, first);
+                // No merge was asked for, so none was attempted.
+                assert!(conflicts.is_empty());
             }
             Err(PutRawError::Other(e)) => panic!("expected a conflict, got {e}"),
-            Ok(()) => panic!("a stale revision must not be accepted"),
+            Ok(_) => panic!("a stale revision must not be accepted"),
         }
         assert_eq!(std::fs::read_to_string(&path).unwrap(), first);
 
         // Writing over it is an explicit second attempt, against the
         // revision the conflict reported.
         let current = meshfox_core::body_rev(&first);
-        assert!(put_canvas_raw(port, &second, &current, None).await.is_ok());
+        assert!(put_canvas_raw(port, &second, &current, None, false)
+            .await
+            .is_ok());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), second);
 
         let _ = std::fs::remove_dir_all(&dir);

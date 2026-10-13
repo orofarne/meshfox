@@ -141,6 +141,10 @@ export interface CanvasNode {
 
 export interface CanvasDoc {
   canvasVersion?: number;
+  /** Set on the response to a write that was three-way merged with someone
+   * else's concurrent change (`NodePatch.merge`): the node in this document
+   * then holds the merged body, not what was sent. */
+  merged?: boolean;
   serverSession?: string;
   nodes: CanvasNode[];
   /** Every `<!-- meshfox:option name="..." -->` this document declares
