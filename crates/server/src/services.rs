@@ -101,6 +101,11 @@ pub struct ServiceHandle {
 }
 
 impl ServiceHandle {
+    /// Unique for each spawn/restart, including if the OS reuses a PID.
+    pub fn generation(&self) -> i64 {
+        self.ledger_row_id
+    }
+
     pub fn status(&self) -> ServiceStatus {
         self.status.lock().unwrap().clone()
     }

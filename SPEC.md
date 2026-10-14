@@ -1320,6 +1320,15 @@ continues immediately, and the process keeps running independently,
 tracked/observable/stoppable/restartable separately from the run that
 started it, until it's explicitly stopped or its owning process exits.
 
+Dependency freshness tracks the live service instance. A successful readiness
+block (`deps="server"`, for example) is reused while that instance remains
+running and its dependency fingerprint is unchanged. Starting or restarting a
+service creates a new generation; stopping or crashing removes the live
+generation. Either change invalidates readiness results and their transitive
+consumers. Merely encountering an already-running service in another chain
+does not invalidate them. Live service generations are never restored from
+persisted session results.
+
 **Ownership**: a service is tied to the lifetime of whichever OS process
 spawned it — the `meshfox view` server, `meshfox tui`, or a `meshfox run`
 invocation. It's tracked in a lock file under `.meshfox/services/`

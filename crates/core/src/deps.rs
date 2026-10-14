@@ -527,6 +527,12 @@ pub fn closure_fingerprint(
     closure_fingerprint_with(canvas, &decls, target, values)
 }
 
+/// Internal runtime value used to bind readiness results to a live service instance.
+/// The NUL prefix cannot collide with an authored environment variable name.
+pub fn service_generation_key(addr: &BlockAddr) -> String {
+    format!("\0service:{}", addr.key())
+}
+
 /// [`closure_fingerprint`] for a caller that already has the canvas's
 /// variable declarations (`crate::vars::declared_vars`).
 pub fn closure_fingerprint_with(
@@ -575,6 +581,12 @@ pub fn closure_fingerprint_with(
                 &canvas.node(&addr.node_id).expect("block owner exists").cwd(&canvas.artifact_root),
             ),
         ];
+        if block.service {
+            parts.push(
+                values.get(&service_generation_key(addr)).cloned()
+                    .unwrap_or_else(|| "not-running".to_string()),
+            );
+        }
         let mut has_artifacts = block.attrs.contains_key("inputs") || block.attrs.contains_key("outputs");
         for attr in ["inputs", "outputs"] {
             if block.attrs.contains_key(attr) {
@@ -772,6 +784,36 @@ pub fn confirmation_blocks(canvas: &Canvas, chain: &[BlockAddr]) -> Vec<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_generations_invalidate_only_their_dependency_closure() {
+        let c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n```sh name=\"server\" service\nsleep 30\n```\n\n```sh name=\"wait\" deps=\"server\"\necho ready\n```\n\n```sh name=\"consumer\" deps=\"wait\"\necho result\n```\n\n```sh name=\"independent\"\necho other\n```\n");
+        let server = BlockAddr::new("root", "server");
+        let mut values = HashMap::new();
+        values.insert(service_generation_key(&server), "first".into());
+        let before: Vec<_> = ["server", "wait", "consumer", "independent"]
+            .iter()
+            .map(|name| closure_fingerprint(&c, &BlockAddr::new("root", *name), &values).unwrap())
+            .collect();
+        for generation in [Some("second"), None] {
+            match generation {
+                Some(generation) => {
+                    values.insert(service_generation_key(&server), generation.into());
+                }
+                None => {
+                    values.remove(&service_generation_key(&server));
+                }
+            }
+            for (index, name) in ["server", "wait", "consumer", "independent"]
+                .iter()
+                .enumerate()
+            {
+                let after =
+                    closure_fingerprint(&c, &BlockAddr::new("root", *name), &values).unwrap();
+                assert_eq!(before[index] == after, *name == "independent", "{name}");
+            }
+        }
+    }
 
     fn canvas(md: &str) -> Canvas {
         Canvas::from_markdown(md).unwrap()

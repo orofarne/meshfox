@@ -1618,6 +1618,7 @@ fn run_fingerprint_in(
         .into_iter()
         .filter(|(name, _)| !ctx.decls.iter().any(|d| d.secret && &d.name == name))
         .collect();
+    let values = service_values(state, &values);
     meshfox_core::closure_fingerprint_with(&ctx.canvas, &ctx.decls, addr, &values).ok()
 }
 
@@ -2440,6 +2441,22 @@ fn artifact_results(
     Ok(())
 }
 
+/// Refresh internal runtime stamps; stopped/crashed services have no live stamp.
+fn service_values(state: &AppState, values: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut values = values.clone();
+    values.retain(|key, _| !key.starts_with("\0service:"));
+    for ((node, block), handle) in state.services.lock().unwrap().iter() {
+        if matches!(handle.status(), services::ServiceStatus::Running) {
+            let addr = meshfox_core::BlockAddr::new(node, block);
+            values.insert(
+                meshfox_core::deps::service_generation_key(&addr),
+                handle.generation().to_string(),
+            );
+        }
+    }
+    values
+}
+
 /// Recompute skip/sync decisions after observing computed variables. Actual
 /// values take precedence over provisional outputs from previous runs.
 fn replan_runs(
@@ -2454,6 +2471,7 @@ fn replan_runs(
     if fresh {
         return Ok(chain.iter().cloned().collect());
     }
+    let values = service_values(state, values);
     let runs = state.session_runs.lock().unwrap();
     meshfox_core::deps::compute_forced_reruns_planned(
         canvas,
@@ -2464,8 +2482,19 @@ fn replan_runs(
             vars
         },
         |addr| {
-            runs.get(&(addr.node_id.clone(), addr.block_name.clone()))
-                .map(|run| (run.fingerprint.clone(), run.produced_vars.clone()))
+            let block = meshfox_core::deps::find_block(canvas, addr).ok()?;
+            if block.service {
+                // A live service is a successful runtime dependency, even though
+                // it has not exited. Never restore this fact from session storage.
+                values.get(&meshfox_core::deps::service_generation_key(addr))?;
+                let decls = meshfox_core::vars::declared_vars(canvas).ok()?;
+                let fp =
+                    meshfox_core::closure_fingerprint_with(canvas, &decls, addr, &values).ok()?;
+                Some((fp, HashMap::new()))
+            } else {
+                runs.get(&(addr.node_id.clone(), addr.block_name.clone()))
+                    .map(|run| (run.fingerprint.clone(), run.produced_vars.clone()))
+            }
         },
         executed,
         skip_fresh,
@@ -2503,12 +2532,10 @@ fn extend_plan_locks(
 /// held since it was first spawned, is untouched by this request — see
 /// `AppState.services`). Deliberately built from `forced_reruns` alone
 /// (already computed by `compute_forced_reruns` before this is ever called)
-/// rather than re-resolving each block's own kind/fingerprint a second
-/// time: a `service` never populates `session_runs` (see `SessionRun`'s own
-/// doc comment), so `compute_forced_reruns` already treats it as "no skip
-/// mechanism, always forced" on its own — exactly the set this needs,
-/// service-liveness aside (a `tty` step does populate it, once it exits 0,
-/// so a fresh one is skipped like a plain step). Resolves each address's
+/// rather than re-resolving each block's own fingerprint a second time.
+/// The planner accounts for live service generations; this final liveness
+/// check also excludes running services explicitly requested as targets.
+/// Resolves each address's
 /// own block (not just `locate_node`) to know whether it's
 /// `RunKind::Service`, `RunKind::Tty` or `RunKind::Plain` for the row's own
 /// `kind` column —
@@ -7188,30 +7215,16 @@ async fn run_block_impl_sized(
     // this can't be decided incrementally inside the loop below the way the
     // rest of the skip logic is. See `compute_forced_reruns`'s own doc
     // comment for what "dry run" means here and its one known gap.
-    let forced_reruns = {
-        let session_runs = state.session_runs.lock().unwrap();
-        // The real loop below fingerprints against the *whole* accumulated
-        // `resolved_vars` map, not a per-block-filtered subset (see its own
-        // `session_fingerprint` call) — mirror that here: this dry run's
-        // own seed plus whatever a skipped step's `produced_vars` folds in.
-        meshfox_core::deps::compute_forced_reruns_planned(
-            &canvas,
-            &chain,
-            |_block, sim_computed| {
-                let mut vars = sim_computed.clone();
-                vars.extend(resolved_vars.clone());
-                vars
-            },
-            |addr| {
-                session_runs
-                    .get(&(addr.node_id.clone(), addr.block_name.clone()))
-                    .map(|run| (run.fingerprint.clone(), run.produced_vars.clone()))
-            },
-            &std::collections::HashSet::new(),
-            req.skip_fresh,
-        )
-        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?
-    };
+    let forced_reruns = replan_runs(
+        &state,
+        &canvas,
+        &chain,
+        &resolved_vars,
+        &std::collections::HashSet::new(),
+        false,
+        req.skip_fresh,
+    )
+    .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
     // `fresh`: nothing in this chain counts as already-fresh — every block
     // runs (and takes its run lock) for real, this once.
     let forced_reruns: std::collections::HashSet<meshfox_core::BlockAddr> = if req.fresh {
@@ -7453,7 +7466,8 @@ async fn run_block_impl_sized(
                 break;
             }
             let is_requested_target = Some(addr) == chain.last();
-            let live_fingerprint = step_fingerprint(Some(&canvas), &decls, addr, &block, &resolved_vars);
+            let runtime_values = service_values(&state, &resolved_vars);
+            let live_fingerprint = step_fingerprint(Some(&canvas), &decls, addr, &block, &runtime_values);
             if (!is_requested_target || req.skip_fresh) && !block.always && !forced_reruns.contains(addr) {
                 let already_fresh = state
                     .session_runs
@@ -7545,6 +7559,7 @@ async fn run_block_impl_sized(
                     .filter(|s| matches!(s.status(), services::ServiceStatus::Running))
                     .map(|s| s.pid);
                 if let Some(pid) = already_running {
+                    executed.remove(addr);
                     // This process already owns a live instance of this
                     // exact service (e.g. a "run chain" that pulls it in
                     // as a dependency, run twice) — nothing to do, just
@@ -7916,7 +7931,13 @@ async fn run_block_impl_sized(
                     break;
                 }
             }
-            let live_fingerprint = step_fingerprint(Some(&canvas), &decls, addr, &block, &resolved_vars);
+            // Keep the service generations observed before execution: a restart
+            // during a readiness probe must not certify the new instance.
+            let mut completed_values = resolved_vars.clone();
+            completed_values.extend(
+                runtime_values.into_iter().filter(|(key, _)| key.starts_with("\0service:")),
+            );
+            let live_fingerprint = step_fingerprint(Some(&canvas), &decls, addr, &block, &completed_values);
             if let Some(id) = artifact_run_id { stamp_run_fingerprint(&state, addr, id); }
 
             // Never persisted for a block living inside an `include` node's
@@ -19204,6 +19225,95 @@ mod service_endpoint_tests {
         assert_eq!(services[0]["status"], "running");
         assert!(services[0]["pid"].as_u64().unwrap() > 0);
 
+        let _ = post_json(
+            addr,
+            "/api/services/stop",
+            r#"{"nodeId":"root","block":"srv"}"#,
+        )
+        .await;
+        cleanup(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn service_generation_controls_readiness_freshness() {
+        let canvas_path = write_test_canvas(&format!(
+            "{SERVICE_CANVAS}\n```bash name=\"wait\" deps=\"srv\"\necho ready\n```\n\n```bash name=\"query\" deps=\"wait\"\necho result\n```\n"
+        ));
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let run = || run_ws_events(addr, &[("block", "query")]);
+        let did_run_wait = |events: &[serde_json::Value]| {
+            events
+                .iter()
+                .any(|e| e["type"] == "step-start" && e["block"] == "wait")
+        };
+        let first = run().await;
+        assert!(did_run_wait(&first), "{first:?}");
+        let second = run().await;
+        assert!(!did_run_wait(&second), "{second:?}");
+        assert!(
+            second
+                .iter()
+                .any(|e| e["type"] == "step-skipped" && e["block"] == "wait"),
+            "{second:?}"
+        );
+        let fresh_target = run_ws_events(addr, &[("block", "query"), ("skipFresh", "true")]).await;
+        assert!(
+            fresh_target
+                .iter()
+                .any(|e| e["type"] == "step-skipped" && e["block"] == "query"),
+            "{fresh_target:?}"
+        );
+
+        let (status, _) = post_json(
+            addr,
+            "/api/services/restart",
+            r#"{"nodeId":"root","block":"srv"}"#,
+        )
+        .await;
+        assert_eq!(status, 200);
+        let restarted = run().await;
+        assert!(did_run_wait(&restarted), "{restarted:?}");
+        assert!(!did_run_wait(&run().await));
+
+        let (status, _) = post_json(
+            addr,
+            "/api/services/stop",
+            r#"{"nodeId":"root","block":"srv"}"#,
+        )
+        .await;
+        assert_eq!(status, 204);
+        let stopped = run().await;
+        assert!(did_run_wait(&stopped), "{stopped:?}");
+        assert!(
+            stopped.iter().any(|e| e["type"] == "service-started"),
+            "{stopped:?}"
+        );
+        assert!(!did_run_wait(&run().await));
+
+        let (_, body) = get(addr, "/api/services").await;
+        let list: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        let pid = list[0]["pid"].as_u64().unwrap();
+        assert!(std::process::Command::new("kill")
+            .args(["-KILL", "--", &format!("-{pid}")])
+            .status()
+            .unwrap()
+            .success());
+        for _ in 0..100 {
+            let (_, body) = get(addr, "/api/services").await;
+            let list: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+            if list[0]["status"] == "crashed" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let (_, body) = get(addr, "/api/services").await;
+        assert_eq!(
+            serde_json::from_str::<Vec<serde_json::Value>>(&body).unwrap()[0]["status"],
+            "crashed"
+        );
+        let crashed = run().await;
+        assert!(did_run_wait(&crashed), "{crashed:?}");
+        assert!(!did_run_wait(&run().await));
         let _ = post_json(
             addr,
             "/api/services/stop",
