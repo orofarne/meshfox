@@ -9,6 +9,7 @@
 //! web UI's Source mode; still no *structural* editing (that's `meshfox
 //! node ...`/the browser UI's Edit mode's dedicated node operations).
 
+mod ansi;
 mod app;
 mod markdown;
 mod path_picker;
@@ -307,6 +308,14 @@ fn spawn_worker_watcher(
                         return;
                     }
                 }
+                WatchEvent::TtyStarted { node_id, block } => {
+                    if external_run_tx
+                        .send(ExternalMsg::TtyStarted { node_id, block })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
             }
         }
     });
@@ -319,6 +328,9 @@ enum ExternalMsg {
     /// Some run started or ended somewhere (another frontend, a terminal
     /// session): the worker's `GET /api/runs` has changed, refetch it.
     RunsChanged,
+    /// A terminal session started in the worker (see
+    /// `WatchEvent::TtyStarted`).
+    TtyStarted { node_id: String, block: String },
 }
 
 /// One incremental update for a run this TUI session never itself started
@@ -504,6 +516,9 @@ async fn main_loop(
                     update.known_duration_ms,
                 ),
                 ExternalMsg::RunsChanged => app.refresh_runs_soon = true,
+                ExternalMsg::TtyStarted { node_id, block } => {
+                    app.on_tty_started(node_id, block).await
+                }
             },
             // A table that is still importing (or hasn't answered yet) is
             // polled faster than the general tick below.
@@ -630,8 +645,11 @@ async fn run_http_tty_handoff(
     let exit_code = bridge_http_tty(&mut socket).await;
     let _ = futures_util::SinkExt::close(&mut socket).await;
 
-    if !autoclose {
-        print!("\r\n(exited {exit_code} — press any key to return to the canvas)\r\n");
+    if !autoclose || !matches!(exit_code, TtyEnd::Exited(_)) {
+        print!(
+            "\r\n({} — press any key to return to the canvas)\r\n",
+            exit_code.label()
+        );
         io::stdout().flush()?;
         input_paused.store(false, Ordering::Release);
         let _ = input_rx.recv().await;
@@ -646,20 +664,11 @@ async fn run_http_tty_handoff(
     terminal.clear()?;
 
     input_paused.store(false, Ordering::Release);
-    Ok(exit_code)
+    Ok(exit_code.exit_code())
 }
 
-/// The attach-mode counterpart to `run_http_tty_handoff` — joins a `tty`
-/// session this TUI didn't itself start (`app::PendingHttpTtyAttach`, from
-/// the `t` live-terminals view) instead of one it just spun up. No
-/// `autoclose` concept: there's no chain waiting on this step to finish
-/// the way a self-started run has, so there's nothing to skip straight
-/// back to — always pauses on a plain "detached" message instead of
-/// `run_http_tty_handoff`'s own "(exited N — ...)" (an attach-only viewer
-/// is never told a real exit code either way — see `bridge_tty_pty_phase`'s
-/// own doc comment on why its `RunEvent`-reading branch is dead code on
-/// this path — so showing one here would just be a plausible-looking
-/// guess).
+/// Joins an existing tty session, then displays its actual final outcome.
+/// Attach viewers always wait for a key before returning to the canvas.
 async fn run_http_tty_attach_handoff(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     input_paused: &Arc<AtomicBool>,
@@ -680,10 +689,13 @@ async fn run_http_tty_attach_handoff(
     crate::run_output::banner(&format!("attached to {block_name}"), "\r\n");
     io::stdout().flush()?;
 
-    bridge_http_tty_attach(&mut socket).await;
+    let outcome = bridge_http_tty_attach(&mut socket).await;
     let _ = futures_util::SinkExt::close(&mut socket).await;
 
-    print!("\r\n(detached — the session may still be running elsewhere; press any key to return to the canvas)\r\n");
+    print!(
+        "\r\n({} — press any key to return to the canvas)\r\n",
+        outcome.label()
+    );
     io::stdout().flush()?;
     input_paused.store(false, Ordering::Release);
     let _ = input_rx.recv().await;
@@ -837,10 +849,37 @@ fn spawn_raw_stdin_reader(
 /// relay on `EnterPty` (the interactive step itself is about to start),
 /// and returns the run's own exit code on `Done` (a terminal event arrived
 /// before any `tty` step ever did — a failed dep, say).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TtyEnd {
+    Exited(i32),
+    Killed,
+    Disconnected,
+    Error,
+}
+
+impl TtyEnd {
+    pub(crate) fn exit_code(self) -> i32 {
+        match self {
+            Self::Exited(code) => code,
+            _ => -1,
+        }
+    }
+
+    fn label(self) -> String {
+        match self {
+            Self::Exited(0) => "Completed · exit 0".into(),
+            Self::Exited(code) => format!("Failed · exit {code}"),
+            Self::Killed => "Killed".into(),
+            Self::Disconnected => "Connection lost · result unknown".into(),
+            Self::Error => "Run failed · see error above".into(),
+        }
+    }
+}
+
 enum TtyPreludeOutcome {
     Continue,
     EnterPty,
-    Done(i32),
+    Done(TtyEnd),
 }
 
 fn print_tty_transcript_event(event: crate::worker_client::RunEvent) -> TtyPreludeOutcome {
@@ -871,10 +910,10 @@ fn print_tty_transcript_event(event: crate::worker_client::RunEvent) -> TtyPrelu
             crate::run_output::step_end(exit_code, duration_ms, "\r\n");
             TtyPreludeOutcome::Continue
         }
-        RunEvent::Killed { .. } => TtyPreludeOutcome::Done(-1),
+        RunEvent::Killed { .. } => TtyPreludeOutcome::Done(TtyEnd::Killed),
         RunEvent::Error { message } => {
             print!("{message}\r\n");
-            TtyPreludeOutcome::Continue
+            TtyPreludeOutcome::Done(TtyEnd::Error)
         }
         // `/api/run/tty` still reports a conflict as a pre-upgrade `409`
         // (`TtyConnectError::Conflict`), not a streamed event — this arm
@@ -887,9 +926,9 @@ fn print_tty_transcript_event(event: crate::worker_client::RunEvent) -> TtyPrelu
             owner_desc,
         } => {
             print!("{node_id:?}/{block:?} is locked by pid {owner_pid} ({owner_desc})\r\n");
-            TtyPreludeOutcome::Done(-1)
+            TtyPreludeOutcome::Done(TtyEnd::Error)
         }
-        RunEvent::Done { exit_code } => TtyPreludeOutcome::Done(exit_code),
+        RunEvent::Done { exit_code } => TtyPreludeOutcome::Done(TtyEnd::Exited(exit_code)),
     }
 }
 
@@ -912,7 +951,7 @@ fn print_tty_transcript_event(event: crate::worker_client::RunEvent) -> TtyPrelu
 /// `run_http_tty_handoff`, which a plain `run` invocation has no
 /// equivalent of — it's never in an alt screen to begin with, just needs
 /// its own raw-mode enable/disable around this call).
-pub(crate) async fn bridge_http_tty(socket: &mut crate::worker_client::TtySocket) -> i32 {
+pub(crate) async fn bridge_http_tty(socket: &mut crate::worker_client::TtySocket) -> TtyEnd {
     use tokio_tungstenite::tungstenite::Message;
 
     // Pre-tty phase: a `tty`-touching chain can (and typically does) run
@@ -949,10 +988,10 @@ pub(crate) async fn bridge_http_tty(socket: &mut crate::worker_client::TtySocket
             // erroring costs nothing.
             crate::worker_client::WsNext::Frame(Message::Binary(_)) => {}
             crate::worker_client::WsNext::Frame(Message::Close(_))
-            | crate::worker_client::WsNext::Closed => return -1,
+            | crate::worker_client::WsNext::Closed => return TtyEnd::Disconnected,
             crate::worker_client::WsNext::Silent => {
                 eprintln!("meshfox: the worker stopped responding");
-                return -1;
+                return TtyEnd::Disconnected;
             }
             crate::worker_client::WsNext::Frame(_) => {}
         }
@@ -969,15 +1008,13 @@ pub(crate) async fn bridge_http_tty(socket: &mut crate::worker_client::TtySocket
 /// bytes (real stdin -> socket, socket -> real stdout); a text frame from
 /// the server is a `RunEvent`, printed as a plain transcript
 /// (`print_tty_transcript_event`) — meaningful for a `tty_connect`ed
-/// socket (a trailing `Done` after the interactive step, say), never sent
-/// at all by an attach connection (`relay_tty_viewer`, server-side, has no
-/// `RunEvent` vocabulary), so this branch is simply dead code on that path.
+/// socket and for an attach viewer's final `Done` or `Killed` event.
 /// Also watches the real terminal's own size every 300ms (simpler and
 /// portable than a `SIGWINCH` handler, and plenty responsive for a size
 /// that only ever changes on an explicit user resize) and sends a
 /// `{"cols":..,"rows":..}` text frame whenever it changes — the only thing
 /// a text frame ever means client-to-server on either kind of connection.
-async fn bridge_tty_pty_phase(socket: &mut crate::worker_client::TtySocket) -> i32 {
+async fn bridge_tty_pty_phase(socket: &mut crate::worker_client::TtySocket) -> TtyEnd {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
 
@@ -1012,9 +1049,9 @@ async fn bridge_tty_pty_phase(socket: &mut crate::worker_client::TtySocket) -> i
     let exit_code = loop {
         tokio::select! {
             input = stdin_rx.recv() => {
-                let Some(bytes) = input else { break -1 };
+                let Some(bytes) = input else { break TtyEnd::Disconnected };
                 if socket.send(Message::Binary(bytes.into())).await.is_err() {
-                    break -1;
+                    break TtyEnd::Disconnected;
                 }
             }
             msg = socket.next() => {
@@ -1022,7 +1059,7 @@ async fn bridge_tty_pty_phase(socket: &mut crate::worker_client::TtySocket) -> i
                 match msg {
                     Some(Ok(Message::Binary(bytes))) => {
                         if write_all_retrying(&mut stdout, &bytes).is_err() {
-                            break -1;
+                            break TtyEnd::Disconnected;
                         }
                     }
                     Some(Ok(Message::Text(text))) => {
@@ -1034,21 +1071,21 @@ async fn bridge_tty_pty_phase(socket: &mut crate::worker_client::TtySocket) -> i
                             TtyPreludeOutcome::Done(exit_code) => break exit_code,
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break -1,
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break TtyEnd::Disconnected,
                     Some(Ok(_)) => {}
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(300)) => {
                 if last_heard.elapsed() > crate::worker_client::ws_silence_limit() {
                     worker_silent = true;
-                    break -1;
+                    break TtyEnd::Disconnected;
                 }
                 if let Ok(size) = crossterm::terminal::size() {
                     if Some(size) != last_size {
                         last_size = Some(size);
                         let resize = serde_json::json!({"cols": size.0, "rows": size.1}).to_string();
                         if socket.send(Message::Text(resize.into())).await.is_err() {
-                            break -1;
+                            break TtyEnd::Disconnected;
                         }
                     }
                 }
@@ -1087,6 +1124,20 @@ async fn bridge_tty_pty_phase(socket: &mut crate::worker_client::TtySocket) -> i
 /// session the instant it opens (see that function's own doc comment), so
 /// this goes straight to the same interactive byte relay `bridge_http_tty`
 /// itself hands off to once its own prelude reaches `TtyStart`.
-async fn bridge_http_tty_attach(socket: &mut crate::worker_client::TtySocket) -> i32 {
+async fn bridge_http_tty_attach(socket: &mut crate::worker_client::TtySocket) -> TtyEnd {
     bridge_tty_pty_phase(socket).await
+}
+
+#[cfg(test)]
+mod tty_end_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_outcomes_distinguish_exit_kill_and_lost_connection() {
+        assert_eq!(TtyEnd::Exited(0).label(), "Completed · exit 0");
+        assert_eq!(TtyEnd::Exited(7).label(), "Failed · exit 7");
+        assert_eq!(TtyEnd::Disconnected.label(), "Connection lost · result unknown");
+        assert!(matches!(print_tty_transcript_event(crate::worker_client::RunEvent::Done { exit_code: 7 }), TtyPreludeOutcome::Done(TtyEnd::Exited(7))));
+        assert!(matches!(print_tty_transcript_event(crate::worker_client::RunEvent::Killed { node_id: "root".into(), block: "shell".into() }), TtyPreludeOutcome::Done(TtyEnd::Killed)));
+    }
 }

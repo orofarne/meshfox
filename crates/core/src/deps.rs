@@ -70,8 +70,6 @@ pub enum DepsError {
     ButtonAttrConflict(String, String, &'static str),
     #[error("node {0:?} block {1:?}: a `form` fence can't also carry `{2}` — it has no real code of its own to run under it, and no \"done\" state for a dependency/dependent edge to mean anything")]
     FormAttrConflict(String, String, &'static str),
-    #[error("node {0:?} block {1:?}: `autorun` and `tty` are mutually exclusive — there's no human to hand a terminal to when a variable changes unattended")]
-    AutorunTtyConflict(String, String),
     #[error("node {0:?} block {1:?}: `send=` only means anything on a `form` fence")]
     SendWithoutForm(String, String),
     #[error("node {0:?} block {1:?}: `output-attrs=` only means anything with `output=\"image\"`")]
@@ -644,9 +642,6 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
                     node.id.clone(),
                     name.clone(),
                 ));
-            }
-            if block.autorun && block.tty {
-                return Err(DepsError::AutorunTtyConflict(node.id.clone(), name.clone()));
             }
             if block.attrs.contains_key("send") && !crate::exec::is_form(&block.lang) {
                 return Err(DepsError::SendWithoutForm(node.id.clone(), name.clone()));
@@ -1484,15 +1479,12 @@ mod tests {
     }
 
     #[test]
-    fn validate_catches_autorun_and_tty_on_the_same_block() {
+    fn validate_ok_for_autorun_and_tty_on_the_same_block() {
         let c = canvas(concat!(
             "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
             "```bash name=\"shell\" tty autorun\nbash\n```\n",
         ));
-        assert_eq!(
-            validate(&c).unwrap_err(),
-            DepsError::AutorunTtyConflict("root".to_string(), "shell".to_string())
-        );
+        assert!(validate(&c).is_ok());
     }
 
     #[test]

@@ -1938,6 +1938,13 @@ impl App {
     /// them right away — `advance_run`'s own "chain exhausted" hook drains
     /// the rest.
     async fn submit_inline_form(&mut self) {
+        // The worker refuses a Send while a foreground run is in progress
+        // (it commits values *and* starts runs); say so here instead of
+        // round-tripping, leaving the form open with what was typed.
+        if self.foreground_run_in_progress() {
+            self.status = "meshfox: a run is in progress — wait for it to finish (or stop it) before sending the form".into();
+            return;
+        }
         {
             let Some(form) = &self.active_inline_form else {
                 return;
@@ -4598,9 +4605,8 @@ impl App {
                 // killed process's exit status actually resolves
                 // (`on_output_line`'s own `None` branch always inserts
                 // one, non-zero or not) — the server never sends a
-                // `StepEnd` for a killed step (see `run_block_impl`/
-                // `run_tty_chain`'s own "killed short-circuits before
-                // StepEnd" shape), so this is worker mode's own
+                // `StepEnd` for a killed step (see `run_block_impl`'s own
+                // "killed short-circuits before StepEnd" shape), so this is worker mode's own
                 // equivalent, needed for `ui::render_tree`'s failed-badge
                 // aggregation to see this address at all.
                 let addr = BlockAddr::new(node_id, block);
@@ -5825,6 +5831,47 @@ impl App {
                 self.status = format!("jumped to #{} · {}", entry.seq, entry.summary);
             }
             Err(e) => self.status = format!("history jump failed: {e}"),
+        }
+    }
+
+    /// Whether a foreground (non-`service`) run is in progress as far as
+    /// this TUI knows: its own run, a passively watched one, a terminal
+    /// being handed over, or any running entry in the worker's last
+    /// `GET /api/runs`. The worker's `409` on a form's Send is the backstop.
+    fn foreground_run_in_progress(&self) -> bool {
+        self.spinner_active()
+            || self.pending_http_tty.is_some()
+            || self.pending_http_tty_attach.is_some()
+            || self
+                .block_runs
+                .as_ref()
+                .is_some_and(|runs| runs.iter().any(|r| r.status == "running"))
+    }
+
+    /// `WatchEvent::TtyStarted`: a terminal session started in the worker
+    /// that this TUI didn't ask for (an `autorun` `tty` block after a
+    /// form's Send, or a manual run in another frontend) — hand the terminal
+    /// to it, like picking it in the `t` live-terminals view, unless one is
+    /// already being handed over. Skipped for a session that is no longer
+    /// running by the time this is looked at: this TUI's own run delivers
+    /// its own announcement too, queued behind the handoff that just ended,
+    /// and a finished session is still attachable (its byte history) — it
+    /// would flash a dead screen.
+    pub async fn on_tty_started(&mut self, node_id: String, block: String) {
+        let Some(port) = self.worker_port else { return };
+        if self.pending_http_tty.is_some() || self.pending_http_tty_attach.is_some() {
+            return;
+        }
+        let running = crate::worker_client::list_active_runs(port)
+            .await
+            .map(|runs| {
+                runs.iter().any(|r| {
+                    r.kind == "tty" && r.status == "running" && r.node_id == node_id && r.block == block
+                })
+            })
+            .unwrap_or(false);
+        if running {
+            self.attach_tty_session(port, node_id, block).await;
         }
     }
 
@@ -8041,6 +8088,48 @@ mod tests {
         .unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         App::new(path, tx, None, None).await.unwrap()
+    }
+
+    fn active_run(block: &str, kind: &str, status: &str) -> crate::worker_client::ActiveRunDto {
+        crate::worker_client::ActiveRunDto {
+            node_id: "root".into(),
+            block: block.into(),
+            kind: kind.into(),
+            status: status.into(),
+            exit_code: None,
+            uptime_ms: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_form_send_is_refused_while_a_foreground_run_is_in_progress() {
+        let mut app = app_with_blocks("send-busy", "```sh name=build\necho build\n```\n").await;
+        assert!(!app.foreground_run_in_progress());
+
+        // A finished run, and a service-less idle worker, don't count...
+        app.block_runs = Some(vec![active_run("build", "plain", "exited")]);
+        assert!(!app.foreground_run_in_progress());
+        // ...a running one does, plain or `tty` (an unattended `autorun`
+        // terminal can sit there for as long as it likes).
+        for kind in ["plain", "tty"] {
+            app.block_runs = Some(vec![active_run("build", kind, "running")]);
+            assert!(app.foreground_run_in_progress(), "{kind}");
+        }
+
+        // The Send itself: refused with a reason, nothing committed.
+        app.active_inline_form = Some(InlineFormState {
+            node_id: "root".into(),
+            block_name: "pick".into(),
+            fields: Vec::new(),
+            decls: Vec::new(),
+            inputs: Vec::new(),
+            selected: 0,
+            editing: true,
+        });
+        app.submit_inline_form().await;
+        assert!(app.status.contains("run is in progress"), "{}", app.status);
+        assert!(app.session_vars.is_empty());
+        assert!(app.active_inline_form.as_ref().unwrap().editing);
     }
 
     #[tokio::test]

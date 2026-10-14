@@ -597,9 +597,10 @@ Lives inside a node's Markdown text, as fence-info-string attributes:
   next manual "⛓ run chain". The natural source of such a change is a
   `form` fence's own Send (see "Form fences" below), but nothing requires
   one — any resolved-value change reaches it the same way, including one
-  var's own `from=` source producing a different result. Mutually
-  exclusive with `tty` (`meshfox validate` error) — there's no human to
-  hand a terminal to when a variable changes unattended.
+  var's own `from=` source producing a different result. Compatible with
+  `tty`: the session is started by the session's server and a connected
+  client attaches to it — see "Interactive (`tty`) blocks" below for what
+  that means when nobody is watching.
 - `render="..."` — optional; swaps this block's default display from
   "code + run controls" to a custom widget for the named kind, with the
   raw fence source reachable only via an explicit edit toggle (the web
@@ -673,8 +674,9 @@ forward whatever it last wrote via `from=` (see "Computed variables"
 below), so a later step in the same chain that depends on that value isn't
 affected by the skip. Session freshness survives process restarts in the
 canvas session database. Applies the same way whether the
-chain ends in a `tty` step or not — the web UI's `/api/run/tty` WebSocket
-consults the same per-session record `/api/run` does, not a separate one.
+chain ends in a `tty` step or not — a `tty` step is just another step of
+the same run driver (the web UI's `/api/run/tty` WebSocket only adds the
+terminal relay on top), so it consults the same per-session record.
 
 For a built-in `@name` interpreter, runtime freshness also includes the
 embedded script's content identity and settings that affect its invocation
@@ -1043,6 +1045,13 @@ only ever prompting before a run. Its body is a line-based list, one
   submitting a value for one would let a human override what its source
   block computes, exactly what `from=` exists to prevent; `meshfox
   validate` rejects either case.
+- Dynamic `choices_var=` and `default_var=` on the referenced variable
+  work in a `form` fence too. Loading its fields resolves those references
+  transitively and runs the needed `from=` source blocks and their `deps=`
+  chains, with the same empty environment and graceful unresolved fallback
+  as the pre-run form (see "Dynamic `default`/`choices`" below). Only the
+  form's declared fields are displayed; source variables are not inputs.
+  Computed choices remain available when a field already has a session value.
 - `send="..."` — the Send button's own caption, on the fence's info
   string (not a `field` line) — falls back to a plain `"Send"` when
   omitted.
@@ -1076,6 +1085,15 @@ only ever prompting before a run. Its body is a line-based list, one
   combination this section opened with. A value committed this way is
   visible to every block's `env=` for the rest of that session, not just
   whichever `autorun` block happened to react to this particular Send.
+- **A form can only be sent while no foreground run is in progress** — a
+  plain run, a `tty` session, or the gap between a chain's steps; a
+  `service` doesn't count. Send commits the values *and* starts every
+  `autorun` block they reach, so sending on top of a running chain would
+  race its inputs, and an interactive session can last as long as its user
+  likes. The server refuses (`POST /api/form/submit` answers `409`) before
+  committing anything, and the web UI and TUI disable Send (and say why)
+  while one is running. A form that triggers a `tty` block therefore holds
+  further Sends until that terminal is closed or the program exits.
 - A form fence can't declare its own `deps=`, `env=`, `interpreter=`,
   `cache`, `tty`, `service`, or `autorun` — none of those presuppose a
   real process of the form's own, which it never has (same reasoning
@@ -1245,11 +1263,33 @@ terminal to hand over.
 - Either way, output from a `tty` block is never written back into the
   file — that's what the `cache` conflict (above) rules out.
 
+**A `tty` session belongs to the session's server, not to whoever started
+it.** In `meshfox view`/`meshfox tui` the pty is owned by the server
+process; a client that runs the block (or a chain that passes through it)
+is just its first viewer. Any number of clients can attach and leave, and
+closing the one that started it neither ends the session nor stops the rest
+of its chain — only the program exiting, or an explicit stop, does. So a
+`tty` block triggers like any other: manually, as a `deps=` target, or by
+`autorun` (after a `form`'s Send, say). The server then starts it
+unattended and announces it to every connected client, and each client that
+isn't already showing a terminal attaches — the web UI opens its terminal
+panel, `meshfox tui` takes over the screen. With no client attached the
+program simply waits on its own input for as long as it takes (there is no
+timeout); it shows up as a running `tty` run, and stopping it ends the
+chain like any other kill. A `tty` session's terminal is as large as the
+smallest attached client's, and before any client attaches it is 80×24.
+
 By default, once a `tty` block's process exits, its exit code (and
 whatever it last printed) stays visible until a deliberate action returns
 to the canvas — a keypress in `meshfox tui`, closing the panel by hand in
 `meshfox view` — same as leaving a real terminal window open after a
-command finishes. `autoclose` (a flag, `autoclose` or `autoclose="true"`;
+command finishes. This also applies to viewers that attach to an existing
+session: the server sends its final outcome before closing the socket.
+The web panel and its minimized pill show Completed (exit 0), Failed
+(nonzero exit), or Killed, and the expanded panel offers a Close button.
+A lost connection is reported separately as "result unknown"; the TUI
+likewise never presents it as a process exit code.
+`autoclose` (a flag, `autoclose` or `autoclose="true"`;
 only meaningful on a `tty` block — `meshfox validate` rejects it on
 anything else) skips that and returns to the canvas the instant the
 process exits instead:
@@ -2150,8 +2190,12 @@ re-run. A marker written before this field existed has no `hash=` at all —
 treated the same as stale, since there's nothing to compare against.
 
 Output (live or cached) that contains ANSI SGR color/style escape codes
-renders in color in the web UI, both while a block is still streaming and
-for a previously-cached block's saved output. Commands run without a
+renders in color in the web UI and TUI, both while a block is still streaming
+and for a previously-cached block's saved output. The TUI supports standard,
+256-color and RGB foreground/background colors, bold, dim, italic, underline,
+reverse, hidden and strikethrough styles, including styles spanning lines.
+ANSI colors also render in the TUI output console, service logs and run history;
+cursor movement and other terminal controls are ignored. Commands run without a
 pseudo-terminal, so a tool that auto-detects "not a real terminal" and
 disables its own color output (`cargo`, `git`, plain `ls`) prints plain
 text here unless it's told to force color (`--color=always`, or a script

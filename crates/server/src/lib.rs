@@ -1536,7 +1536,7 @@ struct SessionRun {
     /// instead, letting the client still show it (typically collapsed by
     /// default — see `web/src/MeshNode.tsx`'s `LiveRunOutput`). Empty for a
     /// `tty` step, which never populates `full_output` to begin with (see
-    /// the `!block.tty` guard around `run_tty_chain`'s own `ExecOutput`).
+    /// the `!block.tty` guard around `run_block_impl`'s own `ExecOutput`).
     output: String,
     /// That same earlier run's own wall-clock duration, in milliseconds —
     /// mirrors `RunEvent::StepEnd`'s `duration_ms`.
@@ -1751,13 +1751,9 @@ fn has_running_services(state: &AppState) -> bool {
 /// exactly the "already running elsewhere" conflict a *later* run of the
 /// same block then hit against a pid that no longer existed.
 ///
-/// Covers a `tty` step only for as long as *some* connection to it is still
-/// open (`state.runs`'s own entry is tied to one connection's own stream,
-/// dropped the moment that connection ends) — a `tty` session's whole
-/// point is to outlive that (see `tty_registry`'s own module doc comment:
-/// "closing one viewer's tab no longer ends the session"), so a session
-/// nobody's currently watching needs its own check —
-/// `has_running_tty_sessions`, right below.
+/// A `tty` step is part of its chain (the generator waits on it), so this
+/// covers a session for as long as its chain runs — `has_running_tty_sessions`,
+/// right below, is the direct check on the sessions themselves.
 fn has_active_runs(state: &AppState) -> bool {
     !state.runs.lock().unwrap().is_empty()
 }
@@ -1776,6 +1772,23 @@ fn has_running_tty_sessions(state: &AppState) -> bool {
         .unwrap()
         .values()
         .any(|s| matches!(s.outcome(), tty_registry::RunOutcome::Running))
+}
+
+/// Whether a foreground run — anything but a `service`, which is meant to
+/// run indefinitely in the background — is in progress: a chain being
+/// driven (`state.runs`, which also covers the gaps between its steps), a
+/// plain step's process, or a live `tty` session. What `submit_form` refuses
+/// to start more work on top of, and what a client reads off `GET
+/// /api/runs` (`status: "running"`) to grey out its Send buttons.
+fn foreground_run_in_progress(state: &AppState) -> bool {
+    has_active_runs(state)
+        || has_running_tty_sessions(state)
+        || state
+            .runs_registry
+            .lock()
+            .unwrap()
+            .values()
+            .any(|h| matches!(h.outcome(), run_registry::RunOutcome::Running))
 }
 
 /// True if some debug session this worker holds still has a live shell — the
@@ -3129,10 +3142,26 @@ async fn run_from_source_for_status(
 /// `ResolvedVars` for the whole batch — split out from `get_vars` so this
 /// (pure, `State`/`Query`-free) mapping is unit-testable on its own.
 fn var_status(
-    d: meshfox_core::VarDecl,
+    mut d: meshfox_core::VarDecl,
     resolved: &meshfox_core::ResolvedVars,
     store: meshfox_core::secret_store::SecretStoreKind,
 ) -> VarStatus {
+    // Resolved fields bypass reference substitution in vars::resolve: their
+    // existing answer needs no choices/default. A displayed form still does.
+    if let Some(value) = d
+        .choices_var
+        .as_ref()
+        .and_then(|name| resolved.values.get(name))
+    {
+        d.choices = meshfox_core::vars::split_choices(value);
+    }
+    if let Some(value) = d
+        .default_var
+        .as_ref()
+        .and_then(|name| resolved.values.get(name))
+    {
+        d.default = Some(value.clone());
+    }
     let resolved_value = resolved.values.get(&d.name).cloned();
     let is_resolved = resolved_value.is_some();
     // A `required` declaration with nothing else supplying it lands in
@@ -3416,8 +3445,8 @@ enum RunEvent {
     /// `AppState::session_runs`'s own doc comment) that already ran
     /// successfully earlier in this same `meshfox view` session and hasn't
     /// changed since. Emitted the same way over both the plain NDJSON
-    /// `/api/run` path and `/api/run/tty`'s WebSocket — `run_tty_chain`
-    /// consults the same `session_runs` map `run_block` does.
+    /// `/api/run` path and `/api/run/tty`'s WebSocket — both are
+    /// `run_block_impl`, so they consult the same `session_runs` map.
     StepSkipped {
         node_id: String,
         block: String,
@@ -3587,6 +3616,21 @@ enum ServerEvent {
         /// its run stream already ended (a chain that stops at a failing
         /// dependency finishes within milliseconds).
         run_id: String,
+    },
+    /// A `tty` step's pty session was just registered in
+    /// `AppState::tty_registry` — pushed by the run driver itself
+    /// (`run_block_impl`), whoever started the chain: a manual run, a
+    /// `force_run`, or a server-triggered `autorun`. The terminal has no
+    /// output stream to subscribe to the way a plain block's run does, so
+    /// this is what tells every connected client "there is a live terminal
+    /// for `node_id`/`block` you may not be showing yet" — each one that
+    /// isn't already showing a terminal attaches via
+    /// `GET /api/run/tty/attach`. The address is the `tty` step's own,
+    /// which for a chain that merely passes through a `tty` dependency is
+    /// not the chain's requested block.
+    TtyStarted {
+        node_id: String,
+        block: String,
     },
     /// A node was created, or an existing one's own fields (title/body/
     /// meta/edges/parent) changed — `node.parent` already says where it
@@ -7034,6 +7078,21 @@ fn require_run_confirmation(
 }
 
 async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Response, ApiError> {
+    run_block_impl_sized(state, req, (DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS)).await
+}
+
+/// `run_block_impl` with an explicit initial pty size for any `tty` step in
+/// the chain — what `/api/run/tty` passes (the connecting terminal's own
+/// `cols`/`rows`). A chain started without a terminal of its own (`autorun`,
+/// a plain `/api/run`) uses the default; the pty is resized to the
+/// componentwise minimum of its viewers as soon as one attaches
+/// (`TtySessionHandle::register_viewer`), so the initial size only matters
+/// until then.
+async fn run_block_impl_sized(
+    state: Arc<AppState>,
+    req: RunRequest,
+    tty_size: (u16, u16),
+) -> Result<Response, ApiError> {
     let raw_snapshot = state.raw.lock().unwrap().clone();
     // Include-resolved (not just `parse_or_error`) so `path`/`block` below
     // can address a node spliced in from an `include` — its id in the
@@ -7044,15 +7103,6 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
     seed_artifact_paths(&state, &mut canvas, &effective_overrides(&state, &req.vars));
     let path: Vec<&str> = req.path.iter().map(String::as_str).collect();
     let chain = meshfox_core::resolve_run_chain(&canvas, &path, &req.block, !req.no_deps)?;
-    if let Some(addr) = find_tty_block(&canvas, &chain) {
-        return Err(ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!(
-                "block {:?} in node {:?} is a `tty` block — run it via the WebSocket endpoint (`/api/run/tty`), not `/api/run`",
-                addr.block_name, addr.node_id
-            ),
-        ));
-    }
     require_run_confirmation(&canvas, &chain, req.confirm)?;
     let persist = req.persist;
 
@@ -7216,7 +7266,14 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
     // breaking the loop, say), so an already-waiting subscriber isn't left
     // hanging on a `Running` outcome forever.
     let run_id = uuid::Uuid::new_v4().to_string();
-    let target_reservation = chain.last().map(|target| {
+    // Never for a `tty` target: its session lives in `tty_registry` (found
+    // via `ServerEvent::TtyStarted`/`GET /api/run/tty/attach`), and a
+    // placeholder here would shadow it in `kill_run`'s by-address lookup
+    // and in `GET /api/runs`, which report it as a plain run.
+    let target_reservation = chain
+        .last()
+        .filter(|target| find_tty_block(&canvas, std::slice::from_ref(*target)).is_none())
+        .map(|target| {
         let reserved = run_registry::reserve(target.node_id.clone(), target.block_name.clone());
         state.runs_registry.lock().unwrap().insert(
             (target.node_id.clone(), target.block_name.clone()),
@@ -7258,9 +7315,7 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
         // turn never came, or that were mid-execution as a *plain* step
         // when the stream ended one way or another. Runs before `_guard`
         // (declared after it), same reverse-declaration-order `Drop` every
-        // other guard here already relies on. `ReleaseRemainingLocks` is
-        // shared with `run_tty_chain`'s own use of it, see that struct's
-        // own doc comment.
+        // other guard here already relies on.
         let mut _release_guard = ReleaseRemainingLocks(std::mem::take(&mut held_locks), state.run_ledger.clone());
         let held_locks = &mut _release_guard.0;
         // See `target_reservation`'s own doc comment above — resolved here
@@ -7377,12 +7432,6 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
                 yield Ok(ndjson_line(&RunEvent::Error {
                     message: format!("no executor registered for language {:?}", block.lang),
                 }));
-                break;
-            }
-
-            if block.tty {
-                final_exit_code = 1;
-                yield Ok(ndjson_line(&RunEvent::Error { message: "newly selected tty producer requires /api/run/tty".into() }));
                 break;
             }
 
@@ -7561,6 +7610,108 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
             }
 
             let step_started = std::time::Instant::now();
+            let mut full_output = String::new();
+            let mut stdout_only = String::new();
+            let mut stderr_only = String::new();
+            // A `tty` step is a session in `tty_registry`, not a process
+            // whose lines this generator relays: it is detached from every
+            // connection (any number of viewers attach and leave, none of
+            // them owns it), and this chain only *waits* for it to end —
+            // so the chain is driven the same way whether a terminal is
+            // attached or not (an `autorun` block, say, runs it unattended
+            // and sits there until someone attaches and the program exits,
+            // or it is killed). Viewers find it through
+            // `RunEvent::TtyStart` (the connection that started the chain)
+            // or `ServerEvent::TtyStarted` (everyone else).
+            let exit_code = if resolved_block.tty {
+                let key = (addr.node_id.clone(), addr.block_name.clone());
+                let pty = match pty_exec::spawn(
+                    &block.code,
+                    resolved_block.interpreter.as_deref(),
+                    Some(&block.lang),
+                    &block_env,
+                    Some(&cwd),
+                    Some(canvas_path_for_step),
+                    tty_size,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        if let Some(id) = held_locks.remove(&key) {
+                            let _ = state.run_ledger.finish(id, run_ledger::FinishOutcome::Killed);
+                        }
+                        final_exit_code = 1;
+                        yield Ok(ndjson_line(&RunEvent::Error { message: e.to_string() }));
+                        break;
+                    }
+                };
+                // Handed to `tty_registry::track` by value: its background
+                // task finishes the row once the session really ends, not
+                // whenever this generator does (see that function's doc
+                // comment).
+                let ledger_row = held_locks.remove(&key).map(|id| (state.run_ledger.clone(), id));
+                if let Some((ledger, id)) = &ledger_row {
+                    let _ = ledger.update_pid(*id, pty.pid() as u32);
+                    stamp_run_fingerprint(&state, addr, *id);
+                }
+                let handle = tty_registry::track(
+                    addr.node_id.clone(),
+                    addr.block_name.clone(),
+                    pty,
+                    ledger_row,
+                );
+                state.tty_registry.lock().unwrap().insert(key, Arc::clone(&handle));
+                // Subscribed before anything else can be observed, so the
+                // outcome below can't be missed.
+                let (_backlog, mut tty_rx) = handle.attach();
+                yield Ok(ndjson_line(&RunEvent::TtyStart {
+                    node_id: addr.node_id.clone(),
+                    block: addr.block_name.clone(),
+                }));
+                state.canvas_events.push(ServerEvent::TtyStarted {
+                    node_id: addr.node_id.clone(),
+                    block: addr.block_name.clone(),
+                });
+                let mut kill_requested = false;
+                let tty_exit_code = loop {
+                    tokio::select! {
+                        event = tty_rx.recv() => {
+                            let outcome = match event {
+                                // Output belongs to the viewers; this
+                                // generator only waits for the end.
+                                Ok(tty_registry::TtyEvent::Bytes(_)) => continue,
+                                Ok(tty_registry::TtyEvent::Done(outcome)) => outcome,
+                                // Fell behind on bytes nobody here reads —
+                                // but the `Done` it may have skipped past
+                                // is only visible through `outcome()`.
+                                Err(broadcast::error::RecvError::Lagged(_)) => handle.outcome(),
+                                Err(broadcast::error::RecvError::Closed) => {
+                                    tty_registry::RunOutcome::Exited { exit_code: -1 }
+                                }
+                            };
+                            match outcome {
+                                tty_registry::RunOutcome::Running => {}
+                                tty_registry::RunOutcome::Exited { exit_code } => break exit_code,
+                                tty_registry::RunOutcome::Killed => {
+                                    yield Ok(ndjson_line(&RunEvent::Killed {
+                                        node_id: addr.node_id.clone(),
+                                        block: addr.block_name.clone(),
+                                    }));
+                                    killed = true;
+                                    break -1;
+                                }
+                            }
+                        }
+                        // Armed once, like the plain step's: the kill
+                        // reaches the session, and every attached viewer
+                        // sees it resolve as `Done(Killed)` above.
+                        _ = &mut kill_rx, if !kill_requested => {
+                            kill_requested = true;
+                            handle.kill();
+                        }
+                    }
+                };
+                tty_exit_code
+            } else {
             let proc = match stream_exec::spawn_block(
                 &resolved_block,
                 &block_env,
@@ -7585,9 +7736,6 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
                 let _ = state.run_ledger.update_pid(*id, proc.child.id().unwrap_or(0));
             }
 
-            let mut full_output = String::new();
-            let mut stdout_only = String::new();
-            let mut stderr_only = String::new();
             // Registering this run — instead of draining `proc` directly
             // here — is what lets its output survive this one connection:
             // a reconnect or a second tab can subscribe to the exact same
@@ -7695,6 +7843,8 @@ async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Respons
                         run_handle.kill();
                     }
                 }
+            };
+            exit_code
             };
             if killed {
                 break;
@@ -8025,6 +8175,11 @@ struct SubmitFormRequest {
 struct TriggeredRun {
     node_id: String,
     block: String,
+    /// The block itself is a `tty` block. Its session is not a run output
+    /// to `subscribe` to — it is announced by `ServerEvent::TtyStarted` and
+    /// joined with `GET /api/run/tty/attach` — so a client skips the
+    /// `subscribeRun` it would otherwise do for this address.
+    tty: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -8221,6 +8376,19 @@ async fn submit_form(
     }
     let form = meshfox_core::form_block(&block)
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    // One foreground run at a time: a Send commits values *and* starts every
+    // `autorun` block they reach, so submitting while something else runs
+    // would either race its inputs or queue a second run on top of it (an
+    // interactive `tty` session, say, can last as long as its user likes).
+    // Checked before anything is committed, so a refused Send changes
+    // nothing.
+    if foreground_run_in_progress(&state) {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "a run is in progress — wait for it to finish (or stop it) before sending the form"
+                .into(),
+        ));
+    }
     let decls = meshfox_core::declared_vars(&canvas)
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
     let decls_by_name: HashMap<&str, &meshfox_core::VarDecl> =
@@ -8270,6 +8438,7 @@ async fn submit_form(
         autorun_triggered: triggered
             .into_iter()
             .map(|a| TriggeredRun {
+                tty: find_tty_block(&canvas, std::slice::from_ref(&a)).is_some(),
                 node_id: a.node_id,
                 block: a.block_name,
             })
@@ -8277,12 +8446,12 @@ async fn submit_form(
     }))
 }
 
-/// The first block in `chain` (if any) flagged `tty` — `meshfox validate`'s
-/// rule that a `tty` block may only be a `deps=` target of *another* `tty`
-/// block (enforced inside `resolve_run_chain` itself, via
-/// `deps::visit`) means a chain can only ever contain one if the
-/// originally-requested block itself is `tty` too, but this checks every
-/// entry anyway rather than leaning on that invariant staying true forever.
+/// The first block in `chain` (if any) flagged `tty`. A chain may contain
+/// one anywhere (a `tty` block can be the `deps=` target of any block, see
+/// SPEC.md's `tty` flag); `run_block_impl` drives it like any other step.
+/// Used to tell whether a given address *is* one — the run's target gets no
+/// `run_registry` reservation if so, and a form's triggered `autorun` block
+/// is flagged `tty` for the client.
 fn find_tty_block(
     canvas: &Canvas,
     chain: &[meshfox_core::BlockAddr],
@@ -8350,20 +8519,24 @@ struct TtyRunQuery {
     /// `ForceRunWsQuery`'s pair does for `/api/run/force`. Optional (rather
     /// than a separate `/api/run/tty/force` endpoint) because a `tty` chain
     /// already has exactly one WebSocket endpoint to upgrade through — no
-    /// second one to duplicate the pty-handling half of `run_tty_chain`
-    /// into.
+    /// second one to duplicate.
     #[serde(default)]
     force_node_id: Option<String>,
     #[serde(default)]
     force_block: Option<String>,
 }
 
+/// A `tty` session's initial size when nothing connected asked for one
+/// (see `run_block_impl_sized`).
+const DEFAULT_PTY_COLS: u16 = 80;
+const DEFAULT_PTY_ROWS: u16 = 24;
+
 fn default_pty_cols() -> u16 {
-    80
+    DEFAULT_PTY_COLS
 }
 
 fn default_pty_rows() -> u16 {
-    24
+    DEFAULT_PTY_ROWS
 }
 
 /// A client's resize control message during an active `tty` step (see
@@ -8377,208 +8550,133 @@ struct ResizeMessage {
 }
 
 /// `GET /api/run/tty` — the WebSocket counterpart to `run_block`, for a
-/// chain that ends in (or, via a `tty`-only `deps=` chain, passes through)
-/// a `tty` block. Chain resolution, `tty`/`cache` well-formedness (already
-/// enforced by `resolve_run_chain` itself — see `deps::visit`), and
-/// variable resolution all happen *before* the WebSocket upgrade, so a
-/// request that doesn't even make sense still fails as a normal HTTP error
-/// (same guarantee `run_block` gives) instead of upgrading and then
-/// immediately closing.
+/// chain with a `tty` step (the requested block or any dependency): runs the
+/// chain through the same `run_block_impl` every other run uses, then, as
+/// the connection that started it, attaches to each `tty` step's session
+/// when it starts (see `pump_tty_run_response_into_ws`). The chain itself is
+/// not owned by this connection — closing it leaves the run going, exactly
+/// as for `/api/run`. Chain resolution, `tty`/`cache` well-formedness
+/// (`resolve_run_chain`) and variable resolution all happen *before* the
+/// WebSocket upgrade, so a request that doesn't even make sense still fails
+/// as a normal HTTP error — and so does a `409` lock conflict, which the
+/// CLI's own retry-with-`force` reads straight off the failed handshake.
 async fn run_block_tty(
     State(state): State<Arc<AppState>>,
     Query(query): Query<TtyRunQuery>,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
-    let raw_snapshot = state.raw.lock().unwrap().clone();
-    // Include-resolved for the same reason `run_block` is — see its own
-    // doc comment on the equivalent line.
-    let mut canvas = resolved_canvas(&raw_snapshot, &state.canvas_path)?;
-    let requested_vars: HashMap<String, String> = if query.vars.is_empty() {
-        HashMap::new()
-    } else {
-        serde_json::from_str(&query.vars)
-            .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("invalid `vars`: {e}")))?
-    };
-    seed_artifact_paths(&state, &mut canvas, &effective_overrides(&state, &requested_vars));
-    let path: Vec<&str> = if query.path.is_empty() {
-        Vec::new()
-    } else {
-        query.path.split(',').collect()
-    };
-    let chain = meshfox_core::resolve_run_chain(&canvas, &path, &query.block, !query.no_deps)?;
-    require_run_confirmation(&canvas, &chain, query.confirm)?;
-    let persist = query.persist;
+    let req = parse_run_request(
+        &query.path,
+        query.block,
+        query.no_deps,
+        query.fresh,
+        query.skip_fresh,
+        query.persist,
+        query.confirm,
+        &query.vars,
+        &query.save_secrets,
+    )?;
     let (cols, rows) = (query.cols.max(1), query.rows.max(1));
 
-    let save_secrets: std::collections::HashSet<String> = if query.save_secrets.is_empty() {
-        std::collections::HashSet::new()
-    } else {
-        serde_json::from_str(&query.save_secrets).map_err(|e| {
-            ApiError(
-                StatusCode::BAD_REQUEST,
-                format!("invalid `saveSecrets`: {e}"),
-            )
-        })?
-    };
+    // Force-kill prep, same as `force_run`'s — the confirmation check comes
+    // first so an unconfirmed request never kills anything.
+    if let (Some(force_node_id), Some(force_block)) = (query.force_node_id, query.force_block) {
+        let raw = state.raw.lock().unwrap().clone();
+        let mut canvas = resolved_canvas(&raw, &state.canvas_path)?;
+        seed_artifact_paths(&state, &mut canvas, &effective_overrides(&state, &req.vars));
+        let path: Vec<&str> = req.path.iter().map(String::as_str).collect();
+        let chain = meshfox_core::resolve_run_chain(&canvas, &path, &req.block, !req.no_deps)?;
+        require_run_confirmation(&canvas, &chain, req.confirm)?;
+        force_run_kill_prep(
+            &state,
+            &ForceTarget {
+                node_id: force_node_id,
+                block: force_block,
+            },
+        )
+        .await?;
+    }
 
-    // Same resolution this chain's `env=` needs as `run_block` does — see
-    // its own doc comment for why only the chain's actually-referenced
-    // variables are ever looked at.
-    let needed = meshfox_core::env_var_names_for_chain(&canvas, &chain);
-    let decls = meshfox_core::declared_vars(&canvas)
-        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
-    let relevant_decls: Vec<_> = decls
-        .iter()
-        .filter(|d| needed.contains(&d.name))
-        .cloned()
-        .collect();
-    validate_var_overrides(&relevant_decls, &requested_vars)?;
-    // `computed` (the empty map here) means a `from`-declared decl in
-    // `relevant_decls` lands in `unresolved_from`, not `missing` — it's
-    // resolved incrementally, mid-chain, by `run_tty_chain` instead.
-    let overrides = effective_overrides(&state, &requested_vars);
-    let resolved_vars = {
-        let mut cache = state.vars_cache.lock().unwrap();
-        let shared = meshfox_core::load_shared_env(canvas_root_dir(&state.canvas_path));
-        let resolved = meshfox_core::resolve_with_shared(
-            &relevant_decls,
-            &overrides,
-            &cache,
-            &HashMap::new(),
-            &shared,
-        );
-        if !resolved.missing.is_empty() {
-            let names: Vec<&str> = resolved.missing.iter().map(|d| d.name.as_str()).collect();
-            return Err(ApiError(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!(
-                    "missing required variable(s): {}{}",
-                    names.join(", "),
-                    secret_error_suffix(&resolved)
-                ),
-            ));
-        }
-        for (name, value) in &requested_vars {
-            if let Some(d) = relevant_decls.iter().find(|d| {
-                &d.name == name && (!d.secret || save_secrets.contains(name)) && !d.session
-            }) {
-                if d.secret {
-                    // The user explicitly asked to save this one: if the
-                    // store refuses, say so now instead of starting a run
-                    // that will ask for it again next time.
-                    cache.save_secret(name, value).map_err(|e| {
-                        ApiError(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("couldn't save {name} to the secret store: {e}"),
-                        )
-                    })?;
-                } else {
-                    cache.set(name, value).map_err(|e| {
-                        ApiError(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("couldn't save {name} to the variable cache: {e}"),
-                        )
-                    })?;
+    let response = run_block_impl_sized(Arc::clone(&state), req, (cols, rows)).await?;
+    if response.status() != StatusCode::OK {
+        return Ok(response);
+    }
+    Ok(ws.on_upgrade(move |socket| {
+        pump_tty_run_response_into_ws(state, socket, response, cols, rows)
+    }))
+}
+
+/// `pump_run_response_into_ws`'s counterpart for a chain that may contain
+/// `tty` steps: relays the run's NDJSON events as text frames, and when one
+/// is `tty-start` makes this connection a viewer of that step's session —
+/// pty output out as binary frames, incoming binary frames into its stdin,
+/// text frames as `ResizeMessage` — until the session ends, then carries on
+/// with the rest of the chain's events. A client that goes away (at any
+/// point) just stops being a viewer; the chain, and the session, go on.
+async fn pump_tty_run_response_into_ws(
+    state: Arc<AppState>,
+    mut socket: WebSocket,
+    response: Response,
+    cols: u16,
+    rows: u16,
+) {
+    use futures_util::StreamExt;
+    let mut body = response.into_body().into_data_stream();
+    let mut heartbeat = ws_heartbeat();
+    loop {
+        tokio::select! {
+            chunk = body.next() => {
+                let Some(Ok(bytes)) = chunk else { break };
+                let text = String::from_utf8_lossy(&bytes);
+                let line = text.trim_end();
+                if socket.send(Message::Text(line.to_string())).await.is_err() {
+                    return;
+                }
+                if !line.contains("\"tty-start\"") {
+                    continue;
+                }
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                if value["type"] != "tty-start" {
+                    continue;
+                }
+                let (Some(node_id), Some(block)) = (
+                    value["nodeId"].as_str(),
+                    value["block"].as_str(),
+                ) else {
+                    continue;
+                };
+                let handle = state
+                    .tty_registry
+                    .lock()
+                    .unwrap()
+                    .get(&(node_id.to_string(), block.to_string()))
+                    .cloned();
+                if let Some(handle) = handle {
+                    if matches!(
+                        relay_tty_session(&handle, &mut socket, cols, rows).await,
+                        TtyViewerEnd::ClientGone
+                    ) {
+                        return;
+                    }
+                }
+            }
+            _ = heartbeat.tick() => {
+                if socket.send(heartbeat_message()).await.is_err() {
+                    return;
                 }
             }
         }
-        resolved.values
-    };
-
-    // Same up-front dry-run pass `run_block` does — see its own doc
-    // comment on the equivalent line.
-    let forced_reruns = {
-        let session_runs = state.session_runs.lock().unwrap();
-        // The real loop below fingerprints against the *whole* accumulated
-        // `resolved_vars` map, not a per-block-filtered subset (see its own
-        // `session_fingerprint` call) — mirror that here: this dry run's
-        // own seed plus whatever a skipped step's `produced_vars` folds in.
-        meshfox_core::deps::compute_forced_reruns_planned(
-            &canvas,
-            &chain,
-            |_block, sim_computed| {
-                let mut vars = sim_computed.clone();
-                vars.extend(resolved_vars.clone());
-                vars
-            },
-            |addr| {
-                session_runs
-                    .get(&(addr.node_id.clone(), addr.block_name.clone()))
-                    .map(|run| (run.fingerprint.clone(), run.produced_vars.clone()))
-            },
-            &std::collections::HashSet::new(),
-            query.skip_fresh,
-        )
-        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?
-    };
-    // `fresh` — same as in `run_block_impl`.
-    let forced_reruns: std::collections::HashSet<meshfox_core::BlockAddr> = if query.fresh {
-        chain.iter().cloned().collect()
-    } else {
-        forced_reruns
-    };
-
-    // Force-kill prep, mirroring `force_run_kill_prep` — see its own doc
-    // comment for why this only proves the old owner is gone and leaves the
-    // address free, rather than claiming it itself (the locking pass right
-    // below does that, from scratch, for the whole chain).
-    if let (Some(force_node_id), Some(force_block)) = (&query.force_node_id, &query.force_block) {
-        locate_node(&raw_snapshot, force_node_id)?;
-        let addr = canonical_run_address(&state, force_node_id, force_block);
-        state
-            .run_ledger
-            .kill_running(&addr.node_id, &addr.block_name)
-            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
-
-    // Same queued-time, transactional locking `run_block` does — see its
-    // own doc comment on the equivalent line. Still entirely pre-upgrade,
-    // so a conflict is a plain HTTP response, not a WebSocket frame.
-    // Computed observations can change the plan after admission. Reserve the
-    // whole possible chain atomically rather than executing an unlocked step.
-    let lock_candidates = artifact_lock_candidates(&canvas, &chain, &forced_reruns)
-        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
-    let lock_targets = steps_needing_a_lock(&state, &raw_snapshot, &lock_candidates);
-    let held_locks = match acquire_chain_locks(&state.run_ledger, &lock_targets, "webui") {
-        Ok(locks) => locks,
-        Err(ChainLockError::Conflict(conflict)) => return Ok(lock_conflict_response(&conflict)),
-        Err(ChainLockError::Io(e)) => {
-            return Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
-        }
-    };
-
-    let run_id = uuid::Uuid::new_v4().to_string();
-    let (kill_tx, kill_rx) = oneshot::channel::<()>();
-    state.runs.lock().unwrap().insert(run_id.clone(), kill_tx);
-
-    Ok(ws.on_upgrade(move |socket| {
-        run_tty_chain(
-            socket,
-            state,
-            run_id,
-            chain,
-            decls,
-            resolved_vars,
-            query.confirm,
-            query.fresh,
-            query.skip_fresh,
-            !query.no_deps,
-            persist,
-            cols,
-            rows,
-            kill_rx,
-            held_locks,
-        )
-    }))
+    let _ = socket.close().await;
 }
 
 /// Finishes (as `Killed`) every `run_ledger` row still left in `0` on drop
 /// — same "sweep whatever wasn't explicitly resolved" guard `run_block`'s
-/// own `ReleaseRemainingLocks` is, factored out here so `run_tty_chain` (a
-/// plain `async fn` with several early `return`s, not a `stream!`
-/// generator) gets the exact same "resolved no matter how this function
-/// actually ends" guarantee without duplicating the `Drop` impl. Carries
-/// its own `RunLedger` clone since `Drop::drop` takes no extra arguments.
+/// own guard is — resolved no matter how the generator that holds it
+/// actually ends. Carries its own `RunLedger` clone since `Drop::drop`
+/// takes no extra arguments.
 struct ReleaseRemainingLocks(HashMap<(String, String), i64>, run_ledger::RunLedger);
 
 impl Drop for ReleaseRemainingLocks {
@@ -8587,858 +8685,6 @@ impl Drop for ReleaseRemainingLocks {
             let _ = self.1.finish(*id, run_ledger::FinishOutcome::Killed);
         }
     }
-}
-
-/// Sends one `RunEvent` as a WebSocket text frame (JSON) — the WS
-/// equivalent of `run_block`'s `ndjson_line`. Returns `false` if the send
-/// failed (client gone), the signal callers use to give up on the rest of
-/// the run entirely rather than attempt any further sends on a dead socket.
-async fn send_event(socket: &mut WebSocket, event: &RunEvent) -> bool {
-    let text = serde_json::to_string(event).expect("RunEvent always serializes");
-    socket.send(Message::Text(text)).await.is_ok()
-}
-
-/// Runs `chain` over `socket` — every step captured/streamed as `RunEvent`
-/// text frames exactly like `run_block`'s NDJSON body, except a `tty` step
-/// (there can be more than one, each running its own `deps=` first —
-/// see SPEC.md's "Interactive (`tty`) blocks") instead hands the process a
-/// real pty and relays it raw (see `relay_tty_step`), bracketed by
-/// `RunEvent::TtyStart`/`StepEnd`. Mirrors `run_block`'s
-/// `async_stream::stream!` body closely — same guard, same
-/// stop-the-chain-on-first-failure/kill rules, same cache-persist-at-the-end
-/// behavior — just pushed over a WebSocket instead of yielded into an
-/// NDJSON stream.
-#[allow(clippy::too_many_arguments)]
-async fn run_tty_chain(
-    mut socket: WebSocket,
-    state: Arc<AppState>,
-    run_id: String,
-    chain: Vec<meshfox_core::BlockAddr>,
-    decls: Vec<meshfox_core::VarDecl>,
-    mut resolved_vars: HashMap<String, String>,
-    confirmed: bool,
-    fresh: bool,
-    skip_fresh: bool,
-    with_deps: bool,
-    persist: bool,
-    cols: u16,
-    rows: u16,
-    mut kill_rx: oneshot::Receiver<()>,
-    held_locks: HashMap<(String, String), i64>,
-) {
-    let _guard = RunGuard {
-        state: Arc::clone(&state),
-        run_id: run_id.clone(),
-    };
-    // Finished (as `Killed`) on drop, however this function actually ends (a
-    // clean finish, `killed`, or an early `return` on a dead socket) — see
-    // `ReleaseRemainingLocks`'s own doc comment. No `service` step can ever
-    // reach this function (`tty`/`service` are mutually exclusive, see
-    // `DepsError::ServiceTtyConflict`), so — unlike `run_block` — nothing
-    // here ever needs to *remove* an address from this map without
-    // finishing it: every address this function locks (plain or `tty`) is
-    // finished the moment its own step ends, and this only ever sweeps up
-    // whatever a kill/disconnect/failure left unresolved.
-    let mut held_locks = ReleaseRemainingLocks(held_locks, state.run_ledger.clone());
-
-    if !send_event(
-        &mut socket,
-        &RunEvent::Started {
-            run_id: run_id.clone(),
-        },
-    )
-    .await
-    {
-        return;
-    }
-
-    let mut final_exit_code = 0;
-    let mut killed = false;
-    // Same per-file tracking `run_block` uses — see its own doc comment.
-    let mut file_raws: HashMap<Option<PathBuf>, String> = HashMap::new();
-    // See `run_block_impl`'s own `pending_outputs`.
-    let mut pending_outputs: Vec<PendingOutput> = Vec::new();
-    // Parsed once for every step's `step_fingerprint` below.
-    let fp_canvas = {
-        let raw = state.raw.lock().unwrap().clone();
-        resolved_canvas(&raw, &state.canvas_path)
-            .ok()
-            .map(|mut canvas| {
-                seed_artifact_paths(
-                    &state,
-                    &mut canvas,
-                    &effective_overrides(&state, &resolved_vars),
-                );
-                canvas
-            })
-    };
-
-    let target = chain.last().unwrap().clone();
-    let mut executed = std::collections::HashSet::new();
-    let mut visited = std::collections::HashSet::new();
-    loop {
-        let Some(mut canvas) = fp_canvas.clone() else { return; };
-        canvas.artifact_values.extend(resolved_vars.clone());
-        let chain = match if with_deps { meshfox_core::deps::resolve_chain(&canvas, target.clone()) }
-            else { meshfox_core::deps::resolve_from_chain(&canvas, target.clone()) } {
-            Ok(chain) => chain,
-            Err(e) => {
-                final_exit_code = 1;
-                send_event(&mut socket, &RunEvent::Error { message: e.to_string() }).await;
-                break;
-            }
-        };
-        if let Err(error) = require_run_confirmation(&canvas, &chain, confirmed) {
-            final_exit_code = 1;
-            send_event(&mut socket, &RunEvent::Error { message: error.1 }).await;
-            break;
-        }
-        let Some(addr_owned) = chain.iter().find(|addr| !visited.contains(*addr)).cloned() else { break; };
-        let addr = &addr_owned;
-        visited.insert(addr.clone());
-        let forced_reruns = match Some(replan_runs(
-            &state,
-            &canvas,
-            &chain,
-            &resolved_vars,
-            &executed,
-            fresh,
-            skip_fresh,
-        )) {
-            Some(Ok(plan)) => plan,
-            _ => {
-                send_event(&mut socket, &RunEvent::Error { message: "could not re-plan run chain".into() }).await;
-                return;
-            }
-        };
-        let lock_raw = state.raw.lock().unwrap().clone();
-        if let Err(error) = extend_plan_locks(
-            &state,
-            &lock_raw,
-            &chain,
-            &forced_reruns,
-            &visited,
-            addr,
-            &mut held_locks.0,
-        ) {
-            final_exit_code = 1;
-            let event = match error {
-                ChainLockError::Conflict(c) => RunEvent::LockConflict {
-                    node_id: c.node_id,
-                    block: c.block,
-                    owner_pid: c.owner_pid,
-                    owner_desc: c.owner_desc,
-                },
-                ChainLockError::Io(e) => RunEvent::Error {
-                    message: e.to_string(),
-                },
-            };
-            send_event(&mut socket, &event).await;
-            break;
-        }
-
-        let primary_raw_now = file_raws
-            .get(&None)
-            .cloned()
-            .unwrap_or_else(|| state.raw.lock().unwrap().clone());
-        let located = match locate_node(&primary_raw_now, &addr.node_id) {
-            Ok(l) => l,
-            Err(e) => {
-                send_event(&mut socket, &RunEvent::Error { message: e.1 }).await;
-                break;
-            }
-        };
-
-        // Re-parse (include-resolved, so a block living inside an
-        // `include` node's own dumped body is visible too — see
-        // `Node::cwd`) so an earlier step's freshly-patched cache (above)
-        // is visible before this one runs — same reasoning `run_block`
-        // already has.
-        let Ok(step_canvas) = resolved_canvas(&located.raw, &state.canvas_path) else {
-            send_event(
-                &mut socket,
-                &RunEvent::Error {
-                    message: format!("node {:?} not found", addr.node_id),
-                },
-            )
-            .await;
-            break;
-        };
-        let Some(step_node) = step_canvas.node(&addr.node_id) else {
-            send_event(
-                &mut socket,
-                &RunEvent::Error {
-                    message: format!("node {:?} not found", addr.node_id),
-                },
-            )
-            .await;
-            break;
-        };
-        let node_text = step_node.text.clone();
-        let canvas_path_for_step = &state.canvas_path;
-        let cwd = step_node.cwd(canvas_root_dir(canvas_path_for_step));
-        let Some(block) = meshfox_core::args::bind_block(
-            &addr.node_id,
-            &node_text,
-            &addr.block_name,
-            &HashMap::new(),
-        )
-        .ok() else {
-            send_event(
-                &mut socket,
-                &RunEvent::Error {
-                    message: format!(
-                        "no runnable block named {:?} in node {:?}",
-                        addr.block_name, addr.node_id
-                    ),
-                },
-            )
-            .await;
-            break;
-        };
-
-        // Same session-freshness skip `run_block` already has (see its own
-        // doc comment) — previously missing here entirely, so a `⛓ run
-        // chain` through this WebSocket path always re-ran every pulled-in
-        // dependency regardless of whether it had already run successfully
-        // this session, unlike the plain (non-`tty`) `/api/run` path.
-        if let Err(e) = step_values(&state, &canvas, &block, &mut resolved_vars) {
-            final_exit_code = 1;
-            send_event(&mut socket, &RunEvent::Error { message: e.to_string() }).await;
-            break;
-        }
-        let is_requested_target = Some(addr) == chain.last();
-        let live_fingerprint =
-            step_fingerprint(fp_canvas.as_ref(), &decls, addr, &block, &resolved_vars);
-        if (!is_requested_target || skip_fresh) && !block.always && !forced_reruns.contains(addr) {
-            let already_fresh = state
-                .session_runs
-                .lock()
-                .unwrap()
-                .get(&(addr.node_id.clone(), addr.block_name.clone()))
-                .filter(|run| run.fingerprint == live_fingerprint)
-                .cloned();
-            if let Some(session_run) = already_fresh {
-                if let Some(id) = held_locks.0.remove(&(addr.node_id.clone(), addr.block_name.clone())) {
-                    let _ = state.run_ledger.discard_reservation(id);
-                }
-                resolved_vars.extend(session_run.produced_vars);
-                if !send_event(
-                    &mut socket,
-                    &RunEvent::StepSkipped {
-                        node_id: addr.node_id.clone(),
-                        block: addr.block_name.clone(),
-                        output: session_run.output,
-                        duration_ms: session_run.duration_ms,
-                    },
-                )
-                .await
-                {
-                    return;
-                }
-                continue;
-            }
-        }
-
-        if !send_event(
-            &mut socket,
-            &RunEvent::StepStart {
-                node_id: addr.node_id.clone(),
-                block: addr.block_name.clone(),
-            },
-        )
-        .await
-        {
-            return;
-        }
-
-        let input_stamp = match fp_canvas.as_ref().map(|canvas| artifact_inputs(canvas, addr, &block, &resolved_vars)) {
-            Some(Ok(stamp)) => stamp,
-            Some(Err(e)) => {
-                final_exit_code = 1;
-                send_event(&mut socket, &RunEvent::Error { message: e.to_string() }).await;
-                break;
-            }
-            None => { final_exit_code = 1; break; }
-        };
-        let artifact_run_id = held_locks.0.get(&(addr.node_id.clone(), addr.block_name.clone())).copied();
-        executed.insert(addr.clone());
-
-        let mut block_env = meshfox_core::args::block_env(&block, &resolved_vars);
-        // If some declared variable is `from=`-sourced from *this* block
-        // (tty or not), give it a fresh output file to write `NAME=value`
-        // lines to (see `meshfox_core::varout`) — read back below, once
-        // its exit code is known.
-        let from_decls = meshfox_core::from_targets(&decls, addr);
-        let vars_out_path = if from_decls.is_empty() {
-            None
-        } else {
-            let path = meshfox_core::allocate_vars_out_path();
-            block_env.insert(
-                meshfox_core::VARS_OUT_ENV.to_string(),
-                path.display().to_string(),
-            );
-            Some(path)
-        };
-        let mut full_output = String::new();
-        let mut stdout_only = String::new();
-        let mut stderr_only = String::new();
-        let step_started = std::time::Instant::now();
-
-        // Same block-with-substituted-interpreter clone `run_block` uses —
-        // see its own comment on the equivalent line.
-        let mut resolved_block = block.clone();
-        if block.interpreter.is_some() {
-            resolved_block.interpreter =
-                meshfox_core::args::resolve_interpreter(&block, &resolved_vars);
-        }
-
-        let exit_code = if block.tty {
-            if !send_event(
-                &mut socket,
-                &RunEvent::TtyStart {
-                    node_id: addr.node_id.clone(),
-                    block: addr.block_name.clone(),
-                },
-            )
-            .await
-            {
-                return;
-            }
-            match relay_tty_step(
-                &state,
-                addr.node_id.clone(),
-                addr.block_name.clone(),
-                &mut socket,
-                &block.code,
-                resolved_block.interpreter.as_deref(),
-                Some(&block.lang),
-                &block_env,
-                Some(&cwd),
-                Some(canvas_path_for_step),
-                cols,
-                rows,
-                &mut kill_rx,
-                // Handed off by value, not borrowed — ownership (and the
-                // responsibility to finish it once the session actually
-                // ends, not whenever this one connection does) transfers
-                // to the `tty_registry::TtySessionHandle` this call
-                // registers, same reasoning `run_registry::track`'s own
-                // callers already follow for a plain block's row.
-                held_locks
-                    .0
-                    .remove(&(addr.node_id.clone(), addr.block_name.clone()))
-                    .map(|id| (state.run_ledger.clone(), id)),
-            )
-            .await
-            {
-                TtyStepOutcome::Exited(code) => code,
-                TtyStepOutcome::Killed => {
-                    killed = true;
-                    -1
-                }
-                // Client disconnected mid-session — nothing left to send.
-                TtyStepOutcome::Disconnected => return,
-            }
-        } else {
-            let proc = match stream_exec::spawn_block(
-                &resolved_block,
-                &block_env,
-                Some(&cwd),
-                Some(canvas_path_for_step),
-            ) {
-                Ok(p) => p,
-                Err(e) => {
-                    if let Some(id) = held_locks
-                        .0
-                        .remove(&(addr.node_id.clone(), addr.block_name.clone()))
-                    {
-                        let _ = state
-                            .run_ledger
-                            .finish(id, run_ledger::FinishOutcome::Killed);
-                    }
-                    send_event(
-                        &mut socket,
-                        &RunEvent::Error {
-                            message: e.to_string(),
-                        },
-                    )
-                    .await;
-                    break;
-                }
-            };
-            if let Some(id) = held_locks
-                .0
-                .get(&(addr.node_id.clone(), addr.block_name.clone()))
-            {
-                let _ = state
-                    .run_ledger
-                    .update_pid(*id, proc.child.id().unwrap_or(0));
-            }
-            // Same registry-backed detachment `run_block_impl` uses for
-            // its own plain steps — see its own doc comment, including on
-            // why this address's row (if any) is handed to `track` below
-            // instead of being finished once this step's own loop ends —
-            // a client disconnect here must not free a row the process is
-            // still genuinely running under.
-            let lock_path_for_run = held_locks
-                .0
-                .remove(&(addr.node_id.clone(), addr.block_name.clone()))
-                .map(|id| (state.run_ledger.clone(), id));
-            if let Some((_, id)) = &lock_path_for_run {
-                stamp_run_fingerprint(&state, addr, *id);
-            }
-            let run_handle = run_registry::track(
-                addr.node_id.clone(),
-                addr.block_name.clone(),
-                proc,
-                lock_path_for_run,
-            );
-            state.runs_registry.lock().unwrap().insert(
-                (addr.node_id.clone(), addr.block_name.clone()),
-                Arc::clone(&run_handle),
-            );
-            let (_backlog, mut run_rx) = run_handle.subscribe_from(0);
-            let mut kill_requested = false;
-            // A plain step can stay silent for minutes (a PDF parse that
-            // only prints when done); without a heartbeat here the client's
-            // silence clock would declare a perfectly healthy worker dead.
-            let mut heartbeat = ws_heartbeat();
-            loop {
-                tokio::select! {
-                    _ = heartbeat.tick() => {
-                        if socket.send(heartbeat_message()).await.is_err() {
-                            // Client gone — the run keeps going in the
-                            // background, same as on a failed output send.
-                            return;
-                        }
-                    }
-                    event = run_rx.recv() => {
-                        match event {
-                            Ok(run_registry::RunEvent::Line(line)) => {
-                                full_output.push_str(&line.text);
-                                full_output.push('\n');
-                                match line.stream {
-                                    stream_exec::OutputStream::Stdout => {
-                                        stdout_only.push_str(&line.text);
-                                        stdout_only.push('\n');
-                                    }
-                                    stream_exec::OutputStream::Stderr => {
-                                        stderr_only.push_str(&line.text);
-                                        stderr_only.push('\n');
-                                    }
-                                }
-                                if !send_event(&mut socket, &RunEvent::Output {
-                                    node_id: addr.node_id.clone(),
-                                    block: addr.block_name.clone(),
-                                    stream: line.stream,
-                                    text: line.text,
-                                }).await {
-                                    // Client gone — this run keeps going in
-                                    // the background regardless (any other
-                                    // subscriber, or a reconnect, still
-                                    // sees it through), same as
-                                    // `run_block_impl`'s stream simply not
-                                    // being polled any more.
-                                    return;
-                                }
-                            }
-                            Ok(run_registry::RunEvent::Done(run_registry::RunOutcome::Exited { exit_code })) => {
-                                break exit_code;
-                            }
-                            Ok(run_registry::RunEvent::Done(run_registry::RunOutcome::Killed)) => {
-                                killed = true;
-                                break -1;
-                            }
-                            Ok(run_registry::RunEvent::Done(run_registry::RunOutcome::Running)) | Err(_) => {
-                                break -1;
-                            }
-                        }
-                    }
-                    _ = &mut kill_rx, if !kill_requested => {
-                        kill_requested = true;
-                        run_handle.kill();
-                    }
-                }
-            }
-        };
-
-        if killed {
-            send_event(
-                &mut socket,
-                &RunEvent::Killed {
-                    node_id: addr.node_id.clone(),
-                    block: addr.block_name.clone(),
-                },
-            )
-            .await;
-            break;
-        }
-
-        let duration_ms = step_started.elapsed().as_millis() as u64;
-        if !send_event(
-            &mut socket,
-            &RunEvent::StepEnd {
-                node_id: addr.node_id.clone(),
-                block: addr.block_name.clone(),
-                exit_code,
-                duration_ms,
-            },
-        )
-        .await
-        {
-            return;
-        }
-        final_exit_code = exit_code;
-        // This step's own lock (`tty` or plain) was already handed off —
-        // to `relay_tty_step`'s own `tty_registry::track` call or this
-        // loop's own `run_registry::track` call, above — nothing left to
-        // release here (see either call site's own comment on why).
-
-        // Read back whatever this step wrote to its own vars-out file (if
-        // it had one) and fold the type-validated values straight into
-        // `resolved_vars`, so a later step's `map_block_env` call sees
-        // them. Only trusted on a `0` exit.
-        let mut from_value_error = false;
-        if let Some(path) = &vars_out_path {
-            match meshfox_core::read_and_cleanup_vars_out(path) {
-                Ok(produced) if exit_code == 0 => {
-                    for decl in &from_decls {
-                        match produced.get(&decl.name) {
-                            Some(value) => match meshfox_core::validate_value(decl, value) {
-                                Ok(()) => {
-                                    resolved_vars.insert(decl.name.clone(), value.clone());
-                                }
-                                Err(e) => {
-                                    send_event(
-                                        &mut socket,
-                                        &RunEvent::Error {
-                                            message: format!(
-                                                "computed variable {:?} is invalid: {e}",
-                                                decl.name
-                                            ),
-                                        },
-                                    )
-                                    .await;
-                                    from_value_error = true;
-                                }
-                            },
-                            None => {
-                                send_event(
-                                    &mut socket,
-                                    &RunEvent::Error {
-                                        message: format!(
-                                            "block {:?} produced no value for {:?} (declared from=\"{}/{}\")",
-                                            addr.block_name, decl.name, addr.node_id, addr.block_name
-                                        ),
-                                    },
-                                )
-                                .await;
-                                from_value_error = true;
-                            }
-                        }
-                    }
-                }
-                Ok(_) => {} // nonzero exit — handled by the check below
-                Err(e) => {
-                    send_event(
-                        &mut socket,
-                        &RunEvent::Error {
-                            message: format!("failed to read computed variables: {e}"),
-                        },
-                    )
-                    .await;
-                    from_value_error = true;
-                }
-            }
-        }
-
-        // `tty` and `cache` are mutually exclusive (a `meshfox validate`
-        // error) — `!block.tty` here is belt-and-suspenders against ever
-        // writing a `tty` step's (empty) `full_output` into the file for a
-        // document that reached this endpoint without being validated.
-        // Never persisted for a block living inside an `include` node's own
-        // dumped body — see the HTTP chain loop's own identical guard.
-        if exit_code == 0 && !from_value_error {
-            if let Some(Err(e)) = fp_canvas.as_ref().map(|canvas| artifact_results(canvas, addr, &block, &resolved_vars, &input_stamp)) {
-                final_exit_code = 1;
-                if let Some(id) = artifact_run_id { let _ = state.run_ledger.finish(id, run_ledger::FinishOutcome::Exited(1)); }
-                send_event(&mut socket, &RunEvent::Error { message: e.to_string() }).await;
-                break;
-            }
-        }
-        let live_fingerprint = step_fingerprint(fp_canvas.as_ref(), &decls, addr, &block, &resolved_vars);
-        if let Some(id) = artifact_run_id { stamp_run_fingerprint(&state, addr, id); }
-
-        if persist && block.cache && !block.tty && !step_node.plain_markdown_include {
-            let result = ExecOutput {
-                exit_code,
-                output: full_output.clone(),
-                duration_ms,
-                stdout: stdout_only,
-                stderr: stderr_only,
-            };
-            if let Some(updated) = meshfox_core::write_output(&node_text, &addr.block_name, &result)
-            {
-                if let Some(patched) =
-                    mdcanvas::set_node_body(&located.raw, &located.local_id, &updated)
-                {
-                    file_raws.insert(None, patched);
-                }
-            }
-            pending_outputs.push(PendingOutput {
-                node_id: addr.node_id.clone(),
-                block: addr.block_name.clone(),
-                result,
-            });
-        }
-
-        if exit_code == 0 && !from_value_error {
-            let produced_vars = from_decls
-                .iter()
-                .filter_map(|decl| {
-                    resolved_vars
-                        .get(&decl.name)
-                        .map(|v| (decl.name.clone(), v.clone()))
-                })
-                .collect();
-            remember_session_run(
-                &state,
-                addr,
-                &decls,
-                SessionRun {
-                    fingerprint: live_fingerprint,
-                    produced_vars,
-                    output: full_output,
-                    duration_ms,
-                },
-            );
-        }
-
-        if exit_code != 0 || from_value_error {
-            break;
-        }
-    }
-
-    for (_, id) in held_locks.0.drain() {
-        let _ = state.run_ledger.discard_reservation(id);
-    }
-
-    if persist {
-        if let Err(message) = persist_run_outputs(&state, &pending_outputs).await {
-            send_event(&mut socket, &RunEvent::Error { message }).await;
-        }
-    }
-
-    if !killed {
-        send_event(
-            &mut socket,
-            &RunEvent::Done {
-                exit_code: final_exit_code,
-            },
-        )
-        .await;
-    }
-}
-
-/// How one `tty` step (see `relay_tty_step`) ended, distinguishing the
-/// three ways that matters to `run_tty_chain`: a normal exit (still emits
-/// `StepEnd` and may continue the chain), an explicit kill (emits `Killed`
-/// instead, same as a captured step's kill path, and always stops the
-/// chain), or the client disconnecting (nothing left to send to `socket`
-/// at all — `run_tty_chain` must return immediately without attempting
-/// any further `RunEvent`).
-enum TtyStepOutcome {
-    Exited(i32),
-    Killed,
-    Disconnected,
-}
-
-/// Relays one `tty` step over `socket` once it's already in "raw I/O" mode
-/// (right after `RunEvent::TtyStart`): pty output bytes go out as binary
-/// frames, incoming binary frames go to the pty's stdin, incoming text
-/// frames are parsed as a `ResizeMessage`.
-///
-/// Relays one `tty` step over `socket` once it's already in "raw I/O" mode
-/// (right after `RunEvent::TtyStart`), *as one viewer of* the address's own
-/// `tty_registry::TtySessionHandle` — this connection is never the pty's
-/// sole owner any more (see that module's own doc comment): closing it
-/// (`Message::Close`/a dropped socket) only removes *this* viewer from the
-/// session's size negotiation and returns `Disconnected`, it doesn't kill
-/// anything — the session keeps running for any other attached viewer, or
-/// for a future `/api/run/tty/attach` reconnect, exactly like a real `tmux`
-/// pane surviving a detach. Only an explicit `/api/kill` (the `kill_rx`
-/// arm below) or the process exiting on its own actually ends it.
-#[allow(clippy::too_many_arguments)]
-async fn relay_tty_step(
-    state: &Arc<AppState>,
-    node_id: String,
-    block_name: String,
-    socket: &mut WebSocket,
-    code: &str,
-    interpreter: Option<&str>,
-    lang: Option<&str>,
-    envs: &HashMap<String, String>,
-    cwd: Option<&std::path::Path>,
-    canvas_path: Option<&std::path::Path>,
-    cols: u16,
-    rows: u16,
-    kill_rx: &mut oneshot::Receiver<()>,
-    ledger_row: Option<(run_ledger::RunLedger, i64)>,
-) -> TtyStepOutcome {
-    let pty = match pty_exec::spawn(
-        code,
-        interpreter,
-        lang,
-        envs,
-        cwd,
-        canvas_path,
-        (cols, rows),
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            if let Some((ledger, id)) = &ledger_row {
-                let _ = ledger.finish(*id, run_ledger::FinishOutcome::Killed);
-            }
-            send_event(
-                socket,
-                &RunEvent::Error {
-                    message: e.to_string(),
-                },
-            )
-            .await;
-            return TtyStepOutcome::Exited(-1);
-        }
-    };
-    // Same placeholder-pid correction `run_block`'s own plain-block spawn
-    // path does — this address's row (if any) was necessarily claimed
-    // before this pty existed.
-    if let Some((ledger, id)) = &ledger_row {
-        let _ = ledger.update_pid(*id, pty.pid() as u32);
-        // Same fingerprint a plain run gets when it spawns, so this session
-        // counts as the block's current run (and goes stale like any other
-        // when the document changes) — after a restart too.
-        stamp_run_fingerprint(
-            state,
-            &meshfox_core::BlockAddr::new(&node_id, &block_name),
-            *id,
-        );
-    }
-
-    // `ledger_row` (if any) is handed to `track` below by value — its
-    // background task finishes it once the session actually ends, not
-    // whenever this one connection does (see `tty_registry::track`'s own
-    // doc comment on why: this session outlives whatever connection
-    // started it, so its row has to too).
-    let handle = tty_registry::track(node_id.clone(), block_name.clone(), pty, ledger_row);
-    state
-        .tty_registry
-        .lock()
-        .unwrap()
-        .insert((node_id, block_name), Arc::clone(&handle));
-
-    let (backlog, mut rx) = handle.attach();
-    if !backlog.is_empty() && socket.send(Message::Binary(backlog)).await.is_err() {
-        return TtyStepOutcome::Disconnected;
-    }
-    let viewer_id = handle.register_viewer(cols, rows);
-    let mut kill_requested = false;
-    let mut heartbeat = ws_heartbeat();
-
-    let outcome = loop {
-        tokio::select! {
-            _ = heartbeat.tick() => {
-                if socket.send(heartbeat_message()).await.is_err() {
-                    handle.forget_viewer(viewer_id);
-                    break TtyStepOutcome::Disconnected;
-                }
-            }
-            event = rx.recv() => {
-                match event {
-                    Ok(tty_registry::TtyEvent::Bytes(bytes)) => {
-                        if socket.send(Message::Binary(bytes.to_vec())).await.is_err() {
-                            handle.forget_viewer(viewer_id);
-                            break TtyStepOutcome::Disconnected;
-                        }
-                    }
-                    Ok(tty_registry::TtyEvent::Done(tty_registry::RunOutcome::Exited { exit_code })) => {
-                        handle.forget_viewer(viewer_id);
-                        break TtyStepOutcome::Exited(exit_code);
-                    }
-                    Ok(tty_registry::TtyEvent::Done(tty_registry::RunOutcome::Killed)) => {
-                        handle.forget_viewer(viewer_id);
-                        break TtyStepOutcome::Killed;
-                    }
-                    Ok(tty_registry::TtyEvent::Done(tty_registry::RunOutcome::Running)) | Err(broadcast::error::RecvError::Closed) => {
-                        handle.forget_viewer(viewer_id);
-                        break TtyStepOutcome::Exited(-1);
-                    }
-                    // This connection's own receiver fell more than
-                    // `tty_registry`'s broadcast capacity behind the live
-                    // tail (a fast-redrawing full-screen program like
-                    // `tabiew` can produce enough chunks per redraw for
-                    // this to happen even to the *originating* connection
-                    // under load) — see `relay_tty_viewer`'s identical arm
-                    // for the full reasoning on why this can't just be
-                    // folded into the `Err(_) => exited(-1)` case above:
-                    // that would falsely report a still-running pty as
-                    // having exited (a lie `run_tty_chain`'s own caller
-                    // would act on), not merely drop a passive viewer.
-                    // Re-subscribing and replaying the current backlog
-                    // recovers the same way; `handle.outcome()` catches
-                    // the case where the session *also* genuinely ended in
-                    // the gap this missed.
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let (backlog, fresh_rx) = handle.attach();
-                        rx = fresh_rx;
-                        if !backlog.is_empty() && socket.send(Message::Binary(backlog)).await.is_err() {
-                            handle.forget_viewer(viewer_id);
-                            break TtyStepOutcome::Disconnected;
-                        }
-                        match handle.outcome() {
-                            tty_registry::RunOutcome::Running => {}
-                            tty_registry::RunOutcome::Exited { exit_code } => {
-                                handle.forget_viewer(viewer_id);
-                                break TtyStepOutcome::Exited(exit_code);
-                            }
-                            tty_registry::RunOutcome::Killed => {
-                                handle.forget_viewer(viewer_id);
-                                break TtyStepOutcome::Killed;
-                            }
-                        }
-                    }
-                }
-            }
-            msg = socket.recv() => {
-                match msg {
-                    Some(Ok(Message::Binary(bytes))) => handle.write(bytes),
-                    Some(Ok(Message::Text(text))) => {
-                        if let Ok(resize) = serde_json::from_str::<ResizeMessage>(&text) {
-                            handle.resize_viewer(viewer_id, resize.cols.max(1), resize.rows.max(1));
-                        }
-                    }
-                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => {
-                        handle.forget_viewer(viewer_id);
-                        break TtyStepOutcome::Disconnected;
-                    }
-                    // Ping/Pong: axum answers Pings internally; nothing to
-                    // relay to the pty either way.
-                    Some(Ok(_)) => {}
-                }
-            }
-            // Only armed once — after firing, this connection's own kill
-            // request has been delivered to the registry, which every
-            // attached viewer (not just this one) will see resolve as
-            // `Done(Killed)` above; re-arming would just fire again
-            // immediately for no reason (same pattern `run_block_impl`'s
-            // own plain-step loop uses).
-            _ = &mut *kill_rx, if !kill_requested => {
-                kill_requested = true;
-                handle.kill();
-            }
-        }
-    };
-    outcome
 }
 
 #[derive(Debug, Deserialize)]
@@ -9464,9 +8710,9 @@ fn default_tty_rows() -> u16 {
 /// *already-running* `tty` session as an additional viewer, without
 /// spawning anything: replays its full still-buffered byte history, then
 /// relays live output/input exactly like the connection that originally
-/// started it (see `relay_tty_step`'s own doc comment — this is the exact
-/// same "just a viewer" relationship to the session, just without ever
-/// having spawned it). `404` if this address has no live session right
+/// started it (see `relay_tty_session` — the same "just a viewer"
+/// relationship `/api/run/tty` has to a session it started). `404` if this
+/// address has no live session right
 /// now (never started, or it's already finished and nothing is tracking
 /// it any more — a finished session's own final byte history is still
 /// attachable for as long as it stays the *current* entry for this
@@ -9489,75 +8735,105 @@ async fn attach_tty(
 }
 
 /// The actual attach loop `attach_tty` upgrades into — see its own doc
-/// comment. No local kill switch here (unlike `relay_tty_step`'s own
-/// `kill_rx`): an attach-only viewer never has a `runId` of its own to
-/// begin with, so killing this session is always done by address, via the
-/// ordinary `POST /api/kill {nodeId, block}` path (already reaches the
-/// exact same `TtySessionHandle` through `AppState::tty_registry`) rather
-/// than anything this socket needs to carry itself.
+/// comment. No local kill switch here: an attach-only viewer never has a
+/// `runId` of its own to begin with, so killing this session is always done
+/// by address, via the ordinary `POST /api/kill {nodeId, block}` path
+/// (already reaches the exact same `TtySessionHandle` through
+/// `AppState::tty_registry`) rather than anything this socket needs to
+/// carry itself.
 async fn relay_tty_viewer(
     handle: Arc<tty_registry::TtySessionHandle>,
     mut socket: WebSocket,
     cols: u16,
     rows: u16,
 ) {
+    if matches!(
+        relay_tty_session(&handle, &mut socket, cols, rows).await,
+        TtyViewerEnd::SessionDone
+    ) {
+        let event = match handle.outcome() {
+            tty_registry::RunOutcome::Exited { exit_code } => RunEvent::Done { exit_code },
+            tty_registry::RunOutcome::Killed => RunEvent::Killed {
+                node_id: handle.node_id.clone(),
+                block: handle.block_name.clone(),
+            },
+            tty_registry::RunOutcome::Running => return,
+        };
+        let _ = socket.send(run_event_msg(&event)).await;
+        let _ = socket.send(Message::Close(None)).await;
+    }
+}
+
+/// Why `relay_tty_session` returned.
+enum TtyViewerEnd {
+    /// The session ended (exited, or was killed) — nothing more to relay.
+    SessionDone,
+    /// The viewer's own socket closed or failed. The session is untouched:
+    /// it outlives every one of its viewers.
+    ClientGone,
+}
+
+/// Relays one `tty` session over `socket` *as a viewer of it* — never its
+/// owner (see `tty_registry`'s own module doc comment): replays the
+/// still-buffered byte history, then pty output goes out as binary frames,
+/// incoming binary frames go to the pty's stdin and incoming text frames
+/// are parsed as a `ResizeMessage` that takes part in the session's size
+/// negotiation. Shared by `GET /api/run/tty/attach` (which closes the
+/// socket afterward) and `/api/run/tty` (which carries on with the chain's
+/// remaining events). Never closes the socket itself.
+async fn relay_tty_session(
+    handle: &Arc<tty_registry::TtySessionHandle>,
+    socket: &mut WebSocket,
+    cols: u16,
+    rows: u16,
+) -> TtyViewerEnd {
     let (backlog, mut rx) = handle.attach();
     if !backlog.is_empty() && socket.send(Message::Binary(backlog)).await.is_err() {
-        return;
+        return TtyViewerEnd::ClientGone;
     }
     // Already finished by the time this attached — tell this late viewer
     // right away instead of waiting on a broadcast that already fired
     // before `rx` existed (same race-freedom reasoning `subscribe_run`
     // documents for a plain block's own equivalent).
     if !matches!(handle.outcome(), tty_registry::RunOutcome::Running) {
-        let _ = socket.send(Message::Close(None)).await;
-        return;
+        return TtyViewerEnd::SessionDone;
     }
 
     let viewer_id = handle.register_viewer(cols, rows);
     let mut heartbeat = ws_heartbeat();
-    loop {
+    let end = loop {
         tokio::select! {
             _ = heartbeat.tick() => {
                 if socket.send(heartbeat_message()).await.is_err() {
-                    handle.forget_viewer(viewer_id);
-                    return;
+                    break TtyViewerEnd::ClientGone;
                 }
             }
             event = rx.recv() => {
                 match event {
                     Ok(tty_registry::TtyEvent::Bytes(bytes)) => {
                         if socket.send(Message::Binary(bytes.to_vec())).await.is_err() {
-                            handle.forget_viewer(viewer_id);
-                            return;
+                            break TtyViewerEnd::ClientGone;
                         }
                     }
                     Ok(tty_registry::TtyEvent::Done(_)) | Err(broadcast::error::RecvError::Closed) => {
-                        handle.forget_viewer(viewer_id);
-                        let _ = socket.send(Message::Close(None)).await;
-                        return;
+                        break TtyViewerEnd::SessionDone;
                     }
                     // This viewer's own receiver fell more than
                     // `tty_registry`'s broadcast capacity (1024 messages)
                     // behind the live tail — a slow WebSocket/browser
                     // watching a fast-redrawing full-screen program
                     // (`tabiew`, say) is exactly the case this handles.
-                    // Lumping this in with the `Err(_) => close` arm below
-                    // (as this used to) treated falling behind as if the
-                    // session itself had ended: this viewer's socket got
-                    // silently closed (a blank terminal, then
-                    // "disconnected") the moment it couldn't keep up,
-                    // while the session — and every *other* viewer, an
-                    // originating TUI connection's own `relay_tty_step`
-                    // included — kept going completely fine. Re-
-                    // subscribing via `attach()` (same call the initial
-                    // connection above used) gets a fresh receiver plus
-                    // whatever's *currently* in the byte-history ring
-                    // buffer — replaying that lets xterm.js's own parser
-                    // resync from a recent, coherent state instead of
-                    // wherever the skipped chunk happened to leave it.
-                    // `attach()` alone can't tell whether the session
-                    // *itself* also ended in the gap this missed (a
+                    // Treating falling behind as if the session itself had
+                    // ended would silently close this viewer (a blank
+                    // terminal, then "disconnected") while the session —
+                    // and every *other* viewer — kept going completely
+                    // fine. Re-subscribing via `attach()` gets a fresh
+                    // receiver plus whatever's *currently* in the
+                    // byte-history ring buffer — replaying that lets
+                    // xterm.js's own parser resync from a recent, coherent
+                    // state instead of wherever the skipped chunk happened
+                    // to leave it. `attach()` alone can't tell whether the
+                    // session *itself* also ended in the gap this missed (a
                     // `Done` broadcast the old, now-abandoned `rx` would
                     // never see) — `handle.outcome()` is what actually
                     // answers that, same check the pre-loop code above
@@ -9567,13 +8843,10 @@ async fn relay_tty_viewer(
                         let (backlog, fresh_rx) = handle.attach();
                         rx = fresh_rx;
                         if !backlog.is_empty() && socket.send(Message::Binary(backlog)).await.is_err() {
-                            handle.forget_viewer(viewer_id);
-                            return;
+                            break TtyViewerEnd::ClientGone;
                         }
                         if !matches!(handle.outcome(), tty_registry::RunOutcome::Running) {
-                            handle.forget_viewer(viewer_id);
-                            let _ = socket.send(Message::Close(None)).await;
-                            return;
+                            break TtyViewerEnd::SessionDone;
                         }
                     }
                 }
@@ -9587,14 +8860,15 @@ async fn relay_tty_viewer(
                         }
                     }
                     Some(Ok(Message::Close(_))) | None | Some(Err(_)) => {
-                        handle.forget_viewer(viewer_id);
-                        return;
+                        break TtyViewerEnd::ClientGone;
                     }
                     Some(Ok(_)) => {}
                 }
             }
         }
-    }
+    };
+    handle.forget_viewer(viewer_id);
+    end
 }
 
 /// One entry of `GET /api/services`'s response — see `crate::services`'s own
@@ -15793,7 +15067,7 @@ mod ws_tests {
         let _ = std::fs::remove_file(&canvas_path);
     }
 
-    /// `run_tty_chain`'s counterpart of `run_block_ws_tests`'s
+    /// The `tty` counterpart of `run_block_ws_tests`'s
     /// `persisting_run_output_keeps_edits_made_while_the_block_was_running`:
     /// a `tty` block can't be `cache`d itself, but a `cache`d dependency of
     /// it is written back after the chain, and that write-back must be
@@ -15924,6 +15198,35 @@ mod ws_tests {
     }
 
     #[tokio::test]
+    async fn attached_tty_viewers_receive_exit_code_including_late_attach() {
+        let canvas_path = write_test_canvas(concat!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Shell\n<!-- meshfox:node id=\"shell\" -->\n\n",
+            "```bash name=\"interactive\" tty\necho ready; read line; exit 7\n```\n",
+        ));
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let (mut owner, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{addr}/api/run/tty?path=shell&block=interactive"
+        )).await.unwrap();
+        next_event(&mut owner).await;
+        next_event(&mut owner).await;
+        next_event(&mut owner).await;
+        read_until(&mut owner, "ready").await;
+        let url = format!("ws://{addr}/api/run/tty/attach?nodeId=shell&block=interactive");
+        let (mut viewer, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        read_until(&mut viewer, "ready").await;
+        owner.send(WsMessage::Binary(b"\n".to_vec().into())).await.unwrap();
+        let event = next_event(&mut viewer).await;
+        assert_eq!(event["type"], "done");
+        assert_eq!(event["exitCode"], 7);
+        let (mut late, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        let event = next_event(&mut late).await;
+        assert_eq!(event["type"], "done");
+        assert_eq!(event["exitCode"], 7);
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    #[tokio::test]
     async fn killing_a_tty_session_by_address_closes_every_attached_viewer() {
         let canvas_path = write_test_canvas(concat!(
             "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
@@ -15966,9 +15269,11 @@ mod ws_tests {
             "unexpected response: {response}"
         );
 
-        // The attached viewer sees the session end too, even though it
-        // never held any kill switch of its own — either a close frame or
-        // the socket just ending are both "it's over" from this side.
+        // Attached viewers get the real outcome before the close frame.
+        let event = next_event(&mut ws2).await;
+        assert_eq!(event["type"], "killed");
+        assert_eq!(event["nodeId"], "shell");
+        assert_eq!(event["block"], "interactive");
         let next = ws2.next().await;
         assert!(
             matches!(next, Some(Ok(WsMessage::Close(_))) | None),
@@ -15985,7 +15290,7 @@ mod ws_tests {
         // as fast as a loopback TUI socket reading straight into a raw
         // buffer) watching a fast-redrawing full-screen program could fall
         // behind `tty_registry`'s 1024-message broadcast capacity, and
-        // `relay_tty_viewer`/`relay_tty_step` used to treat *any*
+        // `relay_tty_session`'s predecessors used to treat *any*
         // `rx.recv()` error — a lagged receiver included — as if the
         // session itself had ended, silently closing that viewer's socket
         // (a blank terminal, then "disconnected") while the session and
@@ -19013,6 +18318,44 @@ mod form_endpoint_tests {
     }
 
     #[tokio::test]
+    async fn get_form_fields_keeps_computed_choices_after_submit() {
+        let canvas_path = write_test_canvas(concat!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "<!-- meshfox:var name=\"REGIONS_LIST\" from=\"root/list-regions\" -->\n",
+            "<!-- meshfox:var name=\"REGION\" type=\"select\" choices_var=\"REGIONS_LIST\" -->\n\n",
+            "```bash name=\"list-regions\"\necho \"REGIONS_LIST=us-east-1,eu-west-1\" >> \"$MESHFOX_VARS_OUT\"\n```\n\n",
+            "```form name=\"pick-region\"\nfield var=\"REGION\"\n```\n",
+        ));
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        for submitted in [false, true] {
+            if submitted {
+                let (status, body) = post_json(
+                    addr,
+                    "/api/form/submit",
+                    r#"{"nodeId":"root","block":"pick-region","values":{"REGION":"eu-west-1"}}"#,
+                )
+                .await;
+                assert_eq!(status, 200, "{body}");
+            }
+            let (status, body) = get(addr, "/api/form/fields?nodeId=root&block=pick-region").await;
+            assert_eq!(status, 200, "{body}");
+            let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(resp["fields"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                resp["fields"][0]["choices"],
+                serde_json::json!(["us-east-1", "eu-west-1"])
+            );
+            if submitted {
+                assert_eq!(resp["fields"][0]["value"], "eu-west-1");
+                assert_eq!(resp["fields"][0]["resolved"], true);
+            }
+        }
+        let _ = std::fs::remove_file(&canvas_path);
+        let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));
+    }
+
+    #[tokio::test]
     async fn get_form_fields_404s_for_an_unknown_block() {
         let canvas_path = write_test_canvas(FORM_CANVAS);
         let addr = spawn_test_server(canvas_path.clone()).await;
@@ -19115,6 +18458,169 @@ mod form_endpoint_tests {
         let exit_code = wait_for_exit(addr, "config", "show-region").await;
         assert_eq!(exit_code, Some(0), "autorun-triggered block never finished");
 
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    const TTY_FORM_CANVAS: &str = concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "## Config\n<!-- meshfox:node id=\"config\" -->\n\n",
+        "<!-- meshfox:var name=\"REGION\" type=\"select\" choices=\"us,eu\" -->\n\n",
+        "```form name=\"pick-region\" send=\"Apply\"\n",
+        "field var=\"REGION\"\n",
+        "```\n\n",
+        "```bash name=\"shell\" env=\"$REGION\" tty autorun\n",
+        "echo ready; read line; echo \"$REGION:$line\"\n",
+        "```\n",
+    );
+
+    const SEND_EU: &str =
+        r#"{"nodeId":"config","block":"pick-region","values":{"REGION":"eu"}}"#;
+
+    /// The `status` of `node_id`/`block`'s entry in `GET /api/runs`, polled
+    /// until it is `want` (or ~5 s pass).
+    async fn wait_for_run_status(
+        addr: SocketAddr,
+        node_id: &str,
+        block: &str,
+        want: &str,
+    ) -> bool {
+        for _ in 0..250 {
+            let (status, body) = get(addr, "/api/runs").await;
+            if status == 200 {
+                if let Ok(runs) = serde_json::from_str::<Vec<serde_json::Value>>(&body) {
+                    if runs
+                        .iter()
+                        .any(|r| r["nodeId"] == node_id && r["block"] == block && r["status"] == want)
+                    {
+                        return true;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    /// A `tty` block with `autorun` is started by the server itself when a
+    /// form's Send reaches it — no client connection owns it — and every
+    /// connected client is told (`tty-started` on `/api/watch`) so it can
+    /// attach; the attached viewer then drives the program like any other.
+    #[tokio::test]
+    async fn submit_form_starts_an_autorun_tty_block_and_a_viewer_can_attach() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+        let canvas_path = write_test_canvas(TTY_FORM_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (mut watch, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/watch"))
+            .await
+            .expect("watch");
+
+        let (status, body) = post_json(addr, "/api/form/submit", SEND_EU).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            body.contains("\"shell\""),
+            "the tty block should be reported as triggered: {body}"
+        );
+
+        // The announcement carries the `tty` step's own address.
+        let announced = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(Ok(msg)) = watch.next().await {
+                if let WsMessage::Text(t) = msg {
+                    let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                    if v["type"] == "tty-started" {
+                        return Some(v);
+                    }
+                }
+            }
+            None
+        })
+        .await
+        .expect("a tty-started event within 5 s")
+        .expect("watch stayed open");
+        assert_eq!(announced["nodeId"], "config", "{announced}");
+        assert_eq!(announced["block"], "shell", "{announced}");
+
+        assert!(wait_for_run_status(addr, "config", "shell", "running").await);
+
+        let url = format!("ws://{addr}/api/run/tty/attach?nodeId=config&block=shell&cols=80&rows=24");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("attach");
+        ws.send(WsMessage::Binary(b"hello\n".to_vec().into())).await.unwrap();
+        let mut output = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(Ok(msg)) = ws.next().await {
+                match msg {
+                    WsMessage::Binary(b) => {
+                        output.extend_from_slice(&b);
+                        if String::from_utf8_lossy(&output).contains("eu:hello") {
+                            return;
+                        }
+                    }
+                    WsMessage::Close(_) => return,
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        let output = String::from_utf8_lossy(&output).into_owned();
+        assert!(output.contains("eu:hello"), "{output:?}");
+
+        assert!(wait_for_run_status(addr, "config", "shell", "exited").await);
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    /// Send commits values *and* starts runs, so it is refused (`409`, and
+    /// nothing committed) for as long as a foreground run — here, the
+    /// unattended `tty` session the first Send started — is in progress,
+    /// and accepted again once that is over.
+    #[tokio::test]
+    async fn a_form_send_is_refused_while_a_foreground_run_is_in_progress() {
+        let canvas_path = write_test_canvas(TTY_FORM_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, body) = post_json(addr, "/api/form/submit", SEND_EU).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(wait_for_run_status(addr, "config", "shell", "running").await);
+
+        let (status, body) = post_json(
+            addr,
+            "/api/form/submit",
+            r#"{"nodeId":"config","block":"pick-region","values":{"REGION":"us"}}"#,
+        )
+        .await;
+        assert_eq!(status, 409, "{body}");
+        assert!(body.contains("in progress"), "{body}");
+        // The refused Send changed nothing.
+        let (_, vars) = get(addr, "/api/vars?path=config&block=shell").await;
+        let vars: Vec<serde_json::Value> = serde_json::from_str(&vars).unwrap();
+        assert_eq!(vars[0]["value"], "eu", "{vars:?}");
+
+        // Stopping the session (by address) frees the form again.
+        let (status, _) = post_json(
+            addr,
+            "/api/kill",
+            r#"{"nodeId":"config","block":"shell"}"#,
+        )
+        .await;
+        assert_eq!(status, 204);
+        assert!(wait_for_run_status(addr, "config", "shell", "killed").await);
+        let mut accepted = false;
+        for _ in 0..100 {
+            let (status, _) = post_json(
+                addr,
+                "/api/form/submit",
+                r#"{"nodeId":"config","block":"pick-region","values":{"REGION":"us"}}"#,
+            )
+            .await;
+            if status == 200 {
+                accepted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(accepted, "Send should be accepted again once the run is over");
+
+        let _ = post_json(addr, "/api/kill", r#"{"nodeId":"config","block":"shell"}"#).await;
         let _ = std::fs::remove_file(&canvas_path);
     }
 

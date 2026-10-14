@@ -2,6 +2,8 @@ import { createContext, useCallback, useContext, useEffect, useLayoutEffect, use
 import { Handle, NodeResizer, NodeToolbar, Position, useReactFlow, useUpdateNodeInternals, type NodeProps } from "@xyflow/react";
 import ReactMarkdown, { defaultUrlTransform, type Components, type UrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { NodeFitSize } from "./NodeFitSize";
+import type { NodeSize } from "./contentFit";
 import remarkImageAttrs from "./remarkImageAttrs";
 import remarkSubSup from "./remarkSubSup";
 import remarkGfmAlerts from "./remarkGfmAlerts";
@@ -94,6 +96,14 @@ const InsideMarkdownPre = createContext(false);
  * of some `display="code"` file node changed on disk: the signal for such a
  * preview to re-read its own target. */
 export const FileRefreshContext = createContext(0);
+
+/** Whether a foreground run — anything but a `service` — is in progress
+ * (a plain run or chain, or a live `tty` session): `App` derives it from
+ * what it already tracks. A `form`'s Send commits values and starts every
+ * `autorun` block they reach, so the server refuses it (`409`) while one is
+ * running, and `FormBlock` disables its button rather than let the click
+ * fail. */
+export const ForegroundRunContext = createContext(false);
 
 /**
  * A fenced code block embedded in plain prose (not a runnable/constraint
@@ -520,6 +530,7 @@ export interface MeshNodeData {
    * auto-placed (`suggested`) node — hides the button entirely, since
    * there's nothing authored there to clear. */
   onClearLayout?: () => void;
+  onFitSize?: (size: NodeSize) => void;
   /** Opens this node's settings modal (title/type/color/target/edges). */
   onOpenSettings: () => void;
   /** Renames this node inline — the canvas-native counterpart to
@@ -1908,6 +1919,7 @@ function FormBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData
   const [values, setValues] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const runInProgress = useContext(ForegroundRunContext);
 
   useEffect(() => {
     let cancelled = false;
@@ -1993,7 +2005,17 @@ function FormBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData
           )}
         </label>
       ))}
-      <button type="button" className="mesh-run-button" disabled={submitting} onClick={handleSend}>
+      <button
+        type="button"
+        className="mesh-run-button"
+        disabled={submitting || runInProgress}
+        title={
+          runInProgress
+            ? "A run is in progress — wait for it to finish (or stop it) before sending"
+            : undefined
+        }
+        onClick={handleSend}
+      >
         {sendCaption}
       </button>
     </div>
@@ -2859,6 +2881,8 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
   // itself changes to (presumably) the just-saved value, hand-off back to
   // the prop is silent since by then they agree.
   const [liveHeight, setLiveHeight] = useState<number | undefined>(undefined);
+  const [fitPreview, setFitPreview] = useState<NodeSize | null>(null);
+  useEffect(() => { if (!selected || !data.editMode) setFitPreview(null); }, [selected, data.editMode]);
   useEffect(() => {
     setLiveHeight(undefined);
   }, [data.fixedHeight]);
@@ -3044,6 +3068,8 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
             : undefined),
       }}
     >
+      {fitPreview && data.editMode && selected && <div className="mesh-node-fit-preview" aria-hidden="true"
+        style={{ width: fitPreview.width, height: fitPreview.height }} />}
       {data.nodeType !== "group" && (
         <NodeResizer
           minWidth={100}
@@ -3174,6 +3200,11 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
           ) : (
             <span
               className="mesh-node-title-text nopan"
+              onMouseEnter={(event) => {
+                const title = event.currentTarget;
+                if (title.scrollWidth > title.clientWidth) title.title = data.title;
+                else title.removeAttribute("title");
+              }}
               onMouseDown={handleTitleMouseDown}
               onClick={handleTitleClick}
               onDoubleClick={handleTitleDoubleClick}
@@ -3373,6 +3404,8 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
               ↺
             </button>
           )}
+          {!isGroup && !data.folded && data.onFitSize && <NodeFitSize nodeRef={nodeRootRef}
+            onPreview={setFitPreview} onApply={size => { setLiveHeight(size.height); data.onFitSize!(size); }} />}
           <button
             type="button"
             className="mesh-node-icon-button nodrag"

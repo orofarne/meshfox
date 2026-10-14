@@ -75,7 +75,7 @@ import { computeAutoLayout, FOLDED_HEIGHT, type LayoutBox } from "./autolayout";
 import { buildBlockGraph, resolveChain, type BlockAddr } from "./deps";
 import { parseVarDecls } from "./vars";
 import { parseBody, type CodeSegment } from "./fence";
-import { FileRefreshContext, MeshNode, resolveNodeColor, type MeshNodeData, type LiveBlockState } from "./MeshNode";
+import { FileRefreshContext, ForegroundRunContext, MeshNode, resolveNodeColor, type MeshNodeData, type LiveBlockState } from "./MeshNode";
 import { VarsForm } from "./VarsForm";
 import { RunConfirmDialog } from "./RunConfirmDialog";
 import { DocumentOptions } from "./DocumentOptions";
@@ -88,7 +88,7 @@ import { ResetSessionConfirmDialog } from "./ResetSessionConfirmDialog";
 import { ReparentChoiceDialog } from "./ReparentChoiceDialog";
 import { DeletableEdge } from "./DeletableEdge";
 import { distributeEdgePorts } from "./edgePorts";
-import { withEdgeRoutes } from "./edgeRouteLayout";
+import { withEdgeGeometry } from "./edgeRouteLayout";
 import { CanvasSourceEditor } from "./CanvasSourceEditor";
 import { ConsolePanel, type ConsoleLine } from "./ConsolePanel";
 import { getThemePreference, setThemePreference, type ThemePreference } from "./theme";
@@ -478,6 +478,8 @@ export default function App() {
   // The latest `nodes`, for callbacks that must compare against what's on screen
   // right now without being re-created on every change.
   const nodesRef = useRef(nodes);
+  const fitNodeSizeRef = useRef<(id: string, size: { width: number; height: number }) => void>(() => {});
+  const fitSizedNodeIds = useRef(new Set<string>());
   nodesRef.current = nodes;
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   // Set via `onInit` below — needed to call `setCenter` imperatively once
@@ -795,6 +797,10 @@ export default function App() {
   // `TtySessionsPanel`'s list.
   const [liveTtySessions, setLiveTtySessions] = useState<ActiveRunDto[]>([]);
   const [ttySessionsPanelOpen, setTtySessionsPanelOpen] = useState(false);
+  // Mirrors `ttySession` for the watch-socket callback below, which is
+  // created once and must not re-subscribe whenever a terminal opens.
+  const ttySessionRef = useRef<typeof ttySession>(null);
+  ttySessionRef.current = ttySession;
 
   // `HistoryPanel`'s own data — unlike `services`/`liveTtySessions`, not
   // polled: fetched fresh whenever the panel opens and again after every
@@ -1294,6 +1300,21 @@ export default function App() {
       },
       // A code preview's target changed on disk — see `FileRefreshContext`.
       () => setFileRefreshTick((t) => t + 1),
+      // A terminal session started somewhere — most often an `autorun`
+      // `tty` block after a form's Send, which no client asked for. Show
+      // it unless a terminal is already open (only one at a time; a
+      // session this tab started itself has its panel open already, and
+      // any other stays one click away in `TtySessionsPanel`).
+      (nodeId, block) => {
+        if (ttySessionRef.current !== null) return;
+        setTtySession({
+          path: [],
+          blockName: block,
+          withDeps: false,
+          autoclose: false,
+          attachTo: { nodeId, block },
+        });
+      },
     );
     return stop;
   }, [load, watchAutorunBlock, handleNodeOp, refreshLiveTtySessions]);
@@ -1309,6 +1330,9 @@ export default function App() {
       try {
         const result = await submitForm(nodeId, blockName, values);
         for (const addr of result.autorunTriggered) {
+          // A `tty` target has no output to watch — its terminal arrives
+          // as a `"tty-started"` event, see `watchChanges` above.
+          if (addr.tty) continue;
           watchAutorunBlock(addr.nodeId, addr.block);
         }
       } catch (e) {
@@ -2600,6 +2624,7 @@ export default function App() {
             onOpenFile: () => handleOpenFile(n.id),
             onOpenFileFolder: () => handleOpenFileFolder(n.id),
             onAddChild: () => handleAddChild(n.id),
+            onFitSize: size => fitNodeSizeRef.current(n.id, size),
             onMoveUp:
               autoOrdered && prevSibling
                 ? () => handleMoveSibling(n.id, { before: prevSibling.id })
@@ -3600,6 +3625,7 @@ export default function App() {
       let touched = false;
       for (const c of changes) {
         if (isUserDriven(c) && "id" in c) {
+          fitSizedNodeIds.current.delete(c.id);
           touchedNodeIds.current.add(c.id);
           touched = true;
         }
@@ -3609,6 +3635,12 @@ export default function App() {
     },
     [onNodesChange],
   );
+  fitNodeSizeRef.current = (id, size) => {
+    onNodesChangeAndMark([{ id, type: "dimensions", dimensions: size, resizing: false, setAttributes: true }]);
+    fitSizedNodeIds.current.add(id);
+    setNodes(current => current.map(node => node.id === id
+      ? { ...node, data: { ...node.data, maxHeight: undefined, fixedSize: true, fixedHeight: size.height } } : node));
+  };
 
   // Intercepts a "remove" change (Backspace/Delete with an edge selected)
   // for either deletable-edge kind, persisting server-side instead of
@@ -3684,13 +3716,16 @@ export default function App() {
         .filter((n) => touchedNodeIds.current.has(n.id))
         .map((n) => {
           const position = canvasPosition(n);
+          // Fitting changes size only: retain the corner and the unchanged
+          // dimension exactly, including an authored value off the grid.
+          const snap = fitSizedNodeIds.current.has(n.id) ? (value: number) => value : snapToGrid;
           return [
             n.id,
             {
-              x: snapToGrid(position.x),
-              y: snapToGrid(position.y),
-              width: n.data.nodeType === "group" || n.width === undefined ? undefined : snapToGrid(n.width),
-              height: n.data.nodeType === "group" || n.height === undefined ? undefined : snapToGrid(n.height),
+              x: snap(position.x),
+              y: snap(position.y),
+              width: n.data.nodeType === "group" || n.width === undefined ? undefined : snap(n.width),
+              height: n.data.nodeType === "group" || n.height === undefined ? undefined : snap(n.height),
             },
           ] as const;
         }),
@@ -3750,6 +3785,22 @@ export default function App() {
     const failed = results.filter((r) => !r.ok).length;
     return { total: results.length, failed };
   }, [canvas]);
+
+  // A form's Send is refused server-side while a foreground run is in
+  // progress (see `ForegroundRunContext`); this is what greys it out. Only
+  // what this tab already tracks — a run started elsewhere shows up once
+  // `"runs-changed"`/`"run-started"` bring it in, and the server's `409`
+  // remains the backstop.
+  const foregroundRunInProgress = useMemo(
+    () =>
+      liveTtySessions.length > 0 ||
+      nodes.some((n) =>
+        Object.values(n.data.liveBlocks ?? {}).some(
+          (b) => b.status === "queued" || b.status === "running",
+        ),
+      ),
+    [nodes, liveTtySessions],
+  );
 
   const toolbar = useMemo(
     () => (
@@ -3958,10 +4009,23 @@ export default function App() {
     ],
   );
 
-  const routedVisibleEdges = useMemo(
-    () => withEdgeRoutes(focusedRenderNodes, visibleEdges),
+  const edgeGeometry = useMemo(
+    () => withEdgeGeometry(focusedRenderNodes, visibleEdges),
     [focusedRenderNodes, visibleEdges],
   );
+  const routeRenderNodes = edgeGeometry.nodes;
+  const routedVisibleEdges = edgeGeometry.edges;
+  const onRouteNodesChange: typeof onNodesChange = useCallback(changes => {
+    const offsets = new Map(routeRenderNodes.map((node, index) => [node.id, {
+      x: edgeGeometry.layoutNodes[index].position.x - node.position.x,
+      y: edgeGeometry.layoutNodes[index].position.y - node.position.y,
+    }]));
+    onNodesChangeAndMark(changes.map(change => {
+      if (change.type !== "position" || !change.position) return change;
+      const offset = offsets.get(change.id);
+      return offset ? { ...change, position: { x: change.position.x + offset.x, y: change.position.y + offset.y } } : change;
+    }));
+  }, [edgeGeometry, routeRenderNodes, onNodesChangeAndMark]);
 
   if (serverGone) {
     return (
@@ -3974,6 +4038,7 @@ export default function App() {
 
   return (
     <FileRefreshContext.Provider value={fileRefreshTick}>
+    <ForegroundRunContext.Provider value={foregroundRunInProgress}>
     <div className="app">
       {toolbar}
       <div className="canvas-area">
@@ -3986,9 +4051,9 @@ export default function App() {
           />
         ) : (
           <ReactFlow
-            nodes={focusedRenderNodes}
+            nodes={routeRenderNodes}
             edges={routedVisibleEdges}
-            onNodesChange={onNodesChangeAndMark}
+            onNodesChange={onRouteNodesChange}
             onEdgesChange={onEdgesChangeAndPersist}
             onConnect={handleConnect}
             onInit={setFlowInstance}
@@ -4280,6 +4345,7 @@ export default function App() {
         />
       )}
     </div>
+    </ForegroundRunContext.Provider>
     </FileRefreshContext.Provider>
   );
 }

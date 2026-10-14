@@ -1418,7 +1418,7 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
     // anything but raw text.
     let content: Option<Vec<Line<'static>>> = if let Some(run) = &app.run {
         let mut lines: Vec<Line<'static>> =
-            run.lines.iter().map(|l| Line::from(l.clone())).collect();
+            super::ansi::lines(&run.lines.join("\n"));
         if run.finished && run.output_markdown && !run.stdout_only.trim().is_empty() {
             lines.push(Line::from(""));
             lines.push(Line::styled(
@@ -1451,7 +1451,7 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
     } else {
         app.file_run
             .as_ref()
-            .map(|run| run.lines.iter().map(|l| Line::from(l.clone())).collect())
+            .map(|run| super::ansi::lines(&run.lines.join("\n")))
     };
     let text: Text = if let Some(lines) = content {
         // `output_scroll` counts lines back from the bottom (see its own
@@ -2230,7 +2230,8 @@ fn render_services_view(f: &mut Frame, area: Rect, app: &App, sv: &ServicesViewS
         {
             let take = log_area.height as usize;
             let start = log.len().saturating_sub(take);
-            let lines: Vec<Line> = log[start..]
+            let mut ansi = super::ansi::Ansi::default();
+            let lines: Vec<Line> = log
                 .iter()
                 .map(|(stream, text)| {
                     let style = match stream {
@@ -2239,10 +2240,10 @@ fn render_services_view(f: &mut Frame, area: Rect, app: &App, sv: &ServicesViewS
                         }
                         meshfox_server::stream_exec::OutputStream::Stdout => Style::default(),
                     };
-                    Line::from(Span::styled(text.as_str(), style))
+                    ansi.line(text, style)
                 })
                 .collect();
-            f.render_widget(Paragraph::new(Text::from(lines)), log_area);
+            f.render_widget(Paragraph::new(Text::from(lines[start..].to_vec())), log_area);
         }
     }
 }
@@ -2390,27 +2391,6 @@ fn render_history_view(f: &mut Frame, area: Rect, hv: &super::app::HistoryViewSt
     );
 }
 
-/// `text` without ANSI CSI escape sequences (colors, cursor moves) — a
-/// stored run's output is raw process output, and a terminal escape in a
-/// ratatui cell would garble the screen instead of coloring it.
-fn strip_ansi(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\u{1b}' && chars.peek() == Some(&'[') {
-            chars.next();
-            for c in chars.by_ref() {
-                if ('@'..='~').contains(&c) {
-                    break;
-                }
-            }
-        } else if c != '\r' {
-            out.push(c);
-        }
-    }
-    out
-}
-
 /// The `L` run-history view: the block's kept runs on the left (newest
 /// first, stale ones dimmed), the selected run's stored output on the right.
 /// The terminal counterpart of the web UI's `RunHistoryDialog`.
@@ -2531,8 +2511,9 @@ fn render_run_history_view(f: &mut Frame, area: Rect, rv: &super::app::RunHistor
                 Style::default().fg(Color::DarkGray),
             ))]
         }
-        Some((_, lines)) => lines
-            .iter()
+        Some((_, lines)) => {
+            let mut ansi = super::ansi::Ansi::default();
+            lines.iter()
             .map(|(stream, text)| {
                 let style = match stream {
                     meshfox_server::stream_exec::OutputStream::Stdout => Style::default(),
@@ -2540,9 +2521,13 @@ fn render_run_history_view(f: &mut Frame, area: Rect, rv: &super::app::RunHistor
                         Style::default().fg(Color::Yellow)
                     }
                 };
-                Line::from(Span::styled(format!(" {}", strip_ansi(text)), style))
+                let line = ansi.line(text, style);
+                let mut spans = vec![Span::raw(" ")];
+                spans.extend(line.spans);
+                Line::from(spans)
             })
-            .collect(),
+            .collect()
+        },
     };
     f.render_widget(
         Paragraph::new(output_lines).scroll((rv.output_scroll.min(u16::MAX as usize) as u16, 0)),
@@ -3694,19 +3679,13 @@ mod tests {
         );
         assert!(
             screen.contains("red text") && !screen.contains("[31m"),
-            "ANSI stripped:\n{screen}"
+            "ANSI rendered:\n{screen}"
         );
         assert!(screen.contains("boom"), "stderr shown too:\n{screen}");
         assert!(
             rv.list_rect.get().width > 0,
             "list position recorded for mouse hit-testing"
         );
-    }
-
-    #[test]
-    fn strip_ansi_removes_color_codes_and_carriage_returns_but_keeps_text() {
-        assert_eq!(strip_ansi("\u{1b}[1;32mok\u{1b}[0m done\r"), "ok done");
-        assert_eq!(strip_ansi("plain"), "plain");
     }
 
     #[tokio::test]

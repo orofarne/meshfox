@@ -215,3 +215,186 @@ test("stacked right lanes avoid a neighboring card and respect pinned vertical s
   assert.equal(pinned.sourceHandle, "source-bottom");
   assert.equal(pinned.targetHandle, "target-top");
 });
+
+test("labels avoid crossings, other badges, and node clearance on their own route", async () => {
+  const { placeLabel, labelRect } = await import("../src/edgeLabels.ts");
+  const points = [{ x: 0, y: 100 }, { x: 600, y: 100 }];
+  const size = { width: 120, height: 24 };
+  const nodes = [{ x: -100, y: 80, width: 180, height: 40 }, { x: 520, y: 80, width: 180, height: 40 }];
+  const crossing = [{ from: { x: 300, y: 0 }, to: { x: 300, y: 200 } }];
+  const first = placeLabel(points, size, 500, nodes, [], crossing);
+  assert.equal(first.y, 100);
+  assert.ok(Math.abs(first.x - 300) > 68);
+  assert.ok(first.x - 60 >= 94 && first.x + 60 <= 506);
+  const second = placeLabel(points, size, 500, nodes, [labelRect(first, size)], crossing);
+  assert.equal(second.y, 100);
+  assert.ok(Math.abs(second.x - first.x) >= 130);
+  assert.ok(Math.abs(second.x - 300) > 68);
+});
+
+test("group frames contain internal routes and badges without moving members", async () => {
+  const { withRouteGroupFrames } = await import("../src/edgeRouteLayout.ts");
+  const nodes = [
+    { id: "g", position: { x: 100, y: 100 }, width: 300, height: 400, data: { nodeType: "group" } },
+    { id: "a", parentId: "g", position: { x: 40, y: 80 }, width: 200, height: 80, data: { nodeType: "text" } },
+    { id: "b", parentId: "g", position: { x: 40, y: 280 }, width: 200, height: 80, data: { nodeType: "text" } },
+  ];
+  const edges = [{ id: "ab", source: "a", target: "b", data: {
+    label: "a long internal link", routedLabel: { x: 80, y: 300 },
+    routedPoints: [{ x: 340, y: 220 }, { x: 400, y: 220 }, { x: 400, y: 420 }, { x: 340, y: 420 }],
+  } }];
+  const result = withRouteGroupFrames(nodes, edges);
+  assert.ok(result[0].width > 400);
+  assert.ok(result[0].position.x < nodes[0].position.x);
+  for (let i = 1; i < nodes.length; i++) {
+    assert.equal(result[0].position.x + result[i].position.x, nodes[0].position.x + nodes[i].position.x);
+    assert.equal(result[0].position.y + result[i].position.y, nodes[0].position.y + nodes[i].position.y);
+  }
+});
+
+test("incoming tips do not retrace the shared automatic outgoing port, including folded cards", () => {
+  for (const height of [44, 200]) {
+    const nodes = [0, 1].map(i => ({ id: `n${i}`, position: { x: 100, y: i * 400 },
+      width: 800, height, data: { level: 3, nodeType: "text" } }));
+    const routes = withEdgeRoutes(nodes, [
+      { id: "n0->n1", source: "n0", target: "n1", type: "extra", data: {} },
+      { id: "n1->n0", source: "n1", target: "n0", type: "extra", data: {} },
+    ]);
+    for (const route of routes) {
+      assert.equal(route.data.sourceOffset, 0, "automatic outgoing port remains centered");
+      assert.ok(Math.abs(route.data.targetOffset) >= 12, "incoming tip is visibly separated from the outgoing port");
+    }
+    assert.notDeepEqual(routes[0].data.routedPoints[0], routes[1].data.routedPoints.at(-1));
+    assert.notDeepEqual(routes[1].data.routedPoints[0], routes[0].data.routedPoints.at(-1));
+  }
+});
+
+test("tree and extra incoming links refresh their ports together after folding", () => {
+  const nodes = [
+    { id: "above", position: { x: 0, y: 0 }, width: 200, height: 100, data: { level: 3, nodeType: "text" } },
+    { id: "below", position: { x: 0, y: 800 }, width: 200, height: 100, data: { level: 3, nodeType: "text" } },
+    { id: "target", position: { x: 500, y: 400 }, width: 200, height: 44, data: { level: 3, nodeType: "text" } },
+  ];
+  const routes = withEdgeRoutes(nodes, [
+    { id: "above->target", source: "above", target: "target", type: "tree", data: { targetOffset: 0 } },
+    { id: "below->target", source: "below", target: "target", type: "extra", data: { sourceSide: "right", targetSide: "left", targetOffset: 0 } },
+  ]);
+  assert.notEqual(routes[0].data.targetOffset, routes[1].data.targetOffset);
+  assert.ok(Math.abs(routes[0].data.targetOffset - routes[1].data.targetOffset) >= 24);
+  const ends = routes.map(r => r.data.routedPoints.at(-1));
+  assert.equal(ends[0].x, ends[1].x);
+  assert.notEqual(ends[0].y, ends[1].y);
+  const segments = r => r.data.routedPoints.slice(1).map((to, i) => ({ from: r.data.routedPoints[i], to }));
+  for (const a of segments(routes[0])) for (const b of segments(routes[1])) {
+    const horizontal = a.from.y === a.to.y;
+    if (horizontal !== (b.from.y === b.to.y)) continue;
+    if (horizontal ? a.from.y !== b.from.y : a.from.x !== b.from.x) continue;
+    const axis = horizontal ? "x" : "y";
+    const overlap = Math.min(Math.max(a.from[axis], a.to[axis]), Math.max(b.from[axis], b.to[axis])) -
+      Math.max(Math.min(a.from[axis], a.to[axis]), Math.min(b.from[axis], b.to[axis]));
+    assert.ok(overlap <= 0, "tree and extra routes must not merge into a shared lane");
+  }
+});
+
+function assertSimpleRoute(points) {
+  for (let i = 1; i < points.length; i++) for (let j = 1; j < i - 1; j++) {
+    const a = points[j - 1], b = points[j], c = points[i - 1], d = points[i];
+    const horizontal = a.y === b.y, otherHorizontal = c.y === d.y;
+    if (horizontal === otherHorizontal) {
+      if (horizontal ? a.y !== c.y : a.x !== c.x) continue;
+      const axis = horizontal ? "x" : "y";
+      const overlap = Math.min(Math.max(a[axis], b[axis]), Math.max(c[axis], d[axis])) -
+        Math.max(Math.min(a[axis], b[axis]), Math.min(c[axis], d[axis]));
+      assert.ok(overlap < 0, `route retraces itself: ${JSON.stringify(points)}`);
+    } else {
+      const point = horizontal ? { x: c.x, y: a.y } : { x: a.x, y: c.y };
+      const inside = (p, q) => point.x >= Math.min(p.x, q.x) && point.x <= Math.max(p.x, q.x) &&
+        point.y >= Math.min(p.y, q.y) && point.y <= Math.max(p.y, q.y);
+      assert.ok(!(inside(a, b) && inside(c, d)), `route crosses itself: ${JSON.stringify(points)}`);
+    }
+  }
+}
+
+test("a lane detour cannot loop across its own source or target stub on any side", () => {
+  const rotate = p => ({ x: -p.y, y: p.x });
+  const rotateBox = box => ({ x: -box.y - box.height, y: box.x, width: box.height, height: box.width });
+  const rotateSide = side => ({ left: "top", top: "right", right: "bottom", bottom: "left" })[side];
+  let start = { x: 150, y: 127 }, end = { x: 600, y: 198 };
+  let source = { x: 0, y: 0, width: 300, height: 125 }, target = { x: 450, y: 200, width: 300, height: 125 };
+  let startSide = "bottom", endSide = "top";
+  let occupied = [{ from: { x: 152, y: 170 }, to: { x: 800, y: 170 } },
+    { from: { x: 152, y: 0 }, to: { x: 152, y: 400 } }];
+  for (let rotation = 0; rotation < 4; rotation++) {
+    for (const reverse of [false, true]) {
+      const route = reverse
+        ? routeAroundNodes(end, endSide, start, startSide, [], target, source, occupied)
+        : routeAroundNodes(start, startSide, end, endSide, [], source, target, occupied);
+      assert.ok(route, "detouring around a terminal stub must still produce a route");
+      assertSimpleRoute(route[3]);
+      assertOutside(route[0], [source, target]);
+    }
+    start = rotate(start); end = rotate(end); source = rotateBox(source); target = rotateBox(target);
+    startSide = rotateSide(startSide); endSide = rotateSide(endSide);
+    occupied = occupied.map(segment => ({ from: rotate(segment.from), to: rotate(segment.to) }));
+  }
+});
+
+test("facing ports retain a straight connector when their short stubs overlap", () => {
+  const route = routeAroundNodes({ x: 102, y: 50 }, "right", { x: 138, y: 50 }, "left", [],
+    { x: 0, y: 0, width: 100, height: 100 }, { x: 140, y: 0, width: 100, height: 100 });
+  assert.ok(route);
+  assert.deepEqual(route[3], [{ x: 102, y: 50 }, { x: 138, y: 50 }]);
+});
+
+test("nearby perpendicular ports join intersecting stubs without a rectangular loop", () => {
+  const route = routeAroundNodes({ x: 0, y: 0 }, "right", { x: 12, y: 12 }, "top", []);
+  assert.ok(route);
+  assert.deepEqual(route[3], [{ x: 0, y: 0 }, { x: 12, y: 0 }, { x: 12, y: 12 }]);
+  assertSimpleRoute(route[3]);
+});
+
+test("parallel lanes keep a real gap even when a nearby free grid line is only a pixel away", () => {
+  const occupied = [{ from: { x: 0, y: 100 }, to: { x: 700, y: 100 } }];
+  const route = routeAroundNodes({ x: 50, y: 101 }, "bottom", { x: 600, y: 101 }, "bottom", [], undefined, undefined, occupied);
+  assert.ok(route);
+  for (let i = 1; i < route[3].length; i++) {
+    const a = route[3][i - 1], b = route[3][i];
+    if (a.y === b.y && Math.abs(a.x - b.x) > 40) assert.ok(Math.abs(a.y - 100) >= 20);
+  }
+  assertSimpleRoute(route[3]);
+});
+
+test("route-expanded automatic groups clear neighboring cards and reroute their endpoints", async () => {
+  const { withEdgeGeometry } = await import("../src/edgeRouteLayout.ts");
+  const nodes = [
+    { id: "neighbor", position: { x: 0, y: 140 }, width: 120, height: 120, data: { level: 2, nodeType: "text", suggested: false } },
+    { id: "g", position: { x: 140, y: 0 }, width: 300, height: 400, data: { level: 2, nodeType: "group", suggested: true } },
+    { id: "a", parentId: "g", position: { x: 40, y: 80 }, width: 200, height: 80, data: { level: 3, nodeType: "text", suggested: true } },
+    { id: "b", parentId: "g", position: { x: 40, y: 280 }, width: 200, height: 80, data: { level: 3, nodeType: "text", suggested: true } },
+  ];
+  const edges = [{ id: "ab", source: "a", target: "b", type: "extra", data: {
+    sourceSide: "left", targetSide: "left", label: "an internal labeled arrow" } }];
+  const result = withEdgeGeometry(nodes, edges);
+  const group = result.nodes[1], neighbor = result.nodes[0];
+  assert.ok(group.position.x >= neighbor.position.x + neighbor.width + 25 || group.position.y >= neighbor.position.y + neighbor.height + 25);
+  assert.deepEqual(neighbor.position, nodes[0].position, "authored neighbor must stay put");
+  const start = result.edges[0].data.routedPoints[0];
+  const layoutGroup = result.layoutNodes[1], member = result.layoutNodes[2];
+  assert.equal(start.x, layoutGroup.position.x + member.position.x - 2);
+  assert.equal(start.y, layoutGroup.position.y + member.position.y + member.height / 2);
+  const again = withEdgeGeometry(nodes.map(n => n.id === "g" ? { ...n, measured: { width: group.width, height: group.height } } : n), edges);
+  assert.deepEqual(again.nodes.map(n => n.position), result.nodes.map(n => n.position), "measurement must not keep shifting the group");
+});
+
+test("a crossing is kept away from another arrow's bend or tip", () => {
+  const route = routeAroundNodes({ x: 190, y: 0 }, "bottom", { x: 190, y: 300 }, "top", [],
+    undefined, undefined, [{ from: { x: 0, y: 100 }, to: { x: 200, y: 100 } }]);
+  assert.ok(route);
+  assertSimpleRoute(route[3]);
+  for (let i = 1; i < route[3].length; i++) {
+    const a = route[3][i - 1], b = route[3][i];
+    if (a.x === b.x && Math.min(a.y, b.y) <= 100 && Math.max(a.y, b.y) >= 100 && a.x >= 0 && a.x <= 200) {
+      assert.ok(a.x >= 20 && a.x <= 180, "crossing must leave room around both endpoints");
+    }
+  }
+});

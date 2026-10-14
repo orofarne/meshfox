@@ -19,6 +19,7 @@ export function distributeEdgePorts(
 ): Map<string, EdgePorts> {
   const result = new Map<string, EdgePorts>();
   const groups = new Map<string, { edgeId: string; end: "source" | "target"; order: number }[]>();
+  const automaticSources = new Set<string>();
   const center = (box: LayoutBox, side: EdgeSide) =>
     side === "top" || side === "bottom" ? box.x + box.width / 2 : box.y + box.height / 2;
 
@@ -43,6 +44,7 @@ export function distributeEdgePorts(
     }
     sourceSide = edge.sourceSide ?? sourceSide;
     targetSide = edge.targetSide ?? targetSide;
+    if (!edge.sourceSide) automaticSources.add(`${edge.source}\0${sourceSide}`);
     result.set(edge.id, {
       sourceHandle: !edge.sourceSide && sourceSide === defaultSourceSide ? "source-default" : `source-${sourceSide}`,
       targetHandle: targetSide === "left" ? "target-default" : `target-${targetSide}`,
@@ -61,13 +63,14 @@ export function distributeEdgePorts(
   }
 
   for (const [key, group] of groups) {
-    if (group.length < 2) continue;
+    const reserveCenter = automaticSources.has(key) && group.some(item => item.end === "target");
+    if (group.length < 2 && !reserveCenter) continue;
     const [nodeId, side] = key.split("\0") as [string, EdgeSide];
     const box = boxes.get(nodeId)!;
     const length = side === "top" || side === "bottom" ? box.width : box.height;
     // Keep endpoints away from rounded corners. Dense groups compress
     // rather than letting their outer endpoints leave the node's border.
-    const halfSpan = Math.max(0, length / 2 - 20);
+    const halfSpan = Math.max(0, length / 2 - 6);
     // An arrowhead is wider than the old 18 px pitch. Use the other
     // endpoint's projected position when there is room, while keeping at
     // least 40 px between neighboring tips. Very crowded sides compress
@@ -79,6 +82,21 @@ export function distributeEdgePorts(
     for (let i = 1; i < positions.length; i++) positions[i] = Math.max(positions[i], positions[i - 1] + step);
     positions[positions.length - 1] = Math.min(positions.at(-1)!, halfSpan);
     for (let i = positions.length - 2; i >= 0; i--) positions[i] = Math.min(positions[i], positions[i + 1] - step);
+    // Automatic outgoing links retain their shared center. Incoming tips
+    // must not retrace that exit stub, even with just one incoming link.
+    if (reserveCenter) {
+      const slots = [...positions, 0].sort((a, b) => a - b);
+      const reserved = slots.indexOf(0);
+      const pitch = Math.min(40, halfSpan / Math.max(reserved, group.length - reserved, 1));
+      const available = slots.filter((_, i) => i !== reserved).map((value, i) => {
+        const index = i < reserved ? i : i + 1;
+        const lower = index < reserved ? -halfSpan + index * pitch : (index - reserved) * pitch;
+        const upper = index < reserved ? -(reserved - index) * pitch : halfSpan - (group.length - index) * pitch;
+        return Math.max(lower, Math.min(upper, value));
+      });
+      for (let i = 1; i < available.length; i++) available[i] = Math.max(available[i], available[i - 1] + pitch);
+      positions.splice(0, positions.length, ...available);
+    }
     group.forEach(({ edgeId, end }, index) => {
       const ports = result.get(edgeId)!;
       ports[`${end}Offset`] = positions[index];

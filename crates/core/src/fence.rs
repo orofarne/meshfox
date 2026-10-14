@@ -70,9 +70,9 @@ pub struct CodeBlock {
     /// block does, only when it's triggered, so (like `cache`/`tty`/
     /// `default`/`always`) it's deliberately left out of `fingerprint`. See
     /// `crate::autorun_blocks_for_changed_vars` for the actual trigger,
-    /// and SPEC.md's "Runnable code fences". Mutually exclusive with `tty`
-    /// (enforced by `crate::deps::validate`, not here) — there's no human to
-    /// hand a terminal to when a variable changes unattended.
+    /// and SPEC.md's "Runnable code fences". Compatible with `tty`: the
+    /// session is started by the server and any connected client attaches
+    /// to it (SPEC.md's "Interactive (`tty`) blocks").
     pub autorun: bool,
     /// `render="..."` — swaps this block's default display from "code +
     /// run controls" to a custom widget for the named kind, with the raw

@@ -134,6 +134,13 @@ const FORM_AUTORUN_OUTPUT_PORT = 4614;
 // concurrent run against the same block from some other suite sharing a
 // server.
 const RELOAD_LIVE_RUN_PORT = 4615;
+// Server + port for form-autorun-tty.spec.ts — its own fixture
+// (form-autorun-tty.canvas.md, a `form` paired with a `tty`+`autorun`
+// block) and port: it leaves a terminal session running for a few seconds
+// and checks that Send is disabled meanwhile, which any other suite
+// sharing this canvas's worker would trip over. Chrome only (see the
+// spec): one server, so no second browser's copy to race it.
+const FORM_AUTORUN_TTY_PORT = 4631;
 // Ninth server + port for document-options.spec.ts — same reasoning
 // again, its own fixture (document-options.canvas.md) and port, so its
 // own `PUT /api/options` writes never collide with any other suite's
@@ -458,6 +465,11 @@ export default defineConfig({
       use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${browser === "firefox" ? FORM_AUTORUN_OUTPUT_FIREFOX_PORT : FORM_AUTORUN_OUTPUT_PORT}` },
     },
     {
+      name: `${browser}-form-autorun-tty`,
+      testMatch: /(^|\/)form-autorun-tty\.spec\.ts$/,
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${FORM_AUTORUN_TTY_PORT}` },
+    },
+    {
       name: `${browser}-reload-live-run`,
       testMatch: /(^|\/)reload-live-run\.spec\.ts$/,
       use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${RELOAD_LIVE_RUN_PORT}` },
@@ -670,6 +682,12 @@ export default defineConfig({
     {
       command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/form-autorun-output.canvas.md --port ${FORM_AUTORUN_OUTPUT_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${FORM_AUTORUN_OUTPUT_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/form-autorun-tty.canvas.md --port ${FORM_AUTORUN_TTY_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${FORM_AUTORUN_TTY_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },

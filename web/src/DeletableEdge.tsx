@@ -57,6 +57,7 @@ export interface DeletableEdgeData {
   /** Derived from all visible extra edges for this render; never persisted. */
   routedPath?: [string, number, number];
   routedPoints?: { x: number; y: number }[];
+  routedLabel?: { x: number; y: number };
   routeFailed?: boolean;
   via?: { x: number; y: number }[];
   sourceSide?: ExtraEdgeDto["sourceSide"];
@@ -124,7 +125,7 @@ export function DeletableEdge({
   const renderer = useStore((state) => state.domNode?.querySelector(".react-flow__renderer"));
   const flowNodes = useStore((state) => state.nodes);
   const flowEdges = useStore((state) => state.edges);
-  useViewport(); // Reposition the portal controls when the canvas pans or zooms.
+  const viewport = useViewport(); // Reposition the portal controls when the canvas pans or zooms.
   const [draggingRoute, setDraggingRoute] = useState(false);
   const [draggingLabelAt, setDraggingLabelAt] = useState<number | null>(null);
   const [draggingEndpoint, setDraggingEndpoint] = useState<{
@@ -198,11 +199,12 @@ export function DeletableEdge({
   }, [path, hasBadge]);
   const labelAt = draggingLabelAt ?? edgeData?.labelAt ?? 500;
   const labelPoint = useMemo(() => {
+    if (draggingLabelAt === null && !preview && edgeData?.routedLabel) return edgeData.routedLabel;
     const length = pathGeometry?.getTotalLength() ?? 0;
     if (!length) return { x: labelX, y: labelY };
     const point = pathGeometry!.getPointAtLength(length * labelAt / 1000);
     return { x: point.x, y: point.y };
-  }, [pathGeometry, labelAt, labelX, labelY]);
+  }, [pathGeometry, labelAt, labelX, labelY, draggingLabelAt, preview, edgeData?.routedLabel]);
 
   const [open, setOpen] = useState(false);
   const canOpen = !!(edgeData?.editMode && (edgeData.editable ? edgeData.onUpdate : edgeData.onUpdateRoute));
@@ -435,7 +437,8 @@ export function DeletableEdge({
       {renderer && hasBadge && createPortal(
         <div className="mesh-edge-label-layer">
           <div className={`mesh-edge-label-badge nodrag nopan${canOpen ? " mesh-edge-label-draggable" : ""}`}
-            style={{ left: localPoint(labelPoint).x, top: localPoint(labelPoint).y }}
+            data-edge-id={id}
+            style={{ left: localPoint(labelPoint).x, top: localPoint(labelPoint).y, transform: `translate(-50%, -50%) scale(${viewport.zoom})` }}
             title={canOpen ? "Drag label along arrow" : undefined}
             onPointerDown={dragLabel}>
             {edgeData!.label}

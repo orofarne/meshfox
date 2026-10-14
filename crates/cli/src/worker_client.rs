@@ -1189,6 +1189,11 @@ pub enum WatchEvent {
     /// a run I didn't start" flow the web UI's `watchAutorunBlock` already
     /// has.
     RunStarted { node_id: String, block: String },
+    /// A `tty` step's terminal session just started in the worker — a
+    /// manual run elsewhere, or an `autorun` after a form's Send, which
+    /// nobody asked this process for. `mod.rs` hands the terminal to it
+    /// (`App::on_tty_started`) unless one is already being shown.
+    TtyStarted { node_id: String, block: String },
     /// A run (plain or `tty`) started or ended somewhere, or the session was
     /// reset: refetch `GET /api/runs`.
     RunsChanged,
@@ -1295,6 +1300,10 @@ pub fn watch(port: u16) -> tokio::sync::mpsc::UnboundedReceiver<WatchEvent> {
                 block: String,
             },
             RunsChanged,
+            TtyStarted {
+                node_id: String,
+                block: String,
+            },
             /// A `display="code"` file node's target changed on disk — the
             /// TUI re-reads the document, same as for `"changed"`.
             FilesChanged,
@@ -1330,6 +1339,9 @@ pub fn watch(port: u16) -> tokio::sync::mpsc::UnboundedReceiver<WatchEvent> {
                     | WatchMsg::Other => WatchEvent::Changed,
                     WatchMsg::RunStarted { node_id, block } => {
                         WatchEvent::RunStarted { node_id, block }
+                    }
+                    WatchMsg::TtyStarted { node_id, block } => {
+                        WatchEvent::TtyStarted { node_id, block }
                     }
                     WatchMsg::RunsChanged => WatchEvent::RunsChanged,
                 };

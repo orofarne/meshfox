@@ -58,6 +58,32 @@ function segmentBlocked(a: Point, b: Point, obstacles: Rect[]): boolean {
   );
 }
 
+function samePoint(a: Point, b: Point): boolean { return a.x === b.x && a.y === b.y; }
+
+/** A route may leave/join its terminal stub at the outer end, but must not
+ * cross or retrace the stub elsewhere. Without this a cheap lane detour
+ * can loop back across the fixed section that is outside the search grid. */
+function crossesStub(a: Point, b: Point, stub: Segment, join: Point): boolean {
+  const c = stub.from, d = stub.to;
+  if (samePoint(c, d)) return false;
+  const horizontal = a.y === b.y, otherHorizontal = c.y === d.y;
+  let intersection: Point;
+  if (horizontal === otherHorizontal) {
+    if (horizontal ? a.y !== c.y : a.x !== c.x) return false;
+    const axis = horizontal ? "x" : "y";
+    const low = Math.max(Math.min(a[axis], b[axis]), Math.min(c[axis], d[axis]));
+    const high = Math.min(Math.max(a[axis], b[axis]), Math.max(c[axis], d[axis]));
+    if (high < low) return false;
+    if (high > low) return true;
+    intersection = horizontal ? { x: low, y: a.y } : { x: a.x, y: low };
+  } else {
+    intersection = horizontal ? { x: c.x, y: a.y } : { x: a.x, y: c.y };
+    if ([ [a, b], [c, d] ].some(([p, q]) => intersection.x < Math.min(p.x, q.x) || intersection.x > Math.max(p.x, q.x) ||
+      intersection.y < Math.min(p.y, q.y) || intersection.y > Math.max(p.y, q.y))) return false;
+  }
+  return !(samePoint(intersection, join) && (samePoint(a, join) || samePoint(b, join)));
+}
+
 class MinHeap {
   private items: { state: number; cost: number }[] = [];
   get length() { return this.items.length; }
@@ -135,7 +161,7 @@ export function draw(points: Point[]): RoutedPath {
   return [path, label.x, label.y, points];
 }
 
-function sharedLaneCost(a: Point, b: Point, occupied: Segment[]): number {
+function sharedLaneCost(a: Point, b: Point, occupied: Segment[], separate = false, joins: Point[] = []): number {
   let cost = 0;
   for (const segment of occupied) {
     const c = segment.from, d = segment.to;
@@ -143,14 +169,25 @@ function sharedLaneCost(a: Point, b: Point, occupied: Segment[]): number {
     const otherHorizontal = c.y === d.y;
     if (horizontal === otherHorizontal) {
       const distance = horizontal ? Math.abs(a.y - c.y) : Math.abs(a.x - c.x);
-      if (distance >= LANE_GAP) continue;
+      if (distance >= LANE_GAP - 1e-6) continue;
       const overlap = horizontal
         ? Math.max(0, Math.min(Math.max(a.x, b.x), Math.max(c.x, d.x)) - Math.max(Math.min(a.x, b.x), Math.min(c.x, d.x)))
         : Math.max(0, Math.min(Math.max(a.y, b.y), Math.max(c.y, d.y)) - Math.max(Math.min(a.y, b.y), Math.min(c.y, d.y)));
-      if (overlap) cost += (1 - distance / LANE_GAP) * (overlap * 3 + 80);
+      if (overlap) {
+        if (separate) return Infinity;
+        cost += (1 - distance / LANE_GAP) * (overlap * 100 + 1000);
+      }
     } else {
       const h1 = horizontal ? a : c, h2 = horizontal ? b : d;
       const v1 = horizontal ? c : a, v2 = horizontal ? d : b;
+      const intersection = { x: v1.x, y: h1.y };
+      const crosses = v1.x >= Math.min(h1.x, h2.x) && v1.x <= Math.max(h1.x, h2.x) &&
+        h1.y >= Math.min(v1.y, v2.y) && h1.y <= Math.max(v1.y, v2.y);
+      // A crossing beside another arrow's bend reads like a shared fork.
+      // Shared terminal joins remain valid for outgoing links at one port.
+      if (separate && crosses && !joins.some(join => samePoint(join, intersection)) &&
+        Math.min(Math.hypot(intersection.x - c.x, intersection.y - c.y),
+          Math.hypot(intersection.x - d.x, intersection.y - d.y)) < LANE_GAP) return Infinity;
       if (v1.x > Math.min(h1.x, h2.x) && v1.x < Math.max(h1.x, h2.x) &&
           h1.y > Math.min(v1.y, v2.y) && h1.y < Math.max(v1.y, v2.y)) cost += 30;
     }
@@ -165,6 +202,7 @@ export function routeAroundNodes(
   start: Point, startSide: EdgeSide, end: Point, endSide: EdgeSide,
   boxes: Rect[], sourceBox?: Rect, targetBox?: Rect, occupied: Segment[] = [],
   noStartStub = false, noEndStub = false,
+  labelClearance = CLEARANCE,
 ): RoutedPath | undefined {
   // Adjacent rows have a 25 px gap, narrower than two default clearance
   // envelopes. Keep an exit corridor even when the next card is an
@@ -192,8 +230,9 @@ export function routeAroundNodes(
     left: Math.min(start.x, end.x) - ROUTE_MARGIN, right: Math.max(start.x, end.x) + ROUTE_MARGIN,
     top: Math.min(start.y, end.y) - ROUTE_MARGIN, bottom: Math.max(start.y, end.y) + ROUTE_MARGIN,
   };
-  const expand = (r: Rect): Rect => ({ x: r.x - clearance, y: r.y - clearance,
-    width: r.width + 2 * clearance, height: r.height + 2 * clearance });
+  const horizontalClearance = Math.max(clearance, labelClearance);
+  const expand = (r: Rect): Rect => ({ x: r.x - horizontalClearance, y: r.y - clearance,
+    width: r.width + 2 * horizontalClearance, height: r.height + 2 * clearance });
   const obstacles = boxes
     .filter((r) => r.x < bounds.right && r.x + r.width > bounds.left && r.y < bounds.bottom && r.y + r.height > bounds.top)
     .map(expand);
@@ -201,25 +240,51 @@ export function routeAroundNodes(
   const targetObstacle = targetBox && expand(targetBox);
   if (sourceObstacle) obstacles.push(sourceObstacle);
   if (targetObstacle) obstacles.push(targetObstacle);
-  const preferredStub = startSide === "right" && endSide === "right" ? 36 : END_STUB;
-  const startLength = noStartStub ? 0 : stubLength(start, startSide, sourceObstacle, obstacles.filter((r) => r !== sourceObstacle), preferredStub);
-  const endLength = noEndStub ? 0 : stubLength(end, endSide, targetObstacle, obstacles.filter((r) => r !== targetObstacle), preferredStub);
+  const preferredStub = (side: EdgeSide) => side === "left" || side === "right"
+    ? Math.max(startSide === "right" && endSide === "right" ? 36 : END_STUB, horizontalClearance + 10)
+    : Math.max(END_STUB, clearance + 10);
+  const startLength = noStartStub ? 0 : stubLength(start, startSide, sourceObstacle, obstacles.filter((r) => r !== sourceObstacle), preferredStub(startSide));
+  const endLength = noEndStub ? 0 : stubLength(end, endSide, targetObstacle, obstacles.filter((r) => r !== targetObstacle), preferredStub(endSide));
   if (startLength === undefined || endLength === undefined) return undefined;
   const from = outside(start, startSide, startLength);
   const to = outside(end, endSide, endLength);
+  const stubs = [
+    { segment: { from: start, to: from }, join: from },
+    { segment: { from: to, to: end }, join: to },
+  ];
   if (obstacles.some((r) => inside(from, r) || inside(to, r)) ||
       segmentBlocked(start, from, obstacles.filter((r) => r !== sourceObstacle)) ||
       segmentBlocked(to, end, obstacles.filter((r) => r !== targetObstacle))) return undefined;
+
+  // Facing ports in a narrow gap can have overlapping stubs. They form one
+  // straight connector, not two forbidden segments that need a detour.
+  const facing = start.y === end.y && (
+    (startSide === "right" && endSide === "left" && start.x < end.x && from.x >= to.x) ||
+    (startSide === "left" && endSide === "right" && start.x > end.x && from.x <= to.x)) ||
+    start.x === end.x && (
+    (startSide === "bottom" && endSide === "top" && start.y < end.y && from.y >= to.y) ||
+    (startSide === "top" && endSide === "bottom" && start.y > end.y && from.y <= to.y));
+  if (facing && !segmentBlocked(start, end, obstacles.filter(r => r !== sourceObstacle && r !== targetObstacle))) {
+    return draw([start, end]);
+  }
+  // Close perpendicular ports can have intersecting fixed stubs as well.
+  // Join at their intersection instead of completing a rectangle around it.
+  if (startLength > 0 && endLength > 0 && (start.y === from.y) !== (to.y === end.y)) {
+    const joint = start.y === from.y ? { x: end.x, y: start.y } : { x: start.x, y: end.y };
+    const on = (a: Point, b: Point) => joint.x >= Math.min(a.x, b.x) && joint.x <= Math.max(a.x, b.x) &&
+      joint.y >= Math.min(a.y, b.y) && joint.y <= Math.max(a.y, b.y);
+    if (on(start, from) && on(to, end)) return draw(simplify([start, joint, end]));
+  }
 
   const nearby = occupied.filter(({ from: a, to: b }) =>
     Math.max(a.x, b.x) >= bounds.left && Math.min(a.x, b.x) <= bounds.right &&
     Math.max(a.y, b.y) >= bounds.top && Math.min(a.y, b.y) <= bounds.bottom);
   const xs = uniqueSorted([from.x, to.x, bounds.left, bounds.right,
     ...obstacles.flatMap((r) => [r.x, r.x + r.width]),
-    ...nearby.filter((s) => s.from.x === s.to.x).flatMap((s) => [s.from.x - LANE_GAP, s.from.x + LANE_GAP])]);
+    ...nearby.flatMap((s) => [s.from.x - LANE_GAP, s.from.x + LANE_GAP, s.to.x - LANE_GAP, s.to.x + LANE_GAP])]);
   const ys = uniqueSorted([from.y, to.y, bounds.top, bounds.bottom,
     ...obstacles.flatMap((r) => [r.y, r.y + r.height]),
-    ...nearby.filter((s) => s.from.y === s.to.y).flatMap((s) => [s.from.y - LANE_GAP, s.from.y + LANE_GAP])]);
+    ...nearby.flatMap((s) => [s.from.y - LANE_GAP, s.from.y + LANE_GAP, s.to.y - LANE_GAP, s.to.y + LANE_GAP])]);
   const nx = xs.length, ny = ys.length;
   const point = (index: number): Point => ({ x: xs[index % nx], y: ys[Math.floor(index / nx)] });
   const free = new Uint8Array(nx * ny);
@@ -228,31 +293,40 @@ export function routeAroundNodes(
   const endIndex = ys.indexOf(to.y) * nx + xs.indexOf(to.x);
   const costs = new Float64Array(nx * ny * 3).fill(Infinity);
   const previous = new Int32Array(costs.length).fill(-1);
-  const heap = new MinHeap();
   const initial = startIndex * 3;
-  costs[initial] = 0;
-  heap.push({ state: initial, cost: 0 });
   let found = -1;
-  while (heap.length) {
-    const current = heap.pop()!;
-    if (current.cost !== costs[current.state]) continue;
-    const index = Math.floor(current.state / 3), direction = current.state % 3;
-    if (index === endIndex) { found = current.state; break; }
-    const x = index % nx, y = Math.floor(index / nx);
-    for (const [next, nextDirection] of [
-      [x > 0 ? index - 1 : -1, 1], [x + 1 < nx ? index + 1 : -1, 1],
-      [y > 0 ? index - nx : -1, 2], [y + 1 < ny ? index + nx : -1, 2],
-    ]) {
-      if (next < 0 || !free[next] || segmentBlocked(point(index), point(next), obstacles)) continue;
-      const a = point(index), b = point(next);
-      const nextCost = current.cost + Math.abs(a.x - b.x) + Math.abs(a.y - b.y) +
-        (direction && direction !== nextDirection ? BEND_COST : 0) + sharedLaneCost(a, b, nearby);
-      const state = next * 3 + nextDirection;
-      if (nextCost >= costs[state]) continue;
-      costs[state] = nextCost;
-      previous[state] = current.state;
-      heap.push({ state, cost: nextCost });
+  // A soft penalty still allowed paths a pixel apart beside an obstacle.
+  // Search with real lane clearance first; relax only when the corridor
+  // cannot accommodate it. Terminal stubs stay protected in both passes.
+  for (const separate of [true, false]) {
+    costs.fill(Infinity);
+    previous.fill(-1);
+    const heap = new MinHeap();
+    costs[initial] = 0;
+    heap.push({ state: initial, cost: 0 });
+    while (heap.length) {
+      const current = heap.pop()!;
+      if (current.cost !== costs[current.state]) continue;
+      const index = Math.floor(current.state / 3), direction = current.state % 3;
+      if (index === endIndex) { found = current.state; break; }
+      const x = index % nx, y = Math.floor(index / nx);
+      for (const [next, nextDirection] of [
+        [x > 0 ? index - 1 : -1, 1], [x + 1 < nx ? index + 1 : -1, 1],
+        [y > 0 ? index - nx : -1, 2], [y + 1 < ny ? index + nx : -1, 2],
+      ]) {
+        if (next < 0 || !free[next] || segmentBlocked(point(index), point(next), obstacles) ||
+          stubs.some(({ segment, join }) => crossesStub(point(index), point(next), segment, join))) continue;
+        const a = point(index), b = point(next);
+        const nextCost = current.cost + Math.abs(a.x - b.x) + Math.abs(a.y - b.y) +
+          (direction && direction !== nextDirection ? BEND_COST : 0) + sharedLaneCost(a, b, nearby, separate, [from, to]);
+        const state = next * 3 + nextDirection;
+        if (nextCost >= costs[state]) continue;
+        costs[state] = nextCost;
+        previous[state] = current.state;
+        heap.push({ state, cost: nextCost });
+      }
     }
+    if (found >= 0) break;
   }
   if (found < 0) return undefined;
   const reversed: Point[] = [];

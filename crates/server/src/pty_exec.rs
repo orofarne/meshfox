@@ -247,8 +247,8 @@ where
             .unwrap_or(-1);
         // Removed here, once the child is actually confirmed gone, rather
         // than relying on the caller to `.wait()` on the returned
-        // `PtyProcess` — `relay_tty_step`'s own `Disconnected` case
-        // returns without ever awaiting it.
+        // `PtyProcess` — a session's driver (`tty_registry::track`) may
+        // be dropped without ever awaiting it.
         if let Some(path) = cleanup {
             let _ = std::fs::remove_file(path);
         }

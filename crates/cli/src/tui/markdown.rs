@@ -951,11 +951,10 @@ impl<'a> Renderer<'a> {
             // instead of running straight into the last table row.
             if !live.stderr.trim().is_empty() {
                 let muted = Style::default().fg(super::theme::BORDER);
-                for line in live.stderr.lines() {
-                    framed.push(Line::from(vec![
-                        Span::styled("│ ", border),
-                        Span::styled(line.to_string(), muted),
-                    ]));
+                for line in super::ansi::lines(&live.stderr) {
+                    let mut spans = vec![Span::styled("│ ", border)];
+                    spans.extend(line.spans.into_iter().map(|mut s| { s.style = muted.patch(s.style); s }));
+                    framed.push(Line::from(spans));
                 }
                 framed.push(Line::from(Span::styled("│ ────", border)));
             }
@@ -996,14 +995,11 @@ impl<'a> Renderer<'a> {
                 first_seg = false;
             }
         } else {
-            for text in [&live.text] {
-                for line in text.lines() {
-                    any_output = true;
-                    framed.push(Line::from(vec![
-                        Span::styled("│ ", border),
-                        Span::raw(line.to_string()),
-                    ]));
-                }
+            for line in super::ansi::lines(&live.text) {
+                any_output = true;
+                let mut spans = vec![Span::styled("│ ", border)];
+                spans.extend(line.spans);
+                framed.push(Line::from(spans));
             }
         }
         if !any_output {
@@ -1820,7 +1816,11 @@ impl<'a> Renderer<'a> {
                         .or_else(|| self.output_region.as_ref().map(|r| r.name.as_str())),
                 );
                 let highlighted = if !view.collapsed && source_expanded {
-                    self.hl.highlight(&lang, &code)
+                    if self.output_region.is_some() {
+                        super::ansi::lines(&code)
+                    } else {
+                        self.hl.highlight(&lang, &code)
+                    }
                 } else {
                     Vec::new()
                 };
@@ -2127,6 +2127,31 @@ mod tests {
             duration_ms: 5,
             running,
         }
+    }
+
+    #[test]
+    fn live_output_renders_ansi_while_running_and_after_completion() {
+        for running in [true, false] {
+            let mut live = table_output(false, running);
+            live.text = "\x1b[38;5;123mfirst\nsecond\x1b[0m".into();
+            let output = std::collections::HashMap::from([("t".into(), live)]);
+            let (segments, _) = render("```bash name=\"t\"\necho hi\n```\n", Path::new("."), &Highlighter::new(), "root", &[], &Default::default(), None, &output);
+            for word in ["first", "second"] {
+                let span = segments.iter().filter_map(|s| if let Segment::Text(l) = s { Some(l) } else { None }).flatten().flat_map(|l| &l.spans).find(|s| s.content == word).unwrap();
+                assert_eq!(span.style.fg, Some(Color::Indexed(123)));
+            }
+        }
+    }
+
+    #[test]
+    fn cached_output_keeps_ansi_styles_across_lines() {
+        let md = "<!-- meshfox:output name=\"build\" hash=\"x\" -->\n```text\n\x1b[31mred\nsecond\x1b[0m plain\n```\n<!-- /meshfox:output -->\n";
+        let (segments, _) = render(md, Path::new("."), &Highlighter::new(), "root", &[], &Default::default(), None, &Default::default());
+        let spans: Vec<_> = segments.iter().filter_map(|s| if let Segment::Text(l) = s { Some(l) } else { None }).flatten().flat_map(|l| &l.spans).collect();
+        for word in ["red", "second"] {
+            assert_eq!(spans.iter().find(|s| s.content == word).unwrap().style.fg, Some(Color::Indexed(1)));
+        }
+        assert!(!segment_text(&segments).contains("[31m"));
     }
 
     #[test]

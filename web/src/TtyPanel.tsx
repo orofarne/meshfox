@@ -63,11 +63,12 @@ interface TtyPanelProps {
    * attach`) instead of starting a fresh one via `/api/run/tty` — every
    * prop above is ignored in this mode (see `TtySessionsPanel`'s own
    * "reopen"). There's no chain/`step-start`/`tty-start` preamble to wait
-   * for here (this endpoint never sends any `TtyRunEvent` JSON at all,
-   * only raw pty bytes) — the mount effect flips straight to `"tty"`
+   * for here (this endpoint sends raw pty bytes and a final done/killed
+   * event) — the mount effect flips straight to `"tty"`
    * status on `ws.onopen`, and killing goes by address
    * (`{nodeId, block}`) rather than a `runId`, since an attach-only
-   * connection never has one. */
+   * connection never has one. It receives a final done/killed event
+   * before the server closes the socket. */
   attachTo?: { nodeId: string; block: string };
   /** Reports each step's state as this run's events arrive (a fresh run
    * only — an attach has none), so the canvas node can show it the same way
@@ -88,13 +89,13 @@ function statusLabel(status: Status, exitCode: number | undefined, errorMsg: str
     case "tty":
       return "interactive";
     case "exited":
-      return `exited (${exitCode})`;
+      return exitCode === 0 ? "✓ Completed · exit 0" : `✕ Failed · exit ${exitCode}`;
     case "killed":
-      return "killed";
+      return "■ Killed";
     case "error":
       return errorMsg ?? "error";
     case "closed":
-      return "disconnected";
+      return "⚠ Connection lost · result unknown";
   }
 }
 
@@ -274,9 +275,8 @@ export function TtyPanel({
             onStepStateRef.current?.(event.nodeId, event.block, { status: "done", exitCode: event.exitCode });
             if (ttyActiveRef.current) {
               ttyActiveRef.current = false;
-              setCanKill(false);
-              setStatus("exited");
-              setExitCode(event.exitCode);
+              // Wait for the chain's final done event before declaring
+              // completion: later dependencies may still be running.
             } else {
               term.write(`\x1b[2m(exit ${event.exitCode})\x1b[0m\r\n`);
             }
@@ -294,6 +294,10 @@ export function TtyPanel({
             setErrorMsg(event.message);
             break;
           case "done":
+            ttyActiveRef.current = false;
+            setCanKill(false);
+            setStatus((s) => s === "killed" || s === "error" ? s : "exited");
+            setExitCode(event.exitCode);
             break;
         }
       } else {
@@ -396,7 +400,7 @@ export function TtyPanel({
       <div className="mesh-tty-panel">
         <div className="mesh-tty-head">
           <span className="mesh-tty-head-title">▶ {activeBlock}</span>
-          <span className="mesh-tty-head-status" data-status={status}>
+          <span className="mesh-tty-head-status" data-status={status} data-outcome={status === "exited" ? (exitCode === 0 ? "success" : "failure") : status}>
             {statusLabel(status, exitCode, errorMsg)}
           </span>
           <span className="mesh-tty-head-actions">
@@ -405,10 +409,10 @@ export function TtyPanel({
                 ⏹ kill
               </button>
             )}
-            <button type="button" onClick={() => setCollapsed(true)} title="Minimize — session keeps running">
+            <button type="button" onClick={() => setCollapsed(true)} title={canKill ? "Minimize — session keeps running" : "Minimize terminal"}>
               _
             </button>
-            <button type="button" onClick={handleClose} title="Close (session keeps running in the background)">
+            <button type="button" onClick={handleClose} title={canKill ? "Close (session keeps running in the background)" : "Close terminal"}>
               ✕
             </button>
           </span>
@@ -426,9 +430,15 @@ export function TtyPanel({
            * area. */}
           <div className="mesh-tty-terminal" ref={containerRef} />
         </div>
+        {["exited", "killed", "error", "closed"].includes(status) && (
+          <div className="mesh-tty-finished" role="status">
+            <span>{status === "closed" ? "Connection lost — result unknown" : status === "error" ? "Session error" : "Session finished"}</span>
+            <button type="button" onClick={handleClose}>Close</button>
+          </div>
+        )}
       </div>
       {collapsed && (
-        <button type="button" className="mesh-tty-pill" onClick={() => setCollapsed(false)}>
+        <button type="button" className="mesh-tty-pill" data-outcome={status === "exited" ? (exitCode === 0 ? "success" : "failure") : status} onClick={() => setCollapsed(false)}>
           ▶ {activeBlock} · {statusLabel(status, exitCode, errorMsg)}
         </button>
       )}

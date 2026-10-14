@@ -1022,12 +1022,14 @@ Working on the frontend itself: the embedded copy is a snapshot from your last `
 `cargo test --workspace` runs the Rust workspace's own unit/integration tests — `crates/core`'s parsing (`mdcanvas`), tree derivation, auto-layout, fence-scanning, dependency-resolution, and variable-handling logic is the bulk of the coverage, each in its own `#[cfg(test)]` module next to the code it exercises, plus a handful of higher-level tests in `crates/server`/`crates/cli` (e.g. the `tty` websocket path). Pure Rust — no Node.js, no built frontend, no browser needed, unlike the end-to-end suite below. `name=`d so it's runnable like any other block here, deliberately without `cache`, same reasoning as "End-to-end tests"/"Release build": the log is per-run noise, not something worth freezing into this file. Flagged `default` since its block name (`run`) doesn't match its node id (`unit-tests`):
 
 ```sh name="run" default
-cargo test --workspace
+export CARGO_TERM_COLOR=always
+cargo test --workspace -- --color=always
 ```
 
 `web/scripts/*.test.mjs` are the frontend's own unit tests: plain `node --test` files over the pure-logic modules under `web/src/` (the fence/argument-signature parser, edge routing, the meshfox Markdown grammar, SVG theming, the table view's filter language and virtual-scroll arithmetic) — no browser, no server, a second or two in total. Nothing runs them implicitly (the release workflow only builds the web app, and `test:e2e`'s `pretest` hook only builds), so run them yourself, alongside the type-check under "Linting" below; the end-to-end suite that drives the real UI is the next section:
 
 ```sh name="web"
+export FORCE_COLOR=1
 cd web && npm run test:unit
 ```
 
@@ -1045,6 +1047,7 @@ npx playwright install chromium firefox
 ```
 
 ```sh name="run" deps="e2e-prep" default
+export FORCE_COLOR=1
 cd web
 npm run test:e2e
 ```
@@ -1068,6 +1071,7 @@ npm install
 ```
 
 ```sh name="vscode-e2e-run" deps="vscode-e2e-prep"
+export CARGO_TERM_COLOR=always FORCE_COLOR=1
 cargo build -p meshfox-cli
 cd web && npm run build && cd ..
 cd editors/vscode && npm run compile && cd e2e
@@ -1086,7 +1090,8 @@ Every test in it is `#[ignore]`d — Cargo has no other way to exclude one integ
 At most six `meshfox tui` sessions are alive at once, whatever `--test-threads` says (`MAX_LIVE_SESSIONS` in `harness.rs`, a semaphore that `TuiSession::spawn` takes a permit from and `Drop` gives back): each one is a real process, a real embedded worker and a pty, and with every test running at once the machine gets loaded enough that tests which look for something on screen right after the first frame fail at random — a different one each run, each green on its own.
 
 ```sh name="tui-e2e-run"
-cargo test --test tui_e2e -- --ignored
+export CARGO_TERM_COLOR=always
+cargo test --test tui_e2e -- --ignored --color=always
 ```
 
 ### Linux tests
@@ -1113,13 +1118,26 @@ limactl shell mfx -- bash -lc '
 `secrets` runs `crates/core/tests/secret_service_it.rs` and `crates/cli/tests/secret_cmd_linux.rs` against `gnome-keyring` in a throwaway session bus (`scripts/secret-service-it.sh`): the backend's round trips, `meshfox secret set/show/rm/list` through the real CLI, a `run` that reads the stored value, and the loud failure when no Secret Service is reachable. It never touches your own keyring.
 
 ```sh name="secrets" deps="lima-prep"
-limactl shell mfx -- bash -lc "cd '$PWD' && export CARGO_TARGET_DIR=\$HOME/target PATH=\$HOME/.cargo/bin:\$PATH CARGO_PROFILE_DEV_DEBUG=0 && scripts/secret-service-it.sh"
+limactl shell mfx -- bash -lc "
+  set -e
+  cd '$PWD'
+  export CARGO_TARGET_DIR=\$HOME/target PATH=\$HOME/.cargo/bin:\$PATH
+  export CARGO_PROFILE_DEV_DEBUG=0 CARGO_TERM_COLOR=always FORCE_COLOR=1
+  scripts/secret-service-it.sh
+"
 ```
 
 `systemd` builds `meshfox`, installs `linux/systemd/meshfox.{socket,service}` for the VM user under a real `systemd --user` and checks socket activation end to end (`scripts/systemd-socket-activation-it.sh`): the service starts on the first connection, `stop` takes the workers down but leaves the socket, a clean `SIGTERM` doesn't restart it, and a worker the service spawned reads a secret from the keyring. The units are removed again afterwards.
 
 ```sh name="systemd" deps="lima-prep"
-limactl shell mfx -- bash -lc "cd '$PWD' && export CARGO_TARGET_DIR=\$HOME/target PATH=\$HOME/.cargo/bin:\$PATH CARGO_PROFILE_DEV_DEBUG=0 && cargo build -p meshfox-cli && scripts/systemd-socket-activation-it.sh"
+limactl shell mfx -- bash -lc "
+  set -e
+  cd '$PWD'
+  export CARGO_TARGET_DIR=\$HOME/target PATH=\$HOME/.cargo/bin:\$PATH
+  export CARGO_PROFILE_DEV_DEBUG=0 CARGO_TERM_COLOR=always FORCE_COLOR=1
+  cargo build -p meshfox-cli
+  scripts/systemd-socket-activation-it.sh
+"
 ```
 
 ```sh name="run" deps="secrets!,systemd!" default
@@ -1132,7 +1150,7 @@ echo "Linux tests passed"
 `web/`'s TypeScript type-checking (`tsc --noEmit`) — no ESLint yet, see TODO.canvas.md (not tracked in this repo) for why. `name=`d so it's runnable like any other block here, deliberately without `cache`, same reasoning as "Unit tests":
 
 ```sh name="typecheck" default
-cd web && npm run typecheck
+cd web && npm run typecheck -- --pretty
 ```
 
 ### Release build
@@ -1142,6 +1160,7 @@ An optimized, distributable single binary. The declared inputs cover Rust and fr
 
 ```sh name="release-build" inputs="Cargo.toml,Cargo.lock,.cargo/config.toml,crates/*/Cargo.toml,crates/*/build.rs,crates/*/src/**,web/src/**,web/public/**,web/package*.json,web/index.html,web/vite.config.ts,web/tsconfig*.json,grammars/**" outputs="target/release/meshfox"
 set -e
+export CARGO_TERM_COLOR=always
 (cd web && npm ci && npm run build)
 cargo build --workspace --release
 if [ "$(uname -s)" = "Darwin" ]; then

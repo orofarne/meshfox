@@ -3032,7 +3032,7 @@ async fn run_worker_tty(
     let exit_code = crate::tui::bridge_http_tty(&mut socket).await;
     let _ = crossterm::terminal::disable_raw_mode();
     let _ = futures_util::SinkExt::close(&mut socket).await;
-    exit_code == 0
+    exit_code.exit_code() == 0
 }
 
 /// Worker-routed counterpart to `apply_node_mv`'s own two-step direct-file

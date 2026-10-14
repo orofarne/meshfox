@@ -138,7 +138,13 @@ export async function submitForm(
   nodeId: string,
   block: string,
   values: Record<string, string>,
-): Promise<{ saved: number; autorunTriggered: { nodeId: string; block: string }[] }> {
+): Promise<{
+  saved: number;
+  /** `tty` is set when the triggered block is itself a `tty` block — there
+   * is no run output to `subscribeRun` to for it; its terminal is announced
+   * by the watch socket's `"tty-started"` and joined by attaching. */
+  autorunTriggered: { nodeId: string; block: string; tty?: boolean }[];
+}> {
   const res = await fetch("/api/form/submit", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -1575,6 +1581,12 @@ export function watchChanges(
    * on disk (a block wrote it, an editor edited it): re-read the preview.
    * Optional. */
   onFilesChanged?: () => void,
+  /** `"tty-started"` — a `tty` step's terminal session just started in the
+   * server (a manual run in any tab, or an `autorun` after a form's Send),
+   * with no output stream to subscribe to: a client that isn't already
+   * showing a terminal attaches to `nodeId`/`block`
+   * (`GET /api/run/tty/attach`). Optional. */
+  onTtyStarted?: (nodeId: string, block: string) => void,
 ): () => void {
   let leaving = false;
   let stopped = false;
@@ -1630,6 +1642,8 @@ export function watchChanges(
           onRunsChanged?.();
         } else if (event.type === "files-changed") {
           onFilesChanged?.();
+        } else if (event.type === "tty-started" && event.nodeId !== undefined && event.block !== undefined) {
+          onTtyStarted?.(event.nodeId, event.block);
         } else if (event.type === "run-started" && event.nodeId !== undefined && event.block !== undefined) {
           onRunStarted?.(event.nodeId, event.block, event.runId);
         } else if (event.type === "node-upserted" && event.node !== undefined) {

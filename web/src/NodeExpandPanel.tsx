@@ -12,7 +12,7 @@ import {
 } from "@xyflow/react";
 import { NodeBodyContent, MeshNode, type MeshNodeData } from "./MeshNode";
 import { DeletableEdge } from "./DeletableEdge";
-import { withEdgeRoutes } from "./edgeRouteLayout";
+import { withEdgeGeometry } from "./edgeRouteLayout";
 import type { CanvasDoc } from "./types";
 import { subtreeIds } from "./tree";
 import type { ThemePreference } from "./theme";
@@ -122,10 +122,22 @@ export function NodeExpandPanel({
     () => edges.filter((e) => memberIds.has(e.source) && memberIds.has(e.target)),
     [edges, memberIds],
   );
-  const routedMemberEdges = useMemo(
-    () => withEdgeRoutes(memberNodes, memberEdges),
+  const geometry = useMemo(
+    () => withEdgeGeometry(memberNodes, memberEdges),
     [memberNodes, memberEdges],
   );
+  const framedMemberNodes = geometry.nodes;
+  const routedMemberEdges = geometry.edges;
+  const onFramedNodesChange: typeof onNodesChange = changes => {
+    const offsets = new Map(framedMemberNodes.map((n, i) => [n.id, {
+      x: geometry.layoutNodes[i].position.x - n.position.x, y: geometry.layoutNodes[i].position.y - n.position.y,
+    }]));
+    onNodesChange(changes.map(change => {
+      if (change.type !== "position" || !change.position) return change;
+      const offset = offsets.get(change.id);
+      return offset ? { ...change, position: { x: change.position.x + offset.x, y: change.position.y + offset.y } } : change;
+    }));
+  };
 
   return createPortal(
     <div className="mesh-expand-backdrop" onClick={onClose}>
@@ -152,9 +164,9 @@ export function NodeExpandPanel({
           {isGroup ? (
             <ReactFlowProvider>
               <ReactFlow
-                nodes={memberNodes}
+                nodes={framedMemberNodes}
                 edges={routedMemberEdges}
-                onNodesChange={onNodesChange}
+                onNodesChange={onFramedNodesChange}
                 onEdgesChange={onEdgesChange}
                 nodeTypes={nodeTypes}
                 edgeTypes={edgeTypes}

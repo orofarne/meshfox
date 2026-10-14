@@ -567,6 +567,7 @@ a {
 }
 
 .mesh-node-title {
+  min-height: calc(2.6rem + 3px);
   flex-shrink: 0;
   display: flex;
   align-items: center;
@@ -1176,6 +1177,9 @@ a {
    * selectable and copyable, in Edit mode or not. */
   user-select: text;
 }
+
+.mesh-node-body > :first-child { margin-top: 0; }
+.mesh-node-body > :last-child { margin-bottom: 0; }
 
 /* A `file` node's `display: "code"` body — see `FileCodePreview` in
  * MeshNode.tsx. Scrolls within its own box rather than growing the node,
@@ -2545,6 +2549,7 @@ a {
 }
 
 .mesh-edge-label-badge {
+  overflow-wrap: anywhere;
   position: absolute;
   transform: translate(-50%, -50%);
   display: flex;
@@ -3662,4 +3667,57 @@ a {
   border-top: 1px solid var(--node-border);
   font-size: 0.8rem;
   color: var(--accent);
+}
+
+.mesh-tty-head-status[data-outcome="success"],
+.mesh-tty-pill[data-outcome="success"] { color: var(--ok); opacity: 1; }
+.mesh-tty-head-status[data-outcome="failure"],
+.mesh-tty-head-status[data-outcome="closed"],
+.mesh-tty-pill[data-outcome="failure"],
+.mesh-tty-pill[data-outcome="error"],
+.mesh-tty-pill[data-outcome="closed"] { color: var(--fail); opacity: 1; }
+.mesh-tty-finished { color: var(--fg); background: var(--code-head-bg); display: flex; align-items: center; justify-content: space-between; padding: 0.6rem 0.9rem; border-top: 1px solid var(--node-border); }
+
+.mesh-node-fit { position: relative; }
+.mesh-node-fit-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  min-width: 275px;
+  padding: 4px;
+  border: 1px solid var(--node-border);
+  border-radius: 8px;
+  background: var(--node-bg);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+}
+.mesh-node-fit-menu button {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--fg);
+  text-align: left;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.mesh-node-fit-menu button:is(:hover, :focus-visible):not(:disabled) { background: var(--code-head-bg); outline: 1px solid var(--accent); }
+.mesh-node-fit-menu button:disabled { opacity: 0.45; cursor: default; }
+.mesh-node-fit-menu small { display: block; font-size: 10px; opacity: 0.65; }
+.mesh-node-fit-direction { width: 20px; font-size: 20px; text-align: center; }
+.mesh-node-fit-dimensions { margin-left: auto; font-size: 10px; opacity: 0.65; white-space: nowrap; }
+.mesh-node-fit-preview {
+  position: absolute;
+  left: -1px;
+  top: -1px;
+  border: 2px dashed var(--accent);
+  border-radius: inherit;
+  background: color-mix(in srgb, var(--accent) 5%, transparent);
+  z-index: 100;
+  pointer-events: none;
 }
