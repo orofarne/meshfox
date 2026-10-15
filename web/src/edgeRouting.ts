@@ -9,7 +9,9 @@ const CLEARANCE = 14;
 const END_STUB = 24;
 const ROUTE_MARGIN = 240;
 const BEND_COST = 28;
-const CORNER_RADIUS = 8;
+// Wider bends make branches at a shared source port visible sooner. A 24px
+// source stub keeps 12px straight before the bend; short legs clamp the radius.
+const CORNER_RADIUS = 16;
 const LANE_GAP = 20;
 
 function outside(point: Point, side: EdgeSide, length: number): Point {

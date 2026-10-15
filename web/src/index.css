@@ -1209,6 +1209,7 @@ a {
   height: 100%;
 }
 .mesh-table-toolbar {
+  flex: none;
   display: flex;
   align-items: center;
   gap: 0.4rem;
@@ -1261,6 +1262,7 @@ a {
   color: var(--accent);
 }
 .mesh-table-banner {
+  flex: none;
   padding: 0.25rem 0.5rem;
   background: var(--syntax-tint);
   font-size: 0.72rem;
@@ -1271,7 +1273,7 @@ a {
 }
 .mesh-table-scroller {
   flex: 1;
-  min-height: 6rem;
+  min-height: 0;
   /* A container with no height of its own (an auto-sized node) would
    * otherwise let the scroller grow to the whole scroll track. */
   max-height: 80vh;
@@ -1408,6 +1410,7 @@ a {
   opacity: 0.6;
 }
 .mesh-table-detail {
+  flex: none;
   display: flex;
   align-items: baseline;
   gap: 0.6rem;
