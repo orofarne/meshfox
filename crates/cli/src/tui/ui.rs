@@ -919,8 +919,8 @@ fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
     let mut service_by_node: HashMap<String, ServiceRowState> = HashMap::new();
     for dto in &app.service_list {
         let state = match dto.status.as_str() {
-            "running" => ServiceRowState::Running,
-            "crashed" => ServiceRowState::Crashed,
+            "running" | "starting" | "stopping" | "restarting" => ServiceRowState::Running,
+            "crashed" | "stop_failed" => ServiceRowState::Crashed,
             _ => continue,
         };
         let entry = service_by_node.entry(dto.node_id.clone()).or_insert(state);
@@ -2131,11 +2131,11 @@ fn render_services_view(f: &mut Frame, area: Rect, app: &App, sv: &ServicesViewS
         .into_iter()
         .map(|dto| {
             let line = match dto.status.as_str() {
-                "running" => Line::from(vec![
+                "running" | "starting" | "stopping" | "restarting" | "stop_failed" => Line::from(vec![
                     Span::raw(format!("{}  ", dto.block)),
                     Span::styled(
-                        format!("running · pid {}", dto.pid),
-                        Style::default().fg(OK),
+                        format!("{} · pid {}", dto.status.replace('_', " "), dto.pid),
+                        Style::default().fg(if dto.status == "stop_failed" { FAIL } else { OK }),
                     ),
                     Span::styled(
                         format!("  {}", dto.node_id),
@@ -2569,7 +2569,8 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         "                so the next chain run re-runs every dependency",
         "e               edit this node's own file, full-screen (Ctrl-s save,",
         "                Ctrl-f switch file, Ctrl-n heading->node, Ctrl-p",
-        "                suggest attributes/tags, mouse click/drag/scroll, esc close)",
+        "                suggest attributes/tags, Ctrl-g Unicode, esc close)",
+        "                mouse click/drag/scroll inside the editor",
         "                (unavailable on a read-only canvas, like H below)",
         "i               (Document focus) open/focus this node's own form —",
         "                tab/down next field, shift-tab/up previous, left/right",
@@ -2749,7 +2750,7 @@ fn render_source_editor(
     let footer = match &se.error {
         Some(msg) => Line::from(Span::styled(msg.as_str(), Style::default().fg(FAIL))),
         None => Line::from(Span::styled(
-            "Ctrl-s save · Ctrl-f switch file · Ctrl-n heading→node · Ctrl-p suggest params · \
+            "Ctrl-s save · Ctrl-f switch file · Ctrl-n heading→node · Ctrl-p suggest params · Ctrl-g Unicode · \
              esc close (vim keys inside the buffer)",
             Style::default().fg(Color::DarkGray),
         )),
@@ -2764,6 +2765,9 @@ fn render_source_editor(
     }
     if se.tag_suggest_open {
         render_tag_suggest_popup(f, area, se);
+    }
+    if let Some(picker) = &mut se.unicode_picker {
+        picker.render(f, area);
     }
 }
 

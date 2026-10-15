@@ -3245,6 +3245,13 @@ a {
   background: var(--ok);
 }
 
+.service-panel-status-starting,
+.service-panel-status-stopping,
+.service-panel-status-restarting {
+  background: var(--warn, #d9a441);
+}
+
+.service-panel-status-stop_failed,
 .service-panel-status-crashed {
   background: var(--fail);
 }

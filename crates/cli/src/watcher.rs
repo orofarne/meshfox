@@ -438,7 +438,8 @@ async fn watch_worker(
 
 /// How long a worker asked to stop (`Kill`) gets to exit after `SIGTERM`
 /// before it is killed outright.
-const TERMINATE_GRACE: Duration = Duration::from_secs(5);
+// Must exceed the largest configurable service stop_timeout.
+const TERMINATE_GRACE: Duration = Duration::from_secs(3620);
 
 /// `SIGTERM` first (the macOS daemon's `Process.terminate()` does the same),
 /// then `SIGKILL` if the worker is still there after [`TERMINATE_GRACE`].
@@ -746,7 +747,7 @@ pub async fn run(
     // Give every worker task a moment to actually kill+reap its child and
     // deregister — best-effort, not load-bearing for correctness (each
     // task keeps running to completion regardless of this timing out).
-    let _ = tokio::time::timeout(Duration::from_secs(5), registry.wait_until_empty()).await;
+    let _ = tokio::time::timeout(TERMINATE_GRACE, registry.wait_until_empty()).await;
     accept_task.abort();
     let _ = std::fs::remove_file(&socket_path);
     Ok(())

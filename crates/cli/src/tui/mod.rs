@@ -20,6 +20,7 @@ mod svg_raster;
 mod table;
 mod theme;
 mod tree;
+mod unicode_picker;
 // `pub(crate)` (not the default private) so `syntax_registry.rs`'s own
 // tests can reference `ui::SOURCE_EDITOR_THEME` directly rather than
 // hardcoding a second copy of it that could silently drift out of sync.
@@ -208,6 +209,18 @@ pub async fn run(canvas_path: PathBuf, initial_node: Option<String>) -> io::Resu
     )?;
     terminal.show_cursor()?;
 
+    if embedded_worker {
+        if let Some(port) = worker_port {
+            if let Ok(services) = crate::worker_client::list_services(port).await {
+                let results = futures_util::future::join_all(services.iter().map(|s| {
+                    crate::worker_client::stop_service(port, &s.node_id, &s.block)
+                })).await;
+                for error in results.into_iter().filter_map(Result::err) {
+                    eprintln!("meshfox tui: service shutdown failed: {error}");
+                }
+            }
+        }
+    }
     result
 }
 
@@ -226,7 +239,7 @@ pub async fn run(canvas_path: PathBuf, initial_node: Option<String>) -> io::Resu
 ///   same signals) stops every service/run/tty and then `exit`s ~200ms
 ///   later. This handler only has to restore the terminal *before* that
 ///   `exit` — it does so immediately, so it always wins the race — and
-///   exits itself after a grace period in case the worker's never does.
+///   lets the embedded worker finish its configured shutdown grace period.
 /// - `false`: the worker belongs to someone else and outlives this TUI
 ///   (its services are not ours to stop), so restoring and exiting is all
 ///   there is to do.
@@ -248,7 +261,9 @@ fn spawn_signal_terminal_restore(embedded_worker: bool) {
         };
         restore_terminal_best_effort();
         if embedded_worker {
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            // The embedded worker owns shutdown and exits after its
+            // services have completed their configured grace periods.
+            std::future::pending::<()>().await;
         }
         std::process::exit(code);
     });
@@ -282,7 +297,7 @@ fn spawn_worker_watcher(
     port: u16,
     reload_tx: tokio::sync::mpsc::UnboundedSender<Reload>,
     external_run_tx: tokio::sync::mpsc::UnboundedSender<ExternalMsg>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         use crate::worker_client::WatchEvent;
         let mut changes = crate::worker_client::watch(port);
@@ -318,7 +333,7 @@ fn spawn_worker_watcher(
                 }
             }
         }
-    });
+    })
 }
 
 /// What the worker watcher tells the main loop.
@@ -449,14 +464,10 @@ async fn main_loop(
         }
 
         if let Some(pending) = app.pending_child_canvas.take() {
-            run_child_canvas_handoff(
-                terminal,
-                input_paused,
-                input_rx,
-                &pending.path,
-                pending.node.as_deref(),
-            )
-            .await?;
+            let result = run_child_canvas_handoff(terminal, input_paused, input_rx, pending).await;
+            if let Err(e) = result {
+                app.status = format!("failed to open canvas: {e}");
+            }
             continue;
         }
 
@@ -548,69 +559,40 @@ async fn main_loop(
     }
 }
 
-/// Leaves the TUI's screen entirely, runs a synchronous child `meshfox tui
-/// <path>` (`--node <id>` too, for a deep link — see `Command::Tui`'s own
-/// `node` field) with its stdin/stdout/stderr inherited from the real
-/// terminal, and comes back once it exits — the terminal counterpart to
-/// the web UI's "↗ open" button navigating to another canvas (see
-/// `crates/server/src/lib.rs`'s `open_node_file`), but without that one's
-/// registry/daemon machinery: a nested TUI is a plain foreground child,
-/// same as a `tty` block, so there's no port to hand back and nothing to
-/// keep alive after it exits. Same leave/restore-screen shape as
-/// `run_tty_handoff` right below, for the same reason (`input_paused`
-/// keeps the background reader thread off the fd the child now owns).
+/// Enter a nested API client using the worker selected by the open API.
+/// The parent App and its subscriptions remain alive for return with `q`.
 async fn run_child_canvas_handoff(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     input_paused: &Arc<AtomicBool>,
     input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
-    path: &std::path::Path,
-    node: Option<&str>,
+    pending: app::PendingChildCanvas,
 ) -> io::Result<()> {
-    input_paused.store(true, Ordering::Release);
-    tokio::time::sleep(Duration::from_millis(80)).await;
-
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-
-    let outcome = async {
-        let exe = std::env::current_exe()?;
-        let mut cmd = tokio::process::Command::new(&exe);
-        cmd.arg("tui").arg(path);
-        if let Some(node) = node {
-            cmd.arg("--node").arg(node);
-        }
-        cmd.stdin(std::process::Stdio::inherit())
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
-            .status()
-            .await
-    }
+    let (background_tx, mut background_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut child = App::new(
+        pending.path,
+        background_tx,
+        pending.node.as_deref(),
+        Some(pending.port),
+    )
+    .await?;
+    let (reload_tx, mut reload_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (external_tx, mut external_rx) = tokio::sync::mpsc::unbounded_channel();
+    let watcher = spawn_worker_watcher(pending.port, reload_tx, external_tx);
+    // Box the recursive navigation so arbitrarily nested canvases have a
+    // finite future size. All input stays on the existing reader thread.
+    let result = Box::pin(main_loop(
+        terminal,
+        &mut child,
+        input_rx,
+        input_paused,
+        &mut reload_rx,
+        &mut background_rx,
+        &mut external_rx,
+    ))
     .await;
-
-    if let Err(e) = outcome {
-        println!(
-            "\r\nfailed to open {}: {e}\r\n(press any key to return to the canvas)",
-            path.display()
-        );
-        input_paused.store(false, Ordering::Release);
-        let _ = input_rx.recv().await;
-        input_paused.store(true, Ordering::Release);
-    }
-
-    enable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        EnterAlternateScreen,
-        EnableMouseCapture
-    )?;
+    watcher.abort();
     terminal.clear()?;
-
-    input_paused.store(false, Ordering::Release);
-    Ok(())
+    result
 }
 
 /// Leaves the alternate screen and relays an already-connected

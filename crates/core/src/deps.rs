@@ -48,6 +48,8 @@ impl BlockAddr {
 pub enum DepsError {
     #[error("application graph exceeds its limit ({0})")]
     ExpansionLimit(&'static str),
+    #[error("service configuration: {0}")]
+    ServiceConfig(String),
     #[error("block arguments: {0}")]
     Arguments(String),
     #[error("artifact dependency: {0}")]
@@ -645,6 +647,10 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
                     node.id.clone(),
                     name.clone(),
                 ));
+            }
+            if block.interpreter.as_deref() == Some("@service") {
+                crate::service::ServiceConfig::parse(&block.code)
+                    .map_err(|e| DepsError::ServiceConfig(e.to_string()))?;
             }
             if block.service && block.tty {
                 return Err(DepsError::ServiceTtyConflict(node.id.clone(), name.clone()));

@@ -17,7 +17,8 @@ use std::time::Duration;
 // |---|---|---|
 // | quick | 30 s | node edits and reads, canvas/vars/history/run/service reads, forms, `debug_start`/`debug_stop`, file reads |
 // | whole document | 60 s | `put_canvas_raw` (a canvas-valued include goes through another worker, which the daemon gives 15 s to start), `history_goto` (replays up to 200 steps) |
-// | control | 20 s | `stop_service`, `restart_service`, `kill_run` (a `SIGKILL` of the process group and a wait of up to 5 s) |
+// | control | 20 s | `kill_run` (a `SIGKILL` of the process group and a wait of up to 5 s) |
+// | service control | 3620 s | `stop_service`, `restart_service` (configurable graceful shutdown, at most 1h plus margin) |
 // | debug command | the command's own `timeoutMs` + 15 s | `debug_send` — its own limit must fire before this one does |
 //
 // Connecting gets 5 s on top of that: a worker listens on localhost, so a
@@ -29,6 +30,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const QUICK: Duration = Duration::from_secs(30);
 const WHOLE_DOCUMENT: Duration = Duration::from_secs(60);
 const CONTROL: Duration = Duration::from_secs(20);
+// Service stop_timeout is author-configurable (up to one hour).
+const SERVICE_CONTROL: Duration = Duration::from_secs(3620);
 const DEBUG_SEND_MARGIN: Duration = Duration::from_secs(15);
 const PING: Duration = Duration::from_secs(3);
 
@@ -978,6 +981,42 @@ pub async fn get_node_file_content(port: u16, node_id: &str) -> Result<(String, 
     Ok((body.content, body.truncated))
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum OpenAction {
+    Done,
+    OpenCanvas {
+        path: std::path::PathBuf,
+        fragment: Option<String>,
+        port: u16,
+    },
+}
+
+/// Resolve and open a file node through the same API as the web client.
+pub async fn open_node_file(port: u16, node_id: &str) -> Result<OpenAction, String> {
+    let mut url = node_url(port, node_id)?;
+    url.path_segments_mut()
+        .map_err(|_| "couldn't build the worker's open URL".to_string())?
+        .push("open");
+    url.query_pairs_mut().append_pair("context", "tui");
+    let res = client()
+        .post(url)
+        .timeout(time_limit(WHOLE_DOCUMENT))
+        .send()
+        .await
+        .map_err(|e| describe(&e))?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        return Err(if text.is_empty() {
+            status.to_string()
+        } else {
+            text
+        });
+    }
+    res.json().await.map_err(|e| e.to_string())
+}
+
 /// One column of a `display="table"` node, as `GET /api/nodes/:id/table`
 /// reports it (see `meshfox_server::tables::Column`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
@@ -1315,13 +1354,22 @@ pub fn watch(port: u16) -> tokio::sync::mpsc::UnboundedReceiver<WatchEvent> {
         }
         loop {
             let url = format!("ws://127.0.0.1:{port}/api/watch");
-            let Ok((mut ws, _)) = tokio_tungstenite::connect_async(&url).await else {
+            let connection = tokio::select! {
+                _ = tx.closed() => return,
+                result = tokio_tungstenite::connect_async(&url) => result,
+            };
+            let Ok((mut ws, _)) = connection else {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 continue;
             };
             // A silent connection is dropped and re-established below, the
             // same as one the worker closed.
-            while let WsNext::Frame(msg) = ws_next(&mut ws).await {
+            loop {
+                let next = tokio::select! {
+                    _ = tx.closed() => return,
+                    next = ws_next(&mut ws) => next,
+                };
+                let WsNext::Frame(msg) = next else { break };
                 let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
                     continue;
                 };
@@ -2451,7 +2499,7 @@ pub async fn stop_service(port: u16, node_id: &str, block: &str) -> Result<(), S
     let res = client()
         .post(format!("{}/api/services/stop", base_url(port)))
         .json(&serde_json::json!({ "nodeId": node_id, "block": block }))
-        .timeout(time_limit(CONTROL))
+        .timeout(time_limit(SERVICE_CONTROL))
         .send()
         .await
         .map_err(|e| describe(&e))?;
@@ -2468,7 +2516,7 @@ pub async fn restart_service(
     let res = client()
         .post(format!("{}/api/services/restart", base_url(port)))
         .json(&serde_json::json!({ "nodeId": node_id, "block": block, "confirm": confirm }))
-        .timeout(time_limit(CONTROL))
+        .timeout(time_limit(SERVICE_CONTROL))
         .send()
         .await
         .map_err(|e| describe(&e))?;

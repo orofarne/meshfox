@@ -173,7 +173,14 @@ where
     for name in context.remove {
         cmd.env_remove(name);
     }
+    let configured: Vec<_> = context.values.iter().map(|(k, _)| k.clone()).collect();
     for (name, value) in context.values {
+        cmd.env(name, value);
+    }
+    // The pty is rendered by xterm.js, which handles 256-color/truecolor, but
+    // a server started from a GUI app (launchd) inherits neither `TERM` nor
+    // `COLORTERM` — TUIs such as Claude Code then fall back to monochrome.
+    for (name, value) in terminal_defaults(&configured, |n| std::env::var_os(n)) {
         cmd.env(name, value);
     }
     if let Some(cwd) = cwd {
@@ -265,6 +272,22 @@ where
     })
 }
 
+/// `TERM`/`COLORTERM` defaults for a pty child, only for the names neither
+/// configured explicitly (`[process_env]` / block locals) nor inherited
+/// non-empty from the server's own environment.
+fn terminal_defaults(
+    configured: &[std::ffi::OsString],
+    inherited: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<(&'static str, &'static str)> {
+    [("TERM", "xterm-256color"), ("COLORTERM", "truecolor")]
+        .into_iter()
+        .filter(|(name, _)| {
+            !configured.iter().any(|c| c == std::ffi::OsStr::new(name))
+                && inherited(name).is_none_or(|v| v.is_empty())
+        })
+        .collect()
+}
+
 fn to_io_error(e: anyhow::Error) -> io::Error {
     io::Error::other(e)
 }
@@ -275,6 +298,27 @@ mod tests {
 
     fn no_envs() -> [(&'static str, &'static str); 0] {
         []
+    }
+
+    #[test]
+    fn terminal_defaults_only_fill_what_is_missing() {
+        let none = |_: &str| None;
+        assert_eq!(
+            terminal_defaults(&[], none),
+            [("TERM", "xterm-256color"), ("COLORTERM", "truecolor")]
+        );
+        let configured = ["TERM".into()];
+        assert_eq!(
+            terminal_defaults(&configured, none),
+            [("COLORTERM", "truecolor")]
+        );
+        let inherited = |n: &str| (n == "COLORTERM").then(|| "24bit".into());
+        assert_eq!(
+            terminal_defaults(&[], inherited),
+            [("TERM", "xterm-256color")]
+        );
+        let empty = |_: &str| Some("".into());
+        assert_eq!(terminal_defaults(&[], empty).len(), 2);
     }
 
     #[tokio::test]

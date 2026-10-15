@@ -937,9 +937,9 @@ function ConstraintBadge({ status }: { status: ConstraintStatusDto | undefined }
  * service shows two visually distinguishable badges. */
 function ServiceBadge({ services, onOpen }: { services: ServiceStatusDto[] | undefined; onOpen: () => void }) {
   if (!services || services.length === 0) return null;
-  const anyCrashed = services.some((s) => s.status === "crashed");
+  const anyCrashed = services.some((s) => (s.status === "crashed" || s.status === "stop_failed"));
   const title = anyCrashed
-    ? `${services.filter((s) => s.status === "crashed").length} service(s) crashed — click to open`
+    ? `${services.filter((s) => (s.status === "crashed" || s.status === "stop_failed")).length} service(s) crashed — click to open`
     : `${services.length} service(s) — click to open`;
   return (
     <span

@@ -124,6 +124,8 @@ pub struct SourceEditorState {
     pub tag_suggest_open: bool,
     pub tag_suggest_candidates: Vec<String>,
     pub tag_suggest_selected: usize,
+    /// Ctrl-g captures input until a symbol is inserted or the palette is cancelled.
+    pub unicode_picker: Option<super::unicode_picker::UnicodePicker>,
 }
 
 /// Which attribute vocabulary a suggestible line belongs to — see
@@ -197,6 +199,7 @@ impl SourceEditorState {
             attr_suggest_candidates: Vec::new(),
             attr_suggest_selected: 0,
             all_tags,
+            unicode_picker: None,
             tag_suggest_open: false,
             tag_suggest_candidates: Vec::new(),
             tag_suggest_selected: 0,
@@ -295,6 +298,27 @@ impl SourceEditorState {
         if self.diff.is_some() {
             return self.on_diff_key(key);
         }
+        if let Some(picker) = &mut self.unicode_picker {
+            match key.code {
+                KeyCode::Esc => self.unicode_picker = None,
+                KeyCode::Enter => {
+                    if let Some(c) = picker.chosen() {
+                        let mode = self.editor.mode;
+                        if mode != EditorMode::Insert {
+                            self.editor
+                                .execute(edtui::actions::SwitchMode(EditorMode::Insert));
+                        }
+                        type_str(&mut self.editor, &c.to_string());
+                        if mode != EditorMode::Insert {
+                            self.editor.execute(edtui::actions::SwitchMode(mode));
+                        }
+                        self.unicode_picker = None;
+                    }
+                }
+                _ => picker.on_key(key),
+            }
+            return SourceEditorOutcome::Stay;
+        }
         if self.file_picker_open {
             return match self.on_file_picker_key(key) {
                 Some((path, is_canvas)) => SourceEditorOutcome::Switch { path, is_canvas },
@@ -311,6 +335,11 @@ impl SourceEditorState {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
+                KeyCode::Char('g') => {
+                    self.pending_discard = false;
+                    self.unicode_picker = Some(super::unicode_picker::UnicodePicker::new());
+                    return SourceEditorOutcome::Stay;
+                }
                 KeyCode::Char('s') => return SourceEditorOutcome::Save,
                 KeyCode::Char('f') => {
                     self.file_picker_open = true;
@@ -377,7 +406,11 @@ impl SourceEditorState {
             diff.on_mouse(mouse);
             return;
         }
-        if self.file_picker_open || self.attr_suggest_open || self.tag_suggest_open {
+        if self.file_picker_open
+            || self.attr_suggest_open
+            || self.tag_suggest_open
+            || self.unicode_picker.is_some()
+        {
             return;
         }
         self.events.on_mouse_event(mouse, &mut self.editor);
@@ -873,7 +906,10 @@ mod tests {
         assert!(matches!(outcome, SourceEditorOutcome::Stay));
         assert!(editor.diff.is_none());
         assert_eq!(editor.editor.lines.to_string(), "# Root\n");
-        assert!(editor.error.as_deref().is_some_and(|e| e.contains("not saved")));
+        assert!(editor
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("not saved")));
         // Nothing was decided: the next save is still against what was read.
         assert_eq!(editor.base_rev(), meshfox_core::body_rev("# Root\n"));
     }
@@ -944,6 +980,44 @@ mod tests {
     // cover is the wiring itself (crossterm's `MouseEvent` reaches
     // `EditorState` correctly through it) and the one guard this file adds
     // on top (no mouse handling while the file picker overlay is open).
+    #[test]
+    fn unicode_picker_inserts_at_cursor_and_undoes_in_normal_and_insert_modes() {
+        for insert_mode in [false, true] {
+            let mut se = open_test_editor("ab");
+            se.editor.cursor = Index2::new(0, 1);
+            if insert_mode {
+                se.on_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+            }
+            se.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+            for c in "U+221E".chars() {
+                se.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+            }
+            se.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(se.unicode_picker.is_none());
+            assert_eq!(se.editor.lines.to_string(), "a∞b");
+            if insert_mode {
+                se.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            }
+            se.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+            assert_eq!(se.editor.lines.to_string(), "ab");
+        }
+    }
+
+    #[test]
+    fn unicode_picker_cancel_and_empty_enter_leave_editor_untouched() {
+        let mut se = open_test_editor("ab");
+        se.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        for c in "U+D800".chars() {
+            se.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        se.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(se.unicode_picker.is_some());
+        se.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(se.unicode_picker.is_none());
+        assert_eq!(se.editor.lines.to_string(), "ab");
+        assert!(!se.dirty());
+    }
+
     fn open_test_editor(text: &str) -> SourceEditorState {
         open_test_editor_with_tags(text, Vec::new())
     }

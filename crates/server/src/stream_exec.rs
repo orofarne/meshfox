@@ -154,6 +154,23 @@ where
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
+    spawn_bash_command(command)
+}
+
+/// Run a lifecycle command using the environment captured at service start.
+/// It deliberately does not reload process_env from a possibly edited config.
+pub(crate) fn spawn_bash_frozen(
+    code: &str,
+    environment: &[(std::ffi::OsString, std::ffi::OsString)],
+    cwd: &Path,
+) -> io::Result<SpawnedProcess> {
+    let mut command = Command::new("bash");
+    command.arg("-e").arg("-c").arg(code)
+        .current_dir(cwd).env_clear().envs(environment.iter().map(|(k, v)| (k, v)));
+    spawn_bash_command(command)
+}
+
+fn spawn_bash_command(mut command: Command) -> io::Result<SpawnedProcess> {
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

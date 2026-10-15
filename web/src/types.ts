@@ -171,7 +171,7 @@ export interface CanvasDoc {
 export interface ServiceStatusDto {
   nodeId: string;
   block: string;
-  status: "running" | "crashed" | "stopped";
+  status: "running" | "starting" | "stopping" | "restarting" | "stop_failed" | "crashed" | "stopped";
   /** Present only when `status === "crashed"`. */
   exitCode?: number;
   pid: number;

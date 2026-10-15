@@ -257,19 +257,10 @@ impl RunHistoryViewState {
     }
 }
 
-/// A canvas-target `file`-node "open" waiting for `mod.rs`'s event loop to
-/// hand the terminal to a nested child TUI — the terminal counterpart to
-/// `PendingHttpTty` above, and to the web UI's cross-canvas navigation (see
-/// `crates/server/src/lib.rs`'s `open_node_file`), but without that one's
-/// registry/daemon: a nested TUI runs synchronously in the foreground, so
-/// there's nothing to keep alive once it exits and nothing to look up by
-/// port. See `App::trigger_open_file`.
+/// API-resolved canvas navigation waiting for the event loop.
 pub struct PendingChildCanvas {
     pub path: PathBuf,
-    /// The `#fragment` off the original link target, if any — becomes the
-    /// child's own `--node` (see `Command::Tui`), so a
-    /// `[label](other.canvas.md#some-node)` deep link lands the nested TUI
-    /// on `some-node` instead of its root.
+    pub port: u16,
     pub node: Option<String>,
 }
 
@@ -1492,7 +1483,7 @@ impl App {
             KeyCode::Char('t') => self.open_tty_sessions_view().await,
             KeyCode::Char('H') => self.open_history_view().await,
             KeyCode::Char('L') => self.open_run_history().await,
-            KeyCode::Char('o') => self.trigger_open_file(),
+            KeyCode::Char('o') => self.trigger_open_file().await,
             KeyCode::Char('c') => self.trigger_configure().await,
             KeyCode::Char('e') => self.open_source_editor().await,
             // The keyboard counterpart to clicking a pane's own `[+]`/`[-]`
@@ -3077,64 +3068,31 @@ impl App {
             .is_some_and(|node| node.node_type == NodeType::File && node.target.is_some())
     }
 
-    /// `o` — opens the selected `file` node's `target`, the terminal
-    /// counterpart to the web UI's "↗ open" button
-    /// (`crates/server/src/lib.rs`'s `open_node_file` handler does the
-    /// same thing over HTTP, for the browser case). A plain file goes to
-    /// the OS's own default application for it (`open` on macOS,
-    /// `xdg-open` on Linux, `start` on Windows, via the `open` crate) —
-    /// best-effort, spawns the opener and returns as soon as it has,
-    /// without waiting for it to exit. A `.canvas.md` (or marker-carrying
-    /// `.md`) target has no such OS association to hand off to instead
-    /// arms `pending_child_canvas` for `mod.rs`'s event loop to hand the
-    /// terminal to a nested `meshfox tui` — no registry/daemon needed
-    /// here, unlike the web case: a nested TUI is a plain synchronous
-    /// foreground child, same shape as a `tty` block's own handoff. Target
-    /// resolved relative to the canvas file's own directory, same
-    /// `base_dir` join `render_current_document`'s `display="code"`
-    /// preview already uses — no separate "must stay inside the canvas
-    /// directory" confinement check like the server's own
-    /// `resolve_confined_target`, since there's no network boundary to
-    /// defend here: this is the user's own local process, opening a file
-    /// they can already reach directly.
-    fn trigger_open_file(&mut self) {
+    /// Open via the worker: it owns target resolution, file access and
+    /// coordinator requests; the TUI only handles the returned navigation.
+    async fn trigger_open_file(&mut self) {
         let Some(row) = self.rows.get(self.selected) else {
             return;
         };
-        let Some(node) = self.display_canvas.node(&row.node_id) else {
+        let node_id = row.node_id.clone();
+        let Some(port) = self.worker_port else {
+            self.status = "no worker for canvas".into();
             return;
         };
-        if node.node_type != NodeType::File {
-            self.status = "not a file node".into();
-            return;
-        }
-        let Some(target) = &node.target else {
-            self.status = "file node has no target".into();
-            return;
-        };
-        let (target_path, fragment) = meshfox_core::mdcanvas::split_target_fragment(target);
-        let base_dir = self
-            .canvas_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf();
-        let path = base_dir.join(target_path);
-
-        let is_canvas = meshfox_core::mdcanvas::is_canvas_path(&path)
-            || (path.extension().is_some_and(|ext| ext == "md")
-                && std::fs::read_to_string(&path)
-                    .is_ok_and(|contents| meshfox_core::mdcanvas::has_marker(&contents)));
-        if is_canvas {
-            self.pending_child_canvas = Some(PendingChildCanvas {
+        match crate::worker_client::open_node_file(port, &node_id).await {
+            Ok(crate::worker_client::OpenAction::Done) => self.status = "opened".into(),
+            Ok(crate::worker_client::OpenAction::OpenCanvas {
                 path,
-                node: fragment.map(str::to_string),
-            });
-            return;
-        }
-
-        match open::that(&path) {
-            Ok(()) => self.status = format!("opened {}", path.display()),
-            Err(e) => self.status = format!("failed to open {}: {e}", path.display()),
+                fragment,
+                port,
+            }) => {
+                self.pending_child_canvas = Some(PendingChildCanvas {
+                    path,
+                    port,
+                    node: fragment,
+                });
+            }
+            Err(e) => self.status = format!("failed to open: {e}"),
         }
     }
 
@@ -5093,8 +5051,8 @@ impl App {
         let (mut running, mut crashed) = (0usize, 0usize);
         for dto in &list {
             match dto.status.as_str() {
-                "running" => running += 1,
-                "crashed" => crashed += 1,
+                "running" | "starting" | "stopping" | "restarting" => running += 1,
+                "crashed" | "stop_failed" => crashed += 1,
                 _ => {}
             }
         }
@@ -6930,6 +6888,74 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn opening_missing_file_reports_worker_error_without_handoff() {
+        for target in ["missing.txt", "missing.canvas.md#root"] {
+            let fixture = app_with_blocks(
+                "missing-open",
+                &format!(
+                    "## Missing\n<!-- meshfox:node id=\"missing\" type=\"file\" -->\n\n[Missing]({target})\n"
+                ),
+            )
+            .await;
+            let mut app = app_with_real_worker(fixture.canvas_path.clone()).await;
+            app.selected = app
+                .rows
+                .iter()
+                .position(|r| r.node_id == "missing")
+                .unwrap();
+            app.on_key(key(KeyCode::Char('o'))).await;
+            assert!(app.status.starts_with("failed to open:"), "{}", app.status);
+            assert!(app.status.contains("missing."), "{}", app.status);
+            assert!(app.pending_child_canvas.is_none());
+            let _ = std::fs::remove_dir_all(app.canvas_path.parent().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn open_uses_worker_action_without_reading_the_returned_path() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        for body in [
+            r#"{"error":"missing.txt: No such file or directory"}"#,
+            r#"{"action":"done"}"#,
+            r#"{"action":"open_canvas","path":"/api-only/other.canvas.md","fragment":"child","port":4242}"#,
+        ] {
+            let mut app = app_with_blocks("api-open", "").await;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            app.worker_port = Some(listener.local_addr().unwrap().port());
+            let request = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = vec![0; 4096];
+                let n = socket.read(&mut bytes).await.unwrap();
+                socket.write_all(format!(
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", if body.contains("error") { "404 Not Found" } else { "200 OK" }, body.len()
+                ).as_bytes()).await.unwrap();
+                String::from_utf8_lossy(&bytes[..n]).into_owned()
+            });
+            app.on_key(key(KeyCode::Char('o'))).await;
+            assert!(request
+                .await
+                .unwrap()
+                .starts_with("POST /api/nodes/root/open?context=tui "));
+            if body.contains("error") {
+                assert!(app
+                    .status
+                    .contains("missing.txt: No such file or directory"));
+                assert!(app.pending_child_canvas.is_none());
+            } else if body.contains("open_canvas") {
+                let pending = app.pending_child_canvas.as_ref().unwrap();
+                assert_eq!(pending.path, Path::new("/api-only/other.canvas.md"));
+                assert_eq!(pending.port, 4242);
+                assert_eq!(pending.node.as_deref(), Some("child"));
+            } else {
+                assert_eq!(app.status, "opened");
+                assert!(app.pending_child_canvas.is_none());
+            }
+            let _ = std::fs::remove_dir_all(app.canvas_path.parent().unwrap());
+        }
+    }
 
     #[tokio::test]
     async fn passive_output_before_foreground_step_does_not_leave_a_spinner() {

@@ -571,7 +571,7 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
     const cache = attrs.cache !== undefined && attrs.cache !== "false";
     const tty = attrs.tty !== undefined && attrs.tty !== "false";
     const autoclose = attrs.autoclose !== undefined && attrs.autoclose !== "false";
-    const service = attrs.service !== undefined && attrs.service !== "false";
+    const service = attrs.interpreter === "@service" || (attrs.service !== undefined && attrs.service !== "false");
     const isDefault = attrs.default !== undefined && attrs.default !== "false";
     const autorun = attrs.autorun !== undefined && attrs.autorun !== "false";
     const render = attrs.render;

@@ -1288,7 +1288,7 @@ export async function fetchServiceLog(
   return res.json();
 }
 
-/** Kills the service's whole process group and releases its lock file —
+/** Awaits graceful service shutdown before releasing its ledger address —
  * the registry entry itself stays (now `"stopped"`), not removed. */
 export async function stopService(nodeId: string, block: string): Promise<void> {
   const res = await fetch("/api/services/stop", {

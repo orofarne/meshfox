@@ -97,6 +97,7 @@ tokio-tungstenite = "0.30.0"
 # bytes_stream()` needs `StreamExt` to poll; already a real dependency of
 # `meshfox-server` at this same version, reused rather than re-pinned.
 futures-util = "0.3.33"
+unicode_names2 = "3"
 
 [dev-dependencies]
 portable-pty = "0.9"

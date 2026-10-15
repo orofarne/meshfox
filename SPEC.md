@@ -248,6 +248,15 @@ canvas (own process, own crash/hang boundary), the same "click through"
 `meshfox view`/`meshfox tui` already use for cross-canvas navigation, with
 an optional `#node-id` fragment deep-linking to a node in it.
 
+WebUI and TUI open file nodes through `POST /api/nodes/:id/open` with
+`context=web` or `context=tui`. The worker resolves the target and checks
+file access and existence; clients display API failures. Plain files open
+through the coordinator. For canvas targets the coordinator gets or starts
+the target worker, and the API returns its port and optional node fragment.
+WebUI opens a browser tab; TUI enters a nested API client and returns to the
+parent canvas on `q`, without reading the target or spawning another TUI.
+Opening requires a coordinator; an unavailable coordinator is an API error.
+
 ## Includes
 
 `type="include"` dynamically dumps another file's raw content into this
@@ -1331,9 +1340,8 @@ persisted session results.
 
 **Ownership**: a service is tied to the lifetime of whichever OS process
 spawned it — the `meshfox view` server, `meshfox tui`, or a `meshfox run`
-invocation. It's tracked in a lock file under `.meshfox/services/`
-(gitignored local machine state, same convention as the venv/resolved-var
-caches) recording the owning process. If that lock file already names
+invocation. Its address and owning PID are tracked by the per-canvas run ledger
+under `.meshfox/` (gitignored local machine state). If that ledger already names
 another live (or dead-but-unreleased) process when a `service` block is
 about to start, the user is always prompted — kill the recorded process
 and start fresh, or cancel (the block errors out) — never resolved
@@ -1365,6 +1373,81 @@ alive or not.
 **Restart is local only**: restarting a service restarts just that one
 process, with the exact parameters it was last started with — it never
 touches, reruns, or even looks at anything that depends on it.
+
+### Graceful stop and declarative lifecycle
+
+Stop enters `stopping` and disables automatic restarts before cleanup begins.
+For an ordinary foreground service, meshfox sends SIGTERM to its process group
+and tracked detached descendants, allows 30 seconds for shutdown, then escalates
+to SIGKILL and reaps the processes. A shell exiting early does not shorten its
+children's grace period. The ledger address stays claimed until shutdown finishes.
+Restart awaits that same stop before claiming a new generation. Worker shutdown,
+CLI Ctrl-C, and quitting an embedded TUI await service cleanup too.
+
+`interpreter="@service"` selects a built-in, worker-managed lifecycle supervisor
+and implies the `service` flag. The fence body is YAML; `yaml` is the recommended
+language hint. `tty` and `cache` remain invalid for a service. Unknown YAML keys,
+empty commands and invalid durations are errors during validation and startup.
+Unlike script-backed builtins, `@service` is only supported on managed runnable
+fences, not file-node interpreters or direct one-shot interpreter execution.
+
+```yaml name="app" interpreter="@service"
+start: docker compose up --build --wait
+stop: docker compose stop
+monitor: docker compose logs --follow --no-color
+check: ./scripts/check-app.sh
+check_interval: 5s
+restart_on_fail: true
+restart_delay: 2s
+stop_timeout: 30s
+```
+
+| Property | Default | Meaning |
+| --- | --- | --- |
+| `start` | required | Bash command; foreground without `monitor`, one-shot startup with `monitor`. |
+| `stop` | absent | Explicit cleanup command for external resources; zero exit means success. |
+| `monitor` | absent | Long-running log command, started after successful one-shot startup. |
+| `check` | absent | Liveness command: zero exit is healthy, any other exit is failure. |
+| `check_interval` | `5s` | Interval between checks and timeout for each check; checks never overlap. |
+| `restart_on_fail` | `false` | Retry nonzero foreground/start exits or failed/timed-out checks. |
+| `restart_delay` | `2s` | Initial retry delay; doubles on consecutive failures, capped at the greater of 60s and this value. Resets after a minute of healthy operation. |
+| `stop_timeout` | `30s` | Deadline for the stop command, or grace period for foreground termination without a stop command. |
+
+Durations are strings with `ms`, `s` or `m` suffixes (including fractions), from
+1ms through 1h. Commands run with `bash -e -c`, using the cwd and environment
+captured at service startup. Restart reuses that captured configuration even
+if the canvas has since changed; ordinary shell expansion works inside commands.
+No additional YAML templating or command interpolation is performed.
+
+The supervisor runs as an async task inside the worker, with a small idle process
+as its stable, separately killable identity. For `@service`, PID and resource
+counters describe this identity rather than a container or foreground child.
+States are `starting`, `running`, `restarting`, `stopping`, `stop_failed`,
+`crashed`, and `stopped`. Starting completes when the foreground process is
+spawned or one-shot start succeeds; checks are liveness checks, not a readiness
+barrier for dependent blocks. Automatic retries change the live generation,
+invalidating dependency freshness just like an explicit restart.
+
+A monitor exiting only means its log connection ended. Meshfox reconnects it
+after `restart_delay`, without rerunning start. Use `check` to detect failure of
+an external service; without it, a detached service's health is unknown. A clean
+foreground exit does not trigger `restart_on_fail`.
+
+On Stop, meshfox first runs `stop` if present, keeping service logs flowing.
+Then it terminates/reaps local start/monitor processes, allowing up to one extra
+second for local termination after an explicit hook. Without `stop`, it sends
+SIGTERM and uses `stop_timeout` for local shutdown. Startup and restart delays
+can be interrupted by Stop. Stop also runs after a partially failed startup or
+failed check, before an automatic retry.
+
+A failed or timed-out stop leaves `stop_failed`, preserves the recipe, logs and
+ledger ownership, and blocks Restart until a subsequent Stop succeeds. Killing
+local processes cannot prove external resources stopped. Abrupt worker death
+(SIGKILL/OOM) cannot run external cleanup; no detached watchdog is installed.
+Explicit force-takeover remains a hard recovery operation, not graceful shutdown.
+
+See [examples/services.canvas.md](examples/services.canvas.md) for foreground
+and Docker Compose examples and a self-contained Compose fixture.
 
 ## Read-only canvases
 
@@ -2497,3 +2580,16 @@ auto-discover the single `*.canvas.md` (or marked `*.md`) file in the
 current directory — except `create`, which always requires an explicit
 path, since there's nothing to auto-discover for a file that doesn't exist
 yet.
+
+### TUI source-editor Unicode palette
+
+In the fullscreen TUI source editor, `Ctrl-g` opens a modal Unicode palette.
+An empty query shows a small built-in set of common symbols. Search matches
+English Unicode names case-insensitively (exact names first, then prefixes,
+then substrings); `U+XXXX` selects a code point directly. Up/Down moves the
+selection, Enter inserts the symbol at the cursor through the editor undo
+mechanism and closes the palette, and Esc cancels without changing the buffer.
+Invalid codes and queries without matches show an empty result; Enter then
+keeps the palette open. Control, whitespace and zero-width characters are
+excluded. The modal captures keyboard and mouse input so the buffer underneath
+cannot change while choosing. Glyph appearance depends on terminal fonts.

@@ -564,7 +564,8 @@ fn build_code_block(
         .get("autoclose")
         .map(|v| v != "false")
         .unwrap_or(false);
-    let service = attrs.get("service").map(|v| v != "false").unwrap_or(false);
+    let service = attrs.get("service").map(|v| v != "false").unwrap_or(false)
+        || attrs.get("interpreter").is_some_and(|s| s == "@service");
     let always = attrs.get("always").map(|v| v != "false").unwrap_or(false);
     let autorun = attrs.get("autorun").map(|v| v != "false").unwrap_or(false);
     let render = attrs.get("render").cloned();

@@ -32,6 +32,7 @@ pub mod process_env;
 pub mod output;
 pub mod secret_index;
 pub mod secret_store;
+pub mod service;
 pub mod service_lock;
 pub mod shared_env;
 pub mod staticgen;

@@ -15,12 +15,16 @@
 //! address was claimed under, and resolves it (`finish`) whenever it stops,
 //! restarts, or crashes.
 
-use crate::stream_exec::{self, OutputStream, SpawnedProcess};
+use crate::stream_exec::{self, OutputStream};
+use tokio::sync::watch;
+
+#[path = "service_runtime.rs"]
+mod runtime;
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// How many recent output lines a service's log keeps — old lines fall off
 /// the front once this fills up. Generous enough for a dev server's own
@@ -32,6 +36,12 @@ const LOG_CAPACITY: usize = 2000;
 #[derive(Debug, Clone, PartialEq)]
 pub enum ServiceStatus {
     Running,
+    Starting,
+    Stopping,
+    Restarting,
+    StopFailed {
+        message: String,
+    },
     /// Exited on its own, unexpectedly — `exit_code` is whatever its own
     /// process reported (`-1` if that couldn't be determined).
     Crashed {
@@ -47,7 +57,7 @@ pub enum ServiceStatus {
 /// `stream_exec::SpawnedProcess::output_rx` already uses, just retained
 /// instead of streamed straight into an HTTP response the way a normal
 /// chain step's output is.
-struct RingBuffer {
+pub(super) struct RingBuffer {
     cap: usize,
     lines: VecDeque<(OutputStream, String)>,
 }
@@ -79,31 +89,37 @@ impl RingBuffer {
 /// re-walk `deps=`/`meshfox:var` resolution the way starting a chain from
 /// scratch does. Good enough for "restart this one process" without
 /// dragging in the whole variable-resolution machinery `run_block` has.
+#[derive(Clone)]
 struct RespawnRecipe {
     block: meshfox_core::CodeBlock,
     env: HashMap<String, String>,
+    environment: Arc<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
     cwd: PathBuf,
     canvas_path: PathBuf,
     owner: String,
 }
 
 /// One running (or just-stopped) service — see the module doc comment.
+#[derive(Clone)]
 pub struct ServiceHandle {
     pub node_id: String,
     pub block_name: String,
     pub pid: u32,
     pub started_at: Instant,
     ledger: crate::run_ledger::RunLedger,
-    ledger_row_id: i64,
     status: Arc<Mutex<ServiceStatus>>,
     log: Arc<Mutex<RingBuffer>>,
     respawn: RespawnRecipe,
+    control: watch::Sender<u64>,
+    completion: watch::Receiver<(u64, Result<(), String>)>,
+    action: Arc<tokio::sync::Mutex<()>>,
+    epoch: Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl ServiceHandle {
     /// Unique for each spawn/restart, including if the OS reuses a PID.
     pub fn generation(&self) -> i64 {
-        self.ledger_row_id
+        self.epoch.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn status(&self) -> ServiceStatus {
@@ -114,24 +130,50 @@ impl ServiceHandle {
         self.log.lock().unwrap().snapshot()
     }
 
-    /// Kills the whole process group (see `kill_process_group`) and marks
-    /// this handle `Stopped` — set *before* signaling, so the background
-    /// drain task (below) sees `Stopped` already recorded when it notices
-    /// the process gone, rather than racing it and reporting a false
-    /// `Crashed`.
-    pub fn stop(&self) -> io::Result<()> {
-        *self.status.lock().unwrap() = ServiceStatus::Stopped;
-        let _ = self
-            .ledger
-            .finish(self.ledger_row_id, crate::run_ledger::FinishOutcome::Killed);
-        let result = kill_process_group(self.pid);
-        // Doesn't wait for `self.pid` to actually be gone first — a still-
-        // running descendant that's already detached into its own group
-        // (see `kill_orphaned_descendants`'s own doc comment) is
-        // independent of `self.pid` by definition, so there's nothing to
-        // gain by waiting on it here.
-        kill_orphaned_descendants(self.pid);
-        result
+    /// Services keep their address claimed throughout graceful shutdown.
+    pub async fn stop(&self) -> io::Result<()> {
+        let _action = self.action.lock().await;
+        self.stop_inner().await
+    }
+
+    async fn stop_inner(&self) -> io::Result<()> {
+        let request;
+        {
+            let mut status = self.status.lock().unwrap();
+            if matches!(
+                *status,
+                ServiceStatus::Stopped | ServiceStatus::Crashed { .. }
+            ) {
+                return Ok(());
+            }
+            request = *self.control.borrow() + 1;
+            *status = ServiceStatus::Stopping;
+            self.control.send_replace(request);
+        }
+        let mut completion = self.completion.clone();
+        loop {
+            let (finished, result) = completion.borrow_and_update().clone();
+            if finished >= request {
+                return result.map_err(io::Error::other);
+            }
+            if completion.changed().await.is_err() {
+                return if matches!(
+                    self.status(),
+                    ServiceStatus::Stopped | ServiceStatus::Crashed { .. }
+                ) {
+                    Ok(())
+                } else {
+                    Err(io::Error::other("service supervisor exited"))
+                };
+            }
+        }
+    }
+
+    pub fn is_live(&self) -> bool {
+        !matches!(
+            self.status(),
+            ServiceStatus::Stopped | ServiceStatus::Crashed { .. }
+        )
     }
 }
 
@@ -161,23 +203,75 @@ pub fn spawn(
     ledger: crate::run_ledger::RunLedger,
     ledger_row_id: i64,
 ) -> io::Result<ServiceHandle> {
-    let proc = stream_exec::spawn_block(&block, &env, Some(&cwd), Some(&canvas_path))?;
-    let pid = proc.child.id().unwrap_or(0);
-    // The row the caller already claimed was necessarily started with a
-    // placeholder pid (the real one doesn't exist until right *now*) — fix
-    // it up to the real child pid so a later force-take-over against this
-    // address actually targets the right process, not whatever placeholder
-    // claimed it originally.
-    let _ = ledger.update_pid(ledger_row_id, pid);
+    let prepared = meshfox_core::process_env::prepare(Some(&cwd), &env, &[]);
+    let mut environment: std::collections::BTreeMap<_, _> = std::env::vars_os().collect();
+    for name in prepared.remove {
+        environment.remove(&name);
+    }
+    environment.extend(prepared.values);
+    spawn_with_environment(
+        node_id,
+        block_name,
+        block,
+        env,
+        cwd,
+        canvas_path,
+        owner,
+        ledger,
+        ledger_row_id,
+        Arc::new(environment.into_iter().collect()),
+    )
+}
 
-    let status = Arc::new(Mutex::new(ServiceStatus::Running));
+#[allow(clippy::too_many_arguments)]
+fn spawn_with_environment(
+    node_id: String,
+    block_name: String,
+    block: meshfox_core::CodeBlock,
+    env: HashMap<String, String>,
+    cwd: PathBuf,
+    canvas_path: PathBuf,
+    owner: &str,
+    ledger: crate::run_ledger::RunLedger,
+    ledger_row_id: i64,
+    environment: Arc<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
+) -> io::Result<ServiceHandle> {
+    let config = if block.interpreter.as_deref() == Some("@service") {
+        Some(meshfox_core::service::ServiceConfig::parse(&block.code)?)
+    } else {
+        None
+    };
+    // A declarative service has a stable, separately killable identity even
+    // while `start` has exited or an automatic restart is waiting. It never
+    // uses the worker's own PID as a force-takeover target.
+    let proc = if config.is_some() {
+        stream_exec::spawn_bash_frozen("exec sleep 2147483647", &environment, &cwd)?
+    } else {
+        stream_exec::spawn_block(&block, &env, Some(&cwd), Some(&canvas_path))?
+    };
+    let pid = proc.child.id().unwrap_or(0);
+    ledger.update_pid(ledger_row_id, pid)?;
+    let status = Arc::new(Mutex::new(if config.is_some() {
+        ServiceStatus::Starting
+    } else {
+        ServiceStatus::Running
+    }));
     let log = Arc::new(Mutex::new(RingBuffer::new(LOG_CAPACITY)));
-    spawn_drain_task(
+    let (control, stop_rx) = watch::channel(0);
+    let (completed, completion) = watch::channel((0, Ok(())));
+    let epoch = Arc::new(std::sync::atomic::AtomicI64::new(ledger_row_id));
+    runtime::spawn(
         proc,
-        Arc::clone(&status),
-        Arc::clone(&log),
+        config,
+        environment.clone(),
+        cwd.clone(),
+        status.clone(),
+        log.clone(),
         ledger.clone(),
         ledger_row_id,
+        stop_rx,
+        completed,
+        epoch.clone(),
     );
 
     Ok(ServiceHandle {
@@ -186,12 +280,16 @@ pub fn spawn(
         pid,
         started_at: Instant::now(),
         ledger,
-        ledger_row_id,
         status,
         log,
+        control,
+        completion,
+        action: Arc::new(tokio::sync::Mutex::new(())),
+        epoch,
         respawn: RespawnRecipe {
             block,
             env,
+            environment,
             cwd,
             canvas_path,
             owner: owner.to_string(),
@@ -199,17 +297,11 @@ pub fn spawn(
     })
 }
 
-/// Stops `old` and spawns a fresh process with the exact parameters it was
-/// last started with (see `RespawnRecipe`'s own doc comment) — "local
-/// only" restart, per the product decision: this never touches, or even
-/// looks at, anything that depends on `old`. `old.stop()` already finished
-/// `old`'s own row, so this starts a fresh one itself before calling
-/// `spawn` (see that function's own doc comment on why it no longer does
-/// this internally) — nothing else can have taken this address in between,
-/// since `stop` and this call happen back to back with no `.await` for
-/// anyone else to run in between.
-pub fn restart(old: &ServiceHandle) -> io::Result<ServiceHandle> {
-    old.stop()?;
+/// Await the previous generation's cleanup before claiming a new row.
+/// The saved recipe deliberately does not re-resolve edited canvas content.
+pub async fn restart(old: &ServiceHandle) -> io::Result<ServiceHandle> {
+    let _action = old.action.lock().await;
+    old.stop_inner().await?;
     let new_id = match old.ledger.start(
         &old.node_id,
         &old.block_name,
@@ -226,7 +318,7 @@ pub fn restart(old: &ServiceHandle) -> io::Result<ServiceHandle> {
         }
         Err(crate::run_ledger::StartError::Io(e)) => return Err(e),
     };
-    spawn(
+    let result = spawn_with_environment(
         old.node_id.clone(),
         old.block_name.clone(),
         old.respawn.block.clone(),
@@ -236,113 +328,14 @@ pub fn restart(old: &ServiceHandle) -> io::Result<ServiceHandle> {
         &old.respawn.owner,
         old.ledger.clone(),
         new_id,
-    )
-}
-
-/// Drains `proc`'s output into `log` for as long as it runs, then reaps it
-/// and records whatever `ServiceStatus` that leaves it in — `Crashed` for
-/// an unexpected exit, left alone (already `Stopped`) if `ServiceHandle::
-/// stop` already flipped it first. Also finishes `ledger_row_id` on a
-/// `Crashed` exit — `stop` already finishes it for a deliberate stop, but
-/// an unexpected exit used to leave the row `running` forever (until the
-/// whole process exited or someone explicitly stopped it), which meant a
-/// crashed service's own address stayed permanently "held by us" even
-/// though nothing was actually running under it — quietly wrong even
-/// before this module tried to generalize locking to every block kind.
-/// How often the drain task below re-scans for `pid`'s own descendants
-/// while it's still running — see `spawn_drain_task`'s own doc comment on
-/// `seen_descendants` for why this has to happen *before* the process
-/// actually exits, not just once afterward.
-const DESCENDANT_SCAN_INTERVAL: Duration = Duration::from_millis(250);
-
-fn spawn_drain_task(
-    mut proc: SpawnedProcess,
-    status: Arc<Mutex<ServiceStatus>>,
-    log: Arc<Mutex<RingBuffer>>,
-    ledger: crate::run_ledger::RunLedger,
-    ledger_row_id: i64,
-) {
-    tokio::spawn(async move {
-        // Captured before `wait()` below — a `tokio::process::Child` can
-        // stop reporting its own id once it's been reaped.
-        let pid = proc.child.id().unwrap_or(0);
-        // Every descendant pid of `pid` ever noticed while this process
-        // was still alive — see `kill_orphaned_descendants`'s own doc
-        // comment for the daemonizing-tool scenario this exists for.
-        // Crucially, this has to accumulate *during* the loop below, not
-        // just get scanned fresh once the process has already exited: the
-        // kernel reparents an orphan away (to pid 1) essentially the
-        // moment its own parent is reaped, which — for a normal, prompt
-        // exit — has typically *already happened* by the time anything
-        // downstream of `proc.child.wait()` gets around to looking, so a
-        // single post-exit scan routinely finds nothing at all (confirmed
-        // directly: the very first version of this fix, a one-shot scan
-        // right after `wait()`, reliably missed the daemonized descendant
-        // in `services::tests::
-        // an_exit_leaving_a_daemonized_descendant_alive_still_gets_it_killed`).
-        let mut seen_descendants: std::collections::HashSet<sysinfo::Pid> =
-            std::collections::HashSet::new();
-        let mut scan_interval = tokio::time::interval(DESCENDANT_SCAN_INTERVAL);
-        loop {
-            tokio::select! {
-                line = proc.output_rx.recv() => {
-                    match line {
-                        Some((stream, text)) => log.lock().unwrap().push(stream, text),
-                        None => break,
-                    }
-                }
-                _ = scan_interval.tick() => {
-                    seen_descendants.extend(descendant_pids(pid));
-                }
-            }
-        }
-        let exit_code = proc
-            .child
-            .wait()
-            .await
-            .ok()
-            .and_then(|s| s.code())
-            .unwrap_or(-1);
-        // One last scan too — belt and suspenders alongside the
-        // accumulated history above, for whatever's still reachable this
-        // way (a descendant that hasn't been reparented away yet, say).
-        seen_descendants.extend(descendant_pids(pid));
-        for descendant in seen_descendants {
-            // SAFETY: an ordinary, single `SIGKILL` by pid — no process-
-            // group semantics involved, unlike `kill_process_group`.
-            unsafe {
-                libc::kill(descendant.as_u32() as libc::pid_t, libc::SIGKILL);
-            }
-        }
-        let mut current = status.lock().unwrap();
-        if !matches!(*current, ServiceStatus::Stopped) {
-            *current = ServiceStatus::Crashed { exit_code };
-            let _ = ledger.finish(
-                ledger_row_id,
-                crate::run_ledger::FinishOutcome::Exited(exit_code),
-            );
-        }
-    });
-}
-
-/// Same `SIGKILL`-the-whole-process-group primitive `stream_exec::
-/// SpawnedProcess::kill`/`pty_exec::PtyProcess::kill` each already carry
-/// their own copy of — duplicated rather than shared because a service's
-/// `SpawnedProcess` has already been moved into `spawn_drain_task` by the
-/// time `stop` needs to kill it, so there's no `&SpawnedProcess` left to
-/// call a method on; only the bare `pid` survives in `ServiceHandle`.
-fn kill_process_group(pid: u32) -> io::Result<()> {
-    if pid == 0 {
-        return Ok(());
+        old.respawn.environment.clone(),
+    );
+    if result.is_err() {
+        let _ = old
+            .ledger
+            .finish(new_id, crate::run_ledger::FinishOutcome::Killed);
     }
-    // SAFETY: see `stream_exec::SpawnedProcess::kill` — `-pid` signals the
-    // whole process group this pid leads (every spawn function in
-    // `stream_exec` makes its child a fresh group leader).
-    let ret = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
-    if ret != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    result
 }
 
 /// One-shot convenience: `descendant_pids(pid)` (see its own doc comment),
@@ -358,7 +351,7 @@ fn kill_process_group(pid: u32) -> io::Result<()> {
 /// `kill_process_group` and (once the lock file this module released the
 /// moment it saw that "normal" exit) to any later force-start's own
 /// stale-owner kill too. A single call site's worth of best-effort — see
-/// `spawn_drain_task`'s own repeated-scan use of `descendant_pids` for why
+/// `runtime::Process`'s own repeated-scan use of `descendant_pids` for why
 /// a caller watching a process across its *whole* lifetime needs more than
 /// one call here to reliably catch this.
 pub(crate) fn kill_orphaned_descendants(pid: u32) {
@@ -376,7 +369,7 @@ pub(crate) fn kill_orphaned_descendants(pid: u32) {
 /// machine currently has for one whose `parent()` matches something
 /// already found reachable from `pid`, breadth-first (not a `pgrep`/`ps`
 /// shell-out, reusing the `sysinfo` dependency `services::sample` already
-/// has). A snapshot of *right now* only — see `spawn_drain_task`'s own
+/// has). A snapshot of *right now* only — see `runtime::Process`'s own
 /// `seen_descendants` for why a caller that cares about a process that
 /// might exit and get reparented away before it gets around to killing
 /// anything needs to call this repeatedly over the watched process's
@@ -510,7 +503,7 @@ mod tests {
         assert_eq!(active[0].pid, handle.pid);
         assert_eq!(active[0].owner, "cli");
 
-        handle.stop().unwrap();
+        handle.stop().await.unwrap();
         std::fs::remove_dir_all(canvas_path.parent().unwrap()).ok();
     }
 
@@ -530,7 +523,7 @@ mod tests {
         )
         .unwrap();
 
-        handle.stop().unwrap();
+        handle.stop().await.unwrap();
         assert_eq!(handle.status(), ServiceStatus::Stopped);
         assert!(ledger.active_running().unwrap().is_empty());
 
@@ -711,7 +704,7 @@ mod tests {
             ]
         );
 
-        handle.stop().unwrap();
+        handle.stop().await.unwrap();
         std::fs::remove_dir_all(canvas_path.parent().unwrap()).ok();
     }
 
@@ -732,12 +725,238 @@ mod tests {
         .unwrap();
         let old_pid = handle.pid;
 
-        let restarted = restart(&handle).unwrap();
+        let restarted = restart(&handle).await.unwrap();
         assert_eq!(handle.status(), ServiceStatus::Stopped);
         assert_eq!(restarted.status(), ServiceStatus::Running);
         assert_ne!(restarted.pid, old_pid);
 
-        restarted.stop().unwrap();
+        restarted.stop().await.unwrap();
         std::fs::remove_dir_all(canvas_path.parent().unwrap()).ok();
+    }
+    fn managed_block(yaml: &str) -> meshfox_core::CodeBlock {
+        meshfox_core::scan_code_blocks(&format!(
+            "```yaml name=\"x\" interpreter=\"@service\"\n{yaml}\n```\n"
+        ))
+        .remove(0)
+    }
+
+    fn managed(name: &str, yaml: &str) -> (ServiceHandle, crate::run_ledger::RunLedger, PathBuf) {
+        let ledger = crate::run_ledger::RunLedger::open_in_memory().unwrap();
+        let path = tmp_canvas_path(&format!("{name}-{}", uuid::Uuid::new_v4()));
+        let cwd = path.parent().unwrap().to_path_buf();
+        let handle = spawn_locked(
+            &ledger,
+            "root".into(),
+            "srv".into(),
+            managed_block(yaml),
+            HashMap::new(),
+            cwd.clone(),
+            path,
+            "cli",
+        )
+        .unwrap();
+        (handle, ledger, cwd)
+    }
+
+    async fn wait_file(path: &std::path::Path) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !path.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn graceful_stop_waits_for_child_cleanup_and_keeps_ledger_claimed() {
+        let (handle, ledger, cwd) = managed(
+            "graceful",
+            r#"start: |
+  bash -c '
+    trap "echo stopping > stopping; sleep 0.3; echo done > done; exit 0" TERM
+    echo ready > ready
+    while :; do sleep 0.05; done
+  ' &
+  wait
+stop_timeout: 2s"#,
+        );
+        wait_file(&cwd.join("ready")).await;
+        let stopping = handle.clone();
+        let task = tokio::spawn(async move { stopping.stop().await });
+        wait_file(&cwd.join("stopping")).await;
+        assert_eq!(handle.status(), ServiceStatus::Stopping);
+        assert_eq!(ledger.active_running().unwrap().len(), 1);
+        task.await.unwrap().unwrap();
+        assert!(cwd.join("done").exists());
+        assert!(ledger.active_running().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_stop_retains_ownership_and_can_be_retried() {
+        let (handle, ledger, cwd) = managed("stop-failure", "start: touch started\nmonitor: sleep 30\nstop: test -f allow-stop && touch stopped\nstop_timeout: 100ms");
+        wait_file(&cwd.join("started")).await;
+        assert!(handle.stop().await.is_err());
+        assert!(matches!(handle.status(), ServiceStatus::StopFailed { .. }));
+        assert_eq!(ledger.active_running().unwrap().len(), 1);
+        assert!(restart(&handle).await.is_err());
+        std::fs::write(cwd.join("allow-stop"), "").unwrap();
+        handle.stop().await.unwrap();
+        assert!(cwd.join("stopped").exists());
+        assert!(ledger.active_running().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn monitor_exit_reconnects_without_restarting_start() {
+        let (handle, _, cwd) = managed("monitor", "start: echo start >> starts\nmonitor: echo logs >> monitors\nrestart_delay: 50ms\nstop_timeout: 100ms\nrestart_on_fail: true");
+        wait_file(&cwd.join("monitors")).await;
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        handle.stop().await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("starts"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert!(
+            std::fs::read_to_string(cwd.join("monitors"))
+                .unwrap()
+                .lines()
+                .count()
+                > 1
+        );
+    }
+
+    #[tokio::test]
+    async fn checks_restart_service_and_change_generation() {
+        let (handle, _, cwd) = managed("check-restart", "start: echo start >> starts\nmonitor: sleep 30\ncheck: test -f healthy\ncheck_interval: 50ms\nrestart_on_fail: true\nrestart_delay: 50ms\nstop_timeout: 100ms");
+        let original = handle.generation();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let starts = std::fs::read_to_string(cwd.join("starts")).unwrap_or_default();
+                if starts.lines().count() >= 2 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        std::fs::write(cwd.join("healthy"), "").unwrap();
+        assert_ne!(original, handle.generation());
+        handle.stop().await.unwrap();
+        let count = std::fs::read_to_string(cwd.join("starts")).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(count, std::fs::read_to_string(cwd.join("starts")).unwrap());
+    }
+
+    #[tokio::test]
+    async fn stop_interrupts_start_and_still_runs_stop_hook() {
+        let (handle, _, cwd) = managed("cancel-start", "start: touch starting; sleep 30\nmonitor: sleep 30\nstop: touch stopped\nstop_timeout: 100ms");
+        wait_file(&cwd.join("starting")).await;
+        tokio::time::timeout(std::time::Duration::from_secs(3), handle.stop())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(cwd.join("stopped").exists());
+    }
+
+    #[tokio::test]
+    async fn stop_timeout_is_reported_and_retryable() {
+        let (handle, ledger, cwd) = managed("stop-timeout", "start: touch started\nmonitor: sleep 30\nstop: test -f allow-stop || sleep 30\nstop_timeout: 50ms");
+        wait_file(&cwd.join("started")).await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), handle.stop())
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert!(matches!(handle.status(), ServiceStatus::StopFailed { .. }));
+        assert_eq!(ledger.active_running().unwrap().len(), 1);
+        std::fs::write(cwd.join("allow-stop"), "").unwrap();
+        handle.stop().await.unwrap();
+    }
+    #[tokio::test]
+    async fn lifecycle_and_restart_preserve_the_original_process_environment() {
+        let ledger = crate::run_ledger::RunLedger::open_in_memory().unwrap();
+        let path = tmp_canvas_path(&format!("frozen-env-{}", uuid::Uuid::new_v4()));
+        let cwd = path.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(cwd.join(".meshfox")).unwrap();
+        let config = cwd.join(".meshfox/config.toml");
+        std::fs::write(&config, "[process_env]\nSERVICE_TOKEN = 'original'\n").unwrap();
+        let block = managed_block("start: echo \"$SERVICE_TOKEN\" >> starts\nmonitor: sleep 30\nstop: echo \"$SERVICE_TOKEN\" >> stops\nstop_timeout: 100ms");
+        let handle = spawn_locked(
+            &ledger,
+            "root".into(),
+            "srv".into(),
+            block,
+            HashMap::new(),
+            cwd.clone(),
+            path,
+            "cli",
+        )
+        .unwrap();
+        wait_file(&cwd.join("starts")).await;
+        std::fs::write(&config, "[process_env]\nSERVICE_TOKEN = 'edited'\n").unwrap();
+        let next = restart(&handle).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while std::fs::read_to_string(cwd.join("starts"))
+                .unwrap()
+                .lines()
+                .count()
+                < 2
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        next.stop().await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("starts")).unwrap(),
+            "original\noriginal\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("stops")).unwrap(),
+            "original\noriginal\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn unresponsive_foreground_is_killed_after_its_grace_period() {
+        let (handle, ledger, cwd) = managed("hard-fallback", "start: |\n  trap '' TERM\n  echo $$ > pid\n  while :; do sleep 0.05; done\nstop_timeout: 100ms");
+        wait_file(&cwd.join("pid")).await;
+        let pid: u32 = std::fs::read_to_string(cwd.join("pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let began = Instant::now();
+        tokio::time::timeout(std::time::Duration::from_secs(3), handle.stop())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(began.elapsed() >= std::time::Duration::from_millis(100));
+        assert!(!meshfox_core::service_lock::is_alive(pid));
+        assert!(ledger.active_running().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn stop_during_failure_cleanup_does_not_restart_or_run_cleanup_twice() {
+        let (handle, ledger, cwd) = managed("stop-during-cleanup", "start: exit 1\nmonitor: sleep 30\nstop: echo cleanup >> cleanups; touch cleaning; sleep 0.3\nrestart_on_fail: true\nrestart_delay: 50ms\nstop_timeout: 2s");
+        wait_file(&cwd.join("cleaning")).await;
+        tokio::time::timeout(std::time::Duration::from_secs(3), handle.stop())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(handle.status(), ServiceStatus::Stopped);
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("cleanups"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert!(ledger.active_running().unwrap().is_empty());
     }
 }

@@ -1727,7 +1727,7 @@ fn has_running_services(state: &AppState) -> bool {
         .lock()
         .unwrap()
         .values()
-        .any(|s| matches!(s.status(), services::ServiceStatus::Running))
+        .any(|s| s.is_live())
 }
 
 /// True if any run (plain, `tty`, or a `file`-node's own run — every one of
@@ -2559,7 +2559,7 @@ fn steps_needing_a_lock(
             .lock()
             .unwrap()
             .get(&key)
-            .is_some_and(|s| matches!(s.status(), services::ServiceStatus::Running));
+            .is_some_and(|s| s.is_live());
         if already_live_service {
             continue;
         }
@@ -6299,6 +6299,8 @@ enum OpenContext {
     /// browser (the response carries the target worker's port), a plain
     /// file goes through the coordinator (the OS's default application).
     Web,
+    /// Terminal client: uses the same worker/port navigation as the web.
+    Tui,
     /// A VS Code webview: this worker opens nothing itself, the extension
     /// does, from the returned action.
     Vscode,
@@ -6323,7 +6325,8 @@ enum OpenAction {
     OpenFile { path: String },
     /// Open this canvas (at `fragment`, if any) in the client's own way.
     /// `port` is the target canvas's worker, for a client that opens it as
-    /// a URL (`Web`); absent for one that opens it as a document (`Vscode`).
+    /// a URL (`Web`) or connects directly (`Tui`); absent for one that
+    /// opens it as a document (`Vscode`).
     OpenCanvas {
         path: String,
         fragment: Option<String>,
@@ -6398,7 +6401,7 @@ async fn open_node_file(
         )
     })?;
 
-    if is_canvas && query.context == OpenContext::Web {
+    if is_canvas && matches!(query.context, OpenContext::Web | OpenContext::Tui) {
         let port = watcher_protocol::request_port(socket, &resolved)
             .await
             .map_err(|e| {
@@ -7551,12 +7554,20 @@ async fn run_block_impl_sized(
             // comment for the persistent registry this populates.
             if resolved_block.service {
                 let key = (addr.node_id.clone(), addr.block_name.clone());
+                let blocked = state.services.lock().unwrap().get(&key).is_some_and(|s|
+                    matches!(s.status(), services::ServiceStatus::Stopping | services::ServiceStatus::StopFailed { .. }));
+                if blocked {
+                    yield Ok(ndjson_line(&RunEvent::Error {
+                        message: format!("service {:?} has not completed shutdown; retry Stop before starting it", addr.block_name),
+                    }));
+                    break;
+                }
                 let already_running = state
                     .services
                     .lock()
                     .unwrap()
                     .get(&key)
-                    .filter(|s| matches!(s.status(), services::ServiceStatus::Running))
+                    .filter(|s| s.is_live())
                     .map(|s| s.pid);
                 if let Some(pid) = already_running {
                     executed.remove(addr);
@@ -8919,6 +8930,10 @@ fn service_dto(node_id: &str, block: &str, handle: &services::ServiceHandle) -> 
         services::ServiceStatus::Running => ("running", None),
         services::ServiceStatus::Crashed { exit_code } => ("crashed", Some(exit_code)),
         services::ServiceStatus::Stopped => ("stopped", None),
+        services::ServiceStatus::Starting => ("starting", None),
+        services::ServiceStatus::Stopping => ("stopping", None),
+        services::ServiceStatus::Restarting => ("restarting", None),
+        services::ServiceStatus::StopFailed { .. } => ("stop_failed", None),
     };
     let sample = services::sample(handle.pid);
     ServiceDto {
@@ -9130,17 +9145,16 @@ struct ServiceKeyRequest {
     block: String,
 }
 
-/// `POST /api/services/stop` — kills the service's whole process group
-/// (`ServiceHandle::stop`) and releases its lock file. The registry entry
+/// `POST /api/services/stop` — awaits graceful shutdown before releasing
+/// the service ledger row. Failed cleanup remains retryable. The registry entry
 /// itself is kept (now `Stopped`), not removed, so the panel can still show
 /// "stopped" rather than the service just vanishing.
 async fn stop_service(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ServiceKeyRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let services = state.services.lock().unwrap();
-    let handle = services
-        .get(&(req.node_id.clone(), req.block.clone()))
+    let handle = state.services.lock().unwrap()
+        .get(&(req.node_id.clone(), req.block.clone())).cloned()
         .ok_or_else(|| {
             ApiError(
                 StatusCode::NOT_FOUND,
@@ -9148,7 +9162,7 @@ async fn stop_service(
             )
         })?;
     handle
-        .stop()
+        .stop().await
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -9177,18 +9191,17 @@ async fn restart_service(
         )],
         req.confirm,
     )?;
-    let mut services = state.services.lock().unwrap();
     let key = (req.node_id.clone(), req.block.clone());
-    let old = services.get(&key).ok_or_else(|| {
+    let old = state.services.lock().unwrap().get(&key).cloned().ok_or_else(|| {
         ApiError(
             StatusCode::NOT_FOUND,
             format!("no service {:?}/{:?}", req.node_id, req.block),
         )
     })?;
-    let restarted = services::restart(old)
+    let restarted = services::restart(&old).await
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let pid = restarted.pid;
-    services.insert(key, restarted);
+    state.services.lock().unwrap().insert(key, restarted);
     Ok(Json(ServiceActionResponse { pid }))
 }
 
@@ -9298,6 +9311,14 @@ async fn force_start_service(
     if block.interpreter.is_some() {
         resolved_block.interpreter =
             meshfox_core::args::resolve_interpreter(&block, &resolved_vars);
+    }
+
+    // For a locally managed service, join its lifecycle instead of killing
+    // its identity and racing a delayed external cleanup against this start.
+    let local = state.services.lock().unwrap()
+        .get(&(target.node_id.clone(), target.block_name.clone())).cloned();
+    if let Some(handle) = local {
+        handle.stop().await.map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
 
     // Whole-process-group `SIGKILL` on whatever pid the current `running`
@@ -10832,19 +10853,10 @@ fn spawn_shutdown_signal_handler(state: Arc<AppState>) {
             _ = sighup.recv() => {}
             _ = tokio::signal::ctrl_c() => {}
         }
-        // The registry stays locked until every service has been signalled.
-        // `meshfox run` hosts this worker in-process and its own Ctrl-C arm
-        // asks the worker to stop the same services, then exits at once:
-        // with the handles drained out first, that request found nothing,
-        // returned, and the process could exit before this loop's kills were
-        // sent — leaving the services orphaned. Holding the lock makes that
-        // request wait until the kills are out.
-        {
-            let mut services = state.services.lock().unwrap();
-            for (_, handle) in services.drain() {
-                let _ = handle.stop();
-            }
-        }
+        // Keep entries visible until shutdown completes: concurrent CLI
+        // Ctrl-C requests must join the same stop instead of observing an
+        // empty registry and exiting before graceful cleanup is finished.
+        let service_handles: Vec<_> = state.services.lock().unwrap().values().cloned().collect();
         let run_handles: Vec<_> = state
             .runs_registry
             .lock()
@@ -10865,8 +10877,15 @@ fn spawn_shutdown_signal_handler(state: Arc<AppState>) {
         for handle in tty_handles {
             handle.kill();
         }
-        // Unlike `ServiceHandle::stop` above (a synchronous `libc::kill`
-        // call, already fully done by the time its loop returns),
+        let results = futures_util::future::join_all(service_handles.iter().map(|handle| handle.stop())).await;
+        for (handle, result) in service_handles.iter().zip(results) {
+            if let Err(error) = result {
+                eprintln!("meshfox: failed to stop service {}: {error}", handle.block_name);
+                // External cleanup failed; at least reap the local identity.
+                unsafe { libc::kill(-(handle.pid as libc::pid_t), libc::SIGKILL); }
+            }
+        }
+        // Services above have already completed their graceful stop.
         // `RunHandle::kill`/`TtySessionHandle::kill` only *signal* their
         // own already-spawned drain task via a oneshot channel — the
         // actual `libc::kill` for one of these only happens once that
@@ -15686,6 +15705,18 @@ mod run_file_tests {
     }
 
     #[tokio::test]
+    async fn open_node_file_tui_rejects_missing_targets_before_coordinator() {
+        for target in ["./missing.txt", "./missing.canvas.md#o"] {
+            let (dir, canvas_path) = open_fixture(target);
+            let addr = spawn_test_server(canvas_path).await;
+            let (status, body) = post(addr, "/api/nodes/f/open?context=tui").await;
+            assert_eq!(status, 404, "{body}");
+            assert!(body.contains("missing."), "{body}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[tokio::test]
     async fn open_node_file_requires_a_context() {
         let (dir, canvas_path) = open_fixture("./note.txt");
         let addr = spawn_test_server(canvas_path).await;
@@ -15727,7 +15758,7 @@ mod run_file_tests {
     async fn open_node_file_web_and_delegate_need_a_watcher() {
         let (dir, canvas_path) = open_fixture("./other.canvas.md");
         let addr = spawn_test_server(canvas_path).await;
-        for context in ["web", "delegate"] {
+        for context in ["web", "delegate", "tui"] {
             let (status, _) = post(addr, &format!("/api/nodes/f/open?context={context}")).await;
             assert_eq!(status, 503, "context={context}");
         }
@@ -15794,12 +15825,44 @@ mod run_file_tests {
     }
 
     #[tokio::test]
+    async fn open_node_file_tui_asks_the_coordinator_for_the_canvas_port() {
+        let (dir, canvas_path) = open_fixture("./other.canvas.md#o");
+        let socket = short_socket_path();
+        let coordinator = fake_coordinator(&socket, "{\"port\":4242}\n");
+        let addr = spawn_test_server_with_watcher(canvas_path, socket).await;
+        let (status, body) = post(addr, "/api/nodes/f/open?context=tui").await;
+        assert_eq!(status, 200, "unexpected body: {body}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["action"], "open_canvas");
+        assert_eq!(json["port"], 4242);
+        assert_eq!(json["fragment"], "o");
+        let request: serde_json::Value = serde_json::from_str(&coordinator.await.unwrap()).unwrap();
+        assert_eq!(request["op"], "get_port");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn open_node_file_delegate_hands_a_plain_file_to_the_coordinator() {
         let (dir, canvas_path) = open_fixture("./note.txt");
         let socket = short_socket_path();
         let coordinator = fake_coordinator(&socket, "{}\n");
         let addr = spawn_test_server_with_watcher(canvas_path, socket).await;
         let (status, body) = post(addr, "/api/nodes/f/open?context=delegate").await;
+        assert_eq!(status, 200, "unexpected body: {body}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["action"], "done");
+        let request: serde_json::Value = serde_json::from_str(&coordinator.await.unwrap()).unwrap();
+        assert_eq!(request["op"], "open_file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn open_node_file_tui_hands_a_plain_file_to_the_coordinator() {
+        let (dir, canvas_path) = open_fixture("./note.txt");
+        let socket = short_socket_path();
+        let coordinator = fake_coordinator(&socket, "{}\n");
+        let addr = spawn_test_server_with_watcher(canvas_path, socket).await;
+        let (status, body) = post(addr, "/api/nodes/f/open?context=tui").await;
         assert_eq!(status, 200, "unexpected body: {body}");
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["action"], "done");

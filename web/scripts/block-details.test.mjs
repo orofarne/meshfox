@@ -84,3 +84,10 @@ test('example code and cached output never become declared exports', async () =>
 <!-- meshfox:variable name="WRONG_MARKER" from="observe" -->`} ]});
   assert.deepEqual(exportsForBlock(decls,'root','observe').map(v=>v.name), ['REAL']);
 });
+
+
+test('@service YAML is rendered as a managed service without a redundant flag', () => {
+  const block = parseBody('```yaml name="app" interpreter="@service"\nstart: sleep 30\n```', 'root').find(s => s.type === 'code');
+  assert.equal(block.service, true);
+  assert.equal(block.interpreter, '@service');
+});

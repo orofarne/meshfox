@@ -165,6 +165,12 @@ its own flags (`python3 -u`), any other tool on `$PATH` (`node`), an
 interactive `tty` block handing over a real REPL, and the same mechanism on
 a `file`-type node instead of a fence.
 
+[examples/services.canvas.md](./examples/services.canvas.md) covers long-lived
+services: graceful Stop/Restart, the YAML `interpreter="@service"` lifecycle
+(`start`, `stop`, `monitor`, health checks and automatic restart), and a runnable
+Docker Compose stack. Ordinary `service` blocks now receive SIGTERM with a
+30-second grace period before SIGKILL.
+
 #### Example
 <!-- meshfox:node id="example-2" type="file" -->
 
@@ -694,6 +700,7 @@ Keybindings on top of vim's own:
 
 - `Ctrl-s` — save. Validated as a canvas first. If the file changed since the editor opened it (another client, an editor), the worker three-way merges your buffer with that change when the two edits don't overlap — the result is saved and the status line says it was merged. If they do overlap (or the version you started from is no longer in the undo history), nothing is written and a side-by-side comparison opens: the file as it is on disk on the left, your buffer on the right, the lines both sides changed marked with `!`. In it, `n`/`N` jump between conflicts, `j`/`k`/`PgUp`/`PgDn` scroll, `h`/`l` pan, `t` takes theirs (the buffer becomes the file as it is), `m` keeps yours (written over the file as it is now) and `Esc` goes back to the buffer without deciding.
 - `Ctrl-n` — turn the heading the cursor's on into a node: appends a bare `<!-- meshfox:node -->` right below it. That's already enough on its own — no `id=` needed, since a node with none gets one derived from its heading's own slug (see SPEC.md's "Node types" for the fallback).
+- `Ctrl-g` — open the Unicode symbol palette. Search English Unicode names or `U+XXXX`, choose with Up/Down, insert at the cursor with Enter, or cancel with Esc. An empty search shows common symbols; control and zero-width characters are excluded.
 - `Ctrl-p` — suggest attributes for whatever `meshfox:node`/`meshfox:edge` comment or runnable-fence line the cursor's on, filtered down to whatever that line doesn't already have. Picking one types it in: `key=""` with the cursor left between the quotes for `x`/`y`/`w`/`h` get a bare `=0` instead, matching the on-disk convention every authored coordinate already uses; a fence-only presence flag (`cache`, `tty`, `default`) gets just its own word, nothing to fill in. With the cursor inside an already-typed `tags="..."` value instead, the same key suggests tags already used elsewhere in the document rather than attribute names — picking one adds it (comma-separated), cursor left ready for the next.
 - `esc` — leave. A second press discards unsaved edits; the first just warns.
 - mouse — full vim `mouse=a`-equivalent support: click to position the cursor, drag to select (switches to Visual automatically), scroll to move the viewport.
@@ -933,7 +940,7 @@ Two independent syntax-highlighting engines, one shared grammar format (mostly):
 #### MCP root
 <!-- meshfox:node id="mcp-root" x=860 y=0 w=380 h=210 -->
 
-`meshfox mcp` — the one server a host (Claude Code, ...) launches, one process. It keeps a registry of open canvases; each entry owns only its debug shells and the port of the worker it last talked to. Every tool call is a thin client of the file's own worker (`worker_client`/`coordinator`) and has a deadline; a hung worker is reported by `canvas_list`, never killed. Every HTTP call `worker_client` makes (the CLI's `node …` commands, the TUI and this server alike) has a time limit — 30 s for ordinary calls, 60 s for whole-file writes and history jumps, 20 s for stopping or restarting services, a debug command's own timeout + 15 s, and 5 s to connect — so a hung worker ends a command or a TUI action with an error saying so instead of hanging it. WebSocket streams (runs, `tty`, watching) are not covered.
+`meshfox mcp` — the one server a host (Claude Code, ...) launches, one process. It keeps a registry of open canvases; each entry owns only its debug shells and the port of the worker it last talked to. Every tool call is a thin client of the file's own worker (`worker_client`/`coordinator`) and has a deadline; a hung worker is reported by `canvas_list`, never killed. Every HTTP call `worker_client` makes (the CLI's `node …` commands, the TUI and this server alike) has a time limit — 30 s for ordinary calls, 60 s for whole-file writes and history jumps, 20 s for immediate kill operations, a service’s configured shutdown budget (up to one hour plus a margin) for Stop/Restart, a debug command's own timeout + 15 s, and 5 s to connect — so a hung worker ends a command or a TUI action with an error saying so instead of hanging it. WebSocket streams (runs, `tty`, watching) are not covered.
 
 #### CLI one-shot ops
 <!-- meshfox:node id="cli-one-shot-ops" x=1290 y=0 w=380 h=210 -->

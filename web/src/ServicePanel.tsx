@@ -103,6 +103,7 @@ export function ServicePanel({ services, focusNodeId, onClose, onStop, onRestart
             {selected ? (
               <>
                 <div className="service-panel-detail-meta">
+                  <span>{selected.status.replace("_", " ")}</span>
                   <span>pid {selected.pid}</span>
                   <span>uptime {formatUptime(selected.uptimeMs)}</span>
                   {/* `!= null` rather than `!== undefined` — defensive:
@@ -125,12 +126,12 @@ export function ServicePanel({ services, focusNodeId, onClose, onStop, onRestart
                    * `"crashed"` — only shown while there's a real process
                    * behind it. `restart` stays available regardless: it's
                    * exactly how you bring a stopped/crashed one back. */}
-                  {selected.status === "running" && (
+                  {["running", "starting", "restarting", "stop_failed"].includes(selected.status) && (
                     <button type="button" onClick={() => onStop(selected.nodeId, selected.block)}>
                       stop
                     </button>
                   )}
-                  <button type="button" onClick={() => onRestart(selected.nodeId, selected.block)}>
+                  <button type="button" disabled={selected.status === "stopping"} onClick={() => onRestart(selected.nodeId, selected.block)}>
                     restart
                   </button>
                 </div>

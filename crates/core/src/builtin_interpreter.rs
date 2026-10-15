@@ -14,6 +14,9 @@
 //! instead, with no functional difference. See `crate::config` for the
 //! `MESHFOX_CONFIG_*` values a script like `agent.sh` reads.
 //!
+//! `@service` is a native lifecycle interpreter handled by the service
+//! executor; it never materializes a script through this module.
+//!
 //! Wired into both real resolution paths: `stream_exec::spawn_interpreter`
 //! (captured/non-`tty` output) and `crate::exec::resolve_command` (`tty`,
 //! real-terminal handoff) both call `resolve_with_env` below rather than
@@ -55,6 +58,12 @@ fn lookup(name: &str) -> Option<&'static Builtin> {
 /// an error, not a silent pass-through (there's no real program named
 /// `@whatever` it could otherwise fall back to trying).
 pub fn resolve_builtin_spec(spec: &str) -> io::Result<Option<String>> {
+    if spec == "@service" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "@service requires the managed service executor",
+        ));
+    }
     let Some(name) = spec.strip_prefix('@') else {
         return Ok(None);
     };
@@ -193,8 +202,10 @@ pub fn read_only_temp_root(absolute: &Path) -> PathBuf {
 /// for a caller that wants to check without also materializing a script to
 /// disk (e.g. deciding whether to bother loading config at all).
 pub fn is_builtin(spec: &str) -> bool {
-    spec.strip_prefix('@')
-        .is_some_and(|name| lookup(name).is_some())
+    spec == "@service"
+        || spec
+            .strip_prefix('@')
+            .is_some_and(|name| lookup(name).is_some())
 }
 
 /// Writes `builtin.script` to a stable, content-addressed path under the

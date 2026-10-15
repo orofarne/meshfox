@@ -307,6 +307,11 @@ enum Command {
         /// spirit as jumping straight to a line number.
         #[arg(long)]
         node: Option<String>,
+        /// If the file doesn't exist yet, create it (same empty template
+        /// as `create`) before opening it. Requires an explicit path. A
+        /// no-op if the file already exists.
+        #[arg(long)]
+        create: bool,
     },
     /// An MCP stdio server giving an AI agent tool-call access
     /// to every canvas file under the current directory, without shelling
@@ -1349,8 +1354,27 @@ fn main() {
                 }
             }
         }
-        Command::Tui { canvas, node } => {
-            let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
+        Command::Tui {
+            canvas,
+            node,
+            create: create_if_missing,
+        } => {
+            let canvas_path = match canvas.resolve() {
+                Some(p) => p,
+                None => {
+                    if create_if_missing {
+                        eprintln!(
+                            "meshfox tui: --create requires an explicit path (nothing to \
+                             auto-discover when the file doesn't exist yet)"
+                        );
+                        std::process::exit(1);
+                    }
+                    find_canvas()
+                }
+            };
+            if create_if_missing && !canvas_path.exists() {
+                write_canvas_template(&canvas_path);
+            }
             tui(canvas_path, node)
         }
         Command::Mcp => mcp_cmd(),
@@ -2816,7 +2840,7 @@ async fn run_via_worker(
                             .find(|s| &s.node_id == node_id && &s.block == block)
                             .map(|s| s.status.as_str());
                         match status {
-                            Some("running") => any_running = true,
+                            Some("running" | "starting" | "stopping" | "restarting" | "stop_failed") => any_running = true,
                             Some("crashed") => {
                                 any_crashed = true;
                                 if !crash_reported[i] {

@@ -3870,13 +3870,13 @@ export default function App() {
           <button
             type="button"
             className={
-              services.some((s) => s.status === "crashed")
+              services.some((s) => (s.status === "crashed" || s.status === "stop_failed"))
                 ? "service-stats service-stats-fail"
                 : "service-stats service-stats-ok"
             }
             title={
-              services.some((s) => s.status === "crashed")
-                ? `${services.filter((s) => s.status === "crashed").length} of ${services.length} service(s) crashed — click to open`
+              services.some((s) => (s.status === "crashed" || s.status === "stop_failed"))
+                ? `${services.filter((s) => (s.status === "crashed" || s.status === "stop_failed")).length} of ${services.length} service(s) crashed — click to open`
                 : `${services.filter((s) => s.status === "running").length}/${services.length} service(s) running — click to open`
             }
             onClick={() => {
