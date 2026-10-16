@@ -1914,7 +1914,12 @@ async fn api_ping() -> &'static str {
 async fn api_info(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let keychain = state.vars_cache.lock().unwrap().secret_store_kind()
         == meshfox_core::secret_store::SecretStoreKind::Keychain;
-    Json(serde_json::json!({ "readOnly": state.read_only, "secretStore": if keychain { "keychain" } else { "plaintext" } }))
+    let (image_protocol, image_protocol_error) = match meshfox_core::config::tui_image_protocol(canvas_root_dir(&state.canvas_path)) {
+        Ok(protocol) => (protocol, None),
+        Err(error) => (None, Some(error)),
+    };
+    Json(serde_json::json!({ "readOnly": state.read_only, "secretStore": if keychain { "keychain" } else { "plaintext" },
+        "tuiImageProtocol": image_protocol, "tuiImageProtocolError": image_protocol_error }))
 }
 
 /// Whether `method path` changes the canvas file — the requests a read-only
@@ -2162,6 +2167,7 @@ fn image_stamps(
         return Default::default();
     };
     let root = canvas_root_dir(&state.canvas_path);
+    let access = file_access(state);
     let mut stamps = std::collections::BTreeMap::new();
     for node in &canvas.nodes {
         let base = node
@@ -2174,10 +2180,9 @@ fn image_stamps(
         };
         for destination in meshfox_core::image_attrs::local_image_destinations(&node.text) {
             let path = base.join(destination.trim_start_matches('/'));
-            let stamp = path
-                .canonicalize()
+            let stamp = access
+                .confine(&base, destination.trim_start_matches('/'))
                 .ok()
-                .filter(|resolved| resolved.starts_with(&base))
                 .and_then(|resolved| std::fs::metadata(resolved).ok())
                 .filter(|meta| meta.is_file())
                 .and_then(|meta| meta.modified().ok().map(|time| (time, meta.len())));
@@ -4425,7 +4430,12 @@ fn resolve_source_file(state: &AppState, include: Option<&str>) -> Result<Source
     meshfox_core::include::list_includes(&canvas, &state.canvas_path)
         .into_iter()
         .find(|i| i.node_id == include_id)
-        .map(|i| SourceFile::Include { path: i.path })
+        .map(|i| {
+            file_access(state).confine(canvas_root_dir(&state.canvas_path), &i.target)
+                .map(|path| SourceFile::Include { path })
+                .map_err(confine_api_error(&i.target))
+        })
+        .transpose()?
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no include {include_id:?}")))
 }
 
@@ -5959,14 +5969,13 @@ fn confine_api_error(target: &str) -> impl Fn(meshfox_core::ConfineError) -> Api
         meshfox_core::ConfineError::TargetNotFound(p, e) => {
             ApiError(StatusCode::NOT_FOUND, format!("{}: {e}", p.display()))
         }
-        e @ meshfox_core::ConfineError::Unconfirmed(_) => {
+        e @ (meshfox_core::ConfineError::Unconfirmed(_) | meshfox_core::ConfineError::Config(_)) => {
             ApiError(StatusCode::FORBIDDEN, e.to_string())
         }
         meshfox_core::ConfineError::Outside(_) => ApiError(
             StatusCode::FORBIDDEN,
             format!(
-                "{target:?} resolves outside the canvas directory and the directories its \
-                 `type=\"dir\"` variables point to"
+                "{target:?} resolves outside the canvas directory and its trusted roots"
             ),
         ),
     }
@@ -10299,89 +10308,57 @@ async fn relay_canvas_events(state: Arc<AppState>, mut socket: WebSocket, since:
 
 #[derive(Deserialize)]
 struct IncludeAssetQuery {
-    /// A directory reported as some resolved node's `asset_base` (see
-    /// `meshfox_core::canvas::Node::asset_base`) — i.e. an `include`
-    /// target's own directory, which may sit anywhere on disk, not just
-    /// under the canvas file's directory. Re-checked against a fresh
-    /// resolve of the current document below rather than trusted outright,
-    /// so this can't be used to read arbitrary files off disk merely by
-    /// naming their directory in the query string.
-    dir: String,
-    /// Path of the actual asset, relative to `dir`.
+    /// Absent for the main canvas, otherwise an actual include asset base.
+    dir: Option<String>,
     file: String,
 }
 
-/// Backs a relative `![](...)` image (or link) inside an `include`d node's
-/// body — see `Node::asset_base`. `serve_canvas_relative_file` below only
-/// ever resolves against the *main* canvas file's own directory, which is
-/// wrong once a node's content was spliced in from a different directory
-/// (see `meshfox_core::include::resolve`); this is that directory's
-/// counterpart. `dir` is only honored if it's still one of the current
-/// document's actual resolved `asset_base`s — re-derived fresh from the
-/// on-disk file on every request, same as every other read here, so a
-/// stale or hand-crafted `dir` (one this document doesn't currently
-/// include) 404s instead of serving whatever happens to live there.
+/// Query parameters preserve `..` before browser URL normalization. Both
+/// ordinary and included Markdown assets share FileAccess with file nodes.
 async fn get_include_asset(
     State(state): State<Arc<AppState>>,
     Query(q): Query<IncludeAssetQuery>,
 ) -> Response {
-    let raw = state.raw.lock().unwrap().clone();
-    let Ok(canvas) = resolved_canvas(&raw, &state.canvas_path) else {
-        return StatusCode::NOT_FOUND.into_response();
+    let base = if let Some(dir) = q.dir.as_deref() {
+        let raw = state.raw.lock().unwrap().clone();
+        let Ok(canvas) = resolved_canvas(&raw, &state.canvas_path) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        let is_main = std::path::Path::new(dir).canonicalize().ok()
+            == canvas_root_dir(&state.canvas_path).canonicalize().ok();
+        if !is_main
+            && !canvas
+                .nodes
+                .iter()
+                .any(|n| n.asset_base.as_deref() == Some(dir))
+        {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        PathBuf::from(dir)
+    } else {
+        canvas_root_dir(&state.canvas_path).to_path_buf()
     };
-    let requested_dir = PathBuf::from(&q.dir);
-    let known = canvas
-        .nodes
-        .iter()
-        .filter_map(|n| n.asset_base.as_deref())
-        .any(|base| *base == requested_dir);
-    if !known {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-
-    let Ok(dir) = requested_dir.canonicalize() else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let candidate = dir.join(meshfox_core::image_attrs::decode_image_path(&q.file));
-    let Ok(resolved) = candidate.canonicalize() else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    if !resolved.starts_with(&dir) || !resolved.is_file() {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-
-    let Ok(bytes) = std::fs::read(&resolved) else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let mime = mime_guess::from_path(&resolved).first_or_octet_stream();
-    ([(header::CONTENT_TYPE, mime.as_ref().to_string())], bytes).into_response()
+    serve_asset(&state, &base, &q.file).unwrap_or_else(|e| e.into_response())
 }
 
-/// Serves the embedded web UI, falling back to `index.html` for any path
-/// that isn't a real asset (client-side routes) — or, if the UI was never
-/// built into this binary at all, a message saying so instead of a bare
-/// 404.
-/// Serves `path` (a request path, already stripped of its leading `/`) off
-/// disk, resolved relative to the canvas file's own directory — `None` if
-/// it doesn't exist, isn't a plain file, or resolves outside that
-/// directory (`..` traversal).
-async fn serve_canvas_relative_file(state: &AppState, path: &str) -> Option<Response> {
-    let canvas_dir = state
-        .canvas_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(std::path::Path::new("."));
-    let canvas_dir = canvas_dir.canonicalize().ok()?;
-
-    let candidate = canvas_dir.join(meshfox_core::image_attrs::decode_image_path(path));
-    let resolved = candidate.canonicalize().ok()?;
-    if !resolved.starts_with(&canvas_dir) || !resolved.is_file() {
-        return None;
+fn serve_asset(state: &AppState, base: &std::path::Path, path: &str) -> Result<Response, ApiError> {
+    let clean = path.split(['?', '#']).next().unwrap_or(path);
+    let target = meshfox_core::image_attrs::decode_image_path(clean);
+    let resolved = file_access(state)
+        .confine(base, &target)
+        .map_err(confine_api_error(path))?;
+    if !resolved.is_file() {
+        return Err(ApiError(StatusCode::NOT_FOUND, "not a file".into()));
     }
-
-    let bytes = std::fs::read(&resolved).ok()?;
+    let bytes =
+        std::fs::read(&resolved).map_err(|e| ApiError(StatusCode::NOT_FOUND, e.to_string()))?;
     let mime = mime_guess::from_path(&resolved).first_or_octet_stream();
-    Some(([(header::CONTENT_TYPE, mime.as_ref().to_string())], bytes).into_response())
+    Ok(([(header::CONTENT_TYPE, mime.as_ref().to_string())], bytes).into_response())
+}
+
+/// Legacy canvas-relative URL fallback uses the same access policy as the API.
+async fn serve_canvas_relative_file(state: &AppState, path: &str) -> Option<Response> {
+    serve_asset(state, canvas_root_dir(&state.canvas_path), path).ok()
 }
 
 async fn serve_embedded(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
@@ -10672,6 +10649,7 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/info", get(api_info))
         .route("/api/watch", get(watch_changes))
         .route("/api/include-asset", get(get_include_asset))
+        .route("/api/asset", get(get_include_asset))
         .route("/api/syntax", get(get_syntax_list))
         .route("/api/syntax/:name", get(get_syntax_file))
         // Only wraps the routes declared above, not `fallback` — see
@@ -21341,6 +21319,192 @@ mod image_watch_tests {
         assert_eq!(image_stamps(&state)[&dir.join("plot.png")], None);
         std::fs::write(dir.join("plot.png"), b"back").unwrap();
         assert!(image_stamps(&state)[&dir.join("plot.png")].is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tui_image_config_tests {
+    use super::*;
+    #[tokio::test]
+    async fn info_exposes_only_public_tui_protocol_and_reports_invalid_settings() {
+        let dir = std::env::temp_dir().join(format!("meshfox-tui-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join(".meshfox")).unwrap();
+        let path = dir.join("test.canvas.md");
+        std::fs::write(&path, "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n").unwrap();
+        let config = dir.join(".meshfox/config.toml");
+        std::fs::write(&config, "private_setting = \"not-for-clients\"\n[tui]\nimage_protocol = \"sixel\"").unwrap();
+        let state = build_state(path, false, None).await.unwrap();
+        let Json(info) = api_info(State(state.clone())).await;
+        assert_eq!(info["tuiImageProtocol"], "sixel");
+        assert!(info["tuiImageProtocolError"].is_null());
+        assert!(!info.to_string().contains("not-for-clients"));
+        std::fs::write(&config, "[tui]\nimage_protocol = 7").unwrap();
+        let Json(info) = api_info(State(state)).await;
+        assert!(info["tuiImageProtocol"].is_null());
+        assert!(info["tuiImageProtocolError"].as_str().unwrap().contains("tui.image_protocol"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod configured_file_access_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shared_assets_file_nodes_includes_and_revocation_use_one_policy() {
+        let dir = std::env::temp_dir().join(format!("meshfox-files-{}", uuid::Uuid::new_v4()));
+        for sub in [".meshfox", "docs", "child/.meshfox", "private"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        let dir = dir.canonicalize().unwrap();
+        std::fs::write(dir.join("docs/scd 41.svg"), b"shared image").unwrap();
+        std::fs::write(dir.join("docs/literal%20#?.svg"), b"literal delimiters").unwrap();
+        std::fs::write(dir.join("docs/readme.md"), "![sensor](scd%2041.svg)").unwrap();
+        std::fs::write(dir.join("private/secret.txt"), b"secret").unwrap();
+        let path = dir.join("child/README.canvas.md");
+        let raw = "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n![sensor](../docs/scd%2041.svg)\n\n## File\n<!-- meshfox:node id=\"data\" type=\"file\" display=\"code\" -->\n\n[data](../docs/readme.md)\n";
+        std::fs::write(&path, raw).unwrap();
+        let config = dir.join(".meshfox/config.toml");
+        std::fs::write(&config, "[files]\nallow = []\n").unwrap();
+        let addr = spawn_test_server(path.clone()).await;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = reqwest::Client::new();
+        let asset = |file: &str| {
+            let mut url = reqwest::Url::parse(&format!("http://{addr}/api/asset")).unwrap();
+            url.query_pairs_mut().append_pair("file", file);
+            url
+        };
+        assert_eq!(
+            client
+                .get(asset("../docs/scd%2041.svg"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+        std::fs::write(&config, "[files]\nallow = [\"docs\"]\n").unwrap();
+        let image = client
+            .get(asset("../docs/scd%2041.svg"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(image.status(), 200);
+        assert_eq!(image.bytes().await.unwrap().as_ref(), b"shared image");
+        let literal = client
+            .get(asset("../docs/literal%2520%23%3F.svg"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(literal.status(), 200);
+        assert_eq!(
+            literal.bytes().await.unwrap().as_ref(),
+            b"literal delimiters"
+        );
+        let file = client
+            .get(format!("http://{addr}/api/nodes/data/file-content"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(file.status(), 200);
+        assert!(file.text().await.unwrap().contains("sensor"));
+        assert_eq!(
+            client
+                .get(asset("../private/secret.txt"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.join("private"), dir.join("docs/escape")).unwrap();
+            assert_eq!(
+                client
+                    .get(asset("../docs/escape/secret.txt"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                403
+            );
+        }
+        let state = build_state(path.clone(), false, None).await.unwrap();
+        assert!(image_stamps(&state).values().all(Option::is_some));
+        let include_raw = format!("{raw}\n## Included\n<!-- meshfox:node id=\"inc\" type=\"include\" -->\n\n[docs](../docs/readme.md)\n");
+        let included = resolved_canvas(&include_raw, &path).unwrap();
+        assert!(included.node("inc").unwrap().text.contains("sensor"));
+        let mut included_asset = asset("scd%2041.svg");
+        included_asset
+            .query_pairs_mut()
+            .append_pair("dir", dir.join("docs").to_str().unwrap());
+        // Include bases are accepted only while the canvas actually includes them.
+        assert_eq!(
+            client
+                .get(included_asset.clone())
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            404
+        );
+        let included_state = build_state(path.clone(), false, None).await.unwrap();
+        *included_state.raw.lock().unwrap() = include_raw.clone();
+        let result = get_include_asset(
+            State(included_state),
+            Query(IncludeAssetQuery {
+                dir: Some(dir.join("docs").to_string_lossy().into_owned()),
+                file: "scd%2041.svg".into(),
+            }),
+        )
+        .await;
+        assert_eq!(result.status(), 200);
+        // Granting only the included file does not grant its neighboring images.
+        std::fs::write(&config, "[files]\nallow = [\"docs/readme.md\"]\n").unwrap();
+        assert!(resolved_canvas(&include_raw, &path).is_ok());
+        let exact_state = build_state(path.clone(), false, None).await.unwrap();
+        *exact_state.raw.lock().unwrap() = include_raw.clone();
+        let denied = get_include_asset(
+            State(exact_state),
+            Query(IncludeAssetQuery {
+                dir: Some(dir.join("docs").to_string_lossy().into_owned()),
+                file: "scd%2041.svg".into(),
+            }),
+        )
+        .await;
+        assert_eq!(denied.status(), 403);
+        std::fs::write(&config, "[files]\nallow = [\"docs\"]\n").unwrap();
+        // Nearest explicit empty list revokes the parent's grants immediately.
+        std::fs::write(
+            dir.join("child/.meshfox/config.toml"),
+            "[files]\nallow = []\n",
+        )
+        .unwrap();
+        assert_eq!(
+            client
+                .get(asset("../docs/scd%2041.svg"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+        assert!(image_stamps(&state).values().all(Option::is_none));
+        assert!(resolved_canvas(&include_raw, &path).is_err());
+        std::fs::write(
+            dir.join("child/.meshfox/config.toml"),
+            "[files]\nallow = true\n",
+        )
+        .unwrap();
+        let invalid = client
+            .get(asset("../docs/scd%2041.svg"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), 403);
+        assert!(invalid.text().await.unwrap().contains("files.allow"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

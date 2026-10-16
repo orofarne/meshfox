@@ -40,24 +40,7 @@ import {
 } from "./api";
 import type { ConstraintStatusDto, NodeType, ServiceStatusDto } from "./types";
 
-/**
- * A relative `![](...)`/link target inside a node's rendered body normally
- * resolves against the canvas file's own directory (see the server's
- * `serve_canvas_relative_file`) — wrong once this node's body was spliced
- * in from an `include` target that lives in a different directory (see
- * `MeshNodeData.assetBase`, set from `crates/core/src/canvas.rs`'s
- * `Node.asset_base`). Rewrites such a target to `/api/include-asset`,
- * which resolves it against `assetBase` instead (still guarded server-side
- * against arbitrary directories — see that handler's own doc comment).
- * Left untouched: absolute URLs (`scheme:`), root-relative paths (`/...`),
- * bare anchors (`#...`), and anything when `assetBase` is unset (every
- * node that wasn't spliced in from an include, same as before).
- */
-function resolveAssetHref(href: string | undefined, assetBase: string | undefined): string | undefined {
-  if (!href || !assetBase) return href;
-  if (/^[a-z][a-z0-9+.-]*:/i.test(href) || href.startsWith("/") || href.startsWith("#")) return href;
-  return `/api/include-asset?dir=${encodeURIComponent(assetBase)}&file=${encodeURIComponent(href)}`;
-}
+import { resolveAssetHref } from "./assetHref";
 
 /**
  * `react-markdown`'s own `defaultUrlTransform` strips any URL scheme
@@ -2371,7 +2354,7 @@ function FileCodePreview({ nodeId, target, lang }: { nodeId: string; target?: st
     return (
       <div className="mesh-node-body nopan">
         {target ? (
-          <a href={target} target="_blank" rel="noreferrer">
+          <a href={resolveAssetHref(target, undefined)} target="_blank" rel="noreferrer">
             {target}
           </a>
         ) : (
@@ -2703,14 +2686,14 @@ export function NodeBodyContent({ data, nodeId }: { data: MeshNodeData; nodeId: 
                 {data.target}
               </button>
             ) : (
-              <a href={data.target} target="_blank" rel="noreferrer" className="nodrag">
+              <a href={resolveAssetHref(data.target, data.assetBase)} target="_blank" rel="noreferrer" className="nodrag">
                 {data.target}
               </a>
             )}
             {isFile && (
               <>
                 <a
-                  href={data.target}
+                  href={resolveAssetHref(data.target, data.assetBase)}
                   download
                   className="mesh-node-icon-button mesh-node-inline-icon nodrag"
                   title="Download this file"
@@ -3262,7 +3245,7 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
           )}
           {!data.editMode && canOpenLink && (
             <a
-              href={data.target}
+              href={resolveAssetHref(data.target, data.assetBase)}
               target="_blank"
               rel="noopener noreferrer"
               className="mesh-node-icon-button mesh-node-inline-icon nodrag"
@@ -3339,7 +3322,7 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
           )}
           {canOpenLink && (
             <a
-              href={data.target}
+              href={resolveAssetHref(data.target, data.assetBase)}
               target="_blank"
               rel="noopener noreferrer"
               className="mesh-node-icon-button mesh-node-inline-icon nodrag"

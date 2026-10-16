@@ -27,6 +27,8 @@ pub enum IncludeError {
     MissingTarget(String),
     #[error("include target {0} not found: {1}")]
     NotFound(PathBuf, #[source] std::io::Error),
+    #[error(transparent)]
+    Access(#[from] crate::file_read::ConfineError),
 }
 
 /// Returns a new `Canvas` with every `include` node's target dumped into
@@ -34,10 +36,16 @@ pub enum IncludeError {
 /// `canvas` was parsed from, used to resolve a relative include target
 /// against its directory.
 pub fn resolve(canvas: &Canvas, base_path: &Path) -> Result<Canvas, IncludeError> {
+    let access = crate::FileAccess::for_canvas_path(canvas, base_path);
+    resolve_with_access(canvas, base_path, &access)
+}
+
+pub fn resolve_with_access(canvas: &Canvas, base_path: &Path, access: &crate::FileAccess) -> Result<Canvas, IncludeError> {
     let base_dir = base_path
         .parent()
+        .filter(|p| !p.as_os_str().is_empty())
         .map(Path::to_path_buf)
-        .unwrap_or_default();
+        .unwrap_or_else(|| PathBuf::from("."));
     let mut nodes = canvas.nodes.clone();
 
     for node in nodes
@@ -48,7 +56,10 @@ pub fn resolve(canvas: &Canvas, base_path: &Path) -> Result<Canvas, IncludeError
             .target
             .clone()
             .ok_or_else(|| IncludeError::MissingTarget(node.id.clone()))?;
-        let target_path = base_dir.join(&target);
+        let target_path = access.confine(&base_dir, &target).map_err(|error| match error {
+            crate::file_read::ConfineError::TargetNotFound(path, source) => IncludeError::NotFound(path, source),
+            other => IncludeError::Access(other),
+        })?;
         let contents = std::fs::read_to_string(&target_path)
             .map_err(|e| IncludeError::NotFound(target_path.clone(), e))?;
         // Best-effort: an unreadable/relative-weirdness parent just leaves
@@ -94,10 +105,16 @@ pub struct IncludeInfo {
 /// `IncludeInfo`), without ever reading its target's content — `base_path`
 /// is the file `canvas` was parsed from, same as `resolve`.
 pub fn list_includes(canvas: &Canvas, base_path: &Path) -> Vec<IncludeInfo> {
+    let access = crate::FileAccess::for_canvas_path(canvas, base_path);
+    list_includes_with_access(canvas, base_path, &access)
+}
+
+pub fn list_includes_with_access(canvas: &Canvas, base_path: &Path, access: &crate::FileAccess) -> Vec<IncludeInfo> {
     let base_dir = base_path
         .parent()
+        .filter(|p| !p.as_os_str().is_empty())
         .map(Path::to_path_buf)
-        .unwrap_or_default();
+        .unwrap_or_else(|| PathBuf::from("."));
 
     canvas
         .nodes
@@ -105,8 +122,7 @@ pub fn list_includes(canvas: &Canvas, base_path: &Path) -> Vec<IncludeInfo> {
         .filter(|n| n.node_type == NodeType::Include)
         .filter_map(|n| {
             let target = n.target.clone()?;
-            let target_path = base_dir.join(&target);
-            let path = target_path.canonicalize().unwrap_or(target_path);
+            let path = access.confine(&base_dir, &target).ok()?;
             Some(IncludeInfo {
                 node_id: n.id.clone(),
                 title: n.title.clone(),

@@ -5,13 +5,10 @@
 //! participates in resolution, and SPEC.md's "Variables" section for the
 //! user-facing writeup.
 //!
-//! Reuses the same two files `crate::config` already loads
-//! (`~/.meshfox/config.toml` global, `<canvas_root>/.meshfox/config.toml`
-//! local), under a new top-level `env` array-of-tables key — kept
-//! separate from `config::load`'s own whole-table deep-merge (that's for
-//! flat tool settings; this needs per-entry path scoping and a
-//! project-always-wins-over-global tier order a blind table merge can't
-//! express).
+//! Uses the global and ancestor `.meshfox/config.toml` files from `config`.
+//! Each file's `[[env]]` sections are scoped against their own owner and
+//! applied per variable, from global to nearest. A blind whole-array merge
+//! cannot express these per-section scopes and variable overrides.
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
@@ -206,14 +203,11 @@ fn load_from_with_store(
     let global_table = global_path
         .map(crate::config::read_table)
         .unwrap_or_default();
-    let local_table = crate::config::read_table(&crate::config::local_config_path(canvas_root));
 
     // The global tier's own relative (non-`~`) paths have no anchor other
     // than `$HOME` — there's no "directory the file lives in" to resolve
     // against the way the local tier has `canvas_root`.
     let global_sections = parse_env_sections(&global_table, home, home, None);
-    let local_sections =
-        parse_env_sections(&local_table, home, Some(canvas_root), Some(canvas_root));
 
     let normalized_root = normalize(canvas_root);
 
@@ -230,13 +224,13 @@ fn load_from_with_store(
         store.clone(),
         |raw_path| SharedOrigin::Global { path: raw_path },
     );
-    apply_tier(
-        &local_sections,
-        &normalized_root,
-        &mut out,
-        store,
-        |_raw_path| SharedOrigin::Project,
-    );
+    for path in crate::config::ancestor_config_paths(canvas_root, global_path) {
+        let owner = path.parent().and_then(Path::parent).unwrap_or(canvas_root);
+        let table = crate::config::read_table(&path);
+        let sections = parse_env_sections(&table, home, Some(owner), Some(owner));
+        apply_tier(&sections, &normalized_root, &mut out, store.clone(),
+            |_raw_path| SharedOrigin::Project);
+    }
     out
 }
 
@@ -540,6 +534,25 @@ mod tests {
     fn write(path: &Path, contents: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn ancestor_env_sections_overlay_per_variable_and_scope_to_owner() {
+        let root = tempdir("ancestors");
+        let child = root.join("nested/child");
+        std::fs::create_dir_all(&child).unwrap();
+        write(
+            &root.join(".meshfox/config.toml"),
+            "[[env]]\npath = \"nested\"\nvars = { A = \"parent\", B = \"kept\" }\n",
+        );
+        write(
+            &child.join(".meshfox/config.toml"),
+            "[[env]]\nvars = { A = \"child\" }\n",
+        );
+        let shared = load_from(None, &child, None);
+        assert_eq!(shared.get("A").unwrap().value, "child");
+        assert_eq!(shared.get("B").unwrap().value, "kept");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

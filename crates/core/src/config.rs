@@ -1,21 +1,12 @@
 //! meshfox's own settings — distinct from a document's `meshfox:var`s
 //! (`crate::vars`): a value here is a fact about the machine/environment
-//! (which agent CLI is installed and preferred, say), resolved once per
-//! invocation from a `.meshfox/config.toml`, not declared or prompted for
-//! per-canvas. Currently consumed by `crate::builtin_interpreter`'s `@name`
-//! macros only — nothing else reads this yet.
+//! (which agent CLI is installed and preferred, say), read from optional
+//! `.meshfox/config.toml` files rather than declared or prompted for per canvas.
 //!
-//! Local (`<canvas_root>/.meshfox/config.toml`) merges over global
-//! (`~/.meshfox/config.toml`), same locality split `crate::syntax_dirs`
-//! already established for custom grammars: local wins key-by-key, at
-//! every nesting level, not just the top one — so a global `[agent]
-//! provider = "claude"` plus a local file containing only `[agent]
-//! max_budget_usd = 0.05` ends up with both fields, not the local file's
-//! table wholesale replacing the global one.
-//!
-//! Skeleton status: loaded and flattened (`flatten_to_env`) here, but only
-//! wired into one real caller so far (`stream_exec::spawn_interpreter`'s
-//! `@`-builtin path) — see that function's own doc comment.
+//! The global config is overlaid by every ancestor's `.meshfox/config.toml`,
+//! from the filesystem root to the canonical canvas directory. Nearer scalar
+//! keys/arrays win and nested tables merge. `shared_env` resolves `[[env]]`
+//! separately per source; `file_roots` preserves owners for relative grants.
 
 use std::path::{Path, PathBuf};
 
@@ -32,8 +23,8 @@ pub fn local_config_path(canvas_root: &Path) -> PathBuf {
     canvas_root.join(".meshfox").join("config.toml")
 }
 
-/// Loads and deep-merges global + local config into one table (local wins
-/// key-by-key at every level — see module doc). Either file being absent,
+/// Loads and deep-merges global + ancestor configs (nearest wins
+/// key-by-key at every level — see module doc). A file being absent,
 /// or unreadable/unparsable, is treated the same as "empty" for that one
 /// file rather than an error: this is optional configuration a project may
 /// never have, not a required manifest.
@@ -50,9 +41,90 @@ pub fn load(canvas_root: &Path) -> toml::Table {
 /// has one — see that test's own doc comment).
 fn load_from(global_path: Option<&Path>, canvas_root: &Path) -> toml::Table {
     let mut merged = global_path.map(read_table).unwrap_or_default();
-    let local = read_table(&local_config_path(canvas_root));
-    deep_merge(&mut merged, local);
+    for path in ancestor_config_paths(canvas_root, global_path) {
+        deep_merge(&mut merged, read_table(&path));
+    }
     merged
+}
+
+/// Parent configurations, from filesystem root to the canvas directory.
+/// Resolve symlinks first so opening the same canvas via an alias cannot
+/// change its configuration. The global configuration is applied only once.
+pub(crate) fn ancestor_config_paths(canvas_root: &Path, global: Option<&Path>) -> Vec<PathBuf> {
+    let root = canvas_root.canonicalize().unwrap_or_else(|_| {
+        if canvas_root.is_absolute() {
+            canvas_root.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_default()
+                .join(canvas_root)
+        }
+    });
+    let global = global.map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()));
+    let mut paths: Vec<_> = root
+        .ancestors()
+        .map(local_config_path)
+        .filter(|p| {
+            let canonical = p.canonicalize().unwrap_or_else(|_| p.clone());
+            Some(&canonical) != global.as_ref()
+        })
+        .collect();
+    paths.reverse();
+    paths
+}
+
+/// Explicit filesystem grants. A nearer `files.allow` replaces the entire
+/// inherited list (including with `[]`). Paths are relative to the owning
+/// directory, not `.meshfox` or the consuming canvas. Invalid configuration
+/// fails closed rather than silently falling back to a broader ancestor.
+pub fn file_roots(canvas_root: &Path) -> Result<Vec<PathBuf>, String> {
+    file_roots_from(global_config_path().as_deref(), canvas_root)
+}
+
+fn file_roots_from(global: Option<&Path>, canvas_root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut roots = Vec::new();
+    for path in global
+        .into_iter()
+        .map(Path::to_path_buf)
+        .chain(ancestor_config_paths(canvas_root, global))
+    {
+        let table = read_table_strict(&path)?;
+        let Some(files) = table.get("files") else {
+            continue;
+        };
+        let files = files
+            .as_table()
+            .ok_or_else(|| format!("{}: files must be a table", path.display()))?;
+        let Some(allow) = files.get("allow") else {
+            continue;
+        };
+        let allow = allow
+            .as_array()
+            .ok_or_else(|| format!("{}: files.allow must be an array of paths", path.display()))?;
+        let owner = path
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or(Path::new("/"));
+        roots = allow
+            .iter()
+            .map(|value| {
+                let value = value.as_str().filter(|s| !s.is_empty()).ok_or_else(|| {
+                    format!(
+                        "{}: files.allow entries must be nonempty strings",
+                        path.display()
+                    )
+                })?;
+                let expanded = if value == "~" || value.starts_with("~/") {
+                    let home = std::env::var_os("HOME").ok_or("cannot expand ~ without HOME")?;
+                    PathBuf::from(home).join(value.strip_prefix("~/").unwrap_or(""))
+                } else {
+                    owner.join(value)
+                };
+                Ok(expanded)
+            })
+            .collect::<Result<_, String>>()?;
+    }
+    Ok(roots)
 }
 
 pub(crate) fn read_table(path: &Path) -> toml::Table {
@@ -122,6 +194,21 @@ fn server_socket_from_table(table: &toml::Table) -> Option<PathBuf> {
         .and_then(|v| v.as_str())
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
+}
+
+/// Configured TUI graphics protocol. Environment overrides belong to the
+/// terminal client, whose environment may differ from the worker's.
+pub fn tui_image_protocol(canvas_root: &Path) -> Result<Option<String>, String> {
+    tui_image_protocol_from_table(&load(canvas_root))
+}
+
+fn tui_image_protocol_from_table(table: &toml::Table) -> Result<Option<String>, String> {
+    let Some(value) = table.get("tui").and_then(|tui| tui.get("image_protocol")) else { return Ok(None) };
+    let value = value.as_str().ok_or("tui.image_protocol must be a string")?;
+    match value {
+        "auto" | "iterm2" | "sixel" | "kitty" | "halfblocks" => Ok(Some(value.to_owned())),
+        _ => Err(format!("invalid tui.image_protocol={value:?}; expected auto, iterm2, sixel, kitty, or halfblocks")),
+    }
 }
 
 /// Default for [`session_max_output_bytes`] — 256 KiB per block, same
@@ -366,6 +453,21 @@ mod tests {
     }
 
     #[test]
+    fn tui_protocol_uses_merged_config_and_validates_values() {
+        let mut global: toml::Table = "[tui]\nimage_protocol = \"sixel\"\neditor_theme = \"base16-mocha.dark\"".parse().unwrap();
+        let local: toml::Table = "[tui]\nimage_protocol = \"iterm2\"".parse().unwrap();
+        assert_eq!(tui_image_protocol_from_table(&global).unwrap().as_deref(), Some("sixel"));
+        deep_merge(&mut global, local);
+        assert_eq!(tui_image_protocol_from_table(&global).unwrap().as_deref(), Some("iterm2"));
+        assert_eq!(global["tui"]["editor_theme"].as_str(), Some("base16-mocha.dark"));
+        assert_eq!(tui_image_protocol_from_table(&toml::Table::new()).unwrap(), None);
+        for invalid in ["true", "7", "\"unknown\""] {
+            let table = format!("[tui]\nimage_protocol = {invalid}").parse().unwrap();
+            assert!(tui_image_protocol_from_table(&table).is_err());
+        }
+    }
+
+    #[test]
     fn flatten_to_env_joins_nested_keys_with_underscores() {
         let table: toml::Table = "[interpreters.agent]\nprovider = \"codex\"\n"
             .parse()
@@ -606,6 +708,77 @@ mod tests {
     fn load_is_empty_when_neither_file_exists() {
         let dir = tempfile_dir();
         assert!(load_from(None, &dir).is_empty());
+    }
+
+    #[test]
+    fn ancestors_merge_and_file_grants_keep_their_owner_and_replace() {
+        let dir = tempfile_dir().canonicalize().unwrap();
+        let project = dir.join("project");
+        let child = project.join("nested/child");
+        std::fs::create_dir_all(project.join(".meshfox")).unwrap();
+        std::fs::create_dir_all(child.join(".meshfox")).unwrap();
+        let global = dir.join("global.toml");
+        std::fs::write(
+            &global,
+            "[tui]\neditor_theme = \"global\"\n[files]\nallow = [\"/global\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(".meshfox/config.toml"),
+            "[tui]\neditor_theme = \"parent\"\n[files]\nallow = [\"docs\"]\n",
+        )
+        .unwrap();
+        let local = child.join(".meshfox/config.toml");
+        std::fs::write(&local, "[tui]\nimage_protocol = \"sixel\"\n").unwrap();
+        let merged = load_from(Some(&global), &child);
+        assert_eq!(merged["tui"]["editor_theme"].as_str(), Some("parent"));
+        assert_eq!(merged["tui"]["image_protocol"].as_str(), Some("sixel"));
+        assert_eq!(
+            file_roots_from(Some(&global), &child).unwrap(),
+            vec![project.join("docs")]
+        );
+        std::fs::write(&local, "[files]\nallow = [\"own\"]\n").unwrap();
+        assert_eq!(
+            file_roots_from(Some(&global), &child).unwrap(),
+            vec![child.join("own")]
+        );
+        std::fs::write(&local, "[files]\nallow = []\n").unwrap();
+        assert!(file_roots_from(Some(&global), &child).unwrap().is_empty());
+        for invalid in [
+            "[files]\nallow = true",
+            "[files]\nallow = [7]",
+            "[files]\nallow = [\"\"]",
+            "broken = [",
+        ] {
+            std::fs::write(&local, invalid).unwrap();
+            assert!(file_roots_from(Some(&global), &child).is_err(), "{invalid}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn global_config_is_not_applied_twice_through_ancestor_search() {
+        let dir = tempfile_dir().canonicalize().unwrap();
+        let global = local_config_path(&dir);
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(&global, "[files]\nallow = [\"docs\"]").unwrap();
+        let child = dir.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        assert!(!ancestor_config_paths(&child, Some(&global)).contains(&global));
+        assert_eq!(
+            file_roots_from(Some(&global), &child).unwrap(),
+            vec![dir.join("docs")]
+        );
+        #[cfg(unix)]
+        {
+            let alias = dir.join("alias");
+            std::os::unix::fs::symlink(&child, &alias).unwrap();
+            assert_eq!(
+                ancestor_config_paths(&alias, Some(&global)),
+                ancestor_config_paths(&child, Some(&global))
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn tempfile_dir() -> PathBuf {

@@ -218,6 +218,7 @@ pub struct FileAccess {
     /// `dir` variables with no trusted value yet (an unconfirmed default),
     /// so a target naming one can say so instead of just "not found".
     pending: Vec<String>,
+    config_error: Option<String>,
 }
 
 impl FileAccess {
@@ -232,12 +233,26 @@ impl FileAccess {
     pub fn from_values(canvas_path: &Path, values: HashMap<String, String>) -> FileAccess {
         let mut roots: Vec<PathBuf> = values.values().map(PathBuf::from).collect();
         roots.push(tmp_dir(canvas_path));
+        let config = crate::config::file_roots(
+            canvas_path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new(".")),
+        );
+        let config_error = match config {
+            Ok(configured) => {
+                roots.extend(configured);
+                None
+            }
+            Err(error) => Some(error),
+        };
         FileAccess {
             canvas_path: Some(canvas_path.to_path_buf()),
             vars: values,
             roots,
             files: Vec::new(),
             pending: Vec::new(),
+            config_error,
         }
     }
 
@@ -327,19 +342,46 @@ impl FileAccess {
 
     /// `file_read::confine_in` on the expanded target with the trusted roots.
     pub fn confine(&self, dir: &Path, target: &str) -> Result<PathBuf, ConfineError> {
+        if let Some(error) = &self.config_error {
+            return Err(ConfineError::Config(error.clone()));
+        }
         for name in &self.pending {
-            if expand_target(target, &HashMap::from([(name.clone(), String::new())]), None)
-                != target
+            if expand_target(
+                target,
+                &HashMap::from([(name.clone(), String::new())]),
+                None,
+            ) != target
             {
                 return Err(ConfineError::Unconfirmed(name.clone()));
             }
         }
-        file_read::confine_in_files(dir, &self.roots, &self.files, &self.expand(target))
+        // `dir` is the reference's base (an include may have its own),
+        // not an additional grant. Trust remains anchored to the canvas.
+        let candidate = absolutize(&dir.join(self.expand(target)));
+        file_read::confine_in_files(
+            self.canvas_dir(dir),
+            &self.roots,
+            &self.files,
+            &candidate.to_string_lossy(),
+        )
     }
 
     pub fn preview(&self, dir: &Path, target: &str) -> Result<FilePreview, PreviewError> {
-        self.confine(dir, target)?;
-        file_read::preview_in_files(dir, &self.roots, &self.files, &self.expand(target))
+        let resolved = self.confine(dir, target)?;
+        file_read::preview_in_files(
+            self.canvas_dir(dir),
+            &self.roots,
+            &self.files,
+            &resolved.to_string_lossy(),
+        )
+    }
+
+    fn canvas_dir<'a>(&'a self, fallback: &'a Path) -> &'a Path {
+        self.canvas_path
+            .as_deref()
+            .and_then(Path::parent)
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(fallback)
     }
 }
 

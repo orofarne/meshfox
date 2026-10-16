@@ -27,6 +27,7 @@ use ratatui_image::picker::cap_parser::QueryStdioOptions;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::Protocol;
 use ratatui_image::sliced::SlicedProtocol;
+use super::image_render::DocumentImage;
 
 use super::spatial;
 use super::ui;
@@ -499,7 +500,7 @@ pub struct App {
     /// `ui::compute_layout`'s own pane rects), so a click always hit-tests
     /// against exactly what's currently on screen, scroll/wrap included.
     pub doc_click_targets: Vec<(Rect, ClickTarget)>,
-    pub doc_images: HashMap<PathBuf, Option<Arc<SlicedProtocol>>>,
+    pub(super) doc_images: HashMap<PathBuf, Option<Arc<DocumentImage>>>,
     image_viewport: ratatui::layout::Size,
     /// Bytes of the document's image files, fetched from the worker
     /// (`GET /<relative path>`) — `doc_images` is rebuilt from these on
@@ -751,7 +752,7 @@ pub struct App {
     /// `render_current_document` call so the existing `Segment::Image`
     /// render path (`ui.rs`) can show it with no changes of its own —
     /// Shared sliced protocols avoid re-encoding preview images on redraw.
-    pub link_preview_image: HashMap<String, Arc<SlicedProtocol>>,
+    pub(super) link_preview_image: HashMap<String, Arc<DocumentImage>>,
     /// Whether the `S` (reset session) confirm prompt is up — see `on_key`'s
     /// early dispatch to `on_reset_session_confirm_key` and
     /// `reset_session`'s own doc comment for why this asks at all despite
@@ -1072,12 +1073,18 @@ impl App {
         initial_node: Option<&str>,
         worker_port: Option<u16>,
     ) -> io::Result<App> {
+        let configured = if std::env::var_os("MESHFOX_IMAGE_PROTOCOL").is_none() {
+            match worker_port {
+                Some(port) => crate::worker_client::tui_image_protocol(port).await.map_err(io::Error::other)?,
+                None => None,
+            }
+        } else { None };
         Self::new_with_picker(
             canvas_path,
             background_tx,
             initial_node,
             worker_port,
-            build_picker()?,
+            build_picker(configured.as_deref())?,
         )
         .await
     }
@@ -3860,7 +3867,7 @@ impl App {
             }
             BackgroundMsg::Image { url, image } => {
                 let budget = ratatui::layout::Size::new(56, 24);
-                if let Some(protocol) = sliced_image(&self.picker, image, budget) {
+                if let Some(protocol) = prepared_image(&self.picker, image, budget) {
                     self.link_preview_image.insert(url, Arc::new(protocol));
                 }
             }
@@ -6364,9 +6371,9 @@ fn is_svg_path(path: &Path) -> bool {
 /// positive capability reply takes precedence over the iTerm2 hint, bypassing
 /// our cell-based image sizing (Sixel pixels can differ from reported cell
 /// metrics on Retina displays).
-fn build_picker() -> io::Result<Picker> {
-    let forced = match std::env::var("MESHFOX_IMAGE_PROTOCOL") {
-        Ok(value) => parse_image_protocol(Some(&value))?,
+fn build_picker(configured: Option<&str>) -> io::Result<Picker> {
+    let override_value = match std::env::var("MESHFOX_IMAGE_PROTOCOL") {
+        Ok(value) => Some(value),
         Err(std::env::VarError::NotPresent) => None,
         Err(std::env::VarError::NotUnicode(_)) => {
             return Err(io::Error::new(
@@ -6375,6 +6382,7 @@ fn build_picker() -> io::Result<Picker> {
             ))
         }
     };
+    let forced = select_image_protocol(override_value.as_deref(), configured)?;
     if forced == Some(ProtocolType::Halfblocks) {
         return Ok(Picker::halfblocks());
     }
@@ -6395,6 +6403,10 @@ fn build_picker() -> io::Result<Picker> {
         }
     }
     Ok(picker)
+}
+
+fn select_image_protocol(override_value: Option<&str>, configured: Option<&str>) -> io::Result<Option<ProtocolType>> {
+    parse_image_protocol(override_value.or(configured))
 }
 
 fn parse_image_protocol(value: Option<&str>) -> io::Result<Option<ProtocolType>> {
@@ -6453,14 +6465,12 @@ fn request_image(
     let (path, tx) = (path.to_path_buf(), tx.clone());
     pending.insert(path.clone());
     tokio::spawn(async move {
+        let clean = relative.split(['?', '#']).next().unwrap_or(&relative);
+        let relative = meshfox_core::image_attrs::decode_image_path(clean);
         let result = if let Some(base) = asset_base {
             crate::worker_client::get_include_asset(port, &base, &relative).await
         } else {
-            crate::worker_client::get_relative_file(
-                port,
-                &meshfox_core::image_attrs::decode_image_path(&relative),
-            )
-            .await
+            crate::worker_client::get_relative_file(port, &relative).await
         };
         let _ = tx.send(BackgroundMsg::ImageBytes {
             generation,
@@ -6483,7 +6493,7 @@ fn load_document_image(
     bytes: Option<&[u8]>,
     bg: Option<Background>,
     budget: ratatui::layout::Size,
-) -> Option<Arc<SlicedProtocol>> {
+) -> Option<Arc<DocumentImage>> {
     let embedded_svg = path.to_str().and_then(|url| {
         let (meta, payload) = url.strip_prefix("data:")?.split_once(',')?;
         meta.eq_ignore_ascii_case("image/svg+xml;base64").then(|| {
@@ -6504,42 +6514,31 @@ fn load_document_image(
             None => image::load_from_memory(bytes?).ok()?,
         }
     };
-    sliced_image(picker, image, budget).map(Arc::new)
+    prepared_image(picker, image, budget).map(Arc::new)
 }
 
-pub(super) fn sliced_image(picker: &Picker, image: image::DynamicImage, budget: ratatui::layout::Size) -> Option<SlicedProtocol> {
-    let font = picker.font_size();
+pub(super) fn prepared_image(picker: &Picker, image: image::DynamicImage, budget: ratatui::layout::Size) -> Option<DocumentImage> {
     let density = if picker.protocol_type() == ProtocolType::Iterm2 { 2 } else { 1 };
-    let cell_width = u32::from(font.width).checked_mul(density)?.max(1);
-    let cell_height = u32::from(font.height).checked_mul(density)?.max(1);
-    let image = image.resize(
-        u32::from(budget.width) * cell_width,
-        u32::from(budget.height) * cell_height,
-        image::imageops::FilterType::Lanczos3,
-    );
-    let size = ratatui::layout::Size::new(
-        image.width().div_ceil(cell_width) as u16,
-        image.height().div_ceil(cell_height) as u16,
-    );
-    if picker.protocol_type() == ProtocolType::Iterm2 {
-        // Preserve the dense SVG raster and cell-based placement: the library's
-        // generic iTerm2 slicer resizes to logical pixels and emits px sizes.
-        let Protocol::ITerm2(template) = picker.new_protocol(
-            image::DynamicImage::new_rgba8(1, 1), ratatui::layout::Size::new(1, 1),
-            ratatui_image::Resize::Fit(None),
-        ).ok()? else { return None };
-        let mut rows = Vec::with_capacity(usize::from(size.height));
-        for row in 0..size.height {
-            let y = u32::from(row) * cell_height;
-            let pixels = image.crop_imm(0, y, image.width(), cell_height.min(image.height() - y));
-            let protocol = ratatui_image::protocol::iterm2::Iterm2::new(
-                pixels, ratatui::layout::Size::new(size.width, 1), template.is_tmux,
-            ).ok()?;
-            rows.push(image_cell_dimensions(Protocol::ITerm2(protocol)));
+    let font = picker.font_size();
+    let cell_width = (u32::from(font.width) * density).max(1);
+    let cell_height = (u32::from(font.height) * density).max(1);
+    let pixels = image.resize(u32::from(budget.width) * cell_width,
+        u32::from(budget.height) * cell_height, image::imageops::FilterType::Lanczos3);
+    let size = ratatui::layout::Size::new(pixels.width().div_ceil(cell_width) as u16, pixels.height().div_ceil(cell_height) as u16);
+    match picker.protocol_type() {
+        ProtocolType::Iterm2 | ProtocolType::Sixel => {
+            // Obtain tmux framing without encoding the full image or individual rows.
+            let template = picker.new_protocol(image::DynamicImage::new_rgba8(1, 1),
+                ratatui::layout::Size::new(1, 1), ratatui_image::Resize::Fit(None)).ok()?;
+            let (tmux, sixel) = match template {
+                Protocol::ITerm2(image) => (image.is_tmux, false),
+                Protocol::Sixel(image) => (image.is_tmux, true),
+                _ => return None,
+            };
+            Some(DocumentImage::fragment(size, pixels, cell_height, tmux, sixel))
         }
-        Some(SlicedProtocol::Sliced(rows))
-    } else {
-        SlicedProtocol::new_with_resize(picker, image, size, ratatui_image::Resize::Fit(None)).ok()
+        _ => SlicedProtocol::new_with_resize(picker, pixels, size, ratatui_image::Resize::Fit(None))
+            .ok().map(DocumentImage::sliced),
     }
 }
 
@@ -6649,7 +6648,7 @@ fn load_svg_protocol(
 /// iTerm2 pixel dimensions can use a different scale than the reported font
 /// metrics on Retina displays. Use the protocol's cell footprint for both
 /// layout and display, so the image fills exactly the space we reserve.
-fn image_cell_dimensions(mut protocol: Protocol) -> Protocol {
+pub(super) fn image_cell_dimensions(mut protocol: Protocol) -> Protocol {
     if let Protocol::ITerm2(image) = &mut protocol {
         if let Some(start) = image.data.find(";width=") {
             if let Some(end) = image.data[start..].find(";doNotMoveCursor=") {
@@ -7521,6 +7520,16 @@ mod tests {
             let decoded = image::load_from_memory(&bytes).unwrap();
             assert_eq!((decoded.width(), decoded.height()), (1120, 560));
         }
+    }
+
+    #[test]
+    fn image_protocol_environment_overrides_config_including_auto() {
+        assert_eq!(select_image_protocol(None, Some("sixel")).unwrap(), Some(ProtocolType::Sixel));
+        assert_eq!(select_image_protocol(Some("iterm2"), Some("sixel")).unwrap(), Some(ProtocolType::Iterm2));
+        assert_eq!(select_image_protocol(Some("auto"), Some("sixel")).unwrap(), None);
+        assert_eq!(select_image_protocol(Some("halfblocks"), Some("invalid")).unwrap(), Some(ProtocolType::Halfblocks));
+        assert!(select_image_protocol(Some("invalid"), Some("iterm2")).is_err());
+        assert_eq!(select_image_protocol(None, None).unwrap(), None);
     }
 
     #[test]

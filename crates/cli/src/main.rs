@@ -5950,7 +5950,8 @@ fn render_canvas_site<'a>(
                 }
                 std::process::exit(1);
             });
-        let (site, assets, canvas_links) = meshfox_core::staticgen::build_for_static_export(
+        let access = meshfox_core::FileAccess::for_canvas_path(&canvas, &canvas_path);
+        let (site, assets, canvas_links) = meshfox_core::staticgen::build_for_static_export_with_access(
             &canvas,
             canvas_dir,
             &root_canvas_path,
@@ -5959,6 +5960,7 @@ fn render_canvas_site<'a>(
             Some(&previews),
             copy_files,
             recursive,
+            &access,
         )
         .unwrap_or_else(|errors| {
             for e in &errors {
@@ -6035,12 +6037,8 @@ fn render_canvas_site<'a>(
             // for canvas *text* — see `worker_client::get_relative_file`'s
             // own doc comment), but this way nothing in `meshfox static`
             // reads the canvas directory directly at all any more.
-            // `include_asset`, when set, means `asset.source` lives outside
-            // `canvas_dir` entirely (an image from inside an `include`-
-            // dumped body — see `staticgen::Asset::include_asset`'s own doc
-            // comment) — the plain fallback route can't reach it at all
-            // (confined to `canvas_dir`), so this goes through
-            // `GET /api/include-asset` instead.
+            // External assets carry their original source base/path; the
+            // namespaced output destination is not a source filesystem path.
             let result = match &asset.include_asset {
                 Some((dir, file)) => worker_client::get_include_asset(port, dir, file).await,
                 None => worker_client::get_relative_file(port, &asset.dest_rel).await,

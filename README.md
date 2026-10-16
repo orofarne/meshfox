@@ -351,18 +351,25 @@ so the example works before you pick a video of your own.
 ## Configuration
 <!-- meshfox:node id="configuration" -->
 
-meshfox's own settings — facts about a machine or a project, as opposed to a document's `meshfox:var`s (see "Variables") — live in one optional TOML file, read in two places:
+meshfox's own settings — facts about a machine or a project, as opposed to a document's `meshfox:var`s (see "Variables") — live in optional `.meshfox/config.toml` files. meshfox reads `~/.meshfox/config.toml` first, then the configs in every ancestor of the canvas directory, from the filesystem root down to the canvas itself. The canvas directory is canonicalized before searching, and the global config is read only once.
 
-- `<canvas dir>/.meshfox/config.toml` — local to the project, next to the canvas;
-- `~/.meshfox/config.toml` — global, every project.
+Nearer settings win **key by key, at every nesting level**; arrays replace the inherited array. `[[env]]` sections are resolved per file and overlaid per variable, so child configs can override individual shared defaults. A missing file counts as empty. Ordinary settings retain their permissive handling of unreadable/invalid TOML; file access reports such errors and fails closed. Files are re-read on use, so edits apply without restarting (except where a setting below says otherwise).
 
-Local wins over global **key by key, at every nesting level**: a global `[session] max_output_bytes = 1048576` plus a local file containing only `[tui] editor_theme = "base16-mocha.dark"` ends up with both. A missing, unreadable or unparsable file counts as empty — this is optional configuration, never a required manifest. The files are re-read on every use, so an edit applies without restarting anything (except where a setting below says otherwise).
+To share assets between sibling canvases, put this in their parent's `.meshfox/config.toml`:
+
+```toml
+[files]
+allow = ["docs"]
+```
+
+A canvas in `child/` can then use `![sensor](../docs/sensor.webp)` or link to `../docs/datasheet.pdf`, with no variable declaration. Paths in `allow` are relative to the directory owning `.meshfox` (not `.meshfox` itself); absolute paths and `~/...` also work. `allow = ["."]` permits the owner's whole tree. The nearest explicit `allow` **replaces** inherited grants; `allow = []` removes those grants, while the canvas directory and separately trusted `dir`/`file` variable values remain accessible. Every file read is checked through `FileAccess` after resolving symlinks, including Markdown images/links, file nodes, includes and export. Configuration grants are read permissions; they do not sandbox runnable code.
 
 | Key | Default | What it does |
 | --- | --- | --- |
 | `server_socket` | unset | Control socket of an external coordinator (the macOS menu-bar app, see "macOS menu-bar app"). When set, every core-launching command (`view`, `tui`, `run`, `node <op>`, MCP `debug_*`) becomes a client of that daemon instead of spawning its own worker; an empty local value turns a global one off for that project. `MESHFOX_SERVER_SOCKET` overrides it for one invocation (an empty value forces it off). |
 | `[process_env]` | empty | Extra environment variables for every process a block spawns (plain, `tty` and `@`-macro interpreters). A value may reference other variables — `PATH = "$HOME/.cargo/bin:$PATH"` extends rather than replaces — which is how a worker started by the macOS daemon (launchd's bare environment) finds `npm`/`cargo`. String values only. |
 | `secret_store` | `plaintext` | Where `secret` variables are saved: `plaintext` (the `.meshfox/*.env` cache, as always) or `keychain` (the system secret store — the **macOS Keychain**, or the **Secret Service** on Linux). Explicit only, no auto mode; an unknown value is an error. Also enables `secrets = [...]` in `[[env]]` and `meshfox secret set/show/rm`. See SPEC.md's "Secret store". |
+| `[files] allow` | `[]` | Additional readable paths, relative to the configuration owner. Inherited by nested canvases; the nearest explicit array replaces the inherited list. |
 | `[[env]]` | none | Shared defaults for `meshfox:var` resolution across canvases, optionally scoped with `path=`. Not a flat setting, so it isn't merged key by key; see SPEC.md's "Shared/global config (`[[env]]`)". |
 | `[interpreters.agent] provider` | `claude` | Which agent CLI the `@agent` macro calls (`claude` or `codex`) — see "Calling an AI agent from a block". Every scalar key in the file is also exported to a `@`-macro's process as `MESHFOX_CONFIG_<PATH>` (`MESHFOX_CONFIG_INTERPRETERS_AGENT_PROVIDER`), so a hand-written `interpreter=` script can read it too. |
 | `[tui] editor_theme` | `base16-ocean.dark` | `syntect` theme of the terminal viewer's editor and code panes — see "Terminal viewer". An unknown name falls back to the default. |
@@ -660,6 +667,15 @@ No *structural* editing beyond that in this first cut (`meshfox node ...`, or th
 Both the document pane's own highlighting and `e`'s full-screen editor share one `syntect` grammar set (`crate::syntax_registry`, not two independently-loaded copies) — [`syntect`](https://github.com/trishume/syntect)'s own bundled defaults, extended with any `.tmLanguage.json` (via [`syntect-tmlanguage`](https://crates.io/crates/syntect-tmlanguage)) or `.sublime-syntax` grammar file dropped into `.meshfox/syntax/` next to the canvas (the same `.meshfox/` directory `meshfox:var` answers are cached in, see "Variables" above) or `~/.meshfox/syntax/` (global, every project — local wins on a name clash). A grammar that fails to parse is skipped with a warning on stderr rather than stopping the TUI from starting. The same directory (and a `.tmLanguage.json` dropped into it) also works for the browser UI's own syntax highlighting — see "Browser UI (`view`)" above.
 
 Which of `syntect`'s own bundled themes both panes use (`InspiredGitHub`, `Solarized (dark)`/`(light)`, `base16-eighties.dark`, `base16-mocha.dark`, `base16-ocean.dark` — the default — or `base16-ocean.light`) is also a `.meshfox/config.toml` setting, same file/precedence as `interpreters.agent.provider` above: `[tui] editor_theme = "base16-mocha.dark"`, local (next to the canvas) or global (`~/.meshfox/config.toml`). A name that isn't one of those bundled themes is ignored and the default is used instead, rather than erroring. [Live theme preview](https://meshfox.orofarne.net/tui-editor-themes.html) renders every bundled theme's actual colors side by side to help pick one — the page itself is included in `site-template-archive/` (see "Publishing a canvas as a static site" above) so it's built and published alongside this README's own self-hosted site, not committed as a standalone repo file GitHub would only show as raw source.
+
+The TUI image protocol uses the same config merge: `[tui] image_protocol = "auto"`
+(the default), `"iterm2"`, `"sixel"`, `"kitty"`, or `"halfblocks"`.
+`MESHFOX_IMAGE_PROTOCOL` overrides the config for one invocation, including
+`auto` to restore detection. The worker exposes the setting through its API;
+TUI clients do not read config files. Nested canvases keep the parent terminal's
+active protocol and font metrics. iTerm2 and Sixel render cached visible image
+fragments; there is no separate image rendering mode.
+
 
 ```bash name="tui-help" cache
 meshfox tui -h

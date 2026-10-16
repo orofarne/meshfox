@@ -6,7 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
-use ratatui_image::sliced::{SlicedImage, SlicedProtocol, SignedPosition};
+use ratatui_image::sliced::{SlicedImage, SignedPosition};
 use ratatui_image::Image;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1174,22 +1174,13 @@ fn reveal_header_scroll(scroll: u16, height: u16, header: u16) -> u16 {
     }
 }
 
-/// Handle partial rows without re-encoding during scrolling. ratatui-image
-/// 11's generic/Sixel slicers count the bottom cut before skipping top rows;
-/// bound the visible count explicitly when both ends are clipped.
-fn render_clipped_image(image: &SlicedProtocol, skip: u16, area: Rect, buffer: &mut ratatui::buffer::Buffer) {
+/// Bitmap protocols render one cached crop; Kitty/Halfblocks use native slicing.
+fn render_document_image(image: &super::image_render::DocumentImage, skip: u16, area: Rect, buffer: &mut ratatui::buffer::Buffer) {
     use ratatui::widgets::Widget;
-    match image {
-        SlicedProtocol::Sliced(rows) => {
-            for (row, image) in rows.iter().skip(usize::from(skip)).take(usize::from(area.height)).enumerate() {
-                Image::new(image).render(Rect::new(area.x, area.y + row as u16, area.width, 1), buffer);
-            }
-        }
-        SlicedProtocol::Sixel(sixel) => {
-            let drop = image.size().height.saturating_sub(area.height);
-            sixel.borrow_dependent().render(area, buffer, usize::from(skip), usize::from(drop));
-        }
-        _ => SlicedImage::new(image, SignedPosition::from((0, -(skip as i16)))).render(area, buffer),
+    if let Some(fragment) = image.visible_fragment(skip, area.height) {
+        Image::new(fragment.as_ref()).render(area, buffer);
+    } else if let Some(sliced) = &image.sliced {
+        SlicedImage::new(sliced, SignedPosition::from((0, -(skip as i16)))).render(area, buffer);
     }
 }
 
@@ -1401,7 +1392,7 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
                     height,
                 };
                 match protocol {
-                    Some(p) => render_clipped_image(p, skip, rect, f.buffer_mut()),
+                    Some(p) => render_document_image(p, skip, rect, f.buffer_mut()),
                     None if app.image_pending.contains(path) => f.render_widget(
                         Paragraph::new(format!("[image loading: {alt}]"))
                             .style(Style::default().fg(Color::DarkGray)),
@@ -3610,24 +3601,49 @@ mod tests {
         screen
     }
 
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn scrolling_sixel_uses_cropped_raster_dimensions() {
+        use super::super::app::BackgroundMsg;
+        use ratatui_image::{picker::{Picker, ProtocolType}, FontSize};
+        let mut app = test_app().await;
+        app.picker = Picker::from_fontsize(FontSize::new(12, 7));
+        app.picker.set_protocol_type(ProtocolType::Sixel);
+        app.display_canvas = meshfox_core::Canvas::from_markdown(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n![plot](plot.png)\n\ntext below\n",
+        ).unwrap();
+        let path = app.canvas_path.parent().unwrap().join("plot.png");
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(48, 28).write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        app.on_background_msg(BackgroundMsg::ImageBytes { generation: app.image_generation, path, result: Ok(bytes.into_inner()) });
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(12, 8)).unwrap();
+        terminal.draw(|f| render_document(f, Rect::new(0, 0, 12, 8), &mut app)).unwrap();
+        app.doc_scroll = 3;
+        let frame = terminal.draw(|f| render_document(f, Rect::new(0, 0, 12, 8), &mut app)).unwrap();
+        let sequence = frame.buffer.content.iter().map(|cell| cell.symbol()).find(|s| s.contains("q\"1;1;")).unwrap();
+        assert!(sequence.contains("q\"1;1;48;21"), "{sequence:?}");
+        assert!(!sequence.contains("q\"1;1;48;28"));
+        let _ = std::fs::remove_dir_all(app.canvas_path.parent().unwrap());
+    }
+
     #[test]
     fn partial_images_keep_visible_rows_inside_the_viewport_for_all_protocols() {
         use ratatui::buffer::Buffer;
         use ratatui_image::picker::{Picker, ProtocolType};
-        use super::super::app::sliced_image;
+        use super::super::app::prepared_image;
         let pixels = image::RgbaImage::from_fn(40, 80, |_, y| {
             if y < 40 { image::Rgba([255, 0, 0, 255]) } else { image::Rgba([0, 0, 255, 255]) }
         });
         for kind in [ProtocolType::Halfblocks, ProtocolType::Iterm2, ProtocolType::Sixel, ProtocolType::Kitty] {
             let mut picker = Picker::halfblocks();
             picker.set_protocol_type(kind);
-            let protocol = sliced_image(&picker, image::DynamicImage::ImageRgba8(pixels.clone()), ratatui::layout::Size::new(4, 4)).unwrap();
+            let protocol = prepared_image(&picker, image::DynamicImage::ImageRgba8(pixels.clone()), ratatui::layout::Size::new(4, 4)).unwrap();
             assert_eq!(protocol.size(), ratatui::layout::Size::new(4, 4));
             for (skip, height) in [(0, 2), (1, 2), (3, 1)] {
                 let mut buffer = Buffer::empty(Rect::new(0, 0, 6, 6));
                 for cell in &mut buffer.content { cell.set_symbol("."); }
                 let area = Rect::new(1, 1, 4, height);
-                render_clipped_image(&protocol, skip, area, &mut buffer);
+                render_document_image(&protocol, skip, area, &mut buffer);
                 assert_ne!(buffer[(1, 1)].symbol(), ".", "{kind:?} skip={skip}");
                 for y in 0..6 {
                     for x in 0..6 {
@@ -3640,15 +3656,15 @@ mod tests {
                 }
                 if kind == ProtocolType::Iterm2 {
                     use base64::Engine;
+                    let sequence = buffer[(1, 1)].symbol();
+                    assert!(sequence.contains(&format!("width=4;height={height};")), "{sequence}");
+                    let encoded = sequence.split("doNotMoveCursor=1:").nth(1).unwrap().split('\u{7}').next().unwrap();
+                    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
+                    let image = image::load_from_memory(&bytes).unwrap().to_rgba8();
+                    assert_eq!(image.dimensions(), (80, u32::from(height) * 40));
                     for row in 0..height {
-                        let sequence = buffer[(1, 1 + row)].symbol();
-                        assert!(sequence.contains("width=4;height=1;"), "{sequence}");
-                        let encoded = sequence.split("doNotMoveCursor=1:").nth(1).unwrap().split('\u{7}').next().unwrap();
-                        let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
-                        let image = image::load_from_memory(&bytes).unwrap().to_rgba8();
                         let expected = if skip + row < 2 { [255, 0, 0, 255] } else { [0, 0, 255, 255] };
-                        assert_eq!(image.get_pixel(20, 20).0, expected);
-                        assert_eq!((image.width(), image.height()), (80, 40));
+                        assert_eq!(image.get_pixel(20, u32::from(row) * 40 + 20).0, expected);
                     }
                 }
             }

@@ -806,6 +806,17 @@ pub async fn info(port: u16) -> WorkerInfo {
         .unwrap_or_default()
 }
 
+/// Only the public image setting is exposed; the client never reads config files.
+/// Older workers omit the field and retain automatic protocol detection.
+pub async fn tui_image_protocol(port: u16) -> Result<Option<String>, String> {
+    let response = client().get(format!("{}/api/info", base_url(port)))
+        .timeout(time_limit(QUICK)).send().await.map_err(|e| describe(&e))?
+        .error_for_status().map_err(|e| describe(&e))?;
+    let info: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
+    if let Some(error) = info["tuiImageProtocolError"].as_str() { return Err(error.to_owned()); }
+    Ok(info["tuiImageProtocol"].as_str().map(str::to_owned))
+}
+
 /// One region of a whole-file write that overlapped a concurrent change:
 /// zero-based, end-exclusive line ranges in the text that was sent (`mine`)
 /// and in the file as it is now (`theirs`).
@@ -1135,23 +1146,17 @@ pub async fn get_table_rows(
         .map_err(|e| e.to_string())
 }
 
-/// A confined file's raw bytes, off the worker's own static-asset fallback
-/// route (`serve_canvas_relative_file`/`serve_embedded` in
-/// `crates/server/src/lib.rs`, wired as the router's catch-all `fallback`) —
-/// the same route a live `meshfox view` tab already resolves a relative
-/// Markdown image/`file`-node link against. `path` is relative to the
-/// canvas's own directory, forward-slash-separated (`staticgen::Asset::
-/// dest_rel`'s own shape) — each segment is percent-encoded individually via
-/// `path_segments_mut`, same as `node_url`, so a path component with
-/// spaces/non-ASCII round-trips correctly. `meshfox static`'s worker-routed
-/// asset-copy step calls this once per `Asset` instead of `std::fs::read`ing
-/// `Asset::source` itself.
+// The server decodes a Markdown-style file path once after reading the query.
+// These clients accept filesystem paths: protect literal URL delimiters first.
+fn asset_path_argument(path: &str) -> String {
+    path.replace('%', "%25").replace('?', "%3F").replace('#', "%23")
+}
+
+/// Read a filesystem path relative to the canvas through FileAccess.
+/// Query transport preserves parent components before URL normalization.
 pub async fn get_relative_file(port: u16, path: &str) -> Result<Vec<u8>, String> {
-    let mut url = reqwest::Url::parse(&base_url(port)).map_err(|e| e.to_string())?;
-    url.path_segments_mut()
-        .map_err(|_| "couldn't build the worker's asset URL".to_string())?
-        .clear()
-        .extend(path.split('/'));
+    let mut url = reqwest::Url::parse(&format!("{}/api/asset", base_url(port))).map_err(|e| e.to_string())?;
+    url.query_pairs_mut().append_pair("file", &asset_path_argument(path));
     let res = client()
         .get(url)
         .timeout(time_limit(QUICK))
@@ -1173,25 +1178,14 @@ pub async fn get_relative_file(port: u16, path: &str) -> Result<Vec<u8>, String>
         .map_err(|e| e.to_string())
 }
 
-/// A confined file's raw bytes, off the worker's own `GET /api/include-asset
-/// ?dir=&file=` route (`crates/server/src/lib.rs::get_include_asset`) — the
-/// *only* worker route that can serve an asset whose real path lives outside
-/// `canvas_dir` (an image referenced from inside an `include`-dumped body
-/// whose own directory isn't nested under the primary canvas's own
-/// directory), since `get_relative_file`'s plain fallback route is confined
-/// to `canvas_dir` and can't reach it. `dir` must be exactly some node's own
-/// `Node::asset_base` string, unmodified — the server re-derives the
-/// document's current resolved tree and only serves `dir`s that are still
-/// one of its nodes' actual `asset_base`s (see that route's own doc
-/// comment), so a stale or hand-crafted `dir` 404s rather than reading
-/// arbitrary files. `staticgen::Asset::include_asset`, when set, is exactly
-/// this `(dir, file)` pair.
+/// Read a filesystem path relative to a validated include asset base (or
+/// the main canvas directory). The worker rechecks FileAccess on each read.
 pub async fn get_include_asset(port: u16, dir: &str, file: &str) -> Result<Vec<u8>, String> {
     let mut url = reqwest::Url::parse(&format!("{}/api/include-asset", base_url(port)))
         .map_err(|e| e.to_string())?;
     url.query_pairs_mut()
         .append_pair("dir", dir)
-        .append_pair("file", file);
+        .append_pair("file", &asset_path_argument(file));
     let res = client()
         .get(url)
         .timeout(time_limit(QUICK))
@@ -2679,6 +2673,30 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("did not answer in time"), "{err}");
         held.abort();
+    }
+
+    #[tokio::test]
+    async fn tui_image_protocol_reads_config_from_worker_and_accepts_older_workers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        for (body, expected) in [
+            (r#"{"tuiImageProtocol":"sixel"}"#, Ok(Some("sixel".to_string()))),
+            (r#"{"readOnly":false}"#, Ok(None)),
+            (r#"{"tuiImageProtocolError":"bad tui.image_protocol"}"#, Err("bad tui.image_protocol".to_string())),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 2048];
+                let count = socket.read(&mut request).await.unwrap();
+                assert!(String::from_utf8_lossy(&request[..count]).starts_with("GET /api/info "));
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                socket.write_all(response.as_bytes()).await.unwrap();
+            });
+            assert_eq!(tui_image_protocol(port).await, expected);
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]

@@ -12,6 +12,7 @@
 mod ansi;
 mod app;
 mod image_metrics;
+mod image_render;
 mod markdown;
 mod path_picker;
 mod source_diff;

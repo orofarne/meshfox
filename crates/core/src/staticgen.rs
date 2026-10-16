@@ -228,31 +228,16 @@ pub struct EdgeView {
 /// to enumerate these itself, only the CLI's own file-copy step does.
 #[derive(Debug, Clone)]
 pub struct Asset {
-    /// Absolute, canonicalized source path — confined to `canvas_dir` for
-    /// an ordinary node, or to that node's own `asset_base` for one spliced
-    /// in from an `include` target elsewhere on disk (see `include_asset`).
+    /// Absolute source path authorized by the current canvas's FileAccess.
     pub source: PathBuf,
     /// Destination path relative to the site's output root, using forward
     /// slashes regardless of host OS — also what the rendered HTML's `src`
     /// now points to.
     pub dest_rel: String,
-    /// Set only when `source` doesn't live under `canvas_dir` at all — an
-    /// image referenced from inside an `include`-dumped body whose own
-    /// directory (`Node::asset_base`) lies outside the primary canvas's own
-    /// directory (`dest_rel` then carries a `_include-assets/`-namespaced
-    /// path instead of a plain canvas-relative one — see
-    /// `resolve_image_url`). `(dir, file)` is exactly the query-param pair
-    /// the worker's own confined `GET /api/include-asset?dir=&file=` route
-    /// expects (`crates/server/src/lib.rs::get_include_asset`) — the *only*
-    /// worker route that can serve it, since the ordinary canvas-relative
-    /// fallback route is confined to `canvas_dir` and 404s (well, falls
-    /// through to the embedded web UI's own SPA shell — a 200, not a 404,
-    /// so a worker-routed caller can't tell from the status code alone)
-    /// for anything outside it. `dir` is the node's own `asset_base`
-    /// string exactly as received, unmodified — the server's own `known`
-    /// check there is a plain string `==` against every node's
-    /// `asset_base`, so re-deriving/re-canonicalizing it client-side risks
-    /// a canonically-equal-but-not-byte-identical mismatch.
+    /// Worker source `(base, path)` for assets outside the canvas directory.
+    /// Included assets use their actual asset_base and a relative path;
+    /// configured shared assets use the main canvas base and an absolute
+    /// source path. The worker validates both the base and FileAccess.
     pub include_asset: Option<(String, String)>,
 }
 
@@ -356,6 +341,39 @@ pub fn build_for_static_export(
     copy_files: bool,
     recursive: bool,
 ) -> Result<(SiteData, Vec<Asset>, Vec<CanvasLinkTarget>), Vec<CopyFilesTargetError>> {
+    let access = if root_canvas_path.parent() == Some(canvas_dir) {
+        crate::FileAccess::for_canvas_path(canvas, root_canvas_path)
+    } else {
+        // This legacy API has no current document filename. Configuration
+        // grants still apply; never borrow another document's answer cache.
+        crate::FileAccess::from_values(&canvas_dir.join(".static-export"), Default::default())
+    };
+    build_for_static_export_with_access(
+        canvas,
+        canvas_dir,
+        root_canvas_path,
+        current_slot,
+        links_base_url,
+        previews,
+        copy_files,
+        recursive,
+        &access,
+    )
+}
+
+/// Export with the current document's resolved filesystem permissions.
+#[allow(clippy::too_many_arguments)]
+pub fn build_for_static_export_with_access(
+    canvas: &Canvas,
+    canvas_dir: &Path,
+    root_canvas_path: &Path,
+    current_slot: &str,
+    links_base_url: Option<&str>,
+    previews: Option<&NodePreviews>,
+    copy_files: bool,
+    recursive: bool,
+    access: &crate::FileAccess,
+) -> Result<(SiteData, Vec<Asset>, Vec<CanvasLinkTarget>), Vec<CopyFilesTargetError>> {
     let canvas_dir = canvas_dir
         .canonicalize()
         .unwrap_or_else(|_| canvas_dir.to_path_buf());
@@ -371,6 +389,7 @@ pub fn build_for_static_export(
     let (folded_ids, foldable_ids) = resolve_default_fold(canvas, &root_node.id);
     let tag_colors = crate::tag_colors::declared_tag_colors(canvas).unwrap_or_default();
     let ctx = RenderCtx {
+        access,
         canvas_dir: &canvas_dir,
         root_canvas_path: &root_canvas_path,
         current_slot,
@@ -725,6 +744,7 @@ fn build_edges(canvas: &Canvas) -> Vec<EdgeView> {
 /// resolve from, and how to treat whatever's left un-copied. See module
 /// docs.
 struct RenderCtx<'a> {
+    access: &'a crate::FileAccess,
     canvas_dir: &'a Path,
     /// The *original* canvas the whole export started from (its file, not
     /// just its directory) — fixed across a whole recursive export, unlike
@@ -1106,8 +1126,8 @@ fn add_target_blank(html: &str) -> String {
     out
 }
 
-/// A relative reference resolved under `canvas_dir` and confined to it —
-/// `crate::file_read::confine` (also used by the server's own file-node
+/// A relative reference resolved from `canvas_dir` and authorized by
+/// `FileAccess` (also used by the server's own file-node
 /// endpoints and `constraint`'s `.content()`/`.json()`/...), plus this
 /// module's own two extra requirements: query/fragment stripped first (a
 /// Markdown link can carry a `#section` a bare filesystem path never
@@ -1115,39 +1135,23 @@ fn add_target_blank(html: &str) -> String {
 /// anything that doesn't resolve — an escaping target, a missing one, or
 /// one that's a directory — same "leave it alone" fallback every caller
 /// here already takes.
-fn resolve_canvas_relative(url: &str, canvas_dir: &Path) -> Option<PathBuf> {
+fn resolve_canvas_relative(
+    url: &str,
+    canvas_dir: &Path,
+    access: &crate::FileAccess,
+) -> Option<PathBuf> {
     let clean = url.split(['?', '#']).next().unwrap_or(url);
     if clean.is_empty() {
         return None;
     }
-    let resolved = crate::file_read::confine(canvas_dir, clean).ok()?;
+    let clean = crate::image_attrs::decode_image_path(clean);
+    let resolved = access.confine(canvas_dir, &clean).ok()?;
     resolved.is_file().then_some(resolved)
 }
 
-/// `resolved`'s output-relative path, using forward slashes regardless of
-/// host OS (so it's a valid URL path component, not just a valid local
-/// filesystem path), plus the `Asset::include_asset` pair a worker-routed
-/// copy step needs to actually fetch it when it's not under `canvas_dir`
-/// (see `Asset::include_asset`'s own doc comment for why the ordinary
-/// canvas-relative fallback route can't serve it).
-///
-/// Relative to `canvas_dir` when possible — the common case, and the only
-/// one before `asset_base` existed, so every existing `--out` layout is
-/// unchanged (and `include_asset` is `None`). When `resolved` isn't under
-/// `canvas_dir` at all — an image referenced from inside an `include`-
-/// dumped body whose own directory (`base_dir`, from `Node::cwd`) isn't
-/// nested under the primary canvas's directory (see
-/// `crate::include::resolve`'s `asset_base`) — falls back to a path
-/// relative to `base_dir` instead, namespaced under `_include-assets/` so
-/// it can never collide with a primary-canvas-relative asset that happens
-/// to share the same relative filename, and pairs it with `(asset_base,
-/// relative-path)` for `include_asset`. `resolved` is always under one of
-/// the two (it came out of `resolve_canvas_relative` confined to whichever
-/// of them was passed as its own `dir`), so the final `resolved` fallback
-/// only matters if a caller ever passes mismatched dirs — never valid
-/// output, but still a real (if ugly) path rather than a panic; `asset_base`
-/// being `None` there too (nothing to build an `include_asset` pair from)
-/// is deliberate for the same reason.
+/// Keep canvas-relative destinations when possible; namespace included and
+/// shared assets so all copies stay inside the output tree. `include_asset`
+/// carries the source base/path for worker-routed reads through FileAccess.
 fn dest_rel_for(
     resolved: &Path,
     canvas_dir: &Path,
@@ -1164,7 +1168,19 @@ fn dest_rel_for(
             Some((asset_base.to_string(), rel_str)),
         );
     }
-    (resolved.to_string_lossy().replace('\\', "/"), None)
+    // Never let a shared asset's absolute source path escape the output tree.
+    // Namespace by the complete path so equally named files cannot collide.
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    resolved.hash(&mut hash);
+    let name = resolved.file_name().unwrap_or_default().to_string_lossy();
+    (
+        format!("_shared-assets/{:016x}/{name}", hash.finish()),
+        Some((
+            canvas_dir.to_string_lossy().into_owned(),
+            resolved.to_string_lossy().into_owned(),
+        )),
+    )
 }
 
 /// Whether a Markdown link/image URL may reach the output at all — the
@@ -1234,7 +1250,7 @@ fn resolve_image_url(
     if is_external_or_absolute(url) {
         return url.to_string();
     }
-    match resolve_canvas_relative(url, base_dir) {
+    match resolve_canvas_relative(url, base_dir, ctx.access) {
         Some(resolved) => {
             // `resolved` came out of `confine`, which canonicalizes `dir`
             // before comparing — `ctx.canvas_dir` was already canonicalized
@@ -1414,7 +1430,7 @@ fn resolve_file_target_for_copy(
     if is_external_or_absolute(url) {
         return resolve_link_url(url, ctx);
     }
-    match resolve_canvas_relative(url, base_dir) {
+    match resolve_canvas_relative(url, base_dir, ctx.access) {
         Some(resolved) if is_canvas_file(&resolved) => {
             if !ctx.recursive {
                 errors.push(CopyFilesTargetError {
@@ -1501,7 +1517,7 @@ fn render_file_code(node: &Node, ctx: &RenderCtx) -> String {
             (preview.content.clone(), preview.truncated)
         }
         None => {
-            let Ok(preview) = crate::file_read::preview(ctx.canvas_dir, target) else {
+            let Ok(preview) = ctx.access.preview(ctx.canvas_dir, target) else {
                 return fallback_link();
             };
             (preview.content, preview.truncated)
@@ -1688,6 +1704,55 @@ mod tests {
 
     fn write(dir: &Path, name: &str, contents: &[u8]) {
         fs::write(dir.join(name), contents).unwrap();
+    }
+
+    #[test]
+    fn configured_shared_assets_export_inside_output_with_distinct_names() {
+        let root = temp_dir("configured-shared-export");
+        for sub in [".meshfox", "docs/a", "docs/b", "child"] {
+            fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        write(
+            &root,
+            ".meshfox/config.toml",
+            b"[files]\nallow = [\"docs\"]\n",
+        );
+        write(&root, "docs/a/same.svg", b"first");
+        write(&root, "docs/b/same.svg", b"second");
+        write(&root, "docs/readme.md", b"shared text");
+        let c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n![a](../docs/a/same.svg) ![b](../docs/b/same.svg)\n\n## File\n<!-- meshfox:node id=\"f\" type=\"file\" display=\"code\" -->\n\n[doc](../docs/readme.md)\n\n## Attachment\n<!-- meshfox:node id=\"attachment\" type=\"file\" -->\n\n[doc](../docs/readme.md)\n");
+        let child = root.join("child");
+        let (site, assets, _) = build_for_static_export(
+            &c,
+            &child,
+            &child.join("README.canvas.md"),
+            "",
+            None,
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(assets.len(), 3);
+        let destinations: std::collections::HashSet<_> =
+            assets.iter().map(|a| &a.dest_rel).collect();
+        assert_eq!(destinations.len(), 3);
+        for asset in &assets {
+            assert!(
+                asset.dest_rel.starts_with("_shared-assets/"),
+                "{}",
+                asset.dest_rel
+            );
+            assert!(!Path::new(&asset.dest_rel).is_absolute());
+            assert!(!asset.dest_rel.split('/').any(|c| c == ".."));
+            assert!(asset.include_asset.is_some());
+        }
+        assert!(serde_json::to_string(&site)
+            .unwrap()
+            .contains("shared text"));
+        write(&root, ".meshfox/config.toml", b"[files]\nallow = []\n");
+        assert!(build(&c, &child, None).1.is_empty());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2311,6 +2376,9 @@ mod tests {
     fn an_image_inside_an_include_dump_resolves_against_its_own_asset_base_not_canvas_dir() {
         let canvas_dir = temp_dir("asset-base-canvas-dir");
         let include_dir = temp_dir("asset-base-include-dir");
+        fs::create_dir_all(canvas_dir.join(".meshfox")).unwrap();
+        fs::write(canvas_dir.join(".meshfox/config.toml"),
+            format!("[files]\nallow = [{:?}]\n", include_dir.to_string_lossy())).unwrap();
         write(
             &canvas_dir,
             "shot.png",
@@ -2346,6 +2414,9 @@ mod tests {
     fn an_asset_base_image_outside_canvas_dir_gets_a_namespaced_dest_rel() {
         let canvas_dir = temp_dir("asset-base-dest-rel-canvas-dir");
         let include_dir = temp_dir("asset-base-dest-rel-include-dir");
+        fs::create_dir_all(canvas_dir.join(".meshfox")).unwrap();
+        fs::write(canvas_dir.join(".meshfox/config.toml"),
+            format!("[files]\nallow = [{:?}]\n", include_dir.to_string_lossy())).unwrap();
         write(&include_dir, "shot.png", b"bytes");
 
         let mut c =

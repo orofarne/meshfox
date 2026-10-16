@@ -1690,8 +1690,10 @@ tool settings (unrelated to `meshfox:var`) already come from, under a
 separate top-level `env` key (not merged with the rest of that table):
 
 - `~/.meshfox/config.toml` — **global**, every project on this machine.
-- `<canvas_root>/.meshfox/config.toml` — **project/local**, this one
-  canvas tree.
+- `<ancestor>/.meshfox/config.toml` — inherited by every canvas below that
+  directory, with nearer files taking precedence. Search uses the canonical
+  canvas directory and runs from the filesystem root down; the global file
+  is applied only once.
 
 ```toml
 [[env]]
@@ -1711,7 +1713,7 @@ without colliding. It can be a single string or an array of strings
 is under *any* one of them — handy for one section covering several
 unrelated directories without repeating the same `vars=` in multiple
 `[[env]]` blocks. It's optional in the project file too (rarely needed —
-the file is already project-scoped), resolved relative to `canvas_root`
+the file is already project-scoped), resolved relative to the directory owning that config
 there instead of `$HOME`. Matching is by path *component*, not string
 prefix (a scope of `~/work/projectA` never matches `~/work/projectAB`),
 via `canonicalize` where possible. When more than one section in the same
@@ -1719,8 +1721,8 @@ file matches a given canvas, the most path-specific one wins for each
 variable name (an unscoped section is the least specific); on a tie, the
 later section in the file wins.
 
-**Precedence**: project file always wins over global, regardless of
-scoping specificity — this is the escape hatch for overriding an inherited
+**Precedence**: each nearer config file wins over more distant files and
+global, regardless of scoping specificity — this is the escape hatch for overriding an inherited
 value on one canvas tree. Within the resolution chain above, shared/global
 config sits between the per-document cache and each declaration's own
 `default` — an explicit `--set`/submitted-form override, the process
@@ -1914,6 +1916,45 @@ suggested default) end up actually coming from running a script:
   entry above. `meshfox validate` catches a `default_var`/`choices_var`
   naming a variable nothing declares, and a reference cycle.
 
+### Configured file access (`[files] allow`)
+
+Every consumer of a document-authored local file reference uses `FileAccess`:
+file previews/tables, opening and running file nodes, includes, Markdown
+assets, image change tracking and static/PDF export. Besides the canvas's
+own directory and trusted `dir`/`file` variable values, it accepts explicit
+configuration grants:
+
+```toml
+[files]
+allow = ["docs"]
+```
+
+In `/work/esp32/.meshfox/config.toml`, this grants `/work/esp32/docs` to
+nested canvases. `/work/esp32/co2/README.canvas.md` can reference
+`![SCD41](../docs/scd41-module.webp)` without declaring a variable. The
+configuration file itself never implicitly grants its enclosing directory;
+`allow = ["."]` does so explicitly. Grant paths are relative to the owner
+of `.meshfox`, with absolute and `~/...` paths also supported. The global
+file's owner is the user's home directory.
+
+The nearest explicitly configured `allow` replaces the entire inherited
+array, including with `[]`; it does not revoke the canvas directory or
+independent variable grants. Missing config files contribute nothing.
+Unreadable or malformed configs and invalid `files.allow` values produce
+an access error, never a fallback to a broader ancestor. Entries must be
+nonempty strings. Grants are reloaded for each access, so revocation is
+immediate. Canonical-path confinement rejects `..` or symlinks escaping
+all authorized roots.
+
+Local Markdown URLs are transported in `/api/asset?file=...` query parameters
+so browsers cannot normalize away `..` before validation; an include's
+optional `dir=` must match an actual resolved include asset base (or the
+main canvas directory). Both the API and legacy relative-file fallback
+apply the same `FileAccess` policy. Export copies external assets under
+namespaced relative output paths, never outside the output directory.
+These grants govern file access by meshfox, not the filesystem privileges
+of code blocks the user runs.
+
 ### Directory variables (`type="dir"`)
 
 A `file` node's target is confined to the canvas's own directory tree (see
@@ -1968,8 +2009,9 @@ confinement check, which is then applied to the result.
 
 Scope: a trusted root applies to the whole canvas, including a `dir`
 variable declared inside a node (it is not limited to that subtree).
-`include` nodes are not affected: they read their target as written and
-have no `$NAME` expansion.
+`include` nodes use the same `FileAccess` checks and `$NAME` expansion.
+Their relative targets resolve against the main canvas; relative assets
+in included Markdown resolve against the included file's directory.
 
 ### File variables (`type="file"`)
 
@@ -2615,4 +2657,20 @@ TUI document images render their visible rows when scrolled partially above or
 below the document pane, rather than disappearing when clipped. This applies
 to local images, inline images and link-preview images. Encoded row slices are
 reused during scrolling; iTerm2 slices retain dense SVG pixels and cell-based
-placement, while Sixel uses its protocol-specific band slicing.
+placement, while Sixel encodes and caches the exact visible pixel crop, including fresh
+raster dimensions and palette.
+
+iTerm2 and Sixel always render a single cached visible fragment. Halfblocks and
+Kitty use native sliced rendering. There is no selectable image rendering mode.
+The fragment LRU cache holds at most 32 encoded views for iTerm2 or 128 for
+Sixel, and at most 16 MiB per image;
+image changes and viewport resizing replace it. A first visit encodes the
+fragment; repeated visits reuse the encoded PNG.
+
+The TUI image protocol is configured by `[tui] image_protocol` in
+`~/.meshfox/config.toml` and `<canvas_root>/.meshfox/config.toml` (local wins).
+Supported values: `auto` (default), `iterm2`, `sixel`, `kitty`, `halfblocks`.
+`MESHFOX_IMAGE_PROTOCOL` overrides both files; `auto` explicitly restores
+capability detection. The client fetches the public setting from `/api/info`
+when no env override is present. Invalid protocol values are reported at TUI
+startup. Nested canvases inherit the existing terminal Picker.
