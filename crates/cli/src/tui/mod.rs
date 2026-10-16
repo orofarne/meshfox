@@ -11,6 +11,7 @@
 
 mod ansi;
 mod app;
+mod document_layout;
 mod image_metrics;
 mod image_render;
 mod markdown;
@@ -20,6 +21,8 @@ mod source_editor;
 mod spatial;
 mod svg_raster;
 mod table;
+#[cfg(test)]
+mod table_layout_tests;
 mod theme;
 mod tree;
 mod unicode_picker;

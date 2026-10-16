@@ -19,12 +19,17 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
-/// One piece of a rendered node body: either plain styled text (however
-/// many lines) or a local image to hand off to `ratatui-image`. Kept as a
-/// flat `Vec<Segment>` rather than a tree — a node body is read top to
-/// bottom, never nested past what indentation-as-text already conveys.
+/// Width-independent document blocks. Styled text keeps logical lines;
+/// tables keep cells and frame insets; images keep sizing hints. Container
+/// layout resolves these before measurement, scrolling and drawing.
+#[derive(Clone)]
 pub enum Segment {
     Text(Vec<Line<'static>>),
+    Table {
+        table: MarkdownTable,
+        prefix: Vec<Span<'static>>,
+    },
+    TablePreview(Box<super::table::TableData>),
     Image {
         path: PathBuf,
         alt: String,
@@ -617,12 +622,17 @@ struct Renderer<'a> {
 /// links keep their look), so a cell's width is the sum of its spans'.
 type TableCell = Vec<Span<'static>>;
 
+/// Width-independent table content retained until container layout.
+#[derive(Clone)]
+pub struct MarkdownTable {
+    pub(super) alignments: Vec<Alignment>,
+    pub(super) rows: Vec<Vec<TableCell>>,
+}
+
 struct TableState {
-    alignments: Vec<Alignment>,
-    rows: Vec<Vec<TableCell>>,
+    table: MarkdownTable,
     current_row: Vec<TableCell>,
     current_cell: TableCell,
-    in_head: bool,
 }
 
 /// State inside a `<!-- meshfox:output name="..." ... --> ... <!--
@@ -997,9 +1007,14 @@ impl<'a> Renderer<'a> {
                             framed.push(Line::from(spans));
                         }
                     }
+                    Segment::Table { table, mut prefix } => {
+                        flush(self, std::mem::take(&mut framed));
+                        prefix.insert(0, Span::styled("│ ", border));
+                        self.segments.push(Segment::Table { table, prefix });
+                    }
                     // A widget can't sit inside a text border: close off the
                     // lines so far, let the image through as-is, continue.
-                    image @ Segment::Image { .. } => {
+                    image @ (Segment::Image { .. } | Segment::TablePreview(_)) => {
                         flush(self, std::mem::take(&mut framed));
                         self.segments.push(image);
                     }
@@ -1041,6 +1056,10 @@ impl<'a> Renderer<'a> {
                     })
                     .collect(),
             ),
+            Segment::Table { table, mut prefix } => {
+                prefix.insert(0, Span::styled("│ ", self.output_border()));
+                Segment::Table { table, prefix }
+            }
             other => other, // Segment::Image — no border to draw around a widget.
         }
     }
@@ -1410,19 +1429,15 @@ impl<'a> Renderer<'a> {
             Tag::Table(alignments) => {
                 self.flush_paragraph();
                 self.table = Some(TableState {
-                    alignments,
-                    rows: Vec::new(),
+                    table: MarkdownTable {
+                        alignments,
+                        rows: Vec::new(),
+                    },
                     current_row: Vec::new(),
                     current_cell: Vec::new(),
-                    in_head: false,
                 });
             }
-            Tag::TableHead => {
-                if let Some(t) = &mut self.table {
-                    t.in_head = true;
-                }
-            }
-            Tag::TableRow | Tag::TableCell => {}
+            Tag::TableHead | Tag::TableRow | Tag::TableCell => {}
             _ => {}
         }
     }
@@ -2026,13 +2041,15 @@ impl<'a> Renderer<'a> {
             TagEnd::TableRow | TagEnd::TableHead => {
                 if let Some(t) = &mut self.table {
                     let row = std::mem::take(&mut t.current_row);
-                    t.rows.push(row);
-                    t.in_head = false;
+                    t.table.rows.push(row);
                 }
             }
             TagEnd::Table => {
                 if let Some(t) = self.table.take() {
-                    self.push_segment(Segment::Text(render_table(&t)));
+                    self.push_segment(Segment::Table {
+                        table: t.table,
+                        prefix: Vec::new(),
+                    });
                 }
             }
             TagEnd::Image => {
@@ -2053,58 +2070,46 @@ impl<'a> Renderer<'a> {
     }
 }
 
-fn render_table(t: &TableState) -> Vec<Line<'static>> {
-    let cell_width =
-        |cell: &TableCell| -> usize { cell.iter().map(|s| s.content.chars().count()).sum() };
-    let cols = t.rows.iter().map(|r| r.len()).max().unwrap_or(0);
-    let mut widths = vec![0usize; cols];
-    for row in &t.rows {
-        for (i, cell) in row.iter().enumerate() {
-            widths[i] = widths[i].max(cell_width(cell));
-        }
-    }
-    let mut lines = Vec::new();
-    for (ri, row) in t.rows.iter().enumerate() {
-        let mut spans = Vec::new();
-        for (i, w) in widths.iter().enumerate() {
-            let cell: &[Span<'static>] = row.get(i).map(Vec::as_slice).unwrap_or(&[]);
-            let align = t.alignments.get(i).copied().unwrap_or(Alignment::None);
-            let gap = w.saturating_sub(cell.iter().map(|s| s.content.chars().count()).sum());
-            let (left, right) = match align {
-                Alignment::Right => (gap, 0),
-                Alignment::Center => (gap / 2, gap - gap / 2),
-                _ => (0, gap),
-            };
-            if left > 0 {
-                spans.push(Span::raw(" ".repeat(left)));
-            }
-            for span in cell {
-                let mut span = span.clone();
-                if ri == 0 {
-                    span = span.patch_style(Style::default().add_modifier(Modifier::BOLD));
-                }
-                spans.push(span);
-            }
-            if right > 0 {
-                spans.push(Span::raw(" ".repeat(right)));
-            }
-            spans.push(Span::raw(" │ "));
-        }
-        lines.push(Line::from(spans));
-        if ri == 0 {
-            let rule: String = widths.iter().map(|w| "─".repeat(w + 3)).collect();
-            lines.push(Line::from(Span::styled(
-                rule,
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
-    }
-    lines
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Existing rendering assertions inspect styled lines; resolve semantic
+    // tables through the production layout stage before those assertions.
+    fn text_segments(segments: Vec<Segment>) -> Vec<Segment> {
+        segments
+            .into_iter()
+            .map(|s| match s {
+                Segment::Table { table, prefix } => {
+                    let segment = Segment::Table { table, prefix };
+                    Segment::Text(
+                        super::super::document_layout::LayoutContext::new(
+                            ratatui::layout::Size::new(4096, 100),
+                        )
+                        .text(&segment)
+                        .unwrap()
+                        .lines,
+                    )
+                }
+                other => other,
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render(
+        md: &str,
+        base: &Path,
+        hl: &Highlighter,
+        node: &str,
+        decls: &[meshfox_core::vars::VarDecl],
+        values: &std::collections::HashMap<String, String>,
+        focus: Option<(&str, usize)>,
+        live: &std::collections::HashMap<String, super::super::app::StepOutput>,
+    ) -> (Vec<Segment>, Vec<ClickRegion>) {
+        let (segments, clicks) = super::render(md, base, hl, node, decls, values, focus, live);
+        (text_segments(segments), clicks)
+    }
 
     // TODO.canvas.md: "TUI: инлайн live-вывод для output=\"markdown\" блоков
     // ... как plain text" — a finished `output="markdown"` block's live
@@ -2861,7 +2866,7 @@ mod tests {
             .iter()
             .flat_map(|s| match s {
                 Segment::Text(lines) => lines.iter().map(line_text).collect::<Vec<_>>(),
-                Segment::Image { .. } => vec![],
+                Segment::Image { .. } | Segment::Table { .. } | Segment::TablePreview(_) => vec![],
             })
             .collect::<Vec<_>>()
             .join("\n")

@@ -1092,76 +1092,9 @@ fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
-/// How much of a `Segment::Text`'s already-wrapped `total` rows (see
-/// `render_document` — always `Paragraph::line_count(width)`, the *actual*
-/// wrapped row count, never the raw `lines.len()`) to draw this pass:
-/// `row_offset` for `Paragraph::scroll` (applied post-wrap, so it can land
-/// partway through one long logical line, not just before/after one) and
-/// `height` for the rect, already clamped to whatever vertical room is
-/// left in the pane.
-struct TextLayout {
-    row_offset: u16,
-    height: u16,
-}
-
-/// `None` means this whole segment is above the current scroll position —
-/// the caller should skip it, carrying `skip - total` forward as the
-/// remaining skip for the next segment (mirrors `render_document`'s own
-/// loop, which is why this doesn't return the reduced skip itself: the
-/// caller already has `skip` in scope to subtract from directly).
-fn wrapped_text_layout(total: u16, skip: u16, available: u16) -> Option<TextLayout> {
-    if skip >= total {
-        return None;
-    }
-    Some(TextLayout {
-        row_offset: skip,
-        height: (total - skip).min(available),
-    })
-}
-
-/// Let ratatui wrap the same text with a private marker style, so mouse
-/// regions follow word wrapping, wide glyphs and partially scrolled lines.
-fn wrapped_click_rects(line: &Line<'_>, width: u16, start: u16, end: u16) -> Vec<Rect> {
-    use ratatui::buffer::Buffer;
-    use ratatui::widgets::Widget;
-    if width == 0 {
-        return Vec::new();
-    }
-    let marker = Color::Rgb(1, 2, 3);
-    let mut col = 0usize;
-    let spans: Vec<_> = line
-        .styled_graphemes(Style::default())
-        .map(|g| {
-            let w = Span::raw(g.symbol).width();
-            let marked = col < usize::from(end) && col + w > usize::from(start);
-            col += w;
-            Span::styled(
-                g.symbol.to_owned(),
-                if marked { g.style.bg(marker) } else { g.style },
-            )
-        })
-        .collect();
-    let paragraph = Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false });
-    let height = paragraph.line_count(width).min(u16::MAX as usize) as u16;
-    let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
-    paragraph.render(buffer.area, &mut buffer);
-    let mut rects = Vec::new();
-    for y in 0..height {
-        let mut x = 0;
-        while x < width {
-            if buffer[(x, y)].bg != marker {
-                x += 1;
-                continue;
-            }
-            let begin = x;
-            while x < width && buffer[(x, y)].bg == marker {
-                x += Span::raw(buffer[(x, y)].symbol()).width().max(1) as u16;
-            }
-            rects.push(Rect::new(begin, y, x.min(width) - begin, 1));
-        }
-    }
-    rects
-}
+#[cfg(test)]
+use super::document_layout::wrapped_click_rects;
+use super::document_layout::wrapped_text_layout;
 
 /// Reveal an off-screen header with the smallest scroll adjustment.
 fn reveal_header_scroll(scroll: u16, height: u16, header: u16) -> u16 {
@@ -1197,7 +1130,8 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
     if inner.height == 0 || inner.width == 0 {
         return;
     }
-    app.set_image_viewport(inner.width, inner.height);
+    app.set_document_viewport(inner.width, inner.height);
+    let context = super::document_layout::LayoutContext::new(inner.as_size());
 
     if app.reveal_selected_block {
         if let Some(addr) = &app.selected_block {
@@ -1219,9 +1153,9 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
                     .iter()
                     .take(header.segment_index)
                     .map(|seg| match seg {
-                        Segment::Text(lines) => Paragraph::new(Text::from(lines.clone()))
-                            .wrap(Wrap { trim: false })
-                            .line_count(inner.width),
+                        Segment::Text(_) | Segment::Table { .. } | Segment::TablePreview(_) => {
+                            context.text(seg).unwrap().rows()
+                        }
                         Segment::Image { path, .. } => app
                             .doc_images
                             .get(path)
@@ -1248,36 +1182,18 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
             break;
         }
         match seg {
-            Segment::Text(lines) => {
+            Segment::Text(_) | Segment::Table { .. } | Segment::TablePreview(_) => {
+                let text_layout = context.text(seg).unwrap();
                 // How far into this segment's own wrapped rows `skip`
                 // reaches, *before* it gets zeroed out below — needed to
                 // translate a click region's (pre-scroll) row back to
                 // where it actually lands once scrolled.
                 let seg_skip = skip;
-                // A segment's own *rendered* (word-wrapped, `inner.width`)
-                // row count can be well past `lines.len()` — a single
-                // long logical `Line` (a wordy bullet point, say) wraps
-                // into several screen rows on its own. Sizing this
-                // segment's `rect`/advancing `y` by `lines.len()` instead
-                // (as this used to) starves `Paragraph`'s own wrapping of
-                // the rows it actually needs, silently clipping the rest —
-                // and, since `y` then advances by too little, every
-                // segment after it ends up drawn overlapping the tail of
-                // this one instead of below it. `line_count` runs the
-                // exact wrapping `Paragraph` itself will use to render
-                // (unlike a hand-rolled `width()/inner.width` estimate,
-                // which can disagree with it at word-boundary edge cases),
-                // so measuring and rendering never disagree on a segment's
-                // own height. `skip`/scrolling now also count wrapped
-                // rows, via `Paragraph::scroll`'s own row offset (applied
-                // post-wrap) rather than slicing `lines` itself, since a
-                // partial skip can now land *inside* one long logical line
-                // — not just before/after one, like it always could when
-                // "line" and "row" were still the same thing.
-                let mut animated_lines = lines.clone();
+                // Measurement and hit testing come from the same container layout.
+                let mut text_layout = text_layout;
                 // Document segments are cached between output events. Animate
                 // only the live header without re-parsing Markdown or images.
-                for line in &mut animated_lines {
+                for line in &mut text_layout.lines {
                     if let Some(header) = line.spans.first_mut() {
                         if header.content.starts_with("┌─ output: ")
                             && header.content.ends_with(" · running ──")
@@ -1293,9 +1209,8 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
                         }
                     }
                 }
-                let paragraph =
-                    Paragraph::new(Text::from(animated_lines)).wrap(Wrap { trim: false });
-                let total = paragraph.line_count(inner.width) as u16;
+                let paragraph = text_layout.paragraph();
+                let total = text_layout.rows().min(u16::MAX as usize) as u16;
                 let layout = match wrapped_text_layout(total, skip, bottom - y) {
                     None => {
                         skip -= total;
@@ -1322,46 +1237,17 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
                     .iter()
                     .any(|r| r.segment_index == seg_idx)
                 {
-                    // Each line's own wrapped-row start within the
-                    // segment, found by wrapping it alone rather than
-                    // re-deriving an offset from `total` above — wrapping
-                    // is per-`Line` in `ratatui` (a `Paragraph` never
-                    // merges two logical lines' own wrapped rows
-                    // together), so summing each line's own row count in
-                    // isolation gives exactly the same row starts the
-                    // combined `paragraph` above just rendered with.
-                    let mut line_row_starts: Vec<u16> = Vec::with_capacity(lines.len());
-                    let mut acc = 0u16;
-                    for line in lines {
-                        line_row_starts.push(acc);
-                        let single = Paragraph::new(Text::from(vec![line.clone()]))
-                            .wrap(Wrap { trim: false });
-                        acc += single.line_count(inner.width) as u16;
-                    }
                     for region in app
                         .doc_click_regions
                         .iter()
                         .filter(|r| r.segment_index == seg_idx)
                     {
-                        let Some(&line_start) = line_row_starts.get(region.line_index) else {
-                            continue;
-                        };
-                        let line_end = line_row_starts
-                            .get(region.line_index + 1)
-                            .copied()
-                            .unwrap_or(total);
-                        if line_end <= seg_skip
-                            || line_start >= seg_skip.saturating_add(layout.height)
-                        {
-                            continue;
-                        }
-                        for local in wrapped_click_rects(
-                            &lines[region.line_index],
-                            inner.width,
+                        for local in text_layout.click_rects(
+                            region.line_index,
                             region.col_start,
                             region.col_end,
                         ) {
-                            let row = line_start.saturating_add(local.y);
+                            let row = local.y;
                             if row < seg_skip || row - seg_skip >= layout.height {
                                 continue;
                             }
@@ -1378,11 +1264,11 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
             Segment::Image { path, alt, .. } => {
                 let protocol = app.doc_images.get(path).and_then(|o| o.as_ref());
                 let rows = protocol.map(|p| p.size().height).unwrap_or(1);
-                if skip >= rows {
+                let Some(layout) = wrapped_text_layout(rows, skip, bottom - y) else {
                     skip -= rows;
                     continue;
-                }
-                let height = rows.saturating_sub(skip).min(bottom - y);
+                };
+                let height = layout.height;
                 let rect = Rect {
                     x: inner.x,
                     y,
@@ -1495,8 +1381,9 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
                 &HashMap::new(),
             );
             for seg in segs {
-                if let Segment::Text(seg_lines) = seg {
-                    lines.extend(seg_lines);
+                let context = super::document_layout::LayoutContext::new(inner.as_size());
+                if let Some(text) = context.text(&seg) {
+                    lines.extend(text.into_rows());
                 }
             }
         }
@@ -3559,6 +3446,53 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn document_resize_reflows_cached_tables_and_keeps_following_click_targets() {
+        let mut app = test_app().await;
+        let md = "| Mode | Command | Notes |\n|---|---|---|\n| Single shot + power-down | `0x36E0` | long description of sensor power mode |\n\n```bash name=\"go\"\necho AFTER\n```\n";
+        let (segments, clicks) = super::super::markdown::render(
+            md,
+            std::path::Path::new("/nonexistent"),
+            &app.highlighter,
+            "root",
+            &[],
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+        );
+        app.doc_segments = segments;
+        app.doc_click_regions = clicks;
+        let mut header_rows = Vec::new();
+        for width in [72, 32, 72] {
+            let area = Rect::new(0, 0, width, 40);
+            let screen = render_to_screen(area, |f| render_document(f, area, &mut app));
+            assert!(screen.contains("AFTER"), "{screen}");
+            assert!(
+                app.doc_segments
+                    .iter()
+                    .any(|s| matches!(s, Segment::Table { .. })),
+                "resize must retain parsed content"
+            );
+            let target = app
+                .doc_click_targets
+                .iter()
+                .find(|(_, target)| {
+                    matches!(
+                        target,
+                        super::super::markdown::ClickTarget::Block {
+                            action: super::super::markdown::BlockAction::ToggleBlock,
+                            ..
+                        }
+                    )
+                })
+                .unwrap();
+            header_rows.push(target.0.y);
+        }
+        assert!(header_rows[1] > header_rows[0]);
+        assert_eq!(header_rows[0], header_rows[2]);
+        std::fs::remove_dir_all(app.canvas_path.parent().unwrap()).unwrap();
     }
 
     async fn test_app() -> App {

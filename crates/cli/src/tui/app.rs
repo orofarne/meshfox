@@ -501,7 +501,7 @@ pub struct App {
     /// against exactly what's currently on screen, scroll/wrap included.
     pub doc_click_targets: Vec<(Rect, ClickTarget)>,
     pub(super) doc_images: HashMap<PathBuf, Option<Arc<DocumentImage>>>,
-    image_viewport: ratatui::layout::Size,
+    document_viewport: ratatui::layout::Size,
     /// Bytes of the document's image files, fetched from the worker
     /// (`GET /<relative path>`) — `doc_images` is rebuilt from these on
     /// every render. `image_requested` prevents duplicate fetches per path.
@@ -1165,7 +1165,7 @@ impl App {
             doc_click_regions: Vec::new(),
             doc_click_targets: Vec::new(),
             doc_images: HashMap::new(),
-            image_viewport: ratatui::layout::Size::new(56, 24),
+            document_viewport: ratatui::layout::Size::new(56, 24),
             image_bytes: HashMap::new(),
             image_generation: 0,
             image_requested: std::collections::HashSet::new(),
@@ -3532,12 +3532,10 @@ impl App {
                 let caption = node.caption.clone();
                 let preview = if is_table {
                     self.ensure_table(&node_id);
-                    let width = self.document_inner_width();
-                    let lines = match self.tables.get(&node_id) {
-                        Some(data) => table::inline_lines(data, width),
-                        None => Vec::new(),
-                    };
-                    vec![Segment::Text(lines)]
+                    self.tables
+                        .get(&node_id)
+                        .map(|data| vec![Segment::TablePreview(Box::new(data.clone()))])
+                        .unwrap_or_default()
                 } else {
                     self.ensure_file_preview(&node_id);
                     match self.file_previews.get(&node_id).map(|p| &p.state) {
@@ -3599,6 +3597,7 @@ impl App {
                     self.doc_segments.push(Segment::Text(vec![Line::from("")]));
                 }
                 self.doc_segments.extend(preview);
+                self.prepare_document_images(&base_dir, asset_base);
                 return;
             }
         }
@@ -3627,6 +3626,17 @@ impl App {
             })
             .collect();
 
+        let preview_target = (node.node_type == NodeType::Link && node.preview)
+            .then(|| node.target.clone())
+            .flatten();
+        self.prepare_document_images(&base_dir, asset_base);
+
+        if let Some(target) = preview_target {
+            self.append_link_preview(&target);
+        }
+    }
+
+    fn prepare_document_images(&mut self, base_dir: &Path, asset_base: Option<String>) {
         let images: Vec<(PathBuf, Option<u32>, Option<u32>, Option<Background>)> = self
             .doc_segments
             .iter()
@@ -3638,10 +3648,16 @@ impl App {
                     bg,
                     ..
                 } => Some((path.clone(), *width_percent, *height_percent, *bg)),
-                Segment::Text(_) => None,
+                Segment::Text(_) | Segment::Table { .. } | Segment::TablePreview(_) => None,
             })
             .collect();
         for (path, width_percent, height_percent, bg) in images {
+            if path
+                .to_str()
+                .is_some_and(|p| p.starts_with("meshfox-link-preview:"))
+            {
+                continue;
+            }
             let is_data_url = path.to_str().is_some_and(|s| s.starts_with("data:"));
             if !is_data_url && !self.image_bytes.contains_key(&path) {
                 request_image(
@@ -3651,13 +3667,16 @@ impl App {
                     &self.background_tx,
                     &mut self.image_requested,
                     &mut self.image_pending,
-                    &base_dir,
+                    base_dir,
                     &path,
                 );
                 self.doc_images.insert(path, None);
                 continue;
             }
-            let budget = image_size_budget_for_viewport(self.image_viewport, width_percent, height_percent);
+            // The document title and its following blank row occupy two rows.
+            let budget = super::document_layout::LayoutContext::new(self.document_viewport)
+                .inset(0, 2)
+                .image_budget(width_percent, height_percent);
             let protocol = load_document_image(
                 &self.picker,
                 &path,
@@ -3666,12 +3685,6 @@ impl App {
                 budget,
             );
             self.doc_images.insert(path, protocol);
-        }
-
-        if node.node_type == NodeType::Link && node.preview {
-            if let Some(target) = node.target.clone() {
-                self.append_link_preview(&target);
-            }
         }
     }
 
@@ -3747,11 +3760,21 @@ impl App {
 
     /// Fixed image protocols refuse to draw into a smaller rectangle. Rebuild
     /// from cached bytes when the document pane changes size, without refetching.
-    pub(super) fn set_image_viewport(&mut self, width: u16, height: u16) {
-        let viewport = ratatui::layout::Size::new(width.max(1), height.saturating_sub(2).max(1));
-        if viewport != self.image_viewport {
-            self.image_viewport = viewport;
-            self.render_current_document();
+    pub(super) fn set_document_viewport(&mut self, width: u16, height: u16) {
+        let viewport = ratatui::layout::Size::new(width.max(1), height.max(1));
+        if viewport != self.document_viewport {
+            self.document_viewport = viewport;
+            let node = self
+                .rows
+                .get(self.selected)
+                .and_then(|r| self.display_canvas.node(&r.node_id));
+            let asset_base = node.and_then(|n| n.asset_base.clone());
+            let base_dir = asset_base
+                .as_deref()
+                .map(Path::new)
+                .unwrap_or_else(|| self.canvas_path.parent().unwrap_or(Path::new(".")))
+                .to_path_buf();
+            self.prepare_document_images(&base_dir, asset_base);
         }
     }
 
@@ -6665,21 +6688,13 @@ pub(super) fn image_cell_dimensions(mut protocol: Protocol) -> Protocol {
 /// Percentage attributes use the document pane, rather than the default
 /// thumbnail budget. The unconstrained axis can use the whole viewport so
 /// a width hint is not silently defeated by the old 24-row height limit.
+#[cfg(test)]
 fn image_size_budget_for_viewport(
     viewport: ratatui::layout::Size,
     width_percent: Option<u32>,
     height_percent: Option<u32>,
 ) -> ratatui::layout::Size {
-    let width = viewport.width.max(1);
-    let height = viewport.height.max(1);
-    if width_percent.is_none() && height_percent.is_none() {
-        return ratatui::layout::Size::new(width.min(56), height.min(24));
-    }
-    let scale = |available: u16, percent: Option<u32>| {
-        (u64::from(available) * u64::from(percent.unwrap_or(100)) / 100)
-            .clamp(1, u64::from(available)) as u16
-    };
-    ratatui::layout::Size::new(scale(width, width_percent), scale(height, height_percent))
+    super::document_layout::LayoutContext::new(viewport).image_budget(width_percent, height_percent)
 }
 
 #[cfg(test)]
@@ -6699,22 +6714,6 @@ fn point_in(rect: Rect, x: u16, y: u16) -> bool {
 // ---------------------------------------------------------------------------
 
 impl App {
-    /// Columns the document pane has for text — what the inline table is cut
-    /// to, since it would otherwise wrap into a mess. Falls back to a common
-    /// width when the terminal size can't be read (unit tests).
-    fn document_inner_width(&self) -> usize {
-        let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
-        let layout = ui::compute_layout(
-            Rect::new(0, 0, cols, rows),
-            self.fullscreen,
-            self.navigation_width_pct(),
-            self.output_height,
-            self.console_collapsed,
-            self.tree_collapsed,
-        );
-        usize::from(layout.document.width.saturating_sub(2)).max(20)
-    }
-
     /// Starts (or refreshes) the background fetch of a `display="code"`
     /// node's content. The first call leaves a "loading" entry; once content
     /// has landed, an entry older than [`FILE_PREVIEW_REFRESH`] is refetched

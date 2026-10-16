@@ -44,7 +44,7 @@ const COL_GAP: &str = " │ ";
 
 /// What this client knows about one table node: schema, the view being shown
 /// and the blocks of rows fetched for it.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct TableData {
     pub meta: Option<TableMetaDto>,
     /// The last failure to even ask the worker (`GET /table` itself failed).
