@@ -469,7 +469,13 @@ pub fn render_with_blocks(
                 if let Ok(selected) = meshfox_core::args::bind_env_name(&env.var_name, &arguments) {
                     let source = decls.iter().find(|decl| decl.name == selected)
                         .and_then(|decl| decl.from.as_ref())
-                        .map(|source| format!(" ← {}/{}", source.node_id.as_deref().unwrap_or(node_id), source.block_name))
+                        .map(|source| {
+                            format!(
+                                " ← {}/{}",
+                                source.node_id.as_deref().unwrap_or(node_id),
+                                source.block_name
+                            )
+                        })
                         .unwrap_or_default();
                     details.push(format!("env: {application}: {selected}{source}"));
                 }
@@ -703,6 +709,12 @@ impl<'a> Renderer<'a> {
     }
 
     fn block_border(&self, name: Option<&str>) -> Style {
+        if name
+            .and_then(|name| self.live_output.get(name))
+            .is_some_and(|output| output.running)
+        {
+            return Style::default().fg(super::theme::OK);
+        }
         let selected = name.is_some() && name == self.selected_block.as_deref();
         Style::default().fg(if selected {
             if self.focused {
@@ -887,7 +899,7 @@ impl<'a> Renderer<'a> {
         // exit code/duration are already real by the time this struct
         // exists.
         let header = if live.running {
-            format!("┌─ output: {block_name} · live{kind} · running ──")
+            format!("┌─ output: {block_name} · ⠋ live{kind} · running ──")
         } else {
             let status = if live.exit_code == 0 {
                 "done"
@@ -1419,6 +1431,7 @@ impl<'a> Renderer<'a> {
     /// variable source per row, with jump targets for the source names.
     fn dep_lines(
         &self,
+        owner: Option<&str>,
         deps_raw: Option<&str>,
         env_raw: Option<&str>,
         interpreter: Option<&str>,
@@ -1471,7 +1484,14 @@ impl<'a> Renderer<'a> {
             })
             .collect();
 
-        let style = Style::default().fg(super::theme::DEP);
+        let style = if owner
+            .and_then(|name| self.live_output.get(name))
+            .is_some_and(|output| output.running)
+        {
+            self.block_border(owner)
+        } else {
+            Style::default().fg(super::theme::DEP)
+        };
         let click_style = style.add_modifier(Modifier::UNDERLINED);
         let row = |prefix: String, label: String, node_id: String| {
             let start = prefix.chars().count() as u16;
@@ -1766,6 +1786,7 @@ impl<'a> Renderer<'a> {
                     ])];
                     let mut dep_clicks = Vec::new();
                     for (line, clicks) in self.dep_lines(
+                        click_name.as_deref(),
                         deps_raw.as_deref(),
                         env_raw.as_deref(),
                         interpreter.as_deref(),
@@ -1897,6 +1918,7 @@ impl<'a> Renderer<'a> {
                 let mut dep_clicks = Vec::new();
                 if !view.collapsed {
                     for (dep_line, clicks) in self.dep_lines(
+                        click_name.as_deref(),
                         deps_raw.as_deref(),
                         env_raw.as_deref(),
                         interpreter.as_deref(),
@@ -2130,6 +2152,43 @@ mod tests {
     }
 
     #[test]
+    fn running_blocks_color_their_dependency_lines() {
+        let hl = Highlighter::new();
+        for running in [true, false] {
+            let output =
+                std::collections::HashMap::from([("go".into(), table_output(false, running))]);
+            let (segments, _) = render(
+                "```sh name=go deps=build\necho go\n```\n",
+                Path::new("/nonexistent-base-dir"),
+                &hl,
+                "n",
+                &[],
+                &std::collections::HashMap::new(),
+                None,
+                &output,
+            );
+            let line = segments
+                .iter()
+                .filter_map(|segment| match segment {
+                    Segment::Text(lines) => Some(lines),
+                    _ => None,
+                })
+                .flatten()
+                .find(|line| line.to_string().contains("deps: build"))
+                .unwrap();
+            let expected = if running {
+                super::super::theme::OK
+            } else {
+                super::super::theme::DEP
+            };
+            assert!(line
+                .spans
+                .iter()
+                .all(|span| span.style.fg == Some(expected)));
+        }
+    }
+
+    #[test]
     fn live_output_renders_ansi_while_running_and_after_completion() {
         for running in [true, false] {
             let mut live = table_output(false, running);
@@ -2137,7 +2196,19 @@ mod tests {
             let output = std::collections::HashMap::from([("t".into(), live)]);
             let (segments, _) = render("```bash name=\"t\"\necho hi\n```\n", Path::new("."), &Highlighter::new(), "root", &[], &Default::default(), None, &output);
             for word in ["first", "second"] {
-                let span = segments.iter().filter_map(|s| if let Segment::Text(l) = s { Some(l) } else { None }).flatten().flat_map(|l| &l.spans).find(|s| s.content == word).unwrap();
+                let span = segments
+                    .iter()
+                    .filter_map(|s| {
+                        if let Segment::Text(l) = s {
+                            Some(l)
+                        } else {
+                            None
+                        }
+                    })
+                    .flatten()
+                    .flat_map(|l| &l.spans)
+                    .find(|s| s.content == word)
+                    .unwrap();
                 assert_eq!(span.style.fg, Some(Color::Indexed(123)));
             }
         }
@@ -2146,8 +2217,28 @@ mod tests {
     #[test]
     fn cached_output_keeps_ansi_styles_across_lines() {
         let md = "<!-- meshfox:output name=\"build\" hash=\"x\" -->\n```text\n\x1b[31mred\nsecond\x1b[0m plain\n```\n<!-- /meshfox:output -->\n";
-        let (segments, _) = render(md, Path::new("."), &Highlighter::new(), "root", &[], &Default::default(), None, &Default::default());
-        let spans: Vec<_> = segments.iter().filter_map(|s| if let Segment::Text(l) = s { Some(l) } else { None }).flatten().flat_map(|l| &l.spans).collect();
+        let (segments, _) = render(
+            md,
+            Path::new("."),
+            &Highlighter::new(),
+            "root",
+            &[],
+            &Default::default(),
+            None,
+            &Default::default(),
+        );
+        let spans: Vec<_> = segments
+            .iter()
+            .filter_map(|s| {
+                if let Segment::Text(l) = s {
+                    Some(l)
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .flat_map(|l| &l.spans)
+            .collect();
         for word in ["red", "second"] {
             assert_eq!(spans.iter().find(|s| s.content == word).unwrap().style.fg, Some(Color::Indexed(1)));
         }
@@ -2214,7 +2305,12 @@ mod tests {
                 _ => None,
             })
             .flatten()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
             .collect();
         let row = lines
             .iter()

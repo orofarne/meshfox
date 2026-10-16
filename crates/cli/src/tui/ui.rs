@@ -6,6 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
+use ratatui_image::sliced::{SlicedImage, SlicedProtocol, SignedPosition};
 use ratatui_image::Image;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -884,6 +885,7 @@ fn with_ancestors<'a>(
 }
 
 fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
+    app.tree_click_rows.clear();
     if app.tree_collapsed {
         // A narrow, borderless handle — no room for a title the way
         // Output's own collapsed strip shows one (that one collapses along
@@ -1053,6 +1055,7 @@ fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
 
+    let heights: Vec<_> = items.iter().map(ListItem::height).collect();
     app.list_state.select(Some(app.selected));
 
     let list = List::new(items)
@@ -1072,6 +1075,21 @@ fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
     f.render_stateful_widget(list, area, &mut app.list_state);
+    // ListState's offset counts items, while mouse coordinates count terminal
+    // rows. Use the rendered item heights, including wrapped title lines.
+    let mut y = area.y.saturating_add(1);
+    let bottom = area.bottom().saturating_sub(1);
+    for (index, height) in heights.iter().enumerate().skip(app.list_state.offset()) {
+        if y >= bottom {
+            break;
+        }
+        let height = (*height).min(usize::from(bottom - y)) as u16;
+        app.tree_click_rows.push((
+            Rect::new(area.x + 1, y, area.width.saturating_sub(2), height),
+            index,
+        ));
+        y += height;
+    }
 }
 
 /// How much of a `Segment::Text`'s already-wrapped `total` rows (see
@@ -1156,6 +1174,25 @@ fn reveal_header_scroll(scroll: u16, height: u16, header: u16) -> u16 {
     }
 }
 
+/// Handle partial rows without re-encoding during scrolling. ratatui-image
+/// 11's generic/Sixel slicers count the bottom cut before skipping top rows;
+/// bound the visible count explicitly when both ends are clipped.
+fn render_clipped_image(image: &SlicedProtocol, skip: u16, area: Rect, buffer: &mut ratatui::buffer::Buffer) {
+    use ratatui::widgets::Widget;
+    match image {
+        SlicedProtocol::Sliced(rows) => {
+            for (row, image) in rows.iter().skip(usize::from(skip)).take(usize::from(area.height)).enumerate() {
+                Image::new(image).render(Rect::new(area.x, area.y + row as u16, area.width, 1), buffer);
+            }
+        }
+        SlicedProtocol::Sixel(sixel) => {
+            let drop = image.size().height.saturating_sub(area.height);
+            sixel.borrow_dependent().render(area, buffer, usize::from(skip), usize::from(drop));
+        }
+        _ => SlicedImage::new(image, SignedPosition::from((0, -(skip as i16)))).render(area, buffer),
+    }
+}
+
 fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1169,6 +1206,7 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
     if inner.height == 0 || inner.width == 0 {
         return;
     }
+    app.set_image_viewport(inner.width, inner.height);
 
     if app.reveal_selected_block {
         if let Some(addr) = &app.selected_block {
@@ -1245,8 +1283,27 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
                 // partial skip can now land *inside* one long logical line
                 // — not just before/after one, like it always could when
                 // "line" and "row" were still the same thing.
+                let mut animated_lines = lines.clone();
+                // Document segments are cached between output events. Animate
+                // only the live header without re-parsing Markdown or images.
+                for line in &mut animated_lines {
+                    if let Some(header) = line.spans.first_mut() {
+                        if header.content.starts_with("┌─ output: ")
+                            && header.content.ends_with(" · running ──")
+                        {
+                            header.content = header
+                                .content
+                                .replacen(
+                                    " · ⠋ live",
+                                    &format!(" · {} live", spinner_frame(app.spinner_tick)),
+                                    1,
+                                )
+                                .into();
+                        }
+                    }
+                }
                 let paragraph =
-                    Paragraph::new(Text::from(lines.clone())).wrap(Wrap { trim: false });
+                    Paragraph::new(Text::from(animated_lines)).wrap(Wrap { trim: false });
                 let total = paragraph.line_count(inner.width) as u16;
                 let layout = match wrapped_text_layout(total, skip, bottom - y) {
                     None => {
@@ -1344,7 +1401,12 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
                     height,
                 };
                 match protocol {
-                    Some(p) => f.render_widget(Image::new(p), rect),
+                    Some(p) => render_clipped_image(p, skip, rect, f.buffer_mut()),
+                    None if app.image_pending.contains(path) => f.render_widget(
+                        Paragraph::new(format!("[image loading: {alt}]"))
+                            .style(Style::default().fg(Color::DarkGray)),
+                        rect,
+                    ),
                     None => f.render_widget(
                         Paragraph::new(format!("[image failed to load: {alt}]"))
                             .style(Style::default().fg(FAIL)),
@@ -2131,17 +2193,23 @@ fn render_services_view(f: &mut Frame, area: Rect, app: &App, sv: &ServicesViewS
         .into_iter()
         .map(|dto| {
             let line = match dto.status.as_str() {
-                "running" | "starting" | "stopping" | "restarting" | "stop_failed" => Line::from(vec![
-                    Span::raw(format!("{}  ", dto.block)),
-                    Span::styled(
-                        format!("{} · pid {}", dto.status.replace('_', " "), dto.pid),
-                        Style::default().fg(if dto.status == "stop_failed" { FAIL } else { OK }),
-                    ),
-                    Span::styled(
-                        format!("  {}", dto.node_id),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ]),
+                "running" | "starting" | "stopping" | "restarting" | "stop_failed" => {
+                    Line::from(vec![
+                        Span::raw(format!("{}  ", dto.block)),
+                        Span::styled(
+                            format!("{} · pid {}", dto.status.replace('_', " "), dto.pid),
+                            Style::default().fg(if dto.status == "stop_failed" {
+                                FAIL
+                            } else {
+                                OK
+                            }),
+                        ),
+                        Span::styled(
+                            format!("  {}", dto.node_id),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ])
+                }
                 "crashed" => Line::from(vec![
                     Span::raw(format!("{}  ", dto.block)),
                     Span::styled(
@@ -2868,16 +2936,15 @@ fn render_source_diff(f: &mut Frame, area: Rect, se: &mut SourceEditorState) {
         chunks[1],
     );
 
-    let cell = |side: &Option<(usize, String)>, nw: usize, width: usize, hscroll: usize| {
-        match side {
-            Some((idx, text)) => {
-                let prefix = format!("{:>nw$} ", idx + 1);
-                let room = width.saturating_sub(prefix.len());
-                let body = visible_columns(text, hscroll, room);
-                (prefix, body)
-            }
-            None => (String::new(), String::new()),
+    let cell = |side: &Option<(usize, String)>, nw: usize, width: usize, hscroll: usize| match side
+    {
+        Some((idx, text)) => {
+            let prefix = format!("{:>nw$} ", idx + 1);
+            let room = width.saturating_sub(prefix.len());
+            let body = visible_columns(text, hscroll, room);
+            (prefix, body)
         }
+        None => (String::new(), String::new()),
     };
     let mut lines: Vec<Line> = Vec::new();
     for i in diff.scroll..(diff.scroll + diff.view_height).min(diff.rows.len()) {
@@ -3543,6 +3610,180 @@ mod tests {
         screen
     }
 
+    #[test]
+    fn partial_images_keep_visible_rows_inside_the_viewport_for_all_protocols() {
+        use ratatui::buffer::Buffer;
+        use ratatui_image::picker::{Picker, ProtocolType};
+        use super::super::app::sliced_image;
+        let pixels = image::RgbaImage::from_fn(40, 80, |_, y| {
+            if y < 40 { image::Rgba([255, 0, 0, 255]) } else { image::Rgba([0, 0, 255, 255]) }
+        });
+        for kind in [ProtocolType::Halfblocks, ProtocolType::Iterm2, ProtocolType::Sixel, ProtocolType::Kitty] {
+            let mut picker = Picker::halfblocks();
+            picker.set_protocol_type(kind);
+            let protocol = sliced_image(&picker, image::DynamicImage::ImageRgba8(pixels.clone()), ratatui::layout::Size::new(4, 4)).unwrap();
+            assert_eq!(protocol.size(), ratatui::layout::Size::new(4, 4));
+            for (skip, height) in [(0, 2), (1, 2), (3, 1)] {
+                let mut buffer = Buffer::empty(Rect::new(0, 0, 6, 6));
+                for cell in &mut buffer.content { cell.set_symbol("."); }
+                let area = Rect::new(1, 1, 4, height);
+                render_clipped_image(&protocol, skip, area, &mut buffer);
+                assert_ne!(buffer[(1, 1)].symbol(), ".", "{kind:?} skip={skip}");
+                for y in 0..6 {
+                    for x in 0..6 {
+                        if !area.contains((x, y).into()) { assert_eq!(buffer[(x,y)].symbol(), ".", "{kind:?} escaped viewport"); }
+                    }
+                }
+                if kind == ProtocolType::Halfblocks && skip == 1 {
+                    assert!(matches!(buffer[(1, 1)].bg, Color::Rgb(r, _, b) if r > b));
+                    assert!(matches!(buffer[(1, 2)].bg, Color::Rgb(r, _, b) if b > r));
+                }
+                if kind == ProtocolType::Iterm2 {
+                    use base64::Engine;
+                    for row in 0..height {
+                        let sequence = buffer[(1, 1 + row)].symbol();
+                        assert!(sequence.contains("width=4;height=1;"), "{sequence}");
+                        let encoded = sequence.split("doNotMoveCursor=1:").nth(1).unwrap().split('\u{7}').next().unwrap();
+                        let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
+                        let image = image::load_from_memory(&bytes).unwrap().to_rgba8();
+                        let expected = if skip + row < 2 { [255, 0, 0, 255] } else { [0, 0, 255, 255] };
+                        assert_eq!(image.get_pixel(20, 20).0, expected);
+                        assert_eq!((image.width(), image.height()), (80, 40));
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn scrolling_document_keeps_the_correct_image_rows() {
+        use super::super::app::BackgroundMsg;
+        let mut app = test_app().await;
+        app.picker = ratatui_image::picker::Picker::halfblocks();
+        app.display_canvas = meshfox_core::Canvas::from_markdown(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\nbefore\n\n![plot](plot.png)\n",
+        ).unwrap();
+        let path = app.canvas_path.parent().unwrap().join("plot.png");
+        let pixels = image::RgbaImage::from_fn(40, 80, |_, y| {
+            if y < 40 { image::Rgba([255, 0, 0, 255]) } else { image::Rgba([0, 0, 255, 255]) }
+        });
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(pixels).write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        app.on_background_msg(BackgroundMsg::ImageBytes { generation: app.image_generation, path, result: Ok(bytes.into_inner()) });
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(12, 8)).unwrap();
+        for (scroll, color) in [(0, Color::Rgb(255, 0, 0)), (5, Color::Rgb(0, 0, 255))] {
+            app.doc_scroll = scroll;
+            terminal.draw(|f| render_document(f, Rect::new(0, 0, 12, 8), &mut app)).unwrap();
+            assert!(terminal.backend().buffer().content.iter().any(|cell| cell.bg == color), "image disappeared at scroll={scroll}");
+        }
+        let _ = std::fs::remove_dir_all(app.canvas_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn svg_images_render_in_narrow_and_resized_document_panes() {
+        use super::super::app::BackgroundMsg;
+        let mut app = test_app().await;
+        app.picker = ratatui_image::picker::Picker::halfblocks();
+        app.display_canvas = meshfox_core::Canvas::from_markdown(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n![power](docs/power.svg)\n",
+        ).unwrap();
+        let path = app.canvas_path.parent().unwrap().join("docs/power.svg");
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 600"><style>:root { --bg:#ff0000 } .bg { fill:var(--bg) }</style><rect class="bg" width="960" height="600"/></svg>"##;
+        app.on_background_msg(BackgroundMsg::ImageBytes {
+            generation: app.image_generation, path: path.clone(), result: Ok(svg.to_vec()),
+        });
+        for (width, height) in [(54, 22), (30, 12), (100, 40)] {
+            let area = Rect::new(0, 0, width, height);
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| render_document(f, area, &mut app)).unwrap();
+            let image = app.doc_images[&path].as_ref().expect("decoded SVG");
+            assert!(image.size().width <= width - 2);
+            assert!(image.size().height <= height - 4);
+            let buffer = terminal.backend().buffer();
+            assert!(buffer.content.iter().any(|cell| cell.bg == Color::Rgb(255, 0, 0)),
+                "SVG pixels disappeared in {width}x{height}");
+        }
+        let _ = std::fs::remove_dir_all(app.canvas_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn full_width_svg_grows_with_the_document_pane() {
+        use super::super::app::BackgroundMsg;
+        let mut app = test_app().await;
+        app.picker = ratatui_image::picker::Picker::halfblocks();
+        app.display_canvas = meshfox_core::Canvas::from_markdown(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n![power](power.svg){width=100%}\n",
+        ).unwrap();
+        let path = app.canvas_path.parent().unwrap().join("power.svg");
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 600"><rect width="960" height="600" fill="#ff0000"/></svg>"##;
+        app.on_background_msg(BackgroundMsg::ImageBytes {
+            generation: app.image_generation, path: path.clone(), result: Ok(svg.to_vec()),
+        });
+        for width in [82, 122, 62] {
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 60)).unwrap();
+            terminal.draw(|f| render_document(f, Rect::new(0, 0, width, 60), &mut app)).unwrap();
+            assert_eq!(app.doc_images[&path].as_ref().unwrap().size().width, width - 2);
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer[(width - 2, 3)].bg, Color::Rgb(255, 0, 0));
+        }
+        let _ = std::fs::remove_dir_all(app.canvas_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn document_image_loading_is_not_reported_as_failure() {
+        use super::super::app::BackgroundMsg;
+        for result in [Ok(true), Ok(false), Err("not found")] {
+            let mut app = test_app().await;
+            app.picker = ratatui_image::picker::Picker::halfblocks();
+            app.display_canvas = meshfox_core::Canvas::from_markdown(
+                "# Root\n<!-- meshfox:node id=\"root\" -->\n\n![sensor](sensor.png)\n",
+            )
+            .unwrap();
+            let path = app.canvas_path.parent().unwrap().join("sensor.png");
+            app.doc_segments = vec![Segment::Image {
+                path: path.clone(),
+                alt: "sensor".into(),
+                width_percent: None,
+                height_percent: None,
+                bg: None,
+            }];
+            app.image_pending.insert(path.clone());
+            let area = Rect::new(0, 0, 80, 15);
+            let screen = render_to_screen(area, |f| render_document(f, area, &mut app));
+            assert!(screen.contains("[image loading: sensor]"));
+            assert!(!screen.contains("failed to load"));
+
+            let bytes = match result {
+                Ok(true) => {
+                    let mut bytes = std::io::Cursor::new(Vec::new());
+                    image::DynamicImage::new_rgb8(10, 10)
+                        .write_to(&mut bytes, image::ImageFormat::Png)
+                        .unwrap();
+                    Ok(bytes.into_inner())
+                }
+                Ok(false) => Ok(b"invalid image".to_vec()),
+                Err(error) => Err(error.to_string()),
+            };
+            app.on_background_msg(BackgroundMsg::ImageBytes {
+                generation: app.image_generation,
+                path: path.clone(),
+                result: bytes,
+            });
+            assert!(!app.image_pending.contains(&path));
+            let screen = render_to_screen(area, |f| render_document(f, area, &mut app));
+            assert!(!screen.contains("image loading"));
+            assert_eq!(
+                screen.contains("[image failed to load: sensor]"),
+                result != Ok(true)
+            );
+            assert_eq!(
+                app.doc_images.get(&path).is_some_and(Option::is_some),
+                result == Ok(true)
+            );
+            std::fs::remove_dir_all(app.canvas_path.parent().unwrap()).unwrap();
+        }
+    }
+
     // A long keybindings-help line (over the box's old fixed 60-usable-
     // column width) used to just get cut off at the right border —
     // `Paragraph` clips instead of wrapping without an explicit `.wrap()`.
@@ -3778,6 +4019,43 @@ mod tests {
     // TODO.canvas.md: "Tags in TUI" — end to end through `render_tree`
     // itself, over a real `App`/canvas, mirroring the `render_document`
     // integration test above.
+    #[tokio::test]
+    async fn tree_mouse_targets_follow_wrapped_rows_and_scroll() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{backend::TestBackend, Terminal};
+        let dir = std::env::temp_dir().join(format!("meshfox-tree-click-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.md");
+        std::fs::write(&path, "<!-- meshfox:canvas -->\n# A long root title with many words that wraps\n<!-- meshfox:node id=\"root\" -->\n## First\n<!-- meshfox:node id=\"first\" -->\n## Second\n<!-- meshfox:node id=\"second\" -->\n").unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(path, tx, None, None).await.unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let root = app.tree_click_rows[0].0;
+        assert!(root.height > 1);
+        // A continuation line selects its own item and never folds it.
+        let click = |x, y| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.on_mouse(click(root.x, root.y + 1)).await;
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.rows.len(), 3);
+        let (first, index) = app.tree_click_rows[1];
+        app.on_mouse(click(first.x + 5, first.y)).await;
+        assert_eq!(app.selected, index);
+        app.selected = 2;
+        terminal = Terminal::new(TestBackend::new(80, 7)).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        assert!(app.list_state.offset() > 0);
+        let (rect, index) = app.tree_click_rows[0];
+        app.on_mouse(click(rect.x + 5, rect.y)).await;
+        assert_eq!(app.selected, index);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn render_tree_shows_a_nodes_tags_next_to_its_title() {
         use ratatui::backend::TestBackend;

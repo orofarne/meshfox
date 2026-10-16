@@ -2593,3 +2593,26 @@ Invalid codes and queries without matches show an empty result; Enter then
 keeps the palette open. Control, whitespace and zero-width characters are
 excluded. The modal captures keyboard and mouse input so the buffer underneath
 cannot change while choosing. Glyph appearance depends on terminal fonts.
+
+### Local Markdown image refresh
+
+The worker polls local Markdown image targets every 500 ms, including images
+in included documents and cached Markdown block output. Creation, modification,
+atomic replacement and deletion emit `images-changed` on `/api/watch`. WebUI
+invalidates local image URLs; TUI discards its image byte cache and fetches
+through the worker again. Reconnection also invalidates client image caches.
+Remote URLs and inline `data:` images are not filesystem watch targets.
+The same asset confinement rules apply to watching and serving images.
+
+In the TUI, Markdown image percentage dimensions refer to the current document
+pane, preserving aspect ratio and fitting within its available area. For
+example, `{width=100%}` uses the full pane width when height permits; an omitted
+height does not impose the default thumbnail height. Images without percentage
+attributes keep a 56-column by 24-row maximum, limited by the pane size.
+Resizing or entering fullscreen recalculates these dimensions from cached bytes.
+
+TUI document images render their visible rows when scrolled partially above or
+below the document pane, rather than disappearing when clipped. This applies
+to local images, inline images and link-preview images. Encoded row slices are
+reused during scrolling; iTerm2 slices retain dense SVG pixels and cell-based
+placement, while Sixel uses its protocol-specific band slicing.

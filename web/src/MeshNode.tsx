@@ -2,6 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useLayoutEffect, use
 import { Handle, NodeResizer, NodeToolbar, Position, useReactFlow, useUpdateNodeInternals, type NodeProps } from "@xyflow/react";
 import ReactMarkdown, { defaultUrlTransform, type Components, type UrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { refreshImageUrl } from "./imageRefresh";
 import { NodeFitSize } from "./NodeFitSize";
 import type { NodeSize } from "./contentFit";
 import remarkImageAttrs from "./remarkImageAttrs";
@@ -91,7 +92,7 @@ const allowDataImageUrls: UrlTransform = (url, key, node) => {
  */
 const InsideMarkdownPre = createContext(false);
 
-/** Bumped by `App` on the watch socket's `"files-changed"` — the server
+/** Bumped by `App` on local file/image changes and reconnection — the server
  * noticed (by mtime/size, like it does for the canvas file) that the target
  * of some `display="code"` file node changed on disk: the signal for such a
  * preview to re-read its own target. */
@@ -152,6 +153,7 @@ function MarkdownCodeBlock({ className, children }: { className?: string; childr
  */
 function ThemedImg({ src, ...props }: React.ImgHTMLAttributes<HTMLImageElement>) {
   const dark = usePrefersDark();
+  const refresh = useContext(FileRefreshContext);
   const themed = useMemo(() => {
     if (!src?.startsWith("data:image/svg+xml;base64,")) return src;
     // `dark` is only the cache key: the actual colors are read from the
@@ -159,7 +161,9 @@ function ThemedImg({ src, ...props }: React.ImgHTMLAttributes<HTMLImageElement>)
     void dark;
     return themeSvgDataUrl(src, readPageTheme());
   }, [src, dark]);
-  return <img {...props} src={themed} />;
+  // Relative URLs are served by this worker. Remote and inline images
+  // keep their own caching semantics. Preserve query parameters and fragments.
+  return <img {...props} src={refreshImageUrl(themed, refresh, window.location.href)} />;
 }
 
 /**

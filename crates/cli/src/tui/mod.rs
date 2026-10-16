@@ -11,6 +11,7 @@
 
 mod ansi;
 mod app;
+mod image_metrics;
 mod markdown;
 mod path_picker;
 mod source_diff;
@@ -212,9 +213,12 @@ pub async fn run(canvas_path: PathBuf, initial_node: Option<String>) -> io::Resu
     if embedded_worker {
         if let Some(port) = worker_port {
             if let Ok(services) = crate::worker_client::list_services(port).await {
-                let results = futures_util::future::join_all(services.iter().map(|s| {
-                    crate::worker_client::stop_service(port, &s.node_id, &s.block)
-                })).await;
+                let results = futures_util::future::join_all(
+                    services
+                        .iter()
+                        .map(|s| crate::worker_client::stop_service(port, &s.node_id, &s.block)),
+                )
+                .await;
                 for error in results.into_iter().filter_map(Result::err) {
                     eprintln!("meshfox tui: service shutdown failed: {error}");
                 }
@@ -318,6 +322,11 @@ fn spawn_worker_watcher(
                 WatchEvent::RunStarted { node_id, block } => {
                     spawn_run_subscriber(port, node_id, block, None, external_run_tx.clone());
                 }
+                WatchEvent::ImagesChanged => {
+                    if external_run_tx.send(ExternalMsg::ImagesChanged).is_err() {
+                        return;
+                    }
+                }
                 WatchEvent::RunsChanged => {
                     if external_run_tx.send(ExternalMsg::RunsChanged).is_err() {
                         return;
@@ -338,6 +347,7 @@ fn spawn_worker_watcher(
 
 /// What the worker watcher tells the main loop.
 enum ExternalMsg {
+    ImagesChanged,
     /// An incremental update for a run this session never started.
     Run(ExternalRunUpdate),
     /// Some run started or ended somewhere (another frontend, a terminal
@@ -464,7 +474,14 @@ async fn main_loop(
         }
 
         if let Some(pending) = app.pending_child_canvas.take() {
-            let result = run_child_canvas_handoff(terminal, input_paused, input_rx, pending).await;
+            let result = run_child_canvas_handoff(
+                terminal,
+                input_paused,
+                input_rx,
+                pending,
+                app.picker.clone(),
+            )
+            .await;
             if let Err(e) = result {
                 app.status = format!("failed to open canvas: {e}");
             }
@@ -526,6 +543,7 @@ async fn main_loop(
                     update.event,
                     update.known_duration_ms,
                 ),
+                ExternalMsg::ImagesChanged => app.invalidate_images(),
                 ExternalMsg::RunsChanged => app.refresh_runs_soon = true,
                 ExternalMsg::TtyStarted { node_id, block } => {
                     app.on_tty_started(node_id, block).await
@@ -566,13 +584,15 @@ async fn run_child_canvas_handoff(
     input_paused: &Arc<AtomicBool>,
     input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
     pending: app::PendingChildCanvas,
+    picker: ratatui_image::picker::Picker,
 ) -> io::Result<()> {
     let (background_tx, mut background_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut child = App::new(
+    let mut child = App::new_with_picker(
         pending.path,
         background_tx,
         pending.node.as_deref(),
         Some(pending.port),
+        picker,
     )
     .await?;
     let (reload_tx, mut reload_rx) = tokio::sync::mpsc::unbounded_channel();

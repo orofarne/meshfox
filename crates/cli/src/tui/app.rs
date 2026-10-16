@@ -26,6 +26,7 @@ use ratatui::widgets::ListState;
 use ratatui_image::picker::cap_parser::QueryStdioOptions;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::Protocol;
+use ratatui_image::sliced::SlicedProtocol;
 
 use super::spatial;
 use super::ui;
@@ -475,6 +476,8 @@ pub struct App {
     /// row has to be mapped through the *real* scroll offset, not
     /// recomputed by hand.
     pub list_state: ListState,
+    /// Visible rectangles of wrapped tree items, populated by the renderer.
+    pub tree_click_rows: Vec<(Rect, usize)>,
     pub focus: Focus,
     pub doc_segments: Vec<Segment>,
     /// Document selection is independent of pane focus; actions target it
@@ -496,12 +499,16 @@ pub struct App {
     /// `ui::compute_layout`'s own pane rects), so a click always hit-tests
     /// against exactly what's currently on screen, scroll/wrap included.
     pub doc_click_targets: Vec<(Rect, ClickTarget)>,
-    pub doc_images: HashMap<PathBuf, Option<Protocol>>,
+    pub doc_images: HashMap<PathBuf, Option<Arc<SlicedProtocol>>>,
+    image_viewport: ratatui::layout::Size,
     /// Bytes of the document's image files, fetched from the worker
     /// (`GET /<relative path>`) — `doc_images` is rebuilt from these on
-    /// every render. `image_requested` keeps one fetch per path in flight.
+    /// every render. `image_requested` prevents duplicate fetches per path.
     image_bytes: HashMap<PathBuf, Vec<u8>>,
+    pub(super) image_generation: u64,
     image_requested: std::collections::HashSet<PathBuf>,
+    /// Requests that have not answered yet, distinct from completed failures.
+    pub(super) image_pending: HashSet<PathBuf>,
     pub doc_scroll: u16,
     /// Lines scrolled back from the *bottom* of the Output pane — `0`
     /// (the default) pins it to the live tail, same as before this
@@ -743,8 +750,8 @@ pub struct App {
     /// into `doc_images` under a synthetic path on every
     /// `render_current_document` call so the existing `Segment::Image`
     /// render path (`ui.rs`) can show it with no changes of its own —
-    /// `Protocol` is cheap to clone (see `ratatui_image::protocol`).
-    pub link_preview_image: HashMap<String, Protocol>,
+    /// Shared sliced protocols avoid re-encoding preview images on redraw.
+    pub link_preview_image: HashMap<String, Arc<SlicedProtocol>>,
     /// Whether the `S` (reset session) confirm prompt is up — see `on_key`'s
     /// early dispatch to `on_reset_session_confirm_key` and
     /// `reset_session`'s own doc comment for why this asks at all despite
@@ -877,6 +884,7 @@ pub enum BackgroundMsg {
     },
     /// A document image file's bytes, from the worker.
     ImageBytes {
+        generation: u64,
         path: PathBuf,
         result: Result<Vec<u8>, String>,
     },
@@ -1064,6 +1072,25 @@ impl App {
         initial_node: Option<&str>,
         worker_port: Option<u16>,
     ) -> io::Result<App> {
+        Self::new_with_picker(
+            canvas_path,
+            background_tx,
+            initial_node,
+            worker_port,
+            build_picker()?,
+        )
+        .await
+    }
+
+    /// Nested canvases share the terminal and its already detected capabilities.
+    /// Querying stdin again would race the running crossterm input reader.
+    pub(super) async fn new_with_picker(
+        canvas_path: PathBuf,
+        background_tx: tokio::sync::mpsc::UnboundedSender<BackgroundMsg>,
+        initial_node: Option<&str>,
+        worker_port: Option<u16>,
+        picker: Picker,
+    ) -> io::Result<App> {
         let raw = match worker_port {
             Some(port) => match crate::worker_client::get_canvas_raw(port).await {
                 Ok(raw) => raw,
@@ -1101,7 +1128,6 @@ impl App {
         }
         let constraint_stats = constraint_stats(&display_canvas);
         let rows = tree::flatten(&display_canvas, &expanded);
-        let picker = build_picker();
         // Computed before `canvas_path` is moved into the struct literal
         // below (its `canvas_path,` shorthand field).
         let syntax_root = crate::canvas_root_dir(&canvas_path).to_path_buf();
@@ -1123,6 +1149,7 @@ impl App {
             rows,
             selected: 0,
             list_state: ListState::default(),
+            tree_click_rows: Vec::new(),
             focus: Focus::Tree,
             doc_segments: Vec::new(),
             selected_block: None,
@@ -1131,8 +1158,11 @@ impl App {
             doc_click_regions: Vec::new(),
             doc_click_targets: Vec::new(),
             doc_images: HashMap::new(),
+            image_viewport: ratatui::layout::Size::new(56, 24),
             image_bytes: HashMap::new(),
+            image_generation: 0,
             image_requested: std::collections::HashSet::new(),
+            image_pending: HashSet::new(),
             doc_scroll: 0,
             output_scroll: 0,
             output_hscroll: 0,
@@ -2187,8 +2217,12 @@ impl App {
                                     self.trigger_run(true).await;
                                 }
                             }
-                        } else if mouse.row >= inner_y {
-                            let clicked = self.list_state.offset() + (mouse.row - inner_y) as usize;
+                        } else if let Some((rect, clicked)) = self
+                            .tree_click_rows
+                            .iter()
+                            .find(|(rect, _)| point_in(*rect, mouse.column, mouse.row))
+                            .copied()
+                        {
                             if let Some(row) = self.rows.get(clicked) {
                                 // "  " * depth (indent) then a 2-column-wide
                                 // disclosure marker — see `ui::render_tree`'s
@@ -2196,6 +2230,7 @@ impl App {
                                 // has to stay in step with.
                                 let disclosure_col = inner_x + row.depth as u16 * 2;
                                 let on_disclosure = row.has_children
+                                    && mouse.row == rect.y
                                     && mouse.column >= disclosure_col
                                     && mouse.column < disclosure_col + 2;
 
@@ -3418,10 +3453,11 @@ impl App {
         // and scrolls with the body, including file-content previews.
         self.doc_segments
             .push(Segment::Text(vec![Line::from(heading), Line::from("")]));
-        let base_dir = self
-            .canvas_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
+        let asset_base = node.asset_base.clone();
+        let base_dir = asset_base
+            .as_deref()
+            .map(Path::new)
+            .unwrap_or_else(|| self.canvas_path.parent().unwrap_or_else(|| Path::new(".")))
             .to_path_buf();
         // Document-wide declared vars, purely so `markdown::render` can
         // label each fenced block's own implicit `from=` deps (see its own
@@ -3603,21 +3639,24 @@ impl App {
             if !is_data_url && !self.image_bytes.contains_key(&path) {
                 request_image(
                     self.worker_port,
+                    self.image_generation,
+                    asset_base.clone(),
                     &self.background_tx,
                     &mut self.image_requested,
+                    &mut self.image_pending,
                     &base_dir,
                     &path,
                 );
                 self.doc_images.insert(path, None);
                 continue;
             }
-            let protocol = load_image_protocol(
-                &mut self.picker,
+            let budget = image_size_budget_for_viewport(self.image_viewport, width_percent, height_percent);
+            let protocol = load_document_image(
+                &self.picker,
                 &path,
                 self.image_bytes.get(&path).map(Vec::as_slice),
-                width_percent,
-                height_percent,
                 bg,
+                budget,
             );
             self.doc_images.insert(path, protocol);
         }
@@ -3697,6 +3736,24 @@ impl App {
                 let _ = tx.send(BackgroundMsg::Meta { url, meta });
             }
         });
+    }
+
+    /// Fixed image protocols refuse to draw into a smaller rectangle. Rebuild
+    /// from cached bytes when the document pane changes size, without refetching.
+    pub(super) fn set_image_viewport(&mut self, width: u16, height: u16) {
+        let viewport = ratatui::layout::Size::new(width.max(1), height.saturating_sub(2).max(1));
+        if viewport != self.image_viewport {
+            self.image_viewport = viewport;
+            self.render_current_document();
+        }
+    }
+
+    pub(super) fn invalidate_images(&mut self) {
+        self.image_generation += 1;
+        self.image_bytes.clear();
+        self.image_requested.clear();
+        self.image_pending.clear();
+        self.render_current_document();
     }
 
     /// Same idea as `maybe_fetch_link_preview`, but for a loaded preview's
@@ -3788,18 +3845,23 @@ impl App {
                     }
                 }
             }
-            BackgroundMsg::ImageBytes { path, result } => {
+            BackgroundMsg::ImageBytes {
+                generation,
+                path,
+                result,
+            } => {
+                if generation != self.image_generation {
+                    return;
+                }
+                self.image_pending.remove(&path);
                 if let Ok(bytes) = result {
                     self.image_bytes.insert(path, bytes);
                 }
             }
             BackgroundMsg::Image { url, image } => {
                 let budget = ratatui::layout::Size::new(56, 24);
-                if let Ok(protocol) =
-                    self.picker
-                        .new_protocol(image, budget, ratatui_image::Resize::Fit(None))
-                {
-                    self.link_preview_image.insert(url, protocol);
+                if let Some(protocol) = sliced_image(&self.picker, image, budget) {
+                    self.link_preview_image.insert(url, Arc::new(protocol));
                 }
             }
         }
@@ -6298,21 +6360,81 @@ fn is_svg_path(path: &Path) -> bool {
 /// special-cases WezTerm/Konsole the same way (see its own
 /// `blacklist_protocols` handling) for an equivalent false-positive; this
 /// adds iTerm2 to that list from our side so its own env-based
-/// `iterm2_from_env()` hint wins instead.
-fn build_picker() -> Picker {
-    let mut options = QueryStdioOptions::default();
-    if std::env::var("TERM_PROGRAM").is_ok_and(|t| t.contains("iTerm")) {
-        options.blacklist_protocols.push(ProtocolType::Kitty);
+/// `iterm2_from_env()` hint wins instead. Exclude Sixel too: otherwise its
+/// positive capability reply takes precedence over the iTerm2 hint, bypassing
+/// our cell-based image sizing (Sixel pixels can differ from reported cell
+/// metrics on Retina displays).
+fn build_picker() -> io::Result<Picker> {
+    let forced = match std::env::var("MESHFOX_IMAGE_PROTOCOL") {
+        Ok(value) => parse_image_protocol(Some(&value))?,
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "MESHFOX_IMAGE_PROTOCOL must be valid Unicode",
+            ))
+        }
+    };
+    if forced == Some(ProtocolType::Halfblocks) {
+        return Ok(Picker::halfblocks());
     }
-    Picker::from_query_stdio_with_options(options).unwrap_or_else(|_| Picker::halfblocks())
+    let options = image_query_options(std::env::var("TERM_PROGRAM").ok().as_deref());
+    let picker =
+        Picker::from_query_stdio_with_options(options).unwrap_or_else(|_| Picker::halfblocks());
+    let mut picker = apply_image_protocol(picker, forced);
+    if picker.protocol_type() == ProtocolType::Sixel
+        && std::env::var("TERM_PROGRAM").is_ok_and(|t| t.contains("iTerm"))
+    {
+        if let Some(metrics) = super::image_metrics::query_iterm_cell_pixels() {
+            // The generic CSI query reports points in iTerm2, whereas Sixel
+            // uses physical pixels. Preserve the queried display scale.
+            #[allow(deprecated)]
+            let mut physical_picker = Picker::from_fontsize(metrics);
+            physical_picker.set_protocol_type(ProtocolType::Sixel);
+            picker = physical_picker;
+        }
+    }
+    Ok(picker)
+}
+
+fn parse_image_protocol(value: Option<&str>) -> io::Result<Option<ProtocolType>> {
+    match value {
+        None | Some("" | "auto") => Ok(None),
+        Some("sixel") => Ok(Some(ProtocolType::Sixel)),
+        Some("iterm2") => Ok(Some(ProtocolType::Iterm2)),
+        Some("kitty") => Ok(Some(ProtocolType::Kitty)),
+        Some("halfblocks") => Ok(Some(ProtocolType::Halfblocks)),
+        Some(value) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid MESHFOX_IMAGE_PROTOCOL={value:?}; expected auto, sixel, iterm2, kitty, or halfblocks"),
+        )),
+    }
+}
+
+fn apply_image_protocol(mut picker: Picker, forced: Option<ProtocolType>) -> Picker {
+    if let Some(protocol) = forced {
+        picker.set_protocol_type(protocol);
+    }
+    picker
+}
+
+fn image_query_options(term_program: Option<&str>) -> QueryStdioOptions {
+    let mut options = QueryStdioOptions::default();
+    if term_program.is_some_and(|t| t.contains("iTerm")) {
+        options.blacklist_protocols = vec![ProtocolType::Kitty, ProtocolType::Sixel];
+    }
+    options
 }
 
 /// Fetches an image file of the document from the worker (once per path);
 /// the result arrives as `BackgroundMsg::ImageBytes`.
 fn request_image(
     port: Option<u16>,
+    generation: u64,
+    asset_base: Option<String>,
     tx: &tokio::sync::mpsc::UnboundedSender<BackgroundMsg>,
     requested: &mut std::collections::HashSet<PathBuf>,
+    pending: &mut HashSet<PathBuf>,
     base_dir: &Path,
     path: &Path,
 ) {
@@ -6329,9 +6451,22 @@ fn request_image(
         .collect::<Vec<_>>()
         .join("/");
     let (path, tx) = (path.to_path_buf(), tx.clone());
+    pending.insert(path.clone());
     tokio::spawn(async move {
-        let result = crate::worker_client::get_relative_file(port, &relative).await;
-        let _ = tx.send(BackgroundMsg::ImageBytes { path, result });
+        let result = if let Some(base) = asset_base {
+            crate::worker_client::get_include_asset(port, &base, &relative).await
+        } else {
+            crate::worker_client::get_relative_file(
+                port,
+                &meshfox_core::image_attrs::decode_image_path(&relative),
+            )
+            .await
+        };
+        let _ = tx.send(BackgroundMsg::ImageBytes {
+            generation,
+            path,
+            result,
+        });
     });
 }
 
@@ -6341,6 +6476,74 @@ fn request_image(
 /// own `Tag::Image` handling) — same "no file on disk to key it by"
 /// situation `link_preview_image_path` already has, just without a
 /// prefix: a `data:` URL can't collide with a real relative path.
+/// Encode document images once into protocols that can reveal individual rows.
+fn load_document_image(
+    picker: &Picker,
+    path: &Path,
+    bytes: Option<&[u8]>,
+    bg: Option<Background>,
+    budget: ratatui::layout::Size,
+) -> Option<Arc<SlicedProtocol>> {
+    let embedded_svg = path.to_str().and_then(|url| {
+        let (meta, payload) = url.strip_prefix("data:")?.split_once(',')?;
+        meta.eq_ignore_ascii_case("image/svg+xml;base64").then(|| {
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, payload).ok()
+        }).flatten()
+    });
+    let svg = embedded_svg.as_deref().or_else(|| is_svg_path(path).then_some(bytes).flatten());
+    let image = if let Some(svg) = svg {
+        let density = if picker.protocol_type() == ProtocolType::Iterm2 { 2 } else { 1 };
+        super::svg_raster::rasterize_to_fit(
+            std::str::from_utf8(svg).ok()?, bg,
+            u32::from(budget.width) * u32::from(picker.font_size().width) * density,
+            u32::from(budget.height) * u32::from(picker.font_size().height) * density,
+        )?
+    } else {
+        match path.to_str().filter(|s| s.starts_with("data:")) {
+            Some(url) => decode_data_url_image(url, bg)?,
+            None => image::load_from_memory(bytes?).ok()?,
+        }
+    };
+    sliced_image(picker, image, budget).map(Arc::new)
+}
+
+pub(super) fn sliced_image(picker: &Picker, image: image::DynamicImage, budget: ratatui::layout::Size) -> Option<SlicedProtocol> {
+    let font = picker.font_size();
+    let density = if picker.protocol_type() == ProtocolType::Iterm2 { 2 } else { 1 };
+    let cell_width = u32::from(font.width).checked_mul(density)?.max(1);
+    let cell_height = u32::from(font.height).checked_mul(density)?.max(1);
+    let image = image.resize(
+        u32::from(budget.width) * cell_width,
+        u32::from(budget.height) * cell_height,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let size = ratatui::layout::Size::new(
+        image.width().div_ceil(cell_width) as u16,
+        image.height().div_ceil(cell_height) as u16,
+    );
+    if picker.protocol_type() == ProtocolType::Iterm2 {
+        // Preserve the dense SVG raster and cell-based placement: the library's
+        // generic iTerm2 slicer resizes to logical pixels and emits px sizes.
+        let Protocol::ITerm2(template) = picker.new_protocol(
+            image::DynamicImage::new_rgba8(1, 1), ratatui::layout::Size::new(1, 1),
+            ratatui_image::Resize::Fit(None),
+        ).ok()? else { return None };
+        let mut rows = Vec::with_capacity(usize::from(size.height));
+        for row in 0..size.height {
+            let y = u32::from(row) * cell_height;
+            let pixels = image.crop_imm(0, y, image.width(), cell_height.min(image.height() - y));
+            let protocol = ratatui_image::protocol::iterm2::Iterm2::new(
+                pixels, ratatui::layout::Size::new(size.width, 1), template.is_tmux,
+            ).ok()?;
+            rows.push(image_cell_dimensions(Protocol::ITerm2(protocol)));
+        }
+        Some(SlicedProtocol::Sliced(rows))
+    } else {
+        SlicedProtocol::new_with_resize(picker, image, size, ratatui_image::Resize::Fit(None)).ok()
+    }
+}
+
+#[cfg(test)]
 fn load_image_protocol(
     picker: &mut Picker,
     path: &Path,
@@ -6349,40 +6552,140 @@ fn load_image_protocol(
     height_percent: Option<u32>,
     bg: Option<Background>,
 ) -> Option<Protocol> {
+    load_image_protocol_with_budget(picker, path, bytes, bg, image_size_budget(width_percent, height_percent))
+}
+
+#[cfg(test)]
+fn load_image_protocol_with_budget(
+    picker: &mut Picker,
+    path: &Path,
+    bytes: Option<&[u8]>,
+    bg: Option<Background>,
+    budget: ratatui::layout::Size,
+) -> Option<Protocol> {
+    // SVG data URLs and files share the same direct vector-to-display path.
+    let embedded_svg = path.to_str().and_then(|url| {
+        let (meta, payload) = url.strip_prefix("data:")?.split_once(',')?;
+        meta.eq_ignore_ascii_case("image/svg+xml;base64")
+            .then(|| {
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, payload).ok()
+            })
+            .flatten()
+    });
+    if let Some(svg) = embedded_svg
+        .as_deref()
+        .or_else(|| is_svg_path(path).then_some(bytes).flatten())
+    {
+        return load_svg_protocol(picker, std::str::from_utf8(svg).ok()?, bg, budget);
+    }
     let dyn_img = match path.to_str().filter(|s| s.starts_with("data:")) {
         Some(data_url) => decode_data_url_image(data_url, bg)?,
-        None if is_svg_path(path) => {
-            super::svg_raster::rasterize(std::str::from_utf8(bytes?).ok()?, bg)?
-        }
         None => image::load_from_memory(bytes?).ok()?,
     };
-    let budget = image_size_budget(width_percent, height_percent);
     picker
-        .new_protocol(dyn_img, budget, ratatui_image::Resize::Fit(None))
+        .new_protocol(
+            dyn_img,
+            budget,
+            ratatui_image::Resize::Fit(Some(image::imageops::FilterType::Lanczos3)),
+        )
+        .ok()
+        .map(image_cell_dimensions)
+}
+
+#[cfg(test)]
+fn load_svg_protocol(
+    picker: &Picker,
+    svg: &str,
+    bg: Option<Background>,
+    budget: ratatui::layout::Size,
+) -> Option<Protocol> {
+    let font = picker.font_size();
+    // iTerm2 accepts a dense PNG independently of its cell-based placement.
+    // Keep twice the pixel density for Retina instead of shrinking to points
+    // and asking the terminal to enlarge a low-resolution bitmap again.
+    let density = if picker.protocol_type() == ProtocolType::Iterm2 {
+        2
+    } else {
+        1
+    };
+    let pixels_per_col = u32::from(font.width).checked_mul(density)?;
+    let pixels_per_row = u32::from(font.height).checked_mul(density)?;
+    let image = super::svg_raster::rasterize_to_fit(
+        svg,
+        bg,
+        u32::from(budget.width) * pixels_per_col,
+        u32::from(budget.height) * pixels_per_row,
+    )?;
+    if picker.protocol_type() == ProtocolType::Iterm2 {
+        let size = ratatui::layout::Size::new(
+            image.width().div_ceil(pixels_per_col) as u16,
+            image.height().div_ceil(pixels_per_row) as u16,
+        );
+        // Use the picker's own tmux detection/passthrough configuration.
+        let Protocol::ITerm2(template) = picker
+            .new_protocol(
+                image::DynamicImage::new_rgba8(1, 1),
+                ratatui::layout::Size::new(1, 1),
+                ratatui_image::Resize::Fit(None),
+            )
+            .ok()?
+        else {
+            return None;
+        };
+        return ratatui_image::protocol::iterm2::Iterm2::new(image, size, template.is_tmux)
+            .ok()
+            .map(Protocol::ITerm2)
+            .map(image_cell_dimensions);
+    }
+    picker
+        .new_protocol(
+            image,
+            budget,
+            ratatui_image::Resize::Fit(Some(image::imageops::FilterType::Lanczos3)),
+        )
         .ok()
 }
 
-/// TODO.canvas.md: "Формальные граматики для meshfox:*" subtree ->
-/// "Атрибуты картинок в markdown" — this terminal's own fixed 56x24
-/// "how big can an image get" budget, scaled by a `{width=NN%}`/
-/// `{height=NN%}` hint (see `markdown::Segment::Image`). There's no
-/// pixel grid a literal `width=300` (no `%`) could map onto without
-/// knowing the terminal's own font metrics, so only the percent form has
-/// any effect — an absolute value is silently ignored, same fallback
-/// every other unsupported bit of this narrow syntax gets rather than
-/// guessing. Clamped well away from zero/overflow at either end.
-fn image_size_budget(
+/// iTerm2 pixel dimensions can use a different scale than the reported font
+/// metrics on Retina displays. Use the protocol's cell footprint for both
+/// layout and display, so the image fills exactly the space we reserve.
+fn image_cell_dimensions(mut protocol: Protocol) -> Protocol {
+    if let Protocol::ITerm2(image) = &mut protocol {
+        if let Some(start) = image.data.find(";width=") {
+            if let Some(end) = image.data[start..].find(";doNotMoveCursor=") {
+                image.data.replace_range(
+                    start..start + end,
+                    &format!(";width={};height={}", image.size.width, image.size.height),
+                );
+            }
+        }
+    }
+    protocol
+}
+
+/// Percentage attributes use the document pane, rather than the default
+/// thumbnail budget. The unconstrained axis can use the whole viewport so
+/// a width hint is not silently defeated by the old 24-row height limit.
+fn image_size_budget_for_viewport(
+    viewport: ratatui::layout::Size,
     width_percent: Option<u32>,
     height_percent: Option<u32>,
 ) -> ratatui::layout::Size {
-    let mut budget = ratatui::layout::Size::new(56, 24);
-    if let Some(pct) = width_percent {
-        budget.width = ((budget.width as u32 * pct) / 100).clamp(1, 500) as u16;
+    let width = viewport.width.max(1);
+    let height = viewport.height.max(1);
+    if width_percent.is_none() && height_percent.is_none() {
+        return ratatui::layout::Size::new(width.min(56), height.min(24));
     }
-    if let Some(pct) = height_percent {
-        budget.height = ((budget.height as u32 * pct) / 100).clamp(1, 500) as u16;
-    }
-    budget
+    let scale = |available: u16, percent: Option<u32>| {
+        (u64::from(available) * u64::from(percent.unwrap_or(100)) / 100)
+            .clamp(1, u64::from(available)) as u16
+    };
+    ratatui::layout::Size::new(scale(width, width_percent), scale(height, height_percent))
+}
+
+#[cfg(test)]
+fn image_size_budget(width_percent: Option<u32>, height_percent: Option<u32>) -> ratatui::layout::Size {
+    image_size_budget_for_viewport(ratatui::layout::Size::new(56, 24), width_percent, height_percent)
 }
 
 fn point_in(rect: Rect, x: u16, y: u16) -> bool {
@@ -7191,6 +7494,158 @@ mod tests {
     const ONE_PIXEL_PNG_DATA_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
 
     #[test]
+    fn svg_iterm_output_keeps_retina_detail_without_enlarging_cell_placement() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100"><rect width="200" height="100" fill="white"/><path d="M0 0 L200 100" stroke="black" stroke-width="0.5"/><text x="10" y="50" font-size="10">GPIO22 SCL</text></svg>"##;
+        let mut picker = Picker::halfblocks();
+        picker.set_protocol_type(ProtocolType::Iterm2);
+        let data_url = format!(
+            "data:image/svg+xml;base64,{}",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, svg.as_bytes(),)
+        );
+        for (path, bytes) in [
+            (Path::new("diagram.svg"), Some(svg.as_bytes())),
+            (Path::new(&data_url), None),
+        ] {
+            let protocol = load_image_protocol(&mut picker, path, bytes, None, None, None).unwrap();
+            assert_eq!((protocol.size().width, protocol.size().height), (56, 14));
+            let Protocol::ITerm2(image) = protocol else {
+                panic!("iTerm2 expected")
+            };
+            assert!(image
+                .data
+                .contains(";width=56;height=14;doNotMoveCursor=1:"));
+            let png = image.data.split_once("doNotMoveCursor=1:").unwrap().1;
+            let png = png.split('\x07').next().unwrap();
+            let bytes =
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, png).unwrap();
+            let decoded = image::load_from_memory(&bytes).unwrap();
+            assert_eq!((decoded.width(), decoded.height()), (1120, 560));
+        }
+    }
+
+    #[test]
+    fn image_protocol_override_parses_modes_and_preserves_font_metrics() {
+        for value in [None, Some(""), Some("auto")] {
+            assert_eq!(parse_image_protocol(value).unwrap(), None);
+        }
+        for (value, protocol) in [
+            ("sixel", ProtocolType::Sixel),
+            ("iterm2", ProtocolType::Iterm2),
+            ("kitty", ProtocolType::Kitty),
+            ("halfblocks", ProtocolType::Halfblocks),
+        ] {
+            let forced = parse_image_protocol(Some(value)).unwrap();
+            assert_eq!(forced, Some(protocol));
+            let picker = Picker::halfblocks();
+            let metrics = picker.font_size();
+            let picker = apply_image_protocol(picker, forced);
+            assert_eq!(picker.protocol_type(), protocol);
+            assert_eq!(picker.font_size().width, metrics.width);
+            assert_eq!(picker.font_size().height, metrics.height);
+            let image = load_image_protocol(
+                &mut picker.clone(),
+                Path::new(ONE_PIXEL_PNG_DATA_URL),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(matches!(
+                (protocol, image),
+                (ProtocolType::Sixel, Protocol::Sixel(_))
+                    | (ProtocolType::Iterm2, Protocol::ITerm2(_))
+                    | (ProtocolType::Kitty, Protocol::Kitty(_))
+                    | (ProtocolType::Halfblocks, Protocol::Halfblocks(_))
+            ));
+        }
+        let error = parse_image_protocol(Some("sixle")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("MESHFOX_IMAGE_PROTOCOL"));
+        let mut picker = Picker::halfblocks();
+        picker.set_protocol_type(ProtocolType::Sixel);
+        assert_eq!(
+            apply_image_protocol(picker, None).protocol_type(),
+            ProtocolType::Sixel
+        );
+    }
+
+    #[test]
+    fn iterm_image_query_does_not_allow_sixel_to_override_native_protocol() {
+        use ratatui_image::picker::cap_parser::Parser;
+        let query = Parser::query(false, image_query_options(Some("iTerm.app")));
+        assert!(
+            !query.contains("\x1b[c"),
+            "Sixel detection overrides the iTerm2 hint"
+        );
+        assert!(
+            !query.contains("\x1b_G"),
+            "Kitty placeholders are unsupported"
+        );
+        assert!(query.contains("\x1b[16t"), "still query font metrics");
+        for program in [None, Some("kitty"), Some("WezTerm")] {
+            let query = Parser::query(false, image_query_options(program));
+            assert!(query.contains("\x1b[c"));
+            assert!(query.contains("\x1b_G"));
+        }
+    }
+
+    #[test]
+    #[allow(deprecated)] // Explicit metrics exercise Retina scaling without querying a terminal.
+    fn iterm_image_uses_reserved_cells_instead_of_retina_pixels() {
+        let mut picker = Picker::from_fontsize(ratatui_image::FontSize::new(20, 40));
+        picker.set_protocol_type(ProtocolType::Iterm2);
+        let original = picker
+            .new_protocol(
+                image::DynamicImage::new_rgb8(560, 520),
+                image_size_budget(None, None),
+                ratatui_image::Resize::Fit(None),
+            )
+            .unwrap();
+        let size = original.size();
+        let Protocol::ITerm2(original_image) = &original else {
+            panic!("iTerm2")
+        };
+        let payload = original_image
+            .data
+            .split_once("doNotMoveCursor=1:")
+            .unwrap()
+            .1
+            .to_owned();
+        let Protocol::ITerm2(fixed) = image_cell_dimensions(original) else {
+            panic!("iTerm2")
+        };
+        assert!(fixed.data.contains(&format!(
+            ";width={};height={};doNotMoveCursor=1:",
+            size.width, size.height
+        )));
+        assert_eq!(
+            fixed.data.split_once("doNotMoveCursor=1:").unwrap().1,
+            payload
+        );
+        assert_eq!(fixed.size, size);
+    }
+
+    #[tokio::test]
+    #[allow(deprecated)] // Explicit metrics must survive the nested constructor unchanged.
+    async fn nested_canvas_inherits_image_protocol_and_font_metrics() {
+        let dir = std::env::temp_dir().join(format!("meshfox-picker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.canvas.md");
+        std::fs::write(&path, "# Root\n<!-- meshfox:node id=\"root\" -->\n").unwrap();
+        let mut picker = Picker::from_fontsize(ratatui_image::FontSize::new(20, 40));
+        picker.set_protocol_type(ProtocolType::Iterm2);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let child = App::new_with_picker(path, tx, None, None, picker.clone())
+            .await
+            .unwrap();
+        assert_eq!(child.picker.protocol_type(), picker.protocol_type());
+        assert_eq!(child.picker.font_size().width, picker.font_size().width);
+        assert_eq!(child.picker.font_size().height, picker.font_size().height);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn decode_data_url_image_decodes_a_valid_base64_png() {
         let img = decode_data_url_image(ONE_PIXEL_PNG_DATA_URL, None).expect("valid data: URL");
         assert_eq!((img.width(), img.height()), (1, 1));
@@ -7262,6 +7717,15 @@ mod tests {
     fn image_size_budget_defaults_to_the_fixed_budget() {
         let budget = image_size_budget(None, None);
         assert_eq!((budget.width, budget.height), (56, 24));
+    }
+
+    #[test]
+    fn image_percentages_use_the_pane_and_release_the_other_axis() {
+        use ratatui::layout::Size;
+        assert_eq!(image_size_budget_for_viewport(Size::new(120, 60), Some(100), None), Size::new(120, 60));
+        assert_eq!(image_size_budget_for_viewport(Size::new(120, 60), Some(50), None), Size::new(60, 60));
+        assert_eq!(image_size_budget_for_viewport(Size::new(120, 60), None, Some(50)), Size::new(120, 30));
+        assert_eq!(image_size_budget_for_viewport(Size::new(120, 60), None, None), Size::new(56, 24));
     }
 
     #[test]
@@ -7984,14 +8448,14 @@ mod tests {
             },
             None,
         );
-        check_output(&app, super::super::theme::ACCENT);
+        check_output(&app, super::super::theme::OK);
         app.set_focus(Focus::Tree);
-        check_output(&app, Color::DarkGray);
+        check_output(&app, super::super::theme::OK);
         app.set_focus(Focus::Document);
-        check_output(&app, super::super::theme::ACCENT);
+        check_output(&app, super::super::theme::OK);
         app.selected_block = None;
         app.render_current_document();
-        check_output(&app, super::super::theme::DEP);
+        check_output(&app, super::super::theme::OK);
         let _ = std::fs::remove_dir_all(app.canvas_path.parent().unwrap());
     }
 
@@ -8097,6 +8561,30 @@ mod tests {
         app.worker_port = Some(1);
         app.open_run_history().await;
         assert!(app.block_picker.is_some());
+        let _ = std::fs::remove_dir_all(app.canvas_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn image_invalidation_discards_old_responses_and_retries_failed_paths() {
+        let mut app = app_with_blocks("image-refresh", "![plot](plot.png)").await;
+        let path = app.canvas_path.parent().unwrap().join("plot.png");
+        app.image_bytes.insert(path.clone(), vec![1]);
+        app.image_requested.insert(path.clone());
+        app.invalidate_images();
+        assert!(!app.image_bytes.contains_key(&path));
+        assert!(!app.image_requested.contains(&path));
+        app.on_background_msg(BackgroundMsg::ImageBytes {
+            generation: 0,
+            path: path.clone(),
+            result: Ok(vec![2]),
+        });
+        assert!(!app.image_bytes.contains_key(&path));
+        app.on_background_msg(BackgroundMsg::ImageBytes {
+            generation: app.image_generation,
+            path: path.clone(),
+            result: Ok(vec![3]),
+        });
+        assert_eq!(app.image_bytes[&path], vec![3]);
         let _ = std::fs::remove_dir_all(app.canvas_path.parent().unwrap());
     }
 

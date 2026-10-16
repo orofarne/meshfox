@@ -2152,6 +2152,41 @@ fn file_node_stamps(
         .collect()
 }
 
+/// Images share the serving routes' confinement rules. Keep the authored path
+/// as the key so deletion, recreation and atomic replacement are observable.
+fn image_stamps(
+    state: &AppState,
+) -> std::collections::BTreeMap<PathBuf, Option<(std::time::SystemTime, u64)>> {
+    let raw = state.raw.lock().unwrap().clone();
+    let Ok(canvas) = resolved_canvas(&raw, &state.canvas_path) else {
+        return Default::default();
+    };
+    let root = canvas_root_dir(&state.canvas_path);
+    let mut stamps = std::collections::BTreeMap::new();
+    for node in &canvas.nodes {
+        let base = node
+            .asset_base
+            .as_deref()
+            .map(std::path::Path::new)
+            .unwrap_or(root);
+        let Ok(base) = base.canonicalize() else {
+            continue;
+        };
+        for destination in meshfox_core::image_attrs::local_image_destinations(&node.text) {
+            let path = base.join(destination.trim_start_matches('/'));
+            let stamp = path
+                .canonicalize()
+                .ok()
+                .filter(|resolved| resolved.starts_with(&base))
+                .and_then(|resolved| std::fs::metadata(resolved).ok())
+                .filter(|meta| meta.is_file())
+                .and_then(|meta| meta.modified().ok().map(|time| (time, meta.len())));
+            stamps.insert(path, stamp);
+        }
+    }
+    stamps
+}
+
 fn spawn_file_watcher(state: Arc<AppState>) {
     std::thread::spawn(move || {
         let mut last_mtime = std::fs::metadata(&state.canvas_path)
@@ -2159,8 +2194,14 @@ fn spawn_file_watcher(state: Arc<AppState>) {
             .ok();
         let mut last_includes = include_stamps(&state);
         let mut last_files = file_node_stamps(&state);
+        let mut last_images = image_stamps(&state);
         loop {
             std::thread::sleep(Duration::from_millis(500));
+            let images = image_stamps(&state);
+            if images != last_images {
+                last_images = images;
+                state.canvas_events.push(ServerEvent::ImagesChanged);
+            }
             // A code preview's target changing on disk — a block that just
             // ran wrote it, or an editor did. The canvas file itself is
             // untouched, so this is its own, light event (no reload).
@@ -3634,6 +3675,8 @@ enum ServerEvent {
     /// disk (appeared, was edited or removed) — such a preview re-reads it.
     /// Carries nothing: the preview fetches its own content.
     FilesChanged,
+    /// Local Markdown image bytes changed; clients must invalidate their cache.
+    ImagesChanged,
     RunStarted {
         node_id: String,
         block: String,
@@ -6008,9 +6051,7 @@ fn table_target(state: &AppState, id: &str) -> Result<std::path::PathBuf, ApiErr
 fn table_api_error(e: tables::TableError) -> ApiError {
     let status = match &e {
         tables::TableError::Target(_) => StatusCode::NOT_FOUND,
-        tables::TableError::BadRequest(_) | tables::TableError::Query(_) => {
-            StatusCode::BAD_REQUEST
-        }
+        tables::TableError::BadRequest(_) | tables::TableError::Query(_) => StatusCode::BAD_REQUEST,
         tables::TableError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
     };
     ApiError(status, e.message())
@@ -7290,29 +7331,29 @@ async fn run_block_impl_sized(
         .last()
         .filter(|target| find_tty_block(&canvas, std::slice::from_ref(*target)).is_none())
         .map(|target| {
-        let reserved = run_registry::reserve(target.node_id.clone(), target.block_name.clone());
-        state.runs_registry.lock().unwrap().insert(
-            (target.node_id.clone(), target.block_name.clone()),
-            Arc::clone(&reserved),
-        );
-        // Broadcast right after reservation, not before — same
-        // race-freedom reasoning as the reservation itself: a passive
-        // watcher (`GET /api/watch`) that reacts to this by immediately
-        // calling `GET /api/run/subscribe` needs `runs_registry` to
-        // already hold this address's entry by the time this event
-        // reaches it. Every caller of `run_block_impl` goes through here —
-        // an ordinary manual run, `force_run`, and `trigger_autorun` alike
-        // — so a passive tab/TUI session sees *any* rerun of a block it's
-        // displaying, not just an autorun-triggered one (the only case
-        // this event used to cover, back when `submit_form` broadcast it
-        // itself after `trigger_autorun` returned).
-        state.canvas_events.push(ServerEvent::RunStarted {
-            node_id: target.node_id.clone(),
-            block: target.block_name.clone(),
-            run_id: run_id.clone(),
+            let reserved = run_registry::reserve(target.node_id.clone(), target.block_name.clone());
+            state.runs_registry.lock().unwrap().insert(
+                (target.node_id.clone(), target.block_name.clone()),
+                Arc::clone(&reserved),
+            );
+            // Broadcast right after reservation, not before — same
+            // race-freedom reasoning as the reservation itself: a passive
+            // watcher (`GET /api/watch`) that reacts to this by immediately
+            // calling `GET /api/run/subscribe` needs `runs_registry` to
+            // already hold this address's entry by the time this event
+            // reaches it. Every caller of `run_block_impl` goes through here —
+            // an ordinary manual run, `force_run`, and `trigger_autorun` alike
+            // — so a passive tab/TUI session sees *any* rerun of a block it's
+            // displaying, not just an autorun-triggered one (the only case
+            // this event used to cover, back when `submit_form` broadcast it
+            // itself after `trigger_autorun` returned).
+            state.canvas_events.push(ServerEvent::RunStarted {
+                node_id: target.node_id.clone(),
+                block: target.block_name.clone(),
+                run_id: run_id.clone(),
+            });
+            reserved
         });
-        reserved
-    });
 
     let (kill_tx, mut kill_rx) = oneshot::channel::<()>();
     state.runs.lock().unwrap().insert(run_id.clone(), kill_tx);
@@ -10301,7 +10342,7 @@ async fn get_include_asset(
     let Ok(dir) = requested_dir.canonicalize() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let candidate = dir.join(&q.file);
+    let candidate = dir.join(meshfox_core::image_attrs::decode_image_path(&q.file));
     let Ok(resolved) = candidate.canonicalize() else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -10332,7 +10373,7 @@ async fn serve_canvas_relative_file(state: &AppState, path: &str) -> Option<Resp
         .unwrap_or(std::path::Path::new("."));
     let canvas_dir = canvas_dir.canonicalize().ok()?;
 
-    let candidate = canvas_dir.join(path);
+    let candidate = canvas_dir.join(meshfox_core::image_attrs::decode_image_path(path));
     let resolved = candidate.canonicalize().ok()?;
     if !resolved.starts_with(&canvas_dir) || !resolved.is_file() {
         return None;
@@ -18572,10 +18613,9 @@ mod form_endpoint_tests {
             let (status, body) = get(addr, "/api/runs").await;
             if status == 200 {
                 if let Ok(runs) = serde_json::from_str::<Vec<serde_json::Value>>(&body) {
-                    if runs
-                        .iter()
-                        .any(|r| r["nodeId"] == node_id && r["block"] == block && r["status"] == want)
-                    {
+                    if runs.iter().any(|r| {
+                        r["nodeId"] == node_id && r["block"] == block && r["status"] == want
+                    }) {
                         return true;
                     }
                 }
@@ -21264,5 +21304,43 @@ mod table_endpoint_tests {
         .await;
         assert_eq!(status, 503);
         std::fs::remove_dir_all(dir.parent().unwrap()).ok();
+    }
+}
+
+#[cfg(test)]
+mod image_watch_tests {
+    use super::*;
+    #[tokio::test]
+    async fn image_stamps_follow_replace_delete_recreate_and_include() {
+        let dir = std::env::temp_dir().join(format!("meshfox-images-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let path = dir.join("test.canvas.md");
+        std::fs::write(&path, "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n![plot](plot.png)\n\n## Included\n<!-- meshfox:node id=\"inc\" type=\"include\" -->\n\n[docs](docs/readme.md)\n").unwrap();
+        std::fs::write(dir.join("docs/readme.md"), "![included](diagram.svg)").unwrap();
+        let state = build_state(path.clone(), false, None).await.unwrap();
+        let missing = image_stamps(&state);
+        assert_eq!(missing.len(), 2);
+        assert!(missing.values().all(Option::is_none));
+        std::fs::write(dir.join("plot.png"), b"first").unwrap();
+        std::fs::write(dir.join("docs/diagram.svg"), b"svg").unwrap();
+        let present = image_stamps(&state);
+        assert!(present.values().all(Option::is_some));
+        let (_, mut events, _) = state.canvas_events.subscribe_from(0);
+        spawn_file_watcher(state.clone());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        std::fs::write(dir.join("replacement"), b"replacement bytes").unwrap();
+        std::fs::rename(dir.join("replacement"), dir.join("plot.png")).unwrap();
+        assert_ne!(present, image_stamps(&state));
+        let event = tokio::time::timeout(Duration::from_secs(3), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(event.item, ServerEvent::ImagesChanged));
+        std::fs::remove_file(dir.join("plot.png")).unwrap();
+        assert_eq!(image_stamps(&state)[&dir.join("plot.png")], None);
+        std::fs::write(dir.join("plot.png"), b"back").unwrap();
+        assert!(image_stamps(&state)[&dir.join("plot.png")].is_some());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

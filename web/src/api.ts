@@ -1577,9 +1577,8 @@ export function watchChanges(
    * reset: `GET /api/runs` may differ from what was last fetched, so refetch
    * it. Optional — a caller that skips this just relies on its own polling. */
   onRunsChanged?: () => void,
-  /** `"files-changed"` — the target of a `display="code"` file node changed
-   * on disk (a block wrote it, an editor edited it): re-read the preview.
-   * Optional. */
+  /** Local file previews or Markdown images changed on disk, or the
+   * connection resumed: invalidate file and image caches. Optional. */
   onFilesChanged?: () => void,
   /** `"tty-started"` — a `tty` step's terminal session just started in the
    * server (a manual run in any tab, or an `autorun` after a form's Send),
@@ -1617,7 +1616,7 @@ export function watchChanges(
         abandonSocket(ws);
         reject(new Error("WS /api/watch: the worker stopped responding"));
       });
-      ws.onopen = () => onEstablished();
+      ws.onopen = () => { onEstablished(); onFilesChanged?.(); };
       ws.onmessage = (ev) => {
         silence.touch();
         const event = JSON.parse(ev.data as string) as {
@@ -1638,9 +1637,10 @@ export function watchChanges(
         if (event.seq !== undefined) lastSeq = event.seq;
         if (event.type === "changed" || (event.type === "connected" && event.resync) || event.type === "resync") {
           onChanged();
+          onFilesChanged?.();
         } else if (event.type === "runs-changed") {
           onRunsChanged?.();
-        } else if (event.type === "files-changed") {
+        } else if (event.type === "files-changed" || event.type === "images-changed") {
           onFilesChanged?.();
         } else if (event.type === "tty-started" && event.nodeId !== undefined && event.block !== undefined) {
           onTtyStarted?.(event.nodeId, event.block);

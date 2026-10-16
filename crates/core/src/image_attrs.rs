@@ -311,3 +311,64 @@ mod tests {
         assert_eq!(ImageAttrs::default().to_braces(), "");
     }
 }
+
+/// Local image destinations in rendered Markdown (including reference images).
+/// Code fences, remote URLs, fragments and inline data have no local file.
+pub fn local_image_destinations(markdown: &str) -> Vec<String> {
+    use pulldown_cmark::{Event, Parser, Tag};
+    Parser::new(markdown)
+        .filter_map(|event| {
+            let Event::Start(Tag::Image { dest_url, .. }) = event else {
+                return None;
+            };
+            let url = dest_url.as_ref();
+            if url.is_empty() || url.starts_with('#') || url.starts_with("//") || url.contains(':')
+            {
+                return None;
+            }
+            Some(decode_image_path(
+                url.split(['?', '#']).next().unwrap_or(url),
+            ))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod image_dependency_tests {
+    use super::*;
+    #[test]
+    fn image_paths_decode_url_escapes_and_preserve_literal_plus() {
+        assert_eq!(local_image_destinations("![x](plot%20one.svg?x=1#view)"), vec!["plot one.svg"]);
+        assert_eq!(decode_image_path("%D0%B0+%25.svg"), "а+%.svg");
+    }
+    #[test]
+    fn markdown_images_include_references_and_cached_output_but_not_code() {
+        let md = "![a](a.png)\n\n![b][ref]\n\n[ref]: b.svg\n\n```md\n![ignored](code.png)\n```\n\n<!-- meshfox:output name=\"x\" -->\n\n![out](out.png)\n\n<!-- /meshfox:output -->\n\n![inline](data:image/png;base64,AA) ![remote](https://example.org/x)";
+        assert_eq!(
+            local_image_destinations(md),
+            vec!["a.png", "b.svg", "out.png"]
+        );
+    }
+}
+
+/// Decode URL path escapes once, without treating a literal `+` as a space.
+pub fn decode_image_path(path: &str) -> String {
+    let mut decoded = Vec::new();
+    let bytes = path.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(a), Some(b)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            ) {
+                decoded.push((a * 16 + b) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(decoded).unwrap_or_else(|_| path.to_string())
+}

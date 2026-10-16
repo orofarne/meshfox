@@ -41,8 +41,32 @@ fn font_db() -> Arc<usvg::fontdb::Database> {
 /// a color — `None`/`Transparent` leave the pixels transparent. `None` if
 /// the SVG doesn't parse or has no drawable size.
 pub fn rasterize(svg_text: &str, bg: Option<Background>) -> Option<image::DynamicImage> {
+    rasterize_impl(svg_text, bg, None)
+}
+
+/// Render vectors directly at their display resolution, avoiding a second
+/// raster resize that loses fine lines and small text. Bound allocations even
+/// when image attributes or terminal metrics are unusually large.
+pub fn rasterize_to_fit(
+    svg_text: &str,
+    bg: Option<Background>,
+    max_width: u32,
+    max_height: u32,
+) -> Option<image::DynamicImage> {
+    rasterize_impl(
+        svg_text,
+        bg,
+        Some((max_width.min(4096), max_height.min(4096))),
+    )
+}
+
+fn rasterize_impl(
+    svg_text: &str,
+    bg: Option<Background>,
+    target: Option<(u32, u32)>,
+) -> Option<image::DynamicImage> {
     let theme = Theme::dark();
-    let themed = svg::resolve_vars(&svg::inject_theme(svg_text, &theme), &theme);
+    let themed = resolve_root_vars(&svg::resolve_vars(&svg::inject_theme(svg_text, &theme), &theme));
     let mut options = usvg::Options::default();
     options.fontdb = font_db();
     let tree = usvg::Tree::from_str(&themed, &options).ok()?;
@@ -52,15 +76,20 @@ pub fn rasterize(svg_text: &str, bg: Option<Background>) -> Option<image::Dynami
     if !(long.is_finite() && long > 0.0) {
         return None;
     }
-    let scale = if long < MIN_LONG_SIDE {
+    let scale = if let Some((width, height)) = target {
+        if width == 0 || height == 0 {
+            return None;
+        }
+        (width as f32 / size.width()).min(height as f32 / size.height())
+    } else if long < MIN_LONG_SIDE {
         (MIN_LONG_SIDE / long).min(MAX_UPSCALE)
     } else if long > MAX_LONG_SIDE {
         MAX_LONG_SIDE / long
     } else {
         1.0
     };
-    let width = (size.width() * scale).ceil().max(1.0) as u32;
-    let height = (size.height() * scale).ceil().max(1.0) as u32;
+    let width = (size.width() * scale).round().max(1.0) as u32;
+    let height = (size.height() * scale).round().max(1.0) as u32;
 
     let mut pixmap = tiny_skia::Pixmap::new(width, height)?;
     if let Some(Background::Rgb(r, g, b)) = bg {
@@ -81,6 +110,80 @@ pub fn rasterize(svg_text: &str, bg: Option<Background>) -> Option<image::Dynami
     image::RgbaImage::from_raw(width, height, raw).map(image::DynamicImage::ImageRgba8)
 }
 
+/// usvg does not resolve CSS custom properties. Support document-level palettes
+/// declared on :root/svg, including the dark color-scheme media rule. Scoped
+/// element properties remain the stylesheet renderer's responsibility.
+fn resolve_root_vars(svg: &str) -> String {
+    use std::collections::HashMap;
+    fn blocks(css: &str, vars: &mut HashMap<String, String>) {
+        let mut rest = css;
+        while let Some(open) = rest.find('{') {
+            let selector = rest[..open].trim();
+            let body = &rest[open + 1..];
+            let mut depth = 1;
+            let mut end = None;
+            for (i, ch) in body.char_indices() {
+                match ch { '{' => depth += 1, '}' => depth -= 1, _ => {} }
+                if depth == 0 { end = Some(i); break; }
+            }
+            let Some(end) = end else { break };
+            if selector.starts_with("@media") {
+                let condition: String = selector.chars().filter(|c| !c.is_whitespace()).collect();
+                if condition == "@media(prefers-color-scheme:dark)" { blocks(&body[..end], vars); }
+            } else if selector.split(',').any(|s| matches!(s.trim(), ":root" | "svg")) {
+                for declaration in body[..end].split(';') {
+                    if let Some((name, value)) = declaration.split_once(':') {
+                        let name = name.trim();
+                        if name.starts_with("--") {
+                            vars.insert(name.to_string(), value.trim().to_string());
+                        }
+                    }
+                }
+            }
+            rest = &body[end + 1..];
+        }
+    }
+    let mut vars = HashMap::new();
+    let mut rest = svg;
+    while let Some(start) = rest.find("<style") {
+        let Some(open) = rest[start..].find('>') else { break };
+        rest = &rest[start + open + 1..];
+        let Some(end) = rest.find("</style>") else { break };
+        blocks(&rest[..end], &mut vars);
+        rest = &rest[end + "</style>".len()..];
+    }
+    let mut output = svg.to_string();
+    // Bound expansion of references (and cycles) within custom properties.
+    for _ in 0..16 {
+        let mut next = String::new();
+        let mut rest = output.as_str();
+        while let Some(start) = rest.find("var(") {
+            next.push_str(&rest[..start]);
+            let body = &rest[start + 4..];
+            let mut depth = 1;
+            let mut end = None;
+            for (i, ch) in body.char_indices() {
+                match ch { '(' => depth += 1, ')' => depth -= 1, _ => {} }
+                if depth == 0 { end = Some(i); break; }
+            }
+            let Some(end) = end else { next.push_str(&rest[start..]); rest = ""; break };
+            let (name, fallback) = body[..end].split_once(',')
+                .map(|(name, fallback)| (name.trim(), Some(fallback.trim())))
+                .unwrap_or((body[..end].trim(), None));
+            if let Some(value) = vars.get(name).map(String::as_str).or(fallback) {
+                next.push_str(value);
+            } else {
+                next.push_str(&rest[start..start + 4 + end + 1]);
+            }
+            rest = &body[end + 1..];
+        }
+        next.push_str(rest);
+        if next == output { break; }
+        output = next;
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,10 +195,35 @@ mod tests {
     const SQUARE: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 10 10"><rect width="100" height="100" viewBox="0 0 10 10" fill="#ff0000"/></svg>"##;
 
     #[test]
+    fn root_css_palette_renders_visible_pixels_with_the_dark_media_override() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 600"><style>
+          :root { --bg:#fff; --fg:#111; --ink:var(--fg); }
+          @media (prefers-color-scheme: dark) { :root { --bg:#112233; --fg:#ddeeff; } }
+          @media (prefers-color-scheme: light) { :root { --bg:#fff; --fg:#000; } }
+          .bg { fill:var(--bg) } .fg { fill:var(--ink) }
+        </style><rect class="bg" width="960" height="600"/><rect class="fg" width="480" height="600"/></svg>"##;
+        let image = rasterize_to_fit(svg, None, 520, 360).unwrap();
+        assert_eq!(pixel(&image, 10, 10), [0xdd, 0xee, 0xff, 255]);
+        assert_eq!(pixel(&image, 500, 10), [0x11, 0x22, 0x33, 255]);
+        assert!(resolve_root_vars("var(--unknown, rgb(1, 2, 3))").contains("rgb(1, 2, 3)"));
+    }
+
+    #[test]
     fn rasterizes_and_scales_a_small_svg_up() {
         let img = rasterize(SQUARE, None).expect("valid svg");
         assert_eq!((img.width(), img.height()), (800, 800));
         assert_eq!(pixel(&img, 400, 400), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn renders_vectors_at_the_display_resolution_with_bounded_allocations() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100"><rect width="200" height="100" fill="#ff0000"/></svg>"##;
+        let img = rasterize_to_fit(svg, None, 1120, 960).unwrap();
+        assert_eq!((img.width(), img.height()), (1120, 560));
+        assert_eq!(pixel(&img, 1119, 559), [255, 0, 0, 255]);
+        let huge = rasterize_to_fit(svg, None, 100_000, 100_000).unwrap();
+        assert_eq!((huge.width(), huge.height()), (4096, 2048));
+        assert!(rasterize_to_fit(svg, None, 0, 100).is_none());
     }
 
     #[test]

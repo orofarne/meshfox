@@ -1220,6 +1220,7 @@ pub async fn get_include_asset(port: u16, dir: &str, file: &str) -> Result<Vec<u
 /// unset, see `watch`'s own doc comment).
 #[derive(Debug, Clone)]
 pub enum WatchEvent {
+    ImagesChanged,
     /// The canvas itself changed — go re-`GET /api/canvas/raw`.
     Changed,
     /// A plain-block run started somewhere else (another frontend's manual
@@ -1346,6 +1347,7 @@ pub fn watch(port: u16) -> tokio::sync::mpsc::UnboundedReceiver<WatchEvent> {
             /// A `display="code"` file node's target changed on disk — the
             /// TUI re-reads the document, same as for `"changed"`.
             FilesChanged,
+            ImagesChanged,
             NodeUpserted,
             NodeRemoved,
             NodesReordered,
@@ -1377,7 +1379,8 @@ pub fn watch(port: u16) -> tokio::sync::mpsc::UnboundedReceiver<WatchEvent> {
                     continue;
                 };
                 let event = match parsed {
-                    WatchMsg::Connected | WatchMsg::Heartbeat => continue,
+                    WatchMsg::Heartbeat => continue,
+                    WatchMsg::Connected => WatchEvent::ImagesChanged,
                     WatchMsg::Changed
                     | WatchMsg::FilesChanged
                     | WatchMsg::Resync
@@ -1391,6 +1394,7 @@ pub fn watch(port: u16) -> tokio::sync::mpsc::UnboundedReceiver<WatchEvent> {
                     WatchMsg::TtyStarted { node_id, block } => {
                         WatchEvent::TtyStarted { node_id, block }
                     }
+                    WatchMsg::ImagesChanged => WatchEvent::ImagesChanged,
                     WatchMsg::RunsChanged => WatchEvent::RunsChanged,
                 };
                 if tx.send(event).is_err() {
@@ -2914,6 +2918,10 @@ mod tests {
         })
         .await;
         let mut events = watch(port);
+        assert!(matches!(
+            events.recv().await,
+            Some(WatchEvent::ImagesChanged)
+        ));
         tokio::time::sleep(Duration::from_millis(250)).await;
         assert!(
             events.try_recv().is_err(),

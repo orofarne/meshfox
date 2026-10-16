@@ -371,6 +371,8 @@ Local wins over global **key by key, at every nesting level**: a global `[sessio
 | `[tables] duckdb_path` | unset | The `duckdb` executable `display="table"` drives when it isn't on `PATH` (the `MESHFOX_DUCKDB` environment variable overrides it). Looked up in this order: the variable, this key, `PATH`, then `~/.duckdb/cli/latest/duckdb`, `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`. |
 | `[session] max_runs_per_block` | `10` | How many finished runs of one block the core keeps (run record and stored output together); when a run finishes, the oldest beyond this are rotated out. At most `max_runs_per_block × max_output_bytes` of output per block. Minimum `1`. Read once when the core starts. |
 
+When a block's effective `LANG` is unset or empty, Meshfox selects an installed UTF-8 locale (`C.UTF-8`, then `en_US.UTF-8`). If neither is available, it leaves `LANG` unchanged. Explicit `LANG`, `LC_ALL`, and other `LC_*` settings retain their normal precedence.
+
 #### What survives a core restart
 
 Alongside the undo history, the session database (`.meshfox/<canvas>.session.sqlite3`, covered by the repo's `.meshfox/` ignore) keeps what a restarted core needs to pick up where it left off:
@@ -640,6 +642,8 @@ The menu-bar app is macOS only. On Linux, `meshfox serve` is the same coordinato
 <!-- meshfox:node id="usage-tui" -->
 
 ![Terminal viewer screenshot](screenshot-tui.webp)
+
+`MESHFOX_IMAGE_PROTOCOL` overrides the TUI image renderer: `auto` (the default, also used when unset or empty), `sixel`, `iterm2`, `kitty`, or `halfblocks`. For example, `MESHFOX_IMAGE_PROTOCOL=sixel meshfox tui path/to/file.canvas.md` tests Sixel in iTerm2; `MESHFOX_IMAGE_PROTOCOL=halfblocks meshfox tui path/to/file.canvas.md` forces Unicode half-block rendering without querying graphics capabilities. Forced graphical modes still query terminal font metrics, then override protocol detection, including terminal-specific exclusions. The terminal must support the selected protocol. Linked canvases opened with `o` inherit the same renderer and font metrics. An unknown value is a startup error.
 
 `meshfox tui` is the browser UI's tree-and-block-runner experience without leaving the terminal — one more front door onto the same files, alongside `run` and `view`: a left pane walks the node tree (same `[run]`/`[cache]`/`[tty]` flags `meshfox list` prints, as badges), a right pane renders the selected node's body — headings/lists/tables, syntax-highlighted code fences (`syntect`), and local images (`ratatui-image`, real pixels on a terminal that supports it, half-block Unicode art everywhere else, tmux included). `type="include"` is resolved for browsing (same as the browser's `GET /api/canvas`, unlike `run`/`validate`'s raw-file-only scope), a `file` node's `display="code"` shows the target's own content, same as the browser's read-only preview, and opening a `file` node whose target is another `.canvas.md` pushes a new navigation frame for it, same isolated-process "click through" the browser UI offers.
 
