@@ -197,3 +197,24 @@ convention of their own; both this and a "did you mean" typo/missing-
 ancestor suggestion are surfaced back in the error when it happens, so it's
 recoverable, but getting the ordering right the first time avoids the
 detour.
+
+### Terminal status for CLI runs
+
+`meshfox run --terminal-status auto|off|iterm2|progress|title` controls the
+terminal's run indicator. `MESHFOX_TERMINAL_STATUS` supplies the default;
+the flag takes precedence. This is a CLI presentation option, not a canvas
+or worker setting.
+
+Auto selects Session Status (OSC 21337) for iTerm2 and OSC 9;4 progress for
+Ghostty, Contour and Windows Terminal, using `TERM_PROGRAM` and `WT_SESSION`.
+Unknown terminals and tmux/screen are disabled in auto mode. Explicit modes
+can override detection, but stderr must still be a terminal. Older terminal
+versions may ignore the sequences. No multiplexer passthrough is configured.
+
+Runs show the current step; meshfox's own input prompts show waiting.
+Interactive child programs remain running: their input waits are not inferred.
+Success/failure remain visible in iTerm2; progress is withdrawn on success
+and marked as failed on error. Handled Ctrl-C clears the indicator.
+Progress is refreshed once per second for terminals that expire stale state.
+The optional title mode changes the terminal title; the shell may replace it
+at its next prompt. Status sequences are written to stderr, never stdout.

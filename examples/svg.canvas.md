@@ -230,6 +230,18 @@ flowchart LR
 EOF
 ```
 
+**Mermaid, without a browser** (`npm i pele` next to the canvas) — [Pele](https://pele.run) is a small pure-JS Mermaid renderer: no DOM, no Chromium, a few milliseconds per diagram. It is young (October 2026) and draws with its own layout and style, so a diagram can look different from `mmdc`'s. The block is plain Node code; `require.resolve` looks `pele` up from the canvas's directory, since the temp file the code runs from has no `node_modules` of its own:
+
+```javascript name="mermaid-pele" interpreter="node" cache output="image" output-attrs="bg=#fff"
+const { pathToFileURL } = require("node:url");
+const path = require.resolve("pele", { paths: [process.cwd()] });
+import(pathToFileURL(path).href).then(({ render }) => {
+  const { svg } = render(`flowchart LR
+  A[Block] -->|prints SVG| B(output=image) --> C{{Picture}}`);
+  process.stdout.write(svg);
+});
+```
+
 **PlantUML** (needs Java) — `-pipe` reads stdin and writes stdout:
 
 ```bash name="plantuml" cache output="image" output-attrs="bg=#fff"

@@ -116,6 +116,7 @@ pub fn resolve_chain(canvas: &Canvas, target: BlockAddr) -> Result<Vec<BlockAddr
         &mut order,
         &mut visited,
         &mut stack,
+        &mut |_, _| Ok(None),
     )?;
     Ok(order)
 }
@@ -140,6 +141,31 @@ pub fn resolve_from_chain(canvas: &Canvas, target: BlockAddr) -> Result<Vec<Bloc
         &mut order,
         &mut visited,
         &mut stack,
+        &mut |_, _| Ok(None),
+    )?;
+    Ok(order)
+}
+
+/// The ordinary dependency walk, with demand-driven value preparation before
+/// binding each application and discovering its artifact producers. The hook
+/// returns an updated graph view; no block is executed by this walk.
+pub(crate) fn resolve_chain_preparing(
+    canvas: &Canvas,
+    target: BlockAddr,
+    follow_deps: bool,
+    prepare: &mut dyn FnMut(&Canvas, &BlockAddr) -> Result<Option<Canvas>, DepsError>,
+) -> Result<Vec<BlockAddr>, DepsError> {
+    let decls = crate::vars::declared_vars(canvas)?;
+    let mut order = Vec::new();
+    visit(
+        canvas,
+        target,
+        &decls,
+        follow_deps,
+        &mut order,
+        &mut HashSet::new(),
+        &mut Vec::new(),
+        prepare,
     )?;
     Ok(order)
 }
@@ -344,7 +370,10 @@ fn visit(
     order: &mut Vec<BlockAddr>,
     visited: &mut std::collections::HashSet<String>,
     stack: &mut Vec<BlockAddr>,
+    prepare: &mut dyn FnMut(&Canvas, &BlockAddr) -> Result<Option<Canvas>, DepsError>,
 ) -> Result<(), DepsError> {
+    let prepared = prepare(canvas, &addr)?;
+    let canvas = prepared.as_ref().unwrap_or(canvas);
     let block = find_block(canvas, &addr)?;
     let addr = BlockAddr::new(&addr.node_id, block.name.as_deref().unwrap());
     let key = addr.key();
@@ -380,7 +409,16 @@ fn visit(
     }
 
     for dep_addr in dep_addrs {
-        visit(canvas, dep_addr, decls, follow_deps, order, visited, stack)?;
+        visit(
+            canvas,
+            dep_addr,
+            decls,
+            follow_deps,
+            order,
+            visited,
+            stack,
+            prepare,
+        )?;
     }
     stack.pop();
 

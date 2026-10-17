@@ -28,6 +28,7 @@ mod run_output;
 mod secret_cmd;
 mod serve;
 mod syntax_registry;
+mod terminal_status;
 mod tui;
 mod watcher;
 mod worker_client;
@@ -121,6 +122,10 @@ enum Command {
     /// instead of after it (`meshfox examples/hello.canvas.md run tests
     /// smoke-test smoke`), or with `--canvas`, to name one explicitly.
     Run {
+        /// Terminal run indicator (also configurable via MESHFOX_TERMINAL_STATUS).
+        /// Auto supports iTerm2, Ghostty, Contour and Windows Terminal.
+        #[arg(long, value_enum, default_value = terminal_status::default_mode())]
+        terminal_status: terminal_status::Mode,
         /// Approve confirm-marked blocks for this invocation without prompting.
         #[arg(long)]
         confirm: bool,
@@ -1242,6 +1247,7 @@ fn main() {
 
     match command {
         Command::Run {
+            terminal_status,
             confirm,
             args,
             canvas,
@@ -1266,7 +1272,9 @@ fn main() {
                 }
                 find_canvas()
             });
-            run(&canvas_path, args, no_deps, fresh, skip_fresh, set, confirm)
+            run(
+                &canvas_path, args, no_deps, fresh, skip_fresh, set, confirm, terminal_status,
+            )
         }
         Command::Configure { canvas } => {
             let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
@@ -1732,11 +1740,11 @@ pub(crate) fn canvas_root_dir(canvas_path: &Path) -> &Path {
 fn declared_vars_or_exit(canvas_path: &Path, raw: &str) -> Vec<VarDecl> {
     let canvas = Canvas::from_markdown(raw).unwrap_or_else(|e| {
         eprintln!("failed to parse {}: {e}", canvas_path.display());
-        std::process::exit(1);
+        terminal_status::exit(1);
     });
     meshfox_core::declared_vars(&canvas).unwrap_or_else(|e| {
         eprintln!("meshfox: {}: {e}", canvas_path.display());
-        std::process::exit(1);
+        terminal_status::exit(1);
     })
 }
 
@@ -1746,7 +1754,7 @@ fn load_var_cache_or_exit(canvas_path: &Path) -> VarCache {
             "failed to load variable cache for {}: {e}",
             meshfox_core::varcache::cache_path(canvas_path).display()
         );
-        std::process::exit(1);
+        terminal_status::exit(1);
     })
 }
 
@@ -2358,12 +2366,17 @@ fn run(
     skip_fresh: bool,
     set: Vec<(String, String)>,
     confirm: bool,
+    status_mode: terminal_status::Mode,
 ) {
     let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
         eprintln!("failed to start async runtime: {e}");
         std::process::exit(1);
     });
-    runtime.block_on(run_async(canvas_path, args, no_deps, fresh, skip_fresh, set, confirm));
+    runtime.block_on(async {
+        terminal_status::start(status_mode);
+        run_async(canvas_path, args, no_deps, fresh, skip_fresh, set, confirm).await;
+        terminal_status::finish(0);
+    });
 }
 
 /// `--set NAME=VALUE` is the one place a value can enter `resolve`'s
@@ -2378,7 +2391,7 @@ fn run(
 fn validate_set_overrides_or_exit(decls: &[VarDecl], overrides: &HashMap<String, String>) {
     if let Err(e) = validate_set_overrides(decls, overrides) {
         eprintln!("meshfox run: {e}");
-        std::process::exit(1);
+        terminal_status::exit(1);
     }
 }
 
@@ -2413,7 +2426,7 @@ fn persist_set_overrides(
         {
             cache.set(name, value).unwrap_or_else(|e| {
                 eprintln!("failed to save {name}: {e}");
-                std::process::exit(1);
+                terminal_status::exit(1);
             });
         }
     }
@@ -2436,7 +2449,7 @@ async fn run_async(
         .await
         .unwrap_or_else(|e| {
             eprintln!("failed to reach worker for {}: {e}", canvas_path.display());
-            std::process::exit(1);
+            terminal_status::exit(1);
         });
     let initial_raw = worker_client::get_canvas_raw(port)
         .await
@@ -2445,7 +2458,7 @@ async fn run_async(
                 "failed to read {} through worker: {e}",
                 canvas_path.display()
             );
-            std::process::exit(1);
+            terminal_status::exit(1);
         });
 
     // `meshfox:var` only ever lives in the root node, which is always in
@@ -2518,7 +2531,7 @@ async fn run_async(
                 }
                 Err(_) => {
                     eprintln!("meshfox run: failed to start the core for this file");
-                    std::process::exit(1);
+                    terminal_status::exit(1);
                 }
             }
         }
@@ -2538,7 +2551,7 @@ async fn run_async(
         }
         Err(e) => {
             eprintln!("meshfox run: {e}");
-            std::process::exit(1);
+            terminal_status::exit(1);
         }
     }
 }
@@ -2633,6 +2646,7 @@ async fn run_via_worker(
     let mut started_services: Vec<(String, String)> = Vec::new();
 
     for name in block_names {
+        terminal_status::running(name);
         // Mirrors the in-process loop's own "not a fenced-block address —
         // maybe `path`+`name` together name a runnable `file` node
         // instead" fallback (see `run_async`'s own `resolve_run_chain`
@@ -2695,7 +2709,7 @@ async fn run_via_worker(
                     None => {
                         let hint = worker_did_you_mean_hint(canvas_path, port, &path, name).await;
                         eprintln!("meshfox run: {chain_err}{hint}");
-                        std::process::exit(1);
+                        terminal_status::exit(1);
                     }
                 }
             }
@@ -2706,7 +2720,7 @@ async fn run_via_worker(
             .await
             .unwrap_or_else(|error| {
                 eprintln!("meshfox run: {error}");
-                std::process::exit(1)
+                terminal_status::exit(1)
             });
         if !gates.is_empty() && !confirm && !confirm_block_run(&gates) {
             had_failure = true;
@@ -2875,7 +2889,7 @@ async fn run_via_worker(
                             for (node_id, block) in &started_services {
                                 let _ = worker_client::stop_service(port, node_id, block).await;
                             }
-                            std::process::exit(130);
+                            terminal_status::exit(130);
                         }
                         break 'watch;
                     }
@@ -2885,7 +2899,7 @@ async fn run_via_worker(
                     for (node_id, block) in &started_services {
                         let _ = worker_client::stop_service(port, node_id, block).await;
                     }
-                    std::process::exit(130); // 128 + SIGINT, the usual convention
+                    terminal_status::exit(130); // 128 + SIGINT, the usual convention
                 }
             }
         }
@@ -2895,7 +2909,7 @@ async fn run_via_worker(
     }
 
     if had_failure {
-        std::process::exit(1);
+        terminal_status::exit(1);
     }
 }
 
@@ -3169,6 +3183,7 @@ async fn drain_worker_run_events(
                     match event {
                         worker_client::RunEvent::Started { .. } => {}
                         worker_client::RunEvent::StepStart { node_id, block } => {
+                            terminal_status::running(&block);
                             run_output::banner(&block, "\n");
                             current_step = Some((node_id, block));
                         }
@@ -3238,7 +3253,7 @@ async fn drain_worker_run_events(
                     // own `persist` handling), not batched up for this
                     // process to write out at the end the way the
                     // in-process path's own `file_raws` map is.
-                    std::process::exit(130); // 128 + SIGINT, the usual convention
+                    terminal_status::exit(130); // 128 + SIGINT, the usual convention
                 }
             }
         }
@@ -3258,6 +3273,7 @@ fn confirm_block_run(blocks: &[String]) -> bool {
         );
         return false;
     }
+    let _waiting = terminal_status::waiting("confirmation");
     eprint!(
         "Potentially destructive operation(s): {}. Run? [y/N]: ",
         blocks.join(", ")
@@ -3283,6 +3299,7 @@ fn confirm_kill_and_retry(block: &str, owner_pid: u32, owner_desc: &str) -> bool
         );
         return false;
     }
+    let _waiting = terminal_status::waiting("kill and retry");
     print!(
         "{block:?} is already running elsewhere (pid {owner_pid}, started via {owner_desc}) — kill it and retry? (y/n): "
     );

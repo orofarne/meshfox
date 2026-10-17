@@ -283,7 +283,7 @@ impl FileAccess {
             .into_iter()
             .filter(|d| matches!(d.var_type, VarType::Dir | VarType::File))
             .collect();
-        let resolved = crate::vars::resolve_with_shared(&decls, overrides, cache, computed, shared);
+        let resolved = crate::vars::preview_with_shared(&decls, overrides, cache, computed, shared);
         let pending: Vec<String> = resolved.missing.iter().map(|d| d.name.clone()).collect();
         let file_names: std::collections::HashSet<&str> = decls
             .iter()

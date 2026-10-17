@@ -53,6 +53,45 @@ pub trait SecretBackend: std::fmt::Debug + Send + Sync {
     fn delete(&self, account: &str) -> io::Result<bool>;
 }
 
+/// Read-through snapshot owned by a single run preparation, never by the
+/// canvas session. Writes still go to the original backend.
+#[derive(Debug)]
+pub(crate) struct ReadSnapshot {
+    backend: Arc<dyn SecretBackend>,
+    values: Mutex<HashMap<String, Result<Option<String>, (io::ErrorKind, String)>>>,
+}
+
+impl ReadSnapshot {
+    pub(crate) fn new(backend: Arc<dyn SecretBackend>) -> Self {
+        Self {
+            backend,
+            values: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl SecretBackend for ReadSnapshot {
+    fn get(&self, account: &str) -> io::Result<Option<String>> {
+        self.values
+            .lock()
+            .unwrap()
+            .entry(account.to_string())
+            .or_insert_with(|| {
+                self.backend
+                    .get(account)
+                    .map_err(|e| (e.kind(), e.to_string()))
+            })
+            .clone()
+            .map_err(|(kind, message)| io::Error::new(kind, message))
+    }
+    fn set(&self, account: &str, value: &str) -> io::Result<()> {
+        self.backend.set(account, value)
+    }
+    fn delete(&self, account: &str) -> io::Result<bool> {
+        self.backend.delete(account)
+    }
+}
+
 /// The `secret_store` setting for the project rooted at `canvas_root`.
 /// Absent means `plaintext`; any other unrecognised value is an error, so a
 /// typo can't silently leave secrets unprotected.

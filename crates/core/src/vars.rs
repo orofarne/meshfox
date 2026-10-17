@@ -1052,6 +1052,25 @@ pub fn resolve(
     )
 }
 
+/// Resolve values for display and background graph checks without contacting a
+/// secret store. Explicit overrides, process environment and plaintext cache
+/// values retain their ordinary precedence.
+pub fn preview_with_shared(
+    decls: &[VarDecl],
+    overrides: &HashMap<String, String>,
+    cache: &crate::varcache::VarCache,
+    computed: &HashMap<String, String>,
+    shared: &crate::shared_env::SharedEnv,
+) -> ResolvedVars {
+    resolve_with_shared(
+        decls,
+        overrides,
+        &cache.without_secret_reads(),
+        computed,
+        &shared.without_secret_reads(),
+    )
+}
+
 /// Same as `resolve`, but additionally consults `shared` (see
 /// `crate::shared_env::load`) as a precedence tier between the on-disk
 /// document `cache` and a declaration's own `default`. Unlike `cache`,

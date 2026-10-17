@@ -23,6 +23,7 @@ pub fn stdin_is_tty() -> bool {
 /// retyping it. A `secret` declaration ignores `current` entirely and
 /// reads without echoing the input.
 pub fn ask(decl: &VarDecl, current: Option<&str>) -> io::Result<String> {
+    let _waiting = crate::terminal_status::waiting(&decl.name);
     if decl.secret {
         return ask_secret(decl);
     }

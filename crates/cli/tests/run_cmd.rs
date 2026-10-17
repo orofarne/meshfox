@@ -323,3 +323,23 @@ fn confirm_blocks_require_approval_for_every_run_and_gate_dependencies_before_si
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn terminal_status_never_writes_control_sequences_to_redirected_output() {
+    let dir = unique_dir();
+    let canvas = dir.join("status.md");
+    std::fs::write(
+        &canvas,
+        "<!-- meshfox:canvas -->\n# Status\n<!-- meshfox:node id=\"root\" -->\n\n```bash name=\"report\"\nprintf 'report output\\n'\n```\n",
+    ).unwrap();
+    for mode in ["iterm2", "progress", "title"] {
+        let output = meshfox()
+            .arg(&canvas).args(["run", "report", "--terminal-status", mode])
+            .env("MESHFOX_TERMINAL_STATUS", "off")
+            .output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("report output"));
+        assert!(!output.stdout.windows(2).any(|w| w == b"\x1b]"));
+        assert!(!output.stderr.windows(2).any(|w| w == b"\x1b]"));
+    }
+}

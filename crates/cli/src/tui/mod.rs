@@ -891,9 +891,13 @@ enum TtyPreludeOutcome {
 fn print_tty_transcript_event(event: crate::worker_client::RunEvent) -> TtyPreludeOutcome {
     use crate::worker_client::RunEvent;
     match event {
-        RunEvent::TtyStart { .. } => TtyPreludeOutcome::EnterPty,
+        RunEvent::TtyStart { block, .. } => {
+            crate::terminal_status::running(&block);
+            TtyPreludeOutcome::EnterPty
+        }
         RunEvent::Started { .. } | RunEvent::ServiceStarted { .. } => TtyPreludeOutcome::Continue,
         RunEvent::StepStart { block, .. } => {
+            crate::terminal_status::running(&block);
             crate::run_output::banner(&block, "\r\n");
             TtyPreludeOutcome::Continue
         }

@@ -100,6 +100,32 @@ impl SharedEnv {
         SharedEnv::default()
     }
 
+    /// Whether resolving this name can contact a secret store.
+    pub fn contains_secret(&self, name: &str) -> bool {
+        matches!(self.slots.get(name), Some(Slot::Lazy(_)))
+    }
+
+    /// A display-only view: unresolved secret slots are absent, and looking up
+    /// a value or an error cannot initiate a backend read.
+    pub fn without_secret_reads(&self) -> Self {
+        Self {
+            slots: self
+                .slots
+                .iter()
+                .filter_map(|(name, slot)| {
+                    let value = match slot {
+                        Slot::Value(v) => Some(v.clone()),
+                        Slot::Lazy(l) => match l.fetched.get() {
+                            Some(Fetched::Found(v)) => Some(v.clone()),
+                            _ => None,
+                        },
+                    }?;
+                    Some((name.clone(), Slot::Value(value)))
+                })
+                .collect(),
+        }
+    }
+
     /// The value for `name`, reading it from the secret store if it is a
     /// `secrets = [...]` entry (once; the answer is kept).
     pub fn get(&self, name: &str) -> Option<&SharedVar> {
@@ -912,7 +938,15 @@ mod tests {
             Some(&home),
             Some(Arc::new(Counting(calls.clone()))),
         );
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "load must not read the store");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "load must not read the store"
+        );
+        assert!(shared.contains_secret("TOKEN"));
+        let preview = shared.without_secret_reads();
+        assert_eq!(preview.get("TOKEN"), None);
+        assert_eq!(preview.secret_error("TOKEN"), None);
         assert_eq!(shared.get("OTHER"), None);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(shared.get("TOKEN").map(|v| v.value.as_str()), Some("v"));

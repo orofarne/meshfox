@@ -30,6 +30,7 @@ pub mod merge;
 pub mod options;
 pub mod process_env;
 pub mod output;
+pub mod run_plan;
 pub mod secret_index;
 pub mod secret_store;
 pub mod service;
@@ -91,10 +92,10 @@ pub use varout::{
     read_and_cleanup as read_and_cleanup_vars_out, VARS_OUT_ENV,
 };
 pub use vars::{
-    close_over_var_refs, declared_vars, map_block_env, resolve as resolve_vars, resolve_block_env,
-    resolve_block_env_with_shared, resolve_with_shared, validate_env_refs, validate_value,
-    validate_var_refs, validate_var_scope, BlockEnvResolution, FileMode, ResolvedVars, VarDecl, VarType,
-    VarsError,
+    close_over_var_refs, declared_vars, map_block_env, preview_with_shared,
+    resolve as resolve_vars, resolve_block_env, resolve_block_env_with_shared, resolve_with_shared,
+    validate_env_refs, validate_value, validate_var_refs, validate_var_scope, BlockEnvResolution,
+    FileMode, ResolvedVars, VarDecl, VarType, VarsError,
 };
 
 pub use attrs::UnknownAttrError;
@@ -183,25 +184,7 @@ pub fn env_var_names_for_chain(
         if let Ok(block) = deps::find_block(canvas, addr) {
             needed.extend(direct_var_seed(&block));
             if block.attrs.contains_key("inputs") {
-                // Matching requires the entire output-path namespace to be known.
-                for node in &canvas.nodes {
-                    if node.plain_markdown_include { continue; }
-                    for mut producer in scan_runnable_blocks(&node.id, &node.text) {
-                        producer.attrs.remove("inputs");
-                        let local: std::collections::HashSet<_> =
-                            args::scan_signatures(&node.id, &node.text)
-                                .unwrap_or_default()
-                                .into_iter()
-                                .filter(|sig| sig.block.span == producer.span)
-                                .flat_map(|sig| sig.args.into_iter().map(|arg| arg.name))
-                                .collect();
-                        needed.extend(
-                            artifacts::var_refs(&producer)
-                                .into_iter()
-                                .filter(|name| !local.contains(name)),
-                        );
-                    }
-                }
+                needed.extend(output_path_var_names(canvas));
             }
         }
     }
@@ -216,6 +199,32 @@ pub fn env_var_names_for_chain(
     // parse error is `meshfox validate`'s job to report, not this one's.
     let decls = vars::declared_vars(canvas).unwrap_or_default();
     vars::close_over_var_refs(&decls, needed.iter().map(String::as_str))
+}
+
+/// Global variables needed to compare a consumer against every output path.
+/// Local producer arguments are captures, not canvas-variable dependencies.
+pub(crate) fn output_path_var_names(canvas: &Canvas) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    for node in &canvas.nodes {
+        if node.plain_markdown_include {
+            continue;
+        }
+        let signatures = args::scan_signatures(&node.id, &node.text).unwrap_or_default();
+        for mut producer in scan_runnable_blocks(&node.id, &node.text) {
+            producer.attrs.remove("inputs");
+            let local: std::collections::HashSet<_> = signatures
+                .iter()
+                .filter(|sig| sig.block.span == producer.span)
+                .flat_map(|sig| sig.args.iter().map(|arg| arg.name.as_str()))
+                .collect();
+            names.extend(
+                artifacts::var_refs(&producer)
+                    .into_iter()
+                    .filter(|name| !local.contains(name.as_str())),
+            );
+        }
+    }
+    names
 }
 
 /// [`env_var_names_for_chain`] for `target`'s whole dependency chain — which
@@ -313,9 +322,7 @@ fn resolve_target(canvas: &Canvas, path: &[&str], block_name: &str) -> Result<Bl
             .iter()
             .any(|s| s.block.name.as_deref() == Some(block_name))
     {
-        let block = args::bind_block(&node.id, &node.text, block_name, &canvas.artifact_values)
-            .map_err(DepsError::Arguments)?;
-        return Ok(BlockAddr::new(&node.id, block.name.unwrap()));
+        return Ok(BlockAddr::new(&node.id, block_name));
     }
     if has_runnable_block(canvas, &node.id, block_name) {
         return Ok(BlockAddr::new(node.id.clone(), block_name.to_string()));

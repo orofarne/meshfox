@@ -1605,7 +1605,7 @@ fn run_fingerprint_in(
     let overrides = effective_overrides(state, &HashMap::new());
     let resolved = {
         let cache = state.vars_cache.lock().unwrap();
-        meshfox_core::resolve_with_shared(
+        meshfox_core::preview_with_shared(
             &relevant,
             &overrides,
             &cache,
@@ -2377,8 +2377,9 @@ fn lock_conflict_response(conflict: &LockConflict) -> Response {
         .unwrap()
 }
 
-/// Path graph resolution uses the same defaults/cache/overrides as execution.
-/// Cached computed values only predict graph paths; sources still run normally.
+/// Seed display/background graph views without contacting a secret store.
+/// Run preparation fills required secrets on demand. Cached computed values
+/// only predict graph paths; sources still run normally.
 fn seed_artifact_paths(state: &AppState, canvas: &mut Canvas, overrides: &HashMap<String, String>) {
     let Ok(decls) = meshfox_core::declared_vars(canvas) else {
         return;
@@ -2393,7 +2394,30 @@ fn seed_artifact_paths(state: &AppState, canvas: &mut Canvas, overrides: &HashMa
     let shared = meshfox_core::load_shared_env(canvas_root_dir(&state.canvas_path));
     let cache = state.vars_cache.lock().unwrap();
     canvas.artifact_values =
-        meshfox_core::resolve_with_shared(&decls, overrides, &cache, &computed, &shared).values;
+        meshfox_core::preview_with_shared(&decls, overrides, &cache, &computed, &shared).values;
+}
+
+fn prepare_run_plan(
+    state: &AppState,
+    canvas: &mut Canvas,
+    path: &[&str],
+    block: &str,
+    with_deps: bool,
+    overrides: &HashMap<String, String>,
+) -> Result<meshfox_core::run_plan::PreparedRun, ApiError> {
+    seed_artifact_paths(state, canvas, overrides);
+    let cache = state.vars_cache.lock().unwrap().clone();
+    let shared = meshfox_core::load_shared_env(canvas_root_dir(&state.canvas_path));
+    Ok(meshfox_core::run_plan::prepare_run(
+        canvas,
+        path,
+        block,
+        with_deps,
+        overrides,
+        &cache,
+        &HashMap::new(),
+        &shared,
+    )?)
 }
 
 fn artifact_lock_candidates(
@@ -2450,7 +2474,7 @@ fn step_values(
     let cache = state.vars_cache.lock().unwrap();
     let overrides = effective_overrides(state, values);
     let resolved =
-        meshfox_core::resolve_with_shared(&relevant, &overrides, &cache, values, &shared);
+        meshfox_core::preview_with_shared(&relevant, &overrides, &cache, values, &shared);
     if !resolved.missing.is_empty() || !resolved.unresolved_from.is_empty() {
         let names: Vec<_> = resolved.missing.iter().chain(resolved.unresolved_from.iter())
             .map(|decl| decl.name.as_str()).collect();
@@ -2921,44 +2945,52 @@ async fn prepare_arguments(
             }
         }
     }
-    let choice_sources =
-        argument_choice_sources(&state, &canvas, &node.id, &node.text, &block_name).await;
+    let choice_sources = argument_choice_sources(
+        &state,
+        &canvas,
+        &node.id,
+        &node.text,
+        &block_name,
+        &request.args,
+    )
+    .await;
+    let mut argument_values = canvas.artifact_values.clone();
+    argument_values.extend(choice_sources.clone());
     let prepared = meshfox_core::args::prepare_arguments(
         &node.id,
         &node.text,
         &block_name,
         &request.args,
-        &canvas.artifact_values,
+        &argument_values,
         &choice_sources,
     )
     .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e))?;
     let canonical_path = canvas.id_path_to(&node.id).unwrap_or_default();
     let canonical_refs: Vec<&str> = canonical_path.iter().map(String::as_str).collect();
     if let Some(address) = &prepared.block {
-        let bound = meshfox_core::args::bind_block(&node.id, &node.text, address, &canvas.artifact_values)
+        let bound = meshfox_core::args::bind_block(&node.id, &node.text, address, &argument_values)
             .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e))?;
         meshfox_core::vars::validate_selected_env(&canvas, &node.id, &bound)
             .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
     }
-    let terminal = prepared
-        .block
-        .as_ref()
-        .and_then(|block| {
-            meshfox_core::resolve_run_chain(&canvas, &canonical_refs, block, !request.no_deps).ok()
-        })
-        .into_iter()
-        .flatten()
-        .filter_map(|addr| meshfox_core::deps::find_block(&canvas, &addr).ok())
+    let chain = if let Some(block) = &prepared.block {
+        prepare_run_plan(
+            &state,
+            &mut canvas,
+            &canonical_refs,
+            block,
+            !request.no_deps,
+            &effective_overrides(&state, &HashMap::new()),
+        )?
+        .chain
+    } else {
+        Vec::new()
+    };
+    let terminal = chain
+        .iter()
+        .filter_map(|addr| meshfox_core::deps::find_block(&canvas, addr).ok())
         .find(|block| block.tty);
-    let confirmation = prepared
-        .block
-        .as_ref()
-        .map(|block| {
-            meshfox_core::resolve_run_chain(&canvas, &canonical_refs, block, !request.no_deps)
-                .map(|chain| meshfox_core::deps::confirmation_blocks(&canvas, &chain))
-        })
-        .transpose()?
-        .unwrap_or_default();
+    let confirmation = meshfox_core::deps::confirmation_blocks(&canvas, &chain);
     Ok(Json(ArgumentsResponse {
         confirmation,
         tty: terminal.is_some(),
@@ -2980,6 +3012,7 @@ async fn argument_choice_sources(
     node_id: &str,
     node_text: &str,
     block_name: &str,
+    answers: &std::collections::BTreeMap<String, String>,
 ) -> HashMap<String, String> {
     let Ok(app) = meshfox_core::args::Application::parse(block_name) else {
         return HashMap::new();
@@ -2987,11 +3020,21 @@ async fn argument_choice_sources(
     let Ok(signatures) = meshfox_core::args::scan_signatures(node_id, node_text) else {
         return HashMap::new();
     };
-    let sources: Vec<String> = signatures
+    let mut sources: Vec<String> = signatures
         .iter()
         .filter(|s| s.block.name.as_deref() == Some(app.definition.as_str()))
         .flat_map(|s| s.args.iter().filter_map(|a| a.choices_var.clone()))
         .collect();
+    sources.extend(
+        app.bindings
+            .iter()
+            .filter_map(|(arg, binding)| match binding {
+                meshfox_core::args::Binding::Reference(name) if !answers.contains_key(arg) => {
+                    Some(name.clone())
+                }
+                _ => None,
+            }),
+    );
     if sources.is_empty() {
         return HashMap::new();
     }
@@ -3012,7 +3055,7 @@ async fn argument_choice_sources(
         .filter(|d| closure.contains(d.name.as_str()))
         .cloned()
         .collect();
-    let cache = state.vars_cache.lock().unwrap();
+    let cache = state.vars_cache.lock().unwrap().clone();
     let shared = meshfox_core::load_shared_env(canvas_root_dir(&state.canvas_path));
     let overrides = effective_overrides(state, &HashMap::new());
     let resolved = meshfox_core::resolve_with_shared(
@@ -3044,14 +3087,23 @@ async fn get_vars(
     // can address a node spliced in from an `include`, same as `run_block`
     // — see `resolved_canvas`'s own doc comment.
     let mut canvas = resolved_canvas(&raw, &state.canvas_path)?;
-    seed_artifact_paths(&state, &mut canvas, &effective_overrides(&state, &HashMap::new()));
     let path: Vec<&str> = if query.path.is_empty() {
         Vec::new()
     } else {
         query.path.split(',').collect()
     };
-    let chain = meshfox_core::resolve_run_chain(&canvas, &path, &query.block, !query.no_deps)?;
-    let needed = meshfox_core::env_var_names_for_chain(&canvas, &chain);
+    let mut overrides = effective_overrides(&state, &HashMap::new());
+    let plan = prepare_run_plan(
+        &state,
+        &mut canvas,
+        &path,
+        &query.block,
+        !query.no_deps,
+        &overrides,
+    )?;
+    let needed: std::collections::HashSet<_> =
+        plan.declarations.iter().map(|d| d.name.clone()).collect();
+    overrides.extend(plan.resolved.values.clone());
 
     let decls = meshfox_core::declared_vars(&canvas)
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
@@ -3082,18 +3134,28 @@ async fn get_vars(
         meshfox_core::close_over_var_refs(&decls, relevant.iter().map(|d| d.name.as_str()));
     let decls_for_resolve: Vec<_> = decls
         .iter()
-        .filter(|d| closure.contains(d.name.as_str()))
+        .filter(|d| {
+            closure.contains(d.name.as_str())
+                && !plan.resolved.secret_errors.contains_key(&d.name)
+        })
         .cloned()
         .collect();
     let shared = meshfox_core::load_shared_env(canvas_root_dir(&state.canvas_path));
-    let overrides = effective_overrides(&state, &HashMap::new());
-    let resolved = meshfox_core::resolve_with_shared(
+    let mut resolved = meshfox_core::preview_with_shared(
         &decls_for_resolve,
         &overrides,
         &cache,
         &computed,
         &shared,
     );
+    // A display-only re-resolution must not silently accept a default for a
+    // secret whose preparation failed. Keep those fields in the pre-run form.
+    resolved.missing.extend(
+        plan.resolved.missing.into_iter()
+            .filter(|d| plan.resolved.secret_errors.contains_key(&d.name)),
+    );
+    resolved.origins.extend(plan.resolved.origins);
+    resolved.secret_errors.extend(plan.resolved.secret_errors);
     // A decl that needed prompting carries its own *materialized*
     // default/choices (substituted from `default_var`/`choices_var`) in
     // `resolved.missing`, not the raw `relevant` copy — see
@@ -7113,9 +7175,16 @@ async fn force_run(
             )?;
             let raw = state.raw.lock().unwrap().clone();
             let mut canvas = resolved_canvas(&raw, &state.canvas_path)?;
-            seed_artifact_paths(&state, &mut canvas, &effective_overrides(&state, &req.vars));
             let path: Vec<&str> = req.path.iter().map(String::as_str).collect();
-            let chain = meshfox_core::resolve_run_chain(&canvas, &path, &req.block, !req.no_deps)?;
+            let chain = prepare_run_plan(
+                &state,
+                &mut canvas,
+                &path,
+                &req.block,
+                !req.no_deps,
+                &effective_overrides(&state, &req.vars),
+            )?
+            .chain;
             require_run_confirmation(&canvas, &chain, req.confirm)?;
             force_run_kill_prep(&state, &force).await?;
             run_block_impl(state, req).await
@@ -7168,9 +7237,17 @@ async fn run_block_impl_sized(
     // what `GET /api/canvas` already sends the browser, so a path/block
     // the UI read off that response resolves the same way here.
     let mut canvas = resolved_canvas(&raw_snapshot, &state.canvas_path)?;
-    seed_artifact_paths(&state, &mut canvas, &effective_overrides(&state, &req.vars));
     let path: Vec<&str> = req.path.iter().map(String::as_str).collect();
-    let chain = meshfox_core::resolve_run_chain(&canvas, &path, &req.block, !req.no_deps)?;
+    let overrides = effective_overrides(&state, &req.vars);
+    let plan = prepare_run_plan(
+        &state,
+        &mut canvas,
+        &path,
+        &req.block,
+        !req.no_deps,
+        &overrides,
+    )?;
+    let chain = plan.chain;
     require_run_confirmation(&canvas, &chain, req.confirm)?;
     let persist = req.persist;
 
@@ -7187,30 +7264,13 @@ async fn run_block_impl_sized(
     // `secret` one explicitly named in `req.save_secrets` (see that field's
     // own doc comment), still in plaintext (no encryption yet — see
     // TODO.canvas.md's own follow-up item on that).
-    let needed = meshfox_core::env_var_names_for_chain(&canvas, &chain);
     let decls = meshfox_core::declared_vars(&canvas)
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
-    let relevant_decls: Vec<_> = decls
-        .iter()
-        .filter(|d| needed.contains(&d.name))
-        .cloned()
-        .collect();
+    let relevant_decls = plan.declarations;
     validate_var_overrides(&relevant_decls, &req.vars)?;
-    // `computed` (the empty map here) means every `from`-declared decl in
-    // `relevant_decls` lands in `resolved.unresolved_from`, not `missing` —
-    // it's not an error yet, just not resolvable until its own source
-    // block runs, mid-chain, below.
-    let overrides = effective_overrides(&state, &req.vars);
     let mut resolved_vars = {
         let mut cache = state.vars_cache.lock().unwrap();
-        let shared = meshfox_core::load_shared_env(canvas_root_dir(&state.canvas_path));
-        let resolved = meshfox_core::resolve_with_shared(
-            &relevant_decls,
-            &overrides,
-            &cache,
-            &HashMap::new(),
-            &shared,
-        );
+        let resolved = plan.resolved;
         if !resolved.missing.is_empty() {
             let names: Vec<&str> = resolved.missing.iter().map(|d| d.name.as_str()).collect();
             return Err(ApiError(
@@ -8375,7 +8435,7 @@ async fn get_form_fields(
     let cache = state.vars_cache.lock().unwrap();
     let shared = meshfox_core::load_shared_env(canvas_root_dir(&state.canvas_path));
     let overrides = effective_overrides(&state, &HashMap::new());
-    let resolved = meshfox_core::resolve_with_shared(
+    let resolved = meshfox_core::preview_with_shared(
         &decls_for_resolve,
         &overrides,
         &cache,
@@ -8653,9 +8713,16 @@ async fn run_block_tty(
     if let (Some(force_node_id), Some(force_block)) = (query.force_node_id, query.force_block) {
         let raw = state.raw.lock().unwrap().clone();
         let mut canvas = resolved_canvas(&raw, &state.canvas_path)?;
-        seed_artifact_paths(&state, &mut canvas, &effective_overrides(&state, &req.vars));
         let path: Vec<&str> = req.path.iter().map(String::as_str).collect();
-        let chain = meshfox_core::resolve_run_chain(&canvas, &path, &req.block, !req.no_deps)?;
+        let chain = prepare_run_plan(
+            &state,
+            &mut canvas,
+            &path,
+            &req.block,
+            !req.no_deps,
+            &effective_overrides(&state, &req.vars),
+        )?
+        .chain;
         require_run_confirmation(&canvas, &chain, req.confirm)?;
         force_run_kill_prep(
             &state,
@@ -17864,6 +17931,200 @@ mod vars_endpoint_tests {
 
         let _ = std::fs::remove_file(&canvas_path);
         let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));
+    }
+
+    #[derive(Debug)]
+    struct CountingSecrets {
+        reads: std::sync::atomic::AtomicUsize,
+        denied: bool,
+    }
+    impl meshfox_core::secret_store::SecretBackend for CountingSecrets {
+        fn get(&self, _: &str) -> std::io::Result<Option<String>> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.denied {
+                Err(std::io::Error::other("keychain: access denied"))
+            } else {
+                Ok(Some("prepared-token".into()))
+            }
+        }
+        fn set(&self, _: &str, _: &str) -> std::io::Result<()> {
+            unreachable!()
+        }
+        fn delete(&self, _: &str) -> std::io::Result<bool> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn lazy_secrets_background_views_and_inline_forms_never_read_the_store() {
+        let path = write_test_canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n",
+            "<!-- meshfox:var name=\"LAZY_TOKEN\" secret required -->\n",
+            "```sh name=\"private\" env=\"LAZY_TOKEN\"\ntrue\n```\n",
+            "```form name=\"edit\"\nfield var=\"LAZY_TOKEN\"\n```\n",
+        ));
+        let state = build_state(path.clone(), false, None).await.unwrap();
+        let backend = Arc::new(CountingSecrets {
+            reads: Default::default(),
+            denied: true,
+        });
+        *state.vars_cache.lock().unwrap() =
+            VarCache::in_memory().with_secret_backend(backend.clone(), &path);
+        let _ = get_canvas(State(state.clone())).await.unwrap();
+        current_run_fingerprint(&state, &meshfox_core::BlockAddr::new("root", "private"));
+        file_access(&state);
+        let _ = get_form_fields(
+            State(state),
+            Query(FormFieldsQuery {
+                node_id: "root".into(),
+                block: "edit".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(backend.reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn lazy_secrets_denied_defaults_still_prompt_in_the_pre_run_form() {
+        let path = write_test_canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n",
+            "<!-- meshfox:var name=\"LAZY_TOKEN\" secret default=\"suggested\" -->\n",
+            "```sh name=\"private\" env=\"LAZY_TOKEN\"\ntrue\n```\n",
+        ));
+        let state = build_state(path.clone(), false, None).await.unwrap();
+        let backend = Arc::new(CountingSecrets {
+            reads: Default::default(),
+            denied: true,
+        });
+        *state.vars_cache.lock().unwrap() =
+            VarCache::in_memory().with_secret_backend(backend.clone(), &path);
+        let Json(fields) = get_vars(
+            State(state),
+            Query(VarsQuery {
+                path: String::new(),
+                block: "private".into(),
+                no_deps: false,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fields.len(), 1);
+        assert!(!fields[0].resolved);
+        assert!(fields[0].value.is_none());
+        assert!(fields[0]
+            .secret_error
+            .as_deref()
+            .unwrap()
+            .contains("access denied"));
+        assert_eq!(backend.reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn lazy_secrets_denial_aborts_before_the_first_chain_step() {
+        let path = write_test_canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n",
+            "<!-- meshfox:var name=\"LAZY_TOKEN\" secret required -->\n",
+            "```sh name=\"first\"\nprintf started > started\n```\n",
+            "```sh name=\"last\" deps=\"first\" env=\"LAZY_TOKEN\"\ntrue\n```\n",
+        ));
+        let state = build_state(path.clone(), false, None).await.unwrap();
+        let backend = Arc::new(CountingSecrets {
+            reads: Default::default(),
+            denied: true,
+        });
+        *state.vars_cache.lock().unwrap() =
+            VarCache::in_memory().with_secret_backend(backend.clone(), &path);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, build_app(state)).await.unwrap();
+        });
+        let events = run_ws_events(addr, &[("block", "last")]).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["type"], "error");
+        assert!(events[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("access denied"));
+        assert!(!path.parent().unwrap().join("started").exists());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn lazy_secrets_execution_uses_the_prepared_snapshot() {
+        let path = write_test_canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n",
+            "<!-- meshfox:var name=\"LAZY_TOKEN\" secret required -->\n",
+            "```sh name=\"first\" env=\"LAZY_TOKEN\"\ntest \"$LAZY_TOKEN\" = prepared-token\n```\n",
+            "```sh name=\"last\" deps=\"first\" env=\"LAZY_TOKEN\"\ntest \"$LAZY_TOKEN\" = prepared-token\n```\n",
+        ));
+        let state = build_state(path.clone(), false, None).await.unwrap();
+        let backend = Arc::new(CountingSecrets {
+            reads: Default::default(),
+            denied: false,
+        });
+        *state.vars_cache.lock().unwrap() =
+            VarCache::in_memory().with_secret_backend(backend.clone(), &path);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, build_app(state)).await.unwrap();
+        });
+        let events = run_ws_events(addr, &[("block", "last")]).await;
+        assert!(!events.iter().any(|e| e["type"] == "error"), "{events:?}");
+        assert!(
+            events
+                .iter()
+                .any(|e| e["type"] == "done" && e["exitCode"] == 0),
+            "{events:?}"
+        );
+        assert_eq!(
+            backend.reads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no reads during execution"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn lazy_secrets_runtime_selected_producer_uses_prepared_values() {
+        let path = write_test_canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n",
+            "<!-- meshfox:var name=\"LAZY_PATH\" from=\"observe\" -->\n",
+            "<!-- meshfox:var name=\"LAZY_TOKEN\" secret required -->\n",
+            "```sh name=\"observe\"\nprintf 'LAZY_PATH=result.txt\\n' > \"$MESHFOX_VARS_OUT\"\n```\n",
+            "```sh name=\"producer\" outputs=\"result.txt\" env=\"LAZY_TOKEN\"\ntest \"$LAZY_TOKEN\" = prepared-token && printf ok > result.txt\n```\n",
+            "```sh name=\"consumer\" inputs=\"$LAZY_PATH\"\ncat result.txt\n```\n",
+        ));
+        let state = build_state(path.clone(), false, None).await.unwrap();
+        let backend = Arc::new(CountingSecrets {
+            reads: Default::default(),
+            denied: false,
+        });
+        *state.vars_cache.lock().unwrap() =
+            VarCache::in_memory().with_secret_backend(backend.clone(), &path);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, build_app(state)).await.unwrap();
+        });
+        let events = run_ws_events(addr, &[("block", "consumer")]).await;
+        assert!(!events.iter().any(|e| e["type"] == "error"), "{events:?}");
+        assert!(
+            events
+                .iter()
+                .any(|e| e["type"] == "done" && e["exitCode"] == 0),
+            "{events:?}"
+        );
+        assert_eq!(backend.reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            std::fs::read_to_string(path.parent().unwrap().join("result.txt")).unwrap(),
+            "ok"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     // With `secret_store = "keychain"`, configure lists secrets (stored

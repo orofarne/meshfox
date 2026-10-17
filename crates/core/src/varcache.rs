@@ -139,6 +139,23 @@ impl VarCache {
         self
     }
 
+    /// A resolver view that cannot read the system secret store.
+    pub fn without_secret_reads(&self) -> Self {
+        let mut view = self.clone();
+        view.secrets = None;
+        view
+    }
+
+    /// A preparation-local snapshot. Each account, including absent items and
+    /// failures, is read at most once while discovering the execution graph.
+    pub fn for_run(&self) -> Self {
+        let mut view = self.clone();
+        if let Some(binding) = &mut view.secrets {
+            binding.backend = Arc::new(secret_store::ReadSnapshot::new(binding.backend.clone()));
+        }
+        view
+    }
+
     /// Which store a saved `secret` answer goes to.
     pub fn secret_store_kind(&self) -> SecretStoreKind {
         match self.secrets {

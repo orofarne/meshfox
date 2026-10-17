@@ -1763,6 +1763,18 @@ attributes `service=meshfox` and `account=<account>`, so other clients such as
 `secret-tool` see them). Elsewhere, or with no reachable Secret Service or an
 unlockable default keyring, it fails loudly on first use. With it:
 
+- Opening a canvas, rendering inline forms, inspecting file access, and
+  background freshness checks do not read the secret store. Run preparation
+  reads only the variables needed by the requested chain, including indirect
+  defaults/choices and argument references. Explicit secret configuration and
+  management can also access the store.
+- Preparation resolves artifact-path variables before discovering producers,
+  then prepares their inputs before the first block starts. If runtime
+  `from=` values can change producer or argument selection, secrets reachable
+  through the possible definitions are prepared conservatively in advance.
+  This can include a secret for a branch that ultimately is not selected.
+  Each secret account is read at most once per preparation; execution uses
+  the prepared values and does not initiate further secret-store reads.
 - The web form's "save" checkbox on a `secret` field is labelled "save to
   keychain" instead of "save (plaintext)" and writes there. It is still off
   by default. Resolution reads the keychain back where it would read the
