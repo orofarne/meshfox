@@ -483,6 +483,10 @@ enum Command {
         /// reached this way, link to it; a cycle (A links to B, B links
         /// back to A) is graceful, not an error — the back-link just
         /// resolves to A's own already-rendered page.
+        /// A `file`-node target that is a plain `.md` file (not a
+        /// `.canvas.md`) is rendered as a page too: a one-node "document"
+        /// (`page_kind` is `document` in the template context) whose title
+        /// is the file's first `# ` heading.
         #[arg(long)]
         recursive: bool,
         /// Write a `sitemap.xml` at the root of `--out`, listing every
@@ -5571,6 +5575,23 @@ struct SitemapEntry {
     canvas_path: PathBuf,
 }
 
+/// The URL path a page is actually served at, relative to `base_url`: a
+/// directory's own `index.html` is reached as the directory itself
+/// (`examples/x/index.html` -> `examples/x/`, the root's -> ``). Static hosts
+/// (Cloudflare Pages, GitHub Pages, ...) redirect the explicit `index.html`
+/// form to the directory one, and a search engine treats a sitemap `<loc>`
+/// that redirects as a non-canonical URL and defers it.
+fn sitemap_page_path(out_rel: &str) -> &str {
+    let rel = out_rel.trim_start_matches('/');
+    if rel == "index.html" {
+        ""
+    } else {
+        rel.strip_suffix("/index.html")
+            .map(|dir| &rel[..dir.len() + 1])
+            .unwrap_or(rel)
+    }
+}
+
 /// Renders `entries` into a `sitemap.xml` document (sitemaps.org's
 /// `urlset`/`url`/`loc`/`lastmod` schema) — `base_url` is required by the
 /// caller before this is ever called (a `<loc>` has to be an absolute URL).
@@ -5586,7 +5607,7 @@ fn sitemap_xml(entries: &[SitemapEntry], base_url: &str, git_dates: bool) -> Str
         let loc = format!(
             "{}/{}",
             base_url.trim_end_matches('/'),
-            entry.out_rel.trim_start_matches('/')
+            sitemap_page_path(&entry.out_rel)
         );
         xml.push_str("  <url>\n");
         xml.push_str(&format!("    <loc>{}</loc>\n", xml_escape(&loc)));
@@ -5609,6 +5630,24 @@ fn sitemap_xml(entries: &[SitemapEntry], base_url: &str, git_dates: bool) -> Str
 /// itself built (a URL join, a `git log` date), never raw user text, but
 /// escaping it anyway costs nothing and means one less thing to reason
 /// about if that ever changes.
+/// An error and everything it was caused by, joined with `: `. Tera's own
+/// `Display` is only the outermost message ("Failed to render 'index.html.tera'");
+/// the actual reason (an undefined variable, a bad filter, ...) is in its
+/// `source()` chain.
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut source = e.source();
+    while let Some(cause) = source {
+        let message = cause.to_string();
+        if !out.ends_with(&message) {
+            out.push_str(": ");
+            out.push_str(&message);
+        }
+        source = cause.source();
+    }
+    out
+}
+
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -5807,8 +5846,9 @@ fn static_cmd(
     let glob = format!("{}/**/*.tera", template_dir.display());
     let mut tera = tera::Tera::new(&glob).unwrap_or_else(|e| {
         eprintln!(
-            "meshfox static: failed to load templates from {}: {e}",
-            template_dir.display()
+            "meshfox static: failed to load templates from {}: {}",
+            template_dir.display(),
+            error_chain(&e)
         );
         std::process::exit(1);
     });
@@ -5832,6 +5872,7 @@ fn static_cmd(
         canvas_path.to_path_buf(),
         out_dir.to_path_buf(),
         String::new(),
+        meshfox_core::staticgen::PageKind::Canvas,
         template_dir,
         &tera,
         &config,
@@ -5896,6 +5937,7 @@ fn render_canvas_site<'a>(
     root_canvas_path: PathBuf,
     top_out_dir: PathBuf,
     current_slot: String,
+    kind: meshfox_core::staticgen::PageKind,
     template_dir: &'a Path,
     tera: &'a tera::Tera,
     config: &'a TemplateConfig,
@@ -5917,60 +5959,91 @@ fn render_canvas_site<'a>(
             top_out_dir.join(&current_slot)
         };
 
-        let port = coordinator::get_or_spawn(&canvas_path)
-            .await
-            .unwrap_or_else(|e| {
+        // A document (plain Markdown file) has no canvas structure for a
+        // worker to serve: it is read directly, and its images too.
+        let (site, assets, canvas_links, port) = match kind {
+            meshfox_core::staticgen::PageKind::Canvas => {
+            let port = coordinator::get_or_spawn(&canvas_path)
+                .await
+                .unwrap_or_else(|e| {
+                    eprintln!(
+                        "meshfox static: failed to start or reach the worker for {}: {e}",
+                        canvas_path.display()
+                    );
+                    std::process::exit(1);
+                });
+            let canvas = worker_client::get_canvas(port).await.unwrap_or_else(|e| {
                 eprintln!(
-                    "meshfox static: failed to start or reach the worker for {}: {e}",
+                    "meshfox static: failed to read {} through the worker: {e}",
                     canvas_path.display()
                 );
                 std::process::exit(1);
             });
-        let canvas = worker_client::get_canvas(port).await.unwrap_or_else(|e| {
-            eprintln!(
-                "meshfox static: failed to read {} through the worker: {e}",
-                canvas_path.display()
-            );
-            std::process::exit(1);
-        });
 
-        // Same "bare filename has an empty, not missing, parent" edge case
-        // `meshfox_server::get_node_file_content` handles — a canvas passed
-        // as just `README.md` (no directory component) resolves relative
-        // images/`display="code"` targets against the current directory.
-        let canvas_dir = canvas_path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let previews = fetch_node_previews(port, &canvas)
-            .await
+            // Same "bare filename has an empty, not missing, parent" edge case
+            // `meshfox_server::get_node_file_content` handles — a canvas passed
+            // as just `README.md` (no directory component) resolves relative
+            // images/`display="code"` targets against the current directory.
+            let canvas_dir = canvas_path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let previews = fetch_node_previews(port, &canvas)
+                .await
+                .unwrap_or_else(|errors| {
+                    for e in &errors {
+                        eprintln!("meshfox static: {e}");
+                    }
+                    std::process::exit(1);
+                });
+            let access = meshfox_core::FileAccess::for_canvas_path(&canvas, &canvas_path);
+            let (site, assets, canvas_links) = meshfox_core::staticgen::build_for_static_export_with_access(
+                &canvas,
+                canvas_dir,
+                &root_canvas_path,
+                &current_slot,
+                config.links_base_url.as_deref(),
+                Some(&previews),
+                copy_files,
+                recursive,
+                &access,
+            )
             .unwrap_or_else(|errors| {
                 for e in &errors {
                     eprintln!("meshfox static: {e}");
                 }
                 std::process::exit(1);
             });
-        let access = meshfox_core::FileAccess::for_canvas_path(&canvas, &canvas_path);
-        let (site, assets, canvas_links) = meshfox_core::staticgen::build_for_static_export_with_access(
-            &canvas,
-            canvas_dir,
-            &root_canvas_path,
-            &current_slot,
-            config.links_base_url.as_deref(),
-            Some(&previews),
-            copy_files,
-            recursive,
-            &access,
-        )
-        .unwrap_or_else(|errors| {
-            for e in &errors {
-                eprintln!("meshfox static: {e}");
+                (site, assets, canvas_links, Some(port))
             }
-            std::process::exit(1);
-        });
+            meshfox_core::staticgen::PageKind::Document => {
+                let access = meshfox_core::FileAccess::for_canvas_path(
+                    &meshfox_core::Canvas::default(),
+                    &root_canvas_path,
+                );
+                let (site, assets) = meshfox_core::staticgen::build_document_for_static_export(
+                    &canvas_path,
+                    &root_canvas_path,
+                    &current_slot,
+                    config.links_base_url.as_deref(),
+                    &access,
+                )
+                .unwrap_or_else(|errors| {
+                    for e in &errors {
+                        eprintln!("meshfox static: {e}");
+                    }
+                    std::process::exit(1);
+                });
+                (site, assets, Vec::new(), None)
+            }
+        };
 
         let mut context = tera::Context::new();
         context.insert("site", &site);
+        context.insert("page_kind", &kind);
+        // Relative URL of the site root from this page (`./`, `../`, `../../`).
+        let depth = current_slot.split('/').filter(|p| !p.is_empty()).count();
+        context.insert("root_href", &if depth == 0 { "./".to_string() } else { "../".repeat(depth) });
         context.insert("icons", &config.icons);
         // `meshfox_version` is always set (same string `--version` prints —
         // whichever binary is running this export); `canvas_commit` is the
@@ -5978,6 +6051,10 @@ fn render_canvas_site<'a>(
         // isn't inside a git working tree — a template decides for itself
         // whether to show either at all.
         context.insert("meshfox_version", VERSION);
+        let canvas_dir = canvas_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
         context.insert("canvas_commit", &canvas_git_commit(canvas_dir));
 
         let mut count = 0;
@@ -5994,7 +6071,18 @@ fn render_canvas_site<'a>(
                 continue;
             }
             let rendered = tera.render(name, &context).unwrap_or_else(|e| {
-                eprintln!("meshfox static: failed to render {name}: {e}");
+                let cause = error_chain(&e);
+                eprintln!(
+                    "meshfox static: failed to render {name} for {}: {cause}",
+                    canvas_path.display()
+                );
+                if cause.contains("not found in context") {
+                    eprintln!(
+                        "meshfox static: the template uses a variable this meshfox ({VERSION}) \
+                         does not provide — it may be written for a newer meshfox; update it, or \
+                         guard the variable with `| default(value=...)`"
+                    );
+                }
                 std::process::exit(1);
             });
             let page_rel = Path::new(name).with_extension("");
@@ -6039,9 +6127,12 @@ fn render_canvas_site<'a>(
             // reads the canvas directory directly at all any more.
             // External assets carry their original source base/path; the
             // namespaced output destination is not a source filesystem path.
-            let result = match &asset.include_asset {
-                Some((dir, file)) => worker_client::get_include_asset(port, dir, file).await,
-                None => worker_client::get_relative_file(port, &asset.dest_rel).await,
+            let result = match (&asset.include_asset, port) {
+                (Some((dir, file)), Some(port)) => {
+                    worker_client::get_include_asset(port, dir, file).await
+                }
+                (None, Some(port)) => worker_client::get_relative_file(port, &asset.dest_rel).await,
+                (_, None) => std::fs::read(&asset.source).map_err(|e| e.to_string()),
             };
             let bytes = result.unwrap_or_else(|e| {
                 eprintln!(
@@ -6063,6 +6154,7 @@ fn render_canvas_site<'a>(
                 root_canvas_path.clone(),
                 top_out_dir.clone(),
                 link.subdir.clone(),
+                link.kind,
                 template_dir,
                 tera,
                 config,
@@ -7509,5 +7601,23 @@ mod set_override_tests {
         let decls: Vec<VarDecl> = Vec::new();
         let overrides = HashMap::from([("UNRELATED".to_string(), "whatever".to_string())]);
         assert!(validate_set_overrides(&decls, &overrides).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod sitemap_page_path_tests {
+    use super::sitemap_page_path;
+
+    #[test]
+    fn directory_index_is_listed_as_the_directory() {
+        assert_eq!(sitemap_page_path("index.html"), "");
+        assert_eq!(sitemap_page_path("examples/x/index.html"), "examples/x/");
+        assert_eq!(sitemap_page_path("/examples/x/index.html"), "examples/x/");
+    }
+
+    #[test]
+    fn other_pages_are_left_alone() {
+        assert_eq!(sitemap_page_path("about.html"), "about.html");
+        assert_eq!(sitemap_page_path("x/notindex.html"), "x/notindex.html");
     }
 }

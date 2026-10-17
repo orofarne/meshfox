@@ -428,6 +428,108 @@ pub fn build_for_static_export_with_access(
     Ok((SiteData { title, root, edges }, assets, canvas_links))
 }
 
+/// Builds the page data for a plain Markdown file reached through a `file`
+/// node with `--recursive` (`PageKind::Document`): the file becomes a
+/// canvas of one text node — its first `# ` heading is the title, the rest
+/// is the body — and goes through the same `build_for_static_export_with_access`
+/// as any canvas, so images, links and escaping behave identically. Headings
+/// inside the file stay headings of that one body; they never become nodes.
+#[allow(clippy::too_many_arguments)]
+pub fn build_document_for_static_export(
+    markdown_path: &Path,
+    root_canvas_path: &Path,
+    current_slot: &str,
+    links_base_url: Option<&str>,
+    access: &crate::FileAccess,
+) -> Result<(SiteData, Vec<Asset>), Vec<CopyFilesTargetError>> {
+    let source = std::fs::read_to_string(markdown_path).map_err(|e| {
+        vec![CopyFilesTargetError {
+            node_id: "document".to_string(),
+            target: format!("{}: {e}", markdown_path.display()),
+        }]
+    })?;
+    let (title, body) = split_document_title(&source, markdown_path);
+    let node = Node {
+        id: "document".to_string(),
+        title,
+        level: 1,
+        node_type: NodeType::Text,
+        parent: None,
+        extra_parents: Vec::new(),
+        x: None,
+        y: None,
+        width: None,
+        height: None,
+        color: None,
+        fold: None,
+        tags: Vec::new(),
+        target: None,
+        caption: None,
+        display: None,
+        lang: None,
+        interpreter: None,
+        preview: false,
+        edge_label: None,
+        edge_label_at: None,
+        edge_source_side: None,
+        edge_target_side: None,
+        edge_via: Vec::new(),
+        text: body,
+        created_at: None,
+        updated_at: None,
+        constraint_results: Vec::new(),
+        effective_color: None,
+        body_rev: None,
+        asset_base: None,
+        plain_markdown_include: false,
+    };
+    let canvas = Canvas {
+        nodes: vec![node],
+        artifact_root: PathBuf::new(),
+        artifact_values: Default::default(),
+        options: Vec::new(),
+    };
+    let dir = markdown_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let (site, assets, _links) = build_for_static_export_with_access(
+        &canvas,
+        dir,
+        root_canvas_path,
+        current_slot,
+        links_base_url,
+        None,
+        true,
+        true,
+        access,
+    )?;
+    Ok((site, assets))
+}
+
+/// The document's title (its first `# ` line, else the file stem) and the
+/// body without that line.
+fn split_document_title(source: &str, path: &Path) -> (String, String) {
+    let mut offset = 0;
+    for line in source.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            offset += line.len();
+            continue;
+        }
+        if let Some(title) = trimmed.strip_prefix("# ") {
+            let body = source[offset + line.len()..].trim_start_matches('\n');
+            return (title.trim().to_string(), body.to_string());
+        }
+        break;
+    }
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "document".to_string());
+    (stem, source.to_string())
+}
+
 fn build_node_view(
     canvas: &Canvas,
     node: &Node,
@@ -519,8 +621,9 @@ fn build_node_view(
         let first_link_override = (node.node_type == NodeType::File && ctx.copy_files)
             .then_some(target.as_deref())
             .flatten();
+        let text = replace_button_fences(&node.text, canvas, node);
         let html_body = render_markdown(
-            &node.text,
+            &text,
             &base_dir,
             node.asset_base.as_deref(),
             ctx,
@@ -833,8 +936,11 @@ impl std::fmt::Display for CopyFilesTargetError {
 /// need to patch anything, just render what `subdir` names.
 #[derive(Debug, Clone)]
 pub struct CanvasLinkTarget {
-    /// Absolute, canonicalized path to the linked `.canvas.md` file.
+    /// Absolute, canonicalized path to the linked file — a `.canvas.md`
+    /// (`PageKind::Canvas`) or a plain Markdown file (`PageKind::Document`).
     pub resolved: PathBuf,
+    /// What `resolved` is rendered as. Exposed to templates as `page_kind`.
+    pub kind: PageKind,
     /// This target's own position in the `--out` tree, relative to the
     /// root's (see `RenderCtx::current_slot`) — computed once, purely from
     /// `resolved` and the root's own path (`canvas_link_subdir`), so every
@@ -843,6 +949,17 @@ pub struct CanvasLinkTarget {
     /// caller's own `visited`-style dedup (by `resolved`) is what makes sure
     /// it only actually gets rendered once.
     pub subdir: String,
+}
+
+/// What a rendered page is, as templates see it (`page_kind` in the context).
+/// A `Document` is a plain Markdown file (no canvas structure) rendered as a
+/// single-node canvas — a template shows it as one node read full screen
+/// instead of a board.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PageKind {
+    Canvas,
+    Document,
 }
 
 /// A `display="code"` file-node's target content, fetched ahead of time by
@@ -1035,6 +1152,74 @@ fn render_markdown(
     let mut out = String::new();
     html::push_html(&mut out, events.into_iter());
     add_target_blank(&out)
+}
+
+/// A `button` fence has no code of its own: it exists to run its `deps=`
+/// chain, and a static page can't run anything. Rather than leave its caption
+/// as an inert code block, it becomes the caption followed by links to the
+/// nodes its dependencies live in (`**Install** → [Install](#node-install)`).
+/// A button whose dependencies are all in its own node, or don't resolve to a
+/// node of this canvas, is dropped — there is nothing to point at.
+fn replace_button_fences(text: &str, canvas: &Canvas, owner: &Node) -> String {
+    if !text.contains("button") {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for fence in crate::fence::scan_raw_fences(text) {
+        let (lang, attrs) = crate::fence::parse_info_string(&fence.info);
+        if fence.delim_char != '`' || lang != "button" {
+            continue;
+        }
+        out.push_str(&text[cursor..fence.span.start]);
+        cursor = fence.span.end;
+
+        let mut targets: Vec<&Node> = Vec::new();
+        for r in crate::fence::parse_deps_list(attrs.get("deps").map(String::as_str).unwrap_or("")) {
+            let addr = crate::deps::resolve_ref(&owner.id, &r);
+            if addr.node_id == owner.id {
+                continue;
+            }
+            if let Some(node) = canvas.node(&addr.node_id) {
+                if !targets.iter().any(|t| t.id == node.id) {
+                    targets.push(node);
+                }
+            }
+        }
+        if targets.is_empty() {
+            continue;
+        }
+        let caption = fence.code.split_whitespace().collect::<Vec<_>>().join(" ");
+        let caption = if caption.is_empty() {
+            attrs.get("name").cloned().unwrap_or_default()
+        } else {
+            caption
+        };
+        let links: Vec<String> = targets
+            .iter()
+            .map(|t| format!("[{}](#node-{})", escape_markdown_inline(&t.title), t.id))
+            .collect();
+        out.push_str(&format!(
+            "\n**{}** → {}\n",
+            escape_markdown_inline(&caption),
+            links.join(", ")
+        ));
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+/// Backslash-escapes the characters that would turn plain text into Markdown
+/// markup (`*`, `_`, `` ` ``, `[`, `]`, `<`, `\`).
+fn escape_markdown_inline(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '*' | '_' | '`' | '[' | ']' | '<' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Splits `text` on `crate::subsup`'s `~sub~`/`^sup^` syntax and turns
@@ -1301,16 +1486,13 @@ fn resolve_link_url(url: &str, ctx: &RenderCtx) -> String {
     }
 }
 
-/// This repo's own naming convention for a meshfox-structured document
-/// (`TODO.canvas.md`, `memory.canvas.md`, ...) — used by `resolve_file_
-/// target_for_copy` to tell a canvas target apart from an ordinary file. Not
-/// a strict guarantee the target actually parses as one (nothing here reads
-/// it to check), just the same suffix convention every canvas in this repo
-/// already follows.
+/// Whether `path` is a canvas (`mdcanvas::is_canvas`: a `*.canvas.md`, or a
+/// plain `*.md` opening with the `meshfox:canvas` marker, like this repo's own
+/// README.md) — what `resolve_file_target_for_copy` uses to tell a canvas
+/// target apart from an ordinary file. Not a guarantee the target actually
+/// parses as one.
 fn is_canvas_file(path: &Path) -> bool {
-    path.to_string_lossy()
-        .to_ascii_lowercase()
-        .ends_with(".canvas.md")
+    crate::mdcanvas::is_canvas(path)
 }
 
 /// `resolved`'s position in the `--out` tree relative to the *root*
@@ -1333,6 +1515,11 @@ fn is_canvas_file(path: &Path) -> bool {
 /// (that only works there because an asset has one single owning include
 /// directory; a canvas link has no such single "owner" — it's whatever
 /// canvas happens to link to it, from wherever in the tree).
+/// A plain `.md` file that is not a `.canvas.md` — rendered as a document page.
+fn is_plain_markdown_file(path: &Path) -> bool {
+    !is_canvas_file(path) && path.to_string_lossy().to_ascii_lowercase().ends_with(".md")
+}
+
 fn canvas_link_subdir(resolved: &Path, root_canvas_dir: &Path) -> String {
     let rel = match resolved.strip_prefix(root_canvas_dir) {
         Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
@@ -1345,18 +1532,19 @@ fn canvas_link_subdir(resolved: &Path, root_canvas_dir: &Path) -> String {
     strip_canvas_md_suffix(&rel)
 }
 
-/// `rel` with a trailing `.canvas.md` (case-insensitive) removed — the
-/// `canvas_link_subdir`/`is_canvas_file` counterpart to `dest_rel_for`'s own
-/// plain pass-through for a non-canvas asset. Leaves `rel` untouched if it
-/// doesn't actually end that way (defensive; every real call site here only
-/// ever calls this after `is_canvas_file` already confirmed the suffix).
+/// `rel` with a trailing `.canvas.md`, or else `.md` (case-insensitive),
+/// removed — `canvas_link_subdir`'s page directory name for a canvas
+/// (`other.canvas.md` -> `other`), a marker-opening plain `.md` canvas, or a
+/// document (`SPEC.md` -> `SPEC`). Leaves `rel` untouched if it ends neither
+/// way, or if nothing would be left.
 fn strip_canvas_md_suffix(rel: &str) -> String {
-    const SUFFIX_LEN: usize = ".canvas.md".len();
-    if rel.len() > SUFFIX_LEN && rel.to_ascii_lowercase().ends_with(".canvas.md") {
-        rel[..rel.len() - SUFFIX_LEN].to_string()
-    } else {
-        rel.to_string()
+    let lower = rel.to_ascii_lowercase();
+    for suffix in [".canvas.md", ".md"] {
+        if rel.len() > suffix.len() && lower.ends_with(suffix) {
+            return rel[..rel.len() - suffix.len()].to_string();
+        }
     }
+    rel.to_string()
 }
 
 /// The relative path (a sequence of `/`-joined directory names, no leading
@@ -1466,9 +1654,27 @@ fn resolve_file_target_for_copy(
             };
             canvas_links.push(CanvasLinkTarget {
                 resolved,
+                kind: PageKind::Canvas,
                 subdir: target_slot,
             });
             href
+        }
+        // A plain Markdown file, with `--recursive`: rendered as a document
+        // page (see `build_document_for_static_export`) rather than copied
+        // as inert source text.
+        Some(resolved) if ctx.recursive && is_plain_markdown_file(&resolved) => {
+            let root_canvas_dir = ctx
+                .root_canvas_path
+                .parent()
+                .unwrap_or(ctx.root_canvas_path);
+            let target_slot = canvas_link_subdir(&resolved, root_canvas_dir);
+            let href_dir = relative_slot_path(ctx.current_slot, &target_slot);
+            canvas_links.push(CanvasLinkTarget {
+                resolved,
+                kind: PageKind::Document,
+                subdir: target_slot,
+            });
+            format!("{href_dir}/index.html")
         }
         Some(resolved) => {
             let canonical_base_dir = base_dir
@@ -2718,6 +2924,134 @@ mod tests {
         );
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // A plain Markdown file (not a `.canvas.md`) is rendered as a document
+    // page: queued as `PageKind::Document` under its own stem.
+    #[test]
+    fn recursive_queues_a_plain_markdown_target_as_a_document_page() {
+        let dir = temp_dir("recursive-document");
+        write(&dir, "SPEC.md", b"# The spec\n\nBody.\n\n## Part\n\nMore.\n");
+        write(&dir, "doc.canvas.md", b"unused");
+        let root_path = dir.join("doc.canvas.md");
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Spec\n<!-- meshfox:node id=\"f\" type=\"file\" -->\n\n[spec](SPEC.md)\n",
+        ));
+
+        let (site, _assets, canvas_links) =
+            build_for_static_export(&c, &dir, &root_path, "", None, None, true, true).unwrap();
+        assert_eq!(
+            site.find("f").unwrap().target.as_deref(),
+            Some("SPEC/index.html")
+        );
+        assert_eq!(canvas_links.len(), 1, "{canvas_links:?}");
+        assert_eq!(canvas_links[0].subdir, "SPEC");
+        assert_eq!(canvas_links[0].kind, PageKind::Document);
+
+        // Without --recursive it is still just copied, not rendered.
+        let (site, assets, canvas_links) =
+            build_for_static_export(&c, &dir, &root_path, "", None, None, true, false).unwrap();
+        assert_eq!(site.find("f").unwrap().target.as_deref(), Some("SPEC.md"));
+        assert_eq!(assets.len(), 1);
+        assert!(canvas_links.is_empty());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // A `button` fence can't run in a static page: it becomes its caption and
+    // links to the nodes its `deps=` live in, and is dropped when there is
+    // nothing to link to.
+    #[test]
+    fn a_button_fence_becomes_links_to_its_dependency_nodes() {
+        let dir = temp_dir("button-fence");
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```button name=\"go\" deps=\"install/install,tests/unit,install/other\"\n",
+            "🔨 Install *it*\n",
+            "```\n\n",
+            "```button name=\"self\" deps=\"go\"\nSame node\n```\n\n",
+            "```button name=\"nowhere\" deps=\"missing/x\"\nNowhere\n```\n\n",
+            "## Install\n<!-- meshfox:node id=\"install\" -->\n\n",
+            "```bash name=\"install\"\necho hi\n```\n\n",
+            "## Unit tests\n<!-- meshfox:node id=\"tests\" -->\n\n",
+            "```bash name=\"unit\"\necho t\n```\n",
+        ));
+        let (site, _assets, _links) =
+            build_for_static_export(&c, &dir, &dir.join("doc.canvas.md"), "", None, None, false, false)
+                .unwrap();
+        let body = &site.root.html_body;
+        assert!(
+            body.contains("<strong>🔨 Install *it*</strong> → <a href=\"#node-install\">Install</a>, <a href=\"#node-tests\">Unit tests</a>"),
+            "{body}"
+        );
+        assert!(!body.contains("language-button"), "{body}");
+        assert!(!body.contains("Same node") && !body.contains("Nowhere"), "{body}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // A plain `.md` that opens with the `meshfox:canvas` marker is a canvas
+    // (same check as everywhere else), not a document: queued as
+    // `PageKind::Canvas`, in a directory named after its stem.
+    #[test]
+    fn recursive_treats_a_marked_plain_markdown_target_as_a_canvas() {
+        let dir = temp_dir("recursive-marked-md");
+        write(
+            &dir,
+            "notes.md",
+            b"<!-- meshfox:canvas -->\n# Notes\n<!-- meshfox:node id=\"root\" -->\n",
+        );
+        write(&dir, "doc.canvas.md", b"unused");
+        let root_path = dir.join("doc.canvas.md");
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Notes\n<!-- meshfox:node id=\"f\" type=\"file\" -->\n\n[notes](notes.md)\n",
+        ));
+
+        let (site, _assets, canvas_links) =
+            build_for_static_export(&c, &dir, &root_path, "", None, None, true, true).unwrap();
+        assert_eq!(
+            site.find("f").unwrap().target.as_deref(),
+            Some("notes/index.html")
+        );
+        assert_eq!(canvas_links[0].kind, PageKind::Canvas);
+        assert_eq!(canvas_links[0].subdir, "notes");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // The document's first `# ` line is its title; its headings stay inside
+    // the one body instead of becoming nodes.
+    #[test]
+    fn a_document_page_is_one_node_titled_by_its_first_heading() {
+        let dir = temp_dir("document-page");
+        write(&dir, "SPEC.md", b"\n# The spec\n\nBody.\n\n## Part\n\nMore.\n");
+        let root_path = dir.join("doc.canvas.md");
+        let access = crate::FileAccess::from_values(&dir.join(".static-export"), Default::default());
+
+        let (site, _assets) = build_document_for_static_export(
+            &dir.join("SPEC.md"),
+            &root_path,
+            "SPEC",
+            None,
+            &access,
+        )
+        .unwrap();
+        assert_eq!(site.title, "The spec");
+        assert!(site.root.children.is_empty());
+        assert!(site.root.html_body.contains("<p>Body.</p>"), "{}", site.root.html_body);
+        assert!(site.root.html_body.contains("<h2>Part</h2>"), "{}", site.root.html_body);
+        assert!(!site.root.html_body.contains("The spec"), "title is not repeated in the body");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_document_without_a_heading_is_titled_by_its_file_stem() {
+        let (title, body) = split_document_title("Just prose.\n", Path::new("notes.md"));
+        assert_eq!(title, "notes");
+        assert_eq!(body, "Just prose.\n");
     }
 
     // `other.canvas.md#some-node` deep-links to a specific node — carried

@@ -6325,18 +6325,6 @@ async fn run_file_node_impl(state: Arc<AppState>, id: String) -> Result<Response
         .unwrap())
 }
 
-/// Whether `path` (already resolved/confined on disk) counts as a canvas —
-/// `meshfox_core::mdcanvas::is_canvas_path`'s cheap suffix check first, and
-/// only falling back to actually reading the file (for a plain `.md` that
-/// might carry the `meshfox:canvas` marker) when that's inconclusive, so a
-/// `.png`/`.pdf`/etc. target never gets read just to be rejected.
-fn is_canvas_file(path: &std::path::Path) -> bool {
-    meshfox_core::mdcanvas::is_canvas_path(path)
-        || (path.extension().is_some_and(|ext| ext == "md")
-            && std::fs::read_to_string(path)
-                .is_ok_and(|contents| meshfox_core::mdcanvas::has_marker(&contents)))
-}
-
 /// Who is asking `open_node_file` to open something — decides *where* the
 /// target gets opened. Required on every call (no default): a client that
 /// forgot to say would silently get the old "ask this worker's coordinator"
@@ -6427,7 +6415,7 @@ async fn open_node_file(
     let (target_path, fragment) = meshfox_core::mdcanvas::split_target_fragment(target);
     let fragment = fragment.map(str::to_string);
     let resolved = resolve_confined_target(&state, target_path)?;
-    let is_canvas = is_canvas_file(&resolved);
+    let is_canvas = meshfox_core::mdcanvas::is_canvas(&resolved);
     let path = resolved.to_string_lossy().into_owned();
 
     if query.context == OpenContext::Vscode {

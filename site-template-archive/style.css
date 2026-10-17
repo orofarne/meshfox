@@ -147,3 +147,24 @@ dialog.lamp::backdrop { background:transparent; }
   .lamp-sheet::after { display:none; }
   .lamp-btn { width:2.2rem; height:2.2rem; }
 }
+
+/* A plain Markdown file rendered as a page (page_kind == "document"): the lamp sheet, always open, in the page itself. */
+.reader-wrap { min-height:100vh; display:flex; justify-content:center; align-items:flex-start; padding:4rem 3vw 3vh; background:radial-gradient(ellipse 70% 60% at 50% 20%,#4a3a2c 0%,#2a1f17 55%,#0a0705 100%); }
+.lamp-sheet.reader { max-height:none; }
+.reader .lamp-scroll { overflow:visible; }
+a.lamp-close { display:grid; place-items:center; text-decoration:none; }
+.reader .lamp-title { font-size:clamp(1.6rem,4vw,2.4rem); }
+.reader .node-body table { display:block; overflow-x:auto; }
+@media(max-width:760px) { .reader-wrap { padding:2.4rem 0 0; } .lamp-shadow { height:auto; } }
+
+/* Copy button on code blocks (copy.js). */
+.code-wrap { position:relative; margin:1em 0; }
+.node-body > .code-wrap:first-child { margin-top:0; }
+.node-body > .code-wrap:last-child { margin-bottom:0; }
+.code-wrap > pre { margin:0; }
+.copy-btn { position:absolute; top:.4rem; right:.5rem; padding:.15rem .5rem; border:1px solid #f6e9d466; border-radius:3px; background:#342e2acc; color:#f6e9d4; font:700 .65rem/1.4 var(--mono); letter-spacing:.08em; text-transform:uppercase; cursor:pointer; opacity:0; transition:opacity .15s; }
+.code-wrap:hover > .copy-btn,.copy-btn:focus-visible,.copy-btn.done { opacity:1; }
+.copy-btn:hover { background:#4d433c; }
+.copy-btn:focus-visible { outline:2px solid #f6e9d4; outline-offset:2px; }
+.copy-btn.done { color:#9fd08a; border-color:#9fd08a99; }
+@media (hover:none) { .copy-btn { opacity:.85; } }

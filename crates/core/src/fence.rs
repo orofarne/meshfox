@@ -828,7 +828,7 @@ pub fn combine_fingerprints<I: IntoIterator<Item = String>>(parts: I) -> String 
     format!("{:08x}", fnv1a(joined.as_bytes()))
 }
 
-fn parse_info_string(info: &str) -> (String, HashMap<String, String>) {
+pub(crate) fn parse_info_string(info: &str) -> (String, HashMap<String, String>) {
     let mut tokens = crate::attrs::tokenize(info).into_iter();
     let lang = tokens.next().unwrap_or_default();
     let attrs = crate::attrs::attrs_from_tokens(tokens);

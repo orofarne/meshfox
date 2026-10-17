@@ -4,21 +4,53 @@
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{ site.title }}</title>
+{%- if page_kind | default(value="canvas") == "document" %}
+<meta name="description" content="{{ site.root.html_body | striptags | replace(from="\n", to=" ") | truncate(length=160) | trim }}">
+{%- else %}
+<meta name="description" content="{{ site.title }} — an interactive meshfox canvas: a hierarchical, node-based Markdown document with runnable code blocks.">
+{%- endif %}
+<meta name="theme-color" content="#e4d7bb">
+<link rel="preload" href="fonts/special-elite-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="fonts/ibm-plex-serif-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="fonts/ibm-plex-mono-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>
 {%- for icon in icons %}
 <link rel="{{ icon.rel }}" href="{{ icon.href }}"{% if icon.type %} type="{{ icon.type }}"{% endif %}{% if icon.sizes %} sizes="{{ icon.sizes }}"{% endif %}>
 {%- endfor %}
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
+{%- if page_kind | default(value="canvas") == "document" %}
+<main class="reader-wrap">
+  <div class="lamp-shadow"><article class="lamp-sheet reader" id="node-{{ site.root.id }}">
+    <a class="lamp-close" href="{{ root_href }}" aria-label="Back to the board" title="Back to the board">✕</a>
+    <header class="lamp-head">
+      <nav class="lamp-crumbs" aria-label="Path"><a href="{{ root_href }}">← Back to the board</a></nav>
+      <h1 class="lamp-title">{{ site.title }}</h1>
+    </header>
+    <div class="lamp-scroll"><div class="node-body">{{ site.root.html_body | safe }}</div></div>
+  </article></div>
+</main>
+<footer class="archive-footer">BUILT WITH MESHFOX {{ meshfox_version }}</footer>
+<script src="copy.js" defer></script>
+{%- else %}
 <header class="archive-header">
   <h1>{{ site.title }}</h1>
   <span class="stamp">VERSION {{ canvas_commit | default(value="UNFILED") }}</span>
 </header>
 <main class="board-wrap"><div class="tree all-svg-edges">{{ macros::node(n=site.root, spatial=false) }}</div></main>
-<footer class="archive-footer">ARCHIVED WITH MESHFOX {{ meshfox_version }}</footer>
+<footer class="archive-footer">BUILT WITH MESHFOX {{ meshfox_version }}</footer>
 <script id="mesh-edge-data" type="application/json">{{ site.edges | script_json | safe }}</script>
+<script src="copy.js" defer></script>
 <script src="layout.js" defer></script>
-<script src="highlight.js" defer></script>
 <script src="edges.js" defer></script>
 <script src="lamp.js" defer></script>
+{%- endif %}
+<script>
+// highlight.js is ~770 KB: fetch it only for pages with code blocks, and
+// only once the page has loaded, so it never competes with first paint.
+if (document.querySelector('pre > code[class*="language-"]')) addEventListener('load', () => {
+  const load = () => { const s = document.createElement('script'); s.src = 'highlight.js'; document.head.appendChild(s); };
+  'requestIdleCallback' in window ? requestIdleCallback(load, { timeout: 2000 }) : setTimeout(load, 200);
+});
+</script>
 </body></html>

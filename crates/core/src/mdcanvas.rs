@@ -62,6 +62,17 @@ pub fn is_canvas_path(path: &std::path::Path) -> bool {
     path.to_string_lossy().ends_with(".canvas.md")
 }
 
+/// Whether the file at `path` counts as a canvas: a `*.canvas.md` by name
+/// ([`is_canvas_path`]), or a plain `*.md` that opens with the
+/// `meshfox:canvas` marker ([`has_marker`]). The name check goes first, and
+/// only a `*.md` is ever read, so a `.png`/`.pdf`/etc. never is just to be
+/// rejected. An unreadable file is not a canvas.
+pub fn is_canvas(path: &std::path::Path) -> bool {
+    is_canvas_path(path)
+        || (path.extension().is_some_and(|ext| ext == "md")
+            && std::fs::read_to_string(path).is_ok_and(|contents| has_marker(&contents)))
+}
+
 /// Splits a `file`/`link` node's `target` on its first `#` into the path
 /// portion and an optional fragment — e.g. `other.canvas.md#some-node` deep
 /// links to node `some-node` in that canvas. The fragment must be stripped

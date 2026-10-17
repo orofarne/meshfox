@@ -294,6 +294,8 @@ fn refuses_to_clobber_a_non_empty_out_dir_without_force() {
 // a CLI-level test to exercise it at all).
 #[test]
 fn sitemap_lists_the_rendered_page_with_an_absolute_url() {
+    // A directory's index.html is listed as the directory URL: hosts redirect
+    // the explicit form, and a redirecting <loc> is deferred by search engines.
     let template_dir = unique_dir("template-sitemap");
     write_file(&template_dir.join("index.html.tera"), "{{ site.title }}");
     write_file(
@@ -320,7 +322,7 @@ fn sitemap_lists_the_rendered_page_with_an_absolute_url() {
 
     let sitemap = std::fs::read_to_string(out_dir.join("sitemap.xml")).unwrap();
     assert!(
-        sitemap.contains("<loc>https://example.com/repo/index.html</loc>"),
+        sitemap.contains("<loc>https://example.com/repo/</loc>"),
         "{sitemap}"
     );
     assert!(
@@ -805,4 +807,87 @@ fn copies_shared_images_and_attachments_allowed_by_parent_config() {
     assert!(copied.iter().any(|s| s == "shared image bytes"));
     assert!(copied.iter().any(|s| s == "shared datasheet bytes"));
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+// A plain Markdown file linked from a `file` node is rendered, with
+// `--copy-files --recursive`, as a document page through the same template:
+// `page_kind` is "document", its body is the file's Markdown, and it gets a
+// sitemap entry of its own.
+#[test]
+fn recursive_renders_a_plain_markdown_target_as_a_document_page() {
+    let template_dir = unique_dir("template-document");
+    write_file(
+        &template_dir.join("index.html.tera"),
+        "{{ page_kind }}|{{ root_href | safe }}|{{ site.title }}|{{ site.root.html_body | safe }}",
+    );
+    write_file(
+        &template_dir.join("template.toml"),
+        "api_version = 1\nbase_url = \"https://example.com\"\n",
+    );
+
+    let dir = unique_dir("canvas-document");
+    let canvas_path = dir.join("doc.canvas.md");
+    write_file(
+        &canvas_path,
+        "# Root\n<!-- meshfox:node id=\"root\" -->\n\n## Spec\n<!-- meshfox:node id=\"spec\" type=\"file\" -->\n\n[spec](SPEC.md)\n",
+    );
+    write_file(&dir.join("SPEC.md"), "# The spec\n\nHello **world**.\n");
+
+    let out_dir = unique_dir("out-document");
+    let status = meshfox()
+        .arg("static")
+        .arg(&canvas_path)
+        .arg("--template")
+        .arg(&template_dir)
+        .arg("--out")
+        .arg(&out_dir)
+        .args(["--copy-files", "--recursive", "--sitemap"])
+        .status()
+        .expect("failed to run meshfox");
+    assert!(status.success());
+
+    let root = std::fs::read_to_string(out_dir.join("index.html")).unwrap();
+    assert!(root.starts_with("canvas|./|Root|"), "{root}");
+
+    let page = std::fs::read_to_string(out_dir.join("SPEC/index.html")).unwrap();
+    assert!(page.starts_with("document|../|The spec|"), "{page}");
+    assert!(page.contains("<strong>world</strong>"), "{page}");
+
+    let sitemap = std::fs::read_to_string(out_dir.join("sitemap.xml")).unwrap();
+    assert!(sitemap.contains("<loc>https://example.com/SPEC/</loc>"), "{sitemap}");
+
+    let _ = std::fs::remove_dir_all(&template_dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+// A render failure names the real cause (Tera's own message is only
+// "Failed to render '<template>'") and the page it happened on.
+#[test]
+fn a_template_render_error_reports_the_underlying_cause() {
+    let template_dir = unique_dir("template-bad-var");
+    write_file(&template_dir.join("index.html.tera"), "{{ no_such_variable }}");
+
+    let canvas_path = unique_dir("canvas-bad-var").join("doc.canvas.md");
+    write_file(&canvas_path, FIXTURE_CANVAS);
+    let out_dir = unique_dir("out-bad-var");
+
+    let output = meshfox()
+        .arg("static")
+        .arg(&canvas_path)
+        .arg("--template")
+        .arg(&template_dir)
+        .arg("--out")
+        .arg(&out_dir)
+        .output()
+        .expect("failed to run meshfox");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no_such_variable"), "{stderr}");
+    assert!(stderr.contains("doc.canvas.md"), "{stderr}");
+    assert!(stderr.contains("does not provide"), "{stderr}");
+
+    let _ = std::fs::remove_dir_all(&template_dir);
+    let _ = std::fs::remove_dir_all(canvas_path.parent().unwrap());
+    let _ = std::fs::remove_dir_all(&out_dir);
 }

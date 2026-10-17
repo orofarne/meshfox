@@ -63,10 +63,27 @@ Every page is rendered with these variables:
 | `icons` | list of `{rel, href, sizes?, type?}` | The `[[icons]]` of `template.toml`; empty when there are none. A key that is not set is absent — test it with `{% if icon.sizes %}`. |
 | `meshfox_version` | string | The version of the `meshfox` binary doing the export. |
 | `canvas_commit` | string, maybe absent | The short git `HEAD` of the repository the canvas lives in. Absent outside a git working tree, so use `{% if canvas_commit %}` or `default(value=...)`. |
+| `page_kind` | string | `"canvas"` for a `.canvas.md` page, `"document"` for a plain Markdown file rendered with `--recursive` (see below). |
+| `root_href` | string | Relative URL of the site root from this page: `./` for the root page, `../` one level down, and so on. |
 
 With `--recursive`, each nested canvas is rendered with the same template into
 its own subdirectory, and `site` is *that* canvas's data. The context does not
 say where in the site a page lives; use relative links.
+
+### Document pages
+
+With `--copy-files --recursive`, a `file` node whose target is a plain `.md`
+file (not a `.canvas.md`) is rendered as a page of its own, at the target's
+path without the extension (`SPEC.md` → `SPEC/index.html`), through the same
+template. `page_kind` is `"document"`, and `site` holds a canvas of exactly
+one node: `site.title` and `site.root.title` are the file's first `# `
+heading (or its file name when it has none), `site.root.html_body` is the rest
+of the file, its headings staying headings of that one body, and
+`site.root.children` and `site.edges` are empty. A template is expected to show
+it as one node read in full, not as a board; the shipped templates reuse the
+full-screen reading sheet (`lamp.js`) as the page itself. Without
+`--recursive` such a file is copied verbatim instead, as before. Links inside
+the file follow the usual rules (`links_base_url` for a relative one).
 
 ### `SiteData`
 

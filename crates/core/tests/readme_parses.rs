@@ -20,12 +20,11 @@ fn readme_is_a_valid_canvas() {
         );
     }
 
-    // "File format" is meshfox's own `include`, dynamically pulling in
-    // SPEC.md — check that it's well-formed and its target actually
-    // resolves (missing file, cycle, bad parse), same as `meshfox validate`.
+    // "File format" links SPEC.md as a `file` node (the static site renders
+    // it as a page of its own, see `meshfox static --recursive`) — check
+    // that its target really exists next to the README.
     let file_format = canvas.node("file-format").expect("File format node");
-    assert_eq!(file_format.node_type, meshfox_core::NodeType::Include);
+    assert_eq!(file_format.node_type, meshfox_core::NodeType::File);
     assert_eq!(file_format.target.as_deref(), Some("./SPEC.md"));
-    meshfox_core::include::resolve(&canvas, std::path::Path::new(path))
-        .expect("README.md's include(s) should resolve cleanly");
+    assert!(std::path::Path::new(path).with_file_name("SPEC.md").exists());
 }
