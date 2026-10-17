@@ -448,3 +448,43 @@ test("10. scrolling onto a file node's code preview hands the wheel to its conte
 }) => {
   await testScrollHandoff(page, "code-hscroll-node", "file-vscroll-node", fileCodePreview(page, "file-vscroll-node"), "vertical");
 });
+
+test("highlighted source keeps its scroll when another tab's TTY status updates", async ({ page }) => {
+  let finished = false;
+  await page.route("**/api/runs", route => route.fulfill({ json: [{
+    nodeId: "code-hscroll-node", block: "wide", kind: "tty",
+    status: finished ? "exited" : "running", uptimeMs: 1000,
+    ...(finished ? { exitCode: 0 } : {}),
+  }] }));
+  await page.reload();
+  await clickFitViewAndWait(page);
+  const source = block(page, "code-hscroll-node", "wide").locator(".mesh-shiki pre");
+  await expect(source).toBeVisible();
+  await expect(block(page, "code-hscroll-node", "wide").locator(".mesh-kill-button")).toBeVisible();
+  await source.evaluate(el => { el.scrollLeft = 120; el.dataset.scrollIdentity = "original"; });
+  const before = await scrollPos(source);
+  expect(before.left).toBeGreaterThan(0);
+  finished = true;
+  await expect(block(page, "code-hscroll-node", "wide").locator(".mesh-kill-button")).toHaveCount(0, { timeout: 10_000 });
+  await expect(source).toHaveAttribute("data-scroll-identity", "original");
+  expect(await scrollPos(source)).toEqual(before);
+});
+
+test("highlighted source keeps its scroll during idle background polling", async ({ page }) => {
+  let polls = 0;
+  await page.route("**/api/runs", async route => {
+    await route.fulfill({ json: [] });
+    polls++;
+  });
+  await page.reload();
+  await clickFitViewAndWait(page);
+  const source = block(page, "code-hscroll-node", "wide").locator(".mesh-shiki pre");
+  await expect(source).toBeVisible();
+  await source.evaluate(el => { el.scrollLeft = 120; el.dataset.scrollIdentity = "original"; });
+  const before = await scrollPos(source);
+  expect(before.left).toBeGreaterThan(0);
+  const initialPolls = polls;
+  await expect.poll(() => polls, { timeout: 10_000 }).toBeGreaterThan(initialPolls + 1);
+  await expect(source).toHaveAttribute("data-scroll-identity", "original");
+  expect(await scrollPos(source)).toEqual(before);
+});

@@ -1421,6 +1421,10 @@ const JUMP_HIGHLIGHT_MS = 1200;
  */
 function HighlightedCode({ code, lang }: { code: string; lang: string }) {
   const [html, setHtml] = useState<string | null>(null);
+  // React compares this prop by identity. A fresh object on a status
+  // update rewrites innerHTML, replacing the scrollable <pre> even when
+  // the highlighted source is unchanged.
+  const highlightedHtml = useMemo(() => ({ __html: html ?? "" }), [html]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1445,7 +1449,7 @@ function HighlightedCode({ code, lang }: { code: string; lang: string }) {
     <div
       className="mesh-code-block-source mesh-shiki nodrag nopan"
       // eslint-disable-next-line react/no-danger -- Shiki's own trusted HTML output, not user input
-      dangerouslySetInnerHTML={{ __html: html }}
+      dangerouslySetInnerHTML={highlightedHtml}
     />
   );
 }
