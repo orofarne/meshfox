@@ -53,6 +53,7 @@ impl Drop for SessionPermit {
 
 pub struct TuiSession {
     parser: Arc<Mutex<vt100::Parser>>,
+    raw: Arc<Mutex<Vec<u8>>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Box<dyn Child + Send + Sync>,
     // Keeps the pty's master side alive for the session's whole lifetime —
@@ -73,6 +74,16 @@ impl TuiSession {
     /// `fixture_dir` is removed on `Drop` — pass the directory `canvas_path`
     /// itself lives in (see `fixtures::write_fixture`).
     pub fn spawn(canvas_path: &Path, fixture_dir: PathBuf, rows: u16, cols: u16) -> Self {
+        Self::spawn_with_status(canvas_path, fixture_dir, rows, cols, "off")
+    }
+
+    pub fn spawn_with_status(
+        canvas_path: &Path,
+        fixture_dir: PathBuf,
+        rows: u16,
+        cols: u16,
+        mode: &str,
+    ) -> Self {
         let permit = SessionPermit::acquire();
         // `cargo test`'s own `.cargo/config.toml` runner (`scripts/run-signed.sh`)
         // only re-signs whatever cargo itself execs as *this* test binary — it
@@ -116,6 +127,8 @@ impl TuiSession {
         let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_meshfox"));
         cmd.arg("tui");
         cmd.arg(canvas_path);
+        cmd.arg("--terminal-status");
+        cmd.arg(mode);
         // Isolates this process from whatever the *real* machine's
         // `~/.meshfox/config.toml` happens to declare — `meshfox_core::config`
         // reads `$HOME/.meshfox/config.toml` unconditionally, so a developer
@@ -143,6 +156,8 @@ impl TuiSession {
             Arc::new(Mutex::new(pair.master.take_writer().expect("pty writer")));
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
+        let raw = Arc::new(Mutex::new(Vec::new()));
+        let raw_for_thread = Arc::clone(&raw);
         let parser_for_thread = Arc::clone(&parser);
         let writer_for_thread = Arc::clone(&writer);
         std::thread::spawn(move || {
@@ -159,6 +174,14 @@ impl TuiSession {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         let chunk = &buf[..n];
+                        {
+                            let mut raw = raw_for_thread.lock().unwrap();
+                            raw.extend_from_slice(chunk);
+                            if raw.len() > 131072 {
+                                let excess = raw.len() - 131072;
+                                raw.drain(..excess);
+                            }
+                        }
                         parser_for_thread.lock().unwrap().process(chunk);
                         // `Picker::from_query_stdio` (see `App::new`'s own
                         // startup, `crates/cli/src/tui/app.rs::build_picker`)
@@ -195,11 +218,37 @@ impl TuiSession {
 
         TuiSession {
             parser,
+            raw,
             writer,
             child,
             _master: pair.master,
             fixture_dir,
             _permit: permit,
+        }
+    }
+
+    pub fn clear_raw(&self) {
+        self.raw.lock().unwrap().clear();
+    }
+
+    pub fn wait_for_raw(&self, sequence: &str, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self
+                .raw
+                .lock()
+                .unwrap()
+                .windows(sequence.len())
+                .any(|w| w == sequence.as_bytes())
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "missing terminal sequence {sequence:?}; screen:\n{}",
+                self.screen_text()
+            );
+            std::thread::sleep(Duration::from_millis(25));
         }
     }
 

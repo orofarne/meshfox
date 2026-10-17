@@ -121,6 +121,18 @@ pub struct CodeBlock {
 }
 
 impl CodeBlock {
+    /// Explicit `tangle` flag (`tangle` or `tangle="true"`): run this block's
+    /// code from a stable hidden file in its working directory instead of a
+    /// throwaway temp file — see `crate::tangle`. Needs an `interpreter=`
+    /// (`crate::deps::validate` rejects it otherwise). Read off `attrs`
+    /// rather than stored, so it is carried through a fence rewrite as the
+    /// untyped attribute it is.
+    pub fn tangle(&self) -> bool {
+        self.attrs
+            .get("tangle")
+            .is_some_and(|value| value != "false")
+    }
+
     /// Requires explicit approval for each invocation, including dependency runs.
     pub fn requires_confirmation(&self) -> bool {
         self.attrs
@@ -231,7 +243,11 @@ pub struct EnvRef {
 /// check`) — the same place a `deps=` reference to a block that doesn't
 /// exist is already caught, not by the fence grammar itself.
 fn strip_dollar(s: &str) -> &str {
-    if s.starts_with("${") { s } else { s.strip_prefix('$').unwrap_or(s) }
+    if s.starts_with("${") {
+        s
+    } else {
+        s.strip_prefix('$').unwrap_or(s)
+    }
 }
 
 fn parse_env_ref(s: &str) -> EnvRef {
@@ -521,6 +537,7 @@ const FENCE_ATTRS: &[&str] = &[
     "render",
     "send",
     "fold",
+    "tangle",
 ];
 
 /// Known `render=` values — see `CodeBlock::render`'s own doc comment and
@@ -727,7 +744,9 @@ pub fn fingerprint(block: &CodeBlock) -> String {
     let env_refs = if block.attrs.get("env").is_some_and(|raw| raw.contains("${")) {
         source_env = parse_env(&block.attrs);
         &source_env
-    } else { &block.env };
+    } else {
+        &block.env
+    };
     for env in env_refs {
         parts.push(format!("{}\u{0}{}", env.local_name, env.var_name));
     }

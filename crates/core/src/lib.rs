@@ -28,8 +28,9 @@ pub mod locate;
 pub mod mdcanvas;
 pub mod merge;
 pub mod options;
-pub mod process_env;
 pub mod output;
+pub mod process_env;
+pub mod prune;
 pub mod run_plan;
 pub mod secret_index;
 pub mod secret_store;
@@ -41,6 +42,7 @@ pub mod subsup;
 pub mod svg;
 pub mod syntax_dirs;
 pub mod tag_colors;
+pub mod tangle;
 pub mod timestamp;
 pub mod tree;
 pub mod varcache;
@@ -59,7 +61,8 @@ pub use deps::{
 };
 pub use exec::{
     interpreter_var_refs, is_button, is_form, is_supported_lang, resolve_command,
-    resolve_interpreter, split_interpreter, ResolvedCommand, BUTTON_LANG, FORM_LANG,
+    resolve_interpreter, script_extension, script_file, split_interpreter, write_script_file,
+    ResolvedCommand, BUTTON_LANG, FORM_LANG,
 };
 pub use fence::{
     fingerprint, parse_deps_list, parse_env_list, scan_code_blocks, scan_runnable_blocks,
@@ -67,7 +70,8 @@ pub use fence::{
 };
 pub mod dirvars;
 pub use dirvars::{
-    expand_dir_value, expand_file_value, expand_target, is_tmp_ref, reset_tmp, tmp_dir, tmp_size, FileAccess,
+    expand_dir_value, expand_file_value, expand_target, is_tmp_ref, reset_tmp, tmp_dir, tmp_size,
+    FileAccess,
 };
 pub use file_read::{
     confine, confine_in, preview, preview_in, ConfineError, FilePreview, PreviewError,
@@ -285,7 +289,9 @@ pub fn autorun_blocks_for_changed_vars(
             let Some(name) = &block.name else { continue };
             let bound;
             let block = if block.env.iter().any(|env| env.var_name.contains("${")) {
-                let Ok(selected) = args::bind_block(&node.id, &node.text, name, &canvas.artifact_values) else {
+                let Ok(selected) =
+                    args::bind_block(&node.id, &node.text, name, &canvas.artifact_values)
+                else {
                     continue;
                 };
                 bound = selected;

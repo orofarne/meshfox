@@ -334,10 +334,16 @@ fn terminal_status_never_writes_control_sequences_to_redirected_output() {
     ).unwrap();
     for mode in ["iterm2", "progress", "title"] {
         let output = meshfox()
-            .arg(&canvas).args(["run", "report", "--terminal-status", mode])
+            .arg(&canvas)
+            .args(["run", "report", "--terminal-status", mode])
             .env("MESHFOX_TERMINAL_STATUS", "off")
-            .output().unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert!(String::from_utf8_lossy(&output.stdout).contains("report output"));
         assert!(!output.stdout.windows(2).any(|w| w == b"\x1b]"));
         assert!(!output.stderr.windows(2).any(|w| w == b"\x1b]"));

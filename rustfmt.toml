@@ -1,0 +1,3 @@
+# Pinned explicitly: formatting follows the crates' edition, so a future rustfmt
+# default change does not silently reformat the tree. Run `cargo fmt --all`.
+style_edition = "2021"

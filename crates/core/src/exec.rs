@@ -133,18 +133,20 @@ pub struct ResolvedCommand {
     pub extra_envs: Vec<(String, String)>,
 }
 
-/// `lang`/`cwd`/`canvas_path`/`env_names` are only consulted for an `@name`
+/// `lang`/`cwd`/`origin`/`env_names` are only consulted for an `@name`
 /// builtin spec (see `crate::builtin_interpreter::resolve_with_env`) —
-/// `cwd` as the local config root, `canvas_path` to key `@python_venv`'s
-/// own venv directory, `env_names` (the block's own `env=` locals) for
-/// `@agent`'s prompt interpolation. All three can be left empty/`None` for
-/// a plain `interpreter=`, which never touches any of them.
+/// `cwd` as the local config root, `origin`'s canvas path to key
+/// `@python_venv`'s own venv directory, `env_names` (the block's own `env=`
+/// locals) for `@agent`'s prompt interpolation — with one exception: an
+/// `origin` that carries `tangle` makes the code a stable file in `cwd`
+/// (`crate::tangle`) instead of a temp file, for any interpreter. All of
+/// them can be left empty/`None` for a plain `interpreter=`.
 pub fn resolve_command(
     code: &str,
     interpreter: Option<&str>,
     lang: Option<&str>,
     cwd: Option<&std::path::Path>,
-    canvas_path: Option<&std::path::Path>,
+    origin: Option<crate::tangle::BlockOrigin<'_>>,
     env_names: &[String],
 ) -> io::Result<ResolvedCommand> {
     match interpreter {
@@ -161,7 +163,7 @@ pub fn resolve_command(
                 spec,
                 lang,
                 cwd,
-                canvas_path,
+                origin.map(|o| o.canvas_path),
                 env_names,
             )? {
                 Some((path, envs)) => {
@@ -180,17 +182,75 @@ pub fn resolve_command(
                     format!("interpreter={spec:?} isn't a valid shell-word command"),
                 )
             })?;
-            let path = std::env::temp_dir().join(format!("meshfox-{}.tmp", uuid_like_suffix()));
-            std::fs::write(&path, code)?;
+            let (path, cleanup) = script_file(code, lang, cwd, origin)?;
             args.push(path.display().to_string());
             Ok(ResolvedCommand {
                 program,
                 args,
-                cleanup: Some(path),
+                cleanup,
                 extra_envs,
             })
         }
     }
+}
+
+/// The file extension a block's code is written under for `lang`, without
+/// the dot. Runtimes pick a mode from it — Node reads `.tmp` as CommonJS
+/// only (an ESM `import` fails with `ERR_UNKNOWN_FILE_EXTENSION`), `deno`
+/// and `tsx` need `.ts` — so the extension follows the fence language.
+/// `tmp` for a language with no entry (and for `@name` builtins' `text`/
+/// `toml` bodies, which are data for a script, not code).
+pub fn script_extension(lang: Option<&str>) -> &'static str {
+    match lang.map(str::to_ascii_lowercase).as_deref() {
+        Some("python" | "python3" | "py") => "py",
+        Some("javascript" | "js" | "node" | "nodejs" | "mjs") => "js",
+        Some("typescript" | "ts") => "ts",
+        Some("ruby" | "rb") => "rb",
+        Some("perl" | "pl") => "pl",
+        Some("php") => "php",
+        Some("lua") => "lua",
+        Some("sql") => "sql",
+        Some("go" | "golang") => "go",
+        Some("bash" | "sh" | "shell" | "zsh") => "sh",
+        _ => "tmp",
+    }
+}
+
+/// The file an `interpreter=` runs `code` from, and the path the caller must
+/// remove once the child has exited (`None` for a tangled file, which stays):
+/// the block's stable file in `cwd` when `origin` carries `tangle`
+/// (`crate::tangle::materialize`), a fresh temp file otherwise. The one
+/// place both spawn paths (captured and `tty`) choose between the two.
+pub fn script_file(
+    code: &str,
+    lang: Option<&str>,
+    cwd: Option<&std::path::Path>,
+    origin: Option<crate::tangle::BlockOrigin<'_>>,
+) -> io::Result<(std::path::PathBuf, Option<std::path::PathBuf>)> {
+    if let Some(origin) = origin {
+        if let Some(block_name) = origin.tangle {
+            let dir = cwd.unwrap_or(std::path::Path::new("."));
+            let path = crate::tangle::materialize(origin.canvas_path, block_name, code, lang, dir)?;
+            return Ok((path, None));
+        }
+    }
+    let path = write_script_file(code, lang)?;
+    Ok((path.clone(), Some(path)))
+}
+
+/// Writes `code` to a fresh `meshfox-<pid>-<n>.<ext>` file under the system
+/// temp dir (`ext` from [`script_extension`]) and returns its path — the one
+/// place a block's code becomes a file for an `interpreter=`, shared by the
+/// captured (`stream_exec`) and `tty` spawn paths. The caller removes it once
+/// the child has exited.
+pub fn write_script_file(code: &str, lang: Option<&str>) -> io::Result<std::path::PathBuf> {
+    let path = std::env::temp_dir().join(format!(
+        "meshfox-{}.{}",
+        uuid_like_suffix(),
+        script_extension(lang)
+    ));
+    std::fs::write(&path, code)?;
+    Ok(path)
 }
 
 /// A short, unique-enough suffix for a temp filename without pulling in a
@@ -417,6 +477,37 @@ mod tests {
             vec!["-u".to_string(), cleanup.display().to_string()]
         );
         assert_eq!(std::fs::read_to_string(&cleanup).unwrap(), "print('hi')");
+        std::fs::remove_file(&cleanup).unwrap();
+    }
+
+    #[test]
+    fn script_extension_follows_the_fence_language() {
+        assert_eq!(script_extension(Some("python")), "py");
+        assert_eq!(script_extension(Some("JavaScript")), "js");
+        assert_eq!(script_extension(Some("ts")), "ts");
+        assert_eq!(script_extension(Some("sql")), "sql");
+        // No entry, or no language at all: the old extension.
+        assert_eq!(script_extension(Some("text")), "tmp");
+        assert_eq!(script_extension(Some("toml")), "tmp");
+        assert_eq!(script_extension(None), "tmp");
+    }
+
+    #[test]
+    fn resolve_command_names_the_temp_file_after_the_language() {
+        let resolved = resolve_command(
+            "console.log(1)",
+            Some("node"),
+            Some("javascript"),
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        let cleanup = resolved
+            .cleanup
+            .clone()
+            .expect("interpreter spawn sets cleanup");
+        assert_eq!(cleanup.extension().and_then(|e| e.to_str()), Some("js"));
         std::fs::remove_file(&cleanup).unwrap();
     }
 

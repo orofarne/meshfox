@@ -21,11 +21,11 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use meshfox_server::tables::{Filter, FilterOp, SortKey, ViewSpec};
-use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::Frame;
 
 use super::theme::{ACCENT, BORDER, FAIL, OK};
 use crate::worker_client::{TableColumnDto, TableMetaDto, TableRowsDto};

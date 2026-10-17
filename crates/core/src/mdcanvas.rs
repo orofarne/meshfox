@@ -3171,6 +3171,38 @@ Reused from Tests as well.
         assert!(updated.contains("echo hi"));
     }
 
+    /// `tangle` has no typed field in `FenceAttrsPatch`: it must ride through
+    /// a rewrite of the same fence's other attributes as the plain flag it is,
+    /// not be dropped or turned into `tangle="true"`.
+    #[test]
+    fn set_fence_attrs_carries_the_tangle_flag_through_a_rewrite() {
+        let doc = concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```python name=\"b\" interpreter=\"python3\" tangle\nprint(1)\n```\n",
+        );
+        let updated = set_fence_attrs(
+            doc,
+            "root",
+            "b",
+            &FenceAttrsPatch {
+                cache: Some(true),
+                name: Some("renamed".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let canvas = parse(&updated).unwrap();
+        let blocks = scan_runnable_blocks("root", &canvas.node("root").unwrap().text);
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].tangle(), "{updated}");
+        assert!(blocks[0].cache);
+        assert_eq!(blocks[0].name.as_deref(), Some("renamed"));
+        assert!(
+            updated.contains(" tangle\n") && !updated.contains("tangle=\""),
+            "stays a bare flag: {updated}"
+        );
+    }
+
     #[test]
     fn set_fence_attrs_toggles_boolean_flags_on_and_off() {
         let doc = "# Root\n<!-- meshfox:node id=\"root\" -->\n\n```bash name=\"b\"\necho hi\n```\n";
@@ -3854,7 +3886,8 @@ Reused from Tests as well.
         assert!(rendered.contains("display=\"table\""));
         assert_eq!(parse(&rendered).unwrap(), c);
 
-        let plain = "# Root\n\n## Data\n<!-- meshfox:node type=\"file\" -->\n\n[sales](./sales.csv)\n";
+        let plain =
+            "# Root\n\n## Data\n<!-- meshfox:node type=\"file\" -->\n\n[sales](./sales.csv)\n";
         let meta = NodeMeta {
             display: Some(FileDisplay::Table),
             ..Default::default()

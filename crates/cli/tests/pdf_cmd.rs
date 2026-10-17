@@ -328,7 +328,10 @@ fn a_table_node_prints_its_first_rows_into_the_document_pages() {
 
     let out = unique_dir("out").join("with.pdf");
     let pages = run_pdf(&canvas_path, &out, Some("document"));
-    assert!(pages >= 3, "100 table rows should fill several pages, got {pages}");
+    assert!(
+        pages >= 3,
+        "100 table rows should fill several pages, got {pages}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

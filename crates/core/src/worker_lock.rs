@@ -28,6 +28,26 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// Whether a worker is serving `canvas_path` right now: its lock file exists
+/// and another process holds it. Unlike [`try_acquire`] this never creates
+/// anything (no `.meshfox/`, no lock file) and never keeps the lock — safe to
+/// call for a canvas that is gone, or from a read-only tool such as `meshfox
+/// prune`. A lock it can't probe counts as held: the caller should leave it
+/// alone.
+pub fn is_held(canvas_path: &Path) -> bool {
+    let Ok(file) = File::open(lock_path(canvas_path)) else {
+        return false;
+    };
+    // SAFETY: `flock(2)` on a valid, open fd we exclusively own here;
+    // `LOCK_NB` never blocks.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        // We got it, so nobody held it; dropping `file` releases it.
+        return false;
+    }
+    true
+}
+
 /// Where a canvas's worker-discovery lock lives — canonicalizes `canvas_path`
 /// first so callers that reach the same file via different (relative,
 /// symlinked, differently-`cwd`'d) spellings still agree on one path; falls

@@ -1,4 +1,4 @@
-//! Presentation of a CLI run in the enclosing terminal. Never used by workers.
+//! Terminal status transport shared by CLI run and TUI. Never used by workers.
 use std::io::{IsTerminal, Write};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -20,11 +20,14 @@ pub fn default_mode() -> &'static str {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum State {
+pub(crate) enum State {
     Running(String),
     Waiting(String),
     Done,
     Failed,
+    Completed(String),
+    Failure(String),
+    Ready(usize),
     Clear,
 }
 
@@ -50,6 +53,10 @@ fn detect(tty: bool, program: &str, windows: bool, multiplexed: bool) -> Mode {
 }
 
 pub fn start(mode: Mode) {
+    start_with_state(mode, State::Running("preparing".into()));
+}
+
+fn start_with_state(mode: Mode, initial: State) {
     let tty = std::io::stderr().is_terminal();
     let mode = if !tty {
         Mode::Off
@@ -68,9 +75,13 @@ pub fn start(mode: Mode) {
     }
     *storage().lock().unwrap() = Some(Status {
         mode,
-        state: State::Running("preparing".into()),
+        state: State::Clear,
     });
-    running("preparing");
+    // Clear on entry too: the tab may still carry a previous application status.
+    emit(mode, &initial);
+    if let Some(status) = storage().lock().unwrap().as_mut() {
+        status.state = initial;
+    }
     // Ghostty expires progress without keep-alives. Keep the task on the CLI
     // runtime, including while a TTY child owns stdin; never read terminal input.
     tokio::spawn(async {
@@ -99,6 +110,9 @@ fn sequence(mode: Mode, state: &State) -> String {
         State::Waiting(name) => (format!("waiting: {}", label(name)), "#ffd700"),
         State::Done => ("done".into(), "#32cd32"),
         State::Failed => ("failed".into(), "#ff5555"),
+        State::Completed(name) => (format!("done: {}", label(name)), "#32cd32"),
+        State::Failure(name) => (format!("failed: {}", label(name)), "#ff5555"),
+        State::Ready(count) => (format!("ready: {count} services"), "#32cd32"),
         State::Clear => (String::new(), ""),
     };
     match mode {
@@ -109,7 +123,7 @@ fn sequence(mode: Mode, state: &State) -> String {
             let state = match state {
                 State::Running(_) => 3,
                 State::Waiting(_) => 4,
-                State::Failed => 2,
+                State::Failed | State::Failure(_) => 2,
                 _ => 0,
             };
             let value = if matches!(state, 2 | 4) { 100 } else { 0 };
@@ -124,10 +138,12 @@ fn emit(mode: Mode, state: &State) {
     let _ = stderr.write_all(sequence(mode, state).as_bytes());
     let _ = stderr.flush();
 }
-fn set(state: State) {
+pub(crate) fn set(state: State) {
     if let Some(status) = storage().lock().unwrap().as_mut() {
-        emit(status.mode, &state);
-        status.state = state;
+        if status.state != state {
+            emit(status.mode, &state);
+            status.state = state;
+        }
     }
 }
 pub fn running(name: &str) {
@@ -209,5 +225,23 @@ mod tests {
         assert!(!seq.contains('\x07'));
         assert_eq!(seq.matches('\x1b').count(), 2);
         assert!(sequence(Mode::Iterm2, &State::Clear).contains("status=;indicator=;status-color="));
+    }
+}
+
+/// Own the status for the entire TUI, including nested canvases and errors.
+/// Child canvases reuse this session instead of starting another keep-alive.
+pub(crate) struct TuiSession;
+pub(crate) fn start_tui(mode: Mode) -> TuiSession {
+    start_with_state(mode, State::Clear);
+    TuiSession
+}
+pub(crate) fn clear() {
+    if let Some(status) = storage().lock().unwrap().take() {
+        emit(status.mode, &State::Clear);
+    }
+}
+impl Drop for TuiSession {
+    fn drop(&mut self) {
+        clear();
     }
 }

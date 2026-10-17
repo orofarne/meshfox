@@ -732,7 +732,10 @@ fn a_table_node_is_exported_as_a_grid_of_its_first_rows() {
     );
     assert!(index.contains("<th class=\"num\">amount"), "{index}");
     assert!(index.contains("name100"), "{index}");
-    assert!(!index.contains("name101"), "only the first 100 rows: {index}");
+    assert!(
+        !index.contains("name101"),
+        "only the first 100 rows: {index}"
+    );
     assert!(index.contains("<td class=\"num\">200</td>"), "{index}");
 }
 
@@ -756,12 +759,18 @@ fn a_table_without_duckdb_fails_the_export_instead_of_leaving_a_hole() {
         .arg(&out_dir)
         .output()
         .expect("failed to run meshfox");
-    assert!(!output.status.success(), "a table that can't be read must fail the export");
+    assert!(
+        !output.status.success(),
+        "a table that can't be read must fail the export"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("table node \"sales\""), "{stderr}");
     assert!(stderr.contains("sales.csv"), "{stderr}");
     assert!(stderr.contains("/nonexistent/duckdb"), "{stderr}");
-    assert!(!out_dir.join("index.html").exists(), "no half-finished page is left behind");
+    assert!(
+        !out_dir.join("index.html").exists(),
+        "no half-finished page is left behind"
+    );
 }
 
 #[test]
@@ -786,7 +795,10 @@ fn a_canvas_without_table_nodes_never_needs_duckdb() {
 #[test]
 fn copies_shared_images_and_attachments_allowed_by_parent_config() {
     let dir = unique_dir("shared-files");
-    write_file(&dir.join(".meshfox/config.toml"), "[files]\nallow = [\"docs\"]\n");
+    write_file(
+        &dir.join(".meshfox/config.toml"),
+        "[files]\nallow = [\"docs\"]\n",
+    );
     write_file(&dir.join("docs/sensor.svg"), "shared image bytes");
     write_file(&dir.join("docs/datasheet.txt"), "shared datasheet bytes");
     let canvas = dir.join("child/doc.canvas.md");
@@ -794,15 +806,30 @@ fn copies_shared_images_and_attachments_allowed_by_parent_config() {
     let template = dir.join("template");
     write_file(&template.join("index.html.tera"), "{{ site.root.html_body | safe }}{% for n in site.root.children %}{{ n.html_body | safe }}{% endfor %}");
     let out = dir.join("out");
-    let output = meshfox().arg("static").arg(&canvas).arg("--template").arg(&template)
-        .arg("--out").arg(&out).arg("--copy-files").output().unwrap();
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let output = meshfox()
+        .arg("static")
+        .arg(&canvas)
+        .arg("--template")
+        .arg(&template)
+        .arg("--out")
+        .arg(&out)
+        .arg("--copy-files")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let html = std::fs::read_to_string(out.join("index.html")).unwrap();
-    let copied: Vec<_> = html.split('"').filter(|s| s.starts_with("_shared-assets/"))
+    let copied: Vec<_> = html
+        .split('"')
+        .filter(|s| s.starts_with("_shared-assets/"))
         .map(|relative| {
             assert!(!relative.split('/').any(|c| c == ".."));
             std::fs::read_to_string(out.join(relative)).unwrap()
-        }).collect();
+        })
+        .collect();
     assert_eq!(copied.len(), 2, "{html}");
     assert!(copied.iter().any(|s| s == "shared image bytes"));
     assert!(copied.iter().any(|s| s == "shared datasheet bytes"));
@@ -854,7 +881,10 @@ fn recursive_renders_a_plain_markdown_target_as_a_document_page() {
     assert!(page.contains("<strong>world</strong>"), "{page}");
 
     let sitemap = std::fs::read_to_string(out_dir.join("sitemap.xml")).unwrap();
-    assert!(sitemap.contains("<loc>https://example.com/SPEC/</loc>"), "{sitemap}");
+    assert!(
+        sitemap.contains("<loc>https://example.com/SPEC/</loc>"),
+        "{sitemap}"
+    );
 
     let _ = std::fs::remove_dir_all(&template_dir);
     let _ = std::fs::remove_dir_all(&dir);
@@ -866,7 +896,10 @@ fn recursive_renders_a_plain_markdown_target_as_a_document_page() {
 #[test]
 fn a_template_render_error_reports_the_underlying_cause() {
     let template_dir = unique_dir("template-bad-var");
-    write_file(&template_dir.join("index.html.tera"), "{{ no_such_variable }}");
+    write_file(
+        &template_dir.join("index.html.tera"),
+        "{{ no_such_variable }}",
+    );
 
     let canvas_path = unique_dir("canvas-bad-var").join("doc.canvas.md");
     write_file(&canvas_path, FIXTURE_CANVAS);

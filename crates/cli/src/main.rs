@@ -24,6 +24,7 @@ mod cores_cmd;
 mod mcp;
 mod pdf;
 mod prompt;
+mod prune_cmd;
 mod run_output;
 mod secret_cmd;
 mod serve;
@@ -201,6 +202,27 @@ enum Command {
         #[command(subcommand)]
         op: secret_cmd::SecretOp,
     },
+    /// Find — and with `--yes` remove — the regenerable files meshfox
+    /// leaves behind in a directory: tangled files (`.meshfox-tangle-*`)
+    /// whose block or canvas is gone, `.meshfox/<canvas>.venv` and
+    /// `.meshfox/<canvas>.node` environments whose canvas file is gone, and
+    /// stale `meshfox-<pid>-*` temp files (older than a day) in the system
+    /// temp dir. Only lists them unless `--yes` is given. A canvas with a
+    /// running worker is skipped. Never touches run history
+    /// (`.session.sqlite3`) or variable caches (`.env`) — delete those by
+    /// hand. See also `meshfox secret prune` for the secret store.
+    Prune {
+        /// The directory to look at (default: the current one).
+        #[arg(value_name = "DIR", default_value = ".")]
+        dir: PathBuf,
+        /// Also look in every subdirectory (skipping `.git`,
+        /// `node_modules`, `target`).
+        #[arg(long, short)]
+        recursive: bool,
+        /// Remove what is listed instead of only listing it.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Run the persistent coordinator: the headless, cross-platform
     /// counterpart of the macOS menu-bar daemon. Listens on the socket
     /// `server_socket` points at (or `--socket`; or the one systemd hands
@@ -302,6 +324,9 @@ enum Command {
     /// no *structural* editing beyond that (use `meshfox
     /// node ...` or the browser UI's Edit mode for that).
     Tui {
+        /// Terminal activity indicator; defaults to MESHFOX_TERMINAL_STATUS or auto.
+        #[arg(long, value_enum, default_value = terminal_status::default_mode())]
+        terminal_status: terminal_status::Mode,
         #[command(flatten)]
         canvas: CanvasOpt,
         /// Start with this node id already selected (and its ancestors
@@ -1273,7 +1298,14 @@ fn main() {
                 find_canvas()
             });
             run(
-                &canvas_path, args, no_deps, fresh, skip_fresh, set, confirm, terminal_status,
+                &canvas_path,
+                args,
+                no_deps,
+                fresh,
+                skip_fresh,
+                set,
+                confirm,
+                terminal_status,
             )
         }
         Command::Configure { canvas } => {
@@ -1289,6 +1321,16 @@ fn main() {
         Command::Secret { op } => {
             if let Err(e) = secret_cmd::run(op, find_canvas) {
                 eprintln!("meshfox secret: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Prune {
+            dir,
+            recursive,
+            yes,
+        } => {
+            if let Err(e) = prune_cmd::run(dir, recursive, yes) {
+                eprintln!("meshfox prune: {e}");
                 std::process::exit(1);
             }
         }
@@ -1367,6 +1409,7 @@ fn main() {
             }
         }
         Command::Tui {
+            terminal_status,
             canvas,
             node,
             create: create_if_missing,
@@ -1387,7 +1430,7 @@ fn main() {
             if create_if_missing && !canvas_path.exists() {
                 write_canvas_template(&canvas_path);
             }
-            tui(canvas_path, node)
+            tui(canvas_path, node, terminal_status)
         }
         Command::Mcp => mcp_cmd(),
         Command::Validate { canvas } => {
@@ -2200,13 +2243,16 @@ fn view_or_hand_off(canvas_path: PathBuf, port: u16, no_open: bool, no_auto_exit
     }
 }
 
-fn tui(canvas_path: PathBuf, initial_node: Option<String>) {
+fn tui(canvas_path: PathBuf, initial_node: Option<String>, status_mode: terminal_status::Mode) {
     init_blank_canvas(&canvas_path);
     let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
         eprintln!("failed to start async runtime: {e}");
         std::process::exit(1);
     });
-    if let Err(e) = runtime.block_on(tui::run(canvas_path, initial_node)) {
+    if let Err(e) = runtime.block_on(async {
+        let _status = terminal_status::start_tui(status_mode);
+        tui::run(canvas_path, initial_node).await
+    }) {
         eprintln!("meshfox tui: {e}");
         std::process::exit(1);
     }
@@ -2742,7 +2788,11 @@ async fn run_via_worker(
         if let Ok(raw) = worker_client::get_canvas_raw(port).await {
             let path_str: Vec<&str> = path.iter().map(String::as_str).collect();
             if chain_contains_tty(canvas_path, &raw, &path_str, &[name], no_deps) {
-                if !run_worker_tty(port, &path, name, no_deps, fresh, skip_fresh, vars, approved).await {
+                if !run_worker_tty(
+                    port, &path, name, no_deps, fresh, skip_fresh, vars, approved,
+                )
+                .await
+                {
                     had_failure = true;
                 }
                 continue;
@@ -5980,57 +6030,58 @@ fn render_canvas_site<'a>(
         // worker to serve: it is read directly, and its images too.
         let (site, assets, canvas_links, port) = match kind {
             meshfox_core::staticgen::PageKind::Canvas => {
-            let port = coordinator::get_or_spawn(&canvas_path)
-                .await
-                .unwrap_or_else(|e| {
+                let port = coordinator::get_or_spawn(&canvas_path)
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!(
+                            "meshfox static: failed to start or reach the worker for {}: {e}",
+                            canvas_path.display()
+                        );
+                        std::process::exit(1);
+                    });
+                let canvas = worker_client::get_canvas(port).await.unwrap_or_else(|e| {
                     eprintln!(
-                        "meshfox static: failed to start or reach the worker for {}: {e}",
+                        "meshfox static: failed to read {} through the worker: {e}",
                         canvas_path.display()
                     );
                     std::process::exit(1);
                 });
-            let canvas = worker_client::get_canvas(port).await.unwrap_or_else(|e| {
-                eprintln!(
-                    "meshfox static: failed to read {} through the worker: {e}",
-                    canvas_path.display()
-                );
-                std::process::exit(1);
-            });
 
-            // Same "bare filename has an empty, not missing, parent" edge case
-            // `meshfox_server::get_node_file_content` handles — a canvas passed
-            // as just `README.md` (no directory component) resolves relative
-            // images/`display="code"` targets against the current directory.
-            let canvas_dir = canvas_path
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."));
-            let previews = fetch_node_previews(port, &canvas)
-                .await
-                .unwrap_or_else(|errors| {
-                    for e in &errors {
-                        eprintln!("meshfox static: {e}");
-                    }
-                    std::process::exit(1);
-                });
-            let access = meshfox_core::FileAccess::for_canvas_path(&canvas, &canvas_path);
-            let (site, assets, canvas_links) = meshfox_core::staticgen::build_for_static_export_with_access(
-                &canvas,
-                canvas_dir,
-                &root_canvas_path,
-                &current_slot,
-                config.links_base_url.as_deref(),
-                Some(&previews),
-                copy_files,
-                recursive,
-                &access,
-            )
-            .unwrap_or_else(|errors| {
-                for e in &errors {
-                    eprintln!("meshfox static: {e}");
-                }
-                std::process::exit(1);
-            });
+                // Same "bare filename has an empty, not missing, parent" edge case
+                // `meshfox_server::get_node_file_content` handles — a canvas passed
+                // as just `README.md` (no directory component) resolves relative
+                // images/`display="code"` targets against the current directory.
+                let canvas_dir = canvas_path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                let previews = fetch_node_previews(port, &canvas)
+                    .await
+                    .unwrap_or_else(|errors| {
+                        for e in &errors {
+                            eprintln!("meshfox static: {e}");
+                        }
+                        std::process::exit(1);
+                    });
+                let access = meshfox_core::FileAccess::for_canvas_path(&canvas, &canvas_path);
+                let (site, assets, canvas_links) =
+                    meshfox_core::staticgen::build_for_static_export_with_access(
+                        &canvas,
+                        canvas_dir,
+                        &root_canvas_path,
+                        &current_slot,
+                        config.links_base_url.as_deref(),
+                        Some(&previews),
+                        copy_files,
+                        recursive,
+                        &access,
+                    )
+                    .unwrap_or_else(|errors| {
+                        for e in &errors {
+                            eprintln!("meshfox static: {e}");
+                        }
+                        std::process::exit(1);
+                    });
                 (site, assets, canvas_links, Some(port))
             }
             meshfox_core::staticgen::PageKind::Document => {
@@ -6060,7 +6111,14 @@ fn render_canvas_site<'a>(
         context.insert("page_kind", &kind);
         // Relative URL of the site root from this page (`./`, `../`, `../../`).
         let depth = current_slot.split('/').filter(|p| !p.is_empty()).count();
-        context.insert("root_href", &if depth == 0 { "./".to_string() } else { "../".repeat(depth) });
+        context.insert(
+            "root_href",
+            &if depth == 0 {
+                "./".to_string()
+            } else {
+                "../".repeat(depth)
+            },
+        );
         context.insert("icons", &config.icons);
         // `meshfox_version` is always set (same string `--version` prints —
         // whichever binary is running this export); `canvas_commit` is the

@@ -40,7 +40,11 @@ pub fn resolve(canvas: &Canvas, base_path: &Path) -> Result<Canvas, IncludeError
     resolve_with_access(canvas, base_path, &access)
 }
 
-pub fn resolve_with_access(canvas: &Canvas, base_path: &Path, access: &crate::FileAccess) -> Result<Canvas, IncludeError> {
+pub fn resolve_with_access(
+    canvas: &Canvas,
+    base_path: &Path,
+    access: &crate::FileAccess,
+) -> Result<Canvas, IncludeError> {
     let base_dir = base_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -56,10 +60,14 @@ pub fn resolve_with_access(canvas: &Canvas, base_path: &Path, access: &crate::Fi
             .target
             .clone()
             .ok_or_else(|| IncludeError::MissingTarget(node.id.clone()))?;
-        let target_path = access.confine(&base_dir, &target).map_err(|error| match error {
-            crate::file_read::ConfineError::TargetNotFound(path, source) => IncludeError::NotFound(path, source),
-            other => IncludeError::Access(other),
-        })?;
+        let target_path = access
+            .confine(&base_dir, &target)
+            .map_err(|error| match error {
+                crate::file_read::ConfineError::TargetNotFound(path, source) => {
+                    IncludeError::NotFound(path, source)
+                }
+                other => IncludeError::Access(other),
+            })?;
         let contents = std::fs::read_to_string(&target_path)
             .map_err(|e| IncludeError::NotFound(target_path.clone(), e))?;
         // Best-effort: an unreadable/relative-weirdness parent just leaves
@@ -81,7 +89,10 @@ pub fn resolve_with_access(canvas: &Canvas, base_path: &Path, access: &crate::Fi
     Ok(Canvas {
         nodes,
         options: Vec::new(),
-        artifact_root: base_path.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf(),
+        artifact_root: base_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf(),
         artifact_values: canvas.artifact_values.clone(),
     })
 }
@@ -109,7 +120,11 @@ pub fn list_includes(canvas: &Canvas, base_path: &Path) -> Vec<IncludeInfo> {
     list_includes_with_access(canvas, base_path, &access)
 }
 
-pub fn list_includes_with_access(canvas: &Canvas, base_path: &Path, access: &crate::FileAccess) -> Vec<IncludeInfo> {
+pub fn list_includes_with_access(
+    canvas: &Canvas,
+    base_path: &Path,
+    access: &crate::FileAccess,
+) -> Vec<IncludeInfo> {
     let base_dir = base_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())

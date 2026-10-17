@@ -89,3 +89,41 @@ venv     demo
 ```
 <!-- /meshfox:output -->
 
+## A module next to the canvas
+<!-- meshfox:node id="local-module" -->
+
+`$PYTHON` isn't the venv's bare `python3`: `interpreter="@python_venv"` reports
+a small launcher, `.meshfox/python-venv.canvas.md.venv/bin/python3-mf`, which
+is the venv's Python with the block's working directory added to
+`PYTHONPATH`. meshfox runs a block's code from a file that doesn't live in that
+directory, and Python looks next to the *script*, not the cwd — so without the
+launcher a block can't import a module sitting beside its canvas. With it, the
+block below imports [venv_demo_helper.py](./venv_demo_helper.py) (which itself
+uses the venv's `tabulate`) with no `sys.path.insert(0, os.getcwd())`. It
+prints a Markdown table, and `output="markdown"` (see
+[pandas-dataframe.canvas.md](./pandas-dataframe.canvas.md)) shows it as a
+rendered table instead of a block of pipe characters.
+
+```python name="local-module" interpreter="$PYTHON -u" cache output="markdown"
+import sys
+
+import venv_demo_helper
+
+print(venv_demo_helper.render([
+    ["venv_demo_helper", "next to the canvas (PYTHONPATH from the launcher)"],
+    ["tabulate", "the canvas's own virtualenv"],
+]))
+print()
+print(f"Python: `{sys.executable}`")
+```
+<!-- meshfox:output name="local-module" hash="ad6bb00f" -->
+
+| module           | found via                                         |
+|------------------|---------------------------------------------------|
+| venv_demo_helper | next to the canvas (PYTHONPATH from the launcher) |
+| tabulate         | the canvas's own virtualenv                       |
+
+Python: `/Users/orofarne/sources/meshfox/examples/.meshfox/python-venv.canvas.md.venv/bin/python3`
+
+<!-- /meshfox:output -->
+

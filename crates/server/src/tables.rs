@@ -577,7 +577,11 @@ impl DuckProc {
             }
         }
         let msg = errs.join("\n").trim().to_string();
-        if msg.is_empty() { Ok(out) } else { Err(msg) }
+        if msg.is_empty() {
+            Ok(out)
+        } else {
+            Err(msg)
+        }
     }
 
     async fn died(&mut self, what: String) -> String {
@@ -1784,11 +1788,10 @@ mod tests {
         let s = ready(&m, "n", &file).await;
         assert_eq!(s.meta().await.total_rows, Some(1));
         assert!(s.dir.starts_with(std::env::temp_dir()));
-        assert!(
-            s.dir
-                .to_string_lossy()
-                .contains(&format!("tables-{}", std::process::id()))
-        );
+        assert!(s
+            .dir
+            .to_string_lossy()
+            .contains(&format!("tables-{}", std::process::id())));
         assert!(
             !dir.join(".meshfox").exists(),
             "nothing written next to the canvas"

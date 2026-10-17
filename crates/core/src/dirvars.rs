@@ -94,7 +94,11 @@ pub fn expand_dir_value(value: &str, canvas_path: Option<&Path>) -> String {
         };
         let rest = value["@tmp".len()..].trim_start_matches('/');
         let base = tmp_dir(canvas_path);
-        let full = if rest.is_empty() { base } else { base.join(rest) };
+        let full = if rest.is_empty() {
+            base
+        } else {
+            base.join(rest)
+        };
         let _ = std::fs::create_dir_all(&full);
         return absolutize(&full).to_string_lossy().into_owned();
     }
@@ -137,7 +141,11 @@ pub fn expand_file_value(value: &str, canvas_path: Option<&Path>) -> String {
         };
         let rest = value["@tmp".len()..].trim_start_matches('/');
         let base = tmp_dir(canvas_path);
-        let full = if rest.is_empty() { base } else { base.join(rest) };
+        let full = if rest.is_empty() {
+            base
+        } else {
+            base.join(rest)
+        };
         if let Some(parent) = full.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -490,7 +498,10 @@ mod tests {
         std::fs::write(media.join("sub").join("deep.mp4"), "z").unwrap();
 
         let mut files = HashMap::new();
-        files.insert("INPUT".to_string(), media.join("in.mp4").to_string_lossy().into_owned());
+        files.insert(
+            "INPUT".to_string(),
+            media.join("in.mp4").to_string_lossy().into_owned(),
+        );
         let fa = FileAccess::from_values(&canvas, HashMap::new()).with_files(files);
         assert!(fa.confine(&dir, "$INPUT").is_ok());
         let sibling = media.join("other.mp4");

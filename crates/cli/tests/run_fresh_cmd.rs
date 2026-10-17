@@ -86,7 +86,10 @@ fn fresh_reruns_a_skippable_dependency_once_and_session_reset_makes_every_run_fr
     assert_eq!(runs(&dir), 1, "second run: dep already fresh, skipped");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("already run this session, skipped"));
-    assert!(!stdout.contains("dependency-live-output"), "skipped steps must not replay old logs: {stdout}");
+    assert!(
+        !stdout.contains("dependency-live-output"),
+        "skipped steps must not replay old logs: {stdout}"
+    );
 
     let out = run_target(&home, &canvas, &["--fresh"]);
     assert!(

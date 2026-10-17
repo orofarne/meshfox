@@ -72,6 +72,8 @@ pub enum DepsError {
     ButtonAttrConflict(String, String, &'static str),
     #[error("node {0:?} block {1:?}: a `form` fence can't also carry `{2}` — it has no real code of its own to run under it, and no \"done\" state for a dependency/dependent edge to mean anything")]
     FormAttrConflict(String, String, &'static str),
+    #[error("node {0:?} block {1:?}: `tangle` needs an `interpreter=` — without one the code runs under `bash -c` and never becomes a file to place")]
+    TangleWithoutInterpreter(String, String),
     #[error("node {0:?} block {1:?}: `send=` only means anything on a `form` fence")]
     SendWithoutForm(String, String),
     #[error("node {0:?} block {1:?}: `output-attrs=` only means anything with `output=\"image\"`")]
@@ -344,7 +346,8 @@ fn implicit_from_deps(
     let selected = crate::args::selected_env_var_names(block);
     crate::vars::close_over_var_refs(
         decls,
-        env_names.filter(|name| !block.arguments.contains_key(*name))
+        env_names
+            .filter(|name| !block.arguments.contains_key(*name))
             .chain(selected.iter().map(String::as_str)),
     )
     .into_iter()
@@ -618,19 +621,27 @@ pub fn closure_fingerprint_with(
             crate::fence::execution_fingerprint(
                 &block,
                 values,
-                &canvas.node(&addr.node_id).expect("block owner exists").cwd(&canvas.artifact_root),
+                &canvas
+                    .node(&addr.node_id)
+                    .expect("block owner exists")
+                    .cwd(&canvas.artifact_root),
             ),
         ];
         if block.service {
             parts.push(
-                values.get(&service_generation_key(addr)).cloned()
+                values
+                    .get(&service_generation_key(addr))
+                    .cloned()
                     .unwrap_or_else(|| "not-running".to_string()),
             );
         }
-        let mut has_artifacts = block.attrs.contains_key("inputs") || block.attrs.contains_key("outputs");
+        let mut has_artifacts =
+            block.attrs.contains_key("inputs") || block.attrs.contains_key("outputs");
         for attr in ["inputs", "outputs"] {
             if block.attrs.contains_key(attr) {
-                parts.push(crate::artifacts::fingerprint(canvas, addr, &block, values, attr, false)?);
+                parts.push(crate::artifacts::fingerprint(
+                    canvas, addr, &block, values, attr, false,
+                )?);
             }
         }
         for dep in &deps {
@@ -777,6 +788,12 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
                     ));
                 }
                 crate::form::form_block(block)?;
+            }
+            if block.tangle() && block.interpreter.is_none() {
+                return Err(DepsError::TangleWithoutInterpreter(
+                    node.id.clone(),
+                    name.clone(),
+                ));
             }
             for dep in &block.deps {
                 let dep_addr = resolve_ref(&node.id, dep);
@@ -1031,6 +1048,24 @@ mod tests {
             "```button name=\"full-import\" default deps=\"build\"\nRun everything\n```\n",
         ));
         assert!(validate(&c).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_tangle_with_an_interpreter_and_rejects_it_without() {
+        let ok = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```python name=\"go\" interpreter=\"python3\" tangle\nprint(1)\n```\n",
+        ));
+        assert!(validate(&ok).is_ok());
+
+        let bare = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```bash name=\"go\" tangle\necho 1\n```\n",
+        ));
+        assert_eq!(
+            validate(&bare).unwrap_err(),
+            DepsError::TangleWithoutInterpreter("root".to_string(), "go".to_string())
+        );
     }
 
     #[test]

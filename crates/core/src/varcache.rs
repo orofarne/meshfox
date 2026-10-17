@@ -262,10 +262,13 @@ mod tests {
     fn delete_secret_removes_a_stored_value_and_reports_whether_there_was_one() {
         use crate::secret_store::MemoryBackend;
         let canvas = Path::new("/tmp/doc.canvas.md");
-        let mut cache = VarCache::in_memory()
-            .with_secret_backend(Arc::new(MemoryBackend::new()), canvas);
+        let mut cache =
+            VarCache::in_memory().with_secret_backend(Arc::new(MemoryBackend::new()), canvas);
         cache.save_secret("TOKEN", "sk").unwrap();
-        assert_eq!(cache.try_get_secret("TOKEN").unwrap().as_deref(), Some("sk"));
+        assert_eq!(
+            cache.try_get_secret("TOKEN").unwrap().as_deref(),
+            Some("sk")
+        );
         assert!(cache.delete_secret("TOKEN").unwrap());
         assert_eq!(cache.try_get_secret("TOKEN").unwrap(), None);
         assert!(!cache.delete_secret("TOKEN").unwrap());

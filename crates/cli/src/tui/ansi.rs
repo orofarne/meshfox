@@ -206,11 +206,10 @@ mod tests {
     #[test]
     fn extended_colors_and_split_escape() {
         let mut ansi = Ansi::default();
-        assert!(
-            ansi.line("\x1b[38;2;12;", Style::default())
-                .spans
-                .is_empty()
-        );
+        assert!(ansi
+            .line("\x1b[38;2;12;", Style::default())
+            .spans
+            .is_empty());
         let line = ansi.line("34;56;48;5;200mцвет", Style::default());
         assert_eq!(line.spans[0].style.fg, Some(Color::Rgb(12, 34, 56)));
         assert_eq!(line.spans[0].style.bg, Some(Color::Indexed(200)));

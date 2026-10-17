@@ -809,11 +809,18 @@ pub async fn info(port: u16) -> WorkerInfo {
 /// Only the public image setting is exposed; the client never reads config files.
 /// Older workers omit the field and retain automatic protocol detection.
 pub async fn tui_image_protocol(port: u16) -> Result<Option<String>, String> {
-    let response = client().get(format!("{}/api/info", base_url(port)))
-        .timeout(time_limit(QUICK)).send().await.map_err(|e| describe(&e))?
-        .error_for_status().map_err(|e| describe(&e))?;
+    let response = client()
+        .get(format!("{}/api/info", base_url(port)))
+        .timeout(time_limit(QUICK))
+        .send()
+        .await
+        .map_err(|e| describe(&e))?
+        .error_for_status()
+        .map_err(|e| describe(&e))?;
     let info: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
-    if let Some(error) = info["tuiImageProtocolError"].as_str() { return Err(error.to_owned()); }
+    if let Some(error) = info["tuiImageProtocolError"].as_str() {
+        return Err(error.to_owned());
+    }
     Ok(info["tuiImageProtocol"].as_str().map(str::to_owned))
 }
 
@@ -911,7 +918,10 @@ pub async fn put_canvas_raw(
                     .unwrap_or_default();
                 return Err(PutRawError::Conflict {
                     current_rev: value["currentRev"].as_str().unwrap_or_default().to_string(),
-                    current_text: value["currentText"].as_str().unwrap_or_default().to_string(),
+                    current_text: value["currentText"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
                     conflicts,
                 });
             }
@@ -1149,14 +1159,18 @@ pub async fn get_table_rows(
 // The server decodes a Markdown-style file path once after reading the query.
 // These clients accept filesystem paths: protect literal URL delimiters first.
 fn asset_path_argument(path: &str) -> String {
-    path.replace('%', "%25").replace('?', "%3F").replace('#', "%23")
+    path.replace('%', "%25")
+        .replace('?', "%3F")
+        .replace('#', "%23")
 }
 
 /// Read a filesystem path relative to the canvas through FileAccess.
 /// Query transport preserves parent components before URL normalization.
 pub async fn get_relative_file(port: u16, path: &str) -> Result<Vec<u8>, String> {
-    let mut url = reqwest::Url::parse(&format!("{}/api/asset", base_url(port))).map_err(|e| e.to_string())?;
-    url.query_pairs_mut().append_pair("file", &asset_path_argument(path));
+    let mut url =
+        reqwest::Url::parse(&format!("{}/api/asset", base_url(port))).map_err(|e| e.to_string())?;
+    url.query_pairs_mut()
+        .append_pair("file", &asset_path_argument(path));
     let res = client()
         .get(url)
         .timeout(time_limit(QUICK))
@@ -1222,12 +1236,18 @@ pub enum WatchEvent {
     /// by calling `subscribe_run` for this exact address, the same "watch
     /// a run I didn't start" flow the web UI's `watchAutorunBlock` already
     /// has.
-    RunStarted { node_id: String, block: String },
+    RunStarted {
+        node_id: String,
+        block: String,
+    },
     /// A `tty` step's terminal session just started in the worker — a
     /// manual run elsewhere, or an `autorun` after a form's Send, which
     /// nobody asked this process for. `mod.rs` hands the terminal to it
     /// (`App::on_tty_started`) unless one is already being shown.
-    TtyStarted { node_id: String, block: String },
+    TtyStarted {
+        node_id: String,
+        block: String,
+    },
     /// A run (plain or `tty`) started or ended somewhere, or the session was
     /// reset: refetch `GET /api/runs`.
     RunsChanged,
@@ -1741,7 +1761,11 @@ pub async fn fs_list(
     };
     let res = client()
         .get(format!("{}/api/fs/list", base_url(port)))
-        .query(&[("path", path), ("kind", kind), ("hidden", if hidden { "true" } else { "false" })])
+        .query(&[
+            ("path", path),
+            ("kind", kind),
+            ("hidden", if hidden { "true" } else { "false" }),
+        ])
         .timeout(time_limit(QUICK))
         .send()
         .await
@@ -1749,7 +1773,11 @@ pub async fn fs_list(
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
-        return Err(if text.is_empty() { status.to_string() } else { text });
+        return Err(if text.is_empty() {
+            status.to_string()
+        } else {
+            text
+        });
     }
     res.json().await.map_err(|e| e.to_string())
 }
@@ -2680,9 +2708,15 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let _ = rustls::crypto::ring::default_provider().install_default();
         for (body, expected) in [
-            (r#"{"tuiImageProtocol":"sixel"}"#, Ok(Some("sixel".to_string()))),
+            (
+                r#"{"tuiImageProtocol":"sixel"}"#,
+                Ok(Some("sixel".to_string())),
+            ),
             (r#"{"readOnly":false}"#, Ok(None)),
-            (r#"{"tuiImageProtocolError":"bad tui.image_protocol"}"#, Err("bad tui.image_protocol".to_string())),
+            (
+                r#"{"tuiImageProtocolError":"bad tui.image_protocol"}"#,
+                Err("bad tui.image_protocol".to_string()),
+            ),
         ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = listener.local_addr().unwrap().port();
@@ -2768,7 +2802,9 @@ mod tests {
         let held = meshfox_core::body_rev(&read);
 
         let first = original.replace("body", "first");
-        assert!(put_canvas_raw(port, &first, &held, None, false).await.is_ok());
+        assert!(put_canvas_raw(port, &first, &held, None, false)
+            .await
+            .is_ok());
 
         // The revision just read is stale now.
         let second = original.replace("body", "second");

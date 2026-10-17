@@ -254,8 +254,13 @@ fn load_from_with_store(
         let owner = path.parent().and_then(Path::parent).unwrap_or(canvas_root);
         let table = crate::config::read_table(&path);
         let sections = parse_env_sections(&table, home, Some(owner), Some(owner));
-        apply_tier(&sections, &normalized_root, &mut out, store.clone(),
-            |_raw_path| SharedOrigin::Project);
+        apply_tier(
+            &sections,
+            &normalized_root,
+            &mut out,
+            store.clone(),
+            |_raw_path| SharedOrigin::Project,
+        );
     }
     out
 }
@@ -900,7 +905,12 @@ mod tests {
             .set(&env_account("global:~/work/projectA", "TOKEN"), "scoped")
             .unwrap();
 
-        let shared = load_from_with_store(Some(&global), &project_a, Some(&home), Some(Arc::new(store)));
+        let shared = load_from_with_store(
+            Some(&global),
+            &project_a,
+            Some(&home),
+            Some(Arc::new(store)),
+        );
         assert_eq!(
             shared.get("TOKEN").map(|v| v.value.as_str()),
             Some("scoped")

@@ -362,7 +362,9 @@ pub(crate) fn build_var_decl(attrs: HashMap<String, String>) -> Result<VarDecl, 
 /// non-directory is rejected, a missing path is fine (a block may create it).
 fn validate_dir_value(name: &str, value: &str) -> Result<(), String> {
     if value.is_empty() {
-        return Err(format!("{name:?} expects a directory path, got an empty value"));
+        return Err(format!(
+            "{name:?} expects a directory path, got an empty value"
+        ));
     }
     if let Some(rest) = value.strip_prefix("@tmp") {
         if rest.is_empty() || rest.starts_with('/') {
@@ -408,7 +410,9 @@ fn validate_file_value(decl: &VarDecl, value: &str) -> Result<(), String> {
     }
     let expanded = if value == "~" || value.starts_with("~/") {
         match std::env::var_os("HOME") {
-            Some(h) => std::path::Path::new(&h).join(value.trim_start_matches('~').trim_start_matches('/')),
+            Some(h) => {
+                std::path::Path::new(&h).join(value.trim_start_matches('~').trim_start_matches('/'))
+            }
             None => return Ok(()),
         }
     } else {
@@ -710,20 +714,21 @@ pub fn validate_var_scope(canvas: &Canvas) -> Result<(), VarsError> {
         .collect();
     for node in &canvas.nodes {
         for block in crate::fence::scan_runnable_blocks(&node.id, &node.text) {
-            let mut refs: Vec<(String, &'static str)> = static_block_env_names(&node.id, &node.text, &block)?
-                .into_iter()
-                .map(|name| (name, "env"))
-                .chain(
-                    interpreter_refs(&block)
-                        .into_iter()
-                        .map(|n| (n, "interpreter")),
-                )
-                .chain(
-                    crate::args::dependency_refs(&block)
-                        .into_iter()
-                        .map(|n| (n, "deps")),
-                )
-                .collect();
+            let mut refs: Vec<(String, &'static str)> =
+                static_block_env_names(&node.id, &node.text, &block)?
+                    .into_iter()
+                    .map(|name| (name, "env"))
+                    .chain(
+                        interpreter_refs(&block)
+                            .into_iter()
+                            .map(|n| (n, "interpreter")),
+                    )
+                    .chain(
+                        crate::args::dependency_refs(&block)
+                            .into_iter()
+                            .map(|n| (n, "deps")),
+                    )
+                    .collect();
             // A `form` fence's own `field var=` is just as much a
             // reference to a declared variable as `env=`/`interpreter=`
             // are — same node-subtree scoping rule applies. An invalid
@@ -804,20 +809,21 @@ pub fn validate_env_refs(canvas: &Canvas) -> Result<(), VarsError> {
     let declared: HashSet<&str> = decls.iter().map(|d| d.name.as_str()).collect();
     for node in &canvas.nodes {
         for block in crate::fence::scan_runnable_blocks(&node.id, &node.text) {
-            let refs: Vec<(String, &'static str)> = static_block_env_names(&node.id, &node.text, &block)?
-                .into_iter()
-                .map(|name| (name, "env"))
-                .chain(
-                    interpreter_refs(&block)
-                        .into_iter()
-                        .map(|n| (n, "interpreter")),
-                )
-                .chain(
-                    crate::args::dependency_refs(&block)
-                        .into_iter()
-                        .map(|n| (n, "deps")),
-                )
-                .collect();
+            let refs: Vec<(String, &'static str)> =
+                static_block_env_names(&node.id, &node.text, &block)?
+                    .into_iter()
+                    .map(|name| (name, "env"))
+                    .chain(
+                        interpreter_refs(&block)
+                            .into_iter()
+                            .map(|n| (n, "interpreter")),
+                    )
+                    .chain(
+                        crate::args::dependency_refs(&block)
+                            .into_iter()
+                            .map(|n| (n, "deps")),
+                    )
+                    .collect();
             let argument_names: std::collections::HashSet<_> =
                 crate::args::scan_signatures(&node.id, &node.text)
                     .unwrap_or_default()
@@ -1806,21 +1812,39 @@ mod tests {
     fn file_default_outside_tmp_needs_confirmation_like_dir() {
         for d in ["/media/in.mp4", "~/in.mp4", "in.mp4"] {
             let decls = vec![file_decl("F", Some(d), FileMode::Open)];
-            let r = resolve(&decls, &HashMap::new(), &VarCache::in_memory(), &HashMap::new());
+            let r = resolve(
+                &decls,
+                &HashMap::new(),
+                &VarCache::in_memory(),
+                &HashMap::new(),
+            );
             assert!(r.values.get("F").is_none(), "{d} must not resolve silently");
             assert_eq!(r.missing[0].default.as_deref(), Some(d));
         }
         let decls = vec![file_decl("F", Some("@tmp/out.mp4"), FileMode::Save)];
-        let r = resolve(&decls, &HashMap::new(), &VarCache::in_memory(), &HashMap::new());
+        let r = resolve(
+            &decls,
+            &HashMap::new(),
+            &VarCache::in_memory(),
+            &HashMap::new(),
+        );
         assert!(r.missing.is_empty());
         assert_eq!(r.values["F"], "@tmp/out.mp4");
     }
 
     #[test]
     fn tmp_default_with_dotdot_needs_confirmation() {
-        for mk in [dir_decl("W", Some("@tmp/../..")), file_decl("F", Some("@tmp/../x"), FileMode::Save)] {
+        for mk in [
+            dir_decl("W", Some("@tmp/../..")),
+            file_decl("F", Some("@tmp/../x"), FileMode::Save),
+        ] {
             let decls = vec![mk];
-            let r = resolve(&decls, &HashMap::new(), &VarCache::in_memory(), &HashMap::new());
+            let r = resolve(
+                &decls,
+                &HashMap::new(),
+                &VarCache::in_memory(),
+                &HashMap::new(),
+            );
             assert!(r.values.is_empty());
             assert_eq!(r.missing.len(), 1);
         }
@@ -1829,7 +1853,12 @@ mod tests {
     #[test]
     fn dir_default_under_tmp_resolves_silently() {
         let decls = vec![dir_decl("W", Some("@tmp/work"))];
-        let r = resolve(&decls, &HashMap::new(), &VarCache::in_memory(), &HashMap::new());
+        let r = resolve(
+            &decls,
+            &HashMap::new(),
+            &VarCache::in_memory(),
+            &HashMap::new(),
+        );
         assert!(r.missing.is_empty());
         assert_eq!(r.values["W"], "@tmp/work"); // no canvas path -> unexpanded
     }
@@ -1838,7 +1867,12 @@ mod tests {
     fn dir_default_outside_tmp_needs_confirmation_like_required() {
         for d in ["/data", "~/data", "../x", "data"] {
             let decls = vec![dir_decl("W", Some(d))];
-            let r = resolve(&decls, &HashMap::new(), &VarCache::in_memory(), &HashMap::new());
+            let r = resolve(
+                &decls,
+                &HashMap::new(),
+                &VarCache::in_memory(),
+                &HashMap::new(),
+            );
             assert!(r.values.get("W").is_none(), "{d} must not resolve silently");
             assert_eq!(r.missing.len(), 1, "{d}");
             assert_eq!(r.missing[0].default.as_deref(), Some(d)); // offered as pre-fill
@@ -1880,7 +1914,12 @@ mod tests {
     #[test]
     fn non_dir_var_with_a_path_default_is_unchanged() {
         let decls = vec![decl("P", Some("/usr/local/bin"), false)];
-        let r = resolve(&decls, &HashMap::new(), &VarCache::in_memory(), &HashMap::new());
+        let r = resolve(
+            &decls,
+            &HashMap::new(),
+            &VarCache::in_memory(),
+            &HashMap::new(),
+        );
         assert_eq!(r.values["P"], "/usr/local/bin");
     }
 

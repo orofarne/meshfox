@@ -46,7 +46,10 @@ fn edits_that_dont_overlap_are_merged_and_saved() {
 
     session.send_keys("\x13"); // Ctrl-s
     session
-        .wait_for("merged with changes made elsewhere", Duration::from_secs(10))
+        .wait_for(
+            "merged with changes made elsewhere",
+            Duration::from_secs(10),
+        )
         .unwrap_or_else(|e| panic!("{e}"));
 
     let disk = on_disk(&canvas_path);

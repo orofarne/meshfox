@@ -66,7 +66,10 @@ fn rasterize_impl(
     target: Option<(u32, u32)>,
 ) -> Option<image::DynamicImage> {
     let theme = Theme::dark();
-    let themed = resolve_root_vars(&svg::resolve_vars(&svg::inject_theme(svg_text, &theme), &theme));
+    let themed = resolve_root_vars(&svg::resolve_vars(
+        &svg::inject_theme(svg_text, &theme),
+        &theme,
+    ));
     let mut options = usvg::Options::default();
     options.fontdb = font_db();
     let tree = usvg::Tree::from_str(&themed, &options).ok()?;
@@ -110,8 +113,42 @@ fn rasterize_impl(
     image::RgbaImage::from_raw(width, height, raw).map(image::DynamicImage::ImageRgba8)
 }
 
+/// The `--name: value` declarations in the root `<svg>` tag's `style="…"`
+/// attribute, added to `vars`. Declarations are split on `;`, which is safe
+/// for the values a palette holds (colors, lengths, `var(…)` with a
+/// fallback); a non-custom property (`font:`, `color:`) is skipped.
+fn root_style_vars(svg: &str, vars: &mut std::collections::HashMap<String, String>) {
+    let Some(start) = svg.find("<svg") else {
+        return;
+    };
+    let Some(tag_len) = svg[start..].find('>') else {
+        return;
+    };
+    let tag = &svg[start..start + tag_len];
+    for quote in ['"', '\''] {
+        let marker = format!(" style={quote}");
+        let Some(at) = tag.find(&marker) else {
+            continue;
+        };
+        let value = &tag[at + marker.len()..];
+        let Some(close) = value.find(quote) else {
+            continue;
+        };
+        for declaration in value[..close].split(';') {
+            if let Some((name, value)) = declaration.split_once(':') {
+                let name = name.trim();
+                if name.starts_with("--") {
+                    vars.insert(name.to_string(), value.trim().to_string());
+                }
+            }
+        }
+        return;
+    }
+}
+
 /// usvg does not resolve CSS custom properties. Support document-level palettes
-/// declared on :root/svg, including the dark color-scheme media rule. Scoped
+/// declared on :root/svg (in a `<style>` block, including the dark
+/// color-scheme media rule, or the root tag's own `style` attribute). Scoped
 /// element properties remain the stylesheet renderer's responsibility.
 fn resolve_root_vars(svg: &str) -> String {
     use std::collections::HashMap;
@@ -123,14 +160,26 @@ fn resolve_root_vars(svg: &str) -> String {
             let mut depth = 1;
             let mut end = None;
             for (i, ch) in body.char_indices() {
-                match ch { '{' => depth += 1, '}' => depth -= 1, _ => {} }
-                if depth == 0 { end = Some(i); break; }
+                match ch {
+                    '{' => depth += 1,
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+                if depth == 0 {
+                    end = Some(i);
+                    break;
+                }
             }
             let Some(end) = end else { break };
             if selector.starts_with("@media") {
                 let condition: String = selector.chars().filter(|c| !c.is_whitespace()).collect();
-                if condition == "@media(prefers-color-scheme:dark)" { blocks(&body[..end], vars); }
-            } else if selector.split(',').any(|s| matches!(s.trim(), ":root" | "svg")) {
+                if condition == "@media(prefers-color-scheme:dark)" {
+                    blocks(&body[..end], vars);
+                }
+            } else if selector
+                .split(',')
+                .any(|s| matches!(s.trim(), ":root" | "svg"))
+            {
                 for declaration in body[..end].split(';') {
                     if let Some((name, value)) = declaration.split_once(':') {
                         let name = name.trim();
@@ -146,12 +195,20 @@ fn resolve_root_vars(svg: &str) -> String {
     let mut vars = HashMap::new();
     let mut rest = svg;
     while let Some(start) = rest.find("<style") {
-        let Some(open) = rest[start..].find('>') else { break };
+        let Some(open) = rest[start..].find('>') else {
+            break;
+        };
         rest = &rest[start + open + 1..];
-        let Some(end) = rest.find("</style>") else { break };
+        let Some(end) = rest.find("</style>") else {
+            break;
+        };
         blocks(&rest[..end], &mut vars);
         rest = &rest[end + "</style>".len()..];
     }
+    // Custom properties on the root element's own `style` attribute — how a
+    // renderer with no `<style>` block (Pele) ships its palette. Inline wins
+    // over a stylesheet rule, so these go in last.
+    root_style_vars(svg, &mut vars);
     let mut output = svg.to_string();
     // Bound expansion of references (and cycles) within custom properties.
     for _ in 0..16 {
@@ -163,11 +220,23 @@ fn resolve_root_vars(svg: &str) -> String {
             let mut depth = 1;
             let mut end = None;
             for (i, ch) in body.char_indices() {
-                match ch { '(' => depth += 1, ')' => depth -= 1, _ => {} }
-                if depth == 0 { end = Some(i); break; }
+                match ch {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                if depth == 0 {
+                    end = Some(i);
+                    break;
+                }
             }
-            let Some(end) = end else { next.push_str(&rest[start..]); rest = ""; break };
-            let (name, fallback) = body[..end].split_once(',')
+            let Some(end) = end else {
+                next.push_str(&rest[start..]);
+                rest = "";
+                break;
+            };
+            let (name, fallback) = body[..end]
+                .split_once(',')
                 .map(|(name, fallback)| (name.trim(), Some(fallback.trim())))
                 .unwrap_or((body[..end].trim(), None));
             if let Some(value) = vars.get(name).map(String::as_str).or(fallback) {
@@ -178,7 +247,9 @@ fn resolve_root_vars(svg: &str) -> String {
             rest = &body[end + 1..];
         }
         next.push_str(rest);
-        if next == output { break; }
+        if next == output {
+            break;
+        }
         output = next;
     }
     output
@@ -206,6 +277,24 @@ mod tests {
         assert_eq!(pixel(&image, 10, 10), [0xdd, 0xee, 0xff, 255]);
         assert_eq!(pixel(&image, 500, 10), [0x11, 0x22, 0x33, 255]);
         assert!(resolve_root_vars("var(--unknown, rgb(1, 2, 3))").contains("rgb(1, 2, 3)"));
+    }
+
+    /// A renderer that keeps its palette in the root tag's `style` attribute
+    /// and uses it through `var(--_x)` on attributes (Pele): the shapes must
+    /// come out in the palette's colors — falling back to the defaults inside
+    /// `var(--pele-x, #default)` — not as resvg's all-black for an
+    /// unresolved `var()`.
+    #[test]
+    fn a_palette_in_the_root_style_attribute_resolves_through_var_fallbacks() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 10" width="20" height="10" style="max-width:100%;--_s:var(--pele-surface,#f3f3f3);--_l:var(--pele-line,#1f1f1f);--_fm:var(--pele-font-mono,monospace);font:16px sans-serif" fill="var(--_l)"><rect width="10" height="10" fill="var(--_s)"/><rect x="10" width="10" height="10"/></svg>"##;
+        let img = rasterize_to_fit(svg, None, 200, 100).unwrap();
+        assert_eq!(pixel(&img, 50, 50), [0xf3, 0xf3, 0xf3, 255], "the surface");
+        assert_eq!(pixel(&img, 150, 50), [0x1f, 0x1f, 0x1f, 255], "the line");
+
+        // A value for the outer name beats the fallback.
+        let themed = svg.replace("max-width:100%;", "max-width:100%;--pele-surface:#112233;");
+        let img = rasterize_to_fit(&themed, None, 200, 100).unwrap();
+        assert_eq!(pixel(&img, 50, 50), [0x11, 0x22, 0x33, 255]);
     }
 
     #[test]

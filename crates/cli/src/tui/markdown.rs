@@ -451,7 +451,11 @@ pub fn render_with_blocks(
                     && Some(source.block_name.as_str()) == block.name.as_deref()
             })
         }) {
-            details.push(format!("exports: {}: {}", decl.name, decl.var_type.as_str()));
+            details.push(format!(
+                "exports: {}: {}",
+                decl.name,
+                decl.var_type.as_str()
+            ));
         }
         for kind in ["inputs", "outputs"] {
             if let Some(paths) = block.attrs.get(kind) {
@@ -465,14 +469,24 @@ pub fn render_with_blocks(
             let mut applications: Vec<_> = live_output.keys().collect();
             applications.sort();
             for application in applications {
-                let Ok(app) = meshfox_core::args::Application::parse(application) else { continue; };
-                if Some(app.definition.as_str()) != block.name.as_deref() { continue; }
-                let arguments = app.bindings.into_iter().filter_map(|(name, binding)| match binding {
-                    meshfox_core::args::Binding::Literal(value) => Some((name, value)),
-                    _ => None,
-                }).collect();
+                let Ok(app) = meshfox_core::args::Application::parse(application) else {
+                    continue;
+                };
+                if Some(app.definition.as_str()) != block.name.as_deref() {
+                    continue;
+                }
+                let arguments = app
+                    .bindings
+                    .into_iter()
+                    .filter_map(|(name, binding)| match binding {
+                        meshfox_core::args::Binding::Literal(value) => Some((name, value)),
+                        _ => None,
+                    })
+                    .collect();
                 if let Ok(selected) = meshfox_core::args::bind_env_name(&env.var_name, &arguments) {
-                    let source = decls.iter().find(|decl| decl.name == selected)
+                    let source = decls
+                        .iter()
+                        .find(|decl| decl.name == selected)
                         .and_then(|decl| decl.from.as_ref())
                         .map(|source| {
                             format!(
@@ -975,7 +989,10 @@ impl<'a> Renderer<'a> {
                 let muted = Style::default().fg(super::theme::BORDER);
                 for line in super::ansi::lines(&live.stderr) {
                     let mut spans = vec![Span::styled("│ ", border)];
-                    spans.extend(line.spans.into_iter().map(|mut s| { s.style = muted.patch(s.style); s }));
+                    spans.extend(line.spans.into_iter().map(|mut s| {
+                        s.style = muted.patch(s.style);
+                        s
+                    }));
                     framed.push(Line::from(spans));
                 }
                 framed.push(Line::from(Span::styled("│ ────", border)));
@@ -1612,7 +1629,11 @@ impl<'a> Renderer<'a> {
                     let browse_text = super::path_picker::BROWSE_MARKER;
                     let browse_chars = browse_text.chars().count() as u16;
 
-                    let corner = if self.focused && selected { "›─" } else { "┌─" };
+                    let corner = if self.focused && selected {
+                        "›─"
+                    } else {
+                        "┌─"
+                    };
                     let mut header = format!("{corner} form · {form_name} ");
                     if editing_this {
                         header.push_str("· editing ");
@@ -1748,9 +1769,7 @@ impl<'a> Renderer<'a> {
                         });
                         // Header and foot select the form, like clicking a
                         // code block's frame does.
-                        for (line_index, col_end) in
-                            [(0usize, header_width), (foot_index, 40u16)]
-                        {
+                        for (line_index, col_end) in [(0usize, header_width), (foot_index, 40u16)] {
                             self.click_regions.push(ClickRegion {
                                 segment_index,
                                 line_index,
@@ -1880,10 +1899,14 @@ impl<'a> Renderer<'a> {
                 // borders already use (see `Borders::ALL` in ui.rs), so the
                 // corner reads as the same kind of line, not a stray glyph.
                 let mut controls = Vec::new();
-                let mut header = if self.focused && click_name.is_some()
-                    && click_name.as_deref() == self.selected_block.as_deref() {
+                let mut header = if self.focused
+                    && click_name.is_some()
+                    && click_name.as_deref() == self.selected_block.as_deref()
+                {
                     "›─".to_string()
-                } else { "┌─".to_string() };
+                } else {
+                    "┌─".to_string()
+                };
                 if click_name.is_some() {
                     let mut control = |text: &str, action| {
                         let start = Span::raw(header.as_str()).width() as u16;
@@ -2199,7 +2222,16 @@ mod tests {
             let mut live = table_output(false, running);
             live.text = "\x1b[38;5;123mfirst\nsecond\x1b[0m".into();
             let output = std::collections::HashMap::from([("t".into(), live)]);
-            let (segments, _) = render("```bash name=\"t\"\necho hi\n```\n", Path::new("."), &Highlighter::new(), "root", &[], &Default::default(), None, &output);
+            let (segments, _) = render(
+                "```bash name=\"t\"\necho hi\n```\n",
+                Path::new("."),
+                &Highlighter::new(),
+                "root",
+                &[],
+                &Default::default(),
+                None,
+                &output,
+            );
             for word in ["first", "second"] {
                 let span = segments
                     .iter()
@@ -2245,7 +2277,10 @@ mod tests {
             .flat_map(|l| &l.spans)
             .collect();
         for word in ["red", "second"] {
-            assert_eq!(spans.iter().find(|s| s.content == word).unwrap().style.fg, Some(Color::Indexed(1)));
+            assert_eq!(
+                spans.iter().find(|s| s.content == word).unwrap().style.fg,
+                Some(Color::Indexed(1))
+            );
         }
         assert!(!segment_text(&segments).contains("[31m"));
     }
@@ -2277,12 +2312,20 @@ mod tests {
             .find(|l| l.to_string().contains("code"))
             .expect("the body row");
         let code = row.spans.iter().find(|s| s.content == "code").unwrap();
-        assert_eq!(code.style.fg, Some(Color::Rgb(255, 184, 108)), "code keeps its colour");
+        assert_eq!(
+            code.style.fg,
+            Some(Color::Rgb(255, 184, 108)),
+            "code keeps its colour"
+        );
         let bold = row.spans.iter().find(|s| s.content == "bold").unwrap();
         assert!(bold.style.add_modifier.contains(Modifier::BOLD));
         // `--:` right-aligns: "bold" (4) under header "b" (1) is the wider
         // cell, so column b is 4 wide and its header gets 3 spaces of left pad.
-        let header = lines.iter().find(|l| l.to_string().starts_with("a")).or(lines.first()).unwrap();
+        let header = lines
+            .iter()
+            .find(|l| l.to_string().starts_with("a"))
+            .or(lines.first())
+            .unwrap();
         assert!(
             lines.iter().any(|l| l.to_string().contains("   b")),
             "right-aligned header: {header:?}"
@@ -2321,8 +2364,13 @@ mod tests {
             .iter()
             .find(|l| l.contains("INPUT"))
             .unwrap_or_else(|| panic!("no INPUT cell in {lines:?}"));
-        assert!(row.contains("pick a file now"), "code stayed in the row: {row:?}");
-        assert!(lines.iter().any(|l| l.contains("OUT") && l.contains("name it")));
+        assert!(
+            row.contains("pick a file now"),
+            "code stayed in the row: {row:?}"
+        );
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("OUT") && l.contains("name it")));
         assert!(
             !lines.iter().any(|l| l.trim() == "INPUTfileOUT"),
             "code spans must not be flushed after the table: {lines:?}"
@@ -2394,11 +2442,25 @@ mod tests {
             "<!-- meshfox:var name=\"CONFIG\" default=\"configured\" -->\n",
             "## Download\n<!-- meshfox:node id=\"download\" -->\n",
             "<!-- meshfox:var name=\"LOCAL\" type=\"bool\" from=\"observe\" -->\n",
-        )).unwrap();
+        ))
+        .unwrap();
         let decls = meshfox_core::vars::declared_vars(&canvas).unwrap();
-        let (segments, _) = render(md, Path::new("/nonexistent-base-dir"), &Highlighter::new(), "download", &decls, &Default::default(), None, &Default::default());
+        let (segments, _) = render(
+            md,
+            Path::new("/nonexistent-base-dir"),
+            &Highlighter::new(),
+            "download",
+            &decls,
+            &Default::default(),
+            None,
+            &Default::default(),
+        );
         let text = segment_text(&segments);
-        for expected in ["exports: URL: string", "exports: COUNT: int", "exports: LOCAL: bool"] {
+        for expected in [
+            "exports: URL: string",
+            "exports: COUNT: int",
+            "exports: LOCAL: bool",
+        ] {
             assert!(text.contains(expected), "{text}");
         }
         assert!(!text.contains("exports: OTHER"), "{text}");
@@ -2412,8 +2474,10 @@ mod tests {
             "<!-- meshfox:var name=\"URL_hy\" from=\"download/observe\" -->",
         )
         .unwrap();
-        let output =
-            std::collections::HashMap::from([("fetch[lang=hy]".into(), table_output(false, false))]);
+        let output = std::collections::HashMap::from([(
+            "fetch[lang=hy]".into(),
+            table_output(false, false),
+        )]);
         let (segments, _) = render(
             md,
             Path::new("/nonexistent-base-dir"),
@@ -3276,22 +3340,45 @@ mod tests {
         for lang in ["bash", "button"] {
             let md = format!("```{lang} name=\"go\" deps=\"first/build,second/check\"\nRun\n```\n");
             let (segments, clicks) = render(
-                &md, Path::new("/nonexistent-base-dir"), &hl, "n", &[],
-                &std::collections::HashMap::new(), None, &std::collections::HashMap::new(),
+                &md,
+                Path::new("/nonexistent-base-dir"),
+                &hl,
+                "n",
+                &[],
+                &std::collections::HashMap::new(),
+                None,
+                &std::collections::HashMap::new(),
             );
-            let jumps: Vec<_> = clicks.iter().filter(|c| matches!(c.target, ClickTarget::JumpToNode { .. })).collect();
+            let jumps: Vec<_> = clicks
+                .iter()
+                .filter(|c| matches!(c.target, ClickTarget::JumpToNode { .. }))
+                .collect();
             assert_eq!(jumps.len(), 2);
             assert_ne!(jumps[0].line_index, jumps[1].line_index);
             for (click, label) in jumps.iter().zip(["first/build", "second/check"]) {
-                let Segment::Text(lines) = &segments[click.segment_index] else { panic!("text expected") };
-                let text: String = lines[click.line_index].spans.iter().map(|s| s.content.as_ref()).collect();
-                let hit: String = text.chars().skip(click.col_start as usize).take((click.col_end - click.col_start) as usize).collect();
+                let Segment::Text(lines) = &segments[click.segment_index] else {
+                    panic!("text expected")
+                };
+                let text: String = lines[click.line_index]
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect();
+                let hit: String = text
+                    .chars()
+                    .skip(click.col_start as usize)
+                    .take((click.col_end - click.col_start) as usize)
+                    .collect();
                 assert_eq!(hit, label);
             }
             if lang == "button" {
-                assert!(clicks.iter().any(|c| c.line_index == 0 && matches!(c.target, ClickTarget::RunBlock { .. })));
+                assert!(
+                    clicks
+                        .iter()
+                        .any(|c| c.line_index == 0
+                            && matches!(c.target, ClickTarget::RunBlock { .. }))
+                );
             }
         }
     }
-
 }

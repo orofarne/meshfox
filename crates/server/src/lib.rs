@@ -45,6 +45,8 @@ mod canvas_events;
 pub mod debug_session;
 pub mod link_preview;
 mod pty_exec;
+#[cfg(all(test, unix))]
+mod run_environment_tests;
 /// Persistent audit log + startup reconciliation for every run/service/tty
 /// execution — see its own module doc comment. `pub` for the same
 /// test-seeding reason `session_db` is.
@@ -74,8 +76,6 @@ mod session_state;
 /// `pub` so `meshfox-cli` can reuse the same async spawn/kill primitives
 /// for `meshfox run`'s real-time output — see its `main.rs`.
 pub mod stream_exec;
-#[cfg(all(test, unix))]
-mod run_environment_tests;
 pub mod tables;
 /// Webui-only multi-viewer registry for a `tty` block's own live pty
 /// session — see its own module doc comment.
@@ -1609,7 +1609,13 @@ fn run_fingerprint_in(
             &relevant,
             &overrides,
             &cache,
-            &state.session_runs.lock().unwrap().values().flat_map(|run| run.produced_vars.clone()).collect(),
+            &state
+                .session_runs
+                .lock()
+                .unwrap()
+                .values()
+                .flat_map(|run| run.produced_vars.clone())
+                .collect(),
             &ctx.shared,
         )
     };
@@ -1722,12 +1728,7 @@ struct TabGuard {
 /// its owning process (see SPEC.md's "Service blocks (experimental)"), and
 /// this *is* that process, so exiting anyway would kill it too.
 fn has_running_services(state: &AppState) -> bool {
-    state
-        .services
-        .lock()
-        .unwrap()
-        .values()
-        .any(|s| s.is_live())
+    state.services.lock().unwrap().values().any(|s| s.is_live())
 }
 
 /// True if any run (plain, `tty`, or a `file`-node's own run — every one of
@@ -1914,12 +1915,15 @@ async fn api_ping() -> &'static str {
 async fn api_info(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let keychain = state.vars_cache.lock().unwrap().secret_store_kind()
         == meshfox_core::secret_store::SecretStoreKind::Keychain;
-    let (image_protocol, image_protocol_error) = match meshfox_core::config::tui_image_protocol(canvas_root_dir(&state.canvas_path)) {
-        Ok(protocol) => (protocol, None),
-        Err(error) => (None, Some(error)),
-    };
-    Json(serde_json::json!({ "readOnly": state.read_only, "secretStore": if keychain { "keychain" } else { "plaintext" },
-        "tuiImageProtocol": image_protocol, "tuiImageProtocolError": image_protocol_error }))
+    let (image_protocol, image_protocol_error) =
+        match meshfox_core::config::tui_image_protocol(canvas_root_dir(&state.canvas_path)) {
+            Ok(protocol) => (protocol, None),
+            Err(error) => (None, Some(error)),
+        };
+    Json(
+        serde_json::json!({ "readOnly": state.read_only, "secretStore": if keychain { "keychain" } else { "plaintext" },
+        "tuiImageProtocol": image_protocol, "tuiImageProtocolError": image_protocol_error }),
+    )
 }
 
 /// Whether `method path` changes the canvas file — the requests a read-only
@@ -2126,9 +2130,7 @@ fn include_stamps(state: &AppState) -> Vec<(PathBuf, Option<(std::time::SystemTi
 /// shown with `display="code"`. Resolved through [`file_access`], so a
 /// `$VAR` target follows the variable's current value. Nothing is read or
 /// resolved at all for a canvas without such a node.
-fn file_node_stamps(
-    state: &AppState,
-) -> Vec<(String, Option<(std::time::SystemTime, u64)>)> {
+fn file_node_stamps(state: &AppState) -> Vec<(String, Option<(std::time::SystemTime, u64)>)> {
     let raw = state.raw.lock().unwrap().clone();
     let Ok(canvas) = Canvas::from_markdown(&raw) else {
         return Vec::new();
@@ -2190,6 +2192,22 @@ fn image_stamps(
         }
     }
     stamps
+}
+
+/// Once, when a canvas's worker starts: removes the hidden files `tangle`
+/// blocks left behind (`meshfox_core::tangle`) that the document no longer
+/// has a block for. Only this canvas's own files; never for a read-only
+/// canvas (nothing there may be deleted), and only when the document parses
+/// — an unparseable file must never read as "no blocks".
+fn sweep_tangled_files(state: &AppState) {
+    if state.read_only {
+        return;
+    }
+    let raw = state.raw.lock().unwrap().clone();
+    let Ok(canvas) = resolved_canvas(&raw, &state.canvas_path) else {
+        return;
+    };
+    meshfox_core::tangle::sweep_canvas(&canvas, &state.canvas_path);
 }
 
 fn spawn_file_watcher(state: Arc<AppState>) {
@@ -2476,8 +2494,12 @@ fn step_values(
     let resolved =
         meshfox_core::preview_with_shared(&relevant, &overrides, &cache, values, &shared);
     if !resolved.missing.is_empty() || !resolved.unresolved_from.is_empty() {
-        let names: Vec<_> = resolved.missing.iter().chain(resolved.unresolved_from.iter())
-            .map(|decl| decl.name.as_str()).collect();
+        let names: Vec<_> = resolved
+            .missing
+            .iter()
+            .chain(resolved.unresolved_from.iter())
+            .map(|decl| decl.name.as_str())
+            .collect();
         return Err(meshfox_core::DepsError::Artifacts(format!(
             "newly selected producer needs unresolved variables: {}; configure defaults or cached values before running", names.join(", ")
         )));
@@ -3048,8 +3070,7 @@ async fn argument_choice_sources(
         .collect();
     let computed =
         materialize_choices_and_defaults(canvas, &decls, &wanted, &state.canvas_path).await;
-    let closure =
-        meshfox_core::close_over_var_refs(&decls, wanted.iter().map(|d| d.name.as_str()));
+    let closure = meshfox_core::close_over_var_refs(&decls, wanted.iter().map(|d| d.name.as_str()));
     let decls_for_resolve: Vec<_> = decls
         .iter()
         .filter(|d| closure.contains(d.name.as_str()))
@@ -3135,8 +3156,7 @@ async fn get_vars(
     let decls_for_resolve: Vec<_> = decls
         .iter()
         .filter(|d| {
-            closure.contains(d.name.as_str())
-                && !plan.resolved.secret_errors.contains_key(&d.name)
+            closure.contains(d.name.as_str()) && !plan.resolved.secret_errors.contains_key(&d.name)
         })
         .cloned()
         .collect();
@@ -3151,7 +3171,9 @@ async fn get_vars(
     // A display-only re-resolution must not silently accept a default for a
     // secret whose preparation failed. Keep those fields in the pre-run form.
     resolved.missing.extend(
-        plan.resolved.missing.into_iter()
+        plan.resolved
+            .missing
+            .into_iter()
             .filter(|d| plan.resolved.secret_errors.contains_key(&d.name)),
     );
     resolved.origins.extend(plan.resolved.origins);
@@ -4493,7 +4515,8 @@ fn resolve_source_file(state: &AppState, include: Option<&str>) -> Result<Source
         .into_iter()
         .find(|i| i.node_id == include_id)
         .map(|i| {
-            file_access(state).confine(canvas_root_dir(&state.canvas_path), &i.target)
+            file_access(state)
+                .confine(canvas_root_dir(&state.canvas_path), &i.target)
                 .map(|path| SourceFile::Include { path })
                 .map_err(confine_api_error(&i.target))
         })
@@ -4842,7 +4865,9 @@ async fn put_canvas(
 /// *declares* the include right in this file, with its own real
 /// `meshfox:node` comment (position and all), so it must be cleared exactly
 /// like any other node.
-async fn clear_layout(State(state): State<Arc<AppState>>) -> Result<Json<VersionedCanvas>, ApiError> {
+async fn clear_layout(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<VersionedCanvas>, ApiError> {
     let _guard = state.begin_mutation().await;
     let mut raw = state.raw.lock().unwrap().clone();
     let canvas = parse_or_error(&raw)?;
@@ -4887,7 +4912,9 @@ async fn clear_layout(State(state): State<Arc<AppState>>) -> Result<Json<Version
 /// last, stably. Scoped to the primary document only, same as
 /// `clear_layout` above — an include target's own sibling order lives in
 /// a separate file, untouched by this.
-async fn reorder_siblings(State(state): State<Arc<AppState>>) -> Result<Json<VersionedCanvas>, ApiError> {
+async fn reorder_siblings(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<VersionedCanvas>, ApiError> {
     let _guard = state.begin_mutation().await;
     let raw = state.raw.lock().unwrap().clone();
     let updated = mdcanvas::reorder_by_position(&raw, &HashMap::new()).ok_or_else(|| {
@@ -6031,14 +6058,13 @@ fn confine_api_error(target: &str) -> impl Fn(meshfox_core::ConfineError) -> Api
         meshfox_core::ConfineError::TargetNotFound(p, e) => {
             ApiError(StatusCode::NOT_FOUND, format!("{}: {e}", p.display()))
         }
-        e @ (meshfox_core::ConfineError::Unconfirmed(_) | meshfox_core::ConfineError::Config(_)) => {
+        e
+        @ (meshfox_core::ConfineError::Unconfirmed(_) | meshfox_core::ConfineError::Config(_)) => {
             ApiError(StatusCode::FORBIDDEN, e.to_string())
         }
         meshfox_core::ConfineError::Outside(_) => ApiError(
             StatusCode::FORBIDDEN,
-            format!(
-                "{target:?} resolves outside the canvas directory and its trusted roots"
-            ),
+            format!("{target:?} resolves outside the canvas directory and its trusted roots"),
         ),
     }
 }
@@ -6079,15 +6105,15 @@ async fn get_node_file_content(
     let preview = file_access(&state)
         .preview(canvas_dir, target)
         .map_err(|e| match e {
-        meshfox_core::PreviewError::Confine(c) => confine_api_error(target)(c),
-        meshfox_core::PreviewError::Read(_, e) => {
-            ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        }
-        meshfox_core::PreviewError::Binary => ApiError(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "target looks like a binary file, can't preview it as code".to_string(),
-        ),
-    })?;
+            meshfox_core::PreviewError::Confine(c) => confine_api_error(target)(c),
+            meshfox_core::PreviewError::Read(_, e) => {
+                ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            }
+            meshfox_core::PreviewError::Binary => ApiError(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "target looks like a binary file, can't preview it as code".to_string(),
+            ),
+        })?;
 
     Ok(Json(FileContentResponse {
         content: preview.content,
@@ -6166,7 +6192,10 @@ async fn get_node_table_rows(
     let spec = match query.view.as_deref() {
         None | Some("") => tables::ViewSpec::default(),
         Some(raw) => serde_json::from_str(raw).map_err(|e| {
-            ApiError(StatusCode::BAD_REQUEST, format!("invalid view parameter: {e}"))
+            ApiError(
+                StatusCode::BAD_REQUEST,
+                format!("invalid view parameter: {e}"),
+            )
         })?,
     };
     let session = state
@@ -7755,7 +7784,7 @@ async fn run_block_impl_sized(
                     Some(&block.lang),
                     &block_env,
                     Some(&cwd),
-                    Some(canvas_path_for_step),
+                    stream_exec::block_origin(&resolved_block, Some(canvas_path_for_step)),
                     tty_size,
                 ) {
                     Ok(p) => p,
@@ -9258,8 +9287,12 @@ async fn stop_service(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ServiceKeyRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let handle = state.services.lock().unwrap()
-        .get(&(req.node_id.clone(), req.block.clone())).cloned()
+    let handle = state
+        .services
+        .lock()
+        .unwrap()
+        .get(&(req.node_id.clone(), req.block.clone()))
+        .cloned()
         .ok_or_else(|| {
             ApiError(
                 StatusCode::NOT_FOUND,
@@ -9267,7 +9300,8 @@ async fn stop_service(
             )
         })?;
     handle
-        .stop().await
+        .stop()
+        .await
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -9297,13 +9331,20 @@ async fn restart_service(
         req.confirm,
     )?;
     let key = (req.node_id.clone(), req.block.clone());
-    let old = state.services.lock().unwrap().get(&key).cloned().ok_or_else(|| {
-        ApiError(
-            StatusCode::NOT_FOUND,
-            format!("no service {:?}/{:?}", req.node_id, req.block),
-        )
-    })?;
-    let restarted = services::restart(&old).await
+    let old = state
+        .services
+        .lock()
+        .unwrap()
+        .get(&key)
+        .cloned()
+        .ok_or_else(|| {
+            ApiError(
+                StatusCode::NOT_FOUND,
+                format!("no service {:?}/{:?}", req.node_id, req.block),
+            )
+        })?;
+    let restarted = services::restart(&old)
+        .await
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let pid = restarted.pid;
     state.services.lock().unwrap().insert(key, restarted);
@@ -9420,10 +9461,17 @@ async fn force_start_service(
 
     // For a locally managed service, join its lifecycle instead of killing
     // its identity and racing a delayed external cleanup against this start.
-    let local = state.services.lock().unwrap()
-        .get(&(target.node_id.clone(), target.block_name.clone())).cloned();
+    let local = state
+        .services
+        .lock()
+        .unwrap()
+        .get(&(target.node_id.clone(), target.block_name.clone()))
+        .cloned();
     if let Some(handle) = local {
-        handle.stop().await.map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        handle
+            .stop()
+            .await
+            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
 
     // Whole-process-group `SIGKILL` on whatever pid the current `running`
@@ -9974,24 +10022,34 @@ async fn get_run_history(
 ) -> Result<Json<Vec<RunHistoryItem>>, ApiError> {
     let addr = canonical_run_address(&state, &query.node_id, &query.block);
     let blocks = if !query.block.contains('[') {
-        state.run_ledger.history_blocks(&addr.node_id)
+        state
+            .run_ledger
+            .history_blocks(&addr.node_id)
             .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            .into_iter().filter(|block| {
+            .into_iter()
+            .filter(|block| {
                 meshfox_core::args::Application::parse(block)
                     .is_ok_and(|app| app.definition == query.block)
-            }).collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
     } else {
         vec![addr.block_name]
     };
     let mut history = Vec::new();
     for block in blocks {
         let application = meshfox_core::deps::BlockAddr {
-            node_id: addr.node_id.clone(), block_name: block.clone(),
+            node_id: addr.node_id.clone(),
+            block_name: block.clone(),
         };
         let current = current_run_fingerprint(&state, &application);
-        let runs = state.run_ledger.history(&application.node_id, &block, current.as_deref())
+        let runs = state
+            .run_ledger
+            .history(&application.node_id, &block, current.as_deref())
             .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        history.extend(runs.into_iter().map(|run| RunHistoryItem { block: block.clone(), run }));
+        history.extend(runs.into_iter().map(|run| RunHistoryItem {
+            block: block.clone(),
+            run,
+        }));
     }
     history.sort_by(|a, b| b.run.id.cmp(&a.run.id));
     Ok(Json(history))
@@ -10183,7 +10241,10 @@ struct FsListQuery {
 /// its authority equals `Host` (the embedded web UI, including inside VS
 /// Code's webview iframe).
 fn fs_list_request_allowed(headers: &axum::http::HeaderMap) -> bool {
-    let host = match headers.get(axum::http::header::HOST).and_then(|v| v.to_str().ok()) {
+    let host = match headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+    {
         Some(h) => h,
         None => return false,
     };
@@ -10847,6 +10908,7 @@ pub async fn serve_as_worker(
             canvas_path.display()
         );
     }
+    sweep_tangled_files(&state);
     spawn_file_watcher(Arc::clone(&state));
     spawn_shutdown_signal_handler(Arc::clone(&state));
     spawn_api_idle_checker(Arc::clone(&state));
@@ -10951,12 +11013,19 @@ fn spawn_shutdown_signal_handler(state: Arc<AppState>) {
         for handle in tty_handles {
             handle.kill();
         }
-        let results = futures_util::future::join_all(service_handles.iter().map(|handle| handle.stop())).await;
+        let results =
+            futures_util::future::join_all(service_handles.iter().map(|handle| handle.stop()))
+                .await;
         for (handle, result) in service_handles.iter().zip(results) {
             if let Err(error) = result {
-                eprintln!("meshfox: failed to stop service {}: {error}", handle.block_name);
+                eprintln!(
+                    "meshfox: failed to stop service {}: {error}",
+                    handle.block_name
+                );
                 // External cleanup failed; at least reap the local identity.
-                unsafe { libc::kill(-(handle.pid as libc::pid_t), libc::SIGKILL); }
+                unsafe {
+                    libc::kill(-(handle.pid as libc::pid_t), libc::SIGKILL);
+                }
             }
         }
         // Services above have already completed their graceful stop.
@@ -11609,7 +11678,9 @@ mod node_op_broadcast_tests {
         let mut request = text_patch("new body", Some(&current_body_rev(&state, "a")));
         request.title = Some("New title".into());
         request.base_title = Some(title.clone());
-        let Json(saved) = update_node(State(state.clone()), Path("a".into()), Json(request)).await.unwrap();
+        let Json(saved) = update_node(State(state.clone()), Path("a".into()), Json(request))
+            .await
+            .unwrap();
         assert_eq!(saved.node("a").unwrap().title, "New title");
         assert_eq!(saved.node("a").unwrap().text, "new body");
         assert!(saved.canvas_version > before.canvas_version);
@@ -11621,17 +11692,30 @@ mod node_op_broadcast_tests {
         let mut stale = text_patch("must not land", Some(&current));
         stale.title = Some("Must not land".into());
         stale.base_title = Some(title);
-        let error = update_node(State(state.clone()), Path("a".into()), Json(stale)).await.err().unwrap();
+        let error = update_node(State(state.clone()), Path("a".into()), Json(stale))
+            .await
+            .err()
+            .unwrap();
         assert_eq!(error.0, StatusCode::CONFLICT);
         let payload: serde_json::Value = serde_json::from_str(&error.1).unwrap();
         assert_eq!(payload["currentTitle"], "New title");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), raw_before);
 
         // A stale body must not partially commit its accompanying title.
-        let mut stale = text_patch("must not land", Some(&before.node("a").unwrap().body_rev.clone().unwrap()));
+        let mut stale = text_patch(
+            "must not land",
+            Some(&before.node("a").unwrap().body_rev.clone().unwrap()),
+        );
         stale.title = Some("Must not land".into());
         stale.base_title = Some("New title".into());
-        assert_eq!(update_node(State(state.clone()), Path("a".into()), Json(stale)).await.err().unwrap().0, StatusCode::CONFLICT);
+        assert_eq!(
+            update_node(State(state.clone()), Path("a".into()), Json(stale))
+                .await
+                .err()
+                .unwrap()
+                .0,
+            StatusCode::CONFLICT
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), raw_before);
         let _ = std::fs::remove_file(path);
     }
@@ -11644,8 +11728,14 @@ mod node_op_broadcast_tests {
         let Json(same) = get_canvas(State(state.clone())).await.unwrap();
         assert_eq!(first.canvas_version, same.canvas_version);
         let raw = std::fs::read_to_string(&path).unwrap();
-        std::fs::write(&path, mdcanvas::set_node_body(&raw, "a", "external").unwrap()).unwrap();
-        { let _guard = state.begin_mutation().await; }
+        std::fs::write(
+            &path,
+            mdcanvas::set_node_body(&raw, "a", "external").unwrap(),
+        )
+        .unwrap();
+        {
+            let _guard = state.begin_mutation().await;
+        }
         let Json(external) = get_canvas(State(state.clone())).await.unwrap();
         assert!(external.canvas_version > first.canvas_version);
         assert_eq!(external.node("a").unwrap().text, "external");
@@ -11784,7 +11874,10 @@ mod node_op_broadcast_tests {
         let _ = update_node(
             State(state.clone()),
             Path("a".to_string()),
-            Json(text_patch(&base.replace("line 1", "line one"), Some(&base_rev))),
+            Json(text_patch(
+                &base.replace("line 1", "line one"),
+                Some(&base_rev),
+            )),
         )
         .await
         .expect("first write is current");
@@ -11835,7 +11928,10 @@ mod node_op_broadcast_tests {
         let _ = update_node(
             State(state.clone()),
             Path("a".to_string()),
-            Json(text_patch(&base.replace("line 3", "their line"), Some(&base_rev))),
+            Json(text_patch(
+                &base.replace("line 3", "their line"),
+                Some(&base_rev),
+            )),
         )
         .await
         .unwrap();
@@ -11852,12 +11948,18 @@ mod node_op_broadcast_tests {
         assert_eq!(err.0, StatusCode::CONFLICT);
         let conflict = conflict_json(err).await;
         assert_eq!(conflict["error"], "bodyConflict");
-        assert!(conflict["currentText"].as_str().unwrap().contains("their line"));
+        assert!(conflict["currentText"]
+            .as_str()
+            .unwrap()
+            .contains("their line"));
         let hunks = conflict["conflicts"].as_array().expect("conflicts listed");
         assert_eq!(hunks.len(), 1);
         // Line 3 of the body: index 2 in both texts, one line long.
         assert_eq!(hunks[0]["mine"], serde_json::json!({"start": 2, "end": 3}));
-        assert_eq!(hunks[0]["theirs"], serde_json::json!({"start": 2, "end": 3}));
+        assert_eq!(
+            hunks[0]["theirs"],
+            serde_json::json!({"start": 2, "end": 3})
+        );
         let marked = conflict["marked"].as_str().unwrap();
         assert!(
             marked.contains("<<<<<<< mine\nmy line\n=======\ntheir line\n>>>>>>> theirs\n"),
@@ -11899,14 +12001,20 @@ mod node_op_broadcast_tests {
         let _ = update_node(
             State(state.clone()),
             Path("a".to_string()),
-            Json(text_patch(&base.replace("line 1", "line one"), Some(&base_rev))),
+            Json(text_patch(
+                &base.replace("line 1", "line one"),
+                Some(&base_rev),
+            )),
         )
         .await
         .unwrap();
         let err = update_node(
             State(state.clone()),
             Path("a".to_string()),
-            Json(text_patch(&base.replace("line 6", "line six"), Some(&base_rev))),
+            Json(text_patch(
+                &base.replace("line 6", "line six"),
+                Some(&base_rev),
+            )),
         )
         .await
         .map(|_| ())
@@ -11942,7 +12050,10 @@ mod node_op_broadcast_tests {
         let Json(saved) = update_node(
             State(state.clone()),
             Path("a".to_string()),
-            Json(merge_patch(&second.replace("line 1", "line one"), &second_rev)),
+            Json(merge_patch(
+                &second.replace("line 1", "line one"),
+                &second_rev,
+            )),
         )
         .await
         .expect("the base is in the redo tail");
@@ -11950,7 +12061,10 @@ mod node_op_broadcast_tests {
         let text = &saved.node("a").unwrap().text;
         // `theirs` (the undone state) wins line 6, `mine` brings line 1.
         assert!(text.contains("line one"), "{text:?}");
-        assert!(text.contains("line 6") && !text.contains("line six"), "{text:?}");
+        assert!(
+            text.contains("line 6") && !text.contains("line six"),
+            "{text:?}"
+        );
         let _ = std::fs::remove_file(&canvas_path);
     }
 
@@ -12018,7 +12132,10 @@ mod node_op_broadcast_tests {
         let _ = update_node(
             State(state.clone()),
             Path("a".to_string()),
-            Json(text_patch(&base.replace("line 1", "line one"), Some(&base_rev))),
+            Json(text_patch(
+                &base.replace("line 1", "line one"),
+                Some(&base_rev),
+            )),
         )
         .await
         .unwrap();
@@ -12034,7 +12151,10 @@ mod node_op_broadcast_tests {
         .expect("the log outlives the worker");
         assert_eq!(saved.merged, Some(true));
         let text = &saved.node("a").unwrap().text;
-        assert!(text.contains("line one") && text.contains("line six"), "{text:?}");
+        assert!(
+            text.contains("line one") && text.contains("line six"),
+            "{text:?}"
+        );
         let _ = std::fs::remove_file(&canvas_path);
     }
 
@@ -12044,7 +12164,9 @@ mod node_op_broadcast_tests {
     async fn source_put_with_merge_combines_edits_and_returns_the_merged_file() {
         let canvas_path = write_test_canvas(MERGE_DOC);
         let state = build_state(canvas_path.clone(), false, None).await.unwrap();
-        let read = get_canvas_raw(State(state.clone()), raw_query()).await.unwrap();
+        let read = get_canvas_raw(State(state.clone()), raw_query())
+            .await
+            .unwrap();
         let base_etag = etag_of(&read);
 
         let theirs = MERGE_DOC.replace("line 1", "line one");
@@ -12175,7 +12297,10 @@ mod node_op_broadcast_tests {
     }
 
     fn raw_query() -> Query<SourceFileQuery> {
-        Query(SourceFileQuery { include: None, merge: None })
+        Query(SourceFileQuery {
+            include: None,
+            merge: None,
+        })
     }
 
     fn etag_of(response: &Response) -> String {
@@ -12600,7 +12725,10 @@ mod undo_log_recording_tests {
         let held = if_match_for(&state.raw.lock().unwrap());
         let status = put_canvas_raw(
             State(state.clone()),
-            Query(SourceFileQuery { include: None, merge: None }),
+            Query(SourceFileQuery {
+                include: None,
+                merge: None,
+            }),
             held,
             input.clone(),
         )
@@ -15063,12 +15191,17 @@ mod ws_tests {
         let addr = spawn_test_server(canvas_path.clone()).await;
         for (value, should_skip) in [("one", false), ("one", true), ("two", false), ("two", true)] {
             std::fs::write(&revision, value).unwrap();
-            let (mut ws, _) = tokio_tungstenite::connect_async(
-                format!("ws://{addr}/api/run/tty?block=target&cols=80&rows=24")
-            ).await.unwrap();
+            let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+                "ws://{addr}/api/run/tty?block=target&cols=80&rows=24"
+            ))
+            .await
+            .unwrap();
             let mut skipped = Vec::new();
             loop {
-                let event = tokio::time::timeout(std::time::Duration::from_secs(10), next_event(&mut ws)).await.unwrap();
+                let event =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), next_event(&mut ws))
+                        .await
+                        .unwrap();
                 assert_ne!(event["type"], "error", "{event:?}");
                 if event["type"] == "step-skipped" {
                     skipped.push(event["block"].as_str().unwrap().to_string());
@@ -15321,7 +15454,9 @@ mod ws_tests {
         let addr = spawn_test_server(canvas_path.clone()).await;
         let (mut owner, _) = tokio_tungstenite::connect_async(format!(
             "ws://{addr}/api/run/tty?path=shell&block=interactive"
-        )).await.unwrap();
+        ))
+        .await
+        .unwrap();
         next_event(&mut owner).await;
         next_event(&mut owner).await;
         next_event(&mut owner).await;
@@ -15329,7 +15464,10 @@ mod ws_tests {
         let url = format!("ws://{addr}/api/run/tty/attach?nodeId=shell&block=interactive");
         let (mut viewer, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
         read_until(&mut viewer, "ready").await;
-        owner.send(WsMessage::Binary(b"\n".to_vec().into())).await.unwrap();
+        owner
+            .send(WsMessage::Binary(b"\n".to_vec().into()))
+            .await
+            .unwrap();
         let event = next_event(&mut viewer).await;
         assert_eq!(event["type"], "done");
         assert_eq!(event["exitCode"], 7);
@@ -15842,7 +15980,10 @@ mod run_file_tests {
     /// A unix socket path short enough for macOS's `SUN_LEN` (a scratch
     /// dir under `$TMPDIR` is not).
     fn short_socket_path() -> PathBuf {
-        std::env::temp_dir().join(format!("mfx-open-{}.sock", &uuid::Uuid::new_v4().to_string()[..8]))
+        std::env::temp_dir().join(format!(
+            "mfx-open-{}.sock",
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ))
     }
 
     /// Serves one request on `socket` and answers it with `reply`; returns
@@ -15857,16 +15998,16 @@ mod run_file_tests {
             let (stream, _) = listener.accept().await.unwrap();
             let (read_half, mut write_half) = stream.into_split();
             let mut line = String::new();
-            BufReader::new(read_half).read_line(&mut line).await.unwrap();
+            BufReader::new(read_half)
+                .read_line(&mut line)
+                .await
+                .unwrap();
             write_half.write_all(reply.as_bytes()).await.unwrap();
             line
         })
     }
 
-    async fn spawn_test_server_with_watcher(
-        canvas_path: PathBuf,
-        socket: PathBuf,
-    ) -> SocketAddr {
+    async fn spawn_test_server_with_watcher(canvas_path: PathBuf, socket: PathBuf) -> SocketAddr {
         let state = build_state(canvas_path, false, Some(socket))
             .await
             .expect("valid test canvas");
@@ -16286,10 +16427,13 @@ mod session_skip_tests {
     }
 
     fn dir_var_canvas(vars: &str, targets: &[(&str, &str)]) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("meshfox-dirvar-test-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("meshfox-dirvar-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let dir = dir.canonicalize().unwrap();
-        let mut md = format!("<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n{vars}\n");
+        let mut md = format!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n{vars}\n"
+        );
         for (id, target) in targets {
             md.push_str(&format!(
                 "\n## {id}\n<!-- meshfox:node id=\"{id}\" type=\"file\" display=\"code\" -->\n\n[{id}]({target})\n"
@@ -16313,7 +16457,10 @@ mod session_skip_tests {
         let data = outside_dir_with("a.txt", "hello-from-data");
         let other = outside_dir_with("b.txt", "secret");
         let path = dir_var_canvas(
-            &format!("<!-- meshfox:var name=\"D\" type=\"dir\" default=\"{}\" -->", data.display()),
+            &format!(
+                "<!-- meshfox:var name=\"D\" type=\"dir\" default=\"{}\" -->",
+                data.display()
+            ),
             &[
                 ("viavar", "$D/a.txt"),
                 ("other", &format!("{}/b.txt", other.display())),
@@ -16322,7 +16469,10 @@ mod session_skip_tests {
         // Unconfirmed default: grants nothing.
         let addr = spawn_test_server(path.clone()).await;
         let (status, body) = request(addr, "GET", "/api/nodes/viavar/file-content", "", "").await;
-        assert_eq!(status, 403, "an unconfirmed out-of-canvas default must not grant access");
+        assert_eq!(
+            status, 403,
+            "an unconfirmed out-of-canvas default must not grant access"
+        );
         assert!(body.contains("hasn't been confirmed"), "{body}");
 
         // Confirmed (cached answer): reads there, still not elsewhere.
@@ -16365,8 +16515,14 @@ mod session_skip_tests {
         cache.set("IN", file.to_str().unwrap()).unwrap();
         let addr = spawn_test_server(path.clone()).await;
         for id in ["viavar", "direct"] {
-            let (status, body) =
-                request(addr, "GET", &format!("/api/nodes/{id}/file-content"), "", "").await;
+            let (status, body) = request(
+                addr,
+                "GET",
+                &format!("/api/nodes/{id}/file-content"),
+                "",
+                "",
+            )
+            .await;
             assert_eq!(status, 200, "{id}: {body}");
             assert!(body.contains("hello-from-file"), "{id}: {body}");
         }
@@ -16394,10 +16550,11 @@ mod session_skip_tests {
         host: &str,
         origin: Option<&str>,
     ) -> (u16, String) {
-        let origin = origin.map(|o| format!("Origin: {o}\r\n")).unwrap_or_default();
-        let request = format!(
-            "GET {path} HTTP/1.1\r\nHost: {host}\r\n{origin}Connection: close\r\n\r\n"
-        );
+        let origin = origin
+            .map(|o| format!("Origin: {o}\r\n"))
+            .unwrap_or_default();
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{origin}Connection: close\r\n\r\n");
         let mut stream = TcpStream::connect(addr).await.expect("connect");
         stream.write_all(request.as_bytes()).await.expect("write");
         let mut raw = String::new();
@@ -16437,8 +16594,7 @@ mod session_skip_tests {
         let (status, _) = request_with_headers(addr, &url, "evil.example:80", None).await;
         assert_eq!(status, 403);
         // Bad kind.
-        let (status, _) =
-            request_with_headers(addr, "/api/fs/list?kind=socket", &host, None).await;
+        let (status, _) = request_with_headers(addr, "/api/fs/list?kind=socket", &host, None).await;
         assert_eq!(status, 400);
     }
 
@@ -16452,8 +16608,14 @@ mod session_skip_tests {
         std::fs::write(std::path::Path::new(&w).join("x.txt"), "tmp-content").unwrap();
         let addr = spawn_test_server(path.clone()).await;
         for id in ["viatmp", "direct"] {
-            let (status, body) =
-                request(addr, "GET", &format!("/api/nodes/{id}/file-content"), "", "").await;
+            let (status, body) = request(
+                addr,
+                "GET",
+                &format!("/api/nodes/{id}/file-content"),
+                "",
+                "",
+            )
+            .await;
             assert_eq!(status, 200, "{id}: {body}");
             assert!(body.contains("tmp-content"), "{id}: {body}");
         }
@@ -16462,7 +16624,10 @@ mod session_skip_tests {
         assert!(body.contains("\"bytes\":11"), "{body}");
         let (status, _) = request(addr, "POST", "/api/session/reset", "application/json", "").await;
         assert_eq!(status, 204);
-        assert!(!meshfox_core::tmp_dir(&path).exists(), "@tmp must be gone after reset");
+        assert!(
+            !meshfox_core::tmp_dir(&path).exists(),
+            "@tmp must be gone after reset"
+        );
     }
 
     fn write_dep_chain_canvas(dep_code: &str) -> PathBuf {
@@ -16765,13 +16930,34 @@ true
             "EB"
         );
         let restarted = spawn_test_server(path.clone()).await;
-        let (status, body) = request(restarted, "GET", "/api/run/history?nodeId=root&block=extract", "application/json", "").await;
+        let (status, body) = request(
+            restarted,
+            "GET",
+            "/api/run/history?nodeId=root&block=extract",
+            "application/json",
+            "",
+        )
+        .await;
         assert_eq!(status, 200);
         let combined: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
         assert_eq!(combined.len(), 4, "{body}");
-        assert_eq!(combined.iter().filter(|run| run["block"] == "extract[lang=en]").count(), 1);
-        assert_eq!(combined.iter().filter(|run| run["block"] == "extract[lang=hy]").count(), 3);
-        assert!(combined.windows(2).all(|pair| pair[0]["id"].as_i64() > pair[1]["id"].as_i64()));
+        assert_eq!(
+            combined
+                .iter()
+                .filter(|run| run["block"] == "extract[lang=en]")
+                .count(),
+            1
+        );
+        assert_eq!(
+            combined
+                .iter()
+                .filter(|run| run["block"] == "extract[lang=hy]")
+                .count(),
+            3
+        );
+        assert!(combined
+            .windows(2)
+            .all(|pair| pair[0]["id"].as_i64() > pair[1]["id"].as_i64()));
         for (lang, count) in [("en", 1), ("hy", 3)] {
             let (status, body) = request(
                 restarted,
@@ -17823,7 +18009,10 @@ mod vars_endpoint_tests {
         let (status, body) = post_json(addr, "/api/args", r#"{"block":"import"}"#).await;
         assert_eq!(status, 200, "{body}");
         let prepared: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(prepared["fields"][0]["choices"], serde_json::json!(["a.csv", "b.csv"]));
+        assert_eq!(
+            prepared["fields"][0]["choices"],
+            serde_json::json!(["a.csv", "b.csv"])
+        );
         assert!(prepared["fields"][0].get("choicesPending").is_none());
         assert!(prepared["block"].is_null());
 
@@ -18825,17 +19014,11 @@ mod form_endpoint_tests {
         "```\n",
     );
 
-    const SEND_EU: &str =
-        r#"{"nodeId":"config","block":"pick-region","values":{"REGION":"eu"}}"#;
+    const SEND_EU: &str = r#"{"nodeId":"config","block":"pick-region","values":{"REGION":"eu"}}"#;
 
     /// The `status` of `node_id`/`block`'s entry in `GET /api/runs`, polled
     /// until it is `want` (or ~5 s pass).
-    async fn wait_for_run_status(
-        addr: SocketAddr,
-        node_id: &str,
-        block: &str,
-        want: &str,
-    ) -> bool {
+    async fn wait_for_run_status(addr: SocketAddr, node_id: &str, block: &str, want: &str) -> bool {
         for _ in 0..250 {
             let (status, body) = get(addr, "/api/runs").await;
             if status == 200 {
@@ -18894,9 +19077,12 @@ mod form_endpoint_tests {
 
         assert!(wait_for_run_status(addr, "config", "shell", "running").await);
 
-        let url = format!("ws://{addr}/api/run/tty/attach?nodeId=config&block=shell&cols=80&rows=24");
+        let url =
+            format!("ws://{addr}/api/run/tty/attach?nodeId=config&block=shell&cols=80&rows=24");
         let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("attach");
-        ws.send(WsMessage::Binary(b"hello\n".to_vec().into())).await.unwrap();
+        ws.send(WsMessage::Binary(b"hello\n".to_vec().into()))
+            .await
+            .unwrap();
         let mut output = Vec::new();
         let _ = tokio::time::timeout(Duration::from_secs(5), async {
             while let Some(Ok(msg)) = ws.next().await {
@@ -18947,12 +19133,8 @@ mod form_endpoint_tests {
         assert_eq!(vars[0]["value"], "eu", "{vars:?}");
 
         // Stopping the session (by address) frees the form again.
-        let (status, _) = post_json(
-            addr,
-            "/api/kill",
-            r#"{"nodeId":"config","block":"shell"}"#,
-        )
-        .await;
+        let (status, _) =
+            post_json(addr, "/api/kill", r#"{"nodeId":"config","block":"shell"}"#).await;
         assert_eq!(status, 204);
         assert!(wait_for_run_status(addr, "config", "shell", "killed").await);
         let mut accepted = false;
@@ -18969,7 +19151,10 @@ mod form_endpoint_tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(accepted, "Send should be accepted again once the run is over");
+        assert!(
+            accepted,
+            "Send should be accepted again once the run is over"
+        );
 
         let _ = post_json(addr, "/api/kill", r#"{"nodeId":"config","block":"shell"}"#).await;
         let _ = std::fs::remove_file(&canvas_path);
@@ -21110,6 +21295,61 @@ mod read_only_tests {
         addr
     }
 
+    const TANGLE_CANVAS: &str = concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "```python name=\"kept\" interpreter=\"python3\" tangle\nprint(1)\n```\n\n",
+        "```python name=\"plain\" interpreter=\"python3\"\nprint(2)\n```\n",
+    );
+
+    /// Lays down a kept file, a leftover of a removed block and another
+    /// canvas's file next to a canvas, and returns their paths.
+    fn tangle_files_next_to(canvas_path: &std::path::Path) -> (PathBuf, PathBuf, PathBuf) {
+        let dir = canvas_path.parent().unwrap();
+        let write = |canvas: &std::path::Path, block: &str| {
+            meshfox_core::tangle::materialize(canvas, block, "x", Some("python"), dir).unwrap()
+        };
+        (
+            write(canvas_path, "kept"),
+            write(canvas_path, "removed-block"),
+            write(&dir.join("other.canvas.md"), "removed-block"),
+        )
+    }
+
+    /// Starting a worker removes this canvas's tangled files whose block is
+    /// gone — and nothing else.
+    #[tokio::test]
+    async fn a_starting_worker_sweeps_tangled_files_its_document_no_longer_has() {
+        let (dir, canvas_path) = canvas_in_own_dir();
+        std::fs::write(&canvas_path, TANGLE_CANVAS).unwrap();
+        let (kept, leftover, other_canvas) = tangle_files_next_to(&canvas_path);
+
+        let state = build_state_with(canvas_path, false, None, false)
+            .await
+            .expect("valid test canvas");
+        sweep_tangled_files(&state);
+
+        assert!(kept.exists(), "a tangle block's file stays");
+        assert!(!leftover.exists(), "a removed block's file goes");
+        assert!(other_canvas.exists(), "another canvas's file is not ours");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A read-only canvas can't have its directory tidied: nothing is deleted.
+    #[tokio::test]
+    async fn a_read_only_worker_does_not_sweep_tangled_files() {
+        let (dir, canvas_path) = canvas_in_own_dir();
+        std::fs::write(&canvas_path, TANGLE_CANVAS).unwrap();
+        let (_, leftover, _) = tangle_files_next_to(&canvas_path);
+
+        let state = build_state_with(canvas_path, false, None, true)
+            .await
+            .expect("valid test canvas");
+        sweep_tangled_files(&state);
+
+        assert!(leftover.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn only_requests_that_change_the_document_count_as_edits() {
         for (method, path) in [
@@ -21519,16 +21759,12 @@ mod table_endpoint_tests {
         let addr = spawn_test_server(canvas_path).await;
         let _ = rustls::crypto::ring::default_provider().install_default();
         let client = reqwest::Client::new();
-        let (status, meta) =
-            get_json(&client, format!("http://{addr}/api/nodes/data/table")).await;
+        let (status, meta) = get_json(&client, format!("http://{addr}/api/nodes/data/table")).await;
         assert_eq!(status, 200, "{meta}");
         assert_eq!(meta["state"], "failed");
         assert_eq!(meta["error"]["kind"], "duckdb-missing");
-        let (status, _) = get_json(
-            &client,
-            format!("http://{addr}/api/nodes/data/table/rows"),
-        )
-        .await;
+        let (status, _) =
+            get_json(&client, format!("http://{addr}/api/nodes/data/table/rows")).await;
         assert_eq!(status, 503);
         std::fs::remove_dir_all(dir.parent().unwrap()).ok();
     }
@@ -21580,9 +21816,17 @@ mod tui_image_config_tests {
         let dir = std::env::temp_dir().join(format!("meshfox-tui-config-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join(".meshfox")).unwrap();
         let path = dir.join("test.canvas.md");
-        std::fs::write(&path, "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n").unwrap();
+        std::fs::write(
+            &path,
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
+        )
+        .unwrap();
         let config = dir.join(".meshfox/config.toml");
-        std::fs::write(&config, "private_setting = \"not-for-clients\"\n[tui]\nimage_protocol = \"sixel\"").unwrap();
+        std::fs::write(
+            &config,
+            "private_setting = \"not-for-clients\"\n[tui]\nimage_protocol = \"sixel\"",
+        )
+        .unwrap();
         let state = build_state(path, false, None).await.unwrap();
         let Json(info) = api_info(State(state.clone())).await;
         assert_eq!(info["tuiImageProtocol"], "sixel");
@@ -21591,7 +21835,10 @@ mod tui_image_config_tests {
         std::fs::write(&config, "[tui]\nimage_protocol = 7").unwrap();
         let Json(info) = api_info(State(state)).await;
         assert!(info["tuiImageProtocol"].is_null());
-        assert!(info["tuiImageProtocolError"].as_str().unwrap().contains("tui.image_protocol"));
+        assert!(info["tuiImageProtocolError"]
+            .as_str()
+            .unwrap()
+            .contains("tui.image_protocol"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

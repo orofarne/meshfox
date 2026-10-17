@@ -412,10 +412,12 @@ impl RunLedger {
     /// Stored application addresses, including stale runs after a reset.
     pub fn history_blocks(&self, node_id: &str) -> io::Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT block FROM runs WHERE node_id = ?1 AND outcome != 'running'",
-        ).map_err(sqlite_err)?;
-        let rows = stmt.query_map([node_id], |r| r.get(0)).map_err(sqlite_err)?;
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT block FROM runs WHERE node_id = ?1 AND outcome != 'running'")
+            .map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map([node_id], |r| r.get(0))
+            .map_err(sqlite_err)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)
     }
 
@@ -517,10 +519,14 @@ impl RunLedger {
     /// Release a queued reservation for a step that was found fresh and
     /// never spawned. It is not a killed run and must not appear in history.
     pub fn discard_reservation(&self, id: i64) -> io::Result<()> {
-        self.conn.lock().unwrap().execute(
-            "DELETE FROM runs WHERE id = ?1 AND outcome = 'running' AND pid = ?2",
-            params![id, std::process::id()],
-        ).map_err(sqlite_err)?;
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM runs WHERE id = ?1 AND outcome = 'running' AND pid = ?2",
+                params![id, std::process::id()],
+            )
+            .map_err(sqlite_err)?;
         self.notify();
         Ok(())
     }
@@ -718,13 +724,19 @@ mod tests {
     #[test]
     fn skipped_reservations_release_the_lock_without_creating_run_history() {
         let ledger = RunLedger::open_in_memory().unwrap();
-        let id = ledger.start("a", "b", RunKind::Plain, "test", std::process::id()).unwrap();
+        let id = ledger
+            .start("a", "b", RunKind::Plain, "test", std::process::id())
+            .unwrap();
         ledger.discard_reservation(id).unwrap();
         assert!(ledger.active_running().unwrap().is_empty());
         assert!(ledger.history("a", "b", None).unwrap().is_empty());
         let child = ledger.start("a", "b", RunKind::Plain, "test", 1).unwrap();
         ledger.discard_reservation(child).unwrap();
-        assert_eq!(ledger.active_running().unwrap().len(), 1, "a spawned process must not be discarded");
+        assert_eq!(
+            ledger.active_running().unwrap().len(),
+            1,
+            "a spawned process must not be discarded"
+        );
     }
     use std::os::unix::process::CommandExt;
 

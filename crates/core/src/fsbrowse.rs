@@ -93,13 +93,21 @@ fn locate(requested: &str, canvas_path: &Path) -> PathBuf {
     if crate::dirvars::is_tmp_ref(requested) {
         let rest = requested["@tmp".len()..].trim_start_matches('/');
         let base = crate::dirvars::tmp_dir(canvas_path);
-        return if rest.is_empty() { base } else { base.join(rest) };
+        return if rest.is_empty() {
+            base
+        } else {
+            base.join(rest)
+        };
     }
     if requested == "~" || requested.starts_with("~/") {
         if let Some(home) = std::env::var_os("HOME") {
             let rest = requested.trim_start_matches('~').trim_start_matches('/');
             let home = PathBuf::from(home);
-            return if rest.is_empty() { home } else { home.join(rest) };
+            return if rest.is_empty() {
+                home
+            } else {
+                home.join(rest)
+            };
         }
     }
     let p = Path::new(requested);
@@ -251,7 +259,13 @@ mod tests {
         let d = tmp("dirkind");
         fs::create_dir(d.join("sub")).unwrap();
         fs::write(d.join("f.txt"), "").unwrap();
-        let l = list(d.to_str().unwrap(), PickKind::Dir, false, &d.join("c.canvas.md")).unwrap();
+        let l = list(
+            d.to_str().unwrap(),
+            PickKind::Dir,
+            false,
+            &d.join("c.canvas.md"),
+        )
+        .unwrap();
         assert_eq!(names(&l), ["sub"]);
     }
 
@@ -261,7 +275,13 @@ mod tests {
         fs::write(d.join("in.mp4"), "x").unwrap();
         fs::write(d.join("other.mp4"), "x").unwrap();
         let p = d.join("in.mp4");
-        let l = list(p.to_str().unwrap(), PickKind::File, false, &d.join("c.canvas.md")).unwrap();
+        let l = list(
+            p.to_str().unwrap(),
+            PickKind::File,
+            false,
+            &d.join("c.canvas.md"),
+        )
+        .unwrap();
         assert_eq!(l.path, d.to_string_lossy());
         assert_eq!(l.selected.as_deref(), Some("in.mp4"));
     }
@@ -270,12 +290,24 @@ mod tests {
     fn a_missing_path_falls_back_to_its_nearest_existing_ancestor() {
         let d = tmp("missing");
         let p = d.join("out.mp4");
-        let l = list(p.to_str().unwrap(), PickKind::File, false, &d.join("c.canvas.md")).unwrap();
+        let l = list(
+            p.to_str().unwrap(),
+            PickKind::File,
+            false,
+            &d.join("c.canvas.md"),
+        )
+        .unwrap();
         assert_eq!(l.path, d.to_string_lossy());
         assert_eq!(l.selected.as_deref(), Some("out.mp4"));
 
         let deep = d.join("a").join("b").join("out.mp4");
-        let l = list(deep.to_str().unwrap(), PickKind::File, false, &d.join("c.canvas.md")).unwrap();
+        let l = list(
+            deep.to_str().unwrap(),
+            PickKind::File,
+            false,
+            &d.join("c.canvas.md"),
+        )
+        .unwrap();
         assert_eq!(l.path, d.to_string_lossy());
         assert_eq!(l.selected, None);
     }
@@ -285,7 +317,10 @@ mod tests {
         let d = tmp("rel");
         fs::create_dir(d.join("data")).unwrap();
         let canvas = d.join("c.canvas.md");
-        assert_eq!(list("", PickKind::Dir, false, &canvas).unwrap().path, d.to_string_lossy());
+        assert_eq!(
+            list("", PickKind::Dir, false, &canvas).unwrap().path,
+            d.to_string_lossy()
+        );
         assert_eq!(
             list("data", PickKind::Dir, false, &canvas).unwrap().path,
             d.join("data").to_string_lossy()
@@ -295,7 +330,13 @@ mod tests {
     #[test]
     fn parent_is_absent_only_at_the_root() {
         let d = tmp("parent");
-        let l = list(d.to_str().unwrap(), PickKind::Dir, false, &d.join("c.canvas.md")).unwrap();
+        let l = list(
+            d.to_str().unwrap(),
+            PickKind::Dir,
+            false,
+            &d.join("c.canvas.md"),
+        )
+        .unwrap();
         assert_eq!(l.parent.as_deref(), d.parent().and_then(|p| p.to_str()));
         let root = list("/", PickKind::Dir, false, &d.join("c.canvas.md")).unwrap();
         assert_eq!(root.parent, None);

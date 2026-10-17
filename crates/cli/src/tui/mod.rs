@@ -23,6 +23,7 @@ mod svg_raster;
 mod table;
 #[cfg(test)]
 mod table_layout_tests;
+mod terminal_status;
 mod theme;
 mod tree;
 mod unicode_picker;
@@ -126,7 +127,7 @@ pub async fn run(canvas_path: PathBuf, initial_node: Option<String>) -> io::Resu
                 DisableMouseCapture
             )?;
             eprintln!("meshfox tui: couldn't reach a worker for this canvas: {e}");
-            std::process::exit(1);
+            return Err(e);
         }
     };
 
@@ -281,6 +282,7 @@ fn spawn_signal_terminal_restore(embedded_worker: bool) {
 /// this runs from a signal handler, possibly with the terminal already gone
 /// (`SIGHUP`), where there's nobody left to report a failure to.
 fn restore_terminal_best_effort() {
+    crate::terminal_status::clear();
     let _ = disable_raw_mode();
     let _ = execute!(
         io::stdout(),
@@ -359,7 +361,10 @@ enum ExternalMsg {
     RunsChanged,
     /// A terminal session started in the worker (see
     /// `WatchEvent::TtyStarted`).
-    TtyStarted { node_id: String, block: String },
+    TtyStarted {
+        node_id: String,
+        block: String,
+    },
 }
 
 /// One incremental update for a run this TUI session never itself started
@@ -438,7 +443,14 @@ async fn main_loop(
     background_rx: &mut tokio::sync::mpsc::UnboundedReceiver<BackgroundMsg>,
     external_run_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExternalMsg>,
 ) -> io::Result<()> {
+    let mut status = terminal_status::CanvasStatus::default();
+    // Establish the historical baseline before observing live changes.
+    app.refresh_services().await;
+    app.refresh_block_runs().await;
+    let mut worker_tick = tokio::time::interval(Duration::from_secs(3));
+    worker_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
+        status.update(app);
         terminal.draw(|f| ui::render(f, app))?;
         if app.should_quit {
             return Ok(());
@@ -489,6 +501,8 @@ async fn main_loop(
             if let Err(e) = result {
                 app.status = format!("failed to open canvas: {e}");
             }
+            app.refresh_services().await;
+            app.refresh_block_runs().await;
             continue;
         }
 
@@ -558,7 +572,7 @@ async fn main_loop(
             _ = tokio::time::sleep(std::time::Duration::from_millis(700)), if app.tables_want_fast_poll() => {
                 app.poll_tables();
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(3)), if worker_reachable => {
+            _ = worker_tick.tick(), if worker_reachable => {
                 app.poll_tables();
                 app.refresh_services().await;
                 app.refresh_block_runs().await;
@@ -1146,8 +1160,20 @@ mod tty_end_tests {
     fn terminal_outcomes_distinguish_exit_kill_and_lost_connection() {
         assert_eq!(TtyEnd::Exited(0).label(), "Completed · exit 0");
         assert_eq!(TtyEnd::Exited(7).label(), "Failed · exit 7");
-        assert_eq!(TtyEnd::Disconnected.label(), "Connection lost · result unknown");
-        assert!(matches!(print_tty_transcript_event(crate::worker_client::RunEvent::Done { exit_code: 7 }), TtyPreludeOutcome::Done(TtyEnd::Exited(7))));
-        assert!(matches!(print_tty_transcript_event(crate::worker_client::RunEvent::Killed { node_id: "root".into(), block: "shell".into() }), TtyPreludeOutcome::Done(TtyEnd::Killed)));
+        assert_eq!(
+            TtyEnd::Disconnected.label(),
+            "Connection lost · result unknown"
+        );
+        assert!(matches!(
+            print_tty_transcript_event(crate::worker_client::RunEvent::Done { exit_code: 7 }),
+            TtyPreludeOutcome::Done(TtyEnd::Exited(7))
+        ));
+        assert!(matches!(
+            print_tty_transcript_event(crate::worker_client::RunEvent::Killed {
+                node_id: "root".into(),
+                block: "shell".into()
+            }),
+            TtyPreludeOutcome::Done(TtyEnd::Killed)
+        ));
     }
 }

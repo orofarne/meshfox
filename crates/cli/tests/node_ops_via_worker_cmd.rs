@@ -562,8 +562,14 @@ fn node_body_merge_combines_a_stale_write_with_the_concurrent_one() {
     assert!(!clash.status.success());
     let stderr = String::from_utf8_lossy(&clash.stderr);
     assert!(stderr.contains("merge failed"), "stderr: {stderr}");
-    assert!(stderr.contains("your line 1 against current line 1"), "stderr: {stderr}");
-    assert!(stderr.contains("<<<<<<< mine\nmy line\n=======\nline one\n>>>>>>> theirs"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("your line 1 against current line 1"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("<<<<<<< mine\nmy line\n=======\nline one\n>>>>>>> theirs"),
+        "stderr: {stderr}"
+    );
     assert_eq!(std::fs::read_to_string(&canvas_path).unwrap(), before);
 
     kill(worker);

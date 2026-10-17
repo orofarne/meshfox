@@ -124,9 +124,11 @@ impl PtyProcess {
 /// the child starts in — a node's own canvas file's directory (see
 /// `meshfox_core::canvas::Node::cwd`); `None` inherits the server's own
 /// cwd unchanged, same fallback `env_overrides` itself uses when resolving
-/// `[process_env]`. `canvas_path`, when given, is the canvas file this
-/// step's fence actually lives in — only consulted for an `@name` builtin
-/// `interpreter` (see `meshfox_core::resolve_command`'s own doc comment).
+/// `[process_env]`. `origin`'s canvas path, when given, is the canvas file
+/// this step's fence actually lives in — only consulted for an `@name`
+/// builtin `interpreter` (see `meshfox_core::resolve_command`'s own doc
+/// comment); an `origin` that carries `tangle` makes `code` a stable hidden
+/// file in `cwd` instead of a temp file.
 /// `(cols, rows)` is the pty's initial size, one tuple so this stays under
 /// clippy's argument limit.
 pub fn spawn<I, K, V>(
@@ -135,7 +137,7 @@ pub fn spawn<I, K, V>(
     lang: Option<&str>,
     envs: I,
     cwd: Option<&Path>,
-    canvas_path: Option<&Path>,
+    origin: Option<meshfox_core::tangle::BlockOrigin<'_>>,
     (cols, rows): (u16, u16),
 ) -> io::Result<PtyProcess>
 where
@@ -152,8 +154,7 @@ where
         .filter(|(k, _)| !meshfox_core::process_env::is_run_context(std::ffi::OsStr::new(k)))
         .map(|(k, _)| k.clone())
         .collect();
-    let resolved =
-        meshfox_core::resolve_command(code, interpreter, lang, cwd, canvas_path, &env_names)?;
+    let resolved = meshfox_core::resolve_command(code, interpreter, lang, cwd, origin, &env_names)?;
 
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -333,6 +334,47 @@ mod tests {
         }
         assert!(String::from_utf8_lossy(&collected).contains("hello"));
         assert_eq!(proc.wait().await, 0);
+    }
+
+    /// `tangle` on a `tty` block: the pty session runs the code from the stable
+    /// hidden file in `cwd`, and — unlike a temp file — the exit watcher
+    /// leaves it in place.
+    #[tokio::test]
+    async fn a_tangle_block_runs_from_a_stable_file_in_cwd_and_keeps_it() {
+        let dir = std::env::temp_dir().join(format!("meshfox-tangle-pty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let canvas = dir.join("doc.canvas.md");
+        let expected = dir.join(".meshfox-tangle-doc.canvas.md__t.sh");
+
+        let origin = meshfox_core::tangle::BlockOrigin::new(&canvas).with_tangle("t");
+        let mut proc = spawn(
+            "echo \"script=$0\"",
+            Some("bash"),
+            Some("bash"),
+            no_envs(),
+            Some(&dir),
+            Some(origin),
+            (200, 24),
+        )
+        .unwrap();
+        let mut collected = Vec::new();
+        while let Some(chunk) = proc.output_rx.recv().await {
+            collected.extend_from_slice(&chunk);
+        }
+        assert_eq!(proc.wait().await, 0);
+        let output = String::from_utf8_lossy(&collected);
+        assert!(
+            output.contains(&format!("script={}", expected.display())),
+            "ran from the tangled file: {output}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&expected).unwrap(),
+            "echo \"script=$0\"",
+            "the tangled file outlives the session"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

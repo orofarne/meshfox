@@ -40,6 +40,10 @@ pub const BUILTINS: &[Builtin] = &[
         name: "python_venv",
         script: include_str!("builtins/python_venv.sh"),
     },
+    Builtin {
+        name: "node_env",
+        script: include_str!("builtins/node_env.sh"),
+    },
 ];
 
 fn lookup(name: &str) -> Option<&'static Builtin> {
@@ -118,14 +122,21 @@ pub fn resolve_with_env(
     let mut envs = Vec::new();
     let config = crate::config::load(cwd.unwrap_or_else(|| Path::new(".")));
     envs.extend(crate::config::flatten_to_env(&config));
-    if spec == "@python_venv" {
+    // The two environment builtins: both get the fence kind, and — when the
+    // canvas's own path is known — a directory keyed by that path.
+    let environment = match spec {
+        "@python_venv" => Some(("MESHFOX_VENV_DIR", "venv")),
+        "@node_env" => Some(("MESHFOX_NODE_DIR", "node")),
+        _ => None,
+    };
+    if let Some((dir_var, suffix)) = environment {
         if let Some(lang) = lang {
             envs.push(("MESHFOX_BLOCK_LANG".to_string(), lang.to_string()));
         }
         if let Some(canvas_path) = canvas_path {
             envs.push((
-                "MESHFOX_VENV_DIR".to_string(),
-                venv_dir(canvas_path).display().to_string(),
+                dir_var.to_string(),
+                canvas_state_dir(canvas_path, suffix).display().to_string(),
             ));
         }
     }
@@ -133,11 +144,12 @@ pub fn resolve_with_env(
     Ok(Some((interpreter_path, envs)))
 }
 
-/// `.meshfox/<canvas filename>.venv` next to the canvas file — same
+/// `.meshfox/<canvas filename>.<suffix>` (`venv` for `@python_venv`, `node` for
+/// `@node_env`) next to the canvas file — same
 /// colocation convention `crate::varcache::cache_path` already uses for
 /// `<filename>.env`, just a directory instead of a dotenv file. For a canvas
 /// that can't be written, a scratch directory under the system temp dir
-/// instead (see `read_only_venv_dir`). See
+/// instead (see below). See
 /// `resolve_with_env`'s own doc comment for why this is keyed by the
 /// canvas's own path rather than shared per-directory.
 ///
@@ -149,7 +161,7 @@ pub fn resolve_with_env(
 /// double-joining `examples/` onto a path already inside it). Resolved
 /// against this *process's* cwd, not the eventual child's — meshfox itself
 /// hasn't `chdir`'d by the time this runs.
-fn venv_dir(canvas_path: &Path) -> PathBuf {
+fn canvas_state_dir(canvas_path: &Path, suffix: &str) -> PathBuf {
     let absolute = if canvas_path.is_absolute() {
         canvas_path.to_path_buf()
     } else {
@@ -166,22 +178,18 @@ fn venv_dir(canvas_path: &Path) -> PathBuf {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     if crate::worker_lock::is_read_only(&absolute) {
-        return read_only_venv_dir(&absolute, &file_name);
+        return read_only_temp_root(&absolute).join(format!("{file_name}.{suffix}"));
     }
-    dir.join(".meshfox").join(format!("{file_name}.venv"))
+    dir.join(".meshfox").join(format!("{file_name}.{suffix}"))
 }
 
-/// Where the venv of a canvas that can't be written lives instead:
-/// `<system temp>/meshfox-readonly-<hash of the canvas path>/<filename>.venv`,
-/// owner-only, so it's reused across runs but never needs the canvas's own
-/// directory — and the system cleans it up, rather than meshfox leaving state
-/// behind for canvases that are long gone. Keyed by the full path, since
-/// unlike the colocated venv nothing here separates two canvases that happen
-/// to share a file name.
-fn read_only_venv_dir(absolute: &Path, file_name: &str) -> PathBuf {
-    read_only_temp_root(absolute).join(format!("{file_name}.venv"))
-}
-
+/// (A canvas that can't be written keeps its venv/node environment instead
+/// under `<system temp>/meshfox-readonly-<hash of the canvas path>/
+/// <filename>.<suffix>`, owner-only, so it's reused across runs but never
+/// needs the canvas's own directory — and the system cleans it up, rather
+/// than meshfox leaving state behind for canvases that are long gone. Keyed
+/// by the full path, since unlike the colocated directory nothing here
+/// separates two canvases that happen to share a file name.)
 /// `<system temp>/meshfox-readonly-<hash of the canvas path>`, created
 /// owner-only (best effort) — the one place state for a canvas that can't be
 /// written may live on disk (its venv, `display="table"` caches). `absolute`
@@ -360,7 +368,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "meshfox-venv-env-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let examples = dir.join("examples");
         std::fs::create_dir_all(&examples).unwrap();
@@ -454,7 +465,9 @@ mod tests {
         let (_, envs) = resolve_with_env("@agent", None, None, None, &[])
             .unwrap()
             .unwrap();
-        assert!(envs.iter().any(|(k, v)| k == "MESHFOX_ENV_NAMES" && v.is_empty()));
+        assert!(envs
+            .iter()
+            .any(|(k, v)| k == "MESHFOX_ENV_NAMES" && v.is_empty()));
 
         let names = vec!["TOPIC".to_string(), "OTHER".to_string()];
         let (_, envs) = resolve_with_env("@agent", None, None, None, &names)
@@ -498,7 +511,9 @@ mod tests {
             execution_identity("@python_venv", &codex)
         );
         assert_eq!(execution_identity("python3", &empty), None);
-        let non_scalar = "[interpreters.agent]\nprovider = ['codex']\n".parse().unwrap();
+        let non_scalar = "[interpreters.agent]\nprovider = ['codex']\n"
+            .parse()
+            .unwrap();
         assert_eq!(
             execution_identity("@agent", &non_scalar),
             execution_identity("@agent", &empty)
@@ -593,12 +608,10 @@ mod tests {
                 std::fs::metadata(&path).unwrap().permissions().mode() & 0o111,
                 0
             );
-            assert!(
-                std::process::Command::new(&path)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
+            assert!(std::process::Command::new(&path)
+                .status()
+                .unwrap()
+                .success());
         }
     }
 
@@ -686,7 +699,39 @@ mod tests {
         )));
         assert!(calls_text.contains("[project]\nname = \"example\""));
         assert!(calls_text.contains("-m pip install --disable-pip-version-check /"));
-        assert_eq!(std::fs::read_to_string(&vars).unwrap().lines().count(), 2);
+        let launcher = dir.join("venv/bin/python3-mf");
+        assert_eq!(
+            std::fs::read_to_string(&vars).unwrap(),
+            format!("PYTHON={0}\nPYTHON={0}\n", launcher.display()),
+            "the computed PYTHON is the launcher, not the bare venv python"
+        );
+        assert!(
+            std::fs::metadata(&launcher).unwrap().permissions().mode() & 0o111 != 0,
+            "launcher is executable"
+        );
+        // The launcher puts the caller's cwd on PYTHONPATH and runs the venv python.
+        let probe = dir.join("probe");
+        std::fs::create_dir_all(&probe).unwrap();
+        std::fs::write(
+            &fake_python,
+            "#!/bin/sh\nprintf '%s|%s\\n' \"$PYTHONPATH\" \"$*\" > \"$PIP_CALLS\"\n",
+        )
+        .unwrap();
+        let status = std::process::Command::new(&launcher)
+            .current_dir(&probe)
+            .env("PYTHONPATH", "/already/here")
+            .env("PIP_CALLS", &calls)
+            .args(["-u", "script.py"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(&calls).unwrap().trim_end(),
+            format!(
+                "{}:/already/here|-u script.py",
+                probe.canonicalize().unwrap().display()
+            )
+        );
         let unsupported = std::process::Command::new("bash")
             .arg(&script)
             .arg(&project)
@@ -699,6 +744,109 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&unsupported.stderr).contains("expected a text or toml block")
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `@node_env`: package specs from a `text` fence or a whole `json`
+    /// package.json, `npm install` only when the declared input changed, and
+    /// the `NODE` launcher — run with a fake `npm` so no network is needed.
+    #[test]
+    #[cfg(unix)]
+    fn node_env_installs_only_when_the_input_changed_and_reports_a_launcher() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-node-env-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let fake_bin = dir.join("bin");
+        std::fs::create_dir_all(&fake_bin).unwrap();
+        let npm = fake_bin.join("npm");
+        std::fs::write(
+            &npm,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$NPM_CALLS\"\nmkdir -p node_modules\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let node = fake_bin.join("node");
+        std::fs::write(&node, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let env_dir = dir.join("env");
+        let calls = dir.join("npm-calls");
+        let vars = dir.join("vars");
+        let script = resolve_builtin_spec("@node_env").unwrap().unwrap();
+        let path = format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap());
+        let run = |lang: &str, body: &str| {
+            let input = dir.join("input");
+            std::fs::write(&input, body).unwrap();
+            let output = std::process::Command::new("bash")
+                .arg(&script)
+                .arg(&input)
+                .env("PATH", &path)
+                .env("MESHFOX_BLOCK_LANG", lang)
+                .env("MESHFOX_NODE_DIR", &env_dir)
+                .env("MESHFOX_VARS_OUT", &vars)
+                .env("NPM_CALLS", &calls)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        let npm_calls = || std::fs::read_to_string(&calls).unwrap_or_default();
+
+        run("text", "# comment\npele@1.6.0\n\n  @scope/pkg@^2  \n");
+        assert_eq!(
+            npm_calls(),
+            "install --no-audit --no-fund --save pele@1.6.0 @scope/pkg@^2\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(env_dir.join("package.json")).unwrap(),
+            "{\"private\": true}\n"
+        );
+
+        run("text", "# comment\npele@1.6.0\n\n  @scope/pkg@^2  \n");
+        assert_eq!(
+            npm_calls().lines().count(),
+            1,
+            "unchanged input: no install"
+        );
+
+        run("json", "{\"dependencies\": {\"pele\": \"1.6.0\"}}\n");
+        assert_eq!(npm_calls().lines().count(), 2, "changed input: install");
+        assert_eq!(
+            std::fs::read_to_string(env_dir.join("package.json")).unwrap(),
+            "{\"dependencies\": {\"pele\": \"1.6.0\"}}\n"
+        );
+
+        let launcher = env_dir.join("node");
+        assert_eq!(
+            std::fs::read_to_string(&vars).unwrap(),
+            format!("NODE={0}\nNODE={0}\nNODE={0}\n", launcher.display())
+        );
+        let launcher_text = std::fs::read_to_string(&launcher).unwrap();
+        assert!(launcher_text.contains(&format!("NODE_PATH=\"{}/node_modules", env_dir.display())));
+        assert!(launcher_text.contains("--import"));
+        assert!(launcher.metadata().unwrap().permissions().mode() & 0o111 != 0);
+        for file in ["register.mjs", "hooks.mjs", "anchor.mjs"] {
+            assert!(env_dir.join(file).exists(), "{file}");
+        }
+
+        let unsupported = std::process::Command::new("bash")
+            .arg(&script)
+            .arg(dir.join("input"))
+            .env("MESHFOX_BLOCK_LANG", "yaml")
+            .env("MESHFOX_VARS_OUT", &vars)
+            .output()
+            .unwrap();
+        assert_eq!(unsupported.status.code(), Some(2));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -715,7 +863,7 @@ mod tests {
         std::fs::write(&canvas, "# Doc\n").unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-        let venv = venv_dir(&canvas);
+        let venv = canvas_state_dir(&canvas, "venv");
         assert!(
             venv.starts_with(std::env::temp_dir()),
             "unexpected venv dir: {venv:?}"
@@ -726,7 +874,7 @@ mod tests {
         );
         assert!(venv.ends_with("doc.canvas.md.venv"));
         // Stable: the same canvas always maps to the same place.
-        assert_eq!(venv, venv_dir(&canvas));
+        assert_eq!(venv, canvas_state_dir(&canvas, "venv"));
         assert!(!dir.join(".meshfox").exists());
 
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();

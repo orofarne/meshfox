@@ -191,7 +191,11 @@ mod tests {
             Err(ConfineError::Outside(_))
         ));
         // `..` out of the root is judged on the canonical result.
-        let sneaky = format!("{}/../{}/b.csv", data.display(), other.file_name().unwrap().to_str().unwrap());
+        let sneaky = format!(
+            "{}/../{}/b.csv",
+            data.display(),
+            other.file_name().unwrap().to_str().unwrap()
+        );
         assert!(matches!(
             confine_in(&dir, &roots, &sneaky),
             Err(ConfineError::Outside(_))

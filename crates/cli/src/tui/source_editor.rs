@@ -35,8 +35,21 @@ const FENCE_VALUE_ATTRS: &[&str] = &[
     "interpreter",
     "output",
     "output-attrs",
+    "render",
+    "send",
 ];
-const FENCE_FLAG_ATTRS: &[&str] = &["cache", "tty", "autoclose", "always", "default", "confirm"];
+const FENCE_FLAG_ATTRS: &[&str] = &[
+    "cache",
+    "tty",
+    "autoclose",
+    "service",
+    "always",
+    "default",
+    "confirm",
+    "autorun",
+    "fold",
+    "tangle",
+];
 
 /// What the caller (`App::on_key`) should do after handing a keypress to
 /// the editor.
@@ -121,6 +134,7 @@ pub struct SourceEditorState {
     /// tag names already used elsewhere in the document, not attribute
     /// names, and picking one inserts the tag name plus a trailing comma
     /// rather than a `key=""` template.
+    value_suggest: Option<(String, usize, usize)>,
     pub tag_suggest_open: bool,
     pub tag_suggest_candidates: Vec<String>,
     pub tag_suggest_selected: usize,
@@ -200,6 +214,7 @@ impl SourceEditorState {
             attr_suggest_selected: 0,
             all_tags,
             unicode_picker: None,
+            value_suggest: None,
             tag_suggest_open: false,
             tag_suggest_candidates: Vec::new(),
             tag_suggest_selected: 0,
@@ -528,7 +543,7 @@ impl SourceEditorState {
             self.error = Some("no line here".to_string());
             return;
         };
-        let Some(kind) = detect_attr_context(line) else {
+        let Some(kind) = document_attr_context(&text, row) else {
             self.error = Some(
                 "place the cursor on a meshfox:node/meshfox:edge comment or a fence's opening line"
                     .to_string(),
@@ -543,6 +558,21 @@ impl SourceEditorState {
                     return;
                 }
             }
+        }
+        if let Some((name, start, end)) = attribute_value_at(line, self.editor.cursor.col) {
+            let values = finite_values(kind, &name);
+            if !values.is_empty() {
+                self.value_suggest = Some((name, start, end));
+                self.tag_suggest_candidates = values.iter().map(|s| s.to_string()).collect();
+                self.tag_suggest_selected = 0;
+                self.tag_suggest_open = true;
+                self.error = None;
+                return;
+            }
+        }
+        if inside_attribute_value(line, self.editor.cursor.col) {
+            self.error = Some("no suggestions for this attribute value".to_string());
+            return;
         }
         let candidates = attr_candidates(kind, line);
         if candidates.is_empty() {
@@ -580,10 +610,17 @@ impl SourceEditorState {
             self.error = Some("no other tags used elsewhere in the document".to_string());
             return;
         }
+        self.value_suggest = None;
         self.tag_suggest_candidates = candidates;
         self.tag_suggest_selected = 0;
         self.tag_suggest_open = true;
         self.error = None;
+    }
+
+    pub fn value_suggest_label(&self) -> Option<&str> {
+        self.value_suggest
+            .as_ref()
+            .map(|(name, _, _)| name.as_str())
     }
 
     fn on_tag_suggest_key(&mut self, key: KeyEvent) {
@@ -603,7 +640,16 @@ impl SourceEditorState {
                     .get(self.tag_suggest_selected)
                     .cloned()
                 {
-                    self.insert_tag_candidate(&tag);
+                    if let Some((_, start, end)) = self.value_suggest.take() {
+                        self.editor.cursor.col = start;
+                        if end > start {
+                            self.editor
+                                .execute(edtui::actions::DeleteCharForward(end - start));
+                        }
+                        type_str(&mut self.editor, &tag);
+                    } else {
+                        self.insert_tag_candidate(&tag);
+                    }
                 }
             }
             _ => {}
@@ -729,38 +775,163 @@ fn tags_value_range(line: &str) -> Option<(usize, usize)> {
     Some((start_col, end_col))
 }
 
-/// Which attribute vocabulary (if any) the cursor's current line belongs
-/// to — a `meshfox:node`/`meshfox:edge` comment, or a fence's own opening
-/// line (any line starting with a code-fence delimiter; a closing fence
-/// has no attributes to suggest, but detecting the difference isn't worth
-/// the complexity here — `attr_candidates` on one just offers every fence
-/// attribute, harmlessly unused if the popup's dismissed).
+/// Ignore fence bodies (including literal meshfox comments) and closing delimiters.
+fn document_attr_context(text: &str, row: usize) -> Option<AttrKind> {
+    let mut fence: Option<(char, usize)> = None;
+    for (index, line) in text.lines().enumerate() {
+        let trimmed = line.trim_start();
+        let ch = trimmed.chars().next().unwrap_or(' ');
+        let len = trimmed.chars().take_while(|c| *c == ch).count();
+        if let Some((delimiter, minimum)) = fence {
+            if ch == delimiter && len >= minimum && trimmed[len..].trim().is_empty() {
+                fence = None;
+            }
+            if index == row {
+                return None;
+            }
+            continue;
+        }
+        let is_fence = line.len() - trimmed.len() < 4 && matches!(ch, '`' | '~') && len >= 3;
+        if index == row {
+            return if is_fence {
+                let info = trimmed[len..].trim();
+                let language = info.split_whitespace().next().unwrap_or("");
+                let attrs = meshfox_core::attrs::parse_attrs(info);
+                if matches!(language, "bash" | "sh" | "button") || attrs.contains_key("interpreter")
+                {
+                    Some(AttrKind::Fence)
+                } else {
+                    None
+                }
+            } else {
+                detect_attr_context(line)
+            };
+        }
+        if is_fence {
+            fence = Some((ch, len));
+        }
+    }
+    None
+}
+
+/// Attribute values in character columns, including empty and unfinished values.
+fn attribute_value_at(line: &str, col: usize) -> Option<(String, usize, usize)> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].is_whitespace() {
+            i += 1;
+            continue;
+        }
+        let key_start = i;
+        while i < chars.len() && !chars[i].is_whitespace() && chars[i] != '=' {
+            i += 1;
+        }
+        if chars.get(i) != Some(&'=') {
+            continue;
+        }
+        let name: String = chars[key_start..i].iter().collect();
+        i += 1;
+        let quote = chars.get(i).copied().filter(|c| matches!(c, '\'' | '"'));
+        if quote.is_some() {
+            i += 1;
+        }
+        let start = i;
+        while i < chars.len()
+            && match quote {
+                Some(q) => chars[i] != q,
+                None => !chars[i].is_whitespace(),
+            }
+        {
+            i += 1;
+        }
+        if col >= start && col <= i {
+            return Some((name, start, i));
+        }
+        if quote.is_some() && i < chars.len() {
+            i += 1;
+        }
+    }
+    None
+}
+
+fn finite_values(kind: AttrKind, name: &str) -> &'static [&'static str] {
+    match (kind, name) {
+        (AttrKind::Node, "type") => &["text", "file", "link", "group", "include"],
+        (AttrKind::Node, "display") => &["link", "code", "table"],
+        (AttrKind::Node, "preview" | "fold") => &["true", "false"],
+        (AttrKind::Node, "edgeSourceSide" | "edgeTargetSide")
+        | (AttrKind::Edge, "sourceSide" | "targetSide") => &["left", "right", "top", "bottom"],
+        (AttrKind::Edge, "style") => &["solid", "dashed", "dotted"],
+        (AttrKind::Edge, "arrowStart" | "arrowEnd") => &["none", "arrow"],
+        (AttrKind::Fence, "output") => &["text", "markdown", "image"],
+        (AttrKind::Fence, "render") => meshfox_core::fence::RENDER_KINDS,
+        (AttrKind::Fence, name) if FENCE_FLAG_ATTRS.contains(&name) => &["true", "false"],
+        _ => &[],
+    }
+}
+
+fn inside_attribute_value(line: &str, col: usize) -> bool {
+    let chars: Vec<char> = line.chars().collect();
+    let mut quote = None;
+    let mut value = false;
+    for &c in chars.iter().take(col) {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+                value = false;
+            }
+        } else if value && matches!(c, '\'' | '"') {
+            quote = Some(c);
+        } else if c == '=' {
+            value = true;
+        } else if c.is_whitespace() {
+            value = false;
+        }
+    }
+    quote.is_some() || (value && chars.get(col).is_some_and(|c| !c.is_whitespace()))
+}
+
+/// Attribute vocabulary for a standalone structural line.
 fn detect_attr_context(line: &str) -> Option<AttrKind> {
     let trimmed = line.trim_start();
     if trimmed.starts_with("<!-- meshfox:node") {
         Some(AttrKind::Node)
     } else if trimmed.starts_with("<!-- meshfox:edge") {
         Some(AttrKind::Edge)
-    } else if trimmed.starts_with("```") {
+    } else if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
         Some(AttrKind::Fence)
     } else {
         None
     }
 }
 
-/// `kind`'s full attribute vocabulary, minus whatever `line` already has —
-/// a value attribute counts as present if `"name="` appears anywhere in
-/// the line (covers both `id="..."` and the bare-numeric `x=0` form); a
-/// flag attribute counts as present if it appears as its own whitespace-
-/// delimited word. Best-effort — a suggestion list, not the real parser.
+/// Exclude parsed attribute keys and flags that conflict with the current block.
 fn attr_candidates(kind: AttrKind, line: &str) -> Vec<AttrCandidate> {
     let (value_attrs, flag_attrs): (&[&str], &[&str]) = match kind {
         AttrKind::Node => (NODE_ATTRS, &[]),
         AttrKind::Edge => (EDGE_ATTRS, &[]),
         AttrKind::Fence => (FENCE_VALUE_ATTRS, FENCE_FLAG_ATTRS),
     };
-    let value_present = |name: &str| line.contains(&format!("{name}="));
-    let flag_present = |name: &str| line.split_whitespace().any(|tok| tok == name);
+    let attrs = meshfox_core::attrs::parse_attrs(line);
+    let value_present = |name: &str| attrs.contains_key(name);
+    let enabled = |name: &str| attrs.get(name).is_some_and(|v| v != "false");
+    let flag_present = |name: &str| attrs.contains_key(name);
+    let compatible = |name: &str| {
+        kind != AttrKind::Fence
+            || match name {
+                "cache" => !enabled("tty") && !enabled("service"),
+                "tty" => !enabled("cache") && !enabled("service"),
+                "service" => {
+                    !enabled("cache")
+                        && !enabled("tty")
+                        && !line.trim_start().starts_with("```button")
+                }
+                "autoclose" => enabled("tty"),
+                "tangle" => value_present("interpreter"),
+                _ => true,
+            }
+    };
     value_attrs
         .iter()
         .filter(|n| !value_present(n))
@@ -771,7 +942,7 @@ fn attr_candidates(kind: AttrKind, line: &str) -> Vec<AttrCandidate> {
         .chain(
             flag_attrs
                 .iter()
-                .filter(|n| !flag_present(n))
+                .filter(|n| !flag_present(n) && compatible(n))
                 .map(|&name| AttrCandidate {
                     name,
                     is_flag: true,
@@ -1137,6 +1308,128 @@ mod tests {
 
     // TODO.canvas.md: "Саджесты и подсветка синтаксиса в TUI", item 2.
     #[test]
+    fn finite_value_suggestions_replace_values_and_preserve_surroundings() {
+        for (line, value, expected) in [
+            (
+                "<!-- meshfox:node type=\"\" color=\"red\" -->",
+                "file",
+                "<!-- meshfox:node type=\"file\" color=\"red\" -->",
+            ),
+            (
+                "<!-- meshfox:node type='текст' -->",
+                "group",
+                "<!-- meshfox:node type='group' -->",
+            ),
+            (
+                "<!-- meshfox:edge style=dashed -->",
+                "solid",
+                "<!-- meshfox:edge style=solid -->",
+            ),
+            (
+                "```sh output=\"text\" cache",
+                "image",
+                "```sh output=\"image\" cache",
+            ),
+            ("```sh render=\"\"", "form", "```sh render=\"form\""),
+            (
+                "<!-- meshfox:node preview=\"\" -->",
+                "false",
+                "<!-- meshfox:node preview=\"false\" -->",
+            ),
+        ] {
+            for mode in [EditorMode::Normal, EditorMode::Insert] {
+                let mut se = open_editor(line);
+                se.editor.mode = mode;
+                let eq = line.find('=').unwrap();
+                se.editor.cursor.col = line[..eq + 1].chars().count()
+                    + usize::from(matches!(line.as_bytes().get(eq + 1), Some(b'\'' | b'"')));
+                se.open_attr_suggest();
+                assert!(se.tag_suggest_open, "{line}");
+                se.tag_suggest_selected = se
+                    .tag_suggest_candidates
+                    .iter()
+                    .position(|v| v == value)
+                    .unwrap();
+                se.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                assert_eq!(se.editor.lines.to_string(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn finite_value_popup_cancels_without_editing_and_respects_context() {
+        let line = "<!-- meshfox:node type=\"\" -->";
+        let mut se = open_editor(line);
+        se.editor.cursor.col = line.find("\"\"").unwrap() + 1;
+        se.open_attr_suggest();
+        assert_eq!(
+            se.tag_suggest_candidates,
+            ["text", "file", "link", "group", "include"]
+        );
+        se.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!se.tag_suggest_open);
+        assert_eq!(se.editor.lines.to_string(), line);
+        assert!(finite_values(AttrKind::Edge, "type").is_empty());
+        assert!(finite_values(AttrKind::Node, "id").is_empty());
+        assert_eq!(
+            attribute_value_at("type=\"file\"", 8),
+            Some(("type".into(), 6, 10))
+        );
+    }
+
+    #[test]
+    fn suggestions_ignore_fence_bodies_closers_and_non_runnable_languages() {
+        let text = "```bash\n<!-- meshfox:node -->\n```\n```json\n{}\n```\n~~~sh\necho ok\n~~~";
+        assert_eq!(document_attr_context(text, 0), Some(AttrKind::Fence));
+        for row in [1, 2, 3, 4, 5, 7, 8] {
+            assert_eq!(document_attr_context(text, row), None, "row {row}");
+        }
+        assert_eq!(document_attr_context(text, 6), Some(AttrKind::Fence));
+    }
+
+    #[test]
+    fn suggestions_do_not_offer_attribute_names_inside_values() {
+        for line in [
+            "<!-- meshfox:node color=\"red\" -->",
+            "```sh env='FOO'",
+            "```sh env=FOO",
+        ] {
+            let col = line.find("red").or_else(|| line.find("FOO")).unwrap() + 1;
+            assert!(inside_attribute_value(line, col));
+        }
+        let mut se = open_editor("<!-- meshfox:node color=\"red\" -->");
+        se.editor.cursor.col = 26;
+        se.open_attr_suggest();
+        assert!(!se.attr_suggest_open);
+    }
+
+    #[test]
+    fn fence_suggestions_respect_flag_conflicts_and_exact_attribute_names() {
+        let names = |line| {
+            attr_candidates(AttrKind::Fence, line)
+                .into_iter()
+                .map(|c| c.name)
+                .collect::<Vec<_>>()
+        };
+        let tty = names("```sh tty=\"true\"");
+        assert!(!tty.contains(&"cache"));
+        assert!(!tty.contains(&"service"));
+        assert!(!tty.contains(&"tty"));
+        assert!(tty.contains(&"autoclose"));
+        assert!(!names("```sh").contains(&"autoclose"));
+        assert!(names("```sh tty=false").contains(&"cache"));
+        // `tangle` only means something with an `interpreter=` to run the file.
+        assert!(!names("```python name=\"x\"").contains(&"tangle"));
+        assert!(names("```python name=\"x\" interpreter=\"python3\"").contains(&"tangle"));
+        assert!(
+            !names("```python interpreter=\"python3\" tangle").contains(&"tangle"),
+            "an attribute already present is not offered again"
+        );
+        let candidates = attr_candidates(AttrKind::Node, "<!-- meshfox:node tags=\"id=fake\" -->");
+        assert!(candidates.iter().any(|c| c.name == "id"));
+    }
+
+    #[test]
     fn detect_attr_context_recognizes_node_edge_and_fence_lines() {
         assert_eq!(
             detect_attr_context("<!-- meshfox:node id=\"root\" -->"),
@@ -1185,7 +1478,7 @@ mod tests {
     fn attr_candidates_for_a_fence_excludes_a_flag_already_present() {
         let candidates = attr_candidates(AttrKind::Fence, "```bash cache");
         assert!(!candidates.iter().any(|c| c.name == "cache"));
-        assert!(candidates.iter().any(|c| c.name == "tty"));
+        assert!(!candidates.iter().any(|c| c.name == "tty"));
     }
 
     #[test]

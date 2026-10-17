@@ -144,4 +144,3 @@ printf '%s\n' "$URL"
     assert!(String::from_utf8_lossy(&result.stderr).contains("URL_fr"));
     let _ = std::fs::remove_dir_all(dir);
 }
-

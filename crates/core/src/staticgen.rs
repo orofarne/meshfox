@@ -710,7 +710,10 @@ fn is_title_only_node(n: &Node) -> bool {
 fn is_short_body_node(n: &Node) -> bool {
     const SHORT_BODY_MAX_LINES: usize = 2;
     const SHORT_BODY_MAX_CHARS: usize = 120;
-    if !matches!(n.node_type, NodeType::Text | NodeType::File | NodeType::Link) {
+    if !matches!(
+        n.node_type,
+        NodeType::Text | NodeType::File | NodeType::Link
+    ) {
         return false;
     }
     // A `display="code"`/`"table"` file node's one-line body is just the
@@ -769,9 +772,8 @@ fn resolve_default_fold(
         }
         let has_explicit_size = n.width.is_some() || n.height.is_some();
         let resolved = can_fold
-            && n.fold.unwrap_or_else(|| {
-                n.id != root_id && !has_unfold_option && !has_explicit_size
-            });
+            && n.fold
+                .unwrap_or_else(|| n.id != root_id && !has_unfold_option && !has_explicit_size);
         if resolved {
             folded.insert(n.id.clone());
         }
@@ -1175,7 +1177,8 @@ fn replace_button_fences(text: &str, canvas: &Canvas, owner: &Node) -> String {
         cursor = fence.span.end;
 
         let mut targets: Vec<&Node> = Vec::new();
-        for r in crate::fence::parse_deps_list(attrs.get("deps").map(String::as_str).unwrap_or("")) {
+        for r in crate::fence::parse_deps_list(attrs.get("deps").map(String::as_str).unwrap_or(""))
+        {
             let addr = crate::deps::resolve_ref(&owner.id, &r);
             if addr.node_id == owner.id {
                 continue;
@@ -1772,7 +1775,10 @@ fn render_file_table(node: &Node, ctx: &RenderCtx) -> String {
         if table.columns.len() == 1 { "" } else { "s" }
     );
     if (shown as u64) < table.total_rows {
-        caption.push_str(&format!(" \u{b7} first {} shown", group_thousands(shown as u64)));
+        caption.push_str(&format!(
+            " \u{b7} first {} shown",
+            group_thousands(shown as u64)
+        ));
     }
 
     let mut html = format!(
@@ -1781,7 +1787,11 @@ fn render_file_table(node: &Node, ctx: &RenderCtx) -> String {
         html_escape(&caption)
     );
     for c in &table.columns {
-        let class = if c.kind == "number" { " class=\"num\"" } else { "" };
+        let class = if c.kind == "number" {
+            " class=\"num\""
+        } else {
+            ""
+        };
         html.push_str(&format!(
             "<th{class}>{}<span class=\"type\">{}</span></th>",
             html_escape(&c.name),
@@ -1796,12 +1806,20 @@ fn render_file_table(node: &Node, ctx: &RenderCtx) -> String {
             match row.get(j) {
                 Some(Some(v)) => html.push_str(&format!(
                     "<td{}>{}</td>",
-                    if class.is_empty() { String::new() } else { format!(" class=\"{class}\"") },
+                    if class.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" class=\"{class}\"")
+                    },
                     html_escape(v)
                 )),
                 _ => html.push_str(&format!(
                     "<td class=\"null{}\">NULL</td>",
-                    if class.is_empty() { String::new() } else { format!(" {class}") }
+                    if class.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {class}")
+                    }
                 )),
             }
         }
@@ -2583,8 +2601,11 @@ mod tests {
         let canvas_dir = temp_dir("asset-base-canvas-dir");
         let include_dir = temp_dir("asset-base-include-dir");
         fs::create_dir_all(canvas_dir.join(".meshfox")).unwrap();
-        fs::write(canvas_dir.join(".meshfox/config.toml"),
-            format!("[files]\nallow = [{:?}]\n", include_dir.to_string_lossy())).unwrap();
+        fs::write(
+            canvas_dir.join(".meshfox/config.toml"),
+            format!("[files]\nallow = [{:?}]\n", include_dir.to_string_lossy()),
+        )
+        .unwrap();
         write(
             &canvas_dir,
             "shot.png",
@@ -2621,8 +2642,11 @@ mod tests {
         let canvas_dir = temp_dir("asset-base-dest-rel-canvas-dir");
         let include_dir = temp_dir("asset-base-dest-rel-include-dir");
         fs::create_dir_all(canvas_dir.join(".meshfox")).unwrap();
-        fs::write(canvas_dir.join(".meshfox/config.toml"),
-            format!("[files]\nallow = [{:?}]\n", include_dir.to_string_lossy())).unwrap();
+        fs::write(
+            canvas_dir.join(".meshfox/config.toml"),
+            format!("[files]\nallow = [{:?}]\n", include_dir.to_string_lossy()),
+        )
+        .unwrap();
         write(&include_dir, "shot.png", b"bytes");
 
         let mut c =
@@ -2931,7 +2955,11 @@ mod tests {
     #[test]
     fn recursive_queues_a_plain_markdown_target_as_a_document_page() {
         let dir = temp_dir("recursive-document");
-        write(&dir, "SPEC.md", b"# The spec\n\nBody.\n\n## Part\n\nMore.\n");
+        write(
+            &dir,
+            "SPEC.md",
+            b"# The spec\n\nBody.\n\n## Part\n\nMore.\n",
+        );
         write(&dir, "doc.canvas.md", b"unused");
         let root_path = dir.join("doc.canvas.md");
         let c = canvas(concat!(
@@ -2977,16 +3005,27 @@ mod tests {
             "## Unit tests\n<!-- meshfox:node id=\"tests\" -->\n\n",
             "```bash name=\"unit\"\necho t\n```\n",
         ));
-        let (site, _assets, _links) =
-            build_for_static_export(&c, &dir, &dir.join("doc.canvas.md"), "", None, None, false, false)
-                .unwrap();
+        let (site, _assets, _links) = build_for_static_export(
+            &c,
+            &dir,
+            &dir.join("doc.canvas.md"),
+            "",
+            None,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
         let body = &site.root.html_body;
         assert!(
             body.contains("<strong>🔨 Install *it*</strong> → <a href=\"#node-install\">Install</a>, <a href=\"#node-tests\">Unit tests</a>"),
             "{body}"
         );
         assert!(!body.contains("language-button"), "{body}");
-        assert!(!body.contains("Same node") && !body.contains("Nowhere"), "{body}");
+        assert!(
+            !body.contains("Same node") && !body.contains("Nowhere"),
+            "{body}"
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -3026,9 +3065,14 @@ mod tests {
     #[test]
     fn a_document_page_is_one_node_titled_by_its_first_heading() {
         let dir = temp_dir("document-page");
-        write(&dir, "SPEC.md", b"\n# The spec\n\nBody.\n\n## Part\n\nMore.\n");
+        write(
+            &dir,
+            "SPEC.md",
+            b"\n# The spec\n\nBody.\n\n## Part\n\nMore.\n",
+        );
         let root_path = dir.join("doc.canvas.md");
-        let access = crate::FileAccess::from_values(&dir.join(".static-export"), Default::default());
+        let access =
+            crate::FileAccess::from_values(&dir.join(".static-export"), Default::default());
 
         let (site, _assets) = build_document_for_static_export(
             &dir.join("SPEC.md"),
@@ -3040,9 +3084,20 @@ mod tests {
         .unwrap();
         assert_eq!(site.title, "The spec");
         assert!(site.root.children.is_empty());
-        assert!(site.root.html_body.contains("<p>Body.</p>"), "{}", site.root.html_body);
-        assert!(site.root.html_body.contains("<h2>Part</h2>"), "{}", site.root.html_body);
-        assert!(!site.root.html_body.contains("The spec"), "title is not repeated in the body");
+        assert!(
+            site.root.html_body.contains("<p>Body.</p>"),
+            "{}",
+            site.root.html_body
+        );
+        assert!(
+            site.root.html_body.contains("<h2>Part</h2>"),
+            "{}",
+            site.root.html_body
+        );
+        assert!(
+            !site.root.html_body.contains("The spec"),
+            "title is not repeated in the body"
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -3428,10 +3483,16 @@ mod tests {
 
         let (site, _assets) = build_with_previews(&c, &dir, None, Some(&previews));
         let html = &site.find("sales").unwrap().html_body;
-        assert!(html.contains("<p class=\"file-table-status\">2 rows \u{d7} 2 cols</p>"), "{html}");
+        assert!(
+            html.contains("<p class=\"file-table-status\">2 rows \u{d7} 2 cols</p>"),
+            "{html}"
+        );
         // All rows shown: no "first N shown" suffix.
         assert!(!html.contains("shown"), "{html}");
-        assert!(html.contains("<th class=\"num\">id<span class=\"type\">bigint</span></th>"), "{html}");
+        assert!(
+            html.contains("<th class=\"num\">id<span class=\"type\">bigint</span></th>"),
+            "{html}"
+        );
         // Names and values are escaped, not interpreted.
         assert!(html.contains("note &lt;b&gt;"), "{html}");
         assert!(html.contains("a &lt; b &amp; &quot;c&quot;"), "{html}");

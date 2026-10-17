@@ -218,3 +218,14 @@ and marked as failed on error. Handled Ctrl-C clears the indicator.
 Progress is refreshed once per second for terminals that expire stale state.
 The optional title mode changes the terminal title; the shell may replace it
 at its next prompt. Status sequences are written to stderr, never stdout.
+
+`meshfox tui --terminal-status auto|off|iterm2|progress|title` uses the same
+option and environment default. It aggregates the current canvas's local
+and external runs, including TTY sessions. Input forms and run confirmations
+show waiting; normal navigation does not. Parallel runs retain a failure
+until a new batch starts. Finished runs already present when opening a canvas
+do not count as a new result. Nested canvases retain independent results.
+Healthy background services show `ready: N services` in iTerm2/title mode;
+starting/stopping/restarting services count as activity, and a crashed service
+or failed stop shows failure. Progress-only terminals withdraw the indicator
+when services are ready. TUI exit and handled shutdown signals clear status.

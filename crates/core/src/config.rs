@@ -203,8 +203,12 @@ pub fn tui_image_protocol(canvas_root: &Path) -> Result<Option<String>, String> 
 }
 
 fn tui_image_protocol_from_table(table: &toml::Table) -> Result<Option<String>, String> {
-    let Some(value) = table.get("tui").and_then(|tui| tui.get("image_protocol")) else { return Ok(None) };
-    let value = value.as_str().ok_or("tui.image_protocol must be a string")?;
+    let Some(value) = table.get("tui").and_then(|tui| tui.get("image_protocol")) else {
+        return Ok(None);
+    };
+    let value = value
+        .as_str()
+        .ok_or("tui.image_protocol must be a string")?;
     match value {
         "auto" | "iterm2" | "sixel" | "kitty" | "halfblocks" => Ok(Some(value.to_owned())),
         _ => Err(format!("invalid tui.image_protocol={value:?}; expected auto, iterm2, sixel, kitty, or halfblocks")),
@@ -454,15 +458,32 @@ mod tests {
 
     #[test]
     fn tui_protocol_uses_merged_config_and_validates_values() {
-        let mut global: toml::Table = "[tui]\nimage_protocol = \"sixel\"\neditor_theme = \"base16-mocha.dark\"".parse().unwrap();
+        let mut global: toml::Table =
+            "[tui]\nimage_protocol = \"sixel\"\neditor_theme = \"base16-mocha.dark\""
+                .parse()
+                .unwrap();
         let local: toml::Table = "[tui]\nimage_protocol = \"iterm2\"".parse().unwrap();
-        assert_eq!(tui_image_protocol_from_table(&global).unwrap().as_deref(), Some("sixel"));
+        assert_eq!(
+            tui_image_protocol_from_table(&global).unwrap().as_deref(),
+            Some("sixel")
+        );
         deep_merge(&mut global, local);
-        assert_eq!(tui_image_protocol_from_table(&global).unwrap().as_deref(), Some("iterm2"));
-        assert_eq!(global["tui"]["editor_theme"].as_str(), Some("base16-mocha.dark"));
-        assert_eq!(tui_image_protocol_from_table(&toml::Table::new()).unwrap(), None);
+        assert_eq!(
+            tui_image_protocol_from_table(&global).unwrap().as_deref(),
+            Some("iterm2")
+        );
+        assert_eq!(
+            global["tui"]["editor_theme"].as_str(),
+            Some("base16-mocha.dark")
+        );
+        assert_eq!(
+            tui_image_protocol_from_table(&toml::Table::new()).unwrap(),
+            None
+        );
         for invalid in ["true", "7", "\"unknown\""] {
-            let table = format!("[tui]\nimage_protocol = {invalid}").parse().unwrap();
+            let table = format!("[tui]\nimage_protocol = {invalid}")
+                .parse()
+                .unwrap();
             assert!(tui_image_protocol_from_table(&table).is_err());
         }
     }

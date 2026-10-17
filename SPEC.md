@@ -546,6 +546,44 @@ Lives inside a node's Markdown text, as fence-info-string attributes:
   `interpreter="$PYTHON -u"` always runs under whatever interpreter that
   block last resolved to, without hard-coding a path in every fence that
   needs it.
+
+  The temp file's extension follows the fence language (`python` → `.py`,
+  `javascript` → `.js`, `typescript` → `.ts`, `ruby` → `.rb`, `perl` →
+  `.pl`, `php`, `lua`, `sql`, `go`, `bash`/`sh` → `.sh`), because runtimes
+  pick a mode from it — Node reads a `.tmp` file as CommonJS only, so an ESM
+  `import` needs `.js`. A language with no entry, and the `text`/`toml`
+  bodies of `@name` builtins, keep `.tmp`.
+- `tangle` — optional flag (`tangle` or `tangle=true`; `tangle=false`
+  disables it); requires an `interpreter=` (`meshfox validate` error
+  otherwise — without one the code runs under `bash -c` and never becomes
+  a file). Instead of a throwaway temp file, the code is written to a
+  hidden file with a **stable** name in the block's working directory,
+  `.meshfox-tangle-<canvas file>__<block>.<ext>`, and the interpreter runs
+  that. Runtimes resolve `import`/`require`, `package.json`, `tsconfig`
+  and `__file__` from where the script lives, so a tangled block can
+  import the modules sitting next to the canvas without a
+  `sys.path.insert(0, os.getcwd())`-style workaround.
+
+  Both name components are sanitized: anything outside `[A-Za-z0-9_.-]`
+  becomes `_`, runs of `_` collapse, leading and trailing `_` are dropped —
+  so `__` appears in a file name only as the separator, and one canvas's
+  files can never be mistaken for another's in a directory holding many.
+  `<ext>` is the language extension above. An unnamed block uses its
+  implicit name. The file is rewritten only when the code changed (written
+  to a side file and renamed, so it is replaced atomically), which keeps a
+  file-watching dev server from reacting to a re-run of unchanged code.
+  It is a cache of the canvas, not a source: edits to it are overwritten.
+  If it can't be written (a read-only directory), the run fails with an
+  error naming the path — there is deliberately no fallback to the temp
+  dir, which would silently change where imports resolve from. Applies to
+  captured and `tty` runs alike; works with `@name` builtins too (which
+  read the file as `$1`). A tangled file stays on disk after the run.
+  When a canvas's worker starts it removes this canvas's own tangled files
+  that the document no longer has a block for (a deleted or renamed block,
+  one that dropped the flag or changed language), in each directory one of
+  its nodes runs in; files of other canvases, and of a canvas that was
+  renamed, are left alone. Add `.meshfox-tangle-*` to `.gitignore`.
+  Not part of the block's fingerprint.
 - `tty` — optional flag (`tty` or `tty=true`); this block wants a real
   interactive terminal instead of the usual captured/streamed output —
   e.g. `bash` on its own (a login-style shell), or anything else that reads
@@ -1477,8 +1515,10 @@ lifetime.
   in the session; the run itself is not an error.
 - **The disk exceptions**: both live under an owner-only directory in the
   system temp dir, `meshfox-readonly-<hash of the canvas path>/`.
-  A `python_venv` block's venv is `<file>.venv` there, reused across runs
-  and cleaned up by the system, instead of `.meshfox/<file>.venv`.
+  A `python_venv` block's venv is `<file>.venv` there, and a `node_env`
+  block's environment is `<file>.node`, reused across runs
+  and cleaned up by the system, instead of `.meshfox/<file>.venv` /
+  `.meshfox/<file>.node`.
   `display="table"` caches are `tables-<pid>/` there (see "Table previews"):
   per worker, because several read-only workers may serve one canvas and a
   DuckDB database has a single writer; removed when the worker exits, and
@@ -1793,6 +1833,25 @@ unlockable default keyring, it fails loudly on first use. With it:
   section's scope (`global`, `global:<path= as written>` or
   `project:<canvas_root>`). They take the same place in the precedence
   chain as a `vars` entry and get the same "project"/"global" badge.
+- `meshfox prune [DIR] [--recursive] [--yes]` — finds the regenerable files
+  meshfox leaves behind and, with `--yes`, removes them; without it, only
+  lists them (and exits 0). Three kinds, all rebuilt by running the canvas
+  again: **tangled files** (`.meshfox-tangle-<canvas>__<block>.<ext>`, see
+  `tangle` under "Runnable code fences") whose block is gone from a canvas
+  that still exists, or whose canvas is not among the markdown files of the
+  scanned directories; **environments** — `.meshfox/<canvas file>.venv` and
+  `.meshfox/<canvas file>.node` — whose canvas file is gone; and **stale
+  temp files**, `meshfox-<pid>-<n>.<ext>` in the system temp dir older than a
+  day (what a killed run leaves). `DIR` defaults to the current directory;
+  `--recursive` also walks subdirectories, never through a symlink and
+  skipping `.git`, `node_modules`, `target` and `.meshfox`. A canvas with a
+  running worker is skipped and reported. Never touched, and never offered:
+  `.meshfox/<canvas>.session.sqlite3` (run history) and
+  `.meshfox/<canvas>.env` (variable cache, may hold secret values) — those
+  are deleted by hand. Each removal is re-checked against the kind of file it
+  claims to be, and a symlink is refused. It runs in the CLI's own process, not
+  in a worker, since it spans every canvas in a directory, including ones that
+  no longer exist. Secrets in the system store are `meshfox secret prune`'s.
 - `meshfox secret set|show|rm NAME [--canvas F | --global [--path P] |
   --project DIR]` manages values; `show` prints one only with `--reveal`.
 - The keychain can't be enumerated, so every save (checkbox or `secret set`)

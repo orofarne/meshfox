@@ -41,3 +41,5 @@ mod run_history;
 mod services;
 mod source_conflict;
 mod table_view;
+
+mod terminal_status;

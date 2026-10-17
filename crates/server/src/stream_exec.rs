@@ -165,8 +165,13 @@ pub(crate) fn spawn_bash_frozen(
     cwd: &Path,
 ) -> io::Result<SpawnedProcess> {
     let mut command = Command::new("bash");
-    command.arg("-e").arg("-c").arg(code)
-        .current_dir(cwd).env_clear().envs(environment.iter().map(|(k, v)| (k, v)));
+    command
+        .arg("-e")
+        .arg("-c")
+        .arg(code)
+        .current_dir(cwd)
+        .env_clear()
+        .envs(environment.iter().map(|(k, v)| (k, v)));
     spawn_bash_command(command)
 }
 
@@ -259,19 +264,21 @@ where
 /// becomes its materialized script's real path before anything below ever
 /// sees it, with its `MESHFOX_*` env vars (config, and — for
 /// `@python_venv` specifically — `MESHFOX_BLOCK_LANG` and, when
-/// `canvas_path` is given, `MESHFOX_VENV_DIR`) merged into `envs`; a plain, non-`@` `interpreter=`
-/// never pays for any of that at all. `canvas_path`, when given, is the
-/// canvas file this block's fence actually lives in — not necessarily
+/// `origin` is given, `MESHFOX_VENV_DIR`) merged into `envs`; a plain, non-`@` `interpreter=`
+/// never pays for any of that at all. `origin`'s canvas path, when given, is
+/// the canvas file this block's fence actually lives in — not necessarily
 /// derivable from `cwd` alone, since two unrelated canvases can share one
 /// directory (see `meshfox_core::builtin_interpreter::resolve_with_env`'s
-/// own doc comment for why that distinction matters).
+/// own doc comment for why that distinction matters). An `origin` that
+/// carries `tangle` makes `code` a stable hidden file in `cwd` instead of a
+/// temp file, left in place afterwards (`meshfox_core::tangle`).
 pub fn spawn_interpreter<I, K, V>(
     interpreter: &str,
     code: &str,
     lang: Option<&str>,
     envs: I,
     cwd: Option<&Path>,
-    canvas_path: Option<&Path>,
+    origin: Option<meshfox_core::tangle::BlockOrigin<'_>>,
 ) -> io::Result<SpawnedProcess>
 where
     I: IntoIterator<Item = (K, V)>,
@@ -293,15 +300,20 @@ where
 
     let resolved_interpreter;
     let mut extra_envs = Vec::new();
-    let interpreter =
-        match meshfox_core::resolve_with_env(interpreter, lang, cwd, canvas_path, &env_names)? {
-            Some((path, builtin_envs)) => {
-                extra_envs = builtin_envs;
-                resolved_interpreter = path;
-                resolved_interpreter.as_str()
-            }
-            None => interpreter,
-        };
+    let interpreter = match meshfox_core::resolve_with_env(
+        interpreter,
+        lang,
+        cwd,
+        origin.map(|o| o.canvas_path),
+        &env_names,
+    )? {
+        Some((path, builtin_envs)) => {
+            extra_envs = builtin_envs;
+            resolved_interpreter = path;
+            resolved_interpreter.as_str()
+        }
+        None => interpreter,
+    };
 
     let (program, args) = meshfox_core::split_interpreter(interpreter).ok_or_else(|| {
         io::Error::new(
@@ -310,12 +322,7 @@ where
         )
     })?;
 
-    let path = std::env::temp_dir().join(format!(
-        "meshfox-{}-{}.tmp",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-    std::fs::write(&path, code)?;
+    let (path, cleanup) = meshfox_core::script_file(code, lang, cwd, origin)?;
 
     let mut command = Command::new(&program);
     command.args(&args).arg(&path);
@@ -336,7 +343,9 @@ where
     let mut child = match spawned {
         Ok(child) => child,
         Err(e) => {
-            let _ = std::fs::remove_file(&path);
+            if let Some(path) = &cleanup {
+                let _ = std::fs::remove_file(path);
+            }
             return Err(e);
         }
     };
@@ -356,7 +365,7 @@ where
     Ok(SpawnedProcess {
         child,
         output_rx,
-        cleanup: Some(path),
+        cleanup,
     })
 }
 
@@ -399,10 +408,24 @@ where
             Some(&block.lang),
             envs,
             cwd,
-            canvas_path,
+            block_origin(block, canvas_path),
         ),
         None => spawn_bash(&block.code, envs, cwd),
     }
+}
+
+/// `block`'s [`BlockOrigin`](meshfox_core::tangle::BlockOrigin): its canvas
+/// file, plus its name when it carries `tangle`. `None` without a canvas
+/// path — there is nothing to name a tangled file after.
+pub fn block_origin<'a>(
+    block: &'a meshfox_core::CodeBlock,
+    canvas_path: Option<&'a Path>,
+) -> Option<meshfox_core::tangle::BlockOrigin<'a>> {
+    let origin = meshfox_core::tangle::BlockOrigin::new(canvas_path?);
+    Some(match (block.tangle(), block.name.as_deref()) {
+        (true, Some(name)) => origin.with_tangle(name),
+        _ => origin,
+    })
 }
 
 fn spawn_line_reader<R>(
@@ -728,6 +751,100 @@ mod tests {
             lines.push(line);
         }
         assert_eq!(lines, vec!["via interpreter"]);
+    }
+
+    /// `tangle`: the code runs from a stable hidden file in `cwd` and the
+    /// file outlives the run; without the flag it is a temp file, removed.
+    #[tokio::test]
+    async fn spawn_block_runs_a_tangle_block_from_a_stable_file_in_cwd() {
+        let dir = std::env::temp_dir().join(format!("meshfox-tangle-spawn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let canvas = dir.join("doc.canvas.md");
+
+        let md = "```bash name=\"x\" interpreter=\"bash\" tangle\necho \"$0\"\n```\n";
+        let block = meshfox_core::scan_code_blocks(md).remove(0);
+        assert!(block.tangle());
+        let expected = dir.join(".meshfox-tangle-doc.canvas.md__x.sh");
+
+        for _ in 0..2 {
+            let mut proc = spawn_block(&block, no_envs(), Some(&dir), Some(&canvas)).unwrap();
+            let mut lines = Vec::new();
+            while let Some((_, line)) = proc.output_rx.recv().await {
+                lines.push(line);
+            }
+            let _ = proc.child.wait().await;
+            drop(proc);
+            assert_eq!(lines, vec![expected.display().to_string()]);
+            assert_eq!(
+                std::fs::read_to_string(&expected).unwrap(),
+                "echo \"$0\"",
+                "the tangled file stays after the run"
+            );
+        }
+
+        let plain = test_block("bash", Some("bash"), "echo \"$0\"");
+        assert!(!plain.tangle());
+        let mut proc = spawn_block(&plain, no_envs(), Some(&dir), Some(&canvas)).unwrap();
+        let mut lines = Vec::new();
+        while let Some((_, line)) = proc.output_rx.recv().await {
+            lines.push(line);
+        }
+        assert_eq!(lines.len(), 1);
+        assert!(
+            !lines[0].starts_with(dir.to_str().unwrap()),
+            "a block without `tangle` still runs from the temp dir: {}",
+            lines[0]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The documented side effect of running from the project directory: Node
+    /// reads the nearest `package.json`, so a `"type": "module"` project turns
+    /// a tangled CommonJS block (`require`) into an ES module, while the same
+    /// block from the temp dir — outside any project — stays CommonJS.
+    #[tokio::test]
+    async fn a_tangle_block_follows_the_projects_package_json_type() {
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return; // no Node on this machine
+        }
+        let dir = std::env::temp_dir().join(format!("meshfox-tangle-pkg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        std::fs::write(dir.join("package.json"), "{\"type\": \"module\"}").unwrap();
+        let canvas = dir.join("doc.canvas.md");
+
+        async fn run(block: &meshfox_core::CodeBlock, dir: &Path, canvas: &Path) -> (String, i32) {
+            let mut proc = spawn_block(block, no_envs(), Some(dir), Some(canvas)).unwrap();
+            let mut text = String::new();
+            while let Some((_, line)) = proc.output_rx.recv().await {
+                text.push_str(&line);
+                text.push('\n');
+            }
+            let code = proc.child.wait().await.unwrap().code().unwrap_or(-1);
+            (text, code)
+        }
+        let source = "console.log(typeof require)";
+        let tangled = meshfox_core::scan_code_blocks(&format!(
+            "```javascript name=\"c\" interpreter=\"node\" tangle\n{source}\n```\n"
+        ))
+        .remove(0);
+        let plain = meshfox_core::scan_code_blocks(&format!(
+            "```javascript name=\"c\" interpreter=\"node\"\n{source}\n```\n"
+        ))
+        .remove(0);
+
+        let (text, code) = run(&tangled, &dir, &canvas).await;
+        assert_eq!((text.trim(), code), ("undefined", 0), "an ES module here");
+        let (text, code) = run(&plain, &dir, &canvas).await;
+        assert_eq!((text.trim(), code), ("function", 0), "CommonJS from /tmp");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

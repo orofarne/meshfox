@@ -63,7 +63,9 @@ fn declaration(rest: &str) -> Result<ArgDecl, String> {
             "default",
             "prompt",
             "required",
-        ].contains(&key) {
+        ]
+        .contains(&key)
+        {
             return Err(format!("unknown meshfox:arg attribute {key:?}"));
         }
     }
@@ -735,8 +737,7 @@ mod tests {
         assert_eq!(prepared.fields[0].value.as_deref(), Some("2"));
         assert!(prepared.fields[1].resolved);
         let answers = std::collections::BTreeMap::from([("n".into(), "002".into())]);
-        let prepared =
-            prepare_arguments(
+        let prepared = prepare_arguments(
             "root",
             md,
             "extract",
@@ -781,16 +782,15 @@ mod tests {
         .unwrap();
         assert_eq!(block.arguments["q"], "$NAME, [hy]");
         let values = std::collections::HashMap::from([("NAME".into(), "hy".into())]);
-        let prepared =
-            prepare_arguments(
-                "root",
-                md,
-                "search[q=$NAME]",
-                &Default::default(),
-                &values,
-                &Default::default(),
-            )
-            .unwrap();
+        let prepared = prepare_arguments(
+            "root",
+            md,
+            "search[q=$NAME]",
+            &Default::default(),
+            &values,
+            &Default::default(),
+        )
+        .unwrap();
         assert_eq!(prepared.block.as_deref(), Some("search[q=hy]"));
     }
 
@@ -799,16 +799,15 @@ mod tests {
         let md = "<!-- meshfox:arg name=\"file\" type=\"select\" choices_var=\"FILES\" -->\n```bash name=\"import\"\necho ok\n```";
         let none = std::collections::HashMap::new();
         // Source not resolved yet: no choices, flagged pending, not bound.
-        let prepared = prepare_arguments("root", md, "import", &Default::default(), &none, &none)
-            .unwrap();
+        let prepared =
+            prepare_arguments("root", md, "import", &Default::default(), &none, &none).unwrap();
         assert_eq!(prepared.fields[0].choices_pending.as_deref(), Some("FILES"));
         assert!(prepared.fields[0].choices.is_empty());
         assert!(prepared.block.is_none());
         // Source resolved: choices substituted and the answer is checked.
         let sources = std::collections::HashMap::from([("FILES".into(), "a.csv,b.csv".into())]);
         let answers = std::collections::BTreeMap::from([("file".into(), "b.csv".into())]);
-        let prepared =
-            prepare_arguments("root", md, "import", &answers, &none, &sources).unwrap();
+        let prepared = prepare_arguments("root", md, "import", &answers, &none, &sources).unwrap();
         assert_eq!(prepared.fields[0].choices, ["a.csv", "b.csv"]);
         assert_eq!(prepared.fields[0].choices_pending, None);
         assert_eq!(prepared.block.as_deref(), Some("import[file=b.csv]"));

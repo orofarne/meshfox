@@ -135,7 +135,11 @@ impl PathPickerState {
             if self.save {
                 self.name = name.clone();
             }
-            if let Some(i) = self.rows().iter().position(|r| !r.is_parent && r.name == name) {
+            if let Some(i) = self
+                .rows()
+                .iter()
+                .position(|r| !r.is_parent && r.name == name)
+            {
                 self.selected = i;
             }
         }
@@ -199,7 +203,10 @@ impl PathPickerState {
             return PickerAction::Stay;
         };
         if row.is_parent {
-            return l.parent.clone().map_or(PickerAction::Stay, PickerAction::Navigate);
+            return l
+                .parent
+                .clone()
+                .map_or(PickerAction::Stay, PickerAction::Navigate);
         }
         if row.is_dir {
             return PickerAction::Navigate(join_path(&l.path, &row.name));
@@ -416,17 +423,29 @@ mod tests {
     fn enter_descends_into_dirs_and_up_through_the_parent_row() {
         let mut p = picker(VarType::File, Some(FileMode::Open), &[]);
         p.selected = 1; // raw
-        assert_eq!(p.on_key(key(KeyCode::Enter)), PickerAction::Navigate("/media/raw".into()));
+        assert_eq!(
+            p.on_key(key(KeyCode::Enter)),
+            PickerAction::Navigate("/media/raw".into())
+        );
         p.selected = 0; // ..
-        assert_eq!(p.on_key(key(KeyCode::Enter)), PickerAction::Navigate("/".into()));
-        assert_eq!(p.on_key(key(KeyCode::Backspace)), PickerAction::Navigate("/".into()));
+        assert_eq!(
+            p.on_key(key(KeyCode::Enter)),
+            PickerAction::Navigate("/".into())
+        );
+        assert_eq!(
+            p.on_key(key(KeyCode::Backspace)),
+            PickerAction::Navigate("/".into())
+        );
     }
 
     #[test]
     fn open_mode_chooses_the_file_on_enter() {
         let mut p = picker(VarType::File, Some(FileMode::Open), &[]);
         p.selected = 2; // a.mkv
-        assert_eq!(p.on_key(key(KeyCode::Enter)), PickerAction::Choose("/media/a.mkv".into()));
+        assert_eq!(
+            p.on_key(key(KeyCode::Enter)),
+            PickerAction::Choose("/media/a.mkv".into())
+        );
         // `s` is a directory picker's key, not a file picker's.
         assert_eq!(p.on_key(key(KeyCode::Char('s'))), PickerAction::Stay);
     }
@@ -441,7 +460,10 @@ mod tests {
             p.on_key(key(KeyCode::Char(c)));
         }
         p.on_key(key(KeyCode::Char('/'))); // never part of a name
-        assert_eq!(p.on_key(key(KeyCode::Enter)), PickerAction::Choose("/media/out.mp4".into()));
+        assert_eq!(
+            p.on_key(key(KeyCode::Enter)),
+            PickerAction::Choose("/media/out.mp4".into())
+        );
         // Enter on an existing file only fills the name in.
         p.focus = PickerFocus::List;
         p.selected = 2;
@@ -453,14 +475,23 @@ mod tests {
     #[test]
     fn dir_picker_chooses_the_current_directory() {
         let mut p = picker(VarType::Dir, None, &[]);
-        assert_eq!(p.on_key(key(KeyCode::Char('s'))), PickerAction::Choose("/media".into()));
-        assert_eq!(p.on_key(key(KeyCode::Char(' '))), PickerAction::Choose("/media".into()));
+        assert_eq!(
+            p.on_key(key(KeyCode::Char('s'))),
+            PickerAction::Choose("/media".into())
+        );
+        assert_eq!(
+            p.on_key(key(KeyCode::Char(' '))),
+            PickerAction::Choose("/media".into())
+        );
     }
 
     #[test]
     fn dot_toggles_hidden_and_asks_for_a_relisting() {
         let mut p = picker(VarType::Dir, None, &[]);
-        assert_eq!(p.on_key(key(KeyCode::Char('.'))), PickerAction::Navigate("/media".into()));
+        assert_eq!(
+            p.on_key(key(KeyCode::Char('.'))),
+            PickerAction::Navigate("/media".into())
+        );
         assert!(p.show_hidden);
     }
 

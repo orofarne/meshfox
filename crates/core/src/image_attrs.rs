@@ -338,7 +338,10 @@ mod image_dependency_tests {
     use super::*;
     #[test]
     fn image_paths_decode_url_escapes_and_preserve_literal_plus() {
-        assert_eq!(local_image_destinations("![x](plot%20one.svg?x=1#view)"), vec!["plot one.svg"]);
+        assert_eq!(
+            local_image_destinations("![x](plot%20one.svg?x=1#view)"),
+            vec!["plot one.svg"]
+        );
         assert_eq!(decode_image_path("%D0%B0+%25.svg"), "а+%.svg");
     }
     #[test]

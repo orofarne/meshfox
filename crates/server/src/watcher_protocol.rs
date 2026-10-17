@@ -237,7 +237,8 @@ fn is_dropped_connection(e: &io::Error) -> bool {
             | io::ErrorKind::ConnectionAborted
             | io::ErrorKind::UnexpectedEof
     ) || (e.kind() == io::ErrorKind::InvalidData
-        && e.to_string().contains("closed the connection without answering"))
+        && e.to_string()
+            .contains("closed the connection without answering"))
 }
 
 async fn request_and_await_reply_once(socket_path: &Path, msg: &Message) -> io::Result<String> {

@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use meshfox_server::link_preview::{self, PreviewMeta};
 
+use super::image_render::DocumentImage;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use meshfox_core::deps::BlockAddr;
 use meshfox_core::fence::{self, scan_runnable_blocks};
@@ -27,7 +28,6 @@ use ratatui_image::picker::cap_parser::QueryStdioOptions;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::Protocol;
 use ratatui_image::sliced::SlicedProtocol;
-use super::image_render::DocumentImage;
 
 use super::spatial;
 use super::ui;
@@ -1075,10 +1075,14 @@ impl App {
     ) -> io::Result<App> {
         let configured = if std::env::var_os("MESHFOX_IMAGE_PROTOCOL").is_none() {
             match worker_port {
-                Some(port) => crate::worker_client::tui_image_protocol(port).await.map_err(io::Error::other)?,
+                Some(port) => crate::worker_client::tui_image_protocol(port)
+                    .await
+                    .map_err(io::Error::other)?,
                 None => None,
             }
-        } else { None };
+        } else {
+            None
+        };
         Self::new_with_picker(
             canvas_path,
             background_tx,
@@ -2342,7 +2346,8 @@ impl App {
     fn is_form_block(&self, addr: &BlockAddr) -> bool {
         self.display_canvas.node(&addr.node_id).is_some_and(|node| {
             scan_runnable_blocks(&node.id, &node.text).iter().any(|b| {
-                b.name.as_deref() == Some(addr.block_name.as_str()) && meshfox_core::is_form(&b.lang)
+                b.name.as_deref() == Some(addr.block_name.as_str())
+                    && meshfox_core::is_form(&b.lang)
             })
         })
     }
@@ -2683,9 +2688,7 @@ impl App {
                     let marker = super::path_picker::BROWSE_MARKER.chars().count() as u16;
                     let on_marker = mouse.column + marker >= list_rect.x + list_rect.width
                         && mouse.column < list_rect.x + list_rect.width;
-                    if on_marker
-                        && matches!(vf.decls[idx].var_type, VarType::Dir | VarType::File)
-                    {
+                    if on_marker && matches!(vf.decls[idx].var_type, VarType::Dir | VarType::File) {
                         browse = Some(idx);
                     }
                 }
@@ -5916,7 +5919,10 @@ impl App {
             .await
             .map(|runs| {
                 runs.iter().any(|r| {
-                    r.kind == "tty" && r.status == "running" && r.node_id == node_id && r.block == block
+                    r.kind == "tty"
+                        && r.status == "running"
+                        && r.node_id == node_id
+                        && r.block == block
                 })
             })
             .unwrap_or(false);
@@ -6428,7 +6434,10 @@ fn build_picker(configured: Option<&str>) -> io::Result<Picker> {
     Ok(picker)
 }
 
-fn select_image_protocol(override_value: Option<&str>, configured: Option<&str>) -> io::Result<Option<ProtocolType>> {
+fn select_image_protocol(
+    override_value: Option<&str>,
+    configured: Option<&str>,
+) -> io::Result<Option<ProtocolType>> {
     parse_image_protocol(override_value.or(configured))
 }
 
@@ -6519,15 +6528,24 @@ fn load_document_image(
 ) -> Option<Arc<DocumentImage>> {
     let embedded_svg = path.to_str().and_then(|url| {
         let (meta, payload) = url.strip_prefix("data:")?.split_once(',')?;
-        meta.eq_ignore_ascii_case("image/svg+xml;base64").then(|| {
-            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, payload).ok()
-        }).flatten()
+        meta.eq_ignore_ascii_case("image/svg+xml;base64")
+            .then(|| {
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, payload).ok()
+            })
+            .flatten()
     });
-    let svg = embedded_svg.as_deref().or_else(|| is_svg_path(path).then_some(bytes).flatten());
+    let svg = embedded_svg
+        .as_deref()
+        .or_else(|| is_svg_path(path).then_some(bytes).flatten());
     let image = if let Some(svg) = svg {
-        let density = if picker.protocol_type() == ProtocolType::Iterm2 { 2 } else { 1 };
+        let density = if picker.protocol_type() == ProtocolType::Iterm2 {
+            2
+        } else {
+            1
+        };
         super::svg_raster::rasterize_to_fit(
-            std::str::from_utf8(svg).ok()?, bg,
+            std::str::from_utf8(svg).ok()?,
+            bg,
             u32::from(budget.width) * u32::from(picker.font_size().width) * density,
             u32::from(budget.height) * u32::from(picker.font_size().height) * density,
         )?
@@ -6540,28 +6558,56 @@ fn load_document_image(
     prepared_image(picker, image, budget).map(Arc::new)
 }
 
-pub(super) fn prepared_image(picker: &Picker, image: image::DynamicImage, budget: ratatui::layout::Size) -> Option<DocumentImage> {
-    let density = if picker.protocol_type() == ProtocolType::Iterm2 { 2 } else { 1 };
+pub(super) fn prepared_image(
+    picker: &Picker,
+    image: image::DynamicImage,
+    budget: ratatui::layout::Size,
+) -> Option<DocumentImage> {
+    let density = if picker.protocol_type() == ProtocolType::Iterm2 {
+        2
+    } else {
+        1
+    };
     let font = picker.font_size();
     let cell_width = (u32::from(font.width) * density).max(1);
     let cell_height = (u32::from(font.height) * density).max(1);
-    let pixels = image.resize(u32::from(budget.width) * cell_width,
-        u32::from(budget.height) * cell_height, image::imageops::FilterType::Lanczos3);
-    let size = ratatui::layout::Size::new(pixels.width().div_ceil(cell_width) as u16, pixels.height().div_ceil(cell_height) as u16);
+    let pixels = image.resize(
+        u32::from(budget.width) * cell_width,
+        u32::from(budget.height) * cell_height,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let size = ratatui::layout::Size::new(
+        pixels.width().div_ceil(cell_width) as u16,
+        pixels.height().div_ceil(cell_height) as u16,
+    );
     match picker.protocol_type() {
         ProtocolType::Iterm2 | ProtocolType::Sixel => {
             // Obtain tmux framing without encoding the full image or individual rows.
-            let template = picker.new_protocol(image::DynamicImage::new_rgba8(1, 1),
-                ratatui::layout::Size::new(1, 1), ratatui_image::Resize::Fit(None)).ok()?;
+            let template = picker
+                .new_protocol(
+                    image::DynamicImage::new_rgba8(1, 1),
+                    ratatui::layout::Size::new(1, 1),
+                    ratatui_image::Resize::Fit(None),
+                )
+                .ok()?;
             let (tmux, sixel) = match template {
                 Protocol::ITerm2(image) => (image.is_tmux, false),
                 Protocol::Sixel(image) => (image.is_tmux, true),
                 _ => return None,
             };
-            Some(DocumentImage::fragment(size, pixels, cell_height, tmux, sixel))
+            Some(DocumentImage::fragment(
+                size,
+                pixels,
+                cell_height,
+                tmux,
+                sixel,
+            ))
         }
-        _ => SlicedProtocol::new_with_resize(picker, pixels, size, ratatui_image::Resize::Fit(None))
-            .ok().map(DocumentImage::sliced),
+        _ => {
+            SlicedProtocol::new_with_resize(picker, pixels, size, ratatui_image::Resize::Fit(None))
+                .ok()
+                .map(DocumentImage::sliced)
+        }
     }
 }
 
@@ -6574,7 +6620,13 @@ fn load_image_protocol(
     height_percent: Option<u32>,
     bg: Option<Background>,
 ) -> Option<Protocol> {
-    load_image_protocol_with_budget(picker, path, bytes, bg, image_size_budget(width_percent, height_percent))
+    load_image_protocol_with_budget(
+        picker,
+        path,
+        bytes,
+        bg,
+        image_size_budget(width_percent, height_percent),
+    )
 }
 
 #[cfg(test)]
@@ -6698,8 +6750,15 @@ fn image_size_budget_for_viewport(
 }
 
 #[cfg(test)]
-fn image_size_budget(width_percent: Option<u32>, height_percent: Option<u32>) -> ratatui::layout::Size {
-    image_size_budget_for_viewport(ratatui::layout::Size::new(56, 24), width_percent, height_percent)
+fn image_size_budget(
+    width_percent: Option<u32>,
+    height_percent: Option<u32>,
+) -> ratatui::layout::Size {
+    image_size_budget_for_viewport(
+        ratatui::layout::Size::new(56, 24),
+        width_percent,
+        height_percent,
+    )
 }
 
 fn point_in(rect: Rect, x: u16, y: u16) -> bool {
@@ -7523,10 +7582,22 @@ mod tests {
 
     #[test]
     fn image_protocol_environment_overrides_config_including_auto() {
-        assert_eq!(select_image_protocol(None, Some("sixel")).unwrap(), Some(ProtocolType::Sixel));
-        assert_eq!(select_image_protocol(Some("iterm2"), Some("sixel")).unwrap(), Some(ProtocolType::Iterm2));
-        assert_eq!(select_image_protocol(Some("auto"), Some("sixel")).unwrap(), None);
-        assert_eq!(select_image_protocol(Some("halfblocks"), Some("invalid")).unwrap(), Some(ProtocolType::Halfblocks));
+        assert_eq!(
+            select_image_protocol(None, Some("sixel")).unwrap(),
+            Some(ProtocolType::Sixel)
+        );
+        assert_eq!(
+            select_image_protocol(Some("iterm2"), Some("sixel")).unwrap(),
+            Some(ProtocolType::Iterm2)
+        );
+        assert_eq!(
+            select_image_protocol(Some("auto"), Some("sixel")).unwrap(),
+            None
+        );
+        assert_eq!(
+            select_image_protocol(Some("halfblocks"), Some("invalid")).unwrap(),
+            Some(ProtocolType::Halfblocks)
+        );
         assert!(select_image_protocol(Some("invalid"), Some("iterm2")).is_err());
         assert_eq!(select_image_protocol(None, None).unwrap(), None);
     }
@@ -7730,10 +7801,22 @@ mod tests {
     #[test]
     fn image_percentages_use_the_pane_and_release_the_other_axis() {
         use ratatui::layout::Size;
-        assert_eq!(image_size_budget_for_viewport(Size::new(120, 60), Some(100), None), Size::new(120, 60));
-        assert_eq!(image_size_budget_for_viewport(Size::new(120, 60), Some(50), None), Size::new(60, 60));
-        assert_eq!(image_size_budget_for_viewport(Size::new(120, 60), None, Some(50)), Size::new(120, 30));
-        assert_eq!(image_size_budget_for_viewport(Size::new(120, 60), None, None), Size::new(56, 24));
+        assert_eq!(
+            image_size_budget_for_viewport(Size::new(120, 60), Some(100), None),
+            Size::new(120, 60)
+        );
+        assert_eq!(
+            image_size_budget_for_viewport(Size::new(120, 60), Some(50), None),
+            Size::new(60, 60)
+        );
+        assert_eq!(
+            image_size_budget_for_viewport(Size::new(120, 60), None, Some(50)),
+            Size::new(120, 30)
+        );
+        assert_eq!(
+            image_size_budget_for_viewport(Size::new(120, 60), None, None),
+            Size::new(56, 24)
+        );
     }
 
     #[test]
@@ -8312,7 +8395,10 @@ mod tests {
 
         // Enter edits it: the header says so and the foot lists the keys.
         app.on_key(key(KeyCode::Enter)).await;
-        let form = app.active_inline_form.as_ref().expect("Enter opens the form");
+        let form = app
+            .active_inline_form
+            .as_ref()
+            .expect("Enter opens the form");
         assert!(form.editing);
         assert_eq!(form.block_name, "pick");
         assert!(text(&app).contains("· editing"), "{}", text(&app));

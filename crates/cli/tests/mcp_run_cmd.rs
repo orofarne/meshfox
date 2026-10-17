@@ -262,18 +262,33 @@ async fn run_accepts_literal_args_and_keeps_required_defaults_unconfirmed() {
         "```bash name=\"extract\" env=\"URL=URL_${n}\"\nprintf '%s:%s:%s\\n' \"$n\" \"$text\" \"$URL\"\n```\n",
     )).unwrap();
     let mcp = start(&dir).await;
-    call(&mcp, "canvas_open", serde_json::json!({"path":"doc.canvas.md"})).await.unwrap();
+    call(
+        &mcp,
+        "canvas_open",
+        serde_json::json!({"path":"doc.canvas.md"}),
+    )
+    .await
+    .unwrap();
     let base = serde_json::json!({"canvas_id":"doc.canvas.md","node_id":"root","block":"extract"});
     let missing = call(&mcp, "run", base.clone()).await.unwrap_err();
-    assert!(missing.contains("missing required argument(s): n, text"), "{missing}");
+    assert!(
+        missing.contains("missing required argument(s): n, text"),
+        "{missing}"
+    );
     let mut bound = base.clone();
     bound["args"] = serde_json::json!({"n":"009","text":"$NAME, [hy]"});
     let (is_error, result) = call(&mcp, "run", bound).await.unwrap();
     assert!(!is_error, "{result}");
     let application = "extract[n=9,text=\"$NAME, [hy]\"]";
-    assert!(step(&result, application)["output"].as_str().unwrap().contains("9:$NAME, [hy]:selected-url$literal"));
+    assert!(step(&result, application)["output"]
+        .as_str()
+        .unwrap()
+        .contains("9:$NAME, [hy]:selected-url$literal"));
     let missing = call(&mcp, "run", base).await.unwrap_err();
-    assert!(missing.contains("missing required argument(s)"), "arguments must not be cached: {missing}");
+    assert!(
+        missing.contains("missing required argument(s)"),
+        "arguments must not be cached: {missing}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

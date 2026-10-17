@@ -132,7 +132,17 @@ canvas-local `.meshfox/<canvas filename>.venv/`, created once and reported as a 
 whatever Python happens to be on `$PATH`. The venv/install step itself is
 meshfox's own built-in `interpreter="@python_venv"`: a `text` fence supplies
 `requirements.txt`, while a `toml` fence supplies `pyproject.toml`, with no
-shell script of your own to keep in sync.
+shell script of your own to keep in sync. `PYTHON` points at a small launcher,
+`<venv>/bin/python3-mf`, which is the venv's Python with the block's working
+directory added to `PYTHONPATH` — so a block can `import` a module that sits
+next to its canvas without a `sys.path.insert(0, os.getcwd())` of its own.
+
+Node has the same shape: [examples/node-env.canvas.md](./examples/node-env.canvas.md)
+uses `interpreter="@node_env"` — a `text` fence of npm packages (or a `json`
+fence holding a `package.json`) is installed into a canvas-local
+`.meshfox/<canvas filename>.node/` (only when the list changed), and the
+computed `NODE` variable is a launcher that makes those packages visible to
+both `require` and `import`. Blocks then say `interpreter="$NODE"`.
 
 #### Example
 <!-- meshfox:node id="example" type="file" -->
@@ -164,6 +174,24 @@ shape of `interpreter=` side by side: a bare command (`python3`), one with
 its own flags (`python3 -u`), any other tool on `$PATH` (`node`), an
 interactive `tty` block handing over a real REPL, and the same mechanism on
 a `file`-type node instead of a fence.
+
+A block's code is written to a temp file named after its language
+(`.py`, `.js`, `.ts`, …) and handed to the interpreter. Because a runtime
+looks up imports, `package.json` and `tsconfig` next to the script file, a
+block that imports a module sitting beside the canvas needs the `tangle`
+flag next to its `interpreter=`. The code
+then runs from a hidden file with a stable name in the block's working
+directory, `.meshfox-tangle-<canvas file>__<block>.<ext>`, written only when
+the code changes and left in place after the run. Add `.meshfox-tangle-*` to
+your `.gitignore`. If the directory can't be written the run fails with a
+clear error rather than quietly importing from somewhere else. Leftovers of
+blocks that no longer exist are removed when the canvas's worker starts.
+Two side effects of running from the project directory: a file watcher there
+(`nodemon`, `vite`, ...) can see the file appear and change (it does not see
+a re-run of unchanged code), and the runtime now finds the project's own
+configuration — Node reads the nearest `package.json`, so in a
+`"type": "module"` project a tangled block is an ES module (no `require`),
+where the same block without `tangle` runs as CommonJS from the temp dir.
 
 [examples/services.canvas.md](./examples/services.canvas.md) covers long-lived
 services: graceful Stop/Restart, the YAML `interpreter="@service"` lifecycle
@@ -432,6 +460,7 @@ Commands:
   session        Manage a canvas's *session*: what the core remembers between runs — which blocks already ran and still look unchanged (so a later `run` skips them as already-fresh dependencies), and the values a `form` fence submitted. It survives restarts, so a build step whose result depends on files rather than on its own text can look "fresh" forever; `meshfox run --fresh` forces one run, `session reset` forgets everything. See SPEC.md's "Session"
   serve          Run the persistent coordinator (headless counterpart of the macOS menu-bar app); `--socket PATH`, or the socket systemd hands over
   cores          Inspect and control the coordinator's cores: `list` (alias `ls`), `open <canvas>`, `kill <canvas>`
+  prune          Find — and with `--yes` remove — the regenerable files meshfox leaves behind in a directory (`DIR`, default `.`; `--recursive` for subdirectories): tangled files (`.meshfox-tangle-*`) whose block or canvas is gone, `.meshfox/<canvas>.venv` / `.meshfox/<canvas>.node` environments whose canvas file is gone, and stale `meshfox-<pid>-*` temp files (older than a day) in the system temp dir. Only lists them without `--yes`; skips a canvas with a running worker; never touches run history (`.session.sqlite3`) or variable caches (`.env`)
   secret         Manage values in the system secret store (`secret_store = "keychain"` in `.meshfox/config.toml`; macOS and Linux): `set`, `show` (prints a value only with `--reveal`), `rm`. See SPEC.md's "Secret store"
   create         Create a new, empty canvas file: just the `meshfox:canvas` marker followed by a lone root heading (`#`) named after the file itself (its name with a trailing `.canvas.md`/`.md` stripped). Fails if the file already exists — this never overwrites
   view           Start the local web UI: canvas view, run buttons. Opens read-only — running a block is always allowed, but click "Edit" in the browser to unlock dragging, resizing, saving layout, and persisting a `cache`d block's output back into the file
@@ -721,7 +750,7 @@ Keybindings on top of vim's own:
 - `Ctrl-s` — save. Validated as a canvas first. If the file changed since the editor opened it (another client, an editor), the worker three-way merges your buffer with that change when the two edits don't overlap — the result is saved and the status line says it was merged. If they do overlap (or the version you started from is no longer in the undo history), nothing is written and a side-by-side comparison opens: the file as it is on disk on the left, your buffer on the right, the lines both sides changed marked with `!`. In it, `n`/`N` jump between conflicts, `j`/`k`/`PgUp`/`PgDn` scroll, `h`/`l` pan, `t` takes theirs (the buffer becomes the file as it is), `m` keeps yours (written over the file as it is now) and `Esc` goes back to the buffer without deciding.
 - `Ctrl-n` — turn the heading the cursor's on into a node: appends a bare `<!-- meshfox:node -->` right below it. That's already enough on its own — no `id=` needed, since a node with none gets one derived from its heading's own slug (see SPEC.md's "Node types" for the fallback).
 - `Ctrl-g` — open the Unicode symbol palette. Search English Unicode names or `U+XXXX`, choose with Up/Down, insert at the cursor with Enter, or cancel with Esc. An empty search shows common symbols; control and zero-width characters are excluded.
-- `Ctrl-p` — suggest attributes for whatever `meshfox:node`/`meshfox:edge` comment or runnable-fence line the cursor's on, filtered down to whatever that line doesn't already have. Picking one types it in: `key=""` with the cursor left between the quotes for `x`/`y`/`w`/`h` get a bare `=0` instead, matching the on-disk convention every authored coordinate already uses; a fence-only presence flag (`cache`, `tty`, `default`) gets just its own word, nothing to fill in. With the cursor inside an already-typed `tags="..."` value instead, the same key suggests tags already used elsewhere in the document rather than attribute names — picking one adds it (comma-separated), cursor left ready for the next.
+- `Ctrl-p` — suggest attributes for whatever `meshfox:node`/`meshfox:edge` comment or runnable-fence line the cursor's on, filtered down to whatever that line doesn't already have. Picking one types it in: `key=""` with the cursor left between the quotes for `x`/`y`/`w`/`h` get a bare `=0` instead, matching the on-disk convention every authored coordinate already uses; a fence-only presence flag (`cache`, `tty`, `default`) gets just its own word, nothing to fill in. With the cursor inside an already-typed `tags="..."` value instead, the same key suggests tags already used elsewhere in the document rather than attribute names — picking one adds it (comma-separated), cursor left ready for the next. Inside an attribute with a fixed set of values (`type`, `display`, edge sides/style/arrowheads, fence `output`/`render`, or boolean flags), `Ctrl-p` offers those values instead; Enter replaces the current value while preserving its quotes, and Escape cancels.
 - `esc` — leave. A second press discards unsaved edits; the first just warns.
 - mouse — full vim `mouse=a`-equivalent support: click to position the cursor, drag to select (switches to Visual automatically), scroll to move the viewport.
 

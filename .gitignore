@@ -26,6 +26,12 @@ editors/vscode/e2e/blob-report/
 # only remains as the fallback path when no canvas path was available to
 # key it by (see meshfox_core::builtin_interpreter::resolve_with_env).
 .venv/
+# Hidden files a `tangle` block's code is written to (see SPEC.md's "Runnable
+# code fences") — a cache of the canvas, never a source.
+.meshfox-tangle-*
+# Bytecode Python writes next to a module a block imports from the canvas's
+# directory (examples/venv_demo_helper.py).
+__pycache__/
 # Resolved meshfox:var answers (see SPEC.md's "Variables") — local machine
 # state, analogous to CMake's CMakeCache.txt, never something to commit.
 .meshfox/

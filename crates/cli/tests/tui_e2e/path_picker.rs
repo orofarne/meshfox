@@ -20,7 +20,10 @@ fn wait_until(session: &TuiSession, what: &str, pred: impl Fn(&str) -> bool) {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    panic!("timed out waiting for {what}; screen:\n{}", session.screen_text());
+    panic!(
+        "timed out waiting for {what}; screen:\n{}",
+        session.screen_text()
+    );
 }
 
 fn spawn_with_footage() -> TuiSession {
@@ -47,7 +50,10 @@ fn ctrl_o_browses_to_a_file_with_the_keyboard_and_hints_by_extension() {
     session
         .wait_for("choose file", Duration::from_secs(5))
         .expect("Ctrl-O on a file field should open the picker");
-    assert!(session.screen_text().contains("footage/"), "the canvas dir's subdirectory is listed");
+    assert!(
+        session.screen_text().contains("footage/"),
+        "the canvas dir's subdirectory is listed"
+    );
 
     // `..` is row 0; `j` moves to `footage/`, Enter descends.
     session.send_keys("j");
@@ -97,7 +103,9 @@ fn a_second_click_on_a_picker_row_activates_it_and_escape_cancels() {
         .expect("clicking the selected row again should descend into it");
 
     session.send_keys("\x1b");
-    wait_until(&session, "Esc to close the picker", |s| !s.contains("choose file"));
+    wait_until(&session, "Esc to close the picker", |s| {
+        !s.contains("choose file")
+    });
 }
 
 #[test]
