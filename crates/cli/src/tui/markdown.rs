@@ -25,6 +25,10 @@ use syntect::parsing::SyntaxSet;
 #[derive(Clone)]
 pub enum Segment {
     Text(Vec<Line<'static>>),
+    Button {
+        caption: String,
+        selected: bool,
+    },
     Table {
         table: MarkdownTable,
         prefix: Vec<Span<'static>>,
@@ -78,7 +82,7 @@ pub enum ClickTarget {
         block_name: String,
         action: BlockAction,
     },
-    /// A `button` fence's own `▶ caption` marker — runs its `deps=` chain
+    /// A `button` fence's framed surface — runs its `deps=` chain
     /// (plus its own, always-empty body), same as pressing `r` on it would.
     RunBlock { node_id: String, block_name: String },
     /// A block name inside a deps line (`├─ deps: …`/`via var: …`) — the TUI
@@ -583,6 +587,9 @@ struct Renderer<'a> {
     /// UI's `#!interpreter` suffix on the code-block head (see
     /// `web/src/MeshNode.tsx`'s `mesh-code-interpreter`).
     code_interpreter: Option<String>,
+    /// Whether this fence carries the `tangle` flag (runs from a stable
+    /// hidden file in its cwd) — mirrors the web UI's `mesh-tangle-badge`.
+    code_tangle: bool,
     /// This fence's own raw `deps=`/`env=` attributes, if any — parsed in
     /// `TagEnd::CodeBlock` into `dep_lines`'s explicit/implicit deps line.
     code_deps: Option<String>,
@@ -716,6 +723,7 @@ impl<'a> Renderer<'a> {
             code_lang: None,
             code_name: None,
             code_interpreter: None,
+            code_tangle: false,
             code_deps: None,
             code_env: None,
             block_details: Default::default(),
@@ -1031,7 +1039,9 @@ impl<'a> Renderer<'a> {
                     }
                     // A widget can't sit inside a text border: close off the
                     // lines so far, let the image through as-is, continue.
-                    image @ (Segment::Image { .. } | Segment::TablePreview(_)) => {
+                    image @ (Segment::Image { .. }
+                    | Segment::TablePreview(_)
+                    | Segment::Button { .. }) => {
                         flush(self, std::mem::take(&mut framed));
                         self.segments.push(image);
                     }
@@ -1339,6 +1349,7 @@ impl<'a> Renderer<'a> {
             Tag::CodeBlock(kind) => {
                 self.flush_paragraph();
                 self.code_send = None;
+                let mut tangle = false;
                 let (lang, name, interpreter, deps, env) = match kind {
                     // The info string carries meshfox's own attributes past
                     // the language token (`name="..."`, `cache`, ...) — see
@@ -1350,6 +1361,7 @@ impl<'a> Renderer<'a> {
                         let lang = tokens.next().unwrap_or_else(|| "text".to_string());
                         let mut attrs = meshfox_core::attrs::attrs_from_tokens(tokens);
                         let name = attrs.remove("name");
+                        tangle = attrs.get("tangle").is_some_and(|v| v != "false");
                         let interpreter = attrs.remove("interpreter");
                         let deps = attrs.remove("deps");
                         let env = attrs.remove("env");
@@ -1378,6 +1390,7 @@ impl<'a> Renderer<'a> {
                 self.code_lang = Some(lang);
                 self.code_name = name;
                 self.code_interpreter = interpreter;
+                self.code_tangle = tangle;
                 self.code_deps = deps;
                 self.code_env = env;
                 self.code_buf.clear();
@@ -1568,6 +1581,7 @@ impl<'a> Renderer<'a> {
                 let lang = self.code_lang.take().unwrap_or_default();
                 let name = self.code_name.take();
                 let interpreter = self.code_interpreter.take();
+                let tangle = std::mem::take(&mut self.code_tangle);
                 let deps_raw = self.code_deps.take();
                 let env_raw = self.code_env.take();
                 let send_raw = self.code_send.take();
@@ -1786,71 +1800,52 @@ impl<'a> Renderer<'a> {
                     return;
                 }
                 if lang == meshfox_core::BUTTON_LANG {
-                    // No frame, no fill — a bold accent marker instead.
-                    // The caption *is* the fence's own body (falling back
-                    // to `name` when blank), same as the web UI's
-                    // frameless button; no real code to syntax-highlight
-                    // here, so the ordinary framed-code rendering below
-                    // doesn't apply at all. Clicking the marker itself runs
-                    // its `deps=` chain, same as `r` on the tree's selected
-                    // node would (see `ClickTarget::RunBlock`) — the
-                    // `(r to run)` hint still spells out the keyboard route,
-                    // since a TUI has no visual convention suggesting a
-                    // plain-text marker is also clickable the way a real
-                    // button widget would.
                     let caption = code.trim();
                     let caption = if caption.is_empty() {
                         name.clone().unwrap_or_default()
                     } else {
                         caption.to_string()
                     };
-                    // Underlined so the clickable "▶ caption" part reads as
-                    // clickable at a glance — the same convention
-                    // `dep_lines`'s own click spans use — while the
-                    // `(r to run)` hint after it (not itself clickable)
-                    // stays plain.
-                    let marker = Style::default()
-                        .fg(super::theme::ACCENT)
-                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
-                    let hint = Style::default().fg(Color::DarkGray);
-                    let mut lines = vec![Line::from(vec![
-                        Span::styled("▶ ", marker),
-                        Span::styled(caption.clone(), marker),
-                        Span::styled("  (r to run)", hint),
-                    ])];
+                    self.push_segment(Segment::Button {
+                        caption,
+                        selected: self.focused
+                            && click_name.is_some()
+                            && click_name.as_deref() == self.selected_block.as_deref(),
+                    });
+                    if let Some(block_name) = &click_name {
+                        self.click_regions.push(ClickRegion {
+                            segment_index: self.segments.len() - 1,
+                            line_index: 0,
+                            col_start: 0,
+                            col_end: u16::MAX,
+                            target: ClickTarget::RunBlock {
+                                node_id: self.node_id.to_string(),
+                                block_name: block_name.clone(),
+                            },
+                        });
+                    }
+                    let mut lines = Vec::new();
                     let mut dep_clicks = Vec::new();
-                    for (line, clicks) in self.dep_lines(
+                    for (mut line, clicks) in self.dep_lines(
                         click_name.as_deref(),
                         deps_raw.as_deref(),
                         env_raw.as_deref(),
                         interpreter.as_deref(),
                     ) {
+                        for span in &mut line.spans {
+                            span.style = span.style.fg(Color::DarkGray);
+                        }
                         dep_clicks.push((lines.len(), clicks));
                         lines.push(line);
                     }
                     lines.extend(details.into_iter().map(|detail| {
-                        Line::from(Span::styled(
-                            format!("  {detail}"),
-                            Style::default().fg(super::theme::DEP),
-                        ))
+                        Line::styled(format!("  {detail}"), Style::default().fg(Color::DarkGray))
                     }));
-                    self.push_segment(Segment::Text(lines));
-                    self.push_dep_clicks(dep_clicks);
-                    if let Some(block_name) = click_name {
-                        let segment_index = self.segments.len() - 1;
-                        // Covers "▶ caption" (not the "(r to run)" hint) —
-                        // `2` for "▶ "'s own column width.
-                        let col_end = 2 + caption.chars().count() as u16;
-                        self.click_regions.push(ClickRegion {
-                            segment_index,
-                            line_index: 0,
-                            col_start: 0,
-                            col_end,
-                            target: ClickTarget::RunBlock {
-                                node_id: self.node_id.to_string(),
-                                block_name,
-                            },
-                        });
+                    if !lines.is_empty() {
+                        // Adjacent semantic segment: no blank separator between
+                        // the button frame and its external dependency rows.
+                        self.segments.push(Segment::Text(lines));
+                        self.push_dep_clicks(dep_clicks);
                     }
                     return;
                 }
@@ -1893,6 +1888,9 @@ impl<'a> Renderer<'a> {
                 // `mesh-code-interpreter` suffix right after the lang/name.
                 if let Some(interpreter) = &interpreter {
                     label.push_str(&format!(" #!{interpreter}"));
+                }
+                if tangle {
+                    label.push_str(" · tangle");
                 }
                 label.push(' ');
                 // `┌` matches the box-drawing set ratatui's own pane
@@ -2930,6 +2928,7 @@ mod tests {
             .iter()
             .flat_map(|s| match s {
                 Segment::Text(lines) => lines.iter().map(line_text).collect::<Vec<_>>(),
+                Segment::Button { caption, .. } => vec![caption.clone()],
                 Segment::Image { .. } | Segment::Table { .. } | Segment::TablePreview(_) => vec![],
             })
             .collect::<Vec<_>>()
@@ -3241,6 +3240,33 @@ mod tests {
     }
 
     #[test]
+    fn a_tangle_fence_is_marked_in_its_head_and_tangle_false_is_not() {
+        let hl = Highlighter::new();
+        let head = |flag: &str| {
+            let md = format!("```ruby name=\"seed\" interpreter=\"ruby\" {flag}\nputs 1\n```\n");
+            let (segments, _clicks) = render(
+                &md,
+                Path::new("/nonexistent-base-dir"),
+                &hl,
+                "n",
+                &[],
+                &std::collections::HashMap::new(),
+                None,
+                &std::collections::HashMap::new(),
+            );
+            segment_text(&segments)
+        };
+        assert!(
+            head("tangle").contains("#!ruby · tangle"),
+            "{}",
+            head("tangle")
+        );
+        assert!(head("tangle=true").contains("· tangle"));
+        assert!(!head("tangle=false").contains("tangle"));
+        assert!(!head("").contains("tangle"));
+    }
+
+    #[test]
     fn a_fence_with_no_interpreter_attr_has_no_shebang_suffix() {
         let hl = Highlighter::new();
         let md = "```bash name=\"build\" cache\necho hi\n```\n";
@@ -3259,7 +3285,7 @@ mod tests {
     }
 
     #[test]
-    fn a_button_fence_renders_its_body_as_the_caption_with_a_run_hint() {
+    fn a_button_fence_renders_its_body_as_the_caption_without_an_inline_run_hint() {
         let hl = Highlighter::new();
         let md = "```button name=\"full-import\" deps=\"build\"\n🚀 Run everything\n```\n";
         let (segments, _clicks) = render(
@@ -3274,7 +3300,7 @@ mod tests {
         );
         let text = segment_text(&segments);
         assert!(text.contains("🚀 Run everything"), "{text}");
-        assert!(text.contains("(r to run)"), "{text}");
+        assert!(!text.contains("(r to run)"), "{text}");
         // No framed-code rendering (no `┌─`/`│ `/`└─` border) — a button
         // fence has no real code to put in a frame.
         assert!(!text.contains('┌'), "{text}");
@@ -3299,7 +3325,7 @@ mod tests {
     }
 
     #[test]
-    fn a_button_fences_caption_is_rendered_as_a_bold_accent_marker() {
+    fn a_button_caption_is_bold_without_underline_inside_a_rounded_frame() {
         let hl = Highlighter::new();
         let md = "```button name=\"full-import\" deps=\"build\"\nRun everything\n```\n";
         let (segments, _clicks) = render(
@@ -3312,22 +3338,30 @@ mod tests {
             None,
             &std::collections::HashMap::new(),
         );
-        let Segment::Text(lines) = &segments[0] else {
-            panic!("expected a text segment");
-        };
-        let caption_span = lines[0]
+        let layout =
+            crate::tui::document_layout::LayoutContext::new(ratatui::layout::Size::new(80, 20))
+                .text(&segments[0])
+                .unwrap();
+        let lines = layout.lines;
+        let caption_span = lines[1]
             .spans
             .iter()
             .find(|s| s.content.contains("Run everything"))
             .expect("caption span");
         assert_eq!(
             caption_span.style.bg, None,
-            "no fill — see design choice above"
+            "unselected buttons have no fill"
         );
         assert_eq!(caption_span.style.fg, Some(crate::tui::theme::ACCENT));
         assert!(caption_span.style.add_modifier.contains(Modifier::BOLD));
+        assert!(!caption_span
+            .style
+            .add_modifier
+            .contains(Modifier::UNDERLINED));
+        assert!(lines[0].to_string().starts_with('╭'));
+        assert!(lines[2].to_string().starts_with('╰'));
 
-        let marker_span = lines[0]
+        let marker_span = lines[1]
             .spans
             .iter()
             .find(|s| s.content.contains('▶'))

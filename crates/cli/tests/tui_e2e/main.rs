@@ -38,6 +38,7 @@ mod mouse_resize;
 mod mouse_run_buttons;
 mod path_picker;
 mod run_history;
+mod search;
 mod services;
 mod source_conflict;
 mod table_view;

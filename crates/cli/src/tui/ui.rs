@@ -407,6 +407,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
         Some(Focus::Output) => render_output(f, layout.output, &*app),
     }
     render_footer(f, layout.footer, &*app);
+    if app.search.open {
+        render_search(f, layout.footer, app);
+    }
 
     if let Some(pp) = &app.path_picker {
         render_path_picker(f, area, pp);
@@ -441,6 +444,44 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
 fn pane_border(focused: bool) -> Style {
     Style::default().fg(if focused { ACCENT } else { BORDER })
+}
+
+fn render_search(f: &mut Frame, area: Rect, app: &App) {
+    let matches = app.search.matches(&app.display_canvas);
+    let count = if app.search.query.trim().is_empty() {
+        String::new()
+    } else if matches.is_empty() {
+        "0/0".into()
+    } else {
+        format!(
+            "{}/{}",
+            app.search.index.min(matches.len() - 1) + 1,
+            matches.len()
+        )
+    };
+    let prefix = format!("/ {count} ");
+    let budget = usize::from(area.width).saturating_sub(Span::raw(&prefix).width());
+    let cursor = app.search.cursor.min(app.search.query.len());
+    let before = &app.search.query[..cursor];
+    let mut start = 0;
+    let mut width = Span::raw(before).width();
+    for (i, ch) in before.char_indices() {
+        if width < budget {
+            break;
+        }
+        width = width.saturating_sub(Span::raw(ch.to_string()).width());
+        start = i + ch.len_utf8();
+    }
+    let before = &before[start..];
+    let input = format!("{before}▏{}", &app.search.query[cursor..]);
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(format!(
+            "{prefix}{input} · Enter next · Shift+Enter/Tab prev · Esc close"
+        ))
+        .style(Style::default().fg(ACCENT)),
+        area,
+    );
 }
 
 fn type_marker(t: NodeType) -> &'static str {
@@ -1137,6 +1178,93 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
     }
     app.set_document_viewport(inner.width, inner.height);
     let context = super::document_layout::LayoutContext::new(inner.as_size());
+    let query = if app.search.open {
+        app.search.query.trim()
+    } else {
+        ""
+    };
+    let matches = if app.search.open {
+        app.search.matches(&app.display_canvas)
+    } else {
+        Vec::new()
+    };
+    let current = if app.search.open {
+        matches
+            .get(app.search.index.min(matches.len().saturating_sub(1)))
+            .filter(|m| {
+                app.rows
+                    .get(app.selected)
+                    .is_some_and(|r| r.node_id == m.node_id)
+            })
+            .map(|m| m.occurrence)
+    } else {
+        None
+    };
+    let mut layouts: Vec<_> = app
+        .doc_segments
+        .iter()
+        .map(|seg| {
+            if query.is_empty() {
+                None
+            } else {
+                context.text(seg)
+            }
+        })
+        .collect();
+    // Source can include markup with no rendered text (e.g. a URL).
+    // Like webui's DOM highlight, clamp to the last painted occurrence.
+    let visible_count: usize = if query.is_empty() {
+        0
+    } else {
+        layouts
+            .iter()
+            .flatten()
+            .flat_map(|t| &t.lines)
+            .map(|line| super::search::ranges(&line.to_string(), query).len())
+            .sum()
+    };
+    let current = current
+        .filter(|_| visible_count > 0)
+        .map(|i| i.min(visible_count - 1));
+    let mut occurrence = 0;
+    let mut target_row = None;
+    let mut preceding_rows = 0usize;
+    if !query.is_empty() {
+        for (segment, layout) in app.doc_segments.iter().zip(layouts.iter_mut()) {
+            if let Some(text) = layout {
+                for i in 0..text.lines.len() {
+                    if let Some((start, end)) = super::search::highlight(
+                        &mut text.lines[i],
+                        query,
+                        &mut occurrence,
+                        current,
+                    ) {
+                        if let Some(rect) = text.click_rects(i, start, end).first() {
+                            target_row = Some(preceding_rows + usize::from(rect.y));
+                        }
+                    }
+                }
+                preceding_rows += text.rows();
+            } else if let Segment::Image { path, .. } = segment {
+                preceding_rows += app
+                    .doc_images
+                    .get(path)
+                    .and_then(|p| p.as_ref())
+                    .map(|p| usize::from(p.size().height))
+                    .unwrap_or(1);
+            }
+        }
+    }
+    if app.search.reveal_pending {
+        if let Some(row) = target_row {
+            app.doc_scroll = reveal_header_scroll(
+                app.doc_scroll,
+                inner.height,
+                row.min(u16::MAX as usize) as u16,
+            );
+        }
+        app.search.reveal_pending = false;
+    }
 
     if app.reveal_selected_block {
         if let Some(addr) = &app.selected_block {
@@ -1151,6 +1279,11 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
                     app.doc_click_regions.iter().find(|r| matches!(&r.target,
                         super::markdown::ClickTarget::Block { node_id, block_name, action: super::markdown::BlockAction::Select }
                         if node_id == &addr.node_id && block_name == &addr.block_name))
+                })
+                .or_else(|| {
+                    app.doc_click_regions.iter().find(|r| matches!(&r.target,
+                        super::markdown::ClickTarget::RunBlock { node_id, block_name }
+                        if node_id == &addr.node_id && block_name == &addr.block_name))
                 });
             if let Some(header) = header {
                 let rows: usize = app
@@ -1158,9 +1291,10 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
                     .iter()
                     .take(header.segment_index)
                     .map(|seg| match seg {
-                        Segment::Text(_) | Segment::Table { .. } | Segment::TablePreview(_) => {
-                            context.text(seg).unwrap().rows()
-                        }
+                        Segment::Text(_)
+                        | Segment::Button { .. }
+                        | Segment::Table { .. }
+                        | Segment::TablePreview(_) => context.text(seg).unwrap().rows(),
                         Segment::Image { path, .. } => app
                             .doc_images
                             .get(path)
@@ -1187,8 +1321,13 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
             break;
         }
         match seg {
-            Segment::Text(_) | Segment::Table { .. } | Segment::TablePreview(_) => {
-                let text_layout = context.text(seg).unwrap();
+            Segment::Text(_)
+            | Segment::Button { .. }
+            | Segment::Table { .. }
+            | Segment::TablePreview(_) => {
+                let text_layout = layouts[seg_idx]
+                    .take()
+                    .unwrap_or_else(|| context.text(seg).unwrap());
                 // How far into this segment's own wrapped rows `skip`
                 // reaches, *before* it gets zeroed out below — needed to
                 // translate a click region's (pre-scroll) row back to
@@ -1436,7 +1575,11 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     );
     if app.focus == Focus::Document {
         hint = if let Some(addr) = &app.selected_block {
-            format!("block: {} · [/] select · Enter fold · c code · r chain · R run · L history · Esc clear · j/k scroll · tab focus", addr.block_name)
+            if app.is_button_block(addr) {
+                format!("button: {} · Enter/r run chain · R run without deps · [/] select · Esc clear · tab focus", addr.block_name)
+            } else {
+                format!("block: {} · [/] select · Enter fold · c code · r chain · R run · L history · Esc clear · j/k scroll · tab focus", addr.block_name)
+            }
         } else {
             "[/] select block · r run · R run (no deps) · L history · j/k scroll · tab focus".into()
         };
@@ -1461,7 +1604,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     if app.worker_port.is_some() {
         hint.push_str(" · t live terminals · H history · L run history");
     }
-    hint.push_str(" · ? help · q quit");
+    hint.push_str(" · / search · ? help · q quit");
 
     let mut spans = Vec::new();
     if let Some((total, failed)) = app.constraint_stats {
@@ -2509,6 +2652,8 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         "arrows / hjkl   move in spatial view",
         "esc / backspace fold spatial group",
         "j / k           select tree / scroll panes",
+        "/               search all node titles/bodies (case-insensitive)",
+        "                Enter next, Shift+Enter/Shift+Tab previous, Esc close",
         "h / l           collapse / expand tree",
         "enter           expand/collapse node or follow → link",
         "a               toggle all/selected arrows among positioned nodes",
@@ -2516,8 +2661,9 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         "R               run this node's block only (skip deps)",
         "  (a node with more than one block opens a picker first)",
         "L               run history of selected block, otherwise node/picker",
-        "[ / ]           select previous/next code block in Document",
+        "[ / ]           select previous/next block or button in Document",
         "enter / c       fold selected block / its code (output stays visible)",
+        "enter           run the selected button and its dependencies",
         "esc             clear Document block selection; r/R/L target node again",
         "K               kill the running block",
         "f               expand the focused pane to fill the screen, or",
@@ -3535,6 +3681,88 @@ mod tests {
         App::new(path, tx, None, None)
             .await
             .expect("valid test canvas")
+    }
+
+    #[tokio::test]
+    async fn canvas_search_scrolls_to_each_wrapped_occurrence_and_clears_highlights() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = test_app().await;
+        let node = app
+            .display_canvas
+            .nodes
+            .iter_mut()
+            .find(|n| n.id == "root")
+            .unwrap();
+        node.title = "needle title".into();
+        node.text = format!(
+            "{} **needle** {} needle",
+            "длинное слово ".repeat(70),
+            "tail ".repeat(120)
+        );
+        app.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
+            .await;
+        for c in "needle".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+                .await;
+        }
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        for expected in [1, 2, 0] {
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .await;
+            terminal.draw(|f| render(f, &mut app)).unwrap();
+            assert_eq!(app.search.index, expected);
+            let buffer = terminal.backend().buffer();
+            let selected: String = buffer
+                .content
+                .iter()
+                .filter(|cell| cell.bg == Color::Rgb(0, 215, 255))
+                .map(|cell| cell.symbol())
+                .collect();
+            assert_eq!(
+                selected, "needle",
+                "the current occurrence must actually be painted inside the viewport"
+            );
+            if expected != 0 {
+                assert!(app.doc_scroll > 0);
+            } else {
+                assert_eq!(app.doc_scroll, 0);
+            }
+        }
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await;
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        assert!(!terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .any(|c| c.bg == Color::Rgb(0, 215, 255) || c.bg == Color::Yellow));
+        std::fs::remove_dir_all(app.canvas_path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn canvas_search_counts_zero_and_all_occurrences_in_footer() {
+        let mut app = test_app().await;
+        app.search.open = true;
+        app.search.query = "missing".into();
+        let area = Rect::new(0, 0, 90, 2);
+        assert!(render_to_screen(area, |f| render_search(f, area, &app)).contains("0/0"));
+        app.search.query = "Root".into();
+        app.search.index = usize::MAX;
+        assert!(render_to_screen(area, |f| render_search(f, area, &app)).contains("1/1"));
+        app.search.query.clear();
+        assert!(!render_to_screen(area, |f| render_search(f, area, &app)).contains("0/0"));
+        app.search.query = "界".repeat(40);
+        app.search.cursor = app.search.query.len();
+        let narrow = Rect::new(0, 0, 12, 1);
+        let screen = render_to_screen(narrow, |f| render_search(f, narrow, &app));
+        assert!(screen.contains("0/0"));
+        assert!(
+            screen.contains('▏'),
+            "wide query characters must not push the cursor off-screen"
+        );
+        std::fs::remove_dir_all(app.canvas_path.parent().unwrap()).unwrap();
     }
 
     fn render_to_screen(area: Rect, mut draw: impl FnMut(&mut ratatui::Frame)) -> String {

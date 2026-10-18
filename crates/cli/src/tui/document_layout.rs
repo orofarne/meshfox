@@ -29,6 +29,7 @@ pub(super) struct TextLayout {
     rows: usize,
     width: u16,
     wrap: bool,
+    button: bool,
 }
 impl TextLayout {
     pub fn rows(&self) -> usize {
@@ -43,6 +44,14 @@ impl TextLayout {
         }
     }
     pub fn click_rects(&self, line: usize, start: u16, end: u16) -> Vec<Rect> {
+        if self.button && end == u16::MAX {
+            return self
+                .lines
+                .iter()
+                .enumerate()
+                .map(|(y, line)| Rect::new(0, y as u16, line.width() as u16, 1))
+                .collect();
+        }
         let Some(content) = self.lines.get(line) else {
             return Vec::new();
         };
@@ -95,6 +104,9 @@ impl LayoutContext {
         let wrap = matches!(segment, Segment::Text(_));
         let lines = match segment {
             Segment::Text(lines) => lines.clone(),
+            Segment::Button { caption, selected } => {
+                button_lines(caption, *selected, self.size.width)
+            }
             Segment::Table { table, prefix } => {
                 let inset: usize = prefix.iter().map(Span::width).sum();
                 let prefix = if inset < usize::from(self.size.width) {
@@ -137,6 +149,7 @@ impl LayoutContext {
             rows,
             width: self.size.width,
             wrap,
+            button: matches!(segment, Segment::Button { .. }),
         })
     }
 
@@ -153,6 +166,47 @@ impl LayoutContext {
         };
         ratatui::layout::Size::new(scale(width, width_percent), scale(height, height_percent))
     }
+}
+
+fn button_lines(caption: &str, selected: bool, available: u16) -> Vec<Line<'static>> {
+    let border = Style::default().fg(if selected {
+        super::theme::ACCENT
+    } else {
+        super::theme::BORDER
+    });
+    let text = if selected {
+        Style::default()
+            .bg(super::theme::ACCENT)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(super::theme::ACCENT)
+            .add_modifier(Modifier::BOLD)
+    };
+    let caption = format!(
+        "▶ {}",
+        caption.split_whitespace().collect::<Vec<_>>().join(" ")
+    );
+    if available < 5 {
+        return vec![Line::styled(caption, text)];
+    }
+    let width = (Span::raw(&caption).width() + 4).min(usize::from(available));
+    // Use the same grapheme-aware wrapping as table cells so a wide glyph
+    // never spills into the frame's right-hand border.
+    let content = wrap_table_cell(&[Span::raw(caption)], width - 4);
+    let mut lines = vec![Line::styled(format!("╭{}╮", "─".repeat(width - 2)), border)];
+    for line in content {
+        let label = line.to_string();
+        let padding = width.saturating_sub(4 + Span::raw(&label).width());
+        lines.push(Line::from(vec![
+            Span::styled("│", border),
+            Span::styled(format!(" {label}{} ", " ".repeat(padding)), text),
+            Span::styled("│", border),
+        ]));
+    }
+    lines.push(Line::styled(format!("╰{}╯", "─".repeat(width - 2)), border));
+    lines
 }
 
 /// Let ratatui wrap the same text with a private marker style, so mouse
@@ -350,6 +404,38 @@ pub(super) fn wrapped_text_layout(total: u16, skip: u16, available: u16) -> Opti
 mod tests {
     use super::*;
     use std::{collections::HashMap, path::Path};
+
+    #[test]
+    fn button_frame_reflows_and_its_entire_surface_remains_clickable() {
+        for width in [12, 24, 80] {
+            let context = LayoutContext::new(Size::new(width, 20));
+            let segment = Segment::Button {
+                caption: "🔨 Install from source 界".into(),
+                selected: true,
+            };
+            let layout = context.text(&segment).unwrap();
+            let frame_width = layout.lines[0].width();
+            assert!(frame_width <= usize::from(width));
+            assert!(
+                layout.lines.iter().all(|line| line.width() == frame_width),
+                "width {width}: {:?}",
+                layout
+                    .lines
+                    .iter()
+                    .map(|l| (l.width(), l.to_string()))
+                    .collect::<Vec<_>>()
+            );
+            assert!(layout
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.style.bg == Some(super::super::theme::ACCENT)));
+            let rects = layout.click_rects(0, 0, u16::MAX);
+            assert_eq!(rects.len(), layout.rows());
+            assert!(rects.iter().all(|r| usize::from(r.width) == frame_width));
+            assert_eq!(layout.into_rows().len(), rects.len());
+        }
+    }
 
     fn parse(md: &str) -> Vec<Segment> {
         markdown::render(

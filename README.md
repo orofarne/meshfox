@@ -105,277 +105,6 @@ A ` ```starlark constraint ` fence is a sandboxed Starlark contract living right
 
 [examples/constraints.canvas.md](./examples/constraints.canvas.md)
 
-## How-to
-<!-- meshfox:node id="how-to" -->
-
-A few common recipes, each pointing at a real, running example elsewhere in
-this repo rather than repeating it.
-
-### Structured docs instead of a Makefile
-<!-- meshfox:node id="structured-docs-instead-of-a-makefile" -->
-
-This very README is the worked example: every `##` section is a node (see
-"Concept" above), and its runnable fences — "Usage" below runs real CLI
-invocations, "Development" runs the real build/test/lint commands — replace
-what would otherwise be a Makefile's targets. `meshfox validate`/`meshfox
-check` double as the pre-commit/CI gate ("Full check" under "Development"),
-and `meshfox list` prints every runnable block as a tree instead of grepping
-the file for what's runnable.
-
-### A canvas's own Python environment
-<!-- meshfox:node id="a-canvas-s-own-python-environment" -->
-
-[examples/python-venv.canvas.md](./examples/python-venv.canvas.md) — a
-canvas-local `.meshfox/<canvas filename>.venv/`, created once and reported as a computed
-`meshfox:var` (`PYTHON`) every other Python fence references via
-`interpreter="$PYTHON -u"`, so nothing hardcodes a path or depends on
-whatever Python happens to be on `$PATH`. The venv/install step itself is
-meshfox's own built-in `interpreter="@python_venv"`: a `text` fence supplies
-`requirements.txt`, while a `toml` fence supplies `pyproject.toml`, with no
-shell script of your own to keep in sync. `PYTHON` points at a small launcher,
-`<venv>/bin/python3-mf`, which is the venv's Python with the block's working
-directory added to `PYTHONPATH` — so a block can `import` a module that sits
-next to its canvas without a `sys.path.insert(0, os.getcwd())` of its own.
-
-Node has the same shape: [examples/node-env.canvas.md](./examples/node-env.canvas.md)
-uses `interpreter="@node_env"` — a `text` fence of npm packages (or a `json`
-fence holding a `package.json`) is installed into a canvas-local
-`.meshfox/<canvas filename>.node/` (only when the list changed), and the
-computed `NODE` variable is a launcher that makes those packages visible to
-both `require` and `import`. Blocks then say `interpreter="$NODE"`.
-
-#### Example
-<!-- meshfox:node id="example" type="file" -->
-
-[examples/python-venv.canvas.md](./examples/python-venv.canvas.md)
-
-### Rendering rich output (a pandas DataFrame preview)
-<!-- meshfox:node id="rendering-rich-output-a-pandas-dataframe-preview" -->
-
-[examples/pandas-dataframe.canvas.md](./examples/pandas-dataframe.canvas.md)
-— the `output="markdown"` fence attribute (SPEC.md's "Runnable code
-fences"/"Cached output") splices a `cache`d block's captured stdout into the
-canvas as real Markdown instead of the default passive `text` fence, so a
-command that already prints Markdown worth rendering — here, a `pandas`
-`DataFrame` via `df.to_markdown()` — shows up as an actual table rather than
-a wall of pipe characters. Builds on the same venv pattern as "A canvas's own
-Python environment" above.
-
-#### Example
-<!-- meshfox:node id="example-7" type="file" -->
-
-[examples/pandas-dataframe.canvas.md](./examples/pandas-dataframe.canvas.md)
-
-### Running a block under a different language/tool
-<!-- meshfox:node id="running-a-block-under-a-different-language-tool" -->
-
-[examples/interpreters.canvas.md](./examples/interpreters.canvas.md) — every
-shape of `interpreter=` side by side: a bare command (`python3`), one with
-its own flags (`python3 -u`), any other tool on `$PATH` (`node`), an
-interactive `tty` block handing over a real REPL, and the same mechanism on
-a `file`-type node instead of a fence.
-
-A block's code is written to a temp file named after its language
-(`.py`, `.js`, `.ts`, …) and handed to the interpreter. Because a runtime
-looks up imports, `package.json` and `tsconfig` next to the script file, a
-block that imports a module sitting beside the canvas needs the `tangle`
-flag next to its `interpreter=`. The code
-then runs from a hidden file with a stable name in the block's working
-directory, `.meshfox-tangle-<canvas file>__<block>.<ext>`, written only when
-the code changes and left in place after the run. Add `.meshfox-tangle-*` to
-your `.gitignore`. If the directory can't be written the run fails with a
-clear error rather than quietly importing from somewhere else. Leftovers of
-blocks that no longer exist are removed when the canvas's worker starts.
-Two side effects of running from the project directory: a file watcher there
-(`nodemon`, `vite`, ...) can see the file appear and change (it does not see
-a re-run of unchanged code), and the runtime now finds the project's own
-configuration — Node reads the nearest `package.json`, so in a
-`"type": "module"` project a tangled block is an ES module (no `require`),
-where the same block without `tangle` runs as CommonJS from the temp dir.
-
-[examples/services.canvas.md](./examples/services.canvas.md) covers long-lived
-services: graceful Stop/Restart, the YAML `interpreter="@service"` lifecycle
-(`start`, `stop`, `monitor`, health checks and automatic restart), and a runnable
-Docker Compose stack. Ordinary `service` blocks now receive SIGTERM with a
-30-second grace period before SIGKILL.
-
-#### Example
-<!-- meshfox:node id="example-2" type="file" -->
-
-[examples/interpreters.canvas.md](./examples/interpreters.canvas.md)
-
-### Checking that documentation stays consistent
-<!-- meshfox:node id="checking-that-documentation-stays-consistent" -->
-
-[LICENSE.canvas.md](./LICENSE.canvas.md) below is the real, load-bearing
-example: its `every-direct-dep-is-documented` constraint fails `meshfox
-check` whenever a `Cargo.toml`/`package.json` dependency has crept in with no
-matching row in that file's license tables — the same mechanism
-"Constraints" above walks through in isolation
-([examples/constraints.canvas.md](./examples/constraints.canvas.md)'s
-"Dependency audit" node).
-
-#### Example
-<!-- meshfox:node id="example-3" type="file" -->
-
-[LICENSE.canvas.md](./LICENSE.canvas.md)
-
-### Publishing a canvas as a static site
-<!-- meshfox:node id="publishing-a-canvas-as-a-static-site" -->
-
-See "Usage" below → "Static export" for the real `meshfox static`
-invocation against [examples/hello.canvas.md](./examples/hello.canvas.md)
-and [site-template/](./site-template/) as a standalone example. This README's own repo builds and
-publishes itself with [site-template-archive/](./site-template-archive/) (`scripts/build-site.sh`, see `.gitignore`'s
-`/site-dist` entry) — the live result is
-[meshfox.orofarne.net](https://meshfox.orofarne.net/).
-
-#### Example
-<!-- meshfox:node id="example-4" type="file" -->
-
-[examples/hello.canvas.md](./examples/hello.canvas.md)
-
-### A second brain for an LLM agent
-<!-- meshfox:node id="a-second-brain-for-an-llm-agent" -->
-
-[examples/second-brain.canvas.md](./examples/second-brain.canvas.md) — one
-memory per node, tagged by type (`user`/`feedback`/`project`/`reference`),
-with a constraint fence enforcing that a `feedback`/`project` memory always
-carries a `**Why:**` line so a later session can judge an edge case instead
-of blindly following the rule. The same schema this repo's own coding-agent
-sessions use for their persistent memory, outside the chat window itself.
-
-#### Example
-<!-- meshfox:node id="example-5" type="file" -->
-
-[examples/second-brain.canvas.md](./examples/second-brain.canvas.md)
-
-### Navigating between canvases
-<!-- meshfox:node id="navigating-between-canvases" -->
-
-A `file` node whose target is itself a `.canvas.md` (or a plain `.md`
-carrying the `meshfox:canvas` marker) gets special "↗ open" handling
-instead of being handed to the OS's default app: the web UI spawns (or
-reuses) a `meshfox view` worker for it and opens a new browser tab; the
-TUI's `o` spawns a nested `meshfox tui` in the same terminal instead.
-[examples/hello.canvas.md](./examples/hello.canvas.md)'s "Links" node has a
-live example ("Related Canvas") — opening it takes you to
-[examples/vars.canvas.md](./examples/vars.canvas.md).
-
-#### Example
-<!-- meshfox:node id="example-6" type="file" -->
-
-[examples/hello.canvas.md#related-canvas](./examples/hello.canvas.md#related-canvas)
-
-### Calling an AI agent from a block
-<!-- meshfox:node id="calling-an-ai-agent-from-a-block" -->
-
-[examples/agent-prompt.canvas.md](./examples/agent-prompt.canvas.md) —
-`interpreter="@agent"` is one of a small, fixed set of built-in macro
-interpreters meshfox ships in its own binary (`crates/core/src/builtins/`,
-alongside `@python_venv` above) — the fence body becomes a one-shot prompt
-to `claude -p`/`codex exec`, or, on a `tty` block, an interactive CLI
-session instead (`agent.sh`'s own `[ -t 1 ]` check tells the two apart,
-no separate meshfox mechanism needed).
-`env=` locals and bound arguments interpolate right into the prompt as
-`$NAME`/`${NAME}` — whole-token only (`$TOPIC` matches, `$TOPICS` doesn't),
-and only names belonging to this block are substituted; `$$NAME` escapes
-to a literal `$NAME` for anything that shouldn't be touched. No
-shell-quoting of your own to write for any of it. Substitution is one pass:
-inserted variable values are never interpreted as more references.
-
-Like a bash block, `@agent` runs as the current user. Meshfox adds no agent
-access restrictions; the agent's own tool, sandbox, approval, and directory
-trust settings apply. `tty` changes interactivity, not this access contract.
-Dependency results become stale when the builtin script or effective
-provider setting changes.
-
-Which provider a `@name` macro actually calls (`claude` vs. `codex`, for
-`@agent`) comes from a small settings file meshfox itself reads —
-`interpreters.agent.provider` in `.meshfox/config.toml` next to the canvas,
-or `~/.meshfox/config.toml` globally (local wins, key by key) — a fact
-about the machine/what's installed, not something a `meshfox:var` should
-have to prompt for on every run. Every dotted key in there is exported to
-a macro's own process as `MESHFOX_CONFIG_<PATH>` (e.g.
-`MESHFOX_CONFIG_INTERPRETERS_AGENT_PROVIDER`), so a hand-written
-`interpreter=` script can read the same settings too.
-
-#### Example
-<!-- meshfox:node id="example-8" type="file" -->
-
-[examples/agent-prompt.canvas.md](./examples/agent-prompt.canvas.md)
-
-### Showing a diagram, formula or chart (SVG)
-<!-- meshfox:node id="showing-a-diagram-formula-or-chart-svg" -->
-
-[examples/svg.canvas.md](./examples/svg.canvas.md) — an SVG is an ordinary
-Markdown image (`![](data:image/svg+xml;base64,…)`), shown the same way in the
-web UI, the TUI, `meshfox static` and `meshfox pdf`, with no renderer built
-into meshfox: any command that prints an SVG will do (Graphviz, Typst,
-Mermaid, PlantUML, Vega, matplotlib, ...). `output="image"` (SPEC.md's "Image
-output") takes the block's stdout *as* the SVG and stores it as that image;
-`output="markdown"` does the same when a script prints the image line itself.
-An SVG follows the light/dark theme through `currentColor` and
-`var(--mf-fg, …)`, and one drawn for a white page can be backed per block with
-`output-attrs="bg=#fff"` (MARKDOWN.md's "SVG images").
-
-#### Example
-<!-- meshfox:node id="example-9" type="file" -->
-
-[examples/svg.canvas.md](./examples/svg.canvas.md)
-
-### Browsing a huge table (CSV, Parquet, ...)
-<!-- meshfox:node id="browsing-a-huge-table-csv-parquet" -->
-
-[examples/tables.canvas.md](./examples/tables.canvas.md) — a `file` node with
-`display="table"` (SPEC.md's "Table previews") shows its target as an
-interactive, read-only grid in the web UI and, full screen with `Enter`, in the
-terminal viewer: sortable by column, filterable per column (`>10`, `=x`,
-`^start`, `~part`, `null`, ...), searchable across every column, with the whole
-value of any cell a click away. Only the rows on screen are ever fetched, so a
-CSV with a million rows opens as fast as one with twenty — the canvas generates
-one to try, and turns it into Parquet (read in place, no import) with `duckdb`
-itself. Any format the `duckdb` command-line tool reads works, `.csv.gz`
-included.
-
-It needs that `duckdb` executable on `PATH` (or `duckdb_path` under `[tables]`
-in the config below): meshfox never installs it, and a table node without it
-says so rather than showing anything. The table is read-only — edit the file
-with any editor and the node reloads — and `meshfox static`/`meshfox pdf` print
-its first 100 rows as a plain grid, failing loudly if a table can't be read.
-
-#### Example
-<!-- meshfox:node id="example-10" type="file" -->
-
-[examples/tables.canvas.md](./examples/tables.canvas.md)
-
-### Typed variables, forms and file pickers
-<!-- meshfox:node id="typed-variables-forms-and-file-pickers" -->
-
-[examples/ffmpeg.canvas.md](./examples/ffmpeg.canvas.md) — a cut-down `ffmpeg`
-how-to that uses every variable type at once and one `form` fence to set them:
-`type="file"` (an input with `mode="open"`, an output with `mode="save"`,
-`ext="mp4,mkv"` as a picker hint), `type="dir"`, `select`, `int`, `bool` and
-plain strings. A `dir` or `file` field has a **Browse…** button in the web UI
-(`Ctrl-O` in the terminal) that opens a file browser over the *worker's* file
-system — where the blocks actually run, which may not be where the UI is — and
-answers with an absolute path. SPEC.md's "File variables" and "Path pickers"
-have the details.
-
-A chosen path is also a *permission*: a `dir` value becomes a trusted location
-a `file` node may read below, and a `file` value one trusted file — exactly that
-one, never its folder — so `[report]($OUTPUT_DIR/probe.json)` or `[clip]($INPUT)`
-previews what you picked, while a canvas's own text still cannot reach outside
-its directory by itself.
-
-Needs `ffmpeg` and `ffprobe` on `PATH`; the first block generates a test clip,
-so the example works before you pick a video of your own.
-
-#### Example
-<!-- meshfox:node id="example-11" type="file" -->
-
-[examples/ffmpeg.canvas.md](./examples/ffmpeg.canvas.md)
-
 ## Configuration
 <!-- meshfox:node id="configuration" -->
 
@@ -935,6 +664,315 @@ meshfox pdf: wrote /tmp/meshfox-pdf-demo.pdf
 /tmp/meshfox-pdf-demo.pdf: PDF document, version 1.5, 4 pages
 ```
 <!-- /meshfox:output -->
+
+## How-to
+<!-- meshfox:node id="how-to" -->
+
+A few common recipes, each pointing at a real, running example elsewhere in
+this repo rather than repeating it.
+
+### Structured docs instead of a Makefile
+<!-- meshfox:node id="structured-docs-instead-of-a-makefile" -->
+
+This very README is the worked example: every `##` section is a node (see
+"Concept" above), and its runnable fences — "Usage" above runs real CLI
+invocations, "Development" runs the real build/test/lint commands — replace
+what would otherwise be a Makefile's targets. `meshfox validate`/`meshfox
+check` double as the pre-commit/CI gate ("Full check" under "Development"),
+and `meshfox list` prints every runnable block as a tree instead of grepping
+the file for what's runnable.
+
+### A canvas's own Python environment
+<!-- meshfox:node id="a-canvas-s-own-python-environment" -->
+
+[examples/python-venv.canvas.md](./examples/python-venv.canvas.md) — a
+canvas-local `.meshfox/<canvas filename>.venv/`, created once and reported as a computed
+`meshfox:var` (`PYTHON`) every other Python fence references via
+`interpreter="$PYTHON -u"`, so nothing hardcodes a path or depends on
+whatever Python happens to be on `$PATH`. The venv/install step itself is
+meshfox's own built-in `interpreter="@python_venv"`: a `text` fence supplies
+`requirements.txt`, while a `toml` fence supplies `pyproject.toml`, with no
+shell script of your own to keep in sync. `PYTHON` points at a small launcher,
+`<venv>/bin/python3-mf`, which is the venv's Python with the block's working
+directory added to `PYTHONPATH` — so a block can `import` a module that sits
+next to its canvas without a `sys.path.insert(0, os.getcwd())` of its own.
+
+Node has the same shape: [examples/node-env.canvas.md](./examples/node-env.canvas.md)
+uses `interpreter="@node_env"` — a `text` fence of npm packages (or a `json`
+fence holding a `package.json`) is installed into a canvas-local
+`.meshfox/<canvas filename>.node/` (only when the list changed), and the
+computed `NODE` variable is a launcher that makes those packages visible to
+both `require` and `import`. Blocks then say `interpreter="$NODE"`.
+
+#### Example
+<!-- meshfox:node id="example" type="file" -->
+
+[examples/python-venv.canvas.md](./examples/python-venv.canvas.md)
+
+### Rendering rich output (a pandas DataFrame preview)
+<!-- meshfox:node id="rendering-rich-output-a-pandas-dataframe-preview" -->
+
+[examples/pandas-dataframe.canvas.md](./examples/pandas-dataframe.canvas.md)
+— the `output="markdown"` fence attribute (SPEC.md's "Runnable code
+fences"/"Cached output") splices a `cache`d block's captured stdout into the
+canvas as real Markdown instead of the default passive `text` fence, so a
+command that already prints Markdown worth rendering — here, a `pandas`
+`DataFrame` via `df.to_markdown()` — shows up as an actual table rather than
+a wall of pipe characters. Builds on the same venv pattern as "A canvas's own
+Python environment" above.
+
+#### Example
+<!-- meshfox:node id="example-7" type="file" -->
+
+[examples/pandas-dataframe.canvas.md](./examples/pandas-dataframe.canvas.md)
+
+### Running a block under a different language/tool
+<!-- meshfox:node id="running-a-block-under-a-different-language-tool" -->
+
+[examples/interpreters.canvas.md](./examples/interpreters.canvas.md) — every
+shape of `interpreter=` side by side: a bare command (`python3`), one with
+its own flags (`python3 -u`), any other tool on `$PATH` (`node`), an
+interactive `tty` block handing over a real REPL, and the same mechanism on
+a `file`-type node instead of a fence.
+
+A block's code is written to a temp file whose extension follows the fence
+language, because runtimes pick a mode from it (Node reads a `.tmp` file as
+CommonJS only, so an ESM `import` needs `.js`): `python` → `.py`,
+`javascript`/`js`/`node`/`mjs` → `.js`, `typescript`/`ts` → `.ts`,
+`ruby`/`rb` → `.rb`, `perl`/`pl` → `.pl`, `php`, `lua`, `sql`, `go`,
+`bash`/`sh`/`zsh` → `.sh`. A language with no entry keeps `.tmp`. A block
+that also needs to find files next to the canvas wants the `tangle` flag —
+see "Importing a file that sits beside the canvas" below.
+
+[examples/services.canvas.md](./examples/services.canvas.md) covers long-lived
+services: graceful Stop/Restart, the YAML `interpreter="@service"` lifecycle
+(`start`, `stop`, `monitor`, health checks and automatic restart), and a runnable
+Docker Compose stack. Ordinary `service` blocks now receive SIGTERM with a
+30-second grace period before SIGKILL.
+
+#### Example
+<!-- meshfox:node id="example-2" type="file" -->
+
+[examples/interpreters.canvas.md](./examples/interpreters.canvas.md)
+
+### Importing a file that sits beside the canvas
+<!-- meshfox:node id="importing-a-file-that-sits-beside-the-canvas" -->
+
+[examples/tangle.canvas.md](./examples/tangle.canvas.md) — a runtime looks up
+relative imports (Ruby's `require_relative`, Node's `import "./helper.mjs"`),
+`package.json` and `tsconfig` next to the *script file*, and by default that
+file is a throwaway in the system temp directory. Put the `tangle` flag next
+to the block's `interpreter=` and the code instead runs from a hidden file
+with a stable name in the block's working directory,
+`.meshfox-tangle-<canvas file>__<block>.<ext>`, written only when the code
+changes and left in place after the run. Add `.meshfox-tangle-*` to your
+`.gitignore`. If the directory can't be written the run fails with a clear
+error rather than quietly importing from somewhere else. Leftovers of blocks
+that no longer exist are removed when the canvas's worker starts, and
+`meshfox prune` clears those of renamed or deleted canvases.
+
+Two side effects of running from the project directory: a file watcher there
+(`nodemon`, `vite`, ...) can see the file appear and change (it does not see a
+re-run of unchanged code), and the runtime now finds the project's own
+configuration — Node reads the nearest `package.json`, so in a
+`"type": "module"` project a tangled block is an ES module (no `require`),
+where the same block without `tangle` runs as CommonJS from the temp dir.
+
+Bare package imports are a different matter: those are the job of
+`@python_venv` / `@node_env` (see "A canvas's own Python environment").
+
+#### Example
+<!-- meshfox:node id="example-tangle" type="file" -->
+
+[examples/tangle.canvas.md](./examples/tangle.canvas.md)
+
+### Files as a pipeline's inputs and outputs
+<!-- meshfox:node id="files-as-a-pipeline-s-inputs-and-outputs" -->
+
+[examples/artifacts.canvas.md](./examples/artifacts.canvas.md) — `outputs=`
+and `inputs=` on a fence make files part of the dependency graph: a block
+that reads `artifact-demo/source.csv` finds the block that produces it
+without any `deps=` between them, and re-runs only when that file's content
+changed (delete an output and it is restored). Handy for a data-processing
+project where parser code, patches and downloaded CSV/JSON/ZIP files feed
+one another.
+
+#### Example
+<!-- meshfox:node id="example-artifacts" type="file" -->
+
+[examples/artifacts.canvas.md](./examples/artifacts.canvas.md)
+
+### Checking that documentation stays consistent
+<!-- meshfox:node id="checking-that-documentation-stays-consistent" -->
+
+[LICENSE.canvas.md](./LICENSE.canvas.md) below is the real, load-bearing
+example: its `every-direct-dep-is-documented` constraint fails `meshfox
+check` whenever a `Cargo.toml`/`package.json` dependency has crept in with no
+matching row in that file's license tables — the same mechanism
+"Constraints" above walks through in isolation
+([examples/constraints.canvas.md](./examples/constraints.canvas.md)'s
+"Dependency audit" node).
+
+#### Example
+<!-- meshfox:node id="example-3" type="file" -->
+
+[LICENSE.canvas.md](./LICENSE.canvas.md)
+
+### Publishing a canvas as a static site
+<!-- meshfox:node id="publishing-a-canvas-as-a-static-site" -->
+
+See "Usage" above → "Static export" for the real `meshfox static`
+invocation against [examples/hello.canvas.md](./examples/hello.canvas.md)
+and [site-template/](./site-template/) as a standalone example. This README's own repo builds and
+publishes itself with [site-template-archive/](./site-template-archive/) (`scripts/build-site.sh`, see `.gitignore`'s
+`/site-dist` entry) — the live result is
+[meshfox.orofarne.net](https://meshfox.orofarne.net/).
+
+#### Example
+<!-- meshfox:node id="example-4" type="file" -->
+
+[examples/hello.canvas.md](./examples/hello.canvas.md)
+
+### A second brain for an LLM agent
+<!-- meshfox:node id="a-second-brain-for-an-llm-agent" -->
+
+[examples/second-brain.canvas.md](./examples/second-brain.canvas.md) — one
+memory per node, tagged by type (`user`/`feedback`/`project`/`reference`),
+with a constraint fence enforcing that a `feedback`/`project` memory always
+carries a `**Why:**` line so a later session can judge an edge case instead
+of blindly following the rule. The same schema this repo's own coding-agent
+sessions use for their persistent memory, outside the chat window itself.
+
+#### Example
+<!-- meshfox:node id="example-5" type="file" -->
+
+[examples/second-brain.canvas.md](./examples/second-brain.canvas.md)
+
+### Navigating between canvases
+<!-- meshfox:node id="navigating-between-canvases" -->
+
+A `file` node whose target is itself a `.canvas.md` (or a plain `.md`
+carrying the `meshfox:canvas` marker) gets special "↗ open" handling
+instead of being handed to the OS's default app: the web UI spawns (or
+reuses) a `meshfox view` worker for it and opens a new browser tab; the
+TUI's `o` spawns a nested `meshfox tui` in the same terminal instead.
+[examples/hello.canvas.md](./examples/hello.canvas.md)'s "Links" node has a
+live example ("Related Canvas") — opening it takes you to
+[examples/vars.canvas.md](./examples/vars.canvas.md).
+
+#### Example
+<!-- meshfox:node id="example-6" type="file" -->
+
+[examples/hello.canvas.md#related-canvas](./examples/hello.canvas.md#related-canvas)
+
+### Calling an AI agent from a block
+<!-- meshfox:node id="calling-an-ai-agent-from-a-block" -->
+
+[examples/agent-prompt.canvas.md](./examples/agent-prompt.canvas.md) —
+`interpreter="@agent"` is one of a small, fixed set of built-in macro
+interpreters meshfox ships in its own binary (`crates/core/src/builtins/`,
+alongside `@python_venv` above) — the fence body becomes a one-shot prompt
+to `claude -p`/`codex exec`, or, on a `tty` block, an interactive CLI
+session instead (`agent.sh`'s own `[ -t 1 ]` check tells the two apart,
+no separate meshfox mechanism needed).
+`env=` locals and bound arguments interpolate right into the prompt as
+`$NAME`/`${NAME}` — whole-token only (`$TOPIC` matches, `$TOPICS` doesn't),
+and only names belonging to this block are substituted; `$$NAME` escapes
+to a literal `$NAME` for anything that shouldn't be touched. No
+shell-quoting of your own to write for any of it. Substitution is one pass:
+inserted variable values are never interpreted as more references.
+
+Like a bash block, `@agent` runs as the current user. Meshfox adds no agent
+access restrictions; the agent's own tool, sandbox, approval, and directory
+trust settings apply. `tty` changes interactivity, not this access contract.
+Dependency results become stale when the builtin script or effective
+provider setting changes.
+
+Which provider a `@name` macro actually calls (`claude` vs. `codex`, for
+`@agent`) comes from a small settings file meshfox itself reads —
+`interpreters.agent.provider` in `.meshfox/config.toml` next to the canvas,
+or `~/.meshfox/config.toml` globally (local wins, key by key) — a fact
+about the machine/what's installed, not something a `meshfox:var` should
+have to prompt for on every run. Every dotted key in there is exported to
+a macro's own process as `MESHFOX_CONFIG_<PATH>` (e.g.
+`MESHFOX_CONFIG_INTERPRETERS_AGENT_PROVIDER`), so a hand-written
+`interpreter=` script can read the same settings too.
+
+#### Example
+<!-- meshfox:node id="example-8" type="file" -->
+
+[examples/agent-prompt.canvas.md](./examples/agent-prompt.canvas.md)
+
+### Showing a diagram, formula or chart (SVG)
+<!-- meshfox:node id="showing-a-diagram-formula-or-chart-svg" -->
+
+[examples/svg.canvas.md](./examples/svg.canvas.md) — an SVG is an ordinary
+Markdown image (`![](data:image/svg+xml;base64,…)`), shown the same way in the
+web UI, the TUI, `meshfox static` and `meshfox pdf`, with no renderer built
+into meshfox: any command that prints an SVG will do (Graphviz, Typst,
+Mermaid, PlantUML, Vega, matplotlib, ...). `output="image"` (SPEC.md's "Image
+output") takes the block's stdout *as* the SVG and stores it as that image;
+`output="markdown"` does the same when a script prints the image line itself.
+An SVG follows the light/dark theme through `currentColor` and
+`var(--mf-fg, …)`, and one drawn for a white page can be backed per block with
+`output-attrs="bg=#fff"` (MARKDOWN.md's "SVG images").
+
+#### Example
+<!-- meshfox:node id="example-9" type="file" -->
+
+[examples/svg.canvas.md](./examples/svg.canvas.md)
+
+### Browsing a huge table (CSV, Parquet, ...)
+<!-- meshfox:node id="browsing-a-huge-table-csv-parquet" -->
+
+[examples/tables.canvas.md](./examples/tables.canvas.md) — a `file` node with
+`display="table"` (SPEC.md's "Table previews") shows its target as an
+interactive, read-only grid in the web UI and, full screen with `Enter`, in the
+terminal viewer: sortable by column, filterable per column (`>10`, `=x`,
+`^start`, `~part`, `null`, ...), searchable across every column, with the whole
+value of any cell a click away. Only the rows on screen are ever fetched, so a
+CSV with a million rows opens as fast as one with twenty — the canvas generates
+one to try, and turns it into Parquet (read in place, no import) with `duckdb`
+itself. Any format the `duckdb` command-line tool reads works, `.csv.gz`
+included.
+
+It needs that `duckdb` executable on `PATH` (or `duckdb_path` under `[tables]`
+in the config above): meshfox never installs it, and a table node without it
+says so rather than showing anything. The table is read-only — edit the file
+with any editor and the node reloads — and `meshfox static`/`meshfox pdf` print
+its first 100 rows as a plain grid, failing loudly if a table can't be read.
+
+#### Example
+<!-- meshfox:node id="example-10" type="file" -->
+
+[examples/tables.canvas.md](./examples/tables.canvas.md)
+
+### Typed variables, forms and file pickers
+<!-- meshfox:node id="typed-variables-forms-and-file-pickers" -->
+
+[examples/ffmpeg.canvas.md](./examples/ffmpeg.canvas.md) — a cut-down `ffmpeg`
+how-to that uses every variable type at once and one `form` fence to set them:
+`type="file"` (an input with `mode="open"`, an output with `mode="save"`,
+`ext="mp4,mkv"` as a picker hint), `type="dir"`, `select`, `int`, `bool` and
+plain strings. A `dir` or `file` field has a **Browse…** button in the web UI
+(`Ctrl-O` in the terminal) that opens a file browser over the *worker's* file
+system — where the blocks actually run, which may not be where the UI is — and
+answers with an absolute path. SPEC.md's "File variables" and "Path pickers"
+have the details.
+
+A chosen path is also a *permission*: a `dir` value becomes a trusted location
+a `file` node may read below, and a `file` value one trusted file — exactly that
+one, never its folder — so `[report]($OUTPUT_DIR/probe.json)` or `[clip]($INPUT)`
+previews what you picked, while a canvas's own text still cannot reach outside
+its directory by itself.
+
+Needs `ffmpeg` and `ffprobe` on `PATH`; the first block generates a test clip,
+so the example works before you pick a video of your own.
+
+#### Example
+<!-- meshfox:node id="example-11" type="file" -->
+
+[examples/ffmpeg.canvas.md](./examples/ffmpeg.canvas.md)
 
 ## Architecture
 <!-- meshfox:node id="architecture" -->

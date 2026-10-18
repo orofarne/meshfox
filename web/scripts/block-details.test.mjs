@@ -11,8 +11,8 @@ echo ok
 \`\`\``;
   const block = parseBody(source, 'root').find(s => s.type === 'code');
   assert.deepEqual(block.args, [
-    {name:'lang', type:'select', choices:['en','hy'], required:false, default:'en'},
-    {name:'pages', type:'int', choices:[], required:true, default:'09'},
+    {name:'lang', type:'select', choices:['en','hy'], choicesVar:undefined, required:false, default:'en'},
+    {name:'pages', type:'int', choices:[], choicesVar:undefined, required:true, default:'09'},
   ]);
   assert.deepEqual(block.inputs, ['pdf_\${lang}.pdf', 'index.txt']);
   assert.deepEqual(block.outputs, ['csv_\${lang}.csv']);
@@ -90,4 +90,12 @@ test('@service YAML is rendered as a managed service without a redundant flag', 
   const block = parseBody('```yaml name="app" interpreter="@service"\nstart: sleep 30\n```', 'root').find(s => s.type === 'code');
   assert.equal(block.service, true);
   assert.equal(block.interpreter, '@service');
+});
+
+test('tangle flag follows the core: bare or true enables it, false disables it', () => {
+  const blocks = parseBody(
+    ['tangle', 'tangle=true', 'tangle=false', ''].map((flag, i) =>
+      `\`\`\`ruby name="b${i}" interpreter="ruby" ${flag}\nputs 1\n\`\`\``).join('\n'),
+    'root').filter(s => s.type === 'code');
+  assert.deepEqual(blocks.map(b => b.tangle), [true, true, false, false]);
 });

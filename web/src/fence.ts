@@ -234,6 +234,11 @@ export interface CodeSegment {
    * interactive process exits, return to the canvas immediately instead of
    * leaving the panel open showing its exit code until closed by hand. */
   autoclose: boolean;
+  /** Mirrors `core::fence::CodeBlock.tangle` — the code runs from a stable
+   * hidden file (`.meshfox-tangle-<canvas file>__<block>.<ext>`) in the
+   * block's working directory instead of a throwaway temp file; see SPEC.md's
+   * "Runnable code fences". Drives `MeshNode.tsx`'s `tangle` badge. */
+  tangle: boolean;
   /** Mirrors `core::fence::CodeBlock.service` — **experimental**, see
    * SPEC.md's "Service blocks (experimental)". This block starts a
    * long-lived background process instead of one that runs to completion;
@@ -571,6 +576,7 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
     const cache = attrs.cache !== undefined && attrs.cache !== "false";
     const tty = attrs.tty !== undefined && attrs.tty !== "false";
     const autoclose = attrs.autoclose !== undefined && attrs.autoclose !== "false";
+    const tangle = attrs.tangle !== undefined && attrs.tangle !== "false";
     const service = attrs.interpreter === "@service" || (attrs.service !== undefined && attrs.service !== "false");
     const isDefault = attrs.default !== undefined && attrs.default !== "false";
     const autorun = attrs.autorun !== undefined && attrs.autorun !== "false";
@@ -622,7 +628,7 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
     segments.push({ type: "code", args: precedingArguments(lines, i),
       inputs: (attrs.inputs ?? "").split(",").map(s => s.trim()).filter(Boolean),
       outputs: (attrs.outputs ?? "").split(",").map(s => s.trim()).filter(Boolean),
-      lang, name, cache, tty, autoclose, service, deps, envRefs, default: isDefault, autorun, render, fold, outputMarkdown, outputImage, outputAttrs, interpreter, code: codeLines.join("\n"), output });
+      lang, name, cache, tty, autoclose, tangle, service, deps, envRefs, default: isDefault, autorun, render, fold, outputMarkdown, outputImage, outputAttrs, interpreter, code: codeLines.join("\n"), output });
     i = cursor;
   }
   flushMarkdown();

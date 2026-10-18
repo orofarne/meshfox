@@ -1,16 +1,23 @@
-//! TODO.canvas.md: "Мышь в панелях TUI" — clicking a block's own run
-//! affordance in the document pane. The only thing that currently even
-//! *looks* clickable there is a `button` fence's `▶ caption (r to run)`
-//! marker (`markdown.rs`'s `BUTTON_LANG` branch) — every ordinary runnable
-//! block has no inline run control at all, only the tree's `r`/`R`. This
-//! test covers clicking that marker running its own `deps=` chain, same as
-//! pressing `r` on it would (`markdown::ClickTarget::RunBlock`,
-//! `App::activate_click_target`).
+//! Mouse and keyboard activation of framed button fences.
 
 use std::time::Duration;
 
 use crate::fixtures;
 use crate::harness::TuiSession;
+
+#[test]
+#[ignore = "pty-based e2e"]
+fn selecting_a_button_with_brackets_and_enter_runs_its_chain() {
+    let (canvas_path, dir) = fixtures::write_fixture(fixtures::BUTTON_FENCE);
+    let mut session = TuiSession::spawn(&canvas_path, dir, 30, 100);
+    session.wait_for("Go", Duration::from_secs(5)).unwrap();
+    session.send_keys("\t]]");
+    session.wait_for("button:", Duration::from_secs(3)).unwrap();
+    session.send_keys("\r");
+    session
+        .wait_for("tui-e2e-button-marker", Duration::from_secs(10))
+        .unwrap();
+}
 
 #[test]
 #[ignore = "pty-based e2e — run via `cargo test --test tui_e2e -- --ignored`"]

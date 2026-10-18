@@ -463,6 +463,7 @@ pub struct App {
     /// tree and document pane actually render, so browsing a doc in the
     /// TUI reads the same way it does in the browser.
     pub display_canvas: Canvas,
+    pub(super) search: super::search::Search,
     pub decls: Vec<VarDecl>,
     /// Whether the worker stores `secret` answers in the OS keychain
     /// (`GET /api/info`) — decides if `c` has anything to offer for them.
@@ -1154,6 +1155,7 @@ impl App {
             raw,
             canvas,
             display_canvas,
+            search: super::search::Search::default(),
             decls,
             secret_keychain: info.secret_keychain,
             expanded,
@@ -1387,6 +1389,19 @@ impl App {
             self.on_inline_form_key(key).await;
             return;
         }
+        if self.search.open {
+            self.on_search_key(key);
+            return;
+        }
+        if key.code == KeyCode::Char('/') {
+            self.search.open = true;
+            self.search.cursor = self.search.query.len();
+            self.search.expanded_before = self.expanded.clone();
+            self.search.revealed.clear();
+            self.reveal_search_match();
+            self.render_current_document();
+            return;
+        }
         if key.code == KeyCode::Char('i') && self.focus == Focus::Document {
             self.try_enter_inline_form();
             return;
@@ -1409,6 +1424,16 @@ impl App {
                 }
                 KeyCode::Enter | KeyCode::Char('c') if self.selected_block.is_some() => {
                     let addr = self.selected_block.clone().unwrap();
+                    if self.is_button_block(&addr) {
+                        if key.code == KeyCode::Enter {
+                            self.activate_click_target(ClickTarget::RunBlock {
+                                node_id: addr.node_id,
+                                block_name: addr.block_name,
+                            })
+                            .await;
+                        }
+                        return;
+                    }
                     // A selected `form` fence has no source or output to
                     // fold: `Enter` starts editing it, `c` does nothing.
                     if self.is_form_block(&addr) {
@@ -2352,6 +2377,15 @@ impl App {
         })
     }
 
+    pub(super) fn is_button_block(&self, addr: &BlockAddr) -> bool {
+        self.display_canvas.node(&addr.node_id).is_some_and(|node| {
+            scan_runnable_blocks(&node.id, &node.text).iter().any(|b| {
+                b.name.as_deref() == Some(addr.block_name.as_str())
+                    && meshfox_core::is_button(&b.lang)
+            })
+        })
+    }
+
     fn select_adjacent_block(&mut self, direction: i32) {
         let Some(row) = self.rows.get(self.selected) else {
             return;
@@ -2361,7 +2395,6 @@ impl App {
         };
         let blocks: Vec<_> = scan_runnable_blocks(&node.id, &node.text)
             .into_iter()
-            .filter(|b| !meshfox_core::is_button(&b.lang))
             .filter_map(|b| b.name)
             .collect();
         if blocks.is_empty() {
@@ -2911,6 +2944,121 @@ impl App {
                 self.render_current_document();
             }
         }
+    }
+
+    fn on_search_key(&mut self, key: KeyEvent) {
+        let previous_query = self.search.query.clone();
+        match key.code {
+            KeyCode::Esc => {
+                self.search.open = false;
+                self.search.revealed.clear();
+                self.search.reveal_pending = false;
+                self.render_current_document();
+            }
+            KeyCode::Enter | KeyCode::BackTab => {
+                let matches = self.search.matches(&self.display_canvas);
+                if matches.is_empty() {
+                    return;
+                }
+                let index = self.search.index.min(matches.len() - 1);
+                let previous =
+                    key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT);
+                self.search.index = if previous {
+                    (index + matches.len() - 1) % matches.len()
+                } else {
+                    (index + 1) % matches.len()
+                };
+                self.reveal_search_match();
+            }
+            KeyCode::Backspace => {
+                let previous = self.search.previous_char();
+                self.search.query.drain(previous..self.search.cursor);
+                self.search.cursor = previous;
+                self.search.index = 0;
+            }
+            KeyCode::Delete => {
+                let next = self.search.next_char();
+                self.search.query.drain(self.search.cursor..next);
+                self.search.index = 0;
+            }
+            KeyCode::Left => self.search.cursor = self.search.previous_char(),
+            KeyCode::Right => self.search.cursor = self.search.next_char(),
+            KeyCode::Home => self.search.cursor = 0,
+            KeyCode::End => self.search.cursor = self.search.query.len(),
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.search.query.clear();
+                self.search.cursor = 0;
+                self.search.index = 0;
+            }
+            KeyCode::Char(c)
+                if !key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
+            {
+                self.search.query.insert(self.search.cursor, c);
+                self.search.cursor += c.len_utf8();
+                self.search.index = 0;
+            }
+            _ => {}
+        }
+        if self.search.open && self.search.query != previous_query {
+            self.reveal_search_match();
+        }
+    }
+
+    fn reveal_search_match(&mut self) {
+        self.search.reveal_pending = false;
+        let matches = self.search.matches(&self.display_canvas);
+        let Some(current) = matches.get(self.search.index.min(matches.len().saturating_sub(1)))
+        else {
+            return;
+        };
+        self.search.index = self.search.index.min(matches.len() - 1);
+        let id = &current.node_id;
+        // Restore only branches this search opened, then reveal the
+        // current candidate. Closing keeps the last visible branch.
+        for revealed in self.search.revealed.drain() {
+            if !self.search.expanded_before.contains(&revealed) {
+                self.expanded.remove(&revealed);
+            }
+        }
+        let mut current = Some(id.clone());
+        while let Some(node_id) = current {
+            current = self
+                .display_canvas
+                .node(&node_id)
+                .and_then(|n| n.parent.clone());
+            if self.expanded.insert(node_id.clone()) {
+                self.search.revealed.insert(node_id);
+            }
+        }
+        self.rebuild_rows();
+        self.jump_to_node(id);
+        if let Some(node) = self.display_canvas.node(id) {
+            for block in scan_runnable_blocks(id, &node.text) {
+                if !super::search::ranges(&block.code, self.search.query.trim()).is_empty() {
+                    if let Some(name) = block.name {
+                        self.block_views.insert(
+                            BlockAddr {
+                                node_id: id.clone(),
+                                block_name: name,
+                            },
+                            markdown::BlockView {
+                                collapsed: false,
+                                source_expanded: Some(true),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        self.selected_block = None;
+        self.tree_collapsed = false;
+        if self.fullscreen.is_some() {
+            self.fullscreen = Some(Focus::Document);
+        }
+        self.render_current_document();
+        self.search.reveal_pending = true;
     }
 
     /// Shared by `on_mouse`'s tree/document/output branches: a click
@@ -3651,7 +3799,10 @@ impl App {
                     bg,
                     ..
                 } => Some((path.clone(), *width_percent, *height_percent, *bg)),
-                Segment::Text(_) | Segment::Table { .. } | Segment::TablePreview(_) => None,
+                Segment::Text(_)
+                | Segment::Button { .. }
+                | Segment::Table { .. }
+                | Segment::TablePreview(_) => None,
             })
             .collect();
         for (path, width_percent, height_percent, bg) in images {
@@ -7248,6 +7399,105 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn canvas_search_wraps_occurrences_and_restores_only_its_own_branches() {
+        let mut app = app_with_blocks("canvas-search", "## Alpha\n<!-- meshfox:node id=\"alpha\" -->\n\n### First\n<!-- meshfox:node id=\"first\" -->\n\nneedle NEEDLE\n\n## Beta\n<!-- meshfox:node id=\"beta\" -->\n\n### Second needle\n<!-- meshfox:node id=\"second\" -->\n\nbody\n").await;
+        app.expanded.clear();
+        app.rebuild_rows();
+        app.on_key(key(KeyCode::Char('/'))).await;
+        for c in "needle".chars() {
+            app.on_key(key(KeyCode::Char(c))).await;
+        }
+        assert_eq!(app.search.matches(&app.display_canvas).len(), 3);
+        assert_eq!(app.search.index, 0);
+        assert_eq!(app.rows[app.selected].node_id, "first");
+        assert!(app.expanded.contains("alpha"));
+        assert!(app.search.reveal_pending);
+        // Typing reveals 1/N immediately; Enter advances to 2/N.
+        app.on_key(key(KeyCode::Enter)).await;
+        assert_eq!(app.search.index, 1);
+        assert_eq!(app.rows[app.selected].node_id, "first");
+        assert!(app.expanded.contains("alpha"));
+        app.on_key(key(KeyCode::Enter)).await;
+        assert_eq!(app.rows[app.selected].node_id, "second");
+        assert!(!app.expanded.contains("alpha"));
+        assert!(app.expanded.contains("beta"));
+        app.on_key(key(KeyCode::Enter)).await;
+        assert_eq!(app.search.index, 0);
+        assert_eq!(app.rows[app.selected].node_id, "first");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT))
+            .await;
+        assert_eq!(app.search.index, 2);
+        app.on_key(key(KeyCode::Esc)).await;
+        assert!(!app.search.open);
+        assert!(app.expanded.contains("beta"));
+        assert_eq!(app.rows[app.selected].node_id, "second");
+        app.on_key(key(KeyCode::Char('/'))).await;
+        app.on_key(key(KeyCode::Enter)).await;
+        assert!(
+            app.expanded.contains("beta"),
+            "branches open before this session stay open"
+        );
+        std::fs::remove_dir_all(app.canvas_path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn canvas_search_owns_keys_and_handles_empty_results_and_live_reload() {
+        let mut app = app_with_blocks("search-input", "needle\n").await;
+        app.on_key(key(KeyCode::Char('/'))).await;
+        for c in "qПривет".chars() {
+            app.on_key(key(KeyCode::Char(c))).await;
+        }
+        assert_eq!(app.search.query, "qПривет");
+        app.on_key(key(KeyCode::Backspace)).await;
+        assert_eq!(app.search.query, "qПриве");
+        assert!(
+            !app.should_quit,
+            "q belongs to the query while search is open"
+        );
+        app.on_key(key(KeyCode::Left)).await;
+        app.on_key(key(KeyCode::Delete)).await;
+        assert_eq!(app.search.query, "qПрив");
+        app.on_key(key(KeyCode::Home)).await;
+        app.on_key(key(KeyCode::Char('Ж'))).await;
+        assert_eq!(app.search.query, "ЖqПрив");
+        app.on_key(key(KeyCode::Right)).await;
+        app.on_key(key(KeyCode::Backspace)).await;
+        assert_eq!(app.search.query, "ЖПрив");
+        assert!(app.search.matches(&app.display_canvas).is_empty());
+        app.on_key(key(KeyCode::Enter)).await;
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .await;
+        assert!(app.search.query.is_empty());
+        app.search.query = " needle ".into();
+        app.search.index = 99;
+        app.on_key(key(KeyCode::Enter)).await;
+        assert_eq!(app.search.index, 0);
+        app.display_canvas
+            .nodes
+            .iter_mut()
+            .for_each(|n| n.text.clear());
+        assert!(app.search.matches(&app.display_canvas).is_empty());
+        app.on_key(key(KeyCode::Enter)).await;
+        app.on_key(key(KeyCode::Esc)).await;
+        assert_eq!(app.search.query, " needle ");
+        std::fs::remove_dir_all(app.canvas_path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn canvas_search_reveals_matching_folded_code_without_changing_source() {
+        let mut app =
+            app_with_blocks("search-fold", "```sh name=build fold\necho needle\n```\n").await;
+        let raw = app.raw.clone();
+        app.on_key(key(KeyCode::Char('/'))).await;
+        for c in "needle".chars() {
+            app.on_key(key(KeyCode::Char(c))).await;
+        }
+        assert!(document_text(&app).contains("echo needle"));
+        assert_eq!(app.raw, raw);
+        std::fs::remove_dir_all(app.canvas_path.parent().unwrap()).unwrap();
+    }
 
     #[tokio::test]
     async fn opening_missing_file_reports_worker_error_without_handoff() {

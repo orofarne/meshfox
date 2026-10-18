@@ -16,6 +16,7 @@ mod image_metrics;
 mod image_render;
 mod markdown;
 mod path_picker;
+mod search;
 mod source_diff;
 mod source_editor;
 mod spatial;

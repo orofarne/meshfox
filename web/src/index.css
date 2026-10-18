@@ -2110,6 +2110,17 @@ a {
   color: var(--dep);
 }
 
+/* A `tangle` block's badge — same pill as `.mesh-tty-badge`, dimmed: it changes where the code runs from, not how it runs. */
+.mesh-tangle-badge {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0.05rem 0.35rem;
+  border-radius: 3px;
+  border: 1px solid currentColor;
+  opacity: 0.6;
+}
+
 /* A `service` block's own tag, right in its head row next to the language
  * (see MeshNode.tsx's `RunnableCodeBlock`) — deliberately filled, not just
  * outlined like `.mesh-tty-badge`, so it reads as noticeably different at

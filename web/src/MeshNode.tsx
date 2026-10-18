@@ -1611,6 +1611,14 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
             tty
           </span>
         )}
+        {seg.tangle && (
+          <span
+            className="mesh-tangle-badge"
+            title="Runs from a stable hidden file, .meshfox-tangle-<canvas file>__<block>.<ext>, in the block's working directory — so relative imports and the project's package.json/tsconfig apply"
+          >
+            tangle
+          </span>
+        )}
         {seg.service && (
           <span
             className={
