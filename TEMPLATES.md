@@ -64,11 +64,12 @@ Every page is rendered with these variables:
 | `meshfox_version` | string | The version of the `meshfox` binary doing the export. |
 | `canvas_commit` | string, maybe absent | The short git `HEAD` of the repository the canvas lives in. Absent outside a git working tree, so use `{% if canvas_commit %}` or `default(value=...)`. |
 | `page_kind` | string | `"canvas"` for a `.canvas.md` page, `"document"` for a plain Markdown file rendered with `--recursive` (see below). |
+| `page_url` | string or null | Absolute URL of the current template output when `base_url` is configured, otherwise null. Directory index pages use trailing-slash URLs; output path components are percent-encoded. Use `{% if page_url %}` for canonical and Open Graph URL tags. Shared with sitemap URL generation. |
 | `root_href` | string | Relative URL of the site root from this page: `./` for the root page, `../` one level down, and so on. |
 
 With `--recursive`, each nested canvas is rendered with the same template into
-its own subdirectory, and `site` is *that* canvas's data. The context does not
-say where in the site a page lives; use relative links.
+its own subdirectory, and `site` is *that* canvas's data. Use `page_url` for
+absolute metadata URLs and relative links for local assets.
 
 ### Document pages
 

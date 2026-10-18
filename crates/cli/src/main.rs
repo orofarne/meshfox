@@ -5659,6 +5659,21 @@ fn sitemap_page_path(out_rel: &str) -> &str {
     }
 }
 
+/// Join a literal output path to the site URL. Encode path bytes, preserving
+/// slashes and unreserved characters; filenames are not URL syntax.
+fn static_page_url(base_url: &str, out_rel: &str) -> String {
+    use std::fmt::Write;
+    let mut url = format!("{}/", base_url.trim_end_matches('/'));
+    for byte in sitemap_page_path(out_rel).bytes() {
+        if byte.is_ascii_alphanumeric() || b"/-._~".contains(&byte) {
+            url.push(char::from(byte));
+        } else {
+            write!(url, "%{byte:02X}").expect("writing to a String cannot fail");
+        }
+    }
+    url
+}
+
 /// Renders `entries` into a `sitemap.xml` document (sitemaps.org's
 /// `urlset`/`url`/`loc`/`lastmod` schema) — `base_url` is required by the
 /// caller before this is ever called (a `<loc>` has to be an absolute URL).
@@ -5671,11 +5686,7 @@ fn sitemap_xml(entries: &[SitemapEntry], base_url: &str, git_dates: bool) -> Str
          <urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n",
     );
     for entry in entries {
-        let loc = format!(
-            "{}/{}",
-            base_url.trim_end_matches('/'),
-            sitemap_page_path(&entry.out_rel)
-        );
+        let loc = static_page_url(base_url, &entry.out_rel);
         xml.push_str("  <url>\n");
         xml.push_str(&format!("    <loc>{}</loc>\n", xml_escape(&loc)));
         if git_dates {
@@ -6145,6 +6156,21 @@ fn render_canvas_site<'a>(
             if is_partial {
                 continue;
             }
+            let page_rel = Path::new(name).with_extension("");
+            let out_rel = if current_slot.is_empty() {
+                page_rel.to_string_lossy().replace('\\', "/")
+            } else {
+                format!(
+                    "{current_slot}/{}",
+                    page_rel.to_string_lossy().replace('\\', "/")
+                )
+            };
+            // Each template output has its own URL, including non-index pages.
+            let page_url = config
+                .base_url
+                .as_deref()
+                .map(|base| static_page_url(base, &out_rel));
+            context.insert("page_url", &page_url);
             let rendered = tera.render(name, &context).unwrap_or_else(|e| {
                 let cause = error_chain(&e);
                 eprintln!(
@@ -6160,20 +6186,11 @@ fn render_canvas_site<'a>(
                 }
                 std::process::exit(1);
             });
-            let page_rel = Path::new(name).with_extension("");
             write_output_file(&out_dir.join(&page_rel), rendered.as_bytes()).unwrap_or_else(|e| {
                 eprintln!("meshfox static: {e}");
                 std::process::exit(1);
             });
             count += 1;
-            let out_rel = if current_slot.is_empty() {
-                page_rel.to_string_lossy().replace('\\', "/")
-            } else {
-                format!(
-                    "{current_slot}/{}",
-                    page_rel.to_string_lossy().replace('\\', "/")
-                )
-            };
             sitemap_entries.push(SitemapEntry {
                 out_rel,
                 canvas_path: canvas_path.clone(),

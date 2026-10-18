@@ -924,3 +924,81 @@ fn a_template_render_error_reports_the_underlying_cause() {
     let _ = std::fs::remove_dir_all(canvas_path.parent().unwrap());
     let _ = std::fs::remove_dir_all(&out_dir);
 }
+
+#[test]
+fn page_url_matches_sitemap_for_each_recursive_template_output() {
+    let dir = unique_dir("page-urls");
+    let template = dir.join("template");
+    write_file(
+        &template.join("template.toml"),
+        "api_version = 1\nbase_url = \"https://example.com/repo/\"\n",
+    );
+    let markup = "<link rel=\"canonical\" href=\"{{ page_url }}\">";
+    write_file(&template.join("index.html.tera"), markup);
+    write_file(&template.join("extra & б.html.tera"), markup);
+    let canvas = dir.join("root.canvas.md");
+    write_file(
+        &canvas,
+        "# Root\n<!-- meshfox:node id=\"root\" -->\n\n## Canvas\n<!-- meshfox:node id=\"canvas\" type=\"file\" -->\n\n[child](nested/child.canvas.md)\n\n## Document\n<!-- meshfox:node id=\"document\" type=\"file\" -->\n\n[doc](nested/spec.md)\n",
+    );
+    write_file(&dir.join("nested/child.canvas.md"), FIXTURE_CANVAS);
+    write_file(&dir.join("nested/spec.md"), "# Spec\n\nDocument body.\n");
+    let output = dir.join("out");
+    let status = meshfox()
+        .arg("static")
+        .arg(&canvas)
+        .arg("--template")
+        .arg(&template)
+        .arg("--out")
+        .arg(&output)
+        .args(["--copy-files", "--recursive", "--sitemap"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let sitemap = std::fs::read_to_string(output.join("sitemap.xml")).unwrap();
+    for slot in ["", "nested/child/", "nested/spec/"] {
+        for (file, path) in [
+            ("index.html", ""),
+            ("extra & б.html", "extra%20%26%20%D0%B1.html"),
+        ] {
+            let url = format!("https://example.com/repo/{slot}{path}");
+            let html = std::fs::read_to_string(output.join(format!("{slot}{file}"))).unwrap();
+            let document = scraper::Html::parse_document(&html);
+            let selector = scraper::Selector::parse("link[rel=canonical]").unwrap();
+            assert_eq!(
+                document
+                    .select(&selector)
+                    .next()
+                    .unwrap()
+                    .value()
+                    .attr("href"),
+                Some(url.as_str())
+            );
+            assert!(sitemap.contains(&format!("<loc>{url}</loc>")), "{sitemap}");
+        }
+    }
+
+    // A template without base_url can explicitly omit absolute metadata.
+    std::fs::remove_file(template.join("template.toml")).unwrap();
+    write_file(
+        &template.join("index.html.tera"),
+        "{% if page_url %}unexpected{% else %}no absolute URL{% endif %}",
+    );
+    std::fs::remove_file(template.join("extra & б.html.tera")).unwrap();
+    let status = meshfox()
+        .arg("static")
+        .arg(&canvas)
+        .arg("--template")
+        .arg(&template)
+        .arg("--out")
+        .arg(&output)
+        .arg("--force")
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert_eq!(
+        std::fs::read_to_string(output.join("index.html")).unwrap(),
+        "no absolute URL"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}

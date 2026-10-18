@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+<rect width="1200" height="630" fill="#352c27"/>
+<path d="M0 585H1200M40 0V630" stroke="#493c32" stroke-width="2"/>
+<rect x="57" y="58" width="690" height="512" fill="#1b1918" opacity=".4"/>
+<rect x="48" y="46" width="690" height="512" fill="#e4d7bb"/>
+<g fill="#2d2926">
+<text x="94" y="125" font-family="monospace" font-size="19" letter-spacing="3">EXECUTABLE MARKDOWN CANVAS</text>
+<text x="88" y="252" font-family="Courier New, monospace" font-weight="bold" font-size="108" letter-spacing="-7">meshfox</text>
+<text x="96" y="329" font-family="Georgia, serif" font-size="34">Markdown you can map,</text>
+<text x="96" y="374" font-family="Georgia, serif" font-size="34">run, and share.</text>
+<text x="96" y="510" font-family="monospace" font-size="19">meshfox.orofarne.net</text>
+</g>
+<g fill="none" stroke="#ba503e" stroke-width="4"><path d="M705 68Q910 78 968 158M968 158Q800 230 890 328M890 328Q1050 360 1020 465"/></g>
+<g transform="rotate(4 973 172)"><rect x="812" y="98" width="322" height="166" fill="#000" opacity=".25" transform="translate(6 8)"/><rect x="812" y="98" width="322" height="166" fill="#fff8e8"/><text x="847" y="160" font-family="monospace" font-size="29" fill="#2d2926"> /\_/\</text><text x="847" y="198" font-family="monospace" font-size="29" fill="#2d2926">( ¬‿¬ )──●──●</text><text x="847" y="234" font-family="monospace" font-size="29" fill="#2d2926">  c c</text></g>
+<g transform="rotate(-5 899 351)"><rect x="787" y="297" width="224" height="112" fill="#000" opacity=".25" transform="translate(6 8)"/><rect x="787" y="297" width="224" height="112" fill="#f0e4cb"/><text x="815" y="344" font-family="monospace" font-size="22" fill="#2d2926">$ meshfox run</text><text x="815" y="380" font-family="monospace" font-size="16" fill="#8e392f">● connected ideas</text></g>
+<g transform="rotate(3 1027 489)"><rect x="902" y="452" width="250" height="89" fill="#000" opacity=".25" transform="translate(6 8)"/><rect x="902" y="452" width="250" height="89" fill="#ddcfac"/><text x="934" y="507" font-family="monospace" font-size="21" fill="#2d2926">build → publish</text></g>
+<g fill="#ba503e" stroke="#642d28" stroke-width="2"><circle cx="705" cy="68" r="8"/><circle cx="968" cy="112" r="8"/><circle cx="890" cy="299" r="8"/><circle cx="1020" cy="453" r="8"/></g>
+</svg>

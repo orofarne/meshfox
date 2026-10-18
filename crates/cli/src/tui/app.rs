@@ -3268,6 +3268,28 @@ impl App {
             return;
         };
         let node_id = row.node_id.clone();
+        let link = self
+            .display_canvas
+            .node(&node_id)
+            .filter(|n| n.node_type == NodeType::Link)
+            .map(|n| n.target.clone());
+        if let Some(target) = link {
+            let Some(url) = target.filter(|t| !t.is_empty()) else {
+                self.status = "link has no target".into();
+                return;
+            };
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                self.status = format!("not opening non-http link: {url}");
+                return;
+            }
+            let shown = url.clone();
+            self.status = match tokio::task::spawn_blocking(move || open::that(&url)).await {
+                Ok(Ok(())) => format!("opened {shown}"),
+                Ok(Err(e)) => format!("failed to open: {e}"),
+                Err(e) => format!("failed to open: {e}"),
+            };
+            return;
+        }
         let Some(port) = self.worker_port else {
             self.status = "no worker for canvas".into();
             return;
