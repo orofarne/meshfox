@@ -2,7 +2,7 @@
   "name": "meshfox-vscode",
   "displayName": "meshfox",
   "description": "View and run meshfox .canvas.md files as an interactive node canvas, right inside VS Code.",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "publisher": "Orofarne",
   "license": "MIT",
   "repository": {
@@ -92,7 +92,9 @@
       {
         "scopeName": "meshfox.marker.injection",
         "path": "./syntaxes/meshfox-marker.injection.json",
-        "injectTo": ["text.html.markdown"]
+        "injectTo": [
+          "text.html.markdown"
+        ]
       }
     ],
     "configuration": {

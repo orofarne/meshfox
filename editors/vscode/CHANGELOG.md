@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.1
+
+- Changed: dependency updates (security fixes); no functional changes.
+
 ## 0.4.0
 
 - New: **meshfox: New canvas** command (Command Palette) — pick a path and
