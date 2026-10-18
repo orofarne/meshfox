@@ -10,6 +10,8 @@
 
 [Website](https://meshfox.orofarne.net/) · [GitHub](https://github.com/orofarne/meshfox) · [Download binary](https://github.com/orofarne/meshfox/releases)
 
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=orofarne_meshfox&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=orofarne_meshfox)
+
 Install on Linux/macOS in one line:
 
 ```sh
