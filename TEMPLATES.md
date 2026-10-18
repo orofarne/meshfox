@@ -151,6 +151,10 @@ Everything Tera ships, plus one of meshfox's own:
 
 ## Escaping and trust
 
+The exporter escapes `&`, `<`, `>`, `"` and `'`, leaving `/` literal in URLs
+and MIME types. This overrides Tera's default slash escaping. Attribute values
+must be quoted; HTML escaping is not JavaScript or CSS escaping.
+
 Every `*.tera` page is **auto-escaped**: `{{ n.title }}`, `{{ t }}` for a tag,
 `{{ icon.href }}` and every other value are HTML-escaped, whatever the page's
 name. (Tera by itself only escapes names ending in `.html`, `.htm` or `.xml`;

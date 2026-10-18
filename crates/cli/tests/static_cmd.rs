@@ -1002,3 +1002,43 @@ fn page_url_matches_sitemap_for_each_recursive_template_output() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn static_autoescape_preserves_slashes_but_escapes_html_delimiters() {
+    let dir = unique_dir("slash-escaping");
+    let template = dir.join("template");
+    write_file(
+        &template.join("index.html.tera"),
+        "<link href=\"{{ page_url }}\" type=\"{{ icons[0].type }}\"><p>{{ site.title }}</p>",
+    );
+    write_file(
+        &template.join("template.toml"),
+        "api_version = 1\nbase_url = \"https://example.com\"\n[[icons]]\nrel = \"icon\"\nhref = \"icon.png\"\ntype = \"image/png\"\n",
+    );
+    let canvas = dir.join("doc.canvas.md");
+    write_file(
+        &canvas,
+        "# A & <b>\"quoted\" 'single' / текст\n<!-- meshfox:node id=\"root\" -->\n",
+    );
+    let out = dir.join("out");
+    let result = meshfox()
+        .arg("static")
+        .arg(&canvas)
+        .arg("--template")
+        .arg(&template)
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let html = std::fs::read_to_string(out.join("index.html")).unwrap();
+    assert_eq!(
+        html,
+        "<link href=\"https://example.com/\" type=\"image/png\"><p>A &amp; &lt;b&gt;&quot;quoted&quot; &#x27;single&#x27; / текст</p>"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}

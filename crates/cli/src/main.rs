@@ -5402,6 +5402,24 @@ fn html_escape_attr(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// HTML text/quoted-attribute escaping for static templates. Unlike Tera's
+/// default, leave slashes literal in URLs and MIME types; they do not delimit
+/// text or quoted attributes. Script data uses `script_json` separately.
+fn static_html_escape(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    for c in input.chars() {
+        match c {
+            '&' => output.push_str("&amp;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            '"' => output.push_str("&quot;"),
+            '\'' => output.push_str("&#x27;"),
+            _ => output.push(c),
+        }
+    }
+    output
+}
+
 /// The `script_json` Tera filter: any value as JSON that is safe to put
 /// inside a `<script type="application/json">` element. Plain `json_encode`
 /// is not — it leaves `</script>` intact, so an edge label or node title
@@ -5937,6 +5955,7 @@ fn static_cmd(
     // values that really are markup (`html_body`, the edge JSON) opt out with
     // `| safe`, as `TEMPLATES.md` describes.
     tera.autoescape_on(vec![".tera"]);
+    tera.set_escape_fn(static_html_escape);
     tera.register_filter("script_json", script_json_filter);
 
     let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
