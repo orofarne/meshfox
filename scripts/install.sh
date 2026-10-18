@@ -109,7 +109,7 @@ detect_target() {
     TARGET="${arch_part}-${os_part}"
 
     case "$TARGET" in
-        x86_64-unknown-linux-gnu | x86_64-apple-darwin | aarch64-apple-darwin) ;;
+        x86_64-unknown-linux-gnu | aarch64-unknown-linux-gnu | x86_64-apple-darwin | aarch64-apple-darwin) ;;
         *) err "no prebuilt binary for '$TARGET' — see https://github.com/${REPO}/releases" ;;
     esac
 }
