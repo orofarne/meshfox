@@ -18,38 +18,13 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use edtui::actions::{AppendNewline, InsertChar};
 use edtui::{EditorEventHandler, EditorMode, EditorState, Index2, Lines};
 use meshfox_core::include::IncludeInfo;
-use meshfox_core::mdcanvas::{EDGE_ATTRS, NODE_ATTRS};
+use meshfox_core::suggest::{
+    attr_candidates, attribute_value_at, document_attr_context, finite_values, insertion_col,
+    inside_attribute_value, tags_value_range, AttrCandidate, AttrKind,
+};
 
 use super::source_diff::{DiffOutcome, SourceDiff};
 use crate::worker_client::ConflictLines;
-
-/// A runnable fence's own attribute vocabulary (`crates/core/src/fence.rs`)
-/// — value-taking (`name="..."`) vs. bare presence flags (`cache`, no
-/// `=value` at all) need different insertion shapes, see `AttrCandidate`.
-const FENCE_VALUE_ATTRS: &[&str] = &[
-    "name",
-    "deps",
-    "inputs",
-    "outputs",
-    "env",
-    "interpreter",
-    "output",
-    "output-attrs",
-    "render",
-    "send",
-];
-const FENCE_FLAG_ATTRS: &[&str] = &[
-    "cache",
-    "tty",
-    "autoclose",
-    "service",
-    "always",
-    "default",
-    "confirm",
-    "autorun",
-    "fold",
-    "tangle",
-];
 
 /// What the caller (`App::on_key`) should do after handing a keypress to
 /// the editor.
@@ -67,6 +42,9 @@ pub enum SourceEditorOutcome {
     /// deliberately doesn't hold, to keep file I/O and validation in one
     /// place (mirrors the server's `put_canvas_raw`).
     Save,
+    /// `Ctrl-o` — the caller hands the buffer to the external editor
+    /// (`[tui] editor`), or says there is none configured.
+    External,
 }
 
 pub struct SourceEditorState {
@@ -141,37 +119,6 @@ pub struct SourceEditorState {
     pub tag_suggest_selected: usize,
     /// Ctrl-g captures input until a symbol is inserted or the palette is cancelled.
     pub unicode_picker: Option<super::unicode_picker::UnicodePicker>,
-}
-
-/// Which attribute vocabulary a suggestible line belongs to — see
-/// `detect_attr_context`/`attr_candidates`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AttrKind {
-    Node,
-    Edge,
-    Fence,
-}
-
-impl AttrKind {
-    fn label(self) -> &'static str {
-        match self {
-            AttrKind::Node => "node",
-            AttrKind::Edge => "edge",
-            AttrKind::Fence => "fence",
-        }
-    }
-}
-
-/// One entry in the `Ctrl-p` popup. `is_flag` distinguishes a bare
-/// presence flag (a runnable fence's `cache`/`tty`/`default` — inserted as
-/// just the bare word) from a `key="value"`-shaped attribute (every
-/// `meshfox:node`/`meshfox:edge` attribute, plus a fence's own
-/// `name`/`deps`/`env` — inserted as `key=""` with the cursor landing
-/// between the quotes, ready to type the value).
-#[derive(Debug, Clone, Copy)]
-pub struct AttrCandidate {
-    pub name: &'static str,
-    pub is_flag: bool,
 }
 
 impl SourceEditorState {
@@ -269,6 +216,37 @@ impl SourceEditorState {
     /// Replaces the buffer with the file as it is on disk (the comparison's
     /// "take theirs"): nothing of the buffer's own edits survives, and
     /// there is nothing left to save.
+    /// Loads text edited elsewhere (the external editor) into the buffer,
+    /// leaving the saved snapshot and `base_rev` alone so the save that
+    /// follows is checked against the version this editor started from.
+    pub fn replace_text(&mut self, text: &str) {
+        let row = self.editor.cursor.row;
+        self.editor = EditorState::new(Lines::from(text));
+        let last = self.editor.lines.len().saturating_sub(1);
+        self.editor.cursor = Index2::new(row.min(last), 0);
+        prime_viewport(&mut self.editor);
+        self.pending_discard = false;
+    }
+
+    /// The cursor as a 1-based (line, column), for an external editor.
+    pub fn cursor_line_col(&self) -> (usize, usize) {
+        (self.editor.cursor.row + 1, self.editor.cursor.col + 1)
+    }
+
+    /// The edited file's name without its `.canvas.md`/`.md` suffix.
+    pub fn file_stem(&self) -> String {
+        let name = self
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let stem = name
+            .strip_suffix(".canvas.md")
+            .or_else(|| name.strip_suffix(".md"))
+            .unwrap_or(&name);
+        if stem.is_empty() { "canvas" } else { stem }.to_string()
+    }
+
     fn take_theirs(&mut self, theirs: String) {
         let row = self.editor.cursor.row;
         self.editor = EditorState::new(Lines::from(theirs.as_str()));
@@ -384,6 +362,7 @@ impl SourceEditorState {
                     return SourceEditorOutcome::Stay;
                 }
                 KeyCode::Char('s') => return SourceEditorOutcome::Save,
+                KeyCode::Char('o') => return SourceEditorOutcome::External,
                 KeyCode::Char('f') => {
                     self.file_picker_open = true;
                     self.file_picker_selected = if self.path == self.primary_path {
@@ -776,212 +755,6 @@ impl SourceEditorState {
     }
 }
 
-/// Where `insert_attr_candidate` types a new attribute in `line` — right
-/// before a node/edge comment's closing `-->` (so the new attribute lands
-/// *inside* the comment, not after it), or the plain end of line for a
-/// fence's own attribute line (nothing closes it).
-fn insertion_col(line: &str, kind: AttrKind) -> usize {
-    if kind != AttrKind::Fence {
-        if let Some(close) = line.rfind("-->") {
-            return line[..close].trim_end().chars().count();
-        }
-    }
-    line.chars().count()
-}
-
-/// Locates a `tags="..."` attribute's value on `line`, as a char-column
-/// range — `start` right after the opening quote, `end` at the closing
-/// quote (so `end - start` chars sit strictly between them; `start ==
-/// end` for an empty value, `tags=""`). `None` if the line has no `tags=`
-/// at all, or the value's closing quote is missing. Char columns, not byte
-/// offsets — matches `insertion_col`/`Index2` elsewhere in this file.
-fn tags_value_range(line: &str) -> Option<(usize, usize)> {
-    let key = "tags=\"";
-    let start_byte = line.find(key)?;
-    let value_start_byte = start_byte + key.len();
-    let rest = &line[value_start_byte..];
-    let close_byte_in_rest = rest.find('"')?;
-    let start_col = line[..value_start_byte].chars().count();
-    let end_col = start_col + rest[..close_byte_in_rest].chars().count();
-    Some((start_col, end_col))
-}
-
-/// Ignore fence bodies (including literal meshfox comments) and closing delimiters.
-fn document_attr_context(text: &str, row: usize) -> Option<AttrKind> {
-    let mut fence: Option<(char, usize)> = None;
-    for (index, line) in text.lines().enumerate() {
-        let trimmed = line.trim_start();
-        let ch = trimmed.chars().next().unwrap_or(' ');
-        let len = trimmed.chars().take_while(|c| *c == ch).count();
-        if let Some((delimiter, minimum)) = fence {
-            if ch == delimiter && len >= minimum && trimmed[len..].trim().is_empty() {
-                fence = None;
-            }
-            if index == row {
-                return None;
-            }
-            continue;
-        }
-        let is_fence = line.len() - trimmed.len() < 4 && matches!(ch, '`' | '~') && len >= 3;
-        if index == row {
-            return if is_fence {
-                let info = trimmed[len..].trim();
-                let language = info.split_whitespace().next().unwrap_or("");
-                let attrs = meshfox_core::attrs::parse_attrs(info);
-                if matches!(language, "bash" | "sh" | "button") || attrs.contains_key("interpreter")
-                {
-                    Some(AttrKind::Fence)
-                } else {
-                    None
-                }
-            } else {
-                detect_attr_context(line)
-            };
-        }
-        if is_fence {
-            fence = Some((ch, len));
-        }
-    }
-    None
-}
-
-/// Attribute values in character columns, including empty and unfinished values.
-fn attribute_value_at(line: &str, col: usize) -> Option<(String, usize, usize)> {
-    let chars: Vec<char> = line.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i].is_whitespace() {
-            i += 1;
-            continue;
-        }
-        let key_start = i;
-        while i < chars.len() && !chars[i].is_whitespace() && chars[i] != '=' {
-            i += 1;
-        }
-        if chars.get(i) != Some(&'=') {
-            continue;
-        }
-        let name: String = chars[key_start..i].iter().collect();
-        i += 1;
-        let quote = chars.get(i).copied().filter(|c| matches!(c, '\'' | '"'));
-        if quote.is_some() {
-            i += 1;
-        }
-        let start = i;
-        while i < chars.len()
-            && match quote {
-                Some(q) => chars[i] != q,
-                None => !chars[i].is_whitespace(),
-            }
-        {
-            i += 1;
-        }
-        if col >= start && col <= i {
-            return Some((name, start, i));
-        }
-        if quote.is_some() && i < chars.len() {
-            i += 1;
-        }
-    }
-    None
-}
-
-fn finite_values(kind: AttrKind, name: &str) -> &'static [&'static str] {
-    match (kind, name) {
-        (AttrKind::Node, "type") => &["text", "file", "link", "group", "include"],
-        (AttrKind::Node, "display") => &["link", "code", "table"],
-        (AttrKind::Node, "preview" | "fold") => &["true", "false"],
-        (AttrKind::Node, "edgeSourceSide" | "edgeTargetSide")
-        | (AttrKind::Edge, "sourceSide" | "targetSide") => &["left", "right", "top", "bottom"],
-        (AttrKind::Edge, "style") => &["solid", "dashed", "dotted"],
-        (AttrKind::Edge, "arrowStart" | "arrowEnd") => &["none", "arrow"],
-        (AttrKind::Fence, "output") => &["text", "markdown", "image"],
-        (AttrKind::Fence, "render") => meshfox_core::fence::RENDER_KINDS,
-        (AttrKind::Fence, name) if FENCE_FLAG_ATTRS.contains(&name) => &["true", "false"],
-        _ => &[],
-    }
-}
-
-fn inside_attribute_value(line: &str, col: usize) -> bool {
-    let chars: Vec<char> = line.chars().collect();
-    let mut quote = None;
-    let mut value = false;
-    for &c in chars.iter().take(col) {
-        if let Some(q) = quote {
-            if c == q {
-                quote = None;
-                value = false;
-            }
-        } else if value && matches!(c, '\'' | '"') {
-            quote = Some(c);
-        } else if c == '=' {
-            value = true;
-        } else if c.is_whitespace() {
-            value = false;
-        }
-    }
-    quote.is_some() || (value && chars.get(col).is_some_and(|c| !c.is_whitespace()))
-}
-
-/// Attribute vocabulary for a standalone structural line.
-fn detect_attr_context(line: &str) -> Option<AttrKind> {
-    let trimmed = line.trim_start();
-    if trimmed.starts_with("<!-- meshfox:node") {
-        Some(AttrKind::Node)
-    } else if trimmed.starts_with("<!-- meshfox:edge") {
-        Some(AttrKind::Edge)
-    } else if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-        Some(AttrKind::Fence)
-    } else {
-        None
-    }
-}
-
-/// Exclude parsed attribute keys and flags that conflict with the current block.
-fn attr_candidates(kind: AttrKind, line: &str) -> Vec<AttrCandidate> {
-    let (value_attrs, flag_attrs): (&[&str], &[&str]) = match kind {
-        AttrKind::Node => (NODE_ATTRS, &[]),
-        AttrKind::Edge => (EDGE_ATTRS, &[]),
-        AttrKind::Fence => (FENCE_VALUE_ATTRS, FENCE_FLAG_ATTRS),
-    };
-    let attrs = meshfox_core::attrs::parse_attrs(line);
-    let value_present = |name: &str| attrs.contains_key(name);
-    let enabled = |name: &str| attrs.get(name).is_some_and(|v| v != "false");
-    let flag_present = |name: &str| attrs.contains_key(name);
-    let compatible = |name: &str| {
-        kind != AttrKind::Fence
-            || match name {
-                "cache" => !enabled("tty") && !enabled("service"),
-                "tty" => !enabled("cache") && !enabled("service"),
-                "service" => {
-                    !enabled("cache")
-                        && !enabled("tty")
-                        && !line.trim_start().starts_with("```button")
-                }
-                "autoclose" => enabled("tty"),
-                "tangle" => value_present("interpreter"),
-                _ => true,
-            }
-    };
-    value_attrs
-        .iter()
-        .filter(|n| !value_present(n))
-        .map(|&name| AttrCandidate {
-            name,
-            is_flag: false,
-        })
-        .chain(
-            flag_attrs
-                .iter()
-                .filter(|n| !flag_present(n) && compatible(n))
-                .map(|&name| AttrCandidate {
-                    name,
-                    is_flag: true,
-                }),
-        )
-        .collect()
-}
-
 /// Types `s` in at the cursor, one character at a time, via `edtui`'s own
 /// public `InsertChar` action — the same path a real keystroke takes (see
 /// `EditorEventHandler::on_key_event`), so it lands in the same undo/
@@ -1050,6 +823,7 @@ pub fn byte_offset_to_cursor(text: &str, mut byte_offset: usize) -> Index2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use meshfox_core::suggest::detect_attr_context;
 
     fn open_editor(raw: &str) -> SourceEditorState {
         let path = PathBuf::from("/tmp/meshfox-source-editor-test.canvas.md");

@@ -696,6 +696,84 @@ pub fn node_body_offset(markdown: &str, node_id: &str) -> Option<usize> {
     Some(segments[idx].body_span.start)
 }
 
+/// Where one node sits in the text — what an editor integration (the LSP
+/// server) needs to turn a node or an error about it into a source range,
+/// without access to the private `scan` machinery. All ranges are byte
+/// offsets into the string the spans were computed from; `heading` and
+/// `marker` include their line's trailing newline.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeSpan {
+    pub level: u8,
+    pub title: String,
+    /// The id `parse` would give this node. `None` when ids can't be
+    /// assigned at all (a duplicate, invalid or reserved id elsewhere in the
+    /// document) — a half-edited document still has spans.
+    pub id: Option<String>,
+    /// The `id="..."` written on the node's marker, if any.
+    pub explicit_id: Option<String>,
+    pub heading: Range<usize>,
+    /// The `meshfox:node` comment line right under the heading.
+    pub marker: Option<Range<usize>>,
+    /// Everything up to the next node's heading (nested unmarked headings
+    /// belong to the body).
+    pub body: Range<usize>,
+}
+
+/// Every node of `markdown`, in document order. Never fails: see
+/// `NodeSpan::id`.
+pub fn node_spans(markdown: &str) -> Vec<NodeSpan> {
+    let segments = scan(markdown);
+    let ids = assign_ids(&segments).ok();
+    segments
+        .into_iter()
+        .enumerate()
+        .map(|(i, seg)| NodeSpan {
+            level: seg.level,
+            title: seg.title,
+            id: ids.as_ref().map(|ids| ids[i].clone()),
+            explicit_id: seg.node_attrs.get("id").cloned(),
+            heading: seg.heading_span,
+            marker: seg.node_line_span,
+            body: seg.body_span,
+        })
+        .collect()
+}
+
+/// One real ATX heading of the document (outside fences and generated
+/// output). Only a heading with a `meshfox:node` marker under it — or the
+/// document's first — is a node; the rest is plain formatting, which is what
+/// "turn this heading into a node" acts on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HeadingSpan {
+    pub level: u8,
+    pub title: String,
+    /// The heading line, trailing newline included.
+    pub span: Range<usize>,
+    pub is_node: bool,
+}
+
+pub fn headings(markdown: &str) -> Vec<HeadingSpan> {
+    let lines = lines_with_offsets(markdown);
+    heading_line_indices(markdown, &lines)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(pos, idx)| {
+            let (start, line) = lines[idx];
+            let (level, title) = parse_heading(line.trim_end_matches('\n'))?;
+            let marked = matches!(
+                lines.get(idx + 1),
+                Some(&(_, l)) if parse_comment(l.trim_end_matches('\n'), "meshfox:node").is_some()
+            );
+            Some(HeadingSpan {
+                level,
+                title,
+                span: start..start + line.len(),
+                is_node: pos == 0 || marked,
+            })
+        })
+        .collect()
+}
+
 /// Replace just the body of node `node_id` with `new_body`, leaving the
 /// rest of the document untouched. Used to write cached block output back
 /// into the source file without reformatting anything else.
@@ -2925,9 +3003,10 @@ fn caption_is_plain_prose(text: &str) -> bool {
     })
 }
 
-fn scan(markdown: &str) -> Vec<Segment> {
-    let lines = lines_with_offsets(markdown);
-
+/// Indices (into `lines`) of every ATX heading that is real document
+/// structure: not inside a fence and not inside a `meshfox:output` region.
+/// Whether a heading is also a *node* is decided by the caller.
+fn heading_line_indices(markdown: &str, lines: &[(usize, &str)]) -> Vec<usize> {
     // Skip any line that starts inside a real (CommonMark-matched) fence —
     // see `fence::scan_raw_fences` — rather than naively toggling on every
     // ``` -like line. That naive approach would treat a nested/longer outer
@@ -2965,6 +3044,13 @@ fn scan(markdown: &str) -> Vec<Segment> {
             all_headings.push(i);
         }
     }
+    all_headings
+}
+
+fn scan(markdown: &str) -> Vec<Segment> {
+    let lines = lines_with_offsets(markdown);
+
+    let all_headings = heading_line_indices(markdown, &lines);
 
     // A heading only becomes a node if it's immediately followed by a
     // `meshfox:node` comment — except the document's very first heading,
@@ -3046,6 +3132,37 @@ fn scan(markdown: &str) -> Vec<Segment> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_spans_and_headings_locate_nodes_and_plain_headings() {
+        let md = "# Root\n<!-- meshfox:node id=\"root\" -->\nbody\n\n## Plain\ntext\n\n## Node\n<!-- meshfox:node -->\nmore\n```sh\n# not a heading\n```\n";
+        let spans = node_spans(md);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].id.as_deref(), Some("root"));
+        assert_eq!(spans[0].explicit_id.as_deref(), Some("root"));
+        assert_eq!(&md[spans[0].heading.clone()], "# Root\n");
+        assert_eq!(
+            &md[spans[0].marker.clone().unwrap()],
+            "<!-- meshfox:node id=\"root\" -->\n"
+        );
+        assert!(md[spans[0].body.clone()].contains("## Plain"));
+        assert_eq!(spans[1].id.as_deref(), Some("node"));
+        assert_eq!(spans[1].explicit_id, None);
+
+        let hs = headings(md);
+        let seen: Vec<_> = hs.iter().map(|h| (h.title.as_str(), h.is_node)).collect();
+        assert_eq!(seen, [("Root", true), ("Plain", false), ("Node", true)]);
+        assert_eq!(&md[hs[1].span.clone()], "## Plain\n");
+    }
+
+    #[test]
+    fn node_spans_survive_a_duplicate_id_without_resolved_ids() {
+        let md = "# Root\n<!-- meshfox:node id=\"a\" -->\n## B\n<!-- meshfox:node id=\"a\" -->\n";
+        let spans = node_spans(md);
+        assert_eq!(spans.len(), 2);
+        assert!(spans.iter().all(|s| s.id.is_none()));
+        assert_eq!(spans[1].explicit_id.as_deref(), Some("a"));
+    }
 
     const DOC: &str = r#"# Hello Project
 <!-- meshfox:node id="root" x=0 y=0 w=250 h=60 -->

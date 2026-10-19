@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 
 mod coordinator;
 mod cores_cmd;
+mod lsp;
 mod mcp;
 mod pdf;
 mod prompt;
@@ -369,6 +370,15 @@ enum Command {
     /// here) — every write here is the same immediate read-modify-write
     /// `node <op>` already does.
     Mcp,
+    /// A Language Server Protocol server on stdio for editing canvases:
+    /// diagnostics (the same checks as `validate`, minus `include` targets),
+    /// a node outline, attribute/value/tag/id completion and code actions
+    /// such as "turn this heading into a node". Takes no arguments — an
+    /// editor launches it (`meshfox lsp`) and sends it the open buffers, so
+    /// unsaved text is what gets analysed. It never reads or writes a canvas
+    /// file itself; anything that needs the canvas's saved state goes
+    /// through the file's worker.
+    Lsp,
     /// Validate that a file parses as a meshfox canvas — same checks
     /// `run`/`view` already do before touching anything (single root,
     /// no duplicate ids, no dangling `meshfox:edge` targets, `group`/
@@ -1433,6 +1443,7 @@ fn main() {
             tui(canvas_path, node, terminal_status)
         }
         Command::Mcp => mcp_cmd(),
+        Command::Lsp => lsp_cmd(),
         Command::Validate { canvas } => {
             let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
             validate(&canvas_path)
@@ -1954,36 +1965,45 @@ fn validate_canvas(raw: &str, canvas_path: &Path) -> Result<usize, String> {
     // does — this file's own structure is already known good at this
     // point regardless of the outcome below.
     meshfox_core::include::resolve(&canvas, canvas_path).map_err(|e| e.to_string())?;
+    validate_document_rules(&canvas, raw)?;
+    Ok(canvas.nodes.len())
+}
+
+/// Every `validate` rule that needs only the document's own text (no
+/// filesystem — hence no include resolution): the part `meshfox lsp`
+/// runs on an editor's unsaved buffer. `validate_canvas` above adds the
+/// include check in between, so the two can't drift on what else counts.
+fn validate_document_rules(canvas: &Canvas, raw: &str) -> Result<(), String> {
     // Same idea for runnable-fence `deps=`: a dangling reference or a
     // cycle should fail CI/pre-commit here, not surface only when someone
     // actually tries to run the block.
-    meshfox_core::deps::validate(&canvas).map_err(|e| e.to_string())?;
+    meshfox_core::deps::validate(canvas).map_err(|e| e.to_string())?;
     // Validates every `meshfox:var` declaration itself (unique name,
     // declared in the root, `select` has `choices=`, ...) and every
     // runnable fence's `env=` reference against them — a typo'd variable
     // name would otherwise just silently resolve to nothing instead of
     // failing loudly (see `vars::resolve_block_env`).
-    meshfox_core::validate_env_refs(&canvas).map_err(|e| e.to_string())?;
+    meshfox_core::validate_env_refs(canvas).map_err(|e| e.to_string())?;
     // Same idea again for `default_var=`/`choices_var=`: every reference
     // must name a real declared variable, and the reference graph must be
     // acyclic.
-    meshfox_core::validate_var_refs(&canvas).map_err(|e| e.to_string())?;
+    meshfox_core::validate_var_refs(canvas).map_err(|e| e.to_string())?;
     // A node-scoped `meshfox:var` (declared outside root) is only visible
     // to `env=` inside its own subtree — same lenient-at-runtime,
     // strict-at-`validate` split as every check above.
-    meshfox_core::validate_var_scope(&canvas).map_err(|e| e.to_string())?;
+    meshfox_core::validate_var_scope(canvas).map_err(|e| e.to_string())?;
     // Same idea for `meshfox:option` (unique name, declared in the root)
     // — a misplaced or duplicated option should fail loudly here rather
     // than just being silently ignored by whatever consumer reads
     // `Canvas::options`.
-    meshfox_core::declared_options(&canvas).map_err(|e| e.to_string())?;
+    meshfox_core::declared_options(canvas).map_err(|e| e.to_string())?;
     // `validate`-only, unlike every check above: an attribute name a
     // construct doesn't recognize (a typo, most likely) — every other
     // reader keeps silently accepting one it doesn't know, for
     // forward/backward compatibility between format versions (see
     // `validate_known_attrs`'s own doc comment).
     meshfox_core::validate_known_attrs(raw).map_err(|e| e.to_string())?;
-    Ok(canvas.nodes.len())
+    Ok(())
 }
 
 fn validate(canvas_path: &Path) {
@@ -2254,6 +2274,13 @@ fn tui(canvas_path: PathBuf, initial_node: Option<String>, status_mode: terminal
         tui::run(canvas_path, initial_node).await
     }) {
         eprintln!("meshfox tui: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn lsp_cmd() {
+    if let Err(e) = lsp::run() {
+        eprintln!("meshfox lsp: {e}");
         std::process::exit(1);
     }
 }

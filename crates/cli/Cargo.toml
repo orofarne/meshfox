@@ -98,6 +98,8 @@ tokio-tungstenite = "0.30.0"
 # `meshfox-server` at this same version, reused rather than re-pinned.
 futures-util = "0.3.33"
 unicode_names2 = "3"
+lsp-server = "0.7"
+lsp-types = "0.97"
 
 [dev-dependencies]
 portable-pty = "0.9"

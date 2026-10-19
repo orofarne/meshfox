@@ -259,6 +259,16 @@ impl RunHistoryViewState {
     }
 }
 
+/// A source edit waiting for the event loop to hand the terminal to the
+/// external editor (`[tui] editor`).
+pub struct PendingExternalEditor {
+    pub request: super::external_editor::Request,
+    /// The source editor was opened only to feed the external one (`e`), so
+    /// backing out of it should leave no empty editor behind. `false` when
+    /// it came from `Ctrl-o` inside an editor with its own unsaved state.
+    pub close_on_cancel: bool,
+}
+
 /// API-resolved canvas navigation waiting for the event loop.
 pub struct PendingChildCanvas {
     pub path: PathBuf,
@@ -696,6 +706,10 @@ pub struct App {
     /// A background `request_worker_refresh` that hasn't answered yet.
     worker_refresh_inflight: bool,
     pub pending_child_canvas: Option<PendingChildCanvas>,
+    pub pending_external_editor: Option<PendingExternalEditor>,
+    /// `[tui] editor` in `.meshfox/config.toml`: when set, `e` edits the
+    /// source in that program instead of the built-in editor.
+    pub external_editor: Option<String>,
     pub block_picker: Option<BlockPickerState>,
     pub var_form: Option<VarFormState>,
     /// The `dir`/`file` path picker (`Ctrl-O` on such a field of `var_form`
@@ -1166,6 +1180,7 @@ impl App {
         // below (its `canvas_path,` shorthand field).
         let syntax_root = crate::canvas_root_dir(&canvas_path).to_path_buf();
         let editor_theme = crate::syntax_registry::resolve_editor_theme(&syntax_root);
+        let external_editor = super::external_editor::configured(&syntax_root);
 
         let info = match worker_port {
             Some(port) => crate::worker_client::info(port).await,
@@ -1239,6 +1254,8 @@ impl App {
             refresh_runs_soon: true,
             worker_refresh_inflight: false,
             pending_child_canvas: None,
+            pending_external_editor: None,
+            external_editor,
             block_picker: None,
             var_form: None,
             path_picker: None,
@@ -1289,13 +1306,9 @@ impl App {
         if let Some(se) = &mut self.source_editor {
             match se.on_key(key) {
                 SourceEditorOutcome::Stay => {}
-                SourceEditorOutcome::Close => {
-                    self.source_editor = None;
-                    if let Some((pending, display)) = self.pending_external_change.take() {
-                        self.apply_external_reload(pending, display);
-                    }
-                }
+                SourceEditorOutcome::Close => self.close_source_editor(),
                 SourceEditorOutcome::Save => self.save_source_editor().await,
+                SourceEditorOutcome::External => self.request_external_edit(false),
                 SourceEditorOutcome::Switch { path, is_canvas } => {
                     self.switch_source_editor_file(path, is_canvas).await
                 }
@@ -3434,8 +3447,75 @@ impl App {
             self.raw.clone(),
             target_raw,
         ) {
-            Ok(state) => self.source_editor = Some(state),
+            Ok(state) => {
+                self.source_editor = Some(state);
+                if self.external_editor.is_some() {
+                    self.request_external_edit(true);
+                }
+            }
             Err(e) => self.status = format!("failed to open source editor: {e}"),
+        }
+    }
+
+    fn close_source_editor(&mut self) {
+        self.source_editor = None;
+        if let Some((pending, display)) = self.pending_external_change.take() {
+            self.apply_external_reload(pending, display);
+        }
+    }
+
+    /// Queues the open source editor's buffer for the external editor; the
+    /// event loop (`mod.rs`) picks it up and hands over the terminal.
+    fn request_external_edit(&mut self, close_on_cancel: bool) {
+        let Some(template) = self.external_editor.clone() else {
+            if let Some(se) = &mut self.source_editor {
+                se.error = Some("no external editor — set `editor` under [tui] in config".into());
+            }
+            return;
+        };
+        let Some(se) = self.source_editor.as_ref().filter(|se| !se.read_only) else {
+            return;
+        };
+        let (line, col) = se.cursor_line_col();
+        self.pending_external_editor = Some(PendingExternalEditor {
+            request: super::external_editor::Request {
+                template,
+                text: se.editor.lines.to_string(),
+                name: se.file_stem(),
+                line,
+                col,
+            },
+            close_on_cancel,
+        });
+    }
+
+    /// The external editor returned. An edit goes straight through the
+    /// ordinary save (validation, merge or comparison with what changed on
+    /// disk meanwhile); a failed save leaves the edited text in the
+    /// built-in editor with the reason shown.
+    pub async fn finish_external_edit(
+        &mut self,
+        outcome: super::external_editor::Outcome,
+        close_on_cancel: bool,
+    ) {
+        use super::external_editor::Outcome;
+        let message = match outcome {
+            Outcome::Edited(text) => {
+                if let Some(se) = &mut self.source_editor {
+                    se.replace_text(&text);
+                    se.error = None;
+                }
+                self.save_source_editor().await;
+                return;
+            }
+            Outcome::Unchanged => "no changes".to_string(),
+            Outcome::Aborted(msg) | Outcome::Failed(msg) => msg,
+        };
+        if close_on_cancel {
+            self.close_source_editor();
+            self.status = message;
+        } else if let Some(se) = &mut self.source_editor {
+            se.error = Some(message);
         }
     }
 
@@ -3911,7 +3991,8 @@ impl App {
                     if self.doc_image_cache.len() >= DOC_IMAGE_CACHE_ENTRIES {
                         self.doc_image_cache.clear();
                     }
-                    self.doc_image_cache.insert(path.clone(), (key, image.clone()));
+                    self.doc_image_cache
+                        .insert(path.clone(), (key, image.clone()));
                     image
                 }
             };

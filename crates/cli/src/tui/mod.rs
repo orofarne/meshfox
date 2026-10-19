@@ -12,6 +12,7 @@
 mod ansi;
 mod app;
 mod document_layout;
+mod external_editor;
 mod image_metrics;
 mod image_render;
 mod markdown;
@@ -507,6 +508,14 @@ async fn main_loop(
             continue;
         }
 
+        if let Some(pending) = app.pending_external_editor.take() {
+            let outcome =
+                run_external_editor_handoff(terminal, input_paused, pending.request).await?;
+            app.finish_external_edit(outcome, pending.close_on_cancel)
+                .await;
+            continue;
+        }
+
         let has_http_run = app.run.as_ref().is_some_and(|r| r.http_rx.is_some());
         let has_file_proc = app.file_run.as_ref().is_some_and(|r| r.events.is_some());
         // Polls `GET /api/services` (`App::refresh_services`) on the same
@@ -631,6 +640,43 @@ async fn run_child_canvas_handoff(
     watcher.abort();
     terminal.clear()?;
     result
+}
+
+/// Hands the real terminal to the user's editor and takes it back. Raw mode
+/// is left too — unlike the tty relays below, the editor sets up its own.
+/// `input_paused` keeps the crossterm reader thread off stdin meanwhile.
+async fn run_external_editor_handoff(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    input_paused: &Arc<AtomicBool>,
+    request: external_editor::Request,
+) -> io::Result<external_editor::Outcome> {
+    input_paused.store(true, Ordering::Release);
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    let outcome = external_editor::run(request).await;
+
+    enable_raw_mode()?;
+    #[cfg(unix)]
+    flush_pending_stdin();
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    )?;
+    // Not `terminal.clear()`: that asks the terminal for the cursor position
+    // and fails when the answer is slow or missing. A `resize` to the
+    // current size also wipes the screen and forces a full redraw.
+    let size = terminal.size()?;
+    terminal.resize(ratatui::layout::Rect::from(size))?;
+
+    input_paused.store(false, Ordering::Release);
+    Ok(outcome)
 }
 
 /// Leaves the alternate screen and relays an already-connected

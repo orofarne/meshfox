@@ -956,7 +956,10 @@ mod meshfox_grammar_tests {
             .collect()
     }
 
-    fn color_of(spans: &[(syntect::highlighting::Color, String)], needle: &str) -> syntect::highlighting::Color {
+    fn color_of(
+        spans: &[(syntect::highlighting::Color, String)],
+        needle: &str,
+    ) -> syntect::highlighting::Color {
         spans
             .iter()
             .find(|(_, text)| text.contains(needle))

@@ -22,6 +22,7 @@
 
 mod baseline;
 mod block_controls;
+mod external_editor;
 mod file_node_run;
 mod fixtures;
 mod harness;

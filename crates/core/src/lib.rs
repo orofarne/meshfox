@@ -40,6 +40,7 @@ pub mod service_lock;
 pub mod shared_env;
 pub mod staticgen;
 pub mod subsup;
+pub mod suggest;
 pub mod svg;
 pub mod syntax_dirs;
 pub mod tag_colors;

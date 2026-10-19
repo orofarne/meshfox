@@ -2807,7 +2807,11 @@ fn editor_syntect_theme(
     // same as any other comment text.
     let theme = crate::syntax_registry::with_meshfox_scope_colors(theme);
     let theme_set = Arc::new(theme_set);
-    *cache = Some((theme_name.to_string(), Arc::clone(&theme_set), theme.clone()));
+    *cache = Some((
+        theme_name.to_string(),
+        Arc::clone(&theme_set),
+        theme.clone(),
+    ));
     (theme_set, theme)
 }
 
