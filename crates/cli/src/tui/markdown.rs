@@ -594,6 +594,7 @@ struct Renderer<'a> {
     /// This fence's own raw `deps=`/`env=` attributes, if any — parsed in
     /// `TagEnd::CodeBlock` into `dep_lines`'s explicit/implicit deps line.
     code_deps: Option<String>,
+    code_lease: Option<String>,
     code_env: Option<String>,
     block_details: std::collections::HashMap<usize, Vec<String>>,
     code_details: Vec<String>,
@@ -726,6 +727,7 @@ impl<'a> Renderer<'a> {
             code_interpreter: None,
             code_tangle: false,
             code_deps: None,
+            code_lease: None,
             code_env: None,
             block_details: Default::default(),
             code_details: Vec::new(),
@@ -1351,7 +1353,7 @@ impl<'a> Renderer<'a> {
                 self.flush_paragraph();
                 self.code_send = None;
                 let mut tangle = false;
-                let (lang, name, interpreter, deps, env) = match kind {
+                let (lang, name, interpreter, deps, lease, env) = match kind {
                     // The info string carries meshfox's own attributes past
                     // the language token (`name="..."`, `cache`, ...) — see
                     // `meshfox_core::fence`, which this mirrors just enough
@@ -1365,11 +1367,12 @@ impl<'a> Renderer<'a> {
                         tangle = attrs.get("tangle").is_some_and(|v| v != "false");
                         let interpreter = attrs.remove("interpreter");
                         let deps = attrs.remove("deps");
+                        let lease = attrs.remove("lease");
                         let env = attrs.remove("env");
                         self.code_send = attrs.remove("send");
-                        (lang, name, interpreter, deps, env)
+                        (lang, name, interpreter, deps, lease, env)
                     }
-                    CodeBlockKind::Indented => ("text".to_string(), None, None, None, None),
+                    CodeBlockKind::Indented => ("text".to_string(), None, None, None, None, None),
                 };
                 // Matched by byte span (not just re-deriving the "explicit
                 // name, else sole-unnamed-fence" rule here) since only
@@ -1393,6 +1396,7 @@ impl<'a> Renderer<'a> {
                 self.code_interpreter = interpreter;
                 self.code_tangle = tangle;
                 self.code_deps = deps;
+                self.code_lease = lease;
                 self.code_env = env;
                 self.code_buf.clear();
             }
@@ -1479,21 +1483,25 @@ impl<'a> Renderer<'a> {
         &self,
         owner: Option<&str>,
         deps_raw: Option<&str>,
+        lease_raw: Option<&str>,
         env_raw: Option<&str>,
         interpreter: Option<&str>,
     ) -> Vec<(Line<'static>, DepClicks)> {
-        let explicit: Vec<(String, String)> = deps_raw
-            .map(meshfox_core::fence::parse_deps_list)
-            .unwrap_or_default()
-            .iter()
-            .map(|r| {
-                let addr = meshfox_core::deps::resolve_ref(self.node_id, r);
-                (
-                    super::app::dep_label(self.node_id, &addr.node_id, &addr.block_name),
-                    addr.node_id,
-                )
-            })
-            .collect();
+        let references = |raw: Option<&str>| -> Vec<(String, String)> {
+            raw.map(meshfox_core::fence::parse_deps_list)
+                .unwrap_or_default()
+                .iter()
+                .map(|r| {
+                    let addr = meshfox_core::deps::resolve_ref(self.node_id, r);
+                    (
+                        super::app::dep_label(self.node_id, &addr.node_id, &addr.block_name),
+                        addr.node_id,
+                    )
+                })
+                .collect()
+        };
+        let explicit = references(deps_raw);
+        let leases = references(lease_raw);
 
         let env_refs = env_raw
             .map(meshfox_core::fence::parse_env_list)
@@ -1554,6 +1562,9 @@ impl<'a> Renderer<'a> {
         for (label, node_id) in explicit {
             rows.push(row("├─ deps: ".into(), label, node_id));
         }
+        for (label, node_id) in leases {
+            rows.push(row("├─ lease: ".into(), label, node_id));
+        }
         for (var_name, label, node_id) in implicit {
             rows.push(row(format!("├─ via var: {var_name} → "), label, node_id));
         }
@@ -1584,6 +1595,7 @@ impl<'a> Renderer<'a> {
                 let interpreter = self.code_interpreter.take();
                 let tangle = std::mem::take(&mut self.code_tangle);
                 let deps_raw = self.code_deps.take();
+                let lease_raw = self.code_lease.take();
                 let env_raw = self.code_env.take();
                 let send_raw = self.code_send.take();
                 let click_name = self
@@ -1830,6 +1842,7 @@ impl<'a> Renderer<'a> {
                     for (mut line, clicks) in self.dep_lines(
                         click_name.as_deref(),
                         deps_raw.as_deref(),
+                        lease_raw.as_deref(),
                         env_raw.as_deref(),
                         interpreter.as_deref(),
                     ) {
@@ -1933,7 +1946,11 @@ impl<'a> Renderer<'a> {
                     for (text, action, show) in [
                         (" [history]", BlockAction::History, !block.service),
                         (" [run]", BlockAction::Run, true),
-                        (" [chain]", BlockAction::Chain, !block.deps.is_empty()),
+                        (
+                            " [chain]",
+                            BlockAction::Chain,
+                            !block.dependencies().is_empty(),
+                        ),
                     ] {
                         if show {
                             let start = Span::raw(header.as_str()).width() as u16;
@@ -1957,6 +1974,7 @@ impl<'a> Renderer<'a> {
                     for (dep_line, clicks) in self.dep_lines(
                         click_name.as_deref(),
                         deps_raw.as_deref(),
+                        lease_raw.as_deref(),
                         env_raw.as_deref(),
                         interpreter.as_deref(),
                     ) {
@@ -3373,7 +3391,7 @@ mod tests {
     fn dependency_rows_keep_distinct_click_positions_for_code_and_buttons() {
         let hl = Highlighter::new();
         for lang in ["bash", "button"] {
-            let md = format!("```{lang} name=\"go\" deps=\"first/build,second/check\"\nRun\n```\n");
+            let md = format!("```{lang} name=\"go\" deps=\"first/build,second/check\" lease=\"vm/database\"\nRun\n```\n");
             let (segments, clicks) = render(
                 &md,
                 Path::new("/nonexistent-base-dir"),
@@ -3388,9 +3406,12 @@ mod tests {
                 .iter()
                 .filter(|c| matches!(c.target, ClickTarget::JumpToNode { .. }))
                 .collect();
-            assert_eq!(jumps.len(), 2);
+            assert_eq!(jumps.len(), 3);
             assert_ne!(jumps[0].line_index, jumps[1].line_index);
-            for (click, label) in jumps.iter().zip(["first/build", "second/check"]) {
+            for (click, label) in jumps
+                .iter()
+                .zip(["first/build", "second/check", "vm/database"])
+            {
                 let Segment::Text(lines) = &segments[click.segment_index] else {
                     panic!("text expected")
                 };
@@ -3399,6 +3420,9 @@ mod tests {
                     .iter()
                     .map(|s| s.content.as_ref())
                     .collect();
+                if label == "vm/database" {
+                    assert!(text.contains("lease:"));
+                }
                 let hit: String = text
                     .chars()
                     .skip(click.col_start as usize)

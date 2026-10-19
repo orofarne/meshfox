@@ -24,7 +24,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// How many recent output lines a service's log keeps — old lines fall off
 /// the front once this fills up. Generous enough for a dev server's own
@@ -99,6 +99,12 @@ struct RespawnRecipe {
     owner: String,
 }
 
+#[derive(Default)]
+struct Leases {
+    temporary: bool,
+    runs: std::collections::HashSet<String>,
+}
+
 /// One running (or just-stopped) service — see the module doc comment.
 #[derive(Clone)]
 pub struct ServiceHandle {
@@ -114,12 +120,103 @@ pub struct ServiceHandle {
     completion: watch::Receiver<(u64, Result<(), String>)>,
     action: Arc<tokio::sync::Mutex<()>>,
     epoch: Arc<std::sync::atomic::AtomicI64>,
+    leases: Arc<Mutex<Leases>>,
+    force_stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ServiceHandle {
     /// Unique for each spawn/restart, including if the OS reuses a PID.
     pub fn generation(&self) -> i64 {
         self.epoch.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A newly lease-started service is temporary; an existing ordinary
+    /// service stays persistent. The action lock serializes last-release/Stop.
+    pub async fn acquire_lease(&self, run: &str, newly_started: bool) -> io::Result<()> {
+        let _action = self.action.lock().await;
+        if !self.is_live() {
+            return Err(io::Error::other("service stopped before lease acquisition"));
+        }
+        let mut leases = self.leases.lock().unwrap();
+        if newly_started {
+            leases.temporary = true;
+        }
+        leases.runs.insert(run.into());
+        Ok(())
+    }
+    pub async fn retain(&self) {
+        let _action = self.action.lock().await;
+        self.leases.lock().unwrap().temporary = false;
+    }
+    pub async fn release_lease(&self, run: &str) -> io::Result<()> {
+        let _action = self.action.lock().await;
+        let stop = {
+            let mut leases = self.leases.lock().unwrap();
+            leases.runs.remove(run) && leases.temporary && leases.runs.is_empty()
+        };
+        if stop {
+            if let ServiceStatus::StopFailed { message } = self.status() {
+                return Err(io::Error::other(message));
+            }
+            self.stop_inner(false).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn wait_ready(&self, recheck: bool) -> io::Result<()> {
+        let config = if self.respawn.block.interpreter.as_deref() == Some("@service") {
+            Some(meshfox_core::service::ServiceConfig::parse(
+                &self.respawn.block.code,
+            )?)
+        } else {
+            None
+        };
+        let timeout = config
+            .as_ref()
+            .map_or(Duration::from_secs(30), |c| c.start_timeout);
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.status() {
+                ServiceStatus::Running => break,
+                ServiceStatus::Starting | ServiceStatus::Restarting => {}
+                status => {
+                    return Err(io::Error::other(format!(
+                        "service did not become ready: {status:?}"
+                    )))
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "service start timed out",
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if recheck {
+            if let Some(config) = config {
+                if let Some(ready) = config.ready {
+                    runtime::ready_probe(
+                        &ready,
+                        config.start_timeout,
+                        &self.respawn.environment,
+                        &self.respawn.cwd,
+                        &self.status,
+                        &self.log,
+                    )
+                    .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn autostop(&self) -> bool {
+        self.respawn
+            .block
+            .attrs
+            .get("autostop")
+            .is_some_and(|v| v != "false")
     }
 
     pub fn status(&self) -> ServiceStatus {
@@ -133,10 +230,25 @@ impl ServiceHandle {
     /// Services keep their address claimed throughout graceful shutdown.
     pub async fn stop(&self) -> io::Result<()> {
         let _action = self.action.lock().await;
-        self.stop_inner().await
+        {
+            let mut leases = self.leases.lock().unwrap();
+            leases.temporary = false;
+            leases.runs.clear();
+        }
+        self.stop_inner(true).await
     }
 
-    async fn stop_inner(&self) -> io::Result<()> {
+    /// Automatic release/shutdown detaches a reused external resource.
+    pub async fn stop_automatic(&self) -> io::Result<()> {
+        let _action = self.action.lock().await;
+        self.stop_inner(false).await
+    }
+
+    async fn stop_inner(&self, force: bool) -> io::Result<()> {
+        if force {
+            self.force_stop
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         let request;
         {
             let mut status = self.status.lock().unwrap();
@@ -260,6 +372,7 @@ fn spawn_with_environment(
     let (control, stop_rx) = watch::channel(0);
     let (completed, completion) = watch::channel((0, Ok(())));
     let epoch = Arc::new(std::sync::atomic::AtomicI64::new(ledger_row_id));
+    let force_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     runtime::spawn(
         proc,
         config,
@@ -272,6 +385,7 @@ fn spawn_with_environment(
         stop_rx,
         completed,
         epoch.clone(),
+        force_stop.clone(),
     );
 
     Ok(ServiceHandle {
@@ -286,6 +400,8 @@ fn spawn_with_environment(
         completion,
         action: Arc::new(tokio::sync::Mutex::new(())),
         epoch,
+        force_stop,
+        leases: Arc::new(Mutex::new(Leases::default())),
         respawn: RespawnRecipe {
             block,
             env,
@@ -301,7 +417,7 @@ fn spawn_with_environment(
 /// The saved recipe deliberately does not re-resolve edited canvas content.
 pub async fn restart(old: &ServiceHandle) -> io::Result<ServiceHandle> {
     let _action = old.action.lock().await;
-    old.stop_inner().await?;
+    old.stop_inner(true).await?;
     let new_id = match old.ledger.start(
         &old.node_id,
         &old.block_name,
@@ -766,6 +882,79 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn oneshot_without_monitor_is_held_until_automatic_stop() {
+        let (handle, _, cwd) = managed("oneshot", "oneshot: true\nstart: touch started\nstop: touch stopped\nready: test -f started\nstop_timeout: 100ms");
+        handle.wait_ready(false).await.unwrap();
+        assert!(handle.is_live());
+        handle.stop_automatic().await.unwrap();
+        assert!(cwd.join("stopped").exists());
+    }
+
+    #[tokio::test]
+    async fn reused_resource_is_not_started_or_stopped_by_lease_release() {
+        let (handle, _, cwd) = managed("borrowed", "oneshot: true\nreuse: 'true'\nstart: touch started\nstop: touch stopped\nready: 'true'\nstop_timeout: 100ms");
+        handle.acquire_lease("run", true).await.unwrap();
+        handle.wait_ready(false).await.unwrap();
+        handle.release_lease("run").await.unwrap();
+        assert!(!handle.is_live());
+        assert!(!cwd.join("started").exists());
+        assert!(!cwd.join("stopped").exists());
+    }
+
+    #[tokio::test]
+    async fn explicit_stop_stops_a_reused_resource() {
+        let (handle, _, cwd) = managed("borrowed-stop", "oneshot: true\nreuse: 'true'\nstart: touch started\nstop: touch stopped\nstop_timeout: 100ms");
+        handle.wait_ready(false).await.unwrap();
+        handle.stop().await.unwrap();
+        assert!(!cwd.join("started").exists());
+        assert!(cwd.join("stopped").exists());
+    }
+
+    #[tokio::test]
+    async fn stopped_external_resource_is_started_and_owned() {
+        let (handle, _, cwd) = managed("owned-reuse", "oneshot: true\nreuse: exit 1\nstart: touch started\nstop: touch stopped\nready: test -f started\nstop_timeout: 100ms");
+        handle.wait_ready(false).await.unwrap();
+        handle.stop_automatic().await.unwrap();
+        assert!(cwd.join("started").exists());
+        assert!(cwd.join("stopped").exists());
+    }
+
+    #[tokio::test]
+    async fn reuse_errors_and_timeout_never_start_or_clean_up_external_resources() {
+        for probe in ["exit 2", "no_such_meshfox_probe_command", "sleep 30"] {
+            let (handle, _, cwd) = managed("reuse-error", &format!("oneshot: true\nreuse: {probe}\nstart: touch started\nstop: touch stopped\nrestart_on_fail: true\nstart_timeout: 100ms\nstop_timeout: 100ms"));
+            assert!(handle.wait_ready(false).await.is_err());
+            handle.stop_automatic().await.unwrap();
+            assert!(!cwd.join("started").exists());
+            assert!(!cwd.join("stopped").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn reused_resource_survives_readiness_failure_and_automatic_shutdown() {
+        let (handle, _, cwd) = managed("reuse-ready", "oneshot: true\nreuse: 'true'\nstart: touch started\nstop: touch stopped\nready: sleep 30\nstart_timeout: 100ms\nstop_timeout: 100ms");
+        assert!(handle.wait_ready(false).await.is_err());
+        handle.stop_automatic().await.unwrap();
+        assert!(!cwd.join("stopped").exists());
+    }
+
+    #[tokio::test]
+    async fn borrowed_health_failure_never_restarts_or_stops_external_resource() {
+        let (handle, _, cwd) = managed("reuse-health", "oneshot: true\nreuse: 'true'\nstart: touch started\nstop: touch stopped\ncheck: exit 1\ncheck_interval: 50ms\nrestart_on_fail: true\nrestart_delay: 50ms\nstop_timeout: 100ms");
+        handle.wait_ready(false).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while handle.is_live() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(handle.status(), ServiceStatus::Crashed { .. }));
+        assert!(!cwd.join("started").exists());
+        assert!(!cwd.join("stopped").exists());
     }
 
     #[tokio::test]

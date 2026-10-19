@@ -337,3 +337,44 @@ fn killing_the_worker_stops_a_currently_running_plain_block_instead_of_orphaning
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn worker_shutdown_detaches_a_borrowed_external_resource() {
+    let dir = unique_dir();
+    let canvas_path = dir.join("doc.canvas.md");
+    std::fs::write(dir.join("external"), "running").unwrap();
+    std::fs::write(&canvas_path, concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "```yaml name=srv interpreter=@service\noneshot: true\nreuse: test -f external\n",
+        "start: touch started\nready: test -f external\nstop: rm external; touch stopped\nstop_timeout: 100ms\n```\n"
+    )).unwrap();
+    let fake_socket = dir.join("fake.sock");
+    let mut child = meshfox()
+        .args([
+            "view",
+            canvas_path.to_str().unwrap(),
+            "--port",
+            "0",
+            "--watcher-socket",
+            fake_socket.to_str().unwrap(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let port = read_bound_port(&mut child);
+    let body = run_ws_events(port, "block=srv");
+    assert!(body.contains("\"type\":\"service-started\""), "{body}");
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(child.try_wait().unwrap().is_some(), "worker did not stop");
+    assert!(dir.join("external").exists());
+    assert!(!dir.join("started").exists());
+    assert!(!dir.join("stopped").exists());
+    std::fs::remove_dir_all(dir).unwrap();
+}

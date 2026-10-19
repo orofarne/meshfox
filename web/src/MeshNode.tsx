@@ -1725,6 +1725,8 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
 }
 
 function BlockDetails({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData; nodeId: string }) {
+  const deps = seg.declaredDeps ?? seg.deps;
+  const leases = seg.leases ?? [];
   const exported = exportsForBlock(data.varDecls, nodeId, seg.name);
   const implicit = implicitDepsForBlock(nodeId, seg.envRefs.map(ref => ref.varName),
     interpreterVarRefsNaive(seg.interpreter), data.varDecls);
@@ -1754,12 +1756,18 @@ function BlockDetails({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeD
 
   const templates = seg.envRefs.filter(ref => ref.varName.includes("${"));
   const applications = Object.keys(data.liveBlocks).filter(name => name.startsWith(`${seg.name}[`)).sort((a, b) => a.localeCompare(b));
-  if ((seg.args?.length ?? 0) + (seg.inputs?.length ?? 0) + (seg.outputs?.length ?? 0) + templates.length + exported.length + seg.deps.length + implicit.length === 0) return null;
+  if ((seg.args?.length ?? 0) + (seg.inputs?.length ?? 0) + (seg.outputs?.length ?? 0) + templates.length + exported.length + deps.length + leases.length + implicit.length === 0) return null;
   return (
     <div className="mesh-block-details nodrag">
-      {seg.deps.length > 0 && <div className="mesh-block-detail-row">
+      {deps.length > 0 && <div className="mesh-block-detail-row">
         <span className="mesh-block-detail-label">deps</span>
-        <div className="mesh-block-detail-values">{seg.deps.map(raw => (
+        <div className="mesh-block-detail-values">{deps.map(raw => (
+          <button key={raw} type="button" className="mesh-dep-link" onClick={() => jumpTo(raw)} title={`jump to ${raw}`}>{raw}</button>
+        ))}</div>
+      </div>}
+      {leases.length > 0 && <div className="mesh-block-detail-row">
+        <span className="mesh-block-detail-label" title="Service held for the duration of this run">lease</span>
+        <div className="mesh-block-detail-values">{leases.map(raw => (
           <button key={raw} type="button" className="mesh-dep-link" onClick={() => jumpTo(raw)} title={`jump to ${raw}`}>{raw}</button>
         ))}</div>
       </div>}

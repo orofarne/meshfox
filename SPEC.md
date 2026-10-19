@@ -1393,8 +1393,8 @@ alive or not.
   red if it crashed; clicking it (or the toolbar's own aggregate pill,
   next to the constraints one) opens a panel listing every service this
   server process knows about — status, log, CPU/memory, uptime, and
-  Stop/Restart. Closing every browser tab does *not* stop a running
-  service or exit the server early — the whole point of tracking it here
+  Stop/Restart. Unless the service has `autostop`, closing every browser tab does *not*
+  stop a running service or exit the server early — the whole point of tracking it here
   is that it survives a page reload.
 - **TUI** (`meshfox tui`) — a node with a `service` block shows a small
   dot next to its title: white when idle, a smoothly pulsing green while
@@ -1444,11 +1444,15 @@ stop_timeout: 30s
 
 | Property | Default | Meaning |
 | --- | --- | --- |
-| `start` | required | Bash command; foreground without `monitor`, one-shot startup with `monitor`. |
+| `start` | required | Bash command; foreground by default, one-shot with `oneshot: true` or `monitor`. |
+| `oneshot` | `false` | Treat start as a bounded command that acquires an external resource; monitoring is optional. |
+| `reuse` | absent | Probe before initial start: 0 borrows an existing resource, 1 starts and owns it, any other code is an error. |
 | `stop` | absent | Explicit cleanup command for external resources; zero exit means success. |
-| `monitor` | absent | Long-running log command, started after successful one-shot startup. |
+| `monitor` | absent | Optional long-running log command after acquisition, including when reusing a resource. Implies one-shot start for compatibility. |
 | `check` | absent | Liveness command: zero exit is healthy, any other exit is failure. |
 | `check_interval` | `5s` | Interval between checks and timeout for each check; checks never overlap. |
+| `ready` | none | Repeated startup readiness command; exit 0 admits consumers. Separate from health `check`. |
+| `start_timeout` | `30s` | Total deadline for reuse, start and readiness, including a hanging probe. |
 | `restart_on_fail` | `false` | Retry nonzero foreground/start exits or failed/timed-out checks. |
 | `restart_delay` | `2s` | Initial retry delay; doubles on consecutive failures, capped at the greater of 60s and this value. Resets after a minute of healthy operation. |
 | `stop_timeout` | `30s` | Deadline for the stop command, or grace period for foreground termination without a stop command. |
@@ -1464,8 +1468,8 @@ as its stable, separately killable identity. For `@service`, PID and resource
 counters describe this identity rather than a container or foreground child.
 States are `starting`, `running`, `restarting`, `stopping`, `stop_failed`,
 `crashed`, and `stopped`. Starting completes when the foreground process is
-spawned or one-shot start succeeds; checks are liveness checks, not a readiness
-barrier for dependent blocks. Automatic retries change the live generation,
+spawned or one-shot start succeeds, followed by successful `ready` if configured.
+Health checks are separate from this readiness barrier. Automatic retries change the live generation,
 invalidating dependency freshness just like an explicit restart.
 
 A monitor exiting only means its log connection ended. Meshfox reconnects it
@@ -1485,6 +1489,54 @@ ledger ownership, and blocks Restart until a subsequent Stop succeeds. Killing
 local processes cannot prove external resources stopped. Abrupt worker death
 (SIGKILL/OOM) cannot run external cleanup; no detached watchdog is installed.
 Explicit force-takeover remains a hard recovery operation, not graceful shutdown.
+
+#### Reusing external resources
+
+`reuse` probes for an external resource before the first start of a service
+instance. Exit 0 borrows the resource and skips `start`; exit 1 executes `start`
+and makes this instance responsible for cleanup. Other exit codes, signals,
+timeouts and command-launch errors fail acquisition without running `start` or
+the automatic `stop` hook. Missing executables and unexpected statuses must not
+be translated to exit 1 by the probe. Without `reuse`, startup retains the
+existing ownership semantics. The service log records borrowing.
+
+`start_timeout` covers the combined reuse probe, start and readiness wait.
+Ownership is claimed immediately before start, so a partial start or readiness
+failure still cleans up resources it may have created. On a borrowed resource,
+readiness is still required, but its failure only detaches local supervision.
+A failed health check on a borrowed resource is reported without stopping or
+automatically restarting it, even when `restart_on_fail` is true. Automatic
+retries of an owned instance preserve ownership and do not rerun `reuse`.
+
+| Event | Started by this instance | Borrowed by this instance |
+| --- | --- | --- |
+| Last temporary lease released | Run stop hook, terminate local processes | Terminate local monitoring/identity only |
+| Readiness failure or worker automatic shutdown | Clean up the acquired resource | Leave external resource running |
+| Autostop on idle worker | Stop acquired resource | Detach supervision |
+| Explicit Stop/Restart of an active instance | Stop external resource | Stop external resource |
+
+These rules also apply to worker signal handling and cancellation. Explicit
+Stop deliberately ignores borrowing and lease counts; automatic cleanup does
+not. After detachment the meshfox instance is stopped: it is no longer tracking
+the external resource. A later run probes again. As with other stopped instances,
+Stop on an already detached instance is idempotent and does not reacquire it.
+
+`oneshot: true` allows a successful start command to exit without a `monitor`.
+The supervisor's identity stays alive until release/Stop or a failed `check`;
+without `check`, external health is unknown. Existing foreground services remain
+foreground when neither `oneshot` nor `monitor` is specified.
+
+Reuse probes are not an atomic reservation against external actors. Another
+process can start the resource between probe and start; tools requiring strict
+ownership must provide their own atomic acquisition/locking. Abrupt worker death
+still cannot guarantee cleanup of acquired external resources.
+
+The [Linux tests in README.md](README.md#linux-tests) demonstrate this with Lima:
+creation is persistent, the VM is leased through provisioning and tests, and a
+VM already running beforehand is preserved. Unexpected Lima statuses abort
+instead of claiming the VM. See the [Lima list reference](https://lima-vm.io/docs/reference/limactl_list/)
+for the status probe and the [start reference](https://lima-vm.io/docs/reference/limactl_start/)
+for non-interactive startup.
 
 See [examples/services.canvas.md](examples/services.canvas.md) for foreground
 and Docker Compose examples and a self-contained Compose fixture.
@@ -2550,9 +2602,9 @@ leading token instead of a `key=value` pair (`crates/core/src/fence.rs`):
     lang            ::= bare-value
 
     runnable-attr   ::= 'name' | 'cache' | 'default' | 'deps' | 'env' | 'tty'
-                     | 'autoclose' | 'service' | 'always' | 'interpreter'
+                     | 'autoclose' | 'service' | 'autostop' | 'always' | 'interpreter'
                      | 'autorun' | 'render' | 'output' | 'send' | 'fold'
-                     | 'inputs' | 'outputs'
+                     | 'inputs' | 'outputs' | 'lease' | 'defer'
     constraint-attr ::= 'constraint' | 'name'
 
 A runnable fence additionally requires `lang` to be `bash` or `sh`, *or* its
@@ -2749,9 +2801,57 @@ when no env override is present. Invalid protocol values are reported at TUI
 startup. Nested canvases inherit the existing terminal Picker.
 
 
+## Run-scoped services and cleanup
+
+`autostop` is a flag on a service fence (ordinary `service` or `@service`). It
+is off by default. An autostop service does not keep an otherwise idle worker
+alive. After the normal idle grace the worker awaits graceful service cleanup,
+then rechecks clients, runs and API activity before exiting. Failed cleanup
+remains visible and retryable and keeps the worker alive.
+
+An `@service` with `ready` completes its chain step only after readiness succeeds.
+Nonzero readiness exits are retried at a short interval until `start_timeout`.
+Failure/timeout prevents consumers from running and cleans up a newly started
+service. Each new use of an already running service rechecks readiness; failure
+of that probe does not stop an independently started service. Health `check`
+continues to supervise the running service independently.
+
+`lease="database"` on a runnable fence implies a service dependency. It holds
+that service for the entire root run, including cleanup. A lease declared by a
+checker dependency therefore lasts through its consumer's tests. Leases are
+collected even from dependencies whose bodies are skipped as fresh. Repeated
+references within the run share one lease. Nested native meshfox calls inherit
+the root lease scope, including across canvases.
+
+If a lease starts a stopped service, the last lease release stops it gracefully.
+A service already running after an ordinary start is left running. An ordinary
+use of a lease-started service retains it beyond the leases. Explicit Stop wins
+over leases; a lease does not restart a service after Stop. Old cleanup never
+stops a replacement service instance.
+
+`defer="cleanup"` on a runnable fence registers a cleanup block just before
+executing the fence body. Unreached or freshness-skipped blocks register nothing.
+Declare cleanup on the block that creates a resource, so even its partial
+failure triggers cleanup. Cleanup must tolerate partially created resources.
+
+Registered cleanups execute after the run in reverse registration order, on
+success, failure and cancellation. All receive an execution attempt, even if a
+previous cleanup fails. They run without freshness skips and have an independent
+30-second deadline. They inherit the registering block's explicit environment;
+the cleanup block's own environment uses the run's latest produced values and
+bound arguments. Cleanup addresses, inputs and confirmation requirements are
+checked before execution starts. A cleanup block cannot be interactive, a
+service, a form, or declare another defer. Its body runs directly; ordinary
+action dependencies are not executed as part of cleanup.
+
+Leases are released after cleanup. The primary failure is preserved; cleanup
+errors are reported additionally. A cleanup failure makes an otherwise successful
+run fail. Cancellation is reported after cleanup completes. Worker SIGKILL cannot
+guarantee cleanup of external resources.
+
 ## Calling another canvas
 
-A native `meshfox` runnable fence invokes one application in another canvas.
+A native `meshfox` runnable fence invokes one application in the current or another canvas.
 It uses the ordinary runnable-fence naming/default rules, `deps`, `inputs`,
 `outputs`, `cache`, and run controls in CLI, TUI and the web UI.
 
@@ -2765,14 +2865,21 @@ fresh: true
 ```
 ````
 
-The body is YAML with a strict schema. `canvas` and `run` are required nonempty
-strings. `canvas` resolves relative to the document containing the block,
+The body is YAML with a strict schema. Specify exactly one nonempty `run` or
+`stop` address. Omit `canvas` to use the current canvas; when present it must be
+a nonempty string and resolves relative to the document containing the block,
 including inside an `include`. The target must be a canvas. `run` is one CLI
 application address (optional node path followed by an application), with shell-style
 quoting for address tokens, but no shell execution. Bind application arguments
 in this address, e.g. `run: 'build install[DEST=local]'`. Required arguments must
 be bound explicitly; missing child document variables are offered in the
 parent's normal pre-run form.
+
+`stop: database` gracefully stops the addressed service regardless of leases,
+waits for cleanup, and succeeds if it is already stopped. It does not execute
+service dependencies. The target must be a service. Run options (`set`, `fresh`,
+`no-deps`, `skip-fresh`) cannot be combined with `stop`. Target confirmation is
+checked before the caller begins execution.
 
 Optional fields: `set` maps child document-variable names to literal strings;
 `fresh`, `no-deps`, and `skip-fresh` are booleans with the same meaning as the

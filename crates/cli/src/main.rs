@@ -2910,6 +2910,17 @@ async fn run_via_worker(
     // `list_services`) instead of a local `ServiceHandle`, since the
     // service itself is a worker-owned, `crates/server/src/services.rs`-
     // registered process now, not one this CLI process spawned directly.
+    // A run-scoped lease may already have stopped/detached its service before
+    // Done. Do not enter the persistent-service follower for those instances.
+    if !started_services.is_empty() {
+        if let Ok(services) = worker_client::list_services(port).await {
+            started_services.retain(|(node, block)| {
+                !services
+                    .iter()
+                    .any(|s| &s.node_id == node && &s.block == block && s.status == "stopped")
+            });
+        }
+    }
     if !started_services.is_empty() {
         println!(
             "meshfox: {} service(s) running — streaming their output below; Ctrl-C stops them and exits",

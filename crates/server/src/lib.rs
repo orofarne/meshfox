@@ -44,6 +44,7 @@ mod canvas_events;
 /// than duplicating it — the TUI doesn't talk to `meshfox serve` over
 /// HTTP, it links this crate as a plain library.
 pub mod debug_session;
+mod lifecycle;
 pub mod link_preview;
 mod pty_exec;
 #[cfg(all(test, unix))]
@@ -228,6 +229,7 @@ struct AppState {
     /// module doc comment for why this is a real persistent registry, not
     /// a per-request kill-switch like `runs` above.
     services: Mutex<HashMap<(String, String), services::ServiceHandle>>,
+    lease_scopes: Mutex<HashMap<String, Arc<lifecycle::LeaseScope>>>,
     /// A plain (non-`service`, non-`tty`) block's most recently
     /// started run, keyed by address — lets its live/final output survive
     /// a reconnect or a second tab watching the same block, the same way
@@ -1732,6 +1734,49 @@ fn has_running_services(state: &AppState) -> bool {
     state.services.lock().unwrap().values().any(|s| s.is_live())
 }
 
+/// Non-autostop services retain ownership of the worker even when idle.
+fn has_persistent_services(state: &AppState) -> bool {
+    state.services.lock().unwrap().values().any(|s| {
+        s.is_live()
+            && (!s.autostop() || matches!(s.status(), services::ServiceStatus::StopFailed { .. }))
+    })
+}
+
+/// Await graceful cleanup, then re-check activity before exiting. A new request
+/// during cleanup keeps the worker alive; it can retry a stopping service.
+async fn stop_idle_services(state: &AppState) -> bool {
+    let last = state.last_api_activity_millis.load(Ordering::Relaxed);
+    let handles: Vec<_> = state
+        .services
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|s| s.is_live() && s.autostop())
+        .cloned()
+        .collect();
+    for handle in handles {
+        if state.open_tabs.load(Ordering::SeqCst) != 0
+            || has_active_runs(state)
+            || has_retained_leases(state)
+            || has_persistent_services(state)
+            || state.last_api_activity_millis.load(Ordering::Relaxed) != last
+        {
+            return false;
+        }
+        if let Err(e) = handle.stop_automatic().await {
+            eprintln!("meshfox: automatic service stop failed: {e}");
+            return false;
+        }
+    }
+    state.open_tabs.load(Ordering::SeqCst) == 0
+        && !has_running_services(state)
+        && !has_active_runs(state)
+        && !has_retained_leases(state)
+        && !has_running_tty_sessions(state)
+        && !has_live_debug_sessions(state)
+        && state.last_api_activity_millis.load(Ordering::Relaxed) == last
+}
+
 /// True if any run (plain, `tty`, or a `file`-node's own run — every one of
 /// `run_file_node_impl`/`run_block_impl`/`run_block_tty`) is currently
 /// mid-stream — consulted by both `TabGuard`'s auto-exit re-check and
@@ -1759,6 +1804,17 @@ fn has_running_services(state: &AppState) -> bool {
 /// right below, is the direct check on the sessions themselves.
 fn has_active_runs(state: &AppState) -> bool {
     !state.runs.lock().unwrap().is_empty()
+}
+
+/// A child worker can retain a root run's leases after its own call has
+/// returned. This keeps the worker alive without claiming a foreground slot.
+fn has_retained_leases(state: &AppState) -> bool {
+    state
+        .lease_scopes
+        .lock()
+        .unwrap()
+        .values()
+        .any(|scope| scope.has_leases())
 }
 
 /// True if any `tty` session this process has ever spawned is still
@@ -1882,13 +1938,19 @@ impl Drop for TabGuard {
             tokio::spawn(async move {
                 tokio::time::sleep(AUTO_EXIT_GRACE).await;
                 if state.open_tabs.load(Ordering::SeqCst) == 0
-                    && !has_running_services(&state)
+                    && now_millis()
+                        .saturating_sub(state.last_api_activity_millis.load(Ordering::Relaxed))
+                        >= AUTO_EXIT_GRACE.as_millis() as u64
+                    && !has_persistent_services(&state)
                     && !has_active_runs(&state)
+                    && !has_retained_leases(&state)
                     && !has_running_tty_sessions(&state)
                     && !has_live_debug_sessions(&state)
                 {
-                    println!("meshfox: last open tab closed, exiting");
-                    std::process::exit(0);
+                    if stop_idle_services(&state).await {
+                        println!("meshfox: last open tab closed, exiting");
+                        std::process::exit(0);
+                    }
                 }
             });
         }
@@ -2044,8 +2106,9 @@ fn spawn_api_idle_checker_with_config(
         loop {
             tokio::time::sleep(poll_interval).await;
             if state.open_tabs.load(Ordering::SeqCst) != 0
-                || has_running_services(&state)
+                || has_persistent_services(&state)
                 || has_active_runs(&state)
+                || has_retained_leases(&state)
                 || has_running_tty_sessions(&state)
                 || has_live_debug_sessions(&state)
             {
@@ -2054,7 +2117,7 @@ fn spawn_api_idle_checker_with_config(
             let last = state.last_api_activity_millis.load(Ordering::Relaxed);
             if last != 0 {
                 let idle_for = Duration::from_millis(now_millis().saturating_sub(last));
-                if idle_for >= idle_grace {
+                if idle_for >= idle_grace && stop_idle_services(&state).await {
                     println!(
                         "meshfox: no API activity for {}s and no open tabs, exiting",
                         idle_grace.as_secs()
@@ -2066,7 +2129,7 @@ fn spawn_api_idle_checker_with_config(
             if state.ever_connected.load(Ordering::SeqCst) {
                 continue; // a tab's own TabGuard path already owns this worker
             }
-            if started_at.elapsed() >= untouched_timeout {
+            if started_at.elapsed() >= untouched_timeout && stop_idle_services(&state).await {
                 println!(
                     "meshfox: never used (no tab, no API request) after {}s, exiting",
                     untouched_timeout.as_secs()
@@ -7325,8 +7388,19 @@ async fn run_block_impl_sized(
         &overrides,
     )?;
     let chain = plan.chain;
-    let native_calls =
-        canvas_call::plan(&state, &canvas, &chain, &req.vars, &canvas_call::ancestry()).await?;
+    let cleanups = meshfox_core::deps::cleanup_blocks(&canvas, &chain)
+        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    require_run_confirmation(&canvas, &cleanups, req.confirm)?;
+    let mut call_chain = chain.clone();
+    call_chain.extend(cleanups.clone());
+    let native_calls = canvas_call::plan(
+        &state,
+        &canvas,
+        &call_chain,
+        &req.vars,
+        &canvas_call::ancestry(),
+    )
+    .await?;
     canvas_call::admit(&native_calls, req.confirm)?;
     require_run_confirmation(&canvas, &chain, req.confirm)?;
     let persist = req.persist;
@@ -7423,6 +7497,8 @@ async fn run_block_impl_sized(
     // whole possible chain atomically rather than executing an unlocked step.
     let lock_candidates = artifact_lock_candidates(&canvas, &chain, &forced_reruns)
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    let mut lock_candidates = lock_candidates;
+    lock_candidates.extend(cleanups.iter().cloned());
     let lock_targets = steps_needing_a_lock(&state, &raw_snapshot, &lock_candidates);
     let mut held_locks = match acquire_chain_locks(&state.run_ledger, &lock_targets, "webui") {
         Ok(locks) => locks,
@@ -7460,6 +7536,15 @@ async fn run_block_impl_sized(
     // breaking the loop, say), so an already-waiting subscriber isn't left
     // hanging on a `Running` outcome forever.
     let run_id = uuid::Uuid::new_v4().to_string();
+    let inherited_scope = canvas_call::lease_scope();
+    let scope_id = inherited_scope.clone().unwrap_or_else(|| run_id.clone());
+    let lease_scope = state
+        .lease_scopes
+        .lock()
+        .unwrap()
+        .entry(scope_id.clone())
+        .or_insert_with(|| Arc::new(lifecycle::LeaseScope::new(scope_id)))
+        .clone();
     // Never for a `tty` target: its session lives in `tty_registry` (found
     // via `ServerEvent::TtyStarted`/`GET /api/run/tty/attach`), and a
     // placeholder here would shadow it in `kill_run`'s by-address lookup
@@ -7521,6 +7606,7 @@ async fn run_block_impl_sized(
 
         let mut final_exit_code = 0;
         let mut killed = false;
+        let mut killed_addr = None;
         // Each chain step's own file — `None` for the primary document
         // (`state.canvas_path`/`state.raw`), `Some(path)` for a node
         // spliced in from an `include` elsewhere on disk — keyed the same
@@ -7541,6 +7627,7 @@ async fn run_block_impl_sized(
         let target = chain.last().unwrap().clone();
         let mut executed = std::collections::HashSet::new();
         let mut visited = std::collections::HashSet::new();
+        let mut deferred = Vec::new();
         loop {
             let mut canvas = canvas.clone();
             canvas.artifact_values.extend(resolved_vars.clone());
@@ -7558,6 +7645,10 @@ async fn run_block_impl_sized(
                 yield Ok(ndjson_line(&RunEvent::Error { message: error.1 }));
                 break;
             }
+            let lease_targets = match meshfox_core::deps::lease_targets(&canvas, &chain) {
+                Ok(targets) => targets,
+                Err(e) => { final_exit_code = 1; yield Ok(ndjson_line(&RunEvent::Error { message: e.to_string() })); break; }
+            };
             let Some(addr_owned) = chain.iter().find(|addr| !visited.contains(*addr)).cloned() else { break; };
             let addr = &addr_owned;
             visited.insert(addr.clone());
@@ -7713,6 +7804,15 @@ async fn run_block_impl_sized(
                 );
                 Some(path)
             };
+            let executes_body = !block.service || !state.services.lock().unwrap()
+                .get(&(addr.node_id.clone(), addr.block_name.clone())).is_some_and(|s| s.is_live());
+            if executes_body {
+                match meshfox_core::deps::cleanup_blocks(&canvas, std::slice::from_ref(addr)) {
+                    Ok(cleanups) => for cleanup in cleanups { deferred.push((cleanup, block_env.clone())); },
+                    Err(e) => { final_exit_code = 1; yield Ok(ndjson_line(&RunEvent::Error { message: e.to_string() })); break; }
+                }
+            }
+
             // `spawn_block` reads `interpreter` off the `CodeBlock` it's
             // given rather than as a separate parameter — a
             // block-with-substituted-interpreter clone is how a `$NAME`
@@ -7746,8 +7846,18 @@ async fn run_block_impl_sized(
                     .unwrap()
                     .get(&key)
                     .filter(|s| s.is_live())
-                    .map(|s| s.pid);
-                if let Some(pid) = already_running {
+                    .cloned();
+                if let Some(handle) = already_running {
+                    let pid = handle.pid;
+                    if lease_targets.contains(addr) {
+                        if let Err(e) = handle.acquire_lease(&lease_scope.id, false).await { final_exit_code = 1; yield Ok(ndjson_line(&RunEvent::Error { message: e.to_string() })); break; }
+                        lease_scope.insert(addr.clone(), handle.clone());
+                    } else { handle.retain().await; }
+                    let ready = tokio::select! {
+                        result = handle.wait_ready(true) => result,
+                        _ = &mut kill_rx => { killed = true; killed_addr = Some(addr.clone()); Err(io::Error::other("run cancelled while waiting for service")) }
+                    };
+                    if let Err(e) = ready { final_exit_code = 1; yield Ok(ndjson_line(&RunEvent::Error { message: e.to_string() })); break; }
                     executed.remove(addr);
                     // This process already owns a live instance of this
                     // exact service (e.g. a "run chain" that pulls it in
@@ -7794,7 +7904,21 @@ async fn run_block_impl_sized(
                         Ok(handle) => {
                             let pid = handle.pid;
                             held_locks.remove(&key);
-                            state.services.lock().unwrap().insert(key, handle);
+                            if lease_targets.contains(addr) {
+                                if let Err(e) = handle.acquire_lease(&lease_scope.id, true).await { final_exit_code = 1; yield Ok(ndjson_line(&RunEvent::Error { message: e.to_string() })); break; }
+                                lease_scope.insert(addr.clone(), handle.clone());
+                            }
+                            state.services.lock().unwrap().insert(key, handle.clone());
+                            let ready = tokio::select! {
+                                result = handle.wait_ready(false) => result,
+                                _ = &mut kill_rx => { killed = true; killed_addr = Some(addr.clone()); Err(io::Error::other("run cancelled while starting service")) }
+                            };
+                            if let Err(e) = ready {
+                                final_exit_code = 1;
+                                if let Err(cleanup) = handle.stop_automatic().await { yield Ok(ndjson_line(&RunEvent::Error { message: format!("service cleanup: {cleanup}") })); }
+                                yield Ok(ndjson_line(&RunEvent::Error { message: e.to_string() }));
+                                break;
+                            }
                             yield Ok(ndjson_line(&RunEvent::ServiceStarted {
                                 node_id: addr.node_id.clone(),
                                 block: addr.block_name.clone(),
@@ -7896,11 +8020,7 @@ async fn run_block_impl_sized(
                                 tty_registry::RunOutcome::Running => {}
                                 tty_registry::RunOutcome::Exited { exit_code } => break exit_code,
                                 tty_registry::RunOutcome::Killed => {
-                                    yield Ok(ndjson_line(&RunEvent::Killed {
-                                        node_id: addr.node_id.clone(),
-                                        block: addr.block_name.clone(),
-                                    }));
-                                    killed = true;
+                                    killed = true; killed_addr = Some(addr.clone());
                                     break -1;
                                 }
                             }
@@ -7928,7 +8048,7 @@ async fn run_block_impl_sized(
                 let row = held_locks.remove(&(addr.node_id.clone(), addr.block_name.clone()))
                     .map(|id| (state.run_ledger.clone(), id));
                 if let Some((_, id)) = &row { stamp_run_fingerprint(&state, addr, *id); }
-                canvas_call::attach(&handle, call.clone(), req.confirm, req.persist, &req.save_secrets, row);
+                canvas_call::attach(&handle, call.clone(), req.confirm, req.persist, &req.save_secrets, row, Some(lease_scope.clone()));
                 if is_requested_target { _reservation_guard.0 = None; }
                 handle
             } else {
@@ -8052,11 +8172,7 @@ async fn run_block_impl_sized(
                                 break exit_code;
                             }
                             Ok(run_registry::RunEvent::Done(run_registry::RunOutcome::Killed)) => {
-                                yield Ok(ndjson_line(&RunEvent::Killed {
-                                    node_id: addr.node_id.clone(),
-                                    block: addr.block_name.clone(),
-                                }));
-                                killed = true;
+                                killed = true; killed_addr = Some(addr.clone());
                                 break -1;
                             }
                             // `Done` never actually carries `Running` (see
@@ -8208,6 +8324,35 @@ async fn run_block_impl_sized(
             }
         }
 
+        for (addr, environment) in deferred.into_iter().rev() {
+            yield Ok(ndjson_line(&RunEvent::StepStart { node_id: addr.node_id.clone(), block: addr.block_name.clone() }));
+            let began = std::time::Instant::now();
+            let reservation = held_locks.remove(&(addr.node_id.clone(), addr.block_name.clone()));
+            let result = lifecycle::cleanup(&state, &canvas, &addr, &resolved_vars, environment,
+                native_calls.get(&addr).cloned(), req.confirm, req.persist, &req.save_secrets, Some(lease_scope.clone()), reservation).await;
+            match result {
+                Ok((code, lines)) => {
+                    for line in lines { yield Ok(ndjson_line(&RunEvent::Output { node_id: addr.node_id.clone(), block: addr.block_name.clone(), stream: line.stream, text: line.text, child: line.child })); }
+                    yield Ok(ndjson_line(&RunEvent::StepEnd { node_id: addr.node_id.clone(), block: addr.block_name.clone(), exit_code: code, duration_ms: began.elapsed().as_millis() as u64 }));
+                    if code != 0 {
+                        if final_exit_code == 0 { final_exit_code = code; }
+                        yield Ok(ndjson_line(&RunEvent::Error { message: format!("cleanup {} failed ({code})", addr.block_name) }));
+                    }
+                },
+                Err(message) => {
+                    if final_exit_code == 0 { final_exit_code = 1; }
+                    yield Ok(ndjson_line(&RunEvent::Error { message: format!("cleanup {}: {message}", addr.block_name) }));
+                }
+            }
+        }
+
+        if inherited_scope.is_none() {
+            for message in lifecycle::release_scope(&state, &lease_scope.id).await {
+                if final_exit_code == 0 { final_exit_code = 1; }
+                yield Ok(ndjson_line(&RunEvent::Error { message }));
+            }
+        }
+
         // Persist whatever completed, even if the chain was killed partway
         // through — a step that had already finished and been folded into
         // `file_raws` (above) shouldn't lose its freshly-cached output just
@@ -8224,7 +8369,10 @@ async fn run_block_impl_sized(
 
         // `killed` was already emitted as this run's terminal event above —
         // no `Done` follows it.
-        if !killed {
+        if killed {
+            let addr = killed_addr.as_ref().unwrap_or(&target);
+            yield Ok(ndjson_line(&RunEvent::Killed { node_id: addr.node_id.clone(), block: addr.block_name.clone() }));
+        } else {
             yield Ok(ndjson_line(&RunEvent::Done { exit_code: final_exit_code }));
         }
     };
@@ -10772,6 +10920,7 @@ async fn build_state_with(
         session_store,
         session_vars: Mutex::new(session_vars),
         services: Mutex::new(HashMap::new()),
+        lease_scopes: Mutex::new(HashMap::new()),
         runs_registry: Mutex::new(HashMap::new()),
         tty_registry: Mutex::new(HashMap::new()),
         debug_sessions: Mutex::new(HashMap::new()),
@@ -10827,6 +10976,8 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/run", get(run_block))
         .route("/api/canvas-call/prepare", post(canvas_call::prepare))
         .route("/api/canvas-call/run", post(canvas_call::run))
+        .route("/api/canvas-call/stop", post(canvas_call::stop))
+        .route("/api/canvas-call/release", post(lifecycle::release))
         .route("/api/run/force", get(force_run))
         .route("/api/form/fields", get(get_form_fields))
         .route("/api/form/submit", post(submit_form))
@@ -11098,9 +11249,10 @@ fn spawn_shutdown_signal_handler(state: Arc<AppState>) {
         for handle in tty_handles {
             handle.kill();
         }
-        let results =
-            futures_util::future::join_all(service_handles.iter().map(|handle| handle.stop()))
-                .await;
+        let results = futures_util::future::join_all(
+            service_handles.iter().map(|handle| handle.stop_automatic()),
+        )
+        .await;
         for (handle, result) in service_handles.iter().zip(results) {
             if let Err(error) = result {
                 eprintln!(

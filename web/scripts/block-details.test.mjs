@@ -108,3 +108,18 @@ test('native meshfox calls have ordinary runnable controls and implicit defaults
   assert.equal(blocks[0].name, 'build');
   assert.match(blocks[0].code, /canvas: ../);
 });
+
+test('lease stays distinct from deps while participating in dependency planning', () => {
+  for (const lang of ['sh', 'button']) {
+    for (const deps of ['', 'deps="prepare"']) {
+      const block = parseBody([
+        '```' + lang + ' name="tests" ' + deps + ' lease="lima, db/service" fold',
+        'echo tests',
+        '```',
+      ].join('\n'), 'root').find(s => s.type === 'code');
+      assert.deepEqual(block.declaredDeps, deps ? ['prepare'] : []);
+      assert.deepEqual(block.leases, ['lima', 'db/service']);
+      assert.deepEqual(block.deps, [...(deps ? ['prepare'] : []), 'lima', 'db/service']);
+    }
+  }
+});

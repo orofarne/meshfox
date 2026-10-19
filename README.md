@@ -753,7 +753,9 @@ see "Importing a file that sits beside the canvas" below.
 
 [examples/services.canvas.md](./examples/services.canvas.md) covers long-lived
 services: graceful Stop/Restart, the YAML `interpreter="@service"` lifecycle
-(`start`, `stop`, `monitor`, health checks and automatic restart), and a runnable
+(`start`, `stop`, optional `monitor`, readiness and health checks), run-scoped
+`lease` and `defer` cleanup, and `oneshot`/`reuse` for borrowing external resources
+without stopping resources started outside meshfox. It also includes a runnable
 Docker Compose stack. Ordinary `service` blocks now receive SIGTERM with a
 30-second grace period before SIGKILL.
 
@@ -1210,13 +1212,40 @@ cargo test --test tui_e2e -- --ignored --color=always
 ### Linux tests
 <!-- meshfox:node id="linux-tests" -->
 
-Linux-only code (the Secret Service backend behind `secret_store = "keychain"`, systemd socket activation of `meshfox serve`) is never compiled on a macOS host, so it is built and tested in a [lima](https://lima-vm.io) VM named `mfx` (Debian 13, 4 CPUs, 8 GiB — a 4 GiB VM gets the linker OOM-killed). `lima-prep` creates and starts it if needed and installs the toolchain, `gnome-keyring` (the real Secret Service the tests talk to) and `secret-tool`; it is idempotent. `secrets` and `systemd` depend on it with `lima-prep!`, so it runs whenever either of them does — a session-freshness skip of `lima-prep` alone would otherwise leave a VM that has since been stopped (reboot, `limactl stop`) stopped. The repo is mounted into the VM read-only at the same path, so every block builds into `$HOME/target` inside the VM (with debug info off, for the linker's sake) and `Cargo.lock` has to be up to date on the host first.
+Linux-only code (the Secret Service backend behind `secret_store = "keychain"`, systemd socket activation of `meshfox serve`) is never compiled on a macOS host, so it is built and tested in a [Lima](https://lima-vm.io) VM named `mfx` (Debian 13, 4 CPUs, 8 GiB — a 4 GiB VM gets the linker OOM-killed).
 
-```sh name="lima-prep"
-if ! limactl list --format '{{.Name}}' | grep -qx mfx; then
+`lima-create` ensures the VM exists. The `lima` service uses a one-shot start, waits for guest shell readiness, and checks whether the VM was already running before claiming ownership. `lima-prep` leases it and installs the toolchain, `gnome-keyring` (the real Secret Service the tests talk to) and `secret-tool`. `secrets` and `systemd` keep their `lima-prep!` dependency so provisioning is checked each run.
+
+The lease lasts through the complete root run and its cleanup: the combined `run` keeps the VM up between both test suites. If meshfox started the VM, the last lease stops it on success, failure or cancellation. A VM already running before acquisition is borrowed and left running. Explicit Stop on an active service stops even a borrowed VM. Creation is persistent: stopping the VM does not delete it or its build cache. `reuse` is a probe, not an atomic reservation against another external starter; unexpected statuses and command failures abort instead of claiming ownership.
+
+The repo is mounted into the VM read-only at the same path, so every test builds into `$HOME/target` inside the VM (with debug info off, for the linker's sake) and `Cargo.lock` has to be up to date on the host first.
+
+```sh name="lima-create" always
+instances=$(limactl list --format '{{.Name}}')
+if ! printf '%s\n' "$instances" | grep -qx mfx; then
   limactl create --name=mfx --cpus=4 --memory=8 --disk=20 --tty=false template:debian-13
 fi
-limactl list --format '{{.Name}} {{.Status}}' | grep -qx 'mfx Running' || limactl start mfx --tty=false
+```
+
+```yaml name="lima" interpreter="@service" deps="lima-create" autostop
+oneshot: true
+reuse: |
+  status=$(limactl list mfx --format '{{.Status}}') || exit 2
+  case "$status" in
+    Running|Starting) exit 0 ;;
+    Stopped) exit 1 ;;
+    *) printf 'Unexpected Lima status: %s\n' "$status" >&2; exit 2 ;;
+  esac
+start: limactl start mfx --tty=false
+ready: limactl shell mfx -- true
+check: limactl shell mfx -- true
+check_interval: 30s
+stop: limactl stop mfx --tty=false
+start_timeout: 10m
+stop_timeout: 2m
+```
+
+```sh name="lima-prep" lease="lima"
 limactl shell mfx -- bash -lc '
   set -e
   command -v gnome-keyring-daemon >/dev/null && command -v secret-tool >/dev/null && command -v cc >/dev/null || {

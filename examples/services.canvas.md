@@ -63,3 +63,58 @@ Stop preserves containers and volumes. To remove this example's containers and n
 docker compose -p meshfox-services-example -f services-data/compose.yaml down
 ```
 
+## Run-scoped service and cleanup
+<!-- meshfox:node id="run-scoped-service-and-cleanup" -->
+
+`lease` starts the service if needed, waits for readiness and holds it through cleanup. The last lease stops a lease-started service; an already running ordinary service stays up. Run `demo` to try it. The service requires only bash and sleep.
+
+```yaml name=temporary interpreter=@service autostop
+start: sleep 3600
+ready: 'true'
+start_timeout: 5s
+stop_timeout: 1s
+```
+
+```bash name=demo lease=temporary defer=cleanup
+printf 'Service is ready; doing work\n'
+```
+
+```bash name=cleanup
+printf 'Cleanup runs before the lease is released\n'
+```
+
+Explicit Stop ignores leases and awaits graceful shutdown. It is harmless when the service is already stopped:
+
+```meshfox name=stop
+stop: run-scoped-service-and-cleanup temporary
+```
+
+## Borrowing an external resource
+<!-- meshfox:node id="borrowing-an-external-resource" -->
+
+`oneshot: true` starts an external resource without requiring a log monitor. `reuse` returns 0 to borrow an already running resource, 1 to start and own it, and another code to fail acquisition. Automatic lease cleanup leaves borrowed resources alone; explicit Stop on an active instance runs the stop hook.
+
+This example models an external resource with a file. Run `demo` from a stopped state: the file is acquired and removed after cleanup. To try borrowing, run `external-start` first, then `demo`: the file remains. `external-stop` removes it explicitly. A probe is not an atomic lock against another actor.
+
+```bash name=external-start
+touch .borrowed-service-example
+```
+
+```yaml name=resource interpreter=@service autostop
+oneshot: true
+reuse: test -f .borrowed-service-example
+start: touch .borrowed-service-example
+ready: test -f .borrowed-service-example
+stop: rm -f .borrowed-service-example
+start_timeout: 5s
+stop_timeout: 1s
+```
+
+```bash name=demo lease=resource
+printf 'Using the external resource\n'
+```
+
+```bash name=external-stop
+rm -f .borrowed-service-example
+```
+

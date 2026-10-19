@@ -180,3 +180,43 @@ fn cancelling_parent_cancels_child_without_leaving_it_running() {
         "cancelled child survived its parent"
     );
 }
+
+#[test]
+fn a_leased_service_in_an_embedded_child_is_cleaned_up_before_the_host_exits() {
+    let (dir, parent) = fixture(
+        "```yaml name=database interpreter=@service\nstart: sleep 60\nready: 'true'\nstop: touch stopped\nstop_timeout: 100ms\n```\n```bash name=work lease=database\necho using-database\n```", "", "");
+    let out = command(&dir, &parent).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("using-database"));
+    assert!(dir.join("stopped").exists());
+}
+
+#[test]
+fn a_local_lease_returns_without_following_the_released_service() {
+    for borrowed in [false, true] {
+        let (dir, parent) = fixture("", "", "");
+        if borrowed {
+            std::fs::write(dir.join("external"), "running").unwrap();
+        }
+        std::fs::write(&parent, concat!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```yaml name=db interpreter=@service\noneshot: true\nreuse: test -f external\n",
+            "start: touch external\nready: test -f external\nstop: rm external\nstop_timeout: 100ms\n```\n",
+            "```bash name=invoke lease=db\necho finished\n```\n"
+        )).unwrap();
+        let out = command(&dir, &parent).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("finished"));
+        assert!(!stdout.contains("service(s) running"), "{stdout}");
+        assert_eq!(dir.join("external").exists(), borrowed);
+    }
+}

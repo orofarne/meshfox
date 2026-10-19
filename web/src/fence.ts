@@ -246,10 +246,14 @@ export interface CodeSegment {
    * `mesh-service-badge` tag and its "manage services" button in place of
    * the ordinary kill button. */
   service: boolean;
-  /** Raw `deps="a,b"` entries, in document order — a bare name is a block
+  /** Combined deps and lease references for dependency planning and edges.
+   * A bare name is a block
    * in this same node, `node-id/block-name` is a block elsewhere. See
    * `./deps.ts` for resolving these into concrete addresses. */
   deps: string[];
+  /** Authored dependency kinds, retained separately for display. */
+  declaredDeps?: string[];
+  leases?: string[];
   /** Mirrors `core::fence::CodeBlock.env` — which declared `meshfox:var`s
    * this block's own process environment pulls in. Used by `./vars.ts` to
    * compute this block's *implicit* dependencies (a referenced var that's
@@ -587,10 +591,10 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
     const outputAttrs = attrs["output-attrs"];
     const interpreter = attrs.interpreter;
     const envRefs = attrs.env !== undefined ? parseEnvList(attrs.env) : [];
-    const deps = (attrs.deps ?? "")
-      .split(",")
-      .map((s) => s.trim())
-      .filter((s) => s.length > 0);
+    const refs = (raw: string | undefined) => (raw ?? "").split(",").map(s => s.trim()).filter(Boolean);
+    const declaredDeps = refs(attrs.deps);
+    const leases = refs(attrs.lease);
+    const deps = [...declaredDeps, ...leases];
 
     // Look for this block's cached-output marker immediately after the
     // fence (see core::output — no blank line is inserted between them).
@@ -628,7 +632,7 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
     segments.push({ type: "code", args: precedingArguments(lines, i),
       inputs: (attrs.inputs ?? "").split(",").map(s => s.trim()).filter(Boolean),
       outputs: (attrs.outputs ?? "").split(",").map(s => s.trim()).filter(Boolean),
-      lang, name, cache, tty, autoclose, tangle, service, deps, envRefs, default: isDefault, autorun, render, fold, outputMarkdown, outputImage, outputAttrs, interpreter, code: codeLines.join("\n"), output });
+      lang, name, cache, tty, autoclose, tangle, service, deps, declaredDeps, leases, envRefs, default: isDefault, autorun, render, fold, outputMarkdown, outputImage, outputAttrs, interpreter, code: codeLines.join("\n"), output });
     i = cursor;
   }
   flushMarkdown();

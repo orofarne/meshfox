@@ -121,6 +121,23 @@ pub struct CodeBlock {
 }
 
 impl CodeBlock {
+    /// Service dependencies held until the enclosing run (including cleanup) ends.
+    pub fn leases(&self) -> Vec<BlockRef> {
+        self.attrs
+            .get("lease")
+            .map(|s| parse_deps_list(s))
+            .unwrap_or_default()
+    }
+    pub fn dependencies(&self) -> Vec<BlockRef> {
+        self.deps.iter().cloned().chain(self.leases()).collect()
+    }
+    pub fn defers(&self) -> Vec<BlockRef> {
+        self.attrs
+            .get("defer")
+            .map(|s| parse_deps_list(s))
+            .unwrap_or_default()
+    }
+
     /// Explicit `tangle` flag (`tangle` or `tangle="true"`): run this block's
     /// code from a stable hidden file in its working directory instead of a
     /// throwaway temp file — see `crate::tangle`. Needs an `interpreter=`
@@ -759,6 +776,11 @@ pub fn fingerprint(block: &CodeBlock) -> String {
             part.push('!');
         }
         parts.push(part);
+    }
+    for name in ["lease", "defer"] {
+        if let Some(value) = block.attrs.get(name) {
+            parts.push(format!("{name}={value}"));
+        }
     }
     // `output-attrs=` is baked into the cached output's own image (see
     // `output::render_output_block_image`), so editing it must make the

@@ -141,7 +141,7 @@ fn potential_secrets(
     }
     let mut candidates = Vec::new();
     if with_deps {
-        for dep in &block.deps {
+        for dep in &block.dependencies() {
             let app =
                 crate::args::Application::parse(&dep.block_name).map_err(DepsError::Arguments)?;
             if app.bindings.values().any(|v| matches!(v, crate::args::Binding::Reference(name) if computed_name(decls, name))) {
@@ -224,7 +224,12 @@ fn potential_secrets(
             }
         }
         if with_deps {
-            for dep in &raw.deps {
+            for dep in &raw
+                .dependencies()
+                .into_iter()
+                .chain(raw.defers())
+                .collect::<Vec<_>>()
+            {
                 let app = crate::args::Application::parse(&dep.block_name)
                     .map_err(DepsError::Arguments)?;
                 candidates.push(BlockAddr::new(

@@ -6,9 +6,15 @@ use std::{io, time::Duration};
 #[serde(deny_unknown_fields)]
 pub struct ServiceConfig {
     pub start: String,
+    pub reuse: Option<String>,
+    #[serde(default)]
+    pub oneshot: bool,
     pub stop: Option<String>,
     pub monitor: Option<String>,
     pub check: Option<String>,
+    pub ready: Option<String>,
+    #[serde(default = "default_timeout", deserialize_with = "duration")]
+    pub start_timeout: Duration,
     #[serde(default)]
     pub restart_on_fail: bool,
     #[serde(default = "default_interval", deserialize_with = "duration")]
@@ -54,9 +60,11 @@ impl ServiceConfig {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("@service: {e}")))?;
         for (name, command) in [
             ("start", Some(&config.start)),
+            ("reuse", config.reuse.as_ref()),
             ("stop", config.stop.as_ref()),
             ("monitor", config.monitor.as_ref()),
             ("check", config.check.as_ref()),
+            ("ready", config.ready.as_ref()),
         ] {
             if command.is_some_and(|s| s.trim().is_empty()) {
                 return Err(io::Error::new(
@@ -84,6 +92,8 @@ mod tests {
             "start: ''",
             "start: ok\nrestart_on_fail: yes",
             "start: ok\nunknown: true",
+            "start: ok\nreuse: ''",
+            "start: ok\noneshot: yes",
             "start: ok\nrestart_delay: 0s",
             "start: ok\nstop_timeout: infs",
         ] {

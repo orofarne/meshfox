@@ -220,7 +220,7 @@ fn check_expansion(depth: usize, applications: usize) -> Result<(), DepsError> {
 /// Resolve one edge in the caller's lexical scope. A computed global whose
 /// source has not been observed leaves the edge pending; the runner replans
 /// after that source completes. All other missing references remain errors.
-fn application_ref(
+pub fn application_ref(
     canvas: &Canvas,
     node_id: &str,
     owner: &crate::fence::CodeBlock,
@@ -397,9 +397,22 @@ fn visit(
     // Observe computed values before action dependencies, especially `!`
     // preparations whose necessity depends on those values.
     let mut dep_addrs = implicit_from_deps(&addr.node_id, &block, decls);
+    for cleanup in block.defers() {
+        if let Some(cleanup) = application_ref(
+            canvas,
+            &addr.node_id,
+            &block,
+            &cleanup,
+            &canvas.artifact_values,
+            decls,
+        )? {
+            let cleanup_block = find_block(canvas, &cleanup)?;
+            dep_addrs.extend(implicit_from_deps(&cleanup.node_id, &cleanup_block, decls));
+        }
+    }
     dep_addrs.extend(crate::artifacts::producer_deps(canvas, &addr, &block)?);
     if follow_deps {
-        for dep in &block.deps {
+        for dep in &block.dependencies() {
             if let Some(dep) = application_ref(
                 canvas,
                 &addr.node_id,
@@ -430,6 +443,68 @@ fn visit(
     visited.insert(key);
     order.push(addr);
     Ok(())
+}
+
+/// Concrete cleanup applications, without adding their bodies to execution order.
+pub fn cleanup_blocks(canvas: &Canvas, chain: &[BlockAddr]) -> Result<Vec<BlockAddr>, DepsError> {
+    let decls = crate::vars::declared_vars(canvas)?;
+    let mut result = Vec::new();
+    for addr in chain {
+        let owner = find_block(canvas, addr)?;
+        for cleanup in owner.defers() {
+            if let Some(target) = application_ref(
+                canvas,
+                &addr.node_id,
+                &owner,
+                &cleanup,
+                &canvas.artifact_values,
+                &decls,
+            )? {
+                let block = find_block(canvas, &target)?;
+                if block.service
+                    || block.tty
+                    || crate::exec::is_form(&block.lang)
+                    || !block.defers().is_empty()
+                {
+                    return Err(DepsError::ServiceConfig(
+                        "defer requires a non-interactive cleanup block without nested defer"
+                            .into(),
+                    ));
+                }
+                result.push(target);
+            }
+        }
+    }
+    Ok(result)
+}
+
+pub fn lease_targets(
+    canvas: &Canvas,
+    chain: &[BlockAddr],
+) -> Result<HashSet<BlockAddr>, DepsError> {
+    let decls = crate::vars::declared_vars(canvas)?;
+    let mut result = HashSet::new();
+    for addr in chain {
+        let owner = find_block(canvas, addr)?;
+        for lease in owner.leases() {
+            if let Some(target) = application_ref(
+                canvas,
+                &addr.node_id,
+                &owner,
+                &lease,
+                &canvas.artifact_values,
+                &decls,
+            )? {
+                if !find_block(canvas, &target)?.service {
+                    return Err(DepsError::ServiceConfig(
+                        "lease target must be a service".into(),
+                    ));
+                }
+                result.insert(target);
+            }
+        }
+    }
+    Ok(result)
 }
 
 /// Plan required runs using known values. Execution cascades only along explicit
@@ -492,7 +567,7 @@ pub fn compute_forced_reruns_planned(
         values.extend(fingerprint_vars(&block, &sim_computed));
         let mut cascaded = false;
         let mut edges = Vec::new();
-        for dep in &block.deps {
+        for dep in &block.dependencies() {
             if let Some(resolved) =
                 application_ref(canvas, &addr.node_id, &block, dep, &values, &decls)?
             {
@@ -610,7 +685,7 @@ pub fn closure_fingerprint_with(
         }
         check_expansion(stack.len(), memo.len() + stack.len())?;
         let mut deps = Vec::new();
-        for dep in &block.deps {
+        for dep in &block.dependencies() {
             if let Some(dep) = application_ref(canvas, &addr.node_id, &block, dep, values, decls)? {
                 deps.push(dep);
             }
@@ -715,6 +790,11 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
                 crate::service::ServiceConfig::parse(&block.code)
                     .map_err(|e| DepsError::ServiceConfig(e.to_string()))?;
             }
+            if block.attrs.get("autostop").is_some_and(|v| v != "false") && !block.service {
+                return Err(DepsError::ServiceConfig(
+                    "autostop requires a service block".into(),
+                ));
+            }
             if block.service && block.tty {
                 return Err(DepsError::ServiceTtyConflict(node.id.clone(), name.clone()));
             }
@@ -809,7 +889,7 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
                     name.clone(),
                 ));
             }
-            for dep in &block.deps {
+            for dep in &block.dependencies() {
                 let dep_addr = resolve_ref(&node.id, dep);
                 let dep_block = validate_application_ref(canvas, &node.id, block, dep, &decls)?;
                 if crate::exec::is_form(&dep_block.lang) {
@@ -820,9 +900,30 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
                     ));
                 }
             }
+            for lease in block.leases() {
+                let service = validate_application_ref(canvas, &node.id, block, &lease, &decls)?;
+                if !service.service {
+                    return Err(DepsError::ServiceConfig(
+                        "lease target must be a service".into(),
+                    ));
+                }
+            }
+            for cleanup in block.defers() {
+                let cleanup = validate_application_ref(canvas, &node.id, block, &cleanup, &decls)?;
+                if cleanup.service
+                    || cleanup.tty
+                    || crate::exec::is_form(&cleanup.lang)
+                    || !cleanup.defers().is_empty()
+                {
+                    return Err(DepsError::ServiceConfig(
+                        "defer requires a non-interactive cleanup block without nested defer"
+                            .into(),
+                    ));
+                }
+            }
             // Parameterized definitions are not applications; mandatory arguments
             // are checked when a concrete application is requested.
-            let has_unbound_refs = block.deps.iter().any(|dep| {
+            let has_unbound_refs = block.dependencies().iter().any(|dep| {
                 crate::args::Application::parse(&dep.block_name).is_ok_and(|app| {
                     app.bindings.values().any(|binding| matches!(binding, crate::args::Binding::Reference(name) if !canvas.artifact_values.contains_key(name)))
                 })
@@ -845,12 +946,15 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
 /// Authored confirmation gates for the complete resolved application chain.
 /// Check before executing any step, including steps that precede the gated one.
 pub fn confirmation_blocks(canvas: &Canvas, chain: &[BlockAddr]) -> Vec<String> {
-    chain
-        .iter()
+    let mut all = chain.to_vec();
+    if let Ok(cleanups) = cleanup_blocks(canvas, chain) {
+        all.extend(cleanups);
+    }
+    all.iter()
         .filter_map(|addr| {
             find_block(canvas, addr)
                 .ok()
-                .filter(|block| block.requires_confirmation())
+                .filter(|b| b.requires_confirmation())
                 .map(|_| format!("{}/{}", addr.node_id, addr.block_name))
         })
         .collect()
@@ -859,6 +963,27 @@ pub fn confirmation_blocks(canvas: &Canvas, chain: &[BlockAddr]) -> Vec<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn leases_dedupe_with_dependencies_and_reject_nonservices() {
+        let c = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n```bash name=db service\nsleep 60\n```\n```bash name=check lease=db\ntrue\n```\n```bash name=work deps=check lease=db defer=cleanup\ntrue\n```\n```bash name=cleanup\ntrue\n```\n");
+        validate(&c).unwrap();
+        let chain = resolve_chain(&c, BlockAddr::new("root", "work")).unwrap();
+        assert_eq!(
+            chain
+                .iter()
+                .map(|a| a.block_name.as_str())
+                .collect::<Vec<_>>(),
+            ["db", "check", "work"]
+        );
+        assert_eq!(lease_targets(&c, &chain).unwrap().len(), 1);
+        assert_eq!(
+            cleanup_blocks(&c, &chain).unwrap(),
+            [BlockAddr::new("root", "cleanup")]
+        );
+        let invalid = canvas("# Root\n<!-- meshfox:node id=\"root\" -->\n\n```bash name=plain\ntrue\n```\n```bash name=work lease=plain\ntrue\n```\n");
+        assert!(validate(&invalid).is_err());
+    }
 
     #[test]
     fn service_generations_invalidate_only_their_dependency_closure() {

@@ -350,8 +350,9 @@ pub fn canonical_value(arg: &ArgDecl, value: &str) -> Result<String, String> {
 /// Names used by dependency bindings, before the caller's local scope is applied.
 pub fn dependency_refs(block: &CodeBlock) -> Vec<String> {
     block
-        .deps
-        .iter()
+        .dependencies()
+        .into_iter()
+        .chain(block.defers())
         .filter_map(|dep| Application::parse(&dep.block_name).ok())
         .flat_map(|app| app.bindings.into_values())
         .filter_map(|binding| match binding {

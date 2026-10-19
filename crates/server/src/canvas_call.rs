@@ -4,7 +4,10 @@ use super::*;
 use meshfox_core::{canvas_call::CanvasCall, BlockAddr};
 use serde_json::{json, Value};
 
-tokio::task_local! { static ANCESTRY: Vec<String>; }
+tokio::task_local! { static ANCESTRY: Vec<String>; static LEASE_SCOPE: Option<String>; }
+pub(super) fn lease_scope() -> Option<String> {
+    LEASE_SCOPE.try_with(Clone::clone).ok().flatten()
+}
 // Embedded workers cannot outlive a one-shot CLI host. Never start a
 // long-lived service there and accidentally orphan it when that host exits.
 static EMBEDDED_PORTS: std::sync::OnceLock<Mutex<std::collections::HashSet<u16>>> =
@@ -39,6 +42,7 @@ pub(super) struct Preparation {
 pub(super) struct PreparedCall {
     port: u16,
     canvas: PathBuf,
+    local: bool,
     spec: CanvasCall,
     values: HashMap<String, String>,
     ancestry: Vec<String>,
@@ -48,6 +52,8 @@ pub(super) struct PreparedCall {
 pub(super) struct PrepareRequest {
     path: Vec<String>,
     block: String,
+    #[serde(default)]
+    stop: bool,
     no_deps: bool,
     #[serde(default)]
     values: HashMap<String, String>,
@@ -58,6 +64,8 @@ pub(super) struct PrepareRequest {
 pub(super) struct NativeRun {
     request: RunRequest,
     ancestry: Vec<String>,
+    #[serde(default)]
+    lease_scope: Option<String>,
 }
 fn client() -> reqwest::Client {
     reqwest::Client::builder()
@@ -139,7 +147,12 @@ pub(super) async fn plan(
     ancestors: &[String],
 ) -> Result<HashMap<BlockAddr, PreparedCall>, ApiError> {
     let mut calls = HashMap::new();
-    for addr in chain {
+    let mut expanded = chain.to_vec();
+    expanded.extend(meshfox_core::deps::cleanup_blocks(canvas, chain).map_err(error)?);
+    for addr in &expanded {
+        if calls.contains_key(addr) {
+            continue;
+        }
         let block = meshfox_core::deps::find_block(canvas, addr).map_err(error)?;
         if block.lang != "meshfox" {
             continue;
@@ -148,11 +161,12 @@ pub(super) async fn plan(
         let node = canvas
             .node(&addr.node_id)
             .ok_or_else(|| error("canvas call node disappeared"))?;
-        let target = node
-            .cwd(canvas_root_dir(&state.canvas_path))
-            .join(&spec.canvas)
-            .canonicalize()
-            .map_err(error)?;
+        let target = match &spec.canvas {
+            Some(path) => node.cwd(canvas_root_dir(&state.canvas_path)).join(path),
+            None => state.canvas_path.clone(),
+        }
+        .canonicalize()
+        .map_err(error)?;
         if !meshfox_core::mdcanvas::is_canvas(&target) {
             return Err(error(format!("{} is not a canvas", target.display())));
         }
@@ -184,6 +198,7 @@ pub(super) async fn plan(
                 &PrepareRequest {
                     path,
                     block,
+                    stop: spec.stop.is_some(),
                     no_deps: spec.no_deps,
                     values: supplied.clone(),
                     ancestry: ancestry.clone(),
@@ -196,7 +211,7 @@ pub(super) async fn plan(
         )
         .map_err(error)?;
         for gate in &mut prepared.confirmation {
-            *gate = format!("{} → {gate}", spec.canvas);
+            *gate = format!("{} → {gate}", target.display());
         }
         if prepared.services && embedded_ports().lock().unwrap().contains(&port) {
             return Err(error("a canvas call that starts services needs an independently running child worker; open that canvas with meshfox view or a coordinator first"));
@@ -205,6 +220,7 @@ pub(super) async fn plan(
             addr.clone(),
             PreparedCall {
                 port,
+                local: target == state.canvas_path.canonicalize().map_err(error)?,
                 canvas: target,
                 spec,
                 values: supplied,
@@ -220,6 +236,19 @@ pub(super) async fn prepare(
     State(state): State<Arc<AppState>>,
     Json(req): Json<PrepareRequest>,
 ) -> Result<Json<Preparation>, ApiError> {
+    if req.stop {
+        let (_, block) = stop_target(&state, &req.path, &req.block)?;
+        return Ok(Json(Preparation {
+            path: req.path,
+            block: Some(req.block.clone()),
+            confirmation: if block.requires_confirmation() {
+                vec![req.block]
+            } else {
+                vec![]
+            },
+            ..Default::default()
+        }));
+    }
     let response = prepare_arguments_local(
         State(Arc::clone(&state)),
         Json(ArgumentsRequest {
@@ -283,10 +312,11 @@ pub(super) async fn prepare(
             &effective_overrides(&state, &req.values),
         )?
         .chain;
-        result.services = chain
-            .iter()
-            .filter_map(|addr| meshfox_core::deps::find_block(&canvas, addr).ok())
-            .any(|block| block.service);
+        let leased = meshfox_core::deps::lease_targets(&canvas, &chain).map_err(error)?;
+        result.services = chain.iter().any(|addr| {
+            !leased.contains(addr)
+                && meshfox_core::deps::find_block(&canvas, addr).is_ok_and(|block| block.service)
+        });
         let calls = Box::pin(plan(&state, &canvas, &chain, &req.values, &req.ancestry)).await?;
         for (addr, call) in calls {
             result.confirmation.extend(call.prepared.confirmation);
@@ -301,6 +331,42 @@ pub(super) async fn prepare(
         }
     }
     Ok(Json(result))
+}
+
+fn stop_target(
+    state: &AppState,
+    path: &[String],
+    block: &str,
+) -> Result<(BlockAddr, meshfox_core::CodeBlock), ApiError> {
+    let raw = state.raw.lock().unwrap().clone();
+    let canvas = resolved_canvas(&raw, &state.canvas_path)?;
+    let path: Vec<_> = path.iter().map(String::as_str).collect();
+    let addr = meshfox_core::resolve_target(&canvas, &path, block).map_err(error)?;
+    let block = meshfox_core::deps::find_block(&canvas, &addr).map_err(error)?;
+    if !block.service {
+        return Err(error("stop target must be a service"));
+    }
+    Ok((addr, block))
+}
+
+pub(super) async fn stop(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<NativeRun>,
+) -> Result<StatusCode, ApiError> {
+    let (addr, block) = stop_target(&state, &req.request.path, &req.request.block)?;
+    if block.requires_confirmation() && !req.request.confirm {
+        return Err(error("service stop requires confirmation"));
+    }
+    let handle = state
+        .services
+        .lock()
+        .unwrap()
+        .get(&(addr.node_id, addr.block_name))
+        .cloned();
+    if let Some(handle) = handle {
+        handle.stop().await.map_err(error)?;
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub(super) fn admit(
@@ -339,8 +405,11 @@ pub(super) async fn run(
 ) -> Result<Response, ApiError> {
     // The preparation's ancestry is captured by run_block_impl before it builds
     // its lazy response stream; child calls then carry it over the next hop.
-    ANCESTRY
-        .scope(req.ancestry, Box::pin(run_block_impl(state, req.request)))
+    LEASE_SCOPE
+        .scope(
+            req.lease_scope,
+            ANCESTRY.scope(req.ancestry, Box::pin(run_block_impl(state, req.request))),
+        )
         .await
 }
 
@@ -351,6 +420,7 @@ pub(super) fn attach(
     persist: bool,
     save_secrets: &std::collections::HashSet<String>,
     row: Option<(run_ledger::RunLedger, i64)>,
+    scope: Option<Arc<lifecycle::LeaseScope>>,
 ) {
     let namespace = prefix(&BlockAddr::new(&handle.node_id, &handle.block_name));
     let save_secrets = save_secrets
@@ -373,7 +443,19 @@ pub(super) fn attach(
                 .collect(),
             save_secrets,
         };
-        let result = drive(&handle, &call, request, &mut kill).await;
+        if !call.local {
+            if let Some(scope) = &scope {
+                scope.child(call.port);
+            }
+        }
+        let result = drive(
+            &handle,
+            &call,
+            request,
+            &mut kill,
+            scope.as_ref().map(|s| s.id.clone()),
+        )
+        .await;
         match result {
             Ok(outcome) => outcome,
             Err(e) => {
@@ -393,13 +475,27 @@ async fn drive(
     call: &PreparedCall,
     request: RunRequest,
     kill: &mut oneshot::Receiver<()>,
+    lease_scope: Option<String>,
 ) -> Result<run_registry::RunOutcome, ApiError> {
+    if call.spec.stop.is_some() {
+        let request = NativeRun {
+            request,
+            ancestry: call.ancestry.clone(),
+            lease_scope,
+        };
+        tokio::select! {
+            result = post(call.port, "stop", &request) => { result?; },
+            _ = &mut *kill => return Ok(run_registry::RunOutcome::Killed),
+        }
+        return Ok(run_registry::RunOutcome::Exited { exit_code: 0 });
+    }
     let mut response = post(
         call.port,
         "run",
         &NativeRun {
             request,
             ancestry: call.ancestry.clone(),
+            lease_scope,
         },
     )
     .await?;

@@ -189,6 +189,13 @@ pub fn env_var_names_for_chain(
     for addr in chain {
         if let Ok(block) = deps::find_block(canvas, addr) {
             needed.extend(direct_var_seed(&block));
+            for cleanup in block.defers() {
+                if let Ok(cleanup) =
+                    deps::find_block(canvas, &deps::resolve_ref(&addr.node_id, &cleanup))
+                {
+                    needed.extend(direct_var_seed(&cleanup));
+                }
+            }
             if block.attrs.contains_key("inputs") {
                 needed.extend(output_path_var_names(canvas));
             }
@@ -322,7 +329,11 @@ pub fn autorun_blocks_for_changed_vars(
 /// entirely. Only ever takes the fallback when the literal address doesn't
 /// already work, so this is fully backward compatible with every address
 /// that resolved before it existed.
-fn resolve_target(canvas: &Canvas, path: &[&str], block_name: &str) -> Result<BlockAddr, RunError> {
+pub fn resolve_target(
+    canvas: &Canvas,
+    path: &[&str],
+    block_name: &str,
+) -> Result<BlockAddr, RunError> {
     let node = canvas.resolve_path(path)?;
     if block_name.contains('[')
         || args::scan_signatures(&node.id, &node.text)

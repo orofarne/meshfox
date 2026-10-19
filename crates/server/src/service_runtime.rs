@@ -10,7 +10,7 @@ use std::{
     io,
     path::PathBuf,
     sync::{
-        atomic::{AtomicI64, Ordering},
+        atomic::{AtomicBool, AtomicI64, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -159,6 +159,13 @@ enum End {
     Stop,
     Timeout,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ownership {
+    Pending,
+    Owned,
+    Borrowed,
+}
+
 struct Supervisor {
     config: Option<ServiceConfig>,
     env: Arc<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
@@ -169,6 +176,8 @@ struct Supervisor {
     completed: watch::Sender<(u64, Result<(), String>)>,
     handled: u64,
     processes: Vec<Process>,
+    ownership: Ownership,
+    force_stop: Arc<AtomicBool>,
 }
 impl Supervisor {
     fn message(&self, text: impl Into<String>) {
@@ -225,7 +234,12 @@ impl Supervisor {
             .config
             .as_ref()
             .map_or(DEFAULT_STOP, |c| c.stop_timeout);
-        let hook = self.config.as_ref().and_then(|c| c.stop.clone());
+        let hook = if self.ownership == Ownership::Owned || self.force_stop.load(Ordering::SeqCst) {
+            self.config.as_ref().and_then(|c| c.stop.clone())
+        } else {
+            None
+        };
+        let has_hook = hook.is_some();
         let result = if let Some(hook) = hook {
             match self.command_until(&hook, Some(timeout), false, false).await {
                 Ok(End::Exit(0)) => Ok(()),
@@ -237,7 +251,7 @@ impl Supervisor {
         };
         // Do not spend another full grace period per process after a hook:
         // it has already had the configured time to stop the external service.
-        let grace = if self.config.as_ref().is_some_and(|c| c.stop.is_some()) {
+        let grace = if has_hook {
             Duration::from_secs(1)
         } else {
             timeout
@@ -307,15 +321,93 @@ impl Supervisor {
             return Ok(End::Stop);
         }
         self.set_status(ServiceStatus::Starting);
-        if config.monitor.is_some() {
-            match self.command_until(&config.start, None, true, true).await? {
-                End::Exit(0) => {}
-                end => return Ok(end),
+        let deadline = Instant::now() + config.start_timeout;
+        if self.ownership == Ownership::Pending {
+            if let Some(reuse) = &config.reuse {
+                match self
+                    .command_until(reuse, Some(config.start_timeout), true, false)
+                    .await?
+                {
+                    End::Exit(0) => {
+                        self.ownership = Ownership::Borrowed;
+                        self.message(
+                            "reusing external resource; automatic cleanup will only detach",
+                        );
+                    }
+                    End::Exit(1) => {}
+                    End::Stop => return Ok(End::Stop),
+                    end => {
+                        self.message(format!("reuse probe failed: {end:?}"));
+                        return Ok(match end {
+                            End::Exit(_) => End::Exit(2),
+                            other => other,
+                        });
+                    }
+                }
             }
-            self.processes
-                .push(self.command(config.monitor.as_ref().unwrap())?);
-        } else {
-            self.processes.push(self.command(&config.start)?);
+        }
+        let oneshot = config.oneshot || config.monitor.is_some();
+        let mut watched = None;
+        if self.ownership != Ownership::Borrowed {
+            if Instant::now() >= deadline {
+                return Ok(End::Timeout);
+            }
+            self.ownership = Ownership::Owned;
+            if oneshot {
+                match self
+                    .command_until(
+                        &config.start,
+                        Some(deadline.saturating_duration_since(Instant::now())),
+                        true,
+                        true,
+                    )
+                    .await?
+                {
+                    End::Exit(0) => {}
+                    end => return Ok(end),
+                }
+            } else {
+                watched = Some(self.processes.len());
+                self.processes.push(self.command(&config.start)?);
+            }
+        }
+        if let Some(monitor) = &config.monitor {
+            watched = Some(self.processes.len());
+            self.processes.push(self.command(monitor)?);
+        }
+        if let Some(ready) = &config.ready {
+            loop {
+                if self.requested() {
+                    return Ok(End::Stop);
+                }
+                if anchor.pump(&self.log)?.is_some() {
+                    return Ok(End::Stop);
+                }
+                if !oneshot {
+                    if let Some(process) = watched.and_then(|index| self.processes.get_mut(index)) {
+                        if let Some(code) = process.pump(&self.log)? {
+                            return Ok(End::Exit(code));
+                        }
+                    }
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    self.message("service readiness timed out");
+                    return Ok(End::Timeout);
+                }
+                match self
+                    .command_until(ready, Some(remaining), true, false)
+                    .await?
+                {
+                    End::Exit(0) => break,
+                    End::Stop => return Ok(End::Stop),
+                    End::Timeout => {
+                        self.message("service readiness timed out");
+                        return Ok(End::Timeout);
+                    }
+                    _ => tokio::time::sleep(TICK).await,
+                }
+            }
         }
         self.set_status(ServiceStatus::Running);
         let mut next_check = Instant::now() + config.check_interval;
@@ -327,8 +419,7 @@ impl Supervisor {
             if anchor.pump(&self.log)?.is_some() {
                 return Ok(End::Stop);
             }
-            let watched = usize::from(config.monitor.is_some());
-            if let Some(process) = self.processes.get_mut(watched) {
+            if let Some(process) = watched.and_then(|index| self.processes.get_mut(index)) {
                 if let Some(code) = process.pump(&self.log)? {
                     if config.monitor.is_none() {
                         return Ok(End::Exit(code));
@@ -337,9 +428,11 @@ impl Supervisor {
                         "monitor exited ({code}); reconnecting without restarting service"
                     ));
                     self.processes.pop();
+                    watched = None;
                     next_monitor = Instant::now() + config.restart_delay;
                 }
             } else if config.monitor.is_some() && Instant::now() >= next_monitor {
+                watched = Some(self.processes.len());
                 self.processes
                     .push(self.command(config.monitor.as_ref().unwrap())?);
             }
@@ -377,6 +470,7 @@ pub(super) fn spawn(
     stop: watch::Receiver<u64>,
     completed: watch::Sender<(u64, Result<(), String>)>,
     epoch: Arc<AtomicI64>,
+    force_stop: Arc<AtomicBool>,
 ) {
     tokio::spawn(async move {
         let mut supervisor = Supervisor {
@@ -389,6 +483,8 @@ pub(super) fn spawn(
             completed,
             handled: 0,
             processes: Vec::new(),
+            ownership: Ownership::Pending,
+            force_stop,
         };
         let mut identity = Process::new(proc);
         identity.track_descendants = supervisor.config.is_none();
@@ -468,7 +564,11 @@ pub(super) fn spawn(
                 End::Exit(code) => code,
                 _ => 1,
             };
-            if !config.restart_on_fail || code == 0 {
+            if supervisor.ownership != Ownership::Owned
+                || !config.restart_on_fail
+                || code == 0
+                || matches!(end, End::Timeout)
+            {
                 identity.terminate(Duration::ZERO, &supervisor.log).await;
                 supervisor.finish_exit(&ledger, row, code);
                 return;
@@ -504,4 +604,46 @@ pub(super) fn spawn(
             }
         }
     });
+}
+
+/// Probe an already running service without taking over its lifecycle.
+pub(super) async fn ready_probe(
+    code: &str,
+    timeout: Duration,
+    env: &[(std::ffi::OsString, std::ffi::OsString)],
+    cwd: &std::path::Path,
+    status: &Arc<Mutex<ServiceStatus>>,
+    log: &Log,
+) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !matches!(*status.lock().unwrap(), ServiceStatus::Running) {
+            return Err(io::Error::other(
+                "service stopped while waiting for readiness",
+            ));
+        }
+        let mut probe = Process::new(stream_exec::spawn_bash_frozen(code, env, cwd)?);
+        let result = loop {
+            if let Some(code) = probe.pump(log)? {
+                break Some(code);
+            }
+            if Instant::now() >= deadline
+                || !matches!(*status.lock().unwrap(), ServiceStatus::Running)
+            {
+                break None;
+            }
+            tokio::time::sleep(TICK).await;
+        };
+        probe.terminate(Duration::ZERO, log).await;
+        if result == Some(0) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "service readiness timed out",
+            ));
+        }
+        tokio::time::sleep(TICK).await;
+    }
 }

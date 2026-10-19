@@ -13,6 +13,8 @@ use crate::mdcanvas::{EDGE_ATTRS, NODE_ATTRS};
 pub const FENCE_VALUE_ATTRS: &[&str] = &[
     "name",
     "deps",
+    "lease",
+    "defer",
     "inputs",
     "outputs",
     "env",
@@ -28,6 +30,7 @@ pub const FENCE_FLAG_ATTRS: &[&str] = &[
     "tty",
     "autoclose",
     "service",
+    "autostop",
     "always",
     "default",
     "confirm",
@@ -237,6 +240,9 @@ pub fn attr_candidates(kind: AttrKind, line: &str) -> Vec<AttrCandidate> {
                         && !line.trim_start().starts_with("```button")
                 }
                 "autoclose" => enabled("tty"),
+                "autostop" => {
+                    enabled("service") || attrs.get("interpreter").is_some_and(|v| v == "@service")
+                }
                 "tangle" => value_present("interpreter"),
                 _ => true,
             }
@@ -556,7 +562,7 @@ fn is_list_attr(kind: AttrKind, name: &str) -> bool {
         (kind, name),
         (AttrKind::Node | AttrKind::Edge, "tags")
             | (AttrKind::Edge, "from")
-            | (AttrKind::Fence, "deps" | "env")
+            | (AttrKind::Fence, "deps" | "lease" | "defer" | "env")
     )
 }
 
@@ -667,7 +673,7 @@ fn complete_value(
             }
             (AttrKind::Edge, "from") => tagged(&facts.ids, "node"),
             (AttrKind::Node | AttrKind::Edge, "tags") => tagged(&facts.tags, "tag"),
-            (AttrKind::Fence, "deps") => facts
+            (AttrKind::Fence, "deps" | "lease" | "defer") => facts
                 .blocks
                 .iter()
                 .map(|(node, block)| {
