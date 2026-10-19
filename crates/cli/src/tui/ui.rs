@@ -2775,6 +2775,42 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// The editor's syntect theme and the theme set it came from. Unpacking the
+/// bundled `ThemeSet` (zlib + bincode) and recolouring the theme for
+/// meshfox's scopes is far too slow to redo on every frame, so it is built
+/// once per theme name.
+fn editor_syntect_theme(
+    theme_name: &str,
+) -> (
+    Arc<syntect::highlighting::ThemeSet>,
+    syntect::highlighting::Theme,
+) {
+    type Cached = (
+        String,
+        Arc<syntect::highlighting::ThemeSet>,
+        syntect::highlighting::Theme,
+    );
+    static CACHE: std::sync::Mutex<Option<Cached>> = std::sync::Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((name, theme_set, theme)) = cache.as_ref() {
+        if name == theme_name {
+            return (Arc::clone(theme_set), theme.clone());
+        }
+    }
+    let theme_set = syntect::highlighting::ThemeSet::load_defaults();
+    let theme = theme_set.themes.get(theme_name).cloned();
+    let theme = theme.or_else(|| theme_set.themes.values().next().cloned());
+    let theme = theme.expect("syntect ships at least one theme");
+    // Bundled `syntect` themes have no rules at all for meshfox's own scope
+    // names — without this, a `<!-- meshfox:... -->` marker's keyword/
+    // attribute-name/attribute-value would all render in one plain color,
+    // same as any other comment text.
+    let theme = crate::syntax_registry::with_meshfox_scope_colors(theme);
+    let theme_set = Arc::new(theme_set);
+    *cache = Some((theme_name.to_string(), Arc::clone(&theme_set), theme.clone()));
+    (theme_set, theme)
+}
+
 /// The fullscreen source editor (`e`) — header (which file, dirty state),
 /// the `edtui` buffer itself, and a footer (error, or the keybinding
 /// hint) — plus the file-switcher (`Ctrl-f`) as a `render_block_picker`-
@@ -2827,21 +2863,8 @@ fn render_source_editor(
         .or_else(|| syntax_set.find_syntax_by_token(SOURCE_EDITOR_LANG))
         .cloned()
         .map(|syntax_ref| {
-            let theme_set = syntect::highlighting::ThemeSet::load_defaults();
-            let theme = theme_set.themes.get(theme_name).cloned();
-            let theme = theme.or_else(|| theme_set.themes.values().next().cloned());
-            let theme = theme.expect("syntect ships at least one theme");
-            // Bundled `syntect` themes have no rules at all for meshfox's
-            // own scope names — without this, a `<!-- meshfox:... -->`
-            // marker's keyword/attribute-name/attribute-value would all
-            // render in one plain color, same as any other comment text.
-            let theme = crate::syntax_registry::with_meshfox_scope_colors(theme);
-            SyntaxHighlighter::with_sets(
-                theme,
-                Arc::new(theme_set),
-                syntax_ref,
-                Arc::clone(syntax_set),
-            )
+            let (theme_set, theme) = editor_syntect_theme(theme_name);
+            SyntaxHighlighter::with_sets(theme, theme_set, syntax_ref, Arc::clone(syntax_set))
         });
     let view = EditorView::new(&mut se.editor)
         .line_numbers(LineNumbers::Absolute)

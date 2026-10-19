@@ -510,6 +510,9 @@ pub struct App {
     /// against exactly what's currently on screen, scroll/wrap included.
     pub doc_click_targets: Vec<(Rect, ClickTarget)>,
     pub(super) doc_images: HashMap<PathBuf, Option<Arc<DocumentImage>>>,
+    /// Prepared images that survive `render_current_document`'s rebuild of
+    /// `doc_images`; see `prepare_document_images`.
+    doc_image_cache: HashMap<PathBuf, (DocImageKey, Option<Arc<DocumentImage>>)>,
     document_viewport: ratatui::layout::Size,
     /// Bytes of the document's image files, fetched from the worker
     /// (`GET /<relative path>`) — `doc_images` is rebuilt from these on
@@ -690,6 +693,8 @@ pub struct App {
     /// Set when a run just ended, so `mod.rs` refetches `block_runs` right
     /// away instead of waiting for the periodic tick.
     pub refresh_runs_soon: bool,
+    /// A background `request_worker_refresh` that hasn't answered yet.
+    worker_refresh_inflight: bool,
     pub pending_child_canvas: Option<PendingChildCanvas>,
     pub block_picker: Option<BlockPickerState>,
     pub var_form: Option<VarFormState>,
@@ -910,6 +915,12 @@ pub enum BackgroundMsg {
     TableMeta {
         node_id: String,
         result: Result<crate::worker_client::TableMetaDto, String>,
+    },
+    /// The worker's service list and run list, from `request_worker_refresh`;
+    /// `None` for a request that failed (the last list is kept).
+    WorkerState {
+        services: Option<Vec<crate::worker_client::ServiceDto>>,
+        runs: Option<Vec<crate::worker_client::ActiveRunDto>>,
     },
     /// One block of a `display="table"` node's rows. `generation` is the
     /// `TableData` generation the request was made under — an answer for an
@@ -1182,6 +1193,7 @@ impl App {
             doc_click_regions: Vec::new(),
             doc_click_targets: Vec::new(),
             doc_images: HashMap::new(),
+            doc_image_cache: HashMap::new(),
             document_viewport: ratatui::layout::Size::new(56, 24),
             image_bytes: HashMap::new(),
             image_generation: 0,
@@ -1225,6 +1237,7 @@ impl App {
             live_tty_sessions: Vec::new(),
             block_runs: None,
             refresh_runs_soon: true,
+            worker_refresh_inflight: false,
             pending_child_canvas: None,
             block_picker: None,
             var_form: None,
@@ -3875,13 +3888,33 @@ impl App {
             let budget = super::document_layout::LayoutContext::new(self.document_viewport)
                 .inset(0, 2)
                 .image_budget(width_percent, height_percent);
-            let protocol = load_document_image(
-                &self.picker,
-                &path,
-                self.image_bytes.get(&path).map(Vec::as_slice),
-                bg,
+            // Rasterizing (SVG parse + text layout, Lanczos resize, protocol
+            // encoding) is far too slow to repeat on every selection change,
+            // so reuse the result while nothing it depends on has changed.
+            let bytes = self.image_bytes.get(&path).map(Vec::as_slice);
+            let font = self.picker.font_size();
+            let key = DocImageKey {
+                content: bytes.map(|b| {
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    std::hash::Hash::hash(b, &mut hasher);
+                    std::hash::Hasher::finish(&hasher)
+                }),
                 budget,
-            );
+                bg,
+                font: (font.width, font.height),
+                protocol: self.picker.protocol_type(),
+            };
+            let protocol = match self.doc_image_cache.get(&path) {
+                Some((cached, image)) if *cached == key => image.clone(),
+                _ => {
+                    let image = load_document_image(&self.picker, &path, bytes, bg, budget);
+                    if self.doc_image_cache.len() >= DOC_IMAGE_CACHE_ENTRIES {
+                        self.doc_image_cache.clear();
+                    }
+                    self.doc_image_cache.insert(path.clone(), (key, image.clone()));
+                    image
+                }
+            };
             self.doc_images.insert(path, protocol);
         }
     }
@@ -4015,6 +4048,16 @@ impl App {
     /// than something that needs special-casing away.
     pub fn on_background_msg(&mut self, msg: BackgroundMsg) {
         match msg {
+            BackgroundMsg::WorkerState { services, runs } => {
+                self.worker_refresh_inflight = false;
+                if let Some(list) = services {
+                    self.apply_services(list);
+                }
+                if let Some(runs) = runs {
+                    self.block_runs = Some(runs);
+                    self.sync_tty_results();
+                }
+            }
             BackgroundMsg::FileContent { node_id, result } => {
                 if let Some(entry) = self.file_previews.get_mut(&node_id) {
                     entry.inflight = false;
@@ -5355,6 +5398,10 @@ impl App {
         let Ok(list) = crate::worker_client::list_services(port).await else {
             return;
         };
+        self.apply_services(list);
+    }
+
+    fn apply_services(&mut self, list: Vec<crate::worker_client::ServiceDto>) {
         let (mut running, mut crashed) = (0usize, 0usize);
         for dto in &list {
             match dto.status.as_str() {
@@ -5380,6 +5427,36 @@ impl App {
             self.block_runs = Some(runs);
             self.sync_tty_results();
         }
+    }
+
+    /// `refresh_services` + `refresh_block_runs` without waiting for the
+    /// worker: the periodic refresh runs in the event loop, and awaiting
+    /// HTTP there would hold up every keystroke (the source editor's
+    /// included) for as long as the worker takes to answer. The result
+    /// arrives as `BackgroundMsg::WorkerState`. Does nothing while a
+    /// previous request is outstanding; `refresh_runs_soon` then stays set so
+    /// the next loop iteration retries.
+    pub fn request_worker_refresh(&mut self) {
+        let Some(port) = self.worker_port else {
+            self.refresh_runs_soon = false;
+            return;
+        };
+        if self.worker_refresh_inflight {
+            return;
+        }
+        self.worker_refresh_inflight = true;
+        self.refresh_runs_soon = false;
+        let tx = self.background_tx.clone();
+        tokio::spawn(async move {
+            let (services, runs) = tokio::join!(
+                crate::worker_client::list_services(port),
+                crate::worker_client::list_active_runs(port),
+            );
+            let _ = tx.send(BackgroundMsg::WorkerState {
+                services: services.ok(),
+                runs: runs.ok(),
+            });
+        });
     }
 
     /// Shows each `tty` block's latest finished run under it in the Document
@@ -6725,6 +6802,18 @@ fn request_image(
         });
     });
 }
+
+/// Everything `load_document_image`'s output depends on besides the path.
+#[derive(PartialEq)]
+struct DocImageKey {
+    content: Option<u64>,
+    budget: ratatui::layout::Size,
+    bg: Option<Background>,
+    font: (u16, u16),
+    protocol: ProtocolType,
+}
+
+const DOC_IMAGE_CACHE_ENTRIES: usize = 32;
 
 /// `path` is a real file for every ordinary `Segment::Image`, but a
 /// `data:` URL string doubling as its own synthetic cache key for one

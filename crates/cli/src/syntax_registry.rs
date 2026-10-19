@@ -14,20 +14,29 @@ use meshfox_core::syntax_dirs::{global_syntax_dir, local_syntax_dir, tui_syntax_
 use std::path::Path;
 use syntect::parsing::{SyntaxSet, SyntaxSetBuilder};
 
-/// meshfox's own `<!-- meshfox:... -->` marker-comment grammar, bundled
-/// into the binary at compile time (not read from `.meshfox/syntax/` —
-/// this is a built-in feature, not a user-supplied grammar). `include`s
-/// `syntect`'s own bundled `text.html.markdown` scope rather than
-/// reproducing it — see `crates/cli/src/grammars/meshfox.tmLanguage.json`'s
-/// own comments, and TODO.canvas.md's "Единая база языков подсветки" for
-/// why this *isn't* the same file the web side's injection grammar uses
-/// (real VS Code TextMate injections aren't something `syntect` supports
-/// at all, so this is a plain `include`-based grammar instead — same
-/// marker rules, different top-level shape per engine).
+/// meshfox's own Markdown grammar for the full-screen source editor: the
+/// `<!-- meshfox:... -->` marker comments plus a small, deliberately
+/// line-oriented set of Markdown rules (headings, fence opening lines, lists,
+/// quotes, inline code, links, bold/italic), bundled into the binary at
+/// compile time (not read from `.meshfox/syntax/` — this is a built-in
+/// feature, not a user-supplied grammar).
+///
+/// It does *not* `include` `syntect`'s bundled `text.html.markdown`:
+/// `edtui` highlights every visible line on every frame, each from a fresh
+/// parser state, and that grammar's inline rules backtrack exponentially in
+/// the number of code spans on one line (~60 ms for a line with ten of them,
+/// every frame). The rules here have no unbounded nested lookahead, so a line
+/// costs microseconds however many spans it holds. Because `edtui` hands the
+/// highlighter one line at a time, nothing here can depend on earlier lines —
+/// a fenced block's body is not highlighted as its language (it never was).
+/// See `crates/cli/src/grammars/meshfox.tmLanguage.json`, and TODO.canvas.md's
+/// "Единая база языков подсветки" for why this *isn't* the same file the web
+/// side's injection grammar uses (real VS Code TextMate injections aren't
+/// something `syntect` supports at all).
 const MESHFOX_GRAMMAR: &str = include_str!("grammars/meshfox.tmLanguage.json");
 
 /// The `find_syntax_by_name` token `ui.rs`'s full-screen source editor
-/// resolves to pick this grammar over plain `text.html.markdown` — see
+/// resolves to pick this grammar — see
 /// `crates/cli/src/grammars/meshfox.tmLanguage.json`'s own `"name"`.
 pub const MESHFOX_MARKDOWN_SYNTAX_NAME: &str = "meshfox-markdown";
 
@@ -923,5 +932,115 @@ mod meshfox_grammar_tests {
                 "plain text {text:?} on a light theme should not use the near-white dark-mode pin — invisible on a light background"
             );
         }
+    }
+
+    /// Highlights one line the way `edtui` does: a fresh parser state, no newline.
+    fn spans_of(line: &str) -> Vec<(syntect::highlighting::Color, String)> {
+        let ss = build_syntax_set(&std::env::temp_dir().join("meshfox-line-grammar-test"));
+        let syntax = ss
+            .find_syntax_by_name(MESHFOX_MARKDOWN_SYNTAX_NAME)
+            .unwrap();
+        let themes = syntect::highlighting::ThemeSet::load_defaults();
+        let theme = with_meshfox_scope_colors(
+            themes
+                .themes
+                .get(crate::tui::ui::SOURCE_EDITOR_THEME)
+                .unwrap()
+                .clone(),
+        );
+        let mut hl = syntect::easy::HighlightLines::new(syntax, &theme);
+        hl.highlight_line(line, &ss)
+            .unwrap()
+            .into_iter()
+            .map(|(style, text)| (style.foreground, text.to_string()))
+            .collect()
+    }
+
+    fn color_of(spans: &[(syntect::highlighting::Color, String)], needle: &str) -> syntect::highlighting::Color {
+        spans
+            .iter()
+            .find(|(_, text)| text.contains(needle))
+            .unwrap_or_else(|| panic!("no span containing {needle:?} in {spans:?}"))
+            .0
+    }
+
+    /// The reason the grammar is hand-written: the bundled Markdown grammar
+    /// took ~60 ms on a line like this one, and `edtui` re-highlights every
+    /// visible line on every frame. The bound is far above what the grammar
+    /// costs (tens of microseconds) and far below what the old one did.
+    #[test]
+    fn a_line_with_many_inline_code_spans_highlights_quickly() {
+        let line = "Bind `a`, `b`, `c`, `d`, `e`, `f`, `g`, `h`, `i`, `j`, `k` and `l` with **bold** and *it*.";
+        let ss = build_syntax_set(&std::env::temp_dir().join("meshfox-line-grammar-perf-test"));
+        let syntax = ss
+            .find_syntax_by_name(MESHFOX_MARKDOWN_SYNTAX_NAME)
+            .unwrap();
+        let themes = syntect::highlighting::ThemeSet::load_defaults();
+        let theme = with_meshfox_scope_colors(themes.themes.values().next().unwrap().clone());
+        let highlight = || {
+            let mut hl = syntect::easy::HighlightLines::new(syntax, &theme);
+            hl.highlight_line(line, &ss).unwrap().len()
+        };
+        highlight(); // compiles the grammar's regexes lazily
+        let started = std::time::Instant::now();
+        let spans = highlight();
+        assert!(spans > 12, "inline code should split the line into spans");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(20),
+            "highlighting took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn markdown_constructs_get_their_own_colors() {
+        let plain = color_of(&spans_of("just prose"), "just prose");
+
+        let heading = spans_of("## A heading with `code`");
+        assert_ne!(color_of(&heading, "A heading"), plain);
+        assert_ne!(color_of(&heading, "##"), plain);
+
+        let fence = spans_of("```bash name=\"build\"");
+        assert_ne!(color_of(&fence, "bash"), plain);
+
+        let item = spans_of("- an item with `code` inside");
+        assert_ne!(color_of(&item, "an item"), plain);
+        assert_ne!(color_of(&item, "`code`"), color_of(&item, "an item"));
+
+        let bold = spans_of("a **bold** and *italic* word");
+        assert_ne!(color_of(&bold, "**bold**"), plain);
+        assert_ne!(color_of(&bold, "*italic*"), plain);
+
+        let link = spans_of("see [the docs](https://example.com/x) now");
+        assert_ne!(color_of(&link, "[the docs]"), plain);
+    }
+
+    /// A marker run longer than two (`***a***`, or a stray extra `*` after the
+    /// closing `**`) stays part of the bold span instead of leaving one
+    /// plain-coloured star behind.
+    #[test]
+    fn extra_stars_around_a_bold_span_are_part_of_it() {
+        let plain = color_of(&spans_of("just prose"), "just prose");
+        for line in ["**test***", "***test***", "__test___"] {
+            let spans = spans_of(line);
+            assert!(
+                spans.iter().all(|(color, _)| *color != plain),
+                "{line:?} should be coloured throughout: {spans:?}"
+            );
+            assert!(
+                spans.windows(2).all(|w| w[0].0 == w[1].0),
+                "{line:?} should be one colour: {spans:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn underscores_in_identifiers_and_lone_stars_are_not_emphasis() {
+        let plain = color_of(&spans_of("just prose"), "just prose");
+        let spans = spans_of("snake_case_name and 2 * 3 * 4");
+        assert!(
+            spans.iter().all(|(color, _)| *color == plain),
+            "unexpected emphasis: {spans:?}"
+        );
     }
 }

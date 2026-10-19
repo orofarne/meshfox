@@ -2,30 +2,189 @@
   "name": "meshfox-markdown",
   "scopeName": "text.html.markdown.meshfox",
   "patterns": [
-    { "include": "#meshfox-comment" },
-    { "include": "text.html.markdown" }
+    {
+      "include": "#meshfox-comment"
+    },
+    {
+      "include": "#html-comment"
+    },
+    {
+      "include": "#heading"
+    },
+    {
+      "include": "#fence"
+    },
+    {
+      "include": "#separator"
+    },
+    {
+      "include": "#quote"
+    },
+    {
+      "include": "#list-bullet"
+    },
+    {
+      "include": "#list-number"
+    },
+    {
+      "include": "#inline"
+    }
   ],
   "repository": {
     "meshfox-comment": {
       "begin": "(<!--)\\s*(/)?(meshfox:[\\w-]+)",
       "beginCaptures": {
-        "1": { "name": "punctuation.definition.comment.meshfox" },
-        "2": { "name": "punctuation.definition.tag.end.meshfox" },
-        "3": { "name": "keyword.other.meshfox" }
+        "1": {
+          "name": "punctuation.definition.comment.meshfox"
+        },
+        "2": {
+          "name": "punctuation.definition.tag.end.meshfox"
+        },
+        "3": {
+          "name": "keyword.other.meshfox"
+        }
       },
       "end": "(-->)",
       "endCaptures": {
-        "1": { "name": "punctuation.definition.comment.meshfox" }
+        "1": {
+          "name": "punctuation.definition.comment.meshfox"
+        }
       },
       "name": "comment.block.meshfox",
-      "patterns": [{ "include": "#meshfox-attr" }]
+      "patterns": [
+        {
+          "include": "#meshfox-attr"
+        }
+      ]
     },
     "meshfox-attr": {
       "match": "([\\w-]+)(=(?:\"[^\"]*\"|'[^']*'|[^\\s`>]*))?",
       "captures": {
-        "1": { "name": "entity.other.attribute-name.meshfox" },
-        "2": { "name": "string.unquoted.meshfox" }
+        "1": {
+          "name": "entity.other.attribute-name.meshfox"
+        },
+        "2": {
+          "name": "string.unquoted.meshfox"
+        }
       }
+    },
+    "html-comment": {
+      "begin": "<!--",
+      "end": "-->",
+      "name": "comment.block.html"
+    },
+    "heading": {
+      "begin": "^\\s{0,3}(#{1,6})(?=\\s|$)",
+      "beginCaptures": {
+        "0": {
+          "name": "markup.heading.markdown"
+        },
+        "1": {
+          "name": "punctuation.definition.heading.markdown"
+        }
+      },
+      "end": "$",
+      "contentName": "entity.name.section.markdown",
+      "name": "markup.heading.markdown",
+      "patterns": [
+        {
+          "include": "#raw-inline"
+        }
+      ]
+    },
+    "fence": {
+      "match": "^\\s*(`{3,}|~{3,})\\s*([^\\s`]*)(.*)$",
+      "captures": {
+        "1": {
+          "name": "punctuation.definition.raw.code-fence.markdown"
+        },
+        "2": {
+          "name": "constant.other.language-name.markdown"
+        }
+      }
+    },
+    "separator": {
+      "match": "^\\s{0,3}(?:-{3,}|\\*{3,}|_{3,})\\s*$",
+      "name": "meta.separator.markdown"
+    },
+    "quote": {
+      "begin": "^\\s{0,3}>",
+      "end": "$",
+      "name": "markup.quote.markdown",
+      "patterns": [
+        {
+          "include": "#inline"
+        }
+      ]
+    },
+    "escape": {
+      "match": "\\\\[\\\\`*_{}\\[\\]()#+\\-.!<>|~]",
+      "name": "constant.character.escape.markdown"
+    },
+    "raw-inline": {
+      "match": "(?<!`)``(?!`)[^\\n]*?(?<!`)``(?!`)|(?<!`)`(?!`)[^\\n]*?(?<!`)`(?!`)",
+      "name": "markup.raw.inline.markdown"
+    },
+    "link": {
+      "match": "\\[!\\[[^\\]\\n]*\\]\\([^)\\n]*\\)\\]\\([^)\\n]*\\)|!?\\[[^\\]\\n]*\\]\\([^)\\n]*\\)",
+      "name": "meta.link.inline.markdown markup.underline.link.markdown"
+    },
+    "bold": {
+      "match": "\\*{2,}(?:[^*\\n]|\\*(?!\\*))+\\*{2,}|_{2,}(?:[^_\\n]|_(?!_))+_{2,}",
+      "name": "markup.bold.markdown"
+    },
+    "italic": {
+      "match": "\\*[^\\s*](?:[^*\\n]*[^\\s*])?\\*|\\b_[^\\s_](?:[^_\\n]*[^\\s_])?_\\b",
+      "name": "markup.italic.markdown"
+    },
+    "list-bullet": {
+      "begin": "^\\s*([-*+])(?=\\s)",
+      "beginCaptures": {
+        "1": {
+          "name": "punctuation.definition.list_item.markdown"
+        }
+      },
+      "end": "$",
+      "name": "markup.list.unnumbered.markdown",
+      "patterns": [
+        {
+          "include": "#inline"
+        }
+      ]
+    },
+    "list-number": {
+      "begin": "^\\s*(\\d{1,9}[.)])(?=\\s)",
+      "beginCaptures": {
+        "1": {
+          "name": "punctuation.definition.list_item.markdown"
+        }
+      },
+      "end": "$",
+      "name": "markup.list.numbered.markdown",
+      "patterns": [
+        {
+          "include": "#inline"
+        }
+      ]
+    },
+    "inline": {
+      "patterns": [
+        {
+          "include": "#escape"
+        },
+        {
+          "include": "#raw-inline"
+        },
+        {
+          "include": "#link"
+        },
+        {
+          "include": "#bold"
+        },
+        {
+          "include": "#italic"
+        }
+      ]
     }
   }
 }

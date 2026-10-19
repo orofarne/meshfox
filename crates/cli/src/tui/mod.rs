@@ -64,6 +64,7 @@ pub async fn run(canvas_path: PathBuf, initial_node: Option<String>) -> io::Resu
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    svg_raster::warm_up_fonts();
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -460,8 +461,7 @@ async fn main_loop(
         // A run just ended (or the TUI just started): pick up the worker's
         // record of it now, then redraw, instead of waiting for the tick.
         if app.refresh_runs_soon {
-            app.refresh_block_runs().await;
-            continue;
+            app.request_worker_refresh();
         }
 
         if let Some(pending) = app.pending_http_tty.take() {
@@ -575,8 +575,7 @@ async fn main_loop(
             }
             _ = worker_tick.tick(), if worker_reachable => {
                 app.poll_tables();
-                app.refresh_services().await;
-                app.refresh_block_runs().await;
+                app.request_worker_refresh();
             }
             _ = tokio::time::sleep(std::time::Duration::from_secs(1)), if services_view_open_on_worker => {
                 if let Some(view) = &app.services_view {

@@ -37,6 +37,14 @@ fn font_db() -> Arc<usvg::fontdb::Database> {
     .clone()
 }
 
+/// Scans the system fonts ahead of the first SVG, from a background thread,
+/// so that scan isn't paid for inside the event loop.
+pub fn warm_up_fonts() {
+    std::thread::spawn(|| {
+        font_db();
+    });
+}
+
 /// Rasterizes `svg_text` (themed first), painting `bg` behind it when it's
 /// a color — `None`/`Transparent` leave the pixels transparent. `None` if
 /// the SVG doesn't parse or has no drawable size.
