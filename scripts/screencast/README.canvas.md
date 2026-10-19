@@ -5,6 +5,7 @@ Record a silent TUI demo, roughly 30 seconds long, as MP4 and WebM, with sharp S
 
 Run **Install dependencies** once and **Build meshfox** when needed, then **Record with Playwright**. Playwright and its Chromium browser are prepared through the canvas-local **Node environment** automatically. Blocks run relative to this document (`scripts/screencast`).
 
+<!-- meshfox:var name="output_dir" type="dir" default="../../target/screencast-playwright" prompt="Output directory" -->
 <!-- meshfox:var name="NODE" from="node-environment/node-setup" -->
 
 The demo shows Markdown and tree navigation, live canvas search, streamed ANSI output, changing a variable through Configure, rerunning, a local chart image, and saving a prose edit in the source editor.
@@ -37,10 +38,9 @@ This native call runs in the target canvas's worker and streams its steps and ou
 
 Record the TUI through ttyd with SIXEL and full-browser Playwright capture. Playwright comes from this document's own Node environment. The Chromium dependency is installed automatically when needed.
 
-The optional `output_dir` is relative to this document. Outputs: `meshfox-tui-sixel.mp4`, `meshfox-tui-sixel.webm`, and `sixel-chart.png`.
+The canvas directory variable `output_dir` selects the output directory. Confirm its suggested value once in Configure; meshfox then trusts this directory for opening the result file nodes. Outputs: `meshfox-tui-sixel.mp4`, `meshfox-tui-sixel.webm`, and `sixel-chart.png`.
 
-<!-- meshfox:arg name="output_dir" default="../../target/screencast-playwright" prompt="Output directory" -->
-```javascript name="record-playwright" interpreter="$NODE" deps="node-environment/browser-install"
+```javascript name="record-playwright" interpreter="$NODE" env="$output_dir" deps="node-environment/browser-install"
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
@@ -179,7 +179,7 @@ try {
 From the repository root:
 
 ```text
-meshfox scripts/screencast/README.canvas.md run record-with-playwright 'record-playwright[output_dir=/tmp/meshfox-video]'
+meshfox scripts/screencast/README.canvas.md run --set output_dir=/tmp/meshfox-video record-with-playwright record-playwright
 ```
 
 ### Node environment
@@ -206,3 +206,24 @@ execFileSync(process.execPath, [cli, 'install', 'chromium'], { stdio: 'inherit' 
 <!-- meshfox:node id="recording-tape" type="file" -->
 
 [demo.tape](demo.tape)
+
+### Video MP4
+<!-- meshfox:node id="video-mp4" type="file" -->
+
+[meshfox-tui-sixel.mp4]($output_dir/meshfox-tui-sixel.mp4)
+
+### Video WebM
+<!-- meshfox:node id="video-webm" type="file" -->
+
+[meshfox-tui-sixel.webm]($output_dir/meshfox-tui-sixel.webm)
+
+### SIXEL chart screenshot
+<!-- meshfox:node id="sixel-chart-screenshot" type="file" -->
+
+[sixel-chart.png]($output_dir/sixel-chart.png)
+
+### Meshfox end card
+<!-- meshfox:node id="meshfox-end-card" type="file" -->
+
+[end-card.png]($output_dir/end-card.png)
+

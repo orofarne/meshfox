@@ -35,7 +35,7 @@ Sleep 3s
 Type "e"
 Sleep 1s
 Type "Go"
-Type "Ready to share."
+Type "***Ready to share.***"
 Escape
 Ctrl+S
 Sleep 1s
