@@ -232,6 +232,9 @@ fn run_via_an_already_running_worker_still_runs_a_file_node() {
         .arg("--watcher-socket")
         .arg(dir.join("fake.sock"))
         .stdout(std::process::Stdio::null())
+        // The fake watcher is never listening: the worker's "couldn't reach the
+        // watcher" notice (a SUN_LEN error on macOS) is not what this tests.
+        .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
 

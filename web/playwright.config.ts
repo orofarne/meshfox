@@ -2,6 +2,7 @@ import { defineConfig, devices } from "@playwright/test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { MESHFOX_VIEW } from "./e2e/meshfox-bin";
 
 // E2E servers must own their fixture workers, even on a developer machine
 // configured to hand `meshfox view` off to an external coordinator. Playwright
@@ -66,10 +67,15 @@ const DEPS_FIREFOX_FIXTURE = firefoxFixtureCopy("deps");
 const QUICK_RUN_FIREFOX_FIXTURE = firefoxFixtureCopy("quick-run");
 const FORM_AUTORUN_OUTPUT_FIREFOX_FIXTURE = firefoxFixtureCopy("form-autorun-output");
 const UNDO_REDO_FIREFOX_FIXTURE = firefoxFixtureCopy("undo-redo");
+// clear-node-layout.spec.ts rewrites its fixture (↺ clears authored x/y/w/h, then
+// restores it): the chrome and firefox projects run in parallel, so on one
+// shared canvas one browser's clear/restore landed in the middle of the other's.
+const CLEAR_NODE_LAYOUT_FIREFOX_FIXTURE = firefoxFixtureCopy("clear-node-layout");
 const DEPS_FIREFOX_PORT = 4625;
 const QUICK_RUN_FIREFOX_PORT = 4626;
 const FORM_AUTORUN_OUTPUT_FIREFOX_PORT = 4627;
 const UNDO_REDO_FIREFOX_PORT = 4628;
+const CLEAR_NODE_LAYOUT_FIREFOX_PORT = 4632;
 
 const PORT = 4590;
 // Separate server + port for scroll.spec.ts: it needs its own fixture
@@ -423,7 +429,11 @@ export default defineConfig({
     {
       name: `${browser}-clear-node-layout`,
       testMatch: /(^|\/)clear-node-layout\.spec\.ts$/,
-      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${CLEAR_NODE_LAYOUT_PORT}` },
+      use: {
+        ...device,
+        viewport: VIEWPORT,
+        baseURL: `http://127.0.0.1:${browser === "firefox" ? CLEAR_NODE_LAYOUT_FIREFOX_PORT : CLEAR_NODE_LAYOUT_PORT}`,
+      },
     },
     {
       name: `${browser}-image-paste`,
@@ -516,261 +526,267 @@ export default defineConfig({
   ]),
   webServer: [
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/group-edge-routing.canvas.md --port ${GROUP_EDGE_ROUTING_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/group-edge-routing.canvas.md --port ${GROUP_EDGE_ROUTING_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${GROUP_EDGE_ROUTING_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      // `web/dist` is built by `pretest:e2e` before Cargo starts. The server
-      // embeds those assets at compile time; its build script watches the
-      // directory so `cargo run` rebuilds when the frontend bundle changes.
+      // `web/dist` is built by `pretest:e2e` before the servers start, and
+      // the debug server reads it from disk on every request. The binary
+      // itself is built and signed once there too (see ./e2e/meshfox-bin.ts).
       // `--no-auto-exit`: `meshfox view` otherwise exits a few seconds after
       // its last connected tab closes (see README's roadmap) — Playwright
       // opens/closes a fresh page between tests against this one shared
       // server, which would otherwise risk killing it mid-suite during that
       // gap.
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/deps.canvas.md --port ${PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/deps.canvas.md --port ${PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/scroll.canvas.md --port ${SCROLL_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/scroll.canvas.md --port ${SCROLL_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${SCROLL_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/select.canvas.md --port ${SELECT_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/select.canvas.md --port ${SELECT_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${SELECT_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/settings.canvas.md --port ${SETTINGS_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/settings.canvas.md --port ${SETTINGS_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${SETTINGS_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/fold.canvas.md --port ${FOLD_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/fold.canvas.md --port ${FOLD_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${FOLD_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/keyboard-nav.canvas.md --port ${KEYBOARD_NAV_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/keyboard-nav.canvas.md --port ${KEYBOARD_NAV_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${KEYBOARD_NAV_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/group-drag.canvas.md --port ${GROUP_DRAG_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/group-drag.canvas.md --port ${GROUP_DRAG_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${GROUP_DRAG_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/group-enter.canvas.md --port ${GROUP_ENTER_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/group-enter.canvas.md --port ${GROUP_ENTER_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${GROUP_ENTER_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/group-drag-firefox.canvas.md --port ${GROUP_DRAG_FIREFOX_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/group-drag-firefox.canvas.md --port ${GROUP_DRAG_FIREFOX_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${GROUP_DRAG_FIREFOX_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/group-enter-firefox.canvas.md --port ${GROUP_ENTER_FIREFOX_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/group-enter-firefox.canvas.md --port ${GROUP_ENTER_FIREFOX_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${GROUP_ENTER_FIREFOX_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/document-options.canvas.md --port ${DOCUMENT_OPTIONS_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/document-options.canvas.md --port ${DOCUMENT_OPTIONS_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${DOCUMENT_OPTIONS_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/default-fold.canvas.md --port ${DEFAULT_FOLD_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/default-fold.canvas.md --port ${DEFAULT_FOLD_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${DEFAULT_FOLD_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/quick-run.canvas.md --port ${QUICK_RUN_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/quick-run.canvas.md --port ${QUICK_RUN_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${QUICK_RUN_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/run-history.canvas.md --port ${RUN_HISTORY_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/run-history.canvas.md --port ${RUN_HISTORY_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${RUN_HISTORY_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/edge-routing.canvas.md --port ${EDGE_ROUTING_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/edge-routing.canvas.md --port ${EDGE_ROUTING_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${EDGE_ROUTING_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/vars-form.canvas.md --port ${VARS_FORM_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/vars-form.canvas.md --port ${VARS_FORM_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${VARS_FORM_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/move-sibling.canvas.md --port ${MOVE_SIBLING_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/move-sibling.canvas.md --port ${MOVE_SIBLING_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${MOVE_SIBLING_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/clear-node-layout.canvas.md --port ${CLEAR_NODE_LAYOUT_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/clear-node-layout.canvas.md --port ${CLEAR_NODE_LAYOUT_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${CLEAR_NODE_LAYOUT_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/image-paste.canvas.md --port ${IMAGE_PASTE_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/${CLEAR_NODE_LAYOUT_FIREFOX_FIXTURE}.canvas.md --port ${CLEAR_NODE_LAYOUT_FIREFOX_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${CLEAR_NODE_LAYOUT_FIREFOX_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/image-paste.canvas.md --port ${IMAGE_PASTE_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${IMAGE_PASTE_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/markdown-extensions.canvas.md --port ${MARKDOWN_EXTENSIONS_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/markdown-extensions.canvas.md --port ${MARKDOWN_EXTENSIONS_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${MARKDOWN_EXTENSIONS_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/search.canvas.md --port ${SEARCH_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/search.canvas.md --port ${SEARCH_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${SEARCH_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/search-pan.canvas.md --port ${SEARCH_PAN_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/search-pan.canvas.md --port ${SEARCH_PAN_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${SEARCH_PAN_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/autofit-title.canvas.md --port ${AUTOFIT_TITLE_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/autofit-title.canvas.md --port ${AUTOFIT_TITLE_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${AUTOFIT_TITLE_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/copy-paste.canvas.md --port ${COPY_PASTE_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/copy-paste.canvas.md --port ${COPY_PASTE_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${COPY_PASTE_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/copy-paste-firefox.canvas.md --port ${COPY_PASTE_FIREFOX_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/copy-paste-firefox.canvas.md --port ${COPY_PASTE_FIREFOX_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${COPY_PASTE_FIREFOX_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/form-autorun-output.canvas.md --port ${FORM_AUTORUN_OUTPUT_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/form-autorun-output.canvas.md --port ${FORM_AUTORUN_OUTPUT_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${FORM_AUTORUN_OUTPUT_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/form-autorun-tty.canvas.md --port ${FORM_AUTORUN_TTY_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/form-autorun-tty.canvas.md --port ${FORM_AUTORUN_TTY_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${FORM_AUTORUN_TTY_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/reload-live-run.canvas.md --port ${RELOAD_LIVE_RUN_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/reload-live-run.canvas.md --port ${RELOAD_LIVE_RUN_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${RELOAD_LIVE_RUN_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/drag-reorder.canvas.md --port ${DRAG_REORDER_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/drag-reorder.canvas.md --port ${DRAG_REORDER_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${DRAG_REORDER_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/drag-reorder-firefox.canvas.md --port ${DRAG_REORDER_FIREFOX_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/drag-reorder-firefox.canvas.md --port ${DRAG_REORDER_FIREFOX_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${DRAG_REORDER_FIREFOX_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${EXTERNAL_EDIT_DIR}/external-edit.canvas.md --port ${EXTERNAL_EDIT_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${EXTERNAL_EDIT_DIR}/external-edit.canvas.md --port ${EXTERNAL_EDIT_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${EXTERNAL_EDIT_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${MCP_LIVE_DIRS.chrome}/mcp-live.canvas.md --port ${MCP_LIVE_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${MCP_LIVE_DIRS.chrome}/mcp-live.canvas.md --port ${MCP_LIVE_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${MCP_LIVE_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${MCP_LIVE_DIRS.firefox}/mcp-live.canvas.md --port ${MCP_LIVE_FIREFOX_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${MCP_LIVE_DIRS.firefox}/mcp-live.canvas.md --port ${MCP_LIVE_FIREFOX_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${MCP_LIVE_FIREFOX_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/undo-redo.canvas.md --port ${UNDO_REDO_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/undo-redo.canvas.md --port ${UNDO_REDO_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${UNDO_REDO_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/${DEPS_FIREFOX_FIXTURE}.canvas.md --port ${DEPS_FIREFOX_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/${DEPS_FIREFOX_FIXTURE}.canvas.md --port ${DEPS_FIREFOX_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${DEPS_FIREFOX_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/${QUICK_RUN_FIREFOX_FIXTURE}.canvas.md --port ${QUICK_RUN_FIREFOX_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/${QUICK_RUN_FIREFOX_FIXTURE}.canvas.md --port ${QUICK_RUN_FIREFOX_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${QUICK_RUN_FIREFOX_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/${FORM_AUTORUN_OUTPUT_FIREFOX_FIXTURE}.canvas.md --port ${FORM_AUTORUN_OUTPUT_FIREFOX_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/${FORM_AUTORUN_OUTPUT_FIREFOX_FIXTURE}.canvas.md --port ${FORM_AUTORUN_OUTPUT_FIREFOX_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${FORM_AUTORUN_OUTPUT_FIREFOX_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/${UNDO_REDO_FIREFOX_FIXTURE}.canvas.md --port ${UNDO_REDO_FIREFOX_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/${UNDO_REDO_FIREFOX_FIXTURE}.canvas.md --port ${UNDO_REDO_FIREFOX_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${UNDO_REDO_FIREFOX_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/body-conflict.canvas.md --port ${BODY_CONFLICT_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/body-conflict.canvas.md --port ${BODY_CONFLICT_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${BODY_CONFLICT_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/ws-liveness.canvas.md --port ${WS_LIVENESS_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/ws-liveness.canvas.md --port ${WS_LIVENESS_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${WS_LIVENESS_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
     {
-      command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${FIXTURES_DIR}/path-picker.canvas.md --port ${PATH_PICKER_PORT} --no-open --no-auto-exit`,
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/path-picker.canvas.md --port ${PATH_PICKER_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${PATH_PICKER_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,

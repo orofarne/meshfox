@@ -16,6 +16,16 @@
 # lock is held, since whoever held it before us has usually done the job.
 set -euo pipefail
 
+# `--sign-only <bin>`: make sure `bin` is cleanly signed and stop — for a build
+# step that wants to do it once, ahead of many direct runs (the e2e suite's
+# `pretest:e2e`). A no-op off macOS, where there is nothing to sign.
+sign_only=false
+if [[ "${1:-}" == "--sign-only" ]]; then
+  sign_only=true
+  shift
+  [[ "$(uname -s)" == Darwin ]] || exit 0
+fi
+
 bin="$1"
 shift
 
@@ -47,4 +57,5 @@ if needs_sign; then
   rmdir "$lock" 2>/dev/null || true
   trap - EXIT
 fi
+if $sign_only; then exit 0; fi
 exec "$bin" "$@"

@@ -57,6 +57,9 @@ fn spawn_worker(dir: &Path, canvas_path: &Path) -> std::process::Child {
         .arg("--watcher-socket")
         .arg(dir.join("fake.sock"))
         .stdout(std::process::Stdio::null())
+        // The fake watcher is never listening: the worker's "couldn't reach the
+        // watcher" notice (a SUN_LEN error on macOS) is not what this tests.
+        .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
 

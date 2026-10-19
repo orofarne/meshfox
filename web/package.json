@@ -24,7 +24,7 @@
     "test:routing:e2e": "npm run build && playwright test --config=edge-routing.playwright.config.ts",
     "test:svg-theme": "node --test scripts/svg-theme.test.mjs",
     "test:table-view": "node --test scripts/table-view.test.mjs",
-    "pretest:e2e": "npm run build",
+    "pretest:e2e": "npm run build && cargo build --manifest-path ../Cargo.toml -p meshfox-cli && ../scripts/run-signed.sh --sign-only \"${CARGO_TARGET_DIR:-../target}/debug/meshfox\"",
     "test:e2e": "playwright test",
     "test:e2e:ui": "playwright test --ui"
   },
